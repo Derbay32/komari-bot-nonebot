@@ -14,7 +14,6 @@ from nonebot.plugin import require
 
 from .config import Config as EnvConfig
 from .config_schemas import DynamicConfigSchema
-from .crypto import decrypt_token, encrypt_token
 
 # 依赖 localstore 插件
 store = require("nonebot_plugin_localstore")
@@ -99,7 +98,7 @@ class ConfigManager:
             return self._dynamic_config
 
     def _load_from_json(self) -> DynamicConfigSchema:
-        """从 JSON 文件加载配置（token 自动解密）。
+        """从 JSON 文件加载配置。
 
         Returns:
             解析后的 DynamicConfigSchema 实例。
@@ -107,14 +106,6 @@ class ConfigManager:
         try:
             with open(self._config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-
-            # 解密 token
-            if "deepseek_api_token" in data:
-                try:
-                    data["deepseek_api_token"] = decrypt_token(data["deepseek_api_token"])
-                except ValueError as e:
-                    logger.warning(f"Token 解密失败，可能已迁移或使用旧配置: {e}")
-                    # 如果解密失败，保持原值（可能是明文或已加密）
 
             return DynamicConfigSchema(**data)
         except json.JSONDecodeError as e:
@@ -145,7 +136,7 @@ class ConfigManager:
         )
 
     def _save_to_json(self, config: DynamicConfigSchema) -> None:
-        """将配置保存到 JSON 文件（token 自动加密）。
+        """将配置保存到 JSON 文件。
 
         Args:
             config: 要保存的配置。
@@ -157,13 +148,9 @@ class ConfigManager:
             # 更新时间戳
             config.last_updated = datetime.now().isoformat()
 
-            # 创建用于保存的字典，加密 token
-            config_dict = config.model_dump()
-            config_dict["deepseek_api_token"] = encrypt_token(config.deepseek_api_token)
-
             # 以限制性权限写入
             with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
+                json.dump(config.model_dump(), f, indent=2, ensure_ascii=False)
 
             # 设置文件权限（仅用户可读写）
             self._config_file.chmod(0o600)

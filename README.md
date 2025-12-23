@@ -1,11 +1,10 @@
 # komari-bot
 自用小鞠bot库
-## How to start
+## 如何开始？
 
-1. generate project using `nb create` .
-2. create your plugin using `nb plugin create` .
-3. writing your plugins under `komari_bot/plugins` folder.
-4. run your bot using `nb run --reload` .
+1. clone这个仓库
+2. 进入仓库后根据需求修改jrhg_config.json.example 和 .env.example
+3. docker compose up
 
 ## Documentation
 
