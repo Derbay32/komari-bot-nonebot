@@ -28,7 +28,7 @@ ENV MAX_WORKERS 1
 COPY --from=requirements_stage /tmp/bot.py /app
 COPY ./docker/_main.py /app
 
-RUN pip install --no-cache-dir gunicorn uvicorn[standard] nonebot2
+RUN pip install --no-cache-dir gunicorn uvicorn[standard] nonebot2 nonebot2[fastapi] nonebot-adapter-onebot aiohttp aiosqlite nonebot2[aiohttp] nonebot-plugin-localstore nonebot2[websockets]
 COPY . /app/
 
 CMD ["/start.sh"]
