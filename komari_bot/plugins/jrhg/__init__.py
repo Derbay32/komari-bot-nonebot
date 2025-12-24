@@ -112,13 +112,12 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
 
         # 获取用户信息
         user_id = event.get_user_id()
-        group_id = getattr(event, 'group_id', user_id)  # 如果是私聊，使用用户ID作为群组ID
         user_nickname = get_user_nickname(event)
 
         # 获取或生成好感度
-        logger.info(f"用户 {user_nickname}({user_id}) 在群 {group_id} 请求好感度问候")
+        logger.info(f"用户 {user_nickname}({user_id}) 请求好感度问候")
 
-        favor_result = await generate_or_update_favorability(user_id, str(group_id))
+        favor_result = await generate_or_update_favorability(user_id)
 
         if favor_result.is_new_day:
             logger.info(f"为用户 {user_nickname} 生成新的每日好感度: {favor_result.daily_favor}")

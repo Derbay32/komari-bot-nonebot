@@ -47,55 +47,51 @@ async def on_shutdown():
 
 # ===== 公开API接口 =====
 
-async def get_user_favorability(user_id: str, group_id: str) -> Optional[UserFavorability]:
+async def get_user_favorability(user_id: str) -> Optional[UserFavorability]:
     """获取用户好感度
 
     Args:
         user_id: 用户ID
-        group_id: 群组ID
 
     Returns:
         用户好感度对象，如果不存在则返回None
     """
     db = await get_db()
-    return await db.get_user_favorability(user_id, group_id)
+    return await db.get_user_favorability(user_id)
 
 
-async def generate_or_update_favorability(user_id: str, group_id: str) -> FavorGenerationResult:
+async def generate_or_update_favorability(user_id: str) -> FavorGenerationResult:
     """生成或更新用户好感度
 
     Args:
         user_id: 用户ID
-        group_id: 群组ID
 
     Returns:
         好感度生成结果，包含每日好感度、累计好感度和态度等级
     """
     db = await get_db()
-    return await db.generate_or_update_favorability(user_id, group_id)
+    return await db.generate_or_update_favorability(user_id)
 
 
-async def get_user_attribute(user_id: str, group_id: str, attribute_name: str) -> Optional[str]:
+async def get_user_attribute(user_id: str, attribute_name: str) -> Optional[str]:
     """获取用户属性
 
     Args:
         user_id: 用户ID
-        group_id: 群组ID
         attribute_name: 属性名称
 
     Returns:
         属性值，如果不存在则返回None
     """
     db = await get_db()
-    return await db.get_user_attribute(user_id, group_id, attribute_name)
+    return await db.get_user_attribute(user_id, attribute_name)
 
 
-async def set_user_attribute(user_id: str, group_id: str, attribute_name: str, attribute_value: str) -> bool:
+async def set_user_attribute(user_id: str, attribute_name: str, attribute_value: str) -> bool:
     """设置用户属性
 
     Args:
         user_id: 用户ID
-        group_id: 群组ID
         attribute_name: 属性名称
         attribute_value: 属性值
 
@@ -103,39 +99,37 @@ async def set_user_attribute(user_id: str, group_id: str, attribute_name: str, a
         操作是否成功
     """
     db = await get_db()
-    return await db.set_user_attribute(user_id, group_id, attribute_name, attribute_value)
+    return await db.set_user_attribute(user_id, attribute_name, attribute_value)
 
 
-async def get_user_attributes(user_id: str, group_id: str) -> list[UserAttribute]:
+async def get_user_attributes(user_id: str) -> list[UserAttribute]:
     """获取用户的所有属性
 
     Args:
         user_id: 用户ID
-        group_id: 群组ID
 
     Returns:
         用户属性列表
     """
     db = await get_db()
-    return await db.get_user_attributes(user_id, group_id)
+    return await db.get_user_attributes(user_id)
 
 
-async def get_favor_history(user_id: str, group_id: str, days: int = 7) -> list[UserFavorability]:
+async def get_favor_history(user_id: str, days: int = 7) -> list[UserFavorability]:
     """获取用户好感度历史记录
 
     Args:
         user_id: 用户ID
-        group_id: 群组ID
         days: 获取最近多少天的记录
 
     Returns:
         好感度历史记录列表
     """
     db = await get_db()
-    return await db.get_favor_history(user_id, group_id, days)
+    return await db.get_favor_history(user_id, days)
 
 
-async def cleanup_old_data(retention_days: int = 30) -> bool:
+async def cleanup_old_data(retention_days: int = 0) -> bool:
     """清理旧的用户属性数据
 
     Args:

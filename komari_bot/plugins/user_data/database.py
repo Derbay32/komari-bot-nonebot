@@ -36,12 +36,11 @@ class UserDataDB:
             CREATE TABLE IF NOT EXISTS user_attributes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
-                group_id TEXT NOT NULL,
                 attribute_name TEXT NOT NULL,
                 attribute_value TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, group_id, attribute_name)
+                UNIQUE(user_id, attribute_name)
             )
         """)
 
@@ -49,23 +48,22 @@ class UserDataDB:
         await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS user_favorability (
                 user_id TEXT NOT NULL,
-                group_id TEXT NOT NULL,
                 daily_favor INTEGER DEFAULT 0,
                 cumulative_favor INTEGER DEFAULT 0,
                 last_updated DATE NOT NULL,
-                PRIMARY KEY (user_id, group_id, last_updated)
+                PRIMARY KEY (user_id, last_updated)
             )
         """)
 
         # 创建索引以提高查询性能
         await self._connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_user_attributes_composite
-            ON user_attributes(user_id, group_id, attribute_name)
+            ON user_attributes(user_id, attribute_name)
         """)
 
         await self._connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_user_favorability_composite
-            ON user_favorability(user_id, group_id, last_updated)
+            ON user_favorability(user_id, last_updated)
         """)
 
     async def close(self):
@@ -76,21 +74,21 @@ class UserDataDB:
 
     # ===== 用户属性相关操作 =====
 
-    async def get_user_attribute(self, user_id: str, group_id: str, attribute_name: str) -> Optional[str]:
+    async def get_user_attribute(self, user_id: str, attribute_name: str) -> Optional[str]:
         """获取用户属性值"""
         assert self._connection is not None
         cursor = await self._connection.execute(
             """
             SELECT attribute_value
             FROM user_attributes
-            WHERE user_id = ? AND group_id = ? AND attribute_name = ?
+            WHERE user_id = ? AND attribute_name = ?
             """,
-            (user_id, group_id, attribute_name)
+            (user_id, attribute_name)
         )
         row = await cursor.fetchone()
         return row[0] if row else None
 
-    async def set_user_attribute(self, user_id: str, group_id: str, attribute_name: str, attribute_value: str) -> bool:
+    async def set_user_attribute(self, user_id: str, attribute_name: str, attribute_value: str) -> bool:
         """设置用户属性值
 
         Returns:
@@ -100,40 +98,39 @@ class UserDataDB:
         await self._connection.execute(
             """
             INSERT OR REPLACE INTO user_attributes
-            (user_id, group_id, attribute_name, attribute_value, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            (user_id, attribute_name, attribute_value, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             """,
-            (user_id, group_id, attribute_name, attribute_value)
+            (user_id, attribute_name, attribute_value)
         )
         return True
 
-    async def get_user_attributes(self, user_id: str, group_id: str) -> list[UserAttribute]:
+    async def get_user_attributes(self, user_id: str) -> list[UserAttribute]:
         """获取用户的所有属性"""
         assert self._connection is not None
         cursor = await self._connection.execute(
             """
-            SELECT user_id, group_id, attribute_name, attribute_value, created_at, updated_at
+            SELECT user_id, attribute_name, attribute_value, created_at, updated_at
             FROM user_attributes
-            WHERE user_id = ? AND group_id = ?
+            WHERE user_id = ?
             """,
-            (user_id, group_id)
+            (user_id,)
         )
         rows = await cursor.fetchall()
         return [
             UserAttribute(
                 user_id=row[0],
-                group_id=row[1],
-                attribute_name=row[2],
-                attribute_value=row[3],
-                created_at=row[4],
-                updated_at=row[5]
+                attribute_name=row[1],
+                attribute_value=row[2],
+                created_at=row[3],
+                updated_at=row[4]
             )
             for row in rows
         ]
 
     # ===== 好感度相关操作 =====
 
-    async def get_user_favorability(self, user_id: str, group_id: str, target_date: Optional[date] = None) -> Optional[UserFavorability]:
+    async def get_user_favorability(self, user_id: str, target_date: Optional[date] = None) -> Optional[UserFavorability]:
         """获取用户好感度"""
         assert self._connection is not None
         if target_date is None:
@@ -141,29 +138,28 @@ class UserDataDB:
 
         cursor = await self._connection.execute(
             """
-            SELECT user_id, group_id, daily_favor, cumulative_favor, last_updated
+            SELECT user_id, daily_favor, cumulative_favor, last_updated
             FROM user_favorability
-            WHERE user_id = ? AND group_id = ? AND last_updated = ?
+            WHERE user_id = ? AND last_updated = ?
             """,
-            (user_id, group_id, target_date)
+            (user_id, target_date)
         )
         row = await cursor.fetchone()
 
         if row:
             return UserFavorability(
                 user_id=row[0],
-                group_id=row[1],
-                daily_favor=row[2],
-                cumulative_favor=row[3],
-                last_updated=date.fromisoformat(row[4]) if isinstance(row[4], str) else row[4]
+                daily_favor=row[1],
+                cumulative_favor=row[2],
+                last_updated=date.fromisoformat(row[3]) if isinstance(row[3], str) else row[3]
             )
         return None
 
-    async def generate_or_update_favorability(self, user_id: str, group_id: str) -> FavorGenerationResult:
+    async def generate_or_update_favorability(self, user_id: str) -> FavorGenerationResult:
         """生成或更新用户好感度"""
         assert self._connection is not None
         today = date.today()
-        existing_favor = await self.get_user_favorability(user_id, group_id, today)
+        existing_favor = await self.get_user_favorability(user_id, today)
 
         is_new_day = False
         daily_favor = 0
@@ -179,23 +175,22 @@ class UserDataDB:
             daily_favor = random.randint(1, 100)
 
             # 获取历史累计好感度
-            cumulative_favor = await self._get_cumulative_favor(user_id, group_id)
+            cumulative_favor = await self._get_cumulative_favor(user_id)
             cumulative_favor += daily_favor
 
             # 插入新的好感度记录
             await self._connection.execute(
                 """
                 INSERT INTO user_favorability
-                (user_id, group_id, daily_favor, cumulative_favor, last_updated)
-                VALUES (?, ?, ?, ?, ?)
+                (user_id, daily_favor, cumulative_favor, last_updated)
+                VALUES (?, ?, ?, ?)
                 """,
-                (user_id, group_id, daily_favor, cumulative_favor, today)
+                (user_id, daily_favor, cumulative_favor, today)
             )
 
         # 创建好感度对象以获取态度等级
         favor_obj = UserFavorability(
             user_id=user_id,
-            group_id=group_id,
             daily_favor=daily_favor,
             cumulative_favor=cumulative_favor,
             last_updated=today
@@ -203,14 +198,13 @@ class UserDataDB:
 
         return FavorGenerationResult(
             user_id=user_id,
-            group_id=group_id,
             daily_favor=daily_favor,
             cumulative_favor=cumulative_favor,
             is_new_day=is_new_day,
             favor_level=favor_obj.favor_level
         )
 
-    async def _get_cumulative_favor(self, user_id: str, group_id: str) -> int:
+    async def _get_cumulative_favor(self, user_id: str) -> int:
         """获取用户的累计好感度（不包括今天）"""
         assert self._connection is not None
         today = date.today()
@@ -218,34 +212,33 @@ class UserDataDB:
             """
             SELECT MAX(cumulative_favor)
             FROM user_favorability
-            WHERE user_id = ? AND group_id = ? AND last_updated < ?
+            WHERE user_id = ? AND last_updated < ?
             """,
-            (user_id, group_id, today)
+            (user_id, today)
         )
         row = await cursor.fetchone()
         return row[0] if row and row[0] else 0
 
-    async def get_favor_history(self, user_id: str, group_id: str, days: int = 7) -> list[UserFavorability]:
+    async def get_favor_history(self, user_id: str, days: int = 7) -> list[UserFavorability]:
         """获取用户好感度历史记录"""
         assert self._connection is not None
         cursor = await self._connection.execute(
             """
-            SELECT user_id, group_id, daily_favor, cumulative_favor, last_updated
+            SELECT user_id, daily_favor, cumulative_favor, last_updated
             FROM user_favorability
-            WHERE user_id = ? AND group_id = ?
+            WHERE user_id = ?
             ORDER BY last_updated DESC
             LIMIT ?
             """,
-            (user_id, group_id, days)
+            (user_id, days)
         )
         rows = await cursor.fetchall()
         return [
             UserFavorability(
                 user_id=row[0],
-                group_id=row[1],
-                daily_favor=row[2],
-                cumulative_favor=row[3],
-                last_updated=date.fromisoformat(row[4]) if isinstance(row[4], str) else row[4]
+                daily_favor=row[1],
+                cumulative_favor=row[2],
+                last_updated=date.fromisoformat(row[3]) if isinstance(row[3], str) else row[3]
             )
             for row in rows
         ]
