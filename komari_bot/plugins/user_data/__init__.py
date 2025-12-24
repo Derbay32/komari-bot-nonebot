@@ -1,5 +1,5 @@
-from nonebot import get_plugin_config
-from nonebot.plugin import PluginMetadata
+from nonebot import get_plugin_config, logger
+from nonebot.plugin import PluginMetadata, require
 from typing import Optional
 
 from .config import Config
@@ -29,11 +29,38 @@ async def get_db() -> UserDataDB:
 
 # ===== 插件生命周期管理 =====
 
+# 尝试加载 nonebot 内置 scheduler
+_scheduler = None
+try:
+    _scheduler = require("nonebot_plugin_scheduler").scheduler
+except Exception:
+    _scheduler = None
+
+
 async def on_startup():
     """插件启动时的初始化"""
-    db = await get_db()
-    # 可以在这里添加启动时的初始化逻辑
-    print("用户数据插件已启动")
+    await get_db()
+
+    # 注册定时清理任务
+    if _scheduler:
+        _scheduler.add_job(
+            _scheduled_cleanup,
+            "cron",
+            hour=2,  # 每天凌晨2点执行
+            minute=0,
+            id="cleanup_user_data"
+        )
+        logger.info("用户数据插件已启动 (已注册定时清理任务)")
+    else:
+        logger.warning("用户数据插件已启动 (scheduler 不可用，请手动清理数据)")
+
+
+async def _scheduled_cleanup():
+    """定时清理任务（保留7天）"""
+    try:
+        await cleanup_old_data(retention_days=7)
+    except Exception as e:
+        logger.error(f"清理用户数据时出错: {e}")
 
 
 async def on_shutdown():
@@ -42,7 +69,7 @@ async def on_shutdown():
     if _db:
         await _db.close()
         _db = None
-        print("用户数据插件已关闭")
+        logger.info("用户数据插件已关闭")
 
 
 # ===== 公开API接口 =====
@@ -129,7 +156,7 @@ async def get_favor_history(user_id: str, days: int = 7) -> list[UserFavorabilit
     return await db.get_favor_history(user_id, days)
 
 
-async def cleanup_old_data(retention_days: int = 0) -> bool:
+async def cleanup_old_data(retention_days: int = 10) -> bool:
     """清理旧的用户属性数据
 
     Args:
@@ -150,16 +177,6 @@ async def get_user_count() -> int:
     """
     db = await get_db()
     return await db.get_user_count()
-
-
-async def get_group_count() -> int:
-    """获取总群聊数
-
-    Returns:
-        总群聊数
-    """
-    db = await get_db()
-    return await db.get_group_count()
 
 
 # ===== 便捷函数 =====
@@ -211,7 +228,6 @@ __all__ = [
     # 历史和统计API
     "get_favor_history",
     "get_user_count",
-    "get_group_count",
 
     # 便捷函数
     "get_favor_attitude",
