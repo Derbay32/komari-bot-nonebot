@@ -77,7 +77,7 @@ class DeepSeekClient:
             system_prompt = self._build_favor_prompt(daily_favor, user_nickname)
 
             #
-            now_time = time.strftime("%A %Y-%m-%d %H-%M", time.localtime())
+            now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
             # 构建用户消息
             if custom_message:
                 user_message = f"现在的时间是{now_time}。用户{user_nickname}对你说：{custom_message}，请回应他。"
