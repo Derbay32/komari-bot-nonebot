@@ -1,4 +1,4 @@
-# 第一阶段：生成 bot.py (保持你原来的逻辑)
+# 第一阶段：生成 bot.py
 FROM python:3.9-slim as requirements_stage
 
 WORKDIR /wheel
@@ -16,7 +16,7 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# 规范化 ENV 格式 (key=value)
+# ENV
 ENV TZ=Asia/Shanghai
 ENV PYTHONPATH=/app
 ENV APP_MODULE=_main:app
@@ -30,12 +30,11 @@ RUN chmod +x /start.sh
 COPY --from=requirements_stage /tmp/bot.py /app/
 COPY ./docker/_main.py /app/
 
-# --- 关键修改部分 ---
 # 先复制依赖文件进行安装，利用 Docker 缓存
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# 最后复制项目所有代码（这样代码变动时不需要重新安装依赖）
+# 复制项目所有代码
 COPY . /app/
 
 CMD ["/start.sh"]

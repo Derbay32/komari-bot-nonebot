@@ -7,19 +7,17 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent, Message
 from nonebot.exception import FinishedException
 
 from .config import Config
-from .config_manager import get_config_manager, ConfigManager
 from .config_schemas import DynamicConfigSchema
-from .permissions import (
-    get_user_nickname,
-    check_plugin_status,
-    format_permission_info,
-    check_runtime_permission,
-)
 from .deepseek_client import get_client, close_client
 
 # 依赖用户数据插件
 user_data_plugin = require("user_data")
-# 导入函数，如果插件未加载则设为 None
+# 依赖配置管理插件
+config_manager_plugin = require("config_manager")
+# 依赖权限管理插件
+permission_manager_plugin = require("permission_manager")
+
+# 导入用户数据插件函数，如果插件未加载则设为 None
 try:
     generate_or_update_favorability = user_data_plugin.generate_or_update_favorability
     format_favor_response = user_data_plugin.format_favor_response
@@ -35,8 +33,8 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
 )
 
-# 初始化配置管理器
-config_manager: ConfigManager = get_config_manager()
+# 初始化配置管理器（使用新的通用插件）
+config_manager = config_manager_plugin.get_config_manager("jrhg", DynamicConfigSchema)
 dynamic_config: DynamicConfigSchema = config_manager.initialize()
 
 # 主jrhg指令注册，使用动态权限检查
@@ -63,8 +61,8 @@ async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Comm
 
     if action == "status":
         # 显示插件状态信息
-        permission_info = format_permission_info(dynamic_config)
-        plugin_status, status_desc = await check_plugin_status(dynamic_config)
+        permission_info = permission_manager_plugin.format_permission_info(dynamic_config)
+        plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(dynamic_config)
 
         # 获取用户数据插件状态
         user_data_status = "🟢 正常" if generate_or_update_favorability else "🔴 异常"
@@ -101,7 +99,7 @@ async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Comm
 async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     """处理jrhg主命令"""
     # 使用运行时配置进行权限检查
-    can_use, reason = await check_runtime_permission(bot, event, config_manager)
+    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
     if not can_use:
         await jrhg.finish(f"❌ {reason}")
 
@@ -112,7 +110,7 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
 
         # 获取用户信息
         user_id = event.get_user_id()
-        user_nickname = get_user_nickname(event)
+        user_nickname = permission_manager_plugin.get_user_nickname(event)
 
         # 获取或生成好感度
         logger.info(f"用户 {user_nickname}({user_id}) 请求好感度问候")

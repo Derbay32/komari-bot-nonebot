@@ -29,10 +29,10 @@ async def get_db() -> UserDataDB:
 
 # ===== 插件生命周期管理 =====
 
-# 尝试加载 nonebot 内置 scheduler
+# 尝试加载 nonebot_plugin_apscheduler
 _scheduler = None
 try:
-    _scheduler = require("nonebot_plugin_scheduler").scheduler
+    _scheduler = require("nonebot_plugin_apscheduler").scheduler
 except Exception:
     _scheduler = None
 
