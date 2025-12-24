@@ -6,6 +6,10 @@ services:
     image: derbay32/komari-bot-nonebot:latest
     ports:
       - *config-port
+      - 8080:8080
+    volumes:
+      - /app/config:/app/config
+      - /app/user_data.db:/app/user_data.db
     env_file:
       - .env.prod
     environment:

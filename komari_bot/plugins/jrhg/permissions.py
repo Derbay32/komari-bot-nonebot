@@ -8,7 +8,7 @@ from nonebot.adapters.onebot.v11 import MessageEvent as obv11MessEvent
 from .config import Config
 from .config_schemas import DynamicConfigSchema
 
-# Type alias for config compatibility
+# 配置兼容
 ConfigType = Union[Config, DynamicConfigSchema]
 
 
@@ -36,7 +36,11 @@ class PermissionManager:
             return True
         return group_id in self.config.group_whitelist
 
-    async def can_use_command(self, bot: Bot, event: obv11MessEvent) -> tuple[bool, str]:
+    async def can_use_command(
+            self,
+            bot: Bot,
+            event: obv11MessEvent
+            ) -> tuple[bool, str]:
         """检查用户是否可以使用命令
 
         Args:
@@ -44,7 +48,7 @@ class PermissionManager:
             event: 事件实例
 
         Returns:
-            (是否可以使用, 拒绝原因)
+            tuple[是否可以使用, 拒绝原因]
         """
         # 检查插件是否启用
         if not self.is_plugin_enabled():
@@ -56,15 +60,22 @@ class PermissionManager:
         # SUPER用户绕过所有检查
         if await SUPERUSER(bot, event):
             return True, ""
+        
+        # 检查白名单变量声明
+        is_u , is_g = True, True
 
         # 检查用户白名单
         if not self.is_user_whitelisted(user_id):
-            return False, "您不在用户白名单中，无法使用此命令"
+            is_u = False
 
         # 如果是群聊消息，检查群组白名单
         group_id = getattr(event, 'group_id', None)
         if group_id is not None and not self.is_group_whitelisted(str(group_id)):
-            return False, "此群聊不在白名单中，无法使用此命令"
+            is_g = False
+
+        # 判断是否处于任意一个白名单中
+        if not (is_u or is_g):
+            return False, "您不在用户白名单中，无法使用此命令" if is_u else "此群聊不在白名单中，无法使用此命令"
 
         return True, ""
 
