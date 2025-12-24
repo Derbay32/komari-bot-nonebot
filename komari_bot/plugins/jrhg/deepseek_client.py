@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from typing import Optional, Union
 
 import aiohttp
@@ -75,11 +76,13 @@ class DeepSeekClient:
             # 构建系统提示词
             system_prompt = self._build_favor_prompt(daily_favor, user_nickname)
 
+            #
+            now_time = time.strftime("%A %Y-%m-%d %H-%M", time.localtime())
             # 构建用户消息
             if custom_message:
-                user_message = f"用户{user_nickname}对你说：{custom_message}，请回应他。"
+                user_message = f"现在的时间是{now_time}。用户{user_nickname}对你说：{custom_message}，请回应他。"
             else:
-                user_message = f"请向用户{user_nickname}打个招呼。"
+                user_message = f"现在的时间是{now_time}。请向用户{user_nickname}打个招呼。"
 
             # 构建请求数据
             request_data = {
