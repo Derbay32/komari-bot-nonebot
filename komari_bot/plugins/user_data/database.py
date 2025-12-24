@@ -245,8 +245,8 @@ class UserDataDB:
 
     # ===== 数据清理操作 =====
 
-    async def cleanup_old_data(self, retention_days: int = 30) -> bool:
-        """清理旧的用户属性数据
+    async def cleanup_old_data(self, retention_days: int = 7) -> bool:
+        """清理旧的用户数据
 
         Args:
             retention_days: 数据保留天数
@@ -259,12 +259,23 @@ class UserDataDB:
             return False
 
         cutoff_date = datetime.now() - timedelta(days=retention_days)
+
+        # 清理 user_attributes 表
         await self._connection.execute(
             """
             DELETE FROM user_attributes
-            WHERE updated_at < ? AND attribute_name NOT IN ('favorability', 'daily_favor')
+            WHERE updated_at < ?
             """,
             (cutoff_date,)
+        )
+
+        # 清理 user_favorability 表
+        await self._connection.execute(
+            """
+            DELETE FROM user_favorability
+            WHERE last_updated < ?
+            """,
+            (cutoff_date.date(),)
         )
         return True
 
@@ -274,12 +285,5 @@ class UserDataDB:
         """获取总用户数"""
         assert self._connection is not None
         cursor = await self._connection.execute("SELECT COUNT(DISTINCT user_id) FROM user_attributes")
-        row = await cursor.fetchone()
-        return row[0] if row else 0
-
-    async def get_group_count(self) -> int:
-        """获取总群聊数"""
-        assert self._connection is not None
-        cursor = await self._connection.execute("SELECT COUNT(DISTINCT group_id) FROM user_attributes")
         row = await cursor.fetchone()
         return row[0] if row else 0
