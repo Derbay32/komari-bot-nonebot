@@ -1,6 +1,4 @@
 """
-用于 JSON 持久化的配置模型。
-
 JRHG 插件的动态配置 Schema。
 """
 from datetime import datetime

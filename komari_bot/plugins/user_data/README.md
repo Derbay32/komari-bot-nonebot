@@ -14,7 +14,8 @@
 ## 安装依赖
 
 ```bash
-pip install aiosqlite pydantic
+pip install aiosqlite
+nb plugin install nonebot_plugin_apscheduler
 ```
 
 ## 配置说明

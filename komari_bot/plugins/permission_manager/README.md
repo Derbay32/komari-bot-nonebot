@@ -18,6 +18,7 @@
 ```bash
 pip install nonebot2
 ```
+*真的会有人不安这个吗？*
 
 ## 使用方法
 

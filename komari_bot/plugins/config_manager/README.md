@@ -15,7 +15,7 @@
 
 确保已安装依赖：
 ```bash
-pip install nonebot-plugin-localstore
+nb plugin install nonebot-plugin-localstore
 ```
 
 ## 使用方法
