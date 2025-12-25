@@ -14,7 +14,7 @@
 ## 安装依赖
 
 ```bash
-pip install aiohttp aiosqlite pydantic
+pip install aiohttp aiosqlite
 ```
 
 ## 配置说明
@@ -64,9 +64,9 @@ jrhg_group_whitelist = []  # 群聊白名单，为空则允许所有群聊
 
 ## 插件依赖
 
-本插件依赖 `user_data` 插件来管理用户数据。请确保：
+本插件依赖 `user_data`、`permission_manager`、`config_manager` 插件来管理用户数据、配置文件、使用权限。请确保：
 
-1. `user_data` 插件已正确安装在 `plugins/user_data/` 目录
+1. `user_data`、`permission_manager`、`config_manager` 插件已正确安装在 `plugins/user_data/` 目录
 2. 插件配置文件正确设置
 3. 相关依赖包已安装
 
@@ -74,23 +74,17 @@ jrhg_group_whitelist = []  # 群聊白名单，为空则允许所有群聊
 
 ```
 plugins/
-├── jrhg/                          # JRHG插件
-│   ├── __init__.py               # 主插件逻辑
-│   ├── config.py                 # 配置模型
-│   ├── deepseek_client.py        # DeepSeek API客户端
-│   ├── permissions.py            # 权限和白名单管理
-│   └── README.md                 # 说明文档
-└── user_data/                    # 用户数据插件（依赖）
-    ├── __init__.py               # 数据API接口
-    ├── config.py                 # 数据库配置
-    ├── models.py                 # 数据模型
-    └── database.py               # 数据库操作
+└── jrhg/                         # JRHG插件
+    ├── __init__.py               # 主插件逻辑
+    ├── config.py                 # 配置模型
+    ├── deepseek_client.py        # DeepSeek API 客户端
+    └── README.md                 # 说明文档
 ```
 
 ## 注意事项
 
 1. **API密钥安全**: 请妥善保管DeepSeek API密钥，不要泄露
-2. **权限管理**: 只有SUPER用户可以管理插件开关
+2. **权限管理**: 只有SUPERUSER可以管理插件开关
 3. **白名单设置**: 建议在生产环境中设置白名单以控制使用权限
 4. **网络依赖**: 插件需要访问DeepSeek API，请确保网络连接正常
 5. **数据备份**: 建议定期备份SQLite数据库文件
@@ -120,16 +114,3 @@ plugins/
 - API调用状态
 - 用户操作记录
 - 错误和异常信息
-
-## 更新日志
-
-### v1.0.0
-- 初始版本发布
-- 支持DeepSeek API集成
-- 实现好感度系统
-- 添加权限管理和白名单功能
-- 支持每日好感度重置
-
-## 许可证
-
-本插件遵循MIT许可证。
