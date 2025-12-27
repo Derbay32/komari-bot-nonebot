@@ -74,7 +74,6 @@ class DynamicConfigSchema(BaseModel):
 
 ```python
 from nonebot.plugin import PluginMetadata, require
-from .config import Config
 from .config_schema import DynamicConfigSchema
 
 # 依赖配置管理插件

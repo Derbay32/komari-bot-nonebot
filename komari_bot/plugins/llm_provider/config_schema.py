@@ -10,10 +10,10 @@ from pydantic import BaseModel, Field, field_validator
 
 class DynamicConfigSchema(BaseModel):
     """
-    示例配置 Schema。
+    llm provider 配置 Schema。
     """
 
-    # 元数据∂
+    # 元数据
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
         default_factory=lambda: datetime.now().isoformat(),
@@ -33,57 +33,57 @@ class DynamicConfigSchema(BaseModel):
         description="群聊白名单，为空则允许所有群聊"
     )
 
-# DeepSeek 默认配置
+    # DeepSeek 配置
+    deepseek_api_token: str = Field(
+        default="",
+        description="DeepSeek API Token"
+        )
     deepseek_api_base: str = Field(
         default="https://api.deepseek.com/v1/chat/completions",
-        description="Deepseek"
+        description="DeepSeek API 地址"
     )
     deepseek_model: str = Field(
         default="deepseek-chat",
-        description="deepseek 使用模型"
+        description="DeepSeek 使用模型"
     )
     deepseek_temperature: float = Field(
         default=1.0,
         ge=0.0,
         le=2.0,
-        description="deepseek 调用温度参数"
+        description="DeepSeek 调用温度参数"
     )
     deepseek_max_tokens: float = Field(
         default=200,
         ge=20,
         le=500,
-        description="deepseek 最大token数量"
+        description="DeepSeek 最大token数量"
     )
     deepseek_frequency_penalty: float = Field(
         default=0.0,
-        description="deepseek 重复内容惩罚"
+        description="DeepSeek 重复内容惩罚"
     )
 
-
-    # Gemini 默认配置
-    gemini_api_base: str = Field(
-        default="https://generativelanguage.googleapis.com/v1beta",
-        description=""
-    )
+    # Gemini 配置
+    gemini_api_token: str = Field(
+        default="",
+        description="Gemini API Token"
+        )
     gemini_model: str = Field(
         default="gemini-2.5-flash",
-        description=""
+        description="Gemini 使用模型"
     )
     gemini_temperature: float = Field(
         default=1.0,
         ge=0.0,
         le=2.0,
-        description="deepseek 调用温度参数"
+        description="Gemini 调用温度参数"
     )
     gemini_max_tokens: float = Field(
         default=200,
         ge=20,
         le=500,
-        description="deepseek 最大token数量"
+        description="Gemini 最大token数量"
     )
-
-    # 你的自定义字段
-    # custom_field: str = Field(default="", description="自定义配置")
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod

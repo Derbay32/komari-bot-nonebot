@@ -51,7 +51,12 @@ sr_manage = on_command(
 )
 
 @sr_manage.handle()
-async def sr_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...]= Command()):
+async def sr_switch(
+    bot: Bot,
+    event: MessageEvent,
+    cmd: tuple[str, ...]= Command()
+    ):
+
     _, action = cmd
 
     if action == "status":
@@ -84,7 +89,11 @@ async def sr_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...]= Command
         await sr_manage.finish("未知操作，请使用 on/off/status")
 
 @sr.handle()
-async def sr_function(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+async def sr_function(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg()
+    ):
 
     # 获取用户信息
     user_id = event.get_user_id()
@@ -93,27 +102,102 @@ async def sr_function(bot: Bot, event: MessageEvent, args: Message = CommandArg(
     # 使用运行时配置进行权限检查
     can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
     if not can_use:
-        logger.info("用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
+        logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
         await sr.finish(f"❌ {reason}")
 
     try:
-        # 如果有额外参数，作为自定义消息传递给AI
+        # 如果有额外参数，作为自定义消息加入最终回复
         custom_message = args.extract_plain_text().strip() if args else None
 
-        # 获取神人榜长度
+        # 获取神人榜与其长度
         sr_list = dynamic_config.sr_list
         sr_num = len(sr_list)
 
-
-
+        #
+        sr_target = randint(0, sr_num - 1)
 
         # 格式化最终回复
-        response = (
-            f"{user_nickname}抽到的神人是——\n"
-            f"{sr_list[randint(0, sr_num - 1)]}"
-        )
+        if custom_message:
+            response = (
+                f"{user_nickname}抽取：\n"
+                f"{custom_message}——"
+                f"{sr_target - 1}. {sr_list[sr_target]}"
+            )
+        else:
+            response = (
+                f"{user_nickname}抽到的神人是——\n"
+                f"{sr_target - 1}. {sr_list[sr_target]}"
+            )
 
         await sr.finish(response)
+
+    except Exception as e:
+        if not isinstance(e, FinishedException):
+            logger.error(f"处理 sr 命令时发生错误: {e}")
+            await sr.finish("❌ 处理请求时发生错误，请稍后重试")
+
+@sr_custom.handle()
+async def sr_usrcustom(
+    bot: Bot,
+    event: MessageEvent,
+    cmd: tuple[str, ...] = Command(),
+    args: Message = CommandArg()
+    ):
+
+    # 初始化命令层
+    _, action = cmd
+
+    # 获取用户信息
+    user_id = event.get_user_id()
+    user_nickname = permission_manager_plugin.get_user_nickname(event)
+
+    # 使用运行时配置进行权限检查
+    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
+    if not can_use:
+        logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
+        await sr.finish(f"❌ {reason}")
+
+    try:
+        if action == "list":
+            # 获取神人榜
+            sr_list = dynamic_config.sr_list
+
+            if not sr_list:
+                await sr_custom.finish("神人榜为空，使用 /sr add 添加神人")
+                return
+
+            # 解析页码参数
+            page_str = args.extract_plain_text().strip() if args else ""
+            page = int(page_str) if page_str.isdigit() else 1
+
+            chunk_size = dynamic_config.list_chunk_size
+            total_pages = (len(sr_list) + chunk_size - 1) // chunk_size
+
+            if page < 1 or page > total_pages:
+                await sr_custom.finish(f"页码无效，共 {total_pages} 页")
+                return
+
+            start_idx = (page - 1) * chunk_size
+            end_idx = min(start_idx + chunk_size, len(sr_list))
+            page_items = sr_list[start_idx:end_idx]
+
+            content = "\n".join(
+                f"{start_idx + i + 1}. {item}"
+                for i, item in enumerate(page_items)
+            )
+
+            if total_pages == 1:
+                await sr_custom.finish(
+                    f"目前神人榜内共{len(sr_list)}位神人"
+                    f"神人榜列表：\n"
+                    f"{content}"
+                )
+            else:
+                await sr_custom.finish(
+                    f"目前神人榜内共{len(sr_list)}位神人"
+                    f"神人榜列表(第{page}/{total_pages}页)：\n"
+                    f"{content}"
+                )
 
     except Exception as e:
         if not isinstance(e, FinishedException):

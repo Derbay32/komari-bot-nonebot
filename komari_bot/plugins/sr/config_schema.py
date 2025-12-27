@@ -47,6 +47,12 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list,
         description="安科神人榜列表"
     )
+    list_chunk_size: int = Field(
+        default=20,
+        ge=5,
+        le=50,
+        description="list 命令每页显示条数"
+    )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod

@@ -140,7 +140,6 @@ dmypy.json
 
 # programming tools
 /.claude
-/.vscode
 /docs
 /examples
 jrhg_config.json

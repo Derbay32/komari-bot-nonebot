@@ -1,9 +1,7 @@
 """Gemini API 客户端。"""
-import asyncio
-import json
-from typing import Optional
-
-import aiohttp
+from google import genai
+from google.genai import types
+from google.genai import errors
 from nonebot import logger
 from nonebot.plugin import require
 
@@ -27,22 +25,15 @@ class GeminiClient(BaseLLMClient):
             api_token: Gemini API Token
         """
         self.api_token = api_token
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建 HTTP 会话。"""
-        if self._session is None or self._session.closed:
-            headers = {"Content-Type": "application/json"}
-            timeout = aiohttp.ClientTimeout(total=30.0)
-            self._session = aiohttp.ClientSession(headers=headers, timeout=timeout)
-        return self._session
+        # SDK 客户端（同步客户端用于配置，异步操作使用 client.aio）
+        self._client = genai.Client(api_key=api_token)
 
     async def generate_text(
         self,
         prompt: str,
-        system_instruction: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        system_instruction: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> str:
         """生成文本。
@@ -58,60 +49,29 @@ class GeminiClient(BaseLLMClient):
             生成的文本
         """
         try:
-            session = await self._get_session()
-
-            # 构建模型名称
-            model_name = config.gemini_model
-            if not model_name.startswith("models/"):
-                model_name = f"models/{model_name}"
-
-            # 构建请求 URL
-            url = f"{config.gemini_api_base}/{model_name}:generateContent?key={self.api_token}"
-
-            # 构建请求数据
-            request_data = {
-                "contents": [
-                    {
-                        "parts": [{"text": prompt}]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": temperature if temperature is not None else config.gemini_temperature,
-                    "maxOutputTokens": max_tokens if max_tokens is not None else config.gemini_max_tokens,
-                }
-            }
+            # 构建 SDK 配置
+            gen_config = types.GenerateContentConfig(
+                temperature=temperature if temperature is not None else config.gemini_temperature,
+                max_output_tokens=max_tokens if max_tokens is not None else int(config.gemini_max_tokens),
+            )
 
             # 添加系统指令
             if system_instruction:
-                request_data["systemInstruction"] = {
-                    "parts": [{"text": system_instruction}]
-                }
+                gen_config.system_instruction = system_instruction
 
-            # 发送 API 请求
-            async with session.post(url, json=request_data) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Gemini API 请求失败: {response.status} - {error_text}")
-                    raise Exception(f"Gemini API 请求失败: {response.status}")
-
-                response_data = await response.json()
-
-                # 解析响应
-                if "candidates" in response_data and len(response_data["candidates"]) > 0:
-                    content = response_data["candidates"][0]["content"]["parts"][0]["text"]
-                    return content.strip()
-                else:
-                    logger.error(f"Gemini API 响应格式异常: {response_data}")
-                    raise Exception("Gemini API 响应格式异常")
-
-        except asyncio.TimeoutError:
-            logger.error("Gemini API 请求超时")
-            raise
-        except aiohttp.ClientError as e:
-            logger.error(f"Gemini API 网络错误: {e}")
-            raise
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Gemini API 响应解析错误: {e}")
+            # 使用 SDK 的异步接口
+            response = await self._client.aio.models.generate_content(
+                model=config.gemini_model,
+                contents=prompt,
+                config=gen_config,
+            )
+            if not response.text:
+                logger.error(f"Gemini API 错误: 未返回文本，回复可能被拦截")
+                raise
+            else:
+                return response.text
+        except errors.APIError as e:
+            logger.error(f"Gemini API 错误: {e.code} - {e.message}")
             raise
         except Exception as e:
             logger.error(f"Gemini API 未知错误: {e}")
@@ -124,34 +84,25 @@ class GeminiClient(BaseLLMClient):
             连接是否成功
         """
         try:
-            session = await self._get_session()
-
-            model_name = config.gemini_model
-            if not model_name.startswith("models/"):
-                model_name = f"models/{model_name}"
-
-            url = f"{config.gemini_api_base}/{model_name}:generateContent?key={self.api_token}"
-
-            request_data = {
-                "contents": [
-                    {
-                        "parts": [{"text": "你好"}]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 10,
-                }
-            }
-
-            async with session.post(url, json=request_data) as response:
-                return response.status == 200
-
+            response = await self._client.aio.models.generate_content(
+                model=config.gemini_model,
+                contents="你好",
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=10,
+                ),
+            )
+            return True
+        except errors.APIError as e:
+            logger.error(f"Gemini API 连接测试失败: {e.code} - {e.message}")
+            return False
         except Exception as e:
             logger.error(f"Gemini API 连接测试失败: {e}")
             return False
 
     async def close(self):
-        """关闭客户端。"""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        """关闭客户端。
+
+        google-genai SDK 使用 httpx，会自动管理连接，无需手动关闭。
+        """
+        pass

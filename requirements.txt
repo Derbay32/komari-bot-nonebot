@@ -7,3 +7,4 @@ aiosqlite>=0.22.0,<0.23.0
 nonebot-plugin-localstore>=0.7.4
 nonebot-plugin-apscheduler>=0.5.0
 nonebot2[fastapi]>=2.4.4
+google-genai

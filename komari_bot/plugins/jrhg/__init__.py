@@ -1,3 +1,5 @@
+import time
+
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 from nonebot import on_command
@@ -167,10 +169,12 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
 
         # 如果有额外参数，作为自定义消息传递给AI
         custom_message = args.extract_plain_text().strip() if args else None
+        now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
+
         if custom_message:
-            user_message = f"用户{user_nickname}对你说：{custom_message}，请回应他。"
+            user_message = f"现在的时间是{now_time}。用户{user_nickname}对你说：{custom_message}，请回应他。"
         else:
-            user_message = f"请向用户{user_nickname}打个招呼。"
+            user_message = f"现在的时间是{now_time}。请向用户{user_nickname}打个招呼。"
 
         # 调用 LLM Provider
         ai_response = await llm_provider.generate_text(
