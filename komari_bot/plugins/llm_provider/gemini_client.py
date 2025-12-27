@@ -5,15 +5,17 @@ from typing import Optional
 
 import aiohttp
 from nonebot import logger
+from nonebot.plugin import require
 
 from .base_client import BaseLLMClient
-from .config import (
-    GEMINI_API_BASE,
-    GEMINI_MAX_TOKENS,
-    GEMINI_MODEL,
-    GEMINI_TEMPERATURE,
-)
+from .config_schema import DynamicConfigSchema
 
+# 依赖 config_manager 插件
+config_manager_plugin = require("config_manager")
+
+# 获取配置管理器
+config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
+config = config_manager.initialize()
 
 class GeminiClient(BaseLLMClient):
     """Gemini API 客户端。"""
@@ -59,12 +61,12 @@ class GeminiClient(BaseLLMClient):
             session = await self._get_session()
 
             # 构建模型名称
-            model_name = GEMINI_MODEL
+            model_name = config.gemini_model
             if not model_name.startswith("models/"):
                 model_name = f"models/{model_name}"
 
             # 构建请求 URL
-            url = f"{GEMINI_API_BASE}/{model_name}:generateContent?key={self.api_token}"
+            url = f"{config.gemini_api_base}/{model_name}:generateContent?key={self.api_token}"
 
             # 构建请求数据
             request_data = {
@@ -74,8 +76,8 @@ class GeminiClient(BaseLLMClient):
                     }
                 ],
                 "generationConfig": {
-                    "temperature": temperature if temperature is not None else GEMINI_TEMPERATURE,
-                    "maxOutputTokens": max_tokens if max_tokens is not None else GEMINI_MAX_TOKENS,
+                    "temperature": temperature if temperature is not None else config.gemini_temperature,
+                    "maxOutputTokens": max_tokens if max_tokens is not None else config.gemini_max_tokens,
                 }
             }
 
@@ -124,11 +126,11 @@ class GeminiClient(BaseLLMClient):
         try:
             session = await self._get_session()
 
-            model_name = GEMINI_MODEL
+            model_name = config.gemini_model
             if not model_name.startswith("models/"):
                 model_name = f"models/{model_name}"
 
-            url = f"{GEMINI_API_BASE}/{model_name}:generateContent?key={self.api_token}"
+            url = f"{config.gemini_api_base}/{model_name}:generateContent?key={self.api_token}"
 
             request_data = {
                 "contents": [

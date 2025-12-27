@@ -1,5 +1,4 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口。"""
-import os
 from typing import Optional
 
 from nonebot import logger

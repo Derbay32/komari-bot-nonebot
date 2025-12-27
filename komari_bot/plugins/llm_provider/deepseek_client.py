@@ -5,15 +5,18 @@ from typing import Optional
 
 import aiohttp
 from nonebot import logger
+from nonebot.plugin import require
 
 from .base_client import BaseLLMClient
-from .config import (
-    DEEPSEEK_API_URL,
-    DEEPSEEK_FREQUENCY_PENALTY,
-    DEEPSEEK_MAX_TOKENS,
-    DEEPSEEK_MODEL,
-    DEEPSEEK_TEMPERATURE,
-)
+from .config_schema import DynamicConfigSchema
+
+# 依赖 config_manager 插件
+config_manager_plugin = require("config_manager")
+
+# 获取配置管理器
+config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
+config = config_manager.initialize()
+
 
 
 class DeepSeekClient(BaseLLMClient):
@@ -70,16 +73,16 @@ class DeepSeekClient(BaseLLMClient):
 
             # 构建请求数据
             request_data = {
-                "model": DEEPSEEK_MODEL,
+                "model": config.deepseek_model,
                 "messages": messages,
-                "temperature": temperature if temperature is not None else DEEPSEEK_TEMPERATURE,
-                "max_tokens": max_tokens if max_tokens is not None else DEEPSEEK_MAX_TOKENS,
-                "frequency_penalty": kwargs.get("frequency_penalty", DEEPSEEK_FREQUENCY_PENALTY),
+                "temperature": temperature if temperature is not None else config.deepseek_temperature,
+                "max_tokens": max_tokens if max_tokens is not None else config.deepseek_max_tokens,
+                "frequency_penalty": kwargs.get("frequency_penalty", config.deepseek_frequency_penalty),
                 "stream": False,
             }
 
             # 发送 API 请求
-            async with session.post(DEEPSEEK_API_URL, json=request_data) as response:
+            async with session.post(config.deepseek_api_base, json=request_data) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     logger.error(f"DeepSeek API 请求失败: {response.status} - {error_text}")
@@ -118,13 +121,13 @@ class DeepSeekClient(BaseLLMClient):
             session = await self._get_session()
 
             request_data = {
-                "model": DEEPSEEK_MODEL,
+                "model": config.deepseek_model,
                 "messages": [{"role": "user", "content": "你好"}],
                 "temperature": 0.1,
                 "max_tokens": 10,
             }
 
-            async with session.post(DEEPSEEK_API_URL, json=request_data) as response:
+            async with session.post(config.deepseek_api_base, json=request_data) as response:
                 return response.status == 200
 
         except Exception as e:

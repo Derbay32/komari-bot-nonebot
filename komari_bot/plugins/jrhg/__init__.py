@@ -141,6 +141,7 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
     # 获取用户信息
     user_id = event.get_user_id()
     user_nickname = permission_manager_plugin.get_user_nickname(event)
+    favor_result = None  # 初始化以避免异常处理中未绑定
 
     # 使用运行时配置进行权限检查
     can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
@@ -191,7 +192,10 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
         if not isinstance(e, FinishedException):
             logger.error(f"处理jrhg命令时发生错误: {e}")
             # 返回备用回复
-            fallback = _get_fallback_response(favor_result.daily_favor, user_nickname)
+            if favor_result:
+                fallback = _get_fallback_response(favor_result.daily_favor, user_nickname)
+            else:
+                fallback = "发生错误，请稍后重试"
             await jrhg.finish(fallback)
 
 

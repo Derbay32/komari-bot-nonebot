@@ -3,22 +3,52 @@ from pydantic import BaseModel, Field
 
 
 class Config(BaseModel):
-    """LLM Provider 配置（仅用于 NoneBot 加载，实际配置在代码中管理）。"""
-
-    # 这个类仅用于 NoneBot 插件加载，实际配置通过环境变量和代码常量管理
-    pass
-
-
-# DeepSeek 默认配置
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
-DEEPSEEK_TEMPERATURE = 0.7
-DEEPSEEK_MAX_TOKENS = 200
-DEEPSEEK_FREQUENCY_PENALTY = 0.0
+    """LLM Provider 配置"""
+    # DeepSeek 默认配置
+    deepseek_api_base: str = Field(
+        default="https://api.deepseek.com/v1/chat/completions",
+        description="Deepseek"
+    )
+    deepseek_model: str = Field(
+        default="deepseek-chat",
+        description="deepseek 使用模型"
+    )
+    deepseek_temperature: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="deepseek 调用温度参数"
+    )
+    deepseek_max_tokens: float = Field(
+        default=200,
+        ge=20,
+        le=500,
+        description="deepseek 最大token数量"
+    )
+    deepseek_frequency_penalty: float = Field(
+        default=0.0,
+        description="deepseek 重复内容惩罚"
+    )
 
 
 # Gemini 默认配置
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_TEMPERATURE = 0.7
-GEMINI_MAX_TOKENS = 200
+    gemini_api_base: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta",
+        description=""
+    )
+    gemini_model: str = Field(
+        default="gemini-2.5-flash",
+        description=""
+    )
+    gemini_temperature: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="deepseek 调用温度参数"
+    )
+    gemini_max_tokens: float = Field(
+        default=200,
+        ge=20,
+        le=500,
+        description="deepseek 最大token数量"
+    )
