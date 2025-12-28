@@ -51,10 +51,10 @@ class DynamicConfigSchema(BaseModel):
         le=2.0,
         description="DeepSeek 调用温度参数"
     )
-    deepseek_max_tokens: float = Field(
-        default=200,
+    deepseek_max_tokens: int = Field(
+        default=8192,
         ge=20,
-        le=500,
+        le=8192,
         description="DeepSeek 最大token数量"
     )
     deepseek_frequency_penalty: float = Field(
@@ -77,10 +77,10 @@ class DynamicConfigSchema(BaseModel):
         le=2.0,
         description="Gemini 调用温度参数"
     )
-    gemini_max_tokens: float = Field(
-        default=200,
+    gemini_max_tokens: int = Field(
+        default=8192,
         ge=20,
-        le=500,
+        le=8192,
         description="Gemini 最大token数量"
     )
 

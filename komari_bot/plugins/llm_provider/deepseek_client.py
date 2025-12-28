@@ -59,6 +59,17 @@ class DeepSeekClient(BaseLLMClient):
             生成的文本
         """
         try:
+            # 记录请求日志
+            logger.debug(
+                f"DeepSeek API 请求:\n"
+                f"  model: {config.deepseek_model}\n"
+                f"  temperature: {temperature if temperature is not None else config.deepseek_temperature}\n"
+                f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
+                f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
+                f"  system_instruction: {system_instruction}\n"
+                f"  prompt: {prompt}"
+            )
+
             session = await self._get_session()
 
             # 构建消息
@@ -89,6 +100,7 @@ class DeepSeekClient(BaseLLMClient):
                 # 解析响应
                 if "choices" in response_data and len(response_data["choices"]) > 0:
                     content = response_data["choices"][0]["message"]["content"]
+                    logger.debug(f"DeepSeek API 响应: {content}")
                     return content.strip()
                 else:
                     logger.error(f"DeepSeek API 响应格式异常: {response_data}")

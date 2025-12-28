@@ -196,7 +196,7 @@ async def sr_usrcustom(
                     )
                 else:
                     await sr_custom.finish(
-                        f"目前神人榜内共{len(sr_list)}位神人"
+                        f"目前神人榜内共{len(sr_list)}位神人\n"
                         f"神人榜列表(第{page}/{total_pages}页)：\n"
                         f"{content}"
                     )

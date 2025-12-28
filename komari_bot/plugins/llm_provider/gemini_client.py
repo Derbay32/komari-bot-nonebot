@@ -49,6 +49,16 @@ class GeminiClient(BaseLLMClient):
             生成的文本
         """
         try:
+            # 记录请求日志
+            logger.debug(
+                f"Gemini API 请求:\n"
+                f"  model: {config.gemini_model}\n"
+                f"  temperature: {temperature if temperature is not None else config.gemini_temperature}\n"
+                f"  max_output_tokens: {max_tokens if max_tokens is not None else int(config.gemini_max_tokens)}\n"
+                f"  system_instruction: {system_instruction}\n"
+                f"  prompt: {prompt}"
+            )
+
             # 构建 SDK 配置
             gen_config = types.GenerateContentConfig(
                 temperature=temperature if temperature is not None else config.gemini_temperature,
@@ -69,6 +79,7 @@ class GeminiClient(BaseLLMClient):
                 logger.error(f"Gemini API 错误: 未返回文本，回复可能被拦截")
                 raise
             else:
+                logger.debug(f"Gemini API 响应: {response.text}")
                 return response.text
         except errors.APIError as e:
             logger.error(f"Gemini API 错误: {e.code} - {e.message}")
