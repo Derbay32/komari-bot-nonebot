@@ -2,7 +2,6 @@ import aiosqlite
 import random
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from .models import UserAttribute, UserFavorability, FavorGenerationResult
 
@@ -12,7 +11,7 @@ class UserDataDB:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._connection: Optional[aiosqlite.Connection] = None
+        self._connection: aiosqlite.Connection | None = None
 
     async def initialize(self):
         """初始化数据库连接和表结构"""
@@ -74,7 +73,7 @@ class UserDataDB:
 
     # ===== 用户属性相关操作 =====
 
-    async def get_user_attribute(self, user_id: str, attribute_name: str) -> Optional[str]:
+    async def get_user_attribute(self, user_id: str, attribute_name: str) -> str | None:
         """获取用户属性值"""
         assert self._connection is not None
         cursor = await self._connection.execute(
@@ -130,7 +129,7 @@ class UserDataDB:
 
     # ===== 好感度相关操作 =====
 
-    async def get_user_favorability(self, user_id: str, target_date: Optional[date] = None) -> Optional[UserFavorability]:
+    async def get_user_favorability(self, user_id: str, target_date: date | None = None) -> UserFavorability | None:
         """获取用户好感度"""
         assert self._connection is not None
         if target_date is None:

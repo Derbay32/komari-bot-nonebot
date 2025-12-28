@@ -1,6 +1,5 @@
 from nonebot import get_plugin_config, logger
 from nonebot.plugin import PluginMetadata, require
-from typing import Optional
 
 from .config import Config
 from .models import UserAttribute, UserFavorability, FavorGenerationResult
@@ -14,7 +13,7 @@ __plugin_meta__ = PluginMetadata(
 )
 
 # 全局数据库实例
-_db: Optional[UserDataDB] = None
+_db: UserDataDB | None = None
 config: Config = get_plugin_config(Config)
 
 
@@ -75,7 +74,7 @@ async def on_shutdown():
 
 # ===== 公开API接口 =====
 
-async def get_user_favorability(user_id: str) -> Optional[UserFavorability]:
+async def get_user_favorability(user_id: str) -> UserFavorability | None:
     """获取用户好感度
 
     Args:
@@ -101,7 +100,7 @@ async def generate_or_update_favorability(user_id: str) -> FavorGenerationResult
     return await db.generate_or_update_favorability(user_id)
 
 
-async def get_user_attribute(user_id: str, attribute_name: str) -> Optional[str]:
+async def get_user_attribute(user_id: str, attribute_name: str) -> str | None:
     """获取用户属性
 
     Args:
