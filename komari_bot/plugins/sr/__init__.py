@@ -8,6 +8,7 @@ from random import randint
 
 from .config import Config
 from .config_schema import DynamicConfigSchema
+from .commands import AddCommand, DeleteCommand, get_undo_stack
 
 __plugin_meta__ = PluginMetadata(
     name="sr",
@@ -158,48 +159,92 @@ async def sr_usrcustom(
         await sr.finish(f"❌ {reason}")
 
     try:
-        if action == "list":
-            # 获取神人榜
-            sr_list = dynamic_config.sr_list
+        match action:
+            case "list":
+                # 获取神人榜
+                sr_list = dynamic_config.sr_list
 
-            if not sr_list:
-                await sr_custom.finish("神人榜为空，使用 /sr add 添加神人")
-                return
+                if not sr_list:
+                    await sr_custom.finish("神人榜为空，使用 /sr add 添加神人")
+                    return
 
-            # 解析页码参数
-            page_str = args.extract_plain_text().strip() if args else ""
-            page = int(page_str) if page_str.isdigit() else 1
+                # 解析页码参数
+                page_str = args.extract_plain_text().strip() if args else ""
+                page = int(page_str) if page_str.isdigit() else 1
 
-            chunk_size = dynamic_config.list_chunk_size
-            total_pages = (len(sr_list) + chunk_size - 1) // chunk_size
+                chunk_size = dynamic_config.list_chunk_size
+                total_pages = (len(sr_list) + chunk_size - 1) // chunk_size
 
-            if page < 1 or page > total_pages:
-                await sr_custom.finish(f"页码无效，共 {total_pages} 页")
-                return
+                if page < 1 or page > total_pages:
+                    await sr_custom.finish(f"页码无效，共 {total_pages} 页")
+                    return
 
-            start_idx = (page - 1) * chunk_size
-            end_idx = min(start_idx + chunk_size, len(sr_list))
-            page_items = sr_list[start_idx:end_idx]
+                start_idx = (page - 1) * chunk_size
+                end_idx = min(start_idx + chunk_size, len(sr_list))
+                page_items = sr_list[start_idx:end_idx]
 
-            content = "\n".join(
-                f"{start_idx + i + 1}. {item}"
-                for i, item in enumerate(page_items)
-            )
-
-            if total_pages == 1:
-                await sr_custom.finish(
-                    f"目前神人榜内共{len(sr_list)}位神人"
-                    f"神人榜列表：\n"
-                    f"{content}"
+                content = "\n".join(
+                    f"{start_idx + i + 1}. {item}"
+                    for i, item in enumerate(page_items)
                 )
-            else:
-                await sr_custom.finish(
-                    f"目前神人榜内共{len(sr_list)}位神人"
-                    f"神人榜列表(第{page}/{total_pages}页)：\n"
-                    f"{content}"
+
+                if total_pages == 1:
+                    await sr_custom.finish(
+                        f"目前神人榜内共{len(sr_list)}位神人"
+                        f"神人榜列表：\n"
+                        f"{content}"
+                    )
+                else:
+                    await sr_custom.finish(
+                        f"目前神人榜内共{len(sr_list)}位神人"
+                        f"神人榜列表(第{page}/{total_pages}页)：\n"
+                        f"{content}"
+                    )
+            case "add":
+                args_text = args.extract_plain_text().strip()
+                if not args_text:
+                    await sr_custom.finish("❌ 请输入要添加的神人名称")
+
+                cmd_obj = AddCommand(
+                    item=args_text,
+                    config_manager=config_manager,
+                    dynamic_config=dynamic_config
                 )
-        elif action == "add":
-            pass
+
+                result = await cmd_obj.execute()
+
+                if not result.startswith("❌"):
+                    get_undo_stack().append(cmd_obj)
+
+                await sr_custom.finish(result)
+
+            case "del":
+                args_text = args.extract_plain_text().strip()
+                if not args_text:
+                    await sr_custom.finish("❌ 请输入要删除的神人名称")
+
+                cmd_obj = DeleteCommand(
+                    item=args_text,
+                    config_manager=config_manager,
+                    dynamic_config=dynamic_config
+                )
+
+                result = await cmd_obj.execute()
+
+                if not result.startswith("❌"):
+                    get_undo_stack().append(cmd_obj)
+
+                await sr_custom.finish(result)
+
+            case "undo":
+                undo_stack = get_undo_stack()
+                if not undo_stack:
+                    await sr_custom.finish("❌ 没有可撤销的操作")
+
+                last_cmd = undo_stack.pop()
+                result = await last_cmd.undo()
+
+                await sr_custom.finish(result)
 
     except Exception as e:
         if not isinstance(e, FinishedException):

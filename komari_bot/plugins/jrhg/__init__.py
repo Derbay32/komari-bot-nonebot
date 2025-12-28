@@ -62,79 +62,81 @@ def _build_favor_prompt(daily_favor: int, user_nickname: str) -> str:
     base_prompt = dynamic_config.default_prompt
 
     # 根据好感度添加具体的态度指导
-    if daily_favor <= 20:
-        attitude_guide = f"你对{user_nickname}的好感度很低({daily_favor}/100)，请用非常冷淡、疏远的语气回应。"
-    elif daily_favor <= 40:
-        attitude_guide = f"你对{user_nickname}的好感度较低({daily_favor}/100)，请用冷淡、有距离感的语气回应。"
-    elif daily_favor <= 60:
-        attitude_guide = f"你对{user_nickname}的好感度一般({daily_favor}/100)，请用中性、礼貌的语气回应。"
-    elif daily_favor <= 80:
-        attitude_guide = f"你对{user_nickname}的好感度较高({daily_favor}/100)，请用友好、热情的语气回应。"
-    else:
-        attitude_guide = f"你对{user_nickname}的好感度非常高({daily_favor}/100)，请用非常热情、亲密的语气回应。"
+    match daily_favor:
+        case df if df <= 20:
+            attitude_guide = f"你对{user_nickname}的好感度很低({df}/100)，请用非常冷淡、疏远的语气回应。"
+        case df if df <= 40:
+            attitude_guide = f"你对{user_nickname}的好感度较低({df}/100)，请用冷淡、有距离感的语气回应。"
+        case df if df <= 60:
+            attitude_guide = f"你对{user_nickname}的好感度一般({df}/100)，请用中性、礼貌的语气回应。"
+        case df if df <= 80:
+            attitude_guide = f"你对{user_nickname}的好感度较高({df}/100)，请用友好、热情的语气回应。"
+        case _:
+            attitude_guide = f"你对{user_nickname}的好感度非常高({df}/100)，请用非常热情、亲密的语气回应。"
 
     return f"{base_prompt}\n\n{attitude_guide}\n\n请直接生成打招呼的内容，不要提及好感度数值。"
 
 
 def _get_fallback_response(daily_favor: int, user_nickname: str) -> str:
     """获取备用回复（当 API 调用失败时使用）。"""
-    if daily_favor <= 20:
-        return f"咦！？去、去死！"
-    elif daily_favor <= 40:
-        return f"唔诶，{user_nickname}！？怎、怎么是你…!?（后退）。"
-    elif daily_favor <= 60:
-        return f"不、不过是区区{user_nickname}，可、可别得意忘形了。"
-    elif daily_favor <= 80:
-        return f"{user_nickname}，你、你来啦，今天要不要，一、一起看书……？"
-    else:
-        return f"只、只是有一点点在意你哦……唔，{user_nickname}，你就是这点不、不行啦！"
+    match daily_favor:
+        case df if df <= 20:
+            return f"咦！？去、去死！"
+        case df if df <= 40:
+            return f"唔诶，{user_nickname}！？怎、怎么是你…!?（后退）。"
+        case df if df <= 60:
+            return f"不、不过是区区{user_nickname}，可、可别得意忘形了。"
+        case df if df <= 80:
+            return f"{user_nickname}，你、你来啦，今天要不要，一、一起看书……？"
+        case _:
+            return f"只、只是有一点点在意你哦……唔，{user_nickname}，你就是这点不、不行啦！"
 
 
 @manage.handle()
 async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Command()):
     """处理插件开关命令"""
     _, action = cmd
+    match action:
+        case "status":
+            # 显示插件状态信息
+            permission_info = permission_manager_plugin.format_permission_info(dynamic_config)
+            plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(dynamic_config)
 
-    if action == "status":
-        # 显示插件状态信息
-        permission_info = permission_manager_plugin.format_permission_info(dynamic_config)
-        plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(dynamic_config)
+            # 获取用户数据插件状态
+            user_data_status = "🟢 正常" if generate_or_update_favorability else "🔴 异常"
 
-        # 获取用户数据插件状态
-        user_data_status = "🟢 正常" if generate_or_update_favorability else "🔴 异常"
+            # 获取 LLM Provider 状态
+            llm_provider_name = dynamic_config.api_provider.upper()
+            llm_ok = await llm_provider.test_connection(dynamic_config.api_provider)
+            llm_status = "🟢 正常" if llm_ok else "🔴 异常"
 
-        # 获取 LLM Provider 状态
-        llm_provider_name = dynamic_config.api_provider.upper()
-        llm_ok = await llm_provider.test_connection(dynamic_config.api_provider)
-        llm_status = "🟢 正常" if llm_ok else "🔴 异常"
+            message = (
+                f"JRHG插件状态:\n"
+                f"插件: {status_desc}\n"
+                f"用户数据插件: {user_data_status}\n"
+                f"LLM Provider ({llm_provider_name}): {llm_status}\n"
+                f"{permission_info}"
+            )
+            await manage.finish(message)
 
-        message = (
-            f"JRHG插件状态:\n"
-            f"插件: {status_desc}\n"
-            f"用户数据插件: {user_data_status}\n"
-            f"LLM Provider ({llm_provider_name}): {llm_status}\n"
-            f"{permission_info}"
-        )
-        await manage.finish(message)
+        case "on" | "off":
+            # 切换插件开关
+            new_status = action == "on"
+            old_status = dynamic_config.plugin_enable
 
-    elif action in ["on", "off"]:
-        # 切换插件开关
-        new_status = action == "on"
-        old_status = dynamic_config.plugin_enable
+            if old_status == new_status:
+                await manage.finish(f"插件已经是{'开启' if new_status else '关闭'}状态")
 
-        if old_status == new_status:
-            await manage.finish(f"插件已经是{'开启' if new_status else '关闭'}状态")
+            # 持久化到 JSON
+            config_manager.update_field("plugin_enable", new_status)
+            # 更新本地引用
+            dynamic_config.plugin_enable = new_status
 
-        # 持久化到 JSON
-        config_manager.update_field("plugin_enable", new_status)
-        # 更新本地引用
-        dynamic_config.plugin_enable = new_status
+            status_text = "开启" if new_status else "关闭"
+            await manage.finish(f"JRHG插件已{status_text}")
 
-        status_text = "开启" if new_status else "关闭"
-        await manage.finish(f"JRHG插件已{status_text}")
-
-    else:
-        await manage.finish("未知操作，请使用 on/off/status")
+        case _:
+            await manage.finish("未知操作，请使用 on/off/status")
 
 
 @jrhg.handle()
