@@ -3,9 +3,6 @@
 
 提供各种便捷函数用于权限检查和信息格式化。
 """
-
-from typing import Protocol, runtime_checkable, Union
-
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent
 

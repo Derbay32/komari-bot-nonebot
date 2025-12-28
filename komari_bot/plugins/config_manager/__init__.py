@@ -29,8 +29,6 @@ config_manager.update_field("timeout", 60)
 config = config_manager.reload_from_json()
 ```
 """
-from typing import Type
-
 from nonebot.plugin import PluginMetadata
 
 from .manager import ConfigManager, get_config_manager

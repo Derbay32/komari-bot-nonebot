@@ -4,7 +4,7 @@
 提供便捷的装饰器用于权限检查。
 """
 
-from typing import Protocol, runtime_checkable, Union, Callable, Awaitable, Any
+from typing import Callable, Awaitable, Any
 
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent

@@ -1,5 +1,5 @@
 # 第一阶段：生成 bot.py
-FROM python:3.9-slim as requirements_stage
+FROM python:3.13-slim as requirements_stage
 
 WORKDIR /wheel
 
@@ -12,7 +12,7 @@ RUN python -m pipx run --no-cache nb-cli generate -f /tmp/bot.py
 
 
 # 第二阶段：运行环境
-FROM python:3.9-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 

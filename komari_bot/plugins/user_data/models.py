@@ -1,5 +1,4 @@
 from datetime import date
-from typing import Optional
 from pydantic import BaseModel
 
 
@@ -7,9 +6,9 @@ class UserAttribute(BaseModel):
     """用户属性模型"""
     user_id: str
     attribute_name: str
-    attribute_value: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
+    attribute_value: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class UserFavorability(BaseModel):

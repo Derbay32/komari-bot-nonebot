@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import List
 from pydantic import BaseModel, Field, field_validator
 
-class MyPluginConfig(BaseModel):
+class DynamicConfigSchema(BaseModel):
     """我的插件配置"""
 
     # 元数据
@@ -74,13 +74,13 @@ class MyPluginConfig(BaseModel):
 
 ```python
 from nonebot.plugin import PluginMetadata, require
-from config_manager import get_config_manager
+from .config_schema import DynamicConfigSchema
 
 # 依赖配置管理插件
-require("config_manager")
+config_manager_plugin = require("config_manager")
 
 # 定义配置 Schema（见上面）
-class MyPluginConfig(BaseModel):
+class DynamicConfigSchema(BaseModel):
     ...
 
 # 获取配置管理器
