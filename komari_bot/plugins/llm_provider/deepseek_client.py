@@ -1,8 +1,6 @@
 """DeepSeek API 客户端。"""
 import asyncio
 import json
-from typing import Optional
-
 import aiohttp
 from nonebot import logger
 from nonebot.plugin import require
@@ -27,7 +25,7 @@ class DeepSeekClient(BaseLLMClient):
             api_token: DeepSeek API Token
         """
         self.api_token = api_token
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 HTTP 会话。"""
@@ -43,9 +41,9 @@ class DeepSeekClient(BaseLLMClient):
     async def generate_text(
         self,
         prompt: str,
-        system_instruction: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        system_instruction: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> str:
         """生成文本。

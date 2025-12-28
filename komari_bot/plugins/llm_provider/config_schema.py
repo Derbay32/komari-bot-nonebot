@@ -3,7 +3,6 @@ llm provider 配置 Schema 实现。
 """
 
 from datetime import datetime
-from typing import List
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,11 +23,11 @@ class DynamicConfigSchema(BaseModel):
     plugin_enable: bool = Field(default=False, description="插件启用状态")
 
     # 白名单配置
-    user_whitelist: List[str] = Field(
+    user_whitelist: list[str] = Field(
         default_factory=list,
         description="用户白名单，为空则允许所有用户"
     )
-    group_whitelist: List[str] = Field(
+    group_whitelist: list[str] = Field(
         default_factory=list,
         description="群聊白名单，为空则允许所有群聊"
     )

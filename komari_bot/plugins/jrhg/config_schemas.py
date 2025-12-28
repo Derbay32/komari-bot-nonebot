@@ -2,7 +2,6 @@
 JRHG 插件的动态配置 Schema。
 """
 from datetime import datetime
-from typing import List
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,14 +13,20 @@ class DynamicConfigSchema(BaseModel):
     """
 
     # 元数据
-    version: str = Field(default="1.0", description="配置架构版本")
+    version: str = Field(
+        default="1.0",
+        description="配置架构版本"
+        )
     last_updated: str = Field(
         default_factory=lambda: datetime.now().isoformat(),
         description="最后更新时间戳"
     )
 
     # 插件控制
-    plugin_enable: bool = Field(default=False, description="JRHG 插件启用状态")
+    plugin_enable: bool = Field(
+        default=False,
+        description="JRHG 插件启用状态"
+        )
 
     # API 提供商选择
     api_provider: str = Field(
@@ -36,11 +41,11 @@ class DynamicConfigSchema(BaseModel):
     )
 
     # 白名单配置
-    user_whitelist: List[str] = Field(
+    user_whitelist: list[str] = Field(
         default_factory=list,
         description="用户白名单，为空则允许所有用户"
     )
-    group_whitelist: List[str] = Field(
+    group_whitelist: list[str] = Field(
         default_factory=list,
         description="群聊白名单，为空则允许所有群聊"
     )

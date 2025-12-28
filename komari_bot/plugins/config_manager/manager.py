@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Optional, Any, Type
+from typing import Any, Type
 
 from pydantic import BaseModel
 from nonebot import get_plugin_config, logger
@@ -71,8 +71,8 @@ class ConfigManager:
         self._plugin_name = plugin_name
         self._config_schema = config_schema
         self._config_file = store.get_plugin_config_file(f"{plugin_name}_config.json")
-        self._env_config: Optional[Any] = None  # 延迟加载
-        self._dynamic_config: Optional[BaseModel] = None
+        self._env_config: Any | None = None  # 延迟加载
+        self._dynamic_config: BaseModel | None = None
         self._initialized = True
 
         logger.info(f"配置管理器已初始化 [{plugin_name}], 配置文件: {self._config_file}")

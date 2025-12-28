@@ -3,7 +3,7 @@
 
 提供通用的权限检查功能，支持插件开关、用户/群组白名单等。
 """
-from typing import Protocol, runtime_checkable, Union
+from typing import Protocol, runtime_checkable
 
 from nonebot.adapters import Bot
 from nonebot.permission import SUPERUSER
@@ -21,7 +21,7 @@ class PermissionConfig(Protocol):
     group_whitelist: list[str]
 
 
-ConfigType = Union[PermissionConfig, object]
+type ConfigType = PermissionConfig | object
 
 
 class PermissionManager:

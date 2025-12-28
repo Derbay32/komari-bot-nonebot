@@ -1,6 +1,5 @@
 """LLM 客户端抽象基类。"""
 from abc import ABC, abstractmethod
-from typing import Optional
 
 
 class BaseLLMClient(ABC):
@@ -10,9 +9,9 @@ class BaseLLMClient(ABC):
     async def generate_text(
         self,
         prompt: str,
-        system_instruction: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        system_instruction: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> str:
         """生成文本。

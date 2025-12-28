@@ -143,6 +143,8 @@ dmypy.json
 /docs
 /examples
 jrhg_config.json
+llm_provider_config.json
+sr_config.json
 CLAUDE.md
 INSTALLATION_GUIDE.md
 MCP-ASSISTANT-RULES.md

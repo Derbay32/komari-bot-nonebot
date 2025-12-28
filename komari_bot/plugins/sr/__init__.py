@@ -198,6 +198,8 @@ async def sr_usrcustom(
                     f"神人榜列表(第{page}/{total_pages}页)：\n"
                     f"{content}"
                 )
+        elif action == "add":
+            pass
 
     except Exception as e:
         if not isinstance(e, FinishedException):

@@ -172,7 +172,7 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
         now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
 
         if custom_message:
-            user_message = f"现在的时间是{now_time}。用户{user_nickname}对你说：{custom_message}，请回应他。"
+            user_message = (f"现在的时间是{now_time}。用户{user_nickname}对你说：|，请回应他。", f"{custom_message}")
         else:
             user_message = f"现在的时间是{now_time}。请向用户{user_nickname}打个招呼。"
 
