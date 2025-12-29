@@ -13,7 +13,6 @@ config_manager_plugin = require("config_manager")
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
-config = config_manager.initialize()
 
 class GeminiClient(BaseLLMClient):
     """Gemini API 客户端。"""
@@ -48,6 +47,7 @@ class GeminiClient(BaseLLMClient):
         Returns:
             生成的文本
         """
+        config = config_manager.get()
         try:
             # 记录请求日志
             logger.debug(
@@ -94,6 +94,7 @@ class GeminiClient(BaseLLMClient):
         Returns:
             连接是否成功
         """
+        config = config_manager.get()
         try:
             response = await self._client.aio.models.generate_content(
                 model=config.gemini_model,

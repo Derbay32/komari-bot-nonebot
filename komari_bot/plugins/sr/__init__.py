@@ -26,7 +26,6 @@ permission_manager_plugin = require("permission_manager")
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("sr", DynamicConfigSchema)
-dynamic_config: DynamicConfigSchema = config_manager.initialize()
 
 # 注册 sr 主指令
 sr = on_command(
@@ -59,11 +58,12 @@ async def sr_switch(
     ):
 
     _, action = cmd
+    config = config_manager.get()
 
     if action == "status":
         # 显示插件状态信息
-        permission_info = permission_manager_plugin.format_permission_info(dynamic_config)
-        plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(dynamic_config)
+        permission_info = permission_manager_plugin.format_permission_info(config)
+        plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(config)
 
         message = (
             f"SR 插件状态: {status_desc}"
@@ -73,15 +73,13 @@ async def sr_switch(
     elif action == ["on", "off"]:
         # 切换插件开关
         new_status = action == "on"
-        old_status = dynamic_config.plugin_enable
+        old_status = config.plugin_enable
 
         if old_status == new_status:
             await sr_manage.finish(f"插件已经是{'开启' if new_status else '关闭'}状态")
 
         # 持久化到 JSON
         config_manager.update_field("plugin_enable", new_status)
-        # 更新本地引用∂
-        dynamic_config.plugin_enable = new_status
 
         status_text = "开启" if new_status else "关闭"
         await sr_manage.finish(f"SR 插件已{status_text}")
@@ -101,7 +99,7 @@ async def sr_function(
     user_nickname = permission_manager_plugin.get_user_nickname(event)
 
     # 使用运行时配置进行权限检查
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
+    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager.get())
     if not can_use:
         logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
         await sr.finish(f"❌ {reason}")
@@ -111,7 +109,8 @@ async def sr_function(
         custom_message = args.extract_plain_text().strip() if args else None
 
         # 获取神人榜与其长度
-        sr_list = dynamic_config.sr_list
+        config = config_manager.get()
+        sr_list = config.sr_list
         sr_num = len(sr_list)
 
         #
@@ -153,7 +152,7 @@ async def sr_usrcustom(
     user_nickname = permission_manager_plugin.get_user_nickname(event)
 
     # 使用运行时配置进行权限检查
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
+    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager.get())
     if not can_use:
         logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
         await sr.finish(f"❌ {reason}")
@@ -162,7 +161,8 @@ async def sr_usrcustom(
         match action:
             case "list":
                 # 获取神人榜
-                sr_list = dynamic_config.sr_list
+                config = config_manager.get()
+                sr_list = config.sr_list
 
                 if not sr_list:
                     await sr_custom.finish("神人榜为空，使用 /sr add 添加神人")
@@ -172,7 +172,7 @@ async def sr_usrcustom(
                 page_str = args.extract_plain_text().strip() if args else ""
                 page = int(page_str) if page_str.isdigit() else 1
 
-                chunk_size = dynamic_config.list_chunk_size
+                chunk_size = config.list_chunk_size
                 total_pages = (len(sr_list) + chunk_size - 1) // chunk_size
 
                 if page < 1 or page > total_pages:
@@ -207,8 +207,7 @@ async def sr_usrcustom(
 
                 cmd_obj = AddCommand(
                     item=args_text,
-                    config_manager=config_manager,
-                    dynamic_config=dynamic_config
+                    config_manager=config_manager
                 )
 
                 result = await cmd_obj.execute()
@@ -225,8 +224,7 @@ async def sr_usrcustom(
 
                 cmd_obj = DeleteCommand(
                     item=args_text,
-                    config_manager=config_manager,
-                    dynamic_config=dynamic_config
+                    config_manager=config_manager
                 )
 
                 result = await cmd_obj.execute()

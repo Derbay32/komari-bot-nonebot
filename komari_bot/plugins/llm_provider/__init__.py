@@ -26,7 +26,6 @@ config_manager_plugin = require("config_manager")
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
-config: DynamicConfigSchema = config_manager.initialize()
 
 
 # 按理说这两个防注入函数一定会有输入值，否则就没有必要构造防注入提示词
@@ -108,6 +107,7 @@ async def generate_text(
         生成的文本
     """
     provider = provider.lower()
+    config = config_manager.get()
 
     if provider == "gemini":
         token = config.gemini_api_token
@@ -151,6 +151,7 @@ async def test_connection(provider: str) -> bool:
         连接是否成功
     """
     provider = provider.lower()
+    config = config_manager.get()
 
     if provider == "gemini":
         token = config.gemini_api_token
