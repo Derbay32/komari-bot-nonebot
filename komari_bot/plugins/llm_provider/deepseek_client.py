@@ -13,7 +13,6 @@ config_manager_plugin = require("config_manager")
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
-config = config_manager.initialize()
 
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek API 客户端。"""
@@ -58,6 +57,7 @@ class DeepSeekClient(BaseLLMClient):
         Returns:
             生成的文本
         """
+        config = config_manager.get()
         try:
             # 记录请求日志
             logger.debug(
@@ -125,6 +125,7 @@ class DeepSeekClient(BaseLLMClient):
         Returns:
             连接是否成功
         """
+        config = config_manager.get()
         try:
             session = await self._get_session()
 

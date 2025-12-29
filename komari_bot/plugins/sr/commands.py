@@ -44,13 +44,11 @@ class AddCommand(Command):
 
     Attributes:
         item: 要添加的神人名称
-        config_manager: 配置管理器，用于持久化
-        dynamic_config: 动态配置引用
+        config_manager: 配置管理器，用于持久化和获取配置
     """
 
     item: str
     config_manager: Any
-    dynamic_config: "DynamicConfigSchema"
 
     async def execute(self) -> str:
         """执行添加操作。
@@ -58,7 +56,8 @@ class AddCommand(Command):
         Returns:
             执行结果消息
         """
-        sr_list = self.dynamic_config.sr_list
+        config = self.config_manager.get()
+        sr_list = config.sr_list
 
         if self.item in sr_list:
             return f"❌ '{self.item}' 已在神人榜中"
@@ -74,7 +73,8 @@ class AddCommand(Command):
         Returns:
             撤销结果消息
         """
-        sr_list = self.dynamic_config.sr_list
+        config = self.config_manager.get()
+        sr_list = config.sr_list
 
         if self.item not in sr_list:
             return f"⚠️ 无法撤销：'{self.item}' 不在列表中（可能已被其他操作修改）"
@@ -91,13 +91,11 @@ class DeleteCommand(Command):
 
     Attributes:
         item: 要删除的神人名称
-        config_manager: 配置管理器，用于持久化
-        dynamic_config: 动态配置引用
+        config_manager: 配置管理器，用于持久化和获取配置
     """
 
     item: str
     config_manager: Any
-    dynamic_config: "DynamicConfigSchema"
 
     async def execute(self) -> str:
         """执行删除操作。
@@ -105,7 +103,8 @@ class DeleteCommand(Command):
         Returns:
             执行结果消息
         """
-        sr_list = self.dynamic_config.sr_list
+        config = self.config_manager.get()
+        sr_list = config.sr_list
 
         if self.item not in sr_list:
             return f"❌ '{self.item}' 不在神人榜中"
@@ -121,7 +120,8 @@ class DeleteCommand(Command):
         Returns:
             撤销结果消息
         """
-        sr_list = self.dynamic_config.sr_list
+        config = self.config_manager.get()
+        sr_list = config.sr_list
 
         if self.item in sr_list:
             return f"⚠️ 无法撤销：'{self.item}' 已在列表中（可能已被其他操作添加）"

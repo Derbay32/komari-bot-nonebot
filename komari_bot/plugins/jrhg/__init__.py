@@ -38,7 +38,6 @@ __plugin_meta__ = PluginMetadata(
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("jrhg", DynamicConfigSchema)
-dynamic_config: DynamicConfigSchema = config_manager.initialize()
 
 # 主jrhg指令注册，使用动态权限检查
 jrhg = on_command(
@@ -59,7 +58,8 @@ manage = on_command(
 
 def _build_favor_prompt(daily_favor: int, user_nickname: str) -> str:
     """根据好感度构建系统提示词。"""
-    base_prompt = dynamic_config.default_prompt
+    config = config_manager.get()
+    base_prompt = config.default_prompt
 
     # 根据好感度添加具体的态度指导
     match daily_favor:
@@ -96,18 +96,19 @@ def _get_fallback_response(daily_favor: int, user_nickname: str) -> str:
 async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Command()):
     """处理插件开关命令"""
     _, action = cmd
+    config = config_manager.get()
     match action:
         case "status":
             # 显示插件状态信息
-            permission_info = permission_manager_plugin.format_permission_info(dynamic_config)
-            plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(dynamic_config)
+            permission_info = permission_manager_plugin.format_permission_info(config)
+            plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(config)
 
             # 获取用户数据插件状态
             user_data_status = "🟢 正常" if generate_or_update_favorability else "🔴 异常"
 
             # 获取 LLM Provider 状态
-            llm_provider_name = dynamic_config.api_provider.upper()
-            llm_ok = await llm_provider.test_connection(dynamic_config.api_provider)
+            llm_provider_name = config.api_provider.upper()
+            llm_ok = await llm_provider.test_connection(config.api_provider)
             llm_status = "🟢 正常" if llm_ok else "🔴 异常"
 
             message = (
@@ -122,15 +123,13 @@ async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Comm
         case "on" | "off":
             # 切换插件开关
             new_status = action == "on"
-            old_status = dynamic_config.plugin_enable
+            old_status = config.plugin_enable
 
             if old_status == new_status:
                 await manage.finish(f"插件已经是{'开启' if new_status else '关闭'}状态")
 
             # 持久化到 JSON
             config_manager.update_field("plugin_enable", new_status)
-            # 更新本地引用
-            dynamic_config.plugin_enable = new_status
 
             status_text = "开启" if new_status else "关闭"
             await manage.finish(f"JRHG插件已{status_text}")
@@ -148,7 +147,7 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
     favor_result = None  # 初始化以避免异常处理中未绑定
 
     # 使用运行时配置进行权限检查
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager)
+    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager.get())
     if not can_use:
         logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}")
         await jrhg.finish(f"❌ {reason}")
@@ -179,9 +178,10 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
             user_message = f"现在的时间是{now_time}。请向用户{user_nickname}打个招呼。"
 
         # 调用 LLM Provider
+        config = config_manager.get()
         ai_response = await llm_provider.generate_text(
             prompt=user_message,
-            provider=dynamic_config.api_provider,
+            provider=config.api_provider,
             system_instruction=system_prompt,
         )
 
@@ -209,10 +209,11 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
 async def on_startup():
     """插件启动时的初始化"""
     try:
+        config = config_manager.get()
         # 测试 LLM API 连接
-        connection_ok = await llm_provider.test_connection(dynamic_config.api_provider)
+        connection_ok = await llm_provider.test_connection(config.api_provider)
 
-        provider = dynamic_config.api_provider.upper()
+        provider = config.api_provider.upper()
         if connection_ok:
             logger.info(f"JRHG插件启动成功，{provider} API连接正常")
         else:

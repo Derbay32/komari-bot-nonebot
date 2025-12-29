@@ -25,7 +25,7 @@ class Config(BaseModel):
         description="DeepSeek 调用温度参数"
     )
     deepseek_max_tokens: float = Field(
-        default=200,
+        default=8192,
         ge=20,
         le=500,
         description="DeepSeek 最大token数量"
@@ -51,7 +51,7 @@ class Config(BaseModel):
         description="Gemini 调用温度参数"
     )
     gemini_max_tokens: float = Field(
-        default=200,
+        default=8192,
         ge=20,
         le=500,
         description="Gemini 最大token数量"
