@@ -60,32 +60,28 @@ async def sr_switch(
     _, action = cmd
     config = config_manager.get()
 
-    if action == "status":
-        # 显示插件状态信息
-        permission_info = permission_manager_plugin.format_permission_info(config)
-        plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(config)
+    match action:
+        case "status":
+            # 显示插件状态信息
+            permission_info = permission_manager_plugin.format_permission_info(config)
+            await sr_manage.finish(f"SR {permission_info}")
 
-        message = (
-            f"SR 插件状态: {status_desc}"
-        )
-        await sr_manage.finish(message)
+        case "on" | "off":
+            # 切换插件开关
+            new_status = action == "on"
+            old_status = config.plugin_enable
 
-    elif action == ["on", "off"]:
-        # 切换插件开关
-        new_status = action == "on"
-        old_status = config.plugin_enable
+            if old_status == new_status:
+                await sr_manage.finish(f"插件已经是{'开启' if new_status else '关闭'}状态")
 
-        if old_status == new_status:
-            await sr_manage.finish(f"插件已经是{'开启' if new_status else '关闭'}状态")
+            # 持久化到 JSON
+            config_manager.update_field("plugin_enable", new_status)
 
-        # 持久化到 JSON
-        config_manager.update_field("plugin_enable", new_status)
+            status_text = "开启" if new_status else "关闭"
+            await sr_manage.finish(f"SR 插件已{status_text}")
 
-        status_text = "开启" if new_status else "关闭"
-        await sr_manage.finish(f"SR 插件已{status_text}")
-
-    else:
-        await sr_manage.finish("未知操作，请使用 on/off/status")
+        case _:
+            await sr_manage.finish("未知操作，请使用 on/off/status")
 
 @sr.handle()
 async def sr_function(
