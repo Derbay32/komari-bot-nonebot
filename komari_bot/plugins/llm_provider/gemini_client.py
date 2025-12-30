@@ -33,6 +33,7 @@ class GeminiClient(BaseLLMClient):
         system_instruction: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        thinking_token: int = 0,
         **kwargs,
     ) -> str:
         """生成文本。
@@ -63,6 +64,7 @@ class GeminiClient(BaseLLMClient):
             gen_config = types.GenerateContentConfig(
                 temperature=temperature if temperature is not None else config.gemini_temperature,
                 max_output_tokens=max_tokens if max_tokens is not None else int(config.gemini_max_tokens),
+                thinking_config=types.ThinkingConfig(thinking_budget=config.gemini_thinking_tokens,)
             )
 
             # 添加系统指令

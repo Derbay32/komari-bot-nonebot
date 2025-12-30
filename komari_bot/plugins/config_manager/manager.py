@@ -19,6 +19,21 @@ from nonebot.plugin import require
 store = require("nonebot_plugin_localstore")
 
 
+def _get_file_mtime(file_path: Path) -> float:
+    """获取文件修改时间。
+
+    Args:
+        file_path: 文件路径
+
+    Returns:
+        文件修改时间戳，如果文件不存在返回 0
+    """
+    try:
+        return file_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 class ConfigManager:
     """通用配置管理器。
 
@@ -73,6 +88,7 @@ class ConfigManager:
         self._config_file = store.get_plugin_config_file(f"{plugin_name}_config.json")
         self._env_config: Any | None = None  # 延迟加载
         self._dynamic_config: BaseModel | None = None
+        self._file_mtime: float = 0.0  # 记录文件修改时间
         self._initialized = True
 
         logger.info(f"配置管理器已初始化 [{plugin_name}], 配置文件: {self._config_file}")
@@ -114,11 +130,13 @@ class ConfigManager:
             # 尝试从 JSON 加载
             if self._config_file.exists():
                 self._dynamic_config = self._load_from_json()
+                self._file_mtime = _get_file_mtime(self._config_file)
                 logger.info(f"[{self._plugin_name}] 已从 JSON 文件加载配置")
             else:
                 # 首次运行：从 .env 初始化
                 self._dynamic_config = self._initialize_from_env()
                 self._save_to_json(self._dynamic_config)
+                self._file_mtime = _get_file_mtime(self._config_file)
                 logger.info(f"[{self._plugin_name}] 已从 .env 初始化配置（首次运行）")
 
             return self._dynamic_config
@@ -189,10 +207,18 @@ class ConfigManager:
     def get(self) -> BaseModel:
         """获取当前的动态配置。
 
+        自动检测文件变化并重新加载。
+
         Returns:
             当前的配置 Schema 实例。
         """
-        if self._dynamic_config is None:
+        # 检查文件是否被外部修改
+        current_mtime = _get_file_mtime(self._config_file)
+        if current_mtime > 0 and current_mtime != self._file_mtime:
+            logger.info(f"[{self._plugin_name}] 检测到配置文件变化，自动重新加载")
+            self._dynamic_config = self._load_from_json()
+            self._file_mtime = current_mtime
+        elif self._dynamic_config is None:
             return self.initialize()
         return self._dynamic_config
 
@@ -227,6 +253,7 @@ class ConfigManager:
             # 保存并更新内存中的状态
             self._dynamic_config = new_config
             self._save_to_json(new_config)
+            self._file_mtime = _get_file_mtime(self._config_file)
 
             logger.info(f"[{self._plugin_name}] 配置已更新: {field_name} = {value}")
             return new_config
@@ -241,6 +268,7 @@ class ConfigManager:
         """
         with self._lock:
             self._dynamic_config = self._load_from_json()
+            self._file_mtime = _get_file_mtime(self._config_file)
             logger.info(f"[{self._plugin_name}] 已从文件重新加载配置")
             return self._dynamic_config
 
