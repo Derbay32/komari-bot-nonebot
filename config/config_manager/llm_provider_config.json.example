@@ -16,7 +16,7 @@
   "gemini_model": "gemini-2.5-flash",
   "gemini_temperature": 1.0,
   "gemini_max_tokens": 8192,
-  "gemini_thinking_tokens": 0
+  "gemini_thinking_level": "LOW"
 }
 
 /*

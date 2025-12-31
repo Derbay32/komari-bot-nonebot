@@ -7,10 +7,7 @@ SR 插件的命令模式实现。
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .config_schema import DynamicConfigSchema
+from typing import Any
 
 
 class Command(ABC):

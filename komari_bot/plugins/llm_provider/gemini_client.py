@@ -64,7 +64,7 @@ class GeminiClient(BaseLLMClient):
             gen_config = types.GenerateContentConfig(
                 temperature=temperature if temperature is not None else config.gemini_temperature,
                 max_output_tokens=max_tokens if max_tokens is not None else int(config.gemini_max_tokens),
-                thinking_config=types.ThinkingConfig(thinking_budget=config.gemini_thinking_tokens,)
+                thinking_config=types.ThinkingConfig(thinking_level=config.gemini_thinking_level,)
             )
 
             # 添加系统指令

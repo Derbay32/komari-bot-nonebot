@@ -1,0 +1,21 @@
+{
+  "version": "1.0",
+  "last_updated": "2025-12-31T20:03:14.024406",
+  "plugin_enable": true,
+  "user_whitelist": [],
+  "group_whitelist": [],
+  "pg_host": "localhost",
+  "pg_port": 5432,
+  "pg_database": "komari-bot",
+  "pg_user": "komari-bot",
+  "pg_password": "",
+  "embedding_model": "BAAI/bge-small-zh-v1.5",
+  "vector_dimension": 512,
+  "similarity_threshold": 0.65,
+  "layer1_limit": 3,
+  "layer2_limit": 2,
+  "total_limit": 5,
+  "webui_enabled": true,
+  "webui_port":8502,
+  "query_rewrite_rules":{"你": "小鞠", "您的": "小鞠的"}
+}

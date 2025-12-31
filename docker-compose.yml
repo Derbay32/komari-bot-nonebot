@@ -1,12 +1,8 @@
-x-config-host: &config-host ${HOST:-0.0.0.0}
-x-config-port: &config-port ${PORT:-8080}
-
 services:
   nonebot:
     image: derbay32/komari-bot-nonebot:latest
     ports:
-      - *config-port
-      - 8080:8080
+      - 8502:8502
     volumes:
       - /app/config:/app/config
       - /app/user_data.db:/app/user_data.db
