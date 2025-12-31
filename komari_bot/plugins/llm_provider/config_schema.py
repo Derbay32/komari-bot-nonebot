@@ -68,7 +68,7 @@ class DynamicConfigSchema(BaseModel):
         description="Gemini API Token"
         )
     gemini_model: str = Field(
-        default="gemini-2.5-flash",
+        default="gemini-3-flash-preview",
         description="Gemini 使用模型"
     )
     gemini_temperature: float = Field(
@@ -83,10 +83,8 @@ class DynamicConfigSchema(BaseModel):
         le=8192,
         description="Gemini 最大token数量"
     )
-    gemini_thinking_tokens: int = Field(
-        default=0,
-        ge=0,
-        le=8192,
+    gemini_thinking_level: str = Field(
+        default="LOW",
         description="Gemini 思考链长度（为0时不思考）"
     )
 

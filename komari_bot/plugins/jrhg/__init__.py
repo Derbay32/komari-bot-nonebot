@@ -73,8 +73,30 @@ def _build_favor_prompt(daily_favor: int, user_nickname: str) -> str:
             attitude_guide = f"你对{user_nickname}的好感度较高({df}/100)，请用友好、热情的语气回应。"
         case _:
             attitude_guide = f"你对{user_nickname}的好感度非常高({df}/100)，请用非常热情、亲密的语气回应。"
+    
+    # 先替换好感度部分
+    progression_att_num = str(base_prompt).replace(
+        "{{AFFECTION_SCORE}}",
+        f"{daily_favor}",
+        1
+        )
 
-    return f"{base_prompt}\n\n{attitude_guide}\n\n请直接生成打招呼的内容，不要提及好感度数值。"
+    # 再替换好感度提示部分
+    progression_att_guide = progression_att_num.replace(
+        "{{DYNAMIC_AFFECTION_BASE}}",
+        f"{attitude_guide}",
+        1
+    )
+
+    # 最后替换时间
+    now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
+    final_prompt = progression_att_guide.replace(
+        "{{CURRENT_TIME_SCENE}}",
+        f"{now_time}",
+        1
+    )
+
+    return final_prompt
 
 
 def _get_fallback_response(daily_favor: int, user_nickname: str) -> str:
@@ -170,20 +192,26 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
 
         # 如果有额外参数，作为自定义消息传递给AI
         custom_message = args.extract_plain_text().strip() if args else None
-        now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
-
-        if custom_message:
-            user_message = (f"现在的时间是{now_time}。用户{user_nickname}对你说：|，请回应他。", f"{custom_message}")
-        else:
-            user_message = f"现在的时间是{now_time}。请向用户{user_nickname}打个招呼。"
-
         # 调用 LLM Provider
         config = config_manager.get()
-        ai_response = await llm_provider.generate_text(
-            prompt=user_message,
-            provider=config.api_provider,
-            system_instruction=system_prompt,
-        )
+
+        if custom_message:
+            user_message = (f"用户{user_nickname}对你说：|，请回应他。", f"{custom_message}")
+            ai_response = await llm_provider.generate_text(
+                prompt=user_message,
+                provider=config.api_provider,
+                system_instruction=system_prompt,
+                enable_knowledge=True,  # 有自定义内容才需要加常识，否则不加
+                knowledge_query=custom_message, # 仅注入用户输入内容，不要乱加其他的
+                knowledge_limit=3,
+            )
+        else:
+            user_message = f"请向用户{user_nickname}打个招呼。"
+            ai_response = await llm_provider.generate_text(
+                prompt=user_message,
+                provider=config.api_provider,
+                system_instruction=system_prompt,
+            )
 
         # 格式化最终回复
         final_response = await format_favor_response(

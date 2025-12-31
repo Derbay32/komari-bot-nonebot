@@ -151,5 +151,8 @@ MCP-ASSISTANT-RULES.md
 user_data.db
 .env.dev
 .env.prod
+.DS_Store
+plan.md
+komari_memory_config.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
