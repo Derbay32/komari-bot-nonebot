@@ -16,5 +16,6 @@
   "layer2_limit": 2,
   "total_limit": 5,
   "webui_enabled": true,
-  "webui_port":8502
+  "webui_port":8502,
+  "query_rewrite_rules":{"你": "小鞠", "您的": "小鞠的"}
 }

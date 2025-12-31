@@ -153,6 +153,5 @@ user_data.db
 .env.prod
 .DS_Store
 plan.md
-komari_memory_config.json
-
+komari_knowledge_config.json
 # End of https://www.toptal.com/developers/gitignore/api/python
