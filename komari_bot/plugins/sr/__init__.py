@@ -116,13 +116,13 @@ async def sr_function(
         if custom_message:
             response = (
                 f"{user_nickname}抽取：\n"
-                f"{custom_message}——"
-                f"{sr_target - 1}. {sr_list[sr_target]}"
+                f"{custom_message}——\n"
+                f"{sr_target + 1}. {sr_list[sr_target]}"
             )
         else:
             response = (
                 f"{user_nickname}抽到的神人是——\n"
-                f"{sr_target - 1}. {sr_list[sr_target]}"
+                f"{sr_target + 1}. {sr_list[sr_target]}"
             )
 
         await sr.finish(response)
