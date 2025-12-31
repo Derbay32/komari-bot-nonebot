@@ -112,9 +112,9 @@ async def generate_text(
         knowledge_context = ""
         if enable_knowledge:
             try:
-                knowledge_plugin = require("komari_memory")
+                knowledge_plugin = require("komari-knowledge")
                 query = knowledge_query or prompt
-                results = await knowledge_plugin.search_memory(query, limit=knowledge_limit)
+                results = await knowledge_plugin.search_knowledge(query, limit=knowledge_limit)
 
                 if results:
                     knowledge_context = "\n".join(result.content for result in results)
