@@ -1,0 +1,20 @@
+{
+  "version": "1.0",
+  "last_updated": "2025-12-31T20:03:14.024406",
+  "plugin_enable": true,
+  "user_whitelist": [],
+  "group_whitelist": [],
+  "pg_host": "192.168.3.107",
+  "pg_port": 5543,
+  "pg_database": "komari-bot",
+  "pg_user": "komari-bot",
+  "pg_password": "Chewdd8pGw5c3DJM",
+  "embedding_model": "BAAI/bge-small-zh-v1.5",
+  "vector_dimension": 512,
+  "similarity_threshold": 0.65,
+  "layer1_limit": 3,
+  "layer2_limit": 2,
+  "total_limit": 5,
+  "webui_enabled": true,
+  "webui_port":8502
+}

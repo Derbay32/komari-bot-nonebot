@@ -1,10 +1,10 @@
 """
-Komari Memory 管理界面。
+Komari Knowledge 管理界面。
 
 使用 Streamlit 提供可视化的知识库管理功能。
 
 启动方式：
-    streamlit run komari_bot/plugins/komari_memory/webui.py
+    streamlit run komari_bot/plugins/komari_knowledge/webui.py
 """
 import asyncio
 import sys
@@ -24,7 +24,7 @@ import importlib.util
 
 # 首先加载 config_schema
 config_spec = importlib.util.spec_from_file_location(
-    "komari_bot.plugins.komari_memory.config_schema",
+    "komari_bot.plugins.komari_knowledge.config_schema",
     Path(__file__).parent / "config_schema.py",
 )
 if config_spec is None:
@@ -32,12 +32,12 @@ if config_spec is None:
 if config_spec.loader is None:
     raise RuntimeError("config_schema 模块加载器为空")
 config_module = importlib.util.module_from_spec(config_spec)
-sys.modules["komari_bot.plugins.komari_memory.config_schema"] = config_module
+sys.modules["komari_bot.plugins.komari_knowledge.config_schema"] = config_module
 config_spec.loader.exec_module(config_module)
 
 # 然后加载 engine（设置正确的包上下文以支持相对导入）
 engine_spec = importlib.util.spec_from_file_location(
-    "komari_bot.plugins.komari_memory.engine",
+    "komari_bot.plugins.komari_knowledge.engine",
     Path(__file__).parent / "engine.py",
 )
 if engine_spec is None:
@@ -45,11 +45,11 @@ if engine_spec is None:
 if engine_spec.loader is None:
     raise RuntimeError("engine 模块加载器为空")
 engine_module = importlib.util.module_from_spec(engine_spec)
-engine_module.__package__ = "komari_bot.plugins.komari_memory"
-sys.modules["komari_bot.plugins.komari_memory.engine"] = engine_module
+engine_module.__package__ = "komari_bot.plugins.komari_knowledge"
+sys.modules["komari_bot.plugins.komari_knowledge.engine"] = engine_module
 engine_spec.loader.exec_module(engine_module)
 
-MemoryEngine = engine_module.MemoryEngine
+KnowledgeEngine = engine_module.KnowledgeEngine
 
 # 页面配置
 st.set_page_config(
@@ -126,10 +126,10 @@ def run_async(coro):
     return loop.run_until_complete(coro)
 
 
-def get_engine() -> MemoryEngine:
+def get_engine() -> KnowledgeEngine:
     """获取引擎实例（每次重新初始化以避免事件循环问题）。"""
     # 不使用缓存，因为 Streamlit rerun 会导致事件循环变化
-    engine = MemoryEngine()
+    engine = KnowledgeEngine()
     run_async(engine.initialize())
     return engine
 
@@ -147,7 +147,7 @@ def main():
         st.header("⚙️ 配置")
         st.info(
             """
-            配置从 `data/plugin_config/komari_memory_config.json` 读取。
+            配置从 `data/plugin_config/komari_knowledge_config.json` 读取。
 
             如需修改数据库连接，请编辑该文件或通过 Bot 配置管理界面修改。
 
@@ -183,7 +183,17 @@ def main():
     with tab1:
         st.header("录入新知识")
 
-        with st.form("add_knowledge_form"):
+        # 初始化表单状态
+        if "form_submitted" not in st.session_state:
+            st.session_state.form_submitted = False
+        if "last_kid" not in st.session_state:
+            st.session_state.last_kid = None
+
+        # 显示上次的成功消息
+        if st.session_state.form_submitted and st.session_state.last_kid:
+            st.success(f"✅ 知识已添加！ID: {st.session_state.last_kid}")
+
+        with st.form("add_knowledge_form", clear_on_submit=True):
             content = st.text_area(
                 "知识内容",
                 placeholder="例如：小鞠非常喜欢布丁，每次看到布丁都会很开心。",
@@ -226,10 +236,13 @@ def main():
                                 notes=notes if notes else None,
                             )
                         )
-                        st.success(f"✅ 知识已添加！ID: {kid}")
+                        # 记录成功状态
+                        st.session_state.form_submitted = True
+                        st.session_state.last_kid = kid
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ 添加失败：{e}")
+                        st.session_state.form_submitted = False
 
     # --- 标签页 2: 检索测试 ---
     with tab2:
