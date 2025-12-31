@@ -1,5 +1,5 @@
 """
-Komari Memory 常识库插件配置 Schema。
+Komari Knowledge 常识库插件配置 Schema。
 
 用于管理 PostgreSQL 数据库连接和检索参数配置。
 """
@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 class DynamicConfigSchema(BaseModel):
     """
-    Komari Memory 配置 Schema。
+    Komari Knowledge 配置 Schema。
     """
 
     # 元数据
