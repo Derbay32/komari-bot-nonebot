@@ -1,5 +1,5 @@
 """
-Komari Knowledge 常识库插件。
+Komari Memory 常识库插件。
 
 提供 Bot 人物设定和世界知识的混合检索功能。
 
@@ -10,10 +10,10 @@ Komari Knowledge 常识库插件。
 ```python
 from nonebot.plugin import require
 
-knowledge_plugin = require("komari_knowledge")
+memory_plugin = require("komari_memory")
 
 # 检索相关知识
-results = await knowledge_plugin.search_knowledge("小鞠喜欢什么？")
+results = await memory_plugin.search_memory("小鞠喜欢什么？")
 for result in results:
     print(f"{result.category}: {result.content}")
 ```
@@ -36,16 +36,16 @@ config_manager_plugin = require("config_manager")
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
-    "komari_knowledge", DynamicConfigSchema
+    "komari_memory", DynamicConfigSchema
 )
 
 __plugin_meta__ = PluginMetadata(
-    name="komari-knowledge",
+    name="komari_memory",
     description="小鞠常识库 - 提供人物设定和世界知识的混合检索",
     usage="""
     在其他插件中引用：
-    knowledge_plugin = require("komari-knowledge")
-    results = await knowledge_plugin.search_knowledge("查询文本")
+    memory_plugin = require("komari_memory")
+    results = await memory_plugin.search_memory("查询文本")
     """,
     config=DynamicConfigSchema,
 )
@@ -63,21 +63,21 @@ async def on_startup():
     config = config_manager.get()
 
     if not config.plugin_enable:
-        logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
+        logger.info("[Komari Memory] 插件未启用，跳过初始化")
         return
 
     if not config.pg_user or not config.pg_password:
         logger.warning(
-            "[Komari Knowledge] 数据库用户名或密码未配置，跳过初始化。"
+            "[Komari Memory] 数据库用户名或密码未配置，跳过初始化。"
             "请在配置中设置 pg_user 和 pg_password"
         )
         return
 
     try:
         await initialize_engine()
-        logger.info("[Komari Knowledge] 插件启动完成")
+        logger.info("[Komari Memory] 插件启动完成")
     except Exception as e:
-        logger.error(f"[Komari Knowledge] 初始化失败: {e}")
+        logger.error(f"[Komari Memory] 初始化失败: {e}")
         return
 
     # 启动 WebUI
@@ -96,10 +96,10 @@ async def on_startup():
                 ]
             )
             logger.info(
-                f"[Komari Knowledge] WebUI 已启动: http://localhost:{config.webui_port}"
+                f"[Komari Memory] WebUI 已启动: http://localhost:{config.webui_port}"
             )
         except Exception as e:
-            logger.error(f"[Komari Knowledge] WebUI 启动失败: {e}")
+            logger.error(f"[Komari Memory] WebUI 启动失败: {e}")
 
 
 @driver.on_shutdown
@@ -112,12 +112,12 @@ async def on_shutdown():
         try:
             _streamlit_process.terminate()
             _streamlit_process.wait(timeout=5)
-            logger.info("[Komari Knowledge] WebUI 已关闭")
+            logger.info("[Komari Memory] WebUI 已关闭")
         except subprocess.TimeoutExpired:
             _streamlit_process.kill()
-            logger.warning("[Komari Knowledge] WebUI 强制关闭")
+            logger.warning("[Komari Memory] WebUI 强制关闭")
         except Exception as e:
-            logger.error(f"[Komari Knowledge] WebUI 关闭失败: {e}")
+            logger.error(f"[Komari Memory] WebUI 关闭失败: {e}")
         finally:
             _streamlit_process = None
 
@@ -125,10 +125,10 @@ async def on_shutdown():
     engine = get_engine()
     if engine:
         await engine.close()
-        logger.info("[Komari Knowledge] 插件已关闭")
+        logger.info("[Komari Memory] 插件已关闭")
 
 
-async def search_knowledge(query: str, limit: int | None = None) -> list[SearchResult]:
+async def search_memory(query: str, limit: int | None = None) -> list[SearchResult]:
     """
     检索相关知识。
 
@@ -142,13 +142,13 @@ async def search_knowledge(query: str, limit: int | None = None) -> list[SearchR
         检索结果列表
 
     Example:
-        >>> results = await search_knowledge("小鞠喜欢吃什么？")
+        >>> results = await search_memory("小鞠喜欢吃什么？")
         >>> for r in results:
         ...     print(f"[{r.source}] {r.content}")
     """
     engine = get_engine()
     if engine is None:
-        logger.warning("[Komari Knowledge] 引擎未初始化")
+        logger.warning("[Komari Memory] 引擎未初始化")
         return []
 
     config = config_manager.get()

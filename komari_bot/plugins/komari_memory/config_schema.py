@@ -58,10 +58,6 @@ class DynamicConfigSchema(BaseModel):
     )
 
     # 检索配置
-    query_rewrite_rules: dict[str, str] = Field(
-        default={"你": "小鞠", "您的": "小鞠的"},
-        description="查询重写规则，key 为待替换词，value 为替换词"
-    )
     layer1_limit: int = Field(
         default=3,
         ge=0,

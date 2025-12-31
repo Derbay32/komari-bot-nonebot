@@ -1,5 +1,5 @@
 """
-Komari Knowledge 常识库核心引擎。
+Komari Memory 常识库核心引擎。
 
 提供混合检索功能：
 - Layer 1: 关键词精确匹配（内存，微秒级）
@@ -25,7 +25,7 @@ from .config_schema import DynamicConfigSchema
 # 检测运行模式：通过检查是否在 NoneBot 环境中
 _nonebot_mode = "nonebot" in sys.modules
 config_manager = None
-_logger: logging.Logger | Any = logging.getLogger("komari_knowledge")
+_logger: logging.Logger | Any = logging.getLogger("komari_memory")
 
 # 只有在 NoneBot 环境中才尝试加载 config_manager
 if _nonebot_mode:
@@ -35,14 +35,14 @@ if _nonebot_mode:
 
         config_manager_plugin = require("config_manager")
         config_manager = config_manager_plugin.get_config_manager(
-            "komari_knowledge", DynamicConfigSchema
+            "komari_memory", DynamicConfigSchema
         )
         _logger = nb_logger
     except (ImportError, RuntimeError):
         # 回退到独立模式
         _nonebot_mode = False
         config_manager = None
-        _logger = logging.getLogger("komari_knowledge")
+        _logger = logging.getLogger("komari_memory")
 
 
 # 独立模式配置加载器
@@ -51,7 +51,7 @@ _standalone_config: DynamicConfigSchema | None = None
 
 def _load_standalone_config() -> DynamicConfigSchema:
     """独立模式：从 JSON 文件加载配置。"""
-    config_path = Path("config/config_manager/komari_knowledge_config.json")
+    config_path = Path("config/config_manager/komari_memory_config.json")
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -92,7 +92,7 @@ class SearchResult(BaseModel):
     source: str = "keyword"  # "keyword" 或 "vector"
 
 
-class KnowledgeEngine:
+class MemoryEngine:
     """
     常识库核心引擎。
 
@@ -108,21 +108,21 @@ class KnowledgeEngine:
 
     async def initialize(self) -> None:
         """初始化引擎（加载模型、建立连接池、构建索引）。"""
-        _logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
+        _logger.info("[Komari Memory] 正在初始化常识库引擎...")
 
         # 获取配置
         config = get_config()
 
         # 1. 加载向量嵌入模型
         if self._embed_model is None:
-            _logger.info(f"[Komari Knowledge] 加载嵌入模型: {config.embedding_model}")
+            _logger.info(f"[Komari Memory] 加载嵌入模型: {config.embedding_model}")
             # 在独立线程中加载模型，避免阻塞
             loop = asyncio.get_event_loop()
             self._embed_model = await loop.run_in_executor(
                 None,
                 lambda: TextEmbedding(model_name=config.embedding_model),
             )
-            _logger.info("[Komari Knowledge] 嵌入模型加载完成")
+            _logger.info("[Komari Memory] 嵌入模型加载完成")
 
         # 2. 建立数据库连接池
         if self._pool is None:
@@ -138,11 +138,11 @@ class KnowledgeEngine:
                 max_size=5,
                 command_timeout=30,
             )
-            _logger.info("[Komari Knowledge] 数据库连接池已建立")
+            _logger.info("[Komari Memory] 数据库连接池已建立")
 
         # 3. 构建关键词索引（内存预热）
         await self._build_keyword_index()
-        _logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+        _logger.info("[Komari Memory] 常识库引擎初始化完成")
 
     async def _build_keyword_index(self) -> None:
         """构建关键词内存索引。
@@ -152,7 +152,7 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
-        _logger.info("[Komari Knowledge] 正在构建关键词索引...")
+        _logger.info("[Komari Memory] 正在构建关键词索引...")
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -172,7 +172,7 @@ class KnowledgeEngine:
                     self._keyword_index[kw_lower].add(kid)
 
         self._index_loaded = True
-        _logger.info(f"[Komari Knowledge] 关键词索引构建完成，共 {len(rows)} 条知识")
+        _logger.info(f"[Komari Memory] 关键词索引构建完成，共 {len(rows)} 条知识")
 
     def _get_embedding(self, text: str) -> list[float]:
         """生成文本的向量嵌入。
@@ -189,24 +189,6 @@ class KnowledgeEngine:
         # fastembed 返回迭代器，转换为列表后取第一个
         embeddings = list(self._embed_model.embed([text]))
         return embeddings[0].tolist()
-
-    def _rewrite_query(self, query: str) -> str:
-        """应用查询重写规则。
-
-        将用户查询中的代词替换为具体实体，提高检索准确率。
-        例如："你喜欢什么" -> "小鞠喜欢什么"
-
-        Args:
-            query: 原始查询
-
-        Returns:
-            重写后的查询
-        """
-        rules = get_config().query_rewrite_rules
-        rewritten = query
-        for old, new in rules.items():
-            rewritten = rewritten.replace(old, new)
-        return rewritten
 
     async def search(self, query: str, limit: int | None = None) -> list[SearchResult]:
         """
@@ -232,13 +214,6 @@ class KnowledgeEngine:
         # pylance 不知道 config 插件会存取什么东西，写个 assert 告诉它 limit 此时一定是 int
         assert isinstance(limit, int), "limit should be int"
 
-        # 应用查询重写
-        original_query = query
-        query = self._rewrite_query(query)
-
-        if query != original_query:
-            _logger.info(f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'")
-
         results: list[SearchResult] = []
         seen_ids: set[int] = set()
 
@@ -258,7 +233,7 @@ class KnowledgeEngine:
             results.extend(vector_hits)
 
         _logger.debug(
-            f"[Komari Knowledge] 检索 '{query[:20]}...' -> "
+            f"[Komari Memory] 检索 '{query[:20]}...' -> "
             f"关键词命中 {len(keyword_hits)} 条，向量补充 {len(vector_hits)} 条"
         )
 
@@ -430,7 +405,7 @@ class KnowledgeEngine:
             kw_lower = kw.lower()
             self._keyword_index[kw_lower].add(kid)
 
-        _logger.info(f"[Komari Knowledge] 添加知识: ID={kid}, keywords={keywords}")
+        _logger.info(f"[Komari Memory] 添加知识: ID={kid}, keywords={keywords}")
         return kid
 
     async def get_all_knowledge(self) -> list[dict[str, Any]]:
@@ -481,7 +456,7 @@ class KnowledgeEngine:
             if kw_lower in self._keyword_index:
                 self._keyword_index[kw_lower].discard(kid)
 
-        _logger.info(f"[Komari Knowledge] 删除知识: ID={kid}")
+        _logger.info(f"[Komari Memory] 删除知识: ID={kid}")
         return True
 
     async def update_knowledge(
@@ -575,7 +550,7 @@ class KnowledgeEngine:
             kw_lower = kw.lower()
             self._keyword_index[kw_lower].add(kid)
 
-        _logger.info(f"[Komari Knowledge] 更新知识: ID={kid}")
+        _logger.info(f"[Komari Memory] 更新知识: ID={kid}")
         return True
 
     async def close(self) -> None:
@@ -583,19 +558,19 @@ class KnowledgeEngine:
         if self._pool:
             await self._pool.close()
             self._pool = None
-            _logger.info("[Komari Knowledge] 连接池已关闭")
+            _logger.info("[Komari Memory] 连接池已关闭")
 
 
 # 全局单例
-_engine: KnowledgeEngine | None = None
+_engine: MemoryEngine | None = None
 
 
-def get_engine() -> KnowledgeEngine | None:
+def get_engine() -> MemoryEngine | None:
     """获取全局引擎实例。"""
     return _engine
 
 
-async def initialize_engine() -> KnowledgeEngine:
+async def initialize_engine() -> MemoryEngine:
     """初始化全局引擎实例。
 
     Returns:
@@ -604,7 +579,7 @@ async def initialize_engine() -> KnowledgeEngine:
     global _engine
 
     if _engine is None:
-        _engine = KnowledgeEngine()
+        _engine = MemoryEngine()
         await _engine.initialize()
 
     return _engine
