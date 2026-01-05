@@ -53,24 +53,31 @@ __plugin_meta__ = PluginMetadata(
 
 driver = get_driver()
 
+
 # Streamlit 进程
-_streamlit_process: asyncio.subprocess.Process | None = None
+class PluginState:
+    def __init__(self) -> None:
+        self.streamlit_process: asyncio.subprocess.Process | None = None
+
+
+state = PluginState()
 
 
 @driver.on_startup
 async def on_startup() -> None:
     """Bot 启动时初始化常识库引擎并启动 WebUI。"""
-    global _streamlit_process  # noqa: PLW0603
     config = config_manager.get()
 
     if not config.plugin_enable:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
+        return
 
     if not config.pg_user or not config.pg_password:
         logger.warning(
             "[Komari Knowledge] 数据库用户名或密码未配置，跳过初始化。"
             "请在配置中设置 pg_user 和 pg_password"
         )
+        return
 
     try:
         await initialize_engine()
@@ -79,11 +86,11 @@ async def on_startup() -> None:
         logger.error(f"[Komari Knowledge] 初始化失败: {e}")
         return
 
-    # 启动 WebUI
+    # 启动 WebUI（仅在引擎初始化成功后）
     if config.webui_enabled:
         webui_path = Path(__file__).parent / "webui.py"
         try:
-            _streamlit_process = await asyncio.create_subprocess_exec(
+            state.streamlit_process = await asyncio.create_subprocess_exec(
                 "streamlit",
                 "run",
                 str(webui_path),
@@ -104,23 +111,21 @@ async def on_startup() -> None:
 @driver.on_shutdown
 async def on_shutdown() -> None:
     """Bot 关闭时清理资源。"""
-    global _streamlit_process  # noqa: PLW0603
-
     # 关闭 WebUI
-    if _streamlit_process:
+    if state.streamlit_process:
         try:
             try:
-                await asyncio.wait_for(_streamlit_process.wait(), timeout=5)
+                await asyncio.wait_for(state.streamlit_process.wait(), timeout=5)
                 logger.info("[Komari Knowledge] WebUI 已关闭")
             except TimeoutError:
                 # 超时则强制杀掉
-                _streamlit_process.kill()
-                await _streamlit_process.wait()
+                state.streamlit_process.kill()
+                await state.streamlit_process.wait()
                 logger.warning("[Komari Knowledge] WebUI 强制关闭")
         except Exception as e:
             logger.error(f"[Komari Knowledge] WebUI 关闭失败: {e}")
         finally:
-            _streamlit_process = None
+            state.streamlit_process = None
 
     # 关闭数据库连接
     engine = get_engine()
