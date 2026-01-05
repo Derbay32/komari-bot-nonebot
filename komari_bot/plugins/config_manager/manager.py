@@ -5,15 +5,16 @@
 
 接受的配置类型：任何 pydantic.BaseModel 子类
 """
+
 import json
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Type
+from typing import Any, ClassVar
 
-from pydantic import BaseModel
 from nonebot import get_plugin_config, logger
 from nonebot.plugin import require
+from pydantic import BaseModel
 
 # 依赖 localstore 插件
 store = require("nonebot_plugin_localstore")
@@ -44,13 +45,11 @@ class ConfigManager:
     - 支持自定义配置 Schema（任何 BaseModel 子类）
     """
 
-    _instances: dict[str, "ConfigManager"] = {}
-    _lock = RLock()
+    _instances: ClassVar[dict[str, "ConfigManager"]] = {}
+    _lock: ClassVar[RLock] = RLock()
 
     def __new__(
-        cls,
-        plugin_name: str,
-        config_schema: Type[BaseModel]
+        cls, plugin_name: str, config_schema: type[BaseModel]
     ) -> "ConfigManager":
         """单例模式实现，按插件名称区分。
 
@@ -69,11 +68,7 @@ class ConfigManager:
                     cls._instances[key] = instance
         return cls._instances[key]
 
-    def __init__(
-        self,
-        plugin_name: str,
-        config_schema: Type[BaseModel]
-    ):
+    def __init__(self, plugin_name: str, config_schema: type[BaseModel]) -> None:
         """初始化配置管理器。
 
         Args:
@@ -91,7 +86,9 @@ class ConfigManager:
         self._file_mtime: float = 0.0  # 记录文件修改时间
         self._initialized = True
 
-        logger.info(f"配置管理器已初始化 [{plugin_name}], 配置文件: {self._config_file}")
+        logger.info(
+            f"配置管理器已初始化 [{plugin_name}], 配置文件: {self._config_file}"
+        )
 
     @property
     def config_file(self) -> Path:
@@ -151,13 +148,13 @@ class ConfigManager:
             ValueError: 如果 JSON 格式无效
         """
         try:
-            with open(self._config_file, "r", encoding="utf-8") as f:
+            with Path.open(self._config_file, encoding="utf-8") as f:
                 data = json.load(f)
 
             return self._config_schema(**data)
         except json.JSONDecodeError as e:
             logger.error(f"配置文件中的 JSON 无效: {e}")
-            raise ValueError(f"无效的配置文件: {e}") from e
+            raise ValueError(f"无效的配置文件: {e}") from e  # noqa: TRY003
         except Exception as e:
             logger.error(f"加载配置时出错: {e}")
             raise
@@ -190,10 +187,12 @@ class ConfigManager:
 
             # 更新时间戳（使用 object.__setattr__ 绕过类型检查）
             # 假设用户的配置 Schema 包含 last_updated 字段
-            object.__setattr__(config, "last_updated", datetime.now().isoformat())
+            object.__setattr__(
+                config, "last_updated", datetime.now().astimezone().isoformat()
+            )
 
             # 以限制性权限写入
-            with open(self._config_file, "w", encoding="utf-8") as f:
+            with Path.open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(config.model_dump(), f, indent=2, ensure_ascii=False)
 
             # 设置文件权限（仅用户可读写）
@@ -241,11 +240,11 @@ class ConfigManager:
             # 创建包含更新值的字典
             current_dict = config.model_dump()
             if field_name not in current_dict:
-                raise ValueError(f"未知的配置字段: {field_name}")
+                raise ValueError(f"未知的配置字段: {field_name}")  # noqa: TRY003
 
             # 更新并验证
             current_dict[field_name] = value
-            current_dict["last_updated"] = datetime.now().isoformat()
+            current_dict["last_updated"] = datetime.now().astimezone().isoformat()
 
             # 通过创建新的 schema 实例来验证
             new_config = self._config_schema(**current_dict)
@@ -278,8 +277,7 @@ _config_managers: dict[str, ConfigManager] = {}
 
 
 def get_config_manager(
-    plugin_name: str,
-    config_schema: Type[BaseModel]
+    plugin_name: str, config_schema: type[BaseModel]
 ) -> ConfigManager:
     """获取配置管理器实例。
 

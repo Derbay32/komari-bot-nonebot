@@ -6,12 +6,14 @@ Komari Knowledge 管理界面。
 启动方式：
     streamlit run komari_bot/plugins/komari_knowledge/webui.py
 """
+
 import asyncio
 import sys
+import threading
 from pathlib import Path
 
 # 强制使用标准 asyncio，避免 uvloop 在 Streamlit 退出时的错误
-sys.modules["uvloop"] = None  # type: ignore
+sys.modules["uvloop"] = None  # type: ignore[reportGeneralTypeIssues]
 
 import streamlit as st
 
@@ -28,9 +30,9 @@ config_spec = importlib.util.spec_from_file_location(
     Path(__file__).parent / "config_schema.py",
 )
 if config_spec is None:
-    raise RuntimeError("无法加载 config_schema 模块")
+    raise RuntimeError("无法加载 config_schema 模块")  # noqa:TRY003
 if config_spec.loader is None:
-    raise RuntimeError("config_schema 模块加载器为空")
+    raise RuntimeError("config_schema 模块加载器为空")  # noqa:TRY003
 config_module = importlib.util.module_from_spec(config_spec)
 sys.modules["komari_bot.plugins.komari_knowledge.config_schema"] = config_module
 config_spec.loader.exec_module(config_module)
@@ -41,15 +43,70 @@ engine_spec = importlib.util.spec_from_file_location(
     Path(__file__).parent / "engine.py",
 )
 if engine_spec is None:
-    raise RuntimeError("无法加载 engine 模块")
+    raise RuntimeError("无法加载 engine 模块")  # noqa:TRY003
 if engine_spec.loader is None:
-    raise RuntimeError("engine 模块加载器为空")
+    raise RuntimeError("engine 模块加载器为空")  # noqa:TRY003
 engine_module = importlib.util.module_from_spec(engine_spec)
 engine_module.__package__ = "komari_bot.plugins.komari_knowledge"
 sys.modules["komari_bot.plugins.komari_knowledge.engine"] = engine_module
 engine_spec.loader.exec_module(engine_module)
 
 KnowledgeEngine = engine_module.KnowledgeEngine
+
+
+class GlobalContext:
+    def __init__(self) -> None:
+        # 创建一个新的事件循环
+        self.loop = asyncio.new_event_loop()
+        self.engine = None
+
+        # 定义一个在后台运行 Loop 的函数
+        def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_forever()  # 这个 loop 会一直运行，直到进程结束
+
+        # 使用 threading 启动后台线程
+        self.thread = threading.Thread(
+            target=start_background_loop, args=(self.loop,), daemon=True
+        )
+        self.thread.start()
+
+        # 在后台线程中初始化引擎（阻塞等待完成）
+        future = asyncio.run_coroutine_threadsafe(self._init_engine(), self.loop)
+        future.result()  # 等待初始化完成
+
+    async def _init_engine(self) -> None:
+        self.engine = KnowledgeEngine()
+        await self.engine.initialize()
+
+
+# 使用 st.cache_resource 确保全局只有一个后台线程在跑
+@st.cache_resource(hash_funcs={GlobalContext: lambda _: None})
+def get_global_context() -> GlobalContext:
+    return GlobalContext()
+
+
+def run_async(coro):  # noqa: ANN001, ANN201
+    """将协程提交给后台线程的 Loop 执行，并等待结果。"""
+    ctx = get_global_context()
+
+    # 将任务提交给后台线程
+    future = asyncio.run_coroutine_threadsafe(coro, ctx.loop)
+
+    # 在主线程等待结果
+    try:
+        return future.result()
+    except Exception as e:
+        st.error(f"异步任务执行出错: {e}")
+        raise e  # noqa: TRY201
+
+
+def get_engine() -> KnowledgeEngine:
+    ctx = get_global_context()
+    # 告诉类型检查器 engine 一定初始化好了
+    assert ctx.engine is not None
+    return ctx.engine
+
 
 # 页面配置
 st.set_page_config(
@@ -107,40 +164,15 @@ st.markdown(
 )
 
 
-# 全局事件循环（确保所有异步操作使用同一个循环）
-_event_loop: asyncio.AbstractEventLoop | None = None
-
-
-def get_event_loop() -> asyncio.AbstractEventLoop:
-    """获取全局事件循环（单例模式）。"""
-    global _event_loop
-    if _event_loop is None or _event_loop.is_closed():
-        _event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_event_loop)
-    return _event_loop
-
-
-def run_async(coro):
-    """在 Streamlit 中运行异步函数。"""
-    loop = get_event_loop()
-    return loop.run_until_complete(coro)
-
-
-def get_engine() -> KnowledgeEngine:
-    """获取引擎实例（每次重新初始化以避免事件循环问题）。"""
-    # 不使用缓存，因为 Streamlit rerun 会导致事件循环变化
-    engine = KnowledgeEngine()
-    run_async(engine.initialize())
-    return engine
-
-
-def main():
+def main() -> None:
     """主界面。"""
     # 初始化 session_state
     if "editing_kid" not in st.session_state:
         st.session_state.editing_kid = None
 
-    st.markdown('<h1 class="main-header">🧠 小鞠常识库管理</h1>', unsafe_allow_html=True)
+    st.markdown(
+        '<h1 class="main-header">🧠 小鞠常识库管理</h1>', unsafe_allow_html=True
+    )
 
     # 侧边栏配置
     with st.sidebar:
@@ -163,8 +195,6 @@ def main():
         # 刷新按钮
         if st.button("🔄 重新连接"):
             # 重置事件循环（不关闭，避免 Streamlit 关闭时的错误）
-            global _event_loop
-            _event_loop = None
             st.success("已重新连接！")
             st.rerun()
 
@@ -217,7 +247,7 @@ def main():
             with col2:
                 notes = st.text_input("备注（可选）", placeholder="初始设定")
 
-            submitted = st.form_submit_button("➕ 添加知识", type="primary")
+            submitted = st.form_submit_button("➕ 添加知识", type="primary")  # noqa: RUF001
 
             if submitted:
                 if not content or not content.strip():
@@ -225,7 +255,9 @@ def main():
                 elif not keywords_input or not keywords_input.strip():
                     st.error("❌ 关键词不能为空")
                 else:
-                    keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+                    keywords = [
+                        k.strip() for k in keywords_input.split(",") if k.strip()
+                    ]
 
                     try:
                         kid = run_async(
@@ -268,8 +300,12 @@ def main():
                 st.success(f"✅ 找到 {len(results)} 条相关知识")
 
                 for i, result in enumerate(results, 1):
-                    badge_class = "layer1-badge" if result.source == "keyword" else "layer2-badge"
-                    source_text = "关键词匹配" if result.source == "keyword" else "向量检索"
+                    badge_class = (
+                        "layer1-badge" if result.source == "keyword" else "layer2-badge"
+                    )
+                    source_text = (
+                        "关键词匹配" if result.source == "keyword" else "向量检索"
+                    )
 
                     st.markdown(
                         f"""
@@ -314,9 +350,10 @@ def main():
                 keywords = item.get("keywords", []) or []
                 content = item.get("content", "") or ""
 
-                if not any(
-                    kw_lower in k.lower() for k in keywords
-                ) and kw_lower not in content.lower():
+                if (
+                    not any(kw_lower in k.lower() for k in keywords)
+                    and kw_lower not in content.lower()
+                ):
                     continue
 
             # 分类筛选
@@ -331,7 +368,11 @@ def main():
         if st.session_state.editing_kid is not None:
             # 查找编辑的知识
             edit_item = next(
-                (item for item in filtered if item["id"] == st.session_state.editing_kid),
+                (
+                    item
+                    for item in filtered
+                    if item["id"] == st.session_state.editing_kid
+                ),
                 None,
             )
 
@@ -359,9 +400,13 @@ def main():
                         edit_category = st.selectbox(
                             "分类",
                             ["general", "character", "setting", "plot", "other"],
-                            index=["general", "character", "setting", "plot", "other"].index(
-                                edit_item.get("category", "general")
-                            ),
+                            index=[
+                                "general",
+                                "character",
+                                "setting",
+                                "plot",
+                                "other",
+                            ].index(edit_item.get("category", "general")),
                             key="edit_category",
                         )
                     with col2:
@@ -376,7 +421,10 @@ def main():
                         if st.form_submit_button("💾 保存修改", type="primary"):
                             if not edit_content or not edit_content.strip():
                                 st.error("❌ 知识内容不能为空")
-                            elif not edit_keywords_input or not edit_keywords_input.strip():
+                            elif (
+                                not edit_keywords_input
+                                or not edit_keywords_input.strip()
+                            ):
                                 st.error("❌ 关键词不能为空")
                             else:
                                 edit_keywords = [
@@ -413,9 +461,7 @@ def main():
 
         # 显示列表
         for item in filtered:
-            with st.expander(
-                f"📌 {item['content'][:50]}... (ID: {item['id']})"
-            ):
+            with st.expander(f"📌 {item['content'][:50]}... (ID: {item['id']})"):
                 st.markdown(f"**内容：** {item['content']}")
 
                 keywords = item.get("keywords", []) or []
@@ -441,12 +487,12 @@ def main():
                     col_edit, col_del = st.columns(2)
                     with col_edit:
                         if st.button("✏️", key=f"edit_{item['id']}", help="编辑"):
-                            st.session_state.editing_kid = item['id']
+                            st.session_state.editing_kid = item["id"]
                             st.rerun()
                     with col_del:
                         if st.button("🗑️", key=f"del_{item['id']}", help="删除"):
                             try:
-                                success = run_async(engine.delete_knowledge(item['id']))
+                                success = run_async(engine.delete_knowledge(item["id"]))
                                 if success:
                                     st.success("✅ 已删除")
                                     st.rerun()

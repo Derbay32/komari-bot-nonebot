@@ -1,4 +1,5 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口。"""
+
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
@@ -27,53 +28,37 @@ __plugin_meta__ = PluginMetadata(
         system_instruction="你是小鞠",
         enable_knowledge=True,  # 启用知识库检索
         knowledge_limit=3,  # 检索最多 3 条相关知识
+
+    # Gemini 3 特别说明
+    如果使用 gemini 3 以上的 API，你需要使用 thinking_level 参数，而不是 thinking_token。
+    thinking_level 参数应当根据对应的 model 传入思考等级，请使用**小写字母**。
     )
     """,
     config=Config,
 )
 
-# 依赖 config_manager 插件
+# 依赖插件
 config_manager_plugin = require("config_manager")
+knowledge_plugin = require("komari_knowledge")
 
 # 获取配置管理器
-config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
-
-
-# 按理说防注入函数一定会有输入值，否则就没有必要构造防注入提示词
-def _build_safe_prompt(
-    user_input: str | tuple
-) -> str:
-    """构建防注入的用户指令。
-
-    将用户侧传递的 prompt 与防注入指令合并。
-
-    Args:
-        user_input: 用户自定义的输入
-
-    Returns:
-        合并后的最终 user 提示词
-    """
-    # 打标签告诉ai这是用户输入内容
-    # 如果插件侧提供了用户输入内容，则构造防注入格式输入
-    if isinstance(user_input, tuple):
-        final_prompt = (
-            f"{user_input[0].replace("|", f"<user_input>{user_input[1]}</user_input>\n", 1)}"
-            )
-        return final_prompt
-
-    return user_input
+config_manager = config_manager_plugin.get_config_manager(
+    "llm_provider", DynamicConfigSchema
+)
 
 
 async def generate_text(
     prompt: str,
     provider: str,
+    model: str,
     system_instruction: str | None = None,
     temperature: int | None = None,
     max_tokens: int | None = None,
-    enable_knowledge: bool = False,
     knowledge_query: str | None = None,
     knowledge_limit: int = 3,
-    **kwargs,
+    *,
+    enable_knowledge: bool = False,
+    **kwargs,  # noqa: ANN003
 ) -> str:
     """生成文本。
 
@@ -100,21 +85,30 @@ async def generate_text(
         token = config.deepseek_api_token
 
     if not token:
-        raise ValueError(f"{provider.upper()} API Token 未配置，请在配置中设置 {provider}_api_token")
+        raise ValueError(  # noqa:TRY003
+            f"{provider.upper()} API Token 未配置，请在配置中设置 {provider}_api_token"
+        )
 
-    if provider == "gemini":
-        client = GeminiClient(token)
-    else:
-        client = DeepSeekClient(token)
+    match provider:
+        case "gemini":
+            client = GeminiClient(token)
+        case "deepseek":
+            client = DeepSeekClient(token)
+        case _:
+            logger.error(
+                "未传入 API 渠道或渠道不支持，请检查调用方法是否包含 provider 参数。"
+            )
+            raise ValueError
 
     try:
         # 知识库检索
         knowledge_context = ""
         if enable_knowledge:
             try:
-                knowledge_plugin = require("komari-knowledge")
                 query = knowledge_query or prompt
-                results = await knowledge_plugin.search_knowledge(query, limit=knowledge_limit)
+                results = await knowledge_plugin.search_knowledge(
+                    query, limit=knowledge_limit
+                )
 
                 if results:
                     knowledge_context = "\n".join(result.content for result in results)
@@ -126,20 +120,23 @@ async def generate_text(
 
         # 构建系统指令：处理占位符
         placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
-        final_system_instruction = (system_instruction or "").replace(placeholder, knowledge_context)
+        final_system_instruction = (system_instruction or "").replace(
+            placeholder, knowledge_context
+        )
 
-        safe_prompt = _build_safe_prompt(prompt) if prompt else prompt
         result = await client.generate_text(
-            prompt=safe_prompt,  # 保持用户原始输入不变
+            prompt=prompt,  # 保持用户原始输入不变
+            model=model,
             system_instruction=final_system_instruction,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
         )
-        return result
     except Exception as e:
         logger.error(f"LLM 调用失败 ({provider}): {e}")
         raise
+    else:
+        return result
     finally:
         await client.close()
 
@@ -165,10 +162,7 @@ async def test_connection(provider: str) -> bool:
         logger.warning(f"{provider.upper()} API Token 未配置，跳过连接测试")
         return False
 
-    if provider == "gemini":
-        client = GeminiClient(token)
-    else:
-        client = DeepSeekClient(token)
+    client = GeminiClient(token) if provider == "gemini" else DeepSeekClient(token)
 
     try:
         return await client.test_connection()

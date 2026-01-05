@@ -1,6 +1,6 @@
 [project]
 name = "komari-bot"
-version = "0.2.1"
+version = "0.4.0"
 description = "komari-bot"
 readme = "README.md"
 requires-python = ">=3.13, <4.0"
@@ -18,13 +18,11 @@ dependencies = [
     "psycopg (>=3.3.2,<4.0.0)",
     "asyncpg (>=0.31.0,<0.32.0)",
     "streamlit (>=1.52.2,<2.0.0)",
+    "redis (>=7.1.0,<8.0.0)",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pyright[nodejs]",
-    "ruff"
-]
+dev = ["pyright[nodejs]", "ruff"]
 
 [tool.nonebot]
 plugin_dirs = ["komari_bot/plugins"]
@@ -32,7 +30,7 @@ builtin_plugins = ["echo"]
 
 [tool.nonebot.adapters]
 nonebot-adapter-onebot = [
-    { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" }
+    { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" },
 ]
 "@local" = []
 
@@ -84,17 +82,17 @@ select = [
     "ARG",   # flake8-unused-arguments
     "PTH",   # flake8-use-pathlib
     # "ERA",   # eradicate
-    "FAST",  # FastAPI
-    "PERF",  # Perflint
-    "PGH",   # pygrep-hooks
-    "FURB",  # refurb
-    "TRY",   # tryceratops
-    "RUF",   # Ruff-specific rules
+    "FAST", # FastAPI
+    "PERF", # Perflint
+    "PGH",  # pygrep-hooks
+    "FURB", # refurb
+    "TRY",  # tryceratops
+    "RUF",  # Ruff-specific rules
 ]
 ignore = [
-    "E402",    # module-import-not-at-top-of-file  # nonebot2 require() violates this
-    "B008",    # function-call-in-default-argument  # nonebot2 Depends() without Annotated violates this
-    "UP037",   # quoted-annotation
+    "E402",  # module-import-not-at-top-of-file  # nonebot2 require() violates this
+    "B008",  # function-call-in-default-argument  # nonebot2 Depends() without Annotated violates this
+    "UP037", # quoted-annotation
     # "RUF001",  # ambiguous-unicode-character-string
     # "RUF002",  # ambiguous-unicode-character-docstring
     # "RUF003",  # ambiguous-unicode-character-comment
@@ -103,8 +101,33 @@ ignore = [
     "ANN401",  # any-type
     "COM812",  # missing-trailing-comma
     "PLC0415", # import-outside-top-level
+    "BLE001",
+    "PLR0913",
+    "C901",
+    "E501",
+    "PLR2004",
+    "PLR0912",
+    "PLR0915",
 ]
-allowed-confusables = ["，", "。", "“", "”", "：", "；", "？", "！", "【", "】", "《", "》", "…", "—", "（", "）", "、"]
+allowed-confusables = [
+    "，",
+    "。",
+    "“",
+    "”",
+    "：",
+    "；",
+    "？",
+    "！",
+    "【",
+    "】",
+    "《",
+    "》",
+    "…",
+    "—",
+    "（",
+    "）",
+    "、",
+]
 
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true

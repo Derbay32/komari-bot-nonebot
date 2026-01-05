@@ -9,6 +9,7 @@ Komari Knowledge 常识库核心引擎。
 1. NoneBot 模式：使用 config_manager 插件加载配置
 2. 独立模式：直接从 JSON 文件加载配置（用于 WebUI）
 """
+
 import asyncio
 import json
 import logging
@@ -22,13 +23,23 @@ from pydantic import BaseModel
 
 from .config_schema import DynamicConfigSchema
 
-# 检测运行模式：通过检查是否在 NoneBot 环境中
-_nonebot_mode = "nonebot" in sys.modules
-config_manager = None
-_logger: logging.Logger | Any = logging.getLogger("komari_knowledge")
+
+class PluginState:
+    """存放插件全局运行状态的容器"""
+
+    def __init__(self) -> None:
+        self.nonebot_mode: bool = "nonebot" in sys.modules
+        self.config_manager: Any = None
+        self.standalone_config: DynamicConfigSchema | None = None
+        self.engine: KnowledgeEngine | None = None
+        self.logger: logging.Logger | Any = logging.getLogger("komari_knowledge")
+
+
+# 初始化全局状态单例
+state = PluginState()
 
 # 只有在 NoneBot 环境中才尝试加载 config_manager
-if _nonebot_mode:
+if state.nonebot_mode:
     try:
         from nonebot import logger as nb_logger
         from nonebot.plugin import require
@@ -44,7 +55,6 @@ if _nonebot_mode:
         config_manager = None
         _logger = logging.getLogger("komari_knowledge")
 
-
 # 独立模式配置加载器
 _standalone_config: DynamicConfigSchema | None = None
 
@@ -54,7 +64,7 @@ def _load_standalone_config() -> DynamicConfigSchema:
     config_path = Path("config/config_manager/komari_knowledge_config.json")
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with Path.open(config_path, encoding="utf-8") as f:
                 data = json.load(f)
             return DynamicConfigSchema(**data)
         except (json.JSONDecodeError, TypeError) as e:
@@ -73,13 +83,13 @@ def get_config() -> DynamicConfigSchema:
     """
     if _nonebot_mode:
         # 告诉 pylance config_manager 不可能为空
-        assert config_manager is not None, "config_manager 应该在 NoneBot 模式下已初始化"
+        assert config_manager is not None, (
+            "config_manager 应该在 NoneBot 模式下已初始化"
+        )
         return config_manager.get()
-    else:
-        global _standalone_config
-        if _standalone_config is None:
-            _standalone_config = _load_standalone_config()
-        return _standalone_config
+    if state.standalone_config is None:
+        state.standalone_config = _load_standalone_config()
+    return state.standalone_config
 
 
 class SearchResult(BaseModel):
@@ -99,7 +109,7 @@ class KnowledgeEngine:
     负责管理数据库连接池、向量模型和检索逻辑。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化引擎。"""
         self._pool: Any = None
         self._embed_model: TextEmbedding | None = None
@@ -223,7 +233,7 @@ class KnowledgeEngine:
             return []
 
         if self._pool is None:
-            raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")
+            raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")  # noqa:TRY003
 
         # 确保 limit 是 int 类型
         if limit is None:
@@ -237,7 +247,9 @@ class KnowledgeEngine:
         query = self._rewrite_query(query)
 
         if query != original_query:
-            _logger.info(f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'")
+            _logger.info(
+                f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'"
+            )
 
         results: list[SearchResult] = []
         seen_ids: set[int] = set()
@@ -282,7 +294,6 @@ class KnowledgeEngine:
         if not self._index_loaded:
             return []
 
-        results: list[SearchResult] = []
         matched_ids: set[int] = set()
 
         # 检查查询中是否包含已知关键词
@@ -309,19 +320,16 @@ class KnowledgeEngine:
                 list(matched_ids),
                 limit,
             )
-
-            for row in rows:
-                results.append(
-                    SearchResult(
-                        id=row["id"],
-                        category=row["category"],
-                        content=row["content"],
-                        similarity=1.0,  # 关键词匹配视为完全相关
-                        source="keyword",
-                    )
-                )
-
-        return results
+        return [
+            SearchResult(
+                id=row["id"],
+                category=row["category"],
+                content=row["content"],
+                similarity=1.0,  # 关键词匹配视为完全相关
+                source="keyword",
+            )
+            for row in rows
+        ]
 
     async def _layer2_vector_search(
         self, query: str, limit: int, exclude_ids: set[int]
@@ -369,21 +377,18 @@ class KnowledgeEngine:
                 limit,
             )
 
-            results: list[SearchResult] = []
-            for row in rows:
-                # 应用相似度阈值过滤
-                if row["similarity"] >= config.similarity_threshold:
-                    results.append(
-                        SearchResult(
-                            id=row["id"],
-                            category=row["category"],
-                            content=row["content"],
-                            similarity=row["similarity"],
-                            source="vector",
-                        )
-                    )
-
-            return results
+            # 应用相似度阈值过滤
+            return [
+                SearchResult(
+                    id=row["id"],
+                    category=row["category"],
+                    content=row["content"],
+                    similarity=row["similarity"],
+                    source="vector",
+                )
+                for row in rows
+                if row["similarity"] >= config.similarity_threshold
+            ]
 
     async def add_knowledge(
         self,
@@ -530,7 +535,9 @@ class KnowledgeEngine:
             # 内容改变需要重新生成向量
             if content is not None:
                 loop = asyncio.get_event_loop()
-                embedding = await loop.run_in_executor(None, self._get_embedding, content)
+                embedding = await loop.run_in_executor(
+                    None, self._get_embedding, content
+                )
                 updates.append(f"content = ${param_idx}")
                 params.append(content)
                 param_idx += 1
@@ -601,10 +608,8 @@ async def initialize_engine() -> KnowledgeEngine:
     Returns:
         引擎实例
     """
-    global _engine
+    if state.engine is None:
+        state.engine = KnowledgeEngine()
+        await state.engine.initialize()
 
-    if _engine is None:
-        _engine = KnowledgeEngine()
-        await _engine.initialize()
-
-    return _engine
+    return state.engine

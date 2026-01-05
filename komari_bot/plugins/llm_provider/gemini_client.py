@@ -1,7 +1,7 @@
 """Gemini API 客户端。"""
+
 from google import genai
-from google.genai import types
-from google.genai import errors
+from google.genai import errors, types
 from nonebot import logger
 from nonebot.plugin import require
 
@@ -12,12 +12,15 @@ from .config_schema import DynamicConfigSchema
 config_manager_plugin = require("config_manager")
 
 # 获取配置管理器
-config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
+config_manager = config_manager_plugin.get_config_manager(
+    "llm_provider", DynamicConfigSchema
+)
+
 
 class GeminiClient(BaseLLMClient):
     """Gemini API 客户端。"""
 
-    def __init__(self, api_token: str):
+    def __init__(self, api_token: str) -> None:
         """初始化客户端。
 
         Args:
@@ -30,11 +33,13 @@ class GeminiClient(BaseLLMClient):
     async def generate_text(
         self,
         prompt: str,
+        model: str,
         system_instruction: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        thinking_token: int = 0,
-        **kwargs,
+        thinking_token: int | None = None,
+        thinking_level: str | None = None,
+        **kwargs,  # noqa: ANN003, ARG002 - Ruff 闭嘴
     ) -> str:
         """生成文本。
 
@@ -53,7 +58,7 @@ class GeminiClient(BaseLLMClient):
             # 记录请求日志
             logger.debug(
                 f"Gemini API 请求:\n"
-                f"  model: {config.gemini_model}\n"
+                f"  model: {model}\n"
                 f"  temperature: {temperature if temperature is not None else config.gemini_temperature}\n"
                 f"  max_output_tokens: {max_tokens if max_tokens is not None else int(config.gemini_max_tokens)}\n"
                 f"  system_instruction: {system_instruction}\n"
@@ -61,11 +66,48 @@ class GeminiClient(BaseLLMClient):
             )
 
             # 构建 SDK 配置
-            gen_config = types.GenerateContentConfig(
-                temperature=temperature if temperature is not None else config.gemini_temperature,
-                max_output_tokens=max_tokens if max_tokens is not None else int(config.gemini_max_tokens),
-                thinking_config=types.ThinkingConfig(thinking_level=config.gemini_thinking_level,)
-            )
+            if thinking_level:
+                level = None
+                match thinking_level:
+                    case "minimal":
+                        level = types.ThinkingLevel.MINIMAL
+                    case "low":
+                        level = types.ThinkingLevel.LOW
+                    case "medium":
+                        level = types.ThinkingLevel.MEDIUM
+                    case "high":
+                        level = types.ThinkingLevel.HIGH
+                assert level is not None
+                gen_config = types.GenerateContentConfig(
+                    temperature=temperature
+                    if temperature is not None
+                    else config.gemini_temperature,
+                    max_output_tokens=max_tokens
+                    if max_tokens is not None
+                    else int(config.gemini_max_tokens),
+                    thinking_config=types.ThinkingConfig(thinking_level=level),
+                )
+            elif thinking_token:
+                gen_config = types.GenerateContentConfig(
+                    temperature=temperature
+                    if temperature is not None
+                    else config.gemini_temperature,
+                    max_output_tokens=max_tokens
+                    if max_tokens is not None
+                    else int(config.gemini_max_tokens),
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=thinking_token
+                    ),
+                )
+            else:
+                gen_config = types.GenerateContentConfig(
+                    temperature=temperature
+                    if temperature is not None
+                    else config.gemini_temperature,
+                    max_output_tokens=max_tokens
+                    if max_tokens is not None
+                    else int(config.gemini_max_tokens),
+                )
 
             # 添加系统指令
             if system_instruction:
@@ -73,22 +115,22 @@ class GeminiClient(BaseLLMClient):
 
             # 使用 SDK 的异步接口
             response = await self._client.aio.models.generate_content(
-                model=config.gemini_model,
+                model=model,
                 contents=prompt,
                 config=gen_config,
             )
             if not response.text:
-                logger.error(f"Gemini API 错误: 未返回文本，回复可能被拦截")
-                raise
-            else:
-                logger.debug(f"Gemini API 响应: {response.text}")
-                return response.text
+                logger.error("Gemini API 错误: 未返回文本，回复可能被拦截")
+                raise ValueError  # noqa: TRY301 - Ruff 闭嘴
         except errors.APIError as e:
             logger.error(f"Gemini API 错误: {e.code} - {e.message}")
             raise
         except Exception as e:
             logger.error(f"Gemini API 未知错误: {e}")
             raise
+        else:
+            logger.debug(f"Gemini API 响应: {response.text}")
+            return response.text
 
     async def test_connection(self) -> bool:
         """测试 API 连接。
@@ -98,7 +140,7 @@ class GeminiClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
-            response = await self._client.aio.models.generate_content(
+            response = await self._client.aio.models.generate_content(  # noqa: F841
                 model=config.gemini_model,
                 contents="你好",
                 config=types.GenerateContentConfig(
@@ -106,17 +148,17 @@ class GeminiClient(BaseLLMClient):
                     max_output_tokens=10,
                 ),
             )
-            return True
         except errors.APIError as e:
             logger.error(f"Gemini API 连接测试失败: {e.code} - {e.message}")
             return False
         except Exception as e:
             logger.error(f"Gemini API 连接测试失败: {e}")
             return False
+        else:
+            return True
 
-    async def close(self):
+    async def close(self) -> None:
         """关闭客户端。
 
         google-genai SDK 使用 httpx，会自动管理连接，无需手动关闭。
         """
-        pass

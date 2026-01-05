@@ -22,14 +22,15 @@ for result in results:
 
 Bot 启动时自动启动 WebUI 管理界面（可在配置中设置端口）。
 """
-import subprocess
+
+import asyncio
 from pathlib import Path
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import DynamicConfigSchema
-from .engine import SearchResult, initialize_engine, get_engine
+from .engine import SearchResult, get_engine, initialize_engine
 
 # 依赖 config_manager 插件
 config_manager_plugin = require("config_manager")
@@ -53,25 +54,23 @@ __plugin_meta__ = PluginMetadata(
 driver = get_driver()
 
 # Streamlit 进程
-_streamlit_process: subprocess.Popen | None = None
+_streamlit_process: asyncio.subprocess.Process | None = None
 
 
 @driver.on_startup
-async def on_startup():
+async def on_startup() -> None:
     """Bot 启动时初始化常识库引擎并启动 WebUI。"""
-    global _streamlit_process
+    global _streamlit_process  # noqa: PLW0603
     config = config_manager.get()
 
     if not config.plugin_enable:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
-        return
 
     if not config.pg_user or not config.pg_password:
         logger.warning(
             "[Komari Knowledge] 数据库用户名或密码未配置，跳过初始化。"
             "请在配置中设置 pg_user 和 pg_password"
         )
-        return
 
     try:
         await initialize_engine()
@@ -84,16 +83,16 @@ async def on_startup():
     if config.webui_enabled:
         webui_path = Path(__file__).parent / "webui.py"
         try:
-            _streamlit_process = subprocess.Popen(
-                [
-                    "streamlit",
-                    "run",
-                    str(webui_path),
-                    "--server.port",
-                    str(config.webui_port),
-                    "--server.headless",
-                    "true",
-                ]
+            _streamlit_process = await asyncio.create_subprocess_exec(
+                "streamlit",
+                "run",
+                str(webui_path),
+                "--server.port",
+                str(config.webui_port),
+                "--server.headless",
+                "true",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
             logger.info(
                 f"[Komari Knowledge] WebUI 已启动: http://localhost:{config.webui_port}"
@@ -103,19 +102,21 @@ async def on_startup():
 
 
 @driver.on_shutdown
-async def on_shutdown():
+async def on_shutdown() -> None:
     """Bot 关闭时清理资源。"""
-    global _streamlit_process
+    global _streamlit_process  # noqa: PLW0603
 
     # 关闭 WebUI
     if _streamlit_process:
         try:
-            _streamlit_process.terminate()
-            _streamlit_process.wait(timeout=5)
-            logger.info("[Komari Knowledge] WebUI 已关闭")
-        except subprocess.TimeoutExpired:
-            _streamlit_process.kill()
-            logger.warning("[Komari Knowledge] WebUI 强制关闭")
+            try:
+                await asyncio.wait_for(_streamlit_process.wait(), timeout=5)
+                logger.info("[Komari Knowledge] WebUI 已关闭")
+            except TimeoutError:
+                # 超时则强制杀掉
+                _streamlit_process.kill()
+                await _streamlit_process.wait()
+                logger.warning("[Komari Knowledge] WebUI 强制关闭")
         except Exception as e:
             logger.error(f"[Komari Knowledge] WebUI 关闭失败: {e}")
         finally:

@@ -3,10 +3,11 @@
 
 提供各种便捷函数用于权限检查和信息格式化。
 """
+
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent
 
-from .manager import PermissionManager, ConfigType
+from .manager import ConfigType, PermissionManager
 
 
 def get_user_nickname(event: Obv11MessageEvent) -> str:
@@ -31,7 +32,7 @@ def get_user_nickname(event: Obv11MessageEvent) -> str:
 
     # 最后返回用户 ID
     if hasattr(event, "get_user_id"):
-        return "用户（{:.0f}）".format(event.get_user_id())
+        return f"用户（{event.get_user_id():.0f}）"
 
     return "用户"
 
@@ -48,8 +49,7 @@ async def check_plugin_status(config: ConfigType) -> tuple[bool, str]:
     permission_manager = PermissionManager(config)
     if permission_manager.is_plugin_enabled():
         return True, "插件已启用"
-    else:
-        return False, "插件已禁用"
+    return False, "插件已禁用"
 
 
 def format_permission_info(config: ConfigType) -> str:
@@ -68,8 +68,12 @@ def format_permission_info(config: ConfigType) -> str:
     user_whitelist = getattr(pm.config, "user_whitelist", [])
     group_whitelist = getattr(pm.config, "group_whitelist", [])
 
-    user_whitelist_info = "无限制" if not user_whitelist else f"{len(user_whitelist)} 个用户"
-    group_whitelist_info = "无限制" if not group_whitelist else f"{len(group_whitelist)} 个群聊"
+    user_whitelist_info = (
+        "无限制" if not user_whitelist else f"{len(user_whitelist)} 个用户"
+    )
+    group_whitelist_info = (
+        "无限制" if not group_whitelist else f"{len(group_whitelist)} 个群聊"
+    )
 
     return (
         f"插件状态: {status}\n"
