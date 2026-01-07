@@ -116,6 +116,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.env.dev
+.env.prod
 
 # Spyder project settings
 .spyderproject
@@ -142,19 +144,25 @@ dmypy.json
 /.claude
 /docs
 /examples
-jrhg_config.json
-llm_provider_config.json
-sr_config.json
 CLAUDE.md
 INSTALLATION_GUIDE.md
 MCP-ASSISTANT-RULES.md
-user_data.db
-.env.dev
-.env.prod
-.DS_Store
 plan.md
-komari_knowledge_config.json
 Project NEON-TAVERN.md
 Project NEON-TAVERN-Plugin.md
 komari-bert-readme.md
+
+# config files
+jrhg_config.json
+llm_provider_config.json
+sr_config.json
+komari_knowledge_config.json
+komari_memory_config.json
+
+# local database
+user_data.db
+
+# OS
+.DS_Store
+
 # End of https://www.toptal.com/developers/gitignore/api/python

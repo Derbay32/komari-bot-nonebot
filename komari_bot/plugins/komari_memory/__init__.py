@@ -1,0 +1,221 @@
+"""Komari Memory - 智能记忆与对话插件。"""
+
+from typing import TYPE_CHECKING
+
+from nonebot import get_driver, logger, on_message
+from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from nonebot.plugin import PluginMetadata, require
+
+if TYPE_CHECKING:
+    from .config_schema import KomariMemoryConfigSchema
+
+# 依赖插件
+config_manager_plugin = require("config_manager")
+permission_manager_plugin = require("permission_manager")
+apscheduler_plugin = require("nonebot_plugin_apscheduler")
+require("komari_knowledge")  # 常识库集成
+
+from .config_schema import KomariMemoryConfigSchema
+from .database.connection import create_pool
+from .handlers.message_handler import MessageHandler
+from .handlers.summary_worker import register_summary_task, unregister_summary_task
+from .services.memory_service import MemoryService
+from .services.redis_manager import RedisManager
+
+__plugin_meta__ = PluginMetadata(
+    name="小鞠记忆",
+    description="智能记忆与对话插件，支持向量检索和常识库集成",
+    usage="自动运行，无需命令",
+)
+
+
+class PluginManager:
+    """插件管理器，负责组件的生命周期管理。"""
+
+    def __init__(self, config: KomariMemoryConfigSchema) -> None:
+        """初始化插件管理器。
+
+        Args:
+            config: 插件配置
+        """
+        self.config = config
+        self.redis: RedisManager | None = None
+        self.memory: MemoryService | None = None
+        self.handler: MessageHandler | None = None
+        self.pg_pool = None
+        self._last_messages: dict[str, str] = {}
+
+    async def initialize(self) -> None:
+        """初始化所有组件。"""
+        logger.info("[KomariMemory] 正在初始化组件...")
+
+        # 1. 初始化 PostgreSQL 连接池 (用于向量检索)
+        try:
+            self.pg_pool = await create_pool(self.config)
+            logger.info("[KomariMemory] PostgreSQL 连接池已建立")
+        except Exception as e:
+            logger.error(f"[KomariMemory] PostgreSQL 连接失败: {e}")
+            raise
+
+        # 2. 初始化 Redis 管理器
+        try:
+            self.redis = RedisManager(self.config)
+            await self.redis.initialize()
+        except Exception as e:
+            logger.error(f"[KomariMemory] Redis 连接失败: {e}")
+            raise
+
+        # 3. 初始化记忆服务
+        self.memory = MemoryService(self.config, self.pg_pool)
+
+        # 4. 初始化消息处理器
+        self.handler = MessageHandler(
+            redis=self.redis,
+            memory=self.memory,
+        )
+
+        # 5. 注册总结定时任务
+        register_summary_task(self.redis, self.memory)
+
+        logger.info("[KomariMemory] 组件初始化完成")
+
+    async def shutdown(self) -> None:
+        """关闭所有组件。"""
+        # 取消定时任务
+        unregister_summary_task()
+
+        # 关闭 Redis 连接
+        if self.redis:
+            await self.redis.close()
+
+        # 关闭 PostgreSQL 连接池
+        if self.pg_pool:
+            await self.pg_pool.close()
+
+        logger.info("[KomariMemory] 已关闭")
+
+    def get_context_message(
+        self, group_id: str, user_id: str, current_message: str
+    ) -> str:
+        """获取上下文消息。
+
+        Args:
+            group_id: 群组 ID
+            user_id: 用户 ID
+            current_message: 当前消息内容
+
+        Returns:
+            上一句消息内容
+        """
+        key = f"{group_id}:{user_id}"
+        context = self._last_messages.get(key, "")
+        self._last_messages[key] = current_message
+        return context
+
+
+# 获取配置管理器
+config_manager = config_manager_plugin.get_config_manager(
+    "komari_memory", KomariMemoryConfigSchema
+)
+
+
+def get_config() -> KomariMemoryConfigSchema:
+    """获取当前配置（自动检测文件变化）。
+
+    Returns:
+        当前配置对象
+    """
+    return config_manager.get()
+
+# 创建插件管理器实例
+_plugin_manager: PluginManager | None = None
+
+
+def get_plugin_manager() -> PluginManager | None:
+    """获取插件管理器实例。
+
+    Returns:
+        插件管理器实例，如果未初始化则返回 None
+    """
+    return _plugin_manager
+
+
+# 消息处理器
+matcher = on_message(priority=10, block=False)
+
+
+@matcher.handle()
+async def handle_group_message(event: GroupMessageEvent) -> None:
+    """处理群聊消息。"""
+    # 获取最新配置
+    config = get_config()
+
+    # 检查插件是否启用
+    if not config.plugin_enable:
+        return
+
+    manager = get_plugin_manager()
+    if manager is None or manager.handler is None:
+        return
+
+    # 白名单检查：只有白名单内的群组才启用功能（白名单为空则禁用所有功能）
+    group_id = str(event.group_id)
+    if group_id not in config.group_whitelist:
+        return
+
+    # 权限检查
+    can_use = await permission_manager_plugin.check_runtime_permission(event, config)[0]
+    if not can_use:
+        return
+
+    user_id = str(event.user_id)
+    message_content = event.get_plaintext()
+
+    # 获取上一句消息作为上下文
+    context_message = manager.get_context_message(group_id, user_id, message_content)
+
+    try:
+        reply = await manager.handler.process_message(event, context_message)
+
+        if reply:
+            await matcher.send(reply)
+
+    except Exception as e:
+        logger.error(f"[KomariMemory] 消息处理失败: {e}")
+
+
+# 在插件加载时初始化
+driver = get_driver()
+
+
+@driver.on_startup
+async def startup() -> None:
+    """启动时初始化。"""
+    global _plugin_manager  # noqa: PLW0603
+
+    config = get_config()
+
+    if config.plugin_enable:
+        # 检查白名单是否为空
+        if not config.group_whitelist:
+            logger.warning(
+                "[KomariMemory] 群组白名单为空，插件将不会处理任何消息。"
+                "请在配置中设置 group_whitelist"
+            )
+        else:
+            logger.info(
+                f"[KomariMemory] 插件已启用，白名单群组: {config.group_whitelist}"
+            )
+
+        _plugin_manager = PluginManager(config)
+        await _plugin_manager.initialize()
+    else:
+        logger.warning("[KomariMemory] 插件未启用，请在配置中设置 plugin_enable=true")
+
+
+@driver.on_shutdown
+async def shutdown() -> None:
+    """关闭时清理。"""
+    manager = get_plugin_manager()
+    if manager:
+        await manager.shutdown()

@@ -19,6 +19,8 @@ dependencies = [
     "asyncpg (>=0.31.0,<0.32.0)",
     "streamlit (>=1.52.2,<2.0.0)",
     "redis (>=7.1.0,<8.0.0)",
+    "nonebot-plugin-orm>=0.1.0",
+    "greenlet (>=3.3.0,<4.0.0)",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +41,7 @@ nonebot-adapter-onebot = [
 nonebot-plugin-localstore = ["nonebot_plugin_localstore"]
 nonebot-plugin-apscheduler = ["nonebot_plugin_apscheduler"]
 nonebot-plugin-sentry = ["nonebot_plugin_sentry"]
+nonebot-plugin-orm = ["nonebot_plugin_orm"]
 [tool.ruff]
 line-length = 88
 target-version = "py313"
@@ -108,6 +111,7 @@ ignore = [
     "PLR2004",
     "PLR0912",
     "PLR0915",
+    "TID252",
 ]
 allowed-confusables = [
     "，",

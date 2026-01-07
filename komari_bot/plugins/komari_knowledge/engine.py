@@ -125,13 +125,22 @@ class KnowledgeEngine:
             state.logger.info(
                 f"[Komari Knowledge] 加载嵌入模型: {config.embedding_model}"
             )
+            # 配置统一的缓存目录
+            cache_dir = Path.home() / ".cache" / "komari_embeddings"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
             # 在独立线程中加载模型，避免阻塞
             loop = asyncio.get_event_loop()
             self._embed_model = await loop.run_in_executor(
                 None,
-                lambda: TextEmbedding(model_name=config.embedding_model),
+                lambda: TextEmbedding(
+                    model_name=config.embedding_model,
+                    cache_dir=str(cache_dir),
+                ),
             )
-            state.logger.info("[Komari Knowledge] 嵌入模型加载完成")
+            state.logger.info(
+                f"[Komari Knowledge] 嵌入模型加载完成 (缓存: {cache_dir})"
+            )
 
         # 2. 建立数据库连接池
         if self._pool is None:
