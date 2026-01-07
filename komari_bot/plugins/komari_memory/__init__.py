@@ -17,8 +17,14 @@ require("komari_knowledge")  # 常识库集成
 
 from .config_schema import KomariMemoryConfigSchema
 from .database.connection import create_pool
+from .handlers.forgetting_worker import (
+    register_forgetting_task,
+    unregister_forgetting_task,
+)
 from .handlers.message_handler import MessageHandler
 from .handlers.summary_worker import register_summary_task, unregister_summary_task
+from .services.character_binding import CharacterBindingManager
+from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
 from .services.redis_manager import RedisManager
 
@@ -42,6 +48,8 @@ class PluginManager:
         self.redis: RedisManager | None = None
         self.memory: MemoryService | None = None
         self.handler: MessageHandler | None = None
+        self.character_binding: CharacterBindingManager | None = None
+        self.forgetting: ForgettingService | None = None
         self.pg_pool = None
         self._last_messages: dict[str, str] = {}
 
@@ -77,12 +85,20 @@ class PluginManager:
         # 5. 注册总结定时任务
         register_summary_task(self.redis, self.memory)
 
+        # 6. 初始化角色绑定管理器
+        self.character_binding = CharacterBindingManager(self.config)
+
+        # 7. 初始化忘却服务并注册定时任务
+        self.forgetting = ForgettingService(self.config, self.pg_pool)
+        register_forgetting_task(self.forgetting)
+
         logger.info("[KomariMemory] 组件初始化完成")
 
     async def shutdown(self) -> None:
         """关闭所有组件。"""
         # 取消定时任务
         unregister_summary_task()
+        unregister_forgetting_task()
 
         # 关闭 Redis 连接
         if self.redis:
@@ -126,6 +142,7 @@ def get_config() -> KomariMemoryConfigSchema:
         当前配置对象
     """
     return config_manager.get()
+
 
 # 创建插件管理器实例
 _plugin_manager: PluginManager | None = None

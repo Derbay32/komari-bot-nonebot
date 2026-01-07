@@ -9,6 +9,7 @@ from .. import get_config
 from ..services.bert_client import score_message
 from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
+from ..services.message_filter import preprocess_message
 from ..services.prompt_builder import build_prompt
 from ..services.redis_manager import MessageSchema, RedisManager
 
@@ -60,6 +61,23 @@ class MessageHandler:
             timestamp=time.time(),
             message_id=message_id,
         )
+
+        # 前置过滤
+        filter_result = await preprocess_message(
+            message=message_content,
+            config=config,
+            redis=self.redis,
+            group_id=group_id,
+        )
+
+        if filter_result.should_skip:
+            logger.debug(
+                f"[KomariMemory] 消息被过滤: {filter_result.reason} - "
+                f"{message_content[:30]}..."
+            )
+            # 低价值消息直接丢弃
+            await self._handle_low_value(message)
+            return None
 
         # 调用 BERT 服务评分
         score = await score_message(

@@ -118,6 +118,14 @@ class KomariMemoryConfigSchema(BaseModel):
         description="系统提示词",
     )
 
+    # 消息过滤配置
+    filter_min_length: int = Field(
+        default=3, ge=1, le=20, description="最短消息长度阈值（字符数）"
+    )
+    filter_history_check_size: int = Field(
+        default=50, ge=10, le=200, description="历史重复检测检查的最近消息数量"
+    )
+
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:

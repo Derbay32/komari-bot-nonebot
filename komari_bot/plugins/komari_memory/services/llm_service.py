@@ -57,19 +57,27 @@ async def summarize_conversation(
     messages: list[str],
     config: KomariMemoryConfigSchema,
 ) -> dict:
-    """总结对话，提取实体（使用总结模型，带重试机制）。
+    """总结对话，提取实体，并评估重要性（使用总结模型，带重试机制）。
 
     Args:
         messages: 消息列表
         config: 插件配置
 
     Returns:
-        总结结果，包含 summary 和 entities
+        总结结果，包含 summary, entities, importance
     """
-    prompt = f"""请总结以下对话，提取实体信息：
+    prompt = f"""请总结以下对话，提取实体信息，并评估对话的重要性：
+
 {chr(10).join(messages)}
 
-返回 JSON 格式：{{"summary": "...", "entities": [...]}}"""
+请按以下标准评估重要性（1-5分）：
+- 1分：无意义的闲聊、表情、问候
+- 2分：简单的日常对话
+- 3分：一般的讨论交流
+- 4分：有意义的话题讨论
+- 5分：重要的决定、约定、或有价值的讨论
+
+返回 JSON 格式：{{"summary": "...", "entities": [...], "importance": 3}}"""
 
     last_error = None
 
@@ -94,7 +102,16 @@ async def summarize_conversation(
             else:
                 logger.error(f"[LLMService] 总结 3 次全部失败: {last_error}")
         else:
+            # 确保 importance 字段存在且在合理范围内
+            if "importance" not in result:
+                result["importance"] = 3  # 默认值
+            else:
+                try:
+                    importance = int(result["importance"])
+                    result["importance"] = max(1, min(5, importance))
+                except (ValueError, TypeError):
+                    result["importance"] = 3
             return result
 
     # 所有尝试失败，返回默认总结
-    return {"summary": "对话总结暂时不可用", "entities": []}
+    return {"summary": "对话总结暂时不可用", "entities": [], "importance": 3}

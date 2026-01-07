@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS komari_memory_conversations (
     start_time TIMESTAMP NOT NULL,
     end_time TIMESTAMP NOT NULL,
     importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+    importance_initial INT DEFAULT 3 CHECK (importance_initial BETWEEN 1 AND 5),
+    importance_current INT DEFAULT 3 CHECK (importance_current BETWEEN 0 AND 5),
+    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_fuzzy BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

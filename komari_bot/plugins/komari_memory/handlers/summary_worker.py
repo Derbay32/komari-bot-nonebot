@@ -83,6 +83,7 @@ async def perform_summary(
 
     summary = result.get("summary", "")
     entities = result.get("entities", [])
+    importance = result.get("importance", 3)
 
     if not summary:
         logger.warning(f"[KomariMemory] 群组 {group_id} 总结为空，跳过存储")
@@ -91,11 +92,12 @@ async def perform_summary(
     # 获取参与者列表
     participants = list({msg.user_id for msg in messages_buffer})
 
-    # 存储对话总结（带向量）
+    # 存储对话总结（带向量和重要性评分）
     conversation_id = await memory.store_conversation(
         group_id=group_id,
         summary=summary,
         participants=participants,
+        importance_initial=importance,
     )
 
     # 存储实体

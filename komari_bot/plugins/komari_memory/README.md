@@ -21,37 +21,27 @@
 
 ## 安装步骤
 
-### 1. 初始化数据库
+### 1. 安装 pgvector 扩展
 
-连接到 PostgreSQL 数据库并执行以下 SQL：
+连接到 PostgreSQL 数据库并执行：
 
 ```sql
--- 安装 pgvector 扩展
 CREATE EXTENSION IF NOT EXISTS vector;
-
--- 创建对话表
-CREATE TABLE IF NOT EXISTS komari_memory_conversations (
-    id SERIAL PRIMARY KEY,
-    group_id VARCHAR(64) NOT NULL,
-    summary TEXT NOT NULL,
-    embedding VECTOR(512),
-    participants TEXT[],
-    start_time TIMESTAMP NOT NULL,
-    end_time TIMESTAMP NOT NULL,
-    importance INT DEFAULT 3,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 创建向量索引
-CREATE INDEX idx_komari_memory_conv_embedding ON komari_memory_conversations
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
--- 创建实体表（由 ORM 自动管理）
--- komari_memory_entity 表会在插件启动时自动创建
 ```
 
-### 2. 配置插件
+### 2. 初始化数据库表
+
+执行插件提供的初始化脚本：
+
+```bash
+psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_memory/database/init_orm.sql
+```
+
+或者手动执行 `komari_bot/plugins/komari_memory/database/init_orm.sql` 文件中的 SQL 语句。
+
+**注意**：实体表 (`komari_memory_entity`) 会在插件启动时由 ORM 自动创建，无需手动初始化。
+
+### 3. 配置插件
 
 在 `config/config_manager/komari_memory_config.json` 中配置：
 

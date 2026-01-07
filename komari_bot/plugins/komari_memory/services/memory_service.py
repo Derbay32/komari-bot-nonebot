@@ -74,6 +74,7 @@ class MemoryService:
         group_id: str,
         summary: str,
         participants: list[str],
+        importance_initial: int = 3,
     ) -> int:
         """存储对话总结（向量检索用 asyncpg）。
 
@@ -81,6 +82,7 @@ class MemoryService:
             group_id: 群组 ID
             summary: 总结文本
             participants: 参与者列表
+            importance_initial: 初始重要性评分（1-5）
 
         Returns:
             创建的对话 ID
@@ -92,8 +94,8 @@ class MemoryService:
             row = await conn.fetchrow(
                 """
                 INSERT INTO komari_memory_conversations
-                (group_id, summary, embedding, participants, start_time, end_time)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                (group_id, summary, embedding, participants, start_time, end_time, importance_initial, importance_current)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id
                 """,
                 group_id,
@@ -102,10 +104,12 @@ class MemoryService:
                 participants,
                 time.time() - 3600,  # 假设持续 1 小时
                 time.time(),
+                importance_initial,
+                importance_initial,  # 初始时当前重要性等于初始重要性
             )
 
             logger.info(
-                f"[KomariMemory] 存储对话总结: ID={row['id']}, group={group_id}"
+                f"[KomariMemory] 存储对话总结: ID={row['id']}, group={group_id}, importance={importance_initial}"
             )
             return row["id"]
 
@@ -144,6 +148,23 @@ class MemoryService:
             )
 
             results = [dict(row) for row in rows]
+
+            # 检索后重置重要性和更新访问时间
+            if results:
+                result_ids = [r["id"] for r in results]
+                await conn.execute(
+                    """
+                    UPDATE komari_memory_conversations
+                    SET last_accessed = NOW(),
+                        importance_current = importance_initial
+                    WHERE id = ANY($1)
+                    """,
+                    result_ids,
+                )
+                logger.debug(
+                    f"[KomariMemory] 重置 {len(result_ids)} 条记忆的重要性"
+                )
+
             logger.debug(
                 f"[KomariMemory] 检索对话: query='{query[:30]}...', "
                 f"找到 {len(results)} 条结果"
