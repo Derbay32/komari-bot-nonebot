@@ -137,3 +137,6 @@ keep-runtime-typing = true
 pythonVersion = "3.13"
 pythonPlatform = "All"
 typeCheckingMode = "standard"
+
+[tool.poetry]
+package-mode = false
