@@ -165,6 +165,43 @@ class RedisManager:
         key = f"komari_memory:tokens:{group_id}"
         await self.redis.delete(key)
 
+    async def increment_message_count(
+        self,
+        group_id: str,
+    ) -> int:
+        """增加消息计数。
+
+        Args:
+            group_id: 群组 ID
+
+        Returns:
+            当前计数值
+        """
+        key = f"komari_memory:messages:{group_id}"
+        return await self.redis.incrby(key, 1)
+
+    async def get_message_count(self, group_id: str) -> int:
+        """获取当前消息计数。
+
+        Args:
+            group_id: 群组 ID
+
+        Returns:
+            当前计数值
+        """
+        key = f"komari_memory:messages:{group_id}"
+        value = await self.redis.get(key)
+        return int(value) if value else 0
+
+    async def reset_message_count(self, group_id: str) -> None:
+        """重置消息计数。
+
+        Args:
+            group_id: 群组 ID
+        """
+        key = f"komari_memory:messages:{group_id}"
+        await self.redis.delete(key)
+
     async def should_trigger_summary(
         self,
         group_id: str,
@@ -182,18 +219,35 @@ class RedisManager:
 
         config = get_config()
 
-        # 检查 Token 阈值
-        token_count = await self.get_tokens(group_id)
-        if token_count >= config.summary_token_threshold:
+        # 1. 检查消息数量阈值（优先级最高）
+        message_count = await self.get_message_count(group_id)
+        if message_count >= config.summary_message_threshold:
+            logger.debug(
+                f"[KomariMemory] 群组 {group_id} 消息数达标: "
+                f"{message_count}/{config.summary_message_threshold}"
+            )
             return True
 
-        # 检查时间阈值
+        # 2. 检查时间阈值（优先级次之）
         last_key = f"komari_memory:last_summary:{group_id}"
         last_summary = await self.redis.get(last_key)
         if last_summary:
             elapsed = time.time() - float(last_summary)
             if elapsed >= config.summary_time_threshold:
+                logger.debug(
+                    f"[KomariMemory] 群组 {group_id} 时间达标: "
+                    f"{elapsed:.0f}/{config.summary_time_threshold} 秒"
+                )
                 return True
+
+        # 3. 检查 Token 阈值（备用触发条件）
+        token_count = await self.get_tokens(group_id)
+        if token_count >= config.summary_token_threshold:
+            logger.debug(
+                f"[KomariMemory] 群组 {group_id} Token 数达标: "
+                f"{token_count}/{config.summary_token_threshold}"
+            )
+            return True
 
         return False
 
@@ -267,6 +321,18 @@ class RedisManager:
         key = f"komari_memory:proactive:count:{group_id}:{current_hour}"
         value = await self.redis.get(key)
         return int(value) if value else 0
+
+    async def delete_buffer(
+        self,
+        group_id: str,
+    ) -> None:
+        """清空消息缓冲区。
+
+        Args:
+            group_id: 群组 ID
+        """
+        key = f"komari_memory:buffer:{group_id}"
+        await self.redis.delete(key)
 
     async def get_active_groups(self) -> list[str]:
         """获取有活跃消息缓冲的群组列表。

@@ -79,6 +79,7 @@ WITH (m = 16, ef_construction = 64);
   "llm_max_tokens_summary": 2048,
   "knowledge_enabled": true,
   "knowledge_limit": 3,
+  "summary_message_threshold": 50,
   "summary_token_threshold": 1000,
   "summary_time_threshold": 3600,
   "message_buffer_size": 200,
@@ -86,8 +87,7 @@ WITH (m = 16, ef_construction = 64);
   "proactive_score_threshold": 0.8,
   "proactive_cooldown": 300,
   "proactive_max_per_hour": 3,
-  "system_prompt": "你是小鞠，一个友好的 AI 助手",
-  "memory_injection_template": "参考以下信息回复：\n{{CONTEXT}}\n\n用户消息："
+  "system_prompt": "你是小鞠，一个友好的 AI 助手"
 }
 ```
 
@@ -143,12 +143,13 @@ WITH (m = 16, ef_construction = 64);
 
 ### 记忆管理配置
 
-| 配置项                    | 类型 | 默认值                 | 说明                     |
-| ------------------------- | ---- | ---------------------- | ------------------------ |
-| `embedding_model`         | str  | BAAI/bge-small-zh-v1.5 | 向量嵌入模型             |
-| `summary_token_threshold` | int  | 1000                   | 触发总结的 Token 阈值    |
-| `summary_time_threshold`  | int  | 3600                   | 触发总结的时间阈值（秒） |
-| `message_buffer_size`     | int  | 200                    | Redis 消息缓存大小       |
+| 配置项                      | 类型 | 默认值                 | 说明                              |
+| --------------------------- | ---- | ---------------------- | --------------------------------- |
+| `embedding_model`           | str  | BAAI/bge-small-zh-v1.5 | 向量嵌入模型                      |
+| `summary_message_threshold` | int  | 50                     | 触发总结的消息数量阈值（优先）    |
+| `summary_token_threshold`   | int  | 1000                   | 触发总结的 Token 阈值（备用条件） |
+| `summary_time_threshold`    | int  | 3600                   | 触发总结的时间阈值（秒）          |
+| `message_buffer_size`       | int  | 200                    | Redis 消息缓存大小                |
 
 ### 常识库集成配置
 
@@ -168,10 +169,9 @@ WITH (m = 16, ef_construction = 64);
 
 ### 提示词模板配置
 
-| 配置项                      | 类型 | 默认值                       | 说明                                                 |
-| --------------------------- | ---- | ---------------------------- | ---------------------------------------------------- |
-| `system_prompt`             | str  | 你是小鞠，一个友好的 AI 助手 | 系统提示词                                           |
-| `memory_injection_template` | str  | 参考以下信息回复：...        | 记忆注入模板，`{{CONTEXT}}` 会被替换为检索到的上下文 |
+| 配置项          | 类型 | 默认值 | 说明       |
+| --------------- | ---- | ------ | ---------- |
+| `system_prompt` | str  | 略     | 系统提示词 |
 
 ## 工作原理
 
@@ -180,16 +180,17 @@ WITH (m = 16, ef_construction = 64);
 1. **消息接收**: 接收群组消息
 2. **BERT 评分**: 调用 BERT 服务对消息进行重要性评分 (0.0-1.0)
 3. **分类处理**:
-   - **低价值消息** (score < 0.3): 仅存储到 Redis，不计入 token
-   - **普通消息** (0.3 ≤ score < 0.8): 存储到 Redis 并计入 token
+   - **低价值消息** (score < 0.3): 直接丢弃，不存储
+   - **普通消息** (0.3 ≤ score < 0.8): 存储到 Redis 并计入消息数
    - **中断信号** (score ≥ 0.8): 触发主动回复（如果启用）
-4. **对话总结**: 当 token 数或时间达到阈值时，自动总结对话
+4. **对话总结**: 当消息数、时间或 token 数达到阈值时，自动总结对话并清空缓冲区
 
 ### 记忆检索
 
 - 基于向量相似度检索历史对话
 - 检索结果注入到提示词中作为上下文
 - 结合常识库提供更丰富的回复
+- AI 生成回复时包含最近 10 条消息上下文
 
 ## 使用说明
 
@@ -198,6 +199,7 @@ WITH (m = 16, ef_construction = 64);
 插件启用后会自动运行，无需手动命令。
 
 **重要**：插件需要配置 `group_whitelist` 才能工作：
+
 - 如果白名单为空，插件不会处理任何消息（安全模式）
 - 只有白名单内的群组才会启用插件功能
 
@@ -263,15 +265,16 @@ CREATE EXTENSION IF NOT EXISTS vector;
 - 使用 `nonebot-plugin-apscheduler` 实现后台定时任务
 - 每 5 分钟检查一次是否需要触发对话总结
 
+### 总结触发优先级
+
+1. **消息数量阈值**（优先）: 默认 50 条消息
+2. **时间阈值**（次之）: 默认 3600 秒（1 小时）
+3. **Token 阈值**（备用）: 默认 1000 tokens
+
+总结完成后会自动清空消息缓冲区，释放内存空间。
+
 ### 重试机制
 
 - BERT 评分失败时重试 3 次，指数退避
-- LLM 调用失败时重试 3 次，指数退避
-
-## 许可证
-
-MIT License
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
+- LLM 回复生成失败时重试 3 次，指数退避
+- 总结生成失败时重试 3 次，指数退避

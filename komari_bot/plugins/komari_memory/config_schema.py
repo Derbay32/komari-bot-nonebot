@@ -96,6 +96,9 @@ class KomariMemoryConfigSchema(BaseModel):
     message_buffer_size: int = Field(
         default=200, ge=50, le=1000, description="Redis 消息缓存大小"
     )
+    summary_message_threshold: int = Field(
+        default=50, ge=10, le=500, description="触发总结的消息数量阈值（优先于 token 阈值）"
+    )
 
     # 主动回复配置
     proactive_enabled: bool = Field(default=False, description="是否启用主动回复")
@@ -113,10 +116,6 @@ class KomariMemoryConfigSchema(BaseModel):
     system_prompt: str = Field(
         default="你是小鞠，一个友好的 AI 助手",
         description="系统提示词",
-    )
-    memory_injection_template: str = Field(
-        default="参考以下信息回复：\n{{CONTEXT}}\n\n用户消息：",
-        description="记忆注入模板，{{CONTEXT}} 会被替换为检索到的上下文",
     )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")

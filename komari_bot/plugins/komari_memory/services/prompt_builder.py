@@ -13,45 +13,74 @@ async def build_prompt(
     user_message: str,
     memories: list[dict],
     config: KomariMemoryConfigSchema,
-) -> str:
-    """构建动态提示词（记忆 + 常识库）。
+    recent_messages: list | None = None,
+) -> tuple[str, str]:
+    """构建动态提示词（记忆 + 常识库 + 最近消息）。
 
     Args:
         user_message: 用户消息
         memories: 检索到的对话记忆
         config: 插件配置
+        recent_messages: 最近的消息列表（可选）
 
     Returns:
-        构建好的提示词
+        (system_prompt, user_context) 元组
+        - system_prompt: 系统提示词
+        - user_context: 用户上下文（包含最近消息、记忆、常识库、用户输入）
     """
     context_parts = []
 
-    # 1. 注入对话记忆
-    if memories:
-        memory_text = "\n".join([f"- {m['summary']}" for m in memories])
-        context_parts.append(f"对话记忆:\n{memory_text}")
+    # 1. 注入最近消息（使用 XML 标签）
+    if recent_messages:
+        message_items = [
+            f"- {msg.user_id}: {msg.content}" for msg in recent_messages[-10:]
+        ]  # 只取最近 10 条
+        if message_items:
+            messages_text = "\n".join(message_items)
+            context_parts.append(
+                f"<recent_messages>\n{messages_text}\n</recent_messages>"
+            )
 
-    # 2. 追加常识库检索
+    # 2. 注入对话记忆（使用 XML 标签）
+    if memories:
+        memory_items = "\n".join([f"- {m['summary']}" for m in memories])
+        context_parts.append(f"<memory>\n{memory_items}\n</memory>")
+
+    # 3. 追加常识库检索（使用 XML 标签）
     if config.knowledge_enabled:
         try:
-            knowledge_results = await komari_knowledge.search(
+            knowledge_results = await komari_knowledge.search_knowledge(
                 query=user_message,
                 limit=config.knowledge_limit,
             )
             if knowledge_results:
-                knowledge_text = "\n".join(
+                knowledge_items = "\n".join(
                     [f"- {r.content}" for r in knowledge_results]
                 )
-                context_parts.append(f"常识库:\n{knowledge_text}")
+                context_parts.append(f"<knowledge>\n{knowledge_items}\n</knowledge>")
         except Exception as e:
             logger.debug(f"[KomariMemory] 常识库检索失败: {e}")
 
-    # 3. 组合上下文
-    if context_parts:
-        context = "\n\n".join(context_parts)
-        prompt = config.memory_injection_template.replace("{{CONTEXT}}", context)
-    else:
-        prompt = ""
+    # 4. 构建用户上下文（包含最近消息、记忆、常识库、用户输入）
+    user_context_parts = []
 
-    # 4. 组合系统提示词
-    return f"{config.system_prompt}\n\n{prompt}".strip()
+    if context_parts:
+        user_context_parts.extend(context_parts)
+
+    # 用户当前输入
+    user_context_parts.append(f"<user_input>\n{user_message}\n</user_input>")
+
+    user_context = "\n\n".join(user_context_parts)
+
+    # 5. 构建系统提示词（添加标签说明）
+    tag_instructions = """
+回复时请参考以下上下文信息：
+- <recent_messages>标签内是最近的聊天消息（用户ID: 消息内容）
+- <memory>标签内是历史对话总结
+- <knowledge>标签内是常识库信息
+- <user_input>标签内是用户当前的消息
+"""
+
+    system_prompt = f"{config.system_prompt}\n{tag_instructions}".strip()
+
+    return system_prompt, user_context

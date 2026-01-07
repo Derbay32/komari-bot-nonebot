@@ -114,8 +114,14 @@ async def perform_summary(
         except Exception as e:
             logger.debug(f"[KomariMemory] 存储实体失败: {e}")
 
-    # 重置 token 计数
+    # 重置消息计数
+    await redis.reset_message_count(group_id)
+
+    # 重置 token 计数（保留向后兼容）
     await redis.reset_tokens(group_id)
+
+    # 清空消息缓冲区
+    await redis.delete_buffer(group_id)
 
     # 更新最后总结时间
     await redis.update_last_summary(group_id)

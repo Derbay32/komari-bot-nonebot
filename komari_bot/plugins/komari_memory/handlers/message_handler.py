@@ -87,14 +87,13 @@ class MessageHandler:
         return None
 
     async def _handle_low_value(self, message: MessageSchema) -> None:
-        """处理低价值消息。
+        """处理低价值消息（直接丢弃，不存储）。
 
         Args:
             message: 消息对象
         """
-        # 存入 Redis 但不计入 Token
-        await self.redis.push_message(message.group_id, message)
-        logger.debug(f"[KomariMemory] 低价值消息已过滤: {message.content[:30]}...")
+        # 低价值消息不存储到缓冲区，节省空间
+        logger.debug(f"[KomariMemory] 低价值消息已丢弃: {message.content[:30]}...")
 
     async def _handle_normal_message(self, message: MessageSchema) -> None:
         """处理普通消息。
@@ -102,15 +101,17 @@ class MessageHandler:
         Args:
             message: 消息对象
         """
-        # 存入 Redis 并计入 Token
+        # 存入 Redis 并计入消息数和 token
         await self.redis.push_message(message.group_id, message)
+        await self.redis.increment_message_count(message.group_id)
 
-        # 估算 Token (中文约 1.5 字 = 1 token，这里简化处理)
+        # 同时统计 token（作为备用触发条件）
         token_count = len(message.content)
         await self.redis.increment_tokens(message.group_id, token_count)
 
         logger.debug(
             f"[KomariMemory] 消息已存储: group={message.group_id}, "
+            f"messages={await self.redis.get_message_count(message.group_id)}, "
             f"tokens={await self.redis.get_tokens(message.group_id)}"
         )
 
@@ -153,17 +154,21 @@ class MessageHandler:
             limit=3,
         )
 
-        # 构建提示词
-        prompt = await build_prompt(
+        # 获取最近的消息上下文
+        recent_messages = await self.redis.get_buffer(message.group_id, limit=10)
+
+        # 构建提示词（返回 system_prompt 和 user_context）
+        system_prompt, user_context = await build_prompt(
             user_message=message.content,
             memories=memories,
             config=config,
+            recent_messages=recent_messages,
         )
 
-        # 生成回复
+        # 生成回复（user_context 已包含记忆、常识库、用户输入）
         reply = await generate_reply(
-            user_message=message.content,
-            system_prompt=prompt,
+            user_message=user_context,
+            system_prompt=system_prompt,
             config=config,
         )
 
@@ -181,18 +186,3 @@ class MessageHandler:
             )
 
         return reply
-
-
-# 简单的 token 估算函数
-def estimate_tokens(text: str) -> int:
-    """估算文本的 token 数量。
-
-    Args:
-        text: 输入文本
-
-    Returns:
-        估算的 token 数量
-    """
-    # 简化处理：中文约 1.5 字 = 1 token，英文约 4 字 = 1 token
-    # 这里取平均值，约为 2 字 = 1 token
-    return max(1, len(text) // 2)
