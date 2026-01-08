@@ -1,10 +1,27 @@
 """角色名绑定管理器。"""
 
+from __future__ import annotations
+
 import asyncio
 import json
 from pathlib import Path
 
 from nonebot import logger
+
+# 模块级单例实例
+_manager_instance: CharacterBindingManager | None = None
+
+
+def get_manager() -> CharacterBindingManager:
+    """获取管理器单例实例。
+
+    Returns:
+        管理器实例
+    """
+    global _manager_instance  # noqa: PLW0603
+    if _manager_instance is None:
+        _manager_instance = CharacterBindingManager()
+    return _manager_instance
 
 
 class CharacterBindingManager:

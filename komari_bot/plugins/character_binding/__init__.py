@@ -3,7 +3,9 @@
 from nonebot import get_driver
 from nonebot.plugin import PluginMetadata
 
-from .manager import CharacterBindingManager
+# 导入命令模块以注册命令处理器（必须在 manager 之后导入以避免循环导入）
+from . import commands  # noqa: F401
+from .manager import CharacterBindingManager, get_manager
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
@@ -14,23 +16,6 @@ __plugin_meta__ = PluginMetadata(
 )
 
 
-class _BindingRegistry:
-    """绑定管理器注册表（内部类）。"""
-
-    _instance: CharacterBindingManager | None = None
-
-    @classmethod
-    def get_manager(cls) -> CharacterBindingManager:
-        """获取单例管理器实例。
-
-        Returns:
-            管理器实例
-        """
-        if cls._instance is None:
-            cls._instance = CharacterBindingManager()
-        return cls._instance
-
-
 driver = get_driver()
 
 
@@ -38,7 +23,7 @@ driver = get_driver()
 async def init_plugin() -> None:
     """插件启动时初始化管理器。"""
     # 触发单例初始化，确保启动时加载数据并输出日志
-    _BindingRegistry.get_manager()
+    get_manager()
 
 
 def get_binding_manager() -> CharacterBindingManager:
@@ -47,7 +32,7 @@ def get_binding_manager() -> CharacterBindingManager:
     Returns:
         管理器实例
     """
-    return _BindingRegistry.get_manager()
+    return get_manager()
 
 
 def get_character_name(
@@ -63,7 +48,7 @@ def get_character_name(
     Returns:
         角色名称
     """
-    return get_binding_manager().get_character_name(user_id, fallback_nickname)
+    return get_manager().get_character_name(user_id, fallback_nickname)
 
 
 __all__ = [

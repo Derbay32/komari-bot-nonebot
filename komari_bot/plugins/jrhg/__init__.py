@@ -148,7 +148,7 @@ async def jrhg_function(bot: Bot, event: MessageEvent) -> None:
             )
 
         # 获取回复文本
-        response = _get_response(favor_result, username)
+        response = _get_response(favor_result.daily_favor, username)
 
         # 格式化最终回复
         final_response = await format_favor_response(

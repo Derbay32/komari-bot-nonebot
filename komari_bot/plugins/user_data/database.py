@@ -166,7 +166,7 @@ class UserDataDB:
     ) -> FavorGenerationResult:
         """生成或更新用户好感度"""
         assert self._connection is not None
-        today = datetime.now().astimezone().today()
+        today = datetime.now().astimezone().date()
         existing_favor = await self.get_user_favorability(user_id, today)
 
         is_new_day = False
@@ -215,7 +215,7 @@ class UserDataDB:
     async def _get_cumulative_favor(self, user_id: str) -> int:
         """获取用户的累计好感度（不包括今天）"""
         assert self._connection is not None
-        today = datetime.now().astimezone().today()
+        today = datetime.now().astimezone().date()
         cursor = await self._connection.execute(
             """
             SELECT MAX(cumulative_favor)

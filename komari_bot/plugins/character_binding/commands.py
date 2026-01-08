@@ -4,7 +4,44 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.params import CommandArg
 
-from . import get_binding_manager
+from .manager import get_manager
+
+# /bind - 显示使用说明
+bind = on_command("bind", priority=10, block=True)
+
+
+@bind.handle()
+async def handle_bind_help(event: MessageEvent) -> None:
+    """处理 /bind 命令，显示使用说明。
+
+    Args:
+        event: 消息事件
+    """
+    user_id = str(event.user_id)
+    manager = get_manager()
+
+    # 检查用户是否有绑定
+    has_binding = manager.has_binding(user_id)
+    binding_info = ""
+    if has_binding:
+        character_name = manager.get_character_name(user_id)
+        binding_info = f"\n📋 您当前的角色绑定: {character_name}"
+
+    help_text = (
+        "🎭 角色绑定命令说明：\n"
+        "━━━━━━━━━━━━━━━\n"
+        "• /bind set <角色名>\n"
+        "  设置您的角色绑定\n"
+        "• /bind del\n"
+        "  删除您的角色绑定\n"
+        "• /bind list\n"
+        "  查看您的角色绑定\n"
+        "━━━━━━━━━━━━━━━"
+        f"{binding_info}"
+    )
+
+    await bind.finish(help_text)
+
 
 # /bind set <角色名> 或 /bind set <用户ID> <角色名>
 bind_set = on_command(("bind", "set"), priority=10, block=True)
@@ -21,7 +58,7 @@ async def handle_set(
         event: 消息事件
         args: 命令参数
     """
-    manager = get_binding_manager()
+    manager = get_manager()
     user_id = str(event.user_id)
 
     # 提取参数
@@ -71,7 +108,7 @@ async def handle_del(
         event: 消息事件
         args: 命令参数
     """
-    manager = get_binding_manager()
+    manager = get_manager()
     user_id = str(event.user_id)
 
     # 提取参数
@@ -110,7 +147,7 @@ async def handle_list(bot: Bot, event: MessageEvent) -> None:
         bot: Bot 实例
         event: 消息事件
     """
-    manager = get_binding_manager()
+    manager = get_manager()
     user_id = str(event.user_id)
 
     # 检查是否是 SUPERUSER
