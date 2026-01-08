@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING
 
 from nonebot import get_driver, logger, on_message
-from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
 if TYPE_CHECKING:
@@ -133,7 +133,7 @@ matcher = on_message(priority=10, block=False)
 
 
 @matcher.handle()
-async def handle_group_message(event: GroupMessageEvent) -> None:
+async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     """处理群聊消息。"""
     # 获取最新配置
     config = get_config()
@@ -152,7 +152,7 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
         return
 
     # 权限检查
-    can_use = await permission_manager_plugin.check_runtime_permission(event, config)[0]
+    can_use, _ = await permission_manager_plugin.check_runtime_permission(bot, event, config)
     if not can_use:
         return
 

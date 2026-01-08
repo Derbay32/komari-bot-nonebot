@@ -1,7 +1,10 @@
 """消息预过滤器 - BERT评分前的快速过滤层。"""
 
+import re
 from dataclasses import dataclass
 from typing import Literal
+
+from nonebot import logger
 
 from ..config_schema import KomariMemoryConfigSchema
 from ..services.redis_manager import RedisManager
@@ -12,10 +15,13 @@ class FilterResult:
     """过滤结果。"""
 
     should_skip: bool
-    reason: Literal["short", "history_repeat", "none"]
+    reason: Literal["short", "history_repeat", "none", "command"]
 
     def __init__(
-        self, *, should_skip: bool, reason: Literal["short", "history_repeat", "none"]
+        self,
+        *,
+        should_skip: bool,
+        reason: Literal["short", "history_repeat", "none", "command"],
     ) -> None:
         """初始化过滤结果（强制使用关键字参数）。
 
@@ -25,6 +31,22 @@ class FilterResult:
         """
         object.__setattr__(self, "should_skip", should_skip)
         object.__setattr__(self, "reason", reason)
+
+
+def _is_command_message(message: str) -> bool:
+    """检查消息是否为命令消息（以 . 或 。开头）。
+
+    Args:
+        message: 原始消息内容
+
+    Returns:
+        是否为命令消息
+    """
+    # 使用 regex 匹配以 . 或 。开头的消息
+    # 匹配开头可能有的空白字符，然后是 . 或 。，之后至少有一个非空白字符
+    pattern = r"^\s*[.。]\S"
+
+    return bool(re.match(pattern, message))
 
 
 async def preprocess_message(
@@ -44,6 +66,11 @@ async def preprocess_message(
     Returns:
         过滤结果对象
     """
+    # 0. 命令消息过滤（以 . 或 。 开头）
+    if _is_command_message(message):
+        logger.debug(f"[KomariMemory] 过滤命令消息: {message[:50]}...")
+        return FilterResult(should_skip=True, reason="command")
+
     # 1. 极短文本过滤
     if len(message.strip()) < config.filter_min_length:
         return FilterResult(should_skip=True, reason="short")
