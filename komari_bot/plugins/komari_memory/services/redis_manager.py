@@ -30,8 +30,19 @@ class RedisManager:
         Args:
             config: 插件配置
         """
-        self.config = config
+        self._config = config
         self._redis: aioredis.Redis | None = None
+
+    @property
+    def config(self) -> KomariMemoryConfigSchema:
+        """获取当前配置（支持热重载的访问器）。
+
+        Returns:
+            当前配置对象
+        """
+        from .. import get_config
+
+        return get_config()
 
     async def initialize(self) -> None:
         """初始化 Redis 连接。"""
@@ -75,11 +86,6 @@ class RedisManager:
             group_id: 群组 ID
             message: 消息对象
         """
-        # 动态获取最新配置
-        from .. import get_config
-
-        config = get_config()
-
         key = f"komari_memory:buffer:{group_id}"
         data = {
             "user_id": message.user_id,
@@ -91,7 +97,7 @@ class RedisManager:
 
         pipe = self.redis.pipeline()
         pipe.rpush(key, json.dumps(data))
-        pipe.ltrim(key, 0, config.message_buffer_size - 1)
+        pipe.ltrim(key, 0, self.config.message_buffer_size - 1)
         await pipe.execute()
 
     async def get_buffer(
@@ -214,17 +220,12 @@ class RedisManager:
         Returns:
             是否触发总结
         """
-        # 动态获取最新配置
-        from .. import get_config
-
-        config = get_config()
-
         # 1. 检查消息数量阈值（优先级最高）
         message_count = await self.get_message_count(group_id)
-        if message_count >= config.summary_message_threshold:
+        if message_count >= self.config.summary_message_threshold:
             logger.debug(
                 f"[KomariMemory] 群组 {group_id} 消息数达标: "
-                f"{message_count}/{config.summary_message_threshold}"
+                f"{message_count}/{self.config.summary_message_threshold}"
             )
             return True
 
@@ -233,19 +234,19 @@ class RedisManager:
         last_summary = await self.redis.get(last_key)
         if last_summary:
             elapsed = time.time() - float(last_summary)
-            if elapsed >= config.summary_time_threshold:
+            if elapsed >= self.config.summary_time_threshold:
                 logger.debug(
                     f"[KomariMemory] 群组 {group_id} 时间达标: "
-                    f"{elapsed:.0f}/{config.summary_time_threshold} 秒"
+                    f"{elapsed:.0f}/{self.config.summary_time_threshold} 秒"
                 )
                 return True
 
         # 3. 检查 Token 阈值（备用触发条件）
         token_count = await self.get_tokens(group_id)
-        if token_count >= config.summary_token_threshold:
+        if token_count >= self.config.summary_token_threshold:
             logger.debug(
                 f"[KomariMemory] 群组 {group_id} Token 数达标: "
-                f"{token_count}/{config.summary_token_threshold}"
+                f"{token_count}/{self.config.summary_token_threshold}"
             )
             return True
 
