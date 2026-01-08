@@ -105,6 +105,10 @@ class PluginManager:
         unregister_summary_task()
         unregister_forgetting_task()
 
+        # 清理记忆服务（释放 fastembed 模型）
+        if self.memory:
+            await self.memory.cleanup()
+
         # 关闭 Redis 连接
         if self.redis:
             await self.redis.close()

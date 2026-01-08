@@ -183,3 +183,14 @@ class MemoryService:
             group_id=group_id,
             limit=limit,
         )
+
+    async def cleanup(self) -> None:
+        """清理模型资源，释放 fastembed 的 multiprocessing 资源。
+
+        应该在插件关闭时调用，以避免资源泄漏警告。
+        """
+        if self._embed_model is not None:
+            # 释放 fastembed 模型引用
+            # fastembed 内部使用 multiprocessing，需要显式释放引用
+            self._embed_model = None
+            logger.debug("[KomariMemory] 向量嵌入模型已释放")

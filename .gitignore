@@ -160,6 +160,7 @@ llm_provider_config.json
 sr_config.json
 komari_knowledge_config.json
 komari_memory_config.json
+character_bindings.json
 
 # local database
 user_data.db
