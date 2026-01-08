@@ -41,6 +41,32 @@ CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_time
 ON komari_memory_conversations(start_time DESC);
 
 -- ============================================
+-- 实体表 (entity)
+-- 存储用户/群组结构化信息（如偏好、属性等）
+-- ============================================
+CREATE TABLE IF NOT EXISTS komari_memory_entity (
+    user_id VARCHAR(64) NOT NULL,
+    group_id VARCHAR(64) NOT NULL,
+    key VARCHAR(100) NOT NULL,
+    value TEXT NOT NULL,
+    category VARCHAR(50) NOT NULL,
+    importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+    access_count INT DEFAULT 0,
+    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, group_id, key)
+);
+
+-- ============================================
+-- 创建实体表索引
+-- ============================================
+CREATE INDEX IF NOT EXISTS idx_komari_memory_entity_group
+ON komari_memory_entity(group_id);
+
+CREATE INDEX IF NOT EXISTS idx_komari_memory_entity_importance
+ON komari_memory_entity(importance DESC);
+
+-- ============================================
 -- 表注释
 -- ============================================
 COMMENT ON TABLE komari_memory_conversations IS 'Komari Memory 对话总结表 - 存储对话总结和向量表示';
+COMMENT ON TABLE komari_memory_entity IS 'Komari Memory 实体表 - 存储用户/群组结构化信息';

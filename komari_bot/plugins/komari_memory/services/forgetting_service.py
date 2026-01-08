@@ -1,7 +1,5 @@
 """记忆忘却服务 - 定期清理和压缩低价值记忆。"""
 
-import asyncio
-
 import asyncpg
 from nonebot import logger
 from nonebot.plugin import require
