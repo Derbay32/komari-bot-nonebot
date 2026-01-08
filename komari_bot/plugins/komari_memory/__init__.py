@@ -62,16 +62,16 @@ class PluginManager:
         try:
             self.pg_pool = await create_pool(self.config)
             logger.info("[KomariMemory] PostgreSQL 连接池已建立")
-        except Exception as e:
-            logger.error(f"[KomariMemory] PostgreSQL 连接失败: {e}")
+        except Exception:
+            logger.exception("[KomariMemory] PostgreSQL 连接失败")
             raise
 
         # 2. 初始化 Redis 管理器
         try:
             self.redis = RedisManager(self.config)
             await self.redis.initialize()
-        except Exception as e:
-            logger.error(f"[KomariMemory] Redis 连接失败: {e}")
+        except Exception:
+            logger.exception("[KomariMemory] Redis 连接失败")
             raise
 
         # 3. 初始化数据访问层
@@ -178,8 +178,8 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
         if reply:
             await matcher.send(reply)
 
-    except Exception as e:
-        logger.error(f"[KomariMemory] 消息处理失败: {e}")
+    except Exception:
+        logger.exception("[KomariMemory] 消息处理失败")
 
 
 # 在插件加载时初始化

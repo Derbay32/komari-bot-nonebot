@@ -96,8 +96,8 @@ async def perform_summary(
                 category=entity.get("category", "general"),
                 importance=entity.get("importance", 3),
             )
-        except Exception as e:
-            logger.debug(f"[KomariMemory] 存储实体失败: {e}")
+        except Exception:
+            logger.debug("[KomariMemory] 存储实体失败", exc_info=True)
 
     # 重置消息计数
     await redis.reset_message_count(group_id)

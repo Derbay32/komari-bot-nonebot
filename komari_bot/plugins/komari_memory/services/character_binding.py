@@ -33,8 +33,8 @@ class CharacterBindingManager:
                 with Path.open(self.binding_file, encoding="utf-8") as f:
                     self._bindings = json.load(f)
                 logger.info(f"[KomariMemory] 加载角色绑定: {len(self._bindings)} 条")
-            except (OSError, json.JSONDecodeError) as e:
-                logger.warning(f"[KomariMemory] 绑定文件加载失败: {e}")
+            except (OSError, json.JSONDecodeError):
+                logger.warning("[KomariMemory] 绑定文件加载失败", exc_info=True)
                 self._bindings = {}
         else:
             self._bindings = {}
@@ -42,8 +42,8 @@ class CharacterBindingManager:
             try:
                 with Path.open(self.binding_file, "w", encoding="utf-8") as f:
                     json.dump({}, f, ensure_ascii=False, indent=2)
-            except OSError as e:
-                logger.error(f"[KomariMemory] 初始化绑定文件失败: {e}")
+            except OSError:
+                logger.exception("[KomariMemory] 初始化绑定文件失败")
 
     async def _save_bindings(self) -> None:
         """保存绑定数据到文件。"""
@@ -51,8 +51,8 @@ class CharacterBindingManager:
             try:
                 with Path.open(self.binding_file, "w", encoding="utf-8") as f:
                     json.dump(self._bindings, f, ensure_ascii=False, indent=2)
-            except OSError as e:
-                logger.error(f"[KomariMemory] 绑定文件保存失败: {e}")
+            except OSError:
+                logger.exception("[KomariMemory] 绑定文件保存失败")
 
     def get_character_name(
         self,

@@ -74,8 +74,8 @@ async def build_prompt(
                     context_parts.append(
                         f"<vector_knowledge>\n{vector_items}\n</vector_knowledge>"
                     )
-        except Exception as e:
-            logger.debug(f"[KomariMemory] 常识库检索失败: {e}")
+        except Exception:
+            logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
 
     # 4. 构建用户上下文（包含最近消息、记忆、常识库、用户输入）
     user_context_parts = []

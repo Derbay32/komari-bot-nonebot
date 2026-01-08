@@ -52,8 +52,8 @@ class ForgettingService:
                 f"删除低价值 {deleted_low} 条, "
                 f"删除/模糊化高价值 {deleted_high} 条"
             )
-        except Exception as e:
-            logger.error(f"[KomariMemory] 死神脚本执行失败: {e}")
+        except Exception:
+            logger.exception("[KomariMemory] 死神脚本执行失败")
 
     async def _daily_decay(self) -> None:
         """每日衰减：所有记忆重要性-1。"""
@@ -130,8 +130,8 @@ class ForgettingService:
                     conv_id,
                 )
                 logger.debug(f"[KomariMemory] 模糊化记忆: ID={conv_id}")
-        except Exception as e:
-            logger.error(f"[KomariMemory] 模糊化失败 ID={conv_id}: {e}")
+        except Exception:
+            logger.exception(f"[KomariMemory] 模糊化失败 ID={conv_id}")
 
     async def _generate_fuzzy_summary(self, original: str) -> str:
         """生成模糊化总结。
@@ -157,6 +157,6 @@ class ForgettingService:
                 max_tokens=100,
             )
             return response.strip()
-        except Exception as e:
-            logger.warning(f"[KomariMemory] 模糊化生成失败: {e}")
+        except Exception:
+            logger.warning("[KomariMemory] 模糊化生成失败", exc_info=True)
             return "对话内容已模糊化处理"
