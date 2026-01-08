@@ -20,6 +20,6 @@ async def create_pool(config: KomariMemoryConfigSchema) -> asyncpg.Pool:
         database=config.pg_database,
         user=config.pg_user,
         password=config.pg_password,
-        min_size=2,
-        max_size=5,
+        min_size=config.pg_pool_min_size,
+        max_size=config.pg_pool_max_size,
     )

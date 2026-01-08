@@ -33,6 +33,12 @@ class KomariMemoryConfigSchema(BaseModel):
     pg_database: str = Field(default="komari_bot", description="数据库名称")
     pg_user: str = Field(default="", description="数据库用户名")
     pg_password: str = Field(default="", description="数据库密码")
+    pg_pool_min_size: int = Field(
+        default=2, ge=1, le=10, description="PostgreSQL 连接池最小连接数"
+    )
+    pg_pool_max_size: int = Field(
+        default=5, ge=1, le=50, description="PostgreSQL 连接池最大连接数"
+    )
 
     # Redis 配置
     redis_host: str = Field(default="localhost", description="Redis 主机地址")
