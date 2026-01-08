@@ -103,7 +103,10 @@ class KomariMemoryConfigSchema(BaseModel):
         default=200, ge=50, le=1000, description="Redis 消息缓存大小"
     )
     summary_message_threshold: int = Field(
-        default=50, ge=10, le=500, description="触发总结的消息数量阈值（优先于 token 阈值）"
+        default=50,
+        ge=10,
+        le=500,
+        description="触发总结的消息数量阈值（优先于 token 阈值）",
     )
     summary_max_messages: int = Field(
         default=200, ge=50, le=500, description="总结时从缓冲区获取的最大消息数"
@@ -121,10 +124,10 @@ class KomariMemoryConfigSchema(BaseModel):
         default=0.8, ge=0.0, le=1.0, description="触发主动回复的评分阈值"
     )
     proactive_cooldown: int = Field(
-        default=300, ge=60, le=3600, description="主动回复冷却时间（秒）"
+        default=300, ge=5, le=3600, description="主动回复冷却时间（秒）"
     )
     proactive_max_per_hour: int = Field(
-        default=3, ge=1, le=10, description="每小时最大主动回复次数"
+        default=400, ge=1, le=800, description="每小时最大主动回复次数"
     )
 
     # 提示词模板配置

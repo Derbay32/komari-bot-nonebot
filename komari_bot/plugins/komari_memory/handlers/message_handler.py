@@ -31,6 +31,22 @@ class MessageHandler:
         self.redis = redis
         self.memory = memory
 
+    def _is_reply_trigger(self, event: GroupMessageEvent) -> bool:
+        """检查是否触发被回复回复。
+
+        Args:
+            event: 群聊消息事件
+
+        Returns:
+            是否触发
+        """
+        # 检查是否回复了某条消息
+        if event.reply is not None:
+            return True
+
+        # 检查是否 @ 了 bot
+        return bool(hasattr(event, "to_me") and event.to_me)
+
     async def process_message(
         self,
         event: GroupMessageEvent,
@@ -54,7 +70,7 @@ class MessageHandler:
 
         # 获取用户昵称（用户昵称 > 群昵称 > user_id）
         user_nickname = (
-            event.sender.nickname or event.sender.card
+            (event.sender.nickname or event.sender.card or user_id)
             if event.sender
             else user_id
         )
@@ -84,6 +100,13 @@ class MessageHandler:
             # 低价值消息直接丢弃
             await self._handle_low_value(message)
             return None
+
+        # 检查是否触发被回复回复（优先级最高）
+        if self._is_reply_trigger(event):
+            # 存储当前消息到缓冲区
+            await self.redis.push_message(message.group_id, message)
+            # 生成回复
+            return await self._handle_reply_trigger(event, message)
 
         # 调用 BERT 服务评分
         score = await score_message(
@@ -137,6 +160,102 @@ class MessageHandler:
             f"messages={await self.redis.get_message_count(message.group_id)}, "
             f"tokens={await self.redis.get_tokens(message.group_id)}"
         )
+
+    async def _get_reply_context(
+        self,
+        event: GroupMessageEvent,
+        message: MessageSchema,
+    ) -> list[MessageSchema]:
+        """获取被回复时的上下文。
+
+        Args:
+            event: 群聊消息事件
+            message: 当前消息对象
+
+        Returns:
+            上下文消息列表
+        """
+        config = get_config()
+
+        # 如果是回复消息，尝试获取被回复消息的上下文
+        if event.reply and event.reply.message_id:
+            reply_context = await self.redis.get_context_around_message(
+                group_id=message.group_id,
+                message_id=str(event.reply.message_id),
+                before=5,
+                after=5,
+            )
+
+            if reply_context:
+                logger.debug(
+                    f"[KomariMemory] 找到被回复消息上下文: {len(reply_context)} 条消息"
+                )
+                return reply_context
+
+        # 如果是 @ 或找不到上下文，使用当前上下文
+        recent_messages = await self.redis.get_buffer(
+            message.group_id,
+            limit=config.context_messages_limit,
+        )
+
+        logger.debug(f"[KomariMemory] 使用当前上下文: {len(recent_messages)} 条消息")
+        return recent_messages
+
+    async def _handle_reply_trigger(
+        self,
+        event: GroupMessageEvent,
+        message: MessageSchema,
+    ) -> str:
+        """处理被回复时的回复（必须回复，无冷却限制）。
+
+        Args:
+            event: 群聊消息事件
+            message: 消息对象
+
+        Returns:
+            回复内容
+        """
+        config = get_config()
+
+        # 获取上下文
+        recent_messages = await self._get_reply_context(event, message)
+
+        # 检索相关记忆
+        memories = await self.memory.search_conversations(
+            query=message.content,
+            group_id=message.group_id,
+            user_id=message.user_id,
+            limit=config.memory_search_limit,
+        )
+
+        # 构建提示词
+        system_prompt, user_context = await build_prompt(
+            user_message=message.content,
+            memories=memories,
+            config=config,
+            recent_messages=recent_messages,
+            current_user_id=message.user_id,
+            current_user_nickname=message.user_nickname,
+        )
+
+        # 生成回复
+        reply = await generate_reply(
+            user_message=user_context,
+            system_prompt=system_prompt,
+            config=config,
+        )
+
+        if reply is not None:
+            logger.info(
+                f"[KomariMemory] 被回复回复: group={message.group_id}, "
+                f"trigger={'reply' if event.reply else 'at'}"
+            )
+        else:
+            logger.warning(
+                f"[KomariMemory] 被回复回复生成失败: group={message.group_id}"
+            )
+
+        return reply or "抱歉，我暂时无法回复。"
 
     async def _handle_interrupt_signal(
         self,

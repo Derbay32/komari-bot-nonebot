@@ -135,6 +135,60 @@ class RedisManager:
 
         return messages
 
+    async def get_context_around_message(
+        self,
+        group_id: str,
+        message_id: str,
+        before: int = 5,
+        after: int = 5,
+    ) -> list[MessageSchema]:
+        """获取指定消息前后的上下文。
+
+        Args:
+            group_id: 群组 ID
+            message_id: 消息 ID
+            before: 获取前面的消息数量
+            after: 获取后面的消息数量
+
+        Returns:
+            消息列表（按时间排序）
+        """
+        key = RedisKeys.buffer(group_id)
+        # 获取所有缓冲区消息
+        raw_data = await self.redis.lrange(key, 0, -1)
+
+        # 解析所有消息
+        all_messages: list[MessageSchema] = []
+        for msg_item in raw_data:
+            msg_data = json.loads(msg_item)
+            all_messages.append(
+                MessageSchema(
+                    user_id=msg_data["user_id"],
+                    user_nickname=msg_data.get("user_nickname", msg_data["user_id"]),
+                    group_id=msg_data["group_id"],
+                    content=msg_data["content"],
+                    timestamp=msg_data["timestamp"],
+                    message_id=msg_data["message_id"],
+                )
+            )
+
+        # 找到目标消息的索引
+        target_index = -1
+        for i, msg in enumerate(all_messages):
+            if msg.message_id == message_id:
+                target_index = i
+                break
+
+        # 如果找不到目标消息，返回空列表
+        if target_index == -1:
+            return []
+
+        # 获取上下文范围
+        start = max(0, target_index - before)
+        end = min(len(all_messages), target_index + after + 1)
+
+        return all_messages[start:end]
+
     async def increment_tokens(
         self,
         group_id: str,
