@@ -8,12 +8,17 @@ from ..config_schema import KomariMemoryConfigSchema
 # 获取常识库插件
 komari_knowledge = require("komari_knowledge")
 
+# 获取角色绑定插件
+character_binding = require("character_binding")
+
 
 async def build_prompt(
     user_message: str,
     memories: list[dict],
     config: KomariMemoryConfigSchema,
     recent_messages: list | None = None,
+    current_user_id: str | None = None,
+    current_user_nickname: str | None = None,
 ) -> tuple[str, str]:
     """构建动态提示词（记忆 + 常识库 + 最近消息）。
 
@@ -22,6 +27,8 @@ async def build_prompt(
         memories: 检索到的对话记忆
         config: 插件配置
         recent_messages: 最近的消息列表（可选）
+        current_user_id: 当前用户 ID（可选）
+        current_user_nickname: 当前用户昵称（可选）
 
     Returns:
         (system_prompt, user_context) 元组
@@ -30,11 +37,17 @@ async def build_prompt(
     """
     context_parts = []
 
-    # 1. 注入最近消息（使用 XML 标签）
+    # 1. 注入最近消息（使用 XML 标签，显示角色名）
     if recent_messages:
-        message_items = [
-            f"- {msg.user_id}: {msg.content}" for msg in recent_messages[-10:]
-        ]  # 只取最近 10 条
+        message_items = []
+        for msg in recent_messages[-10:]:  # 只取最近 10 条
+            # 获取角色名（优先级：绑定名 > 昵称 > user_id）
+            character_name = character_binding.get_character_name(
+                user_id=msg.user_id,
+                fallback_nickname=msg.user_nickname,
+            )
+            message_items.append(f"- {character_name}: {msg.content}")
+
         if message_items:
             messages_text = "\n".join(message_items)
             context_parts.append(
@@ -77,7 +90,19 @@ async def build_prompt(
         except Exception:
             logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
 
-    # 4. 构建用户上下文（包含最近消息、记忆、常识库、用户输入）
+    # 4. 添加当前用户标识
+    if current_user_id and current_user_nickname:
+        current_character_name = character_binding.get_character_name(
+            user_id=current_user_id,
+            fallback_nickname=current_user_nickname,
+        )
+        context_parts.append(
+            f"<current_user>\n"
+            f"当前发言者：{current_character_name} (ID: {current_user_id})\n"
+            f"</current_user>"
+        )
+
+    # 5. 构建用户上下文（包含最近消息、记忆、常识库、用户输入）
     user_context_parts = []
 
     if context_parts:
@@ -88,13 +113,14 @@ async def build_prompt(
 
     user_context = "\n\n".join(user_context_parts)
 
-    # 5. 构建系统提示词（添加标签说明）
+    # 6. 构建系统提示词（添加标签说明）
     tag_instructions = """
 回复时请参考以下上下文信息：
-- <recent_messages>标签内是最近的聊天消息（用户ID: 消息内容）
+- <recent_messages>标签内是最近的聊天消息（角色名: 消息内容）
 - <memory>标签内是历史对话总结
 - <keyword_knowledge>标签内是关键词精确匹配的常识库信息
 - <vector_knowledge>标签内是向量语义检索的常识库信息
+- <current_user>标签内是当前发言者的信息
 - <user_input>标签内是用户当前的消息
 """
 

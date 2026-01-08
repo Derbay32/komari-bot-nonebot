@@ -110,13 +110,15 @@ class MemoryService:
         self,
         query: str,
         group_id: str,
+        user_id: str | None = None,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """向量检索对话（asyncpg 原生 SQL）。
+        """向量检索对话（支持用户相关性加权）。
 
         Args:
             query: 查询文本
             group_id: 群组 ID
+            user_id: 当前用户 ID（用于加权该用户参与的记忆）
             limit: 返回数量限制
 
         Returns:
@@ -125,10 +127,11 @@ class MemoryService:
         # 业务逻辑：生成查询向量
         query_vec = await self._get_embedding(query)
 
-        # 数据访问：委托给仓库
+        # 数据访问：委托给仓库（传递 user_id 用于加权）
         return await self._conversation_repo.search_by_similarity(
             embedding=str(query_vec),
             group_id=group_id,
+            user_id=user_id,
             limit=limit,
         )
 

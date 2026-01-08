@@ -52,8 +52,16 @@ class MessageHandler:
         message_content = event.get_plaintext()
         message_id = str(event.message_id)
 
+        # 获取用户昵称（群昵称 > 用户昵称 > user_id）
+        user_nickname = (
+            event.sender.card or event.sender.nickname
+            if event.sender
+            else user_id
+        )
+
         message = MessageSchema(
             user_id=user_id,
+            user_nickname=user_nickname,
             group_id=group_id,
             content=message_content,
             timestamp=time.time(),
@@ -162,10 +170,11 @@ class MessageHandler:
             logger.debug("[KomariMemory] 主动回复频率超限")
             return None
 
-        # 检索相关记忆
+        # 检索相关记忆（传递 user_id 用于用户相关性加权）
         memories = await self.memory.search_conversations(
             query=message.content,
             group_id=message.group_id,
+            user_id=message.user_id,
             limit=config.memory_search_limit,
         )
 
@@ -178,6 +187,8 @@ class MessageHandler:
             memories=memories,
             config=config,
             recent_messages=recent_messages,
+            current_user_id=message.user_id,
+            current_user_nickname=message.user_nickname,
         )
 
         # 生成回复（user_context 已包含记忆、常识库、用户输入）

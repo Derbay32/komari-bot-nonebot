@@ -17,6 +17,7 @@ class MessageSchema:
     """消息数据结构。"""
 
     user_id: str
+    user_nickname: str
     group_id: str
     content: str
     timestamp: float
@@ -89,6 +90,7 @@ class RedisManager:
         key = RedisKeys.buffer(group_id)
         data = {
             "user_id": message.user_id,
+            "user_nickname": message.user_nickname,
             "group_id": message.group_id,
             "content": message.content,
             "timestamp": message.timestamp,
@@ -123,6 +125,7 @@ class RedisManager:
             messages.append(
                 MessageSchema(
                     user_id=data["user_id"],
+                    user_nickname=data.get("user_nickname", data["user_id"]),
                     group_id=data["group_id"],
                     content=data["content"],
                     timestamp=data["timestamp"],
