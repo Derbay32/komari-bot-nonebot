@@ -34,13 +34,11 @@ class MessageHandler:
     async def process_message(
         self,
         event: GroupMessageEvent,
-        context_message: str | None = None,
     ) -> str | None:
         """处理群聊消息的主流程。
 
         Args:
             event: 群聊消息事件
-            context_message: 上一句消息
 
         Returns:
             回复内容，如果不需要回复则返回 None
@@ -82,7 +80,6 @@ class MessageHandler:
         # 调用 BERT 服务评分
         score = await score_message(
             message=message_content,
-            context=context_message or "",
             user_id=user_id,
             group_id=group_id,
             config=config,

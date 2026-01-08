@@ -10,7 +10,6 @@ from ..config_schema import KomariMemoryConfigSchema
 
 async def score_message(
     message: str,
-    context: str,
     user_id: str,
     group_id: str,
     config: KomariMemoryConfigSchema,
@@ -19,7 +18,6 @@ async def score_message(
 
     Args:
         message: 当前消息内容
-        context: 上一句消息内容
         user_id: 发送者 ID
         group_id: 群组 ID
         config: 插件配置
@@ -36,7 +34,7 @@ async def score_message(
                     config.bert_service_url,
                     json={
                         "message": message,
-                        "context": context,
+                        "context": "",
                         "user_id": user_id,
                         "group_id": group_id,
                     },

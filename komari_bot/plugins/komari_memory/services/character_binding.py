@@ -1,5 +1,6 @@
 """角色名绑定管理器。"""
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class CharacterBindingManager:
         self.binding_file = Path("data/komari_memory/character_bindings.json")
         self.binding_file.parent.mkdir(parents=True, exist_ok=True)
         self._bindings: dict[str, str] = {}
+        self._lock = asyncio.Lock()
         self._load_bindings()
 
     def _load_bindings(self) -> None:
@@ -36,15 +38,21 @@ class CharacterBindingManager:
                 self._bindings = {}
         else:
             self._bindings = {}
-            self._save_bindings()
+            # 初始化时同步写入空文件
+            try:
+                with Path.open(self.binding_file, "w", encoding="utf-8") as f:
+                    json.dump({}, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                logger.error(f"[KomariMemory] 初始化绑定文件失败: {e}")
 
-    def _save_bindings(self) -> None:
+    async def _save_bindings(self) -> None:
         """保存绑定数据到文件。"""
-        try:
-            with Path.open(self.binding_file, "w", encoding="utf-8") as f:
-                json.dump(self._bindings, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            logger.error(f"[KomariMemory] 绑定文件保存失败: {e}")
+        async with self._lock:
+            try:
+                with Path.open(self.binding_file, "w", encoding="utf-8") as f:
+                    json.dump(self._bindings, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                logger.error(f"[KomariMemory] 绑定文件保存失败: {e}")
 
     def get_character_name(
         self,
@@ -73,7 +81,7 @@ class CharacterBindingManager:
         # 3. 最后回退到user_id
         return user_id
 
-    def set_character_name(self, user_id: str, character_name: str) -> None:
+    async def set_character_name(self, user_id: str, character_name: str) -> None:
         """设置用户的角色名绑定。
 
         Args:
@@ -81,10 +89,10 @@ class CharacterBindingManager:
             character_name: 角色名称
         """
         self._bindings[user_id] = character_name
-        self._save_bindings()
+        await self._save_bindings()
         logger.info(f"[KomariMemory] 绑定角色: {user_id} -> {character_name}")
 
-    def remove_character_name(self, user_id: str) -> bool:
+    async def remove_character_name(self, user_id: str) -> bool:
         """移除用户的角色名绑定。
 
         Args:
@@ -95,7 +103,7 @@ class CharacterBindingManager:
         """
         if user_id in self._bindings:
             del self._bindings[user_id]
-            self._save_bindings()
+            await self._save_bindings()
             logger.info(f"[KomariMemory] 解除绑定: {user_id}")
             return True
         return False

@@ -38,7 +38,7 @@ class MemoryService:
             cache_dir.mkdir(parents=True, exist_ok=True)
 
             # 在独立线程中加载模型，避免阻塞
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self._embed_model = await loop.run_in_executor(
                 None,
                 lambda: TextEmbedding(
@@ -63,7 +63,7 @@ class MemoryService:
         """
         embed_model = await self._get_embed_model()
         # fastembed 返回迭代器，转换为列表后取第一个
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         embeddings = await loop.run_in_executor(
             None, lambda: list(embed_model.embed([text]))
         )

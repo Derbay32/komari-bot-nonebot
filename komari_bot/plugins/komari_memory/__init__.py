@@ -51,7 +51,6 @@ class PluginManager:
         self.character_binding: CharacterBindingManager | None = None
         self.forgetting: ForgettingService | None = None
         self.pg_pool = None
-        self._last_messages: dict[str, str] = {}
 
     async def initialize(self) -> None:
         """初始化所有组件。"""
@@ -110,24 +109,6 @@ class PluginManager:
 
         logger.info("[KomariMemory] 已关闭")
 
-    def get_context_message(
-        self, group_id: str, user_id: str, current_message: str
-    ) -> str:
-        """获取上下文消息。
-
-        Args:
-            group_id: 群组 ID
-            user_id: 用户 ID
-            current_message: 当前消息内容
-
-        Returns:
-            上一句消息内容
-        """
-        key = f"{group_id}:{user_id}"
-        context = self._last_messages.get(key, "")
-        self._last_messages[key] = current_message
-        return context
-
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
@@ -185,14 +166,8 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
     if not can_use:
         return
 
-    user_id = str(event.user_id)
-    message_content = event.get_plaintext()
-
-    # 获取上一句消息作为上下文
-    context_message = manager.get_context_message(group_id, user_id, message_content)
-
     try:
-        reply = await manager.handler.process_message(event, context_message)
+        reply = await manager.handler.process_message(event)
 
         if reply:
             await matcher.send(reply)
