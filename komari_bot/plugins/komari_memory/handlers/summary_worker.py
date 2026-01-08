@@ -1,16 +1,16 @@
 """Komari Memory 后台总结任务。"""
 
-import asyncio
-
 from nonebot import logger
 from nonebot_plugin_apscheduler import scheduler
 
 from .. import get_config
+from ..core.retry import retry_async
 from ..services.llm_service import summarize_conversation
 from ..services.memory_service import MemoryService
 from ..services.redis_manager import RedisManager
 
 
+@retry_async(max_attempts=3, base_delay=1.0)
 async def summary_worker_task(
     redis: RedisManager,
     memory: MemoryService,
@@ -21,7 +21,6 @@ async def summary_worker_task(
         redis: Redis 管理器
         memory: 记忆服务
     """
-
     # 获取所有有消息缓冲的群组
     group_ids = await redis.get_active_groups()
 
@@ -32,23 +31,7 @@ async def summary_worker_task(
 
     for group_id in group_ids:
         if await redis.should_trigger_summary(group_id):
-            # 重试机制：总共尝试 3 次
-            last_error = None
-            for attempt in range(3):
-                try:
-                    await perform_summary(group_id, redis, memory)
-                    break  # 成功则跳出重试循环
-                except Exception as e:
-                    last_error = e
-                    if attempt < 2:  # 前 2 次失败后重试
-                        logger.warning(
-                            f"[KomariMemory] 群组 {group_id} 总结第 {attempt + 1} 次失败: {e}，重试中..."
-                        )
-                        await asyncio.sleep(1.0 * (attempt + 1))  # 指数退避
-                    else:
-                        logger.error(
-                            f"[KomariMemory] 群组 {group_id} 总结 3 次全部失败: {last_error}，等待下次触发"
-                        )
+            await perform_summary(group_id, redis, memory)
 
 
 async def perform_summary(
