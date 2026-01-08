@@ -52,9 +52,9 @@ class MessageHandler:
         message_content = event.get_plaintext()
         message_id = str(event.message_id)
 
-        # 获取用户昵称（群昵称 > 用户昵称 > user_id）
+        # 获取用户昵称（用户昵称 > 群昵称 > user_id）
         user_nickname = (
-            event.sender.card or event.sender.nickname
+            event.sender.nickname or event.sender.card
             if event.sender
             else user_id
         )
