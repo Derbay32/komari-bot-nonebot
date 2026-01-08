@@ -23,6 +23,8 @@ from .handlers.forgetting_worker import (
 )
 from .handlers.message_handler import MessageHandler
 from .handlers.summary_worker import register_summary_task, unregister_summary_task
+from .repositories.conversation_repository import ConversationRepository
+from .repositories.entity_repository import EntityRepository
 from .services.character_binding import CharacterBindingManager
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
@@ -72,22 +74,26 @@ class PluginManager:
             logger.error(f"[KomariMemory] Redis 连接失败: {e}")
             raise
 
-        # 3. 初始化记忆服务
-        self.memory = MemoryService(self.config, self.pg_pool)
+        # 3. 初始化数据访问层
+        conversation_repo = ConversationRepository(self.pg_pool)
+        entity_repo = EntityRepository(self.pg_pool)
 
-        # 4. 初始化消息处理器
+        # 4. 初始化记忆服务
+        self.memory = MemoryService(self.config, conversation_repo, entity_repo)
+
+        # 5. 初始化消息处理器
         self.handler = MessageHandler(
             redis=self.redis,
             memory=self.memory,
         )
 
-        # 5. 注册总结定时任务
+        # 6. 注册总结定时任务
         register_summary_task(self.redis, self.memory)
 
-        # 6. 初始化角色绑定管理器
+        # 7. 初始化角色绑定管理器
         self.character_binding = CharacterBindingManager(self.config)
 
-        # 7. 初始化忘却服务并注册定时任务
+        # 8. 初始化忘却服务并注册定时任务
         self.forgetting = ForgettingService(self.config, self.pg_pool)
         register_forgetting_task(self.forgetting)
 

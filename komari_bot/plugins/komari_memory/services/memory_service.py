@@ -1,29 +1,36 @@
 """Komari Memory 记忆管理服务。"""
 
 import asyncio
-import time
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 from fastembed import TextEmbedding
 from nonebot import logger
 
 from ..config_schema import KomariMemoryConfigSchema
+from ..repositories.conversation_repository import ConversationRepository
+from ..repositories.entity_repository import EntityRepository
 
 
 class MemoryService:
     """记忆管理服务。"""
 
-    def __init__(self, config: KomariMemoryConfigSchema, pg_pool: asyncpg.Pool) -> None:
+    def __init__(
+        self,
+        config: KomariMemoryConfigSchema,
+        conversation_repo: ConversationRepository,
+        entity_repo: EntityRepository,
+    ) -> None:
         """初始化记忆服务。
 
         Args:
             config: 插件配置
-            pg_pool: asyncpg 连接池
+            conversation_repo: 对话仓库
+            entity_repo: 实体仓库
         """
         self.config = config
-        self.pg_pool = pg_pool
+        self._conversation_repo = conversation_repo
+        self._entity_repo = entity_repo
         self._embed_model: TextEmbedding | None = None
 
     async def _get_embed_model(self) -> TextEmbedding:
@@ -87,31 +94,17 @@ class MemoryService:
         Returns:
             创建的对话 ID
         """
-        # 生成向量
+        # 业务逻辑：生成向量
         embedding = await self._get_embedding(summary)
 
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO komari_memory_conversations
-                (group_id, summary, embedding, participants, start_time, end_time, importance_initial, importance_current)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id
-                """,
-                group_id,
-                summary,
-                str(embedding),
-                participants,
-                time.time() - 3600,  # 假设持续 1 小时
-                time.time(),
-                importance_initial,
-                importance_initial,  # 初始时当前重要性等于初始重要性
-            )
-
-            logger.info(
-                f"[KomariMemory] 存储对话总结: ID={row['id']}, group={group_id}, importance={importance_initial}"
-            )
-            return row["id"]
+        # 数据访问：委托给仓库
+        return await self._conversation_repo.insert_conversation(
+            group_id=group_id,
+            summary=summary,
+            embedding=str(embedding),
+            participants=participants,
+            importance_initial=importance_initial,
+        )
 
     async def search_conversations(
         self,
@@ -129,47 +122,15 @@ class MemoryService:
         Returns:
             检索结果列表，包含 summary, similarity 等
         """
-        # 生成查询向量
+        # 业务逻辑：生成查询向量
         query_vec = await self._get_embedding(query)
 
-        async with self.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, summary, participants,
-                       1 - (embedding <=> $1::vector) as similarity
-                FROM komari_memory_conversations
-                WHERE group_id = $2
-                ORDER BY embedding <=> $1::vector
-                LIMIT $3
-                """,
-                str(query_vec),
-                group_id,
-                limit,
-            )
-
-            results = [dict(row) for row in rows]
-
-            # 检索后重置重要性和更新访问时间
-            if results:
-                result_ids = [r["id"] for r in results]
-                await conn.execute(
-                    """
-                    UPDATE komari_memory_conversations
-                    SET last_accessed = NOW(),
-                        importance_current = importance_initial
-                    WHERE id = ANY($1)
-                    """,
-                    result_ids,
-                )
-                logger.debug(
-                    f"[KomariMemory] 重置 {len(result_ids)} 条记忆的重要性"
-                )
-
-            logger.debug(
-                f"[KomariMemory] 检索对话: query='{query[:30]}...', "
-                f"找到 {len(results)} 条结果"
-            )
-            return results
+        # 数据访问：委托给仓库
+        return await self._conversation_repo.search_by_similarity(
+            embedding=str(query_vec),
+            group_id=group_id,
+            limit=limit,
+        )
 
     async def upsert_entity(
         self,
@@ -190,51 +151,15 @@ class MemoryService:
             category: 分类
             importance: 重要性 (1-5)
         """
-
-        # 检查是否存在
-        async with self.pg_pool.acquire() as conn:
-            existing = await conn.fetchrow(
-                """
-                SELECT id FROM komari_memory_entity
-                WHERE user_id = $1 AND group_id = $2 AND key = $3
-                """,
-                user_id,
-                group_id,
-                key,
-            )
-
-            if existing:
-                # 更新
-                await conn.execute(
-                    """
-                    UPDATE komari_memory_entity
-                    SET value = $1, category = $2, importance = $3
-                    WHERE user_id = $4 AND group_id = $5 AND key = $6
-                    """,
-                    value,
-                    category,
-                    importance,
-                    user_id,
-                    group_id,
-                    key,
-                )
-                logger.debug(f"[KomariMemory] 更新实体: {key}")
-            else:
-                # 创建
-                await conn.execute(
-                    """
-                    INSERT INTO komari_memory_entity
-                    (user_id, group_id, key, value, category, importance)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    """,
-                    user_id,
-                    group_id,
-                    key,
-                    value,
-                    category,
-                    importance,
-                )
-                logger.debug(f"[KomariMemory] 创建实体: {key}")
+        # 数据访问：委托给仓库
+        await self._entity_repo.upsert(
+            user_id=user_id,
+            group_id=group_id,
+            key=key,
+            value=value,
+            category=category,
+            importance=importance,
+        )
 
     async def get_entities(
         self,
@@ -252,41 +177,9 @@ class MemoryService:
         Returns:
             实体列表
         """
-        async with self.pg_pool.acquire() as conn:
-            if user_id and group_id:
-                rows = await conn.fetch(
-                    """
-                    SELECT user_id, group_id, key, value, category, importance
-                    FROM komari_memory_entity
-                    WHERE user_id = $1 AND group_id = $2
-                    ORDER BY importance DESC
-                    LIMIT $3
-                    """,
-                    user_id,
-                    group_id,
-                    limit,
-                )
-            elif group_id:
-                rows = await conn.fetch(
-                    """
-                    SELECT user_id, group_id, key, value, category, importance
-                    FROM komari_memory_entity
-                    WHERE group_id = $1
-                    ORDER BY importance DESC
-                    LIMIT $2
-                    """,
-                    group_id,
-                    limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT user_id, group_id, key, value, category, importance
-                    FROM komari_memory_entity
-                    ORDER BY importance DESC
-                    LIMIT $1
-                    """,
-                    limit,
-                )
-
-            return [dict(row) for row in rows]
+        # 数据访问：委托给仓库
+        return await self._entity_repo.list(
+            user_id=user_id,
+            group_id=group_id,
+            limit=limit,
+        )
