@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from .config_schema import KomariMemoryConfigSchema
 
 # 依赖插件
-config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
 apscheduler_plugin = require("nonebot_plugin_apscheduler")
 require("komari_knowledge")  # 常识库集成
@@ -26,6 +25,7 @@ from .handlers.summary_worker import register_summary_task, unregister_summary_t
 from .repositories.conversation_repository import ConversationRepository
 from .repositories.entity_repository import EntityRepository
 from .services.character_binding import CharacterBindingManager
+from .services.config_interface import get_config
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
 from .services.redis_manager import RedisManager
@@ -114,21 +114,6 @@ class PluginManager:
             await self.pg_pool.close()
 
         logger.info("[KomariMemory] 已关闭")
-
-
-# 获取配置管理器
-config_manager = config_manager_plugin.get_config_manager(
-    "komari_memory", KomariMemoryConfigSchema
-)
-
-
-def get_config() -> KomariMemoryConfigSchema:
-    """获取当前配置（自动检测文件变化）。
-
-    Returns:
-        当前配置对象
-    """
-    return config_manager.get()
 
 
 # 创建插件管理器实例

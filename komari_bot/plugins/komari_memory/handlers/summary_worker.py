@@ -3,8 +3,8 @@
 from nonebot import logger
 from nonebot_plugin_apscheduler import scheduler
 
-from .. import get_config
 from ..core.retry import retry_async
+from ..services.config_interface import get_config
 from ..services.llm_service import summarize_conversation
 from ..services.memory_service import MemoryService
 from ..services.redis_manager import RedisManager

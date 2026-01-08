@@ -5,8 +5,8 @@ import time
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-from .. import get_config
 from ..services.bert_client import score_message
+from ..services.config_interface import get_config
 from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message

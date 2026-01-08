@@ -8,6 +8,7 @@ import redis.asyncio as aioredis
 from nonebot import logger
 
 from ..config_schema import KomariMemoryConfigSchema
+from .config_interface import get_config
 from .redis_keys import RedisKeys
 
 
@@ -41,8 +42,6 @@ class RedisManager:
         Returns:
             当前配置对象
         """
-        from .. import get_config
-
         return get_config()
 
     async def initialize(self) -> None:
