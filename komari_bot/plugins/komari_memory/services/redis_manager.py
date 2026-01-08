@@ -8,6 +8,7 @@ import redis.asyncio as aioredis
 from nonebot import logger
 
 from ..config_schema import KomariMemoryConfigSchema
+from .redis_keys import RedisKeys
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,7 @@ class RedisManager:
             group_id: 群组 ID
             message: 消息对象
         """
-        key = f"komari_memory:buffer:{group_id}"
+        key = RedisKeys.buffer(group_id)
         data = {
             "user_id": message.user_id,
             "group_id": message.group_id,
@@ -114,7 +115,7 @@ class RedisManager:
         Returns:
             消息列表
         """
-        key = f"komari_memory:buffer:{group_id}"
+        key = RedisKeys.buffer(group_id)
         raw_data = await self.redis.lrange(key, 0, limit - 1)  # type: ignore[arg-type]
 
         messages: list[MessageSchema] = []
@@ -146,7 +147,7 @@ class RedisManager:
         Returns:
             当前计数值
         """
-        key = f"komari_memory:tokens:{group_id}"
+        key = RedisKeys.tokens(group_id)
         return await self.redis.incrby(key, count)
 
     async def get_tokens(self, group_id: str) -> int:
@@ -158,7 +159,7 @@ class RedisManager:
         Returns:
             当前计数值
         """
-        key = f"komari_memory:tokens:{group_id}"
+        key = RedisKeys.tokens(group_id)
         value = await self.redis.get(key)
         return int(value) if value else 0
 
@@ -168,7 +169,7 @@ class RedisManager:
         Args:
             group_id: 群组 ID
         """
-        key = f"komari_memory:tokens:{group_id}"
+        key = RedisKeys.tokens(group_id)
         await self.redis.delete(key)
 
     async def increment_message_count(
@@ -183,7 +184,7 @@ class RedisManager:
         Returns:
             当前计数值
         """
-        key = f"komari_memory:messages:{group_id}"
+        key = RedisKeys.messages(group_id)
         return await self.redis.incrby(key, 1)
 
     async def get_message_count(self, group_id: str) -> int:
@@ -195,7 +196,7 @@ class RedisManager:
         Returns:
             当前计数值
         """
-        key = f"komari_memory:messages:{group_id}"
+        key = RedisKeys.messages(group_id)
         value = await self.redis.get(key)
         return int(value) if value else 0
 
@@ -205,7 +206,7 @@ class RedisManager:
         Args:
             group_id: 群组 ID
         """
-        key = f"komari_memory:messages:{group_id}"
+        key = RedisKeys.messages(group_id)
         await self.redis.delete(key)
 
     async def should_trigger_summary(
@@ -230,7 +231,7 @@ class RedisManager:
             return True
 
         # 2. 检查时间阈值（优先级次之）
-        last_key = f"komari_memory:last_summary:{group_id}"
+        last_key = RedisKeys.last_summary(group_id)
         last_summary = await self.redis.get(last_key)
         if last_summary:
             elapsed = time.time() - float(last_summary)
@@ -258,7 +259,7 @@ class RedisManager:
         Args:
             group_id: 群组 ID
         """
-        key = f"komari_memory:last_summary:{group_id}"
+        key = RedisKeys.last_summary(group_id)
         await self.redis.set(key, time.time())
 
     async def set_cooldown(
@@ -272,7 +273,7 @@ class RedisManager:
             group_id: 群组 ID
             seconds: 冷却时间（秒）
         """
-        key = f"komari_memory:proactive:cd:{group_id}"
+        key = RedisKeys.proactive_cooldown(group_id)
         await self.redis.set(key, "1", ex=seconds)
 
     async def is_on_cooldown(self, group_id: str) -> bool:
@@ -284,7 +285,7 @@ class RedisManager:
         Returns:
             是否在冷却中
         """
-        key = f"komari_memory:proactive:cd:{group_id}"
+        key = RedisKeys.proactive_cooldown(group_id)
         return await self.redis.exists(key) > 0
 
     async def increment_proactive_count(
@@ -300,7 +301,7 @@ class RedisManager:
             当前计数值
         """
         current_hour = int(time.time() // 3600)
-        key = f"komari_memory:proactive:count:{group_id}:{current_hour}"
+        key = RedisKeys.proactive_count(group_id, current_hour)
 
         pipe = self.redis.pipeline()
         pipe.incr(key)
@@ -319,7 +320,7 @@ class RedisManager:
             当前计数值
         """
         current_hour = int(time.time() // 3600)
-        key = f"komari_memory:proactive:count:{group_id}:{current_hour}"
+        key = RedisKeys.proactive_count(group_id, current_hour)
         value = await self.redis.get(key)
         return int(value) if value else 0
 
@@ -332,7 +333,7 @@ class RedisManager:
         Args:
             group_id: 群组 ID
         """
-        key = f"komari_memory:buffer:{group_id}"
+        key = RedisKeys.buffer(group_id)
         await self.redis.delete(key)
 
     async def get_active_groups(self) -> list[str]:
@@ -341,7 +342,7 @@ class RedisManager:
         Returns:
             群组 ID 列表
         """
-        pattern = "komari_memory:buffer:*"
+        pattern = RedisKeys.BUFFER_PATTERN
         keys = []
         async for key in self.redis.scan_iter(match=pattern):
             # 提取 group_id
