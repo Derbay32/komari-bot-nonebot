@@ -24,6 +24,8 @@ config = get_plugin_config(Config)
 config_manager_plugin = require("config_manager")
 # 依赖权限管理插件
 permission_manager_plugin = require("permission_manager")
+# 依赖用户名绑定插件
+character_binding = require("character_binding")
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("sr", DynamicConfigSchema)
@@ -82,14 +84,19 @@ async def sr_function(
 ) -> None:
     # 获取用户信息
     user_id = event.get_user_id()
-    user_nickname = permission_manager_plugin.get_user_nickname(event)
+    user_nickname = (
+        (event.sender.nickname or event.sender.card or user_id)
+        if event.sender
+        else user_id
+    )
+    username = character_binding.get_character_name(user_id, user_nickname)
 
     # 使用运行时配置进行权限检查
     can_use, reason = await permission_manager_plugin.check_runtime_permission(
         bot, event, config_manager.get()
     )
     if not can_use:
-        logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
+        logger.info(f"用户 {username}({user_id}) 请求被拒绝，原因：{reason}。")
         await sr.finish(f"❌ {reason}")
 
     try:
@@ -106,13 +113,13 @@ async def sr_function(
         # 格式化最终回复
         if custom_message:
             response = (
-                f"{user_nickname}抽取：\n"
+                f"{username}抽取：\n"
                 f"{custom_message}——\n"
                 f"{sr_target + 1}. {sr_list[sr_target]}"
             )
         else:
             response = (
-                f"{user_nickname}抽到的神人是——\n{sr_target + 1}. {sr_list[sr_target]}"
+                f"{username}抽到的神人是——\n{sr_target + 1}. {sr_list[sr_target]}"
             )
 
         await sr.finish(response)

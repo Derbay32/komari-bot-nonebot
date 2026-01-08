@@ -125,7 +125,7 @@ class RedisManager:
             messages.append(
                 MessageSchema(
                     user_id=data["user_id"],
-                    user_nickname=data.get("user_nickname", data["user_id"]),
+                    user_nickname=data.get("user_nickname") or data["user_id"],
                     group_id=data["group_id"],
                     content=data["content"],
                     timestamp=data["timestamp"],
@@ -155,7 +155,7 @@ class RedisManager:
         """
         key = RedisKeys.buffer(group_id)
         # 获取所有缓冲区消息
-        raw_data = await self.redis.lrange(key, 0, -1)
+        raw_data = await self.redis.lrange(key, 0, -1)  # type: ignore[arg-type]
 
         # 解析所有消息
         all_messages: list[MessageSchema] = []
@@ -164,7 +164,7 @@ class RedisManager:
             all_messages.append(
                 MessageSchema(
                     user_id=msg_data["user_id"],
-                    user_nickname=msg_data.get("user_nickname", msg_data["user_id"]),
+                    user_nickname=msg_data.get("user_nickname") or msg_data["user_id"],
                     group_id=msg_data["group_id"],
                     content=msg_data["content"],
                     timestamp=msg_data["timestamp"],

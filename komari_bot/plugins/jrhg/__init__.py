@@ -30,7 +30,7 @@ except AttributeError:
 __plugin_meta__ = PluginMetadata(
     name="jrhg",
     description="今日好感插件，基于 LLM API 生成个性化问候，支持好感度系统和白名单管理",
-    usage="/jrhg - 获取今日好感问候\n/jrhg on/off - 管理员控制插件开关",
+    usage=".jrhg - 获取今日好感问候\n/jrhg on/off - 管理员控制插件开关",
 )
 
 # 初始化配置管理器
@@ -116,7 +116,12 @@ async def jrhg_function(bot: Bot, event: MessageEvent) -> None:
     """处理jrhg主命令"""
     # 获取用户信息
     user_id = event.get_user_id()
-    user_nickname = character_binding.get_character_name
+    user_nickname = (
+        (event.sender.nickname or event.sender.card or user_id)
+        if event.sender
+        else user_id
+    )
+    username = character_binding.get_character_name(user_id, user_nickname)
     favor_result = None  # 初始化以避免异常处理中未绑定
 
     # 使用运行时配置进行权限检查
@@ -124,7 +129,7 @@ async def jrhg_function(bot: Bot, event: MessageEvent) -> None:
         bot, event, config_manager.get()
     )
     if not can_use:
-        logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}")
+        logger.info(f"用户 {username}({user_id}) 请求被拒绝，原因：{reason}")
         await jrhg.finish(f"❌ {reason}")
 
     try:
@@ -133,22 +138,22 @@ async def jrhg_function(bot: Bot, event: MessageEvent) -> None:
             await jrhg.finish("❌ 用户数据插件不可用，请联系管理员")
 
         # 获取或生成好感度
-        logger.info(f"用户 {user_nickname}({user_id}) 请求好感度问候")
+        logger.info(f"用户 {username}({user_id}) 请求好感度问候")
 
         favor_result = await generate_or_update_favorability(user_id)
 
         if favor_result.is_new_day:
             logger.info(
-                f"为用户 {user_nickname} 生成新的每日好感度: {favor_result.daily_favor}"
+                f"为用户 {username} 生成新的每日好感度: {favor_result.daily_favor}"
             )
 
         # 获取回复文本
-        response = _get_response(favor_result, user_nickname)
+        response = _get_response(favor_result, username)
 
         # 格式化最终回复
         final_response = await format_favor_response(
             ai_response=response,
-            user_nickname=user_nickname,
+            user_nickname=username,
             daily_favor=favor_result.daily_favor,
         )
 

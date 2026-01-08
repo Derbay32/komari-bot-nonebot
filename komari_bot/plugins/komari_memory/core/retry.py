@@ -2,7 +2,7 @@
 
 import asyncio
 import functools
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
 from nonebot import logger
@@ -15,7 +15,10 @@ def retry_async(
     base_delay: float = 1.0,
     max_delay: float = 10.0,
     exceptions: tuple[type[Exception], ...] = (Exception,),
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+) -> Callable[
+    [Callable[..., Awaitable[T]]],
+    Callable[..., Awaitable[T]],
+]:
     """异步重试装饰器。
 
     Args:
@@ -28,7 +31,7 @@ def retry_async(
         装饰器函数
     """
 
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         """装饰器包装器。"""
 
         @functools.wraps(func)
@@ -38,7 +41,7 @@ def retry_async(
 
             for attempt in range(max_attempts):
                 try:
-                    return await func(*args, **kwargs)  # type: ignore[misc]
+                    return await func(*args, **kwargs)
                 except exceptions as e:
                     last_error = e
                     if attempt == max_attempts - 1:
@@ -59,6 +62,6 @@ def retry_async(
                 raise last_error
             raise RuntimeError(msg)
 
-        return wrapper
+        return wrapper  # type: ignore[return-value]
 
     return decorator
