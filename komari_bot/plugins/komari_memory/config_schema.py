@@ -105,6 +105,15 @@ class KomariMemoryConfigSchema(BaseModel):
     summary_message_threshold: int = Field(
         default=50, ge=10, le=500, description="触发总结的消息数量阈值（优先于 token 阈值）"
     )
+    summary_max_messages: int = Field(
+        default=200, ge=50, le=500, description="总结时从缓冲区获取的最大消息数"
+    )
+    memory_search_limit: int = Field(
+        default=3, ge=1, le=10, description="检索相关记忆的最大数量"
+    )
+    context_messages_limit: int = Field(
+        default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
+    )
 
     # 主动回复配置
     proactive_enabled: bool = Field(default=False, description="是否启用主动回复")

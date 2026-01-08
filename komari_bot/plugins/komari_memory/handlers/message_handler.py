@@ -166,11 +166,11 @@ class MessageHandler:
         memories = await self.memory.search_conversations(
             query=message.content,
             group_id=message.group_id,
-            limit=3,
+            limit=config.memory_search_limit,
         )
 
         # 获取最近的消息上下文
-        recent_messages = await self.redis.get_buffer(message.group_id, limit=10)
+        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
 
         # 构建提示词（返回 system_prompt 和 user_context）
         system_prompt, user_context = await build_prompt(

@@ -52,7 +52,7 @@ async def perform_summary(
     config = get_config()
 
     # 获取消息缓冲
-    messages_buffer = await redis.get_buffer(group_id, limit=200)
+    messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_messages)
 
     if not messages_buffer:
         logger.warning(f"[KomariMemory] 群组 {group_id} 消息缓冲为空")
