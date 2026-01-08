@@ -2,8 +2,8 @@ from nonebot import get_plugin_config, logger
 from nonebot.plugin import PluginMetadata, require
 
 from .config import Config
-from .models import UserAttribute, UserFavorability, FavorGenerationResult
 from .database import UserDataDB
+from .models import FavorGenerationResult, UserAttribute, UserFavorability
 
 __plugin_meta__ = PluginMetadata(
     name="user_data",
@@ -19,7 +19,7 @@ config: Config = get_plugin_config(Config)
 
 async def get_db() -> UserDataDB:
     """获取数据库实例"""
-    global _db
+    global _db  # noqa: PLW0603
     if _db is None:
         _db = UserDataDB(config.db_path)
         await _db.initialize()
@@ -47,7 +47,7 @@ async def on_startup():
             "cron",
             hour=2,  # 每天凌晨2点执行
             minute=0,
-            id="cleanup_user_data"
+            id="cleanup_user_data",
         )
         logger.info("用户数据插件已启动 (已注册定时清理任务)")
     else:
@@ -65,7 +65,7 @@ async def _scheduled_cleanup():
 
 async def on_shutdown():
     """插件关闭时的清理"""
-    global _db
+    global _db  # noqa: PLW0603
     if _db:
         await _db.close()
         _db = None
@@ -73,6 +73,7 @@ async def on_shutdown():
 
 
 # ===== 公开API接口 =====
+
 
 async def get_user_favorability(user_id: str) -> UserFavorability | None:
     """获取用户好感度
@@ -114,7 +115,9 @@ async def get_user_attribute(user_id: str, attribute_name: str) -> str | None:
     return await db.get_user_attribute(user_id, attribute_name)
 
 
-async def set_user_attribute(user_id: str, attribute_name: str, attribute_value: str) -> bool:
+async def set_user_attribute(
+    user_id: str, attribute_name: str, attribute_value: str
+) -> bool:
     """设置用户属性
 
     Args:
@@ -168,6 +171,7 @@ async def get_user_count() -> int:
 
 # ===== 便捷函数 =====
 
+
 async def get_favor_attitude(daily_favor: int) -> str:
     """根据每日好感度获取态度描述
 
@@ -179,17 +183,18 @@ async def get_favor_attitude(daily_favor: int) -> str:
     """
     if daily_favor <= 20:
         return "非常冷淡"
-    elif daily_favor <= 40:
+    if daily_favor <= 40:
         return "冷淡"
-    elif daily_favor <= 60:
+    if daily_favor <= 60:
         return "中性"
-    elif daily_favor <= 80:
+    if daily_favor <= 80:
         return "友好"
-    else:
-        return "非常友好"
+    return "非常友好"
 
 
-async def format_favor_response(ai_response: str, user_nickname: str, daily_favor: int) -> str:
+async def format_favor_response(
+    ai_response: str, user_nickname: str, daily_favor: int
+) -> str:
     """格式化好感度回复
 
     Args:
@@ -205,20 +210,15 @@ async def format_favor_response(ai_response: str, user_nickname: str, daily_favo
 
 # 导出的主要API
 __all__ = [
-    # 核心功能API
-    "get_user_favorability",
-    "generate_or_update_favorability",
-    "get_user_attribute",
-    "set_user_attribute",
-    "get_user_attributes",
-
-    # 历史和统计API
-    "get_favor_history",
-    "get_user_count",
-
-    # 便捷函数
-    "get_favor_attitude",
     "format_favor_response",
+    "generate_or_update_favorability",
+    "get_favor_attitude",
+    "get_favor_history",
+    "get_user_attribute",
+    "get_user_attributes",
+    "get_user_count",
+    "get_user_favorability",
+    "set_user_attribute",
 ]
 
 # 注册插件生命周期钩子

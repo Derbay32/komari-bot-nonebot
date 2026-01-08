@@ -10,6 +10,7 @@
 """
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -25,8 +26,8 @@ class ExampleConfigSchema(BaseModel):
     # 这是一个必要项，使用时必须完整复制
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
-        default_factory=lambda: datetime.now().isoformat(),
-        description="最后更新时间戳"
+        default_factory=lambda: datetime.now().astimezone().isoformat(),
+        description="最后更新时间戳",
     )
 
     # 插件控制
@@ -34,12 +35,10 @@ class ExampleConfigSchema(BaseModel):
 
     # 白名单配置
     user_whitelist: list[str] = Field(
-        default_factory=list,
-        description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户"
     )
     group_whitelist: list[str] = Field(
-        default_factory=list,
-        description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
     # 你的自定义字段
@@ -47,7 +46,7 @@ class ExampleConfigSchema(BaseModel):
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
-    def parse_list_string(cls, v):
+    def parse_list_string(cls, v: Any) -> Any:
         """处理从 .env 格式解析列表。
 
         Args:

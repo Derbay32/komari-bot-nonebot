@@ -33,15 +33,16 @@ can_use, reason = await check_runtime_permission(bot, event, config)
 nickname = get_user_nickname(event)
 ```
 """
+
 from nonebot.plugin import PluginMetadata
 
-from .manager import PermissionManager, create_whitelist_rule, PermissionConfig
 from .checker import PermissionChecker, get_permission_checker
+from .manager import PermissionConfig, PermissionManager, create_whitelist_rule
 from .utils import (
-    get_user_nickname,
     check_plugin_status,
-    format_permission_info,
     check_runtime_permission,
+    format_permission_info,
+    get_user_nickname,
 )
 
 __plugin_meta__ = PluginMetadata(
@@ -51,17 +52,13 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
-    # 核心类
-    "PermissionManager",
     "PermissionChecker",
     "PermissionConfig",
-    # 规则创建
-    "create_whitelist_rule",
-    # 装饰器
-    "get_permission_checker",
-    # 便捷函数
-    "get_user_nickname",
+    "PermissionManager",
     "check_plugin_status",
-    "format_permission_info",
     "check_runtime_permission",
+    "create_whitelist_rule",
+    "format_permission_info",
+    "get_permission_checker",
+    "get_user_nickname",
 ]

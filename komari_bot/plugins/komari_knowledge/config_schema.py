@@ -5,6 +5,7 @@ Komari Knowledge 常识库插件配置 Schema。
 """
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -17,8 +18,8 @@ class DynamicConfigSchema(BaseModel):
     # 元数据
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
-        default_factory=lambda: datetime.now().isoformat(),
-        description="最后更新时间戳"
+        default_factory=lambda: datetime.now().astimezone().isoformat(),
+        description="最后更新时间戳",
     )
 
     # 插件控制
@@ -26,12 +27,10 @@ class DynamicConfigSchema(BaseModel):
 
     # 白名单配置
     user_whitelist: list[str] = Field(
-        default_factory=list,
-        description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户"
     )
     group_whitelist: list[str] = Field(
-        default_factory=list,
-        description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
     # PostgreSQL 数据库配置
@@ -43,59 +42,38 @@ class DynamicConfigSchema(BaseModel):
 
     # 向量检索配置
     embedding_model: str = Field(
-        default="BAAI/bge-small-zh-v1.5",
-        description="向量嵌入模型名称"
+        default="BAAI/bge-small-zh-v1.5", description="向量嵌入模型名称"
     )
     vector_dimension: int = Field(
-        default=512,
-        description="向量维度（bge-small-zh-v1.5 为 512）"
+        default=512, description="向量维度（bge-small-zh-v1.5 为 512）"
     )
     similarity_threshold: float = Field(
         default=0.65,
         ge=0.0,
         le=1.0,
-        description="向量相似度阈值，低于此值的结果将被过滤"
+        description="向量相似度阈值，低于此值的结果将被过滤",
     )
 
     # 检索配置
     query_rewrite_rules: dict[str, str] = Field(
         default={"你": "小鞠", "您的": "小鞠的"},
-        description="查询重写规则，key 为待替换词，value 为替换词"
+        description="查询重写规则，key 为待替换词，value 为替换词",
     )
     layer1_limit: int = Field(
-        default=3,
-        ge=0,
-        le=10,
-        description="Layer 1 关键词匹配最大返回数量"
+        default=3, ge=0, le=10, description="Layer 1 关键词匹配最大返回数量"
     )
     layer2_limit: int = Field(
-        default=2,
-        ge=0,
-        le=10,
-        description="Layer 2 向量检索最大返回数量"
+        default=2, ge=0, le=10, description="Layer 2 向量检索最大返回数量"
     )
-    total_limit: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="总返回结果数量上限"
-    )
+    total_limit: int = Field(default=5, ge=1, le=20, description="总返回结果数量上限")
 
     # WebUI 配置
-    webui_enabled: bool = Field(
-        default=False,
-        description="是否启动 WebUI 管理界面"
-    )
-    webui_port: int = Field(
-        default=8502,
-        ge=1024,
-        le=65535,
-        description="WebUI 端口"
-    )
+    webui_enabled: bool = Field(default=False, description="是否启动 WebUI 管理界面")
+    webui_port: int = Field(default=8502, ge=1024, le=65535, description="WebUI 端口")
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
-    def parse_list_string(cls, v):
+    def parse_list_string(cls, v: Any) -> Any:
         """处理从 .env 格式解析列表。
 
         Args:

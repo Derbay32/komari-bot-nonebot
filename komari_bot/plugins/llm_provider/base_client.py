@@ -1,4 +1,5 @@
 """LLM 客户端抽象基类。"""
+
 from abc import ABC, abstractmethod
 
 
@@ -9,10 +10,11 @@ class BaseLLMClient(ABC):
     async def generate_text(
         self,
         prompt: str,
+        model: str,
         system_instruction: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        **kwargs,
+        **kwargs,  # noqa: ANN003
     ) -> str:
         """生成文本。
 
@@ -26,7 +28,6 @@ class BaseLLMClient(ABC):
         Returns:
             生成的文本
         """
-        pass
 
     @abstractmethod
     async def test_connection(self) -> bool:
@@ -35,9 +36,7 @@ class BaseLLMClient(ABC):
         Returns:
             连接是否成功
         """
-        pass
 
     @abstractmethod
-    async def close(self):
+    async def close(self) -> None:
         """关闭客户端并清理资源。"""
-        pass

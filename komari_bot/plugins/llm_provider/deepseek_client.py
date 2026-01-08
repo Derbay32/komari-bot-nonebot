@@ -1,6 +1,7 @@
 """DeepSeek API 客户端。"""
-import asyncio
+
 import json
+
 import aiohttp
 from nonebot import logger
 from nonebot.plugin import require
@@ -12,12 +13,15 @@ from .config_schema import DynamicConfigSchema
 config_manager_plugin = require("config_manager")
 
 # 获取配置管理器
-config_manager = config_manager_plugin.get_config_manager("llm_provider", DynamicConfigSchema)
+config_manager = config_manager_plugin.get_config_manager(
+    "llm_provider", DynamicConfigSchema
+)
+
 
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek API 客户端。"""
 
-    def __init__(self, api_token: str):
+    def __init__(self, api_token: str) -> None:
         """初始化客户端。
 
         Args:
@@ -40,10 +44,11 @@ class DeepSeekClient(BaseLLMClient):
     async def generate_text(
         self,
         prompt: str,
+        model: str,
         system_instruction: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        **kwargs,
+        **kwargs,  # noqa: ANN003 - Ruff 闭嘴
     ) -> str:
         """生成文本。
 
@@ -62,7 +67,7 @@ class DeepSeekClient(BaseLLMClient):
             # 记录请求日志
             logger.debug(
                 f"DeepSeek API 请求:\n"
-                f"  model: {config.deepseek_model}\n"
+                f"  model: {model}\n"
                 f"  temperature: {temperature if temperature is not None else config.deepseek_temperature}\n"
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
@@ -80,20 +85,30 @@ class DeepSeekClient(BaseLLMClient):
 
             # 构建请求数据
             request_data = {
-                "model": config.deepseek_model,
+                "model": model,
                 "messages": messages,
-                "temperature": temperature if temperature is not None else config.deepseek_temperature,
-                "max_tokens": max_tokens if max_tokens is not None else config.deepseek_max_tokens,
-                "frequency_penalty": kwargs.get("frequency_penalty", config.deepseek_frequency_penalty),
+                "temperature": temperature
+                if temperature is not None
+                else config.deepseek_temperature,
+                "max_tokens": max_tokens
+                if max_tokens is not None
+                else config.deepseek_max_tokens,
+                "frequency_penalty": kwargs.get(
+                    "frequency_penalty", config.deepseek_frequency_penalty
+                ),
                 "stream": False,
             }
 
             # 发送 API 请求
-            async with session.post(config.deepseek_api_base, json=request_data) as response:
+            async with session.post(
+                config.deepseek_api_base, json=request_data
+            ) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    logger.error(f"DeepSeek API 请求失败: {response.status} - {error_text}")
-                    raise Exception(f"DeepSeek API 请求失败: {response.status}")
+                    logger.error(
+                        f"DeepSeek API 请求失败: {response.status} - {error_text}"
+                    )
+                    raise Exception(f"DeepSeek API 请求失败: {response.status}")  # noqa: TRY301,TRY002,TRY003
 
                 response_data = await response.json()
 
@@ -102,11 +117,10 @@ class DeepSeekClient(BaseLLMClient):
                     content = response_data["choices"][0]["message"]["content"]
                     logger.debug(f"DeepSeek API 响应: {content}")
                     return content.strip()
-                else:
-                    logger.error(f"DeepSeek API 响应格式异常: {response_data}")
-                    raise Exception("DeepSeek API 响应格式异常")
+                logger.error(f"DeepSeek API 响应格式异常: {response_data}")
+                raise Exception("DeepSeek API 响应格式异常")  # noqa: TRY301,TRY002,TRY003
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("DeepSeek API 请求超时")
             raise
         except aiohttp.ClientError as e:
@@ -136,14 +150,16 @@ class DeepSeekClient(BaseLLMClient):
                 "max_tokens": 10,
             }
 
-            async with session.post(config.deepseek_api_base, json=request_data) as response:
+            async with session.post(
+                config.deepseek_api_base, json=request_data
+            ) as response:
                 return response.status == 200
 
         except Exception as e:
             logger.error(f"DeepSeek API 连接测试失败: {e}")
             return False
 
-    async def close(self):
+    async def close(self) -> None:
         """关闭客户端。"""
         if self.session and not self.session.closed:
             await self.session.close()

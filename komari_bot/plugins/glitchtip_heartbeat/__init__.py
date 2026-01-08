@@ -1,7 +1,7 @@
-from nonebot import get_plugin_config, get_driver, logger
-from nonebot.plugin import PluginMetadata, require
-
 import aiohttp
+from nonebot import get_driver, get_plugin_config, logger
+from nonebot.adapters import Bot
+from nonebot.plugin import PluginMetadata, require
 
 from .config import Config as GlitchtipConfig
 
@@ -25,27 +25,36 @@ except Exception:
 # 心跳任务ID
 _HEARTBEAT_JOB_ID = "glitchtip_heartbeat"
 
+
 # 连接状态标记
-_is_connected = False
+class PluginState:
+    """全局状态存取类"""
+
+    def __init__(self) -> None:
+        self.is_connected: bool = False
+
+
+state = PluginState()
 
 
 async def _send_heartbeat() -> None:
     """发送心跳请求到 Glitchtip"""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(plugin_config.url) as response:
-                if response.status == 200:
-                    logger.debug("Glitchtip 心跳发送成功")
-                else:
-                    logger.warning(f"Glitchtip 心跳返回状态码: {response.status}")
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(plugin_config.url) as response,
+        ):
+            if response.status == 200:
+                logger.debug("Glitchtip 心跳发送成功")
+            else:
+                logger.warning(f"Glitchtip 心跳返回状态码: {response.status}")
     except Exception as e:
         logger.error(f"发送 Glitchtip 心跳时出错: {e}")
 
 
-async def on_bot_connect(bot) -> None:
+async def on_bot_connect(bot: Bot) -> None:
     """Bot 连接时启动心跳任务"""
-    global _is_connected
-    if _is_connected:
+    if state.is_connected:
         return
 
     # 检查插件开关
@@ -53,7 +62,7 @@ async def on_bot_connect(bot) -> None:
         logger.info("Glitchtip 心跳检测插件已禁用，跳过启动")
         return
 
-    _is_connected = True
+    state.is_connected = True
     logger.info(f"Bot {bot.self_id} 已连接，启动 Glitchtip 心跳检测")
 
     if _scheduler:
@@ -73,13 +82,12 @@ async def on_bot_connect(bot) -> None:
         logger.warning("scheduler 不可用，无法启动定时心跳任务")
 
 
-async def on_bot_disconnect(bot) -> None:
+async def on_bot_disconnect(bot: Bot) -> None:
     """Bot 断开连接时停止心跳任务"""
-    global _is_connected
-    if not _is_connected:
+    if not state.is_connected:
         return
 
-    _is_connected = False
+    state.is_connected = False
     logger.info(f"Bot {bot.self_id} 已断开连接，停止 Glitchtip 心跳检测")
 
     if _scheduler:

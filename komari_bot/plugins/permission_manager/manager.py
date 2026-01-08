@@ -3,11 +3,13 @@
 
 提供通用的权限检查功能，支持插件开关、用户/群组白名单等。
 """
+
 from typing import Protocol, runtime_checkable
 
 from nonebot.adapters import Bot
-from nonebot.permission import SUPERUSER
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent
+from nonebot.permission import SUPERUSER
+from nonebot.rule import Rule
 
 
 @runtime_checkable
@@ -16,6 +18,7 @@ class PermissionConfig(Protocol):
 
     任何实现此协议的配置对象都可以用于权限检查。
     """
+
     plugin_enable: bool
     user_whitelist: list[str]
     group_whitelist: list[str]
@@ -34,7 +37,7 @@ class PermissionManager:
     - 完整的命令使用权限检查
     """
 
-    def __init__(self, config: ConfigType):
+    def __init__(self, config: ConfigType) -> None:
         """初始化权限管理器。
 
         Args:
@@ -116,15 +119,14 @@ class PermissionManager:
             # 群聊：用户或群组任一在白名单中即可
             if not (is_user_whitelisted or is_group_whitelisted):
                 return False, "用户和群组均不在白名单中，无法使用此命令"
-        else:
-            # 私聊：只检查用户白名单
-            if not is_user_whitelisted:
-                return False, "您不在用户白名单中，无法使用此命令"
+        # 私聊：只检查用户白名单
+        elif not is_user_whitelisted:
+            return False, "您不在用户白名单中，无法使用此命令"
 
         return True, ""
 
 
-def create_whitelist_rule(config: ConfigType):
+def create_whitelist_rule(config: ConfigType) -> Rule:
     """创建白名单检查规则。
 
     Args:
@@ -133,8 +135,6 @@ def create_whitelist_rule(config: ConfigType):
     Returns:
         nonebot.rule.Rule 实例
     """
-    from nonebot.rule import Rule
-
     permission_manager = PermissionManager(config)
 
     async def check_whitelist(bot: Bot, event: Obv11MessageEvent) -> bool:

@@ -1,14 +1,10 @@
-import time
-
-from nonebot import logger
-from nonebot.plugin import PluginMetadata, require
-from nonebot import on_command
-from nonebot.permission import SUPERUSER
-from nonebot.params import CommandArg, Command
-from nonebot.adapters.onebot.v11 import Bot, MessageEvent, Message
+from nonebot import logger, on_command
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.exception import FinishedException
+from nonebot.params import Command
+from nonebot.permission import SUPERUSER
+from nonebot.plugin import PluginMetadata, require
 
-from .config import Config
 from .config_schemas import DynamicConfigSchema
 
 # 依赖用户数据插件
@@ -19,6 +15,8 @@ config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
 # 依赖 LLM Provider 插件
 llm_provider = require("llm_provider")
+# 依赖角色名绑定插件
+character_binding = require("character_binding")
 
 # 导入用户数据插件函数，如果插件未加载则设为 None
 try:
@@ -32,19 +30,14 @@ except AttributeError:
 __plugin_meta__ = PluginMetadata(
     name="jrhg",
     description="今日好感插件，基于 LLM API 生成个性化问候，支持好感度系统和白名单管理",
-    usage="/jrhg - 获取今日好感问候\n/jrhg on/off - 管理员控制插件开关",
-    config=Config,
+    usage=".jrhg - 获取今日好感问候\n/jrhg on/off - 管理员控制插件开关",
 )
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("jrhg", DynamicConfigSchema)
 
 # 主jrhg指令注册，使用动态权限检查
-jrhg = on_command(
-    "jrhg",
-    priority=10,
-    block=True
-)
+jrhg = on_command("jrhg", priority=10, block=True)
 
 # JRHG开关指令注册，权限SUPERUSER
 manage = on_command(
@@ -52,58 +45,15 @@ manage = on_command(
     aliases={("jrhg", "off"), ("jrhg", "status")},
     permission=SUPERUSER,
     priority=5,
-    block=True
+    block=True,
 )
 
 
-def _build_favor_prompt(daily_favor: int, user_nickname: str) -> str:
-    """根据好感度构建系统提示词。"""
-    config = config_manager.get()
-    base_prompt = config.default_prompt
-
-    # 根据好感度添加具体的态度指导
+def _get_response(daily_favor: int, user_nickname: str) -> str:
+    """获取回复"""
     match daily_favor:
         case df if df <= 20:
-            attitude_guide = f"你对{user_nickname}的好感度很低({df}/100)，请用非常冷淡、疏远的语气回应。"
-        case df if df <= 40:
-            attitude_guide = f"你对{user_nickname}的好感度较低({df}/100)，请用冷淡、有距离感的语气回应。"
-        case df if df <= 60:
-            attitude_guide = f"你对{user_nickname}的好感度一般({df}/100)，请用中性、礼貌的语气回应。"
-        case df if df <= 80:
-            attitude_guide = f"你对{user_nickname}的好感度较高({df}/100)，请用友好、热情的语气回应。"
-        case _:
-            attitude_guide = f"你对{user_nickname}的好感度非常高({df}/100)，请用非常热情、亲密的语气回应。"
-    
-    # 先替换好感度部分
-    progression_att_num = str(base_prompt).replace(
-        "{{AFFECTION_SCORE}}",
-        f"{daily_favor}",
-        1
-        )
-
-    # 再替换好感度提示部分
-    progression_att_guide = progression_att_num.replace(
-        "{{DYNAMIC_AFFECTION_BASE}}",
-        f"{attitude_guide}",
-        1
-    )
-
-    # 最后替换时间
-    now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
-    final_prompt = progression_att_guide.replace(
-        "{{CURRENT_TIME_SCENE}}",
-        f"{now_time}",
-        1
-    )
-
-    return final_prompt
-
-
-def _get_fallback_response(daily_favor: int, user_nickname: str) -> str:
-    """获取备用回复（当 API 调用失败时使用）。"""
-    match daily_favor:
-        case df if df <= 20:
-            return f"咦！？去、去死！"
+            return "咦！？去、去死！"
         case df if df <= 40:
             return f"唔诶，{user_nickname}！？怎、怎么是你…!?（后退）。"
         case df if df <= 60:
@@ -111,11 +61,13 @@ def _get_fallback_response(daily_favor: int, user_nickname: str) -> str:
         case df if df <= 80:
             return f"{user_nickname}，你、你来啦，今天要不要，一、一起看书……？"
         case _:
-            return f"只、只是有一点点在意你哦……唔，{user_nickname}，你就是这点不、不行啦！"
+            return (
+                f"只、只是有一点点在意你哦……唔，{user_nickname}，你就是这点不、不行啦！"
+            )
 
 
 @manage.handle()
-async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Command()):
+async def jrhg_switch(cmd: tuple[str, ...] = Command()) -> None:
     """处理插件开关命令"""
     _, action = cmd
     config = config_manager.get()
@@ -123,21 +75,20 @@ async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Comm
         case "status":
             # 显示插件状态信息
             permission_info = permission_manager_plugin.format_permission_info(config)
-            plugin_status, status_desc = await permission_manager_plugin.check_plugin_status(config)
+            (
+                _plugin_status,
+                status_desc,
+            ) = await permission_manager_plugin.check_plugin_status(config)
 
             # 获取用户数据插件状态
-            user_data_status = "🟢 正常" if generate_or_update_favorability else "🔴 异常"
-
-            # 获取 LLM Provider 状态
-            llm_provider_name = config.api_provider.upper()
-            llm_ok = await llm_provider.test_connection(config.api_provider)
-            llm_status = "🟢 正常" if llm_ok else "🔴 异常"
+            user_data_status = (
+                "🟢 正常" if generate_or_update_favorability else "🔴 异常"
+            )
 
             message = (
                 f"JRHG插件状态:\n"
                 f"插件: {status_desc}\n"
                 f"用户数据插件: {user_data_status}\n"
-                f"LLM Provider ({llm_provider_name}): {llm_status}\n"
                 f"{permission_info}"
             )
             await manage.finish(message)
@@ -161,17 +112,24 @@ async def jrhg_switch(bot: Bot, event: MessageEvent, cmd: tuple[str, ...] = Comm
 
 
 @jrhg.handle()
-async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+async def jrhg_function(bot: Bot, event: MessageEvent) -> None:
     """处理jrhg主命令"""
     # 获取用户信息
     user_id = event.get_user_id()
-    user_nickname = permission_manager_plugin.get_user_nickname(event)
+    user_nickname = (
+        (event.sender.nickname or event.sender.card or user_id)
+        if event.sender
+        else user_id
+    )
+    username = character_binding.get_character_name(user_id, user_nickname)
     favor_result = None  # 初始化以避免异常处理中未绑定
 
     # 使用运行时配置进行权限检查
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(bot, event, config_manager.get())
+    can_use, reason = await permission_manager_plugin.check_runtime_permission(
+        bot, event, config_manager.get()
+    )
     if not can_use:
-        logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}")
+        logger.info(f"用户 {username}({user_id}) 请求被拒绝，原因：{reason}")
         await jrhg.finish(f"❌ {reason}")
 
     try:
@@ -180,73 +138,36 @@ async def jrhg_function(bot: Bot, event: MessageEvent, args: Message = CommandAr
             await jrhg.finish("❌ 用户数据插件不可用，请联系管理员")
 
         # 获取或生成好感度
-        logger.info(f"用户 {user_nickname}({user_id}) 请求好感度问候")
+        logger.info(f"用户 {username}({user_id}) 请求好感度问候")
 
         favor_result = await generate_or_update_favorability(user_id)
 
         if favor_result.is_new_day:
-            logger.info(f"为用户 {user_nickname} 生成新的每日好感度: {favor_result.daily_favor}")
-
-        # 构建提示词
-        system_prompt = _build_favor_prompt(favor_result.daily_favor, user_nickname)
-
-        # 如果有额外参数，作为自定义消息传递给AI
-        custom_message = args.extract_plain_text().strip() if args else None
-        # 调用 LLM Provider
-        config = config_manager.get()
-
-        if custom_message:
-            user_message = (f"用户{user_nickname}对你说：|，请回应他。", f"{custom_message}")
-            ai_response = await llm_provider.generate_text(
-                prompt=user_message,
-                provider=config.api_provider,
-                system_instruction=system_prompt,
-                enable_knowledge=True,  # 有自定义内容才需要加常识，否则不加
-                knowledge_query=custom_message, # 仅注入用户输入内容，不要乱加其他的
-                knowledge_limit=3,
+            logger.info(
+                f"为用户 {username} 生成新的每日好感度: {favor_result.daily_favor}"
             )
-        else:
-            user_message = f"请向用户{user_nickname}打个招呼。"
-            ai_response = await llm_provider.generate_text(
-                prompt=user_message,
-                provider=config.api_provider,
-                system_instruction=system_prompt,
-            )
+
+        # 获取回复文本
+        response = _get_response(favor_result.daily_favor, username)
 
         # 格式化最终回复
         final_response = await format_favor_response(
-            ai_response=ai_response,
-            user_nickname=user_nickname,
-            daily_favor=favor_result.daily_favor
+            ai_response=response,
+            user_nickname=username,
+            daily_favor=favor_result.daily_favor,
         )
 
         await jrhg.finish(final_response)
 
     except Exception as e:
         if not isinstance(e, FinishedException):
-            logger.error(f"处理jrhg命令时发生错误: {e}")
-            # 返回备用回复
-            if favor_result:
-                fallback = _get_fallback_response(favor_result.daily_favor, user_nickname)
-            else:
-                fallback = "发生错误，请稍后重试"
-            await jrhg.finish(fallback)
+            logger.exception(f"处理jrhg命令时发生错误: {e}")
 
 
 # 插件生命周期管理
-async def on_startup():
+async def on_startup() -> None:
     """插件启动时的初始化"""
     try:
-        config = config_manager.get()
-        # 测试 LLM API 连接
-        connection_ok = await llm_provider.test_connection(config.api_provider)
-
-        provider = config.api_provider.upper()
-        if connection_ok:
-            logger.info(f"JRHG插件启动成功，{provider} API连接正常")
-        else:
-            logger.warning(f"JRHG插件启动成功，但{provider} API连接测试失败")
-
         # 检查用户数据插件
         if not generate_or_update_favorability:
             logger.error("用户数据插件不可用，JRHG插件将无法正常工作")
@@ -257,7 +178,7 @@ async def on_startup():
         logger.error(f"JRHG插件启动时发生错误: {e}")
 
 
-async def on_shutdown():
+async def on_shutdown() -> None:
     """插件关闭时的清理"""
     logger.info("JRHG插件已关闭")
 

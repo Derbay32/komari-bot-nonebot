@@ -9,6 +9,7 @@ Komari Knowledge 常识库核心引擎。
 1. NoneBot 模式：使用 config_manager 插件加载配置
 2. 独立模式：直接从 JSON 文件加载配置（用于 WebUI）
 """
+
 import asyncio
 import json
 import logging
@@ -22,13 +23,23 @@ from pydantic import BaseModel
 
 from .config_schema import DynamicConfigSchema
 
-# 检测运行模式：通过检查是否在 NoneBot 环境中
-_nonebot_mode = "nonebot" in sys.modules
-config_manager = None
-_logger: logging.Logger | Any = logging.getLogger("komari_knowledge")
+
+class PluginState:
+    """存放插件全局运行状态的容器"""
+
+    def __init__(self) -> None:
+        self.nonebot_mode: bool = "nonebot" in sys.modules
+        self.config_manager: Any = None
+        self.standalone_config: DynamicConfigSchema | None = None
+        self.engine: KnowledgeEngine | None = None
+        self.logger: logging.Logger | Any = logging.getLogger("komari_knowledge")
+
+
+# 初始化全局状态单例
+state = PluginState()
 
 # 只有在 NoneBot 环境中才尝试加载 config_manager
-if _nonebot_mode:
+if state.nonebot_mode:
     try:
         from nonebot import logger as nb_logger
         from nonebot.plugin import require
@@ -37,16 +48,12 @@ if _nonebot_mode:
         config_manager = config_manager_plugin.get_config_manager(
             "komari_knowledge", DynamicConfigSchema
         )
-        _logger = nb_logger
+        state.logger = nb_logger
     except (ImportError, RuntimeError):
         # 回退到独立模式
-        _nonebot_mode = False
+        state.nonebot_mode = False
         config_manager = None
-        _logger = logging.getLogger("komari_knowledge")
-
-
-# 独立模式配置加载器
-_standalone_config: DynamicConfigSchema | None = None
+        state.logger = logging.getLogger("komari_knowledge")
 
 
 def _load_standalone_config() -> DynamicConfigSchema:
@@ -54,14 +61,14 @@ def _load_standalone_config() -> DynamicConfigSchema:
     config_path = Path("config/config_manager/komari_knowledge_config.json")
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with Path.open(config_path, encoding="utf-8") as f:
                 data = json.load(f)
             return DynamicConfigSchema(**data)
         except (json.JSONDecodeError, TypeError) as e:
-            _logger.warning(f"配置文件解析失败: {e}，使用默认配置")
+            state.logger.warning(f"配置文件解析失败: {e}，使用默认配置")
             return DynamicConfigSchema()
     else:
-        _logger.warning(f"配置文件不存在: {config_path}，使用默认配置")
+        state.logger.warning(f"配置文件不存在: {config_path}，使用默认配置")
         return DynamicConfigSchema()
 
 
@@ -71,15 +78,15 @@ def get_config() -> DynamicConfigSchema:
     Returns:
         当前配置对象
     """
-    if _nonebot_mode:
+    if state.nonebot_mode:
         # 告诉 pylance config_manager 不可能为空
-        assert config_manager is not None, "config_manager 应该在 NoneBot 模式下已初始化"
+        assert config_manager is not None, (
+            "config_manager 应该在 NoneBot 模式下已初始化"
+        )
         return config_manager.get()
-    else:
-        global _standalone_config
-        if _standalone_config is None:
-            _standalone_config = _load_standalone_config()
-        return _standalone_config
+    if state.standalone_config is None:
+        state.standalone_config = _load_standalone_config()
+    return state.standalone_config
 
 
 class SearchResult(BaseModel):
@@ -99,7 +106,7 @@ class KnowledgeEngine:
     负责管理数据库连接池、向量模型和检索逻辑。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化引擎。"""
         self._pool: Any = None
         self._embed_model: TextEmbedding | None = None
@@ -108,21 +115,32 @@ class KnowledgeEngine:
 
     async def initialize(self) -> None:
         """初始化引擎（加载模型、建立连接池、构建索引）。"""
-        _logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
+        state.logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
 
         # 获取配置
         config = get_config()
 
         # 1. 加载向量嵌入模型
         if self._embed_model is None:
-            _logger.info(f"[Komari Knowledge] 加载嵌入模型: {config.embedding_model}")
+            state.logger.info(
+                f"[Komari Knowledge] 加载嵌入模型: {config.embedding_model}"
+            )
+            # 配置统一的缓存目录
+            cache_dir = Path.home() / ".cache" / "komari_embeddings"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
             # 在独立线程中加载模型，避免阻塞
             loop = asyncio.get_event_loop()
             self._embed_model = await loop.run_in_executor(
                 None,
-                lambda: TextEmbedding(model_name=config.embedding_model),
+                lambda: TextEmbedding(
+                    model_name=config.embedding_model,
+                    cache_dir=str(cache_dir),
+                ),
             )
-            _logger.info("[Komari Knowledge] 嵌入模型加载完成")
+            state.logger.info(
+                f"[Komari Knowledge] 嵌入模型加载完成 (缓存: {cache_dir})"
+            )
 
         # 2. 建立数据库连接池
         if self._pool is None:
@@ -138,11 +156,11 @@ class KnowledgeEngine:
                 max_size=5,
                 command_timeout=30,
             )
-            _logger.info("[Komari Knowledge] 数据库连接池已建立")
+            state.logger.info("[Komari Knowledge] 数据库连接池已建立")
 
         # 3. 构建关键词索引（内存预热）
         await self._build_keyword_index()
-        _logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+        state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
 
     async def _build_keyword_index(self) -> None:
         """构建关键词内存索引。
@@ -152,7 +170,7 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
-        _logger.info("[Komari Knowledge] 正在构建关键词索引...")
+        state.logger.info("[Komari Knowledge] 正在构建关键词索引...")
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -172,7 +190,9 @@ class KnowledgeEngine:
                     self._keyword_index[kw_lower].add(kid)
 
         self._index_loaded = True
-        _logger.info(f"[Komari Knowledge] 关键词索引构建完成，共 {len(rows)} 条知识")
+        state.logger.info(
+            f"[Komari Knowledge] 关键词索引构建完成，共 {len(rows)} 条知识"
+        )
 
     def _get_embedding(self, text: str) -> list[float]:
         """生成文本的向量嵌入。
@@ -223,7 +243,7 @@ class KnowledgeEngine:
             return []
 
         if self._pool is None:
-            raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")
+            raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")  # noqa:TRY003
 
         # 确保 limit 是 int 类型
         if limit is None:
@@ -237,7 +257,9 @@ class KnowledgeEngine:
         query = self._rewrite_query(query)
 
         if query != original_query:
-            _logger.info(f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'")
+            state.logger.info(
+                f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'"
+            )
 
         results: list[SearchResult] = []
         seen_ids: set[int] = set()
@@ -257,7 +279,7 @@ class KnowledgeEngine:
             )
             results.extend(vector_hits)
 
-        _logger.debug(
+        state.logger.debug(
             f"[Komari Knowledge] 检索 '{query[:20]}...' -> "
             f"关键词命中 {len(keyword_hits)} 条，向量补充 {len(vector_hits)} 条"
         )
@@ -282,7 +304,6 @@ class KnowledgeEngine:
         if not self._index_loaded:
             return []
 
-        results: list[SearchResult] = []
         matched_ids: set[int] = set()
 
         # 检查查询中是否包含已知关键词
@@ -309,19 +330,16 @@ class KnowledgeEngine:
                 list(matched_ids),
                 limit,
             )
-
-            for row in rows:
-                results.append(
-                    SearchResult(
-                        id=row["id"],
-                        category=row["category"],
-                        content=row["content"],
-                        similarity=1.0,  # 关键词匹配视为完全相关
-                        source="keyword",
-                    )
-                )
-
-        return results
+        return [
+            SearchResult(
+                id=row["id"],
+                category=row["category"],
+                content=row["content"],
+                similarity=1.0,  # 关键词匹配视为完全相关
+                source="keyword",
+            )
+            for row in rows
+        ]
 
     async def _layer2_vector_search(
         self, query: str, limit: int, exclude_ids: set[int]
@@ -369,21 +387,18 @@ class KnowledgeEngine:
                 limit,
             )
 
-            results: list[SearchResult] = []
-            for row in rows:
-                # 应用相似度阈值过滤
-                if row["similarity"] >= config.similarity_threshold:
-                    results.append(
-                        SearchResult(
-                            id=row["id"],
-                            category=row["category"],
-                            content=row["content"],
-                            similarity=row["similarity"],
-                            source="vector",
-                        )
-                    )
-
-            return results
+            # 应用相似度阈值过滤
+            return [
+                SearchResult(
+                    id=row["id"],
+                    category=row["category"],
+                    content=row["content"],
+                    similarity=row["similarity"],
+                    source="vector",
+                )
+                for row in rows
+                if row["similarity"] >= config.similarity_threshold
+            ]
 
     async def add_knowledge(
         self,
@@ -430,7 +445,7 @@ class KnowledgeEngine:
             kw_lower = kw.lower()
             self._keyword_index[kw_lower].add(kid)
 
-        _logger.info(f"[Komari Knowledge] 添加知识: ID={kid}, keywords={keywords}")
+        state.logger.info(f"[Komari Knowledge] 添加知识: ID={kid}, keywords={keywords}")
         return kid
 
     async def get_all_knowledge(self) -> list[dict[str, Any]]:
@@ -481,7 +496,7 @@ class KnowledgeEngine:
             if kw_lower in self._keyword_index:
                 self._keyword_index[kw_lower].discard(kid)
 
-        _logger.info(f"[Komari Knowledge] 删除知识: ID={kid}")
+        state.logger.info(f"[Komari Knowledge] 删除知识: ID={kid}")
         return True
 
     async def update_knowledge(
@@ -530,7 +545,9 @@ class KnowledgeEngine:
             # 内容改变需要重新生成向量
             if content is not None:
                 loop = asyncio.get_event_loop()
-                embedding = await loop.run_in_executor(None, self._get_embedding, content)
+                embedding = await loop.run_in_executor(
+                    None, self._get_embedding, content
+                )
                 updates.append(f"content = ${param_idx}")
                 params.append(content)
                 param_idx += 1
@@ -575,24 +592,23 @@ class KnowledgeEngine:
             kw_lower = kw.lower()
             self._keyword_index[kw_lower].add(kid)
 
-        _logger.info(f"[Komari Knowledge] 更新知识: ID={kid}")
+        state.logger.info(f"[Komari Knowledge] 更新知识: ID={kid}")
         return True
 
     async def close(self) -> None:
-        """关闭连接池。"""
+        """关闭连接池并清理资源。"""
         if self._pool:
             await self._pool.close()
             self._pool = None
-            _logger.info("[Komari Knowledge] 连接池已关闭")
+            state.logger.info("[Komari Knowledge] 连接池已关闭")
 
-
-# 全局单例
-_engine: KnowledgeEngine | None = None
+        # 清理嵌入模型引用，帮助垃圾回收
+        self._embed_model = None
 
 
 def get_engine() -> KnowledgeEngine | None:
     """获取全局引擎实例。"""
-    return _engine
+    return state.engine
 
 
 async def initialize_engine() -> KnowledgeEngine:
@@ -601,10 +617,8 @@ async def initialize_engine() -> KnowledgeEngine:
     Returns:
         引擎实例
     """
-    global _engine
+    if state.engine is None:
+        state.engine = KnowledgeEngine()
+        await state.engine.initialize()
 
-    if _engine is None:
-        _engine = KnowledgeEngine()
-        await _engine.initialize()
-
-    return _engine
+    return state.engine
