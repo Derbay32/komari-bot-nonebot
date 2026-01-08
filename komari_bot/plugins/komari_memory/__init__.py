@@ -24,7 +24,6 @@ from .handlers.message_handler import MessageHandler
 from .handlers.summary_worker import register_summary_task, unregister_summary_task
 from .repositories.conversation_repository import ConversationRepository
 from .repositories.entity_repository import EntityRepository
-from .services.character_binding import CharacterBindingManager
 from .services.config_interface import get_config
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
@@ -50,7 +49,6 @@ class PluginManager:
         self.redis: RedisManager | None = None
         self.memory: MemoryService | None = None
         self.handler: MessageHandler | None = None
-        self.character_binding: CharacterBindingManager | None = None
         self.forgetting: ForgettingService | None = None
         self.pg_pool = None
 
@@ -90,10 +88,7 @@ class PluginManager:
         # 6. 注册总结定时任务
         register_summary_task(self.redis, self.memory)
 
-        # 7. 初始化角色绑定管理器
-        self.character_binding = CharacterBindingManager(self.config)
-
-        # 8. 初始化忘却服务并注册定时任务
+        # 7. 初始化忘却服务并注册定时任务
         self.forgetting = ForgettingService(self.config, self.pg_pool)
         register_forgetting_task(self.forgetting)
 
