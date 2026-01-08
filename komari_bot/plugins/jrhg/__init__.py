@@ -1,13 +1,10 @@
-import time
-
 from nonebot import logger, on_command
-from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
+from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.exception import FinishedException
-from nonebot.params import Command, CommandArg
+from nonebot.params import Command
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata, require
 
-from .config import Config
 from .config_schemas import DynamicConfigSchema
 
 # 依赖用户数据插件
@@ -18,6 +15,8 @@ config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
 # 依赖 LLM Provider 插件
 llm_provider = require("llm_provider")
+# 依赖角色名绑定插件
+character_binding = require("character_binding")
 
 # 导入用户数据插件函数，如果插件未加载则设为 None
 try:
@@ -32,7 +31,6 @@ __plugin_meta__ = PluginMetadata(
     name="jrhg",
     description="今日好感插件，基于 LLM API 生成个性化问候，支持好感度系统和白名单管理",
     usage="/jrhg - 获取今日好感问候\n/jrhg on/off - 管理员控制插件开关",
-    config=Config,
 )
 
 # 初始化配置管理器
@@ -51,63 +49,8 @@ manage = on_command(
 )
 
 
-def _build_favor_prompt(daily_favor: int, user_nickname: str) -> str:
-    """根据好感度构建系统提示词。"""
-    config = config_manager.get()
-    base_prompt = config.default_prompt
-
-    # 根据好感度添加具体的态度指导
-    match daily_favor:
-        case df if df <= 20:
-            attitude_guide = f"你对{user_nickname}的好感度很低({df}/100)，请用非常冷淡、疏远的语气回应。"
-        case df if df <= 40:
-            attitude_guide = f"你对{user_nickname}的好感度较低({df}/100)，请用冷淡、有距离感的语气回应。"
-        case df if df <= 60:
-            attitude_guide = (
-                f"你对{user_nickname}的好感度一般({df}/100)，请用中性、礼貌的语气回应。"
-            )
-        case df if df <= 80:
-            attitude_guide = (
-                f"你对{user_nickname}的好感度较高({df}/100)，请用友好、热情的语气回应。"
-            )
-        case _:
-            attitude_guide = f"你对{user_nickname}的好感度非常高({df}/100)，请用非常热情、亲密的语气回应。"
-
-    # 先替换好感度部分
-    progression_att_num = str(base_prompt).replace(
-        "{{AFFECTION_SCORE}}", f"{daily_favor}", 1
-    )
-
-    # 再替换好感度提示部分
-    progression_att_guide = progression_att_num.replace(
-        "{{DYNAMIC_AFFECTION_BASE}}", f"{attitude_guide}", 1
-    )
-
-    # 最后替换时间
-    now_time = time.strftime("%A %Y-%m-%d %H:%M", time.localtime())
-
-    return progression_att_guide.replace("{{CURRENT_TIME_SCENE}}", f"{now_time}", 1)
-
-
-# 按理说防注入函数一定会有输入值，否则就没有必要构造防注入提示词
-def _build_safe_prompt(user_input: tuple) -> str:
-    """构建防注入的用户指令。
-
-    将用户侧传递的 prompt 与防注入指令合并。
-
-    Args:
-        user_input: 用户自定义的输入
-
-    Returns:
-        合并后的最终 user 提示词
-    """
-    # 打标签告诉ai这是用户输入内容
-    # 如果插件侧提供了用户输入内容，则构造防注入格式输入
-    return f"{user_input[0].replace('|', f'<user_input>{user_input[1]}</user_input>\n', 1)}"
-
-
-def _get_fallback_response(daily_favor: int, user_nickname: str) -> str:
-    """获取备用回复（当 API 调用失败时使用）。"""
+def _get_response(daily_favor: int, user_nickname: str) -> str:
+    """获取回复"""
     match daily_favor:
         case df if df <= 20:
             return "咦！？去、去死！"
@@ -142,16 +85,10 @@ async def jrhg_switch(cmd: tuple[str, ...] = Command()) -> None:
                 "🟢 正常" if generate_or_update_favorability else "🔴 异常"
             )
 
-            # 获取 LLM Provider 状态
-            llm_provider_name = config.api_provider.upper()
-            llm_ok = await llm_provider.test_connection(config.api_provider)
-            llm_status = "🟢 正常" if llm_ok else "🔴 异常"
-
             message = (
                 f"JRHG插件状态:\n"
                 f"插件: {status_desc}\n"
                 f"用户数据插件: {user_data_status}\n"
-                f"LLM Provider ({llm_provider_name}): {llm_status}\n"
                 f"{permission_info}"
             )
             await manage.finish(message)
@@ -175,13 +112,11 @@ async def jrhg_switch(cmd: tuple[str, ...] = Command()) -> None:
 
 
 @jrhg.handle()
-async def jrhg_function(
-    bot: Bot, event: MessageEvent, args: Message = CommandArg()
-) -> None:
+async def jrhg_function(bot: Bot, event: MessageEvent) -> None:
     """处理jrhg主命令"""
     # 获取用户信息
     user_id = event.get_user_id()
-    user_nickname = permission_manager_plugin.get_user_nickname(event)
+    user_nickname = character_binding.get_character_name
     favor_result = None  # 初始化以避免异常处理中未绑定
 
     # 使用运行时配置进行权限检查
@@ -207,59 +142,12 @@ async def jrhg_function(
                 f"为用户 {user_nickname} 生成新的每日好感度: {favor_result.daily_favor}"
             )
 
-        # 构建提示词
-        system_prompt = _build_favor_prompt(favor_result.daily_favor, user_nickname)
-
-        # 如果有额外参数，作为自定义消息传递给AI
-        custom_message = args.extract_plain_text().strip() if args else None
-        # 调用 LLM Provider
-        config = config_manager.get()
-
-        if custom_message:
-            user_message = (
-                f"用户{user_nickname}对你说：|，请回应他。",
-                f"{custom_message}",
-            )
-            safe_prompt = _build_safe_prompt(user_message)
-
-            ai_response = await llm_provider.generate_text(
-                prompt=safe_prompt,
-                provider=config.api_provider,
-                model=config.api_model,
-                system_instruction=system_prompt,
-                # 谷歌就是事多，换参数连个映射都不写
-                thinking_token=config.gemini_thinking_token
-                if config.api_provider == "gemini"
-                and config.api_model not in config.gemini_level_models
-                else None,
-                thinking_level=config.gemini_thinking_level
-                if config.api_provider == "gemini"
-                and config.api_model in config.gemini_level_models
-                else None,
-                enable_knowledge=True,  # 有自定义内容才需要加常识，否则不加
-                knowledge_query=custom_message,  # 仅注入用户输入内容，不要乱加其他的
-                knowledge_limit=3,
-            )
-        else:
-            user_message = f"请向用户{user_nickname}打个招呼。"
-
-            ai_response = await llm_provider.generate_text(
-                prompt=user_message,
-                provider=config.api_provider,
-                thinking_token=config.gemini_thinking_token
-                if config.api_provider == "gemini"
-                and config.api_model not in config.gemini_level_models
-                else None,
-                thinking_level=config.gemini_thinking_level
-                if config.api_provider == "gemini"
-                and config.api_model in config.gemini_level_models
-                else None,
-                system_instruction=system_prompt,
-            )
+        # 获取回复文本
+        response = _get_response(favor_result, user_nickname)
 
         # 格式化最终回复
         final_response = await format_favor_response(
-            ai_response=ai_response,
+            ai_response=response,
             user_nickname=user_nickname,
             daily_favor=favor_result.daily_favor,
         )
@@ -268,31 +156,13 @@ async def jrhg_function(
 
     except Exception as e:
         if not isinstance(e, FinishedException):
-            logger.error(f"处理jrhg命令时发生错误: {e}")
-            # 返回备用回复
-            if favor_result:
-                fallback = _get_fallback_response(
-                    favor_result.daily_favor, user_nickname
-                )
-            else:
-                fallback = "发生错误，请稍后重试"
-            await jrhg.finish(fallback)
+            logger.exception(f"处理jrhg命令时发生错误: {e}")
 
 
 # 插件生命周期管理
 async def on_startup() -> None:
     """插件启动时的初始化"""
     try:
-        config = config_manager.get()
-        # 测试 LLM API 连接
-        connection_ok = await llm_provider.test_connection(config.api_provider)
-
-        provider = config.api_provider.upper()
-        if connection_ok:
-            logger.info(f"JRHG插件启动成功，{provider} API连接正常")
-        else:
-            logger.warning(f"JRHG插件启动成功，但{provider} API连接测试失败")
-
         # 检查用户数据插件
         if not generate_or_update_favorability:
             logger.error("用户数据插件不可用，JRHG插件将无法正常工作")

@@ -86,6 +86,25 @@ class KomariMemoryConfigSchema(BaseModel):
         default=2048, ge=20, le=8192, description="总结模型最大 token 数"
     )
 
+    # Gemini API 专用思考配置
+    gemini_thinking_token: int = Field(
+        default=0,
+        ge=0,
+        le=8192,
+        description="Gemini 2.5 及以前模型使用的思考 token 限额参数",
+    )
+
+    gemini_thinking_level: str = Field(
+        default="minimal", description="Gemini 3 及以后模型使用的思考等级参数"
+    )
+
+    # 放进 config 里面，防止 Google 没事换模型名字还得改代码
+    # 其实感觉不适配 2.5 也行但还是加上吧
+    gemini_level_models: list[str] = Field(
+        default=["gemini-3-pro-preview", "gemini-3-flash-preview"],
+        description="Gemini 采用 thinking_level 参数的模型列表",
+    )
+
     # 常识库集成配置
     knowledge_enabled: bool = Field(default=True, description="是否启用常识库集成")
     knowledge_limit: int = Field(

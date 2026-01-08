@@ -32,6 +32,10 @@
   "llm_temperature_summary": 0.3,
   "llm_max_tokens_summary": 2048,
 
+  "gemini_thinking_token": 0,
+  "gemini_thinking_level": "LOW",
+  "gemini_level_models": ["gemini-3-pro-preview", "gemini-3-flash-preview"],
+
   "knowledge_enabled": true,
   "knowledge_limit": 3,
 

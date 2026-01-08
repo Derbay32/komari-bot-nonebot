@@ -34,6 +34,13 @@ async def generate_reply(
         system_instruction=system_prompt,
         temperature=config.llm_temperature_chat,
         max_tokens=config.llm_max_tokens_chat,
+        thinking_token=config.gemini_thinking_token  # 判断是不是 gemini3 或者以上的模型
+        if config.llm_model_chat
+        not in config.gemini_level_models  # deepseek 那边也会有参数但没定义，少写个判断
+        else None,
+        thinking_level=config.gemini_thinking_level
+        if config.llm_model_chat in config.gemini_level_models
+        else None,
     )
 
 
@@ -64,6 +71,7 @@ async def summarize_conversation(
 
 返回 JSON 格式：{{"summary": "...", "entities": [...], "importance": 3}}"""
 
+    # 总结没必要思考纯浪费钱
     response = await llm_provider.generate_text(
         prompt=prompt,
         provider=config.llm_provider,
