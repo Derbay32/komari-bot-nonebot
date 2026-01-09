@@ -54,9 +54,7 @@ class QueryRewriteService:
 对话历史：
 {history_text if history_text else "(无历史对话)"}
 
-用户最新回复：{current_query}
-
-重写后的查询："""
+用户最新回复：{current_query}"""
 
     @retry_async(max_attempts=2, base_delay=0.5)
     async def rewrite_query(
@@ -73,6 +71,10 @@ class QueryRewriteService:
         Returns:
             重写后的查询，失败时返回原始查询
         """
+        # 没有历史对话时无需重写，直接返回原始查询
+        if not conversation_history:
+            return current_query
+
         # 获取最新配置
         config = get_config()
 

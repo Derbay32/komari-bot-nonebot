@@ -23,7 +23,9 @@ def get_festival_info() -> str | None:
         节日信息字符串，无节日时返回 None
     """
     today = datetime.now().astimezone()
-    lunar = ZhDate.from_datetime(today)
+    # zhdate 不支持时区感知的 datetime，需要转换为 naive datetime
+    today_naive = today.replace(tzinfo=None)
+    lunar = ZhDate.from_datetime(today_naive)
 
     festivals = []
 
