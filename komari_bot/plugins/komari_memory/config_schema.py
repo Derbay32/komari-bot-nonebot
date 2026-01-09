@@ -72,7 +72,7 @@ class KomariMemoryConfigSchema(BaseModel):
         default=1.0, ge=0.0, le=2.0, description="对话模型温度参数"
     )
     llm_max_tokens_chat: int = Field(
-        default=500, ge=20, le=8192, description="对话模型最大 token 数"
+        default=4000, ge=20, le=8192, description="对话模型最大 token 数"
     )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
@@ -186,7 +186,7 @@ class KomariMemoryConfigSchema(BaseModel):
         default=1.2, ge=1.0, le=2.0, description="访问时重要性提升系数"
     )
     forgetting_min_age_days: int = Field(
-        default=7, ge=1, le=30, description="记忆最小保留天数"
+        default=3, ge=1, le=30, description="记忆最小保留天数"
     )
 
     # 消息过滤配置
