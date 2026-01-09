@@ -21,16 +21,18 @@ async def build_prompt(
     recent_messages: list | None = None,
     current_user_id: str | None = None,
     current_user_nickname: str | None = None,
+    search_query: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """构建多轮对话提示词（记忆 + 常识库 + 最近消息）。
 
     Args:
-        user_message: 用户消息
+        user_message: 用户原始消息（用于生成回复）
         memories: 检索到的对话记忆
         config: 插件配置
         recent_messages: 最近的消息列表（可选）
         current_user_id: 当前用户 ID（可选）
         current_user_nickname: 当前用户昵称（可选）
+        search_query: 重写后的搜索查询（用于知识库检索）
 
     Returns:
         (system_prompt, contents_list) 元组
@@ -50,8 +52,10 @@ async def build_prompt(
     # 常识库
     if config.knowledge_enabled:
         try:
+            # 优先使用重写后的查询进行检索
+            query_for_search = search_query or user_message
             knowledge_results = await komari_knowledge.search_knowledge(
-                query=user_message,
+                query=query_for_search,
                 limit=config.knowledge_limit,
             )
             if knowledge_results:

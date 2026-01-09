@@ -12,6 +12,7 @@ from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message
 from ..services.prompt_builder import build_prompt
+from ..services.query_rewrite_service import QueryRewriteService
 from ..services.redis_manager import MessageSchema, RedisManager
 
 
@@ -31,6 +32,7 @@ class MessageHandler:
         """
         self.redis = redis
         self.memory = memory
+        self.query_rewrite = QueryRewriteService()
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。
@@ -202,20 +204,27 @@ class MessageHandler:
         # 先获取最近的消息上下文（不包含当前消息）
         recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
 
+        # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
+        rewritten_query = await self.query_rewrite.rewrite_query(
+            current_query=message.content,
+            conversation_history=recent_messages,
+        )
+
         # 存储当前消息到缓冲区
         await self.redis.push_message(message.group_id, message)
 
-        # 检索相关记忆
+        # 检索相关记忆（使用重写后的查询）
         memories = await self.memory.search_conversations(
-            query=message.content,
+            query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
         )
 
-        # 构建提示词
+        # 构建提示词（传递重写后的查询用于知识库检索）
         system_prompt, contents_list = await build_prompt(
             user_message=message.content,
+            search_query=rewritten_query,
             memories=memories,
             config=config,
             recent_messages=recent_messages,
@@ -281,21 +290,28 @@ class MessageHandler:
         # 先获取最近的消息上下文（不包含当前消息）
         recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
 
+        # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
+        rewritten_query = await self.query_rewrite.rewrite_query(
+            current_query=message.content,
+            conversation_history=recent_messages,
+        )
+
         # 存储当前消息到缓冲区
         await self.redis.push_message(message.group_id, message)
         await self.redis.increment_message_count(message.group_id)
 
-        # 检索相关记忆（传递 user_id 用于用户相关性加权）
+        # 检索相关记忆（传递 user_id 用于用户相关性加权，使用重写后的查询）
         memories = await self.memory.search_conversations(
-            query=message.content,
+            query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
         )
 
-        # 构建提示词（返回 system_prompt 和 contents_list）
+        # 构建提示词（返回 system_prompt 和 contents_list，传递重写后的查询）
         system_prompt, contents_list = await build_prompt(
             user_message=message.content,
+            search_query=rewritten_query,
             memories=memories,
             config=config,
             recent_messages=recent_messages,

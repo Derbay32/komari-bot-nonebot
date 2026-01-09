@@ -197,6 +197,11 @@ class KomariMemoryConfigSchema(BaseModel):
         default=50, ge=10, le=200, description="历史重复检测检查的最近消息数量"
     )
 
+    # 查询重写配置
+    query_rewrite_history_limit: int = Field(
+        default=5, ge=1, le=10, description="查询重写时使用的历史对话数量"
+    )
+
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:

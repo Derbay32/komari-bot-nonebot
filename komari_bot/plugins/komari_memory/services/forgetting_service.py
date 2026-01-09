@@ -87,7 +87,9 @@ class ForgettingService:
                 threshold,
             )
             deleted = result.split()[-1] if result else "0"
-            logger.debug(f"[KomariMemory] 删除低价值记忆: {deleted} 条 (阈值: {threshold})")
+            logger.debug(
+                f"[KomariMemory] 删除低价值记忆: {deleted} 条 (阈值: {threshold})"
+            )
             return int(deleted)
 
     async def _fuzzify_and_cleanup_high_value_memories(self) -> int:
@@ -162,7 +164,7 @@ class ForgettingService:
 
 {original}
 
-只返回压缩后的一句话，不要有任何其他内容。"""
+只返回压缩后的一句话，不要有任何其他内容。输出必须使用简体中文。"""
 
         try:
             response = await llm_provider.generate_text(

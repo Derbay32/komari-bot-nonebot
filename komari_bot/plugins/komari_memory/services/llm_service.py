@@ -145,7 +145,7 @@ async def summarize_conversation(
     Returns:
         总结结果，包含 summary, entities, importance
     """
-    prompt = f"""请总结以下对话，提取实体信息，并评估对话的重要性：
+    prompt = f"""请总结以下对话，提取实体信息，并评估对话的重要性，输出必须使用简体中文：
 
 {chr(10).join(messages)}
 
@@ -177,7 +177,8 @@ async def summarize_conversation(
 
         # 在 prompt 中添加 JSON 格式要求
         prompt_with_format = (
-            prompt + '\n\n返回 JSON 格式：{"summary": "...", "entities": [...], "importance": 3}'
+            prompt
+            + '\n\n返回 JSON 格式：{"summary": "...", "entities": [...], "importance": 3}'
         )
 
         response = await llm_provider.generate_text(
