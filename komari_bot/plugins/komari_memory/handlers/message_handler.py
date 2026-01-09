@@ -31,20 +31,15 @@ class MessageHandler:
         self.redis = redis
         self.memory = memory
 
-    def _is_reply_trigger(self, event: GroupMessageEvent) -> bool:
-        """检查是否触发被回复回复。
+    def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
+        """检查是否 @ 了机器人。
 
         Args:
             event: 群聊消息事件
 
         Returns:
-            是否触发
+            是否 @ 了机器人
         """
-        # 检查是否回复了某条消息
-        if event.reply is not None:
-            return True
-
-        # 检查是否 @ 了 bot
         return bool(hasattr(event, "to_me") and event.to_me)
 
     async def process_message(
@@ -101,12 +96,12 @@ class MessageHandler:
             await self._handle_low_value(message)
             return None
 
-        # 检查是否触发被回复回复（优先级最高）
-        if self._is_reply_trigger(event):
+        # 检查是否 @ 了机器人（跳过 BERT 评分，直接回复）
+        if self._is_at_trigger(event):
             # 存储当前消息到缓冲区
             await self.redis.push_message(message.group_id, message)
             # 生成回复
-            return await self._handle_reply_trigger(event, message)
+            return await self._handle_at_trigger(message)
 
         # 调用 BERT 服务评分
         score = await score_message(
@@ -161,55 +156,41 @@ class MessageHandler:
             f"tokens={await self.redis.get_tokens(message.group_id)}"
         )
 
-    async def _get_reply_context(
+    async def _store_ai_reply(
         self,
-        event: GroupMessageEvent,
-        message: MessageSchema,
-    ) -> list[MessageSchema]:
-        """获取被回复时的上下文。
+        group_id: str,
+        reply_content: str,
+        bot_nickname: str,
+    ) -> None:
+        """存储 AI 回复到缓冲区。
 
         Args:
-            event: 群聊消息事件
-            message: 当前消息对象
-
-        Returns:
-            上下文消息列表
+            group_id: 群组 ID
+            reply_content: 回复内容
+            bot_nickname: 机器人昵称
         """
-        config = get_config()
+        import uuid
 
-        # 如果是回复消息，尝试获取被回复消息的上下文
-        if event.reply and event.reply.message_id:
-            reply_context = await self.redis.get_context_around_message(
-                group_id=message.group_id,
-                message_id=str(event.reply.message_id),
-                before=5,
-                after=5,
-            )
-
-            if reply_context:
-                logger.debug(
-                    f"[KomariMemory] 找到被回复消息上下文: {len(reply_context)} 条消息"
-                )
-                return reply_context
-
-        # 如果是 @ 或找不到上下文，使用当前上下文
-        recent_messages = await self.redis.get_buffer(
-            message.group_id,
-            limit=config.context_messages_limit,
+        bot_message = MessageSchema(
+            user_id="bot",
+            user_nickname=bot_nickname,
+            group_id=group_id,
+            content=reply_content,
+            timestamp=time.time(),
+            message_id=f"bot_{uuid.uuid4().hex[:16]}",
+            is_bot=True,
         )
 
-        logger.debug(f"[KomariMemory] 使用当前上下文: {len(recent_messages)} 条消息")
-        return recent_messages
+        await self.redis.push_message(group_id, bot_message)
+        logger.debug(f"[KomariMemory] AI 回复已存储: {reply_content[:30]}...")
 
-    async def _handle_reply_trigger(
+    async def _handle_at_trigger(
         self,
-        event: GroupMessageEvent,
         message: MessageSchema,
     ) -> str:
-        """处理被回复时的回复（必须回复，无冷却限制）。
+        """处理 @ 触发回复（必须回复，无冷却限制）。
 
         Args:
-            event: 群聊消息事件
             message: 消息对象
 
         Returns:
@@ -217,8 +198,8 @@ class MessageHandler:
         """
         config = get_config()
 
-        # 获取上下文
-        recent_messages = await self._get_reply_context(event, message)
+        # 获取最近的消息上下文
+        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
 
         # 检索相关记忆
         memories = await self.memory.search_conversations(
@@ -229,7 +210,7 @@ class MessageHandler:
         )
 
         # 构建提示词
-        system_prompt, user_context = await build_prompt(
+        system_prompt, contents_list = await build_prompt(
             user_message=message.content,
             memories=memories,
             config=config,
@@ -240,20 +221,22 @@ class MessageHandler:
 
         # 生成回复
         reply = await generate_reply(
-            user_message=user_context,
+            user_message=message.content,
             system_prompt=system_prompt,
             config=config,
+            contents_list=contents_list,
         )
 
         if reply is not None:
-            logger.info(
-                f"[KomariMemory] 被回复回复: group={message.group_id}, "
-                f"trigger={'reply' if event.reply else 'at'}"
+            # 存储 AI 回复到缓冲区
+            await self._store_ai_reply(
+                group_id=message.group_id,
+                reply_content=reply,
+                bot_nickname=config.bot_nickname,
             )
+            logger.info(f"[KomariMemory] @ 回复: group={message.group_id}")
         else:
-            logger.warning(
-                f"[KomariMemory] 被回复回复生成失败: group={message.group_id}"
-            )
+            logger.warning(f"[KomariMemory] @ 回复生成失败: group={message.group_id}")
 
         return reply or "抱歉，我暂时无法回复。"
 
@@ -300,8 +283,8 @@ class MessageHandler:
         # 获取最近的消息上下文
         recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
 
-        # 构建提示词（返回 system_prompt 和 user_context）
-        system_prompt, user_context = await build_prompt(
+        # 构建提示词（返回 system_prompt 和 contents_list）
+        system_prompt, contents_list = await build_prompt(
             user_message=message.content,
             memories=memories,
             config=config,
@@ -310,15 +293,22 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
         )
 
-        # 生成回复（user_context 已包含记忆、常识库、用户输入）
+        # 生成回复（contents_list 已包含记忆、常识库、历史对话、用户输入）
         reply = await generate_reply(
-            user_message=user_context,
+            user_message=message.content,  # 保留用于向后兼容
             system_prompt=system_prompt,
             config=config,
+            contents_list=contents_list,
         )
 
         # 只有成功生成回复时才设置冷却和增加计数
         if reply is not None:
+            # 存储 AI 回复到缓冲区
+            await self._store_ai_reply(
+                group_id=message.group_id,
+                reply_content=reply,
+                bot_nickname=config.bot_nickname,
+            )
             await self.redis.set_cooldown(message.group_id, config.proactive_cooldown)
             await self.redis.increment_proactive_count(message.group_id)
 
