@@ -50,8 +50,8 @@ class ConversationRepository:
                 summary,
                 embedding,
                 participants,
-                datetime.now().astimezone() - timedelta(hours=1),
-                datetime.now().astimezone(),
+                datetime.now() - timedelta(hours=1),  # noqa: DTZ005
+                datetime.now(),  # noqa: DTZ005
                 importance_initial,
                 importance_initial,
             )
