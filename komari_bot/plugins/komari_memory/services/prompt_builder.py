@@ -1,5 +1,6 @@
 """Komari Memory 动态提示词构建服务。"""
 
+from datetime import datetime
 from typing import Any
 
 from nonebot import logger
@@ -43,6 +44,11 @@ async def build_prompt(
 
     # 第一步：背景注入（User + Model 确认）
     background_parts = []
+
+    # 当前时间
+    background_parts.append(
+        f"<current_time>{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}</current_time>"
+    )
 
     # 对话记忆
     if memories:
