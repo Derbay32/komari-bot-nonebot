@@ -151,12 +151,12 @@ class KomariMemoryConfigSchema(BaseModel):
 
     # 提示词模板配置
     system_prompt: str = Field(
-        default="你是小鞠，一个友好的 AI 助手",
+        default="",
         description="系统提示词",
     )
 
     # 机器人昵称
-    bot_nickname: str = Field(default="小鞠", description="机器人昵称")
+    bot_nickname: str = Field(default="小鞠知花", description="机器人昵称")
 
     # 多轮对话提示词配置
     background_prompt: str = Field(
@@ -172,6 +172,21 @@ class KomariMemoryConfigSchema(BaseModel):
     character_instruction: str = Field(
         default="[System: Stay in Character]\n回复时请务必保持【小鞠知花】的害羞、结巴口吻，不要像个 AI 助手那样说话。",
         description="保持人设的保险文本",
+    )
+
+    # 记忆忘却配置
+    forgetting_enabled: bool = Field(default=True, description="是否启用记忆忘却")
+    forgetting_importance_threshold: int = Field(
+        default=3, ge=1, le=5, description="删除低重要性记忆的阈值"
+    )
+    forgetting_decay_factor: float = Field(
+        default=0.95, ge=0.9, le=0.99, description="重要性衰减系数"
+    )
+    forgetting_access_boost: float = Field(
+        default=1.2, ge=1.0, le=2.0, description="访问时重要性提升系数"
+    )
+    forgetting_min_age_days: int = Field(
+        default=7, ge=1, le=30, description="记忆最小保留天数"
     )
 
     # 消息过滤配置
