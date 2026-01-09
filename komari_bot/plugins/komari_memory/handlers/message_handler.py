@@ -98,9 +98,7 @@ class MessageHandler:
 
         # 检查是否 @ 了机器人（跳过 BERT 评分，直接回复）
         if self._is_at_trigger(event):
-            # 存储当前消息到缓冲区
-            await self.redis.push_message(message.group_id, message)
-            # 生成回复
+            # 生成回复（内部会存储当前消息）
             return await self._handle_at_trigger(message)
 
         # 调用 BERT 服务评分
@@ -198,8 +196,11 @@ class MessageHandler:
         """
         config = get_config()
 
-        # 获取最近的消息上下文
+        # 先获取最近的消息上下文（不包含当前消息）
         recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
+
+        # 存储当前消息到缓冲区
+        await self.redis.push_message(message.group_id, message)
 
         # 检索相关记忆
         memories = await self.memory.search_conversations(
@@ -272,6 +273,13 @@ class MessageHandler:
             logger.debug("[KomariMemory] 主动回复频率超限")
             return None
 
+        # 先获取最近的消息上下文（不包含当前消息）
+        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
+
+        # 存储当前消息到缓冲区
+        await self.redis.push_message(message.group_id, message)
+        await self.redis.increment_message_count(message.group_id)
+
         # 检索相关记忆（传递 user_id 用于用户相关性加权）
         memories = await self.memory.search_conversations(
             query=message.content,
@@ -279,9 +287,6 @@ class MessageHandler:
             user_id=message.user_id,
             limit=config.memory_search_limit,
         )
-
-        # 获取最近的消息上下文
-        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
 
         # 构建提示词（返回 system_prompt 和 contents_list）
         system_prompt, contents_list = await build_prompt(
