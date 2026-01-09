@@ -164,6 +164,32 @@ async def search_knowledge(query: str, limit: int | None = None) -> list[SearchR
     return await engine.search(query, limit)
 
 
+async def search_by_keyword(keyword: str) -> list[SearchResult]:
+    """通过关键词精确查询知识。
+
+    Args:
+        keyword: 关键词（如用户 UID）
+
+    Returns:
+        检索结果列表
+
+    Example:
+        >>> results = await search_by_keyword("123456789")
+        >>> for r in results:
+        ...     print(f"{r.content}")
+    """
+    engine = get_engine()
+    if engine is None:
+        logger.warning("[Komari Knowledge] 引擎未初始化")
+        return []
+
+    config = config_manager.get()
+    if not config.plugin_enable:
+        return []
+
+    return await engine.search_by_keyword(keyword)
+
+
 async def add_knowledge(
     content: str,
     keywords: list[str],
