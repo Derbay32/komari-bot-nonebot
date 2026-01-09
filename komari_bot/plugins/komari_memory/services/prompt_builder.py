@@ -47,8 +47,12 @@ def get_festival_info() -> str | None:
 
     month, day = lunar.lunar_month, lunar.lunar_day
     if (month, day) in traditional:
+        # chinese() 返回格式: "二零二五年腊月初八 乙巳年 (蛇年)"
+        # 提取月份日部分（去掉年份前缀）
+        chinese_full = lunar.chinese().split()[0]  # "二零二五年腊月初八"
+        chinese_date = chinese_full[5:]  # 去掉年份，保留 "腊月初八"
         festivals.append(
-            f"今天是{traditional[(month, day)]}（农历{lunar.chinese()}{lunar.lunar_day_cn}）"
+            f"今天是{traditional[(month, day)]}（农历{chinese_date}）"
         )
 
     # 公历节日
@@ -57,6 +61,7 @@ def get_festival_info() -> str | None:
         (2, 14): "情人节",
         (3, 8): "妇女节",
         (3, 12): "植树节",
+        (3, 29): "小鞠知花的生日",
         (4, 1): "愚人节",
         (5, 1): "劳动节",
         (5, 4): "青年节",
