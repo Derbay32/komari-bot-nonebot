@@ -78,6 +78,34 @@ async def build_prompt(
         except Exception:
             logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
 
+    # 用户常识检索（基于对话中的用户 UID）
+    if recent_messages:
+        user_ids: set[str] = set()
+        for msg in recent_messages:
+            if not msg.is_bot:
+                user_ids.add(msg.user_id)
+
+        # 添加当前用户（如果不在 recent_messages 中）
+        if current_user_id:
+            user_ids.add(current_user_id)
+
+        user_profile_results: list[dict] = []
+        for uid in user_ids:
+            try:
+                results = await komari_knowledge.search_by_keyword(uid)
+                user_profile_results.extend([{"uid": uid, "content": r.content} for r in results])
+            except Exception:
+                logger.debug(f"[KomariMemory] 用户 {uid} 的常识检索失败", exc_info=True)
+
+        if user_profile_results:
+            profile_items = "\n".join([
+                f"- 用户({item['uid']}): {item['content']}"
+                for item in user_profile_results
+            ])
+            background_parts.append(
+                f"<user_profiles>\n{profile_items}\n</user_profiles>"
+            )
+
     # 如果有背景信息，添加到 contents 并加上确认块
     if background_parts:
         background_text = "\n\n".join(background_parts)
