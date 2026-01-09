@@ -179,6 +179,83 @@ async def generate_text(
         await client.close()
 
 
+async def generate_text_with_contents(
+    contents: list[dict],
+    provider: str,
+    model: str,
+    system_instruction: str | None = None,
+    temperature: int | None = None,
+    max_tokens: int | None = None,
+    # 结构化输出参数（可选）
+    response_schema: StructuredOutputSchema | None = None,
+    response_json_schema: dict | None = None,
+    response_format: dict | None = None,
+    **kwargs,  # noqa: ANN003
+) -> str:
+    """使用 contents 列表生成文本（多轮对话）。
+
+    Args:
+        contents: contents 列表，每个元素为 {"role": "user"/"model", "parts": [{"text": "..."}]}
+        provider: API 提供商 ("deepseek" 或 "gemini")
+        model: 模型名称
+        system_instruction: 系统指令
+        temperature: 温度参数，None 使用默认值
+        max_tokens: 最大 token 数，None 使用默认值
+        response_schema: Pydantic 模型或 JSON Schema (Gemini/DeepSeek)
+        response_json_schema: JSON Schema 字典 (Gemini only)
+        response_format: Response format dict (DeepSeek only)
+        **kwargs: 其他 provider 特定参数
+
+    Returns:
+        生成的文本（使用结构化输出时为 JSON 字符串）
+    """
+
+    provider = provider.lower()
+    config = config_manager.get()
+
+    if provider == "gemini":
+        token = config.gemini_api_token
+    else:  # 默认 deepseek
+        token = config.deepseek_api_token
+
+    if not token:
+        raise ValueError(  # noqa:TRY003
+            f"{provider.upper()} API Token 未配置，请在配置中设置 {provider}_api_token"
+        )
+
+    match provider:
+        case "gemini":
+            client = GeminiClient(token)
+        case "deepseek":
+            client = DeepSeekClient(token)
+        case _:
+            logger.error(
+                "未传入 API 渠道或渠道不支持，请检查调用方法是否包含 provider 参数。"
+            )
+            raise ValueError
+
+    try:
+        result = await client.generate_text_with_contents(
+            contents=contents,
+            model=model,
+            system_instruction=system_instruction,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            # 结构化输出参数
+            response_schema=response_schema,
+            response_json_schema=response_json_schema,
+            response_format=response_format,
+            **kwargs,
+        )
+    except Exception as e:
+        logger.error(f"LLM 调用失败 ({provider}): {e}")
+        raise
+    else:
+        return result
+    finally:
+        await client.close()
+
+
 async def test_connection(provider: str) -> bool:
     """测试指定 provider 的连接。
 

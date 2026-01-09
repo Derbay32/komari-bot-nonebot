@@ -1,5 +1,7 @@
 """Komari Memory 动态提示词构建服务。"""
 
+from typing import Any
+
 from nonebot import logger
 from nonebot.plugin import require
 
@@ -19,8 +21,8 @@ async def build_prompt(
     recent_messages: list | None = None,
     current_user_id: str | None = None,
     current_user_nickname: str | None = None,
-) -> tuple[str, str]:
-    """构建动态提示词（记忆 + 常识库 + 最近消息）。
+) -> tuple[str, list[dict[str, Any]]]:
+    """构建多轮对话提示词（记忆 + 常识库 + 最近消息）。
 
     Args:
         user_message: 用户消息
@@ -31,35 +33,21 @@ async def build_prompt(
         current_user_nickname: 当前用户昵称（可选）
 
     Returns:
-        (system_prompt, user_context) 元组
+        (system_prompt, contents_list) 元组
         - system_prompt: 系统提示词
-        - user_context: 用户上下文（包含最近消息、记忆、常识库、用户输入）
+        - contents_list: contents 列表，每个元素为 {"role": "user"/"model", "parts": [{"text": "..."}]}
     """
-    context_parts = []
+    contents: list[dict[str, Any]] = []
 
-    # 1. 注入最近消息（使用 XML 标签，显示角色名）
-    if recent_messages:
-        message_items = []
-        for msg in recent_messages[-10:]:  # 只取最近 10 条
-            # 获取角色名（优先级：绑定名 > 昵称 > user_id）
-            character_name = character_binding.get_character_name(
-                user_id=msg.user_id,
-                fallback_nickname=msg.user_nickname,
-            )
-            message_items.append(f"- {character_name}: {msg.content}")
+    # 第一步：背景注入（User + Model 确认）
+    background_parts = []
 
-        if message_items:
-            messages_text = "\n".join(message_items)
-            context_parts.append(
-                f"<recent_messages>\n{messages_text}\n</recent_messages>"
-            )
-
-    # 2. 注入对话记忆（使用 XML 标签）
+    # 对话记忆
     if memories:
         memory_items = "\n".join([f"- {m['summary']}" for m in memories])
-        context_parts.append(f"<memory>\n{memory_items}\n</memory>")
+        background_parts.append(f"<memory>\n{memory_items}\n</memory>")
 
-    # 3. 追加常识库检索（按来源分别注入）
+    # 常识库
     if config.knowledge_enabled:
         try:
             knowledge_results = await komari_knowledge.search_knowledge(
@@ -73,57 +61,80 @@ async def build_prompt(
 
                 # 分别注入不同来源的知识
                 if keyword_results:
-                    keyword_items = "\n".join(
-                        [f"- {r.content}" for r in keyword_results]
-                    )
-                    context_parts.append(
+                    keyword_items = "\n".join([f"- {r.content}" for r in keyword_results])
+                    background_parts.append(
                         f"<keyword_knowledge>\n{keyword_items}\n</keyword_knowledge>"
                     )
 
                 if vector_results:
-                    vector_items = "\n".join(
-                        [f"- {r.content}" for r in vector_results]
-                    )
-                    context_parts.append(
+                    vector_items = "\n".join([f"- {r.content}" for r in vector_results])
+                    background_parts.append(
                         f"<vector_knowledge>\n{vector_items}\n</vector_knowledge>"
                     )
         except Exception:
             logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
 
-    # 4. 添加当前用户标识
-    if current_user_id and current_user_nickname:
-        current_character_name = character_binding.get_character_name(
+    # 如果有背景信息，添加到 contents 并加上确认块
+    if background_parts:
+        background_text = "\n\n".join(background_parts)
+        background_text += f"\n\n{config.background_prompt}"
+
+        contents.append({"role": "user", "parts": [{"text": background_text}]})
+        contents.append({"role": "model", "parts": [{"text": config.background_confirmation}]})
+
+    # 第二步：构造历史对话（按时间线，合并 User/Model 侧）
+    if recent_messages:
+        current_block: list[str] = []
+        current_side: str | None = None  # "user" 或 "model"
+
+        for msg in recent_messages:
+            this_side = "model" if msg.is_bot else "user"
+
+            # 获取角色名：机器人消息使用配置的 bot_nickname
+            if msg.is_bot:
+                character_name = config.bot_nickname
+            else:
+                character_name = character_binding.get_character_name(
+                    user_id=msg.user_id,
+                    fallback_nickname=msg.user_nickname,
+                )
+
+            msg_text = f"- {character_name}: {msg.content}"
+
+            # 切换侧时，保存当前块
+            if current_side is not None and this_side != current_side:
+                block_text = "\n".join(current_block)
+                role = "model" if current_side == "model" else "user"
+                contents.append({"role": role, "parts": [{"text": block_text}]})
+                current_block = []
+
+            current_block.append(msg_text)
+            current_side = this_side
+
+        # 保存最后一个块
+        if current_block:
+            block_text = "\n".join(current_block)
+            role = "model" if current_side == "model" else "user"
+            contents.append({"role": role, "parts": [{"text": block_text}]})
+
+    # 第三步：当前请求（User）+ 保持人设保险
+    current_character_name = (
+        character_binding.get_character_name(
             user_id=current_user_id,
             fallback_nickname=current_user_nickname,
         )
-        context_parts.append(
-            f"<current_user>\n"
-            f"当前发言者：{current_character_name} (ID: {current_user_id})\n"
-            f"</current_user>"
-        )
+        if current_user_id
+        else "用户"
+    )
 
-    # 5. 构建用户上下文（包含最近消息、记忆、常识库、用户输入）
-    user_context_parts = []
+    current_text = f"- {current_character_name}: {user_message}"
 
-    if context_parts:
-        user_context_parts.extend(context_parts)
+    # 保持人设的保险（使用配置中的文本）
+    current_text += f"\n\n{config.character_instruction}"
 
-    # 用户当前输入
-    user_context_parts.append(f"<user_input>\n{user_message}\n</user_input>")
+    contents.append({"role": "user", "parts": [{"text": current_text}]})
 
-    user_context = "\n\n".join(user_context_parts)
+    # system_prompt 保持不变
+    system_prompt = config.system_prompt
 
-    # 6. 构建系统提示词（添加标签说明）
-    tag_instructions = """
-回复时请参考以下上下文信息：
-- <recent_messages>标签内是最近的聊天消息（角色名: 消息内容）
-- <memory>标签内是历史对话总结
-- <keyword_knowledge>标签内是关键词精确匹配的常识库信息
-- <vector_knowledge>标签内是向量语义检索的常识库信息
-- <current_user>标签内是当前发言者的信息
-- <user_input>标签内是用户当前的消息
-"""
-
-    system_prompt = f"{config.system_prompt}\n{tag_instructions}".strip()
-
-    return system_prompt, user_context
+    return system_prompt, contents

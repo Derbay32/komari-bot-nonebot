@@ -64,6 +64,10 @@ class GeminiClient(BaseLLMClient):
                     level = types.ThinkingLevel.MEDIUM
                 case "high":
                     level = types.ThinkingLevel.HIGH
+                case _:
+                    # 未知值，使用默认值
+                    logger.warning(f"未知的 thinking_level: {thinking_level}，使用默认值 minimal")
+                    level = types.ThinkingLevel.MINIMAL
             assert level is not None
             return types.GenerateContentConfig(
                 temperature=temperature
@@ -160,6 +164,104 @@ class GeminiClient(BaseLLMClient):
             response = await self._client.aio.models.generate_content(
                 model=model,
                 contents=prompt,
+                config=gen_config,
+            )
+            if not response.text:
+                logger.error("Gemini API 错误: 未返回文本，回复可能被拦截")
+                raise ValueError  # noqa: TRY301
+        except errors.APIError as e:
+            logger.error(f"Gemini API 错误: {e.code} - {e.message}")
+            raise
+        except Exception as e:
+            logger.error(f"Gemini API 未知错误: {e}")
+            raise
+        else:
+            logger.debug(f"Gemini API 响应: {response.text}")
+            return response.text
+
+    async def generate_text_with_contents(
+        self,
+        contents: list[dict[str, Any]],
+        model: str,
+        system_instruction: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        # 结构化输出参数
+        response_schema: StructuredOutputSchema | None = None,
+        response_json_schema: dict[str, Any] | None = None,
+        # Gemini 特有参数
+        thinking_token: int | None = None,
+        thinking_level: str | None = None,
+        **kwargs,  # noqa: ANN003, ARG002
+    ) -> str:
+        """使用 contents 列表生成文本（多轮对话）。
+
+        Args:
+            contents: contents 列表，每个元素为 {"role": "user"/"model", "parts": [{"text": "..."}]}
+            model: 模型名称
+            system_instruction: 系统指令
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            thinking_token: 思考 token 限额
+            thinking_level: 思考等级
+            response_schema: Pydantic 模型或 JSON Schema
+            response_json_schema: JSON Schema 字典
+            **kwargs: 其他参数
+
+        Returns:
+            生成的文本（使用结构化输出时为 JSON 字符串）
+        """
+        config = config_manager.get()
+        try:
+            # 构建基础配置
+            gen_config = self._build_base_config(
+                temperature, max_tokens, thinking_token, thinking_level, config
+            )
+
+            # 添加系统指令
+            if system_instruction:
+                gen_config.system_instruction = system_instruction
+
+            # 处理结构化输出
+            if response_schema is not None:
+                gen_config.response_mime_type = "application/json"
+                gen_config.response_schema = response_schema
+            elif response_json_schema is not None:
+                gen_config.response_mime_type = "application/json"
+                gen_config.response_json_schema = response_json_schema
+
+            # 将 contents 列表转换为 SDK 需要的格式
+            sdk_contents = []
+            for content in contents:
+                role = content["role"]
+                # 健壮性检查：确保 parts 和 text 存在
+                if not content.get("parts") or len(content["parts"]) == 0:
+                    logger.warning(f"contents 中存在空的 parts: {content}")
+                    continue
+                text = content["parts"][0].get("text", "")
+                if role == "user":
+                    sdk_contents.append(
+                        types.Content(role="user", parts=[types.Part(text=text)])
+                    )
+                else:
+                    sdk_contents.append(
+                        types.Content(role="model", parts=[types.Part(text=text)])
+                    )
+
+            logger.debug(
+                f"Gemini API 请求 (多轮):\n"
+                f"  model: {model}\n"
+                f"  temperature: {temperature if temperature is not None else config.gemini_temperature}\n"
+                f"  max_output_tokens: {max_tokens if max_tokens is not None else int(config.gemini_max_tokens)}\n"
+                f"  system_instruction: {system_instruction}\n"
+                f"  contents: {len(sdk_contents)} turns\n"
+                f"  structured_output: {response_schema or response_json_schema or 'None'}"
+            )
+
+            # 使用 SDK 的异步接口
+            response = await self._client.aio.models.generate_content(
+                model=model,
+                contents=sdk_contents,
                 config=gen_config,
             )
             if not response.text:

@@ -3,6 +3,7 @@
 import json
 import re
 from logging import getLogger
+from typing import Any
 
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
@@ -81,17 +82,38 @@ async def generate_reply(
     user_message: str,
     system_prompt: str,
     config: KomariMemoryConfigSchema,
+    contents_list: list[dict[str, Any]] | None = None,
 ) -> str:
     """生成回复（使用对话模型，带重试机制）。
 
     Args:
-        user_message: 用户消息
+        user_message: 用户消息（兼容旧格式）
         system_prompt: 系统提示词
         config: 插件配置
+        contents_list: contents 列表（可选，优先使用）
 
     Returns:
         生成的回复
     """
+    # 如果提供了 contents_list，使用新的多轮对话格式
+    if contents_list is not None:
+        return await llm_provider.generate_text_with_contents(
+            contents=contents_list,
+            provider=config.llm_provider,
+            model=config.llm_model_chat,  # 对话专用模型
+            system_instruction=system_prompt,
+            temperature=config.llm_temperature_chat,
+            max_tokens=config.llm_max_tokens_chat,
+            thinking_token=config.gemini_thinking_token  # 判断是不是 gemini3 或者以上的模型
+            if config.llm_model_chat
+            not in config.gemini_level_models  # deepseek 那边也会有参数但没定义，少写个判断
+            else None,
+            thinking_level=config.gemini_thinking_level
+            if config.llm_model_chat in config.gemini_level_models
+            else None,
+        )
+
+    # 兼容旧的字符串格式
     return await llm_provider.generate_text(
         prompt=user_message,
         provider=config.llm_provider,
