@@ -189,7 +189,7 @@ class MessageHandler:
         self,
         message: MessageSchema,
         reply_to_message_id: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """处理 @ 触发回复（必须回复，无冷却限制）。
 
         Args:
@@ -202,7 +202,9 @@ class MessageHandler:
         config = get_config()
 
         # 先获取最近的消息上下文（不包含当前消息）
-        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
+        recent_messages = await self.redis.get_buffer(
+            message.group_id, limit=config.context_messages_limit
+        )
 
         # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
         rewritten_query = await self.query_rewrite.rewrite_query(
@@ -250,7 +252,7 @@ class MessageHandler:
             logger.info(f"[KomariMemory] @ 回复: group={message.group_id}")
             return {"reply": reply, "reply_to_message_id": reply_to_message_id}
         logger.warning(f"[KomariMemory] @ 回复生成失败: group={message.group_id}")
-        return {"reply": "抱歉，我暂时无法回复。", "reply_to_message_id": reply_to_message_id}
+        return None
 
     async def _handle_interrupt_signal(
         self,
@@ -288,7 +290,9 @@ class MessageHandler:
             return None
 
         # 先获取最近的消息上下文（不包含当前消息）
-        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
+        recent_messages = await self.redis.get_buffer(
+            message.group_id, limit=config.context_messages_limit
+        )
 
         # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
         rewritten_query = await self.query_rewrite.rewrite_query(

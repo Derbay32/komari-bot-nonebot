@@ -5,6 +5,7 @@ from typing import Any
 
 from nonebot import logger
 from nonebot.plugin import require
+from zhdate import ZhDate
 
 from ..config_schema import KomariMemoryConfigSchema
 
@@ -13,6 +14,66 @@ komari_knowledge = require("komari_knowledge")
 
 # 获取角色绑定插件
 character_binding = require("character_binding")
+
+
+def get_festival_info() -> str | None:
+    """获取当前节日信息。
+
+    Returns:
+        节日信息字符串，无节日时返回 None
+    """
+    today = datetime.now().astimezone()
+    lunar = ZhDate.from_datetime(today)
+
+    festivals = []
+
+    # 传统节日（农历）
+    traditional = {
+        (1, 1): "春节",
+        (1, 15): "元宵节",
+        (2, 2): "龙抬头",
+        (5, 5): "端午节",
+        (7, 7): "七夕节",
+        (7, 15): "中元节",
+        (8, 15): "中秋节",
+        (9, 9): "重阳节",
+        (10, 1): "寒衣节",
+        (10, 15): "下元节",
+        (12, 8): "腊八节",
+        (12, 23): "小年",
+    }
+
+    month, day = lunar.lunar_month, lunar.lunar_day
+    if (month, day) in traditional:
+        festivals.append(
+            f"今天是{traditional[(month, day)]}（农历{lunar.chinese()}{lunar.lunar_day_cn}）"
+        )
+
+    # 公历节日
+    public = {
+        (1, 1): "元旦",
+        (2, 14): "情人节",
+        (3, 8): "妇女节",
+        (3, 12): "植树节",
+        (4, 1): "愚人节",
+        (5, 1): "劳动节",
+        (5, 4): "青年节",
+        (6, 1): "儿童节",
+        (7, 1): "建党节",
+        (8, 1): "建军节",
+        (9, 10): "教师节",
+        (10, 1): "国庆节",
+        (12, 24): "平安夜",
+        (12, 25): "圣诞节",
+    }
+
+    month, day = today.month, today.day
+    if (month, day) in public:
+        festivals.append(f"今天是{public[(month, day)]}")
+
+    if festivals:
+        return "，".join(festivals)
+    return None  # 无节日时不注入
 
 
 async def build_prompt(
@@ -50,6 +111,11 @@ async def build_prompt(
         f"<current_time>{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}</current_time>"
     )
 
+    # 节日信息
+    festival_info = get_festival_info()
+    if festival_info:
+        background_parts.append(f"<festival_info>{festival_info}</festival_info>")
+
     # 对话记忆
     if memories:
         memory_items = "\n".join([f"- {m['summary']}" for m in memories])
@@ -66,12 +132,16 @@ async def build_prompt(
             )
             if knowledge_results:
                 # 根据 source 字段分组
-                keyword_results = [r for r in knowledge_results if r.source == "keyword"]
+                keyword_results = [
+                    r for r in knowledge_results if r.source == "keyword"
+                ]
                 vector_results = [r for r in knowledge_results if r.source == "vector"]
 
                 # 分别注入不同来源的知识
                 if keyword_results:
-                    keyword_items = "\n".join([f"- {r.content}" for r in keyword_results])
+                    keyword_items = "\n".join(
+                        [f"- {r.content}" for r in keyword_results]
+                    )
                     background_parts.append(
                         f"<keyword_knowledge>\n{keyword_items}\n</keyword_knowledge>"
                     )
@@ -99,15 +169,19 @@ async def build_prompt(
         for uid in user_ids:
             try:
                 results = await komari_knowledge.search_by_keyword(uid)
-                user_profile_results.extend([{"uid": uid, "content": r.content} for r in results])
+                user_profile_results.extend(
+                    [{"uid": uid, "content": r.content} for r in results]
+                )
             except Exception:
                 logger.debug(f"[KomariMemory] 用户 {uid} 的常识检索失败", exc_info=True)
 
         if user_profile_results:
-            profile_items = "\n".join([
-                f"- 用户({item['uid']}): {item['content']}"
-                for item in user_profile_results
-            ])
+            profile_items = "\n".join(
+                [
+                    f"- 用户({item['uid']}): {item['content']}"
+                    for item in user_profile_results
+                ]
+            )
             background_parts.append(
                 f"<user_profiles>\n{profile_items}\n</user_profiles>"
             )
@@ -118,7 +192,9 @@ async def build_prompt(
         background_text += f"\n\n{config.background_prompt}"
 
         contents.append({"role": "user", "parts": [{"text": background_text}]})
-        contents.append({"role": "model", "parts": [{"text": config.background_confirmation}]})
+        contents.append(
+            {"role": "model", "parts": [{"text": config.background_confirmation}]}
+        )
 
     # 第二步：构造历史对话（按时间线，合并 User/Model 侧）
     if recent_messages:
@@ -166,7 +242,9 @@ async def build_prompt(
     )
 
     # 使用 <user_input> 标签防止提示词注入
-    current_text = f"- {current_character_name}: <user_input>{user_message}</user_input>"
+    current_text = (
+        f"- {current_character_name}: <user_input>{user_message}</user_input>"
+    )
 
     # 保持人设的保险（使用配置中的文本）
     current_text += f"\n\n{config.character_instruction}"
