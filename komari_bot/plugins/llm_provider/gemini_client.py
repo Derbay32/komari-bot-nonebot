@@ -1,5 +1,7 @@
 """Gemini API 客户端。"""
 
+from typing import Any
+
 from google import genai
 from google.genai import errors, types
 from nonebot import logger
@@ -7,6 +9,7 @@ from nonebot.plugin import require
 
 from .base_client import BaseLLMClient
 from .config_schema import DynamicConfigSchema
+from .types import StructuredOutputSchema
 
 # 依赖 config_manager 插件
 config_manager_plugin = require("config_manager")
@@ -30,6 +33,66 @@ class GeminiClient(BaseLLMClient):
         # SDK 客户端（同步客户端用于配置，异步操作使用 client.aio）
         self._client = genai.Client(api_key=api_token)
 
+    def _build_base_config(
+        self,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_token: int | None,
+        thinking_level: str | None,
+        config: DynamicConfigSchema,
+    ) -> types.GenerateContentConfig:
+        """构建基础 GenerateContentConfig（不包含结构化输出）。
+
+        Args:
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            thinking_token: 思考 token 限额
+            thinking_level: 思考等级
+            config: 插件配置
+
+        Returns:
+            GenerateContentConfig 对象
+        """
+        if thinking_level:
+            level = None
+            match thinking_level:
+                case "minimal":
+                    level = types.ThinkingLevel.MINIMAL
+                case "low":
+                    level = types.ThinkingLevel.LOW
+                case "medium":
+                    level = types.ThinkingLevel.MEDIUM
+                case "high":
+                    level = types.ThinkingLevel.HIGH
+            assert level is not None
+            return types.GenerateContentConfig(
+                temperature=temperature
+                if temperature is not None
+                else config.gemini_temperature,
+                max_output_tokens=max_tokens
+                if max_tokens is not None
+                else int(config.gemini_max_tokens),
+                thinking_config=types.ThinkingConfig(thinking_level=level),
+            )
+        if thinking_token:
+            return types.GenerateContentConfig(
+                temperature=temperature
+                if temperature is not None
+                else config.gemini_temperature,
+                max_output_tokens=max_tokens
+                if max_tokens is not None
+                else int(config.gemini_max_tokens),
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking_token),
+            )
+        return types.GenerateContentConfig(
+            temperature=temperature
+            if temperature is not None
+            else config.gemini_temperature,
+            max_output_tokens=max_tokens
+            if max_tokens is not None
+            else int(config.gemini_max_tokens),
+        )
+
     async def generate_text(
         self,
         prompt: str,
@@ -37,81 +100,61 @@ class GeminiClient(BaseLLMClient):
         system_instruction: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        # 结构化输出参数（必须与基类一致）
+        response_schema: StructuredOutputSchema | None = None,
+        response_json_schema: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,  # noqa: ARG002 - Gemini 不使用
+        # Gemini 特有参数
         thinking_token: int | None = None,
         thinking_level: str | None = None,
-        **kwargs,  # noqa: ANN003, ARG002 - Ruff 闭嘴
+        **kwargs,  # noqa: ANN003, ARG002
     ) -> str:
-        """生成文本。
+        """生成文本（支持结构化输出）。
 
         Args:
             prompt: 用户提示词
+            model: 模型名称
             system_instruction: 系统指令
-            temperature: 温度参数，None 使用默认值
-            max_tokens: 最大 token 数，None 使用默认值
-            **kwargs: 其他参数（当前未使用）
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            thinking_token: 思考 token 限额
+            thinking_level: 思考等级
+            response_schema: Pydantic 模型或 JSON Schema
+            response_json_schema: JSON Schema 字典
+            response_format: Response format (Gemini 不使用)
+            **kwargs: 其他参数
 
         Returns:
-            生成的文本
+            生成的文本（使用结构化输出时为 JSON 字符串）
         """
         config = config_manager.get()
         try:
-            # 记录请求日志
             logger.debug(
                 f"Gemini API 请求:\n"
                 f"  model: {model}\n"
                 f"  temperature: {temperature if temperature is not None else config.gemini_temperature}\n"
                 f"  max_output_tokens: {max_tokens if max_tokens is not None else int(config.gemini_max_tokens)}\n"
                 f"  system_instruction: {system_instruction}\n"
-                f"  prompt: {prompt}"
+                f"  prompt: {prompt}\n"
+                f"  structured_output: {response_schema or response_json_schema or 'None'}"
             )
 
-            # 构建 SDK 配置
-            if thinking_level:
-                level = None
-                match thinking_level:
-                    case "minimal":
-                        level = types.ThinkingLevel.MINIMAL
-                    case "low":
-                        level = types.ThinkingLevel.LOW
-                    case "medium":
-                        level = types.ThinkingLevel.MEDIUM
-                    case "high":
-                        level = types.ThinkingLevel.HIGH
-                assert level is not None
-                gen_config = types.GenerateContentConfig(
-                    temperature=temperature
-                    if temperature is not None
-                    else config.gemini_temperature,
-                    max_output_tokens=max_tokens
-                    if max_tokens is not None
-                    else int(config.gemini_max_tokens),
-                    thinking_config=types.ThinkingConfig(thinking_level=level),
-                )
-            elif thinking_token:
-                gen_config = types.GenerateContentConfig(
-                    temperature=temperature
-                    if temperature is not None
-                    else config.gemini_temperature,
-                    max_output_tokens=max_tokens
-                    if max_tokens is not None
-                    else int(config.gemini_max_tokens),
-                    thinking_config=types.ThinkingConfig(
-                        thinking_budget=thinking_token
-                    ),
-                )
-            else:
-                gen_config = types.GenerateContentConfig(
-                    temperature=temperature
-                    if temperature is not None
-                    else config.gemini_temperature,
-                    max_output_tokens=max_tokens
-                    if max_tokens is not None
-                    else int(config.gemini_max_tokens),
-                )
+            # 构建基础配置
+            gen_config = self._build_base_config(
+                temperature, max_tokens, thinking_token, thinking_level, config
+            )
 
             # 添加系统指令
             if system_instruction:
                 gen_config.system_instruction = system_instruction
+
+            # 处理结构化输出
+            if response_schema is not None:
+                gen_config.response_mime_type = "application/json"
+                gen_config.response_schema = response_schema
+            elif response_json_schema is not None:
+                gen_config.response_mime_type = "application/json"
+                gen_config.response_json_schema = response_json_schema
 
             # 使用 SDK 的异步接口
             response = await self._client.aio.models.generate_content(
@@ -121,7 +164,7 @@ class GeminiClient(BaseLLMClient):
             )
             if not response.text:
                 logger.error("Gemini API 错误: 未返回文本，回复可能被拦截")
-                raise ValueError  # noqa: TRY301 - Ruff 闭嘴
+                raise ValueError  # noqa: TRY301
         except errors.APIError as e:
             logger.error(f"Gemini API 错误: {e.code} - {e.message}")
             raise
@@ -140,7 +183,7 @@ class GeminiClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
-            response = await self._client.aio.models.generate_content(  # noqa: F841
+            await self._client.aio.models.generate_content(
                 model=config.gemini_model,
                 contents="你好",
                 config=types.GenerateContentConfig(

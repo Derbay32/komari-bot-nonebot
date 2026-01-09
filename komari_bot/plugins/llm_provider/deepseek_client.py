@@ -8,6 +8,7 @@ from nonebot.plugin import require
 
 from .base_client import BaseLLMClient
 from .config_schema import DynamicConfigSchema
+from .types import StructuredOutputSchema
 
 # 依赖 config_manager 插件
 config_manager_plugin = require("config_manager")
@@ -48,23 +49,30 @@ class DeepSeekClient(BaseLLMClient):
         system_instruction: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        **kwargs,  # noqa: ANN003 - Ruff 闭嘴
+        # 结构化输出参数
+        response_schema: StructuredOutputSchema | None = None,
+        response_json_schema: object | None = None,  # noqa: ARG002 - DeepSeek 不使用
+        response_format: dict | None = None,
+        **kwargs,  # noqa: ANN003
     ) -> str:
-        """生成文本。
+        """生成文本（支持 JSON 模式）。
 
         Args:
             prompt: 用户提示词
+            model: 模型名称
             system_instruction: 系统指令
-            temperature: 温度参数，None 使用默认值
-            max_tokens: 最大 token 数，None 使用默认值
-            **kwargs: 其他参数 (如 frequency_penalty)
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            response_schema: Pydantic 模型或 JSON Schema（触发 JSON 模式）
+            response_json_schema: JSON Schema 字典（DeepSeek 不使用）
+            response_format: Response format dict
+            **kwargs: 其他参数（如 frequency_penalty）
 
         Returns:
-            生成的文本
+            生成的文本（使用 JSON 模式时为 JSON 字符串）
         """
         config = config_manager.get()
         try:
-            # 记录请求日志
             logger.debug(
                 f"DeepSeek API 请求:\n"
                 f"  model: {model}\n"
@@ -72,7 +80,8 @@ class DeepSeekClient(BaseLLMClient):
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
                 f"  system_instruction: {system_instruction}\n"
-                f"  prompt: {prompt}"
+                f"  prompt: {prompt}\n"
+                f"  json_mode: {response_schema is not None or response_format is not None}"
             )
 
             session = await self._get_session()
@@ -98,6 +107,13 @@ class DeepSeekClient(BaseLLMClient):
                 ),
                 "stream": False,
             }
+
+            # 处理 JSON 模式
+            if response_schema is not None or response_format is not None:
+                # DeepSeek 只支持简单 JSON 模式
+                request_data["response_format"] = response_format or {
+                    "type": "json_object"
+                }
 
             # 发送 API 请求
             async with session.post(
