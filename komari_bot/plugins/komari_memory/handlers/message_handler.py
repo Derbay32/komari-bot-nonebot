@@ -81,6 +81,10 @@ class MessageHandler:
             message_id=message_id,
         )
 
+        # 优先检查是否 @ 了机器人（跳过所有过滤和评分，直接回复）
+        if self._is_at_trigger(event):
+            return await self._handle_at_trigger(message, message_id)
+
         # 前置过滤
         filter_result = await preprocess_message(
             message=message_content,
@@ -97,11 +101,6 @@ class MessageHandler:
             # 低价值消息直接丢弃
             await self._handle_low_value(message)
             return None
-
-        # 检查是否 @ 了机器人（跳过 BERT 评分，直接回复）
-        if self._is_at_trigger(event):
-            # 生成回复（内部会存储当前消息）
-            return await self._handle_at_trigger(message, message_id)
 
         # 调用 BERT 服务评分
         score = await score_message(
