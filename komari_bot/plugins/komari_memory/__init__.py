@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 from nonebot import get_driver, logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
-from nonebot.adapters.onebot.v11.message import MessageSegment
 from nonebot.plugin import PluginMetadata, require
 
 if TYPE_CHECKING:
@@ -163,12 +162,25 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         if result:
             reply = result.get("reply")
             reply_to_message_id = result.get("reply_to_message_id")
-            if reply_to_message_id:
-                # 使用 QQ 原生回复功能
-                reply_message = MessageSegment.reply(reply_to_message_id) + reply
-                await matcher.send(reply_message)
-            else:
-                await matcher.send(reply)
+
+            if reply:
+                if reply_to_message_id:
+                    # 使用 QQ 原生回复功能
+                    message_array = [
+                        {"type": "reply", "data": {"id": reply_to_message_id}},
+                        {"type": "text", "data": {"text": reply}}
+                    ]
+                    try:
+                        await bot.call_api(
+                            "send_group_msg",
+                            group_id=int(event.group_id),
+                            message=message_array
+                        )
+                    except Exception as e:
+                        logger.warning(f"[KomariMemory] 原生回复失败: {e}，降级使用普通发送")
+                        await matcher.send(reply)
+                else:
+                    await matcher.send(reply)
 
     except Exception:
         logger.exception("[KomariMemory] 消息处理失败")
