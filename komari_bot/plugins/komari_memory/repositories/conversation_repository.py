@@ -1,6 +1,6 @@
 """对话数据访问仓库。"""
 
-import time
+from datetime import datetime, timedelta
 from typing import Any
 
 import asyncpg
@@ -50,8 +50,8 @@ class ConversationRepository:
                 summary,
                 embedding,
                 participants,
-                time.time() - 3600,
-                time.time(),
+                datetime.now().astimezone() - timedelta(hours=1),
+                datetime.now().astimezone(),
                 importance_initial,
                 importance_initial,
             )
@@ -133,11 +133,7 @@ class ConversationRepository:
                     """,
                     result_ids,
                 )
-                logger.debug(
-                    f"[KomariMemory] 重置 {len(result_ids)} 条记忆的重要性"
-                )
+                logger.debug(f"[KomariMemory] 重置 {len(result_ids)} 条记忆的重要性")
 
-            logger.debug(
-                f"[KomariMemory] 检索对话: 找到 {len(results)} 条结果"
-            )
+            logger.debug(f"[KomariMemory] 检索对话: 找到 {len(results)} 条结果")
             return results

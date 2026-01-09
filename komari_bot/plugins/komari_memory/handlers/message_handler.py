@@ -1,6 +1,7 @@
 """Komari Memory 消息处理核心。"""
 
 import time
+from typing import Any
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
@@ -45,14 +46,15 @@ class MessageHandler:
     async def process_message(
         self,
         event: GroupMessageEvent,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         """处理群聊消息的主流程。
 
         Args:
             event: 群聊消息事件
 
         Returns:
-            回复内容，如果不需要回复则返回 None
+            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
+            如果不需要回复则返回 None
         """
         # 获取最新配置
         config = get_config()
@@ -99,7 +101,7 @@ class MessageHandler:
         # 检查是否 @ 了机器人（跳过 BERT 评分，直接回复）
         if self._is_at_trigger(event):
             # 生成回复（内部会存储当前消息）
-            return await self._handle_at_trigger(message)
+            return await self._handle_at_trigger(message, message_id)
 
         # 调用 BERT 服务评分
         score = await score_message(
@@ -119,7 +121,7 @@ class MessageHandler:
             return None
 
         if score >= config.proactive_score_threshold:  # 主动回复阈值
-            return await self._handle_interrupt_signal(message, score)
+            return await self._handle_interrupt_signal(message, message_id, score)
 
         # 普通消息
         await self._handle_normal_message(message)
@@ -185,14 +187,16 @@ class MessageHandler:
     async def _handle_at_trigger(
         self,
         message: MessageSchema,
-    ) -> str:
+        reply_to_message_id: str,
+    ) -> dict[str, Any]:
         """处理 @ 触发回复（必须回复，无冷却限制）。
 
         Args:
             message: 消息对象
+            reply_to_message_id: 要回复的消息ID
 
         Returns:
-            回复内容
+            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典
         """
         config = get_config()
 
@@ -236,24 +240,26 @@ class MessageHandler:
                 bot_nickname=config.bot_nickname,
             )
             logger.info(f"[KomariMemory] @ 回复: group={message.group_id}")
-        else:
-            logger.warning(f"[KomariMemory] @ 回复生成失败: group={message.group_id}")
-
-        return reply or "抱歉，我暂时无法回复。"
+            return {"reply": reply, "reply_to_message_id": reply_to_message_id}
+        logger.warning(f"[KomariMemory] @ 回复生成失败: group={message.group_id}")
+        return {"reply": "抱歉，我暂时无法回复。", "reply_to_message_id": reply_to_message_id}
 
     async def _handle_interrupt_signal(
         self,
         message: MessageSchema,
+        reply_to_message_id: str,
         score: float,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         """处理中断信号（主动回复）。
 
         Args:
             message: 消息对象
+            reply_to_message_id: 要回复的消息ID
             score: 评分
 
         Returns:
-            回复内容
+            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
+            如果不需要回复则返回 None
         """
         # 获取最新配置
         config = get_config()
@@ -320,9 +326,8 @@ class MessageHandler:
             logger.info(
                 f"[KomariMemory] 主动回复: group={message.group_id}, score={score:.2f}"
             )
-        else:
-            logger.warning(
-                f"[KomariMemory] 主动回复生成失败: group={message.group_id}, score={score:.2f}"
-            )
-
-        return reply
+            return {"reply": reply, "reply_to_message_id": reply_to_message_id}
+        logger.warning(
+            f"[KomariMemory] 主动回复生成失败: group={message.group_id}, score={score:.2f}"
+        )
+        return None

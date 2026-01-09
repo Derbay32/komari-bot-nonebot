@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from nonebot import get_driver, logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+from nonebot.adapters.onebot.v11.message import MessageSegment
 from nonebot.plugin import PluginMetadata, require
 
 if TYPE_CHECKING:
@@ -157,10 +158,17 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
-        reply = await manager.handler.process_message(event)
+        result = await manager.handler.process_message(event)
 
-        if reply:
-            await matcher.send(reply)
+        if result:
+            reply = result.get("reply")
+            reply_to_message_id = result.get("reply_to_message_id")
+            if reply_to_message_id:
+                # 使用 QQ 原生回复功能
+                reply_message = MessageSegment.reply(reply_to_message_id) + reply
+                await matcher.send(reply_message)
+            else:
+                await matcher.send(reply)
 
     except Exception:
         logger.exception("[KomariMemory] 消息处理失败")
