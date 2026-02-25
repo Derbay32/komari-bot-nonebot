@@ -11,6 +11,7 @@ from ..services.config_interface import get_config
 from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message
+from ..services.not_related_logger import is_not_related, log_not_related
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.redis_manager import MessageSchema, RedisManager
@@ -243,6 +244,16 @@ class MessageHandler:
         )
 
         if reply is not None:
+            # 检测 LLM 是否判断为无关输入
+            if is_not_related(reply):
+                logger.info(f"[KomariMemory] @ not related: group={message.group_id}")
+                await log_not_related(
+                    user_message=message.content,
+                    group_id=message.group_id,
+                    user_id=message.user_id,
+                )
+                return None
+
             # 存储 AI 回复到缓冲区
             await self._store_ai_reply(
                 group_id=message.group_id,
@@ -333,6 +344,19 @@ class MessageHandler:
 
         # 只有成功生成回复时才设置冷却和增加计数
         if reply is not None:
+            # 检测 LLM 是否判断为无关输入
+            if is_not_related(reply):
+                logger.info(
+                    f"[KomariMemory] 主动回复 not related: group={message.group_id}, score={score:.2f}"
+                )
+                await log_not_related(
+                    user_message=message.content,
+                    group_id=message.group_id,
+                    user_id=message.user_id,
+                    score=score,
+                )
+                return None
+
             # 存储 AI 回复到缓冲区
             await self._store_ai_reply(
                 group_id=message.group_id,
