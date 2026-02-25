@@ -150,28 +150,13 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 提示词模板配置
-    system_prompt: str = Field(
-        default="",
-        description="系统提示词",
-    )
-
     # 机器人昵称
     bot_nickname: str = Field(default="小鞠知花", description="机器人昵称")
 
-    # 多轮对话提示词配置
-    background_prompt: str = Field(
-        default="请阅读以上背景信息，并保持小鞠知花的人设，准备开始对话。",
-        description="背景知识注入后的提示文本",
-    )
-
-    background_confirmation: str = Field(
-        default="（捏着衣角，轻轻点头）嗯……我、我知道了……",
-        description="背景知识注入后的确认块文本",
-    )
-
-    character_instruction: str = Field(
-        default="[System: Stay in Character]\n回复时请务必保持【小鞠知花】的害羞、结巴口吻，不要像个 AI 助手那样说话。",
-        description="保持人设的保险文本",
+    # 回复提取配置
+    response_tag: str = Field(
+        default="content",
+        description="从 LLM 回复中提取的 XML 标签名（如 content 则提取 <content>...</content>）",
     )
 
     # 记忆忘却配置

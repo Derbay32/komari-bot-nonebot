@@ -88,7 +88,6 @@ class QueryRewriteService:
             # 调用 LLM 重写（使用总结模型，更快）
             rewritten = await llm_provider.generate_text(
                 prompt=rewrite_prompt,
-                provider=config.llm_provider,
                 model=config.llm_model_summary,
                 temperature=0.3,
                 max_tokens=256,
