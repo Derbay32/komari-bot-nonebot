@@ -145,7 +145,9 @@ async def build_prompt(
     # 对话记忆
     if memories:
         memory_items = "\n".join([f"- {m['summary']}" for m in memories])
-        system_parts.append(f"<memory>\n{memory_items}\n</memory>")
+        system_parts.append(
+            f"<memory>\n以下是过往的对话记忆:\n{memory_items}\n</memory>"
+        )
 
     # 常识库
     if config.knowledge_enabled:
@@ -169,13 +171,13 @@ async def build_prompt(
                         [f"- {r.content}" for r in keyword_results]
                     )
                     system_parts.append(
-                        f"<keyword_knowledge>\n{keyword_items}\n</keyword_knowledge>"
+                        f"<keyword_knowledge>\n以下是与当前话题相关的关键词知识:\n{keyword_items}\n</keyword_knowledge>"
                     )
 
                 if vector_results:
                     vector_items = "\n".join([f"- {r.content}" for r in vector_results])
                     system_parts.append(
-                        f"<vector_knowledge>\n{vector_items}\n</vector_knowledge>"
+                        f"<vector_knowledge>\n以下是语义检索到的相关知识:\n{vector_items}\n</vector_knowledge>"
                     )
         except Exception:
             logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
@@ -208,7 +210,9 @@ async def build_prompt(
                     for item in user_profile_results
                 ]
             )
-            system_parts.append(f"<user_profiles>\n{profile_items}\n</user_profiles>")
+            system_parts.append(
+                f"<user_profiles>\n以下是对话中用户的已知信息:\n{profile_items}\n</user_profiles>"
+            )
 
     # 用户实体注入（从对话总结中提取的结构化实体）
     if memory_service and group_id and all_user_ids:
@@ -227,7 +231,9 @@ async def build_prompt(
 
         if entity_parts:
             entity_text = "\n".join(entity_parts)
-            system_parts.append(f"<user_entities>\n{entity_text}\n</user_entities>")
+            system_parts.append(
+                f"<user_entities>\n以下是从历史对话中提取的用户实体信息:\n{entity_text}\n</user_entities>"
+            )
 
     messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
