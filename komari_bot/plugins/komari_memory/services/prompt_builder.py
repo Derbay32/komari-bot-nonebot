@@ -1,13 +1,18 @@
 """Komari Memory 动态提示词构建服务。"""
 
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.plugin import require
 from zhdate import ZhDate
 
-from ..config_schema import KomariMemoryConfigSchema
+from ..config_schema import KomariMemoryConfigSchema  # noqa: TC001
+
+if TYPE_CHECKING:
+    from .memory_service import MemoryService
 
 # 获取常识库插件
 komari_knowledge = require("komari_knowledge")
@@ -51,9 +56,7 @@ def get_festival_info() -> str | None:
         # 提取月份日部分（去掉年份前缀）
         chinese_full = lunar.chinese().split()[0]  # "二零二五年腊月初八"
         chinese_date = chinese_full[5:]  # 去掉年份，保留 "腊月初八"
-        festivals.append(
-            f"今天是{traditional[(month, day)]}（农历{chinese_date}）"
-        )
+        festivals.append(f"今天是{traditional[(month, day)]}（农历{chinese_date}）")
 
     # 公历节日
     public = {
@@ -91,8 +94,10 @@ async def build_prompt(
     current_user_id: str | None = None,
     current_user_nickname: str | None = None,
     search_query: str | None = None,
+    memory_service: MemoryService | None = None,
+    group_id: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """构建多轮对话提示词（记忆 + 常识库 + 最近消息）。
+    """构建多轮对话提示词（记忆 + 常识库 + 最近消息 + 用户实体）。
 
     Args:
         user_message: 用户原始消息（用于生成回复）
@@ -102,6 +107,8 @@ async def build_prompt(
         current_user_id: 当前用户 ID（可选）
         current_user_nickname: 当前用户昵称（可选）
         search_query: 重写后的搜索查询（用于知识库检索）
+        memory_service: 记忆服务（用于检索用户实体，可选）
+        group_id: 群组 ID（用于检索用户实体，可选）
 
     Returns:
         (system_prompt, contents_list) 元组
@@ -192,6 +199,33 @@ async def build_prompt(
             background_parts.append(
                 f"<user_profiles>\n{profile_items}\n</user_profiles>"
             )
+
+    # 用户实体注入（从对话总结中提取的结构化实体）
+    if memory_service and group_id:
+        entity_user_ids: set[str] = set()
+        if recent_messages:
+            for msg in recent_messages:
+                if not msg.is_bot:
+                    entity_user_ids.add(msg.user_id)
+        if current_user_id:
+            entity_user_ids.add(current_user_id)
+
+        entity_parts: list[str] = []
+        for uid in entity_user_ids:
+            try:
+                entities = await memory_service.get_entities(
+                    user_id=uid, group_id=group_id
+                )
+                entity_parts.extend(
+                    f"- 用户({uid}): {e['key']}={e['value']} [{e.get('category', 'general')}]"
+                    for e in entities
+                )
+            except Exception:
+                logger.debug(f"[KomariMemory] 用户 {uid} 的实体检索失败", exc_info=True)
+
+        if entity_parts:
+            entity_text = "\n".join(entity_parts)
+            background_parts.append(f"<user_entities>\n{entity_text}\n</user_entities>")
 
     # 如果有背景信息，添加到 contents 并加上确认块
     if background_parts:

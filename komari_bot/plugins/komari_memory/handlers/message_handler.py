@@ -232,6 +232,8 @@ class MessageHandler:
             recent_messages=recent_messages,
             current_user_id=message.user_id,
             current_user_nickname=message.user_nickname,
+            memory_service=self.memory,
+            group_id=message.group_id,
         )
 
         # 生成回复
@@ -321,6 +323,8 @@ class MessageHandler:
             recent_messages=recent_messages,
             current_user_id=message.user_id,
             current_user_nickname=message.user_nickname,
+            memory_service=self.memory,
+            group_id=message.group_id,
         )
 
         # 生成回复（contents_list 已包含记忆、常识库、历史对话、用户输入）
