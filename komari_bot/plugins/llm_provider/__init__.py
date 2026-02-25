@@ -1,11 +1,14 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口（OpenAI 兼容格式）。"""
 
+import time
+
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
 from .config import Config
 from .config_schema import DynamicConfigSchema
 from .deepseek_client import DeepSeekClient
+from .llm_logger import log_llm_call
 from .types import StructuredOutputSchema
 
 __plugin_meta__ = PluginMetadata(
@@ -93,6 +96,7 @@ async def generate_text(
         生成的文本
     """
     client = _get_client()
+    start_time = time.monotonic()
 
     try:
         # 知识库检索
@@ -115,7 +119,7 @@ async def generate_text(
             placeholder, knowledge_context
         )
 
-        return await client.generate_text(
+        result = await client.generate_text(
             prompt=prompt,
             model=model,
             system_instruction=final_system_instruction,
@@ -127,8 +131,29 @@ async def generate_text(
             **kwargs,
         )
     except Exception as e:
+        duration_ms = (time.monotonic() - start_time) * 1000
+        await log_llm_call(
+            method="generate_text",
+            model=model,
+            input_data={"prompt": prompt, "system_instruction": system_instruction},
+            error=str(e),
+            duration_ms=duration_ms,
+        )
         logger.error(f"LLM 调用失败: {e}")
         raise
+    else:
+        duration_ms = (time.monotonic() - start_time) * 1000
+        await log_llm_call(
+            method="generate_text",
+            model=model,
+            input_data={
+                "prompt": prompt,
+                "system_instruction": final_system_instruction,
+            },
+            output=result,
+            duration_ms=duration_ms,
+        )
+        return result
     finally:
         await client.close()
 
@@ -155,9 +180,10 @@ async def generate_text_with_messages(
         生成的文本
     """
     client = _get_client()
+    start_time = time.monotonic()
 
     try:
-        return await client.generate_text_with_messages(
+        result = await client.generate_text_with_messages(
             messages=messages,
             model=model,
             temperature=temperature,
@@ -166,8 +192,26 @@ async def generate_text_with_messages(
             **kwargs,
         )
     except Exception as e:
+        duration_ms = (time.monotonic() - start_time) * 1000
+        await log_llm_call(
+            method="generate_text_with_messages",
+            model=model,
+            input_data=messages,
+            error=str(e),
+            duration_ms=duration_ms,
+        )
         logger.error(f"LLM 调用失败: {e}")
         raise
+    else:
+        duration_ms = (time.monotonic() - start_time) * 1000
+        await log_llm_call(
+            method="generate_text_with_messages",
+            model=model,
+            input_data=messages,
+            output=result,
+            duration_ms=duration_ms,
+        )
+        return result
     finally:
         await client.close()
 
@@ -202,9 +246,10 @@ async def generate_text_with_contents(
         生成的文本
     """
     client = _get_client()
+    start_time = time.monotonic()
 
     try:
-        return await client.generate_text_with_contents(
+        result = await client.generate_text_with_contents(
             contents=contents,
             model=model,
             system_instruction=system_instruction,
@@ -216,8 +261,26 @@ async def generate_text_with_contents(
             **kwargs,
         )
     except Exception as e:
+        duration_ms = (time.monotonic() - start_time) * 1000
+        await log_llm_call(
+            method="generate_text_with_contents",
+            model=model,
+            input_data={"contents": contents, "system_instruction": system_instruction},
+            error=str(e),
+            duration_ms=duration_ms,
+        )
         logger.error(f"LLM 调用失败: {e}")
         raise
+    else:
+        duration_ms = (time.monotonic() - start_time) * 1000
+        await log_llm_call(
+            method="generate_text_with_contents",
+            model=model,
+            input_data={"contents": contents, "system_instruction": system_instruction},
+            output=result,
+            duration_ms=duration_ms,
+        )
+        return result
     finally:
         await client.close()
 
