@@ -94,7 +94,7 @@ def _extract_tag_content(text: str, tag: str) -> str:
     Returns:
         标签内的文本，未找到标签则返回原始文本（降级）
     """
-    pattern = rf"<{tag}>([\s\S]*?)</{tag}>"
+    pattern = rf"<{tag}>([\s\S]*)</{tag}>"
     match = re.search(pattern, text)
     if match:
         return match.group(1).strip()

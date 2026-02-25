@@ -52,17 +52,16 @@ async def perform_summary(
     config = get_config()
 
     # 获取消息缓冲
-    messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_messages)
+    messages_buffer = await redis.get_buffer(
+        group_id, limit=config.summary_max_messages
+    )
 
     if not messages_buffer:
         logger.warning(f"[KomariMemory] 群组 {group_id} 消息缓冲为空")
         return
 
-    # 提取消息内容
-    message_texts = [msg.content for msg in messages_buffer]
-
-    # 调用 LLM 总结
-    result = await summarize_conversation(message_texts, config)
+    # 调用 LLM 总结（直接传递 MessageSchema 列表）
+    result = await summarize_conversation(messages_buffer, config)
 
     summary = result.get("summary", "")
     entities = result.get("entities", [])

@@ -223,8 +223,8 @@ class MessageHandler:
             limit=config.memory_search_limit,
         )
 
-        # 构建提示词（传递重写后的查询用于知识库检索）
-        system_prompt, contents_list = await build_prompt(
+        # 构建提示词（5 段式 OpenAI messages）
+        messages = await build_prompt(
             user_message=message.content,
             search_query=rewritten_query,
             memories=memories,
@@ -238,10 +238,8 @@ class MessageHandler:
 
         # 生成回复
         reply = await generate_reply(
-            user_message=message.content,
-            system_prompt=system_prompt,
             config=config,
-            contents_list=contents_list,
+            messages=messages,
         )
 
         if reply is not None:
@@ -314,8 +312,8 @@ class MessageHandler:
             limit=config.memory_search_limit,
         )
 
-        # 构建提示词（返回 system_prompt 和 contents_list，传递重写后的查询）
-        system_prompt, contents_list = await build_prompt(
+        # 构建提示词（5 段式 OpenAI messages）
+        messages = await build_prompt(
             user_message=message.content,
             search_query=rewritten_query,
             memories=memories,
@@ -327,12 +325,10 @@ class MessageHandler:
             group_id=message.group_id,
         )
 
-        # 生成回复（contents_list 已包含记忆、常识库、历史对话、用户输入）
+        # 生成回复
         reply = await generate_reply(
-            user_message=message.content,  # 保留用于向后兼容
-            system_prompt=system_prompt,
             config=config,
-            contents_list=contents_list,
+            messages=messages,
         )
 
         # 只有成功生成回复时才设置冷却和增加计数

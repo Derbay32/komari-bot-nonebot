@@ -41,6 +41,30 @@ class BaseLLMClient(ABC):
         """
 
     @abstractmethod
+    async def generate_text_with_messages(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+        **kwargs,  # noqa: ANN003
+    ) -> str:
+        """使用 OpenAI 格式 messages 生成文本。
+
+        Args:
+            messages: 消息列表 [{role, content}]
+            model: 模型名称
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            response_format: Response format dict
+            **kwargs: 其他参数
+
+        Returns:
+            生成的文本
+        """
+
+    @abstractmethod
     async def test_connection(self) -> bool:
         """测试 API 连接。
 

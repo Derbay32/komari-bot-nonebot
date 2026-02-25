@@ -169,7 +169,6 @@ class ForgettingService:
         try:
             response = await llm_provider.generate_text(
                 prompt=prompt,
-                provider=self.config.llm_provider,
                 model=self.config.llm_model_summary,
                 temperature=0.3,
                 max_tokens=100,
