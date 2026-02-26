@@ -40,7 +40,7 @@ class EntityRepository:
             # 检查是否存在
             existing = await conn.fetchrow(
                 """
-                SELECT id FROM komari_memory_entity
+                SELECT 1 FROM komari_memory_entity
                 WHERE user_id = $1 AND group_id = $2 AND key = $3
                 """,
                 user_id,

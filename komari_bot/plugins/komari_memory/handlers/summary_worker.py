@@ -85,18 +85,26 @@ async def perform_summary(
     # 存储实体
     for entity in entities:
         try:
+            entity_key = entity.get("key", "")
+            entity_value = entity.get("value", "")
+            if not entity_key:
+                logger.debug(f"[KomariMemory] 跳过无效实体 (缺少 key): {entity}")
+                continue
             await memory.upsert_entity(
                 user_id=entity.get(
                     "user_id", participants[0] if participants else "unknown"
                 ),
                 group_id=group_id,
-                key=entity.get("key", ""),
-                value=entity.get("value", ""),
+                key=entity_key,
+                value=entity_value,
                 category=entity.get("category", "general"),
                 importance=entity.get("importance", 3),
             )
         except Exception:
-            logger.debug("[KomariMemory] 存储实体失败", exc_info=True)
+            logger.warning(
+                f"[KomariMemory] 存储实体失败: {entity}",
+                exc_info=True,
+            )
 
     # 重置消息计数
     await redis.reset_message_count(group_id)

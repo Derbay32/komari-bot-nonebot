@@ -185,51 +185,34 @@ async def summarize_conversation(
 - 4分：有意义的话题讨论
 - 5分：重要的决定、约定、或有价值的讨论"""
 
-    # 首先尝试使用结构化输出
-    try:
-        response = await llm_provider.generate_text(
-            prompt=prompt,
-            model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=config.llm_max_tokens_summary,
-            response_schema=ConversationSummarySchema,
-        )
+    # 在 prompt 中添加 JSON 格式要求（直接使用 prompt 引导格式，
+    # 因为 DeepSeekClient 不支持通过 response_schema 约束输出结构）
+    fallback_example = (
+        '{"summary": "...", "entities": '
+        '[{"user_id": "12345", "key": "喜欢的食物", "value": "拉面", "category": "preference"}], '
+        '"importance": 3}'
+    )
+    prompt_with_format = prompt + f"\n\n返回 JSON 格式：{fallback_example}"
 
-        # 解析结构化响应
-        result = ConversationSummarySchema.model_validate_json(response)
-        return result.model_dump()
+    response = await llm_provider.generate_text(
+        prompt=prompt_with_format,
+        model=config.llm_model_summary,
+        temperature=config.llm_temperature_summary,
+        max_tokens=config.llm_max_tokens_summary,
+    )
 
-    except Exception as e:
-        # 结构化输出失败，使用传统方法作为降级方案
-        logger.warning(f"结构化输出失败，使用传统方法: {e}")
+    # 提取 JSON
+    json_text = _extract_json_from_markdown(response)
+    result = json.loads(json_text)
 
-        # 在 prompt 中添加 JSON 格式要求
-        fallback_example = (
-            '{"summary": "...", "entities": '
-            '[{"user_id": "12345", "key": "喜欢的食物", "value": "拉面", "category": "preference"}], '
-            '"importance": 3}'
-        )
-        prompt_with_format = prompt + f"\n\n返回 JSON 格式：{fallback_example}"
-
-        response = await llm_provider.generate_text(
-            prompt=prompt_with_format,
-            model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=config.llm_max_tokens_summary,
-        )
-
-        # 提取 JSON
-        json_text = _extract_json_from_markdown(response)
-        result = json.loads(json_text)
-
-        # 确保 importance 字段存在且在合理范围内
-        if "importance" not in result:
+    # 确保 importance 字段存在且在合理范围内
+    if "importance" not in result:
+        result["importance"] = 3
+    else:
+        try:
+            importance = int(result["importance"])
+            result["importance"] = max(1, min(5, importance))
+        except (ValueError, TypeError):
             result["importance"] = 3
-        else:
-            try:
-                importance = int(result["importance"])
-                result["importance"] = max(1, min(5, importance))
-            except (ValueError, TypeError):
-                result["importance"] = 3
 
-        return result
+    return result
