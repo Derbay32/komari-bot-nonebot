@@ -4,10 +4,11 @@ on:
   # 正式版本：在 GitHub 创建 Release 时触发
   release:
     types: [created]
-  # 预发布版本：推送 tag 时触发
+  # 预发布版本：推送 beta/rc tag 时触发
   push:
     tags:
-      - "v*"
+      - "v*-beta*"
+      - "v*-rc*"
 
 permissions:
   contents: write
