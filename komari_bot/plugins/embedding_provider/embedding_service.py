@@ -81,11 +81,23 @@ class EmbeddingService:
         if self.config.embedding_api_key:
             headers["Authorization"] = f"Bearer {self.config.embedding_api_key}"
 
-        payload = {"model": self.config.embedding_model, "input": texts}
+        payload = {
+            "model": self.config.embedding_model,
+            "input": texts,
+        }
+        if getattr(self.config, "embedding_dimension", None):
+            payload["dimensions"] = self.config.embedding_dimension
 
         session = await self._get_http_session()
         async with session.post(url, headers=headers, json=payload) as resp:
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except aiohttp.ClientResponseError as e:
+                error_body = await resp.text()
+                logger.error(
+                    f"[EmbeddingAPI] Error {e.status}: {error_body}. Payload: {payload}"
+                )
+                raise
             data = await resp.json()
 
             # OpenAI format: {"data": [{"embedding": [...]}, ...]}

@@ -7,12 +7,21 @@
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 
 import asyncpg
+import nonebot
 
-# [需要修改以保证安全导入]
-# import src.plugins.embedding_provider...
+# 将项目根目录添加到 sys.path 以确保能正确导入 komari_bot 包
+project_root = Path(__file__).parent.parent.resolve()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# 初始化 nonebot 并加载必需的外部包，否则直接导入包含 require() 的插件会报错
+nonebot.init()
+nonebot.load_plugin("komari_bot.plugins.config_manager")
+
 from komari_bot.plugins.embedding_provider.config_schema import DynamicConfigSchema
 from komari_bot.plugins.embedding_provider.embedding_service import EmbeddingService
 
@@ -92,24 +101,24 @@ async def migrate_komari_knowledge(
 async def migrate_komari_memory(
     pool: asyncpg.Pool, embedding_service: EmbeddingService
 ) -> None:
-    """[Migrate] 重新嵌入 komari_memory_conversation 表的向量数据"""
-    logger.info("开始迁移 komari_memory_conversation 向量数据...")
+    """[Migrate] 重新嵌入 komari_memory_conversations 表的向量数据"""
+    logger.info("开始迁移 komari_memory_conversations 向量数据...")
 
     async with pool.acquire() as conn:
         # 检查表是否存在
         table_exists = await conn.fetchval(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'komari_memory_conversation')"
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'komari_memory_conversations')"
         )
         if not table_exists:
-            logger.warning("komari_memory_conversation 表不存在，跳过记忆库迁移。\n")
+            logger.warning("komari_memory_conversations 表不存在，跳过记忆库迁移。\n")
             return
 
         # 获取所有需要嵌入的对话摘要
         rows = await conn.fetch(
-            "SELECT id, summary FROM komari_memory_conversation WHERE summary IS NOT NULL AND summary != ''"
+            "SELECT id, summary FROM komari_memory_conversations WHERE summary IS NOT NULL AND summary != ''"
         )
         total = len(rows)
-        logger.info(f"komari_memory_conversation 共需处理 {total} 条数据。")
+        logger.info(f"komari_memory_conversations 共需处理 {total} 条数据。")
 
         for idx, row in enumerate(rows):
             cid = row["id"]
@@ -121,20 +130,20 @@ async def migrate_komari_memory(
 
                 # 更新数据库
                 await conn.execute(
-                    "UPDATE komari_memory_conversation SET embedding = $1::vector WHERE id = $2",
+                    "UPDATE komari_memory_conversations SET embedding = $1::vector WHERE id = $2",
                     str(embedding),
                     cid,
                 )
 
                 if (idx + 1) % 10 == 0:
                     logger.info(
-                        f"komari_memory_conversation: 已处理 {idx + 1}/{total} 条数据"
+                        f"komari_memory_conversations: 已处理 {idx + 1}/{total} 条数据"
                     )
 
             except Exception:
-                logger.exception(f"处理 komari_memory_conversation ID {cid} 时出错:")
+                logger.exception(f"处理 komari_memory_conversations ID {cid} 时出错:")
 
-    logger.info("komari_memory_conversation 向量数据迁移完成！\n")
+    logger.info("komari_memory_conversations 向量数据迁移完成！\n")
 
 
 async def main() -> None:
