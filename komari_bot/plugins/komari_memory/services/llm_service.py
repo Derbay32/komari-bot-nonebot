@@ -151,12 +151,16 @@ async def generate_reply(
 async def summarize_conversation(
     messages: list[MessageSchema],
     config: KomariMemoryConfigSchema,
+    existing_entities: list[dict] | None = None,
+    existing_interactions: list[dict] | None = None,
 ) -> dict:
     """总结对话，提取实体，并评估重要性（使用结构化输出，带重试机制）。
 
     Args:
         messages: MessageSchema 消息列表（包含 user_id 和 user_nickname）
         config: 插件配置
+        existing_entities: 已存储的实体列表，用于 LLM 感知已有信息并执行更新
+        existing_interactions: 已存储的互动历史列表，用于 LLM 在已有记录上追加
 
     Returns:
         总结结果，包含 summary, entities, importance
@@ -171,13 +175,45 @@ async def summarize_conversation(
                 f"[user_id:{msg.user_id}] {msg.user_nickname}: {msg.content}"
             )
 
+    # 格式化已知实体信息
+    existing_context = ""
+    if existing_entities:
+        entity_lines = []
+        for e in existing_entities:
+            uid = e.get("user_id", "unknown")
+            key = e.get("key", "")
+            value = e.get("value", "")
+            category = e.get("category", "general")
+            entity_lines.append(f"- [user_id:{uid}] {key} = {value} ({category})")
+        existing_context += "【已知实体信息（数据库中已有记录）】\n"
+        existing_context += "以下是目前已存储的用户实体：\n"
+        existing_context += "\n".join(entity_lines) + "\n\n"
+
+    if existing_interactions:
+        interaction_lines = []
+        for i in existing_interactions:
+            uid = i.get("user_id", "unknown")
+            value = i.get("value", "{}")
+            interaction_lines.append(f"- [user_id:{uid}] interaction_history: {value}")
+        existing_context += "以下是目前已存储的用户互动历史：\n"
+        existing_context += "\n".join(interaction_lines) + "\n\n"
+
+    if existing_context:
+        existing_context += (
+            "【重要指示】\n"
+            "- 如果对话中出现与已有实体矛盾的新信息，请用新信息覆盖旧值（使用相同的 key）\n"
+            "- 如果对话中没有提到某个已有实体，不要在输出中重复它\n"
+            "- 只输出需要新增或更新的实体\n"
+            "- 对于互动历史，请在已有记录的基础上追加新的 records，合并后输出完整的互动历史\n\n"
+        )
+
     prompt = f"""请总结以下群聊或私聊对话，提取关键实体信息（如偏好、事实、关系等），并评估对话的重要性。输出必须使用简体中文。
 
 每条消息格式为 [user_id:xxx] 昵称: 内容。请你在提取时将 user_id 准确关联。
 
 {chr(10).join(formatted_messages)}
 
-【任务一：客观信息提取】
+{existing_context}【任务一：客观信息提取】
 - 提取对话的核心内容，形成 summary（简短总结）。
 - 提取用户提到的偏好（喜欢的食物、音乐等）、个人事实（职业、年龄等）、关系（朋友、同事等），作为 entities。（category 选：preference/fact/relation/general）
 
