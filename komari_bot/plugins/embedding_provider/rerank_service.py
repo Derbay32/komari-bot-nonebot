@@ -60,21 +60,28 @@ class RerankService:
             "top_n": n,
         }
         session = await self._get_http_session()
-        async with session.post(url, headers=headers, json=payload) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            # Jina/Cohere format: {"results": [{"index": 0, "relevance_score": 0.95}, ...]}
-            results = [
-                RerankResult(
-                    index=item.get("index", 0),
-                    relevance_score=item.get("relevance_score", 0.0),
-                )
-                for item in data.get("results", [])
-            ]
+        logger.info(
+            f"[EmbeddingProvider] 正在使用 {self.config.rerank_model} 对 {len(documents)} 个文档进行重排 (Query: '{query}')"
+        )
+        try:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                # Jina/Cohere format: {"results": [{"index": 0, "relevance_score": 0.95}, ...]}
+                results = [
+                    RerankResult(
+                        index=item.get("index", 0),
+                        relevance_score=item.get("relevance_score", 0.0),
+                    )
+                    for item in data.get("results", [])
+                ]
 
-            # 按分数的降序排列以防万一
-            results.sort(key=lambda x: x.relevance_score, reverse=True)
-            return results
+                # 按分数的降序排列以防万一
+                results.sort(key=lambda x: x.relevance_score, reverse=True)
+                return results
+        except Exception as e:
+            logger.exception(f"[EmbeddingProvider] Rerank API 调用失败: {e}")
+            raise
 
     async def cleanup(self) -> None:
         """释放资源。"""

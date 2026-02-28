@@ -89,19 +89,27 @@ class EmbeddingService:
             payload["dimensions"] = self.config.embedding_dimension
 
         session = await self._get_http_session()
-        async with session.post(url, headers=headers, json=payload) as resp:
-            try:
-                resp.raise_for_status()
-            except aiohttp.ClientResponseError as e:
-                error_body = await resp.text()
-                logger.error(
-                    f"[EmbeddingAPI] Error {e.status}: {error_body}. Payload: {payload}"
-                )
-                raise
-            data = await resp.json()
+        logger.info(
+            f"[EmbeddingProvider] 正在请求 API 生成 {len(texts)} 条文本的嵌入向量 (Model: {self.config.embedding_model})"
+        )
 
-            # OpenAI format: {"data": [{"embedding": [...]}, ...]}
-            return [item.get("embedding", []) for item in data.get("data", [])]
+        try:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                try:
+                    resp.raise_for_status()
+                except aiohttp.ClientResponseError as e:
+                    error_body = await resp.text()
+                    logger.error(
+                        f"[EmbeddingAPI] Error {e.status}: {error_body}. Payload: {payload}"
+                    )
+                    raise
+                data = await resp.json()
+
+                # OpenAI format: {"data": [{"embedding": [...]}, ...]}
+                return [item.get("embedding", []) for item in data.get("data", [])]
+        except Exception as e:
+            logger.exception(f"[EmbeddingProvider] 向量嵌入 API 调用失败: {e}")
+            raise
 
     async def cleanup(self) -> None:
         """释放资源。"""
