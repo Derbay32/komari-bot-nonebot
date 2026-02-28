@@ -22,6 +22,7 @@ class MessageSchema:
     content: str
     timestamp: float
     message_id: str
+    is_bot: bool = False
 
 
 class RedisManager:
@@ -95,6 +96,7 @@ class RedisManager:
             "content": message.content,
             "timestamp": message.timestamp,
             "message_id": message.message_id,
+            "is_bot": message.is_bot,
         }
 
         pipe = self.redis.pipeline()
@@ -130,6 +132,7 @@ class RedisManager:
                     content=data["content"],
                     timestamp=data["timestamp"],
                     message_id=data["message_id"],
+                    is_bot=data.get("is_bot", False),
                 )
             )
 
@@ -169,6 +172,7 @@ class RedisManager:
                     content=msg_data["content"],
                     timestamp=msg_data["timestamp"],
                     message_id=msg_data["message_id"],
+                    is_bot=msg_data.get("is_bot", False),
                 )
             )
 

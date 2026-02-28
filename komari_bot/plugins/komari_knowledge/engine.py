@@ -286,6 +286,50 @@ class KnowledgeEngine:
 
         return results
 
+    async def search_by_keyword(self, keyword: str) -> list[SearchResult]:
+        """通过关键词精确查询知识。
+
+        Args:
+            keyword: 关键词（如用户 UID）
+
+        Returns:
+            检索结果列表
+        """
+        if not self._index_loaded:
+            return []
+
+        # 在内存索引中查找
+        keyword_lower = keyword.lower()
+        if keyword_lower not in self._keyword_index:
+            return []
+
+        matched_ids = self._keyword_index[keyword_lower]
+
+        # 从数据库获取完整内容
+        if self._pool is None:
+            return []
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, category, content
+                FROM komari_knowledge
+                WHERE id = ANY($1)
+                """,
+                list(matched_ids),
+            )
+
+        return [
+            SearchResult(
+                id=row["id"],
+                category=row["category"],
+                content=row["content"],
+                similarity=1.0,
+                source="keyword",
+            )
+            for row in rows
+        ]
+
     async def _layer1_keyword_search(
         self, query: str, limit: int
     ) -> list[SearchResult]:

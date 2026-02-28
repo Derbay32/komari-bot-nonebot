@@ -1,6 +1,7 @@
 """Komari Memory 消息处理核心。"""
 
 import time
+from typing import Any
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
@@ -10,7 +11,9 @@ from ..services.config_interface import get_config
 from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message
+from ..services.not_related_logger import is_not_related, log_not_related
 from ..services.prompt_builder import build_prompt
+from ..services.query_rewrite_service import QueryRewriteService
 from ..services.redis_manager import MessageSchema, RedisManager
 
 
@@ -30,34 +33,31 @@ class MessageHandler:
         """
         self.redis = redis
         self.memory = memory
+        self.query_rewrite = QueryRewriteService()
 
-    def _is_reply_trigger(self, event: GroupMessageEvent) -> bool:
-        """检查是否触发被回复回复。
+    def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
+        """检查是否 @ 了机器人。
 
         Args:
             event: 群聊消息事件
 
         Returns:
-            是否触发
+            是否 @ 了机器人
         """
-        # 检查是否回复了某条消息
-        if event.reply is not None:
-            return True
-
-        # 检查是否 @ 了 bot
         return bool(hasattr(event, "to_me") and event.to_me)
 
     async def process_message(
         self,
         event: GroupMessageEvent,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         """处理群聊消息的主流程。
 
         Args:
             event: 群聊消息事件
 
         Returns:
-            回复内容，如果不需要回复则返回 None
+            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
+            如果不需要回复则返回 None
         """
         # 获取最新配置
         config = get_config()
@@ -84,6 +84,10 @@ class MessageHandler:
             message_id=message_id,
         )
 
+        # 优先检查是否 @ 了机器人（跳过所有过滤和评分，直接回复）
+        if self._is_at_trigger(event):
+            return await self._handle_at_trigger(message, message_id)
+
         # 前置过滤
         filter_result = await preprocess_message(
             message=message_content,
@@ -100,13 +104,6 @@ class MessageHandler:
             # 低价值消息直接丢弃
             await self._handle_low_value(message)
             return None
-
-        # 检查是否触发被回复回复（优先级最高）
-        if self._is_reply_trigger(event):
-            # 存储当前消息到缓冲区
-            await self.redis.push_message(message.group_id, message)
-            # 生成回复
-            return await self._handle_reply_trigger(event, message)
 
         # 调用 BERT 服务评分
         score = await score_message(
@@ -126,7 +123,7 @@ class MessageHandler:
             return None
 
         if score >= config.proactive_score_threshold:  # 主动回复阈值
-            return await self._handle_interrupt_signal(message, score)
+            return await self._handle_interrupt_signal(message, message_id, score)
 
         # 普通消息
         await self._handle_normal_message(message)
@@ -161,115 +158,129 @@ class MessageHandler:
             f"tokens={await self.redis.get_tokens(message.group_id)}"
         )
 
-    async def _get_reply_context(
+    async def _store_ai_reply(
         self,
-        event: GroupMessageEvent,
-        message: MessageSchema,
-    ) -> list[MessageSchema]:
-        """获取被回复时的上下文。
+        group_id: str,
+        reply_content: str,
+        bot_nickname: str,
+    ) -> None:
+        """存储 AI 回复到缓冲区。
 
         Args:
-            event: 群聊消息事件
-            message: 当前消息对象
-
-        Returns:
-            上下文消息列表
+            group_id: 群组 ID
+            reply_content: 回复内容
+            bot_nickname: 机器人昵称
         """
-        config = get_config()
+        import uuid
 
-        # 如果是回复消息，尝试获取被回复消息的上下文
-        if event.reply and event.reply.message_id:
-            reply_context = await self.redis.get_context_around_message(
-                group_id=message.group_id,
-                message_id=str(event.reply.message_id),
-                before=5,
-                after=5,
-            )
-
-            if reply_context:
-                logger.debug(
-                    f"[KomariMemory] 找到被回复消息上下文: {len(reply_context)} 条消息"
-                )
-                return reply_context
-
-        # 如果是 @ 或找不到上下文，使用当前上下文
-        recent_messages = await self.redis.get_buffer(
-            message.group_id,
-            limit=config.context_messages_limit,
+        bot_message = MessageSchema(
+            user_id="bot",
+            user_nickname=bot_nickname,
+            group_id=group_id,
+            content=reply_content,
+            timestamp=time.time(),
+            message_id=f"bot_{uuid.uuid4().hex[:16]}",
+            is_bot=True,
         )
 
-        logger.debug(f"[KomariMemory] 使用当前上下文: {len(recent_messages)} 条消息")
-        return recent_messages
+        await self.redis.push_message(group_id, bot_message)
+        logger.debug(f"[KomariMemory] AI 回复已存储: {reply_content[:30]}...")
 
-    async def _handle_reply_trigger(
+    async def _handle_at_trigger(
         self,
-        event: GroupMessageEvent,
         message: MessageSchema,
-    ) -> str:
-        """处理被回复时的回复（必须回复，无冷却限制）。
+        reply_to_message_id: str,
+    ) -> dict[str, Any] | None:
+        """处理 @ 触发回复（必须回复，无冷却限制）。
 
         Args:
-            event: 群聊消息事件
             message: 消息对象
+            reply_to_message_id: 要回复的消息ID
 
         Returns:
-            回复内容
+            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典
         """
         config = get_config()
 
-        # 获取上下文
-        recent_messages = await self._get_reply_context(event, message)
+        # 先获取最近的消息上下文（不包含当前消息）
+        recent_messages = await self.redis.get_buffer(
+            message.group_id, limit=config.context_messages_limit
+        )
 
-        # 检索相关记忆
+        # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
+        rewritten_query = await self.query_rewrite.rewrite_query(
+            current_query=message.content,
+            conversation_history=recent_messages,
+        )
+
+        # 存储当前消息到缓冲区
+        await self.redis.push_message(message.group_id, message)
+
+        # 检索相关记忆（使用重写后的查询）
         memories = await self.memory.search_conversations(
-            query=message.content,
+            query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
         )
 
-        # 构建提示词
-        system_prompt, user_context = await build_prompt(
+        # 构建提示词（5 段式 OpenAI messages）
+        messages = await build_prompt(
             user_message=message.content,
+            search_query=rewritten_query,
             memories=memories,
             config=config,
             recent_messages=recent_messages,
             current_user_id=message.user_id,
             current_user_nickname=message.user_nickname,
+            memory_service=self.memory,
+            group_id=message.group_id,
         )
 
         # 生成回复
         reply = await generate_reply(
-            user_message=user_context,
-            system_prompt=system_prompt,
             config=config,
+            messages=messages,
         )
 
         if reply is not None:
-            logger.info(
-                f"[KomariMemory] 被回复回复: group={message.group_id}, "
-                f"trigger={'reply' if event.reply else 'at'}"
-            )
-        else:
-            logger.warning(
-                f"[KomariMemory] 被回复回复生成失败: group={message.group_id}"
-            )
+            # 检测 LLM 是否判断为无关输入
+            if is_not_related(reply):
+                logger.info(f"[KomariMemory] @ not related: group={message.group_id}")
+                await log_not_related(
+                    user_message=message.content,
+                    group_id=message.group_id,
+                    user_id=message.user_id,
+                )
+                return None
 
-        return reply or "抱歉，我暂时无法回复。"
+            # 存储 AI 回复到缓冲区
+            await self._store_ai_reply(
+                group_id=message.group_id,
+                reply_content=reply,
+                bot_nickname=config.bot_nickname,
+            )
+            logger.info(f"[KomariMemory] @ 回复: group={message.group_id}")
+            return {"reply": reply, "reply_to_message_id": reply_to_message_id}
+        logger.warning(f"[KomariMemory] @ 回复生成失败: group={message.group_id}")
+        return None
 
     async def _handle_interrupt_signal(
         self,
         message: MessageSchema,
+        reply_to_message_id: str,
         score: float,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         """处理中断信号（主动回复）。
 
         Args:
             message: 消息对象
+            reply_to_message_id: 要回复的消息ID
             score: 评分
 
         Returns:
-            回复内容
+            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
+            如果不需要回复则返回 None
         """
         # 获取最新配置
         config = get_config()
@@ -289,45 +300,77 @@ class MessageHandler:
             logger.debug("[KomariMemory] 主动回复频率超限")
             return None
 
-        # 检索相关记忆（传递 user_id 用于用户相关性加权）
+        # 先获取最近的消息上下文（不包含当前消息）
+        recent_messages = await self.redis.get_buffer(
+            message.group_id, limit=config.context_messages_limit
+        )
+
+        # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
+        rewritten_query = await self.query_rewrite.rewrite_query(
+            current_query=message.content,
+            conversation_history=recent_messages,
+        )
+
+        # 存储当前消息到缓冲区
+        await self.redis.push_message(message.group_id, message)
+        await self.redis.increment_message_count(message.group_id)
+
+        # 检索相关记忆（传递 user_id 用于用户相关性加权，使用重写后的查询）
         memories = await self.memory.search_conversations(
-            query=message.content,
+            query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
         )
 
-        # 获取最近的消息上下文
-        recent_messages = await self.redis.get_buffer(message.group_id, limit=config.context_messages_limit)
-
-        # 构建提示词（返回 system_prompt 和 user_context）
-        system_prompt, user_context = await build_prompt(
+        # 构建提示词（5 段式 OpenAI messages）
+        messages = await build_prompt(
             user_message=message.content,
+            search_query=rewritten_query,
             memories=memories,
             config=config,
             recent_messages=recent_messages,
             current_user_id=message.user_id,
             current_user_nickname=message.user_nickname,
+            memory_service=self.memory,
+            group_id=message.group_id,
         )
 
-        # 生成回复（user_context 已包含记忆、常识库、用户输入）
+        # 生成回复
         reply = await generate_reply(
-            user_message=user_context,
-            system_prompt=system_prompt,
             config=config,
+            messages=messages,
         )
 
         # 只有成功生成回复时才设置冷却和增加计数
         if reply is not None:
+            # 检测 LLM 是否判断为无关输入
+            if is_not_related(reply):
+                logger.info(
+                    f"[KomariMemory] 主动回复 not related: group={message.group_id}, score={score:.2f}"
+                )
+                await log_not_related(
+                    user_message=message.content,
+                    group_id=message.group_id,
+                    user_id=message.user_id,
+                    score=score,
+                )
+                return None
+
+            # 存储 AI 回复到缓冲区
+            await self._store_ai_reply(
+                group_id=message.group_id,
+                reply_content=reply,
+                bot_nickname=config.bot_nickname,
+            )
             await self.redis.set_cooldown(message.group_id, config.proactive_cooldown)
             await self.redis.increment_proactive_count(message.group_id)
 
             logger.info(
                 f"[KomariMemory] 主动回复: group={message.group_id}, score={score:.2f}"
             )
-        else:
-            logger.warning(
-                f"[KomariMemory] 主动回复生成失败: group={message.group_id}, score={score:.2f}"
-            )
-
-        return reply
+            return {"reply": reply, "reply_to_message_id": reply_to_message_id}
+        logger.warning(
+            f"[KomariMemory] 主动回复生成失败: group={message.group_id}, score={score:.2f}"
+        )
+        return None

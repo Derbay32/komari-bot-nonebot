@@ -72,7 +72,7 @@ class KomariMemoryConfigSchema(BaseModel):
         default=1.0, ge=0.0, le=2.0, description="对话模型温度参数"
     )
     llm_max_tokens_chat: int = Field(
-        default=500, ge=20, le=8192, description="对话模型最大 token 数"
+        default=4000, ge=20, le=8192, description="对话模型最大 token 数"
     )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
@@ -84,25 +84,6 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     llm_max_tokens_summary: int = Field(
         default=2048, ge=20, le=8192, description="总结模型最大 token 数"
-    )
-
-    # Gemini API 专用思考配置
-    gemini_thinking_token: int = Field(
-        default=0,
-        ge=0,
-        le=8192,
-        description="Gemini 2.5 及以前模型使用的思考 token 限额参数",
-    )
-
-    gemini_thinking_level: str = Field(
-        default="minimal", description="Gemini 3 及以后模型使用的思考等级参数"
-    )
-
-    # 放进 config 里面，防止 Google 没事换模型名字还得改代码
-    # 其实感觉不适配 2.5 也行但还是加上吧
-    gemini_level_models: list[str] = Field(
-        default=["gemini-3-pro-preview", "gemini-3-flash-preview"],
-        description="Gemini 采用 thinking_level 参数的模型列表",
     )
 
     # 常识库集成配置
@@ -150,9 +131,28 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 提示词模板配置
-    system_prompt: str = Field(
-        default="你是小鞠，一个友好的 AI 助手",
-        description="系统提示词",
+    # 机器人昵称
+    bot_nickname: str = Field(default="小鞠知花", description="机器人昵称")
+
+    # 回复提取配置
+    response_tag: str = Field(
+        default="content",
+        description="从 LLM 回复中提取的 XML 标签名（如 content 则提取 <content>...</content>）",
+    )
+
+    # 记忆忘却配置
+    forgetting_enabled: bool = Field(default=True, description="是否启用记忆忘却")
+    forgetting_importance_threshold: int = Field(
+        default=3, ge=1, le=5, description="删除低重要性记忆的阈值"
+    )
+    forgetting_decay_factor: float = Field(
+        default=0.95, ge=0.9, le=0.99, description="重要性衰减系数"
+    )
+    forgetting_access_boost: float = Field(
+        default=1.2, ge=1.0, le=2.0, description="访问时重要性提升系数"
+    )
+    forgetting_min_age_days: int = Field(
+        default=3, ge=1, le=30, description="记忆最小保留天数"
     )
 
     # 消息过滤配置
@@ -161,6 +161,11 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     filter_history_check_size: int = Field(
         default=50, ge=10, le=200, description="历史重复检测检查的最近消息数量"
+    )
+
+    # 查询重写配置
+    query_rewrite_history_limit: int = Field(
+        default=5, ge=1, le=10, description="查询重写时使用的历史对话数量"
     )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")

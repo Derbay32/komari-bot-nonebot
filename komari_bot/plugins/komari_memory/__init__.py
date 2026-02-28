@@ -157,10 +157,30 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
-        reply = await manager.handler.process_message(event)
+        result = await manager.handler.process_message(event)
 
-        if reply:
-            await matcher.send(reply)
+        if result:
+            reply = result.get("reply")
+            reply_to_message_id = result.get("reply_to_message_id")
+
+            if reply:
+                if reply_to_message_id:
+                    # 使用 QQ 原生回复功能
+                    message_array = [
+                        {"type": "reply", "data": {"id": reply_to_message_id}},
+                        {"type": "text", "data": {"text": reply}}
+                    ]
+                    try:
+                        await bot.call_api(
+                            "send_group_msg",
+                            group_id=int(event.group_id),
+                            message=message_array
+                        )
+                    except Exception as e:
+                        logger.warning(f"[KomariMemory] 原生回复失败: {e}，降级使用普通发送")
+                        await matcher.send(reply)
+                else:
+                    await matcher.send(reply)
 
     except Exception:
         logger.exception("[KomariMemory] 消息处理失败")
