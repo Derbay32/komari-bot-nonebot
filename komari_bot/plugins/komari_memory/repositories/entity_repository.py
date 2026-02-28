@@ -87,7 +87,7 @@ class EntityRepository:
         group_id: str | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """获取实体列表。
+        """获取实体列表（不包含专门的 interaction_history 记录）。
 
         Args:
             user_id: 过滤用户 ID
@@ -103,7 +103,7 @@ class EntityRepository:
                     """
                     SELECT user_id, group_id, key, value, category, importance
                     FROM komari_memory_entity
-                    WHERE user_id = $1 AND group_id = $2
+                    WHERE user_id = $1 AND group_id = $2 AND category != 'interaction_history'
                     ORDER BY importance DESC
                     LIMIT $3
                     """,
@@ -116,7 +116,7 @@ class EntityRepository:
                     """
                     SELECT user_id, group_id, key, value, category, importance
                     FROM komari_memory_entity
-                    WHERE group_id = $1
+                    WHERE group_id = $1 AND category != 'interaction_history'
                     ORDER BY importance DESC
                     LIMIT $2
                     """,
@@ -128,6 +128,7 @@ class EntityRepository:
                     """
                     SELECT user_id, group_id, key, value, category, importance
                     FROM komari_memory_entity
+                    WHERE category != 'interaction_history'
                     ORDER BY importance DESC
                     LIMIT $1
                     """,
@@ -135,3 +136,29 @@ class EntityRepository:
                 )
 
             return [dict(row) for row in rows]
+
+    async def get_interaction_history(
+        self,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """专门获取用户的互动历史记录实体。
+
+        Args:
+            user_id: 用户 ID
+            group_id: 群组 ID
+
+        Returns:
+            实体字典或 None
+        """
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT user_id, group_id, key, value, category, importance
+                FROM komari_memory_entity
+                WHERE user_id = $1 AND group_id = $2 AND key = 'interaction_history'
+                """,
+                user_id,
+                group_id,
+            )
+            return dict(row) if row else None

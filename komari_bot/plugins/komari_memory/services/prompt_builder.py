@@ -219,8 +219,11 @@ async def build_prompt(
     # 用户实体注入（从对话总结中提取的结构化实体）
     if memory_service and group_id and all_user_ids:
         entity_parts: list[str] = []
+        interaction_parts: list[str] = []
+
         for uid in all_user_ids:
             try:
+                # 获取常规实体列表
                 entities = await memory_service.get_entities(
                     user_id=uid, group_id=group_id
                 )
@@ -229,12 +232,32 @@ async def build_prompt(
                     for e in entities
                 )
             except Exception:
-                logger.debug(f"[KomariMemory] 用户 {uid} 的实体检索失败", exc_info=True)
+                logger.debug(
+                    f"[KomariMemory] 用户 {uid} 的常规实体检索失败", exc_info=True
+                )
+
+            try:
+                # 专门获取互动历史记录
+                history_entity = await memory_service.get_interaction_history(
+                    user_id=uid, group_id=group_id
+                )
+                if history_entity:
+                    interaction_parts.append(history_entity["value"])
+            except Exception:
+                logger.debug(
+                    f"[KomariMemory] 用户 {uid} 的互动历史检索失败", exc_info=True
+                )
 
         if entity_parts:
             entity_text = "\n".join(entity_parts)
             system_parts.append(
                 f"<user_entities>\n以下是从历史对话中提取的用户实体信息:\n{entity_text}\n</user_entities>"
+            )
+
+        if interaction_parts:
+            interaction_text = "\n\n".join(interaction_parts)
+            system_parts.append(
+                f"<user_interaction_history>\n{interaction_text}\n</user_interaction_history>"
             )
 
     messages.append({"role": "system", "content": "\n\n".join(system_parts)})

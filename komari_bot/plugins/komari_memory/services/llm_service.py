@@ -47,12 +47,16 @@ class ConversationSummarySchema(BaseModel):
     Attributes:
         summary: 对话的简明总结
         entities: 提取的关键实体列表
+        user_interactions: 用户互动历史（小鞠的主观视角记录）
         importance: 重要性评分 (1-5分)
     """
 
     summary: str = Field(description="对话的简明总结")
     entities: list[EntitySchema] = Field(
         default_factory=list, description="提取的关键实体列表"
+    )
+    user_interactions: list[dict] = Field(
+        default_factory=list, description="用户互动历史（小鞠的主观视角备忘录）"
     )
     importance: int = Field(ge=1, le=5, description="重要性评分 (1-5分)")
 
@@ -167,32 +171,39 @@ async def summarize_conversation(
                 f"[user_id:{msg.user_id}] {msg.user_nickname}: {msg.content}"
             )
 
-    prompt = f"""请总结以下对话，提取关键实体信息（如偏好、事实、关系等），并评估对话的重要性，输出必须使用简体中文。
+    prompt = f"""请总结以下群聊或私聊对话，提取关键实体信息（如偏好、事实、关系等），并评估对话的重要性。输出必须使用简体中文。
 
-每条消息格式为 [user_id:xxx] 昵称: 内容，请在提取实体时将 user_id 字段与对应用户关联。
+每条消息格式为 [user_id:xxx] 昵称: 内容。请你在提取时将 user_id 准确关联。
 
 {chr(10).join(formatted_messages)}
 
-实体提取说明：
-- 提取用户提到的偏好（喜欢的食物、音乐等）、个人事实（职业、年龄等）、关系（朋友、同事等）
-- 每个实体的 user_id 必须来自对话中的 [user_id:xxx]
-- category 可选值：preference(偏好)、fact(事实)、relation(关系)、general(一般)
+【任务一：客观信息提取】
+- 提取对话的核心内容，形成 summary（简短总结）。
+- 提取用户提到的偏好（喜欢的食物、音乐等）、个人事实（职业、年龄等）、关系（朋友、同事等），作为 entities。（category 选：preference/fact/relation/general）
 
+【任务二：主观互动备忘录提取】
+- 你必须基于《败犬女主太多了！》中"小鞠知花"的人设视角，为有明显互动行为的用户，提取出在互动期间该用户的行为记录。这将被作为"小鞠在心里对近期互动过的用户的悄悄记录"。
+- 数据格式要求如下：必须包含 user_id, file_type, description, records(包括 event[行为], result[反应], emotion[感受]), summary。
+
+【任务三：评估重要性】
 请按以下标准评估重要性（1-5分）：
-- 1分：无意义的闲聊、表情、问候
+- 1分：无意义的闲聊、表情包测试、简短问候
 - 2分：简单的日常对话
 - 3分：一般的讨论交流
-- 4分：有意义的话题讨论
-- 5分：重要的决定、约定、或有价值的讨论"""
+- 4分：有意义的话题讨论或较深的互动
+- 5分：重要的决定、约定、深度的设定或情感交流"""
 
-    # 在 prompt 中添加 JSON 格式要求（直接使用 prompt 引导格式，
-    # 因为 DeepSeekClient 不支持通过 response_schema 约束输出结构）
+    # 在 prompt 中添加 JSON 格式要求
     fallback_example = (
         '{"summary": "...", "entities": '
         '[{"user_id": "12345", "key": "喜欢的食物", "value": "拉面", "category": "preference"}], '
+        '"user_interactions": [{"user_id": "12345", "file_type": "用户的近期对鞠行为备忘录", '
+        '"description": "这是我在心里对这个用户近期行为的悄悄记录。用来提醒自己这个人平时是怎么对我的，下次和他说话时应该保持什么态度。", '
+        '"records": [{"event": "用好吃的诱惑我", "result": "咽了口水，稍微凑近了过去", "emotion": "有点警惕但很想吃"}], '
+        '"summary": "是个经常用食物钓我的骗子先生……但也不是坏人。"}], '
         '"importance": 3}'
     )
-    prompt_with_format = prompt + f"\n\n返回 JSON 格式：{fallback_example}"
+    prompt_with_format = prompt + f"\n\n请严格返回以下 JSON 格式：\n{fallback_example}"
 
     response = await llm_provider.generate_text(
         prompt=prompt_with_format,

@@ -53,9 +53,7 @@ class MemoryService:
                     cache_dir=str(cache_dir),
                 ),
             )
-            logger.info(
-                f"[KomariMemory] 向量嵌入模型加载完成 (缓存: {cache_dir})"
-            )
+            logger.info(f"[KomariMemory] 向量嵌入模型加载完成 (缓存: {cache_dir})")
         assert self._embed_model is not None  # 为类型检查器确保非 None
         return self._embed_model
 
@@ -170,7 +168,7 @@ class MemoryService:
         group_id: str | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """获取实体列表。
+        """获取实体列表（已排除 interaction_history 记录）。
 
         Args:
             user_id: 过滤用户 ID
@@ -185,6 +183,25 @@ class MemoryService:
             user_id=user_id,
             group_id=group_id,
             limit=limit,
+        )
+
+    async def get_interaction_history(
+        self,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """专门获取用户的互动历史实体，不占用常规实体检索名额。
+
+        Args:
+            user_id: 用户 ID
+            group_id: 群组 ID
+
+        Returns:
+            实体字典或 None
+        """
+        return await self._entity_repo.get_interaction_history(
+            user_id=user_id,
+            group_id=group_id,
         )
 
     async def cleanup(self) -> None:
