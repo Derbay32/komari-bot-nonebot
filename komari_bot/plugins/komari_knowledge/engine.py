@@ -10,7 +10,6 @@ Komari Knowledge 常识库核心引擎。
 2. 独立模式：直接从 JSON 文件加载配置（用于 WebUI）
 """
 
-import asyncio
 import json
 import logging
 import sys
@@ -18,7 +17,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from fastembed import TextEmbedding
 from pydantic import BaseModel
 
 from .config_schema import DynamicConfigSchema
@@ -109,7 +107,7 @@ class KnowledgeEngine:
     def __init__(self) -> None:
         """初始化引擎。"""
         self._pool: Any = None
-        self._embed_model: TextEmbedding | None = None
+        self._embedding_service: Any = None
         self._keyword_index: dict[str, set[int]] = defaultdict(set)
         self._index_loaded = False
 
@@ -121,26 +119,27 @@ class KnowledgeEngine:
         config = get_config()
 
         # 1. 加载向量嵌入模型
-        if self._embed_model is None:
-            state.logger.info(
-                f"[Komari Knowledge] 加载嵌入模型: {config.embedding_model}"
+        if state.nonebot_mode:
+            state.logger.info("[Komari Knowledge] 使用全局 EmbeddingProvider 服务")
+        elif getattr(self, "_embedding_service", None) is None:
+            state.logger.info("[Komari Knowledge] 加载独立嵌入服务...")
+            from komari_bot.plugins.embedding_provider.config_schema import (
+                DynamicConfigSchema as EmbedConfigSchema,
             )
-            # 配置统一的缓存目录
-            cache_dir = Path.home() / ".cache" / "komari_embeddings"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            from komari_bot.plugins.embedding_provider.embedding_service import (
+                EmbeddingService,
+            )
 
-            # 在独立线程中加载模型，避免阻塞
-            loop = asyncio.get_event_loop()
-            self._embed_model = await loop.run_in_executor(
-                None,
-                lambda: TextEmbedding(
-                    model_name=config.embedding_model,
-                    cache_dir=str(cache_dir),
-                ),
-            )
-            state.logger.info(
-                f"[Komari Knowledge] 嵌入模型加载完成 (缓存: {cache_dir})"
-            )
+            config_path = Path("config/config_manager/embedding_provider_config.json")
+            if config_path.exists():
+                with Path.open(config_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                embed_config = EmbedConfigSchema(**data)
+            else:
+                embed_config = EmbedConfigSchema()
+
+            self._embedding_service = EmbeddingService(embed_config)
+            state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
 
         # 2. 建立数据库连接池
         if self._pool is None:
@@ -194,7 +193,7 @@ class KnowledgeEngine:
             f"[Komari Knowledge] 关键词索引构建完成，共 {len(rows)} 条知识"
         )
 
-    def _get_embedding(self, text: str) -> list[float]:
+    async def _get_embedding(self, text: str) -> list[float]:
         """生成文本的向量嵌入。
 
         Args:
@@ -203,12 +202,14 @@ class KnowledgeEngine:
         Returns:
             向量数组
         """
-        if self._embed_model is None:
-            raise RuntimeError("嵌入模型未初始化")
+        if state.nonebot_mode:
+            from nonebot.plugin import require
 
-        # fastembed 返回迭代器，转换为列表后取第一个
-        embeddings = list(self._embed_model.embed([text]))
-        return embeddings[0].tolist()
+            embedding_provider = require("embedding_provider")
+            return await embedding_provider.embed(text)
+        if getattr(self, "_embedding_service", None) is None:
+            raise RuntimeError("独立嵌入服务未初始化")
+        return await self._embedding_service.embed(text)
 
     def _rewrite_query(self, query: str) -> str:
         """应用查询重写规则。
@@ -407,9 +408,8 @@ class KnowledgeEngine:
         # 获取配置
         config = get_config()
 
-        # 生成查询向量（在独立线程中执行）
-        loop = asyncio.get_event_loop()
-        query_vec = await loop.run_in_executor(None, self._get_embedding, query)
+        # 生成查询向量
+        query_vec = await self._get_embedding(query)
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -467,8 +467,7 @@ class KnowledgeEngine:
             raise RuntimeError("数据库连接池未初始化")
 
         # 生成向量
-        loop = asyncio.get_event_loop()
-        embedding = await loop.run_in_executor(None, self._get_embedding, content)
+        embedding = await self._get_embedding(content)
 
         async with self._pool.acquire() as conn:
             kid = await conn.fetchval(
@@ -588,10 +587,7 @@ class KnowledgeEngine:
 
             # 内容改变需要重新生成向量
             if content is not None:
-                loop = asyncio.get_event_loop()
-                embedding = await loop.run_in_executor(
-                    None, self._get_embedding, content
-                )
+                embedding = await self._get_embedding(content)
                 updates.append(f"content = ${param_idx}")
                 params.append(content)
                 param_idx += 1
