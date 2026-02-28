@@ -9,7 +9,6 @@ from .config import Config
 from .config_schema import DynamicConfigSchema
 from .deepseek_client import DeepSeekClient
 from .llm_logger import log_llm_call
-from .types import StructuredOutputSchema
 
 __plugin_meta__ = PluginMetadata(
     name="llm_provider",
@@ -71,8 +70,6 @@ async def generate_text(
     knowledge_limit: int = 3,
     *,
     enable_knowledge: bool = False,
-    response_schema: StructuredOutputSchema | None = None,
-    response_json_schema: dict | None = None,
     response_format: dict | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
@@ -87,8 +84,6 @@ async def generate_text(
         enable_knowledge: 是否启用知识库检索
         knowledge_query: 知识库查询文本
         knowledge_limit: 检索返回的知识数量上限
-        response_schema: Pydantic 模型或 JSON Schema
-        response_json_schema: JSON Schema 字典
         response_format: Response format dict
         **kwargs: 其他参数
 
@@ -125,8 +120,6 @@ async def generate_text(
             system_instruction=final_system_instruction,
             temperature=temperature,
             max_tokens=max_tokens,
-            response_schema=response_schema,
-            response_json_schema=response_json_schema,
             response_format=response_format,
             **kwargs,
         )
@@ -208,75 +201,6 @@ async def generate_text_with_messages(
             method="generate_text_with_messages",
             model=model,
             input_data=messages,
-            output=result,
-            duration_ms=duration_ms,
-        )
-        return result
-    finally:
-        await client.close()
-
-
-async def generate_text_with_contents(
-    contents: list[dict],
-    provider: str,  # noqa: ARG001  保留参数兼容旧调用
-    model: str,
-    system_instruction: str | None = None,
-    temperature: int | None = None,
-    max_tokens: int | None = None,
-    response_schema: StructuredOutputSchema | None = None,
-    response_json_schema: dict | None = None,
-    response_format: dict | None = None,
-    **kwargs,  # noqa: ANN003
-) -> str:
-    """使用 contents 列表生成文本（兼容旧格式）。
-
-    Args:
-        contents: contents 列表 {role, parts}
-        provider: 保留参数（已忽略）
-        model: 模型名称
-        system_instruction: 系统指令
-        temperature: 温度参数
-        max_tokens: 最大 token 数
-        response_schema: Pydantic 模型或 JSON Schema
-        response_json_schema: JSON Schema 字典
-        response_format: Response format dict
-        **kwargs: 其他参数
-
-    Returns:
-        生成的文本
-    """
-    client = _get_client()
-    start_time = time.monotonic()
-
-    try:
-        result = await client.generate_text_with_contents(
-            contents=contents,
-            model=model,
-            system_instruction=system_instruction,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_schema=response_schema,
-            response_json_schema=response_json_schema,
-            response_format=response_format,
-            **kwargs,
-        )
-    except Exception as e:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        await log_llm_call(
-            method="generate_text_with_contents",
-            model=model,
-            input_data={"contents": contents, "system_instruction": system_instruction},
-            error=str(e),
-            duration_ms=duration_ms,
-        )
-        logger.error(f"LLM 调用失败: {e}")
-        raise
-    else:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        await log_llm_call(
-            method="generate_text_with_contents",
-            model=model,
-            input_data={"contents": contents, "system_instruction": system_instruction},
             output=result,
             duration_ms=duration_ms,
         )

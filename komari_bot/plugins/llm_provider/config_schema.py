@@ -50,21 +50,6 @@ class DynamicConfigSchema(BaseModel):
         default=0.0, description="DeepSeek 重复内容惩罚"
     )
 
-    # Gemini 配置
-    gemini_api_token: str = Field(default="", description="Gemini API Token")
-    gemini_model: str = Field(
-        default="gemini-3-flash-preview", description="Gemini 使用模型"
-    )
-    gemini_temperature: float = Field(
-        default=1.0, ge=0.0, le=2.0, description="Gemini 调用温度参数"
-    )
-    gemini_max_tokens: int = Field(
-        default=8192, ge=20, le=8192, description="Gemini 最大token数量"
-    )
-    gemini_thinking_level: str = Field(
-        default="LOW", description="Gemini 思考链长度（为0时不思考）"
-    )
-
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:

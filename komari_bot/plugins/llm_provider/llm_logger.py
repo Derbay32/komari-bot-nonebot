@@ -39,7 +39,7 @@ async def log_llm_call(
     """记录一次 LLM 调用的输入与输出。
 
     Args:
-        method: 调用方法名（generate_text / generate_text_with_messages / generate_text_with_contents）
+        method: 调用方法名（generate_text / generate_text_with_messages）
         model: 模型名称
         input_data: 输入内容（messages 列表、prompt 字符串或结构化字典）
         output: LLM 返回的文本（成功时）
