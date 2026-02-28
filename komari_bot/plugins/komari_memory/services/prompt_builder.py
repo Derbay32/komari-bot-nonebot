@@ -98,6 +98,7 @@ async def build_prompt(
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
     image_urls: list[str] | None = None,
+    query_embedding: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """构建 5 段式 OpenAI 格式消息数组。
 
@@ -119,6 +120,7 @@ async def build_prompt(
         memory_service: 记忆服务（用于检索用户实体，可选）
         group_id: 群组 ID（用于检索用户实体，可选）
         image_urls: 用户消息中的图片 URL 列表（可选）
+        query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
 
     Returns:
         OpenAI 格式消息列表 [{role, content}]，当包含图片时 content 为数组格式
@@ -159,6 +161,7 @@ async def build_prompt(
             knowledge_results = await komari_knowledge.search_knowledge(
                 query=query_for_search,
                 limit=config.knowledge_limit,
+                query_embedding=query_embedding,
             )
             if knowledge_results:
                 # 根据 source 字段分组

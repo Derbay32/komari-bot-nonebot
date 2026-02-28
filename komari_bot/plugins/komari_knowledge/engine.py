@@ -229,13 +229,17 @@ class KnowledgeEngine:
             rewritten = rewritten.replace(old, new)
         return rewritten
 
-    async def search(self, query: str, limit: int | None = None) -> list[SearchResult]:
+    async def search(
+        self, query: str, limit: int | None = None, query_vec: list[float] | None = None
+    ) -> list[SearchResult]:
         """
         混合检索：关键词 + 向量。
 
         Args:
             query: 用户查询文本
             limit: 最大返回数量，None 使用配置默认值
+            query_vec: 预先计算好的查询特征向量，若提供则跳过模型推理
+
 
         Returns:
             检索结果列表，按相关性排序
@@ -276,7 +280,7 @@ class KnowledgeEngine:
         vector_hits: list[SearchResult] = []
         if len(results) < limit:
             vector_hits = await self._layer2_vector_search(
-                query, limit - len(results), seen_ids
+                query, limit - len(results), seen_ids, query_vec=query_vec
             )
             results.extend(vector_hits)
 
@@ -387,7 +391,11 @@ class KnowledgeEngine:
         ]
 
     async def _layer2_vector_search(
-        self, query: str, limit: int, exclude_ids: set[int]
+        self,
+        query: str,
+        limit: int,
+        exclude_ids: set[int],
+        query_vec: list[float] | None = None,
     ) -> list[SearchResult]:
         """
         Layer 2: 向量语义检索。
@@ -398,6 +406,8 @@ class KnowledgeEngine:
             query: 查询文本
             limit: 最大返回数量
             exclude_ids: 要排除的知识 ID（已被关键词匹配）
+            query_vec: 预先计算好的查询向量
+
 
         Returns:
             检索结果列表
@@ -409,7 +419,8 @@ class KnowledgeEngine:
         config = get_config()
 
         # 生成查询向量
-        query_vec = await self._get_embedding(query)
+        if query_vec is None:
+            query_vec = await self._get_embedding(query)
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(

@@ -230,12 +230,22 @@ class MessageHandler:
         # 存储当前消息到缓冲区
         await self.redis.push_message(message.group_id, message)
 
+        # 预先生成查询向量以避免向 API 发起重复请求
+        try:
+            from nonebot.plugin import require
+
+            embedding_provider = require("embedding_provider")
+            query_embedding = await embedding_provider.embed(rewritten_query)
+        except Exception as e:
+            logger.warning(f"[KomariMemory] 预生成查询特征向量失败: {e}")
+            query_embedding = None
         # 检索相关记忆（使用重写后的查询）
         memories = await self.memory.search_conversations(
             query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
+            query_embedding=query_embedding,
         )
 
         # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
@@ -255,6 +265,7 @@ class MessageHandler:
             memory_service=self.memory,
             group_id=message.group_id,
             image_urls=base64_image_urls,
+            query_embedding=query_embedding,
         )
 
         # 生成回复
@@ -337,12 +348,23 @@ class MessageHandler:
         await self.redis.push_message(message.group_id, message)
         await self.redis.increment_message_count(message.group_id)
 
+        # 预先生成查询向量以避免向 API 发起重复请求
+        try:
+            from nonebot.plugin import require
+
+            embedding_provider = require("embedding_provider")
+            query_embedding = await embedding_provider.embed(rewritten_query)
+        except Exception as e:
+            logger.warning(f"[KomariMemory] 预生成查询特征向量失败: {e}")
+            query_embedding = None
+
         # 检索相关记忆（传递 user_id 用于用户相关性加权，使用重写后的查询）
         memories = await self.memory.search_conversations(
             query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
+            query_embedding=query_embedding,
         )
 
         # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
@@ -362,6 +384,7 @@ class MessageHandler:
             memory_service=self.memory,
             group_id=message.group_id,
             image_urls=base64_image_urls,
+            query_embedding=query_embedding,
         )
 
         # 生成回复

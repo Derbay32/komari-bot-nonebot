@@ -66,6 +66,7 @@ class MemoryService:
         group_id: str,
         user_id: str | None = None,
         limit: int = 5,
+        query_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """向量检索对话（支持用户相关性加权）。
 
@@ -74,12 +75,17 @@ class MemoryService:
             group_id: 群组 ID
             user_id: 当前用户 ID（用于加权该用户参与的记忆）
             limit: 返回数量限制
+            query_embedding: 预先计算好的查询特征向量，若提供则跳过模型推理
 
         Returns:
             检索结果列表，包含 summary, similarity 等
         """
         # 业务逻辑：生成查询向量
-        query_vec = await self._embedding_plugin.embed(query)
+        query_vec = (
+            query_embedding
+            if query_embedding is not None
+            else await self._embedding_plugin.embed(query)
+        )
 
         # rerank 启用时多取候选
         fetch_limit = limit * 3 if self._embedding_plugin.is_rerank_enabled() else limit
