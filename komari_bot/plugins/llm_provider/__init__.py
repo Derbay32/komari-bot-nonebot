@@ -159,17 +159,17 @@ async def generate_text(
 
 
 async def generate_text_with_messages(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     model: str,
     temperature: float | None = None,
     max_tokens: int | None = None,
     response_format: dict | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
-    """使用 OpenAI 格式 messages 生成文本。
+    """使用 OpenAI 格式 messages 生成文本（支持多模态）。
 
     Args:
-        messages: 消息列表 [{role, content}]
+        messages: 消息列表 [{role, content}]，content 可以是字符串或数组（OpenAI Vision 格式）
         model: 模型名称
         temperature: 温度参数
         max_tokens: 最大 token 数

@@ -68,6 +68,15 @@ class MessageHandler:
         message_content = event.get_plaintext()
         message_id = str(event.message_id)
 
+        # 提取图片 URL（从 OneBot v11 消息段中）
+        image_urls = [
+            seg.data["url"]
+            for seg in event.message
+            if seg.type == "image" and seg.data.get("url")
+        ]
+        if image_urls:
+            logger.info(f"[KomariMemory] 检测到 {len(image_urls)} 张图片")
+
         # 获取用户昵称（用户昵称 > 群昵称 > user_id）
         user_nickname = (
             (event.sender.nickname or event.sender.card or user_id)
@@ -86,7 +95,7 @@ class MessageHandler:
 
         # 优先检查是否 @ 了机器人（跳过所有过滤和评分，直接回复）
         if self._is_at_trigger(event):
-            return await self._handle_at_trigger(message, message_id)
+            return await self._handle_at_trigger(message, message_id, image_urls)
 
         # 前置过滤
         filter_result = await preprocess_message(
@@ -123,7 +132,9 @@ class MessageHandler:
             return None
 
         if score >= config.proactive_score_threshold:  # 主动回复阈值
-            return await self._handle_interrupt_signal(message, message_id, score)
+            return await self._handle_interrupt_signal(
+                message, message_id, score, image_urls
+            )
 
         # 普通消息
         await self._handle_normal_message(message)
@@ -190,12 +201,14 @@ class MessageHandler:
         self,
         message: MessageSchema,
         reply_to_message_id: str,
+        image_urls: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """处理 @ 触发回复（必须回复，无冷却限制）。
 
         Args:
             message: 消息对象
             reply_to_message_id: 要回复的消息ID
+            image_urls: 消息中的图片 URL 列表
 
         Returns:
             包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典
@@ -235,6 +248,7 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
+            image_urls=image_urls,
         )
 
         # 生成回复
@@ -270,6 +284,7 @@ class MessageHandler:
         message: MessageSchema,
         reply_to_message_id: str,
         score: float,
+        image_urls: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """处理中断信号（主动回复）。
 
@@ -277,6 +292,7 @@ class MessageHandler:
             message: 消息对象
             reply_to_message_id: 要回复的消息ID
             score: 评分
+            image_urls: 消息中的图片 URL 列表
 
         Returns:
             包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
@@ -334,6 +350,7 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
+            image_urls=image_urls,
         )
 
         # 生成回复

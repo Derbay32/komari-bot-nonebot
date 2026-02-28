@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -97,7 +97,8 @@ async def build_prompt(
     search_query: str | None = None,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
-) -> list[dict[str, str]]:
+    image_urls: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """构建 5 段式 OpenAI 格式消息数组。
 
     结构：
@@ -117,12 +118,13 @@ async def build_prompt(
         search_query: 重写后的搜索查询（用于知识库检索）
         memory_service: 记忆服务（用于检索用户实体，可选）
         group_id: 群组 ID（用于检索用户实体，可选）
+        image_urls: 用户消息中的图片 URL 列表（可选）
 
     Returns:
-        OpenAI 格式消息列表 [{role, content}]
+        OpenAI 格式消息列表 [{role, content}]，当包含图片时 content 为数组格式
     """
     template = get_template()
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
 
     # ═══════════════════════════════════════
     # ① system — 角色设定 + 记忆 + 实体 + 知识库
@@ -284,7 +286,20 @@ async def build_prompt(
     current_text = (
         f"- {current_character_name}: <user_input>{user_message}</user_input>"
     )
-    messages.append({"role": "user", "content": current_text})
+
+    # 如果包含图片，构建 OpenAI Vision 格式的 content 数组
+    if image_urls:
+        content_parts: list[dict[str, Any]] = [{"type": "text", "text": current_text}]
+        content_parts.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": url},
+            }
+            for url in image_urls
+        )
+        messages.append({"role": "user", "content": content_parts})
+    else:
+        messages.append({"role": "user", "content": current_text})
 
     # ═══════════════════════════════════════
     # ③ assistant — 伪造记忆确认

@@ -107,15 +107,15 @@ def _extract_tag_content(text: str, tag: str) -> str:
 @retry_async(max_attempts=3, base_delay=1.0)
 async def generate_reply(
     config: KomariMemoryConfigSchema,
-    messages: list[dict[str, str]] | None = None,
+    messages: list[dict] | None = None,
     user_message: str = "",
     system_prompt: str = "",
 ) -> str:
-    """生成回复（使用 OpenAI messages 格式，带重试机制）。
+    """生成回复（使用 OpenAI messages 格式，带重试机制，支持多模态）。
 
     Args:
         config: 插件配置
-        messages: OpenAI 格式消息列表 [{role, content}]（优先使用）
+        messages: OpenAI 格式消息列表 [{role, content}]（优先使用），content 可以是字符串或数组
         user_message: 用户消息（兼容旧格式）
         system_prompt: 系统提示词（兼容旧格式）
 
