@@ -8,6 +8,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
 from ..services.bert_client import score_message
 from ..services.config_interface import get_config
+from ..services.image_downloader import download_images_as_base64
 from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message
@@ -237,6 +238,11 @@ class MessageHandler:
             limit=config.memory_search_limit,
         )
 
+        # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
+        base64_image_urls = None
+        if image_urls:
+            base64_image_urls = await download_images_as_base64(image_urls)
+
         # 构建提示词（5 段式 OpenAI messages）
         messages = await build_prompt(
             user_message=message.content,
@@ -248,7 +254,7 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
-            image_urls=image_urls,
+            image_urls=base64_image_urls,
         )
 
         # 生成回复
@@ -339,6 +345,11 @@ class MessageHandler:
             limit=config.memory_search_limit,
         )
 
+        # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
+        base64_image_urls = None
+        if image_urls:
+            base64_image_urls = await download_images_as_base64(image_urls)
+
         # 构建提示词（5 段式 OpenAI messages）
         messages = await build_prompt(
             user_message=message.content,
@@ -350,7 +361,7 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
-            image_urls=image_urls,
+            image_urls=base64_image_urls,
         )
 
         # 生成回复
