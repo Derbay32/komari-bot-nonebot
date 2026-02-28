@@ -54,6 +54,7 @@ class EmbeddingService:
         """生成单条文本嵌入。"""
         vectors = await self.embed_batch([text])
         if not vectors:
+            logger.error("[EmbeddingProvider] embed failed to return vectors.")
             raise RuntimeError("Embed failed to return vectors.")  # noqa: TRY003
         return vectors[0]
 
@@ -75,6 +76,7 @@ class EmbeddingService:
     async def _embed_api(self, texts: list[str]) -> list[list[float]]:
         url = self.config.embedding_api_url
         if not url:
+            logger.error("[EmbeddingProvider] embedding_api_url 为空")
             raise ValueError("配置了 API 模式但是 embedding_api_url 为空")  # noqa: TRY003
 
         headers = {}

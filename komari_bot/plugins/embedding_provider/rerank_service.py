@@ -46,6 +46,7 @@ class RerankService:
             return []
         url = self.config.rerank_api_url
         if not url:
+            logger.error("[EmbeddingProvider] rerank_api_url 为空")
             raise ValueError("启用了 rerank，但是 rerank_api_url 为空")  # noqa: TRY003
         n = top_n if top_n is not None else self.config.rerank_top_n
         # 不能超过文档数
