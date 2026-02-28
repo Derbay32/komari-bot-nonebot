@@ -50,12 +50,6 @@ class KomariMemoryConfigSchema(BaseModel):
         default="", description="Redis 密码 (空字符串表示无密码)"
     )
 
-    # 向量嵌入配置
-    embedding_model: str = Field(
-        default="BAAI/bge-small-zh-v1.5",
-        description="向量嵌入模型 (与 komari_knowledge 一致)",
-    )
-
     # BERT 评分服务配置
     bert_service_url: str = Field(
         default="http://localhost:8000/api/v1/score",

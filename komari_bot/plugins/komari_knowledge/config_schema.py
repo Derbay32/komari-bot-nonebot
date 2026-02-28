@@ -1,5 +1,4 @@
-"""
-Komari Knowledge 常识库插件配置 Schema。
+"""Komari Knowledge 常识库插件配置 Schema。
 
 用于管理 PostgreSQL 数据库连接和检索参数配置。
 """
@@ -40,13 +39,6 @@ class DynamicConfigSchema(BaseModel):
     pg_user: str = Field(default="", description="数据库用户名")
     pg_password: str = Field(default="", description="数据库密码")
 
-    # 向量检索配置
-    embedding_model: str = Field(
-        default="BAAI/bge-small-zh-v1.5", description="向量嵌入模型名称"
-    )
-    vector_dimension: int = Field(
-        default=512, description="向量维度（bge-small-zh-v1.5 为 512）"
-    )
     similarity_threshold: float = Field(
         default=0.65,
         ge=0.0,

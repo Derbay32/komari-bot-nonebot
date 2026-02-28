@@ -646,9 +646,6 @@ class KnowledgeEngine:
             self._pool = None
             state.logger.info("[Komari Knowledge] 连接池已关闭")
 
-        # 清理嵌入模型引用，帮助垃圾回收
-        self._embed_model = None
-
 
 def get_engine() -> KnowledgeEngine | None:
     """获取全局引擎实例。"""

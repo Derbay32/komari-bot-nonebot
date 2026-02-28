@@ -32,8 +32,9 @@ from nonebot.plugin import PluginMetadata, require
 from .config_schema import DynamicConfigSchema
 from .engine import SearchResult, get_engine, initialize_engine
 
-# 依赖 config_manager 插件
+# 依赖其他插件
 config_manager_plugin = require("config_manager")
+require("embedding_provider")
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
