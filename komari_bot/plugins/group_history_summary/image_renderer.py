@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import base64
 import io
+from logging import getLogger
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
 FontLike = ImageFont.FreeTypeFont | ImageFont.ImageFont
+logger = getLogger(__name__)
 
 CHARACTER_IMAGE_PATH = Path("data") / "image-summary.png"
+FONT_DIR = Path("data") / "fonts"
+FONT_EXTENSIONS = (".ttf", ".otf", ".ttc")
 DEFAULT_LAYOUT_PARAMS: dict[str, Any] = {
     "canvas_width": 1365,
     "canvas_height": 645,
@@ -35,18 +39,20 @@ DEFAULT_LAYOUT_PARAMS: dict[str, Any] = {
 
 
 def _load_font(size: int) -> FontLike:
-    font_candidates = [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for font_path in font_candidates:
-        if Path(font_path).exists():
+    """统一从 data/fonts 加载自定义字体。"""
+    if FONT_DIR.exists() and FONT_DIR.is_dir():
+        for font_path in sorted(FONT_DIR.iterdir()):
+            if font_path.suffix.lower() not in FONT_EXTENSIONS:
+                continue
             try:
-                return ImageFont.truetype(font_path, size=size)
+                return ImageFont.truetype(str(font_path), size=size)
             except OSError:
                 continue
+
+    logger.warning(
+        "[GroupHistorySummary] 未在 %s 找到可用自定义字体，降级为默认字体",
+        FONT_DIR,
+    )
     return ImageFont.load_default()
 
 
