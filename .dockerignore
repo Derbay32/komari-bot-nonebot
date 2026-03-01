@@ -65,3 +65,8 @@ node_modules/
 config/
 data/
 .env.example
+
+# 部署包产物（避免将 app/data/fonts 等运行时文件打入镜像）
+app/
+komari-bot-deploy/
+komari-bot-*.zip
