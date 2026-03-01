@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-03-01T12:00:00+08:00",
+  "plugin_enable": true,
+  "user_whitelist": [],
+  "group_whitelist": [],
+  "min_summary_count": 10,
+  "max_summary_count": 200,
+  "fetch_batch_size": 50,
+  "summary_model": "deepseek-chat",
+  "summary_temperature": 0.4,
+  "summary_max_tokens": 1200,
+  "card_width": 1080,
+  "card_font_size": 34
+}
