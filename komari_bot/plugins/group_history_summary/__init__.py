@@ -35,7 +35,7 @@ summary_matcher = on_message(priority=9, block=False)
 SUMMARY_PATTERN = re.compile(r"总结(?:过去)?\s*(\d{1,4})\s*条")
 
 _group_locks: dict[str, asyncio.Lock] = {}
-SUMMARY_TITLE = "群聊总结"
+SUMMARY_TITLE = "小鞠的总结时间到！"
 
 
 def _get_group_lock(group_id: str) -> asyncio.Lock:

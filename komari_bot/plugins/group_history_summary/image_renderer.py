@@ -10,6 +10,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 FontLike = ImageFont.FreeTypeFont | ImageFont.ImageFont
 
+CARD_BACKGROUND = "#1A1C21"
+TEXT_COLOR = "#F3F3F3"
+TITLE_COLOR = "#FFFFFF"
+CHARACTER_IMAGE_PATH = Path("data") / "image-summary.png"
+
 
 def _load_font(size: int) -> FontLike:
     font_candidates = [
@@ -47,9 +52,7 @@ def _wrap_text(
         return [""]
 
     wrapped: list[str] = []
-    paragraphs = text.splitlines() or [text]
-
-    for paragraph in paragraphs:
+    for paragraph in text.splitlines() or [text]:
         if not paragraph:
             wrapped.append("")
             continue
@@ -70,6 +73,34 @@ def _wrap_text(
     return wrapped
 
 
+def _load_character_image() -> Image.Image | None:
+    if not CHARACTER_IMAGE_PATH.exists():
+        return None
+    try:
+        return Image.open(CHARACTER_IMAGE_PATH).convert("RGBA")
+    except OSError:
+        return None
+
+
+def _resize_character_image(
+    image: Image.Image,
+    canvas_width: int,
+    canvas_height: int,
+) -> Image.Image:
+    # 右侧预留区域，宽度约占 30%
+    max_width = int(canvas_width * 0.30)
+    max_height = int(canvas_height * 0.82)
+
+    src_w, src_h = image.size
+    if src_w <= 0 or src_h <= 0:
+        return image
+
+    scale = min(max_width / src_w, max_height / src_h)
+    dst_w = max(1, int(src_w * scale))
+    dst_h = max(1, int(src_h * scale))
+    return image.resize((dst_w, dst_h), Image.Resampling.LANCZOS)
+
+
 def render_summary_image_base64(
     title: str,
     subtitle: str,
@@ -78,43 +109,59 @@ def render_summary_image_base64(
     font_size: int,
 ) -> str:
     """渲染总结图片，返回 base64 字符串。"""
-    title_font = _load_font(font_size + 12)
-    subtitle_font = _load_font(max(16, font_size - 8))
-    body_font = _load_font(font_size)
+    # 先保留参数，后续如果需要可用于在卡片上显示时间范围等辅助信息。
+    _ = subtitle
 
-    margin = 64
-    max_text_width = width - margin * 2
+    image_height = max(540, int(width * 0.47))
+    image = Image.new("RGB", (width, image_height), color=CARD_BACKGROUND)
+    draw = ImageDraw.Draw(image)
 
-    measurement_image = Image.new("RGB", (width, 100), color="#FFFFFF")
-    draw = ImageDraw.Draw(measurement_image)
+    # 字体
+    title_font = _load_font(font_size + 14)
+    body_font = _load_font(font_size + 2)
+
+    # 布局参数
+    left_margin = int(width * 0.08)
+    top_margin = int(image_height * 0.12)
+    right_reserved = int(width * 0.34)
+    text_max_width = width - left_margin - right_reserved
+    line_gap = 8
+
+    # 固定样式：标题 + 正文
+    title_height = _line_height(draw, title_font)
+    body_line_height = _line_height(draw, body_font)
+    body_start_y = top_margin + title_height + 48
 
     wrapped_body: list[str] = []
     for line in body_lines:
-        wrapped_body.extend(_wrap_text(draw, line, body_font, max_text_width))
+        wrapped_body.extend(_wrap_text(draw, line, body_font, text_max_width))
+    if not wrapped_body:
+        wrapped_body = ["本次没有可总结的文本内容。"]
 
-    title_height = _line_height(draw, title_font)
-    subtitle_height = _line_height(draw, subtitle_font)
-    body_height = _line_height(draw, body_font)
-
-    section_spacing = 18
-    content_height = max(1, len(wrapped_body)) * (body_height + 10)
-    image_height = (
-        margin * 2 + title_height + subtitle_height + content_height + section_spacing * 3
+    max_body_lines = max(
+        1,
+        (image_height - body_start_y - int(image_height * 0.10))
+        // (body_line_height + line_gap),
     )
+    if len(wrapped_body) > max_body_lines:
+        wrapped_body = wrapped_body[:max_body_lines]
+        last = wrapped_body[-1]
+        wrapped_body[-1] = f"{last[:-1]}…" if len(last) > 1 else "…"
 
-    image = Image.new("RGB", (width, image_height), color="#F7F8FA")
-    draw = ImageDraw.Draw(image)
+    draw.text((left_margin, top_margin), title, fill=TITLE_COLOR, font=title_font)
 
-    y = margin
-    draw.text((margin, y), title, fill="#151515", font=title_font)
-    y += title_height + section_spacing
-
-    draw.text((margin, y), subtitle, fill="#444444", font=subtitle_font)
-    y += subtitle_height + section_spacing * 2
-
+    y = body_start_y
     for line in wrapped_body:
-        draw.text((margin, y), line, fill="#1F1F1F", font=body_font)
-        y += body_height + 10
+        draw.text((left_margin, y), line, fill=TEXT_COLOR, font=body_font)
+        y += body_line_height + line_gap
+
+    # 右侧角色图（可选）
+    character_image = _load_character_image()
+    if character_image is not None:
+        character_image = _resize_character_image(character_image, width, image_height)
+        dst_x = width - character_image.width - int(width * 0.02)
+        dst_y = image_height - character_image.height
+        image.paste(character_image, (dst_x, dst_y), character_image)
 
     output = io.BytesIO()
     image.save(output, format="PNG")
