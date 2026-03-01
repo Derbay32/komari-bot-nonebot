@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -31,18 +32,31 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 
 def _extract_supported_actions(payload: Any) -> list[str]:
+    """从 get_supported_actions 响应中提取动作列表。
+
+    不同 OneBot 实现返回结构并不完全一致，这里统一兼容：
+    1. 直接返回 list[str]
+    2. 返回 {"actions": [...]}
+    3. 返回 {"supported_actions": [...]}
+    4. 返回 {"data": [...]} 或 {"data": {"actions"/"supported_actions": [...]}}
+    """
     actions: list[str] = []
 
     if isinstance(payload, list):
+        # 结构1：直接是数组
         actions = [str(item) for item in payload]
     elif isinstance(payload, dict):
         if isinstance(payload.get("actions"), list):
+            # 结构2：顶层 actions
             actions = [str(item) for item in payload["actions"]]
         elif isinstance(payload.get("supported_actions"), list):
+            # 结构3：顶层 supported_actions
             actions = [str(item) for item in payload["supported_actions"]]
         elif isinstance(payload.get("data"), list):
+            # 结构4-1：data 是数组
             actions = [str(item) for item in payload["data"]]
         elif isinstance(payload.get("data"), dict):
+            # 结构4-2：data 是对象，动作列表在 data 下
             data = payload["data"]
             if isinstance(data.get("actions"), list):
                 actions = [str(item) for item in data["actions"]]
@@ -80,41 +94,40 @@ def _extract_message_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _extract_content(item: dict[str, Any]) -> str:
-    raw_message = item.get("raw_message")
-    if isinstance(raw_message, str) and raw_message.strip():
-        return raw_message.strip()
+CQ_CODE_PATTERN = re.compile(r"\[CQ:[^\]]+\]")
 
+
+def _extract_content(item: dict[str, Any]) -> str | None:
+    """仅提取文本内容，非文本消息返回 None。"""
     message_segments = item.get("message")
     if isinstance(message_segments, list):
         parts: list[str] = []
         for seg in message_segments:
             if not isinstance(seg, dict):
                 continue
-            seg_type = str(seg.get("type", ""))
+            if str(seg.get("type", "")) != "text":
+                continue
+
             seg_data = seg.get("data", {})
-            if seg_type == "text":
-                text = ""
-                if isinstance(seg_data, dict):
-                    text = str(seg_data.get("text", "")).strip()
-                if not text:
-                    text = str(seg.get("content", "")).strip()
-                if text:
-                    parts.append(text)
-            elif seg_type == "image":
-                parts.append("[图片]")
-            elif seg_type == "face":
-                parts.append("[表情]")
-            elif seg_type == "at":
-                parts.append("[@]")
-            elif seg_type:
-                parts.append(f"[{seg_type}]")
+            text = ""
+            if isinstance(seg_data, dict):
+                text = str(seg_data.get("text", "")).strip()
+            if not text:
+                text = str(seg.get("content", "")).strip()
+            if text:
+                parts.append(text)
 
         merged = "".join(parts).strip()
         if merged:
             return merged
 
-    return "[无法解析的消息]"
+    raw_message = item.get("raw_message")
+    if isinstance(raw_message, str):
+        plain_text = CQ_CODE_PATTERN.sub("", raw_message).strip()
+        if plain_text:
+            return plain_text
+
+    return None
 
 
 async def fetch_group_history_messages(
@@ -150,17 +163,19 @@ async def fetch_group_history_messages(
             break
 
         min_seq: int | None = None
-        new_item_count = 0
+        fetched_item_count = 0
 
         for item in items:
             user_id = str(item.get("user_id", "unknown"))
             timestamp = _to_int(item.get("time"))
             message_seq = _to_int(item.get("message_seq"))
+            min_seq = message_seq if min_seq is None else min(min_seq, message_seq)
 
             unique_key = (message_seq, user_id, timestamp)
             if unique_key in seen_keys:
                 continue
             seen_keys.add(unique_key)
+            fetched_item_count += 1
 
             fallback_nickname = user_id
             sender = item.get("sender")
@@ -171,6 +186,9 @@ async def fetch_group_history_messages(
             nickname = name_resolver(user_id, fallback_nickname)
 
             content = _extract_content(item)
+            if not content:
+                continue
+
             collected.append(
                 HistoryMessage(
                     user_id=user_id,
@@ -180,14 +198,11 @@ async def fetch_group_history_messages(
                     message_seq=message_seq,
                 )
             )
-            new_item_count += 1
-
-            min_seq = message_seq if min_seq is None else min(min_seq, message_seq)
 
         if len(collected) >= target_count:
             break
 
-        if new_item_count == 0 or min_seq is None or min_seq <= 1:
+        if fetched_item_count == 0 or min_seq is None or min_seq <= 1:
             break
 
         next_seq = min_seq - 1
