@@ -1,6 +1,6 @@
-"""Migrate user_data from SQLite to PostgreSQL.
+"""将 user_data 从 SQLite 迁移到 PostgreSQL。
 
-Usage:
+用法：
 python tools/migrate_user_data_sqlite_to_pg.py
 python tools/migrate_user_data_sqlite_to_pg.py --sqlite-path user_data.db
 python tools/migrate_user_data_sqlite_to_pg.py --config-path config/config_manager/user_data_config.json
@@ -15,6 +15,8 @@ import json
 import logging
 import sqlite3
 import sys
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +26,73 @@ if str(PROJECT_ROOT) not in sys.path:
 
 if TYPE_CHECKING:
     from komari_bot.common.database_config import DatabaseConfigSchema
-    from komari_bot.plugins.user_data.config_schema import DynamicConfigSchema
+
+
+@dataclass
+class UserDataDbOverrideConfig:
+    """user_data 中与数据库相关的可选覆盖字段。"""
+
+    pg_host: str | None = None
+    pg_port: int | None = None
+    pg_database: str | None = None
+    pg_user: str | None = None
+    pg_password: str | None = None
+    pg_pool_min_size: int | None = None
+    pg_pool_max_size: int | None = None
+
+
+def _read_optional_int(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    return None if value is None else int(value)
+
+
+def _parse_datetime_value(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time(), tzinfo=UTC)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt)  # noqa: DTZ007
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"无法解析为 datetime: {value}")  # noqa: TRY003
+
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _parse_date_value(value: Any) -> date | None:
+    parsed: date | None = None
+    if isinstance(value, datetime):
+        parsed = value.date()
+    elif isinstance(value, date):
+        parsed = value
+    elif value is not None:
+        text = str(value).strip()
+        if text:
+            try:
+                parsed = date.fromisoformat(text)
+            except ValueError:
+                parsed_dt = _parse_datetime_value(text)
+                parsed = parsed_dt.date() if parsed_dt else None
+    return parsed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,22 +101,28 @@ logging.basicConfig(
 logger = logging.getLogger("migrate_user_data")
 
 
-def load_user_data_config(config_path: Path) -> "DynamicConfigSchema":
-    """Load user_data config from config_manager JSON file."""
+def load_user_data_db_override(config_path: Path) -> UserDataDbOverrideConfig:
+    """从 user_data 配置中读取数据库覆盖字段。"""
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path}")  # noqa: TRY003
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    from komari_bot.plugins.user_data.config_schema import DynamicConfigSchema
-
-    return DynamicConfigSchema(**data)
+    return UserDataDbOverrideConfig(
+        pg_host=data.get("pg_host"),
+        pg_port=_read_optional_int(data, "pg_port"),
+        pg_database=data.get("pg_database"),
+        pg_user=data.get("pg_user"),
+        pg_password=data.get("pg_password"),
+        pg_pool_min_size=_read_optional_int(data, "pg_pool_min_size"),
+        pg_pool_max_size=_read_optional_int(data, "pg_pool_max_size"),
+    )
 
 
 def resolve_db_config(
-    user_data_config: "DynamicConfigSchema",
+    user_data_db_override: UserDataDbOverrideConfig,
     db_config_path: Path,
 ) -> "DatabaseConfigSchema":
-    """Resolve final PostgreSQL config from shared config + user_data overrides."""
+    """解析最终 PostgreSQL 配置（共享配置 + user_data 覆盖）。"""
     from komari_bot.common.database_config import (
         DatabaseConfigSchema,
         load_database_config_from_file,
@@ -60,11 +134,11 @@ def resolve_db_config(
         if db_config_path.exists()
         else DatabaseConfigSchema()
     )
-    return merge_database_config(shared, user_data_config)
+    return merge_database_config(shared, user_data_db_override)
 
 
 def read_sqlite_rows(sqlite_path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Read source rows from SQLite."""
+    """从 SQLite 读取源数据。"""
     if not sqlite_path.exists():
         raise FileNotFoundError(f"SQLite 文件不存在: {sqlite_path}")  # noqa: TRY003
 
@@ -109,7 +183,7 @@ def read_sqlite_rows(sqlite_path: Path) -> tuple[list[dict[str, Any]], list[dict
 
 
 async def ensure_pg_schema(pool: Any) -> None:
-    """Create target schema in PostgreSQL if missing."""
+    """确保 PostgreSQL 目标表结构存在。"""
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -154,7 +228,7 @@ async def migrate_to_postgres(
     user_attributes: list[dict[str, Any]],
     user_favorability: list[dict[str, Any]],
 ) -> None:
-    """Migrate rows into PostgreSQL."""
+    """将数据写入 PostgreSQL。"""
     try:
         from komari_bot.common.postgres import create_postgres_pool
     except ModuleNotFoundError as exc:
@@ -170,6 +244,16 @@ async def migrate_to_postgres(
 
         async with pool.acquire() as conn, conn.transaction():
             if user_attributes:
+                attribute_rows = [
+                    (
+                        row["user_id"],
+                        row["attribute_name"],
+                        row.get("attribute_value"),
+                        _parse_datetime_value(row.get("created_at")),
+                        _parse_datetime_value(row.get("updated_at")),
+                    )
+                    for row in user_attributes
+                ]
                 await conn.executemany(
                     """
                     INSERT INTO user_attributes
@@ -180,19 +264,35 @@ async def migrate_to_postgres(
                         attribute_value = EXCLUDED.attribute_value,
                         updated_at = COALESCE(EXCLUDED.updated_at, CURRENT_TIMESTAMP)
                     """,
-                    [
-                        (
-                            row["user_id"],
-                            row["attribute_name"],
-                            row.get("attribute_value"),
-                            row.get("created_at"),
-                            row.get("updated_at"),
-                        )
-                        for row in user_attributes
-                    ],
+                    attribute_rows,
                 )
 
             if user_favorability:
+                favor_rows: list[tuple[str, int, int, date]] = []
+                skipped_rows = 0
+                for row in user_favorability:
+                    last_updated = _parse_date_value(row.get("last_updated"))
+                    if last_updated is None:
+                        skipped_rows += 1
+                        continue
+                    favor_rows.append(
+                        (
+                            row["user_id"],
+                            int(row.get("daily_favor") or 0),
+                            int(row.get("cumulative_favor") or 0),
+                            last_updated,
+                        )
+                    )
+
+                if skipped_rows:
+                    logger.warning(
+                        "user_favorability 有 %d 条记录缺少 last_updated，已跳过",
+                        skipped_rows,
+                    )
+
+                if not favor_rows:
+                    return
+
                 await conn.executemany(
                     """
                     INSERT INTO user_favorability
@@ -203,35 +303,31 @@ async def migrate_to_postgres(
                         daily_favor = EXCLUDED.daily_favor,
                         cumulative_favor = EXCLUDED.cumulative_favor
                     """,
-                    [
-                        (
-                            row["user_id"],
-                            int(row.get("daily_favor") or 0),
-                            int(row.get("cumulative_favor") or 0),
-                            row["last_updated"],
-                        )
-                        for row in user_favorability
-                    ],
+                    favor_rows,
                 )
     finally:
         await pool.close()
 
 
 async def main_async(sqlite_path: Path, config_path: Path, db_config_path: Path) -> None:
-    user_data_config = load_user_data_config(config_path)
-    db_config = resolve_db_config(user_data_config, db_config_path)
+    user_data_db_override = load_user_data_db_override(config_path)
+    db_config = resolve_db_config(user_data_db_override, db_config_path)
     if not db_config.pg_user or not db_config.pg_password:
         raise ValueError("pg_user/pg_password 未配置，无法迁移")  # noqa: TRY003
 
     user_attributes, user_favorability = read_sqlite_rows(sqlite_path)
-    logger.info("读取 SQLite 完成: attributes=%d, favorability=%d", len(user_attributes), len(user_favorability))
+    logger.info(
+        "读取 SQLite 完成: 用户属性=%d, 好感度=%d",
+        len(user_attributes),
+        len(user_favorability),
+    )
 
     await migrate_to_postgres(db_config, user_attributes, user_favorability)
     logger.info("迁移完成")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Migrate user_data SQLite -> PostgreSQL")
+    parser = argparse.ArgumentParser(description="迁移 user_data：SQLite -> PostgreSQL")
     parser.add_argument(
         "--sqlite-path",
         default="user_data.db",
@@ -240,7 +336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config-path",
         default="config/config_manager/user_data_config.json",
-        help="user_data config_manager JSON 路径",
+        help="user_data 的 config_manager JSON 路径",
     )
     parser.add_argument(
         "--db-config-path",
