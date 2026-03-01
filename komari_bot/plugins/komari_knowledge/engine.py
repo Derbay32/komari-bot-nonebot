@@ -19,6 +19,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from komari_bot.common.postgres import create_postgres_pool
+
 from .config_schema import DynamicConfigSchema
 
 
@@ -143,18 +145,7 @@ class KnowledgeEngine:
 
         # 2. 建立数据库连接池
         if self._pool is None:
-            import asyncpg
-
-            self._pool = await asyncpg.create_pool(
-                host=config.pg_host,
-                port=config.pg_port,
-                database=config.pg_database,
-                user=config.pg_user,
-                password=config.pg_password,
-                min_size=2,
-                max_size=5,
-                command_timeout=30,
-            )
+            self._pool = await create_postgres_pool(config, command_timeout=30)
             state.logger.info("[Komari Knowledge] 数据库连接池已建立")
 
         # 3. 构建关键词索引（内存预热）

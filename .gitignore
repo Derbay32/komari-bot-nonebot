@@ -173,4 +173,6 @@ test_multimodal.py
 logs
 config/config_manager/embedding_provider_config.json
 config/config_manager/group_history_summary_config.json
-tools/
+!tools/
+tools/*
+!tools/migrate_user_data_sqlite_to_pg.py

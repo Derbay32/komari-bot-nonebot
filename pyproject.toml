@@ -149,5 +149,5 @@ package-mode = false
 dev = [
     "ipywidgets (>=8.1.8,<9.0.0)",
     "jupyterlab (>=4.5.5,<5.0.0)",
-    "ipykernel (>=7.2.0,<8.0.0)"
+    "ipykernel (>=7.2.0,<8.0.0)",
 ]

@@ -2,6 +2,8 @@
 
 import asyncpg
 
+from komari_bot.common.postgres import create_postgres_pool
+
 from ..config_schema import KomariMemoryConfigSchema
 
 
@@ -14,12 +16,4 @@ async def create_pool(config: KomariMemoryConfigSchema) -> asyncpg.Pool:
     Returns:
         asyncpg 连接池
     """
-    return await asyncpg.create_pool(
-        host=config.pg_host,
-        port=config.pg_port,
-        database=config.pg_database,
-        user=config.pg_user,
-        password=config.pg_password,
-        min_size=config.pg_pool_min_size,
-        max_size=config.pg_pool_max_size,
-    )
+    return await create_postgres_pool(config)

@@ -1,7 +1,7 @@
-from nonebot import get_plugin_config, logger
+from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
-from .config import Config
+from .config_schema import DynamicConfigSchema
 from .database import UserDataDB
 from .models import FavorGenerationResult, UserAttribute, UserFavorability
 
@@ -9,20 +9,31 @@ __plugin_meta__ = PluginMetadata(
     name="user_data",
     description="通用用户数据管理插件，提供用户属性存储和好感度管理功能",
     usage="提供API供其他插件调用，管理用户数据",
-    config=Config,
+    config=DynamicConfigSchema,
+)
+
+# 依赖 config_manager 插件
+config_manager_plugin = require("config_manager")
+config_manager = config_manager_plugin.get_config_manager(
+    "user_data", DynamicConfigSchema
 )
 
 # 全局数据库实例
 _db: UserDataDB | None = None
-config: Config = get_plugin_config(Config)
+
+
+def get_config() -> DynamicConfigSchema:
+    """获取 user_data 动态配置。"""
+    return config_manager.get()
 
 
 async def get_db() -> UserDataDB:
     """获取数据库实例"""
     global _db  # noqa: PLW0603
     if _db is None:
-        _db = UserDataDB(config.db_path)
-        await _db.initialize()
+        db = UserDataDB(get_config())
+        await db.initialize()
+        _db = db
     return _db
 
 
@@ -38,7 +49,16 @@ except Exception:
 
 async def on_startup():
     """插件启动时的初始化"""
-    await get_db()
+    config = get_config()
+    if not config.plugin_enable:
+        logger.info("用户数据插件未启用，跳过初始化")
+        return
+
+    try:
+        await get_db()
+    except Exception as e:
+        logger.error(f"用户数据插件数据库初始化失败: {e}")
+        return
 
     # 注册定时清理任务
     if _scheduler:
@@ -55,10 +75,10 @@ async def on_startup():
 
 
 async def _scheduled_cleanup():
-    """定时清理任务（保留7天）"""
+    """定时清理任务（保留天数由配置项控制）。"""
     try:
         db = await get_db()
-        await db.cleanup_old_data(retention_days=7)
+        await db.cleanup_old_data(retention_days=get_config().data_retention_days)
     except Exception as e:
         logger.error(f"清理用户数据时出错: {e}")
 
