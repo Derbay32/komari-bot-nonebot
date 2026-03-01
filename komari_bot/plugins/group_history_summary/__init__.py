@@ -13,7 +13,11 @@ from nonebot.plugin import PluginMetadata, require
 from nonebot.rule import to_me
 
 from .config_schema import DynamicConfigSchema
-from .history_service import check_group_history_supported, fetch_group_history_messages
+from .history_service import (
+    HistoryMessage,
+    check_group_history_supported,
+    fetch_group_history_messages,
+)
 from .image_renderer import render_summary_image_base64
 from .summarize_service import summarize_history_messages, summary_text_to_lines
 
@@ -59,6 +63,59 @@ def _extract_requested_count(text: str) -> int | None:
         return int(match.group(1))
     except (TypeError, ValueError):
         return None
+
+
+def _is_command_message(text: str) -> bool:
+    """判断是否为命令文本。
+
+    规则：
+    1. 匹配“总结过去XX条 / 总结XX条”
+    2. 以 。/.// 开头（如 .jrhg、/bind、。help）
+    """
+    normalized = "".join(text.split())
+    if not normalized:
+        return False
+
+    if re.search(SUMMARY_PATTERN, normalized):
+        return True
+
+    return normalized.startswith(("。", ".", "/"))
+
+
+def _filter_messages_for_summary(
+    messages: list[HistoryMessage],
+    bot_self_id: str,
+) -> list[HistoryMessage]:
+    """过滤命令消息，以及机器人对这些命令的回复。"""
+    # 第一层：命令文本直接剔除（不论是谁发的）
+    command_indexes = {
+        idx for idx, message in enumerate(messages) if _is_command_message(message.content)
+    }
+    command_message_ids = {
+        message.message_id
+        for idx, message in enumerate(messages)
+        if idx in command_indexes and message.message_id
+    }
+
+    # 第二层：只剔除“机器人 reply 到命令消息”的回复。
+    bot_reply_indexes: set[int] = set()
+    if command_message_ids:
+        for idx, message in enumerate(messages):
+            if message.user_id != bot_self_id:
+                continue
+            if not message.reply_to_message_id:
+                continue
+            if message.reply_to_message_id in command_message_ids:
+                bot_reply_indexes.add(idx)
+
+    filtered: list[HistoryMessage] = []
+    for idx, message in enumerate(messages):
+        if idx in command_indexes:
+            continue
+        if idx in bot_reply_indexes:
+            continue
+        filtered.append(message)
+    return filtered
 
 
 def _format_time_range(start_ts: int, end_ts: int) -> str:
@@ -115,12 +172,17 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 name_resolver=character_binding.get_character_name,
             )
 
-            if not history_messages:
+            filtered_messages = _filter_messages_for_summary(
+                messages=history_messages,
+                bot_self_id=str(bot.self_id),
+            )
+
+            if not filtered_messages:
                 logger.info("[GroupHistorySummary] 没有可用的历史消息")
-                await summary_matcher.finish("没、没有消息啊……？")
+                await summary_matcher.finish("可用的文本记录太少，没法总结……")
 
             summary_text = await summarize_history_messages(
-                history_messages=history_messages,
+                history_messages=filtered_messages,
                 model=config.summary_model,
                 temperature=config.summary_temperature,
                 max_tokens=config.summary_max_tokens,
@@ -128,8 +190,8 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
 
             body_lines = summary_text_to_lines(summary_text)
             subtitle = (
-                f"最近 {len(history_messages)} 条 | "
-                f"{_format_time_range(history_messages[0].timestamp, history_messages[-1].timestamp)}"
+                f"最近 {len(filtered_messages)} 条 | "
+                f"{_format_time_range(filtered_messages[0].timestamp, filtered_messages[-1].timestamp)}"
             )
             image_base64 = render_summary_image_base64(
                 title=SUMMARY_TITLE,

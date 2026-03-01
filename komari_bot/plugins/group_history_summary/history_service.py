@@ -22,6 +22,10 @@ class HistoryMessage:
     content: str
     timestamp: int
     message_seq: int
+    # 当前消息自身 ID（用于被 reply 关联）
+    message_id: str | None
+    # 当前消息 reply 的目标 message_id（用于识别“机器人回复某条命令”）
+    reply_to_message_id: str | None
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -95,6 +99,46 @@ def _extract_message_items(payload: Any) -> list[dict[str, Any]]:
 
 
 CQ_CODE_PATTERN = re.compile(r"\[CQ:[^\]]+\]")
+# 兼容从 raw_message 的 CQ 码中提取 reply 目标 ID
+CQ_REPLY_PATTERN = re.compile(r"\[CQ:reply,[^\]]*id=([^,\]]+)")
+
+
+def _normalize_message_id(value: Any) -> str | None:
+    """统一 message_id/reply_id 为可比较的字符串。"""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _extract_reply_to_message_id(item: dict[str, Any]) -> str | None:
+    """提取当前消息 reply 的目标 message_id。
+
+    提取顺序：
+    1. message 段中的 reply.data.id（结构化字段，优先）
+    2. raw_message 中的 CQ reply 码（兼容兜底）
+    """
+    message_segments = item.get("message")
+    if isinstance(message_segments, list):
+        for seg in message_segments:
+            if not isinstance(seg, dict):
+                continue
+            if str(seg.get("type", "")) != "reply":
+                continue
+
+            seg_data = seg.get("data", {})
+            if isinstance(seg_data, dict):
+                reply_id = _normalize_message_id(seg_data.get("id"))
+                if reply_id:
+                    return reply_id
+
+    raw_message = item.get("raw_message")
+    if isinstance(raw_message, str):
+        match = CQ_REPLY_PATTERN.search(raw_message)
+        if match:
+            return _normalize_message_id(match.group(1))
+
+    return None
 
 
 def _extract_content(item: dict[str, Any]) -> str | None:
@@ -170,6 +214,9 @@ async def fetch_group_history_messages(
             timestamp = _to_int(item.get("time"))
             message_seq = _to_int(item.get("message_seq"))
             min_seq = message_seq if min_seq is None else min(min_seq, message_seq)
+            # 为后续“命令消息 + 机器人 reply 命令”的精准过滤保留关联字段
+            message_id = _normalize_message_id(item.get("message_id"))
+            reply_to_message_id = _extract_reply_to_message_id(item)
 
             unique_key = (message_seq, user_id, timestamp)
             if unique_key in seen_keys:
@@ -196,6 +243,8 @@ async def fetch_group_history_messages(
                     content=content,
                     timestamp=timestamp,
                     message_seq=message_seq,
+                    message_id=message_id,
+                    reply_to_message_id=reply_to_message_id,
                 )
             )
 
