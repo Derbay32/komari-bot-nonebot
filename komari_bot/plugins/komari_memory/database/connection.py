@@ -2,6 +2,7 @@
 
 import asyncpg
 
+from komari_bot.common.database_config import get_effective_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
 from ..config_schema import KomariMemoryConfigSchema
@@ -16,4 +17,5 @@ async def create_pool(config: KomariMemoryConfigSchema) -> asyncpg.Pool:
     Returns:
         asyncpg 连接池
     """
-    return await create_postgres_pool(config)
+    db_config = get_effective_database_config(config)
+    return await create_postgres_pool(db_config)

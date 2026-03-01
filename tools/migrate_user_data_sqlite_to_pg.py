@@ -4,6 +4,7 @@ Usage:
 python tools/migrate_user_data_sqlite_to_pg.py
 python tools/migrate_user_data_sqlite_to_pg.py --sqlite-path user_data.db
 python tools/migrate_user_data_sqlite_to_pg.py --config-path config/config_manager/user_data_config.json
+python tools/migrate_user_data_sqlite_to_pg.py --db-config-path config/config_manager/database_config.json
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if TYPE_CHECKING:
+    from komari_bot.common.database_config import DatabaseConfigSchema
     from komari_bot.plugins.user_data.config_schema import DynamicConfigSchema
 
 logging.basicConfig(
@@ -31,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger("migrate_user_data")
 
 
-def load_config(config_path: Path) -> "DynamicConfigSchema":
+def load_user_data_config(config_path: Path) -> "DynamicConfigSchema":
     """Load user_data config from config_manager JSON file."""
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path}")  # noqa: TRY003
@@ -40,6 +42,25 @@ def load_config(config_path: Path) -> "DynamicConfigSchema":
     from komari_bot.plugins.user_data.config_schema import DynamicConfigSchema
 
     return DynamicConfigSchema(**data)
+
+
+def resolve_db_config(
+    user_data_config: "DynamicConfigSchema",
+    db_config_path: Path,
+) -> "DatabaseConfigSchema":
+    """Resolve final PostgreSQL config from shared config + user_data overrides."""
+    from komari_bot.common.database_config import (
+        DatabaseConfigSchema,
+        load_database_config_from_file,
+        merge_database_config,
+    )
+
+    shared = (
+        load_database_config_from_file(db_config_path)
+        if db_config_path.exists()
+        else DatabaseConfigSchema()
+    )
+    return merge_database_config(shared, user_data_config)
 
 
 def read_sqlite_rows(sqlite_path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -129,7 +150,7 @@ async def ensure_pg_schema(pool: Any) -> None:
 
 
 async def migrate_to_postgres(
-    config: "DynamicConfigSchema",
+    config: "DatabaseConfigSchema",
     user_attributes: list[dict[str, Any]],
     user_favorability: list[dict[str, Any]],
 ) -> None:
@@ -196,15 +217,16 @@ async def migrate_to_postgres(
         await pool.close()
 
 
-async def main_async(sqlite_path: Path, config_path: Path) -> None:
-    config = load_config(config_path)
-    if not config.pg_user or not config.pg_password:
+async def main_async(sqlite_path: Path, config_path: Path, db_config_path: Path) -> None:
+    user_data_config = load_user_data_config(config_path)
+    db_config = resolve_db_config(user_data_config, db_config_path)
+    if not db_config.pg_user or not db_config.pg_password:
         raise ValueError("pg_user/pg_password 未配置，无法迁移")  # noqa: TRY003
 
     user_attributes, user_favorability = read_sqlite_rows(sqlite_path)
     logger.info("读取 SQLite 完成: attributes=%d, favorability=%d", len(user_attributes), len(user_favorability))
 
-    await migrate_to_postgres(config, user_attributes, user_favorability)
+    await migrate_to_postgres(db_config, user_attributes, user_favorability)
     logger.info("迁移完成")
 
 
@@ -220,6 +242,11 @@ def parse_args() -> argparse.Namespace:
         default="config/config_manager/user_data_config.json",
         help="user_data config_manager JSON 路径",
     )
+    parser.add_argument(
+        "--db-config-path",
+        default="config/config_manager/database_config.json",
+        help="共享 database_config JSON 路径",
+    )
     return parser.parse_args()
 
 
@@ -229,6 +256,7 @@ def main() -> None:
         main_async(
             sqlite_path=Path(args.sqlite_path),
             config_path=Path(args.config_path),
+            db_config_path=Path(args.db_config_path),
         )
     )
 

@@ -6,6 +6,7 @@ import random
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from komari_bot.common.database_config import get_effective_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
 from .models import FavorGenerationResult, UserAttribute, UserFavorability
@@ -25,7 +26,8 @@ class UserDataDB:
 
     async def initialize(self) -> None:
         """初始化数据库连接和表结构。"""
-        self._pool = await create_postgres_pool(self.config)
+        db_config = get_effective_database_config(self.config)
+        self._pool = await create_postgres_pool(db_config)
         await self._create_tables()
 
     async def _create_tables(self) -> None:

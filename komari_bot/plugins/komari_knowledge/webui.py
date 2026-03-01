@@ -179,9 +179,10 @@ def main() -> None:
         st.header("⚙️ 配置")
         st.info(
             """
-            配置从 `data/plugin_config/komari_knowledge_config.json` 读取。
+            常识库配置从 `data/plugin_config/komari_knowledge_config.json` 读取。
 
-            如需修改数据库连接，请编辑该文件或通过 Bot 配置管理界面修改。
+            数据库连接优先读取 `data/plugin_config/database_config.json`。
+            若 `komari_knowledge_config.json` 中填写了 `pg_*` 字段，则会覆盖共享配置。
 
             关键配置项：
             - `pg_host`: 数据库主机
