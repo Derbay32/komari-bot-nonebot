@@ -201,10 +201,10 @@ async def summarize_conversation(
     if existing_context:
         existing_context += (
             "【重要指示】\n"
-            "- 如果对话中出现与已有实体矛盾的新信息，请用新信息覆盖旧值（使用相同的 key）\n"
+            "- 如果对话中发现与已有实体矛盾的新信息，请用新信息覆盖旧值（使用相同的 key）\n"
             "- 如果对话中没有提到某个已有实体，不要在输出中重复它\n"
             "- 只输出需要新增或更新的实体\n"
-            "- 对于互动历史，请在已有记录的基础上追加新的 records，合并后输出完整的互动历史\n\n"
+            "- 对于互动历史，请在已有记录的基础上追加新的 records（注意：如果 records 总数超过6条，请只保留最近的6条记录）\n\n"
         )
 
     prompt = f"""请总结以下群聊或私聊对话，提取关键实体信息（如偏好、事实、关系等），并评估对话的重要性。输出必须使用简体中文。
@@ -251,6 +251,16 @@ async def summarize_conversation(
     # 提取 JSON
     json_text = _extract_json_from_markdown(response)
     result = json.loads(json_text)
+
+    # 限制互动历史（records）最多保留最近6条，防止上下文无限追加
+    if "user_interactions" in result and isinstance(result["user_interactions"], list):
+        for interaction in result["user_interactions"]:
+            if (
+                "records" in interaction
+                and isinstance(interaction["records"], list)
+                and len(interaction["records"]) > 6
+            ):
+                interaction["records"] = interaction["records"][-6:]
 
     # 确保 importance 字段存在且在合理范围内
     if "importance" not in result:
