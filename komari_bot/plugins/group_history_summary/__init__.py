@@ -56,11 +56,11 @@ def _extract_requested_count(text: str) -> int | None:
 
 
 def _format_time_range(start_ts: int, end_ts: int) -> str:
-    start_str = datetime.fromtimestamp(start_ts, tz=UTC).astimezone().strftime(
-        "%m-%d %H:%M"
+    start_str = (
+        datetime.fromtimestamp(start_ts, tz=UTC).astimezone().strftime("%m-%d %H:%M")
     )
-    end_str = datetime.fromtimestamp(end_ts, tz=UTC).astimezone().strftime(
-        "%m-%d %H:%M"
+    end_str = (
+        datetime.fromtimestamp(end_ts, tz=UTC).astimezone().strftime("%m-%d %H:%M")
     )
     return f"{start_str} - {end_str}"
 
@@ -86,21 +86,23 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
     group_id = str(event.group_id)
     group_lock = _get_group_lock(group_id)
     if group_lock.locked():
-        await summary_matcher.finish("当前群正在执行总结任务，请稍后再试。")
+        await summary_matcher.finish("在、在看了……等、等会！")
 
-    count = max(config.min_summary_count, min(requested_count, config.max_summary_count))
+    count = max(
+        config.min_summary_count, min(requested_count, config.max_summary_count)
+    )
     if count != requested_count:
-        await summary_matcher.send(f"已将条数调整为 {count} 条。")
+        logger.warning(f"[GroupHistorySummary] 已将条数调整为 {count} 条。")
 
     is_supported = await check_group_history_supported(bot)
     if not is_supported:
-        await summary_matcher.finish(
-            "当前 NapCat/OneBot 实现未支持 get_group_msg_history。"
+        logger.error(
+            "[GroupHistorySummary] 当前 Onebot/Napcat 实现尚未支持获取群聊记录能力"
         )
-
+        return
     try:
         async with group_lock:
-            await summary_matcher.send(f"正在读取并总结最近 {count} 条消息，请稍等...")
+            logger.info(f"[GroupHistorySummary] 正在读取并总结最近 {count} 条消息...")
 
             history_messages = await fetch_group_history_messages(
                 bot=bot,
@@ -111,7 +113,8 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
             )
 
             if not history_messages:
-                await summary_matcher.finish("未读取到可用的历史消息。")
+                logger.info("[GroupHistorySummary] 没有可用的历史消息")
+                await summary_matcher.finish("没、没有消息啊……？")
 
             summary = await summarize_history_messages(
                 history_messages=history_messages,
@@ -142,4 +145,4 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
         raise
     except Exception:
         logger.exception("[GroupHistorySummary] 处理总结请求失败")
-        await summary_matcher.finish("总结失败，请稍后重试。")
+        return
