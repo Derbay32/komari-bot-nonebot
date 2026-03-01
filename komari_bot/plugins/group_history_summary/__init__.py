@@ -6,10 +6,11 @@ import asyncio
 import re
 from datetime import UTC, datetime
 
-from nonebot import logger, on_message
+from nonebot import logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.exception import FinishedException
 from nonebot.plugin import PluginMetadata, require
+from nonebot.rule import to_me
 
 from .config_schema import DynamicConfigSchema
 from .history_service import check_group_history_supported, fetch_group_history_messages
@@ -30,9 +31,13 @@ __plugin_meta__ = PluginMetadata(
     usage="@机器人 总结过去50条",
 )
 
-summary_matcher = on_message(priority=9, block=False)
-
-SUMMARY_PATTERN = re.compile(r"总结(?:过去)?\s*(\d{1,4})\s*条")
+SUMMARY_PATTERN = r"总结(?:过去)?\s*(\d{1,4})\s*条"
+summary_matcher = on_regex(
+    SUMMARY_PATTERN,
+    rule=to_me(),
+    priority=9,
+    block=True,
+)
 
 _group_locks: dict[str, asyncio.Lock] = {}
 SUMMARY_TITLE = "小鞠的总结时间到！"
@@ -47,7 +52,7 @@ def _get_group_lock(group_id: str) -> asyncio.Lock:
 
 
 def _extract_requested_count(text: str) -> int | None:
-    match = SUMMARY_PATTERN.search(text)
+    match = re.search(SUMMARY_PATTERN, text)
     if not match:
         return None
     try:
@@ -69,9 +74,6 @@ def _format_time_range(start_ts: int, end_ts: int) -> str:
 @summary_matcher.handle()
 async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> None:
     """处理 @机器人 总结过去XX条。"""
-    if not event.to_me:
-        return
-
     plain_text = event.get_plaintext().strip()
     requested_count = _extract_requested_count(plain_text)
     if requested_count is None:
