@@ -6,6 +6,32 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
+class LayoutParamsSchema(BaseModel):
+    """图片布局参数。"""
+
+    canvas_width: int = Field(default=1365, ge=600, le=3000)
+    canvas_height: int = Field(default=645, ge=300, le=2000)
+    bg_color: str = Field(default="#444444")
+
+    title_x: int = Field(default=110, ge=0, le=5000)
+    title_y: int = Field(default=80, ge=0, le=5000)
+    title_size: int = Field(default=64, ge=10, le=300)
+    title_color: str = Field(default="#FFFFFF")
+
+    body_x: int = Field(default=112, ge=0, le=5000)
+    body_y: int = Field(default=185, ge=0, le=5000)
+    body_size: int = Field(default=30, ge=10, le=300)
+    body_color: str = Field(default="#F3F3F3")
+    body_line_gap: int = Field(default=10, ge=0, le=100)
+    body_max_width: int = Field(default=750, ge=100, le=5000)
+
+    char_enabled: bool = Field(default=True)
+    char_scale: float = Field(default=0.3, ge=0.01, le=1.0)
+    char_max_height_ratio: float = Field(default=0.82, ge=0.01, le=1.0)
+    char_x_offset: int = Field(default=-10, ge=-5000, le=5000)
+    char_y_offset: int = Field(default=0, ge=-5000, le=5000)
+
+
 class DynamicConfigSchema(BaseModel):
     """群聊历史总结插件动态配置。"""
 
@@ -38,8 +64,10 @@ class DynamicConfigSchema(BaseModel):
         default=1200, ge=128, le=8192, description="总结最大 tokens"
     )
 
-    card_width: int = Field(default=1080, ge=700, le=2000, description="图片宽度")
-    card_font_size: int = Field(default=34, ge=16, le=80, description="图片字体大小")
+    layout_params: LayoutParamsSchema = Field(
+        default_factory=LayoutParamsSchema,
+        description="总结图片布局参数",
+    )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod

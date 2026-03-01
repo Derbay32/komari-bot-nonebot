@@ -10,6 +10,24 @@
   "summary_model": "deepseek-chat",
   "summary_temperature": 0.4,
   "summary_max_tokens": 1200,
-  "card_width": 1080,
-  "card_font_size": 34
+  "layout_params": {
+    "canvas_width": 1365,
+    "canvas_height": 645,
+    "bg_color": "#444444",
+    "title_x": 110,
+    "title_y": 80,
+    "title_size": 64,
+    "title_color": "#FFFFFF",
+    "body_x": 112,
+    "body_y": 185,
+    "body_size": 30,
+    "body_color": "#F3F3F3",
+    "body_line_gap": 10,
+    "body_max_width": 750,
+    "char_enabled": true,
+    "char_scale": 0.3,
+    "char_max_height_ratio": 0.82,
+    "char_x_offset": -10,
+    "char_y_offset": 0
+  }
 }

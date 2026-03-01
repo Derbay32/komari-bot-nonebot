@@ -133,8 +133,7 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 title=SUMMARY_TITLE,
                 subtitle=subtitle,
                 body_lines=body_lines,
-                width=config.card_width,
-                font_size=config.card_font_size,
+                layout_params=config.layout_params.model_dump(),
             )
 
             await bot.send(
