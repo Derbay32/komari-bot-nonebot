@@ -50,12 +50,6 @@ class KomariMemoryConfigSchema(BaseModel):
         default="", description="Redis 密码 (空字符串表示无密码)"
     )
 
-    # 向量嵌入配置
-    embedding_model: str = Field(
-        default="BAAI/bge-small-zh-v1.5",
-        description="向量嵌入模型 (与 komari_knowledge 一致)",
-    )
-
     # BERT 评分服务配置
     bert_service_url: str = Field(
         default="http://localhost:8000/api/v1/score",
@@ -64,7 +58,6 @@ class KomariMemoryConfigSchema(BaseModel):
     bert_timeout: float = Field(default=2.0, description="BERT 请求超时时间（秒）")
 
     # LLM 配置 - 对话模型（用于生成回复）
-    llm_provider: str = Field(default="gemini", description="LLM 提供商")
     llm_model_chat: str = Field(
         default="gemini-3-flash-preview", description="对话使用模型"
     )

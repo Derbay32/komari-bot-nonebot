@@ -8,6 +8,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
 from ..services.bert_client import score_message
 from ..services.config_interface import get_config
+from ..services.image_downloader import download_images_as_base64
 from ..services.llm_service import generate_reply
 from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message
@@ -68,6 +69,15 @@ class MessageHandler:
         message_content = event.get_plaintext()
         message_id = str(event.message_id)
 
+        # 提取图片 URL（从 OneBot v11 消息段中）
+        image_urls = [
+            seg.data["url"]
+            for seg in event.message
+            if seg.type == "image" and seg.data.get("url")
+        ]
+        if image_urls:
+            logger.info(f"[KomariMemory] 检测到 {len(image_urls)} 张图片")
+
         # 获取用户昵称（用户昵称 > 群昵称 > user_id）
         user_nickname = (
             (event.sender.nickname or event.sender.card or user_id)
@@ -86,7 +96,7 @@ class MessageHandler:
 
         # 优先检查是否 @ 了机器人（跳过所有过滤和评分，直接回复）
         if self._is_at_trigger(event):
-            return await self._handle_at_trigger(message, message_id)
+            return await self._handle_at_trigger(message, message_id, image_urls)
 
         # 前置过滤
         filter_result = await preprocess_message(
@@ -123,7 +133,9 @@ class MessageHandler:
             return None
 
         if score >= config.proactive_score_threshold:  # 主动回复阈值
-            return await self._handle_interrupt_signal(message, message_id, score)
+            return await self._handle_interrupt_signal(
+                message, message_id, score, image_urls
+            )
 
         # 普通消息
         await self._handle_normal_message(message)
@@ -190,12 +202,14 @@ class MessageHandler:
         self,
         message: MessageSchema,
         reply_to_message_id: str,
+        image_urls: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """处理 @ 触发回复（必须回复，无冷却限制）。
 
         Args:
             message: 消息对象
             reply_to_message_id: 要回复的消息ID
+            image_urls: 消息中的图片 URL 列表
 
         Returns:
             包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典
@@ -216,13 +230,28 @@ class MessageHandler:
         # 存储当前消息到缓冲区
         await self.redis.push_message(message.group_id, message)
 
+        # 预先生成查询向量以避免向 API 发起重复请求
+        try:
+            from nonebot.plugin import require
+
+            embedding_provider = require("embedding_provider")
+            query_embedding = await embedding_provider.embed(rewritten_query)
+        except Exception as e:
+            logger.warning(f"[KomariMemory] 预生成查询特征向量失败: {e}")
+            query_embedding = None
         # 检索相关记忆（使用重写后的查询）
         memories = await self.memory.search_conversations(
             query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
+            query_embedding=query_embedding,
         )
+
+        # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
+        base64_image_urls = None
+        if image_urls:
+            base64_image_urls = await download_images_as_base64(image_urls)
 
         # 构建提示词（5 段式 OpenAI messages）
         messages = await build_prompt(
@@ -235,6 +264,8 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
+            image_urls=base64_image_urls,
+            query_embedding=query_embedding,
         )
 
         # 生成回复
@@ -270,6 +301,7 @@ class MessageHandler:
         message: MessageSchema,
         reply_to_message_id: str,
         score: float,
+        image_urls: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """处理中断信号（主动回复）。
 
@@ -277,6 +309,7 @@ class MessageHandler:
             message: 消息对象
             reply_to_message_id: 要回复的消息ID
             score: 评分
+            image_urls: 消息中的图片 URL 列表
 
         Returns:
             包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
@@ -315,13 +348,29 @@ class MessageHandler:
         await self.redis.push_message(message.group_id, message)
         await self.redis.increment_message_count(message.group_id)
 
+        # 预先生成查询向量以避免向 API 发起重复请求
+        try:
+            from nonebot.plugin import require
+
+            embedding_provider = require("embedding_provider")
+            query_embedding = await embedding_provider.embed(rewritten_query)
+        except Exception as e:
+            logger.warning(f"[KomariMemory] 预生成查询特征向量失败: {e}")
+            query_embedding = None
+
         # 检索相关记忆（传递 user_id 用于用户相关性加权，使用重写后的查询）
         memories = await self.memory.search_conversations(
             query=rewritten_query,
             group_id=message.group_id,
             user_id=message.user_id,
             limit=config.memory_search_limit,
+            query_embedding=query_embedding,
         )
+
+        # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
+        base64_image_urls = None
+        if image_urls:
+            base64_image_urls = await download_images_as_base64(image_urls)
 
         # 构建提示词（5 段式 OpenAI messages）
         messages = await build_prompt(
@@ -334,6 +383,8 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
+            image_urls=base64_image_urls,
+            query_embedding=query_embedding,
         )
 
         # 生成回复

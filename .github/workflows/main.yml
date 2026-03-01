@@ -44,14 +44,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate and upload docker-compose.yml
-        if: github.event_name == 'push'
+      - name: Package and upload deployment files
         run: |
-          # 复制 docker-compose.yml 并替换镜像标签
-          sed 's|derbay32/komari-bot-nonebot:latest|derbay32/komari-bot-nonebot:${{ github.ref_name }}|g' docker-compose.yml > docker-compose-release.yml
-
-          # 上传到 Release
-          gh release upload "${{ github.ref_name }}" docker-compose-release.yml
+          TAG_NAME="${{ github.event.release.tag_name || github.ref_name }}"
+          
+          # 准备打包目录
+          mkdir -p komari-bot-deploy
+          cp -r config komari-bot-deploy/
+          
+          # 复制 docker-compose.yml 并替换镜像标签为当前版本
+          sed "s|derbay32/komari-bot-nonebot:latest|derbay32/komari-bot-nonebot:${TAG_NAME}|g" docker-compose.yml > komari-bot-deploy/docker-compose.yml
+          
+          # 打包成压缩包
+          cd komari-bot-deploy
+          zip -r "../komari-bot-${TAG_NAME}.zip" ./*
+          cd ..
+          
+          # 上传压缩包到 Release (如果是由 push 触发，前面的步骤已经创建了预发布 Release)
+          gh release upload "${TAG_NAME}" "komari-bot-${TAG_NAME}.zip" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -1,11 +1,8 @@
 """Komari Memory 记忆管理服务。"""
 
-import asyncio
-from pathlib import Path
 from typing import Any
 
-from fastembed import TextEmbedding
-from nonebot import logger
+from nonebot.plugin import require
 
 from ..config_schema import KomariMemoryConfigSchema
 from ..repositories.conversation_repository import ConversationRepository
@@ -31,50 +28,7 @@ class MemoryService:
         self.config = config
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
-        self._embed_model: TextEmbedding | None = None
-
-    async def _get_embed_model(self) -> TextEmbedding:
-        """延迟加载嵌入模型。
-
-        Returns:
-            TextEmbedding 实例
-        """
-        if self._embed_model is None:
-            # 配置统一的缓存目录
-            cache_dir = Path.home() / ".cache" / "komari_embeddings"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-
-            # 在独立线程中加载模型，避免阻塞
-            loop = asyncio.get_running_loop()
-            self._embed_model = await loop.run_in_executor(
-                None,
-                lambda: TextEmbedding(
-                    model_name=self.config.embedding_model,
-                    cache_dir=str(cache_dir),
-                ),
-            )
-            logger.info(
-                f"[KomariMemory] 向量嵌入模型加载完成 (缓存: {cache_dir})"
-            )
-        assert self._embed_model is not None  # 为类型检查器确保非 None
-        return self._embed_model
-
-    async def _get_embedding(self, text: str) -> list[float]:
-        """生成文本的向量嵌入。
-
-        Args:
-            text: 输入文本
-
-        Returns:
-            向量数组
-        """
-        embed_model = await self._get_embed_model()
-        # fastembed 返回迭代器，转换为列表后取第一个
-        loop = asyncio.get_running_loop()
-        embeddings = await loop.run_in_executor(
-            None, lambda: list(embed_model.embed([text]))
-        )
-        return embeddings[0].tolist()
+        self._embedding_plugin = require("embedding_provider")
 
     async def store_conversation(
         self,
@@ -95,7 +49,7 @@ class MemoryService:
             创建的对话 ID
         """
         # 业务逻辑：生成向量
-        embedding = await self._get_embedding(summary)
+        embedding = await self._embedding_plugin.embed(summary)
 
         # 数据访问：委托给仓库
         return await self._conversation_repo.insert_conversation(
@@ -112,6 +66,7 @@ class MemoryService:
         group_id: str,
         user_id: str | None = None,
         limit: int = 5,
+        query_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """向量检索对话（支持用户相关性加权）。
 
@@ -120,20 +75,37 @@ class MemoryService:
             group_id: 群组 ID
             user_id: 当前用户 ID（用于加权该用户参与的记忆）
             limit: 返回数量限制
+            query_embedding: 预先计算好的查询特征向量，若提供则跳过模型推理
 
         Returns:
             检索结果列表，包含 summary, similarity 等
         """
         # 业务逻辑：生成查询向量
-        query_vec = await self._get_embedding(query)
+        query_vec = (
+            query_embedding
+            if query_embedding is not None
+            else await self._embedding_plugin.embed(query)
+        )
+
+        # rerank 启用时多取候选
+        fetch_limit = limit * 3 if self._embedding_plugin.is_rerank_enabled() else limit
 
         # 数据访问：委托给仓库（传递 user_id 用于加权）
-        return await self._conversation_repo.search_by_similarity(
+        results = await self._conversation_repo.search_by_similarity(
             embedding=str(query_vec),
             group_id=group_id,
             user_id=user_id,
-            limit=limit,
+            limit=fetch_limit,
         )
+
+        if self._embedding_plugin.is_rerank_enabled() and results:
+            documents = [r["summary"] for r in results]
+            reranked = await self._embedding_plugin.rerank(
+                query, documents, top_n=limit
+            )
+            results = [results[rr.index] for rr in reranked]
+
+        return results[:limit]
 
     async def upsert_entity(
         self,
@@ -170,7 +142,7 @@ class MemoryService:
         group_id: str | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """获取实体列表。
+        """获取实体列表（已排除 interaction_history 记录）。
 
         Args:
             user_id: 过滤用户 ID
@@ -187,13 +159,24 @@ class MemoryService:
             limit=limit,
         )
 
-    async def cleanup(self) -> None:
-        """清理模型资源，释放 fastembed 的 multiprocessing 资源。
+    async def get_interaction_history(
+        self,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """专门获取用户的互动历史实体，不占用常规实体检索名额。
 
-        应该在插件关闭时调用，以避免资源泄漏警告。
+        Args:
+            user_id: 用户 ID
+            group_id: 群组 ID
+
+        Returns:
+            实体字典或 None
         """
-        if self._embed_model is not None:
-            # 释放 fastembed 模型引用
-            # fastembed 内部使用 multiprocessing，需要显式释放引用
-            self._embed_model = None
-            logger.debug("[KomariMemory] 向量嵌入模型已释放")
+        return await self._entity_repo.get_interaction_history(
+            user_id=user_id,
+            group_id=group_id,
+        )
+
+    async def cleanup(self) -> None:
+        """清理资源。"""

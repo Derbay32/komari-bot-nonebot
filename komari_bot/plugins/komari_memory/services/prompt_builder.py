@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -97,7 +97,9 @@ async def build_prompt(
     search_query: str | None = None,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
-) -> list[dict[str, str]]:
+    image_urls: list[str] | None = None,
+    query_embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
     """构建 5 段式 OpenAI 格式消息数组。
 
     结构：
@@ -117,12 +119,14 @@ async def build_prompt(
         search_query: 重写后的搜索查询（用于知识库检索）
         memory_service: 记忆服务（用于检索用户实体，可选）
         group_id: 群组 ID（用于检索用户实体，可选）
+        image_urls: 用户消息中的图片 URL 列表（可选）
+        query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
 
     Returns:
-        OpenAI 格式消息列表 [{role, content}]
+        OpenAI 格式消息列表 [{role, content}]，当包含图片时 content 为数组格式
     """
     template = get_template()
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
 
     # ═══════════════════════════════════════
     # ① system — 角色设定 + 记忆 + 实体 + 知识库
@@ -157,6 +161,7 @@ async def build_prompt(
             knowledge_results = await komari_knowledge.search_knowledge(
                 query=query_for_search,
                 limit=config.knowledge_limit,
+                query_embedding=query_embedding,
             )
             if knowledge_results:
                 # 根据 source 字段分组
@@ -217,8 +222,11 @@ async def build_prompt(
     # 用户实体注入（从对话总结中提取的结构化实体）
     if memory_service and group_id and all_user_ids:
         entity_parts: list[str] = []
+        interaction_parts: list[str] = []
+
         for uid in all_user_ids:
             try:
+                # 获取常规实体列表
                 entities = await memory_service.get_entities(
                     user_id=uid, group_id=group_id
                 )
@@ -227,12 +235,32 @@ async def build_prompt(
                     for e in entities
                 )
             except Exception:
-                logger.debug(f"[KomariMemory] 用户 {uid} 的实体检索失败", exc_info=True)
+                logger.debug(
+                    f"[KomariMemory] 用户 {uid} 的常规实体检索失败", exc_info=True
+                )
+
+            try:
+                # 专门获取互动历史记录
+                history_entity = await memory_service.get_interaction_history(
+                    user_id=uid, group_id=group_id
+                )
+                if history_entity:
+                    interaction_parts.append(history_entity["value"])
+            except Exception:
+                logger.debug(
+                    f"[KomariMemory] 用户 {uid} 的互动历史检索失败", exc_info=True
+                )
 
         if entity_parts:
             entity_text = "\n".join(entity_parts)
             system_parts.append(
                 f"<user_entities>\n以下是从历史对话中提取的用户实体信息:\n{entity_text}\n</user_entities>"
+            )
+
+        if interaction_parts:
+            interaction_text = "\n\n".join(interaction_parts)
+            system_parts.append(
+                f"<user_interaction_history>\n{interaction_text}\n</user_interaction_history>"
             )
 
     messages.append({"role": "system", "content": "\n\n".join(system_parts)})
@@ -284,7 +312,20 @@ async def build_prompt(
     current_text = (
         f"- {current_character_name}: <user_input>{user_message}</user_input>"
     )
-    messages.append({"role": "user", "content": current_text})
+
+    # 如果包含图片，构建 OpenAI Vision 格式的 content 数组
+    if image_urls:
+        content_parts: list[dict[str, Any]] = [{"type": "text", "text": current_text}]
+        content_parts.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": url},
+            }
+            for url in image_urls
+        )
+        messages.append({"role": "user", "content": content_parts})
+    else:
+        messages.append({"role": "user", "content": current_text})
 
     # ═══════════════════════════════════════
     # ③ assistant — 伪造记忆确认

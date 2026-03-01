@@ -32,8 +32,9 @@ from nonebot.plugin import PluginMetadata, require
 from .config_schema import DynamicConfigSchema
 from .engine import SearchResult, get_engine, initialize_engine
 
-# 依赖 config_manager 插件
+# 依赖其他插件
 config_manager_plugin = require("config_manager")
+require("embedding_provider")
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
@@ -134,7 +135,9 @@ async def on_shutdown() -> None:
         logger.info("[Komari Knowledge] 插件已关闭")
 
 
-async def search_knowledge(query: str, limit: int | None = None) -> list[SearchResult]:
+async def search_knowledge(
+    query: str, limit: int | None = None, query_embedding: list[float] | None = None
+) -> list[SearchResult]:
     """
     检索相关知识。
 
@@ -143,6 +146,7 @@ async def search_knowledge(query: str, limit: int | None = None) -> list[SearchR
     Args:
         query: 查询文本
         limit: 最大返回数量，None 使用配置默认值
+        query_embedding: 可选的预计算查询向量，传入可避免重复请求 Embedding API
 
     Returns:
         检索结果列表
@@ -161,7 +165,7 @@ async def search_knowledge(query: str, limit: int | None = None) -> list[SearchR
     if not config.plugin_enable:
         return []
 
-    return await engine.search(query, limit)
+    return await engine.search(query, limit, query_vec=query_embedding)
 
 
 async def search_by_keyword(keyword: str) -> list[SearchResult]:

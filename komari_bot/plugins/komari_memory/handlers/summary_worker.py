@@ -60,19 +60,40 @@ async def perform_summary(
         logger.warning(f"[KomariMemory] 群组 {group_id} 消息缓冲为空")
         return
 
-    # 调用 LLM 总结（直接传递 MessageSchema 列表）
-    result = await summarize_conversation(messages_buffer, config)
+    # 获取参与者列表（提前到这里，用于查询现有实体）
+    participants = list({msg.user_id for msg in messages_buffer})
+
+    # 查询现有实体和互动历史，传给 LLM 以支持更新操作
+    existing_entities: list[dict] = []
+    existing_interactions: list[dict] = []
+    for uid in participants:
+        user_entities = await memory.get_entities(
+            user_id=uid, group_id=group_id, limit=50
+        )
+        existing_entities.extend(user_entities)
+
+        interaction = await memory.get_interaction_history(
+            user_id=uid, group_id=group_id
+        )
+        if interaction:
+            existing_interactions.append(interaction)
+
+    # 调用 LLM 总结（传递现有实体以支持增量更新）
+    result = await summarize_conversation(
+        messages_buffer,
+        config,
+        existing_entities=existing_entities,
+        existing_interactions=existing_interactions,
+    )
 
     summary = result.get("summary", "")
     entities = result.get("entities", [])
+    user_interactions = result.get("user_interactions", [])
     importance = result.get("importance", 3)
 
     if not summary:
         logger.warning(f"[KomariMemory] 群组 {group_id} 总结为空，跳过存储")
         return
-
-    # 获取参与者列表
-    participants = list({msg.user_id for msg in messages_buffer})
 
     # 存储对话总结（带向量和重要性评分）
     conversation_id = await memory.store_conversation(
@@ -82,7 +103,7 @@ async def perform_summary(
         importance_initial=importance,
     )
 
-    # 存储实体
+    # 存储常规实体
     for entity in entities:
         try:
             entity_key = entity.get("key", "")
@@ -102,8 +123,36 @@ async def perform_summary(
             )
         except Exception:
             logger.warning(
-                f"[KomariMemory] 存储实体失败: {entity}",
+                f"[KomariMemory] 存储常规实体失败: {entity}",
                 exc_info=True,
+            )
+
+    # 存储用户互动历史 (存为特殊实体)
+    import json
+
+    for interaction in user_interactions:
+        try:
+            uid = interaction.get("user_id")
+            if not uid:
+                logger.debug(
+                    f"[KomariMemory] 跳过无效互动历史 (缺少 user_id): {interaction}"
+                )
+                continue
+
+            # 将互动记录保存为 JSON 字符串，关联到专门的分类和 key
+            interaction_json = json.dumps(interaction, ensure_ascii=False)
+            await memory.upsert_entity(
+                user_id=uid,
+                group_id=group_id,
+                key="interaction_history",
+                value=interaction_json,
+                category="interaction_history",
+                importance=5,  # 确保能通过 highest importance 被优先检索到
+            )
+            logger.debug(f"[KomariMemory] 已更新用户 {uid} 的互动历史记录")
+        except Exception:
+            logger.warning(
+                f"[KomariMemory] 存储用户互动历史失败: {interaction}", exc_info=True
             )
 
     # 重置消息计数

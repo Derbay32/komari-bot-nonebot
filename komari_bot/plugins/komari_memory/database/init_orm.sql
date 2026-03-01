@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS komari_memory_conversations (
     id SERIAL PRIMARY KEY,
     group_id VARCHAR(64) NOT NULL,
     summary TEXT NOT NULL,
-    embedding VECTOR(512),  -- fastembed bge-small-zh-v1.5
+    embedding VECTOR(4096),  -- Qwen/Qwen3-Embedding-8B
     participants TEXT[],
     start_time TIMESTAMP NOT NULL,
     end_time TIMESTAMP NOT NULL,
@@ -22,14 +22,6 @@ CREATE TABLE IF NOT EXISTS komari_memory_conversations (
     is_fuzzy BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
--- ============================================
--- 创建向量索引 (HNSW 算法)
--- ============================================
-CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_embedding
-ON komari_memory_conversations
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
 
 -- ============================================
 -- 创建其他索引

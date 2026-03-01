@@ -169,3 +169,6 @@ user_data.db
 .DS_Store
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+test_multimodal.py
+logs
+config/config_manager/embedding_provider_config.json
