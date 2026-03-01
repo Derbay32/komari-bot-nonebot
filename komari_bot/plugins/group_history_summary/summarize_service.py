@@ -1,62 +1,26 @@
-"""群聊历史总结服务。"""
+"""群聊历史总结服务（仅提取总结正文）。"""
 
 from __future__ import annotations
 
-import json
 import re
-from dataclasses import dataclass
 
 from nonebot.plugin import require
 
 from .history_service import HistoryMessage, format_message_for_prompt
+from .prompt_template import get_template
 
 llm_provider = require("llm_provider")
 
 
-@dataclass(slots=True)
-class SummaryResult:
-    """总结结果。"""
+def _extract_tag_content(text: str, tag: str) -> str:
+    """提取指定 XML 标签内容。"""
+    pattern = rf"<{tag}>([\s\S]*)</{tag}>"
+    match = re.search(pattern, text)
+    if match:
+        return match.group(1).strip()
 
-    title: str
-    overview: str
-    highlights: list[str]
-    todos: list[str]
-    risks: list[str]
-
-
-def _trim_code_fence(raw_text: str) -> str:
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def _parse_json_result(raw_text: str) -> SummaryResult:
-    stripped = _trim_code_fence(raw_text)
-    data = json.loads(stripped)
-
-    title = str(data.get("title", "群聊总结")).strip() or "群聊总结"
-    overview = str(data.get("overview", "")).strip()
-
-    def to_text_list(value: object) -> list[str]:
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        if isinstance(value, str) and value.strip():
-            return [value.strip()]
-        return []
-
-    highlights = to_text_list(data.get("highlights"))
-    todos = to_text_list(data.get("todos"))
-    risks = to_text_list(data.get("risks"))
-
-    return SummaryResult(
-        title=title,
-        overview=overview,
-        highlights=highlights,
-        todos=todos,
-        risks=risks,
-    )
+    without_think = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    return without_think.strip()
 
 
 def _build_transcript(history_messages: list[HistoryMessage], max_chars: int = 12000) -> str:
@@ -65,8 +29,8 @@ def _build_transcript(history_messages: list[HistoryMessage], max_chars: int = 1
 
     for message in history_messages:
         line = format_message_for_prompt(message)
-        if len(line) > 220:
-            line = f"{line[:220]}..."
+        if len(line) > 240:
+            line = f"{line[:240]}..."
         if total_chars + len(line) > max_chars:
             break
         lines.append(line)
@@ -80,36 +44,35 @@ async def summarize_history_messages(
     model: str,
     temperature: float,
     max_tokens: int,
-) -> SummaryResult:
-    """总结历史消息。"""
+) -> str:
+    """总结历史消息，返回总结正文。"""
+    template = get_template()
     transcript = _build_transcript(history_messages)
 
     messages = [
         {
             "role": "system",
-            "content": (
-                "你是中文群聊纪要助手。"
-                "请从聊天事实中提炼信息，不要臆造。"
-                "输出必须是 JSON 对象，不要额外文本。"
-            ),
+            "content": template["system_prompt"],
         },
         {
             "role": "user",
             "content": (
-                "请总结下面的群聊记录，并输出 JSON，结构如下：\n"
-                '{\n'
-                '  "title": "不超过18字的标题",\n'
-                '  "overview": "80-180字总体概览",\n'
-                '  "highlights": ["关键点1", "关键点2"],\n'
-                '  "todos": ["待办1", "待办2"],\n'
-                '  "risks": ["风险1", "风险2"]\n'
-                "}\n"
-                "要求：\n"
-                "1. highlights/todos/risks 各 0-5 条。\n"
-                "2. 只基于记录中明确出现的信息。\n"
-                "3. 没有对应内容时返回空数组。\n\n"
-                f"聊天记录：\n{transcript}"
+                "<history_messages>\n"
+                f"{transcript}\n"
+                "</history_messages>"
             ),
+        },
+        {
+            "role": "assistant",
+            "content": template["memory_ack"],
+        },
+        {
+            "role": "system",
+            "content": template["output_instruction"],
+        },
+        {
+            "role": "assistant",
+            "content": template["cot_prefix"],
         },
     ]
 
@@ -118,48 +81,17 @@ async def summarize_history_messages(
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
-        response_format={"type": "json_object"},
     )
+    summary_text = _extract_tag_content(raw_result, "content")
 
-    try:
-        return _parse_json_result(raw_result)
-    except Exception:
-        return SummaryResult(
-            title="群聊总结",
-            overview=_trim_code_fence(raw_result),
-            highlights=[],
-            todos=[],
-            risks=[],
-        )
+    if not summary_text:
+        return "本次聊天记录信息较少，暂无可提炼的有效总结。"
+
+    return summary_text
 
 
-def summary_result_to_lines(summary: SummaryResult) -> list[str]:
-    """将总结结果转换为图片渲染文本行。"""
-    lines: list[str] = []
-
-    if summary.overview:
-        lines.append("概览")
-        lines.append(summary.overview)
-        lines.append("")
-
-    lines.append("关键点")
-    if summary.highlights:
-        lines.extend(f"- {item}" for item in summary.highlights)
-    else:
-        lines.append("- 无")
-    lines.append("")
-
-    lines.append("待办事项")
-    if summary.todos:
-        lines.extend(f"- {item}" for item in summary.todos)
-    else:
-        lines.append("- 无")
-    lines.append("")
-
-    lines.append("风险与关注")
-    if summary.risks:
-        lines.extend(f"- {item}" for item in summary.risks)
-    else:
-        lines.append("- 无")
-
-    return lines
+def summary_text_to_lines(summary_text: str) -> list[str]:
+    """将总结正文转换为图片渲染行。"""
+    lines = [line.strip() for line in summary_text.splitlines()]
+    normalized = [line for line in lines if line]
+    return normalized or ["本次聊天记录信息较少，暂无可提炼的有效总结。"]

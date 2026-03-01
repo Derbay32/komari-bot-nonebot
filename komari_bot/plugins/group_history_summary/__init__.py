@@ -14,7 +14,7 @@ from nonebot.plugin import PluginMetadata, require
 from .config_schema import DynamicConfigSchema
 from .history_service import check_group_history_supported, fetch_group_history_messages
 from .image_renderer import render_summary_image_base64
-from .summarize_service import summarize_history_messages, summary_result_to_lines
+from .summarize_service import summarize_history_messages, summary_text_to_lines
 
 config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
@@ -35,6 +35,7 @@ summary_matcher = on_message(priority=9, block=False)
 SUMMARY_PATTERN = re.compile(r"总结(?:过去)?\s*(\d{1,4})\s*条")
 
 _group_locks: dict[str, asyncio.Lock] = {}
+SUMMARY_TITLE = "群聊总结"
 
 
 def _get_group_lock(group_id: str) -> asyncio.Lock:
@@ -116,20 +117,20 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 logger.info("[GroupHistorySummary] 没有可用的历史消息")
                 await summary_matcher.finish("没、没有消息啊……？")
 
-            summary = await summarize_history_messages(
+            summary_text = await summarize_history_messages(
                 history_messages=history_messages,
                 model=config.summary_model,
                 temperature=config.summary_temperature,
                 max_tokens=config.summary_max_tokens,
             )
 
-            body_lines = summary_result_to_lines(summary)
+            body_lines = summary_text_to_lines(summary_text)
             subtitle = (
                 f"最近 {len(history_messages)} 条 | "
                 f"{_format_time_range(history_messages[0].timestamp, history_messages[-1].timestamp)}"
             )
             image_base64 = render_summary_image_base64(
-                title=summary.title,
+                title=SUMMARY_TITLE,
                 subtitle=subtitle,
                 body_lines=body_lines,
                 width=config.card_width,
