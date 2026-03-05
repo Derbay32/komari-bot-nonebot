@@ -132,6 +132,25 @@ class SceneRepository:
             )
             return dict(row) if row else None
 
+    async def list_ready_sets(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """按时间倒序列出 READY scene set。"""
+        sql = """
+            SELECT id, source_path, source_hash, embedding_model,
+                   embedding_instruction_hash, status, item_total, item_ready,
+                   item_failed, error_message, created_at, ready_at
+            FROM komari_memory_scene_set
+            WHERE status = 'READY'
+            ORDER BY COALESCE(ready_at, created_at) DESC, id DESC
+        """
+        params: list[Any] = []
+        if limit is not None:
+            sql += " LIMIT $1"
+            params.append(limit)
+
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(row) for row in rows]
+
     async def get_latest_set_by_fingerprint(
         self,
         source_hash: str,
@@ -427,3 +446,68 @@ class SceneRepository:
                 error_message,
             )
         logger.warning("[KomariMemory] scene set 失败: id=%s error=%s", set_id, error_message)
+
+    async def reopen_failed_set(self, set_id: int) -> int:
+        """将 FAILED set 重置为 BUILDING，并将 FAILED item 置回 PENDING。"""
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            set_row = await conn.fetchrow(
+                """
+                SELECT status
+                FROM komari_memory_scene_set
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                set_id,
+            )
+            if set_row is None:
+                msg = f"scene set 不存在: {set_id}"
+                raise ValueError(msg)
+            if str(set_row["status"]) != "FAILED":
+                msg = f"仅允许重试 FAILED set: id={set_id} status={set_row['status']}"
+                raise ValueError(msg)
+
+            await conn.execute(
+                """
+                UPDATE komari_memory_scene_set
+                SET status = 'BUILDING',
+                    error_message = NULL,
+                    ready_at = NULL
+                WHERE id = $1
+                """,
+                set_id,
+            )
+
+            result = await conn.execute(
+                """
+                UPDATE komari_memory_scene_item
+                SET status = 'PENDING',
+                    error_message = NULL
+                WHERE set_id = $1
+                  AND status = 'FAILED'
+                """,
+                set_id,
+            )
+            updated = int(result.split()[-1])
+
+        logger.info(
+            "[KomariMemory] 重试 scene set: id=%s reset_failed_items=%s",
+            set_id,
+            updated,
+        )
+        return updated
+
+    async def delete_set(self, set_id: int) -> bool:
+        """删除指定 set（级联删除 item）。"""
+        async with self.pg_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM komari_memory_scene_set
+                WHERE id = $1
+                """,
+                set_id,
+            )
+        affected = int(result.split()[-1])
+        if affected > 0:
+            logger.info("[KomariMemory] 删除 scene set: id=%s", set_id)
+            return True
+        return False
