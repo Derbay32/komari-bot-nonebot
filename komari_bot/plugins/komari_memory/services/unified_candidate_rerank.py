@@ -60,22 +60,6 @@ class UnifiedCandidateRerankService:
         self._cached_embeddings: dict[str, list[float]] = {}
 
     @staticmethod
-    def _with_instruction(text: str, instruction: str) -> str:
-        """将 instruction 注入文本输入。"""
-        instruction_clean = instruction.strip()
-        text_clean = text.strip()
-        if not instruction_clean:
-            return text_clean
-        return (
-            "<instruction>\n"
-            f"{instruction_clean}\n"
-            "</instruction>\n"
-            "<input>\n"
-            f"{text_clean}\n"
-            "</input>"
-        )
-
-    @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
         """计算余弦相似度。"""
         if not v1 or not v2 or len(v1) != len(v2):
@@ -173,18 +157,21 @@ class UnifiedCandidateRerankService:
 
         items: list[tuple[str, str]] = []
         for key, text in fixed.items():
-            items.append((f"fixed::{key}", self._with_instruction(text, instruction)))
+            items.append((f"fixed::{key}", text))
         items.extend(
             [
                 (
                     f"scene::{scene['id']}",
-                    self._with_instruction(scene["text"], instruction),
+                    scene["text"],
                 )
                 for scene in scenes
             ]
         )
 
-        vectors = await embedding_provider.embed_batch([item[1] for item in items])
+        vectors = await embedding_provider.embed_batch(
+            [item[1] for item in items],
+            instruction=instruction,
+        )
         if len(vectors) != len(items):
             msg = (
                 "[UnifiedRerank] embedding 数量异常: "
@@ -224,7 +211,8 @@ class UnifiedCandidateRerankService:
         )
 
         query_vector = await embedding_provider.embed(
-            self._with_instruction(message, config.embedding_instruction_query)
+            message,
+            instruction=config.embedding_instruction_query,
         )
 
         # 固定候选 embedding 先验
@@ -289,12 +277,12 @@ class UnifiedCandidateRerankService:
                 )
             )
 
-        rerank_query = self._with_instruction(message, config.rerank_instruction)
         rerank_documents = [item.text for item in candidates]
         rerank_results = await embedding_provider.rerank(
-            query=rerank_query,
+            query=message,
             documents=rerank_documents,
             top_n=len(rerank_documents),
+            instruction=config.rerank_instruction,
         )
 
         score_map = {item.key: 0.0 for item in candidates}
