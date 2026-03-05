@@ -12,7 +12,6 @@ dependencies = [
     "nonebot-plugin-apscheduler>=0.5.0",
     "nonebot2",
     "nonebot2[fastapi]>=2.4.4",
-    "google-genai (>=1.56.0,<2.0.0)",
     "nonebot-plugin-sentry>=2.0.0",
     "fastembed (>=0.7.4,<0.8.0)",
     "psycopg (>=3.3.2,<4.0.0)",
@@ -21,6 +20,7 @@ dependencies = [
     "redis (>=7.1.0,<8.0.0)",
     "greenlet (>=3.3.0,<4.0.0)",
     "zhdate (>=0.1,<1.0)",
+    "Pillow (>=11.2.1,<12.0.0)",
 ]
 
 [project.optional-dependencies]
@@ -144,3 +144,10 @@ typeCheckingMode = "standard"
 
 [tool.poetry]
 package-mode = false
+
+[dependency-groups]
+dev = [
+    "ipywidgets (>=8.1.8,<9.0.0)",
+    "jupyterlab (>=4.5.5,<5.0.0)",
+    "ipykernel (>=7.2.0,<8.0.0)",
+]

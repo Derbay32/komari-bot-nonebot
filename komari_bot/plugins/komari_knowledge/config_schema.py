@@ -32,12 +32,41 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    # PostgreSQL 数据库配置
-    pg_host: str = Field(default="localhost", description="PostgreSQL 主机地址")
-    pg_port: int = Field(default=5432, description="PostgreSQL 端口")
-    pg_database: str = Field(default="komari_bot", description="数据库名称")
-    pg_user: str = Field(default="", description="数据库用户名")
-    pg_password: str = Field(default="", description="数据库密码")
+    # PostgreSQL 配置覆盖项（默认读取共享 database_config）
+    pg_host: str | None = Field(
+        default=None,
+        description="可选：覆盖共享配置中的 PostgreSQL 主机地址",
+    )
+    pg_port: int | None = Field(
+        default=None,
+        ge=1,
+        le=65535,
+        description="可选：覆盖共享配置中的 PostgreSQL 端口",
+    )
+    pg_database: str | None = Field(
+        default=None,
+        description="可选：覆盖共享配置中的数据库名称",
+    )
+    pg_user: str | None = Field(
+        default=None,
+        description="可选：覆盖共享配置中的数据库用户名",
+    )
+    pg_password: str | None = Field(
+        default=None,
+        description="可选：覆盖共享配置中的数据库密码",
+    )
+    pg_pool_min_size: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="可选：覆盖共享配置中的连接池最小连接数",
+    )
+    pg_pool_max_size: int | None = Field(
+        default=None,
+        ge=1,
+        le=50,
+        description="可选：覆盖共享配置中的连接池最大连接数",
+    )
 
     similarity_threshold: float = Field(
         default=0.65,

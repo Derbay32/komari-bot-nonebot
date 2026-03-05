@@ -49,8 +49,19 @@ jobs:
           TAG_NAME="${{ github.event.release.tag_name || github.ref_name }}"
           
           # 准备打包目录
-          mkdir -p komari-bot-deploy
-          cp -r config komari-bot-deploy/
+          mkdir -p komari-bot-deploy/app
+          # 复制 config 目录（对应 docker-compose 的 ./app/config）
+          if [ -d config ]; then
+            cp -r config komari-bot-deploy/app/config
+          else
+            mkdir -p komari-bot-deploy/app/config
+          fi
+          # 复制 data 目录（对应 docker-compose 的 ./app/data）
+          if [ -d data ]; then
+            cp -r data komari-bot-deploy/app/data
+          else
+            mkdir -p komari-bot-deploy/app/data
+          fi
           
           # 复制 docker-compose.yml 并替换镜像标签为当前版本
           sed "s|derbay32/komari-bot-nonebot:latest|derbay32/komari-bot-nonebot:${TAG_NAME}|g" docker-compose.yml > komari-bot-deploy/docker-compose.yml

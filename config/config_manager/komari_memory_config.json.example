@@ -5,14 +5,6 @@
   "user_whitelist": [],
   "group_whitelist": [],
   
-  "pg_host": "localhost",
-  "pg_port": 5432,
-  "pg_database": "komari_bot",
-  "pg_user": "your_username",
-  "pg_password": "your_password",
-  "pg_pool_min_size": 2,
-  "pg_pool_max_size": 5,
-
   "redis_host": "localhost",
   "redis_port": 6379,
   "redis_db": 1,

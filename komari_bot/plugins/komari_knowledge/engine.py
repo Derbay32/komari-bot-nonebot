@@ -19,6 +19,14 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from komari_bot.common.database_config import (
+    DatabaseConfigSchema,
+    get_effective_database_config,
+    load_database_config_from_file,
+    merge_database_config,
+)
+from komari_bot.common.postgres import create_postgres_pool
+
 from .config_schema import DynamicConfigSchema
 
 
@@ -87,6 +95,25 @@ def get_config() -> DynamicConfigSchema:
     return state.standalone_config
 
 
+def get_db_config(config: DynamicConfigSchema) -> DatabaseConfigSchema:
+    """获取最终生效的数据库配置（兼容两种模式）。"""
+    if state.nonebot_mode:
+        return get_effective_database_config(config)
+
+    shared_config_path = Path("config/config_manager/database_config.json")
+    if shared_config_path.exists():
+        try:
+            shared = load_database_config_from_file(shared_config_path)
+            return merge_database_config(shared, config)
+        except Exception as e:
+            state.logger.warning(
+                "[Komari Knowledge] 共享数据库配置解析失败: %s，回退到本地配置",
+                e,
+            )
+
+    return merge_database_config(DatabaseConfigSchema(), config)
+
+
 class SearchResult(BaseModel):
     """检索结果。"""
 
@@ -143,18 +170,8 @@ class KnowledgeEngine:
 
         # 2. 建立数据库连接池
         if self._pool is None:
-            import asyncpg
-
-            self._pool = await asyncpg.create_pool(
-                host=config.pg_host,
-                port=config.pg_port,
-                database=config.pg_database,
-                user=config.pg_user,
-                password=config.pg_password,
-                min_size=2,
-                max_size=5,
-                command_timeout=30,
-            )
+            db_config = get_db_config(config)
+            self._pool = await create_postgres_pool(db_config, command_timeout=30)
             state.logger.info("[Komari Knowledge] 数据库连接池已建立")
 
         # 3. 构建关键词索引（内存预热）
