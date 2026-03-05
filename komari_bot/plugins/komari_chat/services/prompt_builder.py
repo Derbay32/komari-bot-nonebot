@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -229,26 +230,39 @@ async def build_prompt(
 
         for uid in all_user_ids:
             try:
-                # 获取常规实体列表
-                entities = await memory_service.get_entities(
+                profile = await memory_service.get_user_profile(
                     user_id=uid, group_id=group_id
                 )
-                entity_parts.extend(
-                    f"- 用户({uid}): {e['key']}={e['value']} [{e.get('category', 'general')}]"
-                    for e in entities
-                )
+                if profile:
+                    display_name = str(profile.get("display_name") or uid)
+                    traits = profile.get("traits")
+                    if isinstance(traits, dict):
+                        for key, payload in traits.items():
+                            if not isinstance(payload, dict):
+                                continue
+                            value = str(payload.get("value", "")).strip()
+                            if not value:
+                                continue
+                            category = str(payload.get("category", "general"))
+                            entity_parts.append(
+                                f"- 用户({uid}/{display_name}): {key}={value} [{category}]"
+                            )
             except Exception:
                 logger.debug(
-                    f"[KomariMemory] 用户 {uid} 的常规实体检索失败", exc_info=True
+                    "[KomariMemory] 用户 %s 的画像实体检索失败",
+                    uid,
+                    exc_info=True,
                 )
 
             try:
                 # 专门获取互动历史记录
-                history_entity = await memory_service.get_interaction_history(
+                history_json = await memory_service.get_interaction_history(
                     user_id=uid, group_id=group_id
                 )
-                if history_entity:
-                    interaction_parts.append(history_entity["value"])
+                if history_json:
+                    interaction_parts.append(
+                        json.dumps(history_json, ensure_ascii=False)
+                    )
             except Exception:
                 logger.debug(
                     f"[KomariMemory] 用户 {uid} 的互动历史检索失败", exc_info=True
