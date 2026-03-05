@@ -4,16 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from nonebot import logger
-from nonebot.plugin import require
 
 from .config_interface import get_config
-
-# 依赖 embedding_provider 插件
-embedding_provider = require("embedding_provider")
 
 _SCENE_TEMPLATE_PATH = Path("config") / "prompts" / "komari_memory_scenes.yaml"
 
@@ -58,6 +54,13 @@ class UnifiedCandidateRerankService:
         self._cached_fixed: dict[str, str] = {}
         self._cached_scenes: list[dict[str, str]] = []
         self._cached_embeddings: dict[str, list[float]] = {}
+
+    @staticmethod
+    def _get_embedding_provider() -> Any:
+        """惰性获取 embedding_provider，避免模块导入阶段强依赖。"""
+        from nonebot.plugin import require
+
+        return require("embedding_provider")
 
     @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
@@ -134,6 +137,7 @@ class UnifiedCandidateRerankService:
 
     async def _ensure_embeddings(self) -> None:
         """确保模板和候选 embedding 已加载。"""
+        embedding_provider = self._get_embedding_provider()
         config = get_config()
         path = self._resolve_template_path()
 
@@ -201,6 +205,7 @@ class UnifiedCandidateRerankService:
         alias_hit: bool | None = None,
     ) -> UnifiedRerankResult:
         """对单条消息执行统一候选集单次 rerank。"""
+        embedding_provider = self._get_embedding_provider()
         await self._ensure_embeddings()
         config = get_config()
 
