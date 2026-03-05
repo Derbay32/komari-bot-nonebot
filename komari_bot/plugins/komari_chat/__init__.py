@@ -11,6 +11,7 @@ from .handlers.message_handler import MessageHandler
 # 依赖插件
 permission_manager_plugin = require("permission_manager")
 require("komari_memory")
+require("komari_decision")
 
 from komari_bot.plugins.komari_memory import get_plugin_manager
 from komari_bot.plugins.komari_memory.services.config_interface import get_config

@@ -8,18 +8,14 @@ from typing import TYPE_CHECKING, Literal
 
 from nonebot import logger
 
+from komari_bot.plugins.komari_decision.services.decision_engine import (
+    DecisionEngine,
+    DecisionOutcome,
+)
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
-from komari_bot.plugins.komari_memory.services.message_filter import preprocess_message
 from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
     RedisManager,
-)
-from komari_bot.plugins.komari_memory.services.social_timing_service import (
-    SocialTimingService,
-)
-from komari_bot.plugins.komari_memory.services.unified_candidate_rerank import (
-    UnifiedCandidateRerankService,
-    UnifiedRerankResult,
 )
 
 from ..services.image_downloader import download_images_as_base64
@@ -36,9 +32,7 @@ if TYPE_CHECKING:
         SceneRuntimeService,
     )
 
-CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
-ReplyReason = Literal["at", "direct_call", "score"]
-MemoryAction = Literal["store", "drop"]
+AttemptReplyReason = Literal["at", "direct_call", "score"]
 ReplyAction = Literal[
     "replied",
     "replied_forced",
@@ -51,9 +45,6 @@ ReplyAction = Literal[
 class MessageHandler:
     """消息处理核心。"""
 
-    _DIRECT_CALL_BONUS = 0.25
-    _CASUAL_MENTION_PENALTY = -0.18
-
     def __init__(
         self,
         redis: RedisManager,
@@ -64,60 +55,47 @@ class MessageHandler:
         self.redis = redis
         self.memory = memory
         self.query_rewrite = QueryRewriteService()
-        self.unified_rerank = UnifiedCandidateRerankService(runtime_service=scene_runtime)
-        self.social_timing = SocialTimingService(redis)
+        self.decision_engine = DecisionEngine(redis, scene_runtime)
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。"""
         return bool(hasattr(event, "to_me") and event.to_me)
 
     @staticmethod
-    def _clamp_score(value: float) -> float:
-        return max(0.0, min(1.0, value))
-
-    def _resolve_call_intent(
-        self, rank_result: UnifiedRerankResult
-    ) -> tuple[CallIntent, float]:
-        """根据 CALL_* 分数判定呼叫意图。"""
-        config = get_config()
-
-        if (
-            not rank_result.alias_hit
-            or rank_result.call_direct_score is None
-            or rank_result.call_mention_score is None
-        ):
-            return "none", 0.0
-
-        call_margin = rank_result.call_direct_score - rank_result.call_mention_score
-        threshold = config.call_margin_threshold
-        if call_margin >= threshold:
-            return "direct_call", call_margin
-        if call_margin <= -threshold:
-            return "casual_mention", call_margin
-        return "ambiguous", call_margin
-
-    def _should_drop_memory(self, rank_result: UnifiedRerankResult) -> bool:
-        """根据 NOISE/MEANINGFUL 判定是否丢弃记忆。"""
-        config = get_config()
-        noise_delta = rank_result.noise_score - rank_result.meaningful_score
-        return (
-            rank_result.noise_score >= config.noise_conf_threshold
-            and noise_delta >= config.noise_margin_threshold
-        )
-
-    def _get_alias_adjust(self, intent: CallIntent) -> float:
-        """获取意图对回复分的修正值。"""
-        if intent == "direct_call":
-            return self._DIRECT_CALL_BONUS
-        if intent == "casual_mention":
-            return self._CASUAL_MENTION_PENALTY
-        return 0.0
-
-    @staticmethod
     def _safe_round(value: float | None) -> float | None:
         if value is None:
             return None
         return round(value, 4)
+
+    def _build_decision_payload(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        message_id: str,
+        outcome: DecisionOutcome,
+        reply_action: ReplyAction,
+    ) -> dict[str, object]:
+        return {
+            "group_id": group_id,
+            "user_id": user_id,
+            "message_id": message_id,
+            "alias_hit": outcome.alias_hit,
+            "call_intent": outcome.call_intent,
+            "call_margin": self._safe_round(outcome.call_margin),
+            "memory_action": outcome.memory_action,
+            "reply_action": reply_action,
+            "forced_reply_reason": outcome.forced_reply_reason,
+            "filter_reason": outcome.filter_reason,
+            "reply_score": self._safe_round(outcome.reply_score),
+            "timing_score": self._safe_round(outcome.timing_score),
+            "scene_score": self._safe_round(outcome.scene_score),
+            "best_scene_id": outcome.best_scene_id,
+            "noise_score": self._safe_round(outcome.noise_score),
+            "meaningful_score": self._safe_round(outcome.meaningful_score),
+            "call_direct_score": self._safe_round(outcome.call_direct_score),
+            "call_mention_score": self._safe_round(outcome.call_mention_score),
+        }
 
     def _log_decision(self, payload: dict[str, object]) -> None:
         """输出决策日志（info 摘要 + debug 完整结构）。"""
@@ -146,8 +124,6 @@ class MessageHandler:
         event: GroupMessageEvent,
     ) -> dict[str, str] | None:
         """处理群聊消息的主流程。"""
-        config = get_config()
-
         user_id = str(event.user_id)
         group_id = str(event.group_id)
         message_content = event.get_plaintext()
@@ -175,213 +151,85 @@ class MessageHandler:
             message_id=message_id,
         )
 
-        # 1) @ 强制回复，无视冷却/频控，跳过评分链路
-        if self._is_at_trigger(event):
-            reply, _stored = await self._attempt_reply(
-                message=message,
-                reply_to_message_id=message_id,
-                image_urls=image_urls,
-                force_reply=True,
-                reason="at",
-                reply_score=None,
-                store_current=True,
-            )
-            self._log_decision(
-                {
-                    "group_id": group_id,
-                    "user_id": user_id,
-                    "message_id": message_id,
-                    "alias_hit": None,
-                    "call_intent": "none",
-                    "memory_action": "store",
-                    "reply_action": "replied_forced" if reply else "generation_failed",
-                    "forced_reply_reason": "at",
-                    "reply_score": None,
-                    "timing_score": None,
-                    "scene_score": None,
-                    "best_scene_id": None,
-                    "noise_score": None,
-                    "meaningful_score": None,
-                }
-            )
-            return reply
-
-        # 2) 预过滤
-        filter_result = await preprocess_message(
-            message=message_content,
-            config=config,
-            redis=self.redis,
+        outcome = await self.decision_engine.evaluate(
+            message_content=message_content,
             group_id=group_id,
+            at_trigger=self._is_at_trigger(event),
         )
-        if filter_result.should_skip:
+        memory_store = outcome.memory_action == "store"
+
+        if outcome.filter_reason is not None:
             logger.debug(
                 "[KomariMemory] 消息被过滤: %s - %s...",
-                filter_result.reason,
+                outcome.filter_reason,
                 message_content[:30],
             )
             await self._handle_low_value(message)
             self._log_decision(
-                {
-                    "group_id": group_id,
-                    "user_id": user_id,
-                    "message_id": message_id,
-                    "alias_hit": None,
-                    "call_intent": "none",
-                    "memory_action": "drop",
-                    "reply_action": "not_replied",
-                    "forced_reply_reason": "none",
-                    "filter_reason": filter_result.reason,
-                    "reply_score": None,
-                    "timing_score": None,
-                    "scene_score": None,
-                    "best_scene_id": None,
-                    "noise_score": None,
-                    "meaningful_score": None,
-                }
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    outcome=outcome,
+                    reply_action="not_replied",
+                )
             )
             return None
 
-        # 3) 单次 rerank 统一候选评分
-        rank_result = await self.unified_rerank.rank_message(message_content)
-        memory_drop = self._should_drop_memory(rank_result)
-        memory_store = not memory_drop
-        memory_action: MemoryAction = "store" if memory_store else "drop"
-        call_intent, call_margin = self._resolve_call_intent(rank_result)
-
-        # 4) 时机分（仅影响回复）
-        timing_result = await self.social_timing.score(
-            group_id=group_id,
-            alias_hit=rank_result.alias_hit,
-        )
-        scene_score = rank_result.best_scene_score
-        alias_adjust = self._get_alias_adjust(call_intent)
-        reply_score = self._clamp_score(
-            (1.0 - config.timing_weight) * scene_score
-            + config.timing_weight * timing_result.timing_score
-            + alias_adjust
-        )
-
-        reply_action: ReplyAction = "not_replied"
-        forced_reply_reason: ReplyReason | Literal["none"] = "none"
-
-        # 5) direct_call 强制回复（仍计算并记录评分）
-        if call_intent == "direct_call":
-            forced_reply_reason = "direct_call"
-            reply, stored = await self._attempt_reply(
-                message=message,
-                reply_to_message_id=message_id,
-                image_urls=image_urls,
-                force_reply=True,
-                reason="direct_call",
-                reply_score=reply_score,
-                store_current=memory_store,
-            )
-            if reply is not None:
-                reply_action = "replied_forced"
-                self._log_decision(
-                    {
-                        "group_id": group_id,
-                        "user_id": user_id,
-                        "message_id": message_id,
-                        "alias_hit": rank_result.alias_hit,
-                        "call_intent": call_intent,
-                        "call_margin": self._safe_round(call_margin),
-                        "memory_action": memory_action,
-                        "reply_action": reply_action,
-                        "forced_reply_reason": forced_reply_reason,
-                        "reply_score": self._safe_round(reply_score),
-                        "timing_score": self._safe_round(timing_result.timing_score),
-                        "scene_score": self._safe_round(scene_score),
-                        "best_scene_id": rank_result.best_scene_id,
-                        "noise_score": self._safe_round(rank_result.noise_score),
-                        "meaningful_score": self._safe_round(
-                            rank_result.meaningful_score
-                        ),
-                        "call_direct_score": self._safe_round(
-                            rank_result.call_direct_score
-                        ),
-                        "call_mention_score": self._safe_round(
-                            rank_result.call_mention_score
-                        ),
-                    }
-                )
-                return reply
-            if memory_store and not stored:
-                await self._handle_normal_message(message)
-            reply_action = "generation_failed"
-        else:
-            # 6) 普通回复路径
-            should_reply = reply_score >= config.reply_threshold
-            if should_reply:
-                reply, stored = await self._attempt_reply(
-                    message=message,
-                    reply_to_message_id=message_id,
-                    image_urls=image_urls,
-                    force_reply=False,
-                    reason="score",
-                    reply_score=reply_score,
-                    store_current=memory_store,
-                )
-                if reply is not None:
-                    reply_action = "replied"
-                    self._log_decision(
-                        {
-                            "group_id": group_id,
-                            "user_id": user_id,
-                            "message_id": message_id,
-                            "alias_hit": rank_result.alias_hit,
-                            "call_intent": call_intent,
-                            "call_margin": self._safe_round(call_margin),
-                            "memory_action": memory_action,
-                            "reply_action": reply_action,
-                            "forced_reply_reason": forced_reply_reason,
-                            "reply_score": self._safe_round(reply_score),
-                            "timing_score": self._safe_round(
-                                timing_result.timing_score
-                            ),
-                            "scene_score": self._safe_round(scene_score),
-                            "best_scene_id": rank_result.best_scene_id,
-                            "noise_score": self._safe_round(rank_result.noise_score),
-                            "meaningful_score": self._safe_round(
-                                rank_result.meaningful_score
-                            ),
-                            "call_direct_score": self._safe_round(
-                                rank_result.call_direct_score
-                            ),
-                            "call_mention_score": self._safe_round(
-                                rank_result.call_mention_score
-                            ),
-                        }
-                    )
-                    return reply
-                if memory_store and not stored:
-                    await self._handle_normal_message(message)
-                reply_action = "generation_failed"
-            elif memory_store:
+        if not outcome.should_reply:
+            if memory_store:
                 await self._handle_normal_message(message)
             else:
                 await self._handle_low_value(message)
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    outcome=outcome,
+                    reply_action="not_replied",
+                )
+            )
+            return None
+
+        reason: AttemptReplyReason = (
+            outcome.reply_reason if outcome.reply_reason != "none" else "score"
+        )
+        reply, stored = await self._attempt_reply(
+            message=message,
+            reply_to_message_id=message_id,
+            image_urls=image_urls,
+            force_reply=outcome.force_reply,
+            reason=reason,
+            reply_score=outcome.reply_score,
+            store_current=memory_store,
+        )
+        if reply is not None:
+            reply_action: ReplyAction = (
+                "replied_forced" if outcome.force_reply else "replied"
+            )
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    outcome=outcome,
+                    reply_action=reply_action,
+                )
+            )
+            return reply
+
+        if memory_store and not stored:
+            await self._handle_normal_message(message)
 
         self._log_decision(
-            {
-                "group_id": group_id,
-                "user_id": user_id,
-                "message_id": message_id,
-                "alias_hit": rank_result.alias_hit,
-                "call_intent": call_intent,
-                "call_margin": self._safe_round(call_margin),
-                "memory_action": memory_action,
-                "reply_action": reply_action,
-                "forced_reply_reason": forced_reply_reason,
-                "reply_score": self._safe_round(reply_score),
-                "timing_score": self._safe_round(timing_result.timing_score),
-                "scene_score": self._safe_round(scene_score),
-                "best_scene_id": rank_result.best_scene_id,
-                "noise_score": self._safe_round(rank_result.noise_score),
-                "meaningful_score": self._safe_round(rank_result.meaningful_score),
-                "call_direct_score": self._safe_round(rank_result.call_direct_score),
-                "call_mention_score": self._safe_round(rank_result.call_mention_score),
-            }
+            self._build_decision_payload(
+                group_id=group_id,
+                user_id=user_id,
+                message_id=message_id,
+                outcome=outcome,
+                reply_action="generation_failed",
+            )
         )
         return None
 
@@ -425,7 +273,7 @@ class MessageHandler:
         reply_to_message_id: str,
         image_urls: list[str] | None,
         force_reply: bool,
-        reason: ReplyReason,
+        reason: AttemptReplyReason,
         reply_score: float | None,
         store_current: bool,
     ) -> tuple[dict[str, str] | None, bool]:

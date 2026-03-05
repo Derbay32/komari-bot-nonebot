@@ -1,6 +1,6 @@
 """UnifiedCandidateRerankService 单元测试。"""
 
-from komari_bot.plugins.komari_memory.services.unified_candidate_rerank import (
+from komari_bot.plugins.komari_decision.services.unified_candidate_rerank import (
     UnifiedCandidateRerankService,
 )
 
