@@ -41,6 +41,26 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
 
 或者手动执行 `komari_bot/plugins/komari_memory/database/init_orm.sql` 文件中的 SQL 语句。
 
+### 2.5 实体表一次性迁移（旧版本升级必做）
+
+如果你的 `komari_memory_entity` 里还是旧的多行 key/value 结构，先执行 dry-run：
+
+```bash
+poetry run python scripts/migrate_komari_memory_entity_to_json.py
+```
+
+确认统计无误后执行迁移（会先备份，再写入新结构并应用约束）：
+
+```bash
+poetry run python scripts/migrate_komari_memory_entity_to_json.py --apply
+```
+
+仅应用约束（手动流程）可执行：
+
+```bash
+psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_memory/database/entity_unification_constraints.sql
+```
+
 ### 3. 配置插件
 
 在 `config/config_manager/komari_memory_config.json` 中配置：

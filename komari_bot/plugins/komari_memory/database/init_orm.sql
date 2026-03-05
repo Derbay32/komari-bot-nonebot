@@ -39,12 +39,17 @@ ON komari_memory_conversations(start_time DESC);
 CREATE TABLE IF NOT EXISTS komari_memory_entity (
     user_id VARCHAR(64) NOT NULL,
     group_id VARCHAR(64) NOT NULL,
-    key VARCHAR(100) NOT NULL,
+    key VARCHAR(100) NOT NULL CHECK (key IN ('user_profile', 'interaction_history')),
     value TEXT NOT NULL,
-    category VARCHAR(50) NOT NULL,
+    category VARCHAR(50) NOT NULL CHECK (category IN ('profile_json', 'interaction_history')),
     importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
     access_count INT DEFAULT 0,
     last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ck_komari_memory_entity_two_row_model CHECK (
+        (key = 'user_profile' AND category = 'profile_json')
+        OR
+        (key = 'interaction_history' AND category = 'interaction_history')
+    ),
     PRIMARY KEY (user_id, group_id, key)
 );
 
