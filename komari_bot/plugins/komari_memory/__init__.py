@@ -2,17 +2,14 @@
 
 from typing import TYPE_CHECKING
 
-from nonebot import get_driver, logger, on_message
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 if TYPE_CHECKING:
     from .config_schema import KomariMemoryConfigSchema
 
 # 依赖插件
-permission_manager_plugin = require("permission_manager")
 apscheduler_plugin = require("nonebot_plugin_apscheduler")
-require("komari_knowledge")  # 常识库集成
 
 from .config_schema import KomariMemoryConfigSchema
 from .database.connection import create_pool
@@ -20,7 +17,6 @@ from .handlers.forgetting_worker import (
     register_forgetting_task,
     unregister_forgetting_task,
 )
-from .handlers.message_handler import MessageHandler
 from .handlers.scene_sync_worker import (
     bootstrap_scene_sync_task,
     register_scene_sync_task,
@@ -57,7 +53,6 @@ class PluginManager:
         self.config = config
         self.redis: RedisManager | None = None
         self.memory: MemoryService | None = None
-        self.handler: MessageHandler | None = None
         self.forgetting: ForgettingService | None = None
         self.scene_runtime: SceneRuntimeService | None = None
         self.scene_repository: SceneRepository | None = None
@@ -111,21 +106,14 @@ class PluginManager:
         # 4. 初始化记忆服务
         self.memory = MemoryService(self.config, conversation_repo, entity_repo)
 
-        # 5. 初始化消息处理器
-        self.handler = MessageHandler(
-            redis=self.redis,
-            memory=self.memory,
-            scene_runtime=self.scene_runtime,
-        )
-
-        # 6. 注册总结定时任务
+        # 5. 注册总结定时任务
         register_summary_task(self.redis, self.memory)
 
-        # 7. 初始化忘却服务并注册定时任务
+        # 6. 初始化忘却服务并注册定时任务
         self.forgetting = ForgettingService(self.config, self.pg_pool)
         register_forgetting_task(self.forgetting)
 
-        # 8. 注册 scene 同步任务并执行启动期 bootstrap
+        # 7. 注册 scene 同步任务并执行启动期 bootstrap
         if (
             self.config.scene_persist_enabled
             and self.scene_repository is not None
@@ -178,64 +166,6 @@ def get_plugin_manager() -> PluginManager | None:
     return _plugin_manager
 
 
-# 消息处理器
-matcher = on_message(priority=10, block=False)
-
-
-@matcher.handle()
-async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
-    """处理群聊消息。"""
-    # 获取最新配置
-    config = get_config()
-
-    # 检查插件是否启用
-    if not config.plugin_enable:
-        return
-
-    manager = get_plugin_manager()
-    if manager is None or manager.handler is None:
-        return
-
-    # 白名单检查：只有白名单内的群组才启用功能（白名单为空则禁用所有功能）
-    group_id = str(event.group_id)
-    if group_id not in config.group_whitelist:
-        return
-
-    # 权限检查
-    can_use, _ = await permission_manager_plugin.check_runtime_permission(bot, event, config)
-    if not can_use:
-        return
-
-    try:
-        result = await manager.handler.process_message(event)
-
-        if result:
-            reply = result.get("reply")
-            reply_to_message_id = result.get("reply_to_message_id")
-
-            if reply:
-                if reply_to_message_id:
-                    # 使用 QQ 原生回复功能
-                    message_array = [
-                        {"type": "reply", "data": {"id": reply_to_message_id}},
-                        {"type": "text", "data": {"text": reply}}
-                    ]
-                    try:
-                        await bot.call_api(
-                            "send_group_msg",
-                            group_id=int(event.group_id),
-                            message=message_array
-                        )
-                    except Exception as e:
-                        logger.warning(f"[KomariMemory] 原生回复失败: {e}，降级使用普通发送")
-                        await matcher.send(reply)
-                else:
-                    await matcher.send(reply)
-
-    except Exception:
-        logger.exception("[KomariMemory] 消息处理失败")
-
-
 # 在插件加载时初始化
 driver = get_driver()
 
@@ -248,17 +178,7 @@ async def startup() -> None:
     config = get_config()
 
     if config.plugin_enable:
-        # 检查白名单是否为空
-        if not config.group_whitelist:
-            logger.warning(
-                "[KomariMemory] 群组白名单为空，插件将不会处理任何消息。"
-                "请在配置中设置 group_whitelist"
-            )
-        else:
-            logger.info(
-                f"[KomariMemory] 插件已启用，白名单群组: {config.group_whitelist}"
-            )
-
+        logger.info("[KomariMemory] 插件已启用（记忆/持久化子系统）")
         _plugin_manager = PluginManager(config)
         await _plugin_manager.initialize()
     else:
