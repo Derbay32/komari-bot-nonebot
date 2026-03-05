@@ -184,7 +184,67 @@ class KomariMemoryConfigSchema(BaseModel):
         default=5, ge=1, le=10, description="查询重写时使用的历史对话数量"
     )
 
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
+    # 单次 Rerank 判定配置
+    bot_aliases: list[str] = Field(
+        default_factory=lambda: ["小鞠", "小鞠知花", "komari"],
+        description="机器人别名列表（用于 alias 命中与 call-intent 判定）",
+    )
+    scene_top_k: int = Field(
+        default=4, ge=1, le=8, description="scene embedding 召回数量"
+    )
+    reply_threshold: float = Field(
+        default=0.72, ge=0.0, le=1.0, description="回复判定阈值"
+    )
+    timing_weight: float = Field(
+        default=0.3, ge=0.0, le=1.0, description="reply_score 中 timing_score 的权重"
+    )
+    noise_conf_threshold: float = Field(
+        default=0.76, ge=0.0, le=1.0, description="NOISE 置信度阈值"
+    )
+    noise_margin_threshold: float = Field(
+        default=0.1, ge=0.0, le=1.0, description="NOISE 相对 MEANINGFUL 的最小领先幅度"
+    )
+    call_margin_threshold: float = Field(
+        default=0.08, ge=0.0, le=1.0, description="CALL_DIRECT/CALL_MENTION 判定的最小领先幅度"
+    )
+    social_window_activity_seconds: int = Field(
+        default=10, ge=1, le=120, description="群活跃度统计窗口（秒）"
+    )
+    social_window_dialogue_seconds: int = Field(
+        default=30, ge=1, le=300, description="对话结构统计窗口（秒）"
+    )
+    social_silence_seconds: int = Field(
+        default=60, ge=5, le=600, description="冷场判定阈值（秒）"
+    )
+    social_bot_cooldown_seconds: int = Field(
+        default=10, ge=1, le=120, description="机器人近期发言惩罚阈值（秒）"
+    )
+    embedding_instruction_query: str = Field(
+        default=(
+            "任务：将群聊消息编码为机器人回复场景检索向量。"
+            "重点保留是否提问、是否请求机器人、情绪强度、信息密度和话题意图；"
+            "忽略口头禅、语气词、无意义重复字符。"
+        ),
+        description="query embedding 的 instruction",
+    )
+    embedding_instruction_scene: str = Field(
+        default=(
+            "任务：将候选场景编码为可与用户消息匹配的语义原型向量。"
+            "突出场景核心意图、适用边界和区分点。"
+        ),
+        description="scene/candidate embedding 的 instruction",
+    )
+    rerank_instruction: str = Field(
+        default=(
+            "你在做群聊机器人决策精排。按语义匹配强度给候选打分："
+            "1) 记忆价值（MEANINGFUL vs NOISE）；"
+            "2) 呼叫意图（CALL_DIRECT vs CALL_MENTION）；"
+            "3) 场景匹配（SCENE_*）。优先语义，不因礼貌措辞或语气强弱偏置。"
+        ),
+        description="统一候选集 rerank 的 instruction",
+    )
+
+    @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
         """处理从 .env 格式解析列表。

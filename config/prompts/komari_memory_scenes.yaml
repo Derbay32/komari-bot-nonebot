@@ -1,0 +1,40 @@
+# Komari Memory 统一候选模板
+# 用于单次 rerank 架构:
+# - 固定候选: NOISE / MEANINGFUL / CALL_DIRECT / CALL_MENTION
+# - 动态候选: embedding 召回得到的 general_scenes top-k
+
+version: "1.0"
+
+fixed_candidates:
+  NOISE: |
+    无信息量、无记忆价值的群聊灌水内容。
+    特征：口头禅、单纯附和、重复字符、空洞互动、无事实无观点无请求。
+  MEANINGFUL: |
+    有信息量或记忆价值的内容。
+    特征：包含事实、观点、情绪表达、请求、计划、决定、可追踪线索。
+  CALL_DIRECT: |
+    用户明确在呼叫机器人参与对话或回答问题。
+    特征：直接称呼机器人并提出问题、请求回应、要求执行动作。
+  CALL_MENTION: |
+    用户只是提到机器人，不是在直接呼叫机器人回应。
+    特征：第三人称提及、引用、转述、闲聊中顺带提到机器人名称。
+
+general_scenes:
+  - id: "scene_question_answer"
+    text: |
+      用户在提问，期待机器人给出直接回答或解释。
+  - id: "scene_emotion_support"
+    text: |
+      用户表达明显情绪，需要回应、安慰、接话或情绪承接。
+  - id: "scene_plan_decision"
+    text: |
+      用户在讨论计划、决定、安排或后续行动。
+  - id: "scene_fact_sharing"
+    text: |
+      用户在提供事实信息、状态更新、经历描述或可记录线索。
+  - id: "scene_roleplay_banter"
+    text: |
+      角色互动或轻度玩笑，适合机器人短句接话以维持群聊氛围。
+  - id: "scene_meta_bot_control"
+    text: |
+      用户在讨论机器人行为、触发条件、功能配置或对机器人能力提问。
