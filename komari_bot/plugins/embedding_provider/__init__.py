@@ -95,3 +95,10 @@ def is_rerank_enabled() -> bool:
     if state.rerank_service is None:
         return False
     return state.rerank_service.enabled
+
+
+def get_embedding_model() -> str:
+    """获取当前生效的 embedding 模型名。"""
+    if state.embedding_service is not None:
+        return state.embedding_service.config.embedding_model
+    return config_manager.get().embedding_model
