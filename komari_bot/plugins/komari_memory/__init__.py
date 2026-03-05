@@ -24,10 +24,12 @@ from .handlers.message_handler import MessageHandler
 from .handlers.summary_worker import register_summary_task, unregister_summary_task
 from .repositories.conversation_repository import ConversationRepository
 from .repositories.entity_repository import EntityRepository
+from .repositories.scene_repository import SceneRepository
 from .services.config_interface import get_config
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
 from .services.redis_manager import RedisManager
+from .services.scene_runtime_service import SceneRuntimeService
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠记忆",
@@ -50,6 +52,7 @@ class PluginManager:
         self.memory: MemoryService | None = None
         self.handler: MessageHandler | None = None
         self.forgetting: ForgettingService | None = None
+        self.scene_runtime: SceneRuntimeService | None = None
         self.pg_pool = None
 
     async def initialize(self) -> None:
@@ -75,6 +78,20 @@ class PluginManager:
         # 3. 初始化数据访问层
         conversation_repo = ConversationRepository(self.pg_pool)
         entity_repo = EntityRepository(self.pg_pool)
+        scene_repo = SceneRepository(self.pg_pool)
+
+        # 3.1 初始化 scene runtime 缓存（可选）
+        if self.config.scene_persist_enabled:
+            self.scene_runtime = SceneRuntimeService(scene_repo)
+            try:
+                loaded = await self.scene_runtime.load_active_set_cache()
+                if loaded:
+                    logger.info("[KomariMemory] Scene runtime cache 初始化成功")
+                else:
+                    logger.warning("[KomariMemory] 当前无 active scene set，runtime cache 为空")
+            except Exception:
+                logger.exception("[KomariMemory] Scene runtime cache 初始化失败")
+                self.scene_runtime = None
 
         # 4. 初始化记忆服务
         self.memory = MemoryService(self.config, conversation_repo, entity_repo)
@@ -83,6 +100,7 @@ class PluginManager:
         self.handler = MessageHandler(
             redis=self.redis,
             memory=self.memory,
+            scene_runtime=self.scene_runtime,
         )
 
         # 6. 注册总结定时任务

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 from nonebot import logger
@@ -14,6 +14,9 @@ from .config_interface import get_config
 _SCENE_TEMPLATE_PATH = Path("config") / "prompts" / "komari_memory_scenes.yaml"
 
 _REQUIRED_FIXED_KEYS = ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION")
+
+if TYPE_CHECKING:
+    from .scene_runtime_service import SceneRuntimeService, SceneRuntimeSnapshot
 
 
 @dataclass(frozen=True)
@@ -47,13 +50,25 @@ class UnifiedRerankResult:
 class UnifiedCandidateRerankService:
     """统一候选集组装与单次 rerank。"""
 
-    def __init__(self) -> None:
+    def __init__(self, runtime_service: SceneRuntimeService | None = None) -> None:
+        self._runtime_service = runtime_service
         self._cached_path: Path | None = None
         self._cached_mtime: float = 0.0
         self._cached_instruction: str = ""
         self._cached_fixed: dict[str, str] = {}
         self._cached_scenes: list[dict[str, str]] = []
         self._cached_embeddings: dict[str, list[float]] = {}
+
+    async def _get_runtime_snapshot(self) -> SceneRuntimeSnapshot | None:
+        """按需获取 runtime scene 缓存快照。"""
+        if self._runtime_service is None:
+            return None
+        try:
+            await self._runtime_service.refresh_if_runtime_updated()
+        except Exception:
+            logger.exception("[UnifiedRerank] 刷新 scene runtime cache 失败，回退 YAML")
+            return None
+        return self._runtime_service.get_scene_candidates()
 
     @staticmethod
     def _get_embedding_provider() -> Any:
@@ -220,67 +235,128 @@ class UnifiedCandidateRerankService:
             instruction=config.embedding_instruction_query,
         )
 
-        # 固定候选 embedding 先验
-        meaningful_prior = self._cosine_similarity(
-            query_vector, self._cached_embeddings["fixed::MEANINGFUL"]
-        )
-        noise_prior = self._cosine_similarity(
-            query_vector, self._cached_embeddings["fixed::NOISE"]
-        )
-
-        # scene top-k 召回
-        scene_scored: list[tuple[dict[str, str], float]] = []
-        for scene in self._cached_scenes:
-            score = self._cosine_similarity(
-                query_vector, self._cached_embeddings[f"scene::{scene['id']}"]
-            )
-            scene_scored.append((scene, score))
-        scene_scored.sort(key=lambda x: x[1], reverse=True)
-
+        runtime_snapshot = await self._get_runtime_snapshot()
         top_k = max(1, config.scene_top_k)
-        top_scenes = scene_scored[:top_k]
 
-        candidates: list[CandidateSchema] = [
-            CandidateSchema(
-                key="NOISE",
-                text=self._cached_fixed["NOISE"],
-                kind="fixed",
-                embedding_similarity=noise_prior,
-            ),
-            CandidateSchema(
-                key="MEANINGFUL",
-                text=self._cached_fixed["MEANINGFUL"],
-                kind="fixed",
-                embedding_similarity=meaningful_prior,
-            ),
-        ]
-
-        if alias_detected:
-            candidates.extend(
-                [
-                    CandidateSchema(
-                        key="CALL_DIRECT",
-                        text=self._cached_fixed["CALL_DIRECT"],
-                        kind="call",
-                    ),
-                    CandidateSchema(
-                        key="CALL_MENTION",
-                        text=self._cached_fixed["CALL_MENTION"],
-                        kind="call",
-                    ),
-                ]
+        if runtime_snapshot is not None:
+            noise_prior = self._cosine_similarity(
+                query_vector,
+                runtime_snapshot.fixed_embeddings["NOISE"],
             )
-
-        for scene, score in top_scenes:
-            candidates.append(
-                CandidateSchema(
-                    key=f"SCENE::{scene['id']}",
-                    text=scene["text"],
-                    kind="scene",
-                    scene_id=scene["id"],
-                    embedding_similarity=score,
+            meaningful_prior = self._cosine_similarity(
+                query_vector,
+                runtime_snapshot.fixed_embeddings["MEANINGFUL"],
+            )
+            runtime_scene_scored = [
+                (
+                    scene.scene_id,
+                    scene.text,
+                    self._cosine_similarity(query_vector, scene.embedding),
                 )
+                for scene in runtime_snapshot.general_candidates
+            ]
+            runtime_scene_scored.sort(key=lambda item: item[2], reverse=True)
+            top_scenes = runtime_scene_scored[:top_k]
+
+            candidates: list[CandidateSchema] = [
+                CandidateSchema(
+                    key="NOISE",
+                    text=runtime_snapshot.fixed_candidates["NOISE"],
+                    kind="fixed",
+                    embedding_similarity=noise_prior,
+                ),
+                CandidateSchema(
+                    key="MEANINGFUL",
+                    text=runtime_snapshot.fixed_candidates["MEANINGFUL"],
+                    kind="fixed",
+                    embedding_similarity=meaningful_prior,
+                ),
+            ]
+            if alias_detected:
+                candidates.extend(
+                    [
+                        CandidateSchema(
+                            key="CALL_DIRECT",
+                            text=runtime_snapshot.fixed_candidates["CALL_DIRECT"],
+                            kind="call",
+                        ),
+                        CandidateSchema(
+                            key="CALL_MENTION",
+                            text=runtime_snapshot.fixed_candidates["CALL_MENTION"],
+                            kind="call",
+                        ),
+                    ]
+                )
+            for scene_id, scene_text, score in top_scenes:
+                candidates.append(
+                    CandidateSchema(
+                        key=f"SCENE::{scene_id}",
+                        text=scene_text,
+                        kind="scene",
+                        scene_id=scene_id,
+                        embedding_similarity=score,
+                    )
+                )
+        else:
+            await self._ensure_embeddings()
+            meaningful_prior = self._cosine_similarity(
+                query_vector,
+                self._cached_embeddings["fixed::MEANINGFUL"],
             )
+            noise_prior = self._cosine_similarity(
+                query_vector,
+                self._cached_embeddings["fixed::NOISE"],
+            )
+            yaml_scene_scored: list[tuple[dict[str, str], float]] = []
+            for scene in self._cached_scenes:
+                score = self._cosine_similarity(
+                    query_vector, self._cached_embeddings[f"scene::{scene['id']}"]
+                )
+                yaml_scene_scored.append((scene, score))
+            yaml_scene_scored.sort(key=lambda x: x[1], reverse=True)
+            top_scenes = yaml_scene_scored[:top_k]
+
+            candidates = [
+                CandidateSchema(
+                    key="NOISE",
+                    text=self._cached_fixed["NOISE"],
+                    kind="fixed",
+                    embedding_similarity=noise_prior,
+                ),
+                CandidateSchema(
+                    key="MEANINGFUL",
+                    text=self._cached_fixed["MEANINGFUL"],
+                    kind="fixed",
+                    embedding_similarity=meaningful_prior,
+                ),
+            ]
+
+            if alias_detected:
+                candidates.extend(
+                    [
+                        CandidateSchema(
+                            key="CALL_DIRECT",
+                            text=self._cached_fixed["CALL_DIRECT"],
+                            kind="call",
+                        ),
+                        CandidateSchema(
+                            key="CALL_MENTION",
+                            text=self._cached_fixed["CALL_MENTION"],
+                            kind="call",
+                        ),
+                    ]
+                )
+
+            for scene, score in top_scenes:
+                candidates.append(
+                    CandidateSchema(
+                        key=f"SCENE::{scene['id']}",
+                        text=scene["text"],
+                        kind="scene",
+                        scene_id=scene["id"],
+                        embedding_similarity=score,
+                    )
+                )
 
         rerank_documents = [item.text for item in candidates]
         rerank_results = await embedding_provider.rerank(

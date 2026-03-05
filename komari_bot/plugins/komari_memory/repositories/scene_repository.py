@@ -176,6 +176,38 @@ class SceneRepository:
             )
         logger.info("[KomariMemory] 激活 scene set: id=%s", set_id)
 
+    async def switch_active_set(self, set_id: int) -> None:
+        """原子切换 active set（仅允许 READY 版本）。"""
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id, status
+                FROM komari_memory_scene_set
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                set_id,
+            )
+            if row is None:
+                msg = f"scene set 不存在: {set_id}"
+                raise ValueError(msg)
+            status = str(row["status"])
+            if status != "READY":
+                msg = f"scene set 非 READY 状态，无法激活: id={set_id} status={status}"
+                raise ValueError(msg)
+
+            await self._ensure_runtime_row(conn)
+            await conn.execute(
+                """
+                UPDATE komari_memory_scene_runtime
+                SET active_set_id = $1,
+                    updated_at = NOW()
+                WHERE id = 1
+                """,
+                set_id,
+            )
+        logger.info("[KomariMemory] 原子切换 active scene set: id=%s", set_id)
+
     async def list_items_by_set(
         self,
         set_id: int,

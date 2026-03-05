@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
     from ..services.memory_service import MemoryService
+    from ..services.scene_runtime_service import SceneRuntimeService
 
 CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
 ReplyReason = Literal["at", "direct_call", "score"]
@@ -49,12 +50,13 @@ class MessageHandler:
         self,
         redis: RedisManager,
         memory: MemoryService,
+        scene_runtime: SceneRuntimeService | None = None,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
         self.query_rewrite = QueryRewriteService()
-        self.unified_rerank = UnifiedCandidateRerankService()
+        self.unified_rerank = UnifiedCandidateRerankService(runtime_service=scene_runtime)
         self.social_timing = SocialTimingService(redis)
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
