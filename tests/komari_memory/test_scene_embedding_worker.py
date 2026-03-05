@@ -6,8 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
-from komari_bot.plugins.komari_memory.services import scene_embedding_worker as sew
-from komari_bot.plugins.komari_memory.services.scene_embedding_worker import (
+from komari_bot.plugins.komari_decision.services import scene_embedding_worker as sew
+from komari_bot.plugins.komari_decision.services.scene_embedding_worker import (
     SceneEmbeddingWorker,
 )
 

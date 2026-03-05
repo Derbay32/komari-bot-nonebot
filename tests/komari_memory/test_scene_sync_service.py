@@ -6,11 +6,11 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
-from komari_bot.plugins.komari_memory.services import scene_sync_service as sss
-from komari_bot.plugins.komari_memory.services.scene_sync_service import (
+from komari_bot.plugins.komari_decision.services import scene_sync_service as sss
+from komari_bot.plugins.komari_decision.services.scene_sync_service import (
     SceneSyncService,
 )
-from komari_bot.plugins.komari_memory.services.scene_template_loader import (
+from komari_bot.plugins.komari_decision.services.scene_template_loader import (
     SceneTemplateItem,
     SceneTemplatePayload,
 )

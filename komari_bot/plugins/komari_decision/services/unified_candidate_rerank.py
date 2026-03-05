@@ -16,7 +16,7 @@ _SCENE_TEMPLATE_PATH = Path("config") / "prompts" / "komari_memory_scenes.yaml"
 _REQUIRED_FIXED_KEYS = ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION")
 
 if TYPE_CHECKING:
-    from komari_bot.plugins.komari_memory.services.scene_runtime_service import (
+    from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
         SceneRuntimeService,
         SceneRuntimeSnapshot,
     )

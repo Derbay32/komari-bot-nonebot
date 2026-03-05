@@ -27,10 +27,10 @@ from ..services.query_rewrite_service import QueryRewriteService
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
-    from komari_bot.plugins.komari_memory.services.scene_runtime_service import (
+    from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
         SceneRuntimeService,
     )
+    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
 
 AttemptReplyReason = Literal["at", "direct_call", "score"]
 ReplyAction = Literal[

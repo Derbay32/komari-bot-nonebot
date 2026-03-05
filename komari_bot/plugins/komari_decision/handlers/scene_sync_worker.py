@@ -21,6 +21,7 @@ class SceneSyncTaskManager:
 
     _MAX_BATCHES_PER_TICK = 3
     _MAX_BATCHES_BOOTSTRAP = 128
+    _JOB_ID = "komari_decision_scene_sync_worker"
 
     def __init__(self) -> None:
         self._repository: SceneRepository | None = None
@@ -46,21 +47,21 @@ class SceneSyncTaskManager:
             self._execute_task,
             "interval",
             seconds=config.scene_sync_poll_seconds,
-            id="komari_memory_scene_sync_worker",
+            id=self._JOB_ID,
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
         logger.info(
-            "[KomariMemory] scene 同步定时任务已注册: interval=%ss",
+            "[KomariDecision] scene 同步定时任务已注册: interval=%ss",
             config.scene_sync_poll_seconds,
         )
 
     def unregister(self) -> None:
         """取消 scene 同步定时任务。"""
         try:
-            scheduler.remove_job("komari_memory_scene_sync_worker")
-            logger.info("[KomariMemory] scene 同步定时任务已取消")
+            scheduler.remove_job(self._JOB_ID)
+            logger.info("[KomariDecision] scene 同步定时任务已取消")
         except Exception:
             pass
 
@@ -81,14 +82,14 @@ class SceneSyncTaskManager:
             or self._embedding_worker is None
             or self._runtime_service is None
         ):
-            logger.warning("[KomariMemory] scene task manager 未初始化，跳过 bootstrap")
+            logger.warning("[KomariDecision] scene task manager 未初始化，跳过 bootstrap")
             return
 
         try:
             await self._runtime_service.load_active_set_cache()
             await self._execute_task(max_batches=self._MAX_BATCHES_BOOTSTRAP)
         except Exception:
-            logger.exception("[KomariMemory] scene bootstrap 失败")
+            logger.exception("[KomariDecision] scene bootstrap 失败")
 
     async def _activate_if_ready(self, set_id: int) -> bool:
         if self._repository is None or self._runtime_service is None:
@@ -103,7 +104,7 @@ class SceneSyncTaskManager:
             return False
 
         await self._runtime_service.switch_active_set(set_id)
-        logger.info("[KomariMemory] scene active set 已切换: id=%s", set_id)
+        logger.info("[KomariDecision] scene active set 已切换: id=%s", set_id)
         return True
 
     async def _drain_pending(self, set_id: int, *, max_batches: int) -> None:
@@ -118,7 +119,7 @@ class SceneSyncTaskManager:
             remaining -= 1
 
         logger.warning(
-            "[KomariMemory] scene set 仍有 pending，等待下一轮: set=%s",
+            "[KomariDecision] scene set 仍有 pending，等待下一轮: set=%s",
             set_id,
         )
 
@@ -133,7 +134,7 @@ class SceneSyncTaskManager:
             or self._embedding_worker is None
             or self._runtime_service is None
         ):
-            logger.warning("[KomariMemory] scene 服务未就绪，跳过本轮同步")
+            logger.warning("[KomariDecision] scene 服务未就绪，跳过本轮同步")
             return
 
         try:
@@ -147,7 +148,7 @@ class SceneSyncTaskManager:
             await self._activate_if_ready(sync_result.set_id)
             await self._runtime_service.refresh_if_runtime_updated()
         except Exception:
-            logger.exception("[KomariMemory] scene 同步任务执行失败")
+            logger.exception("[KomariDecision] scene 同步任务执行失败")
 
 
 _task_manager = SceneSyncTaskManager()

@@ -13,7 +13,12 @@ permission_manager_plugin = require("permission_manager")
 require("komari_memory")
 require("komari_decision")
 
-from komari_bot.plugins.komari_memory import get_plugin_manager
+from komari_bot.plugins.komari_decision import (
+    get_plugin_manager as get_decision_plugin_manager,
+)
+from komari_bot.plugins.komari_memory import (
+    get_plugin_manager as get_memory_plugin_manager,
+)
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
 __plugin_meta__ = PluginMetadata(
@@ -29,10 +34,16 @@ _handler: MessageHandler | None = None
 
 def _resolve_runtime_components(
 ) -> tuple[Any, Any, Any | None] | None:
-    manager = get_plugin_manager()
-    if manager is None or manager.redis is None or manager.memory is None:
+    memory_manager = get_memory_plugin_manager()
+    if (
+        memory_manager is None
+        or memory_manager.redis is None
+        or memory_manager.memory is None
+    ):
         return None
-    return manager.redis, manager.memory, manager.scene_runtime
+    decision_manager = get_decision_plugin_manager()
+    scene_runtime = None if decision_manager is None else decision_manager.scene_runtime
+    return memory_manager.redis, memory_manager.memory, scene_runtime
 
 
 def _get_or_build_handler() -> MessageHandler | None:

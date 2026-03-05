@@ -14,10 +14,10 @@ from .unified_candidate_rerank import (
 )
 
 if TYPE_CHECKING:
-    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
-    from komari_bot.plugins.komari_memory.services.scene_runtime_service import (
+    from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
         SceneRuntimeService,
     )
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
 CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
 MemoryAction = Literal["store", "drop"]

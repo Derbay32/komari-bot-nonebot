@@ -175,7 +175,7 @@ class SceneEmbeddingWorker:
 
         progress = await self.refresh_set_counters(set_id)
         logger.info(
-            "[KomariMemory] scene embedding 批处理完成: set=%s fetched=%s ready=%s failed=%s pending=%s status=%s",
+            "[KomariDecision] scene embedding 批处理完成: set=%s fetched=%s ready=%s failed=%s pending=%s status=%s",
             set_id,
             len(pending_items),
             marked_ready,

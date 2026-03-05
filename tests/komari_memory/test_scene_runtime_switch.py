@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, cast
 
-from komari_bot.plugins.komari_memory.services.scene_runtime_service import (
+from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
     SceneRuntimeService,
 )
 

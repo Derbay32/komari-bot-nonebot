@@ -109,7 +109,7 @@ class SceneRuntimeService:
         active_set = await self.repository.get_active_set()
         if active_set is None:
             if self._snapshot is not None:
-                logger.warning("[KomariMemory] active set 已清空，runtime cache 重置")
+                logger.warning("[KomariDecision] active set 已清空，runtime cache 重置")
             self._snapshot = None
             return False
 
@@ -126,7 +126,7 @@ class SceneRuntimeService:
         snapshot = self._build_snapshot(active_set, items)
         self._snapshot = snapshot
         logger.info(
-            "[KomariMemory] scene runtime cache 已加载: set=%s scenes=%s",
+            "[KomariDecision] scene runtime cache 已加载: set=%s scenes=%s",
             snapshot.set_id,
             len(snapshot.general_candidates),
         )
@@ -139,7 +139,7 @@ class SceneRuntimeService:
             changed = self._snapshot is not None
             if changed:
                 self._snapshot = None
-                logger.warning("[KomariMemory] active set 不存在，runtime cache 已清空")
+                logger.warning("[KomariDecision] active set 不存在，runtime cache 已清空")
             return changed
 
         set_id = int(active_set["id"])
