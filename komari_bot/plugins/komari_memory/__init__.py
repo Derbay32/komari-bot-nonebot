@@ -21,6 +21,11 @@ from .handlers.forgetting_worker import (
     unregister_forgetting_task,
 )
 from .handlers.message_handler import MessageHandler
+from .handlers.scene_sync_worker import (
+    bootstrap_scene_sync_task,
+    register_scene_sync_task,
+    unregister_scene_sync_task,
+)
 from .handlers.summary_worker import register_summary_task, unregister_summary_task
 from .repositories.conversation_repository import ConversationRepository
 from .repositories.entity_repository import EntityRepository
@@ -29,7 +34,9 @@ from .services.config_interface import get_config
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
 from .services.redis_manager import RedisManager
+from .services.scene_embedding_worker import SceneEmbeddingWorker
 from .services.scene_runtime_service import SceneRuntimeService
+from .services.scene_sync_service import SceneSyncService
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠记忆",
@@ -53,6 +60,9 @@ class PluginManager:
         self.handler: MessageHandler | None = None
         self.forgetting: ForgettingService | None = None
         self.scene_runtime: SceneRuntimeService | None = None
+        self.scene_repository: SceneRepository | None = None
+        self.scene_sync: SceneSyncService | None = None
+        self.scene_embedding_worker: SceneEmbeddingWorker | None = None
         self.pg_pool = None
 
     async def initialize(self) -> None:
@@ -79,10 +89,13 @@ class PluginManager:
         conversation_repo = ConversationRepository(self.pg_pool)
         entity_repo = EntityRepository(self.pg_pool)
         scene_repo = SceneRepository(self.pg_pool)
+        self.scene_repository = scene_repo
 
         # 3.1 初始化 scene runtime 缓存（可选）
         if self.config.scene_persist_enabled:
             self.scene_runtime = SceneRuntimeService(scene_repo)
+            self.scene_sync = SceneSyncService(scene_repo)
+            self.scene_embedding_worker = SceneEmbeddingWorker(scene_repo, batch_size=16)
             try:
                 loaded = await self.scene_runtime.load_active_set_cache()
                 if loaded:
@@ -92,6 +105,8 @@ class PluginManager:
             except Exception:
                 logger.exception("[KomariMemory] Scene runtime cache 初始化失败")
                 self.scene_runtime = None
+                self.scene_sync = None
+                self.scene_embedding_worker = None
 
         # 4. 初始化记忆服务
         self.memory = MemoryService(self.config, conversation_repo, entity_repo)
@@ -110,6 +125,22 @@ class PluginManager:
         self.forgetting = ForgettingService(self.config, self.pg_pool)
         register_forgetting_task(self.forgetting)
 
+        # 8. 注册 scene 同步任务并执行启动期 bootstrap
+        if (
+            self.config.scene_persist_enabled
+            and self.scene_repository is not None
+            and self.scene_sync is not None
+            and self.scene_embedding_worker is not None
+            and self.scene_runtime is not None
+        ):
+            register_scene_sync_task(
+                self.scene_repository,
+                self.scene_sync,
+                self.scene_embedding_worker,
+                self.scene_runtime,
+            )
+            await bootstrap_scene_sync_task()
+
         logger.info("[KomariMemory] 组件初始化完成")
 
     async def shutdown(self) -> None:
@@ -117,6 +148,7 @@ class PluginManager:
         # 取消定时任务
         unregister_summary_task()
         unregister_forgetting_task()
+        unregister_scene_sync_task()
 
         # 清理记忆服务（释放 fastembed 模型）
         if self.memory:

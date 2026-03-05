@@ -132,6 +132,34 @@ class SceneRepository:
             )
             return dict(row) if row else None
 
+    async def get_latest_set_by_fingerprint(
+        self,
+        source_hash: str,
+        embedding_model: str,
+        embedding_instruction_hash: str,
+        *,
+        status: str | None = None,
+    ) -> dict[str, Any] | None:
+        """按 fingerprint 获取最新 set，可选限定状态。"""
+        sql = """
+            SELECT id, source_path, source_hash, embedding_model,
+                   embedding_instruction_hash, status, item_total, item_ready,
+                   item_failed, error_message, created_at, ready_at
+            FROM komari_memory_scene_set
+            WHERE source_hash = $1
+              AND embedding_model = $2
+              AND embedding_instruction_hash = $3
+        """
+        params: list[Any] = [source_hash, embedding_model, embedding_instruction_hash]
+        if status is not None:
+            sql += " AND status = $4"
+            params.append(status)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT 1"
+
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+            return dict(row) if row else None
+
     async def _ensure_runtime_row(self, conn: Any) -> None:
         """确保 runtime 指针行存在。"""
         await conn.execute(

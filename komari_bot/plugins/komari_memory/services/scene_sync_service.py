@@ -90,6 +90,32 @@ class SceneSyncService:
                 pending_count=0,
             )
 
+        latest_building = await self.repository.get_latest_set_by_fingerprint(
+            source_hash=template.source_hash,
+            embedding_model=embedding_model,
+            embedding_instruction_hash=instruction_hash,
+            status="BUILDING",
+        )
+        if latest_building is not None:
+            existing_set_id = int(latest_building["id"])
+            total = int(latest_building.get("item_total") or 0)
+            ready = int(latest_building.get("item_ready") or 0)
+            failed = int(latest_building.get("item_failed") or 0)
+            pending = max(total - ready - failed, 0)
+            logger.info(
+                "[KomariMemory] 复用构建中的 scene set: id=%s pending=%s",
+                existing_set_id,
+                pending,
+            )
+            return SceneSyncResult(
+                set_id=existing_set_id,
+                created=False,
+                reused_existing_set=True,
+                inserted_count=0,
+                ready_count=ready,
+                pending_count=pending,
+            )
+
         set_id = await self.repository.create_scene_set(
             source_path=template.source_path,
             source_hash=template.source_hash,
