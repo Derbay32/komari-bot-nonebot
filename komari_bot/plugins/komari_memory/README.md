@@ -63,8 +63,6 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
   "redis_db": 1,
   "redis_password": "",
 
-  "embedding_model": "BAAI/bge-small-zh-v1.5",
-
   "bert_service_url": "http://localhost:8000/api/v1/score",
   "bert_timeout": 2.0,
 
@@ -97,6 +95,10 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
   "forgetting_importance_threshold": 3,
   "forgetting_decay_factor": 0.95,
   "forgetting_access_boost": 1.2,
+
+  "scene_persist_enabled": true,
+  "scene_sync_poll_seconds": 30,
+  "scene_keep_versions": 3,
 
   "system_prompt": "你是小鞠，一个友好的 AI 助手"
 }
@@ -160,7 +162,6 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
 
 | 配置项                      | 类型 | 默认值                 | 范围        | 说明                              |
 | --------------------------- | ---- | ---------------------- | ----------- | --------------------------------- |
-| `embedding_model`           | str  | BAAI/bge-small-zh-v1.5 | -           | 向量嵌入模型                      |
 | `summary_message_threshold` | int  | 50                     | 10 - 500    | 触发总结的消息数量阈值（优先）    |
 | `summary_token_threshold`   | int  | 1000                   | 100 - 10000 | 触发总结的 Token 阈值（备用条件） |
 | `summary_time_threshold`    | int  | 3600                   | 300 - 86400 | 触发总结的时间阈值（秒）          |
@@ -168,6 +169,16 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
 | `message_buffer_size`       | int  | 200                    | 50 - 1000   | Redis 消息缓存大小                |
 | `memory_search_limit`       | int  | 3                      | 1 - 10      | 检索相关记忆的最大数量            |
 | `context_messages_limit`    | int  | 10                     | 5 - 50      | 获取最近消息上下文的最大数量      |
+
+> 向量模型与重排模型由 `embedding_provider` 插件统一提供与管理，`komari_memory` 不再维护独立 `embedding_model` 配置。
+
+### Scene 持久化配置
+
+| 配置项                    | 类型 | 默认值 | 范围      | 说明                                |
+| ------------------------- | ---- | ------ | --------- | ----------------------------------- |
+| `scene_persist_enabled`   | bool | false  | -         | 是否启用 scene 持久化与运行时缓存   |
+| `scene_sync_poll_seconds` | int  | 30     | 5 - 3600  | scene 同步/刷新轮询间隔（秒）       |
+| `scene_keep_versions`     | int  | 3      | 1 - 20    | 清理旧版本时保留的 READY 版本数量   |
 
 ### 常识库集成配置
 
@@ -221,6 +232,12 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
   ↓
 融合判定 reply_action / memory_action
   ↓
+Scene 同步任务（按 scene_sync_poll_seconds 轮询）
+  ├─ YAML -> scene_set / scene_item（复用可用 embedding）
+  ├─ 嵌入 worker 处理 PENDING 条目
+  ├─ 全量 READY 后原子切换 active_set
+  └─ runtime cache 热更新
+  ↓
 后台总结任务（每 5 分钟检查）
   ├─ 消息数达到阈值
   ├─ 时间达到阈值
@@ -228,7 +245,7 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
   ↓
 生成总结并存储到 PostgreSQL
   ↓
-记忆忘却任务（每天凌晨 2 点）
+记忆忘却任务（每天凌晨 4 点）
   └─ 删除低重要性、旧的记忆
 ```
 
@@ -333,17 +350,37 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 **解决**: 检查 `embedding_provider` 配置（模型、API 地址、密钥）以及服务可用性
 
-### 4. 向量模型下载失败
+### 4. Scene 持久化开启后未生成 active set
+
+**现象**: 日志出现“当前无 active scene set，runtime cache 为空”，且长期不切换
+
+**解决**:
+
+1. 确认 `scene_persist_enabled=true`
+2. 确认 `config/prompts/komari_memory_scenes.yaml` 格式正确
+3. 检查 `komari_memory_scene_set` / `komari_memory_scene_item` 中是否存在 FAILED 记录
+4. 使用 `SceneAdminService.retry_failed_set(...)` 重试失败版本，必要时 `activate_ready_set(...)` 手动激活
+
+### 5. 向量模型下载失败
 
 **现象**: 启动时卡在"向量嵌入模型加载"
 
 **解决**: 首次运行需要下载模型，请确保网络畅通。模型会缓存到本地。
 
-### 5. 配置修改后不生效
+### 6. 配置修改后不生效
 
 **原因**: 部分配置需要重启插件
 
 **解决**: 重启 NoneBot 以应用新配置
+
+## Scene 运维说明
+
+`SceneAdminService` 提供以下能力：
+
+- `activate_ready_set(set_id)`：手动激活指定 READY 版本
+- `rollback_to_previous_ready()`：回滚到上一版 READY
+- `retry_failed_set(set_id)`：重试 FAILED 版本（FAILED item 回到 PENDING 后重新嵌入）
+- `prune_old_sets(keep_versions)`：清理旧 READY 版本（保留最近 N 个与当前 active）
 
 ## 技术架构
 
