@@ -19,7 +19,7 @@
 
 - **PostgreSQL** (>= 12) 需要安装 pgvector 扩展
 - **Redis** (>= 5.0)
-- **BERT 评分服务** (可选，推荐)
+- **Embedding + Rerank 服务**（通过 `embedding_provider` 提供）
 
 ## 安装步骤
 
@@ -128,7 +128,9 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
 | `redis_db`         | int  | 1          | Redis 数据库编号        |
 | `redis_password`   | str  | -          | Redis 密码              |
 
-### BERT 评分服务配置
+### BERT 评分服务配置（Deprecated）
+
+> 自 `single-rerank` 决策链路启用后，`bert_service_url` / `bert_timeout` 已不参与消息决策，仅为兼容保留。
 
 | 配置项             | 类型  | 默认值                             | 说明               |
 | ------------------ | ----- | ---------------------------------- | ------------------ |
@@ -208,12 +210,16 @@ psql -h localhost -U your_username -d komari_bot -f komari_bot/plugins/komari_me
   ↓
 消息预过滤（长度、重复检测）
   ↓
-BERT 重要性评分 (0.0-1.0)
+@ 判定（命中则强制回复）
   ↓
-分类处理:
-  ├─ 低价值 (score < 0.3) → 丢弃
-  ├─ 普通 (0.3 ≤ score < 阈值) → 存入 Redis
-  └─ 高价值 (score ≥ 阈值) → 触发主动回复（如果启用）
+统一候选评分（单次 rerank）
+  ├─ Memory Gate（NOISE vs MEANINGFUL）→ 决定存储/丢弃
+  ├─ Call Intent（CALL_DIRECT vs CALL_MENTION，alias 命中时）
+  └─ Scene Score（scene top-k 重排取 best）
+  ↓
+社交时机评分 timing_score（只影响回复）
+  ↓
+融合判定 reply_action / memory_action
   ↓
 后台总结任务（每 5 分钟检查）
   ├─ 消息数达到阈值
@@ -321,11 +327,11 @@ nb run
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-### 3. BERT 评分服务连接失败
+### 3. Rerank 或 Embedding 服务异常
 
-**现象**: 所有消息评分都是 0.5（默认值）
+**现象**: 候选评分异常、回复/记忆判定明显不稳定
 
-**解决**: 确保 BERT 评分服务正在运行，或暂时使用默认评分
+**解决**: 检查 `embedding_provider` 配置（模型、API 地址、密钥）以及服务可用性
 
 ### 4. 向量模型下载失败
 
@@ -359,7 +365,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 │          服务层 (services)           │
 │  - memory_service.py  记忆管理      │
 │  - llm_service.py      LLM 调用     │
-│  - bert_client.py     BERT 评分     │
+│  - unified_candidate_rerank.py      │
+│  - social_timing_service.py         │
 │  - redis_manager.py   Redis 操作    │
 │  - config_interface.py 配置接口     │
 └─────────────────────────────────────┘
