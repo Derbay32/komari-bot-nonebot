@@ -62,27 +62,32 @@ async def on_shutdown() -> None:
 # --- 公共 API ---
 
 
-async def embed(text: str) -> list[float]:
+async def embed(text: str, instruction: str = "") -> list[float]:
     """生成单条文本嵌入。"""
     if state.embedding_service is None:
         raise RuntimeError("EmbeddingProvider 尚未初始化")  # noqa: TRY003
-    return await state.embedding_service.embed(text)
+    return await state.embedding_service.embed(text, instruction=instruction)
 
 
-async def embed_batch(texts: list[str]) -> list[list[float]]:
+async def embed_batch(texts: list[str], instruction: str = "") -> list[list[float]]:
     """批量生成文本嵌入。"""
     if state.embedding_service is None:
         raise RuntimeError("EmbeddingProvider 尚未初始化")  # noqa: TRY003
-    return await state.embedding_service.embed_batch(texts)
+    return await state.embedding_service.embed_batch(texts, instruction=instruction)
 
 
 async def rerank(
-    query: str, documents: list[str], top_n: int | None = None
+    query: str,
+    documents: list[str],
+    top_n: int | None = None,
+    instruction: str = "",
 ) -> list[RerankResult]:
     """对文档集进行重排。"""
     if state.rerank_service is None:
         raise RuntimeError("EmbeddingProvider 尚未初始化")  # noqa: TRY003
-    return await state.rerank_service.rerank(query, documents, top_n)
+    return await state.rerank_service.rerank(
+        query, documents, top_n, instruction=instruction
+    )
 
 
 def is_rerank_enabled() -> bool:
