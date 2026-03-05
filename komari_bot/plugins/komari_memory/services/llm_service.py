@@ -8,7 +8,6 @@ from logging import getLogger
 from typing import TYPE_CHECKING
 
 from nonebot.plugin import require
-from pydantic import BaseModel, Field, field_validator
 
 from ..config_schema import KomariMemoryConfigSchema  # noqa: TC001
 from ..core.retry import retry_async
@@ -20,51 +19,6 @@ if TYPE_CHECKING:
 llm_provider = require("llm_provider")
 
 logger = getLogger(__name__)
-
-
-class EntitySchema(BaseModel):
-    """实体结构化输出 Schema。
-
-    Attributes:
-        user_id: 实体关联的用户 ID
-        key: 实体名称/键
-        value: 实体的值或描述
-        category: 分类
-    """
-
-    user_id: str = Field(description="实体关联的用户ID（从对话中识别）")
-    key: str = Field(description="实体名称/键，如'喜欢的食物'、'职业'")
-    value: str = Field(description="实体的值，如'拉面'、'程序员'")
-    category: str = Field(
-        default="general",
-        description="分类：preference(偏好)/fact(事实)/relation(关系)/general(一般)",
-    )
-
-
-class ConversationSummarySchema(BaseModel):
-    """对话总结结果的结构化输出 Schema。
-
-    Attributes:
-        summary: 对话的简明总结
-        entities: 提取的关键实体列表
-        user_interactions: 用户互动历史（小鞠的主观视角记录）
-        importance: 重要性评分 (1-5分)
-    """
-
-    summary: str = Field(description="对话的简明总结")
-    entities: list[EntitySchema] = Field(
-        default_factory=list, description="提取的关键实体列表"
-    )
-    user_interactions: list[dict] = Field(
-        default_factory=list, description="用户互动历史（小鞠的主观视角备忘录）"
-    )
-    importance: int = Field(ge=1, le=5, description="重要性评分 (1-5分)")
-
-    @field_validator("importance")
-    @classmethod
-    def validate_importance(cls, v: int) -> int:
-        """确保 importance 在合理范围内。"""
-        return max(1, min(5, v))
 
 
 def _extract_json_from_markdown(text: str) -> str:
@@ -151,19 +105,19 @@ async def generate_reply(
 async def summarize_conversation(
     messages: list[MessageSchema],
     config: KomariMemoryConfigSchema,
-    existing_entities: list[dict] | None = None,
+    existing_profiles: list[dict] | None = None,
     existing_interactions: list[dict] | None = None,
 ) -> dict:
-    """总结对话，提取实体，并评估重要性（使用结构化输出，带重试机制）。
+    """总结对话，提取用户画像，并评估重要性（带重试机制）。
 
     Args:
         messages: MessageSchema 消息列表（包含 user_id 和 user_nickname）
         config: 插件配置
-        existing_entities: 已存储的实体列表，用于 LLM 感知已有信息并执行更新
+        existing_profiles: 已存储的用户画像列表（JSON）
         existing_interactions: 已存储的互动历史列表，用于 LLM 在已有记录上追加
 
     Returns:
-        总结结果，包含 summary, entities, importance
+        总结结果，包含 summary, user_profiles, user_interactions, importance
     """
     # 格式化消息，包含 user_id 以便 LLM 关联实体到用户
     formatted_messages = []
@@ -175,47 +129,54 @@ async def summarize_conversation(
                 f"[user_id:{msg.user_id}] {msg.user_nickname}: {msg.content}"
             )
 
-    # 格式化已知实体信息
+    # 格式化已知画像信息
     existing_context = ""
-    if existing_entities:
-        entity_lines = []
-        for e in existing_entities:
-            uid = e.get("user_id", "unknown")
-            key = e.get("key", "")
-            value = e.get("value", "")
-            category = e.get("category", "general")
-            entity_lines.append(f"- [user_id:{uid}] {key} = {value} ({category})")
-        existing_context += "【已知实体信息（数据库中已有记录）】\n"
-        existing_context += "以下是目前已存储的用户实体：\n"
-        existing_context += "\n".join(entity_lines) + "\n\n"
+    if existing_profiles:
+        profile_lines = []
+        for profile in existing_profiles:
+            uid = profile.get("user_id", "unknown")
+            display_name = profile.get("display_name", "")
+            traits = profile.get("traits", {})
+            profile_lines.append(
+                f"- [user_id:{uid}] display_name={display_name} traits={json.dumps(traits, ensure_ascii=False)}"
+            )
+        existing_context += "【已知用户画像（数据库中已有记录）】\n"
+        existing_context += "以下是目前已存储的用户画像：\n"
+        existing_context += "\n".join(profile_lines) + "\n\n"
 
     if existing_interactions:
         interaction_lines = []
-        for i in existing_interactions:
-            uid = i.get("user_id", "unknown")
-            value = i.get("value", "{}")
-            interaction_lines.append(f"- [user_id:{uid}] interaction_history: {value}")
+        for interaction in existing_interactions:
+            uid = interaction.get("user_id", "unknown")
+            interaction_lines.append(
+                f"- [user_id:{uid}] interaction_history: {json.dumps(interaction, ensure_ascii=False)}"
+            )
         existing_context += "以下是目前已存储的用户互动历史：\n"
         existing_context += "\n".join(interaction_lines) + "\n\n"
 
     if existing_context:
         existing_context += (
             "【重要指示】\n"
-            "- 如果对话中发现与已有实体矛盾的新信息，请用新信息覆盖旧值（使用相同的 key）\n"
-            "- 如果对话中没有提到某个已有实体，不要在输出中重复它\n"
-            "- 只输出需要新增或更新的实体\n"
+            "- 你输出的是 user_profiles（按用户聚合），不要输出扁平 entities 列表\n"
+            "- 如果对话中发现与已有画像矛盾的新信息，请用新信息覆盖旧值（同 key 覆盖）\n"
+            "- 如果对话中没有提到某个旧特征，不要重复输出它\n"
+            "- 只输出需要新增或更新的画像特征\n"
             "- 对于互动历史，请在已有记录的基础上追加新的 records（注意：如果 records 总数超过6条，请只保留最近的6条记录）\n\n"
         )
 
-    prompt = f"""请总结以下群聊或私聊对话，提取关键实体信息（如偏好、事实、关系等），并评估对话的重要性。输出必须使用简体中文。
+    prompt = f"""请总结以下群聊或私聊对话，提取每个用户的画像信息，并评估对话的重要性。输出必须使用简体中文。
 
 每条消息格式为 [user_id:xxx] 昵称: 内容。请你在提取时将 user_id 准确关联。
 
 {chr(10).join(formatted_messages)}
 
-{existing_context}【任务一：客观信息提取】
+{existing_context}【任务一：用户画像提取（按用户聚合）】
 - 提取对话的核心内容，形成 summary（简短总结）。
-- 提取用户提到的偏好（喜欢的食物、音乐等）、个人事实（职业、年龄等）、关系（朋友、同事等），作为 entities。（category 选：preference/fact/relation/general）
+- 输出 `user_profiles` 数组，每个元素对应一个用户，字段包含：
+  - user_id
+  - display_name（可为空字符串）
+  - traits（数组），每个 trait 包含 key/value/category/importance
+- category 仅可取：preference/fact/relation/general
 
 【任务二：主观互动备忘录提取】
 - 你必须基于《败犬女主太多了！》中"小鞠知花"的人设视角，为有明显互动行为的用户，提取出在互动期间该用户的行为记录。这将被作为"小鞠在心里对近期互动过的用户的悄悄记录"。
@@ -231,8 +192,9 @@ async def summarize_conversation(
 
     # 在 prompt 中添加 JSON 格式要求
     fallback_example = (
-        '{"summary": "...", "entities": '
-        '[{"user_id": "12345", "key": "喜欢的食物", "value": "拉面", "category": "preference"}], '
+        '{"summary": "...", "user_profiles": '
+        '[{"user_id": "12345", "display_name": "阿明", "traits": '
+        '[{"key": "喜欢的食物", "value": "拉面", "category": "preference", "importance": 4}]}], '
         '"user_interactions": [{"user_id": "12345", "file_type": "用户的近期对鞠行为备忘录", '
         '"description": "这是我在心里对这个用户近期行为的悄悄记录。用来提醒自己这个人平时是怎么对我的，下次和他说话时应该保持什么态度。", '
         '"records": [{"event": "用好吃的诱惑我", "result": "咽了口水，稍微凑近了过去", "emotion": "有点警惕但很想吃"}], '
@@ -251,6 +213,50 @@ async def summarize_conversation(
     # 提取 JSON
     json_text = _extract_json_from_markdown(response)
     result = json.loads(json_text)
+
+    # 规范化 user_profiles 输出
+    if "user_profiles" not in result or not isinstance(result["user_profiles"], list):
+        result["user_profiles"] = []
+    normalized_profiles: list[dict] = []
+    for profile in result["user_profiles"]:
+        if not isinstance(profile, dict):
+            continue
+        user_id = str(profile.get("user_id", "")).strip()
+        if not user_id:
+            continue
+        traits = profile.get("traits")
+        normalized_traits: list[dict] = []
+        if isinstance(traits, list):
+            for trait in traits:
+                if not isinstance(trait, dict):
+                    continue
+                key = str(trait.get("key", "")).strip()
+                value = str(trait.get("value", "")).strip()
+                if not key or not value:
+                    continue
+                category = str(trait.get("category", "general")).strip() or "general"
+                if category not in {"preference", "fact", "relation", "general"}:
+                    category = "general"
+                try:
+                    importance = int(trait.get("importance", 3))
+                except (TypeError, ValueError):
+                    importance = 3
+                normalized_traits.append(
+                    {
+                        "key": key,
+                        "value": value,
+                        "category": category,
+                        "importance": max(1, min(5, importance)),
+                    }
+                )
+        normalized_profiles.append(
+            {
+                "user_id": user_id,
+                "display_name": str(profile.get("display_name", "")).strip(),
+                "traits": normalized_traits,
+            }
+        )
+    result["user_profiles"] = normalized_profiles
 
     # 限制互动历史（records）最多保留最近6条，防止上下文无限追加
     if "user_interactions" in result and isinstance(result["user_interactions"], list):

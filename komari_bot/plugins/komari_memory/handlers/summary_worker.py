@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -48,37 +47,11 @@ def _default_interaction(*, user_id: str, display_name: str) -> dict[str, Any]:
     }
 
 
-def _profile_to_entity_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
-    traits = profile.get("traits")
-    if not isinstance(traits, dict):
-        return []
-
-    rows: list[dict[str, Any]] = []
-    user_id = str(profile.get("user_id") or "")
-    for key, raw in traits.items():
-        if not isinstance(raw, dict):
-            continue
-        key_text = str(key).strip()
-        value_text = str(raw.get("value", "")).strip()
-        if not key_text or not value_text:
-            continue
-        rows.append(
-            {
-                "user_id": user_id,
-                "key": key_text,
-                "value": value_text,
-                "category": str(raw.get("category", "general")),
-                "importance": int(raw.get("importance", 3)),
-            }
-        )
-    return rows
-
-
-def _merge_entities_into_profile(
+def _merge_traits_into_profile(
     base_profile: dict[str, Any],
     *,
     display_name: str,
-    entities: list[dict[str, Any]],
+    traits_payload: list[dict[str, Any]],
 ) -> dict[str, Any]:
     profile = dict(base_profile)
     profile["version"] = 1
@@ -86,15 +59,19 @@ def _merge_entities_into_profile(
 
     traits_raw = profile.get("traits")
     traits = dict(traits_raw) if isinstance(traits_raw, dict) else {}
-    for entity in entities:
-        key = str(entity.get("key", "")).strip()
-        value = str(entity.get("value", "")).strip()
+    for trait in traits_payload:
+        key = str(trait.get("key", "")).strip()
+        value = str(trait.get("value", "")).strip()
         if not key or not value:
             continue
+        try:
+            importance = int(trait.get("importance", 3))
+        except (TypeError, ValueError):
+            importance = 3
         traits[key] = {
             "value": value,
-            "category": str(entity.get("category", "general")),
-            "importance": int(entity.get("importance", 3)),
+            "category": str(trait.get("category", "general")),
+            "importance": max(1, min(5, importance)),
             "updated_at": _now_iso(),
         }
 
@@ -166,32 +143,26 @@ async def perform_summary(
 
     existing_profiles: dict[str, dict[str, Any]] = {}
     existing_interactions: dict[str, dict[str, Any]] = {}
-    existing_entities_rows: list[dict[str, Any]] = []
-    existing_interaction_rows: list[dict[str, Any]] = []
 
     for uid in participants:
         profile = await memory.get_user_profile(user_id=uid, group_id=group_id)
         if profile is not None:
             existing_profiles[uid] = profile
-            existing_entities_rows.extend(_profile_to_entity_rows(profile))
 
         interaction = await memory.get_interaction_history(user_id=uid, group_id=group_id)
         if interaction is not None:
             existing_interactions[uid] = interaction
-            existing_interaction_rows.append(
-                {"user_id": uid, "value": json.dumps(interaction, ensure_ascii=False)}
-            )
 
     result = await summarize_conversation(
         messages_buffer,
         config,
-        existing_entities=existing_entities_rows,
-        existing_interactions=existing_interaction_rows,
+        existing_profiles=list(existing_profiles.values()),
+        existing_interactions=list(existing_interactions.values()),
     )
 
     summary = str(result.get("summary", "")).strip()
     importance = int(result.get("importance", 3))
-    entities = result.get("entities", [])
+    user_profiles = result.get("user_profiles", [])
     user_interactions = result.get("user_interactions", [])
 
     if not summary:
@@ -205,15 +176,15 @@ async def perform_summary(
         importance_initial=max(1, min(5, importance)),
     )
 
-    entities_by_user: dict[str, list[dict[str, Any]]] = {}
-    if isinstance(entities, list):
-        for entity in entities:
-            if not isinstance(entity, dict):
+    profiles_by_user: dict[str, dict[str, Any]] = {}
+    if isinstance(user_profiles, list):
+        for profile in user_profiles:
+            if not isinstance(profile, dict):
                 continue
-            uid = str(entity.get("user_id", "")).strip()
+            uid = str(profile.get("user_id", "")).strip()
             if not uid:
                 continue
-            entities_by_user.setdefault(uid, []).append(entity)
+            profiles_by_user[uid] = profile
 
     interactions_by_user: dict[str, dict[str, Any]] = {}
     if isinstance(user_interactions, list):
@@ -225,20 +196,29 @@ async def perform_summary(
                 continue
             interactions_by_user[uid] = interaction
 
-    target_users = set(participants) | set(entities_by_user) | set(interactions_by_user)
+    target_users = set(participants) | set(profiles_by_user) | set(interactions_by_user)
     for uid in sorted(target_users):
+        model_display_name = ""
+        profile_payload = profiles_by_user.get(uid)
+        if profile_payload is not None:
+            model_display_name = str(profile_payload.get("display_name", "")).strip()
         display_name = character_binding.get_character_name(
             user_id=uid,
-            fallback_nickname=nickname_map.get(uid),
+            fallback_nickname=nickname_map.get(uid) or model_display_name,
         )
         base_profile = existing_profiles.get(uid) or _default_profile(
             user_id=uid,
             display_name=display_name,
         )
-        merged_profile = _merge_entities_into_profile(
+        traits_payload = (
+            profile_payload.get("traits", [])
+            if isinstance(profile_payload, dict)
+            else []
+        )
+        merged_profile = _merge_traits_into_profile(
             base_profile,
             display_name=display_name,
-            entities=entities_by_user.get(uid, []),
+            traits_payload=traits_payload if isinstance(traits_payload, list) else [],
         )
         await memory.upsert_user_profile(
             user_id=uid,
@@ -266,11 +246,11 @@ async def perform_summary(
     await redis.update_last_summary(group_id)
 
     logger.info(
-        "[KomariMemory] 群组 %s 总结完成: conversation_id=%s users=%s raw_entities=%s",
+        "[KomariMemory] 群组 %s 总结完成: conversation_id=%s users=%s raw_profiles=%s",
         group_id,
         conversation_id,
         len(target_users),
-        len(entities) if isinstance(entities, list) else 0,
+        len(user_profiles) if isinstance(user_profiles, list) else 0,
     )
 
 
