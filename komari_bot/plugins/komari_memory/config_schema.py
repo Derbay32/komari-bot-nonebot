@@ -244,6 +244,17 @@ class KomariMemoryConfigSchema(BaseModel):
         description="统一候选集 rerank 的 instruction",
     )
 
+    # Scene 持久化配置
+    scene_persist_enabled: bool = Field(
+        default=False, description="是否启用 scene 持久化到 PostgreSQL"
+    )
+    scene_sync_poll_seconds: int = Field(
+        default=30, ge=5, le=3600, description="scene runtime 指针轮询间隔（秒）"
+    )
+    scene_keep_versions: int = Field(
+        default=3, ge=1, le=20, description="保留的 READY scene 版本数量"
+    )
+
     @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
