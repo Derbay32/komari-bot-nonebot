@@ -72,6 +72,7 @@ class PluginManager:
         self.scene_embedding_worker = scene_embedding_worker
 
         try:
+            await self.scene_repository.ensure_schema()
             loaded = await self.scene_runtime.load_active_set_cache()
             if loaded:
                 logger.info("[KomariDecision] scene runtime cache 初始化成功")
