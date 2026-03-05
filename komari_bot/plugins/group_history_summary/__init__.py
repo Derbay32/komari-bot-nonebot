@@ -35,9 +35,13 @@ __plugin_meta__ = PluginMetadata(
     usage="@机器人 总结过去50条",
 )
 
-SUMMARY_PATTERN = r"总结(?:过去)?\s*(\d{1,4})\s*条"
+SUMMARY_TRIGGER_PATTERN = r"(?=.*总结)(?=.*\d).+"
+SUMMARY_COUNT_PATTERN = r"总结[^\d]{0,20}(\d{1,4})"
+FALLBACK_COUNT_PATTERN = r"(\d{1,4})"
+OUT_OF_RANGE_MESSAGE = "我、我只能看10-200条……"
+
 summary_matcher = on_regex(
-    SUMMARY_PATTERN,
+    SUMMARY_TRIGGER_PATTERN,
     rule=to_me(),
     priority=9,
     block=True,
@@ -56,9 +60,16 @@ def _get_group_lock(group_id: str) -> asyncio.Lock:
 
 
 def _extract_requested_count(text: str) -> int | None:
-    match = re.search(SUMMARY_PATTERN, text)
-    if not match:
+    normalized = " ".join(text.split())
+    if "总结" not in normalized:
         return None
+
+    match = re.search(SUMMARY_COUNT_PATTERN, normalized)
+    if match is None:
+        match = re.search(FALLBACK_COUNT_PATTERN, normalized)
+    if match is None:
+        return None
+
     try:
         return int(match.group(1))
     except (TypeError, ValueError):
@@ -76,7 +87,7 @@ def _is_command_message(text: str) -> bool:
     if not normalized:
         return False
 
-    if re.search(SUMMARY_PATTERN, normalized):
+    if re.search(SUMMARY_TRIGGER_PATTERN, normalized):
         return True
 
     return normalized.startswith(("。", ".", "/"))
@@ -89,7 +100,9 @@ def _filter_messages_for_summary(
     """过滤命令消息，以及机器人对这些命令的回复。"""
     # 第一层：命令文本直接剔除（不论是谁发的）
     command_indexes = {
-        idx for idx, message in enumerate(messages) if _is_command_message(message.content)
+        idx
+        for idx, message in enumerate(messages)
+        if _is_command_message(message.content)
     }
     command_message_ids = {
         message.message_id
@@ -148,11 +161,16 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
     if group_lock.locked():
         await summary_matcher.finish("在、在看了……等、等会！")
 
-    count = max(
-        config.min_summary_count, min(requested_count, config.max_summary_count)
-    )
-    if count != requested_count:
-        logger.warning(f"[GroupHistorySummary] 已将条数调整为 {count} 条。")
+    if not (config.min_summary_count <= requested_count <= config.max_summary_count):
+        logger.info(
+            "[GroupHistorySummary] 请求条数越界: requested=%d, allowed=[%d,%d]",
+            requested_count,
+            config.min_summary_count,
+            config.max_summary_count,
+        )
+        await summary_matcher.finish(OUT_OF_RANGE_MESSAGE)
+
+    count = requested_count
 
     is_supported = await check_group_history_supported(bot)
     if not is_supported:
