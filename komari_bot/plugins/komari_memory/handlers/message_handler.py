@@ -1,90 +1,124 @@
 """Komari Memory 消息处理核心。"""
 
+from __future__ import annotations
+
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Literal
 
 from nonebot import logger
-from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-from ..services.bert_client import score_message
 from ..services.config_interface import get_config
 from ..services.image_downloader import download_images_as_base64
 from ..services.llm_service import generate_reply
-from ..services.memory_service import MemoryService
 from ..services.message_filter import preprocess_message
 from ..services.not_related_logger import is_not_related, log_not_related
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.redis_manager import MessageSchema, RedisManager
+from ..services.social_timing_service import SocialTimingService
+from ..services.unified_candidate_rerank import (
+    UnifiedCandidateRerankService,
+    UnifiedRerankResult,
+)
+
+if TYPE_CHECKING:
+    from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+    from ..services.memory_service import MemoryService
+
+CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
+ReplyReason = Literal["at", "direct_call", "score"]
 
 
 class MessageHandler:
     """消息处理核心。"""
+
+    _DIRECT_CALL_BONUS = 0.25
+    _CASUAL_MENTION_PENALTY = -0.18
 
     def __init__(
         self,
         redis: RedisManager,
         memory: MemoryService,
     ) -> None:
-        """初始化消息处理器。
-
-        Args:
-            redis: Redis 管理器
-            memory: 记忆服务
-        """
+        """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
         self.query_rewrite = QueryRewriteService()
+        self.unified_rerank = UnifiedCandidateRerankService()
+        self.social_timing = SocialTimingService(redis)
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
-        """检查是否 @ 了机器人。
-
-        Args:
-            event: 群聊消息事件
-
-        Returns:
-            是否 @ 了机器人
-        """
+        """检查是否 @ 了机器人。"""
         return bool(hasattr(event, "to_me") and event.to_me)
+
+    @staticmethod
+    def _clamp_score(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _resolve_call_intent(
+        self, rank_result: UnifiedRerankResult
+    ) -> tuple[CallIntent, float]:
+        """根据 CALL_* 分数判定呼叫意图。"""
+        config = get_config()
+
+        if (
+            not rank_result.alias_hit
+            or rank_result.call_direct_score is None
+            or rank_result.call_mention_score is None
+        ):
+            return "none", 0.0
+
+        call_margin = rank_result.call_direct_score - rank_result.call_mention_score
+        threshold = config.call_margin_threshold
+        if call_margin >= threshold:
+            return "direct_call", call_margin
+        if call_margin <= -threshold:
+            return "casual_mention", call_margin
+        return "ambiguous", call_margin
+
+    def _should_drop_memory(self, rank_result: UnifiedRerankResult) -> bool:
+        """根据 NOISE/MEANINGFUL 判定是否丢弃记忆。"""
+        config = get_config()
+        noise_delta = rank_result.noise_score - rank_result.meaningful_score
+        return (
+            rank_result.noise_score >= config.noise_conf_threshold
+            and noise_delta >= config.noise_margin_threshold
+        )
+
+    def _get_alias_adjust(self, intent: CallIntent) -> float:
+        """获取意图对回复分的修正值。"""
+        if intent == "direct_call":
+            return self._DIRECT_CALL_BONUS
+        if intent == "casual_mention":
+            return self._CASUAL_MENTION_PENALTY
+        return 0.0
 
     async def process_message(
         self,
         event: GroupMessageEvent,
-    ) -> dict[str, Any] | None:
-        """处理群聊消息的主流程。
-
-        Args:
-            event: 群聊消息事件
-
-        Returns:
-            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
-            如果不需要回复则返回 None
-        """
-        # 获取最新配置
+    ) -> dict[str, str] | None:
+        """处理群聊消息的主流程。"""
         config = get_config()
 
-        # 提取消息信息
         user_id = str(event.user_id)
         group_id = str(event.group_id)
         message_content = event.get_plaintext()
         message_id = str(event.message_id)
 
-        # 提取图片 URL（从 OneBot v11 消息段中）
         image_urls = [
             seg.data["url"]
             for seg in event.message
             if seg.type == "image" and seg.data.get("url")
         ]
         if image_urls:
-            logger.info(f"[KomariMemory] 检测到 {len(image_urls)} 张图片")
+            logger.info("[KomariMemory] 检测到 %s 张图片", len(image_urls))
 
-        # 获取用户昵称（用户昵称 > 群昵称 > user_id）
         user_nickname = (
             (event.sender.nickname or event.sender.card or user_id)
             if event.sender
             else user_id
         )
-
         message = MessageSchema(
             user_id=user_id,
             user_nickname=user_nickname,
@@ -94,81 +128,120 @@ class MessageHandler:
             message_id=message_id,
         )
 
-        # 优先检查是否 @ 了机器人（跳过所有过滤和评分，直接回复）
+        # 1) @ 强制回复，无视冷却/频控，跳过评分链路
         if self._is_at_trigger(event):
-            return await self._handle_at_trigger(message, message_id, image_urls)
+            reply, _stored = await self._attempt_reply(
+                message=message,
+                reply_to_message_id=message_id,
+                image_urls=image_urls,
+                force_reply=True,
+                reason="at",
+                reply_score=None,
+                store_current=True,
+            )
+            return reply
 
-        # 前置过滤
+        # 2) 预过滤
         filter_result = await preprocess_message(
             message=message_content,
             config=config,
             redis=self.redis,
             group_id=group_id,
         )
-
         if filter_result.should_skip:
             logger.debug(
-                f"[KomariMemory] 消息被过滤: {filter_result.reason} - "
-                f"{message_content[:30]}..."
+                "[KomariMemory] 消息被过滤: %s - %s...",
+                filter_result.reason,
+                message_content[:30],
             )
-            # 低价值消息直接丢弃
             await self._handle_low_value(message)
             return None
 
-        # 调用 BERT 服务评分
-        score = await score_message(
-            message=message_content,
-            user_id=user_id,
+        # 3) 单次 rerank 统一候选评分
+        rank_result = await self.unified_rerank.rank_message(message_content)
+        memory_drop = self._should_drop_memory(rank_result)
+        memory_store = not memory_drop
+        call_intent, call_margin = self._resolve_call_intent(rank_result)
+
+        # 4) 时机分（仅影响回复）
+        timing_result = await self.social_timing.score(
             group_id=group_id,
-            config=config,
+            alias_hit=rank_result.alias_hit,
+        )
+        scene_score = rank_result.best_scene_score
+        alias_adjust = self._get_alias_adjust(call_intent)
+        reply_score = self._clamp_score(
+            (1.0 - config.timing_weight) * scene_score
+            + config.timing_weight * timing_result.timing_score
+            + alias_adjust
         )
 
-        logger.debug(
-            f"[KomariMemory] 消息评分: {score:.2f} (group={group_id}, user={user_id})"
+        logger.info(
+            "[KomariMemory] 判定: group=%s user=%s store=%s intent=%s "
+            "scene=%.3f timing=%.3f reply=%.3f noise=%.3f meaningful=%.3f "
+            "call_margin=%.3f best_scene=%s",
+            group_id,
+            user_id,
+            memory_store,
+            call_intent,
+            scene_score,
+            timing_result.timing_score,
+            reply_score,
+            rank_result.noise_score,
+            rank_result.meaningful_score,
+            call_margin,
+            rank_result.best_scene_id or "none",
         )
 
-        # 根据评分分类处理
-        if score < 0.3:  # 低价值
-            await self._handle_low_value(message)
-            return None
-
-        if score >= config.proactive_score_threshold:  # 主动回复阈值
-            return await self._handle_interrupt_signal(
-                message, message_id, score, image_urls
+        # 5) direct_call 强制回复（仍计算并记录评分）
+        if call_intent == "direct_call":
+            reply, stored = await self._attempt_reply(
+                message=message,
+                reply_to_message_id=message_id,
+                image_urls=image_urls,
+                force_reply=True,
+                reason="direct_call",
+                reply_score=reply_score,
+                store_current=memory_store,
             )
+            if reply is not None:
+                return reply
+            if memory_store and not stored:
+                await self._handle_normal_message(message)
+        else:
+            # 6) 普通回复路径
+            should_reply = reply_score >= config.reply_threshold
+            if should_reply:
+                reply, stored = await self._attempt_reply(
+                    message=message,
+                    reply_to_message_id=message_id,
+                    image_urls=image_urls,
+                    force_reply=False,
+                    reason="score",
+                    reply_score=reply_score,
+                    store_current=memory_store,
+                )
+                if reply is not None:
+                    return reply
+                if memory_store and not stored:
+                    await self._handle_normal_message(message)
+            elif memory_store:
+                await self._handle_normal_message(message)
+            else:
+                await self._handle_low_value(message)
 
-        # 普通消息
-        await self._handle_normal_message(message)
         return None
 
     async def _handle_low_value(self, message: MessageSchema) -> None:
-        """处理低价值消息（直接丢弃，不存储）。
-
-        Args:
-            message: 消息对象
-        """
-        # 低价值消息不存储到缓冲区，节省空间
-        logger.debug(f"[KomariMemory] 低价值消息已丢弃: {message.content[:30]}...")
+        """处理低价值消息（直接丢弃，不存储）。"""
+        logger.debug("[KomariMemory] 低价值消息已丢弃: %s...", message.content[:30])
 
     async def _handle_normal_message(self, message: MessageSchema) -> None:
-        """处理普通消息。
-
-        Args:
-            message: 消息对象
-        """
-        # 存入 Redis 并计入消息数和 token
+        """处理普通消息（存储缓冲并计数）。"""
         await self.redis.push_message(message.group_id, message)
         await self.redis.increment_message_count(message.group_id)
-
-        # 同时统计 token（作为备用触发条件）
         token_count = len(message.content)
         await self.redis.increment_tokens(message.group_id, token_count)
-
-        logger.debug(
-            f"[KomariMemory] 消息已存储: group={message.group_id}, "
-            f"messages={await self.redis.get_message_count(message.group_id)}, "
-            f"tokens={await self.redis.get_tokens(message.group_id)}"
-        )
 
     async def _store_ai_reply(
         self,
@@ -176,13 +249,7 @@ class MessageHandler:
         reply_content: str,
         bot_nickname: str,
     ) -> None:
-        """存储 AI 回复到缓冲区。
-
-        Args:
-            group_id: 群组 ID
-            reply_content: 回复内容
-            bot_nickname: 机器人昵称
-        """
+        """存储 AI 回复到缓冲区。"""
         import uuid
 
         bot_message = MessageSchema(
@@ -196,50 +263,62 @@ class MessageHandler:
         )
 
         await self.redis.push_message(group_id, bot_message)
-        logger.debug(f"[KomariMemory] AI 回复已存储: {reply_content[:30]}...")
+        logger.debug("[KomariMemory] AI 回复已存储: %s...", reply_content[:30])
 
-    async def _handle_at_trigger(
+    async def _attempt_reply(
         self,
+        *,
         message: MessageSchema,
         reply_to_message_id: str,
-        image_urls: list[str] | None = None,
-    ) -> dict[str, Any] | None:
-        """处理 @ 触发回复（必须回复，无冷却限制）。
-
-        Args:
-            message: 消息对象
-            reply_to_message_id: 要回复的消息ID
-            image_urls: 消息中的图片 URL 列表
+        image_urls: list[str] | None,
+        force_reply: bool,
+        reason: ReplyReason,
+        reply_score: float | None,
+        store_current: bool,
+    ) -> tuple[dict[str, str] | None, bool]:
+        """尝试生成并返回回复。
 
         Returns:
-            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典
+            (回复结果, 当前消息是否已存储)
         """
         config = get_config()
+        stored = False
 
-        # 先获取最近的消息上下文（不包含当前消息）
+        if not force_reply:
+            if not config.proactive_enabled:
+                return None, stored
+
+            if await self.redis.is_on_cooldown(message.group_id):
+                logger.debug("[KomariMemory] 主动回复冷却中")
+                return None, stored
+
+            current_count = await self.redis.get_proactive_count(message.group_id)
+            if current_count >= config.proactive_max_per_hour:
+                logger.debug("[KomariMemory] 主动回复频率超限")
+                return None, stored
+
         recent_messages = await self.redis.get_buffer(
             message.group_id, limit=config.context_messages_limit
         )
 
-        # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
+        if store_current:
+            await self._handle_normal_message(message)
+            stored = True
+
         rewritten_query = await self.query_rewrite.rewrite_query(
             current_query=message.content,
             conversation_history=recent_messages,
         )
 
-        # 存储当前消息到缓冲区
-        await self.redis.push_message(message.group_id, message)
-
-        # 预先生成查询向量以避免向 API 发起重复请求
         try:
             from nonebot.plugin import require
 
             embedding_provider = require("embedding_provider")
             query_embedding = await embedding_provider.embed(rewritten_query)
         except Exception as e:
-            logger.warning(f"[KomariMemory] 预生成查询特征向量失败: {e}")
+            logger.warning("[KomariMemory] 预生成查询特征向量失败: %s", e)
             query_embedding = None
-        # 检索相关记忆（使用重写后的查询）
+
         memories = await self.memory.search_conversations(
             query=rewritten_query,
             group_id=message.group_id,
@@ -248,13 +327,11 @@ class MessageHandler:
             query_embedding=query_embedding,
         )
 
-        # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
         base64_image_urls = None
         if image_urls:
             base64_image_urls = await download_images_as_base64(image_urls)
 
-        # 构建提示词（5 段式 OpenAI messages）
-        messages = await build_prompt(
+        prompt_messages = await build_prompt(
             user_message=message.content,
             search_query=rewritten_query,
             memories=memories,
@@ -268,160 +345,47 @@ class MessageHandler:
             query_embedding=query_embedding,
         )
 
-        # 生成回复
         reply = await generate_reply(
             config=config,
-            messages=messages,
+            messages=prompt_messages,
         )
-
-        if reply is not None:
-            # 检测 LLM 是否判断为无关输入
-            if is_not_related(reply):
-                logger.info(f"[KomariMemory] @ not related: group={message.group_id}")
-                await log_not_related(
-                    user_message=message.content,
-                    group_id=message.group_id,
-                    user_id=message.user_id,
-                )
-                return None
-
-            # 存储 AI 回复到缓冲区
-            await self._store_ai_reply(
-                group_id=message.group_id,
-                reply_content=reply,
-                bot_nickname=config.bot_nickname,
+        if reply is None:
+            logger.warning(
+                "[KomariMemory] 回复生成失败: group=%s reason=%s score=%s",
+                message.group_id,
+                reason,
+                f"{reply_score:.3f}" if reply_score is not None else "-",
             )
-            logger.info(f"[KomariMemory] @ 回复: group={message.group_id}")
-            return {"reply": reply, "reply_to_message_id": reply_to_message_id}
-        logger.warning(f"[KomariMemory] @ 回复生成失败: group={message.group_id}")
-        return None
+            return None, stored
 
-    async def _handle_interrupt_signal(
-        self,
-        message: MessageSchema,
-        reply_to_message_id: str,
-        score: float,
-        image_urls: list[str] | None = None,
-    ) -> dict[str, Any] | None:
-        """处理中断信号（主动回复）。
-
-        Args:
-            message: 消息对象
-            reply_to_message_id: 要回复的消息ID
-            score: 评分
-            image_urls: 消息中的图片 URL 列表
-
-        Returns:
-            包含 reply (回复内容) 和 reply_to_message_id (要回复的消息ID) 的字典，
-            如果不需要回复则返回 None
-        """
-        # 获取最新配置
-        config = get_config()
-
-        # 检查是否启用主动回复
-        if not config.proactive_enabled:
-            return None
-
-        # 检查冷却
-        if await self.redis.is_on_cooldown(message.group_id):
-            logger.debug("[KomariMemory] 主动回复冷却中")
-            return None
-
-        # 检查频率限制
-        current_count = await self.redis.get_proactive_count(message.group_id)
-        if current_count >= config.proactive_max_per_hour:
-            logger.debug("[KomariMemory] 主动回复频率超限")
-            return None
-
-        # 先获取最近的消息上下文（不包含当前消息）
-        recent_messages = await self.redis.get_buffer(
-            message.group_id, limit=config.context_messages_limit
-        )
-
-        # 查询重写：结合历史对话将当前输入重写为独立的搜索查询
-        rewritten_query = await self.query_rewrite.rewrite_query(
-            current_query=message.content,
-            conversation_history=recent_messages,
-        )
-
-        # 存储当前消息到缓冲区
-        await self.redis.push_message(message.group_id, message)
-        await self.redis.increment_message_count(message.group_id)
-
-        # 预先生成查询向量以避免向 API 发起重复请求
-        try:
-            from nonebot.plugin import require
-
-            embedding_provider = require("embedding_provider")
-            query_embedding = await embedding_provider.embed(rewritten_query)
-        except Exception as e:
-            logger.warning(f"[KomariMemory] 预生成查询特征向量失败: {e}")
-            query_embedding = None
-
-        # 检索相关记忆（传递 user_id 用于用户相关性加权，使用重写后的查询）
-        memories = await self.memory.search_conversations(
-            query=rewritten_query,
-            group_id=message.group_id,
-            user_id=message.user_id,
-            limit=config.memory_search_limit,
-            query_embedding=query_embedding,
-        )
-
-        # 将图片 URL 转为 base64（Gemini 无法直接访问 QQ 图片 URL）
-        base64_image_urls = None
-        if image_urls:
-            base64_image_urls = await download_images_as_base64(image_urls)
-
-        # 构建提示词（5 段式 OpenAI messages）
-        messages = await build_prompt(
-            user_message=message.content,
-            search_query=rewritten_query,
-            memories=memories,
-            config=config,
-            recent_messages=recent_messages,
-            current_user_id=message.user_id,
-            current_user_nickname=message.user_nickname,
-            memory_service=self.memory,
-            group_id=message.group_id,
-            image_urls=base64_image_urls,
-            query_embedding=query_embedding,
-        )
-
-        # 生成回复
-        reply = await generate_reply(
-            config=config,
-            messages=messages,
-        )
-
-        # 只有成功生成回复时才设置冷却和增加计数
-        if reply is not None:
-            # 检测 LLM 是否判断为无关输入
-            if is_not_related(reply):
-                logger.info(
-                    f"[KomariMemory] 主动回复 not related: group={message.group_id}, score={score:.2f}"
-                )
-                await log_not_related(
-                    user_message=message.content,
-                    group_id=message.group_id,
-                    user_id=message.user_id,
-                    score=score,
-                )
-                return None
-
-            # 存储 AI 回复到缓冲区
-            await self._store_ai_reply(
-                group_id=message.group_id,
-                reply_content=reply,
-                bot_nickname=config.bot_nickname,
+        if is_not_related(reply):
+            logger.info(
+                "[KomariMemory] not related: group=%s reason=%s score=%s",
+                message.group_id,
+                reason,
+                f"{reply_score:.3f}" if reply_score is not None else "-",
             )
+            await log_not_related(
+                user_message=message.content,
+                group_id=message.group_id,
+                user_id=message.user_id,
+                score=reply_score,
+            )
+            return None, stored
+
+        await self._store_ai_reply(
+            group_id=message.group_id,
+            reply_content=reply,
+            bot_nickname=config.bot_nickname,
+        )
+        if not force_reply:
             await self.redis.set_cooldown(message.group_id, config.proactive_cooldown)
             await self.redis.increment_proactive_count(message.group_id)
 
-            logger.info(
-                f"[KomariMemory] 主动回复: group={message.group_id}, score={score:.2f}"
-            )
-            return {"reply": reply, "reply_to_message_id": reply_to_message_id}
-        logger.warning(
-            f"[KomariMemory] 主动回复生成失败: group={message.group_id}, score={score:.2f}"
+        logger.info(
+            "[KomariMemory] 回复成功: group=%s reason=%s score=%s",
+            message.group_id,
+            reason,
+            f"{reply_score:.3f}" if reply_score is not None else "-",
         )
-        return None
+        return {"reply": reply, "reply_to_message_id": reply_to_message_id}, stored
