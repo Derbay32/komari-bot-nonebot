@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import TYPE_CHECKING, Literal
 
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
 
 CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
 ReplyReason = Literal["at", "direct_call", "score"]
+MemoryAction = Literal["store", "drop"]
+ReplyAction = Literal[
+    "replied",
+    "replied_forced",
+    "not_replied",
+    "not_related",
+    "generation_failed",
+]
 
 
 class MessageHandler:
@@ -94,6 +103,34 @@ class MessageHandler:
             return self._CASUAL_MENTION_PENALTY
         return 0.0
 
+    @staticmethod
+    def _safe_round(value: float | None) -> float | None:
+        if value is None:
+            return None
+        return round(value, 4)
+
+    def _log_decision(self, payload: dict[str, object]) -> None:
+        """输出决策日志（info 摘要 + debug 完整结构）。"""
+        logger.info(
+            "[KomariMemory] decision_summary group=%s user=%s msg=%s "
+            "memory=%s reply=%s reason=%s intent=%s scene=%s "
+            "reply_score=%s timing=%s",
+            payload.get("group_id"),
+            payload.get("user_id"),
+            payload.get("message_id"),
+            payload.get("memory_action"),
+            payload.get("reply_action"),
+            payload.get("forced_reply_reason"),
+            payload.get("call_intent"),
+            payload.get("best_scene_id"),
+            payload.get("reply_score"),
+            payload.get("timing_score"),
+        )
+        logger.debug(
+            "[KomariMemory] decision_full=%s",
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        )
+
     async def process_message(
         self,
         event: GroupMessageEvent,
@@ -139,6 +176,24 @@ class MessageHandler:
                 reply_score=None,
                 store_current=True,
             )
+            self._log_decision(
+                {
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "message_id": message_id,
+                    "alias_hit": None,
+                    "call_intent": "none",
+                    "memory_action": "store",
+                    "reply_action": "replied_forced" if reply else "generation_failed",
+                    "forced_reply_reason": "at",
+                    "reply_score": None,
+                    "timing_score": None,
+                    "scene_score": None,
+                    "best_scene_id": None,
+                    "noise_score": None,
+                    "meaningful_score": None,
+                }
+            )
             return reply
 
         # 2) 预过滤
@@ -155,12 +210,32 @@ class MessageHandler:
                 message_content[:30],
             )
             await self._handle_low_value(message)
+            self._log_decision(
+                {
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "message_id": message_id,
+                    "alias_hit": None,
+                    "call_intent": "none",
+                    "memory_action": "drop",
+                    "reply_action": "not_replied",
+                    "forced_reply_reason": "none",
+                    "filter_reason": filter_result.reason,
+                    "reply_score": None,
+                    "timing_score": None,
+                    "scene_score": None,
+                    "best_scene_id": None,
+                    "noise_score": None,
+                    "meaningful_score": None,
+                }
+            )
             return None
 
         # 3) 单次 rerank 统一候选评分
         rank_result = await self.unified_rerank.rank_message(message_content)
         memory_drop = self._should_drop_memory(rank_result)
         memory_store = not memory_drop
+        memory_action: MemoryAction = "store" if memory_store else "drop"
         call_intent, call_margin = self._resolve_call_intent(rank_result)
 
         # 4) 时机分（仅影响回复）
@@ -176,25 +251,12 @@ class MessageHandler:
             + alias_adjust
         )
 
-        logger.info(
-            "[KomariMemory] 判定: group=%s user=%s store=%s intent=%s "
-            "scene=%.3f timing=%.3f reply=%.3f noise=%.3f meaningful=%.3f "
-            "call_margin=%.3f best_scene=%s",
-            group_id,
-            user_id,
-            memory_store,
-            call_intent,
-            scene_score,
-            timing_result.timing_score,
-            reply_score,
-            rank_result.noise_score,
-            rank_result.meaningful_score,
-            call_margin,
-            rank_result.best_scene_id or "none",
-        )
+        reply_action: ReplyAction = "not_replied"
+        forced_reply_reason: ReplyReason | Literal["none"] = "none"
 
         # 5) direct_call 强制回复（仍计算并记录评分）
         if call_intent == "direct_call":
+            forced_reply_reason = "direct_call"
             reply, stored = await self._attempt_reply(
                 message=message,
                 reply_to_message_id=message_id,
@@ -205,9 +267,38 @@ class MessageHandler:
                 store_current=memory_store,
             )
             if reply is not None:
+                reply_action = "replied_forced"
+                self._log_decision(
+                    {
+                        "group_id": group_id,
+                        "user_id": user_id,
+                        "message_id": message_id,
+                        "alias_hit": rank_result.alias_hit,
+                        "call_intent": call_intent,
+                        "call_margin": self._safe_round(call_margin),
+                        "memory_action": memory_action,
+                        "reply_action": reply_action,
+                        "forced_reply_reason": forced_reply_reason,
+                        "reply_score": self._safe_round(reply_score),
+                        "timing_score": self._safe_round(timing_result.timing_score),
+                        "scene_score": self._safe_round(scene_score),
+                        "best_scene_id": rank_result.best_scene_id,
+                        "noise_score": self._safe_round(rank_result.noise_score),
+                        "meaningful_score": self._safe_round(
+                            rank_result.meaningful_score
+                        ),
+                        "call_direct_score": self._safe_round(
+                            rank_result.call_direct_score
+                        ),
+                        "call_mention_score": self._safe_round(
+                            rank_result.call_mention_score
+                        ),
+                    }
+                )
                 return reply
             if memory_store and not stored:
                 await self._handle_normal_message(message)
+            reply_action = "generation_failed"
         else:
             # 6) 普通回复路径
             should_reply = reply_score >= config.reply_threshold
@@ -222,14 +313,66 @@ class MessageHandler:
                     store_current=memory_store,
                 )
                 if reply is not None:
+                    reply_action = "replied"
+                    self._log_decision(
+                        {
+                            "group_id": group_id,
+                            "user_id": user_id,
+                            "message_id": message_id,
+                            "alias_hit": rank_result.alias_hit,
+                            "call_intent": call_intent,
+                            "call_margin": self._safe_round(call_margin),
+                            "memory_action": memory_action,
+                            "reply_action": reply_action,
+                            "forced_reply_reason": forced_reply_reason,
+                            "reply_score": self._safe_round(reply_score),
+                            "timing_score": self._safe_round(
+                                timing_result.timing_score
+                            ),
+                            "scene_score": self._safe_round(scene_score),
+                            "best_scene_id": rank_result.best_scene_id,
+                            "noise_score": self._safe_round(rank_result.noise_score),
+                            "meaningful_score": self._safe_round(
+                                rank_result.meaningful_score
+                            ),
+                            "call_direct_score": self._safe_round(
+                                rank_result.call_direct_score
+                            ),
+                            "call_mention_score": self._safe_round(
+                                rank_result.call_mention_score
+                            ),
+                        }
+                    )
                     return reply
                 if memory_store and not stored:
                     await self._handle_normal_message(message)
+                reply_action = "generation_failed"
             elif memory_store:
                 await self._handle_normal_message(message)
             else:
                 await self._handle_low_value(message)
 
+        self._log_decision(
+            {
+                "group_id": group_id,
+                "user_id": user_id,
+                "message_id": message_id,
+                "alias_hit": rank_result.alias_hit,
+                "call_intent": call_intent,
+                "call_margin": self._safe_round(call_margin),
+                "memory_action": memory_action,
+                "reply_action": reply_action,
+                "forced_reply_reason": forced_reply_reason,
+                "reply_score": self._safe_round(reply_score),
+                "timing_score": self._safe_round(timing_result.timing_score),
+                "scene_score": self._safe_round(scene_score),
+                "best_scene_id": rank_result.best_scene_id,
+                "noise_score": self._safe_round(rank_result.noise_score),
+                "meaningful_score": self._safe_round(rank_result.meaningful_score),
+                "call_direct_score": self._safe_round(rank_result.call_direct_score),
+                "call_mention_score": self._safe_round(rank_result.call_mention_score),
+            }
+        )
         return None
 
     async def _handle_low_value(self, message: MessageSchema) -> None:
