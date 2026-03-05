@@ -246,6 +246,70 @@ class SceneRepository:
             )
             return dict(row) if row else None
 
+    async def fetch_pending_items(
+        self,
+        set_id: int,
+        *,
+        limit: int = 32,
+    ) -> list[dict[str, Any]]:
+        """拉取待嵌入的 PENDING 条目。"""
+        if limit <= 0:
+            return []
+
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, set_id, scene_key, scene_type, content_text, content_hash,
+                       enabled, order_index, embedding, embedding_dim,
+                       status, error_message, embedded_at
+                FROM komari_memory_scene_item
+                WHERE set_id = $1
+                  AND status = 'PENDING'
+                ORDER BY order_index ASC, id ASC
+                LIMIT $2
+                """,
+                set_id,
+                limit,
+            )
+            return [dict(row) for row in rows]
+
+    async def mark_item_ready(
+        self,
+        item_id: int,
+        embedding: list[float],
+        embedding_dim: int,
+    ) -> None:
+        """将条目标记为 READY。"""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE komari_memory_scene_item
+                SET embedding = $2,
+                    embedding_dim = $3,
+                    status = 'READY',
+                    error_message = NULL,
+                    embedded_at = NOW()
+                WHERE id = $1
+                """,
+                item_id,
+                embedding,
+                embedding_dim,
+            )
+
+    async def mark_item_failed(self, item_id: int, error_message: str) -> None:
+        """将条目标记为 FAILED。"""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE komari_memory_scene_item
+                SET status = 'FAILED',
+                    error_message = $2
+                WHERE id = $1
+                """,
+                item_id,
+                error_message,
+            )
+
     async def update_set_counters(self, set_id: int) -> None:
         """基于 item 状态刷新 set 计数。"""
         async with self.pg_pool.acquire() as conn:
