@@ -25,6 +25,7 @@ from komari_bot.common.database_config import (
     load_database_config_from_file,
     merge_database_config,
 )
+from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
 
 from .config_schema import DynamicConfigSchema
@@ -173,10 +174,43 @@ class KnowledgeEngine:
             db_config = get_db_config(config)
             self._pool = await create_postgres_pool(db_config, command_timeout=30)
             state.logger.info("[Komari Knowledge] 数据库连接池已建立")
+            await self._validate_embedding_dimension()
 
         # 3. 构建关键词索引（内存预热）
         await self._build_keyword_index()
         state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+
+    async def _validate_embedding_dimension(self) -> None:
+        """校验知识库向量列与当前 embedding 配置一致。"""
+        if self._pool is None:
+            msg = "数据库连接池未初始化"
+            raise RuntimeError(msg)
+
+        expected_dimension: int | None = None
+        if state.nonebot_mode:
+            from nonebot.plugin import require
+
+            embedding_provider = require("embedding_provider")
+            get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
+            if callable(get_dimension):
+                raw_dimension = get_dimension()
+                if isinstance(raw_dimension, int):
+                    expected_dimension = raw_dimension
+                elif isinstance(raw_dimension, str):
+                    expected_dimension = int(raw_dimension)
+                elif raw_dimension is not None:
+                    msg = f"embedding_provider 返回了无效维度类型: {type(raw_dimension)!r}"
+                    raise TypeError(msg)
+        elif getattr(self, "_embedding_service", None) is not None:
+            expected_dimension = int(self._embedding_service.config.embedding_dimension)
+
+        await ensure_vector_column_dimension(
+            self._pool,
+            table_name="komari_knowledge",
+            column_name="embedding",
+            expected_dimension=expected_dimension,
+            label="KomariKnowledge",
+        )
 
     async def _build_keyword_index(self) -> None:
         """构建关键词内存索引。

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
+
 if TYPE_CHECKING:
     from .config_schema import KomariMemoryConfigSchema
 
@@ -59,6 +61,12 @@ class PluginManager:
             logger.exception("[KomariMemory] PostgreSQL 连接失败")
             raise
 
+        try:
+            await self._validate_embedding_dimension()
+        except Exception:
+            logger.exception("[KomariMemory] 向量列维度校验失败")
+            raise
+
         # 2. 初始化 Redis 管理器
         try:
             self.redis = RedisManager(self.config)
@@ -81,6 +89,33 @@ class PluginManager:
         register_forgetting_task(self.forgetting)
 
         logger.info("[KomariMemory] 组件初始化完成")
+
+    async def _validate_embedding_dimension(self) -> None:
+        """校验会话向量列与 embedding_provider 的维度一致。"""
+        if self.pg_pool is None:
+            msg = "PostgreSQL 连接池未初始化"
+            raise RuntimeError(msg)
+
+        embedding_provider = require("embedding_provider")
+        get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
+        expected_dimension: int | None = None
+        if callable(get_dimension):
+            raw_dimension = get_dimension()
+            if isinstance(raw_dimension, int):
+                expected_dimension = raw_dimension
+            elif isinstance(raw_dimension, str):
+                expected_dimension = int(raw_dimension)
+            elif raw_dimension is not None:
+                msg = f"embedding_provider 返回了无效维度类型: {type(raw_dimension)!r}"
+                raise TypeError(msg)
+
+        await ensure_vector_column_dimension(
+            self.pg_pool,
+            table_name="komari_memory_conversations",
+            column_name="embedding",
+            expected_dimension=expected_dimension,
+            label="KomariMemory",
+        )
 
     async def shutdown(self) -> None:
         """关闭所有组件。"""

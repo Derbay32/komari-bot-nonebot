@@ -102,3 +102,10 @@ def get_embedding_model() -> str:
     if state.embedding_service is not None:
         return state.embedding_service.config.embedding_model
     return config_manager.get().embedding_model
+
+
+def get_embedding_dimension() -> int | None:
+    """获取当前生效的 embedding 维度配置。"""
+    if state.embedding_service is not None:
+        return int(state.embedding_service.config.embedding_dimension)
+    return int(config_manager.get().embedding_dimension)
