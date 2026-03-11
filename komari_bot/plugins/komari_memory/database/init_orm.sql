@@ -63,76 +63,12 @@ CREATE INDEX IF NOT EXISTS idx_komari_memory_entity_importance
 ON komari_memory_entity(importance DESC);
 
 -- ============================================
--- Scene 持久化: 版本集表 (scene_set)
--- 记录一次场景构建的元信息与状态
+-- Scene 持久化表结构已迁移到 komari_decision 运行时维护
+-- 避免与 memory 插件中的历史 SQL 副本继续漂移
 -- ============================================
-CREATE TABLE IF NOT EXISTS komari_memory_scene_set (
-    id BIGSERIAL PRIMARY KEY,
-    source_path TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    embedding_model TEXT NOT NULL,
-    embedding_instruction_hash TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('BUILDING', 'READY', 'FAILED')),
-    item_total INT NOT NULL DEFAULT 0 CHECK (item_total >= 0),
-    item_ready INT NOT NULL DEFAULT 0 CHECK (item_ready >= 0),
-    item_failed INT NOT NULL DEFAULT 0 CHECK (item_failed >= 0),
-    error_message TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    ready_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_set_status
-ON komari_memory_scene_set(status, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_set_source_hash
-ON komari_memory_scene_set(source_hash);
-
--- ============================================
--- Scene 持久化: 条目表 (scene_item)
--- 保存每个 scene 的文本、哈希和 embedding
--- ============================================
-CREATE TABLE IF NOT EXISTS komari_memory_scene_item (
-    id BIGSERIAL PRIMARY KEY,
-    set_id BIGINT NOT NULL REFERENCES komari_memory_scene_set(id) ON DELETE CASCADE,
-    scene_key TEXT NOT NULL,
-    scene_type TEXT NOT NULL CHECK (scene_type IN ('fixed', 'general')),
-    content_text TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    order_index INT NOT NULL DEFAULT 0,
-    embedding REAL[],
-    embedding_dim INT,
-    status TEXT NOT NULL CHECK (status IN ('PENDING', 'READY', 'FAILED')),
-    error_message TEXT,
-    embedded_at TIMESTAMPTZ,
-    UNIQUE (set_id, scene_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_set_status
-ON komari_memory_scene_item(set_id, status);
-
-CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_reuse
-ON komari_memory_scene_item(scene_key, content_hash);
-
--- ============================================
--- Scene 持久化: 运行时指针表 (scene_runtime)
--- 仅保留一行，指向当前 active set
--- ============================================
-CREATE TABLE IF NOT EXISTS komari_memory_scene_runtime (
-    id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    active_set_id BIGINT REFERENCES komari_memory_scene_set(id),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO komari_memory_scene_runtime (id, active_set_id)
-VALUES (1, NULL)
-ON CONFLICT (id) DO NOTHING;
 
 -- ============================================
 -- 表注释
 -- ============================================
 COMMENT ON TABLE komari_memory_conversations IS 'Komari Memory 对话总结表 - 存储对话总结和向量表示';
 COMMENT ON TABLE komari_memory_entity IS 'Komari Memory 实体表 - 存储用户/群组结构化信息';
-COMMENT ON TABLE komari_memory_scene_set IS 'Komari Memory Scene 版本集表';
-COMMENT ON TABLE komari_memory_scene_item IS 'Komari Memory Scene 条目与 embedding 表';
-COMMENT ON TABLE komari_memory_scene_runtime IS 'Komari Memory Scene 运行时 active set 指针';
