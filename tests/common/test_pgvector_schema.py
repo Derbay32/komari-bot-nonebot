@@ -10,6 +10,7 @@ import pytest
 from komari_bot.common.pgvector_schema import (
     ensure_vector_column_dimension,
     get_vector_column_dimension,
+    get_vector_column_dimension_from_connection,
     parse_vector_type_dimension,
 )
 
@@ -64,6 +65,17 @@ def test_get_vector_column_dimension_reads_catalog_type() -> None:
         )
     )
     assert dimension == 512
+
+
+def test_get_vector_column_dimension_from_connection_reads_catalog_type() -> None:
+    dimension = asyncio.run(
+        get_vector_column_dimension_from_connection(
+            _FakeConnection({"data_type": "vector(1536)"}),
+            table_name="komari_knowledge",
+            column_name="embedding",
+        )
+    )
+    assert dimension == 1536
 
 
 def test_ensure_vector_column_dimension_accepts_matching_dimension() -> None:

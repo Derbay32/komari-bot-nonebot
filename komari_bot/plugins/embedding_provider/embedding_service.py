@@ -2,18 +2,26 @@
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import aiohttp
 from nonebot import logger
 
-from .config_schema import DynamicConfigSchema
+
+class EmbeddingConfigProtocol(Protocol):
+    """EmbeddingService 运行所需的最小配置接口。"""
+
+    embedding_source: str
+    embedding_model: str
+    embedding_api_url: str
+    embedding_api_key: str
+    embedding_dimension: int
 
 
 class EmbeddingService:
     """提供文本嵌入服务，支持本地 fastembed 和远程 OpenAI 兼容 API。"""
 
-    def __init__(self, config: DynamicConfigSchema) -> None:
+    def __init__(self, config: EmbeddingConfigProtocol) -> None:
         self.config = config
         self._embed_model: Any = None
         self._http_session: aiohttp.ClientSession | None = None

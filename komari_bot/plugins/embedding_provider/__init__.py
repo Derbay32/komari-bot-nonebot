@@ -5,6 +5,8 @@ Komari Bot Embedding Provider。
 支持本地 fastembed 以及在线 API 兼容格式。
 """
 
+from typing import Any
+
 from nonebot import get_driver, logger
 from nonebot.plugin import require
 
@@ -13,15 +15,16 @@ from .config_schema import DynamicConfigSchema
 from .embedding_service import EmbeddingService
 from .rerank_service import RerankResult, RerankService
 
-# 依赖 config_manager 插件
-config_manager_plugin = require("config_manager")
-
-# 获取配置管理器
-config_manager = config_manager_plugin.get_config_manager(
-    "embedding_provider", DynamicConfigSchema
-)
-
-driver = get_driver()
+try:
+    driver = get_driver()
+except ValueError:
+    driver = None
+    config_manager: Any | None = None
+else:
+    config_manager_plugin = require("config_manager")
+    config_manager = config_manager_plugin.get_config_manager(
+        "embedding_provider", DynamicConfigSchema
+    )
 
 
 class ProviderState:
@@ -34,9 +37,11 @@ class ProviderState:
 state = ProviderState()
 
 
-@driver.on_startup
-async def on_startup() -> None:
+async def _startup() -> None:
     """初始化服务。"""
+    if config_manager is None:
+        msg = "EmbeddingProvider 只能在 NoneBot 环境中自动初始化"
+        raise RuntimeError(msg)
     config = config_manager.get()
 
     state.embedding_service = EmbeddingService(config)
@@ -45,8 +50,7 @@ async def on_startup() -> None:
     logger.info(f"[EmbeddingProvider] 插件启动完成 (模式: {config.embedding_source})")
 
 
-@driver.on_shutdown
-async def on_shutdown() -> None:
+async def _shutdown() -> None:
     """清理服务。"""
     if state.embedding_service:
         await state.embedding_service.cleanup()
@@ -57,6 +61,17 @@ async def on_shutdown() -> None:
         state.rerank_service = None
 
     logger.info("[EmbeddingProvider] 插件已关闭")
+
+
+if driver is not None:
+
+    @driver.on_startup
+    async def on_startup() -> None:
+        await _startup()
+
+    @driver.on_shutdown
+    async def on_shutdown() -> None:
+        await _shutdown()
 
 
 # --- 公共 API ---
@@ -101,11 +116,15 @@ def get_embedding_model() -> str:
     """获取当前生效的 embedding 模型名。"""
     if state.embedding_service is not None:
         return state.embedding_service.config.embedding_model
-    return config_manager.get().embedding_model
+    if config_manager is not None:
+        return config_manager.get().embedding_model
+    return DynamicConfigSchema().embedding_model
 
 
 def get_embedding_dimension() -> int | None:
     """获取当前生效的 embedding 维度配置。"""
     if state.embedding_service is not None:
         return int(state.embedding_service.config.embedding_dimension)
-    return int(config_manager.get().embedding_dimension)
+    if config_manager is not None:
+        return int(config_manager.get().embedding_dimension)
+    return int(DynamicConfigSchema().embedding_dimension)

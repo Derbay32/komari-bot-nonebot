@@ -29,22 +29,36 @@ async def get_vector_column_dimension(
 ) -> int | None:
     """Return the declared dimension of a pgvector column."""
     async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type
-            FROM pg_attribute a
-            JOIN pg_class c ON c.oid = a.attrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = $1
-              AND a.attname = $2
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-            ORDER BY CASE WHEN n.nspname = current_schema() THEN 0 ELSE 1 END, n.nspname
-            LIMIT 1
-            """,
-            table_name,
-            column_name,
+        return await get_vector_column_dimension_from_connection(
+            conn,
+            table_name=table_name,
+            column_name=column_name,
         )
+
+
+async def get_vector_column_dimension_from_connection(
+    conn: Any,
+    *,
+    table_name: str,
+    column_name: str,
+) -> int | None:
+    """Return the declared dimension of a pgvector column using an existing connection."""
+    row = await conn.fetchrow(
+        """
+        SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = $1
+          AND a.attname = $2
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY CASE WHEN n.nspname = current_schema() THEN 0 ELSE 1 END, n.nspname
+        LIMIT 1
+        """,
+        table_name,
+        column_name,
+    )
     if row is None:
         msg = f"找不到向量列: {table_name}.{column_name}"
         raise RuntimeError(msg)
