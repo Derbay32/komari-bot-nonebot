@@ -12,7 +12,6 @@ dependencies = [
     "nonebot-plugin-apscheduler>=0.5.0",
     "nonebot2",
     "nonebot2[fastapi]>=2.4.4",
-    "nonebot-plugin-sentry>=2.0.0",
     "fastembed (>=0.7.4,<0.8.0)",
     "psycopg (>=3.3.2,<4.0.0)",
     "asyncpg (>=0.31.0,<0.32.0)",
@@ -40,7 +39,6 @@ nonebot-adapter-onebot = [
 "@local" = []
 nonebot-plugin-localstore = ["nonebot_plugin_localstore"]
 nonebot-plugin-apscheduler = ["nonebot_plugin_apscheduler"]
-nonebot-plugin-sentry = ["nonebot_plugin_sentry"]
 
 [tool.ruff]
 line-length = 88
