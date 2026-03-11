@@ -9,6 +9,11 @@ from types import SimpleNamespace
 
 import nonebot.plugin
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 def _ensure_package_shim() -> None:
     """为 komari_memory 包注入 shim，避免测试导入触发插件入口副作用。"""
@@ -16,8 +21,7 @@ def _ensure_package_shim() -> None:
     if package_name in sys.modules:
         return
 
-    project_root = Path(__file__).resolve().parents[1]
-    package_path = project_root / "komari_bot" / "plugins" / "komari_memory"
+    package_path = PROJECT_ROOT / "komari_bot" / "plugins" / "komari_memory"
 
     shim = types.ModuleType(package_name)
     shim.__path__ = [str(package_path)]  # type: ignore[attr-defined]

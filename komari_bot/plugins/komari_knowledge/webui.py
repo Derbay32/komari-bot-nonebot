@@ -10,6 +10,7 @@ Komari Knowledge 管理界面。
 import asyncio
 import sys
 import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 # 强制使用标准 asyncio，避免 uvloop 在 Streamlit 退出时的错误
@@ -58,7 +59,8 @@ class GlobalContext:
     def __init__(self) -> None:
         # 创建一个新的事件循环
         self.loop = asyncio.new_event_loop()
-        self.engine = None
+        self.engine: KnowledgeEngine | None = None
+        self._closed = False
 
         # 定义一个在后台运行 Loop 的函数
         def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -78,6 +80,35 @@ class GlobalContext:
     async def _init_engine(self) -> None:
         self.engine = KnowledgeEngine()
         await self.engine.initialize()
+
+    async def _close_engine(self) -> None:
+        if self.engine is not None:
+            await self.engine.close()
+            self.engine = None
+
+    def shutdown(self) -> None:
+        """关闭后台引擎与事件循环。"""
+        if self._closed:
+            return
+
+        self._closed = True
+        if self.loop.is_closed():
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._close_engine(), self.loop)
+            future.result(timeout=5)
+        except FutureTimeoutError:
+            pass
+        except Exception:
+            pass
+
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(timeout=5)
+
+        if not self.thread.is_alive() and not self.loop.is_closed():
+            self.loop.close()
 
 
 # 使用 st.cache_resource 确保全局只有一个后台线程在跑
@@ -169,6 +200,12 @@ def main() -> None:
     # 初始化 session_state
     if "editing_kid" not in st.session_state:
         st.session_state.editing_kid = None
+    if "reconnected" not in st.session_state:
+        st.session_state.reconnected = False
+
+    if st.session_state.reconnected:
+        st.success("已重新连接！")
+        st.session_state.reconnected = False
 
     st.markdown(
         '<h1 class="main-header">🧠 小鞠常识库管理</h1>', unsafe_allow_html=True
@@ -195,8 +232,9 @@ def main() -> None:
 
         # 刷新按钮
         if st.button("🔄 重新连接"):
-            # 重置事件循环（不关闭，避免 Streamlit 关闭时的错误）
-            st.success("已重新连接！")
+            get_global_context().shutdown()
+            get_global_context.clear()
+            st.session_state.reconnected = True
             st.rerun()
 
     # 初始化引擎
