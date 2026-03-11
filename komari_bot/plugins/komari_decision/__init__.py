@@ -98,6 +98,7 @@ class PluginManager:
 
         register_scene_sync_task(
             scene_repository,
+            scene_admin,
             scene_sync,
             scene_embedding_worker,
             scene_runtime,

@@ -11,6 +11,7 @@ from ..services.config_interface import get_config
 
 if TYPE_CHECKING:
     from ..repositories.scene_repository import SceneRepository
+    from ..services.scene_admin_service import SceneAdminService
     from ..services.scene_embedding_worker import SceneEmbeddingWorker
     from ..services.scene_runtime_service import SceneRuntimeService
     from ..services.scene_sync_service import SceneSyncService
@@ -25,6 +26,7 @@ class SceneSyncTaskManager:
 
     def __init__(self) -> None:
         self._repository: SceneRepository | None = None
+        self._admin_service: SceneAdminService | None = None
         self._sync_service: SceneSyncService | None = None
         self._embedding_worker: SceneEmbeddingWorker | None = None
         self._runtime_service: SceneRuntimeService | None = None
@@ -32,12 +34,14 @@ class SceneSyncTaskManager:
     def register(
         self,
         repository: SceneRepository,
+        admin_service: SceneAdminService,
         sync_service: SceneSyncService,
         embedding_worker: SceneEmbeddingWorker,
         runtime_service: SceneRuntimeService,
     ) -> None:
         """注册 scene 同步定时任务。"""
         self._repository = repository
+        self._admin_service = admin_service
         self._sync_service = sync_service
         self._embedding_worker = embedding_worker
         self._runtime_service = runtime_service
@@ -66,6 +70,7 @@ class SceneSyncTaskManager:
             pass
 
         self._repository = None
+        self._admin_service = None
         self._sync_service = None
         self._embedding_worker = None
         self._runtime_service = None
@@ -123,6 +128,18 @@ class SceneSyncTaskManager:
             set_id,
         )
 
+    async def _prune_ready_sets(self) -> None:
+        if self._admin_service is None:
+            return
+
+        prune_result = await self._admin_service.prune_old_sets()
+        if prune_result.deleted_set_ids:
+            logger.info(
+                "[KomariDecision] scene 旧 READY 版本已清理: deleted=%s kept=%s",
+                prune_result.deleted_set_ids,
+                prune_result.kept_set_ids,
+            )
+
     async def _execute_task(self, max_batches: int | None = None) -> None:
         """执行 scene 同步任务。"""
         config = get_config()
@@ -145,8 +162,10 @@ class SceneSyncTaskManager:
                     max_batches=max_batches or self._MAX_BATCHES_PER_TICK,
                 )
 
-            await self._activate_if_ready(sync_result.set_id)
+            activated = await self._activate_if_ready(sync_result.set_id)
             await self._runtime_service.refresh_if_runtime_updated()
+            if sync_result.created or activated:
+                await self._prune_ready_sets()
         except Exception:
             logger.exception("[KomariDecision] scene 同步任务执行失败")
 
@@ -156,6 +175,7 @@ _task_manager = SceneSyncTaskManager()
 
 def register_scene_sync_task(
     repository: SceneRepository,
+    admin_service: SceneAdminService,
     sync_service: SceneSyncService,
     embedding_worker: SceneEmbeddingWorker,
     runtime_service: SceneRuntimeService,
@@ -163,6 +183,7 @@ def register_scene_sync_task(
     """注册 scene 同步定时任务。"""
     _task_manager.register(
         repository,
+        admin_service,
         sync_service,
         embedding_worker,
         runtime_service,

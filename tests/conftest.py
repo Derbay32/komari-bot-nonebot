@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import nonebot.plugin
 
@@ -13,6 +14,19 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+class _DummyScheduler:
+    def add_job(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def remove_job(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+apscheduler_module = cast("Any", types.ModuleType("nonebot_plugin_apscheduler"))
+apscheduler_module.scheduler = _DummyScheduler()
+sys.modules.setdefault("nonebot_plugin_apscheduler", apscheduler_module)
 
 
 def _ensure_package_shim() -> None:
