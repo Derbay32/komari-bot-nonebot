@@ -8,6 +8,8 @@ Komari Knowledge 管理界面。
 """
 
 import asyncio
+import atexit
+import importlib.util
 import sys
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -21,9 +23,6 @@ import streamlit as st
 # 添加项目根目录到 Python 路径
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
-
-# 直接加载 engine.py 及其依赖，避免触发 __init__.py 中的 NoneBot 代码
-import importlib.util
 
 # 首先加载 config_schema
 config_spec = importlib.util.spec_from_file_location(
@@ -53,6 +52,7 @@ sys.modules["komari_bot.plugins.komari_knowledge.engine"] = engine_module
 engine_spec.loader.exec_module(engine_module)
 
 KnowledgeEngine = engine_module.KnowledgeEngine
+_active_context = None
 
 
 class GlobalContext:
@@ -78,8 +78,9 @@ class GlobalContext:
         future.result()  # 等待初始化完成
 
     async def _init_engine(self) -> None:
-        self.engine = KnowledgeEngine()
-        await self.engine.initialize()
+        engine = KnowledgeEngine()
+        await engine.initialize()
+        self.engine = engine
 
     async def _close_engine(self) -> None:
         if self.engine is not None:
@@ -114,7 +115,21 @@ class GlobalContext:
 # 使用 st.cache_resource 确保全局只有一个后台线程在跑
 @st.cache_resource(hash_funcs={GlobalContext: lambda _: None})
 def get_global_context() -> GlobalContext:
-    return GlobalContext()
+    global _active_context  # noqa: PLW0603
+    context = GlobalContext()
+    _active_context = context
+    return context
+
+
+def _shutdown_active_context() -> None:
+    global _active_context  # noqa: PLW0603
+    if _active_context is None:
+        return
+    _active_context.shutdown()
+    _active_context = None
+
+
+atexit.register(_shutdown_active_context)
 
 
 def run_async(coro):  # noqa: ANN001, ANN201
@@ -129,7 +144,7 @@ def run_async(coro):  # noqa: ANN001, ANN201
         return future.result()
     except Exception as e:
         st.error(f"异步任务执行出错: {e}")
-        raise e  # noqa: TRY201
+        raise
 
 
 def get_engine() -> KnowledgeEngine:
