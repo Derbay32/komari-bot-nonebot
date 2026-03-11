@@ -11,6 +11,7 @@ from .services.config_interface import get_config
 
 if TYPE_CHECKING:
     from .repositories.scene_repository import SceneRepository
+    from .services.scene_admin_service import SceneAdminService
     from .services.scene_embedding_worker import SceneEmbeddingWorker
     from .services.scene_runtime_service import SceneRuntimeService
     from .services.scene_sync_service import SceneSyncService
@@ -27,6 +28,7 @@ class PluginManager:
 
     def __init__(self) -> None:
         self.scene_repository: SceneRepository | None = None
+        self.scene_admin: SceneAdminService | None = None
         self.scene_runtime: SceneRuntimeService | None = None
         self.scene_sync: SceneSyncService | None = None
         self.scene_embedding_worker: SceneEmbeddingWorker | None = None
@@ -44,6 +46,7 @@ class PluginManager:
             register_scene_sync_task,
         )
         from .repositories.scene_repository import SceneRepository
+        from .services.scene_admin_service import SceneAdminService
         from .services.scene_embedding_worker import SceneEmbeddingWorker
         from .services.scene_runtime_service import SceneRuntimeService
         from .services.scene_sync_service import SceneSyncService
@@ -65,8 +68,14 @@ class PluginManager:
         scene_runtime = SceneRuntimeService(scene_repository)
         scene_sync = SceneSyncService(scene_repository)
         scene_embedding_worker = SceneEmbeddingWorker(scene_repository, batch_size=16)
+        scene_admin = SceneAdminService(
+            scene_repository,
+            scene_runtime,
+            scene_embedding_worker,
+        )
 
         self.scene_repository = scene_repository
+        self.scene_admin = scene_admin
         self.scene_runtime = scene_runtime
         self.scene_sync = scene_sync
         self.scene_embedding_worker = scene_embedding_worker
@@ -81,6 +90,7 @@ class PluginManager:
         except Exception:
             logger.exception("[KomariDecision] scene runtime cache 初始化失败")
             self.scene_repository = None
+            self.scene_admin = None
             self.scene_runtime = None
             self.scene_sync = None
             self.scene_embedding_worker = None
@@ -101,6 +111,7 @@ class PluginManager:
 
         unregister_scene_sync_task()
         self.scene_repository = None
+        self.scene_admin = None
         self.scene_runtime = None
         self.scene_sync = None
         self.scene_embedding_worker = None
@@ -113,6 +124,14 @@ _plugin_manager: PluginManager | None = None
 def get_plugin_manager() -> PluginManager | None:
     """获取插件管理器实例。"""
     return _plugin_manager
+
+
+def get_scene_admin_service() -> SceneAdminService | None:
+    """获取 scene 运维服务。"""
+    manager = get_plugin_manager()
+    if manager is None:
+        return None
+    return manager.scene_admin
 
 
 try:
