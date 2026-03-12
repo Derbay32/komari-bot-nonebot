@@ -7,7 +7,7 @@
 
 \if :{?embedding_dimension}
 \else
-\set embedding_dimension 4096
+\set embedding_dimension 512
 \endif
 
 CREATE EXTENSION IF NOT EXISTS vector;
