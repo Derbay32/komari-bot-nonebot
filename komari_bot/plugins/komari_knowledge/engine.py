@@ -150,41 +150,48 @@ class KnowledgeEngine:
         # 获取配置
         config = get_config()
 
-        # 1. 加载向量嵌入模型
-        if state.nonebot_mode:
-            state.logger.info("[Komari Knowledge] 使用全局 EmbeddingProvider 服务")
-        elif getattr(self, "_embedding_service", None) is None:
-            state.logger.info("[Komari Knowledge] 加载独立嵌入服务...")
-            from komari_bot.plugins.embedding_provider.config_schema import (
-                DynamicConfigSchema as EmbedConfigSchema,
-            )
-            from komari_bot.plugins.embedding_provider.embedding_service import (
-                EmbeddingService,
-            )
+        try:
+            # 1. 加载向量嵌入模型
+            if state.nonebot_mode:
+                state.logger.info("[Komari Knowledge] 使用全局 EmbeddingProvider 服务")
+            elif getattr(self, "_embedding_service", None) is None:
+                state.logger.info("[Komari Knowledge] 加载独立嵌入服务...")
+                from komari_bot.plugins.embedding_provider.config_schema import (
+                    DynamicConfigSchema as EmbedConfigSchema,
+                )
+                from komari_bot.plugins.embedding_provider.embedding_service import (
+                    EmbeddingService,
+                )
 
-            config_path = Path("config/config_manager/embedding_provider_config.json")
-            if config_path.exists():
-                with Path.open(config_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                embed_config = EmbedConfigSchema(**data)
-            else:
-                embed_config = EmbedConfigSchema()
+                config_path = Path("config/config_manager/embedding_provider_config.json")
+                if config_path.exists():
+                    with Path.open(config_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    embed_config = EmbedConfigSchema(**data)
+                else:
+                    embed_config = EmbedConfigSchema()
 
-            self._embedding_service = EmbeddingService(embed_config)
-            state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
+                self._embedding_service = EmbeddingService(embed_config)
+                state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
 
-        # 2. 建立数据库连接池
-        if self._pool is None:
-            db_config = get_db_config(config)
-            self._pool = await create_postgres_pool(db_config, command_timeout=30)
-            state.logger.info("[Komari Knowledge] 数据库连接池已建立")
-            expected_dimension = self._resolve_expected_embedding_dimension()
-            await self._ensure_storage_schema(expected_dimension)
-            await self._validate_embedding_dimension(expected_dimension)
+            # 2. 建立数据库连接池
+            if self._pool is None:
+                db_config = get_db_config(config)
+                self._pool = await create_postgres_pool(db_config, command_timeout=30)
+                state.logger.info("[Komari Knowledge] 数据库连接池已建立")
+                expected_dimension = self._resolve_expected_embedding_dimension()
+                await self._ensure_storage_schema(expected_dimension)
+                await self._validate_embedding_dimension(expected_dimension)
 
-        # 3. 构建关键词索引（内存预热）
-        await self._build_keyword_index()
-        state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+            # 3. 构建关键词索引（内存预热）
+            await self._build_keyword_index()
+            state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+        except Exception:
+            try:
+                await self.close()
+            except Exception:
+                state.logger.exception("[Komari Knowledge] 初始化失败后的清理失败")
+            raise
 
     def _resolve_expected_embedding_dimension(self) -> int | None:
         """解析当前 embedding 配置的目标维度。"""
@@ -774,7 +781,8 @@ async def initialize_engine() -> KnowledgeEngine:
         引擎实例
     """
     if state.engine is None:
-        state.engine = KnowledgeEngine()
-        await state.engine.initialize()
+        engine = KnowledgeEngine()
+        await engine.initialize()
+        state.engine = engine
 
     return state.engine

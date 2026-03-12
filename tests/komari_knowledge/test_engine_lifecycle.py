@@ -6,6 +6,7 @@ import asyncio
 from collections import defaultdict
 from typing import Any
 
+from komari_bot.plugins.komari_knowledge import engine as engine_module
 from komari_bot.plugins.komari_knowledge.engine import KnowledgeEngine, state
 
 
@@ -78,3 +79,27 @@ def test_close_cleans_embedding_service_pool_and_global_state() -> None:
     assert engine._keyword_index == {}
     assert engine._index_loaded is False
     assert state.engine is None
+
+    state.engine = original_engine
+
+
+def test_initialize_engine_does_not_keep_failed_instance(monkeypatch: Any) -> None:
+    original_engine = state.engine
+
+    async def _raise_initialize(self: KnowledgeEngine) -> None:
+        del self
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine_module.KnowledgeEngine, "initialize", _raise_initialize)
+    state.engine = None
+
+    try:
+        try:
+            asyncio.run(engine_module.initialize_engine())
+        except RuntimeError as exc:
+            assert str(exc) == "boom"
+        else:
+            raise AssertionError
+        assert state.engine is None
+    finally:
+        state.engine = original_engine

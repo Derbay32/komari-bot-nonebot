@@ -57,28 +57,24 @@ class PluginManager:
         """初始化所有组件。"""
         logger.info("[KomariMemory] 正在初始化组件...")
 
-        # 1. 初始化 PostgreSQL 连接池 (用于向量检索)
         try:
+            # 1. 初始化 PostgreSQL 连接池 (用于向量检索)
             self.pg_pool = await create_pool(self.config)
             logger.info("[KomariMemory] PostgreSQL 连接池已建立")
-        except Exception:
-            logger.exception("[KomariMemory] PostgreSQL 连接失败")
-            raise
 
-        expected_dimension = self._resolve_expected_embedding_dimension()
-        try:
+            expected_dimension = self._resolve_expected_embedding_dimension()
             await self._ensure_storage_schema(expected_dimension)
             await self._validate_embedding_dimension(expected_dimension)
-        except Exception:
-            logger.exception("[KomariMemory] PostgreSQL schema 检查失败")
-            raise
 
-        # 2. 初始化 Redis 管理器
-        try:
+            # 2. 初始化 Redis 管理器
             self.redis = RedisManager(self.config)
             await self.redis.initialize()
         except Exception:
-            logger.exception("[KomariMemory] Redis 连接失败")
+            logger.exception("[KomariMemory] 初始化失败")
+            try:
+                await self.shutdown()
+            except Exception:
+                logger.exception("[KomariMemory] 初始化失败后的清理失败")
             raise
 
         # 3. 初始化数据访问层
@@ -155,14 +151,19 @@ class PluginManager:
         # 清理记忆服务（释放 fastembed 模型）
         if self.memory:
             await self.memory.cleanup()
+            self.memory = None
+
+        self.forgetting = None
 
         # 关闭 Redis 连接
         if self.redis:
             await self.redis.close()
+            self.redis = None
 
         # 关闭 PostgreSQL 连接池
         if self.pg_pool:
             await self.pg_pool.close()
+            self.pg_pool = None
 
         logger.info("[KomariMemory] 已关闭")
 
@@ -193,8 +194,13 @@ async def startup() -> None:
 
     if config.plugin_enable:
         logger.info("[KomariMemory] 插件已启用（记忆/持久化子系统）")
-        _plugin_manager = PluginManager(config)
-        await _plugin_manager.initialize()
+        manager = PluginManager(config)
+        try:
+            await manager.initialize()
+        except Exception:
+            _plugin_manager = None
+            raise
+        _plugin_manager = manager
     else:
         logger.warning("[KomariMemory] 插件未启用，请在配置中设置 plugin_enable=true")
 
@@ -202,6 +208,8 @@ async def startup() -> None:
 @driver.on_shutdown
 async def shutdown() -> None:
     """关闭时清理。"""
+    global _plugin_manager  # noqa: PLW0603
     manager = get_plugin_manager()
     if manager:
         await manager.shutdown()
+    _plugin_manager = None

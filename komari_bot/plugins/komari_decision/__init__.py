@@ -154,13 +154,16 @@ if driver is not None:
             logger.warning("[KomariDecision] KomariMemory 未启用，跳过初始化")
             return
 
-        _plugin_manager = PluginManager()
-        await _plugin_manager.initialize()
+        manager = PluginManager()
+        await manager.initialize()
+        _plugin_manager = manager
 
 
     @driver.on_shutdown
     async def shutdown() -> None:
         """关闭时清理。"""
+        global _plugin_manager  # noqa: PLW0603
         manager = get_plugin_manager()
         if manager:
             await manager.shutdown()
+        _plugin_manager = None
