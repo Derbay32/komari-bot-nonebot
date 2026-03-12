@@ -6,6 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
+from apscheduler.jobstores.base import JobLookupError
+
 from komari_bot.plugins.komari_decision.handlers.scene_sync_worker import (
     SceneSyncTaskManager,
 )
@@ -133,3 +135,33 @@ def test_execute_task_skips_prune_when_set_not_new_and_not_activated(
     assert runtime_service.switched_ids == []
     assert runtime_service.refresh_calls == 1
     assert admin_service.prune_calls == 0
+
+
+def test_unregister_clears_state_when_job_missing(monkeypatch: Any) -> None:
+    manager = SceneSyncTaskManager()
+    manager._repository = cast("Any", object())
+    manager._admin_service = cast("Any", object())
+    manager._sync_service = cast("Any", object())
+    manager._embedding_worker = cast("Any", object())
+    manager._runtime_service = cast("Any", object())
+
+    removed_job_ids: list[str] = []
+
+    class _FakeScheduler:
+        def remove_job(self, job_id: str) -> None:
+            removed_job_ids.append(job_id)
+            raise JobLookupError(job_id)
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.scheduler",
+        _FakeScheduler(),
+    )
+
+    manager.unregister()
+
+    assert removed_job_ids == [manager._JOB_ID]
+    assert manager._repository is None
+    assert manager._admin_service is None
+    assert manager._sync_service is None
+    assert manager._embedding_worker is None
+    assert manager._runtime_service is None

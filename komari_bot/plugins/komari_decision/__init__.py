@@ -44,6 +44,7 @@ class PluginManager:
         from .handlers.scene_sync_worker import (
             bootstrap_scene_sync_task,
             register_scene_sync_task,
+            unregister_scene_sync_task,
         )
         from .repositories.scene_repository import SceneRepository
         from .services.scene_admin_service import SceneAdminService
@@ -87,23 +88,24 @@ class PluginManager:
                 logger.info("[KomariDecision] scene runtime cache 初始化成功")
             else:
                 logger.warning("[KomariDecision] 当前无 active scene set，runtime cache 为空")
+            register_scene_sync_task(
+                scene_repository,
+                scene_admin,
+                scene_sync,
+                scene_embedding_worker,
+                scene_runtime,
+            )
+            await bootstrap_scene_sync_task()
         except Exception:
-            logger.exception("[KomariDecision] scene runtime cache 初始化失败")
+            unregister_scene_sync_task()
             self.scene_repository = None
             self.scene_admin = None
             self.scene_runtime = None
             self.scene_sync = None
             self.scene_embedding_worker = None
+            logger.exception("[KomariDecision] scene 子系统初始化失败")
             return
 
-        register_scene_sync_task(
-            scene_repository,
-            scene_admin,
-            scene_sync,
-            scene_embedding_worker,
-            scene_runtime,
-        )
-        await bootstrap_scene_sync_task()
         logger.info("[KomariDecision] scene 子系统初始化完成")
 
     async def shutdown(self) -> None:

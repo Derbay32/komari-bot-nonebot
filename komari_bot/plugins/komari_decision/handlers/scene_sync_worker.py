@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
 from nonebot_plugin_apscheduler import scheduler
 
@@ -65,9 +66,12 @@ class SceneSyncTaskManager:
         """取消 scene 同步定时任务。"""
         try:
             scheduler.remove_job(self._JOB_ID)
-            logger.info("[KomariDecision] scene 同步定时任务已取消")
+        except JobLookupError:
+            logger.debug("[KomariDecision] scene 同步定时任务不存在，无需取消")
         except Exception:
-            pass
+            logger.exception("[KomariDecision] scene 同步定时任务取消失败")
+        else:
+            logger.info("[KomariDecision] scene 同步定时任务已取消")
 
         self._repository = None
         self._admin_service = None

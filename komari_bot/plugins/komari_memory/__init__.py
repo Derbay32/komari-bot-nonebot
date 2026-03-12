@@ -69,6 +69,18 @@ class PluginManager:
             # 2. 初始化 Redis 管理器
             self.redis = RedisManager(self.config)
             await self.redis.initialize()
+            # 3. 初始化数据访问层
+            conversation_repo = ConversationRepository(self.pg_pool)
+            entity_repo = EntityRepository(self.pg_pool)
+            # 4. 初始化记忆服务
+            self.memory = MemoryService(self.config, conversation_repo, entity_repo)
+
+            # 5. 注册总结定时任务
+            register_summary_task(self.redis, self.memory)
+
+            # 6. 初始化忘却服务并注册定时任务
+            self.forgetting = ForgettingService(self.config, self.pg_pool)
+            register_forgetting_task(self.forgetting)
         except Exception:
             logger.exception("[KomariMemory] 初始化失败")
             try:
@@ -76,19 +88,6 @@ class PluginManager:
             except Exception:
                 logger.exception("[KomariMemory] 初始化失败后的清理失败")
             raise
-
-        # 3. 初始化数据访问层
-        conversation_repo = ConversationRepository(self.pg_pool)
-        entity_repo = EntityRepository(self.pg_pool)
-        # 4. 初始化记忆服务
-        self.memory = MemoryService(self.config, conversation_repo, entity_repo)
-
-        # 5. 注册总结定时任务
-        register_summary_task(self.redis, self.memory)
-
-        # 6. 初始化忘却服务并注册定时任务
-        self.forgetting = ForgettingService(self.config, self.pg_pool)
-        register_forgetting_task(self.forgetting)
 
         logger.info("[KomariMemory] 组件初始化完成")
 

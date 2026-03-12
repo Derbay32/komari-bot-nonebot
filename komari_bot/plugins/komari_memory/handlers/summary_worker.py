@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
 from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
@@ -274,6 +275,9 @@ def unregister_summary_task() -> None:
     """取消注册总结定时任务。"""
     try:
         scheduler.remove_job("komari_memory_summary_worker")
-        logger.info("[KomariMemory] 总结定时任务已取消")
+    except JobLookupError:
+        logger.debug("[KomariMemory] 总结定时任务不存在，无需取消")
     except Exception:
-        pass
+        logger.exception("[KomariMemory] 总结定时任务取消失败")
+    else:
+        logger.info("[KomariMemory] 总结定时任务已取消")
