@@ -58,10 +58,18 @@ class _DummyConfigManagerPlugin:
         return _DummyConfigManager()
 
 
+class _DummyLLMProvider:
+    @staticmethod
+    async def generate_text(**_kwargs: object) -> str:
+        return "对话内容已模糊化处理"
+
+
 def _fake_require(name: str) -> object:
     """测试阶段替换 nonebot.require，避免真实插件加载。"""
     if name == "config_manager":
         return _DummyConfigManagerPlugin()
+    if name == "llm_provider":
+        return _DummyLLMProvider()
     msg = f"Unsupported plugin require in tests: {name}"
     raise RuntimeError(msg)
 

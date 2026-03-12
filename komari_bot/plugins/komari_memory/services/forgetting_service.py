@@ -81,14 +81,24 @@ class ForgettingService:
             删除的记录数
         """
         threshold = self.config.forgetting_importance_threshold
+        min_age_days = self.config.forgetting_min_age_days
         async with self.pg_pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM komari_memory_conversations WHERE importance_current = 0 AND importance_initial <= $1",
+                """
+                DELETE FROM komari_memory_conversations
+                WHERE importance_current = 0
+                  AND importance_initial <= $1
+                  AND created_at <= NOW() - ($2 * INTERVAL '1 day')
+                """,
                 threshold,
+                min_age_days,
             )
             deleted = result.split()[-1] if result else "0"
             logger.debug(
-                f"[KomariMemory] 删除低价值记忆: {deleted} 条 (阈值: {threshold})"
+                "[KomariMemory] 删除低价值记忆: %s 条 (阈值: %s, 最小保留天数: %s)",
+                deleted,
+                threshold,
+                min_age_days,
             )
             return int(deleted)
 
@@ -99,18 +109,34 @@ class ForgettingService:
             处理的记录数（删除+模糊化）
         """
         threshold = self.config.forgetting_importance_threshold
+        min_age_days = self.config.forgetting_min_age_days
         async with self.pg_pool.acquire() as conn:
             # 1. 删除已模糊化的高价值记忆
             fuzzy_result = await conn.execute(
-                "DELETE FROM komari_memory_conversations WHERE importance_current = 0 AND importance_initial > $1 AND is_fuzzy = TRUE",
+                """
+                DELETE FROM komari_memory_conversations
+                WHERE importance_current = 0
+                  AND importance_initial > $1
+                  AND is_fuzzy = TRUE
+                  AND created_at <= NOW() - ($2 * INTERVAL '1 day')
+                """,
                 threshold,
+                min_age_days,
             )
             deleted_fuzzy = int(fuzzy_result.split()[-1]) if fuzzy_result else 0
 
             # 2. 模糊化未处理的高价值记忆
             rows = await conn.fetch(
-                "SELECT id, summary FROM komari_memory_conversations WHERE importance_current = 0 AND importance_initial > $1 AND is_fuzzy = FALSE",
+                """
+                SELECT id, summary
+                FROM komari_memory_conversations
+                WHERE importance_current = 0
+                  AND importance_initial > $1
+                  AND is_fuzzy = FALSE
+                  AND created_at <= NOW() - ($2 * INTERVAL '1 day')
+                """,
                 threshold,
+                min_age_days,
             )
 
             fuzzified_count = 0
@@ -120,7 +146,10 @@ class ForgettingService:
 
             total = deleted_fuzzy + fuzzified_count
             logger.debug(
-                f"[KomariMemory] 高价值记忆处理: 删除 {deleted_fuzzy} 条, 模糊化 {fuzzified_count} 条"
+                "[KomariMemory] 高价值记忆处理: 删除 %s 条, 模糊化 %s 条 (最小保留天数: %s)",
+                deleted_fuzzy,
+                fuzzified_count,
+                min_age_days,
             )
             return total
 
