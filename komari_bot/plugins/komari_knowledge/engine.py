@@ -27,6 +27,10 @@ from komari_bot.common.database_config import (
 )
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.vector_storage_schema import (
+    apply_schema_statements,
+    build_knowledge_schema_statements,
+)
 
 from .config_schema import DynamicConfigSchema
 
@@ -174,18 +178,16 @@ class KnowledgeEngine:
             db_config = get_db_config(config)
             self._pool = await create_postgres_pool(db_config, command_timeout=30)
             state.logger.info("[Komari Knowledge] 数据库连接池已建立")
-            await self._validate_embedding_dimension()
+            expected_dimension = self._resolve_expected_embedding_dimension()
+            await self._ensure_storage_schema(expected_dimension)
+            await self._validate_embedding_dimension(expected_dimension)
 
         # 3. 构建关键词索引（内存预热）
         await self._build_keyword_index()
         state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
 
-    async def _validate_embedding_dimension(self) -> None:
-        """校验知识库向量列与当前 embedding 配置一致。"""
-        if self._pool is None:
-            msg = "数据库连接池未初始化"
-            raise RuntimeError(msg)
-
+    def _resolve_expected_embedding_dimension(self) -> int | None:
+        """解析当前 embedding 配置的目标维度。"""
         expected_dimension: int | None = None
         if state.nonebot_mode:
             from nonebot.plugin import require
@@ -203,6 +205,34 @@ class KnowledgeEngine:
                     raise TypeError(msg)
         elif getattr(self, "_embedding_service", None) is not None:
             expected_dimension = int(self._embedding_service.config.embedding_dimension)
+        return expected_dimension
+
+    async def _ensure_storage_schema(self, expected_dimension: int | None) -> None:
+        """按当前 embedding 维度补齐常识库基础表结构。"""
+        if self._pool is None:
+            msg = "数据库连接池未初始化"
+            raise RuntimeError(msg)
+        if expected_dimension is None:
+            msg = "无法确定 embedding 维度，不能初始化 knowledge schema"
+            raise RuntimeError(msg)
+
+        await apply_schema_statements(
+            self._pool,
+            statements=build_knowledge_schema_statements(expected_dimension),
+        )
+        state.logger.info(
+            "[Komari Knowledge] PostgreSQL schema 检查完成 (embedding=%s)",
+            expected_dimension,
+        )
+
+    async def _validate_embedding_dimension(
+        self,
+        expected_dimension: int | None,
+    ) -> None:
+        """校验知识库向量列与当前 embedding 配置一致。"""
+        if self._pool is None:
+            msg = "数据库连接池未初始化"
+            raise RuntimeError(msg)
 
         await ensure_vector_column_dimension(
             self._pool,
