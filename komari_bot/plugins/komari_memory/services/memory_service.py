@@ -32,7 +32,7 @@ class MemoryService:
         self.config = config
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
-        self._embedding_plugin = require("embedding_provider")
+        self._embedding_plugin: Any = require("embedding_provider")
 
     async def store_conversation(
         self,
@@ -92,7 +92,8 @@ class MemoryService:
         )
 
         # rerank 启用时多取候选
-        fetch_limit = limit * 3 if self._embedding_plugin.is_rerank_enabled() else limit
+        rerank_enabled = self._embedding_plugin.is_rerank_enabled()
+        fetch_limit = limit * 3 if rerank_enabled else limit
 
         # 数据访问：委托给仓库（传递 user_id 用于加权）
         results = await self._conversation_repo.search_by_similarity(
@@ -101,14 +102,19 @@ class MemoryService:
             user_id=user_id,
             limit=fetch_limit,
             access_boost=self.config.forgetting_access_boost,
+            touch_results=not rerank_enabled,
         )
 
-        if self._embedding_plugin.is_rerank_enabled() and results:
+        if rerank_enabled and results:
             documents = [r["summary"] for r in results]
             reranked = await self._embedding_plugin.rerank(
                 query, documents, top_n=limit
             )
             results = [results[rr.index] for rr in reranked]
+            await self._conversation_repo.touch_conversations(
+                [int(result["id"]) for result in results],
+                access_boost=self.config.forgetting_access_boost,
+            )
 
         return results[:limit]
 
