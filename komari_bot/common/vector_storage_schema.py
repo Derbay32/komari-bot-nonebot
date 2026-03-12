@@ -21,11 +21,16 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             end_time TIMESTAMP NOT NULL,
             importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
             importance_initial INT DEFAULT 3 CHECK (importance_initial BETWEEN 1 AND 5),
-            importance_current INT DEFAULT 3 CHECK (importance_current BETWEEN 0 AND 5),
+            importance_current DOUBLE PRECISION DEFAULT 3 CHECK (importance_current BETWEEN 0 AND 5),
             last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_fuzzy BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+        """,
+        """
+        ALTER TABLE komari_memory_conversations
+        ALTER COLUMN importance_current TYPE DOUBLE PRECISION
+        USING importance_current::DOUBLE PRECISION
         """,
         """
         CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_group

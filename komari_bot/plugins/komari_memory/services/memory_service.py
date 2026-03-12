@@ -100,6 +100,7 @@ class MemoryService:
             group_id=group_id,
             user_id=user_id,
             limit=fetch_limit,
+            access_boost=self.config.forgetting_access_boost,
         )
 
         if self._embedding_plugin.is_rerank_enabled() and results:

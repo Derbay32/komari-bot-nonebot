@@ -80,6 +80,19 @@ def test_delete_low_value_memories_respects_min_age_days() -> None:
     assert args == (3, 7)
 
 
+def test_daily_decay_uses_configured_decay_factor() -> None:
+    conn = _FakeConnection(execute_results=["UPDATE 4"])
+    service = _make_service(conn)
+
+    asyncio.run(service._daily_decay())
+
+    assert len(conn.execute_calls) == 1
+    query, args = conn.execute_calls[0]
+    assert "importance_current * $1 < 0.5" in query
+    assert "ROUND((importance_current * $1)::numeric, 3)::DOUBLE PRECISION" in query
+    assert args == (0.95,)
+
+
 def test_fuzzify_and_cleanup_high_value_memories_respects_min_age_days() -> None:
     conn = _FakeConnection(
         execute_results=["DELETE 1"],

@@ -67,6 +67,7 @@ class ConversationRepository:
         group_id: str,
         user_id: str | None = None,
         limit: int = 10,
+        access_boost: float = 1.0,
     ) -> list[dict[str, Any]]:
         """向量搜索对话（支持用户加权）。
 
@@ -75,6 +76,7 @@ class ConversationRepository:
             group_id: 群组 ID
             user_id: 用户 ID（用于加权该用户参与的记忆）
             limit: 返回数量限制
+            access_boost: 命中后重要性回升系数
 
         Returns:
             检索结果列表，包含 summary, similarity 等
@@ -128,10 +130,17 @@ class ConversationRepository:
                     """
                     UPDATE komari_memory_conversations
                     SET last_accessed = NOW(),
-                        importance_current = importance_initial
+                        importance_current = LEAST(
+                            5.0,
+                            GREATEST(
+                                importance_initial::DOUBLE PRECISION,
+                                ROUND((importance_current * $2)::numeric, 3)::DOUBLE PRECISION
+                            )
+                        )
                     WHERE id = ANY($1)
                     """,
                     result_ids,
+                    access_boost,
                 )
                 logger.debug(f"[KomariMemory] 重置 {len(result_ids)} 条记忆的重要性")
 

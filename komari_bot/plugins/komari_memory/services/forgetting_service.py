@@ -62,16 +62,22 @@ class ForgettingService:
 
     async def _daily_decay(self) -> None:
         """每日衰减：所有记忆重要性按配置系数衰减。"""
-        # 获取配置的衰减系数（转换为衰减量）
-        # 例如：decay_factor=0.95 表示每次衰减5%，即 importance_current * 0.95
-        # 但当前设计是整数衰减，所以暂时保持-1的简单逻辑
-        # TODO: 改为使用 decay_factor 进行浮点数衰减
+        decay_factor = float(self.config.forgetting_decay_factor)
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
-                "UPDATE komari_memory_conversations SET importance_current = GREATEST(0, importance_current - 1)"
+                """
+                UPDATE komari_memory_conversations
+                SET importance_current = CASE
+                    WHEN importance_current <= 0 THEN 0
+                    WHEN importance_current * $1 < 0.5 THEN 0
+                    ELSE ROUND((importance_current * $1)::numeric, 3)::DOUBLE PRECISION
+                END
+                """,
+                decay_factor,
             )
             logger.debug(
-                f"[KomariMemory] 已衰减所有记忆的重要性 (衰减系数: {self.config.forgetting_decay_factor})"
+                "[KomariMemory] 已衰减所有记忆的重要性 (衰减系数: %s)",
+                decay_factor,
             )
 
     async def _delete_low_value_memories(self) -> int:

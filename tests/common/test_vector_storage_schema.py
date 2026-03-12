@@ -43,7 +43,7 @@ class _FakePool:
 def test_build_memory_schema_statements_uses_requested_dimension() -> None:
     statements = build_memory_schema_statements(1536)
     assert "VECTOR(1536)" in statements[1]
-    assert "komari_memory_entity" in statements[4]
+    assert any("komari_memory_entity" in statement for statement in statements)
 
 
 def test_build_knowledge_schema_statements_uses_requested_dimension() -> None:
