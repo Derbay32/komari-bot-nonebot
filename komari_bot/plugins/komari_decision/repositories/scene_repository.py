@@ -63,7 +63,7 @@ class SceneRepository:
             )
             set_id = int(row["id"])
             logger.info(
-                "[KomariDecision] 创建 scene set: id=%s status=%s model=%s",
+                "[KomariDecision] 创建 scene set: id={} status={} model={}",
                 set_id,
                 status,
                 embedding_model,
@@ -118,7 +118,9 @@ class SceneRepository:
             )
 
         logger.info(
-            "[KomariDecision] 批量插入 scene item: set=%s count=%s", set_id, len(values)
+            "[KomariDecision] 批量插入 scene item: set={} count={}",
+            set_id,
+            len(values),
         )
         return len(values)
 
@@ -242,7 +244,7 @@ class SceneRepository:
                 """,
                 set_id,
             )
-        logger.info("[KomariDecision] 激活 scene set: id=%s", set_id)
+        logger.info("[KomariDecision] 激活 scene set: id={}", set_id)
 
     async def switch_active_set(self, set_id: int) -> None:
         """原子切换 active set（仅允许 READY 版本）。"""
@@ -274,7 +276,7 @@ class SceneRepository:
                 """,
                 set_id,
             )
-        logger.info("[KomariDecision] 原子切换 active scene set: id=%s", set_id)
+        logger.info("[KomariDecision] 原子切换 active scene set: id={}", set_id)
 
     async def list_items_by_set(
         self,
@@ -451,7 +453,7 @@ class SceneRepository:
                 """,
                 set_id,
             )
-        logger.info("[KomariDecision] scene set 就绪: id=%s", set_id)
+        logger.info("[KomariDecision] scene set 就绪: id={}", set_id)
 
     async def mark_set_failed(self, set_id: int, error_message: str) -> None:
         """将 set 标记为 FAILED。"""
@@ -466,7 +468,11 @@ class SceneRepository:
                 set_id,
                 error_message,
             )
-        logger.warning("[KomariDecision] scene set 失败: id=%s error=%s", set_id, error_message)
+        logger.warning(
+            "[KomariDecision] scene set 失败: id={} error={}",
+            set_id,
+            error_message,
+        )
 
     async def reopen_failed_set(self, set_id: int) -> int:
         """将 FAILED set 重置为 BUILDING，并将 FAILED item 置回 PENDING。"""
@@ -511,7 +517,7 @@ class SceneRepository:
             updated = int(result.split()[-1])
 
         logger.info(
-            "[KomariDecision] 重试 scene set: id=%s reset_failed_items=%s",
+            "[KomariDecision] 重试 scene set: id={} reset_failed_items={}",
             set_id,
             updated,
         )
@@ -529,6 +535,6 @@ class SceneRepository:
             )
         affected = int(result.split()[-1])
         if affected > 0:
-            logger.info("[KomariDecision] 删除 scene set: id=%s", set_id)
+            logger.info("[KomariDecision] 删除 scene set: id={}", set_id)
             return True
         return False

@@ -76,7 +76,7 @@ class ForgettingService:
                 decay_factor,
             )
             logger.debug(
-                "[KomariMemory] 已衰减所有记忆的重要性 (衰减系数: %s)",
+                "[KomariMemory] 已衰减所有记忆的重要性 (衰减系数: {})",
                 decay_factor,
             )
 
@@ -101,7 +101,7 @@ class ForgettingService:
             )
             deleted = result.split()[-1] if result else "0"
             logger.debug(
-                "[KomariMemory] 删除低价值记忆: %s 条 (阈值: %s, 最小保留天数: %s)",
+                "[KomariMemory] 删除低价值记忆: {} 条 (阈值: {}, 最小保留天数: {})",
                 deleted,
                 threshold,
                 min_age_days,
@@ -152,7 +152,7 @@ class ForgettingService:
 
             total = deleted_fuzzy + fuzzified_count
             logger.debug(
-                "[KomariMemory] 高价值记忆处理: 删除 %s 条, 模糊化 %s 条 (最小保留天数: %s)",
+                "[KomariMemory] 高价值记忆处理: 删除 {} 条, 模糊化 {} 条 (最小保留天数: {})",
                 deleted_fuzzy,
                 fuzzified_count,
                 min_age_days,

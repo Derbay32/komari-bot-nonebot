@@ -111,7 +111,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     message=message_array,
                 )
             except Exception as e:
-                logger.warning("[KomariChat] 原生回复失败: %s，降级普通发送", e)
+                logger.warning("[KomariChat] 原生回复失败: {}，降级普通发送", e)
                 await matcher.send(reply)
         else:
             await matcher.send(reply)

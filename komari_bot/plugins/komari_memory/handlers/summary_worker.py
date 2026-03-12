@@ -114,7 +114,7 @@ async def summary_worker_task(
     if not group_ids:
         return
 
-    logger.debug("[KomariMemory] 检查 %s 个群组的总结任务...", len(group_ids))
+    logger.debug("[KomariMemory] 检查 {} 个群组的总结任务...", len(group_ids))
     for group_id in group_ids:
         if await redis.should_trigger_summary(group_id):
             await perform_summary(group_id, redis, memory)
@@ -126,12 +126,12 @@ async def perform_summary(
     memory: MemoryService,
 ) -> None:
     """执行群组的对话总结。"""
-    logger.info("[KomariMemory] 开始总结群组 %s 的对话", group_id)
+    logger.info("[KomariMemory] 开始总结群组 {} 的对话", group_id)
     config = get_config()
 
     messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_messages)
     if not messages_buffer:
-        logger.warning("[KomariMemory] 群组 %s 消息缓冲为空", group_id)
+        logger.warning("[KomariMemory] 群组 {} 消息缓冲为空", group_id)
         return
 
     participants = list({msg.user_id for msg in messages_buffer if not msg.is_bot})
@@ -167,7 +167,7 @@ async def perform_summary(
     user_interactions = result.get("user_interactions", [])
 
     if not summary:
-        logger.warning("[KomariMemory] 群组 %s 总结为空，跳过存储", group_id)
+        logger.warning("[KomariMemory] 群组 {} 总结为空，跳过存储", group_id)
         return
 
     conversation_id = await memory.store_conversation(
@@ -247,7 +247,7 @@ async def perform_summary(
     await redis.update_last_summary(group_id)
 
     logger.info(
-        "[KomariMemory] 群组 %s 总结完成: conversation_id=%s users=%s raw_profiles=%s",
+        "[KomariMemory] 群组 {} 总结完成: conversation_id={} users={} raw_profiles={}",
         group_id,
         conversation_id,
         len(target_users),

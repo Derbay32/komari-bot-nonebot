@@ -114,7 +114,7 @@ class EntityRepository:
                 importance,
             )
         logger.debug(
-            "[KomariMemory] upsert entity row: group=%s user=%s key=%s",
+            "[KomariMemory] upsert entity row: group={} user={} key={}",
             group_id,
             user_id,
             key,
@@ -145,7 +145,7 @@ class EntityRepository:
             parsed = json.loads(str(row["value"]))
         except (TypeError, ValueError):
             logger.warning(
-                "[KomariMemory] entity JSON parse failed: group=%s user=%s key=%s",
+                "[KomariMemory] entity JSON parse failed: group={} user={} key={}",
                 group_id,
                 user_id,
                 key,

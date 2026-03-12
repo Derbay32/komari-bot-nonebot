@@ -138,12 +138,12 @@ class UnifiedCandidateRerankService:
         scenes: list[dict[str, str]] = []
         for idx, item in enumerate(raw_scenes):
             if not isinstance(item, dict):
-                logger.warning("[UnifiedRerank] 忽略非法 scene 项: index=%s", idx)
+                logger.warning("[UnifiedRerank] 忽略非法 scene 项: index={}", idx)
                 continue
             scene_id = str(item.get("id", "")).strip()
             scene_text = str(item.get("text", "")).strip()
             if not scene_id or not scene_text:
-                logger.warning("[UnifiedRerank] 忽略空 scene 项: index=%s", idx)
+                logger.warning("[UnifiedRerank] 忽略空 scene 项: index={}", idx)
                 continue
             scenes.append({"id": scene_id, "text": scene_text})
 
@@ -211,7 +211,7 @@ class UnifiedCandidateRerankService:
             for (key, _), vector in zip(items, vectors, strict=True)
         }
         logger.info(
-            "[UnifiedRerank] 场景模板已加载: scenes=%s, instruction_hash=%s",
+            "[UnifiedRerank] 场景模板已加载: scenes={}, instruction_hash={}",
             len(scenes),
             hash(instruction),
         )

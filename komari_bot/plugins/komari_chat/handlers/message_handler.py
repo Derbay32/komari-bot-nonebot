@@ -100,9 +100,9 @@ class MessageHandler:
     def _log_decision(self, payload: dict[str, object]) -> None:
         """输出决策日志（info 摘要 + debug 完整结构）。"""
         logger.info(
-            "[KomariMemory] decision_summary group=%s user=%s msg=%s "
-            "memory=%s reply=%s reason=%s intent=%s scene=%s "
-            "reply_score=%s timing=%s",
+            "[KomariMemory] decision_summary group={} user={} msg={} "
+            "memory={} reply={} reason={} intent={} scene={} "
+            "reply_score={} timing={}",
             payload.get("group_id"),
             payload.get("user_id"),
             payload.get("message_id"),
@@ -115,7 +115,7 @@ class MessageHandler:
             payload.get("timing_score"),
         )
         logger.debug(
-            "[KomariMemory] decision_full=%s",
+            "[KomariMemory] decision_full={}",
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
 
@@ -135,7 +135,7 @@ class MessageHandler:
             if seg.type == "image" and seg.data.get("url")
         ]
         if image_urls:
-            logger.info("[KomariMemory] 检测到 %s 张图片", len(image_urls))
+            logger.info("[KomariMemory] 检测到 {} 张图片", len(image_urls))
 
         user_nickname = (
             (event.sender.nickname or event.sender.card or user_id)
@@ -160,7 +160,7 @@ class MessageHandler:
 
         if outcome.filter_reason is not None:
             logger.debug(
-                "[KomariMemory] 消息被过滤: %s - %s...",
+                "[KomariMemory] 消息被过滤: {} - {}...",
                 outcome.filter_reason,
                 message_content[:30],
             )
@@ -235,7 +235,7 @@ class MessageHandler:
 
     async def _handle_low_value(self, message: MessageSchema) -> None:
         """处理低价值消息（直接丢弃，不存储）。"""
-        logger.debug("[KomariMemory] 低价值消息已丢弃: %s...", message.content[:30])
+        logger.debug("[KomariMemory] 低价值消息已丢弃: {}...", message.content[:30])
 
     async def _handle_normal_message(self, message: MessageSchema) -> None:
         """处理普通消息（存储缓冲并计数）。"""
@@ -264,7 +264,7 @@ class MessageHandler:
         )
 
         await self.redis.push_message(group_id, bot_message)
-        logger.debug("[KomariMemory] AI 回复已存储: %s...", reply_content[:30])
+        logger.debug("[KomariMemory] AI 回复已存储: {}...", reply_content[:30])
 
     async def _attempt_reply(
         self,
@@ -317,7 +317,7 @@ class MessageHandler:
             embedding_provider = require("embedding_provider")
             query_embedding = await embedding_provider.embed(rewritten_query)
         except Exception as e:
-            logger.warning("[KomariMemory] 预生成查询特征向量失败: %s", e)
+            logger.warning("[KomariMemory] 预生成查询特征向量失败: {}", e)
             query_embedding = None
 
         memories = await self.memory.search_conversations(
@@ -352,7 +352,7 @@ class MessageHandler:
         )
         if reply is None:
             logger.warning(
-                "[KomariMemory] 回复生成失败: group=%s reason=%s score=%s",
+                "[KomariMemory] 回复生成失败: group={} reason={} score={}",
                 message.group_id,
                 reason,
                 f"{reply_score:.3f}" if reply_score is not None else "-",
@@ -361,7 +361,7 @@ class MessageHandler:
 
         if is_not_related(reply):
             logger.info(
-                "[KomariMemory] not related: group=%s reason=%s score=%s",
+                "[KomariMemory] not related: group={} reason={} score={}",
                 message.group_id,
                 reason,
                 f"{reply_score:.3f}" if reply_score is not None else "-",
@@ -384,7 +384,7 @@ class MessageHandler:
             await self.redis.increment_proactive_count(message.group_id)
 
         logger.info(
-            "[KomariMemory] 回复成功: group=%s reason=%s score=%s",
+            "[KomariMemory] 回复成功: group={} reason={} score={}",
             message.group_id,
             reason,
             f"{reply_score:.3f}" if reply_score is not None else "-",

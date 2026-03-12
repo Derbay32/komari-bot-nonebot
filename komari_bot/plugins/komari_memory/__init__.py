@@ -121,7 +121,7 @@ class PluginManager:
             statements=build_memory_schema_statements(expected_dimension),
         )
         logger.info(
-            "[KomariMemory] PostgreSQL schema 检查完成 (embedding=%s)",
+            "[KomariMemory] PostgreSQL schema 检查完成 (embedding={})",
             expected_dimension,
         )
 

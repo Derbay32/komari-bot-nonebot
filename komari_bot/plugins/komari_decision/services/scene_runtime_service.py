@@ -126,7 +126,7 @@ class SceneRuntimeService:
         snapshot = self._build_snapshot(active_set, items)
         self._snapshot = snapshot
         logger.info(
-            "[KomariDecision] scene runtime cache 已加载: set=%s scenes=%s",
+            "[KomariDecision] scene runtime cache 已加载: set={} scenes={}",
             snapshot.set_id,
             len(snapshot.general_candidates),
         )

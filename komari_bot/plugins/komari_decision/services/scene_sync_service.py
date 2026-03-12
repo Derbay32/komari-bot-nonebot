@@ -79,7 +79,8 @@ class SceneSyncService:
         ):
             existing_set_id = int(latest_ready["id"])
             logger.info(
-                "[KomariDecision] Scene 模板未变化，复用现有 set: id=%s", existing_set_id
+                "[KomariDecision] Scene 模板未变化，复用现有 set: id={}",
+                existing_set_id,
             )
             return SceneSyncResult(
                 set_id=existing_set_id,
@@ -103,7 +104,7 @@ class SceneSyncService:
             failed = int(latest_building.get("item_failed") or 0)
             pending = max(total - ready - failed, 0)
             logger.info(
-                "[KomariDecision] 复用构建中的 scene set: id=%s pending=%s",
+                "[KomariDecision] 复用构建中的 scene set: id={} pending={}",
                 existing_set_id,
                 pending,
             )
@@ -168,7 +169,7 @@ class SceneSyncService:
             await self.repository.mark_set_ready(set_id)
 
         logger.info(
-            "[KomariDecision] 构建 scene set 完成: id=%s inserted=%s ready=%s pending=%s",
+            "[KomariDecision] 构建 scene set 完成: id={} inserted={} ready={} pending={}",
             set_id,
             inserted_count,
             ready_count,

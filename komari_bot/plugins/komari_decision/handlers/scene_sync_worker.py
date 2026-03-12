@@ -58,7 +58,7 @@ class SceneSyncTaskManager:
             coalesce=True,
         )
         logger.info(
-            "[KomariDecision] scene 同步定时任务已注册: interval=%ss",
+            "[KomariDecision] scene 同步定时任务已注册: interval={}s",
             config.scene_sync_poll_seconds,
         )
 
@@ -113,7 +113,7 @@ class SceneSyncTaskManager:
             return False
 
         await self._runtime_service.switch_active_set(set_id)
-        logger.info("[KomariDecision] scene active set 已切换: id=%s", set_id)
+        logger.info("[KomariDecision] scene active set 已切换: id={}", set_id)
         return True
 
     async def _drain_pending(self, set_id: int, *, max_batches: int) -> None:
@@ -128,7 +128,7 @@ class SceneSyncTaskManager:
             remaining -= 1
 
         logger.warning(
-            "[KomariDecision] scene set 仍有 pending，等待下一轮: set=%s",
+            "[KomariDecision] scene set 仍有 pending，等待下一轮: set={}",
             set_id,
         )
 
@@ -139,7 +139,7 @@ class SceneSyncTaskManager:
         prune_result = await self._admin_service.prune_old_sets()
         if prune_result.deleted_set_ids:
             logger.info(
-                "[KomariDecision] scene 旧 READY 版本已清理: deleted=%s kept=%s",
+                "[KomariDecision] scene 旧 READY 版本已清理: deleted={} kept={}",
                 prune_result.deleted_set_ids,
                 prune_result.kept_set_ids,
             )

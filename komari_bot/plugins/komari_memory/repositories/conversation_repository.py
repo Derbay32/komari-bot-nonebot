@@ -162,4 +162,4 @@ class ConversationRepository:
                 access_boost,
             )
 
-        logger.debug("[KomariMemory] 更新 %s 条记忆的访问状态", len(conversation_ids))
+        logger.debug("[KomariMemory] 更新 {} 条记忆的访问状态", len(conversation_ids))

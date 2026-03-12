@@ -113,7 +113,7 @@ async def startup() -> None:
     )
     _initialized_by_plugin = True
     logger.info(
-        "[KomariSentry] 初始化完成 env=%s traces=%.3f profiles=%.3f",
+        "[KomariSentry] 初始化完成 env={} traces={:.3f} profiles={:.3f}",
         environment,
         config.traces_sample_rate,
         config.profiles_sample_rate,

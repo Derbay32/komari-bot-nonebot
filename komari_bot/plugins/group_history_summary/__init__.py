@@ -163,7 +163,7 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
 
     if not (config.min_summary_count <= requested_count <= config.max_summary_count):
         logger.info(
-            "[GroupHistorySummary] 请求条数越界: requested=%d, allowed=[%d,%d]",
+            "[GroupHistorySummary] 请求条数越界: requested={}, allowed=[{},{}]",
             requested_count,
             config.min_summary_count,
             config.max_summary_count,

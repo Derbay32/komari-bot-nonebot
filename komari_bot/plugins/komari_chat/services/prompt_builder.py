@@ -249,7 +249,7 @@ async def build_prompt(
                             )
             except Exception:
                 logger.debug(
-                    "[KomariMemory] 用户 %s 的画像实体检索失败",
+                    "[KomariMemory] 用户 {} 的画像实体检索失败",
                     uid,
                     exc_info=True,
                 )
