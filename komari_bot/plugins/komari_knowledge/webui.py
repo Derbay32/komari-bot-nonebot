@@ -231,9 +231,9 @@ def main() -> None:
         st.header("⚙️ 配置")
         st.info(
             """
-            常识库配置从 `data/plugin_config/komari_knowledge_config.json` 读取。
+            常识库配置从 `config/config_manager/komari_knowledge_config.json` 读取。
 
-            数据库连接优先读取 `data/plugin_config/database_config.json`。
+            数据库连接优先读取 `config/config_manager/database_config.json`。
             若 `komari_knowledge_config.json` 中填写了 `pg_*` 字段，则会覆盖共享配置。
 
             关键配置项：

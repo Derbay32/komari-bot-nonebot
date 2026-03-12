@@ -251,6 +251,8 @@ class KnowledgeEngine:
             raise RuntimeError("数据库连接池未初始化")
 
         state.logger.info("[Komari Knowledge] 正在构建关键词索引...")
+        self._keyword_index.clear()
+        self._index_loaded = False
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -729,10 +731,35 @@ class KnowledgeEngine:
 
     async def close(self) -> None:
         """关闭连接池并清理资源。"""
+        errors: list[BaseException] = []
+
+        if self._embedding_service is not None:
+            try:
+                await self._embedding_service.cleanup()
+                state.logger.info("[Komari Knowledge] 独立嵌入服务已关闭")
+            except Exception as e:
+                errors.append(e)
+                state.logger.exception("[Komari Knowledge] 关闭独立嵌入服务失败")
+            finally:
+                self._embedding_service = None
+
         if self._pool:
-            await self._pool.close()
-            self._pool = None
-            state.logger.info("[Komari Knowledge] 连接池已关闭")
+            try:
+                await self._pool.close()
+                state.logger.info("[Komari Knowledge] 连接池已关闭")
+            except Exception as e:
+                errors.append(e)
+                state.logger.exception("[Komari Knowledge] 关闭连接池失败")
+            finally:
+                self._pool = None
+
+        self._keyword_index.clear()
+        self._index_loaded = False
+        if state.engine is self:
+            state.engine = None
+
+        if errors:
+            raise errors[0]
 
 
 def get_engine() -> KnowledgeEngine | None:

@@ -2,6 +2,15 @@
 -- 前置条件:
 -- 1. 已安装 pgvector 扩展: CREATE EXTENSION IF NOT EXISTS vector;
 -- 2. 数据库已创建
+-- 3. 可选：通过 psql 变量覆盖 embedding 维度，例如：
+--    psql -v embedding_dimension=1536 -f komari_bot/plugins/komari_memory/database/init_orm.sql
+
+\if :{?embedding_dimension}
+\else
+\set embedding_dimension 4096
+\endif
+
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ============================================
 -- 对话总结表 (conversations)
@@ -11,7 +20,7 @@ CREATE TABLE IF NOT EXISTS komari_memory_conversations (
     id SERIAL PRIMARY KEY,
     group_id VARCHAR(64) NOT NULL,
     summary TEXT NOT NULL,
-    embedding VECTOR(4096),  -- Qwen/Qwen3-Embedding-8B
+    embedding VECTOR(:embedding_dimension),
     participants TEXT[],
     start_time TIMESTAMP NOT NULL,
     end_time TIMESTAMP NOT NULL,

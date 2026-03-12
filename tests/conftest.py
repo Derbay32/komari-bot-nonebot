@@ -29,20 +29,21 @@ apscheduler_module.scheduler = _DummyScheduler()
 sys.modules.setdefault("nonebot_plugin_apscheduler", apscheduler_module)
 
 
-def _ensure_package_shim() -> None:
-    """为 komari_memory 包注入 shim，避免测试导入触发插件入口副作用。"""
-    package_name = "komari_bot.plugins.komari_memory"
+def _ensure_package_shim(plugin_name: str) -> None:
+    """为插件包注入 shim，避免测试导入触发插件入口副作用。"""
+    package_name = f"komari_bot.plugins.{plugin_name}"
     if package_name in sys.modules:
         return
 
-    package_path = PROJECT_ROOT / "komari_bot" / "plugins" / "komari_memory"
+    package_path = PROJECT_ROOT / "komari_bot" / "plugins" / plugin_name
 
     shim = types.ModuleType(package_name)
     shim.__path__ = [str(package_path)]  # type: ignore[attr-defined]
     sys.modules[package_name] = shim
 
 
-_ensure_package_shim()
+_ensure_package_shim("komari_memory")
+_ensure_package_shim("komari_knowledge")
 
 
 class _DummyConfigManager:

@@ -4,7 +4,16 @@
 -- 1. 确保 PostgreSQL 已安装 pgvector 扩展
 -- 2. 执行以下命令启用扩展：
 --    CREATE EXTENSION IF NOT EXISTS vector;
--- 3. 执行此脚本创建表和索引
+-- 3. 可选：通过 psql 变量覆盖 embedding 维度，例如：
+--    psql -v embedding_dimension=1536 -f komari_bot/plugins/komari_knowledge/init_db.sql
+-- 4. 执行此脚本创建表和索引
+
+\if :{?embedding_dimension}
+\else
+\set embedding_dimension 512
+\endif
+
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ============================================
 -- 1. 创建知识库主表
@@ -25,8 +34,8 @@ CREATE TABLE IF NOT EXISTS komari_knowledge (
     content TEXT NOT NULL,
 
     -- 向量数据：用于 Layer 2 语义检索
-    -- 维度：512 (bge-small-zh-v1.5)
-    embedding VECTOR(512),
+    -- 维度可通过 psql 变量 embedding_dimension 覆盖
+    embedding VECTOR(:embedding_dimension),
 
     -- 元数据
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -73,10 +82,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trigger_komari_knowledge_updated_at
-BEFORE UPDATE ON komari_knowledge
-FOR EACH ROW
-EXECUTE FUNCTION update_updated_at_column();
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trigger_komari_knowledge_updated_at'
+          AND tgrelid = 'komari_knowledge'::regclass
+    ) THEN
+        CREATE TRIGGER trigger_komari_knowledge_updated_at
+        BEFORE UPDATE ON komari_knowledge
+        FOR EACH ROW
+        EXECUTE FUNCTION update_updated_at_column();
+    END IF;
+END
+$$;
 
 -- ============================================
 -- 4. 预置示例数据（可选）
