@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any
 
+from komari_bot.common.database_config import DatabaseConfigSchema
 from komari_bot.plugins.komari_knowledge import engine as engine_module
 from komari_bot.plugins.komari_knowledge.engine import KnowledgeEngine, state
 
@@ -103,3 +105,79 @@ def test_initialize_engine_does_not_keep_failed_instance(monkeypatch: Any) -> No
         assert state.engine is None
     finally:
         state.engine = original_engine
+
+
+def test_initialize_bootstraps_schema_before_validation(monkeypatch: Any) -> None:
+    engine = KnowledgeEngine()
+    fake_pool = _FakePool()
+    engine._embedding_service = SimpleNamespace(
+        config=SimpleNamespace(embedding_dimension=1536),
+        cleanup=lambda: None,
+    )
+    original_nonebot_mode = state.nonebot_mode
+    original_standalone_config = state.standalone_config
+    events: list[tuple[str, object]] = []
+
+    async def _fake_create_pool(
+        config: DatabaseConfigSchema,
+        *,
+        command_timeout: int,
+    ) -> _FakePool:
+        assert config.pg_user == "user"
+        assert config.pg_password == "pass"
+        events.append(("create_pool", command_timeout))
+        return fake_pool
+
+    async def _fake_apply_schema(pg_pool: object, *, statements: tuple[str, ...]) -> None:
+        events.append(("apply_schema", pg_pool is fake_pool))
+        assert "VECTOR(1536)" in statements[1]
+
+    async def _fake_validate(
+        pg_pool: object,
+        *,
+        table_name: str,
+        column_name: str,
+        expected_dimension: int | None,
+        label: str,
+    ) -> None:
+        events.append(("validate", expected_dimension))
+        assert pg_pool is fake_pool
+        assert table_name == "komari_knowledge"
+        assert column_name == "embedding"
+        assert label == "KomariKnowledge"
+
+    async def _fake_build_keyword_index(self: KnowledgeEngine) -> None:
+        events.append(("build_index", self._pool is fake_pool))
+
+    monkeypatch.setattr(
+        engine_module,
+        "get_db_config",
+        lambda _config: DatabaseConfigSchema(pg_user="user", pg_password="pass"),
+    )
+    monkeypatch.setattr(engine_module, "create_postgres_pool", _fake_create_pool)
+    monkeypatch.setattr(engine_module, "apply_schema_statements", _fake_apply_schema)
+    monkeypatch.setattr(
+        engine_module,
+        "ensure_vector_column_dimension",
+        _fake_validate,
+    )
+    monkeypatch.setattr(
+        engine_module.KnowledgeEngine,
+        "_build_keyword_index",
+        _fake_build_keyword_index,
+    )
+    state.nonebot_mode = False
+    state.standalone_config = engine_module.DynamicConfigSchema()
+
+    try:
+        asyncio.run(engine.initialize())
+    finally:
+        state.nonebot_mode = original_nonebot_mode
+        state.standalone_config = original_standalone_config
+
+    assert events == [
+        ("create_pool", 30),
+        ("apply_schema", True),
+        ("validate", 1536),
+        ("build_index", True),
+    ]
