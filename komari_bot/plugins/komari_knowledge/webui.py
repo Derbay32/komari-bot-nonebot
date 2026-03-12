@@ -12,7 +12,6 @@ import atexit
 import importlib.util
 import sys
 import threading
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 # 强制使用标准 asyncio，避免 uvloop 在 Streamlit 退出时的错误
@@ -53,6 +52,8 @@ engine_spec.loader.exec_module(engine_module)
 
 KnowledgeEngine = engine_module.KnowledgeEngine
 _active_context = None
+
+from .webui_runtime import shutdown_background_context
 
 
 class GlobalContext:
@@ -96,20 +97,13 @@ class GlobalContext:
         if self.loop.is_closed():
             return
 
-        try:
-            future = asyncio.run_coroutine_threadsafe(self._close_engine(), self.loop)
-            future.result(timeout=5)
-        except FutureTimeoutError:
-            pass
-        except Exception:
-            pass
-
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            self.thread.join(timeout=5)
-
-        if not self.thread.is_alive() and not self.loop.is_closed():
-            self.loop.close()
+        shutdown_background_context(
+            close_future_factory=lambda: asyncio.run_coroutine_threadsafe(
+                self._close_engine(), self.loop
+            ),
+            loop=self.loop,
+            thread=self.thread,
+        )
 
 
 # 使用 st.cache_resource 确保全局只有一个后台线程在跑
