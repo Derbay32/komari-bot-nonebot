@@ -73,13 +73,6 @@ class KomariMemoryConfigSchema(BaseModel):
         default="", description="Redis 密码 (空字符串表示无密码)"
     )
 
-    # BERT 评分服务配置
-    bert_service_url: str = Field(
-        default="http://localhost:8000/api/v1/score",
-        description="BERT 评分服务地址",
-    )
-    bert_timeout: float = Field(default=2.0, description="BERT 请求超时时间（秒）")
-
     # LLM 配置 - 对话模型（用于生成回复）
     llm_model_chat: str = Field(
         default="gemini-3-flash-preview", description="对话使用模型"

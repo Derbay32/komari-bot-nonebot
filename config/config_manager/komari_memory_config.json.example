@@ -4,16 +4,11 @@
   "plugin_enable": true,
   "user_whitelist": [],
   "group_whitelist": [],
-  
+
   "redis_host": "localhost",
   "redis_port": 6379,
   "redis_db": 1,
   "redis_password": "",
-
-  "bert_service_url": "http://localhost:8000/api/v1/score",
-  "bert_timeout": 2.0,
-
-  "llm_provider": "gemini",
   "llm_model_chat": "gemini-3-flash-preview",
   "llm_temperature_chat": 1.0,
   "llm_max_tokens_chat": 4000,
