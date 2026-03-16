@@ -57,7 +57,10 @@ def _get_client() -> DeepSeekClient:
     token = config.deepseek_api_token
     if not token:
         raise ValueError("API Token 未配置，请在配置中设置 deepseek_api_token")  # noqa: TRY003
-    return DeepSeekClient(token)
+    return DeepSeekClient(
+        token,
+        timeout_seconds=float(config.deepseek_timeout_seconds),
+    )
 
 
 async def generate_text(
@@ -221,7 +224,10 @@ async def test_connection() -> bool:
         logger.warning("API Token 未配置，跳过连接测试")
         return False
 
-    client = DeepSeekClient(token)
+    client = DeepSeekClient(
+        token,
+        timeout_seconds=float(config.deepseek_timeout_seconds),
+    )
     try:
         return await client.test_connection()
     finally:

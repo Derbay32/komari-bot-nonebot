@@ -21,13 +21,15 @@ config_manager = config_manager_plugin.get_config_manager(
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek API 客户端。"""
 
-    def __init__(self, api_token: str) -> None:
+    def __init__(self, api_token: str, timeout_seconds: float = 300.0) -> None:
         """初始化客户端。
 
         Args:
             api_token: DeepSeek API Token
+            timeout_seconds: 请求总超时时间（秒）
         """
         self.api_token = api_token
+        self.timeout_seconds = timeout_seconds
         self.session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -37,7 +39,7 @@ class DeepSeekClient(BaseLLMClient):
                 "Authorization": f"Bearer {self.api_token}",
                 "Content-Type": "application/json",
             }
-            timeout = aiohttp.ClientTimeout(total=30.0)
+            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             self.session = aiohttp.ClientSession(headers=headers, timeout=timeout)
         return self.session
 
