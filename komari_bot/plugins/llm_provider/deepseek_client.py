@@ -43,6 +43,15 @@ class DeepSeekClient(BaseLLMClient):
             self.session = aiohttp.ClientSession(headers=headers, timeout=timeout)
         return self.session
 
+    @staticmethod
+    def _resolve_reasoning_effort(config: DynamicConfigSchema, **kwargs: object) -> str | None:
+        """解析 OpenAI 兼容的 reasoning_effort 请求参数。"""
+        raw_value = kwargs.get("reasoning_effort", config.deepseek_reasoning_effort)
+        if raw_value is None:
+            return None
+        value = str(raw_value).strip()
+        return value or None
+
     async def generate_text(
         self,
         prompt: str,
@@ -69,11 +78,13 @@ class DeepSeekClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
+            reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
             logger.debug(
                 f"DeepSeek API 请求:\n"
                 f"  model: {model}\n"
                 f"  temperature: {temperature if temperature is not None else config.deepseek_temperature}\n"
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
+                f"  reasoning_effort: {reasoning_effort}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
                 f"  system_instruction: {system_instruction}\n"
                 f"  prompt: {prompt}\n"
@@ -107,6 +118,8 @@ class DeepSeekClient(BaseLLMClient):
             # 处理 JSON 模式
             if response_format is not None:
                 request_data["response_format"] = response_format
+            if reasoning_effort is not None:
+                request_data["reasoning_effort"] = reasoning_effort
 
             # 发送 API 请求
             async with session.post(
@@ -166,6 +179,7 @@ class DeepSeekClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
+            reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
             session = await self._get_session()
 
             # 构建请求数据
@@ -186,13 +200,16 @@ class DeepSeekClient(BaseLLMClient):
 
             if response_format is not None:
                 request_data["response_format"] = response_format
+            if reasoning_effort is not None:
+                request_data["reasoning_effort"] = reasoning_effort
 
             logger.debug(
                 f"DeepSeek API 请求 (messages):\n"
                 f"  model: {model}\n"
                 f"  messages: {len(messages)} turns\n"
                 f"  temperature: {request_data['temperature']}\n"
-                f"  max_tokens: {request_data['max_tokens']}"
+                f"  max_tokens: {request_data['max_tokens']}\n"
+                f"  reasoning_effort: {reasoning_effort}"
             )
 
             # 发送 API 请求

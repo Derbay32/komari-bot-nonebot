@@ -49,6 +49,13 @@ class DynamicConfigSchema(BaseModel):
     deepseek_timeout_seconds: float = Field(
         default=300.0, gt=0.0, description="DeepSeek 请求总超时时间（秒）"
     )
+    deepseek_reasoning_effort: str = Field(
+        default="",
+        description=(
+            "DeepSeek OpenAI 兼容请求的 reasoning_effort。"
+            "可选：none/minimal/low/medium/high/xhigh；为空时不发送"
+        ),
+    )
     deepseek_frequency_penalty: float = Field(
         default=0.0, description="DeepSeek 重复内容惩罚"
     )
