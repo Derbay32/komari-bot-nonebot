@@ -202,7 +202,38 @@ def test_migrate_table_embeddings_rebuilds_dimension_and_index_when_needed() -> 
     assert embedding_service.calls == ["first", "second"]
     assert executed_sql[0] == 'DROP INDEX IF EXISTS "idx_komari_knowledge_embedding"'
     assert "ALTER TABLE" in executed_sql[1]
-    assert executed_sql[-1].startswith("CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding")
+    assert executed_sql[-1].strip().startswith(
+        "CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding"
+    )
+
+
+def test_migrate_table_embeddings_skips_recreating_unsupported_hnsw_index() -> None:
+    conn = _FakeConnection(
+        dimension=1536,
+        rows=[{"row_id": 1, "text_value": "first"}],
+    )
+    embedding_service = _FakeEmbeddingService()
+
+    result = asyncio.run(
+        migrate_table_embeddings(
+            _FakePool(conn),
+            spec=KNOWLEDGE_MIGRATION_SPEC,
+            target_dimension=2048,
+            dry_run=False,
+            embedding_service=embedding_service,
+        )
+    )
+
+    executed_sql = [query for query, _args in conn.executed]
+    assert result.schema_changed is True
+    assert result.updated_rows == 1
+    assert conn.dimension == 2048
+    assert executed_sql[0] == 'DROP INDEX IF EXISTS "idx_komari_knowledge_embedding"'
+    assert "ALTER TABLE" in executed_sql[1]
+    assert not any(
+        query.startswith("CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding")
+        for query in executed_sql
+    )
 
 
 def test_migrate_table_embeddings_skips_missing_table() -> None:

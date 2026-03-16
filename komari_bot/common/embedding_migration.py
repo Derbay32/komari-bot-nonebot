@@ -17,12 +17,17 @@ from komari_bot.common.database_config import (
 from komari_bot.common.pgvector_schema import (
     get_vector_column_dimension_from_connection,
 )
+from komari_bot.common.vector_storage_schema import (
+    PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
+    build_knowledge_embedding_index_statement,
+)
 
 logger = logging.getLogger("migrate_embeddings")
 
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -49,7 +54,14 @@ class ManagedIndex:
     """A managed index that may need to be rebuilt during migration."""
 
     name: str
-    create_sql: str
+    create_sql: str | None = None
+    create_sql_builder: Callable[[int], str | None] | None = None
+
+    def render_create_sql(self, target_dimension: int) -> str | None:
+        """Build the CREATE INDEX statement for the target dimension."""
+        if self.create_sql_builder is not None:
+            return self.create_sql_builder(target_dimension)
+        return self.create_sql
 
 
 @dataclass(frozen=True)
@@ -88,12 +100,7 @@ KNOWLEDGE_MIGRATION_SPEC = TableMigrationSpec(
     managed_indexes=(
         ManagedIndex(
             name="idx_komari_knowledge_embedding",
-            create_sql=(
-                "CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding "
-                "ON komari_knowledge "
-                "USING hnsw (embedding vector_cosine_ops) "
-                "WITH (m = 16, ef_construction = 64)"
-            ),
+            create_sql_builder=build_knowledge_embedding_index_statement,
         ),
     ),
 )
@@ -258,7 +265,7 @@ async def migrate_table_embeddings(
                 logger.exception("处理 %s ID %s 时出错", spec.table_name, row_id)
 
         if spec.managed_indexes:
-            await _ensure_indexes(conn, spec)
+            await _ensure_indexes(conn, spec, target_dimension)
 
         return TableMigrationResult(
             target_name=spec.target_name,
@@ -354,9 +361,24 @@ async def _rebuild_vector_column(
     )
 
 
-async def _ensure_indexes(conn: Any, spec: TableMigrationSpec) -> None:
+async def _ensure_indexes(
+    conn: Any,
+    spec: TableMigrationSpec,
+    target_dimension: int,
+) -> None:
     for index in spec.managed_indexes:
-        await conn.execute(index.create_sql)
+        create_sql = index.render_create_sql(target_dimension)
+        if create_sql is None:
+            logger.warning(
+                "%s 向量索引 %s 已跳过：embedding 维度 %s 超过 pgvector HNSW 上限 %s，"
+                "语义检索将退化为顺序扫描。",
+                spec.target_name,
+                index.name,
+                target_dimension,
+                PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
+            )
+            continue
+        await conn.execute(create_sql)
 
 
 def _quote_identifier(identifier: str) -> str:

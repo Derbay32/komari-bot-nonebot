@@ -28,7 +28,9 @@ from komari_bot.common.database_config import (
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
 from komari_bot.common.vector_storage_schema import (
+    PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
     apply_schema_statements,
+    build_knowledge_embedding_index_statement,
     build_knowledge_schema_statements,
 )
 
@@ -227,6 +229,13 @@ class KnowledgeEngine:
             self._pool,
             statements=build_knowledge_schema_statements(expected_dimension),
         )
+        if build_knowledge_embedding_index_statement(expected_dimension) is None:
+            state.logger.warning(
+                "[Komari Knowledge] embedding 维度 %s 超过 pgvector HNSW 上限 %s，"
+                "已跳过 idx_komari_knowledge_embedding，语义检索将退化为顺序扫描。",
+                expected_dimension,
+                PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
+            )
         state.logger.info(
             "[Komari Knowledge] PostgreSQL schema 检查完成 (embedding=%s)",
             expected_dimension,

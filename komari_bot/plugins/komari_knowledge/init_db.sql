@@ -50,11 +50,22 @@ CREATE TABLE IF NOT EXISTS komari_knowledge (
 -- ============================================
 
 -- 向量相似度索引（HNSW 算法）
--- 使用余弦相似度（cosine operations）
-CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding
-ON komari_knowledge
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+-- pgvector 当前对 vector 列的 HNSW 索引最多支持 2000 维，超过时跳过索引创建
+SELECT CASE
+    WHEN :embedding_dimension <= 2000 THEN
+        'CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding
+         ON komari_knowledge
+         USING hnsw (embedding vector_cosine_ops)
+         WITH (m = 16, ef_construction = 64)'
+    ELSE
+        format(
+            'SELECT %L AS skipped_notice',
+            '[Komari Knowledge] 跳过 idx_komari_knowledge_embedding：embedding_dimension='
+            || (:embedding_dimension)::text
+            || ' 超过 pgvector HNSW 上限 2000'
+        )
+END AS sql_to_execute
+\gexec
 
 -- 关键词倒排索引（GIN）
 -- 加速关键词数组查询

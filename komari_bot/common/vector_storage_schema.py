@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS = 2000
+
 
 def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
     """Build Komari Memory storage schema statements for a specific dimension."""
@@ -72,7 +74,7 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
 def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
     """Build Komari Knowledge storage schema statements for a specific dimension."""
     dimension = _normalize_dimension(embedding_dimension)
-    return (
+    statements = [
         "CREATE EXTENSION IF NOT EXISTS vector",
         f"""
         CREATE TABLE IF NOT EXISTS komari_knowledge (
@@ -86,26 +88,26 @@ def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ..
             notes TEXT
         )
         """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding
-        ON komari_knowledge
-        USING hnsw (embedding vector_cosine_ops)
-        WITH (m = 16, ef_construction = 64)
-        """,
-        """
+    ]
+    embedding_index_statement = build_knowledge_embedding_index_statement(dimension)
+    if embedding_index_statement is not None:
+        statements.append(embedding_index_statement)
+    statements.extend(
+        [
+            """
         CREATE INDEX IF NOT EXISTS idx_komari_knowledge_keywords
         ON komari_knowledge
         USING gin (keywords)
         """,
-        """
+            """
         CREATE INDEX IF NOT EXISTS idx_komari_knowledge_category
         ON komari_knowledge(category)
         """,
-        """
+            """
         CREATE INDEX IF NOT EXISTS idx_komari_knowledge_created_at
         ON komari_knowledge(created_at DESC)
         """,
-        """
+            """
         CREATE OR REPLACE FUNCTION update_updated_at_column()
         RETURNS TRIGGER AS $$
         BEGIN
@@ -114,7 +116,7 @@ def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ..
         END;
         $$ LANGUAGE plpgsql
         """,
-        """
+            """
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -131,7 +133,24 @@ def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ..
         END
         $$;
         """,
+        ]
     )
+    return tuple(statements)
+
+
+def build_knowledge_embedding_index_statement(
+    embedding_dimension: int,
+) -> str | None:
+    """Return the knowledge embedding index DDL when pgvector supports it."""
+    dimension = _normalize_dimension(embedding_dimension)
+    if dimension > PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
+        return None
+    return """
+        CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding
+        ON komari_knowledge
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64)
+        """
 
 
 async def apply_schema_statements(
