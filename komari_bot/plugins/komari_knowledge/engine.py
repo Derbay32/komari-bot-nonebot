@@ -231,13 +231,13 @@ class KnowledgeEngine:
         )
         if build_knowledge_embedding_index_statement(expected_dimension) is None:
             state.logger.warning(
-                "[Komari Knowledge] embedding 维度 %s 超过 pgvector HNSW 上限 %s，"
+                "[Komari Knowledge] embedding 维度 {} 超过 pgvector HNSW 上限 {}，"
                 "已跳过 idx_komari_knowledge_embedding，语义检索将退化为顺序扫描。",
                 expected_dimension,
                 PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
             )
         state.logger.info(
-            "[Komari Knowledge] PostgreSQL schema 检查完成 (embedding=%s)",
+            "[Komari Knowledge] PostgreSQL schema 检查完成 (embedding={})",
             expected_dimension,
         )
 
