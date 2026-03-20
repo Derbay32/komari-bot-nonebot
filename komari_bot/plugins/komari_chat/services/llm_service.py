@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-from logging import getLogger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
@@ -21,7 +21,44 @@ if TYPE_CHECKING:
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
 
-logger = getLogger(__name__)
+
+def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
+    """统计消息列表中的文本与图片体量，便于追踪多模态请求。"""
+    text_parts = 0
+    text_chars = 0
+    image_parts = 0
+    image_url_chars = 0
+
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            text_parts += 1
+            text_chars += len(content)
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_parts += 1
+                text_chars += len(str(part.get("text", "")))
+            elif part_type == "image_url":
+                image_parts += 1
+                image_data = part.get("image_url")
+                if isinstance(image_data, dict):
+                    image_url_chars += len(str(image_data.get("url", "")))
+
+    return {
+        "turns": len(messages),
+        "text_parts": text_parts,
+        "text_chars": text_chars,
+        "image_parts": image_parts,
+        "image_url_chars": image_url_chars,
+    }
 
 
 class EntitySchema(BaseModel):
@@ -116,6 +153,7 @@ async def generate_reply(
     messages: list[dict] | None = None,
     user_message: str = "",
     system_prompt: str = "",
+    request_trace_id: str | None = None,
 ) -> str:
     """生成回复（使用 OpenAI messages 格式，带重试机制，支持多模态）。
 
@@ -129,11 +167,22 @@ async def generate_reply(
         提取 XML 标签后的最终回复
     """
     if messages is not None:
+        payload_stats = _summarize_prompt_messages(messages)
+        logger.info(
+            "[KomariChat] 回复请求追踪: trace_id={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={}",
+            request_trace_id or "-",
+            payload_stats["turns"],
+            payload_stats["text_parts"],
+            payload_stats["text_chars"],
+            payload_stats["image_parts"],
+            payload_stats["image_url_chars"],
+        )
         raw_response = await llm_provider.generate_text_with_messages(
             messages=messages,
             model=config.llm_model_chat,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            request_trace_id=request_trace_id,
         )
     else:
         # 兼容旧格式
@@ -143,6 +192,7 @@ async def generate_reply(
             system_instruction=system_prompt,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            request_trace_id=request_trace_id,
         )
 
     # 提取 XML 标签内容

@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from logging import getLogger
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
+from nonebot import logger
 from nonebot.plugin import require
 
 from ..config_schema import KomariMemoryConfigSchema  # noqa: TC001
@@ -19,8 +20,6 @@ if TYPE_CHECKING:
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
-
-logger = getLogger(__name__)
 
 _JSON_RESPONSE_EXAMPLE = (
     '{"summary": "...", "user_profiles": '
@@ -69,7 +68,7 @@ def _extract_tag_content(text: str, tag: str) -> str:
     if match:
         return match.group(1).strip()
 
-    logger.warning("[KomariMemory] 未找到 <%s> 标签，使用原始回复", tag)
+    logger.warning("[KomariMemory] 未找到 <{}> 标签，使用原始回复", tag)
     return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
 
@@ -370,12 +369,28 @@ async def _request_structured_summary(
     *,
     prompt: str,
     config: KomariMemoryConfigSchema,
+    trace_id: str,
+    stage: str,
+    chunk_index: int | None = None,
+    chunk_total: int | None = None,
+    estimated_input_tokens: int | None = None,
 ) -> dict[str, Any]:
     """调用总结模型并解析结构化 JSON。"""
     estimated_prompt_tokens = estimate_text_tokens(prompt)
+    logger.info(
+        "[KomariMemory] 总结请求追踪: trace_id={} stage={} chunk={}/{} estimated_input_tokens={} estimated_prompt_tokens={}",
+        trace_id,
+        stage,
+        chunk_index if chunk_index is not None else "-",
+        chunk_total if chunk_total is not None else "-",
+        estimated_input_tokens if estimated_input_tokens is not None else "-",
+        estimated_prompt_tokens,
+    )
     if estimated_prompt_tokens > config.summary_chunk_token_limit:
         logger.warning(
-            "[KomariMemory] 总结请求估算 token 超过分段上限: estimated=%s limit=%s",
+            "[KomariMemory] 总结请求估算 token 超过分段上限: trace_id={} stage={} estimated={} limit={}",
+            trace_id,
+            stage,
             estimated_prompt_tokens,
             config.summary_chunk_token_limit,
         )
@@ -385,6 +400,10 @@ async def _request_structured_summary(
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=config.llm_max_tokens_summary,
+        request_trace_id=trace_id,
+        request_phase=stage,
+        request_chunk_index=chunk_index,
+        request_chunk_total=chunk_total,
     )
 
     json_text = _extract_json_from_markdown(response)
@@ -449,11 +468,22 @@ async def summarize_conversation(
     existing_interactions: list[dict] | None = None,
 ) -> dict:
     """总结对话，提取用户画像，并评估重要性（带重试机制）。"""
+    trace_id = f"memsum-{uuid4().hex[:8]}"
+    group_id = messages[0].group_id if messages else "-"
     existing_context = _build_existing_context(
         existing_profiles=existing_profiles,
         existing_interactions=existing_interactions,
     )
     chunks, oversized_message_split = _chunk_formatted_messages(messages, config)
+    logger.info(
+        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={} existing_interactions={}",
+        trace_id,
+        group_id,
+        len(messages),
+        config.summary_chunk_token_limit,
+        len(existing_profiles or []),
+        len(existing_interactions or []),
+    )
     if not chunks:
         return _normalize_summary_result({})
 
@@ -463,24 +493,41 @@ async def summarize_conversation(
             existing_context=existing_context,
         )
         logger.debug(
-            "[KomariMemory] 总结输入未触发分段: estimated_input_tokens=%s",
+            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={}",
+            trace_id,
             chunks[0].estimated_tokens,
         )
-        return await _request_structured_summary(prompt=single_prompt, config=config)
+        return await _request_structured_summary(
+            prompt=single_prompt,
+            config=config,
+            trace_id=trace_id,
+            stage="single",
+            chunk_index=1,
+            chunk_total=1,
+            estimated_input_tokens=chunks[0].estimated_tokens,
+        )
 
     chunk_tokens = [chunk.estimated_tokens for chunk in chunks]
     logger.info(
-        "[KomariMemory] 总结输入触发分段: chunks=%s estimated_input_tokens=%s oversized_message_split=%s",
+        "[KomariMemory] 总结输入触发分段: chunks={} estimated_input_tokens={} oversized_message_split={}",
         len(chunks),
         chunk_tokens,
         oversized_message_split,
     )
 
     chunk_results: list[dict[str, Any]] = []
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks, start=1):
         chunk_prompt = _build_summary_prompt("\n".join(chunk.lines))
         chunk_results.append(
-            await _request_structured_summary(prompt=chunk_prompt, config=config)
+            await _request_structured_summary(
+                prompt=chunk_prompt,
+                config=config,
+                trace_id=trace_id,
+                stage="chunk",
+                chunk_index=index,
+                chunk_total=len(chunks),
+                estimated_input_tokens=chunk.estimated_tokens,
+            )
         )
 
     merge_prompt = _build_merge_prompt(
@@ -488,7 +535,16 @@ async def summarize_conversation(
         existing_context=existing_context,
     )
     logger.info(
-        "[KomariMemory] 开始执行总结二次汇总: chunk_summaries=%s",
+        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={}",
+        trace_id,
         len(chunk_results),
     )
-    return await _request_structured_summary(prompt=merge_prompt, config=config)
+    return await _request_structured_summary(
+        prompt=merge_prompt,
+        config=config,
+        trace_id=trace_id,
+        stage="merge",
+        estimated_input_tokens=estimate_text_tokens(
+            _serialize_chunk_results_for_merge(chunk_results, chunk_tokens)
+        ),
+    )

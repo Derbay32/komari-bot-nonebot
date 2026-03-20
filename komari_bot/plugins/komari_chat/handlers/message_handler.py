@@ -331,9 +331,21 @@ class MessageHandler:
             query_embedding=query_embedding,
         )
 
+        request_trace_id = f"chat-{message.message_id}"
         base64_image_urls = None
         if image_urls:
             base64_image_urls = await download_images_as_base64(image_urls)
+            logger.info(
+                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={}",
+                request_trace_id,
+                message.group_id,
+                message.message_id,
+                len(image_urls),
+                len(base64_image_urls),
+                len(message.content),
+                sum(len(url) for url in base64_image_urls),
+                len(memories),
+            )
 
         prompt_messages = await build_prompt(
             user_message=message.content,
@@ -352,6 +364,7 @@ class MessageHandler:
         reply = await generate_reply(
             config=config,
             messages=prompt_messages,
+            request_trace_id=request_trace_id,
         )
         if reply is None:
             logger.warning(

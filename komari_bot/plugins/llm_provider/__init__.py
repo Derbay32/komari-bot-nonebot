@@ -1,6 +1,7 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口（OpenAI 兼容格式）。"""
 
 import time
+from typing import Any
 
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
@@ -51,6 +52,45 @@ config_manager = config_manager_plugin.get_config_manager(
 )
 
 
+def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int]:
+    """统计 messages 请求中的文本与图片体量。"""
+    text_parts = 0
+    text_chars = 0
+    image_parts = 0
+    image_url_chars = 0
+
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            text_parts += 1
+            text_chars += len(content)
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_parts += 1
+                text_chars += len(str(part.get("text", "")))
+            elif part_type == "image_url":
+                image_parts += 1
+                image_data = part.get("image_url")
+                if isinstance(image_data, dict):
+                    image_url_chars += len(str(image_data.get("url", "")))
+
+    return {
+        "turns": len(messages),
+        "text_parts": text_parts,
+        "text_chars": text_chars,
+        "image_parts": image_parts,
+        "image_url_chars": image_url_chars,
+    }
+
+
 def _get_client() -> DeepSeekClient:
     """获取 LLM 客户端实例。"""
     config = config_manager.get()
@@ -95,6 +135,8 @@ async def generate_text(
     """
     client = _get_client()
     start_time = time.monotonic()
+    request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
+    request_phase = str(kwargs.get("request_phase", "")).strip()
 
     try:
         # 知识库检索
@@ -116,6 +158,15 @@ async def generate_text(
         final_system_instruction = (system_instruction or "").replace(
             placeholder, knowledge_context
         )
+        if request_trace_id:
+            logger.info(
+                "[LLM Provider] 文本请求追踪: trace_id={} phase={} model={} prompt_chars={} system_chars={}",
+                request_trace_id,
+                request_phase or "-",
+                model,
+                len(prompt),
+                len(final_system_instruction),
+            )
 
         result = await client.generate_text(
             prompt=prompt,
@@ -131,11 +182,21 @@ async def generate_text(
         await log_llm_call(
             method="generate_text",
             model=model,
-            input_data={"prompt": prompt, "system_instruction": system_instruction},
+            input_data={
+                "trace_id": request_trace_id,
+                "phase": request_phase,
+                "prompt": prompt,
+                "system_instruction": system_instruction,
+            },
             error=str(e),
             duration_ms=duration_ms,
         )
-        logger.error(f"LLM 调用失败: {e}")
+        logger.error(
+            "[LLM Provider] 文本请求失败: trace_id={} phase={} error={}",
+            request_trace_id or "-",
+            request_phase or "-",
+            e,
+        )
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
@@ -143,6 +204,8 @@ async def generate_text(
             method="generate_text",
             model=model,
             input_data={
+                "trace_id": request_trace_id,
+                "phase": request_phase,
                 "prompt": prompt,
                 "system_instruction": final_system_instruction,
             },
@@ -177,8 +240,20 @@ async def generate_text_with_messages(
     """
     client = _get_client()
     start_time = time.monotonic()
+    request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
+    payload_summary = _summarize_messages_payload(messages)
 
     try:
+        logger.info(
+            "[LLM Provider] Messages 请求追踪: trace_id={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={}",
+            request_trace_id or "-",
+            model,
+            payload_summary["turns"],
+            payload_summary["text_parts"],
+            payload_summary["text_chars"],
+            payload_summary["image_parts"],
+            payload_summary["image_url_chars"],
+        )
         result = await client.generate_text_with_messages(
             messages=messages,
             model=model,
@@ -192,18 +267,32 @@ async def generate_text_with_messages(
         await log_llm_call(
             method="generate_text_with_messages",
             model=model,
-            input_data=messages,
+            input_data={
+                "trace_id": request_trace_id,
+                "payload_summary": payload_summary,
+                "messages": messages,
+            },
             error=str(e),
             duration_ms=duration_ms,
         )
-        logger.error(f"LLM 调用失败: {e}")
+        logger.error(
+            "[LLM Provider] Messages 请求失败: trace_id={} model={} error={} payload={}",
+            request_trace_id or "-",
+            model,
+            e,
+            payload_summary,
+        )
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
         await log_llm_call(
             method="generate_text_with_messages",
             model=model,
-            input_data=messages,
+            input_data={
+                "trace_id": request_trace_id,
+                "payload_summary": payload_summary,
+                "messages": messages,
+            },
             output=result,
             duration_ms=duration_ms,
         )
