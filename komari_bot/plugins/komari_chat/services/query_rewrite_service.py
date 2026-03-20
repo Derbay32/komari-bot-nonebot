@@ -1,7 +1,6 @@
 """查询重写服务 - 将当前输入结合历史重写为独立查询。"""
 
-from logging import getLogger
-
+from nonebot import logger
 from nonebot.plugin import require
 
 from komari_bot.plugins.komari_memory.core.retry import retry_async
@@ -10,8 +9,6 @@ from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchem
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
-
-logger = getLogger(__name__)
 
 
 class QueryRewriteService:

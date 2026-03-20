@@ -8,11 +8,9 @@ Gemini API 代理无法直接下载。此模块在 bot 侧完成下载并转为 
 from __future__ import annotations
 
 import base64
-from logging import getLogger
 
 import aiohttp
-
-logger = getLogger(__name__)
+from nonebot import logger
 
 # 限制：单张图片最大 10 MB
 _MAX_IMAGE_SIZE = 10 * 1024 * 1024
@@ -58,7 +56,7 @@ async def _download_single_image(
         async with session.get(url) as resp:
             if resp.status != 200:
                 logger.warning(
-                    "[ImageDownloader] 下载失败: HTTP %d, url=%s",
+                    "[ImageDownloader] 下载失败: HTTP {}, url={}",
                     resp.status,
                     url[:100],
                 )
@@ -68,7 +66,7 @@ async def _download_single_image(
             content_length = resp.content_length
             if content_length and content_length > _MAX_IMAGE_SIZE:
                 logger.warning(
-                    "[ImageDownloader] 图片过大: %d bytes, url=%s",
+                    "[ImageDownloader] 图片过大: {} bytes, url={}",
                     content_length,
                     url[:100],
                 )
@@ -78,7 +76,7 @@ async def _download_single_image(
             data = await resp.content.read(_MAX_IMAGE_SIZE + 1)
             if len(data) > _MAX_IMAGE_SIZE:
                 logger.warning(
-                    "[ImageDownloader] 图片过大 (读取时): %d bytes, url=%s",
+                    "[ImageDownloader] 图片过大 (读取时): {} bytes, url={}",
                     len(data),
                     url[:100],
                 )
@@ -88,11 +86,11 @@ async def _download_single_image(
             b64 = base64.b64encode(data).decode("ascii")
 
     except (TimeoutError, aiohttp.ClientError) as e:
-        logger.warning("[ImageDownloader] 下载失败: %s, url=%s", e, url[:100])
+        logger.warning("[ImageDownloader] 下载失败: {}, url={}", e, url[:100])
         return None
     except Exception:
         logger.warning(
-            "[ImageDownloader] 下载未知错误: url=%s",
+            "[ImageDownloader] 下载未知错误: url={}",
             url[:100],
             exc_info=True,
         )
@@ -121,14 +119,14 @@ async def download_images_as_base64(urls: list[str]) -> list[str]:
             data_uri = await _download_single_image(session, url)
             if data_uri:
                 logger.info(
-                    "[ImageDownloader] 图片下载成功: %d bytes base64",
+                    "[ImageDownloader] 图片下载成功: {} bytes base64",
                     len(data_uri),
                 )
                 results.append(data_uri)
 
     if len(results) < len(urls):
         logger.warning(
-            "[ImageDownloader] %d / %d 张图片下载成功",
+            "[ImageDownloader] {} / {} 张图片下载成功",
             len(results),
             len(urls),
         )

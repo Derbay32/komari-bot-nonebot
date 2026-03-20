@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from logging import getLogger
 from pathlib import Path
 from typing import Any
 
 import yaml
-
-logger = getLogger(__name__)
+from nonebot import logger
 
 # 默认模板值（YAML 文件缺失或字段缺失时使用）
 _DEFAULTS: dict[str, str] = {
@@ -48,7 +46,7 @@ def get_template() -> dict[str, str]:
         mtime = path.stat().st_mtime
     except OSError:
         if not _cache:
-            logger.warning("[PromptTemplate] 模板文件不存在: %s，使用默认值", path)
+            logger.warning("[PromptTemplate] 模板文件不存在: {}，使用默认值", path)
             _cache = dict(_DEFAULTS)
         return _cache
 
@@ -67,7 +65,7 @@ def get_template() -> dict[str, str]:
 
         _cache = result
         _cache_mtime = mtime
-        logger.info("[PromptTemplate] 模板已加载/重载: %s", path)
+        logger.info("[PromptTemplate] 模板已加载/重载: {}", path)
 
     except yaml.YAMLError:
         logger.warning(

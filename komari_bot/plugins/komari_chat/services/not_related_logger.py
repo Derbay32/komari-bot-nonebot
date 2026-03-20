@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from logging import getLogger
 from pathlib import Path
 
-logger = getLogger(__name__)
+from nonebot import logger
 
 # 日志目录
 _LOG_DIR = Path("logs") / "not_related"
@@ -66,7 +65,7 @@ async def log_not_related(
                 f.write(line)
 
         logger.debug(
-            "[KomariMemory] not related 已记录: user=%s, group=%s", user_id, group_id
+            "[KomariMemory] not related 已记录: user={}, group={}", user_id, group_id
         )
     except Exception:
         logger.warning("[KomariMemory] not related 日志写入失败", exc_info=True)
