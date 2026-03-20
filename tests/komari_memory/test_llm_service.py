@@ -189,3 +189,98 @@ def test_chunk_formatted_messages_splits_oversized_single_message() -> None:
     assert len(chunks) >= 2
     assert all(chunk.lines for chunk in chunks)
     assert any("[分片1]" in line for line in all_lines)
+
+
+def test_existing_context_builder_trims_to_budget() -> None:
+    result = llm_service_module._build_existing_context_with_budget(
+        existing_profiles=[
+            {
+                "user_id": "10001",
+                "display_name": "阿明",
+                "traits": {
+                    f"特征{i}": {
+                        "value": "很长的描述" * 40,
+                        "category": "general",
+                        "importance": 5,
+                        "updated_at": f"2026-03-21T00:00:{i:02d}+08:00",
+                    }
+                    for i in range(10)
+                },
+            }
+        ],
+        existing_interactions=[
+            {
+                "user_id": "10001",
+                "summary": "很长的互动总结" * 40,
+                "records": [
+                    {
+                        "event": "事件" * 20,
+                        "result": "结果" * 20,
+                        "emotion": "情绪" * 20,
+                    }
+                    for _ in range(6)
+                ],
+            }
+        ],
+        token_budget=1200,
+    )
+
+    assert result.estimated_tokens <= 1200
+    assert result.included_profiles + result.included_interactions >= 1
+    assert result.truncated is True
+
+
+def test_summarize_conversation_single_chunk_trims_existing_context_to_fit_limit(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider(
+        [
+            {
+                "summary": "一次总结",
+                "user_profiles": [],
+                "user_interactions": [],
+                "importance": 4,
+            }
+        ]
+    )
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    config = _make_config(summary_chunk_token_limit=4000)
+
+    asyncio.run(
+        _run_summarize_conversation(
+            messages=[_make_message(content="今天一起吃拉面吧")],
+            config=config,
+            existing_profiles=[
+                {
+                    "user_id": "10001",
+                    "display_name": "阿明",
+                    "traits": {
+                        f"特征{i}": {
+                            "value": "很长的描述" * 50,
+                            "category": "general",
+                            "importance": 5,
+                            "updated_at": f"2026-03-21T00:00:{i:02d}+08:00",
+                        }
+                        for i in range(12)
+                    },
+                }
+            ],
+            existing_interactions=[
+                {
+                    "user_id": "10001",
+                    "summary": "很长的互动总结" * 60,
+                    "records": [
+                        {
+                            "event": "事件" * 20,
+                            "result": "结果" * 20,
+                            "emotion": "情绪" * 20,
+                        }
+                        for _ in range(8)
+                    ],
+                }
+            ],
+        )
+    )
+
+    assert len(fake_provider.prompts) == 1
+    assert len(fake_provider.prompts[0]) <= config.summary_chunk_token_limit

@@ -32,12 +32,24 @@ _JSON_RESPONSE_EXAMPLE = (
     '"importance": 3}'
 )
 _MESSAGE_SPLIT_MARKER = "[分片0000] "
+_MAX_EXISTING_TRAITS_PER_USER = 5
+_MAX_EXISTING_INTERACTION_RECORDS = 2
+_TRUNCATED_CONTEXT_MARKER = "【提示】其余已有记录已按 token 上限省略，请仅基于当前提供的已知信息做去重与覆盖。\n\n"
 
 
 @dataclass(frozen=True)
 class _ConversationChunk:
     lines: list[str]
     estimated_tokens: int
+
+
+@dataclass(frozen=True)
+class _ExistingContextBuildResult:
+    text: str
+    estimated_tokens: int
+    included_profiles: int
+    included_interactions: int
+    truncated: bool
 
 
 def _extract_json_from_markdown(text: str) -> str:
@@ -75,43 +87,205 @@ def _extract_tag_content(text: str, tag: str) -> str:
 def _build_existing_context(
     existing_profiles: list[dict] | None = None,
     existing_interactions: list[dict] | None = None,
-) -> str:
-    """构建已有画像与互动历史提示。"""
-    existing_context = ""
-    if existing_profiles:
-        profile_lines = []
-        for profile in existing_profiles:
-            uid = profile.get("user_id", "unknown")
-            display_name = profile.get("display_name", "")
-            traits = profile.get("traits", {})
-            profile_lines.append(
-                f"- [user_id:{uid}] display_name={display_name} traits={json.dumps(traits, ensure_ascii=False)}"
-            )
-        existing_context += "【已知用户画像（数据库中已有记录）】\n"
-        existing_context += "以下是目前已存储的用户画像：\n"
-        existing_context += "\n".join(profile_lines) + "\n\n"
+) -> _ExistingContextBuildResult:
+    return _build_existing_context_with_budget(
+        existing_profiles=existing_profiles,
+        existing_interactions=existing_interactions,
+        token_budget=None,
+    )
 
-    if existing_interactions:
-        interaction_lines = []
-        for interaction in existing_interactions:
-            uid = interaction.get("user_id", "unknown")
-            interaction_lines.append(
-                f"- [user_id:{uid}] interaction_history: {json.dumps(interaction, ensure_ascii=False)}"
-            )
-        existing_context += "以下是目前已存储的用户互动历史：\n"
-        existing_context += "\n".join(interaction_lines) + "\n\n"
 
-    if existing_context:
-        existing_context += (
-            "【重要指示】\n"
-            "- 你输出的是 user_profiles（按用户聚合），不要输出扁平 entities 列表\n"
-            "- 如果对话中发现与已有画像矛盾的新信息，请用新信息覆盖旧值（同 key 覆盖）\n"
-            "- 如果对话中没有提到某个旧特征，不要重复输出它\n"
-            "- 只输出需要新增或更新的画像特征\n"
-            "- 对于互动历史，请在已有记录的基础上追加新的 records（注意：如果 records 总数超过6条，请只保留最近的6条记录）\n\n"
+def _compact_profile_line(profile: dict[str, Any]) -> str | None:
+    """压缩单个用户画像，避免把历史冗余字段整包塞进 prompt。"""
+    user_id = str(profile.get("user_id", "")).strip()
+    if not user_id:
+        return None
+
+    display_name = str(profile.get("display_name", "")).strip()
+    traits_raw = profile.get("traits")
+    compact_traits: list[dict[str, Any]] = []
+    if isinstance(traits_raw, dict):
+        sortable_traits: list[tuple[str, dict[str, Any]]] = []
+        for key, raw in traits_raw.items():
+            if isinstance(raw, dict):
+                sortable_traits.append((str(key), raw))
+        sortable_traits.sort(
+            key=lambda item: (
+                str(item[1].get("updated_at", "")),
+                int(item[1].get("importance", 0) or 0),
+            ),
+            reverse=True,
+        )
+        for key, raw in sortable_traits[:_MAX_EXISTING_TRAITS_PER_USER]:
+            value = str(raw.get("value", "")).strip()
+            if not value:
+                continue
+            compact_traits.append(
+                {
+                    "key": key,
+                    "value": value,
+                    "category": str(raw.get("category", "general")).strip() or "general",
+                    "importance": int(raw.get("importance", 3) or 3),
+                }
+            )
+    elif isinstance(traits_raw, list):
+        for raw in traits_raw[:_MAX_EXISTING_TRAITS_PER_USER]:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key", "")).strip()
+            value = str(raw.get("value", "")).strip()
+            if not key or not value:
+                continue
+            compact_traits.append(
+                {
+                    "key": key,
+                    "value": value,
+                    "category": str(raw.get("category", "general")).strip() or "general",
+                    "importance": int(raw.get("importance", 3) or 3),
+                }
+            )
+
+    return (
+        f"- [user_id:{user_id}] display_name={display_name} "
+        f"traits={json.dumps(compact_traits, ensure_ascii=False)}"
+    )
+
+
+def _compact_interaction_line(interaction: dict[str, Any]) -> str | None:
+    """压缩单个互动历史，保留近期摘要与最近几条 records。"""
+    user_id = str(interaction.get("user_id", "")).strip()
+    if not user_id:
+        return None
+
+    records_raw = interaction.get("records")
+    compact_records: list[dict[str, str]] = []
+    if isinstance(records_raw, list):
+        for record in records_raw[-_MAX_EXISTING_INTERACTION_RECORDS:]:
+            if not isinstance(record, dict):
+                continue
+            compact_records.append(
+                {
+                    "event": str(record.get("event", "")).strip(),
+                    "result": str(record.get("result", "")).strip(),
+                    "emotion": str(record.get("emotion", "")).strip(),
+                }
+            )
+
+    compact_summary = str(interaction.get("summary", "")).strip()
+    return (
+        f"- [user_id:{user_id}] interaction_summary={compact_summary} "
+        f"recent_records={json.dumps(compact_records, ensure_ascii=False)}"
+    )
+
+
+def _build_existing_context_with_budget(
+    *,
+    existing_profiles: list[dict] | None = None,
+    existing_interactions: list[dict] | None = None,
+    token_budget: int | None,
+) -> _ExistingContextBuildResult:
+    """构建可控大小的已有画像与互动历史提示。"""
+    instruction_block = (
+        "【重要指示】\n"
+        "- 你输出的是 user_profiles（按用户聚合），不要输出扁平 entities 列表\n"
+        "- 如果对话中发现与已有画像矛盾的新信息，请用新信息覆盖旧值（同 key 覆盖）\n"
+        "- 如果对话中没有提到某个旧特征，不要重复输出它\n"
+        "- 只输出需要新增或更新的画像特征\n"
+        "- 对于互动历史，请在已有记录的基础上追加新的 records（注意：如果 records 总数超过6条，请只保留最近的6条记录）\n\n"
+    )
+    instruction_tokens = estimate_text_tokens(instruction_block)
+    if token_budget is not None and token_budget <= instruction_tokens:
+        return _ExistingContextBuildResult(
+            text="",
+            estimated_tokens=0,
+            included_profiles=0,
+            included_interactions=0,
+            truncated=bool(existing_profiles or existing_interactions),
         )
 
-    return existing_context
+    data_budget = None
+    if token_budget is not None:
+        data_budget = max(0, token_budget - instruction_tokens)
+
+    blocks: list[str] = []
+    included_profiles = 0
+    included_interactions = 0
+    truncated = False
+
+    def _current_tokens() -> int:
+        return estimate_text_tokens("".join(blocks))
+
+    def _append_block(block: str) -> bool:
+        if data_budget is None:
+            blocks.append(block)
+            return True
+        candidate = "".join(blocks) + block
+        if estimate_text_tokens(candidate) > data_budget:
+            return False
+        blocks.append(block)
+        return True
+
+    profile_lines = [
+        line
+        for profile in (existing_profiles or [])
+        if (line := _compact_profile_line(profile)) is not None
+    ]
+    if profile_lines:
+        profile_header = "【已知用户画像（数据库中已有记录）】\n以下是目前已存储的用户画像：\n"
+        header_added = False
+        for line in profile_lines:
+            block = f"{profile_header}{line}\n" if not header_added else f"{line}\n"
+            if _append_block(block):
+                header_added = True
+                included_profiles += 1
+            else:
+                truncated = True
+                break
+        if header_added:
+            _append_block("\n")
+
+    interaction_lines = [
+        line
+        for interaction in (existing_interactions or [])
+        if (line := _compact_interaction_line(interaction)) is not None
+    ]
+    if interaction_lines:
+        interaction_header = "以下是目前已存储的用户互动历史：\n"
+        header_added = False
+        for line in interaction_lines:
+            block = (
+                f"{interaction_header}{line}\n" if not header_added else f"{line}\n"
+            )
+            if _append_block(block):
+                header_added = True
+                included_interactions += 1
+            else:
+                truncated = True
+                break
+        if header_added:
+            _append_block("\n")
+
+    if truncated:
+        _append_block(_TRUNCATED_CONTEXT_MARKER)
+
+    data_text = "".join(blocks)
+    if not data_text:
+        return _ExistingContextBuildResult(
+            text="",
+            estimated_tokens=0,
+            included_profiles=0,
+            included_interactions=0,
+            truncated=truncated,
+        )
+
+    full_text = data_text + instruction_block
+    return _ExistingContextBuildResult(
+        text=full_text,
+        estimated_tokens=estimate_text_tokens(full_text),
+        included_profiles=included_profiles,
+        included_interactions=included_interactions,
+        truncated=truncated,
+    )
 
 
 def _build_summary_prompt(
@@ -470,10 +644,6 @@ async def summarize_conversation(
     """总结对话，提取用户画像，并评估重要性（带重试机制）。"""
     trace_id = f"memsum-{uuid4().hex[:8]}"
     group_id = messages[0].group_id if messages else "-"
-    existing_context = _build_existing_context(
-        existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
-    )
     chunks, oversized_message_split = _chunk_formatted_messages(messages, config)
     logger.info(
         "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={} existing_interactions={}",
@@ -488,14 +658,29 @@ async def summarize_conversation(
         return _normalize_summary_result({})
 
     if len(chunks) == 1:
+        single_message_text = "\n".join(chunks[0].lines)
+        single_base_prompt = _build_summary_prompt(single_message_text)
+        single_context_budget = max(
+            0,
+            config.summary_chunk_token_limit - estimate_text_tokens(single_base_prompt),
+        )
+        existing_context_result = _build_existing_context_with_budget(
+            existing_profiles=existing_profiles,
+            existing_interactions=existing_interactions,
+            token_budget=single_context_budget,
+        )
         single_prompt = _build_summary_prompt(
-            "\n".join(chunks[0].lines),
-            existing_context=existing_context,
+            single_message_text,
+            existing_context=existing_context_result.text,
         )
         logger.debug(
-            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={}",
+            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={} context_tokens={} included_profiles={} included_interactions={} context_truncated={}",
             trace_id,
             chunks[0].estimated_tokens,
+            existing_context_result.estimated_tokens,
+            existing_context_result.included_profiles,
+            existing_context_result.included_interactions,
+            existing_context_result.truncated,
         )
         return await _request_structured_summary(
             prompt=single_prompt,
@@ -509,7 +694,8 @@ async def summarize_conversation(
 
     chunk_tokens = [chunk.estimated_tokens for chunk in chunks]
     logger.info(
-        "[KomariMemory] 总结输入触发分段: chunks={} estimated_input_tokens={} oversized_message_split={}",
+        "[KomariMemory] 总结输入触发分段: trace_id={} chunks={} estimated_input_tokens={} oversized_message_split={}",
+        trace_id,
         len(chunks),
         chunk_tokens,
         oversized_message_split,
@@ -530,21 +716,34 @@ async def summarize_conversation(
             )
         )
 
+    merge_source = _serialize_chunk_results_for_merge(chunk_results, chunk_tokens)
+    merge_base_prompt = _build_merge_prompt(merge_source)
+    merge_context_budget = max(
+        0,
+        config.summary_chunk_token_limit - estimate_text_tokens(merge_base_prompt),
+    )
+    existing_context_result = _build_existing_context_with_budget(
+        existing_profiles=existing_profiles,
+        existing_interactions=existing_interactions,
+        token_budget=merge_context_budget,
+    )
     merge_prompt = _build_merge_prompt(
-        _serialize_chunk_results_for_merge(chunk_results, chunk_tokens),
-        existing_context=existing_context,
+        merge_source,
+        existing_context=existing_context_result.text,
     )
     logger.info(
-        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={}",
+        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={} context_tokens={} included_profiles={} included_interactions={} context_truncated={}",
         trace_id,
         len(chunk_results),
+        existing_context_result.estimated_tokens,
+        existing_context_result.included_profiles,
+        existing_context_result.included_interactions,
+        existing_context_result.truncated,
     )
     return await _request_structured_summary(
         prompt=merge_prompt,
         config=config,
         trace_id=trace_id,
         stage="merge",
-        estimated_input_tokens=estimate_text_tokens(
-            _serialize_chunk_results_for_merge(chunk_results, chunk_tokens)
-        ),
+        estimated_input_tokens=estimate_text_tokens(merge_source),
     )
