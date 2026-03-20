@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 
 
@@ -25,3 +27,15 @@ def test_example_config_no_longer_contains_dead_fields() -> None:
     assert "bert_service_url" not in config
     assert "bert_timeout" not in config
     assert "llm_provider" not in config
+    assert config["summary_chunk_token_limit"] == 3000
+
+
+def test_config_schema_exposes_summary_chunk_token_limit() -> None:
+    config = KomariMemoryConfigSchema()
+
+    assert config.summary_chunk_token_limit == 3000
+
+
+def test_config_schema_rejects_too_small_summary_chunk_token_limit() -> None:
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(summary_chunk_token_limit=199)

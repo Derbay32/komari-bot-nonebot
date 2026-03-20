@@ -120,6 +120,12 @@ class KomariMemoryConfigSchema(BaseModel):
     summary_max_messages: int = Field(
         default=200, ge=50, le=500, description="总结时从缓冲区获取的最大消息数"
     )
+    summary_chunk_token_limit: int = Field(
+        default=3000,
+        ge=200,
+        le=50000,
+        description="总结前原文分段的估算 token 上限（按当前近似口径计算，不用于触发总结）",
+    )
     memory_search_limit: int = Field(
         default=3, ge=1, le=10, description="检索相关记忆的最大数量"
     )
