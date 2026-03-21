@@ -28,14 +28,21 @@ def test_example_config_no_longer_contains_dead_fields() -> None:
     assert "bert_timeout" not in config
     assert "llm_provider" not in config
     assert config["summary_chunk_token_limit"] == 3000
+    assert config["profile_trait_limit"] == 20
 
 
 def test_config_schema_exposes_summary_chunk_token_limit() -> None:
     config = KomariMemoryConfigSchema()
 
     assert config.summary_chunk_token_limit == 3000
+    assert config.profile_trait_limit == 20
 
 
 def test_config_schema_rejects_too_small_summary_chunk_token_limit() -> None:
     with pytest.raises(ValueError):
         KomariMemoryConfigSchema(summary_chunk_token_limit=199)
+
+
+def test_config_schema_rejects_too_small_profile_trait_limit() -> None:
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(profile_trait_limit=0)

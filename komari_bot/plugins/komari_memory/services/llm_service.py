@@ -307,6 +307,9 @@ def _build_summary_prompt(
   - display_name（可为空字符串）
   - traits（数组），每个 trait 包含 key/value/category/importance
 - category 仅可取：preference/fact/relation/general
+- traits 只保留长期稳定、可复用的画像信息，例如身份、长期偏好、稳定习惯、关系认知、长期事实
+- 不要输出短期状态、一次性事件、瞬时情绪、当天安排，也不要把语义相近的 traits 拆成多个近义 key
+- 对重复或近义 traits 进行合并，尽量使用更稳定、不易过时的 key 与 value
 
 【任务二：主观互动备忘录提取】
 - 你必须基于《败犬女主太多了！》中"小鞠知花"的人设视角，为有明显互动行为的用户，提取出在互动期间该用户的行为记录。这将被作为"小鞠在心里对近期互动过的用户的悄悄记录"。
@@ -335,6 +338,8 @@ def _build_merge_prompt(
 每个分段总结都已经是结构化结果，包含 summary、user_profiles、user_interactions、importance。
 请你基于这些分段结果，输出一份全局统一的最终 JSON：
 - 合并重复 user_id 的画像信息，只保留新增或更新的 traits
+- user_profiles 只保留长期稳定 traits，删除短期状态、一次性事件与明显重复项
+- 对近义或重复 traits 进行合并，统一为更稳定的 key
 - 合并互动历史，records 总数最多保留最近6条
 - 产出一份整体 summary 和整体 importance
 - 不要按分段分别输出，不要解释推理过程

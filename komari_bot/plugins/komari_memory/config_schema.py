@@ -126,6 +126,12 @@ class KomariMemoryConfigSchema(BaseModel):
         le=50000,
         description="总结前原文分段的估算 token 上限（按当前近似口径计算，不用于触发总结）",
     )
+    profile_trait_limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="每个用户画像允许保留的长期稳定 traits 最大数量",
+    )
     memory_search_limit: int = Field(
         default=3, ge=1, le=10, description="检索相关记忆的最大数量"
     )

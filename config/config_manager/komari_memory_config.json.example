@@ -25,6 +25,7 @@
   "summary_time_threshold": 3600,
   "summary_max_messages": 200,
   "summary_chunk_token_limit": 3000,
+  "profile_trait_limit": 20,
   "message_buffer_size": 200,
   "memory_search_limit": 3,
   "context_messages_limit": 10,
