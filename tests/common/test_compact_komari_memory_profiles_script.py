@@ -7,9 +7,8 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/compact_komari_memory_profiles.py"
@@ -66,6 +65,16 @@ def _make_profile_row(
     )
 
 
+def _make_memory_config() -> Any:
+    return SimpleNamespace(
+        llm_model_summary="summary-model",
+        llm_temperature_summary=0.3,
+        llm_max_tokens_summary=2048,
+        summary_chunk_token_limit=3000,
+        profile_trait_limit=20,
+    )
+
+
 def test_process_profile_rows_dry_run_only_reports_changes() -> None:
     module = _load_script_module()
     updated_rows: list[dict[str, Any]] = []
@@ -98,7 +107,7 @@ def test_process_profile_rows_dry_run_only_reports_changes() -> None:
                 _make_profile_row(module, user_id="10001", trait_count=25),
                 _make_profile_row(module, user_id="10002", trait_count=5),
             ],
-            memory_config=KomariMemoryConfigSchema(profile_trait_limit=20),
+            memory_config=_make_memory_config(),
             llm_generate_text=_fake_generate_text,
             apply=False,
             update_profile=_fake_update_profile,
@@ -144,7 +153,7 @@ def test_process_profile_rows_apply_updates_database_callback() -> None:
     stats = asyncio.run(
         module._process_profile_rows(
             [_make_profile_row(module, user_id="10001", trait_count=25)],
-            memory_config=KomariMemoryConfigSchema(profile_trait_limit=20),
+            memory_config=_make_memory_config(),
             llm_generate_text=_fake_generate_text,
             apply=True,
             update_profile=_fake_update_profile,

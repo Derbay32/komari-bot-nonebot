@@ -16,13 +16,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
-from nonebot import logger
+from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,21 +34,53 @@ from komari_bot.common.database_config import (
     merge_database_config,
 )
 from komari_bot.common.postgres import create_postgres_pool
-from komari_bot.plugins.komari_memory.config_schema import (
-    KomariMemoryConfigSchema,
-)
-from komari_bot.plugins.komari_memory.services.profile_compaction import (
+from komari_bot.common.profile_compaction import (
+    LoggerLike,
     compact_profile_with_llm,
     count_profile_traits,
     normalize_profile_for_storage,
     summarize_profile_compaction_diff,
 )
-from komari_bot.plugins.llm_provider.config_schema import (
-    DynamicConfigSchema as LLMProviderConfigSchema,
-)
 
 _PROFILE_KEY = "user_profile"
 _PROFILE_CATEGORY = "profile_json"
+logger = logging.getLogger("compact_komari_memory_profiles")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s | %(message)s",
+    )
+
+
+class StandaloneMemoryConfig(BaseModel):
+    """脚本使用的最小 komari_memory 配置。"""
+
+    pg_host: str | None = Field(default=None)
+    pg_port: int | None = Field(default=None)
+    pg_database: str | None = Field(default=None)
+    pg_user: str | None = Field(default=None)
+    pg_password: str | None = Field(default=None)
+    pg_pool_min_size: int | None = Field(default=None)
+    pg_pool_max_size: int | None = Field(default=None)
+    llm_model_summary: str = Field(default="gemini-2.5-flash-lite")
+    llm_temperature_summary: float = Field(default=0.3)
+    llm_max_tokens_summary: int = Field(default=2048)
+    summary_chunk_token_limit: int = Field(default=3000)
+    profile_trait_limit: int = Field(default=20)
+
+
+class StandaloneLLMConfig(BaseModel):
+    """脚本使用的最小 llm_provider 配置。"""
+
+    deepseek_api_token: str = Field(default="")
+    deepseek_api_base: str = Field(
+        default="https://api.deepseek.com/v1/chat/completions"
+    )
+    deepseek_temperature: float = Field(default=1.0)
+    deepseek_max_tokens: int = Field(default=8192)
+    deepseek_timeout_seconds: float = Field(default=300.0)
+    deepseek_reasoning_effort: str = Field(default="")
+    deepseek_frequency_penalty: float = Field(default=0.0)
 
 
 @dataclass(frozen=True)
@@ -61,7 +94,7 @@ class ProfileRow:
 class DirectLLMClient:
     """脚本模式下的轻量 OpenAI 兼容客户端。"""
 
-    def __init__(self, config: LLMProviderConfigSchema) -> None:
+    def __init__(self, config: StandaloneLLMConfig) -> None:
         self.config = config
         self._session: aiohttp.ClientSession | None = None
 
@@ -222,7 +255,7 @@ async def _update_profile_row(
 async def _process_profile_rows(
     rows: list[ProfileRow],
     *,
-    memory_config: KomariMemoryConfigSchema,
+    memory_config: Any,
     llm_generate_text: Any,
     apply: bool,
     update_profile: Any,
@@ -241,22 +274,16 @@ async def _process_profile_rows(
             parsed = json.loads(row.value)
         except (TypeError, ValueError):
             logger.warning(
-                "[KomariMemory] 画像瘦身跳过非法 JSON: row={}/{} group={} user={}",
-                index,
-                len(rows),
-                row.group_id,
-                row.user_id,
+                f"[KomariMemory] 画像瘦身跳过非法 JSON: row={index}/{len(rows)} "
+                f"group={row.group_id} user={row.user_id}"
             )
             stats["failed"] += 1
             continue
 
         if not isinstance(parsed, dict):
             logger.warning(
-                "[KomariMemory] 画像瘦身跳过非对象 JSON: row={}/{} group={} user={}",
-                index,
-                len(rows),
-                row.group_id,
-                row.user_id,
+                f"[KomariMemory] 画像瘦身跳过非对象 JSON: row={index}/{len(rows)} "
+                f"group={row.group_id} user={row.user_id}"
             )
             stats["failed"] += 1
             continue
@@ -269,13 +296,9 @@ async def _process_profile_rows(
         before_traits = count_profile_traits(before_profile)
         if before_traits <= memory_config.profile_trait_limit:
             logger.info(
-                "[KomariMemory] 画像瘦身跳过: row={}/{} group={} user={} traits={} limit={} reason=within_limit",
-                index,
-                len(rows),
-                row.group_id,
-                row.user_id,
-                before_traits,
-                memory_config.profile_trait_limit,
+                f"[KomariMemory] 画像瘦身跳过: row={index}/{len(rows)} group={row.group_id} "
+                f"user={row.user_id} traits={before_traits} "
+                f"limit={memory_config.profile_trait_limit} reason=within_limit"
             )
             stats["skipped"] += 1
             continue
@@ -288,33 +311,23 @@ async def _process_profile_rows(
                 llm_generate_text=llm_generate_text,
                 trace_id=trace_id,
                 source="migration_script",
+                log=cast("LoggerLike", logger),
             )
         except Exception:
             logger.exception(
-                "[KomariMemory] 画像瘦身失败: row={}/{} group={} user={}",
-                index,
-                len(rows),
-                row.group_id,
-                row.user_id,
+                f"[KomariMemory] 画像瘦身失败: row={index}/{len(rows)} "
+                f"group={row.group_id} user={row.user_id}"
             )
             stats["failed"] += 1
             continue
 
         diff = summarize_profile_compaction_diff(before_profile, compacted_profile)
         logger.info(
-            "[KomariMemory] 画像瘦身结果: row={}/{} group={} user={} apply={} before_traits={} after_traits={} before_chars={} after_chars={} removed_keys={} added_keys={} kept_keys={}",
-            index,
-            len(rows),
-            row.group_id,
-            row.user_id,
-            apply,
-            diff["before_traits"],
-            diff["after_traits"],
-            diff["before_chars"],
-            diff["after_chars"],
-            diff["removed_keys"],
-            diff["added_keys"],
-            diff["kept_keys"],
+            f"[KomariMemory] 画像瘦身结果: row={index}/{len(rows)} group={row.group_id} "
+            f"user={row.user_id} apply={apply} before_traits={diff['before_traits']} "
+            f"after_traits={diff['after_traits']} before_chars={diff['before_chars']} "
+            f"after_chars={diff['after_chars']} removed_keys={diff['removed_keys']} "
+            f"added_keys={diff['added_keys']} kept_keys={diff['kept_keys']}"
         )
 
         if apply:
@@ -338,10 +351,10 @@ async def run(
     shared_database_config = load_database_config_from_file(database_config_path)
     memory_config = _load_schema_config(
         memory_config_path,
-        KomariMemoryConfigSchema,
+        StandaloneMemoryConfig,
         allow_missing=True,
     )
-    llm_config = _load_schema_config(llm_config_path, LLMProviderConfigSchema)
+    llm_config = _load_schema_config(llm_config_path, StandaloneLLMConfig)
     if not str(llm_config.deepseek_api_token).strip():
         raise ValueError("llm_provider 缺少 deepseek_api_token，无法执行画像压缩")  # noqa: TRY003
 
@@ -355,12 +368,8 @@ async def run(
     try:
         rows = await _fetch_profile_rows(pool, group_id=group_id, user_id=user_id)
         logger.info(
-            "[KomariMemory] 画像瘦身脚本启动: rows={} apply={} trait_limit={} group={} user={}",
-            len(rows),
-            apply,
-            memory_config.profile_trait_limit,
-            group_id or "-",
-            user_id or "-",
+            f"[KomariMemory] 画像瘦身脚本启动: rows={len(rows)} apply={apply} "
+            f"trait_limit={memory_config.profile_trait_limit} group={group_id or '-'} user={user_id or '-'}"
         )
         stats = await _process_profile_rows(
             rows,
@@ -370,12 +379,9 @@ async def run(
             update_profile=lambda **kwargs: _update_profile_row(pool, **kwargs),
         )
         logger.info(
-            "[KomariMemory] 画像瘦身脚本完成: scanned={} updated={} would_update={} skipped={} failed={}",
-            stats["scanned"],
-            stats["updated"],
-            stats["would_update"],
-            stats["skipped"],
-            stats["failed"],
+            f"[KomariMemory] 画像瘦身脚本完成: scanned={stats['scanned']} "
+            f"updated={stats['updated']} would_update={stats['would_update']} "
+            f"skipped={stats['skipped']} failed={stats['failed']}"
         )
         return stats
     finally:

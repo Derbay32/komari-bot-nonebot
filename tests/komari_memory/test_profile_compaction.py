@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.services import (
-    profile_compaction as profile_compaction_module,
-)
+from komari_bot.common import profile_compaction as profile_compaction_module
 
 
 class _FakeGenerateText:
@@ -24,7 +22,7 @@ class _FakeGenerateText:
         return json.dumps(self._responses.pop(0), ensure_ascii=False)
 
 
-def _make_config(**overrides: Any) -> KomariMemoryConfigSchema:
+def _make_config(**overrides: Any) -> Any:
     payload = {
         "llm_model_summary": "summary-model",
         "llm_temperature_summary": 0.3,
@@ -33,7 +31,7 @@ def _make_config(**overrides: Any) -> KomariMemoryConfigSchema:
         "profile_trait_limit": 20,
     }
     payload.update(overrides)
-    return KomariMemoryConfigSchema(**payload)
+    return SimpleNamespace(**payload)
 
 
 def _make_profile(trait_count: int) -> dict[str, Any]:

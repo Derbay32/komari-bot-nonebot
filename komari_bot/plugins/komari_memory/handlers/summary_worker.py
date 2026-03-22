@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from apscheduler.jobstores.base import JobLookupError
@@ -15,6 +15,7 @@ from ..core.retry import retry_async
 from ..services.config_interface import get_config
 from ..services.llm_service import summarize_conversation
 from ..services.profile_compaction import (
+    LoggerLike,
     compact_profile_with_llm,
     count_profile_traits,
     profile_json_length,
@@ -122,6 +123,7 @@ async def _enforce_profile_trait_limit(
             llm_generate_text=llm_provider.generate_text,
             trace_id=trace_id,
             source="summary_worker",
+            log=cast("LoggerLike", logger),
         )
     except Exception:
         logger.exception(
