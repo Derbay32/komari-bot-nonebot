@@ -366,7 +366,6 @@ async def _request_profile_compaction(
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=config.llm_max_tokens_summary,
-        response_format={"type": "json_object"},
         request_trace_id=trace_id,
         request_phase=f"profile_compaction_{stage}",
     )

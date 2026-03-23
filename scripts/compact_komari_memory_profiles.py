@@ -121,6 +121,7 @@ class DirectLLMClient:
         response_format: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str:
+        del response_format
         session = await self._get_session()
         messages: list[dict[str, Any]] = []
         if system_instruction:
@@ -148,8 +149,6 @@ class DirectLLMClient:
             "frequency_penalty": self.config.deepseek_frequency_penalty,
             "stream": False,
         }
-        if response_format is not None:
-            request_data["response_format"] = response_format
         if reasoning_effort:
             request_data["reasoning_effort"] = reasoning_effort
 

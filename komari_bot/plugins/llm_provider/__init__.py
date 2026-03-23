@@ -32,11 +32,10 @@ __plugin_meta__ = PluginMetadata(
         model="deepseek-chat",
     )
 
-    # JSON 模式
+    # 结构化输出请直接在 prompt 中明确要求 JSON 字段
     response = await llm_provider.generate_text(
-        prompt="返回 JSON 格式",
+        prompt="请返回 JSON，对象字段为 name 和 age",
         model="deepseek-chat",
-        response_format={"type": "json_object"},
     )
     """,
     config=Config,
@@ -127,7 +126,7 @@ async def generate_text(
         enable_knowledge: 是否启用知识库检索
         knowledge_query: 知识库查询文本
         knowledge_limit: 检索返回的知识数量上限
-        response_format: Response format dict
+        response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
         **kwargs: 其他参数
 
     Returns:
@@ -232,7 +231,7 @@ async def generate_text_with_messages(
         model: 模型名称
         temperature: 温度参数
         max_tokens: 最大 token 数
-        response_format: Response format dict
+        response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
         **kwargs: 其他参数
 
     Returns:
