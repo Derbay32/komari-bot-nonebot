@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Literal
 
@@ -63,6 +64,56 @@ class MessageHandler:
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。"""
         return bool(hasattr(event, "to_me") and event.to_me)
+
+    @staticmethod
+    def _strip_text_at_alias_prefix(
+        message_content: str,
+        aliases: list[str],
+    ) -> str | None:
+        """剥离纯文本形式的 `@机器人别名` 前缀。"""
+        cleaned_aliases = sorted(
+            {alias.strip() for alias in aliases if alias and alias.strip()},
+            key=len,
+            reverse=True,
+        )
+        if not cleaned_aliases:
+            return None
+
+        alias_pattern = "|".join(re.escape(alias) for alias in cleaned_aliases)
+        match = re.match(
+            rf"^\s*(?:@|\uFF20)\s*(?:{alias_pattern})(?:[\s,，。.!！?？:：、~-]|\uFF5E)*",
+            message_content,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        stripped_content = message_content[match.end() :].lstrip()
+        return stripped_content or message_content
+
+    def _resolve_trigger_message(
+        self,
+        event: GroupMessageEvent,
+    ) -> tuple[bool, str]:
+        """解析当前消息是否应按 `@机器人` 直通处理，并返回清洗后的文本。"""
+        message_content = event.get_plaintext()
+        if self._is_at_trigger(event):
+            return True, message_content
+
+        config = get_config()
+        stripped_content = self._strip_text_at_alias_prefix(
+            message_content,
+            [config.bot_nickname, *config.bot_aliases],
+        )
+        if stripped_content is None:
+            return False, message_content
+
+        logger.debug(
+            "[KomariChat] 纯文本 @ 命中机器人别名，按 at_trigger 处理: raw={} cleaned={}",
+            message_content,
+            stripped_content,
+        )
+        return True, stripped_content
 
     @staticmethod
     def _safe_round(value: float | None) -> float | None:
@@ -129,7 +180,7 @@ class MessageHandler:
         """处理群聊消息的主流程。"""
         user_id = str(event.user_id)
         group_id = str(event.group_id)
-        message_content = event.get_plaintext()
+        at_trigger, message_content = self._resolve_trigger_message(event)
         message_id = str(event.message_id)
 
         image_urls = [
@@ -157,7 +208,7 @@ class MessageHandler:
         outcome = await self.decision_engine.evaluate(
             message_content=message_content,
             group_id=group_id,
-            at_trigger=self._is_at_trigger(event),
+            at_trigger=at_trigger,
         )
         memory_store = outcome.memory_action == "store"
 
