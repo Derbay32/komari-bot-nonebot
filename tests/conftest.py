@@ -45,6 +45,7 @@ def _ensure_package_shim(plugin_name: str) -> None:
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
+_ensure_package_shim("character_binding")
 
 
 class _DummyConfigManager:
