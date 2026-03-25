@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib import import_module
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
     import pytest
@@ -23,9 +23,16 @@ class _FakeEvent:
         return self._text
 
 
-def _build_handler() -> object:
-    return message_handler_module.MessageHandler.__new__(
-        message_handler_module.MessageHandler
+class _MessageHandlerLike(Protocol):
+    def _resolve_trigger_message(self, event: _FakeEvent) -> tuple[bool, str]: ...
+
+
+def _build_handler() -> _MessageHandlerLike:
+    return cast(
+        "_MessageHandlerLike",
+        message_handler_module.MessageHandler.__new__(
+            message_handler_module.MessageHandler
+        ),
     )
 
 
