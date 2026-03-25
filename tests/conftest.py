@@ -46,6 +46,7 @@ _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
 _ensure_package_shim("character_binding")
+_ensure_package_shim("komari_chat")
 
 
 class _DummyConfigManager:
@@ -66,12 +67,32 @@ class _DummyLLMProvider:
         return "对话内容已模糊化处理"
 
 
+class _DummyKnowledgePlugin:
+    @staticmethod
+    async def search_knowledge(**_kwargs: object) -> list[object]:
+        return []
+
+    @staticmethod
+    async def search_by_keyword(*_args: object, **_kwargs: object) -> list[object]:
+        return []
+
+
+class _DummyCharacterBindingPlugin:
+    @staticmethod
+    def get_character_name(user_id: str, fallback_nickname: str = "") -> str:
+        return fallback_nickname or user_id
+
+
 def _fake_require(name: str) -> object:
     """测试阶段替换 nonebot.require，避免真实插件加载。"""
     if name == "config_manager":
         return _DummyConfigManagerPlugin()
     if name == "llm_provider":
         return _DummyLLMProvider()
+    if name == "komari_knowledge":
+        return _DummyKnowledgePlugin()
+    if name == "character_binding":
+        return _DummyCharacterBindingPlugin()
     msg = f"Unsupported plugin require in tests: {name}"
     raise RuntimeError(msg)
 
