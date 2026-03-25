@@ -104,6 +104,7 @@ def parse_superuser_bind_delete_request(
         target_user_id=user_id,
     )
 
+
 # /bind - 显示使用说明
 bind = on_command("bind", priority=10, block=True)
 
@@ -134,10 +135,6 @@ async def handle_bind_help(event: MessageEvent) -> None:
         "  删除您的角色绑定\n"
         "• /bind list\n"
         "  查看您的角色绑定\n"
-        "• SUPERUSER: /bind set <用户ID> <角色名>\n"
-        "  为指定用户设置角色绑定\n"
-        "• SUPERUSER: /bind del <用户ID>\n"
-        "  删除指定用户的角色绑定\n"
         "━━━━━━━━━━━━━━━"
         f"{binding_info}"
     )
