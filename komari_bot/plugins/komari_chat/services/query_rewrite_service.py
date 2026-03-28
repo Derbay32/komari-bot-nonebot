@@ -54,6 +54,20 @@ class QueryRewriteService:
 用户最新回复：{current_query}"""
 
     @retry_async(max_attempts=2, base_delay=0.5)
+    async def _generate_rewritten_query(
+        self,
+        *,
+        rewrite_prompt: str,
+        model: str,
+    ) -> str:
+        """调用 LLM 生成重写后的查询。"""
+        return await llm_provider.generate_text(
+            prompt=rewrite_prompt,
+            model=model,
+            temperature=0.3,
+            max_tokens=256,
+        )
+
     async def rewrite_query(
         self,
         current_query: str,
@@ -83,11 +97,9 @@ class QueryRewriteService:
             )
 
             # 调用 LLM 重写（使用总结模型，更快）
-            rewritten = await llm_provider.generate_text(
-                prompt=rewrite_prompt,
+            rewritten = await self._generate_rewritten_query(
+                rewrite_prompt=rewrite_prompt,
                 model=config.llm_model_summary,
-                temperature=0.3,
-                max_tokens=256,
             )
         except Exception as e:
             # 降级：返回原始查询
