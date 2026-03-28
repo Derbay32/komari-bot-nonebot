@@ -9,6 +9,8 @@ from typing import Any, Literal
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata
 
+from komari_bot.common.sentry_support import build_sentry_init_options
+
 from .config_interface import get_config
 from .config_schema import KomariSentryConfigSchema
 
@@ -83,38 +85,21 @@ async def startup() -> None:
         logger.info("[KomariSentry] 检测到 Sentry 已初始化，跳过重复初始化")
         return
 
-    breadcrumb_level = _resolve_level(config.breadcrumb_level, logging.INFO)
-    event_level = _resolve_level(config.event_level, logging.ERROR)
-    logging_integration = LoggingIntegration(
-        level=breadcrumb_level,
-        event_level=event_level,
-    )
-
-    environment = config.environment.strip() or os.getenv("ENVIRONMENT", "prod")
-    release = config.release.strip() or None
-
-    sentry_sdk.init(
+    init_options = build_sentry_init_options(
+        config=config,
         dsn=dsn,
-        environment=environment,
-        release=release,
-        debug=config.debug,
-        sample_rate=config.error_sample_rate,
-        traces_sample_rate=config.traces_sample_rate,
-        profiles_sample_rate=config.profiles_sample_rate,
-        attach_stacktrace=config.attach_stacktrace,
-        send_default_pii=config.send_default_pii,
-        max_breadcrumbs=config.max_breadcrumbs,
-        integrations=[
-            logging_integration,
-            AsyncioIntegration(),
-            FastApiIntegration(),
-            StarletteIntegration(),
-        ],
+        resolve_level=_resolve_level,
+        logging_integration_factory=LoggingIntegration,
+        asyncio_integration_factory=AsyncioIntegration,
+        fastapi_integration_factory=FastApiIntegration,
+        starlette_integration_factory=StarletteIntegration,
+        environ=os.environ,
     )
+    sentry_sdk.init(**init_options)
     _initialized_by_plugin = True
     logger.info(
         "[KomariSentry] 初始化完成 env={} traces={:.3f} profiles={:.3f}",
-        environment,
+        init_options["environment"],
         config.traces_sample_rate,
         config.profiles_sample_rate,
     )
