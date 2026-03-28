@@ -363,6 +363,11 @@ class KnowledgeEngine:
             state.logger.info(
                 f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'"
             )
+            if query_vec is not None:
+                state.logger.debug(
+                    "[Komari Knowledge] 查询文本已改写，丢弃预生成向量并使用新查询重算"
+                )
+                query_vec = None
 
         results: list[SearchResult] = []
         seen_ids: set[int] = set()
