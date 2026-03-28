@@ -6,6 +6,8 @@ from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.onebot_rules import group_message_rule
+
 from .handlers.message_handler import MessageHandler
 
 # 依赖插件
@@ -27,7 +29,7 @@ __plugin_meta__ = PluginMetadata(
     usage="自动运行，无需命令",
 )
 
-matcher = on_message(priority=10, block=False)
+matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 
 _handler: MessageHandler | None = None
 
