@@ -7,6 +7,7 @@ Gemini API 代理无法直接下载。此模块在 bot 侧完成下载并转为 
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import aiohttp
@@ -16,6 +17,11 @@ from nonebot import logger
 _MAX_IMAGE_SIZE = 10 * 1024 * 1024
 # 下载超时 10 秒
 _DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=10)
+_READ_CHUNK_SIZE = 64 * 1024
+_DOWNLOAD_RETRY_ATTEMPTS = 3
+_DOWNLOAD_RETRY_BASE_DELAY = 0.2
+_DOWNLOAD_RETRY_MAX_DELAY = 1.0
+_RETRYABLE_STATUS_CODES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
 
 
 def _guess_mime_type(content_type: str | None, url: str) -> str:
@@ -39,6 +45,86 @@ def _guess_mime_type(content_type: str | None, url: str) -> str:
     return "image/jpeg"
 
 
+def _get_retry_delay(attempt: int) -> float:
+    """根据尝试次数计算下一次重试延迟。"""
+    return min(
+        _DOWNLOAD_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+        _DOWNLOAD_RETRY_MAX_DELAY,
+    )
+
+
+async def _read_image_bytes(
+    resp: aiohttp.ClientResponse,
+    url: str,
+) -> bytes | None:
+    """读取完整图片响应体，并在读取过程中持续检查大小限制。"""
+    content_length = resp.content_length
+    if content_length and content_length > _MAX_IMAGE_SIZE:
+        logger.warning(
+            "[ImageDownloader] 图片过大: {} bytes, url={}",
+            content_length,
+            url[:100],
+        )
+        return None
+
+    if content_length is not None:
+        data = await resp.read()
+        if len(data) > _MAX_IMAGE_SIZE:
+            logger.warning(
+                "[ImageDownloader] 图片过大 (读取时): {} bytes, url={}",
+                len(data),
+                url[:100],
+            )
+            return None
+        return data
+
+    buffer = bytearray()
+    async for chunk in resp.content.iter_chunked(_READ_CHUNK_SIZE):
+        buffer.extend(chunk)
+        if len(buffer) > _MAX_IMAGE_SIZE:
+            logger.warning(
+                "[ImageDownloader] 图片过大 (分块读取时): {} bytes, url={}",
+                len(buffer),
+                url[:100],
+            )
+            return None
+
+    return bytes(buffer)
+
+
+async def _handle_download_response(
+    resp: aiohttp.ClientResponse,
+    url: str,
+    attempt: int,
+) -> tuple[str | None, str | None, bool]:
+    """处理单次下载响应，返回重试原因、数据 URI 和是否应终止。"""
+    if resp.status != 200:
+        if resp.status in _RETRYABLE_STATUS_CODES and attempt < _DOWNLOAD_RETRY_ATTEMPTS:
+            return f"HTTP {resp.status}", None, False
+
+        logger.warning(
+            "[ImageDownloader] 下载失败: HTTP {}, url={}",
+            resp.status,
+            url[:100],
+        )
+        return None, None, True
+
+    data = await _read_image_bytes(resp, url)
+    if data is None:
+        return None, None, True
+
+    if not data:
+        if attempt < _DOWNLOAD_RETRY_ATTEMPTS:
+            return "empty body", None, False
+
+        logger.warning("[ImageDownloader] 图片内容为空: url={}", url[:100])
+        return None, None, True
+
+    mime_type = _guess_mime_type(resp.content_type, url)
+    b64 = base64.b64encode(data).decode("ascii")
+    return None, f"data:{mime_type};base64,{b64}", False
+
+
 async def _download_single_image(
     session: aiohttp.ClientSession,
     url: str,
@@ -52,51 +138,53 @@ async def _download_single_image(
     Returns:
         base64 data URI 字符串，失败时返回 None
     """
-    try:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                logger.warning(
-                    "[ImageDownloader] 下载失败: HTTP {}, url={}",
-                    resp.status,
-                    url[:100],
+    for attempt in range(1, _DOWNLOAD_RETRY_ATTEMPTS + 1):
+        retry_reason: str | None = None
+        data_uri: str | None = None
+        should_abort = False
+
+        try:
+            async with session.get(url) as resp:
+                retry_reason, data_uri, should_abort = await _handle_download_response(
+                    resp,
+                    url,
+                    attempt,
                 )
-                return None
 
-            # 预检大小（通过 Content-Length）
-            content_length = resp.content_length
-            if content_length and content_length > _MAX_IMAGE_SIZE:
-                logger.warning(
-                    "[ImageDownloader] 图片过大: {} bytes, url={}",
-                    content_length,
-                    url[:100],
-                )
-                return None
+        except (TimeoutError, aiohttp.ClientError) as e:
+            if attempt < _DOWNLOAD_RETRY_ATTEMPTS:
+                retry_reason = str(e)
+            else:
+                logger.warning("[ImageDownloader] 下载失败: {}, url={}", e, url[:100])
+                should_abort = True
+        except Exception:
+            logger.warning(
+                "[ImageDownloader] 下载未知错误: url={}",
+                url[:100],
+                exc_info=True,
+            )
+            should_abort = True
 
-            # 读取（带大小限制），读多 1 byte 用于检测超限
-            data = await resp.content.read(_MAX_IMAGE_SIZE + 1)
-            if len(data) > _MAX_IMAGE_SIZE:
-                logger.warning(
-                    "[ImageDownloader] 图片过大 (读取时): {} bytes, url={}",
-                    len(data),
-                    url[:100],
-                )
-                return None
+        if data_uri is not None:
+            return data_uri
 
-            mime_type = _guess_mime_type(resp.content_type, url)
-            b64 = base64.b64encode(data).decode("ascii")
+        if should_abort:
+            break
 
-    except (TimeoutError, aiohttp.ClientError) as e:
-        logger.warning("[ImageDownloader] 下载失败: {}, url={}", e, url[:100])
-        return None
-    except Exception:
-        logger.warning(
-            "[ImageDownloader] 下载未知错误: url={}",
+        if retry_reason is None:
+            break
+
+        delay = _get_retry_delay(attempt)
+        logger.info(
+            "[ImageDownloader] 图片暂未就绪，{} 秒后重试: attempt={} reason={} url={}",
+            f"{delay:.1f}",
+            attempt,
+            retry_reason,
             url[:100],
-            exc_info=True,
         )
-        return None
+        await asyncio.sleep(delay)
 
-    return f"data:{mime_type};base64,{b64}"
+    return None
 
 
 async def download_images_as_base64(urls: list[str]) -> list[str]:
