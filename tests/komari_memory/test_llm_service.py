@@ -230,6 +230,67 @@ def test_existing_context_builder_trims_to_budget() -> None:
     assert result.truncated is True
 
 
+def test_build_summary_prompt_uses_template_content(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        llm_service_module,
+        "get_summary_template",
+        lambda: {
+            "summary_prompt": "前缀\n{{conversation_text}}\n{{existing_context}}\n{{json_response_example}}",
+            "merge_prompt": "不会用到",
+            "existing_context_instruction_block": "不会用到",
+            "existing_profiles_header": "不会用到",
+            "existing_interactions_header": "不会用到",
+            "truncated_context_marker": "不会用到",
+            "json_response_example": '{"ok": true}',
+        },
+    )
+
+    prompt = llm_service_module._build_summary_prompt(
+        "对话正文",
+        existing_context="已有上下文\n",
+    )
+
+    assert prompt == '前缀\n对话正文\n已有上下文\n\n{"ok": true}'
+
+
+def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        llm_service_module,
+        "get_summary_template",
+        lambda: {
+            "summary_prompt": "不会用到",
+            "merge_prompt": "不会用到",
+            "existing_context_instruction_block": "自定义指示",
+            "existing_profiles_header": "自定义画像头",
+            "existing_interactions_header": "自定义互动头",
+            "truncated_context_marker": "自定义截断提示",
+            "json_response_example": "不会用到",
+        },
+    )
+
+    result = llm_service_module._build_existing_context_with_budget(
+        existing_profiles=[
+            {
+                "user_id": "10001",
+                "display_name": "阿明",
+                "traits": [{"key": "喜好", "value": "拉面", "category": "preference"}],
+            }
+        ],
+        existing_interactions=[
+            {
+                "user_id": "10001",
+                "summary": "最近常聊吃饭",
+                "records": [{"event": "约饭", "result": "答应", "emotion": "开心"}],
+            }
+        ],
+        token_budget=None,
+    )
+
+    assert "自定义画像头" in result.text
+    assert "自定义互动头" in result.text
+    assert "自定义指示" in result.text
+
+
 def test_summarize_conversation_single_chunk_trims_existing_context_to_fit_limit(
     monkeypatch: Any,
 ) -> None:

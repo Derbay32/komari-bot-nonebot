@@ -13,6 +13,12 @@ from nonebot.plugin import require
 
 from ..config_schema import KomariMemoryConfigSchema  # noqa: TC001
 from ..core.retry import retry_async
+from .summary_prompt_template import (
+    get_template as get_summary_template,
+)
+from .summary_prompt_template import (
+    render_template as render_summary_template,
+)
 from .token_counter import estimate_text_tokens
 
 if TYPE_CHECKING:
@@ -21,20 +27,9 @@ if TYPE_CHECKING:
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
 
-_JSON_RESPONSE_EXAMPLE = (
-    '{"summary": "...", "user_profiles": '
-    '[{"user_id": "12345", "display_name": "阿明", "traits": '
-    '[{"key": "喜欢的食物", "value": "拉面", "category": "preference", "importance": 4}]}], '
-    '"user_interactions": [{"user_id": "12345", "file_type": "用户的近期对鞠行为备忘录", '
-    '"description": "这是我在心里对这个用户近期行为的悄悄记录。用来提醒自己这个人平时是怎么对我的，下次和他说话时应该保持什么态度。", '
-    '"records": [{"event": "用好吃的诱惑我", "result": "咽了口水，稍微凑近了过去", "emotion": "有点警惕但很想吃"}], '
-    '"summary": "是个经常用食物钓我的骗子先生……但也不是坏人。"}], '
-    '"importance": 3}'
-)
 _MESSAGE_SPLIT_MARKER = "[分片0000] "
 _MAX_EXISTING_TRAITS_PER_USER = 5
 _MAX_EXISTING_INTERACTION_RECORDS = 2
-_TRUNCATED_CONTEXT_MARKER = "【提示】其余已有记录已按 token 上限省略，请仅基于当前提供的已知信息做去重与覆盖。\n\n"
 
 
 @dataclass(frozen=True)
@@ -124,7 +119,8 @@ def _compact_profile_line(profile: dict[str, Any]) -> str | None:
                 {
                     "key": key,
                     "value": value,
-                    "category": str(raw.get("category", "general")).strip() or "general",
+                    "category": str(raw.get("category", "general")).strip()
+                    or "general",
                     "importance": int(raw.get("importance", 3) or 3),
                 }
             )
@@ -140,7 +136,8 @@ def _compact_profile_line(profile: dict[str, Any]) -> str | None:
                 {
                     "key": key,
                     "value": value,
-                    "category": str(raw.get("category", "general")).strip() or "general",
+                    "category": str(raw.get("category", "general")).strip()
+                    or "general",
                     "importance": int(raw.get("importance", 3) or 3),
                 }
             )
@@ -185,14 +182,8 @@ def _build_existing_context_with_budget(
     token_budget: int | None,
 ) -> _ExistingContextBuildResult:
     """构建可控大小的已有画像与互动历史提示。"""
-    instruction_block = (
-        "【重要指示】\n"
-        "- 你输出的是 user_profiles（按用户聚合），不要输出扁平 entities 列表\n"
-        "- 如果对话中发现与已有画像矛盾的新信息，请用新信息覆盖旧值（同 key 覆盖）\n"
-        "- 如果对话中没有提到某个旧特征，不要重复输出它\n"
-        "- 只输出需要新增或更新的画像特征\n"
-        "- 对于互动历史，请在已有记录的基础上追加新的 records（注意：如果 records 总数超过6条，请只保留最近的6条记录）\n\n"
-    )
+    template = get_summary_template()
+    instruction_block = f"{template['existing_context_instruction_block']}\n\n"
     instruction_tokens = estimate_text_tokens(instruction_block)
     if token_budget is not None and token_budget <= instruction_tokens:
         return _ExistingContextBuildResult(
@@ -231,10 +222,10 @@ def _build_existing_context_with_budget(
         if (line := _compact_profile_line(profile)) is not None
     ]
     if profile_lines:
-        profile_header = "【已知用户画像（数据库中已有记录）】\n以下是目前已存储的用户画像：\n"
+        profile_header = template["existing_profiles_header"]
         header_added = False
         for line in profile_lines:
-            block = f"{profile_header}{line}\n" if not header_added else f"{line}\n"
+            block = f"{profile_header}\n{line}\n" if not header_added else f"{line}\n"
             if _append_block(block):
                 header_added = True
                 included_profiles += 1
@@ -250,11 +241,11 @@ def _build_existing_context_with_budget(
         if (line := _compact_interaction_line(interaction)) is not None
     ]
     if interaction_lines:
-        interaction_header = "以下是目前已存储的用户互动历史：\n"
+        interaction_header = template["existing_interactions_header"]
         header_added = False
         for line in interaction_lines:
             block = (
-                f"{interaction_header}{line}\n" if not header_added else f"{line}\n"
+                f"{interaction_header}\n{line}\n" if not header_added else f"{line}\n"
             )
             if _append_block(block):
                 header_added = True
@@ -266,7 +257,7 @@ def _build_existing_context_with_budget(
             _append_block("\n")
 
     if truncated:
-        _append_block(_TRUNCATED_CONTEXT_MARKER)
+        _append_block(f"{template['truncated_context_marker']}\n\n")
 
     data_text = "".join(blocks)
     if not data_text:
@@ -294,37 +285,13 @@ def _build_summary_prompt(
     existing_context: str = "",
 ) -> str:
     """构建原始对话总结提示词。"""
-    return f"""请总结以下群聊或私聊对话，提取每个用户的画像信息，并评估对话的重要性。输出必须使用简体中文。
-
-每条消息格式为 [user_id:xxx] 昵称: 内容。请你在提取时将 user_id 准确关联。
-
-{conversation_text}
-
-{existing_context}【任务一：用户画像提取（按用户聚合）】
-- 提取对话的核心内容，形成 summary（简短总结）。
-- 输出 `user_profiles` 数组，每个元素对应一个用户，字段包含：
-  - user_id
-  - display_name（可为空字符串）
-  - traits（数组），每个 trait 包含 key/value/category/importance
-- category 仅可取：preference/fact/relation/general
-- traits 只保留长期稳定、可复用的画像信息，例如身份、长期偏好、稳定习惯、关系认知、长期事实
-- 不要输出短期状态、一次性事件、瞬时情绪、当天安排，也不要把语义相近的 traits 拆成多个近义 key
-- 对重复或近义 traits 进行合并，尽量使用更稳定、不易过时的 key 与 value
-
-【任务二：主观互动备忘录提取】
-- 你必须基于《败犬女主太多了！》中"小鞠知花"的人设视角，为有明显互动行为的用户，提取出在互动期间该用户的行为记录。这将被作为"小鞠在心里对近期互动过的用户的悄悄记录"。
-- 数据格式要求如下：必须包含 user_id, file_type, description, records(包括 event[行为], result[反应], emotion[感受]), summary。
-
-【任务三：评估重要性】
-请按以下标准评估重要性（1-5分）：
-- 1分：无意义的闲聊、表情包测试、简短问候
-- 2分：简单的日常对话
-- 3分：一般的讨论交流
-- 4分：有意义的话题讨论或较深的互动
-- 5分：重要的决定、约定、深度的设定或情感交流
-
-请严格返回以下 JSON 格式：
-{_JSON_RESPONSE_EXAMPLE}"""
+    template = get_summary_template()
+    return render_summary_template(
+        template["summary_prompt"],
+        conversation_text=conversation_text,
+        existing_context=existing_context,
+        json_response_example=template["json_response_example"],
+    )
 
 
 def _build_merge_prompt(
@@ -333,21 +300,13 @@ def _build_merge_prompt(
     existing_context: str = "",
 ) -> str:
     """构建分段总结后的二次汇总提示词。"""
-    return f"""请将以下按时间顺序排列的分段总结整合成一份最终总结。输出必须使用简体中文。
-
-每个分段总结都已经是结构化结果，包含 summary、user_profiles、user_interactions、importance。
-请你基于这些分段结果，输出一份全局统一的最终 JSON：
-- 合并重复 user_id 的画像信息，只保留新增或更新的 traits
-- user_profiles 只保留长期稳定 traits，删除短期状态、一次性事件与明显重复项
-- 对近义或重复 traits 进行合并，统一为更稳定的 key
-- 合并互动历史，records 总数最多保留最近6条
-- 产出一份整体 summary 和整体 importance
-- 不要按分段分别输出，不要解释推理过程
-
-{chunk_summaries_text}
-
-{existing_context}请严格返回以下 JSON 格式：
-{_JSON_RESPONSE_EXAMPLE}"""
+    template = get_summary_template()
+    return render_summary_template(
+        template["merge_prompt"],
+        chunk_summaries_text=chunk_summaries_text,
+        existing_context=existing_context,
+        json_response_example=template["json_response_example"],
+    )
 
 
 def _format_message_prefix(
@@ -381,7 +340,9 @@ def _split_oversized_message(
     """把单条超长消息拆成多个分片，避免单条消息打爆输入上限。"""
     max_content_tokens = max(
         1,
-        payload_limit - estimate_text_tokens(prefix) - estimate_text_tokens(_MESSAGE_SPLIT_MARKER),
+        payload_limit
+        - estimate_text_tokens(prefix)
+        - estimate_text_tokens(_MESSAGE_SPLIT_MARKER),
     )
 
     parts: list[str] = []
@@ -435,7 +396,10 @@ def _chunk_formatted_messages(
     for line in prepared_lines:
         line_tokens = estimate_text_tokens(line)
         separator_tokens = 1 if current_lines else 0
-        if current_lines and current_tokens + separator_tokens + line_tokens > payload_limit:
+        if (
+            current_lines
+            and current_tokens + separator_tokens + line_tokens > payload_limit
+        ):
             chunks.append(
                 _ConversationChunk(
                     lines=list(current_lines),
