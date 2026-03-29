@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from nonebot import on_command
+
+# NoneBot 会在运行时解析处理函数注解，这里必须导入真实类型。
+from nonebot.adapters.onebot.v11 import Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg, Depends
 from nonebot.permission import SUPERUSER
 
 from .manager import CharacterBindingManager, get_manager
-
-if TYPE_CHECKING:
-    from nonebot.adapters.onebot.v11 import Message, MessageEvent
 
 
 @dataclass(slots=True)

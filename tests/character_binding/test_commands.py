@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import asyncio
 from importlib import import_module
+from typing import get_type_hints
 
 import nonebot
 import pytest
 
 nonebot.init()
 commands = import_module("komari_bot.plugins.character_binding.commands")
+
+
+def test_runtime_type_hints_can_resolve_onebot_message_types() -> None:
+    event_hints = get_type_hints(commands.get_event_user_id)
+    message_hints = get_type_hints(commands.get_command_text)
+
+    assert event_hints["event"].__name__ == "MessageEvent"
+    assert message_hints["args"].__name__ == "Message"
 
 
 class _FinishedError(Exception):
