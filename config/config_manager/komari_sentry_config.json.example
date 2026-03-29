@@ -14,5 +14,6 @@
   "max_breadcrumbs": 100,
   "shutdown_timeout": 2.0,
   "breadcrumb_level": "INFO",
+  "sentry_logs_level": "INFO",
   "event_level": "ERROR"
 }

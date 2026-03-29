@@ -36,6 +36,7 @@ class SentryConfigProtocol(Protocol):
     send_default_pii: bool
     max_breadcrumbs: int
     breadcrumb_level: str
+    sentry_logs_level: str
     event_level: str
 
 
@@ -70,6 +71,7 @@ def build_sentry_init_options(
     dsn: str,
     resolve_level: Callable[[str, int], int],
     logging_integration_factory: Callable[..., Any],
+    loguru_integration_factory: Callable[..., Any],
     asyncio_integration_factory: Callable[[], Any],
     fastapi_integration_factory: Callable[[], Any],
     starlette_integration_factory: Callable[[], Any],
@@ -77,6 +79,7 @@ def build_sentry_init_options(
 ) -> dict[str, Any]:
     """构建 sentry_sdk.init 所需参数。"""
     breadcrumb_level = resolve_level(config.breadcrumb_level, logging.INFO)
+    sentry_logs_level = resolve_level(config.sentry_logs_level, logging.INFO)
     event_level = resolve_level(config.event_level, logging.ERROR)
     environment = config.environment.strip() or environ.get("ENVIRONMENT", "prod")
     release = config.release.strip() or None
@@ -92,10 +95,17 @@ def build_sentry_init_options(
         "attach_stacktrace": config.attach_stacktrace,
         "send_default_pii": config.send_default_pii,
         "max_breadcrumbs": config.max_breadcrumbs,
+        "enable_logs": True,
         "before_send": sentry_before_send,
         "ignore_errors": list(get_ignored_sentry_exceptions()),
         "integrations": [
             logging_integration_factory(
+                sentry_logs_level=sentry_logs_level,
+                level=breadcrumb_level,
+                event_level=event_level,
+            ),
+            loguru_integration_factory(
+                sentry_logs_level=sentry_logs_level,
                 level=breadcrumb_level,
                 event_level=event_level,
             ),

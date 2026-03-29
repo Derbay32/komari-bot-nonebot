@@ -9,6 +9,14 @@ from pydantic import BaseModel, Field, field_validator
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
+def _normalize_log_level(value: object, default: str) -> str:
+    """规范化日志级别字段。"""
+    text = str(value or "").strip().upper()
+    if text not in _VALID_LOG_LEVELS:
+        return default
+    return text
+
+
 class KomariSentryConfigSchema(BaseModel):
     """Komari Sentry 动态配置。"""
 
@@ -67,6 +75,10 @@ class KomariSentryConfigSchema(BaseModel):
         default="INFO",
         description="记录为 breadcrumb 的日志级别",
     )
+    sentry_logs_level: str = Field(
+        default="INFO",
+        description="发送到 Sentry Logs 的日志级别",
+    )
     event_level: str = Field(
         default="ERROR",
         description="转为 Sentry 事件的日志级别",
@@ -76,16 +88,16 @@ class KomariSentryConfigSchema(BaseModel):
     @classmethod
     def normalize_breadcrumb_level(cls, value: object) -> str:
         """规范化 breadcrumb 日志级别字段。"""
-        text = str(value or "").strip().upper()
-        if text not in _VALID_LOG_LEVELS:
-            return "INFO"
-        return text
+        return _normalize_log_level(value, "INFO")
+
+    @field_validator("sentry_logs_level", mode="before")
+    @classmethod
+    def normalize_sentry_logs_level(cls, value: object) -> str:
+        """规范化 Sentry Logs 日志级别字段。"""
+        return _normalize_log_level(value, "INFO")
 
     @field_validator("event_level", mode="before")
     @classmethod
     def normalize_event_level(cls, value: object) -> str:
         """规范化 event 日志级别字段。"""
-        text = str(value or "").strip().upper()
-        if text not in _VALID_LOG_LEVELS:
-            return "ERROR"
-        return text
+        return _normalize_log_level(value, "ERROR")

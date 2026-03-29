@@ -19,12 +19,14 @@ try:
     from sentry_sdk.integrations.asyncio import AsyncioIntegration
     from sentry_sdk.integrations.fastapi import FastApiIntegration
     from sentry_sdk.integrations.logging import LoggingIntegration
+    from sentry_sdk.integrations.loguru import LoguruIntegration
     from sentry_sdk.integrations.starlette import StarletteIntegration
 except ImportError:
     sentry_sdk = None  # type: ignore[assignment]
     AsyncioIntegration = None  # type: ignore[assignment]
     FastApiIntegration = None  # type: ignore[assignment]
     LoggingIntegration = None  # type: ignore[assignment]
+    LoguruIntegration = None  # type: ignore[assignment]
     StarletteIntegration = None  # type: ignore[assignment]
 
 __plugin_meta__ = PluginMetadata(
@@ -71,6 +73,7 @@ async def startup() -> None:
         AsyncioIntegration is None
         or FastApiIntegration is None
         or LoggingIntegration is None
+        or LoguruIntegration is None
         or StarletteIntegration is None
     ):
         logger.warning("[KomariSentry] sentry_sdk integrations 不可用，跳过初始化")
@@ -90,6 +93,7 @@ async def startup() -> None:
         dsn=dsn,
         resolve_level=_resolve_level,
         logging_integration_factory=LoggingIntegration,
+        loguru_integration_factory=LoguruIntegration,
         asyncio_integration_factory=AsyncioIntegration,
         fastapi_integration_factory=FastApiIntegration,
         starlette_integration_factory=StarletteIntegration,
