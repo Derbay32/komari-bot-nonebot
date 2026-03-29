@@ -196,8 +196,6 @@ def test_attempt_reply_uses_history_before_current_message(
         _fake_build_prompt,
     )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_reply)
-    monkeypatch.setattr(message_handler_module, "is_not_related", lambda _reply: False)
-
     original_require = nonebot.plugin.require
 
     def _fake_require(name: str) -> object:

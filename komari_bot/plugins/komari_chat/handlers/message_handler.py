@@ -24,7 +24,6 @@ from komari_bot.plugins.komari_memory.services.token_counter import (
 
 from ..services.image_downloader import download_images_as_base64
 from ..services.llm_service import generate_reply
-from ..services.not_related_logger import is_not_related, log_not_related
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 
@@ -41,7 +40,6 @@ ReplyAction = Literal[
     "replied",
     "replied_forced",
     "not_replied",
-    "not_related",
     "generation_failed",
 ]
 
@@ -423,21 +421,6 @@ class MessageHandler:
                 message.group_id,
                 reason,
                 f"{reply_score:.3f}" if reply_score is not None else "-",
-            )
-            return None, stored
-
-        if is_not_related(reply):
-            logger.info(
-                "[KomariMemory] not related: group={} reason={} score={}",
-                message.group_id,
-                reason,
-                f"{reply_score:.3f}" if reply_score is not None else "-",
-            )
-            await log_not_related(
-                user_message=message.content,
-                group_id=message.group_id,
-                user_id=message.user_id,
-                score=reply_score,
             )
             return None, stored
 
