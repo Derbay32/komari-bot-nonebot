@@ -25,7 +25,14 @@ from komari_bot.common.database_config import (
     load_database_config_from_file,
     merge_database_config,
 )
+from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.vector_storage_schema import (
+    PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
+    apply_schema_statements,
+    build_knowledge_embedding_index_statement,
+    build_knowledge_schema_statements,
+)
 
 from .config_schema import DynamicConfigSchema
 
@@ -145,38 +152,110 @@ class KnowledgeEngine:
         # 获取配置
         config = get_config()
 
-        # 1. 加载向量嵌入模型
+        try:
+            # 1. 加载向量嵌入模型
+            if state.nonebot_mode:
+                state.logger.info("[Komari Knowledge] 使用全局 EmbeddingProvider 服务")
+            elif getattr(self, "_embedding_service", None) is None:
+                state.logger.info("[Komari Knowledge] 加载独立嵌入服务...")
+                from komari_bot.plugins.embedding_provider.config_schema import (
+                    DynamicConfigSchema as EmbedConfigSchema,
+                )
+                from komari_bot.plugins.embedding_provider.embedding_service import (
+                    EmbeddingService,
+                )
+
+                config_path = Path("config/config_manager/embedding_provider_config.json")
+                if config_path.exists():
+                    with Path.open(config_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    embed_config = EmbedConfigSchema(**data)
+                else:
+                    embed_config = EmbedConfigSchema()
+
+                self._embedding_service = EmbeddingService(embed_config)
+                state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
+
+            # 2. 建立数据库连接池
+            if self._pool is None:
+                db_config = get_db_config(config)
+                self._pool = await create_postgres_pool(db_config, command_timeout=30)
+                state.logger.info("[Komari Knowledge] 数据库连接池已建立")
+                expected_dimension = self._resolve_expected_embedding_dimension()
+                await self._ensure_storage_schema(expected_dimension)
+                await self._validate_embedding_dimension(expected_dimension)
+
+            # 3. 构建关键词索引（内存预热）
+            await self._build_keyword_index()
+            state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+        except Exception:
+            try:
+                await self.close()
+            except Exception:
+                state.logger.exception("[Komari Knowledge] 初始化失败后的清理失败")
+            raise
+
+    def _resolve_expected_embedding_dimension(self) -> int | None:
+        """解析当前 embedding 配置的目标维度。"""
+        expected_dimension: int | None = None
         if state.nonebot_mode:
-            state.logger.info("[Komari Knowledge] 使用全局 EmbeddingProvider 服务")
-        elif getattr(self, "_embedding_service", None) is None:
-            state.logger.info("[Komari Knowledge] 加载独立嵌入服务...")
-            from komari_bot.plugins.embedding_provider.config_schema import (
-                DynamicConfigSchema as EmbedConfigSchema,
-            )
-            from komari_bot.plugins.embedding_provider.embedding_service import (
-                EmbeddingService,
-            )
+            from nonebot.plugin import require
 
-            config_path = Path("config/config_manager/embedding_provider_config.json")
-            if config_path.exists():
-                with Path.open(config_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                embed_config = EmbedConfigSchema(**data)
-            else:
-                embed_config = EmbedConfigSchema()
+            embedding_provider = require("embedding_provider")
+            get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
+            if callable(get_dimension):
+                raw_dimension = get_dimension()
+                if isinstance(raw_dimension, int):
+                    expected_dimension = raw_dimension
+                elif isinstance(raw_dimension, str):
+                    expected_dimension = int(raw_dimension)
+                elif raw_dimension is not None:
+                    msg = f"embedding_provider 返回了无效维度类型: {type(raw_dimension)!r}"
+                    raise TypeError(msg)
+        elif getattr(self, "_embedding_service", None) is not None:
+            expected_dimension = int(self._embedding_service.config.embedding_dimension)
+        return expected_dimension
 
-            self._embedding_service = EmbeddingService(embed_config)
-            state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
-
-        # 2. 建立数据库连接池
+    async def _ensure_storage_schema(self, expected_dimension: int | None) -> None:
+        """按当前 embedding 维度补齐常识库基础表结构。"""
         if self._pool is None:
-            db_config = get_db_config(config)
-            self._pool = await create_postgres_pool(db_config, command_timeout=30)
-            state.logger.info("[Komari Knowledge] 数据库连接池已建立")
+            msg = "数据库连接池未初始化"
+            raise RuntimeError(msg)
+        if expected_dimension is None:
+            msg = "无法确定 embedding 维度，不能初始化 knowledge schema"
+            raise RuntimeError(msg)
 
-        # 3. 构建关键词索引（内存预热）
-        await self._build_keyword_index()
-        state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
+        await apply_schema_statements(
+            self._pool,
+            statements=build_knowledge_schema_statements(expected_dimension),
+        )
+        if build_knowledge_embedding_index_statement(expected_dimension) is None:
+            state.logger.warning(
+                "[Komari Knowledge] embedding 维度 "
+                f"{expected_dimension} 超过 pgvector HNSW 上限 "
+                f"{PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS}，"
+                "已跳过 idx_komari_knowledge_embedding，语义检索将退化为顺序扫描。"
+            )
+        state.logger.info(
+            f"[Komari Knowledge] PostgreSQL schema 检查完成 (embedding={expected_dimension})"
+        )
+
+    async def _validate_embedding_dimension(
+        self,
+        expected_dimension: int | None,
+    ) -> None:
+        """校验知识库向量列与当前 embedding 配置一致。"""
+        if self._pool is None:
+            msg = "数据库连接池未初始化"
+            raise RuntimeError(msg)
+
+        await ensure_vector_column_dimension(
+            self._pool,
+            table_name="komari_knowledge",
+            column_name="embedding",
+            expected_dimension=expected_dimension,
+            label="KomariKnowledge",
+        )
 
     async def _build_keyword_index(self) -> None:
         """构建关键词内存索引。
@@ -187,6 +266,8 @@ class KnowledgeEngine:
             raise RuntimeError("数据库连接池未初始化")
 
         state.logger.info("[Komari Knowledge] 正在构建关键词索引...")
+        self._keyword_index.clear()
+        self._index_loaded = False
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -282,6 +363,11 @@ class KnowledgeEngine:
             state.logger.info(
                 f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'"
             )
+            if query_vec is not None:
+                state.logger.debug(
+                    "[Komari Knowledge] 查询文本已改写，丢弃预生成向量并使用新查询重算"
+                )
+                query_vec = None
 
         results: list[SearchResult] = []
         seen_ids: set[int] = set()
@@ -665,10 +751,35 @@ class KnowledgeEngine:
 
     async def close(self) -> None:
         """关闭连接池并清理资源。"""
+        errors: list[BaseException] = []
+
+        if self._embedding_service is not None:
+            try:
+                await self._embedding_service.cleanup()
+                state.logger.info("[Komari Knowledge] 独立嵌入服务已关闭")
+            except Exception as e:
+                errors.append(e)
+                state.logger.exception("[Komari Knowledge] 关闭独立嵌入服务失败")
+            finally:
+                self._embedding_service = None
+
         if self._pool:
-            await self._pool.close()
-            self._pool = None
-            state.logger.info("[Komari Knowledge] 连接池已关闭")
+            try:
+                await self._pool.close()
+                state.logger.info("[Komari Knowledge] 连接池已关闭")
+            except Exception as e:
+                errors.append(e)
+                state.logger.exception("[Komari Knowledge] 关闭连接池失败")
+            finally:
+                self._pool = None
+
+        self._keyword_index.clear()
+        self._index_loaded = False
+        if state.engine is self:
+            state.engine = None
+
+        if errors:
+            raise errors[0]
 
 
 def get_engine() -> KnowledgeEngine | None:
@@ -683,7 +794,8 @@ async def initialize_engine() -> KnowledgeEngine:
         引擎实例
     """
     if state.engine is None:
-        state.engine = KnowledgeEngine()
-        await state.engine.initialize()
+        engine = KnowledgeEngine()
+        await engine.initialize()
+        state.engine = engine
 
     return state.engine

@@ -1,13 +1,175 @@
 """Komari Memory 后台总结任务。"""
 
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
+
+from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
+from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
 from ..core.retry import retry_async
 from ..services.config_interface import get_config
 from ..services.llm_service import summarize_conversation
-from ..services.memory_service import MemoryService
-from ..services.redis_manager import RedisManager
+from ..services.profile_compaction import (
+    LoggerLike,
+    compact_profile_with_llm,
+    count_profile_traits,
+    profile_json_length,
+)
+
+character_binding = require("character_binding")
+llm_provider = require("llm_provider")
+
+if TYPE_CHECKING:
+    from ..config_schema import KomariMemoryConfigSchema
+    from ..services.memory_service import MemoryService
+    from ..services.redis_manager import RedisManager
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _default_profile(*, user_id: str, display_name: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "user_id": user_id,
+        "display_name": display_name,
+        "traits": {},
+        "updated_at": _now_iso(),
+    }
+
+
+def _default_interaction(*, user_id: str, display_name: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "user_id": user_id,
+        "display_name": display_name,
+        "file_type": "用户的近期对鞠行为备忘录",
+        "description": "暂无互动记录",
+        "records": [],
+        "summary": "",
+        "updated_at": _now_iso(),
+    }
+
+
+def _merge_traits_into_profile(
+    base_profile: dict[str, Any],
+    *,
+    display_name: str,
+    traits_payload: list[dict[str, Any]],
+) -> dict[str, Any]:
+    profile = dict(base_profile)
+    profile["version"] = 1
+    profile["display_name"] = display_name
+
+    traits_raw = profile.get("traits")
+    traits = dict(traits_raw) if isinstance(traits_raw, dict) else {}
+    for trait in traits_payload:
+        key = str(trait.get("key", "")).strip()
+        value = str(trait.get("value", "")).strip()
+        if not key or not value:
+            continue
+        try:
+            importance = int(trait.get("importance", 3))
+        except (TypeError, ValueError):
+            importance = 3
+        traits[key] = {
+            "value": value,
+            "category": str(trait.get("category", "general")),
+            "importance": max(1, min(5, importance)),
+            "updated_at": _now_iso(),
+        }
+
+    profile["traits"] = traits
+    profile["updated_at"] = _now_iso()
+    return profile
+
+
+async def _enforce_profile_trait_limit(
+    *,
+    group_id: str,
+    user_id: str,
+    base_profile: dict[str, Any],
+    merged_profile: dict[str, Any],
+    config: KomariMemoryConfigSchema,
+) -> dict[str, Any]:
+    merged_trait_count = count_profile_traits(merged_profile)
+    if merged_trait_count <= config.profile_trait_limit:
+        return merged_profile
+
+    base_trait_count = count_profile_traits(base_profile)
+    trace_id = f"profilecap-{uuid4().hex[:8]}"
+    logger.warning(
+        "[KomariMemory] 用户画像超过上限，准备压缩: trace_id={} group={} user={} base_traits={} merged_traits={} base_chars={} merged_chars={} limit={}",
+        trace_id,
+        group_id,
+        user_id,
+        base_trait_count,
+        merged_trait_count,
+        profile_json_length(base_profile),
+        profile_json_length(merged_profile),
+        config.profile_trait_limit,
+    )
+
+    try:
+        compacted_profile = await compact_profile_with_llm(
+            profile=merged_profile,
+            config=config,
+            llm_generate_text=llm_provider.generate_text,
+            trace_id=trace_id,
+            source="summary_worker",
+            log=cast("LoggerLike", logger),
+        )
+    except Exception:
+        logger.exception(
+            "[KomariMemory] 用户画像压缩失败，回退旧画像: trace_id={} group={} user={} fallback_traits={} fallback_chars={}",
+            trace_id,
+            group_id,
+            user_id,
+            base_trait_count,
+            profile_json_length(base_profile),
+        )
+        return base_profile
+
+    logger.info(
+        "[KomariMemory] 用户画像压缩完成: trace_id={} group={} user={} before_traits={} after_traits={} before_chars={} after_chars={}",
+        trace_id,
+        group_id,
+        user_id,
+        merged_trait_count,
+        count_profile_traits(compacted_profile),
+        profile_json_length(merged_profile),
+        profile_json_length(compacted_profile),
+    )
+    return compacted_profile
+
+
+def _normalize_interaction(
+    raw: dict[str, Any] | None,
+    *,
+    user_id: str,
+    display_name: str,
+) -> dict[str, Any]:
+    if raw is None:
+        return _default_interaction(user_id=user_id, display_name=display_name)
+    interaction = dict(raw)
+    interaction["version"] = 1
+    interaction["user_id"] = user_id
+    interaction["display_name"] = display_name
+    interaction["file_type"] = str(
+        interaction.get("file_type", "用户的近期对鞠行为备忘录")
+    )
+    interaction["description"] = str(interaction.get("description", ""))
+    records = interaction.get("records")
+    interaction["records"] = records if isinstance(records, list) else []
+    interaction["summary"] = str(interaction.get("summary", ""))
+    interaction["updated_at"] = _now_iso()
+    return interaction
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -15,20 +177,12 @@ async def summary_worker_task(
     redis: RedisManager,
     memory: MemoryService,
 ) -> None:
-    """定期检查并触发总结。
-
-    Args:
-        redis: Redis 管理器
-        memory: 记忆服务
-    """
-    # 获取所有有消息缓冲的群组
+    """定期检查并触发总结。"""
     group_ids = await redis.get_active_groups()
-
     if not group_ids:
         return
 
-    logger.debug(f"[KomariMemory] 检查 {len(group_ids)} 个群组的总结任务...")
-
+    logger.debug("[KomariMemory] 检查 {} 个群组的总结任务...", len(group_ids))
     for group_id in group_ids:
         if await redis.should_trigger_summary(group_id):
             await perform_summary(group_id, redis, memory)
@@ -39,151 +193,148 @@ async def perform_summary(
     redis: RedisManager,
     memory: MemoryService,
 ) -> None:
-    """执行群组的对话总结。
-
-    Args:
-        group_id: 群组 ID
-        redis: Redis 管理器
-        memory: 记忆服务
-    """
-    logger.info(f"[KomariMemory] 开始总结群组 {group_id} 的对话")
-
-    # 获取最新配置
+    """执行群组的对话总结。"""
+    logger.info("[KomariMemory] 开始总结群组 {} 的对话", group_id)
     config = get_config()
 
-    # 获取消息缓冲
-    messages_buffer = await redis.get_buffer(
-        group_id, limit=config.summary_max_messages
-    )
-
+    messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_messages)
     if not messages_buffer:
-        logger.warning(f"[KomariMemory] 群组 {group_id} 消息缓冲为空")
+        logger.warning("[KomariMemory] 群组 {} 消息缓冲为空", group_id)
         return
 
-    # 获取参与者列表（提前到这里，用于查询现有实体）
-    participants = list({msg.user_id for msg in messages_buffer})
+    participants = list({msg.user_id for msg in messages_buffer if not msg.is_bot})
+    nickname_map: dict[str, str] = {}
+    for msg in messages_buffer:
+        if msg.is_bot:
+            continue
+        if msg.user_id not in nickname_map and msg.user_nickname:
+            nickname_map[msg.user_id] = msg.user_nickname
 
-    # 查询现有实体和互动历史，传给 LLM 以支持更新操作
-    existing_entities: list[dict] = []
-    existing_interactions: list[dict] = []
+    existing_profiles: dict[str, dict[str, Any]] = {}
+    existing_interactions: dict[str, dict[str, Any]] = {}
+
     for uid in participants:
-        user_entities = await memory.get_entities(
-            user_id=uid, group_id=group_id, limit=50
-        )
-        existing_entities.extend(user_entities)
+        profile = await memory.get_user_profile(user_id=uid, group_id=group_id)
+        if profile is not None:
+            existing_profiles[uid] = profile
 
-        interaction = await memory.get_interaction_history(
-            user_id=uid, group_id=group_id
-        )
-        if interaction:
-            existing_interactions.append(interaction)
+        interaction = await memory.get_interaction_history(user_id=uid, group_id=group_id)
+        if interaction is not None:
+            existing_interactions[uid] = interaction
 
-    # 调用 LLM 总结（传递现有实体以支持增量更新）
     result = await summarize_conversation(
         messages_buffer,
         config,
-        existing_entities=existing_entities,
-        existing_interactions=existing_interactions,
+        existing_profiles=list(existing_profiles.values()),
+        existing_interactions=list(existing_interactions.values()),
     )
 
-    summary = result.get("summary", "")
-    entities = result.get("entities", [])
+    summary = str(result.get("summary", "")).strip()
+    importance = int(result.get("importance", 3))
+    user_profiles = result.get("user_profiles", [])
     user_interactions = result.get("user_interactions", [])
-    importance = result.get("importance", 3)
 
     if not summary:
-        logger.warning(f"[KomariMemory] 群组 {group_id} 总结为空，跳过存储")
+        logger.warning("[KomariMemory] 群组 {} 总结为空，跳过存储", group_id)
         return
 
-    # 存储对话总结（带向量和重要性评分）
     conversation_id = await memory.store_conversation(
         group_id=group_id,
         summary=summary,
         participants=participants,
-        importance_initial=importance,
+        importance_initial=max(1, min(5, importance)),
     )
 
-    # 存储常规实体
-    for entity in entities:
-        try:
-            entity_key = entity.get("key", "")
-            entity_value = entity.get("value", "")
-            if not entity_key:
-                logger.debug(f"[KomariMemory] 跳过无效实体 (缺少 key): {entity}")
+    profiles_by_user: dict[str, dict[str, Any]] = {}
+    if isinstance(user_profiles, list):
+        for profile in user_profiles:
+            if not isinstance(profile, dict):
                 continue
-            await memory.upsert_entity(
-                user_id=entity.get(
-                    "user_id", participants[0] if participants else "unknown"
-                ),
-                group_id=group_id,
-                key=entity_key,
-                value=entity_value,
-                category=entity.get("category", "general"),
-                importance=entity.get("importance", 3),
-            )
-        except Exception:
-            logger.warning(
-                f"[KomariMemory] 存储常规实体失败: {entity}",
-                exc_info=True,
-            )
-
-    # 存储用户互动历史 (存为特殊实体)
-    import json
-
-    for interaction in user_interactions:
-        try:
-            uid = interaction.get("user_id")
+            uid = str(profile.get("user_id", "")).strip()
             if not uid:
-                logger.debug(
-                    f"[KomariMemory] 跳过无效互动历史 (缺少 user_id): {interaction}"
-                )
                 continue
+            profiles_by_user[uid] = profile
 
-            # 将互动记录保存为 JSON 字符串，关联到专门的分类和 key
-            interaction_json = json.dumps(interaction, ensure_ascii=False)
-            await memory.upsert_entity(
-                user_id=uid,
-                group_id=group_id,
-                key="interaction_history",
-                value=interaction_json,
-                category="interaction_history",
-                importance=5,  # 确保能通过 highest importance 被优先检索到
-            )
-            logger.debug(f"[KomariMemory] 已更新用户 {uid} 的互动历史记录")
-        except Exception:
-            logger.warning(
-                f"[KomariMemory] 存储用户互动历史失败: {interaction}", exc_info=True
-            )
+    interactions_by_user: dict[str, dict[str, Any]] = {}
+    if isinstance(user_interactions, list):
+        for interaction in user_interactions:
+            if not isinstance(interaction, dict):
+                continue
+            uid = str(interaction.get("user_id", "")).strip()
+            if not uid:
+                continue
+            interactions_by_user[uid] = interaction
 
-    # 重置消息计数
+    target_users = set(participants) | set(profiles_by_user) | set(interactions_by_user)
+    for uid in sorted(target_users):
+        model_display_name = ""
+        profile_payload = profiles_by_user.get(uid)
+        if profile_payload is not None:
+            model_display_name = str(profile_payload.get("display_name", "")).strip()
+        display_name = character_binding.get_character_name(
+            user_id=uid,
+            fallback_nickname=nickname_map.get(uid) or model_display_name,
+        )
+        base_profile = existing_profiles.get(uid) or _default_profile(
+            user_id=uid,
+            display_name=display_name,
+        )
+        traits_payload = (
+            profile_payload.get("traits", [])
+            if isinstance(profile_payload, dict)
+            else []
+        )
+        merged_profile = _merge_traits_into_profile(
+            base_profile,
+            display_name=display_name,
+            traits_payload=traits_payload if isinstance(traits_payload, list) else [],
+        )
+        merged_profile = await _enforce_profile_trait_limit(
+            group_id=group_id,
+            user_id=uid,
+            base_profile=base_profile,
+            merged_profile=merged_profile,
+            config=config,
+        )
+        await memory.upsert_user_profile(
+            user_id=uid,
+            group_id=group_id,
+            profile=merged_profile,
+            importance=4,
+        )
+
+        raw_interaction = interactions_by_user.get(uid) or existing_interactions.get(uid)
+        merged_interaction = _normalize_interaction(
+            raw_interaction,
+            user_id=uid,
+            display_name=display_name,
+        )
+        await memory.upsert_interaction_history(
+            user_id=uid,
+            group_id=group_id,
+            interaction=merged_interaction,
+            importance=5,
+        )
+
     await redis.reset_message_count(group_id)
-
-    # 重置 token 计数（保留向后兼容）
     await redis.reset_tokens(group_id)
-
-    # 清空消息缓冲区
     await redis.delete_buffer(group_id)
-
-    # 更新最后总结时间
     await redis.update_last_summary(group_id)
 
     logger.info(
-        f"[KomariMemory] 群组 {group_id} 总结完成: "
-        f"conversation_id={conversation_id}, entities={len(entities)}"
+        "[KomariMemory] 群组 {} 总结完成: conversation_id={} users={} raw_profiles={}",
+        group_id,
+        conversation_id,
+        len(target_users),
+        len(user_profiles) if isinstance(user_profiles, list) else 0,
     )
 
 
-# 注册定时任务的辅助函数
 def register_summary_task(
     redis: RedisManager,
     memory: MemoryService,
 ) -> None:
-    """注册总结定时任务。
-
-    Args:
-        redis: Redis 管理器
-        memory: 记忆服务
-    """
+    """注册总结定时任务。"""
     scheduler.add_job(
         summary_worker_task,
         "interval",
@@ -195,11 +346,13 @@ def register_summary_task(
     logger.info("[KomariMemory] 总结定时任务已注册")
 
 
-# 取消注册定时任务的辅助函数
 def unregister_summary_task() -> None:
     """取消注册总结定时任务。"""
     try:
         scheduler.remove_job("komari_memory_summary_worker")
-        logger.info("[KomariMemory] 总结定时任务已取消")
+    except JobLookupError:
+        logger.debug("[KomariMemory] 总结定时任务不存在，无需取消")
     except Exception:
-        pass
+        logger.exception("[KomariMemory] 总结定时任务取消失败")
+    else:
+        logger.info("[KomariMemory] 总结定时任务已取消")

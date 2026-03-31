@@ -1,206 +1,209 @@
-# 向量嵌入数据迁移脚本
-# 用于在更换 embedding 模型（由于维度或语义空间变化）时，重新计算数据库中常识库和记忆库的向量。
+"""向量嵌入迁移工具。
 
-# 建议在运行前备份数据库。
-# 运行方式：在项目根目录执行 `poetry run python scripts/migrate_embeddings.py`
+默认以 dry-run 模式运行，只打印配置解析结果、表状态和预计改动。
+执行实际迁移时请显式传入 ``--apply``。
+"""
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
-import asyncpg
-import nonebot
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# 将项目根目录添加到 sys.path 以确保能正确导入 komari_bot 包
-project_root = Path(__file__).parent.parent.resolve()
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-# 初始化 nonebot 并加载必需的外部包，否则直接导入包含 require() 的插件会报错
-nonebot.init()
-nonebot.load_plugin("komari_bot.plugins.config_manager")
-
-from komari_bot.plugins.embedding_provider.config_schema import DynamicConfigSchema
-from komari_bot.plugins.embedding_provider.embedding_service import EmbeddingService
-
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+from komari_bot.common.embedding_migration import (
+    KNOWLEDGE_MIGRATION_SPEC,
+    MEMORY_MIGRATION_SPEC,
+    TableMigrationResult,
+    get_pool_key,
+    load_embedding_config,
+    migrate_table_embeddings,
+    resolve_knowledge_database_config,
+    resolve_memory_database_config,
 )
-logger = logging.getLogger("MigrateEmbeddings")
+from komari_bot.common.postgres import create_postgres_pool
+
+logger = logging.getLogger("migrate_embeddings")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
 
-def load_embedding_config() -> DynamicConfigSchema:
-    """[Helper] 加载 embedding provider 配置"""
-    config_path = Path("config/config_manager/embedding_provider_config.json")
-    if config_path.exists():
-        with config_path.open(encoding="utf-8") as f:
-            data = json.load(f)
-            return DynamicConfigSchema(**data)
-    else:
-        logger.warning(
-            f"Embedding Provider 配置文件不存在 ({config_path})，使用默认配置。请确保已在正确模式下配置API！"
-        )
-        return DynamicConfigSchema()
-
-
-def load_db_config() -> dict:
-    """[Helper] 尝试从 komari_knowledge_config.json 提取数据库配置"""
-    config_path = Path("config/config_manager/komari_knowledge_config.json")
-    if config_path.exists():
-        with config_path.open(encoding="utf-8") as f:
-            data = json.load(f)
-            return {
-                "host": data.get("pg_host", "localhost"),
-                "port": data.get("pg_port", 5432),
-                "user": data.get("pg_user", ""),
-                "password": data.get("pg_password", ""),
-                "database": data.get("pg_database", "komari_bot"),
-            }
-    return {}
-
-
-async def migrate_komari_knowledge(
-    pool: asyncpg.Pool, embedding_service: EmbeddingService
+async def main_async(
+    *,
+    shared_db_config_path: Path,
+    knowledge_config_path: Path,
+    memory_config_path: Path,
+    embedding_config_path: Path,
+    targets: set[str],
+    apply: bool,
 ) -> None:
-    """[Migrate] 重新嵌入 komari_knowledge 表的向量数据"""
-    logger.info("开始迁移 komari_knowledge 向量数据...")
-
-    async with pool.acquire() as conn:
-        # 获取所有需要嵌入的内容
-        rows = await conn.fetch("SELECT id, content FROM komari_knowledge")
-        total = len(rows)
-        logger.info(f"komari_knowledge 共需处理 {total} 条数据。")
-
-        for idx, row in enumerate(rows):
-            kid = row["id"]
-            content = row["content"]
-
-            try:
-                # 重新计算向量
-                embedding = await embedding_service.embed(content)
-
-                # 更新数据库
-                await conn.execute(
-                    "UPDATE komari_knowledge SET embedding = $1::vector WHERE id = $2",
-                    str(embedding),
-                    kid,
-                )
-
-                if (idx + 1) % 10 == 0:
-                    logger.info(f"komari_knowledge: 已处理 {idx + 1}/{total} 条数据")
-
-            except Exception:
-                logger.exception(f"处理 komari_knowledge ID {kid} 时出错:")
-
-    logger.info("komari_knowledge 向量数据迁移完成！\n")
-
-
-async def migrate_komari_memory(
-    pool: asyncpg.Pool, embedding_service: EmbeddingService
-) -> None:
-    """[Migrate] 重新嵌入 komari_memory_conversations 表的向量数据"""
-    logger.info("开始迁移 komari_memory_conversations 向量数据...")
-
-    async with pool.acquire() as conn:
-        # 检查表是否存在
-        table_exists = await conn.fetchval(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'komari_memory_conversations')"
-        )
-        if not table_exists:
-            logger.warning("komari_memory_conversations 表不存在，跳过记忆库迁移。\n")
-            return
-
-        # 获取所有需要嵌入的对话摘要
-        rows = await conn.fetch(
-            "SELECT id, summary FROM komari_memory_conversations WHERE summary IS NOT NULL AND summary != ''"
-        )
-        total = len(rows)
-        logger.info(f"komari_memory_conversations 共需处理 {total} 条数据。")
-
-        for idx, row in enumerate(rows):
-            cid = row["id"]
-            summary = row["summary"]
-
-            try:
-                # 重新计算向量
-                embedding = await embedding_service.embed(summary)
-
-                # 更新数据库
-                await conn.execute(
-                    "UPDATE komari_memory_conversations SET embedding = $1::vector WHERE id = $2",
-                    str(embedding),
-                    cid,
-                )
-
-                if (idx + 1) % 10 == 0:
-                    logger.info(
-                        f"komari_memory_conversations: 已处理 {idx + 1}/{total} 条数据"
-                    )
-
-            except Exception:
-                logger.exception(f"处理 komari_memory_conversations ID {cid} 时出错:")
-
-    logger.info("komari_memory_conversations 向量数据迁移完成！\n")
-
-
-async def main() -> None:
-    """[Main] 迁移主函数"""
-    logger.info("=== Komari Bot 向量嵌入重计算迁移工具 ===")
-
-    # 1. 初始化 Embedding Service
-    embed_config = load_embedding_config()
+    embed_config = load_embedding_config(embedding_config_path)
+    target_dimension = int(embed_config.embedding_dimension)
     logger.info(
-        f"当前使用的 Embedding Provider 模式: {embed_config.embedding_source} (维度: {embed_config.embedding_dimension})"
+        "当前 Embedding Provider: source=%s model=%s dimension=%s",
+        embed_config.embedding_source,
+        embed_config.embedding_model,
+        target_dimension,
     )
 
-    embedding_service = EmbeddingService(embed_config)
-
-    # 请注意：如果是修改了维度，你需要提前在 psql 中执行：
-    # ALTER TABLE komari_knowledge ALTER COLUMN embedding TYPE vector(新维度);
-    # ALTER TABLE komari_memory_conversation ALTER COLUMN embedding TYPE vector(新维度);
-    # 否则插入时会报错维度不匹配。
-
-    # 2. 连接数据库
-    db_config = load_db_config()
-    if not db_config.get("user") or not db_config.get("password"):
-        logger.error(
-            "无法从配置文件读取到 PostgreSQL 账户密码。请确保 komari_knowledge_config.json 中配置正确。"
-        )
-        return
-
-    logger.info(
-        f"正在连接到数据库 PostgreSQL {db_config['host']}:{db_config['port']} / {db_config['database']} ..."
+    knowledge_db_config = resolve_knowledge_database_config(
+        shared_config_path=shared_db_config_path,
+        knowledge_config_path=knowledge_config_path,
+    )
+    memory_db_config = resolve_memory_database_config(
+        shared_config_path=shared_db_config_path,
+        memory_config_path=memory_config_path,
     )
 
-    try:
-        pool = await asyncpg.create_pool(
-            host=db_config["host"],
-            port=db_config["port"],
-            user=db_config["user"],
-            password=db_config["password"],
-            database=db_config["database"],
+    for label, config in (
+        ("knowledge", knowledge_db_config),
+        ("memory", memory_db_config),
+    ):
+        if label not in targets:
+            continue
+        if not config.pg_user or not config.pg_password:
+            msg = f"{label} 数据库配置缺少 pg_user 或 pg_password"
+            raise RuntimeError(msg)
+
+    pools: dict[tuple[str, int, str, str, str], Any] = {}
+    embedding_service: Any | None = None
+    if apply:
+        from komari_bot.plugins.embedding_provider.embedding_service import (
+            EmbeddingService,
         )
-    except Exception:
-        logger.exception("数据库连接失败:")
-        return
 
-    logger.info("数据库连接成功。")
-
+        embedding_service = EmbeddingService(embed_config)
     try:
-        # 3. 开始迁移常识库
-        await migrate_komari_knowledge(pool, embedding_service)
+        async def get_pool(config_key: str) -> Any:
+            config = knowledge_db_config if config_key == "knowledge" else memory_db_config
+            pool_key = get_pool_key(config)
+            if pool_key not in pools:
+                logger.info(
+                    "连接数据库(%s): %s:%s/%s",
+                    config_key,
+                    config.pg_host,
+                    config.pg_port,
+                    config.pg_database,
+                )
+                pools[pool_key] = await create_postgres_pool(config, command_timeout=60)
+            return pools[pool_key]
 
-        # 4. 开始迁移记忆库
-        await migrate_komari_memory(pool, embedding_service)
+        results: list[TableMigrationResult] = []
+        if "knowledge" in targets:
+            pool = await get_pool("knowledge")
+            results.append(
+                await migrate_table_embeddings(
+                    pool,
+                    spec=KNOWLEDGE_MIGRATION_SPEC,
+                    target_dimension=target_dimension,
+                    dry_run=not apply,
+                    embedding_service=embedding_service,
+                )
+            )
 
-        logger.info("=== 所有数据的向量重新嵌入与迁移已顺利结束 ===")
+        if "memory" in targets:
+            pool = await get_pool("memory")
+            results.append(
+                await migrate_table_embeddings(
+                    pool,
+                    spec=MEMORY_MIGRATION_SPEC,
+                    target_dimension=target_dimension,
+                    dry_run=not apply,
+                    embedding_service=embedding_service,
+                )
+            )
+
+        _log_summary(results, apply=apply)
     finally:
-        await pool.close()
-        await embedding_service.cleanup()
+        for pool in pools.values():
+            await pool.close()
+        if embedding_service is not None:
+            await embedding_service.cleanup()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Komari Bot 向量嵌入迁移工具")
+    parser.add_argument(
+        "--database-config-path",
+        type=Path,
+        default=Path("config/config_manager/database_config.json"),
+        help="共享数据库配置路径",
+    )
+    parser.add_argument(
+        "--knowledge-config-path",
+        type=Path,
+        default=Path("config/config_manager/komari_knowledge_config.json"),
+        help="komari_knowledge 配置路径",
+    )
+    parser.add_argument(
+        "--memory-config-path",
+        type=Path,
+        default=Path("config/config_manager/komari_memory_config.json"),
+        help="komari_memory 配置路径",
+    )
+    parser.add_argument(
+        "--embedding-config-path",
+        type=Path,
+        default=Path("config/config_manager/embedding_provider_config.json"),
+        help="embedding_provider 配置路径",
+    )
+    parser.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        choices=("knowledge", "memory"),
+        help="限制迁移目标，可重复传入；默认同时处理 knowledge 和 memory",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="执行数据库写入（默认 dry-run）",
+    )
+    return parser.parse_args()
+
+
+def _log_summary(results: list[TableMigrationResult], *, apply: bool) -> None:
+    mode = "apply" if apply else "dry-run"
+    logger.info("=== 迁移总结 (%s) ===", mode)
+    for result in results:
+        if not result.table_exists:
+            logger.info("%s: 表不存在，已跳过", result.table_name)
+            continue
+        logger.info(
+            "%s: current_dim=%s target_dim=%s schema_changed=%s rows=%s updated=%s failed=%s",
+            result.table_name,
+            result.current_dimension,
+            result.target_dimension,
+            result.schema_changed,
+            result.row_total,
+            result.updated_rows,
+            result.failed_rows,
+        )
+    if not apply:
+        logger.info("当前为 dry-run，未写入数据库。使用 --apply 执行迁移。")
+
+
+def main() -> None:
+    args = parse_args()
+    asyncio.run(
+        main_async(
+            shared_db_config_path=args.database_config_path,
+            knowledge_config_path=args.knowledge_config_path,
+            memory_config_path=args.memory_config_path,
+            embedding_config_path=args.embedding_config_path,
+            targets=set(args.targets or {"knowledge", "memory"}),
+            apply=args.apply,
+        )
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

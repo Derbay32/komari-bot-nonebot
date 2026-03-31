@@ -1,5 +1,6 @@
 """记忆忘却定时任务。"""
 
+from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
 from nonebot_plugin_apscheduler import scheduler
 
@@ -47,11 +48,15 @@ class ForgettingTaskManager:
 
     def unregister(self) -> None:
         """取消注册忘却定时任务。"""
+        self._service = None
         try:
             scheduler.remove_job("komari_memory_forgetting_worker")
-            logger.info("[KomariMemory] 忘却定时任务已取消")
+        except JobLookupError:
+            logger.debug("[KomariMemory] 忘却定时任务不存在，无需取消")
         except Exception:
-            pass
+            logger.exception("[KomariMemory] 忘却定时任务取消失败")
+        else:
+            logger.info("[KomariMemory] 忘却定时任务已取消")
 
 
 # 创建单例实例

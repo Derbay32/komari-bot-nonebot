@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import base64
 import io
-from logging import getLogger
 from pathlib import Path
 from typing import Any
 
+from nonebot import logger
 from PIL import Image, ImageDraw, ImageFont
 
 FontLike = ImageFont.FreeTypeFont | ImageFont.ImageFont
-logger = getLogger(__name__)
 
 CHARACTER_IMAGE_PATH = Path("data") / "image-summary.png"
 FONT_DIR = Path("data") / "fonts"
@@ -50,7 +49,7 @@ def _load_font(size: int) -> FontLike:
                 continue
 
     logger.warning(
-        "[GroupHistorySummary] 未在 %s 找到可用自定义字体，降级为默认字体",
+        "[GroupHistorySummary] 未在 {} 找到可用自定义字体，降级为默认字体",
         FONT_DIR,
     )
     return ImageFont.load_default()

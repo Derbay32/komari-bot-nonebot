@@ -12,7 +12,6 @@ dependencies = [
     "nonebot-plugin-apscheduler>=0.5.0",
     "nonebot2",
     "nonebot2[fastapi]>=2.4.4",
-    "nonebot-plugin-sentry>=2.0.0",
     "fastembed (>=0.7.4,<0.8.0)",
     "psycopg (>=3.3.2,<4.0.0)",
     "asyncpg (>=0.31.0,<0.32.0)",
@@ -21,6 +20,7 @@ dependencies = [
     "greenlet (>=3.3.0,<4.0.0)",
     "zhdate (>=0.1,<1.0)",
     "Pillow (>=11.2.1,<12.0.0)",
+    "sentry-sdk (>=2.54.0,<3.0.0)",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +40,6 @@ nonebot-adapter-onebot = [
 "@local" = []
 nonebot-plugin-localstore = ["nonebot_plugin_localstore"]
 nonebot-plugin-apscheduler = ["nonebot_plugin_apscheduler"]
-nonebot-plugin-sentry = ["nonebot_plugin_sentry"]
 
 [tool.ruff]
 line-length = 88
@@ -150,4 +149,5 @@ dev = [
     "ipywidgets (>=8.1.8,<9.0.0)",
     "jupyterlab (>=4.5.5,<5.0.0)",
     "ipykernel (>=7.2.0,<8.0.0)",
+    "pytest (>=9.0.2,<10.0.0)",
 ]

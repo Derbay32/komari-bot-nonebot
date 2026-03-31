@@ -8,6 +8,8 @@ Komari Knowledge 管理界面。
 """
 
 import asyncio
+import atexit
+import importlib.util
 import sys
 import threading
 from pathlib import Path
@@ -20,9 +22,6 @@ import streamlit as st
 # 添加项目根目录到 Python 路径
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
-
-# 直接加载 engine.py 及其依赖，避免触发 __init__.py 中的 NoneBot 代码
-import importlib.util
 
 # 首先加载 config_schema
 config_spec = importlib.util.spec_from_file_location(
@@ -52,13 +51,17 @@ sys.modules["komari_bot.plugins.komari_knowledge.engine"] = engine_module
 engine_spec.loader.exec_module(engine_module)
 
 KnowledgeEngine = engine_module.KnowledgeEngine
+_active_context = None
+
+from .webui_runtime import shutdown_background_context
 
 
 class GlobalContext:
     def __init__(self) -> None:
         # 创建一个新的事件循环
         self.loop = asyncio.new_event_loop()
-        self.engine = None
+        self.engine: KnowledgeEngine | None = None
+        self._closed = False
 
         # 定义一个在后台运行 Loop 的函数
         def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -76,14 +79,51 @@ class GlobalContext:
         future.result()  # 等待初始化完成
 
     async def _init_engine(self) -> None:
-        self.engine = KnowledgeEngine()
-        await self.engine.initialize()
+        engine = KnowledgeEngine()
+        await engine.initialize()
+        self.engine = engine
+
+    async def _close_engine(self) -> None:
+        if self.engine is not None:
+            await self.engine.close()
+            self.engine = None
+
+    def shutdown(self) -> None:
+        """关闭后台引擎与事件循环。"""
+        if self._closed:
+            return
+
+        self._closed = True
+        if self.loop.is_closed():
+            return
+
+        shutdown_background_context(
+            close_future_factory=lambda: asyncio.run_coroutine_threadsafe(
+                self._close_engine(), self.loop
+            ),
+            loop=self.loop,
+            thread=self.thread,
+        )
 
 
 # 使用 st.cache_resource 确保全局只有一个后台线程在跑
 @st.cache_resource(hash_funcs={GlobalContext: lambda _: None})
 def get_global_context() -> GlobalContext:
-    return GlobalContext()
+    global _active_context  # noqa: PLW0603
+    context = GlobalContext()
+    _active_context = context
+    return context
+
+
+def _shutdown_active_context() -> None:
+    global _active_context  # noqa: PLW0603
+    if _active_context is None:
+        return
+    _active_context.shutdown()
+    _active_context = None
+
+
+atexit.register(_shutdown_active_context)
 
 
 def run_async(coro):  # noqa: ANN001, ANN201
@@ -98,7 +138,7 @@ def run_async(coro):  # noqa: ANN001, ANN201
         return future.result()
     except Exception as e:
         st.error(f"异步任务执行出错: {e}")
-        raise e  # noqa: TRY201
+        raise
 
 
 def get_engine() -> KnowledgeEngine:
@@ -169,6 +209,12 @@ def main() -> None:
     # 初始化 session_state
     if "editing_kid" not in st.session_state:
         st.session_state.editing_kid = None
+    if "reconnected" not in st.session_state:
+        st.session_state.reconnected = False
+
+    if st.session_state.reconnected:
+        st.success("已重新连接！")
+        st.session_state.reconnected = False
 
     st.markdown(
         '<h1 class="main-header">🧠 小鞠常识库管理</h1>', unsafe_allow_html=True
@@ -179,9 +225,9 @@ def main() -> None:
         st.header("⚙️ 配置")
         st.info(
             """
-            常识库配置从 `data/plugin_config/komari_knowledge_config.json` 读取。
+            常识库配置从 `config/config_manager/komari_knowledge_config.json` 读取。
 
-            数据库连接优先读取 `data/plugin_config/database_config.json`。
+            数据库连接优先读取 `config/config_manager/database_config.json`。
             若 `komari_knowledge_config.json` 中填写了 `pg_*` 字段，则会覆盖共享配置。
 
             关键配置项：
@@ -195,8 +241,9 @@ def main() -> None:
 
         # 刷新按钮
         if st.button("🔄 重新连接"):
-            # 重置事件循环（不关闭，避免 Streamlit 关闭时的错误）
-            st.success("已重新连接！")
+            get_global_context().shutdown()
+            get_global_context.clear()
+            st.session_state.reconnected = True
             st.rerun()
 
     # 初始化引擎

@@ -10,7 +10,8 @@ from nonebot import logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.exception import FinishedException
 from nonebot.plugin import PluginMetadata, require
-from nonebot.rule import to_me
+
+from komari_bot.common.onebot_rules import group_message_to_me_rule
 
 from .config_schema import DynamicConfigSchema
 from .history_service import (
@@ -42,7 +43,7 @@ OUT_OF_RANGE_MESSAGE = "我、我只能看10-200条……"
 
 summary_matcher = on_regex(
     SUMMARY_TRIGGER_PATTERN,
-    rule=to_me(),
+    rule=group_message_to_me_rule(),
     priority=9,
     block=True,
 )
@@ -163,7 +164,7 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
 
     if not (config.min_summary_count <= requested_count <= config.max_summary_count):
         logger.info(
-            "[GroupHistorySummary] 请求条数越界: requested=%d, allowed=[%d,%d]",
+            "[GroupHistorySummary] 请求条数越界: requested={}, allowed=[{},{}]",
             requested_count,
             config.min_summary_count,
             config.max_summary_count,
