@@ -1,11 +1,10 @@
-"""查询重写服务 - 将当前输入结合历史重写为独立查询。"""
+"""查询重写服务 - 仅重写当前用户输入。"""
 
 from nonebot import logger
 from nonebot.plugin import require
 
 from komari_bot.plugins.komari_memory.core.retry import retry_async
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
@@ -20,38 +19,18 @@ class QueryRewriteService:
     def _build_rewrite_prompt(
         self,
         current_query: str,
-        conversation_history: list[MessageSchema],
     ) -> str:
         """构建查询重写的 Prompt。
 
         Args:
             current_query: 当前用户输入
-            conversation_history: 最近的历史对话
 
         Returns:
             重写 Prompt
         """
-        # 获取最新配置
-        config = get_config()
+        return f"""请将以下用户输入重写为一个语义完整、表达自然的句子。不要回答问题，只需重写。若原句已经清晰，可保持原意做最小修改。注意：输出必须使用简体中文。
 
-        # 格式化历史对话（只取最近配置数量的对话作为上下文）
-        history_text = ""
-        if conversation_history:
-            history_lines = []
-            # 使用配置中的历史对话数量限制
-            limit = min(config.query_rewrite_history_limit, len(conversation_history))
-            for msg in conversation_history[-limit:]:
-                role = "助手" if msg.is_bot else msg.user_nickname
-                history_lines.append(f"{role}: {msg.content}")
-            history_text = "\n".join(history_lines)
-
-        # 构建完整的重写指令
-        return f"""根据以下对话历史，将用户的最新回复重写为一个语义完整、指代清晰的搜索查询语句。不要回答问题，只需重写。如果话题发生了跳跃，忽略旧历史。注意：输出必须使用简体中文。
-
-对话历史：
-{history_text if history_text else "(无历史对话)"}
-
-用户最新回复：{current_query}"""
+用户输入：{current_query}"""
 
     @retry_async(max_attempts=2, base_delay=0.5)
     async def _generate_rewritten_query(
@@ -71,19 +50,16 @@ class QueryRewriteService:
     async def rewrite_query(
         self,
         current_query: str,
-        conversation_history: list[MessageSchema],
     ) -> str:
         """重写查询为语义完整的独立语句。
 
         Args:
             current_query: 当前用户输入
-            conversation_history: 最近的历史对话（按时间顺序）
 
         Returns:
             重写后的查询，失败时返回原始查询
         """
-        # 没有历史对话时无需重写，直接返回原始查询
-        if not conversation_history:
+        if not current_query.strip():
             return current_query
 
         # 获取最新配置
@@ -93,7 +69,6 @@ class QueryRewriteService:
             # 构建重写 Prompt
             rewrite_prompt = self._build_rewrite_prompt(
                 current_query=current_query,
-                conversation_history=conversation_history,
             )
 
             # 调用 LLM 重写（使用总结模型，更快）

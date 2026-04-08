@@ -92,7 +92,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
-        result = await handler.process_message(event)
+        result = await handler.process_message(bot, event)
         if not result:
             return
 

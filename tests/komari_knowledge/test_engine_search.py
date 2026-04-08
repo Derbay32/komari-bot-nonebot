@@ -82,7 +82,7 @@ def test_search_reuses_embedding_when_rewrite_does_not_change_query(
         return []
 
     async def _unexpected_get_embedding(_query: str) -> list[float]:
-        raise AssertionError("不应重算 embedding")
+        raise AssertionError
 
     monkeypatch.setattr(engine, "_layer1_keyword_search", _fake_keyword_search)
     monkeypatch.setattr(engine, "_get_embedding", _unexpected_get_embedding)
