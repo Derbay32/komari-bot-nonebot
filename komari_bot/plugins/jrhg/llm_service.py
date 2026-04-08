@@ -8,6 +8,8 @@ from typing import Any
 from nonebot import logger
 from nonebot.plugin import require
 
+from .config_interface import get_config
+
 llm_provider = require("llm_provider")
 
 
@@ -46,7 +48,7 @@ async def generate_reply(
     request_trace_id: str | None = None,
 ) -> str:
     """调用 LLM 生成 JRHG 回复。"""
-    config = llm_provider.config_manager.get()
+    config = get_config()
     payload_stats = _summarize_prompt_messages(messages)
     logger.info(
         "[JRHG] LLM 请求追踪: trace_id={} turns={} text_parts={} text_chars={}",
@@ -58,9 +60,9 @@ async def generate_reply(
 
     raw_response = await llm_provider.generate_text_with_messages(
         messages=messages,
-        model=config.deepseek_model,
-        temperature=config.deepseek_temperature,
-        max_tokens=config.deepseek_max_tokens,
+        model=config.llm_model,
+        temperature=config.llm_temperature,
+        max_tokens=config.llm_max_tokens,
         request_trace_id=request_trace_id,
     )
     return _extract_tag_content(raw_response, "content")

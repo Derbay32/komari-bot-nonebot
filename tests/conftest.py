@@ -52,7 +52,12 @@ _ensure_package_shim("jrhg")
 
 class _DummyConfigManager:
     def get(self) -> object:
-        return SimpleNamespace()
+        return SimpleNamespace(
+            plugin_enable=True,
+            llm_model="deepseek-chat",
+            llm_temperature=1.0,
+            llm_max_tokens=8192,
+        )
 
 
 class _DummyConfigManagerPlugin:
