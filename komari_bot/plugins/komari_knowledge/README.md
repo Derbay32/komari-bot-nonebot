@@ -1,23 +1,24 @@
 # Komari Knowledge
 
-小鞠常识库插件，提供关键词精确匹配 + pgvector 语义检索的混合知识检索能力，并可选启动 Streamlit WebUI 管理界面。
+小鞠常识库插件，提供关键词精确匹配 + pgvector 语义检索的混合知识检索能力，并在 FastAPI 驱动下暴露 REST 管理接口，供外部 WebUI 或其他后台工具接入。
 
 ## 当前状态
 
 - 插件入口：`komari_bot/plugins/komari_knowledge/__init__.py`
 - 核心引擎：`komari_bot/plugins/komari_knowledge/engine.py`
-- WebUI：`komari_bot/plugins/komari_knowledge/webui.py`
+- REST API：`komari_bot/plugins/komari_knowledge/api.py`
+- 路由挂载：`komari_bot/plugins/komari_knowledge/api_runtime.py`
+- 数据模型：`komari_bot/plugins/komari_knowledge/models.py`
 - 手工初始化 SQL：`komari_bot/plugins/komari_knowledge/init_db.sql`
 
-运行时已经支持自动补齐基础表结构并校验向量维度。
-手工执行 SQL 只在需要预建表、手动运维或排障时使用。
+运行时会自动补齐基础表结构并校验向量维度。手工 SQL 只在预建表、运维或排障时需要。
 
 ## 依赖
 
 - PostgreSQL 12+，并安装 `pgvector`
 - `embedding_provider` 插件
 - `config_manager` 插件
-- 可选：`streamlit`（启用 WebUI 时）
+- `nonebot2[fastapi]`
 
 ## 快速开始
 
@@ -38,8 +39,11 @@
   "plugin_enable": true,
   "pg_user": "your_username",
   "pg_password": "your_password",
-  "webui_enabled": true,
-  "webui_port": 8502
+  "api_enabled": true,
+  "api_token": "replace-with-a-secret-token",
+  "api_allowed_origins": [
+    "http://localhost:3000"
+  ]
 }
 ```
 
@@ -58,7 +62,7 @@ Bot 启动后：
 - 会初始化 `KnowledgeEngine`
 - 会按当前 embedding 维度自动补齐 `komari_knowledge` 表结构
 - 会校验 `komari_knowledge.embedding` 与当前 provider 维度是否一致
-- 如果启用了 WebUI，会自动启动 Streamlit 管理界面
+- 在 FastAPI 驱动下，如果配置了 `api_token`，会自动挂载管理 REST API
 
 ## 手工初始化与迁移
 
@@ -96,30 +100,115 @@ poetry run python scripts/migrate_embeddings.py --apply --target knowledge
 poetry run python scripts/migrate_embeddings.py --apply --target knowledge --target memory
 ```
 
-## WebUI
+## REST API
 
-默认地址：
+默认前缀：
 
-- `http://localhost:8502`
+- `/api/komari-knowledge/v1`
 
-手动独立启动：
+### 启用条件
 
-```bash
-streamlit run komari_bot/plugins/komari_knowledge/webui.py
+只有在以下条件都满足时才会挂载管理接口：
+
+- `plugin_enable = true`
+- `api_enabled = true`
+- `api_token` 非空
+- 当前 NoneBot 驱动是 FastAPI
+
+### 鉴权
+
+所有管理接口都要求：
+
+- `Authorization: Bearer <api_token>`
+
+缺失或错误 Token 返回 `401`。
+
+### CORS
+
+外部 WebUI 需要的跨域来源请配置到：
+
+- `api_allowed_origins`
+
+例如：
+
+```json
+{
+  "api_allowed_origins": [
+    "http://localhost:3000",
+    "https://knowledge.example.com"
+  ]
+}
 ```
 
-WebUI 读取的配置路径：
+如果不配置该字段，接口仍可被同源或反向代理调用，但不会额外放开浏览器跨域。
 
-- `config/config_manager/komari_knowledge_config.json`
-- `config/config_manager/database_config.json`
+### 接口列表
 
-主要功能：
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/knowledge` | 分页获取知识列表，支持 `q`、`category`、`limit`、`offset` |
+| `GET` | `/knowledge/{id}` | 获取单条知识 |
+| `POST` | `/knowledge` | 新增知识 |
+| `PATCH` | `/knowledge/{id}` | 更新知识；`notes: null` 表示清空备注 |
+| `DELETE` | `/knowledge/{id}` | 删除知识 |
+| `POST` | `/search` | 测试混合检索 |
 
-- 新增知识
-- 编辑知识
-- 删除知识
-- 测试检索
-- 查看全部知识和关键词
+### 请求示例
+
+获取知识列表：
+
+```bash
+curl -H "Authorization: Bearer replace-with-a-secret-token" \
+  "http://localhost:8080/api/komari-knowledge/v1/knowledge?limit=20&offset=0"
+```
+
+按关键词/内容搜索知识列表：
+
+```bash
+curl -H "Authorization: Bearer replace-with-a-secret-token" \
+  "http://localhost:8080/api/komari-knowledge/v1/knowledge?q=布丁&category=character"
+```
+
+新增知识：
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer replace-with-a-secret-token" \
+  -H "Content-Type: application/json" \
+  "http://localhost:8080/api/komari-knowledge/v1/knowledge" \
+  -d '{
+    "content": "小鞠喜欢布丁",
+    "keywords": ["小鞠", "布丁"],
+    "category": "character",
+    "notes": "外部后台录入"
+  }'
+```
+
+更新知识并清空备注：
+
+```bash
+curl -X PATCH \
+  -H "Authorization: Bearer replace-with-a-secret-token" \
+  -H "Content-Type: application/json" \
+  "http://localhost:8080/api/komari-knowledge/v1/knowledge/1" \
+  -d '{
+    "content": "小鞠超喜欢布丁",
+    "notes": null
+  }'
+```
+
+测试混合检索：
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer replace-with-a-secret-token" \
+  -H "Content-Type: application/json" \
+  "http://localhost:8080/api/komari-knowledge/v1/search" \
+  -d '{
+    "query": "小鞠喜欢吃什么？",
+    "limit": 5
+  }'
+```
 
 ## 对外接口
 
@@ -128,7 +217,10 @@ WebUI 读取的配置路径：
 - `search_knowledge(query, limit=None, query_embedding=None)`
 - `search_by_keyword(keyword)`
 - `add_knowledge(content, keywords, category="general", notes=None)`
+- `get_knowledge(kid)`
+- `list_knowledge(limit, offset, query=None, category=None)`
 - `get_all_knowledge()`
+- `update_knowledge(kid, ...)`
 - `delete_knowledge(kid)`
 
 示例：
@@ -157,11 +249,14 @@ for item in results:
 | `pg_host` / `pg_port` / `pg_database` / `pg_user` / `pg_password` | `None` | 可选：覆盖共享数据库配置 |
 | `similarity_threshold` | `0.65` | 向量检索最低相似度阈值 |
 | `query_rewrite_rules` | `{"你": "小鞠", "您的": "小鞠的"}` | 查询重写规则 |
-| `layer1_limit` | `3` | 关键词匹配返回上限 |
-| `layer2_limit` | `2` | 向量检索返回上限 |
+| `layer1_limit` | `3` | Layer 1 关键词匹配返回上限 |
+| `layer2_limit` | `2` | Layer 2 向量检索返回上限 |
 | `total_limit` | `5` | 最终总返回上限 |
-| `webui_enabled` | `false` | 是否自动启动 WebUI |
-| `webui_port` | `8502` | WebUI 端口 |
+| `api_enabled` | `true` | 是否启用 REST 管理接口 |
+| `api_token` | `""` | REST 管理接口 Bearer Token |
+| `api_allowed_origins` | `[]` | 允许跨域访问接口的前端 Origin 白名单 |
+| `webui_enabled` | `false` | 已废弃，仅为兼容旧配置保留 |
+| `webui_port` | `8502` | 已废弃，仅为兼容旧配置保留 |
 
 ## 检索原理
 
@@ -172,6 +267,15 @@ for item in results:
 `KnowledgeEngine` 在启动时会预热关键词索引，并在增删改知识后同步更新内存索引。
 
 ## 排障
+
+### 管理 API 未挂载
+
+检查：
+
+- `plugin_enable` 是否为 `true`
+- `api_enabled` 是否为 `true`
+- `api_token` 是否为空
+- `.env` / `env.example` 中的驱动是否仍为 `DRIVER=~fastapi`
 
 ### 数据库密码未配置
 
@@ -198,11 +302,10 @@ poetry run python scripts/migrate_embeddings.py --target knowledge
 poetry run python scripts/migrate_embeddings.py --apply --target knowledge
 ```
 
-### WebUI 无法连接
+### 外部 WebUI 跨域失败
 
 检查：
 
-- 插件是否启用 `webui_enabled`
-- `streamlit` 是否已安装
-- 端口是否被占用
-- Bot 启动日志中是否有 `WebUI 已启动` 或相关错误
+- 前端页面 `Origin` 是否加入 `api_allowed_origins`
+- 请求是否携带了 `Authorization: Bearer <api_token>`
+- 反向代理是否拦截了 `OPTIONS` 预检请求

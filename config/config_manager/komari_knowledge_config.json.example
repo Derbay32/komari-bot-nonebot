@@ -4,13 +4,19 @@
   "plugin_enable": true,
   "user_whitelist": [],
   "group_whitelist": [],
-  "embedding_model": "BAAI/bge-small-zh-v1.5",
-  "vector_dimension": 512,
   "similarity_threshold": 0.65,
   "layer1_limit": 3,
   "layer2_limit": 2,
   "total_limit": 5,
-  "webui_enabled": true,
-  "webui_port":8502,
-  "query_rewrite_rules":{"你": "小鞠", "您的": "小鞠的"}
+  "api_enabled": true,
+  "api_token": "请替换为你的管理令牌",
+  "api_allowed_origins": [
+    "http://localhost:3000"
+  ],
+  "webui_enabled": false,
+  "webui_port": 8502,
+  "query_rewrite_rules": {
+    "你": "小鞠",
+    "您的": "小鞠的"
+  }
 }

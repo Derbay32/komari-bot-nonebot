@@ -88,11 +88,20 @@ class DynamicConfigSchema(BaseModel):
     )
     total_limit: int = Field(default=5, ge=1, le=20, description="总返回结果数量上限")
 
-    # WebUI 配置
-    webui_enabled: bool = Field(default=False, description="是否启动 WebUI 管理界面")
-    webui_port: int = Field(default=8502, ge=1024, le=65535, description="WebUI 端口")
+    # REST API 配置
+    api_enabled: bool = Field(default=True, description="是否启用 REST 管理接口")
+    api_token: str = Field(default="", description="REST 管理接口 Bearer Token")
+    api_allowed_origins: list[str] = Field(
+        default_factory=list,
+        description="允许访问 REST 管理接口的前端 Origin 白名单",
+    )
 
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
+    @field_validator(
+        "user_whitelist",
+        "group_whitelist",
+        "api_allowed_origins",
+        mode="before",
+    )
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
         """处理从 .env 格式解析列表。
