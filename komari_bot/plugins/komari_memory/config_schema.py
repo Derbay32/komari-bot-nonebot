@@ -101,6 +101,9 @@ class KomariMemoryConfigSchema(BaseModel):
         default=3, ge=1, le=10, description="常识库检索数量限制"
     )
 
+    # REST API 配置
+    api_enabled: bool = Field(default=True, description="是否启用本地 REST 管理接口")
+
     # 记忆管理配置
     summary_token_threshold: int = Field(
         default=1000, ge=100, le=10000, description="触发总结的 Token 阈值"

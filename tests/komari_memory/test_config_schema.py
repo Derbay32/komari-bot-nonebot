@@ -34,6 +34,7 @@ def test_example_config_no_longer_contains_dead_fields() -> None:
 def test_config_schema_exposes_summary_chunk_token_limit() -> None:
     config = KomariMemoryConfigSchema()
 
+    assert config.api_enabled is True
     assert config.summary_chunk_token_limit == 3000
     assert config.profile_trait_limit == 20
 

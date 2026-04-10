@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 # 依赖插件
 apscheduler_plugin = require("nonebot_plugin_apscheduler")
 
+from .api_runtime import register_management_api_for_driver
 from .config_schema import KomariMemoryConfigSchema
 from .database.connection import create_pool
 from .handlers.forgetting_worker import (
@@ -36,6 +37,13 @@ __plugin_meta__ = PluginMetadata(
     description="智能记忆与对话插件，支持向量检索和常识库集成",
     usage="自动运行，无需命令",
 )
+
+
+class PluginState:
+    """插件运行时状态。"""
+
+    def __init__(self) -> None:
+        self.api_registered = False
 
 
 class PluginManager:
@@ -169,6 +177,7 @@ class PluginManager:
 
 # 创建插件管理器实例
 _plugin_manager: PluginManager | None = None
+state = PluginState()
 
 
 def get_plugin_manager() -> PluginManager | None:
@@ -180,8 +189,21 @@ def get_plugin_manager() -> PluginManager | None:
     return _plugin_manager
 
 
+def _get_memory_service() -> MemoryService | None:
+    manager = get_plugin_manager()
+    if manager is None:
+        return None
+    return manager.memory
+
+
 # 在插件加载时初始化
 driver = get_driver()
+state.api_registered = register_management_api_for_driver(
+    driver=driver,
+    config=get_config(),
+    service_getter=_get_memory_service,
+    logger=logger,
+)
 
 
 @driver.on_startup

@@ -19,6 +19,7 @@
 
   "knowledge_enabled": true,
   "knowledge_limit": 3,
+  "api_enabled": true,
 
   "summary_message_threshold": 50,
   "summary_token_threshold": 1000,
