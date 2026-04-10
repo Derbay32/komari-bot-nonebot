@@ -26,7 +26,9 @@ DEFAULTS: dict[str, str] = {
         "- 对重复或近义 traits 进行合并，尽量使用更稳定、不易过时的 key 与 value\n\n"
         "【任务二：主观互动备忘录提取】\n"
         '- 你必须基于《败犬女主太多了！》中"小鞠知花"的人设视角，为有明显互动行为的用户，提取出在互动期间该用户的行为记录。这将被作为"小鞠在心里对近期互动过的用户的悄悄记录"。\n'
-        "- 数据格式要求如下：必须包含 user_id, file_type, description, records(包括 event[行为], result[反应], emotion[感受]), summary。\n\n"
+        "- 数据格式要求如下：必须包含 user_id, file_type, description, records(包括 event[行为], result[反应], emotion[感受]), summary。\n"
+        "- `records` 只记录本次这批对话中新增的互动，不要改写、重排或复述旧历史。\n"
+        "- `summary` 只输出本次互动结束后形成的新的整体印象或评价。\n\n"
         "【任务三：评估重要性】\n"
         "请按以下标准评估重要性（1-5分）：\n"
         "- 1分：无意义的闲聊、表情包测试、简短问候\n"
@@ -44,7 +46,8 @@ DEFAULTS: dict[str, str] = {
         "- 合并重复 user_id 的画像信息，只保留新增或更新的 traits\n"
         "- user_profiles 只保留长期稳定 traits，删除短期状态、一次性事件与明显重复项\n"
         "- 对近义或重复 traits 进行合并，统一为更稳定的 key\n"
-        "- 合并互动历史，records 总数最多保留最近6条\n"
+        "- 合并同一用户在各分段里新增的互动记录，保持时间顺序，不要补写旧历史\n"
+        "- `summary` 表示本次互动结束后的新印象/评价\n"
         "- 产出一份整体 summary 和整体 importance\n"
         "- 不要按分段分别输出，不要解释推理过程\n\n"
         "{{chunk_summaries_text}}\n\n"
@@ -58,12 +61,10 @@ DEFAULTS: dict[str, str] = {
         "- 如果对话中发现与已有画像矛盾的新信息，请用新信息覆盖旧值（同 key 覆盖）\n"
         "- 如果对话中没有提到某个旧特征，不要重复输出它\n"
         "- 只输出需要新增或更新的画像特征\n"
-        "- 对于互动历史，请在已有记录的基础上追加新的 records（注意：如果 records 总数超过6条，请只保留最近的6条记录）"
     ),
     "existing_profiles_header": (
         "【已知用户画像（数据库中已有记录）】\n以下是目前已存储的用户画像："
     ),
-    "existing_interactions_header": "以下是目前已存储的用户互动历史：",
     "truncated_context_marker": (
         "【提示】其余已有记录已按 token 上限省略，请仅基于当前提供的已知信息做去重与覆盖。"
     ),

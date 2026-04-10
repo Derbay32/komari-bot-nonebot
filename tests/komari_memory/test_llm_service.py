@@ -90,13 +90,11 @@ async def _run_summarize_conversation(
     messages: list[MessageSchema],
     config: KomariMemoryConfigSchema,
     existing_profiles: list[dict[str, Any]] | None = None,
-    existing_interactions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return await summarize_conversation(
         messages=messages,
         config=config,
         existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
     )
 
 
@@ -146,15 +144,6 @@ def test_summarize_conversation_chunks_then_merges(monkeypatch: Any) -> None:
                     "traits": {"喜欢的饮料": {"value": "可乐", "category": "preference"}},
                 }
             ],
-            existing_interactions=[
-                {
-                    "user_id": "10001",
-                    "file_type": "用户的近期对鞠行为备忘录",
-                    "description": "旧记录",
-                    "records": [{"event": "投喂", "result": "开心", "emotion": "期待"}],
-                    "summary": "旧总结",
-                }
-            ],
         )
     )
 
@@ -175,6 +164,7 @@ def test_summarize_conversation_chunks_then_merges(monkeypatch: Any) -> None:
     assert all("【已知用户画像" not in prompt for prompt in raw_prompts)
     assert "【已知用户画像" in merge_prompts[0]
     assert "【分段1/" in merge_prompts[0]
+    assert "以下是目前已存储的用户互动历史" not in merge_prompts[0]
 
 
 def test_chunk_formatted_messages_splits_oversized_single_message() -> None:
@@ -195,8 +185,8 @@ def test_existing_context_builder_trims_to_budget() -> None:
     result = llm_service_module._build_existing_context_with_budget(
         existing_profiles=[
             {
-                "user_id": "10001",
-                "display_name": "阿明",
+                "user_id": f"{10001 + index}",
+                "display_name": f"阿明{index}",
                 "traits": {
                     f"特征{i}": {
                         "value": "很长的描述" * 40,
@@ -207,26 +197,13 @@ def test_existing_context_builder_trims_to_budget() -> None:
                     for i in range(10)
                 },
             }
+            for index in range(4)
         ],
-        existing_interactions=[
-            {
-                "user_id": "10001",
-                "summary": "很长的互动总结" * 40,
-                "records": [
-                    {
-                        "event": "事件" * 20,
-                        "result": "结果" * 20,
-                        "emotion": "情绪" * 20,
-                    }
-                    for _ in range(6)
-                ],
-            }
-        ],
-        token_budget=1200,
+        token_budget=2200,
     )
 
-    assert result.estimated_tokens <= 1200
-    assert result.included_profiles + result.included_interactions >= 1
+    assert result.estimated_tokens <= 2200
+    assert result.included_profiles >= 1
     assert result.truncated is True
 
 
@@ -253,6 +230,13 @@ def test_build_summary_prompt_uses_template_content(monkeypatch: Any) -> None:
     assert prompt == '前缀\n对话正文\n已有上下文\n\n{"ok": true}'
 
 
+def test_build_summary_prompt_uses_incremental_interaction_contract() -> None:
+    prompt = llm_service_module._build_summary_prompt("对话正文")
+
+    assert "只记录本次这批对话中新增的互动" in prompt
+    assert "不要改写、重排或复述旧历史" in prompt
+
+
 def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         llm_service_module,
@@ -262,7 +246,6 @@ def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> No
             "merge_prompt": "不会用到",
             "existing_context_instruction_block": "自定义指示",
             "existing_profiles_header": "自定义画像头",
-            "existing_interactions_header": "自定义互动头",
             "truncated_context_marker": "自定义截断提示",
             "json_response_example": "不会用到",
         },
@@ -276,18 +259,10 @@ def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> No
                 "traits": [{"key": "喜好", "value": "拉面", "category": "preference"}],
             }
         ],
-        existing_interactions=[
-            {
-                "user_id": "10001",
-                "summary": "最近常聊吃饭",
-                "records": [{"event": "约饭", "result": "答应", "emotion": "开心"}],
-            }
-        ],
         token_budget=None,
     )
 
     assert "自定义画像头" in result.text
-    assert "自定义互动头" in result.text
     assert "自定义指示" in result.text
 
 
@@ -324,20 +299,6 @@ def test_summarize_conversation_single_chunk_trims_existing_context_to_fit_limit
                         }
                         for i in range(12)
                     },
-                }
-            ],
-            existing_interactions=[
-                {
-                    "user_id": "10001",
-                    "summary": "很长的互动总结" * 60,
-                    "records": [
-                        {
-                            "event": "事件" * 20,
-                            "result": "结果" * 20,
-                            "emotion": "情绪" * 20,
-                        }
-                        for _ in range(8)
-                    ],
                 }
             ],
         )

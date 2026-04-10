@@ -29,7 +29,6 @@ llm_provider = require("llm_provider")
 
 _MESSAGE_SPLIT_MARKER = "[分片0000] "
 _MAX_EXISTING_TRAITS_PER_USER = 5
-_MAX_EXISTING_INTERACTION_RECORDS = 2
 
 
 @dataclass(frozen=True)
@@ -43,7 +42,6 @@ class _ExistingContextBuildResult:
     text: str
     estimated_tokens: int
     included_profiles: int
-    included_interactions: int
     truncated: bool
 
 
@@ -81,11 +79,9 @@ def _extract_tag_content(text: str, tag: str) -> str:
 
 def _build_existing_context(
     existing_profiles: list[dict] | None = None,
-    existing_interactions: list[dict] | None = None,
 ) -> _ExistingContextBuildResult:
     return _build_existing_context_with_budget(
         existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
         token_budget=None,
     )
 
@@ -148,40 +144,12 @@ def _compact_profile_line(profile: dict[str, Any]) -> str | None:
     )
 
 
-def _compact_interaction_line(interaction: dict[str, Any]) -> str | None:
-    """压缩单个互动历史，保留近期摘要与最近几条 records。"""
-    user_id = str(interaction.get("user_id", "")).strip()
-    if not user_id:
-        return None
-
-    records_raw = interaction.get("records")
-    compact_records: list[dict[str, str]] = []
-    if isinstance(records_raw, list):
-        for record in records_raw[-_MAX_EXISTING_INTERACTION_RECORDS:]:
-            if not isinstance(record, dict):
-                continue
-            compact_records.append(
-                {
-                    "event": str(record.get("event", "")).strip(),
-                    "result": str(record.get("result", "")).strip(),
-                    "emotion": str(record.get("emotion", "")).strip(),
-                }
-            )
-
-    compact_summary = str(interaction.get("summary", "")).strip()
-    return (
-        f"- [user_id:{user_id}] interaction_summary={compact_summary} "
-        f"recent_records={json.dumps(compact_records, ensure_ascii=False)}"
-    )
-
-
 def _build_existing_context_with_budget(
     *,
     existing_profiles: list[dict] | None = None,
-    existing_interactions: list[dict] | None = None,
     token_budget: int | None,
 ) -> _ExistingContextBuildResult:
-    """构建可控大小的已有画像与互动历史提示。"""
+    """构建可控大小的已有画像提示。"""
     template = get_summary_template()
     instruction_block = f"{template['existing_context_instruction_block']}\n\n"
     instruction_tokens = estimate_text_tokens(instruction_block)
@@ -190,8 +158,7 @@ def _build_existing_context_with_budget(
             text="",
             estimated_tokens=0,
             included_profiles=0,
-            included_interactions=0,
-            truncated=bool(existing_profiles or existing_interactions),
+            truncated=bool(existing_profiles),
         )
 
     data_budget = None
@@ -200,7 +167,6 @@ def _build_existing_context_with_budget(
 
     blocks: list[str] = []
     included_profiles = 0
-    included_interactions = 0
     truncated = False
 
     def _current_tokens() -> int:
@@ -235,27 +201,6 @@ def _build_existing_context_with_budget(
         if header_added:
             _append_block("\n")
 
-    interaction_lines = [
-        line
-        for interaction in (existing_interactions or [])
-        if (line := _compact_interaction_line(interaction)) is not None
-    ]
-    if interaction_lines:
-        interaction_header = template["existing_interactions_header"]
-        header_added = False
-        for line in interaction_lines:
-            block = (
-                f"{interaction_header}\n{line}\n" if not header_added else f"{line}\n"
-            )
-            if _append_block(block):
-                header_added = True
-                included_interactions += 1
-            else:
-                truncated = True
-                break
-        if header_added:
-            _append_block("\n")
-
     if truncated:
         _append_block(f"{template['truncated_context_marker']}\n\n")
 
@@ -265,7 +210,6 @@ def _build_existing_context_with_budget(
             text="",
             estimated_tokens=0,
             included_profiles=0,
-            included_interactions=0,
             truncated=truncated,
         )
 
@@ -274,7 +218,6 @@ def _build_existing_context_with_budget(
         text=full_text,
         estimated_tokens=estimate_text_tokens(full_text),
         included_profiles=included_profiles,
-        included_interactions=included_interactions,
         truncated=truncated,
     )
 
@@ -608,20 +551,18 @@ async def summarize_conversation(
     messages: list[MessageSchema],
     config: KomariMemoryConfigSchema,
     existing_profiles: list[dict] | None = None,
-    existing_interactions: list[dict] | None = None,
 ) -> dict:
     """总结对话，提取用户画像，并评估重要性（带重试机制）。"""
     trace_id = f"memsum-{uuid4().hex[:8]}"
     group_id = messages[0].group_id if messages else "-"
     chunks, oversized_message_split = _chunk_formatted_messages(messages, config)
     logger.info(
-        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={} existing_interactions={}",
+        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={}",
         trace_id,
         group_id,
         len(messages),
         config.summary_chunk_token_limit,
         len(existing_profiles or []),
-        len(existing_interactions or []),
     )
     if not chunks:
         return _normalize_summary_result({})
@@ -635,7 +576,6 @@ async def summarize_conversation(
         )
         existing_context_result = _build_existing_context_with_budget(
             existing_profiles=existing_profiles,
-            existing_interactions=existing_interactions,
             token_budget=single_context_budget,
         )
         single_prompt = _build_summary_prompt(
@@ -643,12 +583,11 @@ async def summarize_conversation(
             existing_context=existing_context_result.text,
         )
         logger.debug(
-            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={} context_tokens={} included_profiles={} included_interactions={} context_truncated={}",
+            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={} context_tokens={} included_profiles={} context_truncated={}",
             trace_id,
             chunks[0].estimated_tokens,
             existing_context_result.estimated_tokens,
             existing_context_result.included_profiles,
-            existing_context_result.included_interactions,
             existing_context_result.truncated,
         )
         return await _request_structured_summary(
@@ -693,7 +632,6 @@ async def summarize_conversation(
     )
     existing_context_result = _build_existing_context_with_budget(
         existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
         token_budget=merge_context_budget,
     )
     merge_prompt = _build_merge_prompt(
@@ -701,12 +639,11 @@ async def summarize_conversation(
         existing_context=existing_context_result.text,
     )
     logger.info(
-        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={} context_tokens={} included_profiles={} included_interactions={} context_truncated={}",
+        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={} context_tokens={} included_profiles={} context_truncated={}",
         trace_id,
         len(chunk_results),
         existing_context_result.estimated_tokens,
         existing_context_result.included_profiles,
-        existing_context_result.included_interactions,
         existing_context_result.truncated,
     )
     return await _request_structured_summary(

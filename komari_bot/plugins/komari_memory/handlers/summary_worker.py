@@ -30,6 +30,9 @@ if TYPE_CHECKING:
     from ..services.redis_manager import RedisManager
 
 
+_MAX_INTERACTION_RECORDS = 6
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -165,11 +168,61 @@ def _normalize_interaction(
         interaction.get("file_type", "用户的近期对鞠行为备忘录")
     )
     interaction["description"] = str(interaction.get("description", ""))
-    records = interaction.get("records")
-    interaction["records"] = records if isinstance(records, list) else []
-    interaction["summary"] = str(interaction.get("summary", ""))
+    interaction["records"] = _normalize_interaction_records(interaction.get("records"))
+    interaction["summary"] = str(interaction.get("summary", "")).strip()
     interaction["updated_at"] = _now_iso()
     return interaction
+
+
+def _normalize_interaction_records(raw_records: Any) -> list[dict[str, str]]:
+    normalized_records: list[dict[str, str]] = []
+    if not isinstance(raw_records, list):
+        return normalized_records
+
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            continue
+        normalized_record = {
+            "event": str(raw_record.get("event", "")).strip(),
+            "result": str(raw_record.get("result", "")).strip(),
+            "emotion": str(raw_record.get("emotion", "")).strip(),
+        }
+        if not any(normalized_record.values()):
+            continue
+        normalized_records.append(normalized_record)
+
+    return normalized_records
+
+
+def _merge_interaction_update(
+    base_interaction: dict[str, Any] | None,
+    interaction_update: dict[str, Any] | None,
+    *,
+    user_id: str,
+    display_name: str,
+) -> dict[str, Any]:
+    merged_interaction = _normalize_interaction(
+        base_interaction,
+        user_id=user_id,
+        display_name=display_name,
+    )
+    if not isinstance(interaction_update, dict):
+        return merged_interaction
+
+    appended_records = _normalize_interaction_records(interaction_update.get("records"))
+    if appended_records:
+        existing_records = merged_interaction.get("records", [])
+        merged_interaction["records"] = [
+            *(existing_records if isinstance(existing_records, list) else []),
+            *appended_records,
+        ][-_MAX_INTERACTION_RECORDS:]
+
+    updated_summary = str(interaction_update.get("summary", "")).strip()
+    if updated_summary:
+        merged_interaction["summary"] = updated_summary
+
+    merged_interaction["updated_at"] = _now_iso()
+    return merged_interaction
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -226,7 +279,6 @@ async def perform_summary(
         messages_buffer,
         config,
         existing_profiles=list(existing_profiles.values()),
-        existing_interactions=list(existing_interactions.values()),
     )
 
     summary = str(result.get("summary", "")).strip()
@@ -303,9 +355,9 @@ async def perform_summary(
             importance=4,
         )
 
-        raw_interaction = interactions_by_user.get(uid) or existing_interactions.get(uid)
-        merged_interaction = _normalize_interaction(
-            raw_interaction,
+        merged_interaction = _merge_interaction_update(
+            existing_interactions.get(uid),
+            interactions_by_user.get(uid),
             user_id=uid,
             display_name=display_name,
         )
