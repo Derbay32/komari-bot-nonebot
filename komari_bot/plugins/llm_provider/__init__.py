@@ -113,6 +113,7 @@ async def generate_text(
     *,
     enable_knowledge: bool = False,
     response_format: dict | None = None,
+    record_chat_log: bool = False,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """生成文本（简单 prompt 模式）。
@@ -127,6 +128,7 @@ async def generate_text(
         knowledge_query: 知识库查询文本
         knowledge_limit: 检索返回的知识数量上限
         response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+        record_chat_log: 是否记录聊天回复日志
         **kwargs: 其他参数
 
     Returns:
@@ -178,18 +180,19 @@ async def generate_text(
         )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
-        await log_llm_call(
-            method="generate_text",
-            model=model,
-            input_data={
-                "trace_id": request_trace_id,
-                "phase": request_phase,
-                "prompt": prompt,
-                "system_instruction": system_instruction,
-            },
-            error=str(e),
-            duration_ms=duration_ms,
-        )
+        if record_chat_log:
+            await log_llm_call(
+                method="generate_text",
+                model=model,
+                input_data={
+                    "trace_id": request_trace_id,
+                    "phase": request_phase,
+                    "prompt": prompt,
+                    "system_instruction": system_instruction,
+                },
+                error=str(e),
+                duration_ms=duration_ms,
+            )
         logger.error(
             "[LLM Provider] 文本请求失败: trace_id={} phase={} error={}",
             request_trace_id or "-",
@@ -199,18 +202,19 @@ async def generate_text(
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
-        await log_llm_call(
-            method="generate_text",
-            model=model,
-            input_data={
-                "trace_id": request_trace_id,
-                "phase": request_phase,
-                "prompt": prompt,
-                "system_instruction": final_system_instruction,
-            },
-            output=result,
-            duration_ms=duration_ms,
-        )
+        if record_chat_log:
+            await log_llm_call(
+                method="generate_text",
+                model=model,
+                input_data={
+                    "trace_id": request_trace_id,
+                    "phase": request_phase,
+                    "prompt": prompt,
+                    "system_instruction": final_system_instruction,
+                },
+                output=result,
+                duration_ms=duration_ms,
+            )
         return result
     finally:
         await client.close()
@@ -222,6 +226,8 @@ async def generate_text_with_messages(
     temperature: float | None = None,
     max_tokens: int | None = None,
     response_format: dict | None = None,
+    *,
+    record_chat_log: bool = False,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -232,6 +238,7 @@ async def generate_text_with_messages(
         temperature: 温度参数
         max_tokens: 最大 token 数
         response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+        record_chat_log: 是否记录聊天回复日志
         **kwargs: 其他参数
 
     Returns:
@@ -263,17 +270,18 @@ async def generate_text_with_messages(
         )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
-        await log_llm_call(
-            method="generate_text_with_messages",
-            model=model,
-            input_data={
-                "trace_id": request_trace_id,
-                "payload_summary": payload_summary,
-                "messages": messages,
-            },
-            error=str(e),
-            duration_ms=duration_ms,
-        )
+        if record_chat_log:
+            await log_llm_call(
+                method="generate_text_with_messages",
+                model=model,
+                input_data={
+                    "trace_id": request_trace_id,
+                    "payload_summary": payload_summary,
+                    "messages": messages,
+                },
+                error=str(e),
+                duration_ms=duration_ms,
+            )
         logger.error(
             "[LLM Provider] Messages 请求失败: trace_id={} model={} error={} payload={}",
             request_trace_id or "-",
@@ -284,17 +292,18 @@ async def generate_text_with_messages(
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
-        await log_llm_call(
-            method="generate_text_with_messages",
-            model=model,
-            input_data={
-                "trace_id": request_trace_id,
-                "payload_summary": payload_summary,
-                "messages": messages,
-            },
-            output=result,
-            duration_ms=duration_ms,
-        )
+        if record_chat_log:
+            await log_llm_call(
+                method="generate_text_with_messages",
+                model=model,
+                input_data={
+                    "trace_id": request_trace_id,
+                    "payload_summary": payload_summary,
+                    "messages": messages,
+                },
+                output=result,
+                duration_ms=duration_ms,
+            )
         return result
     finally:
         await client.close()
