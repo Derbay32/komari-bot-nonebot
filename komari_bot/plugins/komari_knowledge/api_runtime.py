@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from komari_bot.common.management_api import normalize_origins
+
 from .api import API_PREFIX, KnowledgeEngineProtocol, register_knowledge_api
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
 
 
 def register_management_api_for_driver(
@@ -37,7 +39,7 @@ def register_management_api_for_driver(
         logger.warning("[Komari Knowledge] 当前驱动不是 FastAPI，无法挂载管理 API")
         return False
 
-    allowed_origins = _normalize_origins(getattr(config, "api_allowed_origins", []))
+    allowed_origins = normalize_origins(getattr(config, "api_allowed_origins", []))
     register_knowledge_api(
         server_app,
         api_token=api_token.strip(),
@@ -46,12 +48,3 @@ def register_management_api_for_driver(
     )
     logger.info("[Komari Knowledge] 管理 API 已注册: %s", API_PREFIX)
     return True
-
-
-def _normalize_origins(raw_value: Any) -> Sequence[str]:
-    """归一化 Origin 白名单配置。"""
-    if isinstance(raw_value, list):
-        return [str(item).strip() for item in raw_value if str(item).strip()]
-    if isinstance(raw_value, str):
-        return [item.strip() for item in raw_value.split(",") if item.strip()]
-    return []

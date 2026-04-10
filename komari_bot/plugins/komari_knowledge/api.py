@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-import secrets
 from typing import TYPE_CHECKING, Annotated, Any, Protocol
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response
 from starlette import status
+
+from komari_bot.common.management_api import (
+    create_bearer_auth_dependency,
+    ensure_management_cors,
+)
 
 from .engine import UNSET
 from .models import (
@@ -99,23 +102,6 @@ def _keywords_required_error() -> HTTPException:
 def _category_required_error() -> HTTPException:
     return _validation_error("category 不能为空")
 
-
-def _build_auth_dependency(api_token: str) -> Callable[[str | None], Any]:
-    async def _verify_token(
-        authorization: Annotated[str | None, Header()] = None,
-    ) -> None:
-        if authorization is None:
-            raise _unauthorized()
-
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not token:
-            raise _unauthorized()
-        if not secrets.compare_digest(token, api_token):
-            raise _unauthorized()
-
-    return _verify_token
-
-
 def _build_engine_dependency(
     engine_getter: Callable[[], KnowledgeEngineProtocol | None],
 ) -> Callable[[], KnowledgeEngineProtocol]:
@@ -154,7 +140,10 @@ def create_knowledge_router(
     engine_getter: Callable[[], KnowledgeEngineProtocol | None],
 ) -> APIRouter:
     """创建知识库管理路由。"""
-    auth_dependency = _build_auth_dependency(api_token)
+    auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权访问 Komari Knowledge 管理接口",
+    )
     engine_dependency = _build_engine_dependency(engine_getter)
     router = APIRouter(
         prefix=API_PREFIX,
@@ -266,14 +255,7 @@ def register_knowledge_api(
     if getattr(app.state, "komari_knowledge_api_registered", False):
         return
 
-    if allowed_origins and not getattr(app.state, "komari_knowledge_cors_registered", False):
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=list(allowed_origins),
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-        app.state.komari_knowledge_cors_registered = True
+    ensure_management_cors(app, allowed_origins)
 
     app.include_router(
         create_knowledge_router(
