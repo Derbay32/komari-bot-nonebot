@@ -7,39 +7,124 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
-import nonebot
-import nonebot.plugin
+import pytest
+from nonebot.adapters.onebot.v11 import (
+    Adapter,
+    Bot,
+    GroupMessageEvent,
+    Message,
+    PrivateMessageEvent,
+)
+from nonebot.adapters.onebot.v11.event import Sender
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from nonebug import App
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = PROJECT_ROOT / "komari_bot/plugins/jrhg/__init__.py"
 PACKAGE_ROOT = PROJECT_ROOT / "komari_bot/plugins/jrhg"
 
 
-def _load_jrhg_module(monkeypatch: Any) -> Any:
-    class _DummyMatcher:
-        @staticmethod
-        def handle() -> Any:
-            def _decorator(func: Any) -> Any:
-                return func
+@pytest.fixture
+def jrhg_module(app: App) -> Iterator[Any]:
+    del app
+    original_package = sys.modules.get("komari_bot.plugins.jrhg")
+    spec = importlib.util.spec_from_file_location(
+        "komari_bot.plugins.jrhg",
+        MODULE_PATH,
+        submodule_search_locations=[str(PACKAGE_ROOT)],
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError
 
-            return _decorator
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["komari_bot.plugins.jrhg"] = module
+    spec.loader.exec_module(module)
 
-        async def finish(self, _message: str) -> None:
-            return None
+    try:
+        yield module
+    finally:
+        if original_package is not None:
+            sys.modules["komari_bot.plugins.jrhg"] = original_package
+        else:
+            sys.modules.pop("komari_bot.plugins.jrhg", None)
 
-    class _DummyConfigManager:
-        def get(self) -> object:
-            return SimpleNamespace(plugin_enable=True)
 
-        def update_field(self, _field: str, _value: object) -> None:
-            return None
+def _build_sender(user_id: int, nickname: str = "阿虚") -> Sender:
+    return Sender.model_construct(user_id=user_id, nickname=nickname, card="")
 
-    class _DummyConfigManagerPlugin:
-        @staticmethod
-        def get_config_manager(_name: str, _schema: object) -> _DummyConfigManager:
-            return _DummyConfigManager()
+
+def _build_group_event(
+    plain_text: str,
+    *,
+    message_id: int,
+    group_id: int = 114514,
+) -> GroupMessageEvent:
+    message = Message(plain_text)
+    return GroupMessageEvent.model_construct(
+        time=1,
+        self_id=669293859,
+        post_type="message",
+        sub_type="normal",
+        user_id=10001,
+        message_type="group",
+        message_id=message_id,
+        message=message,
+        original_message=message,
+        raw_message=plain_text,
+        font=14,
+        sender=_build_sender(10001),
+        to_me=False,
+        reply=None,
+        group_id=group_id,
+        anonymous=None,
+    )
+
+
+def _build_private_event(
+    plain_text: str,
+    *,
+    message_id: int,
+) -> PrivateMessageEvent:
+    message = Message(plain_text)
+    return PrivateMessageEvent.model_construct(
+        time=1,
+        self_id=669293859,
+        post_type="message",
+        sub_type="friend",
+        user_id=10001,
+        message_type="private",
+        message_id=message_id,
+        message=message,
+        original_message=message,
+        raw_message=plain_text,
+        font=14,
+        sender=_build_sender(10001),
+        to_me=True,
+        reply=None,
+    )
+
+
+def _create_onebot_bot(ctx: Any) -> Bot:
+    adapter = ctx.create_adapter(base=Adapter)
+    return cast("Bot", ctx.create_bot(base=Bot, adapter=adapter, self_id="669293859"))
+
+
+@pytest.mark.asyncio
+async def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_text(
+    app: App,
+    jrhg_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction_history = {
+        "summary": "最近常找小鞠聊天",
+        "records": [{"event": "投喂", "result": "开心"}],
+    }
+    captured_prompts: list[dict[str, Any]] = []
 
     async def _generate_or_update_favorability(_user_id: str) -> object:
         return SimpleNamespace(
@@ -57,92 +142,6 @@ def _load_jrhg_module(monkeypatch: Any) -> Any:
         del user_nickname, daily_favor
         return ai_response
 
-    async def _check_runtime_permission(
-        _bot: object,
-        _event: object,
-        _config: object,
-    ) -> tuple[bool, str]:
-        return True, ""
-
-    def _fake_require(name: str) -> object:
-        if name == "config_manager":
-            return _DummyConfigManagerPlugin()
-        if name == "user_data":
-            return SimpleNamespace(
-                generate_or_update_favorability=_generate_or_update_favorability,
-                format_favor_response=_format_favor_response,
-            )
-        if name == "permission_manager":
-            return SimpleNamespace(
-                check_runtime_permission=_check_runtime_permission,
-                check_plugin_status=lambda _config: (True, "🟢 正常"),
-                format_permission_info=lambda _config: "权限正常",
-            )
-        if name == "komari_memory":
-            return SimpleNamespace(get_plugin_manager=lambda: None)
-        if name == "llm_provider":
-            return SimpleNamespace()
-        if name == "character_binding":
-            return SimpleNamespace(
-                get_character_name=lambda user_id, fallback_nickname="": (
-                    fallback_nickname or user_id
-                )
-            )
-        msg = f"Unsupported plugin require in tests: {name}"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(nonebot, "on_command", lambda *_args, **_kwargs: _DummyMatcher())
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
-
-    original_package = sys.modules.get("komari_bot.plugins.jrhg")
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "komari_bot.plugins.jrhg",
-            MODULE_PATH,
-            submodule_search_locations=[str(PACKAGE_ROOT)],
-        )
-        if spec is None or spec.loader is None:
-            raise AssertionError
-
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["komari_bot.plugins.jrhg"] = module
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        if original_package is not None:
-            sys.modules["komari_bot.plugins.jrhg"] = original_package
-        else:
-            sys.modules.pop("komari_bot.plugins.jrhg", None)
-
-
-def _make_event(
-    *,
-    message_id: int,
-    plain_text: str,
-    group_id: int | None,
-) -> Any:
-    event = SimpleNamespace(
-        message_id=message_id,
-        sender=SimpleNamespace(nickname="阿虚", card=""),
-        get_user_id=lambda: "10001",
-        get_plaintext=lambda: plain_text,
-    )
-    if group_id is not None:
-        event.group_id = group_id
-    return event
-
-
-def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_text(
-    monkeypatch: Any,
-) -> None:
-    module = _load_jrhg_module(monkeypatch)
-    interaction_history = {
-        "summary": "最近常找小鞠聊天",
-        "records": [{"event": "投喂", "result": "开心"}],
-    }
-    captured_prompts: list[dict[str, Any]] = []
-    finished_messages: list[str] = []
-
     async def _get_interaction_history(**_kwargs: object) -> dict[str, Any]:
         return interaction_history
 
@@ -153,11 +152,14 @@ def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_text(
     async def _generate_reply(**_kwargs: object) -> str:
         return "生成回复"
 
-    async def _finish(message: str) -> None:
-        finished_messages.append(message)
-
     monkeypatch.setattr(
-        module,
+        jrhg_module,
+        "generate_or_update_favorability",
+        _generate_or_update_favorability,
+    )
+    monkeypatch.setattr(jrhg_module, "format_favor_response", _format_favor_response)
+    monkeypatch.setattr(
+        jrhg_module,
         "komari_memory_plugin",
         SimpleNamespace(
             get_plugin_manager=lambda: SimpleNamespace(
@@ -167,40 +169,55 @@ def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_text(
             )
         ),
     )
-    monkeypatch.setattr(module, "build_prompt", _build_prompt)
-    monkeypatch.setattr(module, "generate_reply", _generate_reply)
-    monkeypatch.setattr(module.jrhg, "finish", _finish)
+    monkeypatch.setattr(jrhg_module, "build_prompt", _build_prompt)
+    monkeypatch.setattr(jrhg_module, "generate_reply", _generate_reply)
 
-    asyncio.run(
-        module.jrhg_function(
-            SimpleNamespace(),
-            _make_event(message_id=1, plain_text=".jrhg", group_id=114514),
-        )
-    )
-    asyncio.run(
-        module.jrhg_function(
-            SimpleNamespace(),
-            _make_event(
-                message_id=2,
-                plain_text=".jrhg 任意尾随文本",
-                group_id=114514,
-            ),
-        )
-    )
+    async with app.test_matcher(jrhg_module.jrhg) as ctx:
+        bot = _create_onebot_bot(ctx)
+
+        event = _build_group_event(".jrhg", message_id=1)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=jrhg_module.jrhg)
+        ctx.should_pass_rule(matcher=jrhg_module.jrhg)
+        ctx.should_call_send(event, "生成回复", bot=bot)
+        ctx.should_finished()
+
+        event_with_tail = _build_group_event(".jrhg 任意尾随文本", message_id=2)
+        ctx.receive_event(bot, event_with_tail)
+        ctx.should_pass_permission(matcher=jrhg_module.jrhg)
+        ctx.should_pass_rule(matcher=jrhg_module.jrhg)
+        ctx.should_call_send(event_with_tail, "生成回复", bot=bot)
+        ctx.should_finished()
 
     assert captured_prompts == [
         {"daily_favor": 73, "interaction_history": interaction_history},
         {"daily_favor": 73, "interaction_history": interaction_history},
     ]
-    assert finished_messages == ["生成回复", "生成回复"]
 
 
-def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
-    monkeypatch: Any,
+@pytest.mark.asyncio
+async def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
+    app: App,
+    jrhg_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _load_jrhg_module(monkeypatch)
     captured_prompts: list[dict[str, Any]] = []
-    finished_messages: list[str] = []
+
+    async def _generate_or_update_favorability(_user_id: str) -> object:
+        return SimpleNamespace(
+            daily_favor=73,
+            cumulative_favor=114,
+            is_new_day=False,
+            favor_level="友好",
+        )
+
+    async def _format_favor_response(
+        ai_response: str,
+        user_nickname: str,
+        daily_favor: int,
+    ) -> str:
+        del user_nickname, daily_favor
+        return ai_response
 
     def _build_prompt(**kwargs: Any) -> list[dict[str, str]]:
         captured_prompts.append(kwargs)
@@ -209,43 +226,45 @@ def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
     async def _generate_reply(**_kwargs: object) -> str:
         raise RuntimeError("boom")
 
-    async def _finish(message: str) -> None:
-        finished_messages.append(message)
-
     monkeypatch.setattr(
-        module,
+        jrhg_module,
+        "generate_or_update_favorability",
+        _generate_or_update_favorability,
+    )
+    monkeypatch.setattr(jrhg_module, "format_favor_response", _format_favor_response)
+    monkeypatch.setattr(
+        jrhg_module,
         "komari_memory_plugin",
         SimpleNamespace(get_plugin_manager=lambda: None),
     )
-    monkeypatch.setattr(module, "build_prompt", _build_prompt)
-    monkeypatch.setattr(module, "generate_reply", _generate_reply)
-    monkeypatch.setattr(module.jrhg, "finish", _finish)
+    monkeypatch.setattr(jrhg_module, "build_prompt", _build_prompt)
+    monkeypatch.setattr(jrhg_module, "generate_reply", _generate_reply)
 
-    asyncio.run(
-        module.jrhg_function(
-            SimpleNamespace(),
-            _make_event(
-                message_id=3,
-                plain_text=".jrhg 任意尾随文本",
-                group_id=None,
-            ),
+    async with app.test_matcher(jrhg_module.jrhg) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".jrhg 任意尾随文本", message_id=3)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=jrhg_module.jrhg)
+        ctx.should_pass_rule(matcher=jrhg_module.jrhg)
+        ctx.should_call_send(
+            event,
+            jrhg_module._get_response(73, "阿虚"),
+            bot=bot,
         )
-    )
+        ctx.should_finished()
 
     assert captured_prompts == [{"daily_favor": 73, "interaction_history": None}]
-    assert finished_messages == [module._get_response(73, "阿虚")]
 
 
 def test_load_interaction_history_returns_none_when_memory_has_no_record(
-    monkeypatch: Any,
+    jrhg_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _load_jrhg_module(monkeypatch)
-
     async def _get_interaction_history(**_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(
-        module,
+        jrhg_module,
         "komari_memory_plugin",
         SimpleNamespace(
             get_plugin_manager=lambda: SimpleNamespace(
@@ -257,7 +276,7 @@ def test_load_interaction_history_returns_none_when_memory_has_no_record(
     )
 
     result = asyncio.run(
-        module._load_interaction_history(user_id="10001", group_id="114514")
+        jrhg_module._load_interaction_history(user_id="10001", group_id="114514")
     )
 
     assert result is None
