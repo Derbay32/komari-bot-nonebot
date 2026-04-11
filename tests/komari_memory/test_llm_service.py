@@ -269,6 +269,45 @@ def test_build_summary_prompt_uses_operation_contract() -> None:
     assert "user_interaction_operations" in prompt
     assert "add / replace / delete" in prompt
     assert "你输出的是“增量操作”" in prompt
+    assert "`field` 只允许：trait" in prompt
+    assert "绝对不要尝试修改它" in prompt
+    assert "严禁为 `[bot]` 消息" in prompt
+
+
+def test_normalize_profile_operations_drops_display_name_operations() -> None:
+    normalized = llm_service_module._normalize_user_operation_payloads(
+        [
+            {
+                "user_id": "10001",
+                "display_name": "阿明",
+                "operations": [
+                    {"op": "replace", "field": "display_name", "value": "新名字"},
+                    {
+                        "op": "replace",
+                        "field": "trait",
+                        "key": "喜欢的食物",
+                        "value": "拉面",
+                        "category": "preference",
+                        "importance": 4,
+                    },
+                ],
+            }
+        ],
+        operation_type="profile",
+    )
+
+    assert len(normalized) == 1
+    assert normalized[0]["display_name"] == "阿明"
+    assert normalized[0]["operations"] == [
+        {
+            "op": "replace",
+            "field": "trait",
+            "key": "喜欢的食物",
+            "value": "拉面",
+            "category": "preference",
+            "importance": 4,
+        }
+    ]
 
 
 def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> None:
@@ -394,7 +433,7 @@ def test_normalize_summary_result_converts_legacy_payload_to_operations() -> Non
         }
     )
 
-    assert normalized["user_profile_operations"][0]["operations"][0]["field"] == "display_name"
-    assert normalized["user_profile_operations"][0]["operations"][1]["field"] == "trait"
+    assert len(normalized["user_profile_operations"][0]["operations"]) == 1
+    assert normalized["user_profile_operations"][0]["operations"][0]["field"] == "trait"
     assert normalized["user_interaction_operations"][0]["operations"][0]["field"] == "summary"
     assert normalized["user_interaction_operations"][0]["operations"][1]["field"] == "record"

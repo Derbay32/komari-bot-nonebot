@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
 
 
 _MAX_INTERACTION_RECORDS = 6
+_BOT_UID_ALIASES = frozenset({"bot", "assistant", "system", "self", "[bot]"})
 
 
 def _now_iso() -> str:
@@ -58,6 +60,154 @@ def _default_interaction(*, user_id: str, display_name: str) -> dict[str, Any]:
         "summary": "",
         "updated_at": _now_iso(),
     }
+
+
+def _normalize_identity_key(value: str) -> str:
+    return value.strip().casefold()
+
+
+async def _refresh_character_binding_if_needed(*, group_id: str) -> bool:
+    refresh_func = getattr(character_binding, "refresh_if_file_updated", None)
+    if not callable(refresh_func):
+        return False
+
+    try:
+        result = refresh_func()
+        changed = await result if inspect.isawaitable(result) else result
+    except Exception:
+        logger.exception("[KomariMemory] binding 热刷新失败: group={}", group_id)
+        return False
+
+    if bool(changed):
+        logger.info("[KomariMemory] 检测到 binding 更新，已在总结前刷新: group={}", group_id)
+    return bool(changed)
+
+
+def _refresh_existing_context_display_names(
+    *,
+    group_id: str,
+    participants: list[str],
+    nickname_map: dict[str, str],
+    existing_profiles: dict[str, dict[str, Any]],
+    existing_interactions: dict[str, dict[str, Any]],
+) -> None:
+    updated_profiles = 0
+    updated_interactions = 0
+
+    for uid in participants:
+        display_name = str(
+            character_binding.get_character_name(
+                user_id=uid,
+                fallback_nickname=nickname_map.get(uid),
+            )
+        ).strip() or nickname_map.get(uid, "").strip() or uid
+
+        profile = existing_profiles.get(uid)
+        if profile is not None and str(profile.get("display_name", "")).strip() != display_name:
+            normalized_profile = dict(profile)
+            normalized_profile["user_id"] = uid
+            normalized_profile["display_name"] = display_name
+            existing_profiles[uid] = normalized_profile
+            updated_profiles += 1
+
+        interaction = existing_interactions.get(uid)
+        if (
+            interaction is not None
+            and str(interaction.get("display_name", "")).strip() != display_name
+        ):
+            normalized_interaction = dict(interaction)
+            normalized_interaction["user_id"] = uid
+            normalized_interaction["display_name"] = display_name
+            existing_interactions[uid] = normalized_interaction
+            updated_interactions += 1
+
+    if updated_profiles or updated_interactions:
+        logger.info(
+            "[KomariMemory] 总结前已按 binding 对齐上下文 display_name: group={} profiles={} interactions={}",
+            group_id,
+            updated_profiles,
+            updated_interactions,
+        )
+
+
+def _collect_bot_identities(
+    *,
+    messages_buffer: list[Any],
+    config: KomariMemoryConfigSchema,
+) -> tuple[set[str], set[str]]:
+    bot_user_ids: set[str] = set()
+    bot_display_names = {
+        _normalize_identity_key(str(config.bot_nickname)),
+        *{
+            _normalize_identity_key(str(alias))
+            for alias in config.bot_aliases
+            if str(alias).strip()
+        },
+    }
+
+    for msg in messages_buffer:
+        if not getattr(msg, "is_bot", False):
+            continue
+
+        user_id = str(getattr(msg, "user_id", "")).strip()
+        if user_id:
+            bot_user_ids.add(user_id)
+
+        candidates = {
+            str(getattr(msg, "user_nickname", "")).strip(),
+            str(
+                character_binding.get_character_name(
+                    user_id=user_id,
+                    fallback_nickname=getattr(msg, "user_nickname", ""),
+                )
+            ).strip(),
+        }
+        for candidate in candidates:
+            if candidate:
+                bot_display_names.add(_normalize_identity_key(candidate))
+
+    bot_display_names.discard("")
+    return bot_user_ids, bot_display_names
+
+
+def _should_skip_bot_summary_entry(
+    *,
+    raw_uid: str,
+    display_name: str,
+    participant_set: set[str],
+    bot_user_ids: set[str],
+    bot_display_names: set[str],
+    group_id: str,
+    source: str,
+) -> bool:
+    normalized_uid = str(raw_uid).strip()
+    normalized_display_name = str(display_name).strip()
+
+    if normalized_uid in bot_user_ids or _normalize_identity_key(normalized_uid) in _BOT_UID_ALIASES:
+        logger.warning(
+            "[KomariMemory] 总结结果丢弃机器人条目: group={} source={} raw_uid={} display_name={}",
+            group_id,
+            source,
+            normalized_uid or "-",
+            normalized_display_name or "-",
+        )
+        return True
+
+    if (
+        normalized_display_name
+        and _normalize_identity_key(normalized_display_name) in bot_display_names
+        and normalized_uid not in participant_set
+    ):
+        logger.warning(
+            "[KomariMemory] 总结结果按机器人名称丢弃条目: group={} source={} raw_uid={} display_name={}",
+            group_id,
+            source,
+            normalized_uid or "-",
+            normalized_display_name,
+        )
+        return True
+
+    return False
 
 
 def _merge_traits_into_profile(
@@ -261,8 +411,11 @@ def _apply_profile_operations(
     profile = dict(base_profile)
     profile["version"] = 1
     profile["user_id"] = user_id
-
-    current_display_name = str(profile.get("display_name", "")).strip() or display_name
+    resolved_display_name = (
+        str(display_name).strip()
+        or str(profile.get("display_name", "")).strip()
+        or user_id
+    )
     traits_raw = profile.get("traits")
     traits = dict(traits_raw) if isinstance(traits_raw, dict) else {}
 
@@ -271,19 +424,6 @@ def _apply_profile_operations(
             continue
         op = str(operation.get("op", "")).strip()
         field = str(operation.get("field", "")).strip()
-
-        if field == "display_name":
-            if op == "delete":
-                current_display_name = ""
-                continue
-            value = str(operation.get("value", "")).strip()
-            if not value:
-                continue
-            if op == "add" and current_display_name:
-                continue
-            if op in {"add", "replace"}:
-                current_display_name = value
-            continue
 
         if field != "trait":
             continue
@@ -311,7 +451,7 @@ def _apply_profile_operations(
             "updated_at": _now_iso(),
         }
 
-    profile["display_name"] = current_display_name or display_name or user_id
+    profile["display_name"] = resolved_display_name
     profile["traits"] = traits
     profile["updated_at"] = _now_iso()
     return profile
@@ -478,6 +618,8 @@ async def perform_summary(
         logger.warning("[KomariMemory] 群组 {} 消息缓冲为空", group_id)
         return
 
+    await _refresh_character_binding_if_needed(group_id=group_id)
+
     participants = list({msg.user_id for msg in messages_buffer if not msg.is_bot})
     participant_set = set(participants)
     nickname_map: dict[str, str] = {}
@@ -498,6 +640,14 @@ async def perform_summary(
         interaction = await memory.get_interaction_history(user_id=uid, group_id=group_id)
         if interaction is not None:
             existing_interactions[uid] = interaction
+
+    _refresh_existing_context_display_names(
+        group_id=group_id,
+        participants=participants,
+        nickname_map=nickname_map,
+        existing_profiles=existing_profiles,
+        existing_interactions=existing_interactions,
+    )
 
     result = await summarize_conversation(
         messages_buffer,
@@ -527,6 +677,10 @@ async def perform_summary(
         nickname_map=nickname_map,
     )
     uid_alias_map: dict[str, str] = {}
+    bot_user_ids, bot_display_names = _collect_bot_identities(
+        messages_buffer=messages_buffer,
+        config=config,
+    )
 
     profile_operations_by_user: dict[str, dict[str, Any]] = {}
     if isinstance(user_profile_operations, list):
@@ -535,6 +689,16 @@ async def perform_summary(
                 continue
             raw_uid = str(payload.get("user_id", "")).strip()
             display_name = str(payload.get("display_name", "")).strip()
+            if _should_skip_bot_summary_entry(
+                raw_uid=raw_uid,
+                display_name=display_name,
+                participant_set=participant_set,
+                bot_user_ids=bot_user_ids,
+                bot_display_names=bot_display_names,
+                group_id=group_id,
+                source="user_profile_operation",
+            ):
+                continue
             uid = _resolve_summary_uid(
                 raw_uid=raw_uid,
                 display_name=display_name,
@@ -544,7 +708,7 @@ async def perform_summary(
                 group_id=group_id,
                 source="user_profile_operation",
             )
-            if uid is None:
+            if uid is None or uid in bot_user_ids:
                 continue
             normalized_payload = dict(payload)
             normalized_payload["user_id"] = uid
@@ -560,6 +724,16 @@ async def perform_summary(
                 continue
             raw_uid = str(payload.get("user_id", "")).strip()
             display_name = str(payload.get("display_name", "")).strip()
+            if _should_skip_bot_summary_entry(
+                raw_uid=raw_uid,
+                display_name=display_name,
+                participant_set=participant_set,
+                bot_user_ids=bot_user_ids,
+                bot_display_names=bot_display_names,
+                group_id=group_id,
+                source="user_interaction_operation",
+            ):
+                continue
             uid = _resolve_summary_uid(
                 raw_uid=raw_uid,
                 display_name=display_name,
@@ -569,7 +743,7 @@ async def perform_summary(
                 group_id=group_id,
                 source="user_interaction_operation",
             )
-            if uid is None:
+            if uid is None or uid in bot_user_ids:
                 continue
             normalized_payload = dict(payload)
             normalized_payload["user_id"] = uid
@@ -582,18 +756,13 @@ async def perform_summary(
         set(participants)
         | set(profile_operations_by_user)
         | set(interaction_operations_by_user)
-    )
+    ) - bot_user_ids
     for uid in sorted(target_users):
-        model_display_name = ""
-        profile_operation_payload = profile_operations_by_user.get(uid)
-        if profile_operation_payload is not None:
-            model_display_name = str(
-                profile_operation_payload.get("display_name", "")
-            ).strip()
         display_name = character_binding.get_character_name(
             user_id=uid,
-            fallback_nickname=nickname_map.get(uid) or model_display_name,
+            fallback_nickname=nickname_map.get(uid),
         )
+        profile_operation_payload = profile_operations_by_user.get(uid)
         base_profile = existing_profiles.get(uid) or _default_profile(
             user_id=uid,
             display_name=display_name,

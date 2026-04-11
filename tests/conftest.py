@@ -151,6 +151,10 @@ class _DummyCharacterBindingPlugin:
     def get_character_name(user_id: str, fallback_nickname: str = "") -> str:
         return fallback_nickname or user_id
 
+    @staticmethod
+    def refresh_if_file_updated() -> bool:
+        return False
+
 
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),

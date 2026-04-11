@@ -18,10 +18,11 @@ DEFAULTS: dict[str, str] = {
         "- 提取对话的核心内容，形成 summary（简短总结）。\n"
         "- 输出 `user_profile_operations` 数组，每个元素对应一个用户，字段包含：\n"
         "  - user_id\n"
-        "  - display_name（可为空字符串）\n"
+        "  - display_name（仅作为用户识别提示，可为空字符串）\n"
         "  - operations（数组），每个操作都必须包含 op/field，按需要补充 key/value/category/importance\n"
         "- `op` 只允许：add / replace / delete。\n"
-        "- `field` 只允许：display_name / trait。\n"
+        "- `field` 只允许：trait。\n"
+        "- `display_name` 绝对不能作为可修改字段写进 operations；禁止新增、删除、替换 display_name。\n"
         "- 当 `field=trait` 时，必须提供 `key`；若 `op` 为 add 或 replace，还必须提供 `value/category/importance`。\n"
         "- category 仅可取：preference/fact/relation/general。\n"
         "- traits 只保留长期稳定、可复用的画像信息，例如身份、长期偏好、稳定习惯、关系认知、长期事实。\n"
@@ -35,6 +36,10 @@ DEFAULTS: dict[str, str] = {
         "- 当 `field=record` 时，`value` 必须是对象，包含 event/result/emotion；record 仅允许 add 或 delete，若要改写旧 record，请先 delete 再 add。\n"
         "- `summary` 只表示本次互动结束后形成的新的整体印象或评价；`records` 只记录本次对话新增或需要删除的互动片段。\n"
         "- 你输出的是“增量操作”，不是最终完整互动历史；禁止把完整 records 全量重写出来。\n\n"
+        "【额外硬性约束】\n"
+        "- `display_name` 由程序根据 binding 和昵称维护，你只能把它当作识别线索，绝对不要尝试修改它。\n"
+        "- 严禁为 `[bot]` 消息、机器人自己、assistant、自身昵称或机器人别名生成任何画像或互动历史操作。\n"
+        "- bot 发言只用于理解上下文，不能作为要写入数据库的用户条目。\n\n"
         "【任务三：评估重要性】\n"
         "请按以下标准评估重要性（1-5分）：\n"
         "- 1分：无意义的闲聊、表情包测试、简短问候\n"
@@ -52,6 +57,8 @@ DEFAULTS: dict[str, str] = {
         "- 合并重复 user_id 的操作，按时间顺序保留最终需要执行的 add/replace/delete 指令\n"
         "- 对近义或重复 trait 进行合并，统一为更稳定的 key，尽量减少多余操作\n"
         "- 对同一用户的互动 record 操作进行去重，保持 add/delete 的实际执行顺序\n"
+        "- `display_name` 只作为识别提示，绝对不要把它写进 operations，也不要尝试修改它\n"
+        "- 严禁为 `[bot]` 消息、机器人自己、assistant、自身昵称或机器人别名生成任何操作\n"
         "- 不要输出最终完整画像或完整互动历史，只输出最终需要执行的增量操作\n"
         "- 产出一份整体 summary 和整体 importance\n"
         "- 不要按分段分别输出，不要解释推理过程\n\n"
@@ -64,6 +71,8 @@ DEFAULTS: dict[str, str] = {
         "【重要指示】\n"
         "- 你输出的是按用户聚合的增量操作，不要输出扁平 entities 列表\n"
         "- 不要输出最终完整画像或完整互动历史，只输出需要程序执行的 add/replace/delete 操作\n"
+        "- `display_name` 由程序维护，绝对不要把它写进 operations，也不要尝试修改它\n"
+        "- 严禁为 `[bot]` 消息、机器人自己、assistant、自身昵称或机器人别名生成任何操作\n"
         "- 如果对话中发现与已有画像矛盾的新信息，请输出 replace 或 delete 操作\n"
         "- 如果对话中没有提到某个旧特征或旧互动，不要重复输出它\n"
     ),
@@ -80,7 +89,7 @@ DEFAULTS: dict[str, str] = {
         '{"summary": "...", "user_profile_operations": '
         '[{"user_id": "12345", "display_name": "阿明", "operations": '
         '[{"op": "add", "field": "trait", "key": "喜欢的食物", "value": "拉面", "category": "preference", "importance": 4}, '
-        '{"op": "replace", "field": "display_name", "value": "阿明"}, '
+        '{"op": "replace", "field": "trait", "key": "怕冷", "value": "换季时会裹紧外套", "category": "fact", "importance": 3}, '
         '{"op": "delete", "field": "trait", "key": "短期状态"}]}], '
         '"user_interaction_operations": [{"user_id": "12345", "display_name": "阿明", "operations": '
         '[{"op": "add", "field": "record", "value": {"event": "用好吃的诱惑我", "result": "咽了口水，稍微凑近了过去", "emotion": "有点警惕但很想吃"}}, '

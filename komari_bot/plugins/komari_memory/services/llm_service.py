@@ -520,22 +520,13 @@ def _normalize_profile_operation(operation: dict[str, Any]) -> dict[str, Any] | 
     field = str(operation.get("field", operation.get("target", ""))).strip()
     if op not in {"add", "replace", "delete"}:
         return None
-    if field not in {"display_name", "trait"}:
+    if field != "trait":
         return None
 
     normalized: dict[str, Any] = {
         "op": op,
         "field": field,
     }
-    if field == "display_name":
-        if op == "delete":
-            return normalized
-        value = str(operation.get("value", "")).strip()
-        if not value:
-            return None
-        normalized["value"] = value
-        return normalized
-
     key = str(operation.get("key", "")).strip()
     if not key:
         return None
@@ -617,15 +608,6 @@ def _convert_legacy_profiles_to_operations(
             continue
         operations: list[dict[str, Any]] = []
         display_name = str(profile.get("display_name", "")).strip()
-        if display_name:
-            operations.append(
-                {
-                    "op": "replace",
-                    "field": "display_name",
-                    "value": display_name,
-                }
-            )
-
         traits = profile.get("traits")
         if isinstance(traits, list):
             for trait in traits:
