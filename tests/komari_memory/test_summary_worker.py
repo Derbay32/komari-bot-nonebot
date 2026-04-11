@@ -287,19 +287,50 @@ def test_perform_summary_appends_interaction_records_and_preserves_metadata(
         del args, kwargs
         return {
             "summary": "新的群聊总结",
-            "user_profiles": [],
-            "user_interactions": [
+            "user_profile_operations": [],
+            "user_interaction_operations": [
                 {
                     "user_id": "10001",
-                    "file_type": "不要信这个",
-                    "description": "也不要信这个",
-                    "records": [
-                        {"event": "新事件1", "result": "新反应1", "emotion": "新情绪1"},
-                        {"event": "新事件2", "result": "新反应2", "emotion": "新情绪2"},
-                        {"event": "新事件3", "result": "新反应3", "emotion": "新情绪3"},
-                        {"event": "新事件4", "result": "新反应4", "emotion": "新情绪4"},
+                    "display_name": "阿明",
+                    "operations": [
+                        {"op": "replace", "field": "summary", "value": "新的整体评价"},
+                        {
+                            "op": "add",
+                            "field": "record",
+                            "value": {
+                                "event": "新事件1",
+                                "result": "新反应1",
+                                "emotion": "新情绪1",
+                            },
+                        },
+                        {
+                            "op": "add",
+                            "field": "record",
+                            "value": {
+                                "event": "新事件2",
+                                "result": "新反应2",
+                                "emotion": "新情绪2",
+                            },
+                        },
+                        {
+                            "op": "add",
+                            "field": "record",
+                            "value": {
+                                "event": "新事件3",
+                                "result": "新反应3",
+                                "emotion": "新情绪3",
+                            },
+                        },
+                        {
+                            "op": "add",
+                            "field": "record",
+                            "value": {
+                                "event": "新事件4",
+                                "result": "新反应4",
+                                "emotion": "新情绪4",
+                            },
+                        },
                     ],
-                    "summary": "新的整体评价",
                 }
             ],
             "importance": 4,
@@ -360,8 +391,8 @@ def test_perform_summary_keeps_existing_interaction_when_model_returns_no_update
         del args, kwargs
         return {
             "summary": "新的群聊总结",
-            "user_profiles": [],
-            "user_interactions": [],
+            "user_profile_operations": [],
+            "user_interaction_operations": [],
             "importance": 4,
         }
 
@@ -386,3 +417,154 @@ def test_perform_summary_keeps_existing_interaction_when_model_returns_no_update
     assert interaction["description"] == "旧描述"
     assert interaction["summary"] == "旧评价"
     assert interaction["records"] == existing_interaction["records"]
+
+
+def test_perform_summary_remaps_hallucinated_uid_by_display_name_and_drops_unknown_uid(
+    monkeypatch: Any,
+) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+    )
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "summary": "新的群聊总结",
+            "user_profile_operations": [
+                {
+                    "user_id": "99999",
+                    "display_name": "阿明",
+                    "operations": [
+                        {
+                            "op": "replace",
+                            "field": "trait",
+                            "key": "喜欢的食物",
+                            "value": "布丁",
+                            "category": "preference",
+                            "importance": 4,
+                        }
+                    ],
+                },
+                {
+                    "user_id": "88888",
+                    "display_name": "路人甲",
+                    "operations": [
+                        {
+                            "op": "replace",
+                            "field": "trait",
+                            "key": "无效画像",
+                            "value": "不该入库",
+                            "category": "general",
+                            "importance": 1,
+                        }
+                    ],
+                },
+            ],
+            "user_interaction_operations": [
+                {
+                    "user_id": "99999",
+                    "display_name": "阿明",
+                    "operations": [
+                        {
+                            "op": "add",
+                            "field": "record",
+                            "value": {
+                                "event": "递上布丁",
+                                "result": "立刻靠近",
+                                "emotion": "开心",
+                            },
+                        },
+                        {
+                            "op": "replace",
+                            "field": "summary",
+                            "value": "会被布丁钓走",
+                        },
+                    ],
+                },
+                {
+                    "user_id": "77777",
+                    "display_name": "路人乙",
+                    "operations": [
+                        {
+                            "op": "add",
+                            "field": "record",
+                            "value": {
+                                "event": "无效事件",
+                                "result": "无效反应",
+                                "emotion": "无效情绪",
+                            },
+                        }
+                    ],
+                },
+            ],
+            "importance": 4,
+        }
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+
+    redis = _FakeRedis([_make_message(user_id="10001", user_nickname="阿明")])
+    memory = _FakeMemory()
+
+    asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert [call["user_id"] for call in memory.upsert_user_profile_calls] == ["10001"]
+    assert [call["user_id"] for call in memory.upsert_interaction_history_calls] == [
+        "10001"
+    ]
+    profile = memory.upsert_user_profile_calls[0]["profile"]
+    assert profile["traits"]["喜欢的食物"]["value"] == "布丁"
+    interaction = memory.upsert_interaction_history_calls[0]["interaction"]
+    assert interaction["summary"] == "会被布丁钓走"
+    assert interaction["records"] == [
+        {"event": "递上布丁", "result": "立刻靠近", "emotion": "开心"}
+    ]
+
+
+def test_apply_profile_operations_supports_add_replace_delete(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+
+    result = module._apply_profile_operations(
+        {
+            "version": 1,
+            "user_id": "10001",
+            "display_name": "旧名字",
+            "traits": {
+                "旧特征": {
+                    "value": "会过时",
+                    "category": "general",
+                    "importance": 2,
+                    "updated_at": "2026-04-01T00:00:00+08:00",
+                },
+                "保留特征": {
+                    "value": "旧值",
+                    "category": "general",
+                    "importance": 3,
+                    "updated_at": "2026-04-01T00:00:00+08:00",
+                },
+            },
+        },
+        user_id="10001",
+        display_name="阿明",
+        operations=[
+            {"op": "add", "field": "trait", "key": "新增特征", "value": "新值"},
+            {
+                "op": "replace",
+                "field": "trait",
+                "key": "保留特征",
+                "value": "改成新值",
+                "category": "fact",
+                "importance": 5,
+            },
+            {"op": "delete", "field": "trait", "key": "旧特征"},
+            {"op": "replace", "field": "display_name", "value": "新名字"},
+        ],
+    )
+
+    assert result["display_name"] == "新名字"
+    assert "旧特征" not in result["traits"]
+    assert result["traits"]["新增特征"]["value"] == "新值"
+    assert result["traits"]["保留特征"]["value"] == "改成新值"
+    assert result["traits"]["保留特征"]["category"] == "fact"

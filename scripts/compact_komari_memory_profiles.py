@@ -1,4 +1,4 @@
-"""压缩 komari_memory_entity 中的用户画像。
+"""压缩 komari_memory_user_profile 中的用户画像。
 
 默认是 dry-run，仅打印压缩前后统计，不写库。
 
@@ -19,6 +19,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,8 +43,7 @@ from komari_bot.common.profile_compaction import (
     summarize_profile_compaction_diff,
 )
 
-_PROFILE_KEY = "user_profile"
-_PROFILE_CATEGORY = "profile_json"
+_PROFILE_TABLE = "komari_memory_user_profile"
 logger = logging.getLogger("compact_komari_memory_profiles")
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -87,7 +87,10 @@ class StandaloneLLMConfig(BaseModel):
 class ProfileRow:
     user_id: str
     group_id: str
-    value: str
+    version: int
+    display_name: str
+    traits: Any
+    updated_at: Any
     importance: int
 
 
@@ -198,8 +201,8 @@ async def _fetch_profile_rows(
     group_id: str | None = None,
     user_id: str | None = None,
 ) -> list[ProfileRow]:
-    conditions = ["key = $1"]
-    args: list[Any] = [_PROFILE_KEY]
+    conditions: list[str] = []
+    args: list[Any] = []
 
     if group_id:
         conditions.append(f"group_id = ${len(args) + 1}")
@@ -208,11 +211,18 @@ async def _fetch_profile_rows(
         conditions.append(f"user_id = ${len(args) + 1}")
         args.append(user_id)
 
-    where_clause = " AND ".join(conditions)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     query = f"""
-        SELECT user_id, group_id, value, importance
-        FROM komari_memory_entity
-        WHERE {where_clause}
+        SELECT
+            user_id,
+            group_id,
+            version,
+            display_name,
+            traits,
+            updated_at,
+            importance
+        FROM {_PROFILE_TABLE}
+        {where_clause}
         ORDER BY group_id, user_id
     """
     async with pool.acquire() as conn:
@@ -222,11 +232,33 @@ async def _fetch_profile_rows(
         ProfileRow(
             user_id=str(row["user_id"]),
             group_id=str(row["group_id"]),
-            value=str(row["value"]),
+            version=int(row["version"] or 1),
+            display_name=str(row["display_name"] or row["user_id"]),
+            traits=row["traits"],
+            updated_at=row["updated_at"],
             importance=int(row["importance"] or 4),
         )
         for row in rows
     ]
+
+
+def _normalize_profile_updated_at(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    text = str(value or "").strip()
+    if text:
+        normalized_text = f"{text[:-1]}+00:00" if text.endswith("Z") else text
+        try:
+            parsed = datetime.fromisoformat(normalized_text)
+        except ValueError:
+            logger.warning(
+                "[KomariMemory] 画像 updated_at 解析失败，回退当前时间: raw=%s",
+                text,
+            )
+        else:
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return datetime.now(UTC)
 
 
 async def _update_profile_row(
@@ -237,18 +269,42 @@ async def _update_profile_row(
 ) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
-            """
-            UPDATE komari_memory_entity
-            SET value = $4, category = $5, importance = $6
-            WHERE user_id = $1 AND group_id = $2 AND key = $3
+            f"""
+            UPDATE {_PROFILE_TABLE}
+            SET version = $3,
+                display_name = $4,
+                traits = $5::jsonb,
+                updated_at = $6::timestamptz,
+                importance = $7
+            WHERE user_id = $1 AND group_id = $2
             """,
             row.user_id,
             row.group_id,
-            _PROFILE_KEY,
-            json.dumps(compacted_profile, ensure_ascii=False),
-            _PROFILE_CATEGORY,
+            int(compacted_profile.get("version", 1) or 1),
+            str(compacted_profile.get("display_name", "")).strip() or row.user_id,
+            json.dumps(compacted_profile.get("traits", {}), ensure_ascii=False),
+            _normalize_profile_updated_at(compacted_profile.get("updated_at")),
             row.importance,
         )
+
+
+def _build_profile_payload(row: ProfileRow) -> dict[str, Any] | None:
+    traits_raw = row.traits
+    if isinstance(traits_raw, str):
+        try:
+            traits_raw = json.loads(traits_raw)
+        except (TypeError, ValueError):
+            traits_raw = None
+    updated_at = row.updated_at
+    if hasattr(updated_at, "isoformat"):
+        updated_at = updated_at.isoformat()
+    return {
+        "version": max(1, int(row.version or 1)),
+        "user_id": str(row.user_id),
+        "display_name": str(row.display_name).strip() or str(row.user_id),
+        "traits": dict(traits_raw) if isinstance(traits_raw, dict) else {},
+        "updated_at": str(updated_at or "").strip(),
+    }
 
 
 async def _process_profile_rows(
@@ -269,19 +325,10 @@ async def _process_profile_rows(
 
     for index, row in enumerate(rows, start=1):
         stats["scanned"] += 1
-        try:
-            parsed = json.loads(row.value)
-        except (TypeError, ValueError):
+        parsed = _build_profile_payload(row)
+        if parsed is None:
             logger.warning(
-                f"[KomariMemory] 画像瘦身跳过非法 JSON: row={index}/{len(rows)} "
-                f"group={row.group_id} user={row.user_id}"
-            )
-            stats["failed"] += 1
-            continue
-
-        if not isinstance(parsed, dict):
-            logger.warning(
-                f"[KomariMemory] 画像瘦身跳过非对象 JSON: row={index}/{len(rows)} "
+                f"[KomariMemory] 画像瘦身跳过非法画像结构: row={index}/{len(rows)} "
                 f"group={row.group_id} user={row.user_id}"
             )
             stats["failed"] += 1

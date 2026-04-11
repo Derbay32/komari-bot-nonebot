@@ -59,7 +59,7 @@
 Bot 启动后：
 
 - 会建立 PostgreSQL 连接池
-- 会按当前 embedding 维度自动补齐 `komari_memory_conversations` / `komari_memory_entity`
+- 会按当前 embedding 维度自动补齐 `komari_memory_conversations` / `komari_memory_user_profile` / `komari_memory_interaction_history`
 - 会校验 `komari_memory_conversations.embedding` 与 provider 维度一致
 - 会初始化 Redis 缓冲区管理
 - 会注册总结任务和忘却任务
@@ -90,6 +90,20 @@ poetry run python scripts/migrate_embeddings.py --target memory
 
 ```bash
 poetry run python scripts/migrate_embeddings.py --apply --target memory
+```
+
+### 单表实体拆表迁移
+
+如果你的库里仍然只有旧的 `komari_memory_entity`，先做 dry-run：
+
+```bash
+poetry run python scripts/split_komari_memory_entity_tables.py
+```
+
+确认后执行真实迁移：
+
+```bash
+poetry run python scripts/split_komari_memory_entity_tables.py --apply
 ```
 
 ### `komari_memory_entity` 旧结构迁移
@@ -140,7 +154,8 @@ psql -h localhost -U your_username -d komari_bot \
 - 群聊消息先进入 Redis 缓冲
 - 达到消息数 / token / 时间阈值后，触发总结任务
 - 总结结果写入 `komari_memory_conversations`
-- 用户画像和互动历史写入 `komari_memory_entity`
+- 用户画像写入 `komari_memory_user_profile`
+- 互动历史写入 `komari_memory_interaction_history`
 
 ### 记忆检索
 

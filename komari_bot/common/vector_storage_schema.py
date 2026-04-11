@@ -43,30 +43,63 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         ON komari_memory_conversations(start_time DESC)
         """,
         """
-        CREATE TABLE IF NOT EXISTS komari_memory_entity (
+        CREATE TABLE IF NOT EXISTS komari_memory_user_profile (
             user_id VARCHAR(64) NOT NULL,
             group_id VARCHAR(64) NOT NULL,
-            key VARCHAR(100) NOT NULL CHECK (key IN ('user_profile', 'interaction_history')),
-            value TEXT NOT NULL,
-            category VARCHAR(50) NOT NULL CHECK (category IN ('profile_json', 'interaction_history')),
-            importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
-            access_count INT DEFAULT 0,
+            version INT NOT NULL DEFAULT 1 CHECK (version >= 1),
+            display_name TEXT NOT NULL,
+            traits JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            importance INT DEFAULT 4 CHECK (importance BETWEEN 1 AND 5),
+            access_count INT DEFAULT 0 CHECK (access_count >= 0),
             last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT ck_komari_memory_entity_two_row_model CHECK (
-                (key = 'user_profile' AND category = 'profile_json')
-                OR
-                (key = 'interaction_history' AND category = 'interaction_history')
-            ),
-            PRIMARY KEY (user_id, group_id, key)
+            CONSTRAINT ck_komari_memory_user_profile_traits_object
+                CHECK (jsonb_typeof(traits) = 'object'),
+            PRIMARY KEY (user_id, group_id)
         )
         """,
         """
-        CREATE INDEX IF NOT EXISTS idx_komari_memory_entity_group
-        ON komari_memory_entity(group_id)
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_user_profile_group
+        ON komari_memory_user_profile(group_id)
         """,
         """
-        CREATE INDEX IF NOT EXISTS idx_komari_memory_entity_importance
-        ON komari_memory_entity(importance DESC)
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_user_profile_importance
+        ON komari_memory_user_profile(importance DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_user_profile_display_name
+        ON komari_memory_user_profile(display_name)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS komari_memory_interaction_history (
+            user_id VARCHAR(64) NOT NULL,
+            group_id VARCHAR(64) NOT NULL,
+            version INT NOT NULL DEFAULT 1 CHECK (version >= 1),
+            display_name TEXT NOT NULL,
+            file_type TEXT NOT NULL DEFAULT '用户的近期对鞠行为备忘录',
+            description TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            records JSONB NOT NULL DEFAULT '[]'::jsonb,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            importance INT DEFAULT 5 CHECK (importance BETWEEN 1 AND 5),
+            access_count INT DEFAULT 0 CHECK (access_count >= 0),
+            last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT ck_komari_memory_interaction_history_records_array
+                CHECK (jsonb_typeof(records) = 'array'),
+            PRIMARY KEY (user_id, group_id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_history_group
+        ON komari_memory_interaction_history(group_id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_history_importance
+        ON komari_memory_interaction_history(importance DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_history_display_name
+        ON komari_memory_interaction_history(display_name)
         """,
     )
 

@@ -225,6 +225,229 @@ def _merge_interaction_update(
     return merged_interaction
 
 
+def _merge_user_operation_payloads(
+    base_payload: dict[str, Any] | None,
+    incoming_payload: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(base_payload or {})
+    merged["user_id"] = str(
+        incoming_payload.get("user_id", merged.get("user_id", ""))
+    ).strip()
+
+    display_name = str(incoming_payload.get("display_name", "")).strip()
+    if display_name:
+        merged["display_name"] = display_name
+
+    operations: list[dict[str, Any]] = []
+    existing_operations = merged.get("operations")
+    if isinstance(existing_operations, list):
+        operations.extend(op for op in existing_operations if isinstance(op, dict))
+
+    incoming_operations = incoming_payload.get("operations")
+    if isinstance(incoming_operations, list):
+        operations.extend(op for op in incoming_operations if isinstance(op, dict))
+
+    merged["operations"] = operations
+    return merged
+
+
+def _apply_profile_operations(
+    base_profile: dict[str, Any],
+    *,
+    user_id: str,
+    display_name: str,
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    profile = dict(base_profile)
+    profile["version"] = 1
+    profile["user_id"] = user_id
+
+    current_display_name = str(profile.get("display_name", "")).strip() or display_name
+    traits_raw = profile.get("traits")
+    traits = dict(traits_raw) if isinstance(traits_raw, dict) else {}
+
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        op = str(operation.get("op", "")).strip()
+        field = str(operation.get("field", "")).strip()
+
+        if field == "display_name":
+            if op == "delete":
+                current_display_name = ""
+                continue
+            value = str(operation.get("value", "")).strip()
+            if not value:
+                continue
+            if op == "add" and current_display_name:
+                continue
+            if op in {"add", "replace"}:
+                current_display_name = value
+            continue
+
+        if field != "trait":
+            continue
+
+        key = str(operation.get("key", "")).strip()
+        if not key:
+            continue
+        if op == "delete":
+            traits.pop(key, None)
+            continue
+
+        value = str(operation.get("value", "")).strip()
+        if not value:
+            continue
+        if op == "add" and key in traits:
+            continue
+        try:
+            importance = int(operation.get("importance", 3))
+        except (TypeError, ValueError):
+            importance = 3
+        traits[key] = {
+            "value": value,
+            "category": str(operation.get("category", "general")).strip() or "general",
+            "importance": max(1, min(5, importance)),
+            "updated_at": _now_iso(),
+        }
+
+    profile["display_name"] = current_display_name or display_name or user_id
+    profile["traits"] = traits
+    profile["updated_at"] = _now_iso()
+    return profile
+
+
+def _apply_interaction_operations(
+    base_interaction: dict[str, Any] | None,
+    *,
+    user_id: str,
+    display_name: str,
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    merged_interaction = _normalize_interaction(
+        base_interaction,
+        user_id=user_id,
+        display_name=display_name,
+    )
+
+    records = merged_interaction.get("records", [])
+    normalized_records = list(records) if isinstance(records, list) else []
+
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        op = str(operation.get("op", "")).strip()
+        field = str(operation.get("field", "")).strip()
+
+        if field in {"file_type", "description", "summary"}:
+            if op == "delete":
+                merged_interaction[field] = (
+                    "用户的近期对鞠行为备忘录" if field == "file_type" else ""
+                )
+                continue
+            value = str(operation.get("value", "")).strip()
+            if not value:
+                continue
+            if op == "add" and str(merged_interaction.get(field, "")).strip():
+                continue
+            if op in {"add", "replace"}:
+                merged_interaction[field] = value
+            continue
+
+        if field != "record":
+            continue
+
+        candidate_records = _normalize_interaction_records([operation.get("value")])
+        if not candidate_records:
+            continue
+        candidate_record = candidate_records[0]
+        if op == "delete":
+            normalized_records = [
+                record for record in normalized_records if record != candidate_record
+            ]
+            continue
+        if op == "add" and candidate_record not in normalized_records:
+            normalized_records.append(candidate_record)
+
+    merged_interaction["records"] = normalized_records[-_MAX_INTERACTION_RECORDS:]
+    merged_interaction["updated_at"] = _now_iso()
+    return merged_interaction
+
+
+def _build_display_name_uid_map(
+    *,
+    participants: list[str],
+    nickname_map: dict[str, str],
+) -> dict[str, str]:
+    display_name_candidates: dict[str, set[str]] = {}
+    for uid in participants:
+        for candidate in {
+            str(nickname_map.get(uid, "")).strip(),
+            str(
+                character_binding.get_character_name(
+                    user_id=uid,
+                    fallback_nickname=nickname_map.get(uid),
+                )
+            ).strip(),
+        }:
+            if not candidate:
+                continue
+            display_name_candidates.setdefault(candidate, set()).add(uid)
+
+    return {
+        display_name: next(iter(uid_set))
+        for display_name, uid_set in display_name_candidates.items()
+        if len(uid_set) == 1
+    }
+
+
+def _resolve_summary_uid(
+    *,
+    raw_uid: str,
+    display_name: str,
+    participant_set: set[str],
+    display_name_uid_map: dict[str, str],
+    uid_alias_map: dict[str, str],
+    group_id: str,
+    source: str,
+) -> str | None:
+    normalized_uid = str(raw_uid).strip()
+    if not normalized_uid:
+        return None
+
+    cached_uid = uid_alias_map.get(normalized_uid)
+    if cached_uid:
+        return cached_uid
+
+    if normalized_uid in participant_set:
+        uid_alias_map[normalized_uid] = normalized_uid
+        return normalized_uid
+
+    normalized_display_name = str(display_name).strip()
+    if normalized_display_name:
+        mapped_uid = display_name_uid_map.get(normalized_display_name)
+        if mapped_uid:
+            uid_alias_map[normalized_uid] = mapped_uid
+            logger.warning(
+                "[KomariMemory] 总结结果出现异常 uid，按名称重定向: group={} source={} raw_uid={} display_name={} canonical_uid={}",
+                group_id,
+                source,
+                normalized_uid,
+                normalized_display_name,
+                mapped_uid,
+            )
+            return mapped_uid
+
+    logger.warning(
+        "[KomariMemory] 总结结果丢弃未知 uid: group={} source={} raw_uid={} display_name={}",
+        group_id,
+        source,
+        normalized_uid,
+        normalized_display_name or "-",
+    )
+    return None
+
+
 @retry_async(max_attempts=3, base_delay=1.0)
 async def summary_worker_task(
     redis: RedisManager,
@@ -256,6 +479,7 @@ async def perform_summary(
         return
 
     participants = list({msg.user_id for msg in messages_buffer if not msg.is_bot})
+    participant_set = set(participants)
     nickname_map: dict[str, str] = {}
     for msg in messages_buffer:
         if msg.is_bot:
@@ -279,12 +503,13 @@ async def perform_summary(
         messages_buffer,
         config,
         existing_profiles=list(existing_profiles.values()),
+        existing_interactions=list(existing_interactions.values()),
     )
 
     summary = str(result.get("summary", "")).strip()
     importance = int(result.get("importance", 3))
-    user_profiles = result.get("user_profiles", [])
-    user_interactions = result.get("user_interactions", [])
+    user_profile_operations = result.get("user_profile_operations", [])
+    user_interaction_operations = result.get("user_interaction_operations", [])
 
     if not summary:
         logger.warning("[KomariMemory] 群组 {} 总结为空，跳过存储", group_id)
@@ -297,32 +522,74 @@ async def perform_summary(
         importance_initial=max(1, min(5, importance)),
     )
 
-    profiles_by_user: dict[str, dict[str, Any]] = {}
-    if isinstance(user_profiles, list):
-        for profile in user_profiles:
-            if not isinstance(profile, dict):
-                continue
-            uid = str(profile.get("user_id", "")).strip()
-            if not uid:
-                continue
-            profiles_by_user[uid] = profile
+    display_name_uid_map = _build_display_name_uid_map(
+        participants=participants,
+        nickname_map=nickname_map,
+    )
+    uid_alias_map: dict[str, str] = {}
 
-    interactions_by_user: dict[str, dict[str, Any]] = {}
-    if isinstance(user_interactions, list):
-        for interaction in user_interactions:
-            if not isinstance(interaction, dict):
+    profile_operations_by_user: dict[str, dict[str, Any]] = {}
+    if isinstance(user_profile_operations, list):
+        for payload in user_profile_operations:
+            if not isinstance(payload, dict):
                 continue
-            uid = str(interaction.get("user_id", "")).strip()
-            if not uid:
+            raw_uid = str(payload.get("user_id", "")).strip()
+            display_name = str(payload.get("display_name", "")).strip()
+            uid = _resolve_summary_uid(
+                raw_uid=raw_uid,
+                display_name=display_name,
+                participant_set=participant_set,
+                display_name_uid_map=display_name_uid_map,
+                uid_alias_map=uid_alias_map,
+                group_id=group_id,
+                source="user_profile_operation",
+            )
+            if uid is None:
                 continue
-            interactions_by_user[uid] = interaction
+            normalized_payload = dict(payload)
+            normalized_payload["user_id"] = uid
+            profile_operations_by_user[uid] = _merge_user_operation_payloads(
+                profile_operations_by_user.get(uid),
+                normalized_payload,
+            )
 
-    target_users = set(participants) | set(profiles_by_user) | set(interactions_by_user)
+    interaction_operations_by_user: dict[str, dict[str, Any]] = {}
+    if isinstance(user_interaction_operations, list):
+        for payload in user_interaction_operations:
+            if not isinstance(payload, dict):
+                continue
+            raw_uid = str(payload.get("user_id", "")).strip()
+            display_name = str(payload.get("display_name", "")).strip()
+            uid = _resolve_summary_uid(
+                raw_uid=raw_uid,
+                display_name=display_name,
+                participant_set=participant_set,
+                display_name_uid_map=display_name_uid_map,
+                uid_alias_map=uid_alias_map,
+                group_id=group_id,
+                source="user_interaction_operation",
+            )
+            if uid is None:
+                continue
+            normalized_payload = dict(payload)
+            normalized_payload["user_id"] = uid
+            interaction_operations_by_user[uid] = _merge_user_operation_payloads(
+                interaction_operations_by_user.get(uid),
+                normalized_payload,
+            )
+
+    target_users = (
+        set(participants)
+        | set(profile_operations_by_user)
+        | set(interaction_operations_by_user)
+    )
     for uid in sorted(target_users):
         model_display_name = ""
-        profile_payload = profiles_by_user.get(uid)
-        if profile_payload is not None:
-            model_display_name = str(profile_payload.get("display_name", "")).strip()
+        profile_operation_payload = profile_operations_by_user.get(uid)
+        if profile_operation_payload is not None:
+            model_display_name = str(
+                profile_operation_payload.get("display_name", "")
+            ).strip()
         display_name = character_binding.get_character_name(
             user_id=uid,
             fallback_nickname=nickname_map.get(uid) or model_display_name,
@@ -331,15 +598,16 @@ async def perform_summary(
             user_id=uid,
             display_name=display_name,
         )
-        traits_payload = (
-            profile_payload.get("traits", [])
-            if isinstance(profile_payload, dict)
+        profile_operations = (
+            profile_operation_payload.get("operations", [])
+            if isinstance(profile_operation_payload, dict)
             else []
         )
-        merged_profile = _merge_traits_into_profile(
+        merged_profile = _apply_profile_operations(
             base_profile,
+            user_id=uid,
             display_name=display_name,
-            traits_payload=traits_payload if isinstance(traits_payload, list) else [],
+            operations=profile_operations if isinstance(profile_operations, list) else [],
         )
         merged_profile = await _enforce_profile_trait_limit(
             group_id=group_id,
@@ -355,11 +623,19 @@ async def perform_summary(
             importance=4,
         )
 
-        merged_interaction = _merge_interaction_update(
+        interaction_operation_payload = interaction_operations_by_user.get(uid)
+        interaction_operations = (
+            interaction_operation_payload.get("operations", [])
+            if isinstance(interaction_operation_payload, dict)
+            else []
+        )
+        merged_interaction = _apply_interaction_operations(
             existing_interactions.get(uid),
-            interactions_by_user.get(uid),
             user_id=uid,
             display_name=display_name,
+            operations=(
+                interaction_operations if isinstance(interaction_operations, list) else []
+            ),
         )
         await memory.upsert_interaction_history(
             user_id=uid,
@@ -374,11 +650,11 @@ async def perform_summary(
     await redis.update_last_summary(group_id)
 
     logger.info(
-        "[KomariMemory] 群组 {} 总结完成: conversation_id={} users={} raw_profiles={}",
+        "[KomariMemory] 群组 {} 总结完成: conversation_id={} users={} raw_profile_operations={}",
         group_id,
         conversation_id,
         len(target_users),
-        len(user_profiles) if isinstance(user_profiles, list) else 0,
+        len(user_profile_operations) if isinstance(user_profile_operations, list) else 0,
     )
 
 

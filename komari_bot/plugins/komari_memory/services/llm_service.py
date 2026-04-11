@@ -29,6 +29,7 @@ llm_provider = require("llm_provider")
 
 _MESSAGE_SPLIT_MARKER = "[分片0000] "
 _MAX_EXISTING_TRAITS_PER_USER = 5
+_MAX_EXISTING_INTERACTION_RECORDS_PER_USER = 3
 
 
 @dataclass(frozen=True)
@@ -79,9 +80,11 @@ def _extract_tag_content(text: str, tag: str) -> str:
 
 def _build_existing_context(
     existing_profiles: list[dict] | None = None,
+    existing_interactions: list[dict] | None = None,
 ) -> _ExistingContextBuildResult:
     return _build_existing_context_with_budget(
         existing_profiles=existing_profiles,
+        existing_interactions=existing_interactions,
         token_budget=None,
     )
 
@@ -144,9 +147,48 @@ def _compact_profile_line(profile: dict[str, Any]) -> str | None:
     )
 
 
+def _compact_interaction_line(interaction: dict[str, Any]) -> str | None:
+    """压缩单个用户互动历史，便于模型输出增量操作。"""
+    user_id = str(interaction.get("user_id", "")).strip()
+    if not user_id:
+        return None
+
+    display_name = str(interaction.get("display_name", "")).strip()
+    file_type = str(interaction.get("file_type", "")).strip()
+    description = str(interaction.get("description", "")).strip()
+    summary = str(interaction.get("summary", "")).strip()
+
+    compact_records: list[dict[str, str]] = []
+    records_raw = interaction.get("records")
+    if isinstance(records_raw, list):
+        for raw in records_raw[-_MAX_EXISTING_INTERACTION_RECORDS_PER_USER:]:
+            if not isinstance(raw, dict):
+                continue
+            compact_record = {
+                "event": str(raw.get("event", "")).strip(),
+                "result": str(raw.get("result", "")).strip(),
+                "emotion": str(raw.get("emotion", "")).strip(),
+            }
+            if not any(compact_record.values()):
+                continue
+            compact_records.append(compact_record)
+
+    if not any([display_name, file_type, description, summary, compact_records]):
+        return None
+
+    return (
+        f"- [user_id:{user_id}] display_name={display_name} "
+        f"file_type={json.dumps(file_type, ensure_ascii=False)} "
+        f"description={json.dumps(description, ensure_ascii=False)} "
+        f"summary={json.dumps(summary, ensure_ascii=False)} "
+        f"recent_records={json.dumps(compact_records, ensure_ascii=False)}"
+    )
+
+
 def _build_existing_context_with_budget(
     *,
     existing_profiles: list[dict] | None = None,
+    existing_interactions: list[dict] | None = None,
     token_budget: int | None,
 ) -> _ExistingContextBuildResult:
     """构建可控大小的已有画像提示。"""
@@ -195,6 +237,29 @@ def _build_existing_context_with_budget(
             if _append_block(block):
                 header_added = True
                 included_profiles += 1
+            else:
+                truncated = True
+                break
+        if header_added:
+            _append_block("\n")
+
+    interaction_lines = [
+        line
+        for interaction in (existing_interactions or [])
+        if (line := _compact_interaction_line(interaction)) is not None
+    ]
+    if interaction_lines:
+        interaction_header = template.get(
+            "existing_interactions_header",
+            "【已知互动历史（数据库中已有记录）】\n以下是目前已存储的用户互动备忘录：",
+        )
+        header_added = False
+        for line in interaction_lines:
+            block = (
+                f"{interaction_header}\n{line}\n" if not header_added else f"{line}\n"
+            )
+            if _append_block(block):
+                header_added = True
             else:
                 truncated = True
                 break
@@ -374,17 +439,194 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized_result = dict(result)
     normalized_result["summary"] = str(normalized_result.get("summary", "")).strip()
 
-    if not isinstance(normalized_result.get("user_profiles"), list):
-        normalized_result["user_profiles"] = []
-    normalized_profiles: list[dict[str, Any]] = []
-    for profile in normalized_result["user_profiles"]:
+    profile_operation_payloads = normalized_result.get("user_profile_operations")
+    if not isinstance(profile_operation_payloads, list):
+        legacy_profiles = normalized_result.get("user_profiles")
+        if isinstance(legacy_profiles, list):
+            profile_operation_payloads = _convert_legacy_profiles_to_operations(
+                legacy_profiles
+            )
+        else:
+            profile_operation_payloads = []
+    normalized_result["user_profile_operations"] = _normalize_user_operation_payloads(
+        profile_operation_payloads,
+        operation_type="profile",
+    )
+
+    interaction_operation_payloads = normalized_result.get("user_interaction_operations")
+    if not isinstance(interaction_operation_payloads, list):
+        legacy_interactions = normalized_result.get("user_interactions")
+        if isinstance(legacy_interactions, list):
+            interaction_operation_payloads = _convert_legacy_interactions_to_operations(
+                legacy_interactions
+            )
+        else:
+            interaction_operation_payloads = []
+    normalized_result["user_interaction_operations"] = _normalize_user_operation_payloads(
+        interaction_operation_payloads,
+        operation_type="interaction",
+    )
+
+    try:
+        importance = int(normalized_result.get("importance", 3))
+        normalized_result["importance"] = max(1, min(5, importance))
+    except (TypeError, ValueError):
+        normalized_result["importance"] = 3
+
+    return normalized_result
+
+
+def _normalize_user_operation_payloads(
+    payloads: list[Any],
+    *,
+    operation_type: str,
+) -> list[dict[str, Any]]:
+    normalized_payloads: list[dict[str, Any]] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        user_id = str(payload.get("user_id", "")).strip()
+        if not user_id:
+            continue
+        operations_raw = payload.get("operations")
+        if not isinstance(operations_raw, list):
+            continue
+        normalized_operations: list[dict[str, Any]] = []
+        for operation in operations_raw:
+            if not isinstance(operation, dict):
+                continue
+            normalized_operation = (
+                _normalize_profile_operation(operation)
+                if operation_type == "profile"
+                else _normalize_interaction_operation(operation)
+            )
+            if normalized_operation is not None:
+                normalized_operations.append(normalized_operation)
+
+        if not normalized_operations:
+            continue
+        normalized_payloads.append(
+            {
+                "user_id": user_id,
+                "display_name": str(payload.get("display_name", "")).strip(),
+                "operations": normalized_operations,
+            }
+        )
+    return normalized_payloads
+
+
+def _normalize_profile_operation(operation: dict[str, Any]) -> dict[str, Any] | None:
+    op = str(operation.get("op", "")).strip().lower()
+    field = str(operation.get("field", operation.get("target", ""))).strip()
+    if op not in {"add", "replace", "delete"}:
+        return None
+    if field not in {"display_name", "trait"}:
+        return None
+
+    normalized: dict[str, Any] = {
+        "op": op,
+        "field": field,
+    }
+    if field == "display_name":
+        if op == "delete":
+            return normalized
+        value = str(operation.get("value", "")).strip()
+        if not value:
+            return None
+        normalized["value"] = value
+        return normalized
+
+    key = str(operation.get("key", "")).strip()
+    if not key:
+        return None
+    normalized["key"] = key
+    if op == "delete":
+        return normalized
+
+    value = str(operation.get("value", "")).strip()
+    if not value:
+        return None
+    category = str(operation.get("category", "general")).strip() or "general"
+    if category not in {"preference", "fact", "relation", "general"}:
+        category = "general"
+    try:
+        importance = int(operation.get("importance", 3))
+    except (TypeError, ValueError):
+        importance = 3
+
+    normalized["value"] = value
+    normalized["category"] = category
+    normalized["importance"] = max(1, min(5, importance))
+    return normalized
+
+
+def _normalize_interaction_operation(
+    operation: dict[str, Any],
+) -> dict[str, Any] | None:
+    op = str(operation.get("op", "")).strip().lower()
+    field = str(operation.get("field", operation.get("target", ""))).strip()
+    if op not in {"add", "replace", "delete"}:
+        return None
+    if field not in {"file_type", "description", "summary", "record"}:
+        return None
+
+    normalized: dict[str, Any] = {
+        "op": op,
+        "field": field,
+    }
+    if field != "record":
+        if op == "delete":
+            return normalized
+        value = str(operation.get("value", "")).strip()
+        if not value:
+            return None
+        normalized["value"] = value
+        return normalized
+
+    if op == "replace":
+        return None
+    record = _normalize_record_value(operation.get("value"))
+    if record is None:
+        return None
+    normalized["value"] = record
+    return normalized
+
+
+def _normalize_record_value(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized = {
+        "event": str(value.get("event", "")).strip(),
+        "result": str(value.get("result", "")).strip(),
+        "emotion": str(value.get("emotion", "")).strip(),
+    }
+    if not any(normalized.values()):
+        return None
+    return normalized
+
+
+def _convert_legacy_profiles_to_operations(
+    profiles: list[Any],
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for profile in profiles:
         if not isinstance(profile, dict):
             continue
         user_id = str(profile.get("user_id", "")).strip()
         if not user_id:
             continue
+        operations: list[dict[str, Any]] = []
+        display_name = str(profile.get("display_name", "")).strip()
+        if display_name:
+            operations.append(
+                {
+                    "op": "replace",
+                    "field": "display_name",
+                    "value": display_name,
+                }
+            )
+
         traits = profile.get("traits")
-        normalized_traits: list[dict[str, Any]] = []
         if isinstance(traits, list):
             for trait in traits:
                 if not isinstance(trait, dict):
@@ -400,8 +642,10 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
                     importance = int(trait.get("importance", 3))
                 except (TypeError, ValueError):
                     importance = 3
-                normalized_traits.append(
+                operations.append(
                     {
+                        "op": "replace",
+                        "field": "trait",
                         "key": key,
                         "value": value,
                         "category": category,
@@ -409,46 +653,62 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
 
-        normalized_profiles.append(
-            {
-                "user_id": user_id,
-                "display_name": str(profile.get("display_name", "")).strip(),
-                "traits": normalized_traits,
-            }
-        )
-    normalized_result["user_profiles"] = normalized_profiles
+        if operations:
+            converted.append(
+                {
+                    "user_id": user_id,
+                    "display_name": display_name,
+                    "operations": operations,
+                }
+            )
+    return converted
 
-    if not isinstance(normalized_result.get("user_interactions"), list):
-        normalized_result["user_interactions"] = []
-    normalized_interactions: list[dict[str, Any]] = []
-    for interaction in normalized_result["user_interactions"]:
+
+def _convert_legacy_interactions_to_operations(
+    interactions: list[Any],
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for interaction in interactions:
         if not isinstance(interaction, dict):
             continue
         user_id = str(interaction.get("user_id", "")).strip()
         if not user_id:
             continue
+        operations: list[dict[str, Any]] = []
+        for field in ("file_type", "description", "summary"):
+            value = str(interaction.get(field, "")).strip()
+            if value:
+                operations.append(
+                    {
+                        "op": "replace",
+                        "field": field,
+                        "value": value,
+                    }
+                )
+
         records = interaction.get("records")
-        normalized_records = records if isinstance(records, list) else []
-        if len(normalized_records) > 6:
-            normalized_records = normalized_records[-6:]
-        normalized_interactions.append(
-            {
-                "user_id": user_id,
-                "file_type": str(interaction.get("file_type", "")).strip(),
-                "description": str(interaction.get("description", "")).strip(),
-                "records": normalized_records,
-                "summary": str(interaction.get("summary", "")).strip(),
-            }
-        )
-    normalized_result["user_interactions"] = normalized_interactions
+        if isinstance(records, list):
+            for record in records[-6:]:
+                normalized_record = _normalize_record_value(record)
+                if normalized_record is None:
+                    continue
+                operations.append(
+                    {
+                        "op": "add",
+                        "field": "record",
+                        "value": normalized_record,
+                    }
+                )
 
-    try:
-        importance = int(normalized_result.get("importance", 3))
-        normalized_result["importance"] = max(1, min(5, importance))
-    except (TypeError, ValueError):
-        normalized_result["importance"] = 3
-
-    return normalized_result
+        if operations:
+            converted.append(
+                {
+                    "user_id": user_id,
+                    "display_name": str(interaction.get("display_name", "")).strip(),
+                    "operations": operations,
+                }
+            )
+    return converted
 
 
 async def _request_structured_summary(
@@ -551,6 +811,7 @@ async def summarize_conversation(
     messages: list[MessageSchema],
     config: KomariMemoryConfigSchema,
     existing_profiles: list[dict] | None = None,
+    existing_interactions: list[dict] | None = None,
 ) -> dict:
     """总结对话，提取用户画像，并评估重要性（带重试机制）。"""
     trace_id = f"memsum-{uuid4().hex[:8]}"
@@ -576,6 +837,7 @@ async def summarize_conversation(
         )
         existing_context_result = _build_existing_context_with_budget(
             existing_profiles=existing_profiles,
+            existing_interactions=existing_interactions,
             token_budget=single_context_budget,
         )
         single_prompt = _build_summary_prompt(
@@ -632,6 +894,7 @@ async def summarize_conversation(
     )
     existing_context_result = _build_existing_context_with_budget(
         existing_profiles=existing_profiles,
+        existing_interactions=existing_interactions,
         token_budget=merge_context_budget,
     )
     merge_prompt = _build_merge_prompt(

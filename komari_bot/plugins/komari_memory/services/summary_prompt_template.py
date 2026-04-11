@@ -10,25 +10,31 @@ from nonebot import logger
 
 DEFAULTS: dict[str, str] = {
     "summary_prompt": (
-        "请总结以下群聊或私聊对话，提取每个用户的画像信息，并评估对话的重要性。输出必须使用简体中文。\n\n"
+        "请总结以下群聊或私聊对话，提取每个用户画像与互动历史的增量操作，并评估对话的重要性。输出必须使用简体中文。\n\n"
         "每条消息格式为 [user_id:xxx] 昵称: 内容。请你在提取时将 user_id 准确关联。\n\n"
         "{{conversation_text}}\n\n"
         "{{existing_context}}"
-        "【任务一：用户画像提取（按用户聚合）】\n"
+        "【任务一：用户画像增量操作提取（按用户聚合）】\n"
         "- 提取对话的核心内容，形成 summary（简短总结）。\n"
-        "- 输出 `user_profiles` 数组，每个元素对应一个用户，字段包含：\n"
+        "- 输出 `user_profile_operations` 数组，每个元素对应一个用户，字段包含：\n"
         "  - user_id\n"
         "  - display_name（可为空字符串）\n"
-        "  - traits（数组），每个 trait 包含 key/value/category/importance\n"
-        "- category 仅可取：preference/fact/relation/general\n"
-        "- traits 只保留长期稳定、可复用的画像信息，例如身份、长期偏好、稳定习惯、关系认知、长期事实\n"
-        "- 不要输出短期状态、一次性事件、瞬时情绪、当天安排，也不要把语义相近的 traits 拆成多个近义 key\n"
-        "- 对重复或近义 traits 进行合并，尽量使用更稳定、不易过时的 key 与 value\n\n"
-        "【任务二：主观互动备忘录提取】\n"
+        "  - operations（数组），每个操作都必须包含 op/field，按需要补充 key/value/category/importance\n"
+        "- `op` 只允许：add / replace / delete。\n"
+        "- `field` 只允许：display_name / trait。\n"
+        "- 当 `field=trait` 时，必须提供 `key`；若 `op` 为 add 或 replace，还必须提供 `value/category/importance`。\n"
+        "- category 仅可取：preference/fact/relation/general。\n"
+        "- traits 只保留长期稳定、可复用的画像信息，例如身份、长期偏好、稳定习惯、关系认知、长期事实。\n"
+        "- 不要输出短期状态、一次性事件、瞬时情绪、当天安排，也不要把语义相近的 traits 拆成多个近义 key。\n"
+        "- 你输出的是“增量操作”，不是最终完整画像；禁止把完整 traits 全量重写出来。\n\n"
+        "【任务二：主观互动备忘录增量操作提取】\n"
         '- 你必须基于《败犬女主太多了！》中"小鞠知花"的人设视角，为有明显互动行为的用户，提取出在互动期间该用户的行为记录。这将被作为"小鞠在心里对近期互动过的用户的悄悄记录"。\n'
-        "- 数据格式要求如下：必须包含 user_id, file_type, description, records(包括 event[行为], result[反应], emotion[感受]), summary。\n"
-        "- `records` 只记录本次这批对话中新增的互动，不要改写、重排或复述旧历史。\n"
-        "- `summary` 只输出本次互动结束后形成的新的整体印象或评价。\n\n"
+        "- 输出 `user_interaction_operations` 数组，每个元素对应一个用户，字段包含：user_id、display_name、operations。\n"
+        "- `op` 只允许：add / replace / delete。\n"
+        "- `field` 只允许：file_type / description / summary / record。\n"
+        "- 当 `field=record` 时，`value` 必须是对象，包含 event/result/emotion；record 仅允许 add 或 delete，若要改写旧 record，请先 delete 再 add。\n"
+        "- `summary` 只表示本次互动结束后形成的新的整体印象或评价；`records` 只记录本次对话新增或需要删除的互动片段。\n"
+        "- 你输出的是“增量操作”，不是最终完整互动历史；禁止把完整 records 全量重写出来。\n\n"
         "【任务三：评估重要性】\n"
         "请按以下标准评估重要性（1-5分）：\n"
         "- 1分：无意义的闲聊、表情包测试、简短问候\n"
@@ -41,13 +47,12 @@ DEFAULTS: dict[str, str] = {
     ),
     "merge_prompt": (
         "请将以下按时间顺序排列的分段总结整合成一份最终总结。输出必须使用简体中文。\n\n"
-        "每个分段总结都已经是结构化结果，包含 summary、user_profiles、user_interactions、importance。\n"
+        "每个分段总结都已经是结构化结果，包含 summary、user_profile_operations、user_interaction_operations、importance。\n"
         "请你基于这些分段结果，输出一份全局统一的最终 JSON：\n"
-        "- 合并重复 user_id 的画像信息，只保留新增或更新的 traits\n"
-        "- user_profiles 只保留长期稳定 traits，删除短期状态、一次性事件与明显重复项\n"
-        "- 对近义或重复 traits 进行合并，统一为更稳定的 key\n"
-        "- 合并同一用户在各分段里新增的互动记录，保持时间顺序，不要补写旧历史\n"
-        "- `summary` 表示本次互动结束后的新印象/评价\n"
+        "- 合并重复 user_id 的操作，按时间顺序保留最终需要执行的 add/replace/delete 指令\n"
+        "- 对近义或重复 trait 进行合并，统一为更稳定的 key，尽量减少多余操作\n"
+        "- 对同一用户的互动 record 操作进行去重，保持 add/delete 的实际执行顺序\n"
+        "- 不要输出最终完整画像或完整互动历史，只输出最终需要执行的增量操作\n"
         "- 产出一份整体 summary 和整体 importance\n"
         "- 不要按分段分别输出，不要解释推理过程\n\n"
         "{{chunk_summaries_text}}\n\n"
@@ -57,25 +62,30 @@ DEFAULTS: dict[str, str] = {
     ),
     "existing_context_instruction_block": (
         "【重要指示】\n"
-        "- 你输出的是 user_profiles（按用户聚合），不要输出扁平 entities 列表\n"
-        "- 如果对话中发现与已有画像矛盾的新信息，请用新信息覆盖旧值（同 key 覆盖）\n"
-        "- 如果对话中没有提到某个旧特征，不要重复输出它\n"
-        "- 只输出需要新增或更新的画像特征\n"
+        "- 你输出的是按用户聚合的增量操作，不要输出扁平 entities 列表\n"
+        "- 不要输出最终完整画像或完整互动历史，只输出需要程序执行的 add/replace/delete 操作\n"
+        "- 如果对话中发现与已有画像矛盾的新信息，请输出 replace 或 delete 操作\n"
+        "- 如果对话中没有提到某个旧特征或旧互动，不要重复输出它\n"
     ),
     "existing_profiles_header": (
         "【已知用户画像（数据库中已有记录）】\n以下是目前已存储的用户画像："
+    ),
+    "existing_interactions_header": (
+        "【已知互动历史（数据库中已有记录）】\n以下是目前已存储的用户互动备忘录："
     ),
     "truncated_context_marker": (
         "【提示】其余已有记录已按 token 上限省略，请仅基于当前提供的已知信息做去重与覆盖。"
     ),
     "json_response_example": (
-        '{"summary": "...", "user_profiles": '
-        '[{"user_id": "12345", "display_name": "阿明", "traits": '
-        '[{"key": "喜欢的食物", "value": "拉面", "category": "preference", "importance": 4}]}], '
-        '"user_interactions": [{"user_id": "12345", "file_type": "用户的近期对小鞠行为备忘录", '
-        '"description": "这是我在心里对这个用户近期行为的悄悄记录。用来提醒自己这个人平时是怎么对我的，下次和他说话时应该保持什么态度。", '
-        '"records": [{"event": "用好吃的诱惑我", "result": "咽了口水，稍微凑近了过去", "emotion": "有点警惕但很想吃"}], '
-        '"summary": "是个经常用食物钓我的骗子先生……但也不是坏人。"}], '
+        '{"summary": "...", "user_profile_operations": '
+        '[{"user_id": "12345", "display_name": "阿明", "operations": '
+        '[{"op": "add", "field": "trait", "key": "喜欢的食物", "value": "拉面", "category": "preference", "importance": 4}, '
+        '{"op": "replace", "field": "display_name", "value": "阿明"}, '
+        '{"op": "delete", "field": "trait", "key": "短期状态"}]}], '
+        '"user_interaction_operations": [{"user_id": "12345", "display_name": "阿明", "operations": '
+        '[{"op": "add", "field": "record", "value": {"event": "用好吃的诱惑我", "result": "咽了口水，稍微凑近了过去", "emotion": "有点警惕但很想吃"}}, '
+        '{"op": "replace", "field": "summary", "value": "是个经常用食物钓我的骗子先生……但也不是坏人。"}, '
+        '{"op": "delete", "field": "record", "value": {"event": "旧事件", "result": "旧反应", "emotion": "旧情绪"}}]}], '
         '"importance": 3}'
     ),
 }
