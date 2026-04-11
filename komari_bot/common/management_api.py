@@ -5,18 +5,12 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from nonebot.plugin import require
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette import status
-
-from komari_bot.plugins.komari_knowledge.config_schema import (
-    DynamicConfigSchema as KnowledgeConfigSchema,
-)
-
-config_manager_plugin = require("config_manager")
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,11 +25,12 @@ def create_bearer_auth_dependency(
     api_token: str,
     *,
     detail: str = "未授权访问管理接口",
-) -> Callable[[str | None], Any]:
+) -> Callable[[HTTPAuthorizationCredentials | None], Any]:
     """创建 Bearer Token 鉴权依赖。"""
+    bearer_scheme = HTTPBearer(auto_error=False)
 
     async def _verify_token(
-        authorization: Annotated[str | None, Header()] = None,
+        authorization: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     ) -> None:
         if authorization is None:
             raise HTTPException(
@@ -43,7 +38,8 @@ def create_bearer_auth_dependency(
                 detail=detail,
             )
 
-        scheme, _, token = authorization.partition(" ")
+        scheme = authorization.scheme
+        token = authorization.credentials
         if scheme.lower() != "bearer" or not token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -97,16 +93,16 @@ def ensure_management_cors(app: FastAPI, allowed_origins: Sequence[str]) -> None
     app.state.komari_management_cors_origins = origins
 
 
-def load_shared_management_settings(logger: Any) -> SharedManagementSettings | None:
-    """从 komari_knowledge 配置读取共享管理 API 凭证。"""
-    config_manager = config_manager_plugin.get_config_manager(
-        "komari_knowledge",
-        KnowledgeConfigSchema,
-    )
-    config = config_manager.get()
+def resolve_management_settings(
+    config: Any,
+    *,
+    logger: Any,
+    warning_prefix: str = "[Komari Management]",
+) -> SharedManagementSettings | None:
+    """从配置对象解析管理 API 共用设置。"""
     api_token = getattr(config, "api_token", "")
     if not isinstance(api_token, str) or not api_token.strip():
-        logger.warning("[Komari Management] 未配置共享 api_token，跳过管理 API 注册")
+        logger.warning("%s 未配置 api_token，跳过管理 API 注册", warning_prefix)
         return None
 
     return SharedManagementSettings(

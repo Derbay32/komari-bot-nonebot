@@ -179,3 +179,4 @@ tools/*
 config/config_manager/database_config.json
 config/config_manager/user_data_config.json
 config/config_manager/komari_sentry_config.json
+config/config_manager/komari_management_config.json

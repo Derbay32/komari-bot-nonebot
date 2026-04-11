@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
+import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from komari_bot.plugins.komari_memory.api import API_PREFIX, register_memory_api
+
+if TYPE_CHECKING:
+    from nonebug import App
+
+
+def _with_query(path: str, **params: object) -> str:
+    query = "&".join(
+        f"{key}={value}" for key, value in params.items() if value is not None
+    )
+    return f"{path}?{query}" if query else path
 
 
 def _conversation_entry(
@@ -164,78 +175,91 @@ class _FakeMemoryService:
         return self.interaction_histories.pop((group_id, user_id), None) is not None
 
 
-def _build_client(service: _FakeMemoryService | None) -> TestClient:
-    app = FastAPI()
+def _build_app(service: _FakeMemoryService | None) -> FastAPI:
+    api_app = FastAPI()
     register_memory_api(
-        app,
+        api_app,
         api_token="secret-token",
         allowed_origins=["https://ui.example.com"],
         service_getter=lambda: service,
     )
-    return TestClient(app)
+    return api_app
 
 
-def test_memory_routes_require_token_and_handle_cors() -> None:
-    client = _build_client(_FakeMemoryService())
+@pytest.mark.asyncio
+async def test_memory_routes_require_token_and_handle_cors(app: App) -> None:
+    async with app.test_server(asgi=_build_app(_FakeMemoryService())) as ctx:
+        client = ctx.get_client()
+        unauthorized = await client.get(f"{API_PREFIX}/conversations")
+        assert unauthorized.status_code == 401
 
-    unauthorized = client.get(f"{API_PREFIX}/conversations")
-    assert unauthorized.status_code == 401
+        preflight = await client.options(
+            f"{API_PREFIX}/conversations",
+            headers={
+                "Origin": "https://ui.example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert preflight.status_code == 200
+        assert (
+            preflight.headers["access-control-allow-origin"]
+            == "https://ui.example.com"
+        )
 
-    preflight = client.options(
-        f"{API_PREFIX}/conversations",
-        headers={
-            "Origin": "https://ui.example.com",
-            "Access-Control-Request-Method": "GET",
-        },
-    )
-    assert preflight.status_code == 200
-    assert preflight.headers["access-control-allow-origin"] == "https://ui.example.com"
 
-
-def test_memory_routes_return_503_when_service_unavailable() -> None:
-    client = _build_client(None)
-
-    response = client.get(
-        f"{API_PREFIX}/conversations",
-        headers={"Authorization": "Bearer secret-token"},
-    )
+@pytest.mark.asyncio
+async def test_memory_routes_return_503_when_service_unavailable(app: App) -> None:
+    async with app.test_server(asgi=_build_app(None)) as ctx:
+        client = ctx.get_client()
+        response = await client.get(
+            f"{API_PREFIX}/conversations",
+            headers={"Authorization": "Bearer secret-token"},
+        )
 
     assert response.status_code == 503
     assert "服务未初始化" in response.json()["detail"]
 
 
-def test_conversation_routes_forward_filters_and_support_crud() -> None:
+@pytest.mark.asyncio
+async def test_conversation_routes_forward_filters_and_support_crud(app: App) -> None:
     service = _FakeMemoryService()
-    client = _build_client(service)
     headers = {"Authorization": "Bearer secret-token"}
 
-    listed = client.get(
-        f"{API_PREFIX}/conversations",
-        params={"group_id": "g1", "participant": "u1", "q": "布丁", "limit": 5, "offset": 2},
-        headers=headers,
-    )
-    detail = client.get(f"{API_PREFIX}/conversations/1", headers=headers)
-    created = client.post(
-        f"{API_PREFIX}/conversations",
-        json={
-            "group_id": "g1",
-            "summary": "  新记忆  ",
-            "participants": ["u1", " u2 "],
-            "importance_initial": 5,
-        },
-        headers=headers,
-    )
-    updated = client.patch(
-        f"{API_PREFIX}/conversations/1",
-        json={"summary": "改过的记忆", "importance_current": 4.2},
-        headers=headers,
-    )
-    missing_patch = client.patch(
-        f"{API_PREFIX}/conversations/999",
-        json={"summary": "不存在"},
-        headers=headers,
-    )
-    deleted = client.delete(f"{API_PREFIX}/conversations/2", headers=headers)
+    async with app.test_server(asgi=_build_app(service)) as ctx:
+        client = ctx.get_client()
+        listed = await client.get(
+            _with_query(
+                f"{API_PREFIX}/conversations",
+                group_id="g1",
+                participant="u1",
+                q="布丁",
+                limit=5,
+                offset=2,
+            ),
+            headers=headers,
+        )
+        detail = await client.get(f"{API_PREFIX}/conversations/1", headers=headers)
+        created = await client.post(
+            f"{API_PREFIX}/conversations",
+            json={
+                "group_id": "g1",
+                "summary": "  新记忆  ",
+                "participants": ["u1", " u2 "],
+                "importance_initial": 5,
+            },
+            headers=headers,
+        )
+        updated = await client.patch(
+            f"{API_PREFIX}/conversations/1",
+            json={"summary": "改过的记忆", "importance_current": 4.2},
+            headers=headers,
+        )
+        missing_patch = await client.patch(
+            f"{API_PREFIX}/conversations/999",
+            json={"summary": "不存在"},
+            headers=headers,
+        )
+        deleted = await client.delete(f"{API_PREFIX}/conversations/2", headers=headers)
 
     assert listed.status_code == 200
     assert listed.json()["total"] == 2
@@ -259,71 +283,119 @@ def test_conversation_routes_forward_filters_and_support_crud() -> None:
     assert deleted.status_code == 204
 
 
-def test_entity_routes_support_list_get_put_delete_and_validate_user_id_conflict() -> None:
+@pytest.mark.asyncio
+async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> None:
     service = _FakeMemoryService()
-    client = _build_client(service)
     headers = {"Authorization": "Bearer secret-token"}
 
-    listed_profiles = client.get(
-        f"{API_PREFIX}/user-profiles",
-        params={"group_id": "g1", "user_id": "u1", "q": "阿明", "limit": 5, "offset": 1},
-        headers=headers,
-    )
-    listed_histories = client.get(
-        f"{API_PREFIX}/interaction-histories",
-        params={"group_id": "g1", "user_id": "u1", "q": "聊天"},
-        headers=headers,
-    )
-    detail = client.get(f"{API_PREFIX}/user-profiles/g1/u1", headers=headers)
-    put_profile = client.put(
-        f"{API_PREFIX}/user-profiles/g1/u1",
-        params={"importance": 5},
-        json={"user_id": "u1", "display_name": "阿明", "traits": {"喜欢的食物": {"value": "布丁"}}},
-        headers=headers,
-    )
-    conflict = client.put(
-        f"{API_PREFIX}/interaction-histories/g1/u1",
-        json={"user_id": "u2", "summary": "冲突"},
-        headers=headers,
-    )
-    put_history = client.put(
-        f"{API_PREFIX}/interaction-histories/g1/u1",
-        json={"user_id": "u1", "summary": "一起打游戏", "records": []},
-        headers=headers,
-    )
-    deleted_profile = client.delete(f"{API_PREFIX}/user-profiles/g1/u1", headers=headers)
-    deleted_history = client.delete(
-        f"{API_PREFIX}/interaction-histories/g1/u1",
-        headers=headers,
-    )
+    async with app.test_server(asgi=_build_app(service)) as ctx:
+        client = ctx.get_client()
+        profiles = await client.get(
+            _with_query(
+                f"{API_PREFIX}/user-profiles",
+                group_id="g1",
+                user_id="u1",
+                q="布丁",
+                limit=3,
+            ),
+            headers=headers,
+        )
+        histories = await client.get(
+            _with_query(
+                f"{API_PREFIX}/interaction-histories",
+                group_id="g1",
+                user_id="u1",
+                q="聊天",
+                offset=1,
+            ),
+            headers=headers,
+        )
+        profile_detail = await client.get(
+            f"{API_PREFIX}/user-profiles/g1/u1",
+            headers=headers,
+        )
+        history_detail = await client.get(
+            f"{API_PREFIX}/interaction-histories/g1/u1",
+            headers=headers,
+        )
+        profile_put = await client.put(
+            f"{API_PREFIX}/user-profiles/g1/u2",
+            json={"user_id": "u2", "display_name": "小李", "traits": {"爱好": {"value": "游戏"}}},
+            headers=headers,
+        )
+        history_put = await client.put(
+            f"{API_PREFIX}/interaction-histories/g1/u2",
+            json={"user_id": "u2", "summary": "最近常聊游戏", "records": []},
+            headers=headers,
+        )
+        mismatch = await client.put(
+            f"{API_PREFIX}/user-profiles/g1/u3",
+            json={"user_id": "u4"},
+            headers=headers,
+        )
+        bad_body = await client.put(
+            f"{API_PREFIX}/interaction-histories/g1/u3",
+            json=["not-an-object"],
+            headers=headers,
+        )
+        deleted_profile = await client.delete(
+            f"{API_PREFIX}/user-profiles/g1/u1",
+            headers=headers,
+        )
+        deleted_history = await client.delete(
+            f"{API_PREFIX}/interaction-histories/g1/u1",
+            headers=headers,
+        )
 
-    assert listed_profiles.status_code == 200
-    assert listed_profiles.json()["items"][0]["key"] == "user_profile"
+    assert profiles.status_code == 200
+    assert profiles.json()["total"] == 1
+    assert histories.status_code == 200
+    assert histories.json()["items"][0]["key"] == "interaction_history"
     assert service.list_profile_calls == [
         {
-            "limit": 5,
-            "offset": 1,
+            "limit": 3,
+            "offset": 0,
             "group_id": "g1",
             "user_id": "u1",
-            "query": "阿明",
+            "query": "布丁",
         }
     ]
-    assert listed_histories.status_code == 200
     assert service.list_history_calls == [
         {
             "limit": 20,
-            "offset": 0,
+            "offset": 1,
             "group_id": "g1",
             "user_id": "u1",
             "query": "聊天",
         }
     ]
-    assert detail.status_code == 200
-    assert put_profile.status_code == 200
-    assert put_profile.json()["importance"] == 5
-    assert conflict.status_code == 422
-    assert "user_id" in conflict.json()["detail"]
-    assert put_history.status_code == 200
-    assert put_history.json()["value"]["summary"] == "一起打游戏"
+    assert profile_detail.status_code == 200
+    assert history_detail.status_code == 200
+    assert profile_put.status_code == 200
+    assert profile_put.json()["value"]["display_name"] == "小李"
+    assert history_put.status_code == 200
+    assert history_put.json()["value"]["summary"] == "最近常聊游戏"
+    assert mismatch.status_code == 422
+    assert "user_id" in mismatch.json()["detail"]
+    assert bad_body.status_code == 422
     assert deleted_profile.status_code == 204
     assert deleted_history.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_entity_routes_return_404_for_missing_rows(app: App) -> None:
+    headers = {"Authorization": "Bearer secret-token"}
+
+    async with app.test_server(asgi=_build_app(_FakeMemoryService())) as ctx:
+        client = ctx.get_client()
+        missing_profile = await client.get(
+            f"{API_PREFIX}/user-profiles/g1/u9",
+            headers=headers,
+        )
+        missing_history = await client.delete(
+            f"{API_PREFIX}/interaction-histories/g1/u9",
+            headers=headers,
+        )
+
+    assert missing_profile.status_code == 404
+    assert missing_history.status_code == 404

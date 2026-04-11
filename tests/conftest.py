@@ -9,11 +9,25 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import nonebot.plugin
+from nonebug import NONEBOT_INIT_KWARGS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def pytest_configure(config: object) -> None:
+    """在 NoneBug 初始化前写入 NoneBot 启动参数。"""
+    config.stash[NONEBOT_INIT_KWARGS] = {
+        "driver": "~fastapi",
+        "command_start": ["。", "."],
+        "command_sep": [" "],
+        "fastapi_docs_url": "/api/komari-management/docs",
+        "fastapi_openapi_url": "/api/komari-management/openapi.json",
+        "fastapi_redoc_url": None,
+        "fastapi_include_adapter_schema": False,
+    }
 
 
 class _DummyScheduler:
@@ -45,6 +59,7 @@ def _ensure_package_shim(plugin_name: str) -> None:
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
+_ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
 _ensure_package_shim("jrhg")

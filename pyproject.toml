@@ -140,6 +140,9 @@ pythonVersion = "3.13"
 pythonPlatform = "All"
 typeCheckingMode = "standard"
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [tool.poetry]
 package-mode = false
 
@@ -149,4 +152,6 @@ dev = [
     "jupyterlab (>=4.5.5,<5.0.0)",
     "ipykernel (>=7.2.0,<8.0.0)",
     "pytest (>=9.0.2,<10.0.0)",
+    "nonebug (>=0.4.4,<0.5.0)",
+    "pytest-asyncio (>=1.3.0,<2.0.0)",
 ]

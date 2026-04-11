@@ -1,19 +1,17 @@
 """
 Komari Knowledge 常识库插件。
 
-提供 Bot 人物设定和世界知识的混合检索能力，并在 FastAPI 驱动下暴露管理 REST API。
+提供 Bot 人物设定和世界知识的混合检索能力，管理 REST API 由 komari_management 统一挂载。
 """
 
 from __future__ import annotations
-
-from typing import Any, cast
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.database_config import get_effective_database_config
 
-from .api_runtime import register_management_api_for_driver
+from .api import register_knowledge_api
 from .config_schema import DynamicConfigSchema
 from .engine import (
     UNSET,
@@ -43,20 +41,23 @@ __plugin_meta__ = PluginMetadata(
     config=DynamicConfigSchema,
 )
 
-
-class PluginState:
-    def __init__(self) -> None:
-        self.api_registered = False
+__all__ = [
+    "UNSET",
+    "SearchResult",
+    "add_knowledge",
+    "delete_knowledge",
+    "get_all_knowledge",
+    "get_engine",
+    "get_knowledge",
+    "list_knowledge",
+    "register_knowledge_api",
+    "search_by_keyword",
+    "search_knowledge",
+    "update_knowledge",
+]
 
 
 driver = get_driver()
-state = PluginState()
-state.api_registered = register_management_api_for_driver(
-    driver=driver,
-    config=config_manager.get(),
-    engine_getter=cast("Any", get_engine),
-    logger=logger,
-)
 
 
 @driver.on_startup

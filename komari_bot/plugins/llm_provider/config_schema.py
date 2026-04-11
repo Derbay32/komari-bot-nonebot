@@ -31,9 +31,6 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    # REST API 配置
-    api_enabled: bool = Field(default=True, description="是否启用本地 reply 日志管理接口")
-
     # DeepSeek 配置
     deepseek_api_token: str = Field(default="", description="DeepSeek API Token")
     deepseek_api_base: str = Field(

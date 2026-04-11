@@ -3,10 +3,10 @@
 import time
 from typing import Any
 
-from nonebot import get_driver, logger
+from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
-from .api_runtime import register_management_api_for_driver
+from .api import register_llm_provider_api
 from .config import Config
 from .config_schema import DynamicConfigSchema
 from .deepseek_client import DeepSeekClient
@@ -43,6 +43,13 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
 )
 
+__all__ = [
+    "generate_text",
+    "generate_text_with_messages",
+    "get_reply_log_reader",
+    "register_llm_provider_api",
+]
+
 # 依赖插件
 config_manager_plugin = require("config_manager")
 knowledge_plugin = require("komari_knowledge")
@@ -54,31 +61,8 @@ config_manager = config_manager_plugin.get_config_manager(
 _reply_log_reader = ReplyLogReader()
 
 
-class PluginState:
-    """插件运行时状态。"""
-
-    def __init__(self) -> None:
-        self.api_registered = False
-
-
-state = PluginState()
-
-
-def _get_reply_log_reader() -> ReplyLogReader:
+def get_reply_log_reader() -> ReplyLogReader:
     return _reply_log_reader
-
-
-try:
-    driver = get_driver()
-except (RuntimeError, ValueError):
-    driver = None
-else:
-    state.api_registered = register_management_api_for_driver(
-        driver=driver,
-        config=config_manager.get(),
-        reader_getter=_get_reply_log_reader,
-        logger=logger,
-    )
 
 
 def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int]:

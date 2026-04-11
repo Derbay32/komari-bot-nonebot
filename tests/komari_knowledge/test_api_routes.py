@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
+import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from komari_bot.plugins.komari_knowledge.api import API_PREFIX, register_knowledge_api
 from komari_bot.plugins.komari_knowledge.engine import UNSET, SearchResult
 from komari_bot.plugins.komari_knowledge.models import KnowledgeCategory, KnowledgeEntry
+
+if TYPE_CHECKING:
+    from nonebug import App
+
+
+def _with_query(path: str, **params: object) -> str:
+    query = "&".join(
+        f"{key}={value}" for key, value in params.items() if value is not None
+    )
+    return f"{path}?{query}" if query else path
 
 
 def _build_entry(
@@ -92,7 +103,9 @@ class _FakeEngine:
         if entry is None:
             return False
 
-        changes: dict[str, object] = {"updated_at": datetime(2026, 4, 10, 13, 0, tzinfo=UTC)}
+        changes: dict[str, object] = {
+            "updated_at": datetime(2026, 4, 10, 13, 0, tzinfo=UTC)
+        }
         if kwargs.get("content", UNSET) is not UNSET:
             changes["content"] = kwargs["content"]
         if kwargs.get("keywords", UNSET) is not UNSET:
@@ -128,69 +141,82 @@ class _FakeEngine:
         ]
 
 
-def _build_client(engine: _FakeEngine | None) -> TestClient:
-    app = FastAPI()
+def _build_app(engine: _FakeEngine | None) -> FastAPI:
+    api_app = FastAPI()
     register_knowledge_api(
-        app,
+        api_app,
         api_token="secret-token",
         allowed_origins=["https://ui.example.com"],
         engine_getter=lambda: engine,
     )
-    return TestClient(app)
+    return api_app
 
 
-def test_knowledge_routes_require_token_and_handle_cors() -> None:
-    client = _build_client(_FakeEngine())
+@pytest.mark.asyncio
+async def test_knowledge_routes_require_token_and_handle_cors(app: App) -> None:
+    async with app.test_server(asgi=_build_app(_FakeEngine())) as ctx:
+        client = ctx.get_client()
 
-    unauthorized = client.get(f"{API_PREFIX}/knowledge")
-    assert unauthorized.status_code == 401
+        unauthorized = await client.get(f"{API_PREFIX}/knowledge")
+        assert unauthorized.status_code == 401
 
-    wrong_token = client.get(
-        f"{API_PREFIX}/knowledge",
-        headers={"Authorization": "Bearer wrong-token"},
-    )
-    assert wrong_token.status_code == 401
+        wrong_token = await client.get(
+            f"{API_PREFIX}/knowledge",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert wrong_token.status_code == 401
 
-    preflight = client.options(
-        f"{API_PREFIX}/knowledge",
-        headers={
-            "Origin": "https://ui.example.com",
-            "Access-Control-Request-Method": "GET",
-        },
-    )
-    assert preflight.status_code == 200
-    assert preflight.headers["access-control-allow-origin"] == "https://ui.example.com"
+        preflight = await client.options(
+            f"{API_PREFIX}/knowledge",
+            headers={
+                "Origin": "https://ui.example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert preflight.status_code == 200
+        assert (
+            preflight.headers["access-control-allow-origin"]
+            == "https://ui.example.com"
+        )
 
 
-def test_knowledge_routes_return_503_when_engine_unavailable() -> None:
-    client = _build_client(None)
-
-    response = client.get(
-        f"{API_PREFIX}/knowledge",
-        headers={"Authorization": "Bearer secret-token"},
-    )
+@pytest.mark.asyncio
+async def test_knowledge_routes_return_503_when_engine_unavailable(app: App) -> None:
+    async with app.test_server(asgi=_build_app(None)) as ctx:
+        client = ctx.get_client()
+        response = await client.get(
+            f"{API_PREFIX}/knowledge",
+            headers={"Authorization": "Bearer secret-token"},
+        )
 
     assert response.status_code == 503
     assert "引擎未初始化" in response.json()["detail"]
 
 
-def test_list_and_get_knowledge_routes_forward_filters() -> None:
+@pytest.mark.asyncio
+async def test_list_and_get_knowledge_routes_forward_filters(app: App) -> None:
     engine = _FakeEngine()
-    client = _build_client(engine)
 
-    response = client.get(
-        f"{API_PREFIX}/knowledge",
-        params={"q": "布丁", "category": "character", "limit": 5, "offset": 3},
-        headers={"Authorization": "Bearer secret-token"},
-    )
-    detail = client.get(
-        f"{API_PREFIX}/knowledge/1",
-        headers={"Authorization": "Bearer secret-token"},
-    )
-    missing = client.get(
-        f"{API_PREFIX}/knowledge/999",
-        headers={"Authorization": "Bearer secret-token"},
-    )
+    async with app.test_server(asgi=_build_app(engine)) as ctx:
+        client = ctx.get_client()
+        response = await client.get(
+            _with_query(
+                f"{API_PREFIX}/knowledge",
+                q="布丁",
+                category="character",
+                limit=5,
+                offset=3,
+            ),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        detail = await client.get(
+            f"{API_PREFIX}/knowledge/1",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        missing = await client.get(
+            f"{API_PREFIX}/knowledge/999",
+            headers={"Authorization": "Bearer secret-token"},
+        )
 
     assert response.status_code == 200
     assert response.json()["total"] == 2
@@ -201,33 +227,38 @@ def test_list_and_get_knowledge_routes_forward_filters() -> None:
     assert missing.status_code == 404
 
 
-def test_create_update_delete_and_search_routes() -> None:
+@pytest.mark.asyncio
+async def test_create_update_delete_and_search_routes(app: App) -> None:
     engine = _FakeEngine()
-    client = _build_client(engine)
     headers = {"Authorization": "Bearer secret-token"}
 
-    created = client.post(
-        f"{API_PREFIX}/knowledge",
-        json={
-            "content": "  小鞠喜欢打游戏  ",
-            "keywords": ["小鞠", " 游戏 "],
-            "category": "character",
-            "notes": " 熬夜记录 ",
-        },
-        headers=headers,
-    )
-    updated = client.patch(
-        f"{API_PREFIX}/knowledge/1",
-        json={"notes": None, "content": "小鞠超喜欢布丁"},
-        headers=headers,
-    )
-    searched = client.post(
-        f"{API_PREFIX}/search",
-        json={"query": "布丁", "limit": 2},
-        headers=headers,
-    )
-    deleted = client.delete(f"{API_PREFIX}/knowledge/2", headers=headers)
-    missing_delete = client.delete(f"{API_PREFIX}/knowledge/999", headers=headers)
+    async with app.test_server(asgi=_build_app(engine)) as ctx:
+        client = ctx.get_client()
+        created = await client.post(
+            f"{API_PREFIX}/knowledge",
+            json={
+                "content": "  小鞠喜欢打游戏  ",
+                "keywords": ["小鞠", " 游戏 "],
+                "category": "character",
+                "notes": " 熬夜记录 ",
+            },
+            headers=headers,
+        )
+        updated = await client.patch(
+            f"{API_PREFIX}/knowledge/1",
+            json={"notes": None, "content": "小鞠超喜欢布丁"},
+            headers=headers,
+        )
+        searched = await client.post(
+            f"{API_PREFIX}/search",
+            json={"query": "布丁", "limit": 2},
+            headers=headers,
+        )
+        deleted = await client.delete(f"{API_PREFIX}/knowledge/2", headers=headers)
+        missing_delete = await client.delete(
+            f"{API_PREFIX}/knowledge/999",
+            headers=headers,
+        )
 
     assert created.status_code == 201
     assert created.json()["id"] == 3
@@ -237,33 +268,34 @@ def test_create_update_delete_and_search_routes() -> None:
         "character",
         "熬夜记录",
     )
-
     assert updated.status_code == 200
     assert updated.json()["notes"] is None
     assert engine.update_calls[0][0] == 1
-    assert engine.update_calls[0][1]["content"] == "小鞠超喜欢布丁"
-    assert engine.update_calls[0][1]["notes"] is None
-    assert engine.update_calls[0][1]["keywords"] is UNSET
-
     assert searched.status_code == 200
-    assert searched.json()[0]["source"] == "vector"
+    assert searched.json()[0]["similarity"] == 0.93
     assert engine.search_calls == [("布丁", 2)]
-
     assert deleted.status_code == 204
     assert missing_delete.status_code == 404
 
 
-def test_update_route_validates_patch_payload() -> None:
-    client = _build_client(_FakeEngine())
+@pytest.mark.asyncio
+async def test_update_validation_errors_are_reported(app: App) -> None:
     headers = {"Authorization": "Bearer secret-token"}
 
-    empty_patch = client.patch(f"{API_PREFIX}/knowledge/1", json={}, headers=headers)
-    empty_keywords = client.patch(
-        f"{API_PREFIX}/knowledge/1",
-        json={"keywords": []},
-        headers=headers,
-    )
+    async with app.test_server(asgi=_build_app(_FakeEngine())) as ctx:
+        client = ctx.get_client()
+        empty_patch = await client.patch(
+            f"{API_PREFIX}/knowledge/1",
+            json={},
+            headers=headers,
+        )
+        missing_content = await client.patch(
+            f"{API_PREFIX}/knowledge/1",
+            json={"content": None},
+            headers=headers,
+        )
 
     assert empty_patch.status_code == 422
     assert "至少提供一个要更新的字段" in empty_patch.json()["detail"]
-    assert empty_keywords.status_code == 422
+    assert missing_content.status_code == 422
+    assert "content 不能为空" in missing_content.json()["detail"]

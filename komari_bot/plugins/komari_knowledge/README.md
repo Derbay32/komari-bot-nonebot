@@ -1,6 +1,10 @@
 # Komari Knowledge
 
-小鞠常识库插件，提供关键词精确匹配 + pgvector 语义检索的混合知识检索能力，并在 FastAPI 驱动下暴露 REST 管理接口，供外部 WebUI 或其他后台工具接入。
+小鞠常识库插件，提供关键词精确匹配 + pgvector 语义检索的混合知识检索能力。
+
+> 2026-04 管理接口迁移说明：
+> 知识库、记忆库、reply 日志的管理 API 与 Swagger/OpenAPI 文档已统一迁移到 `komari_management` 插件。
+> 旧的 `api_enabled`、`api_token`、`api_allowed_origins`、`webui_*` 配置说明仅供历史参考，不再作为当前实现的生效来源。
 
 ## 当前状态
 

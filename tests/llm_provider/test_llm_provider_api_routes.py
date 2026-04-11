@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from komari_bot.plugins.llm_provider.api import API_PREFIX, register_llm_provider_api
+
+if TYPE_CHECKING:
+    from nonebug import App
+
+
+def _with_query(path: str, **params: object) -> str:
+    query = "&".join(
+        f"{key}={value}" for key, value in params.items() if value is not None
+    )
+    return f"{path}?{query}" if query else path
 
 
 class _FakeReader:
@@ -58,61 +70,67 @@ class _FakeReader:
         }
 
 
-def _build_client(reader: _FakeReader | None) -> TestClient:
-    app = FastAPI()
+def _build_app(reader: _FakeReader | None) -> FastAPI:
+    api_app = FastAPI()
     register_llm_provider_api(
-        app,
+        api_app,
         api_token="secret-token",
         allowed_origins=["https://ui.example.com"],
         reader_getter=lambda: reader,
     )
-    return TestClient(app)
+    return api_app
 
 
-def test_llm_provider_routes_require_token_and_handle_cors() -> None:
-    client = _build_client(_FakeReader())
+@pytest.mark.asyncio
+async def test_llm_provider_routes_require_token_and_handle_cors(app: App) -> None:
+    async with app.test_server(asgi=_build_app(_FakeReader())) as ctx:
+        client = ctx.get_client()
+        unauthorized = await client.get(f"{API_PREFIX}/reply-logs")
+        assert unauthorized.status_code == 401
 
-    unauthorized = client.get(f"{API_PREFIX}/reply-logs")
-    assert unauthorized.status_code == 401
+        preflight = await client.options(
+            f"{API_PREFIX}/reply-logs",
+            headers={
+                "Origin": "https://ui.example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert preflight.status_code == 200
+        assert (
+            preflight.headers["access-control-allow-origin"]
+            == "https://ui.example.com"
+        )
 
-    preflight = client.options(
-        f"{API_PREFIX}/reply-logs",
-        headers={
-            "Origin": "https://ui.example.com",
-            "Access-Control-Request-Method": "GET",
-        },
-    )
-    assert preflight.status_code == 200
-    assert preflight.headers["access-control-allow-origin"] == "https://ui.example.com"
 
-
-def test_llm_provider_routes_support_list_and_detail_filters() -> None:
+@pytest.mark.asyncio
+async def test_llm_provider_routes_support_list_and_detail_filters(app: App) -> None:
     reader = _FakeReader()
-    client = _build_client(reader)
     headers = {"Authorization": "Bearer secret-token"}
 
-    listed = client.get(
-        f"{API_PREFIX}/reply-logs",
-        params={
-            "date": "2026-04-10",
-            "days": 3,
-            "trace_id": "chat-1",
-            "model": "deepseek-chat",
-            "method": "generate_text_with_messages",
-            "status": "success",
-            "limit": 5,
-            "offset": 1,
-        },
-        headers=headers,
-    )
-    detail = client.get(
-        f"{API_PREFIX}/reply-logs/2026-04-10/1",
-        headers=headers,
-    )
-    missing = client.get(
-        f"{API_PREFIX}/reply-logs/2026-04-10/99",
-        headers=headers,
-    )
+    async with app.test_server(asgi=_build_app(reader)) as ctx:
+        client = ctx.get_client()
+        listed = await client.get(
+            _with_query(
+                f"{API_PREFIX}/reply-logs",
+                date="2026-04-10",
+                days=3,
+                trace_id="chat-1",
+                model="deepseek-chat",
+                method="generate_text_with_messages",
+                status="success",
+                limit=5,
+                offset=1,
+            ),
+            headers=headers,
+        )
+        detail = await client.get(
+            f"{API_PREFIX}/reply-logs/2026-04-10/1",
+            headers=headers,
+        )
+        missing = await client.get(
+            f"{API_PREFIX}/reply-logs/2026-04-10/99",
+            headers=headers,
+        )
 
     assert listed.status_code == 200
     assert listed.json()["items"][0]["trace_id"] == "chat-1"
@@ -133,13 +151,26 @@ def test_llm_provider_routes_support_list_and_detail_filters() -> None:
     assert missing.status_code == 404
 
 
-def test_llm_provider_routes_return_503_when_reader_unavailable() -> None:
-    client = _build_client(None)
-
-    response = client.get(
-        f"{API_PREFIX}/reply-logs",
-        headers={"Authorization": "Bearer secret-token"},
-    )
+@pytest.mark.asyncio
+async def test_llm_provider_routes_return_503_when_reader_unavailable(app: App) -> None:
+    async with app.test_server(asgi=_build_app(None)) as ctx:
+        client = ctx.get_client()
+        response = await client.get(
+            f"{API_PREFIX}/reply-logs",
+            headers={"Authorization": "Bearer secret-token"},
+        )
 
     assert response.status_code == 503
     assert "读取器未初始化" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_llm_provider_routes_report_validation_errors(app: App) -> None:
+    async with app.test_server(asgi=_build_app(_FakeReader())) as ctx:
+        client = ctx.get_client()
+        response = await client.get(
+            _with_query(f"{API_PREFIX}/reply-logs", date="bad-date"),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+    assert response.status_code == 422

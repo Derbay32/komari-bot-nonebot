@@ -9,7 +9,15 @@ from typing import get_type_hints
 import nonebot
 import pytest
 
-nonebot.init()
+nonebot.init(
+    driver="~fastapi",
+    command_start=["。", "."],
+    command_sep=[" "],
+    fastapi_docs_url="/api/komari-management/docs",
+    fastapi_openapi_url="/api/komari-management/openapi.json",
+    fastapi_redoc_url=None,
+    fastapi_include_adapter_schema=False,
+)
 commands = import_module("komari_bot.plugins.character_binding.commands")
 
 
