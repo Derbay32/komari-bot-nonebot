@@ -72,10 +72,14 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         reader_getter=components.reply_log_reader_getter,
     )
+    docs_url = getattr(server_app, "docs_url", None) or "未启用"
+    openapi_url = getattr(server_app, "openapi_url", None) or "未启用"
     logger.info(
-        "[Komari Management] 管理 API 已注册: %s, %s, %s",
-        KNOWLEDGE_API_PREFIX,
-        MEMORY_API_PREFIX,
-        LLM_PROVIDER_API_PREFIX,
+        "[Komari Management] 管理 API 已注册: "
+        f"{KNOWLEDGE_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}"
+    )
+    logger.info(
+        "[Komari Management] 管理文档入口: "
+        f"docs={docs_url}, openapi={openapi_url}"
     )
     return True

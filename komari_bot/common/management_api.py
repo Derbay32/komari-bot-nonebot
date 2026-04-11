@@ -102,7 +102,7 @@ def resolve_management_settings(
     """从配置对象解析管理 API 共用设置。"""
     api_token = getattr(config, "api_token", "")
     if not isinstance(api_token, str) or not api_token.strip():
-        logger.warning("%s 未配置 api_token，跳过管理 API 注册", warning_prefix)
+        logger.warning(f"{warning_prefix} 未配置 api_token，跳过管理 API 注册")
         return None
 
     return SharedManagementSettings(

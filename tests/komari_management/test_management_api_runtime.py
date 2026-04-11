@@ -31,11 +31,23 @@ class _FakeLogger:
         self.info_messages: list[str] = []
         self.warning_messages: list[str] = []
 
+    @staticmethod
+    def _render(message: str, args: tuple[object, ...]) -> str:
+        if not args:
+            return message
+        try:
+            return message.format(*args)
+        except Exception:
+            try:
+                return message % args
+            except Exception:
+                return " ".join([message, *(str(arg) for arg in args)])
+
     def info(self, message: str, *args: object) -> None:
-        self.info_messages.append(message % args if args else message)
+        self.info_messages.append(self._render(message, args))
 
     def warning(self, message: str, *args: object) -> None:
-        self.warning_messages.append(message % args if args else message)
+        self.warning_messages.append(self._render(message, args))
 
 
 def _build_api_app() -> FastAPI:
@@ -95,6 +107,15 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert any(
         item.get("type") == "http" and item.get("scheme") == "bearer"
         for item in security_schemes.values()
+    )
+    assert logger.info_messages[-2] == (
+        "[Komari Management] 管理 API 已注册: "
+        "/api/komari-knowledge/v1, /api/komari-memory/v1, /api/llm-provider/v1"
+    )
+    assert logger.info_messages[-1] == (
+        "[Komari Management] 管理文档入口: "
+        "docs=/api/komari-management/docs, "
+        "openapi=/api/komari-management/openapi.json"
     )
     assert logger.warning_messages == []
 
