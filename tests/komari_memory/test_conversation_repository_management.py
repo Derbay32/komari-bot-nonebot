@@ -33,7 +33,7 @@ class _FakeConnection:
                 "start_time": datetime(2026, 4, 10, 10, 0, tzinfo=UTC),
                 "end_time": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
                 "importance_initial": 3,
-                "importance_current": 3.5,
+                "importance_current": 3,
                 "last_accessed": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
                 "created_at": datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
             }
@@ -50,7 +50,7 @@ class _FakeConnection:
                 "start_time": datetime(2026, 4, 10, 10, 0, tzinfo=UTC),
                 "end_time": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
                 "importance_initial": 4,
-                "importance_current": 4.2,
+                "importance_current": 4,
                 "last_accessed": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
                 "created_at": datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
             }
@@ -62,7 +62,7 @@ class _FakeConnection:
             "start_time": datetime(2026, 4, 10, 10, 0, tzinfo=UTC),
             "end_time": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
             "importance_initial": 3,
-            "importance_current": 3.5,
+            "importance_current": 3,
             "last_accessed": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
             "created_at": datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
         }
@@ -126,7 +126,7 @@ def test_update_and_delete_conversation() -> None:
             summary="更新后的总结",
             embedding="[0.1, 0.2]",
             importance_initial=4,
-            importance_current=4.2,
+            importance_current=4,
         )
     )
     deleted = asyncio.run(repository.delete_conversation(11))
@@ -135,7 +135,7 @@ def test_update_and_delete_conversation() -> None:
     update_query, update_args = conn.fetchrow_calls[0]
     assert "summary = $2" in update_query
     assert "embedding = $3" in update_query
-    assert update_args == (11, "更新后的总结", "[0.1, 0.2]", 4, 4.2)
+    assert update_args == (11, "更新后的总结", "[0.1, 0.2]", 4, 4)
     assert deleted is True
     delete_query, delete_args = conn.execute_calls[0]
     assert "DELETE FROM komari_memory_conversations" in delete_query

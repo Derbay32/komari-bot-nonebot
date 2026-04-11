@@ -150,7 +150,7 @@ class MemoryService:
         summary: str,
         participants: list[str],
         importance_initial: int = 3,
-        importance_current: float | None = None,
+        importance_current: int | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         last_accessed: datetime | None = None,
@@ -170,7 +170,7 @@ class MemoryService:
             start_time=normalized_start,
             end_time=normalized_end,
             importance_initial=importance_initial,
-            importance_current=float(
+            importance_current=int(
                 importance_current
                 if importance_current is not None
                 else importance_initial
@@ -186,7 +186,7 @@ class MemoryService:
         summary: str | None = None,
         participants: list[str] | None = None,
         importance_initial: int | None = None,
-        importance_current: float | None = None,
+        importance_current: int | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         last_accessed: datetime | None = None,

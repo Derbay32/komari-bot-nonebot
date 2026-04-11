@@ -45,6 +45,11 @@ class _FakePool:
 def test_build_memory_schema_statements_uses_requested_dimension() -> None:
     statements = build_memory_schema_statements(1536)
     assert "VECTOR(1536)" in statements[1]
+    assert "importance_current INT DEFAULT 3" in statements[1]
+    assert any(
+        "ALTER COLUMN importance_current TYPE INTEGER" in statement
+        for statement in statements
+    )
     assert any("komari_memory_user_profile" in statement for statement in statements)
     assert any(
         "komari_memory_interaction_history" in statement for statement in statements

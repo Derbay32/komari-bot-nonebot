@@ -23,7 +23,7 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             end_time TIMESTAMP NOT NULL,
             importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
             importance_initial INT DEFAULT 3 CHECK (importance_initial BETWEEN 1 AND 5),
-            importance_current DOUBLE PRECISION DEFAULT 3 CHECK (importance_current BETWEEN 0 AND 5),
+            importance_current INT DEFAULT 3 CHECK (importance_current BETWEEN 0 AND 5),
             last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_fuzzy BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -31,8 +31,30 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         """,
         """
         ALTER TABLE komari_memory_conversations
-        ALTER COLUMN importance_current TYPE DOUBLE PRECISION
-        USING importance_current::DOUBLE PRECISION
+        DROP CONSTRAINT IF EXISTS komari_memory_conversations_importance_current_check
+        """,
+        """
+        ALTER TABLE komari_memory_conversations
+        ALTER COLUMN importance_current TYPE INTEGER
+        USING LEAST(
+            COALESCE(importance_initial, 5),
+            GREATEST(
+                0,
+                LEAST(
+                    5,
+                    FLOOR(COALESCE(importance_current, importance_initial, 0))
+                )::INTEGER
+            )
+        )
+        """,
+        """
+        ALTER TABLE komari_memory_conversations
+        ALTER COLUMN importance_current SET DEFAULT 3
+        """,
+        """
+        ALTER TABLE komari_memory_conversations
+        ADD CONSTRAINT komari_memory_conversations_importance_current_check
+        CHECK (importance_current BETWEEN 0 AND 5)
         """,
         """
         CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_group

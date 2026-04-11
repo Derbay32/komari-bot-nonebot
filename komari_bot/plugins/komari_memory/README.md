@@ -167,10 +167,12 @@ psql -h localhost -U your_username -d komari_bot \
 
 忘却任务每天凌晨 4 点运行，核心规则：
 
-- `forgetting_decay_factor`：每日按比例衰减 `importance_current`
-- `forgetting_access_boost`：记忆被命中时提升 `importance_current`
+- `importance_current` 使用整数模型，每天执行 `-1`，最低降到 `0`
+- 记忆被命中后，`importance_current` 直接恢复为 `importance_initial`
+- `importance_initial <= forgetting_importance_threshold` 的低价值记忆，归零后会直接删除
+- `importance_initial > forgetting_importance_threshold` 的高价值记忆，第一次归零会交给 LLM 模糊化并重置重要性，下一次归零再删除
+- `forgetting_fuzzify_concurrency`：首次归零模糊化时的并发上限
 - `forgetting_min_age_days`：未达到最小保留天数的记忆不会被删除或模糊化
-- 低价值记忆删除，高价值记忆先模糊化，再进入下一轮删除
 
 ### scene 持久化依赖
 
@@ -227,10 +229,11 @@ psql -h localhost -U your_username -d komari_bot \
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `forgetting_enabled` | `true` | 是否启用忘却 |
-| `forgetting_importance_threshold` | `3` | 低价值记忆阈值 |
-| `forgetting_decay_factor` | `0.95` | 每日衰减系数 |
-| `forgetting_access_boost` | `1.2` | 命中时的访问回升系数 |
+| `forgetting_importance_threshold` | `3` | 低价值记忆直接删除阈值，高于该值的记忆首次归零会先模糊化 |
+| `forgetting_decay_factor` | `0.95` | 兼容旧配置，当前整数忘却模型未使用 |
+| `forgetting_access_boost` | `1.2` | 兼容旧配置，当前整数忘却模型未使用 |
 | `forgetting_min_age_days` | `3` | 最小保留天数 |
+| `forgetting_fuzzify_concurrency` | `3` | 首次归零模糊化时的 LLM 最大并发数 |
 
 ### 主动回复与判定
 

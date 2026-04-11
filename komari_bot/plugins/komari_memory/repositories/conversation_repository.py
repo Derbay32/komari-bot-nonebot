@@ -158,7 +158,7 @@ class ConversationRepository:
         start_time: datetime,
         end_time: datetime,
         importance_initial: int,
-        importance_current: float,
+        importance_current: int,
         last_accessed: datetime | None = None,
     ) -> dict[str, Any]:
         """创建可管理的对话记忆记录。"""
@@ -217,7 +217,7 @@ class ConversationRepository:
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         importance_initial: int | None = None,
-        importance_current: float | None = None,
+        importance_current: int | None = None,
         last_accessed: datetime | None = None,
     ) -> dict[str, Any] | None:
         """更新单条对话记忆。"""
@@ -357,7 +357,7 @@ class ConversationRepository:
         *,
         access_boost: float = 1.0,
     ) -> None:
-        """更新命中对话的访问时间和重要性。"""
+        """更新命中对话的访问时间并恢复到初始重要性。"""
         if not conversation_ids:
             return
 
@@ -366,17 +366,10 @@ class ConversationRepository:
                 """
                 UPDATE komari_memory_conversations
                 SET last_accessed = NOW(),
-                    importance_current = LEAST(
-                        5.0,
-                        GREATEST(
-                            importance_initial::DOUBLE PRECISION,
-                            ROUND((importance_current * $2)::numeric, 3)::DOUBLE PRECISION
-                        )
-                    )
+                    importance_current = importance_initial
                 WHERE id = ANY($1)
                 """,
                 conversation_ids,
-                access_boost,
             )
 
         logger.debug("[KomariMemory] 更新 {} 条记忆的访问状态", len(conversation_ids))

@@ -46,7 +46,7 @@ class _FakePool:
         return _FakeAcquire(self._conn)
 
 
-def test_search_by_similarity_applies_access_boost_on_hit() -> None:
+def test_search_by_similarity_restores_initial_importance_on_hit() -> None:
     conn = _FakeConnection()
     repository = ConversationRepository(_FakePool(conn))  # type: ignore[arg-type]
 
@@ -62,8 +62,8 @@ def test_search_by_similarity_applies_access_boost_on_hit() -> None:
     assert len(results) == 2
     assert len(conn.execute_calls) == 1
     update_query, update_args = conn.execute_calls[0]
-    assert "importance_current = LEAST(" in update_query
-    assert update_args == ([11, 12], 1.2)
+    assert "importance_current = importance_initial" in update_query
+    assert update_args == ([11, 12],)
 
 
 def test_search_by_similarity_can_skip_touch_results() -> None:

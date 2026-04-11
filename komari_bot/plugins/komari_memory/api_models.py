@@ -18,7 +18,7 @@ class ConversationEntry(BaseModel):
     start_time: datetime
     end_time: datetime
     importance_initial: int
-    importance_current: float
+    importance_current: int
     last_accessed: datetime | None = None
     created_at: datetime | None = None
 
@@ -39,7 +39,7 @@ class ConversationCreateRequest(BaseModel):
     summary: str = Field(min_length=1)
     participants: list[str] = Field(default_factory=list)
     importance_initial: int = Field(default=3, ge=1, le=5)
-    importance_current: float | None = Field(default=None, ge=0.0, le=5.0)
+    importance_current: int | None = Field(default=None, ge=0, le=5)
     start_time: datetime | None = None
     end_time: datetime | None = None
     last_accessed: datetime | None = None
@@ -65,7 +65,7 @@ class ConversationUpdateRequest(BaseModel):
     summary: str | None = Field(default=None, min_length=1)
     participants: list[str] | None = None
     importance_initial: int | None = Field(default=None, ge=1, le=5)
-    importance_current: float | None = Field(default=None, ge=0.0, le=5.0)
+    importance_current: int | None = Field(default=None, ge=0, le=5)
     start_time: datetime | None = None
     end_time: datetime | None = None
     last_accessed: datetime | None = None

@@ -35,7 +35,7 @@ def _conversation_entry(
         "start_time": timestamp,
         "end_time": timestamp,
         "importance_initial": 4,
-        "importance_current": 4.5,
+        "importance_current": 4,
         "last_accessed": timestamp,
         "created_at": timestamp,
     }
@@ -251,7 +251,7 @@ async def test_conversation_routes_forward_filters_and_support_crud(app: App) ->
         )
         updated = await client.patch(
             f"{API_PREFIX}/conversations/1",
-            json={"summary": "改过的记忆", "importance_current": 4.2},
+            json={"summary": "改过的记忆", "importance_current": 4},
             headers=headers,
         )
         missing_patch = await client.patch(
@@ -277,7 +277,7 @@ async def test_conversation_routes_forward_filters_and_support_crud(app: App) ->
     assert created.status_code == 201
     assert created.json()["summary"] == "新记忆"
     assert updated.status_code == 200
-    assert updated.json()["importance_current"] == 4.2
+    assert updated.json()["importance_current"] == 4
     assert service.update_conversation_calls[0][1]["summary"] == "改过的记忆"
     assert missing_patch.status_code == 404
     assert deleted.status_code == 204

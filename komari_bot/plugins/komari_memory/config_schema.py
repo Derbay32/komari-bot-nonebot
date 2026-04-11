@@ -164,16 +164,19 @@ class KomariMemoryConfigSchema(BaseModel):
     # 记忆忘却配置
     forgetting_enabled: bool = Field(default=True, description="是否启用记忆忘却")
     forgetting_importance_threshold: int = Field(
-        default=3, ge=1, le=5, description="删除低重要性记忆的阈值"
+        default=3, ge=1, le=5, description="低价值记忆直接删除阈值（高于该值的记忆首次归零会先模糊化）"
     )
     forgetting_decay_factor: float = Field(
-        default=0.95, ge=0.9, le=0.99, description="重要性衰减系数"
+        default=0.95, ge=0.9, le=0.99, description="兼容旧配置，当前整数忘却模型未使用"
     )
     forgetting_access_boost: float = Field(
-        default=1.2, ge=1.0, le=2.0, description="访问时重要性提升系数"
+        default=1.2, ge=1.0, le=2.0, description="兼容旧配置，当前整数忘却模型未使用"
     )
     forgetting_min_age_days: int = Field(
         default=3, ge=1, le=30, description="记忆最小保留天数"
+    )
+    forgetting_fuzzify_concurrency: int = Field(
+        default=3, ge=1, le=10, description="首次归零模糊化时的 LLM 最大并发数"
     )
 
     # 消息过滤配置

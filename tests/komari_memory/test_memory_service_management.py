@@ -49,7 +49,7 @@ class _FakeConversationRepository:
             "start_time": datetime(2026, 4, 10, 10, 0, tzinfo=UTC),
             "end_time": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
             "importance_initial": 3,
-            "importance_current": 3.5,
+            "importance_current": 3,
             "last_accessed": datetime(2026, 4, 10, 11, 0, tzinfo=UTC),
             "created_at": datetime(2026, 4, 10, 12, 0, tzinfo=UTC),
         }
@@ -146,7 +146,7 @@ def test_create_conversation_entry_embeds_summary_and_sets_defaults(
     assert embedding_plugin.embed_calls == ["新的对话总结"]
     assert conversation_repo.created_kwargs is not None
     assert conversation_repo.created_kwargs["embedding"] == "[0.1, 0.2]"
-    assert conversation_repo.created_kwargs["importance_current"] == 5.0
+    assert conversation_repo.created_kwargs["importance_current"] == 5
 
 
 def test_update_conversation_entry_reembeds_when_summary_changes(
@@ -158,7 +158,7 @@ def test_update_conversation_entry_reembeds_when_summary_changes(
         service.update_conversation_entry(
             11,
             summary="新的总结",
-            importance_current=4.2,
+            importance_current=4,
         )
     )
 
@@ -175,7 +175,7 @@ def test_update_conversation_entry_reembeds_when_summary_changes(
                 "start_time": None,
                 "end_time": None,
                 "importance_initial": None,
-                "importance_current": 4.2,
+                "importance_current": 4,
                 "last_accessed": None,
             },
         )
