@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -92,7 +92,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/komari-memory/v1/conversations" in route_paths
     assert "/api/llm-provider/v1/reply-logs" in route_paths
 
-    async with app.test_server(asgi=api_app) as ctx:
+    async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
         docs = await client.get("/api/komari-management/docs")
         schema_response = await client.get("/api/komari-management/openapi.json")

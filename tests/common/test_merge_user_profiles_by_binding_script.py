@@ -52,7 +52,7 @@ def test_build_merge_plans_merges_same_display_name_into_binding_uid() -> None:
             updated_at=datetime(2026, 4, 10, 0, 0, tzinfo=UTC),
             importance=4,
             access_count=1,
-            last_accessed=datetime(2026, 4, 10, 0, 0),
+            last_accessed=datetime(2026, 4, 10, 0, 0, tzinfo=UTC).replace(tzinfo=None),
         ),
         module.ProfileRow(
             user_id="1047195267",
@@ -76,7 +76,7 @@ def test_build_merge_plans_merges_same_display_name_into_binding_uid() -> None:
             updated_at=datetime(2026, 4, 11, 0, 0, tzinfo=UTC),
             importance=4,
             access_count=2,
-            last_accessed=datetime(2026, 4, 11, 0, 0),
+            last_accessed=datetime(2026, 4, 11, 0, 0, tzinfo=UTC).replace(tzinfo=None),
         ),
     ]
 
@@ -131,5 +131,5 @@ def test_coerce_timestamp_returns_naive_utc_datetime() -> None:
 
     result = module._coerce_timestamp("2026-04-12T02:20:36+08:00")
 
-    assert result == datetime(2026, 4, 11, 18, 20, 36)
+    assert result == datetime(2026, 4, 11, 18, 20, 36, tzinfo=UTC).replace(tzinfo=None)
     assert result.tzinfo is None

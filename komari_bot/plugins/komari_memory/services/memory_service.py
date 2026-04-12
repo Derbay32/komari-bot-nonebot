@@ -101,7 +101,6 @@ class MemoryService:
             group_id=group_id,
             user_id=user_id,
             limit=fetch_limit,
-            access_boost=self.config.forgetting_access_boost,
             touch_results=not rerank_enabled,
         )
 
@@ -113,7 +112,6 @@ class MemoryService:
             results = [results[rr.index] for rr in reranked]
             await self._conversation_repo.touch_conversations(
                 [int(result["id"]) for result in results],
-                access_boost=self.config.forgetting_access_boost,
             )
 
         return results[:limit]
@@ -160,7 +158,9 @@ class MemoryService:
             start_time=start_time,
             end_time=end_time,
         )
-        normalized_last_accessed = self._normalize_datetime(last_accessed) or normalized_end
+        normalized_last_accessed = (
+            self._normalize_datetime(last_accessed) or normalized_end
+        )
         embedding = await self._embedding_plugin.embed(summary)
         return await self._conversation_repo.create_conversation(
             group_id=group_id,
@@ -387,7 +387,9 @@ class MemoryService:
             interaction=interaction,
             importance=importance,
         )
-        return await self.get_interaction_history_row(user_id=user_id, group_id=group_id)
+        return await self.get_interaction_history_row(
+            user_id=user_id, group_id=group_id
+        )
 
     async def delete_user_profile(
         self,
@@ -436,7 +438,9 @@ class MemoryService:
                 profile=profile,
             )
 
-        interaction = await self.get_interaction_history(user_id=user_id, group_id=group_id)
+        interaction = await self.get_interaction_history(
+            user_id=user_id, group_id=group_id
+        )
         if interaction is None:
             interaction = {
                 "version": 1,
@@ -475,13 +479,12 @@ class MemoryService:
     ) -> tuple[datetime, datetime]:
         normalized_start = self._normalize_datetime(start_time)
         normalized_end = self._normalize_datetime(end_time)
-        if normalized_start is None and normalized_end is None:
-            normalized_end = self._now_naive()
+        if normalized_end is None:
+            normalized_end = (
+                self._now_naive() if normalized_start is None else normalized_start
+            )
+        if normalized_start is None:
             normalized_start = normalized_end - timedelta(hours=1)
-        elif normalized_start is None:
-            normalized_start = normalized_end - timedelta(hours=1)
-        elif normalized_end is None:
-            normalized_end = normalized_start
 
         if normalized_end < normalized_start:
             msg = "end_time 不能早于 start_time"

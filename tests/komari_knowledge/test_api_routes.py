@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -58,9 +58,7 @@ class _FakeEngine:
         self.list_calls: list[
             tuple[int, int, str | None, KnowledgeCategory | None]
         ] = []
-        self.add_calls: list[
-            tuple[str, list[str], KnowledgeCategory, str | None]
-        ] = []
+        self.add_calls: list[tuple[str, list[str], KnowledgeCategory, str | None]] = []
         self.update_calls: list[tuple[int, dict[str, object]]] = []
         self.delete_calls: list[int] = []
         self.search_calls: list[tuple[str, int | None]] = []
@@ -154,7 +152,7 @@ def _build_app(engine: _FakeEngine | None) -> FastAPI:
 
 @pytest.mark.asyncio
 async def test_knowledge_routes_require_token_and_handle_cors(app: App) -> None:
-    async with app.test_server(asgi=_build_app(_FakeEngine())) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(_FakeEngine()))) as ctx:
         client = ctx.get_client()
 
         unauthorized = await client.get(f"{API_PREFIX}/knowledge")
@@ -175,14 +173,13 @@ async def test_knowledge_routes_require_token_and_handle_cors(app: App) -> None:
         )
         assert preflight.status_code == 200
         assert (
-            preflight.headers["access-control-allow-origin"]
-            == "https://ui.example.com"
+            preflight.headers["access-control-allow-origin"] == "https://ui.example.com"
         )
 
 
 @pytest.mark.asyncio
 async def test_knowledge_routes_return_503_when_engine_unavailable(app: App) -> None:
-    async with app.test_server(asgi=_build_app(None)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(None))) as ctx:
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/knowledge",
@@ -197,7 +194,7 @@ async def test_knowledge_routes_return_503_when_engine_unavailable(app: App) -> 
 async def test_list_and_get_knowledge_routes_forward_filters(app: App) -> None:
     engine = _FakeEngine()
 
-    async with app.test_server(asgi=_build_app(engine)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
         client = ctx.get_client()
         response = await client.get(
             _with_query(
@@ -232,7 +229,7 @@ async def test_create_update_delete_and_search_routes(app: App) -> None:
     engine = _FakeEngine()
     headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=_build_app(engine)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
         client = ctx.get_client()
         created = await client.post(
             f"{API_PREFIX}/knowledge",
@@ -282,7 +279,7 @@ async def test_create_update_delete_and_search_routes(app: App) -> None:
 async def test_update_validation_errors_are_reported(app: App) -> None:
     headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=_build_app(_FakeEngine())) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(_FakeEngine()))) as ctx:
         client = ctx.get_client()
         empty_patch = await client.patch(
             f"{API_PREFIX}/knowledge/1",

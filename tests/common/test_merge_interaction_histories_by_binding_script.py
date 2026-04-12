@@ -125,5 +125,5 @@ def test_coerce_timestamp_returns_naive_utc_datetime() -> None:
 
     result = module._coerce_timestamp("2026-04-12T02:20:36+08:00")
 
-    assert result == datetime(2026, 4, 11, 18, 20, 36)
+    assert result == datetime(2026, 4, 11, 18, 20, 36, tzinfo=UTC).replace(tzinfo=None)
     assert result.tzinfo is None

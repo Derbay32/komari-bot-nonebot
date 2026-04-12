@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -55,7 +55,9 @@ def _entity_entry(*, key: str, user_id: str = "u1") -> dict[str, object]:
             "user_id": user_id,
             "display_name": "阿明",
             "summary": "最近常聊天" if key == "interaction_history" else "",
-            "traits": {"喜欢的食物": {"value": "布丁"}} if key == "user_profile" else {},
+            "traits": {"喜欢的食物": {"value": "布丁"}}
+            if key == "user_profile"
+            else {},
             "records": [],
         },
     }
@@ -76,11 +78,15 @@ class _FakeMemoryService:
         self.list_profile_calls: list[dict[str, object]] = []
         self.list_history_calls: list[dict[str, object]] = []
 
-    async def list_conversations(self, **kwargs: object) -> tuple[list[dict[str, object]], int]:
+    async def list_conversations(
+        self, **kwargs: object
+    ) -> tuple[list[dict[str, object]], int]:
         self.list_conversation_calls.append(dict(kwargs))
         return [self.conversations[1]], len(self.conversations)
 
-    async def get_conversation_entry(self, conversation_id: int) -> dict[str, object] | None:
+    async def get_conversation_entry(
+        self, conversation_id: int
+    ) -> dict[str, object] | None:
         return self.conversations.get(conversation_id)
 
     async def create_conversation_entry(self, **kwargs: object) -> dict[str, object]:
@@ -98,14 +104,18 @@ class _FakeMemoryService:
         if current is None:
             return None
         updated = dict(current)
-        updated.update({key: value for key, value in kwargs.items() if value is not None})
+        updated.update(
+            {key: value for key, value in kwargs.items() if value is not None}
+        )
         self.conversations[conversation_id] = updated
         return updated
 
     async def delete_conversation_entry(self, conversation_id: int) -> bool:
         return self.conversations.pop(conversation_id, None) is not None
 
-    async def list_user_profile_rows(self, **kwargs: object) -> tuple[list[dict[str, object]], int]:
+    async def list_user_profile_rows(
+        self, **kwargs: object
+    ) -> tuple[list[dict[str, object]], int]:
         self.list_profile_calls.append(dict(kwargs))
         return [self.user_profiles[("g1", "u1")]], len(self.user_profiles)
 
@@ -188,7 +198,7 @@ def _build_app(service: _FakeMemoryService | None) -> FastAPI:
 
 @pytest.mark.asyncio
 async def test_memory_routes_require_token_and_handle_cors(app: App) -> None:
-    async with app.test_server(asgi=_build_app(_FakeMemoryService())) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(_FakeMemoryService()))) as ctx:
         client = ctx.get_client()
         unauthorized = await client.get(f"{API_PREFIX}/conversations")
         assert unauthorized.status_code == 401
@@ -202,14 +212,13 @@ async def test_memory_routes_require_token_and_handle_cors(app: App) -> None:
         )
         assert preflight.status_code == 200
         assert (
-            preflight.headers["access-control-allow-origin"]
-            == "https://ui.example.com"
+            preflight.headers["access-control-allow-origin"] == "https://ui.example.com"
         )
 
 
 @pytest.mark.asyncio
 async def test_memory_routes_return_503_when_service_unavailable(app: App) -> None:
-    async with app.test_server(asgi=_build_app(None)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(None))) as ctx:
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/conversations",
@@ -225,7 +234,7 @@ async def test_conversation_routes_forward_filters_and_support_crud(app: App) ->
     service = _FakeMemoryService()
     headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=_build_app(service)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
         client = ctx.get_client()
         listed = await client.get(
             _with_query(
@@ -288,7 +297,7 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
     service = _FakeMemoryService()
     headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=_build_app(service)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
         client = ctx.get_client()
         profiles = await client.get(
             _with_query(
@@ -320,7 +329,11 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
         )
         profile_put = await client.put(
             f"{API_PREFIX}/user-profiles/g1/u2",
-            json={"user_id": "u2", "display_name": "小李", "traits": {"爱好": {"value": "游戏"}}},
+            json={
+                "user_id": "u2",
+                "display_name": "小李",
+                "traits": {"爱好": {"value": "游戏"}},
+            },
             headers=headers,
         )
         history_put = await client.put(
@@ -386,7 +399,7 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
 async def test_entity_routes_return_404_for_missing_rows(app: App) -> None:
     headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=_build_app(_FakeMemoryService())) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(_FakeMemoryService()))) as ctx:
         client = ctx.get_client()
         missing_profile = await client.get(
             f"{API_PREFIX}/user-profiles/g1/u9",

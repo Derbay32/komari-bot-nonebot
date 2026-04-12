@@ -247,7 +247,7 @@ class ConversationRepository:
             row = await conn.fetchrow(
                 f"""
                 UPDATE komari_memory_conversations
-                SET {', '.join(updates)}
+                SET {", ".join(updates)}
                 WHERE id = $1
                 RETURNING
                     id,
@@ -284,7 +284,6 @@ class ConversationRepository:
         group_id: str,
         user_id: str | None = None,
         limit: int = 10,
-        access_boost: float = 1.0,
         *,
         touch_results: bool = True,
     ) -> list[dict[str, Any]]:
@@ -295,7 +294,6 @@ class ConversationRepository:
             group_id: 群组 ID
             user_id: 用户 ID（用于加权该用户参与的记忆）
             limit: 返回数量限制
-            access_boost: 命中后重要性回升系数
             touch_results: 是否更新命中结果的访问时间和重要性
 
         Returns:
@@ -346,7 +344,7 @@ class ConversationRepository:
             # 检索后重置重要性和更新访问时间
             if results and touch_results:
                 result_ids = [r["id"] for r in results]
-                await self.touch_conversations(result_ids, access_boost=access_boost)
+                await self.touch_conversations(result_ids)
 
             logger.debug(f"[KomariMemory] 检索对话: 找到 {len(results)} 条结果")
             return results
@@ -354,8 +352,6 @@ class ConversationRepository:
     async def touch_conversations(
         self,
         conversation_ids: list[int],
-        *,
-        access_boost: float = 1.0,
     ) -> None:
         """更新命中对话的访问时间并恢复到初始重要性。"""
         if not conversation_ids:

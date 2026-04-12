@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -83,7 +83,7 @@ def _build_app(reader: _FakeReader | None) -> FastAPI:
 
 @pytest.mark.asyncio
 async def test_llm_provider_routes_require_token_and_handle_cors(app: App) -> None:
-    async with app.test_server(asgi=_build_app(_FakeReader())) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(_FakeReader()))) as ctx:
         client = ctx.get_client()
         unauthorized = await client.get(f"{API_PREFIX}/reply-logs")
         assert unauthorized.status_code == 401
@@ -97,8 +97,7 @@ async def test_llm_provider_routes_require_token_and_handle_cors(app: App) -> No
         )
         assert preflight.status_code == 200
         assert (
-            preflight.headers["access-control-allow-origin"]
-            == "https://ui.example.com"
+            preflight.headers["access-control-allow-origin"] == "https://ui.example.com"
         )
 
 
@@ -107,7 +106,7 @@ async def test_llm_provider_routes_support_list_and_detail_filters(app: App) -> 
     reader = _FakeReader()
     headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=_build_app(reader)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(reader))) as ctx:
         client = ctx.get_client()
         listed = await client.get(
             _with_query(
@@ -153,7 +152,7 @@ async def test_llm_provider_routes_support_list_and_detail_filters(app: App) -> 
 
 @pytest.mark.asyncio
 async def test_llm_provider_routes_return_503_when_reader_unavailable(app: App) -> None:
-    async with app.test_server(asgi=_build_app(None)) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(None))) as ctx:
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/reply-logs",
@@ -166,7 +165,7 @@ async def test_llm_provider_routes_return_503_when_reader_unavailable(app: App) 
 
 @pytest.mark.asyncio
 async def test_llm_provider_routes_report_validation_errors(app: App) -> None:
-    async with app.test_server(asgi=_build_app(_FakeReader())) as ctx:
+    async with app.test_server(asgi=cast("Any", _build_app(_FakeReader()))) as ctx:
         client = ctx.get_client()
         response = await client.get(
             _with_query(f"{API_PREFIX}/reply-logs", date="bad-date"),

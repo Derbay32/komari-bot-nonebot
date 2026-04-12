@@ -55,7 +55,6 @@ def test_search_by_similarity_restores_initial_importance_on_hit() -> None:
             embedding="[0.1, 0.2]",
             group_id="g1",
             limit=2,
-            access_boost=1.2,
         )
     )
 
@@ -75,7 +74,6 @@ def test_search_by_similarity_can_skip_touch_results() -> None:
             embedding="[0.1, 0.2]",
             group_id="g1",
             limit=2,
-            access_boost=1.2,
             touch_results=False,
         )
     )

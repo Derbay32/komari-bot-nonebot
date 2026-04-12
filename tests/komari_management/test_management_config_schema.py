@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from komari_bot.plugins.komari_management.config_schema import DynamicConfigSchema
 
 
 def test_management_config_schema_parses_origin_list_string() -> None:
     config = DynamicConfigSchema(
-        api_allowed_origins='["https://ui.example.com", "http://localhost:3000"]'
+        api_allowed_origins=cast(
+            "Any",
+            '["https://ui.example.com", "http://localhost:3000"]',
+        )
     )
 
     assert config.api_allowed_origins == [

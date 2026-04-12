@@ -192,10 +192,10 @@ async def _fetch_legacy_profile_rows(
             user_id,
             group_id,
             value,
-            {_optional_column_sql('profile_version', available_columns)},
-            {_optional_column_sql('profile_display_name', available_columns)},
-            {_optional_column_sql('profile_traits', available_columns)},
-            {_optional_column_sql('profile_updated_at', available_columns)},
+            {_optional_column_sql("profile_version", available_columns)},
+            {_optional_column_sql("profile_display_name", available_columns)},
+            {_optional_column_sql("profile_traits", available_columns)},
+            {_optional_column_sql("profile_updated_at", available_columns)},
             importance,
             access_count,
             last_accessed
@@ -212,7 +212,9 @@ async def _fetch_legacy_profile_rows(
             group_id=str(row["group_id"]),
             value=str(row["value"]) if row["value"] is not None else None,
             profile_version=(
-                int(row["profile_version"]) if row["profile_version"] is not None else None
+                int(row["profile_version"])
+                if row["profile_version"] is not None
+                else None
             ),
             profile_display_name=(
                 str(row["profile_display_name"])
@@ -331,7 +333,7 @@ def _build_interaction_payload(
             records = None
 
     updated_at = parsed.get("updated_at")
-    if hasattr(updated_at, "isoformat"):
+    if isinstance(updated_at, datetime):
         updated_at = updated_at.isoformat()
 
     return {

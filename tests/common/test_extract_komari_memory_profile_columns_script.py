@@ -7,7 +7,10 @@ import importlib.util
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from types import TracebackType
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/extract_komari_memory_profile_columns.py"
@@ -49,7 +52,12 @@ class _FakeAcquireContext:
     async def __aenter__(self) -> _FakeConnection:
         return self._conn
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         del exc_type, exc, tb
 
 

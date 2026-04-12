@@ -6,7 +6,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import nonebot.plugin
 from nonebug import NONEBOT_INIT_KWARGS
@@ -17,9 +17,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+class _PytestConfigWithStash(Protocol):
+    stash: dict[object, object]
+
+
 def pytest_configure(config: object) -> None:
     """在 NoneBug 初始化前写入 NoneBot 启动参数。"""
-    config.stash[NONEBOT_INIT_KWARGS] = {
+    pytest_config = cast("_PytestConfigWithStash", config)
+    pytest_config.stash[NONEBOT_INIT_KWARGS] = {
         "driver": "~fastapi",
         "command_start": ["。", "."],
         "command_sep": [" "],

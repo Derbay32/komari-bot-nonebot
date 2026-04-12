@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace as _SimpleNamespace
 from types import SimpleNamespace
+from types import SimpleNamespace as _SimpleNamespace
 from typing import Any, cast
 
 from komari_bot.plugins.komari_memory.services import (

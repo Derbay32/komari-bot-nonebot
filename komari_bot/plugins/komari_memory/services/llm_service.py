@@ -453,7 +453,9 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
         operation_type="profile",
     )
 
-    interaction_operation_payloads = normalized_result.get("user_interaction_operations")
+    interaction_operation_payloads = normalized_result.get(
+        "user_interaction_operations"
+    )
     if not isinstance(interaction_operation_payloads, list):
         legacy_interactions = normalized_result.get("user_interactions")
         if isinstance(legacy_interactions, list):
@@ -462,9 +464,11 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             interaction_operation_payloads = []
-    normalized_result["user_interaction_operations"] = _normalize_user_operation_payloads(
-        interaction_operation_payloads,
-        operation_type="interaction",
+    normalized_result["user_interaction_operations"] = (
+        _normalize_user_operation_payloads(
+            interaction_operation_payloads,
+            operation_type="interaction",
+        )
     )
 
     try:
@@ -556,30 +560,28 @@ def _normalize_interaction_operation(
 ) -> dict[str, Any] | None:
     op = str(operation.get("op", "")).strip().lower()
     field = str(operation.get("field", operation.get("target", ""))).strip()
-    if op not in {"add", "replace", "delete"}:
-        return None
-    if field not in {"file_type", "description", "summary", "record"}:
+    allowed_ops = {"add", "replace", "delete"}
+    allowed_fields = {"file_type", "description", "summary", "record"}
+    if op not in allowed_ops or field not in allowed_fields:
         return None
 
     normalized: dict[str, Any] = {
         "op": op,
         "field": field,
     }
-    if field != "record":
-        if op == "delete":
-            return normalized
-        value = str(operation.get("value", "")).strip()
-        if not value:
+    value: str | dict[str, str] | None = None
+    if field == "record":
+        if op == "replace":
             return None
-        normalized["value"] = value
-        return normalized
+        value = _normalize_record_value(operation.get("value"))
+    elif op != "delete":
+        text = str(operation.get("value", "")).strip()
+        value = text or None
 
-    if op == "replace":
+    if op != "delete" and value is None:
         return None
-    record = _normalize_record_value(operation.get("value"))
-    if record is None:
-        return None
-    normalized["value"] = record
+    if value is not None:
+        normalized["value"] = value
     return normalized
 
 

@@ -86,8 +86,7 @@ class EntityRepository:
         """写入互动历史。"""
         display_name = str(interaction.get("display_name", "")).strip() or user_id
         file_type = (
-            str(interaction.get("file_type", "")).strip()
-            or "用户的近期对鞠行为备忘录"
+            str(interaction.get("file_type", "")).strip() or "用户的近期对鞠行为备忘录"
         )
         description = str(interaction.get("description", "")).strip()
         summary = str(interaction.get("summary", "")).strip()
@@ -489,8 +488,7 @@ class EntityRepository:
     def _format_datetime(self, value: Any) -> str:
         if isinstance(value, datetime):
             return value.isoformat()
-        text = str(value or "").strip()
-        return text
+        return str(value or "").strip()
 
     def _normalize_timestamptz(self, value: Any) -> datetime:
         if isinstance(value, datetime):
@@ -507,7 +505,7 @@ class EntityRepository:
                     text,
                 )
             else:
-                return parsed if parsed.tzinfo is not None else parsed.replace(
-                    tzinfo=UTC
+                return (
+                    parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
                 )
         return datetime.now(UTC)
