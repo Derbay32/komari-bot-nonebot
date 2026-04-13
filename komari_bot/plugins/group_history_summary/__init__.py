@@ -12,9 +12,6 @@ from nonebot.exception import FinishedException
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.onebot_rules import group_message_to_me_rule
-from komari_bot.plugins.komari_decision.services.unified_candidate_rerank import (
-    UnifiedCandidateRerankService,
-)
 
 from .config_schema import DynamicConfigSchema
 from .history_service import check_group_history_supported
@@ -25,6 +22,9 @@ from .summarize_service import summarize_history_messages, summary_text_to_lines
 config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
 character_binding = require("character_binding")
+komari_decision_plugin = require("komari_decision")
+
+UnifiedCandidateRerankService = komari_decision_plugin.UnifiedCandidateRerankService
 
 config_manager = config_manager_plugin.get_config_manager(
     "group_history_summary", DynamicConfigSchema
