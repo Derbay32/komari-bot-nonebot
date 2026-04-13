@@ -31,17 +31,6 @@ class TimingScoreBreakdown:
 class SocialTimingService:
     """根据群聊实时状态计算时机分。"""
 
-    # 固定分项强度（可后续配置化）
-    _MENTION_BONUS = 0.20
-    _SILENCE_BONUS = 0.20
-    _ACTIVITY_MAX_PENALTY = 0.25
-    _DIALOGUE_PENALTY = 0.20
-    _COOLDOWN_MAX_PENALTY = 0.25
-
-    # 群活跃惩罚拐点
-    _ACTIVITY_THRESHOLD = 5
-    _ACTIVITY_SLOPE_DENOMINATOR = 10
-
     def __init__(self, redis: RedisManager) -> None:
         self.redis = redis
 
@@ -75,14 +64,18 @@ class SocialTimingService:
         activity_window_start = now - config.social_window_activity_seconds
         dialogue_window_start = now - config.social_window_dialogue_seconds
 
-        activity_messages = [m for m in messages if m.timestamp >= activity_window_start]
-        dialogue_messages = [m for m in messages if m.timestamp >= dialogue_window_start]
+        activity_messages = [
+            m for m in messages if m.timestamp >= activity_window_start
+        ]
+        dialogue_messages = [
+            m for m in messages if m.timestamp >= dialogue_window_start
+        ]
 
         activity_count = len(activity_messages)
         unique_users = len({m.user_id for m in dialogue_messages if not m.is_bot})
 
         # 1) 被 cue 加分
-        mention_bonus = self._MENTION_BONUS if alias_hit else 0.0
+        mention_bonus = config.social_timing_mention_bonus if alias_hit else 0.0
 
         # 2) 冷场加分
         if messages:
@@ -90,21 +83,25 @@ class SocialTimingService:
         else:
             # 无历史消息视为冷场
             silence_gap = float(config.social_silence_seconds)
-        silence_bonus = self._SILENCE_BONUS if silence_gap >= config.social_silence_seconds else 0.0
+        silence_bonus = (
+            config.social_timing_silence_bonus
+            if silence_gap >= config.social_silence_seconds
+            else 0.0
+        )
 
         # 3) 高活跃惩罚
-        if activity_count > self._ACTIVITY_THRESHOLD:
-            activity_over = activity_count - self._ACTIVITY_THRESHOLD
+        if activity_count > config.social_timing_activity_threshold:
+            activity_over = activity_count - config.social_timing_activity_threshold
             activity_penalty = min(
-                self._ACTIVITY_MAX_PENALTY,
-                activity_over / self._ACTIVITY_SLOPE_DENOMINATOR,
+                config.social_timing_activity_max_penalty,
+                activity_over / config.social_timing_activity_slope_denominator,
             )
         else:
             activity_penalty = 0.0
 
         # 4) 两人对话惩罚（至少有 2 条消息时才施加）
         dialogue_penalty = (
-            self._DIALOGUE_PENALTY
+            config.social_timing_dialogue_penalty
             if len(dialogue_messages) >= 2 and unique_users <= 2
             else 0.0
         )
@@ -125,7 +122,10 @@ class SocialTimingService:
                 ratio = (config.social_bot_cooldown_seconds - bot_gap) / max(
                     float(config.social_bot_cooldown_seconds), 1.0
                 )
-                cooldown_penalty = min(self._COOLDOWN_MAX_PENALTY, ratio * self._COOLDOWN_MAX_PENALTY)
+                cooldown_penalty = min(
+                    config.social_timing_cooldown_max_penalty,
+                    ratio * config.social_timing_cooldown_max_penalty,
+                )
             else:
                 cooldown_penalty = 0.0
 

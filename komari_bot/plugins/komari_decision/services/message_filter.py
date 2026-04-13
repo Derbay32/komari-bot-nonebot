@@ -6,8 +6,9 @@ from typing import Literal
 
 from nonebot import logger
 
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
+
+from ..config_schema import KomariDecisionConfigSchema
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ def _is_command_message(message: str) -> bool:
 
 async def preprocess_message(
     message: str,
-    config: KomariMemoryConfigSchema,
+    config: KomariDecisionConfigSchema,
     redis: RedisManager,
     group_id: str,
 ) -> FilterResult:
