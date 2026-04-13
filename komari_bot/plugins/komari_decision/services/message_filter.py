@@ -1,14 +1,17 @@
 """消息预过滤器 - BERT评分前的快速过滤层。"""
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from nonebot import logger
 
-from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
-from ..config_schema import KomariDecisionConfigSchema
+    from ..config_schema import KomariDecisionConfigSchema
 
 
 @dataclass(frozen=True)

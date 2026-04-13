@@ -42,6 +42,7 @@ __all__ = [
     "PluginManager",
     "get_memory_service",
     "get_plugin_manager",
+    "get_redis_manager",
     "register_memory_api",
 ]
 
@@ -193,6 +194,14 @@ def get_memory_service() -> MemoryService | None:
     if manager is None:
         return None
     return manager.memory
+
+
+def get_redis_manager() -> RedisManager | None:
+    """获取 Redis 管理器实例。"""
+    manager = get_plugin_manager()
+    if manager is None:
+        return None
+    return manager.redis
 
 
 # 在插件加载时初始化

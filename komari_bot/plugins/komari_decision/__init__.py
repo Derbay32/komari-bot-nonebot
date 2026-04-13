@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 from nonebot import logger
 from nonebot.plugin import PluginMetadata
@@ -10,11 +10,20 @@ from nonebot.plugin import PluginMetadata
 from .services.config_interface import get_config
 
 if TYPE_CHECKING:
+    from asyncpg import Pool
+
     from .repositories.scene_repository import SceneRepository
     from .services.scene_admin_service import SceneAdminService
     from .services.scene_embedding_worker import SceneEmbeddingWorker
     from .services.scene_runtime_service import SceneRuntimeService
     from .services.scene_sync_service import SceneSyncService
+
+
+class MemoryPluginManagerProtocol(Protocol):
+    """Komari Memory 插件管理器协议。"""
+
+    pg_pool: Pool | None
+
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠判定",
@@ -37,10 +46,6 @@ class PluginManager:
         """初始化 scene 运行时与同步任务。"""
         from nonebot.plugin import require
 
-        from komari_bot.plugins.komari_memory import (
-            get_plugin_manager as get_memory_plugin_manager,
-        )
-
         from .handlers.scene_sync_worker import (
             bootstrap_scene_sync_task,
             register_scene_sync_task,
@@ -53,16 +58,28 @@ class PluginManager:
         from .services.scene_sync_service import SceneSyncService
 
         require("nonebot_plugin_apscheduler")
-        require("komari_memory")
+        memory_plugin = require("komari_memory")
 
         config = get_config()
         if not config.scene_persist_enabled:
             logger.info("[KomariDecision] scene 持久化未启用，跳过初始化")
             return
 
-        memory_manager = get_memory_plugin_manager()
+        get_memory_plugin_manager = getattr(memory_plugin, "get_plugin_manager", None)
+        if not callable(get_memory_plugin_manager):
+            logger.warning(
+                "[KomariDecision] KomariMemory 未导出 get_plugin_manager，跳过初始化"
+            )
+            return
+
+        memory_manager = cast(
+            "MemoryPluginManagerProtocol | None",
+            get_memory_plugin_manager(),
+        )
         if memory_manager is None or memory_manager.pg_pool is None:
-            logger.warning("[KomariDecision] KomariMemory 未就绪，scene 子系统初始化跳过")
+            logger.warning(
+                "[KomariDecision] KomariMemory 未就绪，scene 子系统初始化跳过"
+            )
             return
 
         scene_repository = SceneRepository(memory_manager.pg_pool)
@@ -87,7 +104,9 @@ class PluginManager:
             if loaded:
                 logger.info("[KomariDecision] scene runtime cache 初始化成功")
             else:
-                logger.warning("[KomariDecision] 当前无 active scene set，runtime cache 为空")
+                logger.warning(
+                    "[KomariDecision] 当前无 active scene set，runtime cache 为空"
+                )
             register_scene_sync_task(
                 scene_repository,
                 scene_admin,
@@ -159,7 +178,6 @@ if driver is not None:
         manager = PluginManager()
         await manager.initialize()
         _plugin_manager = manager
-
 
     @driver.on_shutdown
     async def shutdown() -> None:
