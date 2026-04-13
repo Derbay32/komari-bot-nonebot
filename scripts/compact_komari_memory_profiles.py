@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-import aiohttp
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -73,9 +73,7 @@ class StandaloneLLMConfig(BaseModel):
     """脚本使用的最小 llm_provider 配置。"""
 
     deepseek_api_token: str = Field(default="")
-    deepseek_api_base: str = Field(
-        default="https://api.deepseek.com/v1/chat/completions"
-    )
+    deepseek_api_base: str = Field(default="https://api.deepseek.com/v1")
     deepseek_temperature: float = Field(default=1.0)
     deepseek_max_tokens: int = Field(default=8192)
     deepseek_timeout_seconds: float = Field(default=300.0)
@@ -99,19 +97,11 @@ class DirectLLMClient:
 
     def __init__(self, config: StandaloneLLMConfig) -> None:
         self.config = config
-        self._session: aiohttp.ClientSession | None = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            headers = {
-                "Authorization": f"Bearer {self.config.deepseek_api_token}",
-                "Content-Type": "application/json",
-            }
-            timeout = aiohttp.ClientTimeout(
-                total=float(self.config.deepseek_timeout_seconds)
-            )
-            self._session = aiohttp.ClientSession(headers=headers, timeout=timeout)
-        return self._session
+        self._client = AsyncOpenAI(
+            api_key=self.config.deepseek_api_token,
+            base_url=str(self.config.deepseek_api_base),
+            timeout=float(self.config.deepseek_timeout_seconds),
+        )
 
     async def generate_text(
         self,
@@ -125,7 +115,6 @@ class DirectLLMClient:
         **kwargs: Any,
     ) -> str:
         del response_format
-        session = await self._get_session()
         messages: list[dict[str, Any]] = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
@@ -147,7 +136,9 @@ class DirectLLMClient:
                 else self.config.deepseek_temperature
             ),
             "max_tokens": (
-                max_tokens if max_tokens is not None else self.config.deepseek_max_tokens
+                max_tokens
+                if max_tokens is not None
+                else self.config.deepseek_max_tokens
             ),
             "frequency_penalty": self.config.deepseek_frequency_penalty,
             "stream": False,
@@ -155,29 +146,17 @@ class DirectLLMClient:
         if reasoning_effort:
             request_data["reasoning_effort"] = reasoning_effort
 
-        async with session.post(
-            str(self.config.deepseek_api_base),
-            json=request_data,
-        ) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                msg = (
-                    f"画像压缩脚本 LLM 请求失败: status={response.status} body={error_text}"
-                )
-                raise RuntimeError(msg)
-            payload = await response.json()
+        response = await self._client.chat.completions.create(**request_data)
 
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
-            msg = f"画像压缩脚本 LLM 响应格式异常: {payload}"
+        if not response.choices:
+            msg = f"画像压缩脚本 LLM 响应格式异常: {response}"
             raise RuntimeError(msg)
 
-        content = choices[0].get("message", {}).get("content", "")
+        content = response.choices[0].message.content or ""
         return str(content).strip()
 
     async def close(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
+        await self._client.close()
 
 
 def _load_schema_config(

@@ -32,11 +32,25 @@ def test_llm_provider_example_includes_timeout_field() -> None:
 
 
 def test_deepseek_client_session_uses_configured_timeout() -> None:
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def close(self) -> None:
+            return None
+
     async def _run() -> None:
-        client = DeepSeekClient("token", timeout_seconds=300.0)
-        session = await client._get_session()
+        deepseek_client_module.AsyncOpenAI = _FakeAsyncOpenAI  # type: ignore[method-assign]
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
         try:
-            assert session.timeout.total == 300.0
+            sdk_client = client.client
+            assert isinstance(sdk_client, _FakeAsyncOpenAI)
+            assert sdk_client.kwargs["timeout"] == 300.0
+            assert sdk_client.kwargs["base_url"] == "https://example.com/v1"
         finally:
             await client.close()
 
@@ -46,43 +60,31 @@ def test_deepseek_client_session_uses_configured_timeout() -> None:
 def test_deepseek_client_generate_text_includes_reasoning_effort(
     monkeypatch: Any,
 ) -> None:
-    class _FakeResponse:
-        status = 200
-
-        async def json(self) -> dict[str, Any]:
-            return {"choices": [{"message": {"content": "ok"}}]}
-
-    class _FakePostContext:
-        def __init__(self, response: _FakeResponse) -> None:
-            self._response = response
-
-        async def __aenter__(self) -> _FakeResponse:
-            return self._response
-
-        async def __aexit__(
-            self,
-            exc_type: object,
-            exc: object,
-            tb: object,
-        ) -> None:
-            del exc_type, exc, tb
-
-    class _FakeSession:
+    class _FakeCompletions:
         def __init__(self) -> None:
-            self.last_json: dict[str, Any] | None = None
+            self.last_kwargs: dict[str, Any] | None = None
 
-        def post(self, _url: str, *, json: dict[str, Any]) -> _FakePostContext:
-            self.last_json = json
-            return _FakePostContext(_FakeResponse())
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
 
     async def _run() -> None:
-        fake_session = _FakeSession()
-        client = DeepSeekClient("token", timeout_seconds=300.0)
-
-        async def _fake_get_session() -> _FakeSession:
-            return fake_session
-
-        monkeypatch.setattr(client, "_get_session", _fake_get_session)
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
         monkeypatch.setattr(
             deepseek_client_module,
             "config_manager",
@@ -91,7 +93,7 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
                     deepseek_temperature=1.0,
                     deepseek_max_tokens=8192,
                     deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1/chat/completions",
+                    deepseek_api_base="https://example.com/v1",
                     deepseek_reasoning_effort="medium",
                 )
             ),
@@ -100,9 +102,10 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
         result = await client.generate_text(prompt="你好", model="deepseek-chat")
 
         assert result == "ok"
-        assert fake_session.last_json is not None
-        assert fake_session.last_json["reasoning_effort"] == "medium"
-        assert "response_format" not in fake_session.last_json
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert request_data["reasoning_effort"] == "medium"
+        assert "response_format" not in request_data
 
     asyncio.run(_run())
 
@@ -110,43 +113,31 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
 def test_deepseek_client_generate_text_ignores_response_format(
     monkeypatch: Any,
 ) -> None:
-    class _FakeResponse:
-        status = 200
-
-        async def json(self) -> dict[str, Any]:
-            return {"choices": [{"message": {"content": "ok"}}]}
-
-    class _FakePostContext:
-        def __init__(self, response: _FakeResponse) -> None:
-            self._response = response
-
-        async def __aenter__(self) -> _FakeResponse:
-            return self._response
-
-        async def __aexit__(
-            self,
-            exc_type: object,
-            exc: object,
-            tb: object,
-        ) -> None:
-            del exc_type, exc, tb
-
-    class _FakeSession:
+    class _FakeCompletions:
         def __init__(self) -> None:
-            self.last_json: dict[str, Any] | None = None
+            self.last_kwargs: dict[str, Any] | None = None
 
-        def post(self, _url: str, *, json: dict[str, Any]) -> _FakePostContext:
-            self.last_json = json
-            return _FakePostContext(_FakeResponse())
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
 
     async def _run() -> None:
-        fake_session = _FakeSession()
-        client = DeepSeekClient("token", timeout_seconds=300.0)
-
-        async def _fake_get_session() -> _FakeSession:
-            return fake_session
-
-        monkeypatch.setattr(client, "_get_session", _fake_get_session)
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
         monkeypatch.setattr(
             deepseek_client_module,
             "config_manager",
@@ -155,7 +146,7 @@ def test_deepseek_client_generate_text_ignores_response_format(
                     deepseek_temperature=1.0,
                     deepseek_max_tokens=8192,
                     deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1/chat/completions",
+                    deepseek_api_base="https://example.com/v1",
                     deepseek_reasoning_effort="",
                 )
             ),
@@ -168,7 +159,8 @@ def test_deepseek_client_generate_text_ignores_response_format(
         )
 
         assert result == "ok"
-        assert fake_session.last_json is not None
-        assert "response_format" not in fake_session.last_json
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert "response_format" not in request_data
 
     asyncio.run(_run())

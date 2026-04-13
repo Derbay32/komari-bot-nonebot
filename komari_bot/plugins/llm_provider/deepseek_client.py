@@ -1,10 +1,10 @@
 """DeepSeek API 客户端。"""
 
-import json
+from typing import Never
 
-import aiohttp
 from nonebot import logger
 from nonebot.plugin import require
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, OpenAIError
 
 from .base_client import BaseLLMClient
 from .config_schema import DynamicConfigSchema
@@ -21,36 +21,45 @@ config_manager = config_manager_plugin.get_config_manager(
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek API 客户端。"""
 
-    def __init__(self, api_token: str, timeout_seconds: float = 300.0) -> None:
+    _INVALID_RESPONSE_MESSAGE = "DeepSeek API 响应格式异常"
+
+    def __init__(
+        self,
+        api_token: str,
+        base_url: str,
+        timeout_seconds: float = 300.0,
+    ) -> None:
         """初始化客户端。
 
         Args:
             api_token: DeepSeek API Token
+            base_url: OpenAI 兼容 API Base URL
             timeout_seconds: 请求总超时时间（秒）
         """
         self.api_token = api_token
         self.timeout_seconds = timeout_seconds
-        self.session: aiohttp.ClientSession | None = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建 HTTP 会话。"""
-        if self.session is None or self.session.closed:
-            headers = {
-                "Authorization": f"Bearer {self.api_token}",
-                "Content-Type": "application/json",
-            }
-            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-            self.session = aiohttp.ClientSession(headers=headers, timeout=timeout)
-        return self.session
+        self.base_url = base_url
+        self.client = AsyncOpenAI(
+            api_key=api_token,
+            base_url=base_url,
+            timeout=timeout_seconds,
+        )
 
     @staticmethod
-    def _resolve_reasoning_effort(config: DynamicConfigSchema, **kwargs: object) -> str | None:
+    def _resolve_reasoning_effort(
+        config: DynamicConfigSchema, **kwargs: object
+    ) -> str | None:
         """解析 OpenAI 兼容的 reasoning_effort 请求参数。"""
         raw_value = kwargs.get("reasoning_effort", config.deepseek_reasoning_effort)
         if raw_value is None:
             return None
         value = str(raw_value).strip()
         return value or None
+
+    @classmethod
+    def _raise_invalid_response(cls) -> "Never":
+        """抛出响应格式异常。"""
+        raise RuntimeError(cls._INVALID_RESPONSE_MESSAGE)
 
     async def generate_text(
         self,
@@ -91,15 +100,11 @@ class DeepSeekClient(BaseLLMClient):
             )
             del response_format
 
-            session = await self._get_session()
-
-            # 构建消息
             messages = []
             if system_instruction:
                 messages.append({"role": "system", "content": system_instruction})
             messages.append({"role": "user", "content": prompt})
 
-            # 构建请求数据
             request_data = {
                 "model": model,
                 "messages": messages,
@@ -112,41 +117,29 @@ class DeepSeekClient(BaseLLMClient):
                 "frequency_penalty": kwargs.get(
                     "frequency_penalty", config.deepseek_frequency_penalty
                 ),
-                "stream": False,
             }
 
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            # 发送 API 请求
-            async with session.post(
-                config.deepseek_api_base, json=request_data
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(
-                        f"DeepSeek API 请求失败: {response.status} - {error_text}"
-                    )
-                    raise Exception(f"DeepSeek API 请求失败: {response.status}")  # noqa: TRY301,TRY002,TRY003
+            response = await self.client.chat.completions.create(**request_data)
 
-                response_data = await response.json()
-
-                # 解析响应
-                if "choices" in response_data and len(response_data["choices"]) > 0:
-                    content = response_data["choices"][0]["message"]["content"]
+            if response.choices:
+                content = response.choices[0].message.content
+                if content is not None:
                     logger.debug(f"DeepSeek API 响应: {content}")
                     return content.strip()
-                logger.error(f"DeepSeek API 响应格式异常: {response_data}")
-                raise Exception("DeepSeek API 响应格式异常")  # noqa: TRY301,TRY002,TRY003
+            logger.error(f"DeepSeek API 响应格式异常: {response}")
+            self._raise_invalid_response()
 
-        except TimeoutError:
+        except APITimeoutError:
             logger.error("DeepSeek API 请求超时")
             raise
-        except aiohttp.ClientError as e:
+        except APIConnectionError as e:
             logger.error(f"DeepSeek API 网络错误: {e}")
             raise
-        except json.JSONDecodeError as e:
-            logger.error(f"DeepSeek API 响应解析错误: {e}")
+        except OpenAIError as e:
+            logger.error(f"DeepSeek API 调用失败: {e}")
             raise
         except Exception as e:
             logger.error(f"DeepSeek API 未知错误: {e}")
@@ -178,9 +171,7 @@ class DeepSeekClient(BaseLLMClient):
         try:
             reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
             del response_format
-            session = await self._get_session()
 
-            # 构建请求数据
             request_data = {
                 "model": model,
                 "messages": messages,
@@ -193,7 +184,6 @@ class DeepSeekClient(BaseLLMClient):
                 "frequency_penalty": kwargs.get(
                     "frequency_penalty", config.deepseek_frequency_penalty
                 ),
-                "stream": False,
             }
 
             if reasoning_effort is not None:
@@ -208,35 +198,24 @@ class DeepSeekClient(BaseLLMClient):
                 f"  reasoning_effort: {reasoning_effort}"
             )
 
-            # 发送 API 请求
-            async with session.post(
-                config.deepseek_api_base, json=request_data
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(
-                        f"DeepSeek API 请求失败: {response.status} - {error_text}"
-                    )
-                    raise Exception(f"DeepSeek API 请求失败: {response.status}")  # noqa: TRY002, TRY003
+            response = await self.client.chat.completions.create(**request_data)
 
-                response_data = await response.json()
-
-                # 解析响应
-                if "choices" in response_data and len(response_data["choices"]) > 0:
-                    content = response_data["choices"][0]["message"]["content"]
+            if response.choices:
+                content = response.choices[0].message.content
+                if content is not None:
                     logger.debug(f"DeepSeek API 响应: {content[:200]}...")
                     return content.strip()
-                logger.error(f"DeepSeek API 响应格式异常: {response_data}")
-                raise Exception("DeepSeek API 响应格式异常")  # noqa: TRY002, TRY003
+            logger.error(f"DeepSeek API 响应格式异常: {response}")
+            self._raise_invalid_response()
 
-        except TimeoutError:
+        except APITimeoutError:
             logger.error("DeepSeek API 请求超时")
             raise
-        except aiohttp.ClientError as e:
+        except APIConnectionError as e:
             logger.error(f"DeepSeek API 网络错误: {e}")
             raise
-        except json.JSONDecodeError as e:
-            logger.error(f"DeepSeek API 响应解析错误: {e}")
+        except OpenAIError as e:
+            logger.error(f"DeepSeek API 调用失败: {e}")
             raise
 
     async def test_connection(self) -> bool:
@@ -247,25 +226,18 @@ class DeepSeekClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
-            session = await self._get_session()
-
-            request_data = {
-                "model": config.deepseek_model,
-                "messages": [{"role": "user", "content": "你好"}],
-                "temperature": 0.1,
-                "max_tokens": 10,
-            }
-
-            async with session.post(
-                config.deepseek_api_base, json=request_data
-            ) as response:
-                return response.status == 200
-
+            await self.client.chat.completions.create(
+                model=config.deepseek_model,
+                messages=[{"role": "user", "content": "你好"}],
+                temperature=0.1,
+                max_tokens=10,
+            )
         except Exception as e:
             logger.error(f"DeepSeek API 连接测试失败: {e}")
             return False
+        else:
+            return True
 
     async def close(self) -> None:
         """关闭客户端。"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+        await self.client.close()
