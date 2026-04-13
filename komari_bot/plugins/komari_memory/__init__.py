@@ -155,7 +155,7 @@ class PluginManager:
         # 取消定时任务
         unregister_summary_task()
         unregister_forgetting_task()
-        # 清理记忆服务（释放 fastembed 模型）
+        # 清理记忆服务
         if self.memory:
             await self.memory.cleanup()
             self.memory = None
