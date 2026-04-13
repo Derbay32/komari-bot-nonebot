@@ -1,12 +1,18 @@
 """DeepSeek API 客户端。"""
 
-from typing import Never
+import json
+from typing import Any, Never
 
 from nonebot import logger
 from nonebot.plugin import require
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, OpenAIError
 
-from .base_client import BaseLLMClient
+from .base_client import (
+    BaseLLMClient,
+    LLMCompletionResultSchema,
+    LLMToolCallFunctionSchema,
+    LLMToolCallSchema,
+)
 from .config_schema import DynamicConfigSchema
 
 # 依赖 config_manager 插件
@@ -61,6 +67,58 @@ class DeepSeekClient(BaseLLMClient):
         """抛出响应格式异常。"""
         raise RuntimeError(cls._INVALID_RESPONSE_MESSAGE)
 
+    @staticmethod
+    def _parse_tool_arguments(raw_arguments: str) -> dict[str, Any] | None:
+        """安全解析工具参数 JSON。"""
+        if not raw_arguments.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _build_completion_result(self, response: Any) -> LLMCompletionResultSchema:
+        """将 OpenAI 兼容响应转换为统一结果。"""
+        if not getattr(response, "choices", None):
+            logger.error(f"DeepSeek API 响应格式异常: {response}")
+            self._raise_invalid_response()
+
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        if message is None:
+            logger.error(f"DeepSeek API 响应缺少 message: {response}")
+            self._raise_invalid_response()
+
+        content = getattr(message, "content", None) or ""
+        tool_calls: list[LLMToolCallSchema] = []
+        raw_tool_calls = getattr(message, "tool_calls", None) or []
+        for raw_tool_call in raw_tool_calls:
+            function = getattr(raw_tool_call, "function", None)
+            function_name = str(getattr(function, "name", "")).strip()
+            raw_arguments = str(getattr(function, "arguments", "") or "")
+            if not function_name:
+                continue
+            tool_calls.append(
+                LLMToolCallSchema(
+                    id=getattr(raw_tool_call, "id", None),
+                    type=str(getattr(raw_tool_call, "type", "function") or "function"),
+                    function=LLMToolCallFunctionSchema(
+                        name=function_name,
+                        arguments=raw_arguments,
+                    ),
+                    raw_arguments=raw_arguments,
+                    parsed_arguments=self._parse_tool_arguments(raw_arguments),
+                )
+            )
+
+        finish_reason = getattr(choice, "finish_reason", None)
+        return LLMCompletionResultSchema(
+            content=content.strip(),
+            tool_calls=tool_calls,
+            finish_reason=str(finish_reason) if finish_reason is not None else None,
+        )
+
     async def generate_text(
         self,
         prompt: str,
@@ -69,8 +127,12 @@ class DeepSeekClient(BaseLLMClient):
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         **kwargs,  # noqa: ANN003
-    ) -> str:
+    ) -> LLMCompletionResultSchema:
         """生成文本（支持 JSON 模式）。
 
         Args:
@@ -119,19 +181,17 @@ class DeepSeekClient(BaseLLMClient):
                 ),
             }
 
+            if tools is not None:
+                request_data["tools"] = tools
+            if tool_choice is not None:
+                request_data["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                request_data["parallel_tool_calls"] = parallel_tool_calls
+
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
             response = await self.client.chat.completions.create(**request_data)
-
-            if response.choices:
-                content = response.choices[0].message.content
-                if content is not None:
-                    logger.debug(f"DeepSeek API 响应: {content}")
-                    return content.strip()
-            logger.error(f"DeepSeek API 响应格式异常: {response}")
-            self._raise_invalid_response()
-
         except APITimeoutError:
             logger.error("DeepSeek API 请求超时")
             raise
@@ -144,6 +204,15 @@ class DeepSeekClient(BaseLLMClient):
         except Exception as e:
             logger.error(f"DeepSeek API 未知错误: {e}")
             raise
+        else:
+            result = self._build_completion_result(response)
+            logger.debug(
+                "DeepSeek API 响应: content_chars={} tool_calls={} finish_reason={}",
+                len(result.content),
+                len(result.tool_calls),
+                result.finish_reason or "-",
+            )
+            return result
 
     async def generate_text_with_messages(
         self,
@@ -152,8 +221,12 @@ class DeepSeekClient(BaseLLMClient):
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         **kwargs,  # noqa: ANN003
-    ) -> str:
+    ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 直接生成文本（支持多模态）。
 
         Args:
@@ -186,6 +259,13 @@ class DeepSeekClient(BaseLLMClient):
                 ),
             }
 
+            if tools is not None:
+                request_data["tools"] = tools
+            if tool_choice is not None:
+                request_data["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                request_data["parallel_tool_calls"] = parallel_tool_calls
+
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
@@ -200,14 +280,6 @@ class DeepSeekClient(BaseLLMClient):
 
             response = await self.client.chat.completions.create(**request_data)
 
-            if response.choices:
-                content = response.choices[0].message.content
-                if content is not None:
-                    logger.debug(f"DeepSeek API 响应: {content[:200]}...")
-                    return content.strip()
-            logger.error(f"DeepSeek API 响应格式异常: {response}")
-            self._raise_invalid_response()
-
         except APITimeoutError:
             logger.error("DeepSeek API 请求超时")
             raise
@@ -217,6 +289,15 @@ class DeepSeekClient(BaseLLMClient):
         except OpenAIError as e:
             logger.error(f"DeepSeek API 调用失败: {e}")
             raise
+        else:
+            result = self._build_completion_result(response)
+            logger.debug(
+                "DeepSeek API 响应: content_chars={} tool_calls={} finish_reason={}",
+                len(result.content),
+                len(result.tool_calls),
+                result.finish_reason or "-",
+            )
+            return result
 
     async def test_connection(self) -> bool:
         """测试 API 连接。
