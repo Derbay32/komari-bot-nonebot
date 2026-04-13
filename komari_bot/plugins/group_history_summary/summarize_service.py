@@ -11,6 +11,8 @@ from .prompt_template import get_template
 
 llm_provider = require("llm_provider")
 
+DEFAULT_SUMMARY_TEXT = "本次聊天记录信息较少，暂无可提炼的有效总结。"
+
 
 def _extract_tag_content(text: str, tag: str) -> str:
     """提取指定 XML 标签内容。"""
@@ -23,7 +25,9 @@ def _extract_tag_content(text: str, tag: str) -> str:
     return without_think.strip()
 
 
-def _build_transcript(history_messages: list[HistoryMessage], max_chars: int = 12000) -> str:
+def _build_transcript(
+    history_messages: list[HistoryMessage], max_chars: int = 12000
+) -> str:
     lines: list[str] = []
     total_chars = 0
 
@@ -46,6 +50,9 @@ async def summarize_history_messages(
     max_tokens: int,
 ) -> str:
     """总结历史消息，返回总结正文。"""
+    if not history_messages:
+        return DEFAULT_SUMMARY_TEXT
+
     template = get_template()
     transcript = _build_transcript(history_messages)
 
@@ -56,11 +63,7 @@ async def summarize_history_messages(
         },
         {
             "role": "user",
-            "content": (
-                "<history_messages>\n"
-                f"{transcript}\n"
-                "</history_messages>"
-            ),
+            "content": (f"<history_messages>\n{transcript}\n</history_messages>"),
         },
         {
             "role": "assistant",
@@ -85,7 +88,7 @@ async def summarize_history_messages(
     summary_text = _extract_tag_content(raw_result, "content")
 
     if not summary_text:
-        return "本次聊天记录信息较少，暂无可提炼的有效总结。"
+        return DEFAULT_SUMMARY_TEXT
 
     return summary_text
 
@@ -94,4 +97,4 @@ def summary_text_to_lines(summary_text: str) -> list[str]:
     """将总结正文转换为图片渲染行。"""
     lines = [line.strip() for line in summary_text.splitlines()]
     normalized = [line for line in lines if line]
-    return normalized or ["本次聊天记录信息较少，暂无可提炼的有效总结。"]
+    return normalized or [DEFAULT_SUMMARY_TEXT]

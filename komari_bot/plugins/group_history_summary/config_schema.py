@@ -50,11 +50,28 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    min_summary_count: int = Field(default=10, ge=1, le=1000, description="最少总结条数")
+    min_summary_count: int = Field(
+        default=10, ge=1, le=1000, description="最少总结条数"
+    )
     max_summary_count: int = Field(
         default=200, ge=1, le=1000, description="最多总结条数"
     )
     fetch_batch_size: int = Field(default=50, ge=1, le=200, description="单次拉取条数")
+    summary_default_count: int = Field(
+        default=50, ge=1, le=200, description="LLM 未指定时的默认总结条数"
+    )
+    summary_planning_model: str = Field(
+        default="deepseek-chat", description="总结规划阶段模型"
+    )
+    summary_planning_max_tokens: int = Field(
+        default=800, ge=128, le=8192, description="总结规划阶段最大 tokens"
+    )
+    summary_planning_round_limit: int = Field(
+        default=3, ge=1, le=6, description="总结规划工具循环上限"
+    )
+    summary_tool_scan_limit: int = Field(
+        default=300, ge=10, le=500, description="总结工具本地扫描历史硬上限"
+    )
 
     summary_model: str = Field(default="deepseek-chat", description="总结模型")
     summary_temperature: float = Field(

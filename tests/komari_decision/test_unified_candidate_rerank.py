@@ -19,15 +19,21 @@ def test_detect_alias_miss() -> None:
 
 def test_cosine_similarity_basic() -> None:
     assert (
-        UnifiedCandidateRerankService._cosine_similarity([1.0, 0.0], [1.0, 0.0])
-        == 1.0
+        UnifiedCandidateRerankService._cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
     )
     assert (
-        UnifiedCandidateRerankService._cosine_similarity([1.0, 0.0], [0.0, 1.0])
-        == 0.0
+        UnifiedCandidateRerankService._cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0
     )
 
 
 def test_cosine_similarity_invalid_vectors() -> None:
     assert UnifiedCandidateRerankService._cosine_similarity([], []) == 0.0
     assert UnifiedCandidateRerankService._cosine_similarity([1.0], [1.0, 2.0]) == 0.0
+
+
+def test_load_template_contains_group_history_summary_scene() -> None:
+    service = UnifiedCandidateRerankService()
+    fixed, scenes = service._load_template(service._resolve_template_path())
+
+    assert "NOISE" in fixed
+    assert any(scene["id"] == "scene_group_history_summary" for scene in scenes)

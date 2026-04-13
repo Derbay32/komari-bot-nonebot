@@ -96,6 +96,10 @@ class _DummyLLMProvider:
     async def generate_text_with_messages(**_kwargs: object) -> str:
         return "<content>对话内容已模糊化处理</content>"
 
+    @staticmethod
+    async def generate_messages_completion(**_kwargs: object) -> object:
+        return SimpleNamespace(content="规划完成", tool_calls=[], finish_reason="stop")
+
 
 class _DummyUserDataPlugin:
     @staticmethod

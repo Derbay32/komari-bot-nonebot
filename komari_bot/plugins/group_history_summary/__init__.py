@@ -12,14 +12,14 @@ from nonebot.exception import FinishedException
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.onebot_rules import group_message_to_me_rule
+from komari_bot.plugins.komari_decision.services.unified_candidate_rerank import (
+    UnifiedCandidateRerankService,
+)
 
 from .config_schema import DynamicConfigSchema
-from .history_service import (
-    HistoryMessage,
-    check_group_history_supported,
-    fetch_group_history_messages,
-)
+from .history_service import check_group_history_supported
 from .image_renderer import render_summary_image_base64
+from .planner_service import plan_summary_request
 from .summarize_service import summarize_history_messages, summary_text_to_lines
 
 config_manager_plugin = require("config_manager")
@@ -40,9 +40,10 @@ SUMMARY_TRIGGER_PATTERN = r"(?=.*总结)(?=.*\d).+"
 SUMMARY_COUNT_PATTERN = r"总结[^\d]{0,20}(\d{1,4})"
 FALLBACK_COUNT_PATTERN = r"(\d{1,4})"
 OUT_OF_RANGE_MESSAGE = "我、我只能看10-200条……"
+SUMMARY_SCENE_ID = "scene_group_history_summary"
 
 summary_matcher = on_regex(
-    SUMMARY_TRIGGER_PATTERN,
+    r".*总结.*",
     rule=group_message_to_me_rule(),
     priority=9,
     block=True,
@@ -50,6 +51,7 @@ summary_matcher = on_regex(
 
 _group_locks: dict[str, asyncio.Lock] = {}
 SUMMARY_TITLE = "小鞠的总结时间到！"
+_scene_rerank_service = UnifiedCandidateRerankService()
 
 
 def _get_group_lock(group_id: str) -> asyncio.Lock:
@@ -94,44 +96,6 @@ def _is_command_message(text: str) -> bool:
     return normalized.startswith(("。", ".", "/"))
 
 
-def _filter_messages_for_summary(
-    messages: list[HistoryMessage],
-    bot_self_id: str,
-) -> list[HistoryMessage]:
-    """过滤命令消息，以及机器人对这些命令的回复。"""
-    # 第一层：命令文本直接剔除（不论是谁发的）
-    command_indexes = {
-        idx
-        for idx, message in enumerate(messages)
-        if _is_command_message(message.content)
-    }
-    command_message_ids = {
-        message.message_id
-        for idx, message in enumerate(messages)
-        if idx in command_indexes and message.message_id
-    }
-
-    # 第二层：只剔除“机器人 reply 到命令消息”的回复。
-    bot_reply_indexes: set[int] = set()
-    if command_message_ids:
-        for idx, message in enumerate(messages):
-            if message.user_id != bot_self_id:
-                continue
-            if not message.reply_to_message_id:
-                continue
-            if message.reply_to_message_id in command_message_ids:
-                bot_reply_indexes.add(idx)
-
-    filtered: list[HistoryMessage] = []
-    for idx, message in enumerate(messages):
-        if idx in command_indexes:
-            continue
-        if idx in bot_reply_indexes:
-            continue
-        filtered.append(message)
-    return filtered
-
-
 def _format_time_range(start_ts: int, end_ts: int) -> str:
     start_str = (
         datetime.fromtimestamp(start_ts, tz=UTC).astimezone().strftime("%m-%d %H:%M")
@@ -142,12 +106,34 @@ def _format_time_range(start_ts: int, end_ts: int) -> str:
     return f"{start_str} - {end_str}"
 
 
+async def _is_summary_request(message_text: str) -> bool:
+    """结合兜底规则与统一 scene 识别判断是否为总结请求。"""
+    normalized = " ".join(message_text.split())
+    if "总结" not in normalized:
+        return False
+    if re.search(SUMMARY_TRIGGER_PATTERN, normalized):
+        return True
+
+    try:
+        rank_result = await _scene_rerank_service.rank_message(
+            normalized, alias_hit=True
+        )
+    except Exception:
+        logger.exception("[GroupHistorySummary] scene 判定失败，回退关键词兜底")
+        return False
+
+    return (
+        rank_result.best_scene_id == SUMMARY_SCENE_ID
+        and rank_result.best_scene_score >= 0.6
+        and rank_result.meaningful_score >= rank_result.noise_score
+    )
+
+
 @summary_matcher.handle()
 async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> None:
-    """处理 @机器人 总结过去XX条。"""
+    """处理群聊历史总结请求。"""
     plain_text = event.get_plaintext().strip()
-    requested_count = _extract_requested_count(plain_text)
-    if requested_count is None:
+    if not await _is_summary_request(plain_text):
         return
 
     config = config_manager.get()
@@ -162,7 +148,10 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
     if group_lock.locked():
         await summary_matcher.finish("在、在看了……等、等会！")
 
-    if not (config.min_summary_count <= requested_count <= config.max_summary_count):
+    requested_count = _extract_requested_count(plain_text)
+    if requested_count is not None and not (
+        config.min_summary_count <= requested_count <= config.max_summary_count
+    ):
         logger.info(
             "[GroupHistorySummary] 请求条数越界: requested={}, allowed=[{},{}]",
             requested_count,
@@ -170,8 +159,6 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
             config.max_summary_count,
         )
         await summary_matcher.finish(OUT_OF_RANGE_MESSAGE)
-
-    count = requested_count
 
     is_supported = await check_group_history_supported(bot)
     if not is_supported:
@@ -181,20 +168,24 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
         return
     try:
         async with group_lock:
-            logger.info(f"[GroupHistorySummary] 正在读取并总结最近 {count} 条消息...")
+            logger.info("[GroupHistorySummary] 正在规划并总结群聊历史...")
 
-            history_messages = await fetch_group_history_messages(
+            plan_result = await plan_summary_request(
                 bot=bot,
                 group_id=group_id,
-                count=count,
-                batch_size=config.fetch_batch_size,
-                name_resolver=character_binding.get_character_name,
+                bot_self_id=str(bot.self_id),
+                user_request=plain_text,
+                planning_model=config.summary_planning_model,
+                planning_max_tokens=config.summary_planning_max_tokens,
+                planning_round_limit=config.summary_planning_round_limit,
+                summary_default_count=requested_count or config.summary_default_count,
+                min_summary_count=config.min_summary_count,
+                max_summary_count=config.max_summary_count,
+                summary_tool_scan_limit=config.summary_tool_scan_limit,
+                fetch_batch_size=config.fetch_batch_size,
             )
 
-            filtered_messages = _filter_messages_for_summary(
-                messages=history_messages,
-                bot_self_id=str(bot.self_id),
-            )
+            filtered_messages = plan_result.messages
 
             if not filtered_messages:
                 logger.info("[GroupHistorySummary] 没有可用的历史消息")
@@ -208,8 +199,11 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
             )
 
             body_lines = summary_text_to_lines(summary_text)
+            filter_label = "最近消息"
+            if plan_result.tool_result is not None:
+                filter_label = str(plan_result.tool_result.source)
             subtitle = (
-                f"最近 {len(filtered_messages)} 条 | "
+                f"{filter_label} {len(filtered_messages)} 条 | "
                 f"{_format_time_range(filtered_messages[0].timestamp, filtered_messages[-1].timestamp)}"
             )
             image_base64 = render_summary_image_base64(
