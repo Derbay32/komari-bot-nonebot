@@ -2,7 +2,7 @@
 
 from nonebot.plugin import require
 
-from .config_schemas import DynamicConfigSchema
+from .config_schema import DynamicConfigSchema
 
 config_manager_plugin = require("config_manager")
 

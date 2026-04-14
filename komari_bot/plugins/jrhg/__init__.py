@@ -7,7 +7,7 @@ from nonebot.params import Command
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata, require
 
-from .config_schemas import DynamicConfigSchema
+from .config_schema import DynamicConfigSchema
 from .llm_service import generate_reply
 from .prompt_builder import build_prompt
 
@@ -87,7 +87,9 @@ async def _load_interaction_history(
 
     try:
         manager: Any = get_plugin_manager()
-        memory_service: Any = None if manager is None else getattr(manager, "memory", None)
+        memory_service: Any = (
+            None if manager is None else getattr(manager, "memory", None)
+        )
         if memory_service is None:
             return None
 
