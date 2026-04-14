@@ -8,6 +8,11 @@ from nonebot import logger
 from nonebot.plugin import PluginMetadata
 
 from .services.config_interface import get_config
+from .services.unified_candidate_rerank import (
+    CandidateSchema,
+    UnifiedCandidateRerankService,
+    UnifiedRerankResult,
+)
 
 if TYPE_CHECKING:
     from asyncpg import Pool
@@ -30,6 +35,15 @@ __plugin_meta__ = PluginMetadata(
     description="向量检索重排判定与 scene 运行时子系统",
     usage="被其他插件通过服务接口调用",
 )
+
+__all__ = [
+    "CandidateSchema",
+    "PluginManager",
+    "UnifiedCandidateRerankService",
+    "UnifiedRerankResult",
+    "get_plugin_manager",
+    "get_scene_admin_service",
+]
 
 
 class PluginManager:
