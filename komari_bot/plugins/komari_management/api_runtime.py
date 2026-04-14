@@ -7,12 +7,19 @@ from typing import TYPE_CHECKING, Any
 
 from komari_bot.common.management_api import resolve_management_settings
 
+from .config_api import register_config_api
+from .prompt_api import register_prompt_api
+
 KNOWLEDGE_API_PREFIX = "/api/komari-knowledge/v1"
 MEMORY_API_PREFIX = "/api/komari-memory/v1"
 LLM_PROVIDER_API_PREFIX = "/api/llm-provider/v1"
+MANAGEMENT_CONFIG_API_PREFIX = "/api/komari-management-config/v1"
+MANAGEMENT_PROMPT_API_PREFIX = "/api/komari-management-prompt/v1"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +32,8 @@ class ManagementApiComponents:
     memory_service_getter: Callable[[], object | None]
     register_llm_provider_api: Callable[..., None]
     reply_log_reader_getter: Callable[[], object | None]
+    config_resources: tuple[ManagedConfigResource, ...]
+    prompt_resources: tuple[ManagedPromptResource, ...]
 
 
 def register_management_api_for_driver(
@@ -72,14 +81,26 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         reader_getter=components.reply_log_reader_getter,
     )
+    register_config_api(
+        server_app,
+        api_token=settings.api_token,
+        allowed_origins=settings.allowed_origins,
+        resources=components.config_resources,
+    )
+    register_prompt_api(
+        server_app,
+        api_token=settings.api_token,
+        allowed_origins=settings.allowed_origins,
+        resources=components.prompt_resources,
+    )
     docs_url = getattr(server_app, "docs_url", None) or "未启用"
     openapi_url = getattr(server_app, "openapi_url", None) or "未启用"
     logger.info(
         "[Komari Management] 管理 API 已注册: "
-        f"{KNOWLEDGE_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}"
+        f"{KNOWLEDGE_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}, "
+        f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}"
     )
     logger.info(
-        "[Komari Management] 管理文档入口: "
-        f"docs={docs_url}, openapi={openapi_url}"
+        f"[Komari Management] 管理文档入口: docs={docs_url}, openapi={openapi_url}"
     )
     return True

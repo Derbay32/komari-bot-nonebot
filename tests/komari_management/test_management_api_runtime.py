@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
     ManagementApiComponents,
     register_management_api_for_driver,
+)
+from komari_bot.plugins.komari_management.managed_resources import (
+    ManagedConfigResource,
+    ManagedPromptResource,
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
 from komari_bot.plugins.llm_provider.api import register_llm_provider_api
@@ -50,6 +56,26 @@ class _FakeLogger:
         self.warning_messages.append(self._render(message, args))
 
 
+class _FakeConfigSchema(BaseModel):
+    plugin_enable: bool = True
+
+
+class _FakeConfigManager:
+    @property
+    def config_file(self) -> Path:
+        return Path("/tmp/komari_management.json")
+
+    def get(self) -> BaseModel:
+        return _FakeConfigSchema()
+
+    def update_field(self, field_name: str, value: object) -> BaseModel:
+        del field_name, value
+        return self.get()
+
+    def reload_from_json(self) -> BaseModel:
+        return self.get()
+
+
 def _build_api_app() -> FastAPI:
     return FastAPI(
         docs_url="/api/komari-management/docs",
@@ -66,6 +92,21 @@ def _build_components() -> ManagementApiComponents:
         memory_service_getter=lambda: None,
         register_llm_provider_api=register_llm_provider_api,
         reply_log_reader_getter=lambda: None,
+        config_resources=(
+            ManagedConfigResource(
+                resource_id="komari_management",
+                display_name="Komari Management",
+                manager_getter=lambda: _FakeConfigManager(),
+            ),
+        ),
+        prompt_resources=(
+            ManagedPromptResource(
+                resource_id="komari_chat",
+                display_name="Komari Chat Prompt",
+                file_path=Path("config") / "prompts" / "komari_memory.yaml",
+                defaults={"system_prompt": "默认值"},
+            ),
+        ),
     )
 
 
@@ -91,6 +132,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/komari-knowledge/v1/knowledge" in route_paths
     assert "/api/komari-memory/v1/conversations" in route_paths
     assert "/api/llm-provider/v1/reply-logs" in route_paths
+    assert "/api/komari-management-config/v1/resources" in route_paths
+    assert "/api/komari-management-prompt/v1/resources" in route_paths
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
@@ -103,6 +146,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/komari-knowledge/v1/knowledge" in schema["paths"]
     assert "/api/komari-memory/v1/conversations" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
+    assert "/api/komari-management-config/v1/resources" in schema["paths"]
+    assert "/api/komari-management-prompt/v1/resources" in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(
         item.get("type") == "http" and item.get("scheme") == "bearer"
@@ -110,7 +155,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     )
     assert logger.info_messages[-2] == (
         "[Komari Management] 管理 API 已注册: "
-        "/api/komari-knowledge/v1, /api/komari-memory/v1, /api/llm-provider/v1"
+        "/api/komari-knowledge/v1, /api/komari-memory/v1, /api/llm-provider/v1, "
+        "/api/komari-management-config/v1, /api/komari-management-prompt/v1"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "
