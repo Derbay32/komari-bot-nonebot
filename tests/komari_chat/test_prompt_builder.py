@@ -29,8 +29,10 @@ def _patch_dependencies(monkeypatch: Any) -> None:
         lambda: {
             "system_prompt": "system",
             "memory_ack": "ack",
+            "memory_ack_role": "user",
             "output_instruction": "output",
             "cot_prefix": "cot",
+            "cot_prefix_role": "system",
         },
     )
     monkeypatch.setattr(prompt_builder_module, "get_festival_info", lambda: None)
@@ -57,7 +59,9 @@ def _build_config() -> SimpleNamespace:
     return SimpleNamespace(knowledge_enabled=False)
 
 
-def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(monkeypatch: Any) -> None:
+def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
+    monkeypatch: Any,
+) -> None:
     _patch_dependencies(monkeypatch)
     reply_context = ReplyContext(
         source_side="assistant",
@@ -86,9 +90,14 @@ def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(monkeypatch: Any
         "role": "user",
         "content": "- 阿虚: <user_input>继续说</user_input>",
     }
+    assert messages[3] == {"role": "user", "content": "ack"}
+    assert messages[4] == {"role": "system", "content": "output"}
+    assert messages[5] == {"role": "system", "content": "cot"}
 
 
-def test_build_prompt_inserts_bot_reply_image_as_user_attachment(monkeypatch: Any) -> None:
+def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
+    monkeypatch: Any,
+) -> None:
     _patch_dependencies(monkeypatch)
     reply_context = ReplyContext(
         source_side="assistant",

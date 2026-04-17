@@ -16,9 +16,11 @@ def _patch_template(monkeypatch: Any) -> None:
         lambda: {
             "system_prompt": "system",
             "memory_ack": "ack",
+            "memory_ack_role": "user",
             "request_text": "固定请求",
             "output_instruction": "output",
             "cot_prefix": "cot",
+            "cot_prefix_role": "system",
         },
     )
 
@@ -48,9 +50,9 @@ def test_build_prompt_injects_interaction_history_and_request_text(
             "<request_text>固定请求</request_text>"
         ),
     }
-    assert messages[2] == {"role": "assistant", "content": "ack"}
+    assert messages[2] == {"role": "user", "content": "ack"}
     assert messages[3] == {"role": "system", "content": "output"}
-    assert messages[4] == {"role": "assistant", "content": "cot"}
+    assert messages[4] == {"role": "system", "content": "cot"}
 
 
 def test_build_prompt_uses_empty_interaction_history_when_missing(

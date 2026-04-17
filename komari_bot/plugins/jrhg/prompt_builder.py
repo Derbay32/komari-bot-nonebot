@@ -46,7 +46,13 @@ def build_prompt(
                 f"<request_text>{request_text}</request_text>"
             ),
         },
-        {"role": "assistant", "content": template["memory_ack"]},
+        {
+            "role": template.get("memory_ack_role", "assistant"),
+            "content": template["memory_ack"],
+        },
         {"role": "system", "content": template["output_instruction"]},
-        {"role": "assistant", "content": template["cot_prefix"]},
+        {
+            "role": template.get("cot_prefix_role", "assistant"),
+            "content": template["cot_prefix"],
+        },
     ]

@@ -66,7 +66,7 @@ async def summarize_history_messages(
             "content": (f"<history_messages>\n{transcript}\n</history_messages>"),
         },
         {
-            "role": "assistant",
+            "role": template.get("memory_ack_role", "assistant"),
             "content": template["memory_ack"],
         },
         {
@@ -74,7 +74,7 @@ async def summarize_history_messages(
             "content": template["output_instruction"],
         },
         {
-            "role": "assistant",
+            "role": template.get("cot_prefix_role", "assistant"),
             "content": template["cot_prefix"],
         },
     ]

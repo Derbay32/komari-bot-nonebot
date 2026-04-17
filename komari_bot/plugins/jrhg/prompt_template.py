@@ -32,6 +32,7 @@ DEFAULTS: dict[str, str] = {
         "</Character>"
     ),
     "memory_ack": "（抱着手机，小声嘀咕）嗯……我先看看今天该怎么说……",
+    "memory_ack_role": "assistant",
     "request_text": "请根据好感度和互动历史，生成一句今日好感回复。",
     "output_instruction": (
         "<format_settings>\n"
@@ -48,6 +49,7 @@ DEFAULTS: dict[str, str] = {
         "</format_settings>"
     ),
     "cot_prefix": "<think>\n先看好感度，再想想今天该怎么开口……",
+    "cot_prefix_role": "assistant",
 }
 
 

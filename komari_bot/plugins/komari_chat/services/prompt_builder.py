@@ -426,7 +426,12 @@ async def build_prompt(
     # ═══════════════════════════════════════
     # ③ assistant — 伪造记忆确认
     # ═══════════════════════════════════════
-    messages.append({"role": "assistant", "content": template["memory_ack"]})
+    messages.append(
+        {
+            "role": template.get("memory_ack_role", "assistant"),
+            "content": template["memory_ack"],
+        }
+    )
 
     # ═══════════════════════════════════════
     # ④ system — 输出格式指令
@@ -436,6 +441,11 @@ async def build_prompt(
     # ═══════════════════════════════════════
     # ⑤ assistant — CoT 思维链前缀
     # ═══════════════════════════════════════
-    messages.append({"role": "assistant", "content": template["cot_prefix"]})
+    messages.append(
+        {
+            "role": template.get("cot_prefix_role", "assistant"),
+            "content": template["cot_prefix"],
+        }
+    )
 
     return messages
