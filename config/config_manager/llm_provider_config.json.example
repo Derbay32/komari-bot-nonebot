@@ -13,7 +13,14 @@
   "deepseek_max_tokens": 8192,
   "deepseek_timeout_seconds": 300.0,
   "deepseek_reasoning_effort": "medium",
-  "deepseek_frequency_penalty": 0.0
+  "deepseek_frequency_penalty": 0.0,
+  # DeepSeek 额外参数会原样合并到每次请求体中，可用于 enable_thinking、thinking、logprobs 等自定义参数
+  # 简单参数示例：
+  # "deepseek_extra_params": {"enable_thinking": false},
+  # 嵌套结构示例（如 Anthropic 风格的 thinking 参数）：
+  # "deepseek_extra_params": {"thinking": {"type": "disabled"}},
+  # 不需要额外参数时留空：
+  "deepseek_extra_params": {}
 }
 
 /*

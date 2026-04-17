@@ -191,6 +191,17 @@ class DeepSeekClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
+            extra_params = config.deepseek_extra_params
+            if extra_params:
+                conflict_keys = sorted(set(request_data) & set(extra_params))
+                if conflict_keys:
+                    logger.warning(
+                        "DeepSeek 额外参数覆盖已有请求字段: {}",
+                        ", ".join(conflict_keys),
+                    )
+                logger.debug("注入 DeepSeek 额外参数: {}", extra_params)
+                request_data.update(extra_params)
+
             response = await self.client.chat.completions.create(**request_data)
         except APITimeoutError:
             logger.error("DeepSeek API 请求超时")
@@ -268,6 +279,17 @@ class DeepSeekClient(BaseLLMClient):
 
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
+
+            extra_params = config.deepseek_extra_params
+            if extra_params:
+                conflict_keys = sorted(set(request_data) & set(extra_params))
+                if conflict_keys:
+                    logger.warning(
+                        "DeepSeek 额外参数覆盖已有请求字段: {}",
+                        ", ".join(conflict_keys),
+                    )
+                logger.debug("注入 DeepSeek 额外参数: {}", extra_params)
+                request_data.update(extra_params)
 
             logger.debug(
                 f"DeepSeek API 请求 (messages):\n"
