@@ -191,16 +191,16 @@ class DeepSeekClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_params = config.deepseek_extra_params
+            extra_params = getattr(config, "deepseek_extra_params", {})
             if extra_params:
                 conflict_keys = sorted(set(request_data) & set(extra_params))
                 if conflict_keys:
                     logger.warning(
-                        "DeepSeek 额外参数覆盖已有请求字段: {}",
+                        "DeepSeek 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
                         ", ".join(conflict_keys),
                     )
                 logger.debug("注入 DeepSeek 额外参数: {}", extra_params)
-                request_data.update(extra_params)
+                request_data["extra_body"] = dict(extra_params)
 
             response = await self.client.chat.completions.create(**request_data)
         except APITimeoutError:
@@ -280,16 +280,16 @@ class DeepSeekClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_params = config.deepseek_extra_params
+            extra_params = getattr(config, "deepseek_extra_params", {})
             if extra_params:
                 conflict_keys = sorted(set(request_data) & set(extra_params))
                 if conflict_keys:
                     logger.warning(
-                        "DeepSeek 额外参数覆盖已有请求字段: {}",
+                        "DeepSeek 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
                         ", ".join(conflict_keys),
                     )
                 logger.debug("注入 DeepSeek 额外参数: {}", extra_params)
-                request_data.update(extra_params)
+                request_data["extra_body"] = dict(extra_params)
 
             logger.debug(
                 f"DeepSeek API 请求 (messages):\n"

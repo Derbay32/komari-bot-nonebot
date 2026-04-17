@@ -18,6 +18,7 @@ def test_llm_provider_timeout_defaults_to_300_seconds() -> None:
     assert Config().deepseek_timeout_seconds == 300.0
     assert DynamicConfigSchema().deepseek_reasoning_effort == ""
     assert Config().deepseek_reasoning_effort == ""
+    assert DynamicConfigSchema().deepseek_extra_params == {}
 
 
 def test_llm_provider_example_includes_timeout_field() -> None:
@@ -29,6 +30,7 @@ def test_llm_provider_example_includes_timeout_field() -> None:
 
     assert '"deepseek_timeout_seconds": 300.0' in content
     assert '"deepseek_reasoning_effort": "medium"' in content
+    assert '"deepseek_extra_params": {}' in content
 
 
 def test_deepseek_client_session_uses_configured_timeout() -> None:
@@ -301,5 +303,65 @@ def test_deepseek_client_generate_messages_completion_keeps_invalid_json_argumen
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].raw_arguments == '{"keywords": [发布,]}'
         assert result.tool_calls[0].parsed_arguments is None
+
+    asyncio.run(_run())
+
+
+def test_deepseek_client_generate_text_sends_extra_params_via_extra_body(
+    monkeypatch: Any,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.last_kwargs: dict[str, Any] | None = None
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    async def _run() -> None:
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
+        monkeypatch.setattr(
+            deepseek_client_module,
+            "config_manager",
+            SimpleNamespace(
+                get=lambda: SimpleNamespace(
+                    deepseek_temperature=1.0,
+                    deepseek_max_tokens=8192,
+                    deepseek_frequency_penalty=0.0,
+                    deepseek_api_base="https://example.com/v1",
+                    deepseek_reasoning_effort="",
+                    deepseek_extra_params={
+                        "enable_thinking": False,
+                        "thinking": {"type": "disabled"},
+                    },
+                )
+            ),
+        )
+
+        result = await client.generate_text(prompt="你好", model="deepseek-chat")
+
+        assert result.content == "ok"
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert request_data["extra_body"] == {
+            "enable_thinking": False,
+            "thinking": {"type": "disabled"},
+        }
+        assert "enable_thinking" not in request_data
 
     asyncio.run(_run())
