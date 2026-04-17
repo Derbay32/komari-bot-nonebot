@@ -160,6 +160,17 @@ output_instruction: |
   </Output_format>
   </format_settings>
 
+# ⑤ CoT 思维链前缀（assistant prefill）
+memory_ack_role: assistant
+cot_prefix_role: assistant
+# ass 预填充用
+# <think>
+#  好、好的……先让我想想，再、再说话。
+#  现在是，什、什么情况？
+# user 非预填充用
+# 你将根据提示词，竭尽全力去思考和<content>内最终回答有关的所有要求，尽可能创作出符合上述规定的<content>内回复。
+#  现在你将按照格式，开始思考创作准则，思考完成创作指导之后在思考外输出<content>内的最终回复。
+#  **现在，你将直接开启思考创作。**
 cot_prefix: |
   <think>
   好、好的……先让我想想，再、再说话。
