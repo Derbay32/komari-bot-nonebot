@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 from nonebot import logger
 from nonebot.adapters.onebot.v11.event import Reply
 from nonebot.compat import type_validate_python
+from nonebot.plugin import require
 
 from komari_bot.plugins.komari_decision.services.decision_engine import (
     DecisionEngine,
@@ -30,6 +31,11 @@ from ..services.llm_service import generate_reply
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
+
+try:
+    user_data_plugin = require("user_data")
+except Exception:
+    user_data_plugin = None
 
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
@@ -166,9 +172,7 @@ class MessageHandler:
             return None
 
         user_id = (
-            str(reply.sender.user_id)
-            if reply.sender.user_id is not None
-            else None
+            str(reply.sender.user_id) if reply.sender.user_id is not None else None
         )
         user_nickname = (
             str(reply.sender.card or reply.sender.nickname).strip()
@@ -384,6 +388,7 @@ class MessageHandler:
             reason=reason,
             reply_score=outcome.reply_score,
             store_current=memory_store,
+            best_scene_id=outcome.best_scene_id,
         )
         if reply is not None:
             reply_action: ReplyAction = (
@@ -460,6 +465,7 @@ class MessageHandler:
         reason: AttemptReplyReason,
         reply_score: float | None,
         store_current: bool,
+        best_scene_id: str | None = None,
     ) -> tuple[dict[str, str] | None, bool]:
         """尝试生成并返回回复。
 
@@ -468,6 +474,8 @@ class MessageHandler:
         """
         config = get_config()
         stored = False
+        favor_daily: int | None = None
+        favor_level: str | None = None
 
         if not force_reply:
             if not config.proactive_enabled:
@@ -551,6 +559,19 @@ class MessageHandler:
                 len(memories),
             )
 
+        if user_data_plugin is not None:
+            try:
+                favor_result = await user_data_plugin.generate_or_update_favorability(
+                    message.user_id
+                )
+                favor_daily = favor_result.daily_favor
+                favor_level = favor_result.favor_level
+            except Exception:
+                logger.debug(
+                    "[KomariChat] 获取今日好感度失败，跳过好感度注入",
+                    exc_info=True,
+                )
+
         prompt_messages = await build_prompt(
             user_message=message.content,
             search_query=rewritten_query,
@@ -565,6 +586,8 @@ class MessageHandler:
             reply_context=reply_context,
             reply_image_urls=reply_image_urls,
             query_embedding=query_embedding,
+            favor_daily=favor_daily,
+            favor_user_id=message.user_id,
         )
 
         reply = await generate_reply(
@@ -580,6 +603,24 @@ class MessageHandler:
                 f"{reply_score:.3f}" if reply_score is not None else "-",
             )
             return None, stored
+
+        if best_scene_id == "scene_direct_interaction" and favor_daily is not None:
+            try:
+                is_first_greeting = not await self.redis.is_favor_greeted(
+                    message.group_id,
+                    message.user_id,
+                )
+                if is_first_greeting:
+                    reply = (
+                        f"{reply}\n【小鞠对{message.user_nickname}今日的好感为"
+                        f"{favor_daily}，态度：{favor_level or '中性'}】"
+                    )
+                    await self.redis.mark_favor_greeted(
+                        message.group_id,
+                        message.user_id,
+                    )
+            except Exception:
+                logger.warning("[KomariChat] 好感文案追加失败，跳过", exc_info=True)
 
         await self._store_ai_reply(
             group_id=message.group_id,

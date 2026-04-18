@@ -201,13 +201,11 @@ async def get_favor_attitude(daily_favor: int) -> str:
     Returns:
         态度描述字符串
     """
-    if daily_favor <= 20:
-        return "非常冷淡"
-    if daily_favor <= 40:
+    if daily_favor <= 25:
         return "冷淡"
-    if daily_favor <= 60:
+    if daily_favor <= 50:
         return "中性"
-    if daily_favor <= 80:
+    if daily_favor <= 75:
         return "友好"
     return "非常友好"
 
@@ -218,14 +216,16 @@ async def format_favor_response(
     """格式化好感度回复
 
     Args:
-        ai_response: AI生成的回复内容
+        ai_response: 兼容旧接口保留的参数，不参与输出
         user_nickname: 用户昵称
         daily_favor: 每日好感度值
 
     Returns:
         格式化后的回复字符串
     """
-    return f"{ai_response}\n【小鞠对{user_nickname}今日的好感为{daily_favor}】"
+    del ai_response
+    attitude = await get_favor_attitude(daily_favor)
+    return f"小鞠今天对{user_nickname}的态度：{attitude}（好感度 {daily_favor}）"
 
 
 # 导出的主要API

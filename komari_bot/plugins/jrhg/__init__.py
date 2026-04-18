@@ -1,5 +1,3 @@
-from typing import Any
-
 from nonebot import logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.exception import FinishedException
@@ -8,8 +6,6 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import DynamicConfigSchema
-from .llm_service import generate_reply
-from .prompt_builder import build_prompt
 
 # 依赖用户数据插件
 user_data_plugin = require("user_data")
@@ -17,10 +13,6 @@ user_data_plugin = require("user_data")
 config_manager_plugin = require("config_manager")
 # 依赖权限管理插件
 permission_manager_plugin = require("permission_manager")
-# 依赖记忆插件
-komari_memory_plugin = require("komari_memory")
-# 依赖 LLM Provider 插件
-llm_provider = require("llm_provider")
 # 依赖角色名绑定插件
 character_binding = require("character_binding")
 
@@ -35,8 +27,8 @@ except AttributeError:
 
 __plugin_meta__ = PluginMetadata(
     name="jrhg",
-    description="今日好感插件，基于 LLM API 生成个性化问候，支持好感度系统和白名单管理",
-    usage=".jrhg - 获取今日好感问候\n/jrhg on/off - 管理员控制插件开关",
+    description="今日好感插件，提供每日好感度查询和白名单管理",
+    usage=".jrhg - 查询今日好感度\n/jrhg on/off - 管理员控制插件开关",
 )
 
 # 初始化配置管理器
@@ -53,59 +45,6 @@ manage = on_command(
     priority=5,
     block=True,
 )
-
-
-def _get_response(daily_favor: int, user_nickname: str) -> str:
-    """获取回复"""
-    match daily_favor:
-        case df if df <= 20:
-            return "咦！？去、去死！"
-        case df if df <= 40:
-            return f"唔诶，{user_nickname}！？怎、怎么是你…!?（后退）。"
-        case df if df <= 60:
-            return f"不、不过是区区{user_nickname}，可、可别得意忘形了。"
-        case df if df <= 80:
-            return f"{user_nickname}，你、你来啦，今天要不要，一、一起看书……？"
-        case _:
-            return (
-                f"只、只是有一点点在意你哦……唔，{user_nickname}，你就是这点不、不行啦！"
-            )
-
-
-async def _load_interaction_history(
-    *,
-    user_id: str,
-    group_id: str | None,
-) -> dict[str, Any] | None:
-    """读取用户互动历史，失败时返回 None。"""
-    if not group_id:
-        return None
-
-    get_plugin_manager = getattr(komari_memory_plugin, "get_plugin_manager", None)
-    if not callable(get_plugin_manager):
-        return None
-
-    try:
-        manager: Any = get_plugin_manager()
-        memory_service: Any = (
-            None if manager is None else getattr(manager, "memory", None)
-        )
-        if memory_service is None:
-            return None
-
-        interaction_history = await memory_service.get_interaction_history(
-            user_id=user_id,
-            group_id=group_id,
-        )
-        return interaction_history if isinstance(interaction_history, dict) else None
-    except Exception:
-        logger.warning(
-            "[JRHG] 读取互动历史失败，改用空历史占位: user={} group={}",
-            user_id,
-            group_id,
-            exc_info=True,
-        )
-        return None
 
 
 @manage.handle()
@@ -167,9 +106,6 @@ async def jrhg_function(
         else user_id
     )
     username = character_binding.get_character_name(user_id, user_nickname)
-    raw_group_id = getattr(event, "group_id", None)
-    group_id = str(raw_group_id) if raw_group_id is not None else None
-    favor_result = None  # 初始化以避免异常处理中未绑定
 
     # 使用运行时配置进行权限检查
     can_use, reason = await permission_manager_plugin.check_runtime_permission(
@@ -194,44 +130,8 @@ async def jrhg_function(
                 f"为用户 {username} 生成新的每日好感度: {favor_result.daily_favor}"
             )
 
-        interaction_history = await _load_interaction_history(
-            user_id=user_id,
-            group_id=group_id,
-        )
-        response = _get_response(favor_result.daily_favor, username)
-        prompt_messages = build_prompt(
-            daily_favor=favor_result.daily_favor,
-            interaction_history=interaction_history,
-        )
-
-        try:
-            generated_response = await generate_reply(
-                messages=prompt_messages,
-                request_trace_id=f"jrhg-{event.message_id}",
-            )
-        except Exception as llm_error:
-            logger.warning(
-                "[JRHG] LLM 生成失败，使用固定文案兜底: user={} group={} has_history={} error={}",
-                username,
-                group_id or "-",
-                interaction_history is not None,
-                llm_error,
-                exc_info=True,
-            )
-        else:
-            if generated_response.strip():
-                response = generated_response.strip()
-            else:
-                logger.warning(
-                    "[JRHG] LLM 返回空回复，使用固定文案兜底: user={} group={} has_history={}",
-                    username,
-                    group_id or "-",
-                    interaction_history is not None,
-                )
-
-        # 格式化最终回复
         final_response = await format_favor_response(
-            ai_response=response,
+            ai_response="",
             user_nickname=username,
             daily_favor=favor_result.daily_favor,
         )

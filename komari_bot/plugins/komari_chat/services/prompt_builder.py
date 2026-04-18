@@ -27,6 +27,38 @@ komari_knowledge = require("komari_knowledge")
 character_binding = require("character_binding")
 
 
+def _resolve_favor_level(daily_favor: int) -> str:
+    if daily_favor <= 25:
+        return "冷淡"
+    if daily_favor <= 50:
+        return "中性"
+    if daily_favor <= 75:
+        return "友好"
+    return "非常友好"
+
+
+def _resolve_favor_description(daily_favor: int) -> str:
+    if daily_favor <= 25:
+        return (
+            "今日小鞠对这位用户兴致不高，态度偏淡漠，不会有太多主动交流的意愿，"
+            "回复保持礼貌但疏远"
+        )
+    if daily_favor <= 50:
+        return (
+            "今日小鞠对这位用户的态度正常，没有特别的亲近或疏远，"
+            "按照平时的关系和印象来互动即可"
+        )
+    if daily_favor <= 75:
+        return (
+            "今日小鞠对这位用户心情不错，比平时更愿意多聊几句，"
+            "语气中带着一些亲近感，偶尔会主动关心"
+        )
+    return (
+        "今日小鞠格外亲近这位用户，说话时会不自觉地更加坦诚和温柔，"
+        "甚至愿意分享一些平时不会说的事"
+    )
+
+
 def get_festival_info() -> str | None:
     """获取当前节日信息。
 
@@ -106,6 +138,8 @@ async def build_prompt(
     reply_context: ReplyContext | None = None,
     reply_image_urls: list[str] | None = None,
     query_embedding: list[float] | None = None,
+    favor_daily: int | None = None,
+    favor_user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """构建 5 段式 OpenAI 格式消息数组。
 
@@ -290,6 +324,29 @@ async def build_prompt(
             system_parts.append(
                 f"<user_interaction_history>\n{interaction_text}\n</user_interaction_history>"
             )
+
+    if favor_daily is not None:
+        favor_display_name = (
+            character_binding.get_character_name(
+                user_id=favor_user_id,
+                fallback_nickname=current_user_nickname,
+            )
+            if favor_user_id
+            else (current_user_nickname or "当前用户")
+        )
+        favor_level = _resolve_favor_level(favor_daily)
+        favor_description = _resolve_favor_description(favor_daily)
+        system_parts.append(
+            "\n".join(
+                [
+                    "<favorability_modifier>",
+                    "[注意：此修饰为基于普通态度的加值，优先级低于<long_term_relation>和<user_interaction_history>中的实际关系描述]",
+                    f"今日小鞠对用户({favor_display_name})的好感度：{favor_daily}（{favor_level}）",
+                    f"影响描述：{favor_description}",
+                    "</favorability_modifier>",
+                ]
+            )
+        )
 
     messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 

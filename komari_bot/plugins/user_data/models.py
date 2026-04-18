@@ -27,13 +27,11 @@ class UserFavorability(BaseModel):
     @property
     def favor_level(self) -> str:
         """根据好感度返回态度等级"""
-        if self.daily_favor <= 20:
-            return "非常冷淡"
-        if self.daily_favor <= 40:
+        if self.daily_favor <= 25:
             return "冷淡"
-        if self.daily_favor <= 60:
+        if self.daily_favor <= 50:
             return "中性"
-        if self.daily_favor <= 80:
+        if self.daily_favor <= 75:
             return "友好"
         return "非常友好"
 

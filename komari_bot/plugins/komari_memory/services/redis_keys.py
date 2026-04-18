@@ -28,6 +28,9 @@ class RedisKeys:
     # 每小时主动回复计数
     PROACTIVE_COUNT = f"{PREFIX}:proactive:count:%s:%s"
 
+    # 每日好感问候标记
+    FAVOR_GREETED = f"{PREFIX}:favor:greeted:%s:%s"
+
     @classmethod
     def buffer(cls, group_id: str) -> str:
         """获取消息缓冲区键。
@@ -100,3 +103,16 @@ class RedisKeys:
             Redis 键
         """
         return cls.PROACTIVE_COUNT % (group_id, hour)
+
+    @classmethod
+    def favor_greeted(cls, group_id: str, user_id: str) -> str:
+        """获取每日好感问候标记键。
+
+        Args:
+            group_id: 群组 ID
+            user_id: 用户 ID
+
+        Returns:
+            Redis 键
+        """
+        return cls.FAVOR_GREETED % (group_id, user_id)

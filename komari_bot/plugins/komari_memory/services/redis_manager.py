@@ -3,6 +3,7 @@
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import redis.asyncio as aioredis
 from nonebot import logger
@@ -360,6 +361,21 @@ class RedisManager:
         key = RedisKeys.proactive_count(group_id, current_hour)
         value = await self.redis.get(key)
         return int(value) if value else 0
+
+    async def is_favor_greeted(self, group_id: str, user_id: str) -> bool:
+        """检查用户当天是否已追加过好感文案。"""
+        key = RedisKeys.favor_greeted(group_id, user_id)
+        return await self.redis.exists(key) > 0
+
+    async def mark_favor_greeted(self, group_id: str, user_id: str) -> None:
+        """标记用户当天已追加过好感文案，并设置到当天结束的 TTL。"""
+        key = RedisKeys.favor_greeted(group_id, user_id)
+        now = datetime.now().astimezone()
+        end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+        if end_of_day <= now:
+            end_of_day += timedelta(days=1)
+        ttl = max(1, int((end_of_day - now).total_seconds()) + 1)
+        await self.redis.set(key, "1", ex=ttl)
 
     async def delete_buffer(
         self,
