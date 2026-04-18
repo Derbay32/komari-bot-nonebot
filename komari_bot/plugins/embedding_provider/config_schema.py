@@ -19,13 +19,12 @@ class DynamicConfigSchema(BaseModel):
         description="最后更新时间戳",
     )
     # 嵌入配置
-    embedding_source: str = Field(default="local", description="嵌入模式: local | api")
     embedding_model: str = Field(
         default="BAAI/bge-small-zh-v1.5", description="模型名称"
     )
     embedding_api_url: str = Field(
         default="",
-        description="API 地址 (source=api 时), 例如 https://api.openai.com/v1/embeddings",
+        description="API 地址，例如 https://api.openai.com/v1/embeddings",
     )
     embedding_api_key: str = Field(default="", description="API 密钥")
     embedding_dimension: int = Field(default=512, description="向量维度")

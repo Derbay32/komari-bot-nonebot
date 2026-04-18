@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-01-07T23:13:17.148103+08:00",
+  "last_updated": "2026-04-12T04:32:00+08:00",
   "plugin_enable": true,
   "user_whitelist": [],
   "group_whitelist": [],
@@ -40,6 +40,7 @@
   "forgetting_decay_factor": 0.95,
   "forgetting_access_boost": 1.2,
   "forgetting_min_age_days": 3,
+  "forgetting_fuzzify_concurrency": 2,
 
   "filter_min_length": 3,
   "filter_history_check_size": 50,

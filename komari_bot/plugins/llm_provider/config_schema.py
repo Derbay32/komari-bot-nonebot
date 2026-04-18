@@ -34,8 +34,8 @@ class DynamicConfigSchema(BaseModel):
     # DeepSeek 配置
     deepseek_api_token: str = Field(default="", description="DeepSeek API Token")
     deepseek_api_base: str = Field(
-        default="https://api.deepseek.com/v1/chat/completions",
-        description="DeepSeek API 地址",
+        default="https://api.deepseek.com/v1",
+        description="DeepSeek OpenAI 兼容 API Base URL",
     )
     deepseek_model: str = Field(
         default="deepseek-chat", description="DeepSeek 使用模型"
@@ -58,6 +58,14 @@ class DynamicConfigSchema(BaseModel):
     )
     deepseek_frequency_penalty: float = Field(
         default=0.0, description="DeepSeek 重复内容惩罚"
+    )
+    deepseek_extra_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "DeepSeek API 请求的额外自定义参数，"
+            "会合并到每次请求体中。支持简单值和嵌套结构。"
+            '例如：{"enable_thinking": false} 或 {"thinking": {"type": "disabled"}}'
+        ),
     )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")

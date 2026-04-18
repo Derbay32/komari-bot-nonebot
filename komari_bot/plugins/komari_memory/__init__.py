@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 # 依赖插件
 apscheduler_plugin = require("nonebot_plugin_apscheduler")
 
+from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema
 from .database.connection import create_pool
 from .handlers.forgetting_worker import (
@@ -36,6 +37,14 @@ __plugin_meta__ = PluginMetadata(
     description="智能记忆与对话插件，支持向量检索和常识库集成",
     usage="自动运行，无需命令",
 )
+
+__all__ = [
+    "PluginManager",
+    "get_memory_service",
+    "get_plugin_manager",
+    "get_redis_manager",
+    "register_memory_api",
+]
 
 
 class PluginManager:
@@ -147,7 +156,7 @@ class PluginManager:
         # 取消定时任务
         unregister_summary_task()
         unregister_forgetting_task()
-        # 清理记忆服务（释放 fastembed 模型）
+        # 清理记忆服务
         if self.memory:
             await self.memory.cleanup()
             self.memory = None
@@ -178,6 +187,21 @@ def get_plugin_manager() -> PluginManager | None:
         插件管理器实例，如果未初始化则返回 None
     """
     return _plugin_manager
+
+
+def get_memory_service() -> MemoryService | None:
+    manager = get_plugin_manager()
+    if manager is None:
+        return None
+    return manager.memory
+
+
+def get_redis_manager() -> RedisManager | None:
+    """获取 Redis 管理器实例。"""
+    manager = get_plugin_manager()
+    if manager is None:
+        return None
+    return manager.redis
 
 
 # 在插件加载时初始化

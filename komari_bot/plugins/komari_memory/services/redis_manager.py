@@ -126,11 +126,7 @@ class RedisManager:
         # 读取尾部最近 N 条消息，Redis 会保持原有顺序返回。
         raw_data = await self.redis.lrange(key, -limit, -1)  # type: ignore[arg-type]
 
-        messages: list[MessageSchema] = []
-        for item in raw_data:
-            messages.append(self._deserialize_message(item))
-
-        return messages
+        return [self._deserialize_message(item) for item in raw_data]
 
     async def get_context_around_message(
         self,
@@ -155,9 +151,7 @@ class RedisManager:
         raw_data = await self.redis.lrange(key, 0, -1)  # type: ignore[arg-type]
 
         # 解析所有消息
-        all_messages: list[MessageSchema] = []
-        for msg_item in raw_data:
-            all_messages.append(self._deserialize_message(msg_item))
+        all_messages = [self._deserialize_message(msg_item) for msg_item in raw_data]
 
         # 找到目标消息的索引
         target_index = -1

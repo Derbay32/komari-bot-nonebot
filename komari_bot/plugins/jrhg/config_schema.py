@@ -32,6 +32,21 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
+    # LLM 配置
+    llm_model: str = Field(default="deepseek-chat", description="JRHG 使用的模型名称")
+    llm_temperature: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="JRHG 调用模型时的温度参数",
+    )
+    llm_max_tokens: int = Field(
+        default=8192,
+        ge=1,
+        le=8192,
+        description="JRHG 调用模型时的最大输出 token 数",
+    )
+
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:

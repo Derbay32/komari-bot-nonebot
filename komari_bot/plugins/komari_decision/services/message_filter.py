@@ -1,13 +1,17 @@
 """消息预过滤器 - BERT评分前的快速过滤层。"""
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from nonebot import logger
 
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
+
+    from ..config_schema import KomariDecisionConfigSchema
 
 
 @dataclass(frozen=True)
@@ -51,7 +55,7 @@ def _is_command_message(message: str) -> bool:
 
 async def preprocess_message(
     message: str,
-    config: KomariMemoryConfigSchema,
+    config: KomariDecisionConfigSchema,
     redis: RedisManager,
     group_id: str,
 ) -> FilterResult:

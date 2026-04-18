@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from nonebot.plugin import require
@@ -101,7 +101,6 @@ class MemoryService:
             group_id=group_id,
             user_id=user_id,
             limit=fetch_limit,
-            access_boost=self.config.forgetting_access_boost,
             touch_results=not rerank_enabled,
         )
 
@@ -113,10 +112,118 @@ class MemoryService:
             results = [results[rr.index] for rr in reranked]
             await self._conversation_repo.touch_conversations(
                 [int(result["id"]) for result in results],
-                access_boost=self.config.forgetting_access_boost,
             )
 
         return results[:limit]
+
+    async def list_conversations(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        group_id: str | None = None,
+        participant: str | None = None,
+        query: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """分页获取对话记忆。"""
+        return await self._conversation_repo.list_conversations(
+            limit=limit,
+            offset=offset,
+            group_id=group_id,
+            participant=participant,
+            query=query,
+        )
+
+    async def get_conversation_entry(
+        self,
+        conversation_id: int,
+    ) -> dict[str, Any] | None:
+        """按 ID 获取对话记忆。"""
+        return await self._conversation_repo.get_conversation(conversation_id)
+
+    async def create_conversation_entry(
+        self,
+        *,
+        group_id: str,
+        summary: str,
+        participants: list[str],
+        importance_initial: int = 3,
+        importance_current: int | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        last_accessed: datetime | None = None,
+    ) -> dict[str, Any]:
+        """创建可管理的对话记忆。"""
+        normalized_start, normalized_end = self._resolve_conversation_range(
+            start_time=start_time,
+            end_time=end_time,
+        )
+        normalized_last_accessed = (
+            self._normalize_datetime(last_accessed) or normalized_end
+        )
+        embedding = await self._embedding_plugin.embed(summary)
+        return await self._conversation_repo.create_conversation(
+            group_id=group_id,
+            summary=summary,
+            embedding=str(embedding),
+            participants=participants,
+            start_time=normalized_start,
+            end_time=normalized_end,
+            importance_initial=importance_initial,
+            importance_current=int(
+                importance_current
+                if importance_current is not None
+                else importance_initial
+            ),
+            last_accessed=normalized_last_accessed,
+        )
+
+    async def update_conversation_entry(
+        self,
+        conversation_id: int,
+        *,
+        group_id: str | None = None,
+        summary: str | None = None,
+        participants: list[str] | None = None,
+        importance_initial: int | None = None,
+        importance_current: int | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        last_accessed: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """更新单条对话记忆。"""
+        existing = await self._conversation_repo.get_conversation(conversation_id)
+        if existing is None:
+            return None
+
+        normalized_start = self._normalize_datetime(start_time)
+        normalized_end = self._normalize_datetime(end_time)
+        merged_start = normalized_start or existing["start_time"]
+        merged_end = normalized_end or existing["end_time"]
+        if merged_end < merged_start:
+            msg = "end_time 不能早于 start_time"
+            raise ValueError(msg)
+
+        embedding: str | None = None
+        if summary is not None:
+            embedding = str(await self._embedding_plugin.embed(summary))
+
+        return await self._conversation_repo.update_conversation(
+            conversation_id,
+            group_id=group_id,
+            summary=summary,
+            embedding=embedding,
+            participants=participants,
+            start_time=normalized_start,
+            end_time=normalized_end,
+            importance_initial=importance_initial,
+            importance_current=importance_current,
+            last_accessed=self._normalize_datetime(last_accessed),
+        )
+
+    async def delete_conversation_entry(self, conversation_id: int) -> bool:
+        """删除单条对话记忆。"""
+        return await self._conversation_repo.delete_conversation(conversation_id)
 
     async def upsert_user_profile(
         self,
@@ -188,6 +295,126 @@ class MemoryService:
             group_id=group_id,
         )
 
+    async def list_user_profile_rows(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        group_id: str | None = None,
+        user_id: str | None = None,
+        query: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """分页获取用户画像文档行。"""
+        return await self._entity_repo.list_user_profiles(
+            limit=limit,
+            offset=offset,
+            group_id=group_id,
+            user_id=user_id,
+            query=query,
+        )
+
+    async def list_interaction_history_rows(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        group_id: str | None = None,
+        user_id: str | None = None,
+        query: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """分页获取互动历史文档行。"""
+        return await self._entity_repo.list_interaction_histories(
+            limit=limit,
+            offset=offset,
+            group_id=group_id,
+            user_id=user_id,
+            query=query,
+        )
+
+    async def get_user_profile_row(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """获取带元数据的用户画像行。"""
+        return await self._entity_repo.get_user_profile_row(
+            user_id=user_id,
+            group_id=group_id,
+        )
+
+    async def get_interaction_history_row(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """获取带元数据的互动历史行。"""
+        return await self._entity_repo.get_interaction_history_row(
+            user_id=user_id,
+            group_id=group_id,
+        )
+
+    async def upsert_user_profile_row(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+        profile: dict[str, Any],
+        importance: int = 4,
+    ) -> dict[str, Any] | None:
+        """写入用户画像并返回最新行。"""
+        await self.upsert_user_profile(
+            user_id=user_id,
+            group_id=group_id,
+            profile=profile,
+            importance=importance,
+        )
+        return await self.get_user_profile_row(user_id=user_id, group_id=group_id)
+
+    async def upsert_interaction_history_row(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+        interaction: dict[str, Any],
+        importance: int = 5,
+    ) -> dict[str, Any] | None:
+        """写入互动历史并返回最新行。"""
+        await self.upsert_interaction_history(
+            user_id=user_id,
+            group_id=group_id,
+            interaction=interaction,
+            importance=importance,
+        )
+        return await self.get_interaction_history_row(
+            user_id=user_id, group_id=group_id
+        )
+
+    async def delete_user_profile(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        """删除用户画像文档。"""
+        return await self._entity_repo.delete_user_profile(
+            user_id=user_id,
+            group_id=group_id,
+        )
+
+    async def delete_interaction_history(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        """删除互动历史文档。"""
+        return await self._entity_repo.delete_interaction_history(
+            user_id=user_id,
+            group_id=group_id,
+        )
+
     async def ensure_user_memory_rows(
         self,
         *,
@@ -211,7 +438,9 @@ class MemoryService:
                 profile=profile,
             )
 
-        interaction = await self.get_interaction_history(user_id=user_id, group_id=group_id)
+        interaction = await self.get_interaction_history(
+            user_id=user_id, group_id=group_id
+        )
         if interaction is None:
             interaction = {
                 "version": 1,
@@ -237,3 +466,35 @@ class MemoryService:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(UTC).isoformat()
+
+    @staticmethod
+    def _now_naive() -> datetime:
+        return datetime.now(UTC).replace(tzinfo=None)
+
+    def _resolve_conversation_range(
+        self,
+        *,
+        start_time: datetime | None,
+        end_time: datetime | None,
+    ) -> tuple[datetime, datetime]:
+        normalized_start = self._normalize_datetime(start_time)
+        normalized_end = self._normalize_datetime(end_time)
+        if normalized_end is None:
+            normalized_end = (
+                self._now_naive() if normalized_start is None else normalized_start
+            )
+        if normalized_start is None:
+            normalized_start = normalized_end - timedelta(hours=1)
+
+        if normalized_end < normalized_start:
+            msg = "end_time 不能早于 start_time"
+            raise ValueError(msg)
+        return normalized_start, normalized_end
+
+    @staticmethod
+    def _normalize_datetime(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(UTC).replace(tzinfo=None)

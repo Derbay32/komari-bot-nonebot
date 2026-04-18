@@ -3,6 +3,37 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
+from pydantic import BaseModel, Field
+
+
+class LLMToolCallFunctionSchema(BaseModel):
+    """LLM 工具调用中的函数信息。"""
+
+    name: str = Field(description="工具函数名")
+    arguments: str = Field(default="", description="原始 JSON 参数字符串")
+
+
+class LLMToolCallSchema(BaseModel):
+    """LLM 工具调用结构。"""
+
+    id: str | None = Field(default=None, description="工具调用 ID")
+    type: str = Field(default="function", description="工具调用类型")
+    function: LLMToolCallFunctionSchema = Field(description="函数调用信息")
+    raw_arguments: str = Field(default="", description="模型返回的原始参数字符串")
+    parsed_arguments: dict[str, Any] | None = Field(
+        default=None, description="安全解析后的参数"
+    )
+
+
+class LLMCompletionResultSchema(BaseModel):
+    """统一的 LLM 完成结果。"""
+
+    content: str = Field(default="", description="文本内容")
+    tool_calls: list[LLMToolCallSchema] = Field(
+        default_factory=list, description="工具调用列表"
+    )
+    finish_reason: str | None = Field(default=None, description="结束原因")
+
 
 class BaseLLMClient(ABC):
     """LLM 客户端抽象基类，定义统一接口。"""
@@ -16,8 +47,12 @@ class BaseLLMClient(ABC):
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         **kwargs,  # noqa: ANN003
-    ) -> str:
+    ) -> LLMCompletionResultSchema:
         """生成文本。
 
         Args:
@@ -27,10 +62,13 @@ class BaseLLMClient(ABC):
             temperature: 温度参数
             max_tokens: 最大 token 数
             response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+            tools: 可用工具定义
+            tool_choice: 工具选择策略
+            parallel_tool_calls: 是否允许并行工具调用
             **kwargs: 其他 provider 特定参数
 
         Returns:
-            生成的文本
+            统一完成结果
         """
 
     @abstractmethod
@@ -41,8 +79,12 @@ class BaseLLMClient(ABC):
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
         **kwargs,  # noqa: ANN003
-    ) -> str:
+    ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 生成文本（支持多模态）。
 
         Args:
@@ -51,10 +93,13 @@ class BaseLLMClient(ABC):
             temperature: 温度参数
             max_tokens: 最大 token 数
             response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+            tools: 可用工具定义
+            tool_choice: 工具选择策略
+            parallel_tool_calls: 是否允许并行工具调用
             **kwargs: 其他参数
 
         Returns:
-            生成的文本
+            统一完成结果
         """
 
     @abstractmethod

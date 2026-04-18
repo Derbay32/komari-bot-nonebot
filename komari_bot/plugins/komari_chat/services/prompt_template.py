@@ -12,8 +12,10 @@ from nonebot import logger
 _DEFAULTS: dict[str, str] = {
     "system_prompt": "你是一个友善的助手。",
     "memory_ack": "好的，我了解了。",
+    "memory_ack_role": "assistant",
     "output_instruction": "请将最终回复放在 <content></content> 标签中。",
     "cot_prefix": "<think>\n开始思考。\n",
+    "cot_prefix_role": "assistant",
 }
 
 # 缓存
@@ -35,7 +37,7 @@ def get_template() -> dict[str, str]:
     """获取最新的提示词模板（基于文件 mtime 热重载）.
 
     Returns:
-        包含 system_prompt, memory_ack, output_instruction, cot_prefix 的字典.
+        包含 system_prompt、memory_ack、memory_ack_role、output_instruction、cot_prefix、cot_prefix_role 的字典.
 
     """
     global _cache, _cache_mtime  # noqa: PLW0603

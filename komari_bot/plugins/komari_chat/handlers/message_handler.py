@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from nonebot import logger
+from nonebot.adapters.onebot.v11.event import Reply
+from nonebot.compat import type_validate_python
 
 from komari_bot.plugins.komari_decision.services.decision_engine import (
     DecisionEngine,
@@ -22,13 +25,14 @@ from komari_bot.plugins.komari_memory.services.token_counter import (
     estimate_text_tokens,
 )
 
-from ..services.image_downloader import download_images_as_base64
+from ..services.image_downloader import download_images_as_base64, extract_image_sources
 from ..services.llm_service import generate_reply
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
+from ..services.reply_context import ReplyContext
 
 if TYPE_CHECKING:
-    from nonebot.adapters.onebot.v11 import GroupMessageEvent
+    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
     from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
         SceneRuntimeService,
@@ -42,6 +46,19 @@ ReplyAction = Literal[
     "not_replied",
     "generation_failed",
 ]
+
+
+@dataclass(frozen=True)
+class ResolvedReplyContext:
+    """引用消息解析结果。"""
+
+    context: ReplyContext | None
+    refetched: bool = False
+
+
+@runtime_checkable
+class _PlainTextExtractable(Protocol):
+    def extract_plain_text(self) -> str: ...
 
 
 class MessageHandler:
@@ -119,6 +136,113 @@ class MessageHandler:
             return None
         return round(value, 4)
 
+    @staticmethod
+    def _extract_plain_text_from_message(message: object) -> str:
+        if isinstance(message, _PlainTextExtractable):
+            return str(message.extract_plain_text()).strip()
+
+        if isinstance(message, str):
+            return message.strip()
+
+        if isinstance(message, list):
+            return "".join(
+                str(seg.get("data", {}).get("text", ""))
+                for seg in message
+                if isinstance(seg, dict) and str(seg.get("type", "")) == "text"
+            ).strip()
+
+        return ""
+
+    @staticmethod
+    def _build_reply_context(
+        *,
+        reply: Reply,
+        bot_self_id: str,
+    ) -> ReplyContext | None:
+        text = MessageHandler._extract_plain_text_from_message(reply.message)
+        image_sources, image_count = extract_image_sources(reply.message)
+
+        if not text and image_count <= 0:
+            return None
+
+        user_id = (
+            str(reply.sender.user_id)
+            if reply.sender.user_id is not None
+            else None
+        )
+        user_nickname = (
+            str(reply.sender.card or reply.sender.nickname).strip()
+            if (reply.sender.card or reply.sender.nickname)
+            else user_id
+        )
+
+        return ReplyContext(
+            source_side="assistant" if user_id == bot_self_id else "user",
+            message_id=str(reply.message_id),
+            user_id=user_id,
+            user_nickname=user_nickname,
+            text=text,
+            image_sources=tuple(image_sources),
+            image_count=image_count,
+            has_visible_image=bool(image_sources),
+        )
+
+    @staticmethod
+    def _should_refetch_reply_context(
+        *,
+        context: ReplyContext | None,
+    ) -> bool:
+        return context is None or (
+            context.image_count > 0 and not context.has_visible_image
+        )
+
+    @staticmethod
+    async def _refetch_reply(
+        *,
+        bot: Bot,
+        reply: Reply,
+    ) -> Reply | None:
+        try:
+            payload = await bot.get_msg(message_id=int(reply.message_id))
+            return type_validate_python(Reply, payload)
+        except Exception:
+            logger.debug(
+                "[KomariMemory] 补取引用消息失败: message_id={}",
+                reply.message_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _resolve_reply_context(
+        self,
+        *,
+        bot: Bot,
+        event: GroupMessageEvent,
+        at_trigger: bool,
+    ) -> ResolvedReplyContext:
+        if not at_trigger or event.reply is None:
+            return ResolvedReplyContext(context=None, refetched=False)
+
+        context = self._build_reply_context(
+            reply=event.reply,
+            bot_self_id=str(event.self_id),
+        )
+        if not self._should_refetch_reply_context(context=context):
+            return ResolvedReplyContext(context=context, refetched=False)
+
+        refetched_reply = await self._refetch_reply(bot=bot, reply=event.reply)
+        if refetched_reply is None:
+            return ResolvedReplyContext(context=context, refetched=True)
+
+        refetched_context = self._build_reply_context(
+            reply=refetched_reply,
+            bot_self_id=str(event.self_id),
+        )
+        return ResolvedReplyContext(
+            context=refetched_context or context,
+            refetched=True,
+        )
+
     def _build_decision_payload(
         self,
         *,
@@ -173,6 +297,7 @@ class MessageHandler:
 
     async def process_message(
         self,
+        bot: Bot,
         event: GroupMessageEvent,
     ) -> dict[str, str] | None:
         """处理群聊消息的主流程。"""
@@ -180,14 +305,15 @@ class MessageHandler:
         group_id = str(event.group_id)
         at_trigger, message_content = self._resolve_trigger_message(event)
         message_id = str(event.message_id)
+        reply_context_result = await self._resolve_reply_context(
+            bot=bot,
+            event=event,
+            at_trigger=at_trigger,
+        )
 
-        image_urls = [
-            seg.data["url"]
-            for seg in event.message
-            if seg.type == "image" and seg.data.get("url")
-        ]
-        if image_urls:
-            logger.info("[KomariMemory] 检测到 {} 张图片", len(image_urls))
+        image_urls, image_count = extract_image_sources(event.message)
+        if image_count:
+            logger.info("[KomariMemory] 检测到 {} 张图片", image_count)
 
         user_nickname = (
             (event.sender.nickname or event.sender.card or user_id)
@@ -251,6 +377,9 @@ class MessageHandler:
             message=message,
             reply_to_message_id=message_id,
             image_urls=image_urls,
+            reply_context=reply_context_result.context,
+            reply_context_requested=at_trigger and event.reply is not None,
+            reply_context_refetched=reply_context_result.refetched,
             force_reply=outcome.force_reply,
             reason=reason,
             reply_score=outcome.reply_score,
@@ -324,6 +453,9 @@ class MessageHandler:
         message: MessageSchema,
         reply_to_message_id: str,
         image_urls: list[str] | None,
+        reply_context: ReplyContext | None,
+        reply_context_requested: bool,
+        reply_context_refetched: bool,
         force_reply: bool,
         reason: AttemptReplyReason,
         reply_score: float | None,
@@ -360,7 +492,6 @@ class MessageHandler:
 
         rewritten_query = await self.query_rewrite.rewrite_query(
             current_query=message.content,
-            conversation_history=recent_messages,
         )
 
         try:
@@ -381,18 +512,42 @@ class MessageHandler:
         )
 
         request_trace_id = f"chat-{message.message_id}"
-        base64_image_urls = None
+        base64_image_urls: list[str] | None = None
         if image_urls:
             base64_image_urls = await download_images_as_base64(image_urls)
+        reply_image_urls: list[str] | None = None
+        if reply_context and reply_context.image_sources:
+            reply_image_urls = await download_images_as_base64(
+                list(reply_context.image_sources)
+            )
+
+        if reply_context_requested:
             logger.info(
-                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={}",
+                "[KomariMemory] 引用上下文追踪: group={} message={} enabled={} side={} text_chars={} image_count={} visible_sources={} refetched={} downloaded_images={}",
+                message.group_id,
+                message.message_id,
+                reply_context is not None,
+                reply_context.source_side if reply_context else "-",
+                len(reply_context.text) if reply_context else 0,
+                reply_context.image_count if reply_context else 0,
+                len(reply_context.image_sources) if reply_context else 0,
+                reply_context_refetched,
+                len(reply_image_urls or []),
+            )
+
+        if image_urls or reply_image_urls:
+            logger.info(
+                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={}",
                 request_trace_id,
                 message.group_id,
                 message.message_id,
-                len(image_urls),
-                len(base64_image_urls),
+                reply_context.image_count if reply_context else 0,
+                len(reply_image_urls or []),
+                len(image_urls or []),
+                len(base64_image_urls or []),
                 len(message.content),
-                sum(len(url) for url in base64_image_urls),
+                sum(len(url) for url in (reply_image_urls or []))
+                + sum(len(url) for url in (base64_image_urls or [])),
                 len(memories),
             )
 
@@ -407,6 +562,8 @@ class MessageHandler:
             memory_service=self.memory,
             group_id=message.group_id,
             image_urls=base64_image_urls,
+            reply_context=reply_context,
+            reply_image_urls=reply_image_urls,
             query_embedding=query_embedding,
         )
 

@@ -7,7 +7,7 @@ Komari Knowledge 常识库核心引擎。
 
 支持两种运行模式：
 1. NoneBot 模式：使用 config_manager 插件加载配置
-2. 独立模式：直接从 JSON 文件加载配置（用于 WebUI）
+2. 独立模式：直接从 JSON 文件加载配置（用于离线脚本或独立调用）
 """
 
 import json
@@ -15,9 +15,7 @@ import logging
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
-
-from pydantic import BaseModel
+from typing import Any, Final
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
@@ -35,6 +33,7 @@ from komari_bot.common.vector_storage_schema import (
 )
 
 from .config_schema import DynamicConfigSchema
+from .models import KnowledgeCategory, KnowledgeEntry, SearchResult
 
 
 class PluginState:
@@ -121,14 +120,7 @@ def get_db_config(config: DynamicConfigSchema) -> DatabaseConfigSchema:
     return merge_database_config(DatabaseConfigSchema(), config)
 
 
-class SearchResult(BaseModel):
-    """检索结果。"""
-
-    id: int
-    category: str
-    content: str
-    similarity: float = 0.0
-    source: str = "keyword"  # "keyword" 或 "vector"
+UNSET: Final[object] = object()
 
 
 class KnowledgeEngine:
@@ -562,7 +554,7 @@ class KnowledgeEngine:
         self,
         content: str,
         keywords: list[str],
-        category: str = "general",
+        category: KnowledgeCategory = "general",
         notes: str | None = None,
     ) -> int:
         """
@@ -606,20 +598,124 @@ class KnowledgeEngine:
         return kid
 
     async def get_all_knowledge(self) -> list[dict[str, Any]]:
-        """获取所有知识（用于 WebUI 展示）。"""
+        """获取所有知识。"""
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, category, keywords, content, notes, created_at, updated_at
+                SELECT
+                    id,
+                    category,
+                    keywords,
+                    content,
+                    notes,
+                    created_at,
+                    updated_at
                 FROM komari_knowledge
                 ORDER BY created_at DESC
                 """
             )
 
-            return [dict(row) for row in rows]
+        return [self._build_knowledge_entry(dict(row)).model_dump() for row in rows]
+
+    async def get_knowledge(self, kid: int) -> KnowledgeEntry | None:
+        """按 ID 获取单条知识。"""
+        if self._pool is None:
+            raise RuntimeError("数据库连接池未初始化")
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    id,
+                    category,
+                    keywords,
+                    content,
+                    notes,
+                    created_at,
+                    updated_at
+                FROM komari_knowledge
+                WHERE id = $1
+                """,
+                kid,
+            )
+
+        if row is None:
+            return None
+        return self._build_knowledge_entry(dict(row))
+
+    async def list_knowledge(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        query: str | None = None,
+        category: KnowledgeCategory | None = None,
+    ) -> tuple[list[KnowledgeEntry], int]:
+        """分页获取知识列表，并支持关键词/内容过滤。"""
+        if self._pool is None:
+            raise RuntimeError("数据库连接池未初始化")
+
+        conditions: list[str] = []
+        params: list[object] = []
+        param_idx = 1
+
+        if query is not None:
+            keyword_pattern = f"%{query.strip()}%"
+            if keyword_pattern != "%%":
+                conditions.append(
+                    f"""
+                    (
+                        content ILIKE ${param_idx}
+                        OR EXISTS (
+                            SELECT 1
+                            FROM unnest(COALESCE(keywords, ARRAY[]::text[])) AS keyword
+                            WHERE keyword ILIKE ${param_idx}
+                        )
+                    )
+                    """
+                )
+                params.append(keyword_pattern)
+                param_idx += 1
+
+        if category is not None:
+            conditions.append(f"category = ${param_idx}")
+            params.append(category)
+            param_idx += 1
+
+        where_clause = ""
+        if conditions:
+            where_clause = f"WHERE {' AND '.join(conditions)}"
+
+        count_query = f"""
+            SELECT COUNT(*)
+            FROM komari_knowledge
+            {where_clause}
+        """
+        data_query = f"""
+            SELECT
+                id,
+                category,
+                keywords,
+                content,
+                notes,
+                created_at,
+                updated_at
+            FROM komari_knowledge
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ${param_idx}
+            OFFSET ${param_idx + 1}
+        """
+
+        async with self._pool.acquire() as conn:
+            total = await conn.fetchval(count_query, *params)
+            rows = await conn.fetch(data_query, *params, limit, offset)
+
+        items = [self._build_knowledge_entry(dict(row)) for row in rows]
+        return items, int(total)
 
     async def delete_knowledge(self, kid: int) -> bool:
         """删除知识。
@@ -659,20 +755,20 @@ class KnowledgeEngine:
     async def update_knowledge(
         self,
         kid: int,
-        content: str | None = None,
-        keywords: list[str] | None = None,
-        category: str | None = None,
-        notes: str | None = None,
+        content: str | object = UNSET,
+        keywords: list[str] | object = UNSET,
+        category: KnowledgeCategory | object = UNSET,
+        notes: str | None | object = UNSET,
     ) -> bool:
         """
         更新知识。
 
         Args:
             kid: 知识 ID
-            content: 新内容（None 表示不修改）
-            keywords: 新关键词（None 表示不修改）
-            category: 新分类（None 表示不修改）
-            notes: 新备注（None 表示不修改）
+            content: 新内容（UNSET 表示不修改）
+            keywords: 新关键词（UNSET 表示不修改）
+            category: 新分类（UNSET 表示不修改）
+            notes: 新备注（UNSET 表示不修改，None 表示清空）
 
         Returns:
             是否更新成功
@@ -681,7 +777,7 @@ class KnowledgeEngine:
             raise RuntimeError("数据库连接池未初始化")
 
         # 至少需要一个更新字段
-        if all(v is None for v in [content, keywords, category, notes]):
+        if all(v is UNSET for v in [content, keywords, category, notes]):
             raise ValueError("至少提供一个要更新的字段")
 
         async with self._pool.acquire() as conn:
@@ -700,7 +796,8 @@ class KnowledgeEngine:
             param_idx = 2  # $1 是 kid
 
             # 内容改变需要重新生成向量
-            if content is not None:
+            if content is not UNSET:
+                assert isinstance(content, str), "content 更新值必须是字符串"
                 embedding = await self._get_embedding(content)
                 updates.append(f"content = ${param_idx}")
                 params.append(content)
@@ -709,17 +806,19 @@ class KnowledgeEngine:
                 params.append(str(embedding))
                 param_idx += 1
 
-            if keywords is not None:
+            if keywords is not UNSET:
+                assert isinstance(keywords, list), "keywords 更新值必须是字符串列表"
                 updates.append(f"keywords = ${param_idx}")
                 params.append(keywords)
                 param_idx += 1
 
-            if category is not None:
+            if category is not UNSET:
+                assert isinstance(category, str), "category 更新值必须是字符串"
                 updates.append(f"category = ${param_idx}")
                 params.append(category)
                 param_idx += 1
 
-            if notes is not None:
+            if notes is not UNSET:
                 updates.append(f"notes = ${param_idx}")
                 params.append(notes)
                 param_idx += 1
@@ -733,7 +832,8 @@ class KnowledgeEngine:
 
         # 更新内存关键词索引
         old_keywords = row["keywords"] or []
-        new_keywords = keywords if keywords is not None else old_keywords
+        new_keywords = keywords if keywords is not UNSET else old_keywords
+        assert isinstance(new_keywords, list), "keywords 更新值必须是字符串列表"
 
         # 移除旧关键词索引
         for kw in old_keywords:
@@ -748,6 +848,18 @@ class KnowledgeEngine:
 
         state.logger.info(f"[Komari Knowledge] 更新知识: ID={kid}")
         return True
+
+    def _build_knowledge_entry(self, payload: dict[str, Any]) -> KnowledgeEntry:
+        """把数据库记录转换为统一知识条目模型。"""
+        return KnowledgeEntry(
+            id=int(payload["id"]),
+            category=payload["category"],
+            keywords=list(payload.get("keywords") or []),
+            content=str(payload["content"]),
+            notes=payload.get("notes"),
+            created_at=payload["created_at"],
+            updated_at=payload["updated_at"],
+        )
 
     async def close(self) -> None:
         """关闭连接池并清理资源。"""

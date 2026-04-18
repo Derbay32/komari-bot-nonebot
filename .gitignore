@@ -142,25 +142,13 @@ dmypy.json
 .pytype/
 
 # programming tools
-/.claude
 /docs
-/examples
 /.ruff_cache
-CLAUDE.md
-INSTALLATION_GUIDE.md
-MCP-ASSISTANT-RULES.md
-plan.md
-Project NEON-TAVERN.md
-Project NEON-TAVERN-Plugin.md
-komari-bert-readme.md
+/.kilo
 
 # config files
-jrhg_config.json
-llm_provider_config.json
-sr_config.json
-komari_knowledge_config.json
-komari_memory_config.json
-bindings.json
+config/config_manager/*.json
+data/character_binding/bindings.json
 
 # local database
 user_data.db
@@ -171,11 +159,6 @@ user_data.db
 # End of https://www.toptal.com/developers/gitignore/api/python
 test_multimodal.py
 logs
-config/config_manager/embedding_provider_config.json
-config/config_manager/group_history_summary_config.json
 !tools/
 tools/*
 !tools/migrate_user_data_sqlite_to_pg.py
-config/config_manager/database_config.json
-config/config_manager/user_data_config.json
-config/config_manager/komari_sentry_config.json
