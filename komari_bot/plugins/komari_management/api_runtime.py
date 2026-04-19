@@ -11,6 +11,7 @@ from .config_api import register_config_api
 from .prompt_api import register_prompt_api
 
 KNOWLEDGE_API_PREFIX = "/api/komari-knowledge/v1"
+HELP_API_PREFIX = "/api/komari-help/v1"
 MEMORY_API_PREFIX = "/api/komari-memory/v1"
 LLM_PROVIDER_API_PREFIX = "/api/llm-provider/v1"
 MANAGEMENT_CONFIG_API_PREFIX = "/api/komari-management-config/v1"
@@ -28,6 +29,8 @@ class ManagementApiComponents:
 
     register_knowledge_api: Callable[..., None]
     knowledge_engine_getter: Callable[[], object | None]
+    register_help_api: Callable[..., None]
+    help_engine_getter: Callable[[], object | None]
     register_memory_api: Callable[..., None]
     memory_service_getter: Callable[[], object | None]
     register_llm_provider_api: Callable[..., None]
@@ -69,6 +72,12 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         engine_getter=components.knowledge_engine_getter,
     )
+    components.register_help_api(
+        server_app,
+        api_token=settings.api_token,
+        allowed_origins=settings.allowed_origins,
+        engine_getter=components.help_engine_getter,
+    )
     components.register_memory_api(
         server_app,
         api_token=settings.api_token,
@@ -97,7 +106,7 @@ def register_management_api_for_driver(
     openapi_url = getattr(server_app, "openapi_url", None) or "未启用"
     logger.info(
         "[Komari Management] 管理 API 已注册: "
-        f"{KNOWLEDGE_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}, "
+        f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}"
     )
     logger.info(

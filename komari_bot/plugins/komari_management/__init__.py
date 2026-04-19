@@ -21,6 +21,9 @@ from komari_bot.plugins.komari_chat.services.prompt_template import (
     _DEFAULTS as KOMARI_CHAT_PROMPT_DEFAULTS,
 )
 from komari_bot.plugins.komari_decision.config_schema import KomariDecisionConfigSchema
+from komari_bot.plugins.komari_help.config_schema import (
+    DynamicConfigSchema as HelpConfigSchema,
+)
 from komari_bot.plugins.komari_knowledge.config_schema import (
     DynamicConfigSchema as KnowledgeConfigSchema,
 )
@@ -67,12 +70,15 @@ class PluginState:
 def _load_management_components() -> ManagementApiComponents:
     """加载统一管理 API 所需的业务插件组件。"""
     knowledge_plugin = require("komari_knowledge")
+    help_plugin = require("komari_help")
     memory_plugin = require("komari_memory")
     llm_provider_plugin = require("llm_provider")
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
         knowledge_engine_getter=knowledge_plugin.get_engine,
+        register_help_api=help_plugin.register_help_api,
+        help_engine_getter=help_plugin.get_engine,
         register_memory_api=memory_plugin.register_memory_api,
         memory_service_getter=memory_plugin.get_memory_service,
         register_llm_provider_api=llm_provider_plugin.register_llm_provider_api,
@@ -97,6 +103,14 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "komari_knowledge",
                     KnowledgeConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="komari_help",
+                display_name="Komari Help",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_help",
+                    HelpConfigSchema,
                 ),
             ),
             ManagedConfigResource(

@@ -208,6 +208,95 @@ def build_knowledge_embedding_index_statement(
         """
 
 
+def build_help_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
+    """Build Komari Help storage schema statements for a specific dimension."""
+    dimension = _normalize_dimension(embedding_dimension)
+    statements = [
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        f"""
+        CREATE TABLE IF NOT EXISTS komari_help (
+            id SERIAL PRIMARY KEY,
+            category TEXT NOT NULL DEFAULT 'other',
+            plugin_name TEXT,
+            keywords TEXT[] NOT NULL DEFAULT '{{}}',
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            notes TEXT,
+            is_auto_generated BOOLEAN NOT NULL DEFAULT FALSE,
+            embedding VECTOR({dimension}),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+    ]
+    embedding_index_statement = build_help_embedding_index_statement(dimension)
+    if embedding_index_statement is not None:
+        statements.append(embedding_index_statement)
+    statements.extend(
+        [
+            """
+        CREATE INDEX IF NOT EXISTS idx_komari_help_keywords
+        ON komari_help
+        USING gin (keywords)
+        """,
+            """
+        CREATE INDEX IF NOT EXISTS idx_komari_help_category
+        ON komari_help(category)
+        """,
+            """
+        CREATE INDEX IF NOT EXISTS idx_komari_help_plugin_name
+        ON komari_help(plugin_name)
+        """,
+            """
+        CREATE INDEX IF NOT EXISTS idx_komari_help_created_at
+        ON komari_help(created_at DESC)
+        """,
+            """
+        CREATE OR REPLACE FUNCTION update_updated_at_column()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = CURRENT_TIMESTAMP;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+            """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_trigger
+                WHERE tgname = 'trigger_komari_help_updated_at'
+                  AND tgrelid = 'komari_help'::regclass
+            ) THEN
+                CREATE TRIGGER trigger_komari_help_updated_at
+                BEFORE UPDATE ON komari_help
+                FOR EACH ROW
+                EXECUTE FUNCTION update_updated_at_column();
+            END IF;
+        END
+        $$;
+        """,
+        ]
+    )
+    return tuple(statements)
+
+
+def build_help_embedding_index_statement(
+    embedding_dimension: int,
+) -> str | None:
+    """Return the help embedding index DDL when pgvector supports it."""
+    dimension = _normalize_dimension(embedding_dimension)
+    if dimension > PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
+        return None
+    return """
+        CREATE INDEX IF NOT EXISTS idx_komari_help_embedding
+        ON komari_help
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64)
+        """
+
+
 async def apply_schema_statements(
     pg_pool: Any,
     *,
