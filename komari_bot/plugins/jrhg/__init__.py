@@ -28,7 +28,10 @@ except AttributeError:
 __plugin_meta__ = PluginMetadata(
     name="jrhg",
     description="今日好感插件，提供每日好感度查询和白名单管理",
-    usage=".jrhg - 查询今日好感度\n/jrhg on/off - 管理员控制插件开关",
+    usage="""
+    .jrhg - 查询今日好感度
+    .jrhg on/off - 管理员控制插件开关
+    """,
 )
 
 # 初始化配置管理器
