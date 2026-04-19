@@ -128,11 +128,11 @@ async def handle_bind_help(event: MessageEvent) -> None:
     help_text = (
         "🎭 角色绑定命令说明：\n"
         "━━━━━━━━━━━━━━━\n"
-        "• /bind set <角色名>\n"
+        "• .bind set <角色名>\n"
         "  设置您的角色绑定\n"
-        "• /bind del\n"
+        "• .bind del\n"
         "  删除您的角色绑定\n"
-        "• /bind list\n"
+        "• .bind list\n"
         "  查看您的角色绑定\n"
         "━━━━━━━━━━━━━━━"
         f"{binding_info}"
@@ -157,8 +157,8 @@ async def handle_set_superuser(
     if not request.character_name:
         await bind_set_superuser.finish(
             "❌ 请提供角色名\n"
-            "用法: /bind set <角色名>\n"
-            "SUPERUSER 用法: /bind set <用户ID> <角色名>"
+            "用法: .bind set <角色名>\n"
+            "SUPERUSER 用法: .bind set <用户ID> <角色名>"
         )
 
     await manager.set_character_name(request.target_user_id, request.character_name)
@@ -179,7 +179,7 @@ async def handle_set(
 ) -> None:
     """处理普通用户设置绑定命令。"""
     if not request.character_name:
-        await bind_set.finish("❌ 请提供角色名\n用法: /bind set <角色名>")
+        await bind_set.finish("❌ 请提供角色名\n用法: .bind set <角色名>")
 
     await manager.set_character_name(request.target_user_id, request.character_name)
     await bind_set.finish(f"✅ 已设置您的角色名为 {request.character_name}")

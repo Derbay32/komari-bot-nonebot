@@ -10,9 +10,11 @@ from .manager import CharacterBindingManager, get_manager
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
     description="提供跨插件的角色名绑定管理功能",
-    usage="/bind set <角色名> - 设置绑定\n"
-    "/bind del - 删除绑定\n"
-    "/bind list - 查看绑定列表",
+    usage="""
+    .bind set <角色名> - 设置绑定
+    .bind del - 删除绑定
+    .bind list - 查看绑定列表
+    """,
 )
 
 
