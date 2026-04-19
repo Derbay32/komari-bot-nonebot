@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from nonebot import logger, on_command
+from nonebot.adapters.onebot.v11 import Message  # noqa: TC002
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
@@ -13,10 +14,6 @@ from .engine import get_config, get_engine
 from .scanner import scan_and_sync
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from nonebot.adapters.onebot.v11 import Message
-
     from .models import HelpSearchResult
 
 help_cmd = on_command("help", aliases={"帮助"}, priority=10, block=True)
@@ -47,7 +44,7 @@ def _preview_content(content: str) -> str:
     return f"{normalized[:max_length].rstrip()}…"
 
 
-def _format_results(results: Sequence[HelpSearchResult]) -> str:
+def _format_results(results: list[HelpSearchResult]) -> str:
     config = get_config()
     lines = ["📖 帮助文档检索结果", "━━━━━━━━━━━━━━━"]
     for item in results:
