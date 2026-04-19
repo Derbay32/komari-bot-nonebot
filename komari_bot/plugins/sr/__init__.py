@@ -13,8 +13,19 @@ from .redis_undo_stack import pop_undo, push_undo
 
 __plugin_meta__ = PluginMetadata(
     name="sr",
-    description="",
-    usage="",
+    description="神人榜随机抽选插件",
+    usage="""
+    核心指令：.sr
+    .sr 随机从神人榜内抽取一个
+    .sr <任意内容> 以指定内容为判定，随机从神人榜内抽取一个
+    .sr add 向神人榜内添加神人
+    .sr del 删除神人榜内的指定神人
+    .sr undo 撤销上次的添加/删除操作
+    .sr list 查看目前神人榜内的神人
+    以下为管理员指令：
+    .sr status 查看插件运行情况
+    .sr on/off 开关本插件
+    """,
     config=Config,
 )
 
@@ -160,7 +171,7 @@ async def sr_usrcustom(
                 sr_list = config.sr_list
 
                 if not sr_list:
-                    await sr_custom.finish("神人榜为空，使用 /sr add 添加神人")
+                    await sr_custom.finish("神人榜为空，使用 .sr add 添加神人")
                     return
 
                 # 解析页码参数
