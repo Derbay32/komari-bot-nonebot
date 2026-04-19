@@ -14,8 +14,7 @@ from komari_bot.common.embedding_migration import (
     get_pool_key,
     load_embedding_config,
     migrate_table_embeddings,
-    resolve_knowledge_database_config,
-    resolve_memory_database_config,
+    resolve_shared_database_config,
 )
 
 if TYPE_CHECKING:
@@ -51,7 +50,9 @@ class _FakeConnection:
             return self.table_exists
         raise AssertionError
 
-    async def fetchrow(self, query: str, table_name: str, column_name: str) -> dict[str, Any] | None:
+    async def fetchrow(
+        self, query: str, table_name: str, column_name: str
+    ) -> dict[str, Any] | None:
         del table_name, column_name
         if "pg_catalog.format_type" not in query:
             raise AssertionError
@@ -104,7 +105,7 @@ def test_load_embedding_config_returns_default_when_missing(tmp_path: Path) -> N
     assert config.embedding_dimension == 512
 
 
-def test_resolve_database_config_merges_local_override(tmp_path: Path) -> None:
+def test_resolve_shared_database_config_reads_shared_config(tmp_path: Path) -> None:
     shared_path = tmp_path / "database.json"
     shared_path.write_text(
         json.dumps(
@@ -118,34 +119,14 @@ def test_resolve_database_config_merges_local_override(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    knowledge_path = tmp_path / "knowledge.json"
-    knowledge_path.write_text(
-        json.dumps({"pg_database": "knowledge-db", "pg_pool_max_size": 9}),
-        encoding="utf-8",
-    )
-    memory_path = tmp_path / "memory.json"
-    memory_path.write_text(
-        json.dumps({"pg_host": "memory-host", "pg_port": 15432}),
-        encoding="utf-8",
-    )
+    shared_config = resolve_shared_database_config(shared_config_path=shared_path)
 
-    knowledge_config = resolve_knowledge_database_config(
-        shared_config_path=shared_path,
-        knowledge_config_path=knowledge_path,
-    )
-    memory_config = resolve_memory_database_config(
-        shared_config_path=shared_path,
-        memory_config_path=memory_path,
-    )
-
-    assert knowledge_config.pg_host == "shared-host"
-    assert knowledge_config.pg_database == "knowledge-db"
-    assert knowledge_config.pg_pool_max_size == 9
-    assert memory_config.pg_host == "memory-host"
-    assert memory_config.pg_port == 15432
-    assert get_pool_key(memory_config) == (
-        "memory-host",
-        15432,
+    assert shared_config.pg_host == "shared-host"
+    assert shared_config.pg_database == "shared-db"
+    assert shared_config.pg_pool_max_size == 5
+    assert get_pool_key(shared_config) == (
+        "shared-host",
+        5432,
         "shared-db",
         "shared-user",
         "shared-pass",
@@ -155,7 +136,10 @@ def test_resolve_database_config_merges_local_override(tmp_path: Path) -> None:
 def test_migrate_table_embeddings_supports_dry_run_without_embed_calls() -> None:
     conn = _FakeConnection(
         dimension=512,
-        rows=[{"row_id": 1, "text_value": "alpha"}, {"row_id": 2, "text_value": "beta"}],
+        rows=[
+            {"row_id": 1, "text_value": "alpha"},
+            {"row_id": 2, "text_value": "beta"},
+        ],
     )
     embedding_service = _FakeEmbeddingService()
 
@@ -180,7 +164,10 @@ def test_migrate_table_embeddings_supports_dry_run_without_embed_calls() -> None
 def test_migrate_table_embeddings_rebuilds_dimension_and_index_when_needed() -> None:
     conn = _FakeConnection(
         dimension=512,
-        rows=[{"row_id": 1, "text_value": "first"}, {"row_id": 2, "text_value": "second"}],
+        rows=[
+            {"row_id": 1, "text_value": "first"},
+            {"row_id": 2, "text_value": "second"},
+        ],
     )
     embedding_service = _FakeEmbeddingService()
 
@@ -202,8 +189,10 @@ def test_migrate_table_embeddings_rebuilds_dimension_and_index_when_needed() -> 
     assert embedding_service.calls == ["first", "second"]
     assert executed_sql[0] == 'DROP INDEX IF EXISTS "idx_komari_knowledge_embedding"'
     assert "ALTER TABLE" in executed_sql[1]
-    assert executed_sql[-1].strip().startswith(
-        "CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding"
+    assert (
+        executed_sql[-1]
+        .strip()
+        .startswith("CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding")
     )
 
 

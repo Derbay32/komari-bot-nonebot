@@ -11,9 +11,8 @@ from typing import Any, Final
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
-    get_effective_database_config,
+    get_shared_database_config,
     load_database_config_from_file,
-    merge_database_config,
 )
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
@@ -85,21 +84,20 @@ def get_config() -> DynamicConfigSchema:
     return state.standalone_config
 
 
-def get_db_config(config: DynamicConfigSchema) -> DatabaseConfigSchema:
+def get_db_config() -> DatabaseConfigSchema:
     if state.nonebot_mode:
-        return get_effective_database_config(config)
+        return get_shared_database_config()
 
     shared_config_path = Path("config/config_manager/database_config.json")
     if shared_config_path.exists():
         try:
-            shared = load_database_config_from_file(shared_config_path)
-            return merge_database_config(shared, config)
+            return load_database_config_from_file(shared_config_path)
         except Exception as exc:
             state.logger.warning(
-                "[Komari Help] 共享数据库配置解析失败: %s，回退到本地配置",
+                "[Komari Help] 共享数据库配置解析失败: %s，回退到默认共享配置",
                 exc,
             )
-    return merge_database_config(DatabaseConfigSchema(), config)
+    return DatabaseConfigSchema()
 
 
 UNSET: Final[object] = object()
@@ -120,7 +118,7 @@ class HelpEngine:
 
     async def initialize(self) -> None:
         state.logger.info("[Komari Help] 正在初始化帮助引擎...")
-        config = get_config()
+        get_config()
 
         try:
             if state.nonebot_mode:
@@ -147,7 +145,7 @@ class HelpEngine:
                 state.logger.info("[Komari Help] 独立嵌入服务初始化完成")
 
             if self._pool is None:
-                db_config = get_db_config(config)
+                db_config = get_db_config()
                 self._pool = await create_postgres_pool(db_config, command_timeout=30)
                 expected_dimension = self._resolve_expected_embedding_dimension()
                 await self._ensure_storage_schema(expected_dimension)

@@ -27,42 +27,6 @@ class KomariMemoryConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    # PostgreSQL 配置覆盖项（默认读取共享 database_config）
-    pg_host: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的 PostgreSQL 主机地址",
-    )
-    pg_port: int | None = Field(
-        default=None,
-        ge=1,
-        le=65535,
-        description="可选：覆盖共享配置中的 PostgreSQL 端口",
-    )
-    pg_database: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库名称",
-    )
-    pg_user: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库用户名",
-    )
-    pg_password: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库密码",
-    )
-    pg_pool_min_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=10,
-        description="可选：覆盖共享配置中的连接池最小连接数",
-    )
-    pg_pool_max_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=50,
-        description="可选：覆盖共享配置中的连接池最大连接数",
-    )
-
     # Redis 配置
     redis_host: str = Field(default="localhost", description="Redis 主机地址")
     redis_port: int = Field(default=6379, description="Redis 端口")

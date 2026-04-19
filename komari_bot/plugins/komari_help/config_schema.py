@@ -26,35 +26,6 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    pg_host: str | None = Field(
-        default=None, description="可选：覆盖共享配置中的数据库主机"
-    )
-    pg_port: int | None = Field(
-        default=None,
-        ge=1,
-        le=65535,
-        description="可选：覆盖共享配置中的数据库端口",
-    )
-    pg_database: str | None = Field(
-        default=None, description="可选：覆盖共享数据库名称"
-    )
-    pg_user: str | None = Field(default=None, description="可选：覆盖共享数据库用户名")
-    pg_password: str | None = Field(
-        default=None, description="可选：覆盖共享数据库密码"
-    )
-    pg_pool_min_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=10,
-        description="可选：覆盖共享连接池最小连接数",
-    )
-    pg_pool_max_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=50,
-        description="可选：覆盖共享连接池最大连接数",
-    )
-
     similarity_threshold: float = Field(
         default=0.60,
         ge=0.0,

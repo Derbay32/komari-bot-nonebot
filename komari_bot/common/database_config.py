@@ -35,48 +35,6 @@ class DatabaseConfigSchema(BaseModel):
     )
 
 
-def _pick_str(value: Any, fallback: str) -> str:
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped if stripped else fallback
-    return fallback if value is None else str(value)
-
-
-def _pick_int(value: Any, fallback: int) -> int:
-    return fallback if value is None else int(value)
-
-
-def merge_database_config(
-    shared_config: DatabaseConfigSchema,
-    local_config: Any | None,
-) -> DatabaseConfigSchema:
-    """将插件本地配置覆盖到共享数据库配置上。"""
-    if local_config is None:
-        return shared_config
-
-    return DatabaseConfigSchema(
-        version=shared_config.version,
-        last_updated=shared_config.last_updated,
-        pg_host=_pick_str(getattr(local_config, "pg_host", None), shared_config.pg_host),
-        pg_port=_pick_int(getattr(local_config, "pg_port", None), shared_config.pg_port),
-        pg_database=_pick_str(
-            getattr(local_config, "pg_database", None), shared_config.pg_database
-        ),
-        pg_user=_pick_str(getattr(local_config, "pg_user", None), shared_config.pg_user),
-        pg_password=_pick_str(
-            getattr(local_config, "pg_password", None), shared_config.pg_password
-        ),
-        pg_pool_min_size=_pick_int(
-            getattr(local_config, "pg_pool_min_size", None),
-            shared_config.pg_pool_min_size,
-        ),
-        pg_pool_max_size=_pick_int(
-            getattr(local_config, "pg_pool_max_size", None),
-            shared_config.pg_pool_max_size,
-        ),
-    )
-
-
 def load_database_config_from_file(config_path: "Path") -> DatabaseConfigSchema:
     """从 JSON 文件加载共享数据库配置。"""
     if not config_path.exists():
@@ -91,18 +49,10 @@ def _get_database_config_manager() -> Any:
     from nonebot.plugin import require
 
     config_manager_plugin = require("config_manager")
-    return config_manager_plugin.get_config_manager(
-        "database", DatabaseConfigSchema
-    )
+    return config_manager_plugin.get_config_manager("database", DatabaseConfigSchema)
 
 
 def get_shared_database_config() -> DatabaseConfigSchema:
     """获取共享数据库配置。"""
     manager = _get_database_config_manager()
     return manager.get()
-
-
-def get_effective_database_config(local_config: Any | None = None) -> DatabaseConfigSchema:
-    """获取最终生效的数据库配置（本地覆盖 > 共享配置）。"""
-    shared = get_shared_database_config()
-    return merge_database_config(shared, local_config)

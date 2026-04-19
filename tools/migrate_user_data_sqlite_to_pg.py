@@ -3,7 +3,6 @@
 用法：
 python tools/migrate_user_data_sqlite_to_pg.py
 python tools/migrate_user_data_sqlite_to_pg.py --sqlite-path user_data.db
-python tools/migrate_user_data_sqlite_to_pg.py --config-path config/config_manager/user_data_config.json
 python tools/migrate_user_data_sqlite_to_pg.py --db-config-path config/config_manager/database_config.json
 """
 
@@ -11,11 +10,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sqlite3
 import sys
-from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,24 +23,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 if TYPE_CHECKING:
     from komari_bot.common.database_config import DatabaseConfigSchema
-
-
-@dataclass
-class UserDataDbOverrideConfig:
-    """user_data 中与数据库相关的可选覆盖字段。"""
-
-    pg_host: str | None = None
-    pg_port: int | None = None
-    pg_database: str | None = None
-    pg_user: str | None = None
-    pg_password: str | None = None
-    pg_pool_min_size: int | None = None
-    pg_pool_max_size: int | None = None
-
-
-def _read_optional_int(data: dict[str, Any], key: str) -> int | None:
-    value = data.get(key)
-    return None if value is None else int(value)
 
 
 def _parse_datetime_value(value: Any) -> datetime | None:
@@ -94,6 +73,7 @@ def _parse_date_value(value: Any) -> date | None:
                 parsed = parsed_dt.date() if parsed_dt else None
     return parsed
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -101,43 +81,23 @@ logging.basicConfig(
 logger = logging.getLogger("migrate_user_data")
 
 
-def load_user_data_db_override(config_path: Path) -> UserDataDbOverrideConfig:
-    """从 user_data 配置中读取数据库覆盖字段。"""
-    if not config_path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {config_path}")  # noqa: TRY003
-
-    data = json.loads(config_path.read_text(encoding="utf-8"))
-    return UserDataDbOverrideConfig(
-        pg_host=data.get("pg_host"),
-        pg_port=_read_optional_int(data, "pg_port"),
-        pg_database=data.get("pg_database"),
-        pg_user=data.get("pg_user"),
-        pg_password=data.get("pg_password"),
-        pg_pool_min_size=_read_optional_int(data, "pg_pool_min_size"),
-        pg_pool_max_size=_read_optional_int(data, "pg_pool_max_size"),
-    )
-
-
-def resolve_db_config(
-    user_data_db_override: UserDataDbOverrideConfig,
-    db_config_path: Path,
-) -> "DatabaseConfigSchema":
-    """解析最终 PostgreSQL 配置（共享配置 + user_data 覆盖）。"""
+def resolve_db_config(db_config_path: Path) -> "DatabaseConfigSchema":
+    """解析共享 PostgreSQL 配置。"""
     from komari_bot.common.database_config import (
         DatabaseConfigSchema,
         load_database_config_from_file,
-        merge_database_config,
     )
 
-    shared = (
+    return (
         load_database_config_from_file(db_config_path)
         if db_config_path.exists()
         else DatabaseConfigSchema()
     )
-    return merge_database_config(shared, user_data_db_override)
 
 
-def read_sqlite_rows(sqlite_path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def read_sqlite_rows(
+    sqlite_path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """从 SQLite 读取源数据。"""
     if not sqlite_path.exists():
         raise FileNotFoundError(f"SQLite 文件不存在: {sqlite_path}")  # noqa: TRY003
@@ -309,9 +269,8 @@ async def migrate_to_postgres(
         await pool.close()
 
 
-async def main_async(sqlite_path: Path, config_path: Path, db_config_path: Path) -> None:
-    user_data_db_override = load_user_data_db_override(config_path)
-    db_config = resolve_db_config(user_data_db_override, db_config_path)
+async def main_async(sqlite_path: Path, db_config_path: Path) -> None:
+    db_config = resolve_db_config(db_config_path)
     if not db_config.pg_user or not db_config.pg_password:
         raise ValueError("pg_user/pg_password 未配置，无法迁移")  # noqa: TRY003
 
@@ -334,11 +293,6 @@ def parse_args() -> argparse.Namespace:
         help="SQLite 源文件路径，默认 user_data.db",
     )
     parser.add_argument(
-        "--config-path",
-        default="config/config_manager/user_data_config.json",
-        help="user_data 的 config_manager JSON 路径",
-    )
-    parser.add_argument(
         "--db-config-path",
         default="config/config_manager/database_config.json",
         help="共享 database_config JSON 路径",
@@ -351,7 +305,6 @@ def main() -> None:
     asyncio.run(
         main_async(
             sqlite_path=Path(args.sqlite_path),
-            config_path=Path(args.config_path),
             db_config_path=Path(args.db_config_path),
         )
     )

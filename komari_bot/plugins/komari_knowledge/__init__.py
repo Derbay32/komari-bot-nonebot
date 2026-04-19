@@ -9,7 +9,7 @@ from __future__ import annotations
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.database_config import get_effective_database_config
+from komari_bot.common.database_config import get_shared_database_config
 
 from .api import register_knowledge_api
 from .config_schema import DynamicConfigSchema
@@ -69,7 +69,7 @@ async def on_startup() -> None:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
         return
 
-    db_config = get_effective_database_config(config)
+    db_config = get_shared_database_config()
     if not db_config.pg_user or not db_config.pg_password:
         logger.warning(
             "[Komari Knowledge] 数据库用户名或密码未配置，跳过初始化。"

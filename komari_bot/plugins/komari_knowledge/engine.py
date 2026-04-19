@@ -19,9 +19,8 @@ from typing import Any, Final
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
-    get_effective_database_config,
+    get_shared_database_config,
     load_database_config_from_file,
-    merge_database_config,
 )
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
@@ -101,23 +100,22 @@ def get_config() -> DynamicConfigSchema:
     return state.standalone_config
 
 
-def get_db_config(config: DynamicConfigSchema) -> DatabaseConfigSchema:
+def get_db_config() -> DatabaseConfigSchema:
     """获取最终生效的数据库配置（兼容两种模式）。"""
     if state.nonebot_mode:
-        return get_effective_database_config(config)
+        return get_shared_database_config()
 
     shared_config_path = Path("config/config_manager/database_config.json")
     if shared_config_path.exists():
         try:
-            shared = load_database_config_from_file(shared_config_path)
-            return merge_database_config(shared, config)
+            return load_database_config_from_file(shared_config_path)
         except Exception as e:
             state.logger.warning(
-                "[Komari Knowledge] 共享数据库配置解析失败: %s，回退到本地配置",
+                "[Komari Knowledge] 共享数据库配置解析失败: %s，回退到默认共享配置",
                 e,
             )
 
-    return merge_database_config(DatabaseConfigSchema(), config)
+    return DatabaseConfigSchema()
 
 
 UNSET: Final[object] = object()
@@ -142,7 +140,7 @@ class KnowledgeEngine:
         state.logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
 
         # 获取配置
-        config = get_config()
+        get_config()
 
         try:
             # 1. 加载向量嵌入模型
@@ -157,7 +155,9 @@ class KnowledgeEngine:
                     EmbeddingService,
                 )
 
-                config_path = Path("config/config_manager/embedding_provider_config.json")
+                config_path = Path(
+                    "config/config_manager/embedding_provider_config.json"
+                )
                 if config_path.exists():
                     with Path.open(config_path, encoding="utf-8") as f:
                         data = json.load(f)
@@ -170,7 +170,7 @@ class KnowledgeEngine:
 
             # 2. 建立数据库连接池
             if self._pool is None:
-                db_config = get_db_config(config)
+                db_config = get_db_config()
                 self._pool = await create_postgres_pool(db_config, command_timeout=30)
                 state.logger.info("[Komari Knowledge] 数据库连接池已建立")
                 expected_dimension = self._resolve_expected_embedding_dimension()

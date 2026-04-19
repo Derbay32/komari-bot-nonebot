@@ -128,7 +128,9 @@ def test_initialize_bootstraps_schema_before_validation(monkeypatch: Any) -> Non
         events.append(("create_pool", command_timeout))
         return fake_pool
 
-    async def _fake_apply_schema(pg_pool: object, *, statements: tuple[str, ...]) -> None:
+    async def _fake_apply_schema(
+        pg_pool: object, *, statements: tuple[str, ...]
+    ) -> None:
         events.append(("apply_schema", pg_pool is fake_pool))
         assert "VECTOR(1536)" in statements[1]
 
@@ -152,7 +154,7 @@ def test_initialize_bootstraps_schema_before_validation(monkeypatch: Any) -> Non
     monkeypatch.setattr(
         engine_module,
         "get_db_config",
-        lambda _config: DatabaseConfigSchema(pg_user="user", pg_password="pass"),
+        lambda: DatabaseConfigSchema(pg_user="user", pg_password="pass"),
     )
     monkeypatch.setattr(engine_module, "create_postgres_pool", _fake_create_pool)
     monkeypatch.setattr(engine_module, "apply_schema_statements", _fake_apply_schema)

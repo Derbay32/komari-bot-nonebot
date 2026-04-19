@@ -24,8 +24,7 @@ from komari_bot.common.embedding_migration import (
     get_pool_key,
     load_embedding_config,
     migrate_table_embeddings,
-    resolve_knowledge_database_config,
-    resolve_memory_database_config,
+    resolve_shared_database_config,
 )
 from komari_bot.common.postgres import create_postgres_pool
 
@@ -39,8 +38,6 @@ logging.basicConfig(
 async def main_async(
     *,
     shared_db_config_path: Path,
-    knowledge_config_path: Path,
-    memory_config_path: Path,
     embedding_config_path: Path,
     targets: set[str],
     apply: bool,
@@ -53,18 +50,13 @@ async def main_async(
         target_dimension,
     )
 
-    knowledge_db_config = resolve_knowledge_database_config(
-        shared_config_path=shared_db_config_path,
-        knowledge_config_path=knowledge_config_path,
-    )
-    memory_db_config = resolve_memory_database_config(
-        shared_config_path=shared_db_config_path,
-        memory_config_path=memory_config_path,
+    shared_db_config = resolve_shared_database_config(
+        shared_config_path=shared_db_config_path
     )
 
     for label, config in (
-        ("knowledge", knowledge_db_config),
-        ("memory", memory_db_config),
+        ("knowledge", shared_db_config),
+        ("memory", shared_db_config),
     ):
         if label not in targets:
             continue
@@ -83,9 +75,7 @@ async def main_async(
     try:
 
         async def get_pool(config_key: str) -> Any:
-            config = (
-                knowledge_db_config if config_key == "knowledge" else memory_db_config
-            )
+            config = shared_db_config
             pool_key = get_pool_key(config)
             if pool_key not in pools:
                 logger.info(
@@ -140,18 +130,6 @@ def parse_args() -> argparse.Namespace:
         help="共享数据库配置路径",
     )
     parser.add_argument(
-        "--knowledge-config-path",
-        type=Path,
-        default=Path("config/config_manager/komari_knowledge_config.json"),
-        help="komari_knowledge 配置路径",
-    )
-    parser.add_argument(
-        "--memory-config-path",
-        type=Path,
-        default=Path("config/config_manager/komari_memory_config.json"),
-        help="komari_memory 配置路径",
-    )
-    parser.add_argument(
         "--embedding-config-path",
         type=Path,
         default=Path("config/config_manager/embedding_provider_config.json"),
@@ -198,8 +176,6 @@ def main() -> None:
     asyncio.run(
         main_async(
             shared_db_config_path=args.database_config_path,
-            knowledge_config_path=args.knowledge_config_path,
-            memory_config_path=args.memory_config_path,
             embedding_config_path=args.embedding_config_path,
             targets=set(args.targets or {"knowledge", "memory"}),
             apply=args.apply,

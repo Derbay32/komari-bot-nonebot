@@ -6,13 +6,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
     load_database_config_from_file,
-    merge_database_config,
 )
 from komari_bot.common.pgvector_schema import (
     get_vector_column_dimension_from_connection,
@@ -123,29 +121,12 @@ def load_embedding_config(config_path: Path) -> EmbeddingMigrationConfig:
     )
 
 
-def resolve_knowledge_database_config(
-    *,
-    shared_config_path: Path,
-    knowledge_config_path: Path,
-) -> DatabaseConfigSchema:
-    """Resolve the final DB config for komari_knowledge."""
-    knowledge_config = _load_optional_namespace(knowledge_config_path)
-    return _resolve_database_config(
-        shared_config_path=shared_config_path,
-        local_config=knowledge_config,
-    )
-
-
-def resolve_memory_database_config(
-    *,
-    shared_config_path: Path,
-    memory_config_path: Path,
-) -> DatabaseConfigSchema:
-    """Resolve the final DB config for komari_memory."""
-    memory_config = _load_optional_namespace(memory_config_path)
-    return _resolve_database_config(
-        shared_config_path=shared_config_path,
-        local_config=memory_config,
+def resolve_shared_database_config(*, shared_config_path: Path) -> DatabaseConfigSchema:
+    """Resolve the shared DB config used by all modules."""
+    return (
+        load_database_config_from_file(shared_config_path)
+        if shared_config_path.exists()
+        else DatabaseConfigSchema()
     )
 
 
@@ -279,10 +260,6 @@ async def migrate_table_embeddings(
         )
 
 
-def _load_optional_namespace(config_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(**_load_optional_json(config_path))
-
-
 def _load_optional_json(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
@@ -291,19 +268,6 @@ def _load_optional_json(config_path: Path) -> dict[str, Any]:
         msg = f"配置文件格式错误，期望 JSON object: {config_path}"
         raise TypeError(msg)
     return data
-
-
-def _resolve_database_config(
-    *,
-    shared_config_path: Path,
-    local_config: Any,
-) -> DatabaseConfigSchema:
-    shared_config = (
-        load_database_config_from_file(shared_config_path)
-        if shared_config_path.exists()
-        else DatabaseConfigSchema()
-    )
-    return merge_database_config(shared_config, local_config)
 
 
 async def _table_exists(conn: Any, table_name: str) -> bool:

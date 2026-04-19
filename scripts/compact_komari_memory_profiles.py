@@ -32,7 +32,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from komari_bot.common.database_config import (
     load_database_config_from_file,
-    merge_database_config,
 )
 from komari_bot.common.postgres import create_postgres_pool
 from komari_bot.common.profile_compaction import (
@@ -55,13 +54,6 @@ if not logging.getLogger().handlers:
 class StandaloneMemoryConfig(BaseModel):
     """脚本使用的最小 komari_memory 配置。"""
 
-    pg_host: str | None = Field(default=None)
-    pg_port: int | None = Field(default=None)
-    pg_database: str | None = Field(default=None)
-    pg_user: str | None = Field(default=None)
-    pg_password: str | None = Field(default=None)
-    pg_pool_min_size: int | None = Field(default=None)
-    pg_pool_max_size: int | None = Field(default=None)
     llm_model_summary: str = Field(default="gemini-2.5-flash-lite")
     llm_temperature_summary: float = Field(default=0.3)
     llm_max_tokens_summary: int = Field(default=2048)
@@ -383,11 +375,7 @@ async def run(
     if not str(llm_config.deepseek_api_token).strip():
         raise ValueError("llm_provider 缺少 deepseek_api_token，无法执行画像压缩")  # noqa: TRY003
 
-    effective_database_config = merge_database_config(
-        shared_database_config,
-        memory_config,
-    )
-    pool = await create_postgres_pool(effective_database_config, command_timeout=60)
+    pool = await create_postgres_pool(shared_database_config, command_timeout=60)
     client = DirectLLMClient(llm_config)
 
     try:
