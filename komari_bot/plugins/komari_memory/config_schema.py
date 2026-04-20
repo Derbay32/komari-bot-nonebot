@@ -28,13 +28,8 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # Redis 配置
-    redis_host: str = Field(default="localhost", description="Redis 主机地址")
-    redis_port: int = Field(default=6379, description="Redis 端口")
     redis_db: int = Field(
         default=1, description="Redis 数据库编号 (避免与其他插件冲突)"
-    )
-    redis_password: str = Field(
-        default="", description="Redis 密码 (空字符串表示无密码)"
     )
 
     # LLM 配置 - 对话模型（用于生成回复）

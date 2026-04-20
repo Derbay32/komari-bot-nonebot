@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import redis.asyncio as aioredis
 from nonebot import logger
 
+from komari_bot.common.database_config import get_shared_database_config
+
 from ..config_schema import KomariMemoryConfigSchema
 from .config_interface import get_config
 from .redis_keys import RedisKeys
@@ -49,13 +51,15 @@ class RedisManager:
 
     async def initialize(self) -> None:
         """初始化 Redis 连接。"""
+        db_config = get_shared_database_config()
+
         # 构建连接 URL
         password_part = (
-            f":{self.config.redis_password}@" if self.config.redis_password else ""
+            f":{db_config.redis_password}@" if db_config.redis_password else ""
         )
         redis_url = (
-            f"redis://{password_part}{self.config.redis_host}:"
-            f"{self.config.redis_port}/{self.config.redis_db}"
+            f"redis://{password_part}{db_config.redis_host}:"
+            f"{db_config.redis_port}/{self.config.redis_db}"
         )
 
         self._redis = await aioredis.from_url(

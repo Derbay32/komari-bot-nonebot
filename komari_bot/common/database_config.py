@@ -1,4 +1,4 @@
-"""Shared PostgreSQL config schema and resolution helpers."""
+"""共享数据库配置 schema 与读取辅助。"""
 
 from __future__ import annotations
 
@@ -32,6 +32,12 @@ class DatabaseConfigSchema(BaseModel):
     )
     pg_pool_max_size: int = Field(
         default=5, ge=1, le=50, description="PostgreSQL 连接池最大连接数"
+    )
+
+    redis_host: str = Field(default="localhost", description="Redis 主机地址")
+    redis_port: int = Field(default=6379, description="Redis 端口")
+    redis_password: str = Field(
+        default="", description="Redis 密码（空字符串表示无密码）"
     )
 
 
