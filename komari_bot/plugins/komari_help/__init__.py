@@ -78,7 +78,7 @@ if driver is not None:
             if config.auto_scan_on_startup:
                 updated_count = await scan_and_sync(engine)
                 logger.info(
-                    "[Komari Help] 启动扫描完成，同步 %s 条帮助条目", updated_count
+                    f"[Komari Help] 启动扫描完成，同步 {updated_count} 条帮助条目"
                 )
             logger.info("[Komari Help] 插件启动完成")
         except Exception as exc:

@@ -63,12 +63,10 @@ def _load_standalone_config() -> DynamicConfigSchema:
                 **json.loads(config_path.read_text(encoding="utf-8"))
             )
         except (json.JSONDecodeError, TypeError) as exc:
-            state.logger.warning(
-                "[Komari Help] 配置文件解析失败: %s，使用默认配置", exc
-            )
+            state.logger.warning(f"[Komari Help] 配置文件解析失败: {exc}，使用默认配置")
     else:
         state.logger.warning(
-            "[Komari Help] 配置文件不存在: %s，使用默认配置", config_path
+            f"[Komari Help] 配置文件不存在: {config_path}，使用默认配置"
         )
     return DynamicConfigSchema()
 
@@ -94,8 +92,7 @@ def get_db_config() -> DatabaseConfigSchema:
             return load_database_config_from_file(shared_config_path)
         except Exception as exc:
             state.logger.warning(
-                "[Komari Help] 共享数据库配置解析失败: %s，回退到默认共享配置",
-                exc,
+                f"[Komari Help] 共享数据库配置解析失败: {exc}，回退到默认共享配置"
             )
     return DatabaseConfigSchema()
 
@@ -192,9 +189,7 @@ class HelpEngine:
         )
         if build_help_embedding_index_statement(expected_dimension) is None:
             state.logger.warning(
-                "[Komari Help] embedding 维度 %s 超过 pgvector HNSW 上限 %s，已跳过 idx_komari_help_embedding，语义检索将退化为顺序扫描。",
-                expected_dimension,
-                PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
+                f"[Komari Help] embedding 维度 {expected_dimension} 超过 pgvector HNSW 上限 {PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS}，已跳过 idx_komari_help_embedding，语义检索将退化为顺序扫描。",
             )
 
     async def _validate_embedding_dimension(
