@@ -7,11 +7,7 @@
   "filter_min_length": 3,
   "filter_history_check_size": 50,
   "message_buffer_size": 200,
-  "bot_aliases": [
-    "小鞠",
-    "小鞠知花",
-    "komari"
-  ],
+  "bot_aliases": ["小鞠", "小鞠知花", "komari"],
   "scene_top_k": 4,
   "reply_threshold": 0.72,
   "timing_weight": 0.3,
@@ -32,7 +28,7 @@
   "embedding_instruction_query": "任务：将群聊消息编码为机器人回复场景检索向量。重点保留是否提问、是否请求机器人、情绪强度、信息密度和话题意图；忽略口头禅、语气词、无意义重复字符。",
   "embedding_instruction_scene": "任务：将候选场景编码为可与用户消息匹配的语义原型向量。突出场景核心意图、适用边界和区分点。",
   "rerank_instruction": "你在做群聊机器人决策精排。按语义匹配强度给候选打分：1) 记忆价值（MEANINGFUL vs NOISE）；2) 呼叫意图（CALL_DIRECT vs CALL_MENTION）；3) 场景匹配（SCENE_*）。优先语义，不因礼貌措辞或语气强弱偏置。",
-  "scene_persist_enabled": false,
+  "scene_persist_enabled": true,
   "scene_sync_poll_seconds": 30,
   "scene_keep_versions": 3
 }
