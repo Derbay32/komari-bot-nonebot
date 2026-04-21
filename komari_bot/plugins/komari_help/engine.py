@@ -447,6 +447,7 @@ class HelpEngine:
         keywords: list[str],
         category: HelpCategory = "feature",
         notes: str | None = None,
+        rebuild_index: bool = True,
     ) -> bool:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
@@ -454,7 +455,7 @@ class HelpEngine:
         async with self._pool.acquire() as conn:
             existing_row = await conn.fetchrow(
                 """
-                SELECT id, is_auto_generated
+                SELECT id, is_auto_generated, title, content, keywords
                 FROM komari_help
                 WHERE plugin_name = $1
                 ORDER BY is_auto_generated DESC, id ASC
@@ -465,6 +466,16 @@ class HelpEngine:
 
             if existing_row is not None and not bool(existing_row["is_auto_generated"]):
                 return False
+
+            if existing_row is not None:
+                existing_keywords = set(existing_row["keywords"] or [])
+                new_keywords = set(keywords)
+                if (
+                    str(existing_row["title"] or "") == title
+                    and str(existing_row["content"] or "") == content
+                    and existing_keywords == new_keywords
+                ):
+                    return False
 
             embedding = await self._get_embedding(f"{title}\n{content}")
             if existing_row is None:
@@ -506,7 +517,8 @@ class HelpEngine:
                     notes,
                     str(embedding),
                 )
-        await self._build_keyword_index()
+        if rebuild_index:
+            await self._build_keyword_index()
         return True
 
     async def get_help(self, hid: int) -> HelpEntry | None:

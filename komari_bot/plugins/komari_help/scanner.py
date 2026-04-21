@@ -78,7 +78,12 @@ async def scan_and_sync(engine: HelpEngine) -> int:
             keywords=_extract_keywords(plugin_name, title, description),
             category=_guess_category(usage),
             notes="自动扫描生成",
+            rebuild_index=False,
         )
         if changed:
             updated_count += 1
+
+    if updated_count > 0:
+        await engine._build_keyword_index()
+
     return updated_count
