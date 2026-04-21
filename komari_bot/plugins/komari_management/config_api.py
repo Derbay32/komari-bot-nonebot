@@ -28,6 +28,7 @@ class ConfigResourceSummary(BaseModel):
     display_name: str
     config_file: str
     fields: list[str]
+    field_descriptions: dict[str, str]
 
 
 class ConfigResourceDetail(ConfigResourceSummary):
@@ -75,6 +76,13 @@ def _get_fields(config: BaseModel) -> list[str]:
     return sorted(config.model_dump().keys())
 
 
+def _get_field_descriptions(config: BaseModel) -> dict[str, str]:
+    return {
+        field_name: (field_info.description or "")
+        for field_name, field_info in sorted(config.__class__.model_fields.items())
+    }
+
+
 def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSummary:
     manager = resource.manager_getter()
     config = manager.get()
@@ -83,6 +91,7 @@ def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSu
         display_name=resource.display_name,
         config_file=str(manager.config_file),
         fields=_get_fields(config),
+        field_descriptions=_get_field_descriptions(config),
     )
 
 
@@ -94,6 +103,7 @@ def _build_resource_detail(resource: ManagedConfigResource) -> ConfigResourceDet
         display_name=resource.display_name,
         config_file=str(manager.config_file),
         fields=_get_fields(config),
+        field_descriptions=_get_field_descriptions(config),
         values=config.model_dump(),
     )
 

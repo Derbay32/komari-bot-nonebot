@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from komari_bot.plugins.komari_management.config_api import (
     API_PREFIX,
@@ -22,9 +22,12 @@ if TYPE_CHECKING:
 
 
 class _ConfigSchema(BaseModel):
-    plugin_enable: bool = True
-    api_token: str = "secret"
-    last_updated: str = "2026-04-14T00:00:00+08:00"
+    plugin_enable: bool = Field(default=True, description="插件启用状态")
+    api_token: str = Field(default="secret", description="管理接口令牌")
+    last_updated: str = Field(
+        default="2026-04-14T00:00:00+08:00",
+        description="最后更新时间",
+    )
 
 
 class _FakeConfigManager:
@@ -83,6 +86,11 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     payload = listed.json()
     assert payload["total"] == 1
     assert payload["items"][0]["resource_id"] == "komari_management"
+    assert payload["items"][0]["field_descriptions"] == {
+        "api_token": "管理接口令牌",
+        "last_updated": "最后更新时间",
+        "plugin_enable": "插件启用状态",
+    }
 
 
 @pytest.mark.asyncio
@@ -107,9 +115,12 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
 
     assert detail.status_code == 200
     assert detail.json()["values"]["api_token"] == "secret"
+    assert detail.json()["field_descriptions"]["api_token"] == "管理接口令牌"
     assert updated.status_code == 200
     assert updated.json()["values"]["api_token"] == "changed-token"
+    assert updated.json()["field_descriptions"]["api_token"] == "管理接口令牌"
     assert reloaded.status_code == 200
+    assert reloaded.json()["field_descriptions"]["plugin_enable"] == "插件启用状态"
     assert manager.reload_count == 1
 
 
