@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -115,16 +114,12 @@ def _create_onebot_bot(ctx: Any) -> Bot:
 
 
 @pytest.mark.asyncio
-async def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_text(
+async def test_jrhg_function_queries_daily_favor_and_ignores_tail_text(
     app: App,
     jrhg_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    interaction_history = {
-        "summary": "最近常找小鞠聊天",
-        "records": [{"event": "投喂", "result": "开心"}],
-    }
-    captured_prompts: list[dict[str, Any]] = []
+    captured_calls: list[dict[str, Any]] = []
 
     async def _generate_or_update_favorability(_user_id: str) -> object:
         return SimpleNamespace(
@@ -139,18 +134,14 @@ async def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_te
         user_nickname: str,
         daily_favor: int,
     ) -> str:
-        del user_nickname, daily_favor
-        return ai_response
-
-    async def _get_interaction_history(**_kwargs: object) -> dict[str, Any]:
-        return interaction_history
-
-    def _build_prompt(**kwargs: Any) -> list[dict[str, str]]:
-        captured_prompts.append(kwargs)
-        return [{"role": "user", "content": "prompt"}]
-
-    async def _generate_reply(**_kwargs: object) -> str:
-        return "生成回复"
+        captured_calls.append(
+            {
+                "ai_response": ai_response,
+                "user_nickname": user_nickname,
+                "daily_favor": daily_favor,
+            }
+        )
+        return f"{user_nickname}:{daily_favor}"
 
     monkeypatch.setattr(
         jrhg_module,
@@ -158,19 +149,6 @@ async def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_te
         _generate_or_update_favorability,
     )
     monkeypatch.setattr(jrhg_module, "format_favor_response", _format_favor_response)
-    monkeypatch.setattr(
-        jrhg_module,
-        "komari_memory_plugin",
-        SimpleNamespace(
-            get_plugin_manager=lambda: SimpleNamespace(
-                memory=SimpleNamespace(
-                    get_interaction_history=_get_interaction_history,
-                )
-            )
-        ),
-    )
-    monkeypatch.setattr(jrhg_module, "build_prompt", _build_prompt)
-    monkeypatch.setattr(jrhg_module, "generate_reply", _generate_reply)
 
     async with app.test_matcher(jrhg_module.jrhg) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -179,30 +157,36 @@ async def test_jrhg_function_reads_group_interaction_history_and_ignores_tail_te
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=jrhg_module.jrhg)
         ctx.should_pass_rule(matcher=jrhg_module.jrhg)
-        ctx.should_call_send(event, "生成回复", bot=bot)
+        ctx.should_call_send(event, "阿虚:73", bot=bot)
         ctx.should_finished()
 
         event_with_tail = _build_group_event(".jrhg 任意尾随文本", message_id=2)
         ctx.receive_event(bot, event_with_tail)
         ctx.should_pass_permission(matcher=jrhg_module.jrhg)
         ctx.should_pass_rule(matcher=jrhg_module.jrhg)
-        ctx.should_call_send(event_with_tail, "生成回复", bot=bot)
+        ctx.should_call_send(event_with_tail, "阿虚:73", bot=bot)
         ctx.should_finished()
 
-    assert captured_prompts == [
-        {"daily_favor": 73, "interaction_history": interaction_history},
-        {"daily_favor": 73, "interaction_history": interaction_history},
+    assert captured_calls == [
+        {
+            "ai_response": "",
+            "user_nickname": "阿虚",
+            "daily_favor": 73,
+        },
+        {
+            "ai_response": "",
+            "user_nickname": "阿虚",
+            "daily_favor": 73,
+        },
     ]
 
 
 @pytest.mark.asyncio
-async def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
+async def test_jrhg_function_private_chat_uses_formatted_response(
     app: App,
     jrhg_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured_prompts: list[dict[str, Any]] = []
-
     async def _generate_or_update_favorability(_user_id: str) -> object:
         return SimpleNamespace(
             daily_favor=73,
@@ -216,15 +200,8 @@ async def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
         user_nickname: str,
         daily_favor: int,
     ) -> str:
-        del user_nickname, daily_favor
-        return ai_response
-
-    def _build_prompt(**kwargs: Any) -> list[dict[str, str]]:
-        captured_prompts.append(kwargs)
-        return [{"role": "user", "content": "prompt"}]
-
-    async def _generate_reply(**_kwargs: object) -> str:
-        raise RuntimeError("boom")
+        del ai_response
+        return f"{user_nickname} 今日好感 {daily_favor}"
 
     monkeypatch.setattr(
         jrhg_module,
@@ -232,13 +209,6 @@ async def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
         _generate_or_update_favorability,
     )
     monkeypatch.setattr(jrhg_module, "format_favor_response", _format_favor_response)
-    monkeypatch.setattr(
-        jrhg_module,
-        "komari_memory_plugin",
-        SimpleNamespace(get_plugin_manager=lambda: None),
-    )
-    monkeypatch.setattr(jrhg_module, "build_prompt", _build_prompt)
-    monkeypatch.setattr(jrhg_module, "generate_reply", _generate_reply)
 
     async with app.test_matcher(jrhg_module.jrhg) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -246,37 +216,5 @@ async def test_jrhg_function_private_chat_uses_fallback_when_llm_fails(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=jrhg_module.jrhg)
         ctx.should_pass_rule(matcher=jrhg_module.jrhg)
-        ctx.should_call_send(
-            event,
-            jrhg_module._get_response(73, "阿虚"),
-            bot=bot,
-        )
+        ctx.should_call_send(event, "阿虚 今日好感 73", bot=bot)
         ctx.should_finished()
-
-    assert captured_prompts == [{"daily_favor": 73, "interaction_history": None}]
-
-
-def test_load_interaction_history_returns_none_when_memory_has_no_record(
-    jrhg_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _get_interaction_history(**_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(
-        jrhg_module,
-        "komari_memory_plugin",
-        SimpleNamespace(
-            get_plugin_manager=lambda: SimpleNamespace(
-                memory=SimpleNamespace(
-                    get_interaction_history=_get_interaction_history,
-                )
-            )
-        ),
-    )
-
-    result = asyncio.run(
-        jrhg_module._load_interaction_history(user_id="10001", group_id="114514")
-    )
-
-    assert result is None

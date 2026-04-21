@@ -16,7 +16,6 @@ from komari_bot.plugins.group_history_summary.config_schema import (
 from komari_bot.plugins.group_history_summary.prompt_template import (
     DEFAULTS as GROUP_HISTORY_PROMPT_DEFAULTS,
 )
-from komari_bot.plugins.jrhg.prompt_template import DEFAULTS as JRHG_PROMPT_DEFAULTS
 from komari_bot.plugins.komari_chat.services.prompt_template import (
     _DEFAULTS as KOMARI_CHAT_PROMPT_DEFAULTS,
 )
@@ -188,12 +187,6 @@ def _load_management_components() -> ManagementApiComponents:
                 display_name="Group History Summary Prompt",
                 file_path=Path("config") / "prompts" / "group_history_summary.yaml",
                 defaults=GROUP_HISTORY_PROMPT_DEFAULTS,
-            ),
-            ManagedPromptResource(
-                resource_id="jrhg",
-                display_name="JRHG Prompt",
-                file_path=Path("config") / "prompts" / "jrhg.yaml",
-                defaults=JRHG_PROMPT_DEFAULTS,
             ),
         ),
     )
