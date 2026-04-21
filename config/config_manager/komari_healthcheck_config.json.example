@@ -1,0 +1,8 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-04-21T22:30:00+08:00",
+  "plugin_enable": true,
+  "endpoint_path": "/health",
+  "online_message": "OK",
+  "offline_message": "Bot is offline"
+}
