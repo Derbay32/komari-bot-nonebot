@@ -40,6 +40,12 @@ class DynamicConfigSchema(BaseModel):
     default_result_limit: int = Field(
         default=3, ge=1, le=10, description="命令默认返回数量"
     )
+    max_reply_result_count: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="检索回复中最多展示的帮助文档数量",
+    )
 
     query_rewrite_rules: dict[str, str] = Field(
         default_factory=dict,

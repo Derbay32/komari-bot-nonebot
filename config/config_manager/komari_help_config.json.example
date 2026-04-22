@@ -9,6 +9,7 @@
   "layer2_limit": 2,
   "total_limit": 5,
   "default_result_limit": 3,
+  "max_reply_result_count": 3,
   "query_rewrite_rules": {
     "怎么": "如何",
     "帮我": "如何"
