@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 from .engine import get_config
 
 if TYPE_CHECKING:
-    from .models import HelpSearchResult
+    from .models import HelpEntry, HelpSearchResult
+
+LIST_PAGE_SIZE = 10
 
 
 def category_emoji(category: str) -> str:
@@ -40,11 +42,24 @@ def format_results(results: list[HelpSearchResult]) -> str:
         emoji = (
             f"{category_emoji(item.category)} " if config.show_category_emoji else ""
         )
-        lines.append(
-            f"{emoji}{item.title}"
-            + (f" ({item.plugin_name})" if item.plugin_name else "")
-        )
+        lines.append(f"{emoji}{item.title}")
         lines.extend(f"  {line}" for line in format_content_lines(item.content))
     if len(results) > len(display_results):
         lines.extend(["", f"……其余 {len(results) - len(display_results)} 条结果已省略"])
+    return "\n".join(lines)
+
+
+def format_list_page(items: list[HelpEntry], total: int, page: int) -> str:
+    total_pages = max((total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE, 1)
+    lines = [
+        f"📚 当前帮助条目共 {total} 条（第 {page}/{total_pages} 页）",
+        "━━━━━━━━━━━━━━━",
+    ]
+    config = get_config()
+    for item in items:
+        prefix = category_emoji(item.category) if config.show_category_emoji else "•"
+        lines.append(f"{prefix} {item.title}")
+    if page < total_pages:
+        lines.append("")
+        lines.append(f"查看下一页请使用 .docs list {page + 1}")
     return "\n".join(lines)

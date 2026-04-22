@@ -9,14 +9,19 @@ from nonebot.adapters.onebot.v11 import Message  # noqa: TC002
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
-from .engine import get_config, get_engine
-from .rendering import category_emoji, format_results, get_search_result_limit
+from .engine import get_engine
+from .rendering import (
+    LIST_PAGE_SIZE,
+    format_list_page,
+    format_results,
+    get_search_result_limit,
+)
 from .scanner import scan_and_sync
 
-help_cmd = on_command("help", aliases={"帮助"}, priority=10, block=True)
-help_list_cmd = on_command(("help", "list"), priority=9, block=True)
+help_cmd = on_command("docs", aliases={"帮助"}, priority=10, block=True)
+help_list_cmd = on_command(("docs", "list"), priority=9, block=True)
 help_refresh_cmd = on_command(
-    ("help", "refresh"),
+    ("docs", "refresh"),
     permission=SUPERUSER,
     priority=5,
     block=True,
@@ -50,7 +55,9 @@ async def handle_help(args: Message = CommandArg()) -> None:
     if engine is None:
         await help_cmd.finish("帮助引擎尚未初始化，请稍后再试。")
     if not query:
-        await help_cmd.finish(await _build_overview())
+        await help_cmd.finish(
+            "请简单描述你需要查询的指令（如指令本体、或指令能做什么）"
+        )
 
     results = await engine.search(query, limit=get_search_result_limit())
     if not results:
@@ -59,23 +66,32 @@ async def handle_help(args: Message = CommandArg()) -> None:
 
 
 @help_list_cmd.handle()
-async def handle_help_list() -> None:
+async def handle_help_list(args: Message = CommandArg()) -> None:
     engine = get_engine()
     if engine is None:
         await help_list_cmd.finish("帮助引擎尚未初始化，请稍后再试。")
 
-    items, total = await engine.list_help(limit=100, offset=0)
+    raw_page = args.extract_plain_text().strip()
+    page = 1
+    if raw_page:
+        try:
+            page = int(raw_page)
+        except ValueError:
+            await help_list_cmd.finish("页码必须是正整数。")
+        if page < 1:
+            await help_list_cmd.finish("页码必须是正整数。")
+
+    items, total = await engine.list_help(
+        limit=LIST_PAGE_SIZE,
+        offset=(page - 1) * LIST_PAGE_SIZE,
+    )
     if not items:
+        if total > 0:
+            total_pages = (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
+            await help_list_cmd.finish(f"第 {page} 页不存在，当前共 {total_pages} 页。")
         await help_list_cmd.finish("当前还没有可用的帮助条目。")
 
-    lines = [f"📚 当前帮助条目共 {total} 条", "━━━━━━━━━━━━━━━"]
-    for item in items:
-        prefix = (
-            category_emoji(item.category) if get_config().show_category_emoji else "•"
-        )
-        suffix = f" ({item.plugin_name})" if item.plugin_name else ""
-        lines.append(f"{prefix} {item.title}{suffix}")
-    await help_list_cmd.finish("\n".join(lines))
+    await help_list_cmd.finish(format_list_page(items, total, page))
 
 
 @help_refresh_cmd.handle()
