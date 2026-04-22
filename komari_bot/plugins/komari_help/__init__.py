@@ -19,7 +19,7 @@ config_manager_plugin = require("config_manager")
 try:
     require("embedding_provider")
 except RuntimeError as exc:
-    logger.warning("[Komari Help] embedding_provider 依赖未就绪: %s", exc)
+    logger.warning(f"[Komari Help] embedding_provider 依赖未就绪: {exc}")
 
 try:
     driver = get_driver()
@@ -35,7 +35,7 @@ config_manager = config_manager_plugin.get_config_manager(
 __plugin_meta__ = PluginMetadata(
     name="komari-help",
     description="帮助文档查询 - 通过自然语言查询 bot 使用帮助",
-    usage="/help [查询内容] — 查询帮助\n/help list — 列出所有帮助\n/help refresh — 重新扫描插件信息",
+    usage=".help [查询内容] — 查询帮助\n.help list — 列出所有帮助\n.help refresh — 重新扫描插件信息",
     config=DynamicConfigSchema,
 )
 
