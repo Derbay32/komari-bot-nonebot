@@ -610,6 +610,35 @@ class HelpEngine:
             rows = await conn.fetch(data_query, *params, limit, offset)
         return [self._build_help_entry(dict(row)) for row in rows], int(total)
 
+    async def delete_auto_generated_help_by_plugins(
+        self,
+        plugin_names: set[str],
+        *,
+        rebuild_index: bool = True,
+    ) -> int:
+        normalized_plugin_names = {
+            plugin_name.strip() for plugin_name in plugin_names if plugin_name.strip()
+        }
+        if not normalized_plugin_names:
+            return 0
+        if self._pool is None:
+            raise RuntimeError("数据库连接池未初始化")
+
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM komari_help
+                WHERE plugin_name = ANY($1::text[])
+                  AND is_auto_generated = TRUE
+                """,
+                sorted(normalized_plugin_names),
+            )
+
+        deleted_count = int(str(result).split()[-1]) if result else 0
+        if deleted_count > 0 and rebuild_index:
+            await self._build_keyword_index()
+        return deleted_count
+
     async def delete_help(self, hid: int) -> bool:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")

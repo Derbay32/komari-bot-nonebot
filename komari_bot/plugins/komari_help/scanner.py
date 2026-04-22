@@ -58,6 +58,10 @@ async def scan_and_sync(engine: HelpEngine) -> int:
     """扫描所有已加载插件并同步自动生成帮助条目。"""
     updated_count = 0
     disabled_plugins = get_disabled_auto_help_plugins()
+    deleted_count = await engine.delete_auto_generated_help_by_plugins(
+        disabled_plugins,
+        rebuild_index=False,
+    )
 
     for plugin in get_loaded_plugins():
         metadata = _get_plugin_meta(plugin)
@@ -89,7 +93,7 @@ async def scan_and_sync(engine: HelpEngine) -> int:
         if changed:
             updated_count += 1
 
-    if updated_count > 0:
+    if updated_count > 0 or deleted_count > 0:
         await engine._build_keyword_index()
 
     return updated_count

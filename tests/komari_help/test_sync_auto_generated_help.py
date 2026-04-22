@@ -41,6 +41,30 @@ class _FakePool:
         del exc_type, exc, tb
 
 
+class _FakeDeleteConn:
+    def __init__(self, result: str) -> None:
+        self.result = result
+        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.execute_calls.append((query, args))
+        return self.result
+
+
+class _FakeDeletePool:
+    def __init__(self, conn: _FakeDeleteConn) -> None:
+        self.conn = conn
+
+    def acquire(self) -> "_FakeDeletePool":
+        return self
+
+    async def __aenter__(self) -> _FakeDeleteConn:
+        return self.conn
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
+
 def test_sync_auto_generated_help_skips_unchanged_content() -> None:
     engine = HelpEngine()
     conn = _FakeConn(
@@ -151,6 +175,16 @@ def test_scan_and_sync_rebuilds_keyword_index_once(
         def __init__(self) -> None:
             self.sync_calls: list[dict[str, object]] = []
             self.index_rebuild_count = 0
+            self.delete_calls: list[tuple[set[str], bool]] = []
+
+        async def delete_auto_generated_help_by_plugins(
+            self,
+            plugin_names: set[str],
+            *,
+            rebuild_index: bool = True,
+        ) -> int:
+            self.delete_calls.append((plugin_names, rebuild_index))
+            return 0
 
         async def sync_auto_generated_help(self, **kwargs: object) -> bool:
             self.sync_calls.append(kwargs)
@@ -168,6 +202,7 @@ def test_scan_and_sync_rebuilds_keyword_index_once(
     updated_count = asyncio.run(scan_and_sync(cast("HelpEngine", engine)))
 
     assert updated_count == 1
+    assert engine.delete_calls == [(set(), False)]
     assert [call["rebuild_index"] for call in engine.sync_calls] == [False, False]
     assert engine.index_rebuild_count == 1
 
@@ -198,6 +233,16 @@ def test_scan_and_sync_skips_disabled_plugins(
         def __init__(self) -> None:
             self.sync_calls: list[dict[str, object]] = []
             self.index_rebuild_count = 0
+            self.delete_calls: list[tuple[set[str], bool]] = []
+
+        async def delete_auto_generated_help_by_plugins(
+            self,
+            plugin_names: set[str],
+            *,
+            rebuild_index: bool = True,
+        ) -> int:
+            self.delete_calls.append((plugin_names, rebuild_index))
+            return 1 if "demo_plugin" in plugin_names else 0
 
         async def sync_auto_generated_help(self, **kwargs: object) -> bool:
             self.sync_calls.append(kwargs)
@@ -219,6 +264,7 @@ def test_scan_and_sync_skips_disabled_plugins(
     updated_count = asyncio.run(scan_and_sync(cast("HelpEngine", engine)))
 
     assert updated_count == 1
+    assert engine.delete_calls == [({"demo_plugin"}, False)]
     assert [call["plugin_name"] for call in engine.sync_calls] == ["enabled_plugin"]
     assert engine.index_rebuild_count == 1
 
@@ -243,3 +289,70 @@ def test_sync_auto_generated_help_returns_false_for_disabled_plugin(
     )
 
     assert changed is False
+
+
+def test_delete_auto_generated_help_by_plugins_only_removes_auto_generated() -> None:
+    engine = HelpEngine()
+    conn = _FakeDeleteConn("DELETE 2")
+    engine._pool = _FakeDeletePool(conn)
+
+    rebuilt = 0
+
+    async def _fake_build_keyword_index() -> None:
+        nonlocal rebuilt
+        rebuilt += 1
+
+    engine._build_keyword_index = _fake_build_keyword_index  # type: ignore[method-assign]
+
+    deleted_count = asyncio.run(
+        engine.delete_auto_generated_help_by_plugins(
+            {"demo_plugin", "other_plugin"},
+        )
+    )
+
+    assert deleted_count == 2
+    delete_query, delete_args = conn.execute_calls[0]
+    assert "DELETE FROM komari_help" in delete_query
+    assert "is_auto_generated = TRUE" in delete_query
+    assert delete_args == (["demo_plugin", "other_plugin"],)
+    assert rebuilt == 1
+
+
+def test_scan_and_sync_rebuilds_index_when_only_disabled_cleanup_happens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.index_rebuild_count = 0
+            self.delete_calls: list[tuple[set[str], bool]] = []
+
+        async def delete_auto_generated_help_by_plugins(
+            self,
+            plugin_names: set[str],
+            *,
+            rebuild_index: bool = True,
+        ) -> int:
+            self.delete_calls.append((plugin_names, rebuild_index))
+            return 2
+
+        async def sync_auto_generated_help(self, **_kwargs: object) -> bool:
+            raise AssertionError
+
+        async def _build_keyword_index(self) -> None:
+            self.index_rebuild_count += 1
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_help.scanner.get_loaded_plugins",
+        list,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_help.scanner.get_disabled_auto_help_plugins",
+        lambda: {"demo_plugin"},
+    )
+    engine = _FakeEngine()
+
+    updated_count = asyncio.run(scan_and_sync(cast("HelpEngine", engine)))
+
+    assert updated_count == 0
+    assert engine.delete_calls == [({"demo_plugin"}, False)]
+    assert engine.index_rebuild_count == 1
