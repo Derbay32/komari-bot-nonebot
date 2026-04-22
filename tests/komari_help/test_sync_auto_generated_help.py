@@ -170,3 +170,76 @@ def test_scan_and_sync_rebuilds_keyword_index_once(
     assert updated_count == 1
     assert [call["rebuild_index"] for call in engine.sync_calls] == [False, False]
     assert engine.index_rebuild_count == 1
+
+
+def test_scan_and_sync_skips_disabled_plugins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins = [
+        SimpleNamespace(
+            name="demo_plugin",
+            metadata=SimpleNamespace(
+                name="演示插件",
+                description="提供演示命令",
+                usage="/demo help",
+            ),
+        ),
+        SimpleNamespace(
+            name="enabled_plugin",
+            metadata=SimpleNamespace(
+                name="可用插件",
+                description="仍会被同步",
+                usage="/enabled help",
+            ),
+        ),
+    ]
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.sync_calls: list[dict[str, object]] = []
+            self.index_rebuild_count = 0
+
+        async def sync_auto_generated_help(self, **kwargs: object) -> bool:
+            self.sync_calls.append(kwargs)
+            return True
+
+        async def _build_keyword_index(self) -> None:
+            self.index_rebuild_count += 1
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_help.scanner.get_loaded_plugins",
+        lambda: plugins,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_help.scanner.get_disabled_auto_help_plugins",
+        lambda: {"demo_plugin"},
+    )
+    engine = _FakeEngine()
+
+    updated_count = asyncio.run(scan_and_sync(cast("HelpEngine", engine)))
+
+    assert updated_count == 1
+    assert [call["plugin_name"] for call in engine.sync_calls] == ["enabled_plugin"]
+    assert engine.index_rebuild_count == 1
+
+
+def test_sync_auto_generated_help_returns_false_for_disabled_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = HelpEngine()
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_help.engine.get_disabled_auto_help_plugins",
+        lambda: {"demo_plugin"},
+    )
+
+    changed = asyncio.run(
+        engine.sync_auto_generated_help(
+            plugin_name="demo_plugin",
+            title="演示插件",
+            content="/demo help",
+            keywords=["演示", "帮助"],
+        )
+    )
+
+    assert changed is False

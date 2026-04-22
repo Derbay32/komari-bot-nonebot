@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot.plugin import get_loaded_plugins
 
+from .engine import get_disabled_auto_help_plugins
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -55,6 +57,8 @@ def _guess_category(usage: str | None) -> HelpCategory:
 async def scan_and_sync(engine: HelpEngine) -> int:
     """扫描所有已加载插件并同步自动生成帮助条目。"""
     updated_count = 0
+    disabled_plugins = get_disabled_auto_help_plugins()
+
     for plugin in get_loaded_plugins():
         metadata = _get_plugin_meta(plugin)
         if metadata is None:
@@ -62,6 +66,8 @@ async def scan_and_sync(engine: HelpEngine) -> int:
 
         plugin_name = getattr(plugin, "name", None)
         if not isinstance(plugin_name, str) or not plugin_name.strip():
+            continue
+        if plugin_name in disabled_plugins:
             continue
 
         title = str(getattr(metadata, "name", plugin_name)).strip() or plugin_name

@@ -14,6 +14,20 @@
     "帮我": "如何"
   },
   "auto_scan_on_startup": true,
+  "disabled_auto_help_plugins": [
+    "config_manager",
+    "embedding_provider",
+    "komari_chat",
+    "komari_decision",
+    "komari_healthcheck",
+    "komari_knowledge",
+    "komari_management",
+    "komari_memory",
+    "komari_sentry",
+    "llm_provider",
+    "permission_manager",
+    "user_data"
+  ],
   "show_category_emoji": true,
   "max_content_preview_length": 100
 }

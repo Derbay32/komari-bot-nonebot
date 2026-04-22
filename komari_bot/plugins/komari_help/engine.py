@@ -97,6 +97,13 @@ def get_db_config() -> DatabaseConfigSchema:
     return DatabaseConfigSchema()
 
 
+def get_disabled_auto_help_plugins() -> set[str]:
+    raw_value = getattr(get_config(), "disabled_auto_help_plugins", [])
+    if not isinstance(raw_value, list):
+        return set()
+    return {str(plugin_name) for plugin_name in raw_value if str(plugin_name).strip()}
+
+
 UNSET: Final[object] = object()
 
 
@@ -449,6 +456,9 @@ class HelpEngine:
         notes: str | None = None,
         rebuild_index: bool = True,
     ) -> bool:
+        if plugin_name in get_disabled_auto_help_plugins():
+            return False
+
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 

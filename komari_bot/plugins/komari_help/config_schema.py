@@ -48,6 +48,10 @@ class DynamicConfigSchema(BaseModel):
     auto_scan_on_startup: bool = Field(
         default=True, description="启动时是否自动扫描插件元数据"
     )
+    disabled_auto_help_plugins: list[str] = Field(
+        default_factory=list,
+        description="禁止自动生成帮助文档的插件名列表",
+    )
     show_category_emoji: bool = Field(
         default=True, description="展示时是否显示分类 emoji"
     )
@@ -58,7 +62,12 @@ class DynamicConfigSchema(BaseModel):
         description="内容预览最大长度",
     )
 
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
+    @field_validator(
+        "user_whitelist",
+        "group_whitelist",
+        "disabled_auto_help_plugins",
+        mode="before",
+    )
     @classmethod
     def parse_list_string(cls, value: Any) -> Any:
         if isinstance(value, str):
