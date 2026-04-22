@@ -138,6 +138,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/llm-provider/v1/reply-logs" in route_paths
     assert "/api/komari-management-config/v1/resources" in route_paths
     assert "/api/komari-management-prompt/v1/resources" in route_paths
+    assert "/api/komari-announce/v1/groups" in route_paths
+    assert "/api/komari-announce/v1/maintenance" in route_paths
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
@@ -153,6 +155,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
     assert "/api/komari-management-config/v1/resources" in schema["paths"]
     assert "/api/komari-management-prompt/v1/resources" in schema["paths"]
+    assert "/api/komari-announce/v1/groups" in schema["paths"]
+    assert "/api/komari-announce/v1/maintenance" in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(
         item.get("type") == "http" and item.get("scheme") == "bearer"
@@ -161,7 +165,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert logger.info_messages[-2] == (
         "[Komari Management] 管理 API 已注册: "
         "/api/komari-knowledge/v1, /api/komari-help/v1, /api/komari-memory/v1, /api/llm-provider/v1, "
-        "/api/komari-management-config/v1, /api/komari-management-prompt/v1"
+        "/api/komari-management-config/v1, /api/komari-management-prompt/v1, /api/komari-announce/v1"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "

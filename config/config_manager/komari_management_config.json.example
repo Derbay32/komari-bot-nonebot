@@ -3,7 +3,6 @@
   "last_updated": "2026-04-11T18:30:00+08:00",
   "plugin_enable": true,
   "api_token": "请替换为你的管理令牌",
-  "api_allowed_origins": [
-    "http://localhost:3000"
-  ]
+  "api_allowed_origins": ["http://localhost:3000"],
+  "announce_status_page_url": "https://your.status.page/url/here"
 }

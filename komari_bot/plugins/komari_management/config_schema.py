@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
+
 
 class DynamicConfigSchema(BaseModel):
     """Komari Management 配置模型。"""
@@ -23,6 +25,10 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list,
         description="允许访问管理 API 的前端 Origin 白名单",
     )
+    announce_status_page_url: str = Field(
+        default=DEFAULT_ANNOUNCE_STATUS_PAGE_URL,
+        description="维护通知中使用的状态页面链接",
+    )
 
     @field_validator("api_allowed_origins", mode="before")
     @classmethod
@@ -37,3 +43,13 @@ class DynamicConfigSchema(BaseModel):
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("announce_status_page_url")
+    @classmethod
+    def validate_announce_status_page_url(cls, value: str) -> str:
+        """校验维护通知状态页链接。"""
+        normalized = value.strip()
+        if not normalized:
+            msg = "announce_status_page_url 不能为空"
+            raise ValueError(msg)
+        return normalized
