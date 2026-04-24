@@ -122,11 +122,38 @@ async def _is_summary_request(message_text: str) -> bool:
         logger.exception("[GroupHistorySummary] scene 判定失败，回退关键词兜底")
         return False
 
-    return (
-        rank_result.best_scene_id == SUMMARY_SCENE_ID
-        and rank_result.best_scene_score >= 0.6
-        and rank_result.meaningful_score >= rank_result.noise_score
+    logger.info(
+        "[SummaryCheck] rerank结果: best_scene={}, score={:.4f}, "
+        "meaningful={:.4f}, noise={:.4f}",
+        rank_result.best_scene_id,
+        rank_result.best_scene_score,
+        rank_result.meaningful_score,
+        rank_result.noise_score,
     )
+
+    is_summary_request = False
+    if rank_result.best_scene_id != SUMMARY_SCENE_ID:
+        logger.info(
+            "[SummaryCheck] 失败: best_scene_id={} (期望={})",
+            rank_result.best_scene_id,
+            SUMMARY_SCENE_ID,
+        )
+    elif rank_result.best_scene_score < 0.6:
+        logger.info(
+            "[SummaryCheck] 失败: best_scene_score={:.4f} < 0.6",
+            rank_result.best_scene_score,
+        )
+    elif rank_result.meaningful_score < rank_result.noise_score:
+        logger.info(
+            "[SummaryCheck] 失败: meaningful={:.4f} < noise={:.4f}",
+            rank_result.meaningful_score,
+            rank_result.noise_score,
+        )
+    else:
+        logger.info("[SummaryCheck] 全部条件满足，确认为总结请求")
+        is_summary_request = True
+
+    return is_summary_request
 
 
 @summary_matcher.handle()
