@@ -270,15 +270,8 @@ def _serialize_tool_result(result: SummaryToolResult) -> str:
 
 def _build_planning_messages(user_request: str) -> list[dict[str, Any]]:
     template = get_template()
-    planning_instruction = (
-        "你现在负责先规划该取哪些聊天记录。"
-        "不要直接写总结正文。"
-        "优先调用工具获取真实消息，再基于工具结果决定是否继续取数。"
-        "如果已经拿到足够消息，就用一句简短中文说明规划完成。"
-    )
     return [
-        {"role": "system", "content": template["system_prompt"]},
-        {"role": "system", "content": planning_instruction},
+        {"role": "system", "content": template["planning_system_prompt"]},
         {"role": "user", "content": user_request},
     ]
 
