@@ -91,6 +91,13 @@ class DeepSeekClient(BaseLLMClient):
             self._raise_invalid_response()
 
         content = getattr(message, "content", None) or ""
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is None:
+            message_extra = getattr(message, "model_extra", None)
+            if isinstance(message_extra, dict):
+                reasoning_content = message_extra.get("reasoning_content")
+        if reasoning_content is not None:
+            reasoning_content = str(reasoning_content).strip() or None
         tool_calls: list[LLMToolCallSchema] = []
         raw_tool_calls = getattr(message, "tool_calls", None) or []
         for raw_tool_call in raw_tool_calls:
@@ -115,6 +122,7 @@ class DeepSeekClient(BaseLLMClient):
         finish_reason = getattr(choice, "finish_reason", None)
         return LLMCompletionResultSchema(
             content=content.strip(),
+            reasoning_content=reasoning_content,
             tool_calls=tool_calls,
             finish_reason=str(finish_reason) if finish_reason is not None else None,
         )
@@ -218,8 +226,9 @@ class DeepSeekClient(BaseLLMClient):
         else:
             result = self._build_completion_result(response)
             logger.debug(
-                "DeepSeek API 响应: content_chars={} tool_calls={} finish_reason={}",
+                "DeepSeek API 响应: content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
                 len(result.content),
+                len(result.reasoning_content or ""),
                 len(result.tool_calls),
                 result.finish_reason or "-",
             )
@@ -314,8 +323,9 @@ class DeepSeekClient(BaseLLMClient):
         else:
             result = self._build_completion_result(response)
             logger.debug(
-                "DeepSeek API 响应: content_chars={} tool_calls={} finish_reason={}",
+                "DeepSeek API 响应: content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
                 len(result.content),
+                len(result.reasoning_content or ""),
                 len(result.tool_calls),
                 result.finish_reason or "-",
             )

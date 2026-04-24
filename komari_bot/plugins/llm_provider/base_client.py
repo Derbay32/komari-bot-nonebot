@@ -29,6 +29,9 @@ class LLMCompletionResultSchema(BaseModel):
     """统一的 LLM 完成结果。"""
 
     content: str = Field(default="", description="文本内容")
+    reasoning_content: str | None = Field(
+        default=None, description="思考模式返回的推理内容"
+    )
     tool_calls: list[LLMToolCallSchema] = Field(
         default_factory=list, description="工具调用列表"
     )

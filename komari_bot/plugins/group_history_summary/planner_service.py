@@ -516,6 +516,8 @@ async def plan_summary_request(
                 for tool_call in completion.tool_calls
             ],
         }
+        if completion.reasoning_content:
+            assistant_message["reasoning_content"] = completion.reasoning_content
         messages.append(assistant_message)
 
         for tool_call in completion.tool_calls[:1]:
