@@ -15,6 +15,8 @@
   "summary_model": "deepseek-chat",
   "summary_temperature": 0.4,
   "summary_max_tokens": 1200,
+  "assistant_prefill_enabled": false,
+  "dsv4_roleplay_instruct_mode": "inner_os",
   "layout_params": {
     "canvas_width": 1365,
     "canvas_height": 645,

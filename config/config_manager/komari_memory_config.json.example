@@ -9,6 +9,8 @@
   "llm_model_chat": "gemini-3-flash-preview",
   "llm_temperature_chat": 1.0,
   "llm_max_tokens_chat": 4000,
+  "assistant_prefill_enabled": false,
+  "dsv4_roleplay_instruct_mode": "inner_os",
 
   "llm_model_summary": "gemini-3-flash-preview",
   "llm_temperature_summary": 0.3,
