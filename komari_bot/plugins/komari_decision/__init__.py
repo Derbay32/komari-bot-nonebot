@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, cast
 
 from nonebot import logger
-from nonebot.plugin import PluginMetadata
+from nonebot.plugin import PluginMetadata, require
 
 from .services.config_interface import get_config
 from .services.unified_candidate_rerank import (
@@ -29,6 +29,9 @@ class MemoryPluginManagerProtocol(Protocol):
 
     pg_pool: Pool | None
 
+
+# 先加载 memory
+require("komari_memory")
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠判定",
