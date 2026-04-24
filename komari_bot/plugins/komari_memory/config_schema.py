@@ -42,6 +42,18 @@ class KomariMemoryConfigSchema(BaseModel):
     llm_max_tokens_chat: int = Field(
         default=4000, ge=20, le=8192, description="对话模型最大 token 数"
     )
+    assistant_prefill_enabled: bool = Field(
+        default=False,
+        description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
+    )
+    dsv4_roleplay_instruct_mode: str = Field(
+        default="auto",
+        description=(
+            "DeepSeek V4 角色扮演思考指令注入模式："
+            "disabled=关闭，auto=仅 deepseek-v4 模型注入角色沉浸指令，"
+            "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
+        ),
+    )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
     llm_model_summary: str = Field(
@@ -172,3 +184,12 @@ class KomariMemoryConfigSchema(BaseModel):
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("dsv4_roleplay_instruct_mode", mode="before")
+    @classmethod
+    def normalize_dsv4_roleplay_instruct_mode(cls, value: Any) -> str:
+        """规范化 DeepSeek V4 角色扮演指令注入模式。"""
+        normalized = str(value or "auto").strip().lower()
+        if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
+            return "auto"
+        return normalized

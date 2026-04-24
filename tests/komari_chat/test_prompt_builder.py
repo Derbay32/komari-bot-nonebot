@@ -56,7 +56,12 @@ def _patch_dependencies(monkeypatch: Any) -> None:
 
 
 def _build_config() -> SimpleNamespace:
-    return SimpleNamespace(knowledge_enabled=False)
+    return SimpleNamespace(
+        knowledge_enabled=False,
+        llm_model_chat="test-model",
+        assistant_prefill_enabled=False,
+        dsv4_roleplay_instruct_mode="disabled",
+    )
 
 
 def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
@@ -85,14 +90,14 @@ def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
         )
     )
 
-    assert messages[1] == {"role": "assistant", "content": "上一条是机器人说的话"}
-    assert messages[2] == {
+    assert messages[0] == {"role": "system", "content": "system"}
+    assert messages[1] == {"role": "system", "content": "output"}
+    assert messages[3] == {"role": "assistant", "content": "上一条是机器人说的话"}
+    assert messages[4] == {
         "role": "user",
         "content": "- 阿虚: <user_input>继续说</user_input>",
     }
-    assert messages[3] == {"role": "user", "content": "ack"}
-    assert messages[4] == {"role": "system", "content": "output"}
-    assert messages[5] == {"role": "system", "content": "cot"}
+    assert messages[-1] == messages[4]
 
 
 def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
@@ -122,10 +127,10 @@ def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
         )
     )
 
-    assert messages[1]["role"] == "assistant"
-    assert "你上一条还发了 1 张图片" in messages[1]["content"]
-    assert messages[2]["role"] == "user"
-    assert messages[2]["content"] == [
+    assert messages[3]["role"] == "assistant"
+    assert "你上一条还发了 1 张图片" in messages[3]["content"]
+    assert messages[4]["role"] == "user"
+    assert messages[4]["content"] == [
         {"type": "text", "text": "（以下是你上一条被引用的 1 张图片）"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,reply"}},
         {"type": "text", "text": "- 阿虚: <user_input>看看这个</user_input>"},
@@ -156,7 +161,7 @@ def test_build_prompt_merges_user_reply_text_into_user_side(monkeypatch: Any) ->
         )
     )
 
-    assert messages[1] == {
+    assert messages[3] == {
         "role": "user",
         "content": (
             "- 长门（被回复）: 她刚才提到的角色是谁？\n"
@@ -193,8 +198,8 @@ def test_build_prompt_orders_user_reply_images_before_current_images(
         )
     )
 
-    assert messages[1]["role"] == "user"
-    assert messages[1]["content"] == [
+    assert messages[3]["role"] == "user"
+    assert messages[3]["content"] == [
         {
             "type": "text",
             "text": "- 长门（被回复）: 看看这张图\n- 长门（被回复）发送了 1 张图片。",
@@ -203,3 +208,44 @@ def test_build_prompt_orders_user_reply_images_before_current_images(
         {"type": "text", "text": "- 阿虚: <user_input>这个呢</user_input>"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,current"}},
     ]
+
+
+def test_build_prompt_keeps_legacy_prefill_when_enabled(monkeypatch: Any) -> None:
+    _patch_dependencies(monkeypatch)
+    config = _build_config()
+    config.assistant_prefill_enabled = True
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="继续说",
+            memories=[],
+            config=config,
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+        )
+    )
+
+    assert messages[-2] == {"role": "user", "content": "ack"}
+    assert messages[-1] == {"role": "system", "content": "cot"}
+
+
+def test_build_prompt_injects_dsv4_marker_to_first_user_message(
+    monkeypatch: Any,
+) -> None:
+    _patch_dependencies(monkeypatch)
+    config = _build_config()
+    config.llm_model_chat = "deepseek-v4-flash"
+    config.dsv4_roleplay_instruct_mode = "auto"
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="早上好",
+            memories=[],
+            config=config,
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+        )
+    )
+
+    user_message = next(message for message in messages if message["role"] == "user")
+    assert "【角色沉浸要求】" in user_message["content"]

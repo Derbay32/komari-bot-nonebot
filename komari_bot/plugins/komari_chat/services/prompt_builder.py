@@ -10,6 +10,7 @@ from nonebot import logger
 from nonebot.plugin import require
 from zhdate import ZhDate
 
+from komari_bot.common.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )
@@ -141,14 +142,15 @@ async def build_prompt(
     favor_daily: int | None = None,
     favor_user_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """构建 5 段式 OpenAI 格式消息数组。
+    """构建面向 DeepSeek KV Cache 优化的 OpenAI 格式消息数组。
 
     结构：
-    ① system    — 角色设定 + 记忆 + 实体 + 知识库 + 时间
-    ② user/asst — 对话历史（Redis buffer 交替构造）
-    ③ assistant — 伪造记忆确认
-    ④ system    — 输出格式指令
-    ⑤ assistant — CoT 思维链前缀
+    ① system    — 静态角色设定
+    ② system    — 静态输出格式指令
+    ③ system    — 动态上下文（时间、记忆、知识库、实体、好感度）
+    ④ user/asst — 对话历史（Redis buffer 交替构造）
+    ⑤ user      — 当前用户消息
+    ⑥ assistant — 旧版预填充（可选）
 
     Args:
         user_message: 用户原始消息（用于生成回复）
@@ -172,27 +174,30 @@ async def build_prompt(
     messages: list[dict[str, Any]] = []
 
     # ═══════════════════════════════════════
-    # ① system — 角色设定 + 记忆 + 实体 + 知识库
+    # ①② 静态 system — 角色设定 + 输出格式指令
     # ═══════════════════════════════════════
-    system_parts: list[str] = []
+    messages.append({"role": "system", "content": template["system_prompt"]})
+    messages.append({"role": "system", "content": template["output_instruction"]})
 
-    # 角色设定（来自 YAML 模板）
-    system_parts.append(template["system_prompt"])
+    # ═══════════════════════════════════════
+    # ③ 动态 system — 时间 + 记忆 + 实体 + 知识库
+    # ═══════════════════════════════════════
+    dynamic_parts: list[str] = []
 
     # 当前时间
-    system_parts.append(
+    dynamic_parts.append(
         f"<current_time>{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}</current_time>"
     )
 
     # 节日信息
     festival_info = get_festival_info()
     if festival_info:
-        system_parts.append(f"<festival_info>{festival_info}</festival_info>")
+        dynamic_parts.append(f"<festival_info>{festival_info}</festival_info>")
 
     # 对话记忆
     if memories:
         memory_items = "\n".join([f"- {m['summary']}" for m in memories])
-        system_parts.append(
+        dynamic_parts.append(
             f"<memory>\n以下是过往的对话记忆:\n{memory_items}\n</memory>"
         )
 
@@ -218,13 +223,13 @@ async def build_prompt(
                     keyword_items = "\n".join(
                         [f"- {r.content}" for r in keyword_results]
                     )
-                    system_parts.append(
+                    dynamic_parts.append(
                         f"<keyword_knowledge>\n以下是与当前话题相关的关键词知识:\n{keyword_items}\n</keyword_knowledge>"
                     )
 
                 if vector_results:
                     vector_items = "\n".join([f"- {r.content}" for r in vector_results])
-                    system_parts.append(
+                    dynamic_parts.append(
                         f"<vector_knowledge>\n以下是语义检索到的相关知识:\n{vector_items}\n</vector_knowledge>"
                     )
         except Exception:
@@ -264,7 +269,7 @@ async def build_prompt(
                     for item in user_profile_results
                 ]
             )
-            system_parts.append(
+            dynamic_parts.append(
                 f"<user_profiles>\n以下是对话中用户的已知信息:\n{profile_items}\n</user_profiles>"
             )
 
@@ -315,13 +320,13 @@ async def build_prompt(
 
         if entity_parts:
             entity_text = "\n".join(entity_parts)
-            system_parts.append(
+            dynamic_parts.append(
                 f"<user_entities>\n以下是从历史对话中提取的用户实体信息:\n{entity_text}\n</user_entities>"
             )
 
         if interaction_parts:
             interaction_text = "\n\n".join(interaction_parts)
-            system_parts.append(
+            dynamic_parts.append(
                 f"<user_interaction_history>\n{interaction_text}\n</user_interaction_history>"
             )
 
@@ -336,7 +341,7 @@ async def build_prompt(
         )
         favor_level = _resolve_favor_level(favor_daily)
         favor_description = _resolve_favor_description(favor_daily)
-        system_parts.append(
+        dynamic_parts.append(
             "\n".join(
                 [
                     "<favorability_modifier>",
@@ -348,10 +353,11 @@ async def build_prompt(
             )
         )
 
-    messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+    if dynamic_parts:
+        messages.append({"role": "system", "content": "\n\n".join(dynamic_parts)})
 
     # ═══════════════════════════════════════
-    # ② user/assistant — 对话历史
+    # ④ user/assistant — 对话历史
     # ═══════════════════════════════════════
     if recent_messages:
         current_block: list[str] = []
@@ -480,29 +486,27 @@ async def build_prompt(
         )
         messages.append({"role": "user", "content": text_content})
 
-    # ═══════════════════════════════════════
-    # ③ assistant — 伪造记忆确认
-    # ═══════════════════════════════════════
-    messages.append(
-        {
-            "role": template.get("memory_ack_role", "assistant"),
-            "content": template["memory_ack"],
-        }
+    messages = inject_dsv4_instruct_to_first_user_message(
+        messages,
+        model=getattr(config, "llm_model_chat", ""),
+        mode=getattr(config, "dsv4_roleplay_instruct_mode", "auto"),
     )
 
-    # ═══════════════════════════════════════
-    # ④ system — 输出格式指令
-    # ═══════════════════════════════════════
-    messages.append({"role": "system", "content": template["output_instruction"]})
-
-    # ═══════════════════════════════════════
-    # ⑤ assistant — CoT 思维链前缀
-    # ═══════════════════════════════════════
-    messages.append(
-        {
-            "role": template.get("cot_prefix_role", "assistant"),
-            "content": template["cot_prefix"],
-        }
-    )
+    if getattr(config, "assistant_prefill_enabled", False):
+        # ═══════════════════════════════════════
+        # ⑥ assistant — 旧版预填充（可选）
+        # ═══════════════════════════════════════
+        messages.append(
+            {
+                "role": template.get("memory_ack_role", "assistant"),
+                "content": template["memory_ack"],
+            }
+        )
+        messages.append(
+            {
+                "role": template.get("cot_prefix_role", "assistant"),
+                "content": template["cot_prefix"],
+            }
+        )
 
     return messages
