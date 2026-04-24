@@ -80,6 +80,18 @@ class DynamicConfigSchema(BaseModel):
     summary_max_tokens: int = Field(
         default=1200, ge=128, le=8192, description="总结最大 tokens"
     )
+    assistant_prefill_enabled: bool = Field(
+        default=False,
+        description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
+    )
+    dsv4_roleplay_instruct_mode: str = Field(
+        default="auto",
+        description=(
+            "DeepSeek V4 角色扮演思考指令注入模式："
+            "disabled=关闭，auto=仅 deepseek-v4 模型注入角色沉浸指令，"
+            "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
+        ),
+    )
 
     layout_params: LayoutParamsSchema = Field(
         default_factory=LayoutParamsSchema,
@@ -99,3 +111,12 @@ class DynamicConfigSchema(BaseModel):
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("dsv4_roleplay_instruct_mode", mode="before")
+    @classmethod
+    def normalize_dsv4_roleplay_instruct_mode(cls, value: Any) -> str:
+        """规范化 DeepSeek V4 角色扮演指令注入模式。"""
+        normalized = str(value or "auto").strip().lower()
+        if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
+            return "auto"
+        return normalized

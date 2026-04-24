@@ -196,6 +196,8 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 model=config.summary_model,
                 temperature=config.summary_temperature,
                 max_tokens=config.summary_max_tokens,
+                assistant_prefill_enabled=config.assistant_prefill_enabled,
+                dsv4_roleplay_instruct_mode=config.dsv4_roleplay_instruct_mode,
             )
 
             body_lines = summary_text_to_lines(summary_text)
