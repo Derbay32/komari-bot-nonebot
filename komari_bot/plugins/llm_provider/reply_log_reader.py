@@ -243,6 +243,9 @@ class ReplyLogReader:
             "status": "error" if error_text else "success",
             "input_preview": self._build_preview(input_data),
             "output_preview": self._build_preview(output_text),
+            "reasoning_content_preview": self._build_preview(
+                record.get("reasoning_content")
+            ),
             "error_preview": self._build_preview(error_text),
         }
 
@@ -260,6 +263,7 @@ class ReplyLogReader:
         )
         summary["input"] = record.get("input")
         summary["output"] = record.get("output")
+        summary["reasoning_content"] = record.get("reasoning_content")
         summary["error"] = record.get("error")
         return summary
 

@@ -32,6 +32,7 @@ async def log_llm_call(
     model: str,
     input_data: dict | list | str,
     output: str | None = None,
+    reasoning_content: str | None = None,
     error: str | None = None,
     duration_ms: float | None = None,
 ) -> None:
@@ -42,6 +43,7 @@ async def log_llm_call(
         model: 模型名称
         input_data: 输入内容（messages 列表、prompt 字符串或结构化字典）
         output: LLM 返回的文本（成功时）
+        reasoning_content: LLM 返回的推理内容（成功时）
         error: 错误信息（失败时）
         duration_ms: 调用耗时（毫秒）
     """
@@ -60,6 +62,8 @@ async def log_llm_call(
         }
         if output is not None:
             record["output"] = output
+        if reasoning_content is not None:
+            record["reasoning_content"] = reasoning_content
         if error is not None:
             record["error"] = error
         if duration_ms is not None:

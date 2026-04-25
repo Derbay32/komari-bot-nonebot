@@ -121,6 +121,22 @@ def _get_client() -> DeepSeekClient:
     )
 
 
+def _get_completion_content(result: LLMCompletionResultSchema | str) -> str:
+    """兼容测试替身与真实客户端的完成文本。"""
+    if isinstance(result, str):
+        return result
+    return result.content
+
+
+def _get_completion_reasoning_content(
+    result: LLMCompletionResultSchema | str,
+) -> str | None:
+    """兼容测试替身与真实客户端的推理内容。"""
+    if isinstance(result, str):
+        return None
+    return result.reasoning_content
+
+
 async def generate_text(
     prompt: str,
     model: str,
@@ -221,6 +237,8 @@ async def generate_text(
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
+        content = _get_completion_content(result)
+        reasoning_content = _get_completion_reasoning_content(result)
         if record_chat_log:
             await log_llm_call(
                 method="generate_text",
@@ -231,10 +249,11 @@ async def generate_text(
                     "prompt": prompt,
                     "system_instruction": final_system_instruction,
                 },
-                output=result.content,
+                output=content,
+                reasoning_content=reasoning_content,
                 duration_ms=duration_ms,
             )
-        return result.content
+        return content
     finally:
         await client.close()
 
@@ -336,6 +355,7 @@ async def generate_completion(
                     "tool_choice": tool_choice,
                 },
                 output=json.dumps(result.model_dump(), ensure_ascii=False),
+                reasoning_content=result.reasoning_content,
                 duration_ms=duration_ms,
             )
         return result
@@ -415,6 +435,8 @@ async def generate_text_with_messages(
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
+        content = _get_completion_content(result)
+        reasoning_content = _get_completion_reasoning_content(result)
         if record_chat_log:
             await log_llm_call(
                 method="generate_text_with_messages",
@@ -424,10 +446,11 @@ async def generate_text_with_messages(
                     "payload_summary": payload_summary,
                     "messages": messages,
                 },
-                output=result.content,
+                output=content,
+                reasoning_content=reasoning_content,
                 duration_ms=duration_ms,
             )
-        return result.content
+        return content
     finally:
         await client.close()
 
@@ -505,6 +528,7 @@ async def generate_messages_completion(
                     "tool_choice": tool_choice,
                 },
                 output=json.dumps(result.model_dump(), ensure_ascii=False),
+                reasoning_content=result.reasoning_content,
                 duration_ms=duration_ms,
             )
         return result

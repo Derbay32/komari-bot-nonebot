@@ -42,6 +42,7 @@ class ReplyLogReaderProtocol(Protocol):
         line_number: int,
     ) -> dict[str, Any] | None: ...
 
+
 class ReplyLogListItem(BaseModel):
     """reply 日志摘要。"""
 
@@ -56,6 +57,7 @@ class ReplyLogListItem(BaseModel):
     status: Literal["success", "error"]
     input_preview: str = ""
     output_preview: str = ""
+    reasoning_content_preview: str = ""
     error_preview: str = ""
 
 
@@ -73,6 +75,7 @@ class ReplyLogDetail(ReplyLogListItem):
 
     input: Any = None
     output: str | None = None
+    reasoning_content: str | None = None
     error: str | None = None
 
 
