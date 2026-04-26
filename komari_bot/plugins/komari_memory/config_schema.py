@@ -54,6 +54,10 @@ class KomariMemoryConfigSchema(BaseModel):
             "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
         ),
     )
+    vision_tool_enabled: bool = Field(
+        default=True,
+        description="是否启用 V4 工具调用读图模式",
+    )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
     llm_model_summary: str = Field(

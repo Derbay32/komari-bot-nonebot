@@ -141,6 +141,8 @@ async def build_prompt(
     query_embedding: list[float] | None = None,
     favor_daily: int | None = None,
     favor_user_id: str | None = None,
+    *,
+    vision_tool_mode: bool = False,
 ) -> list[dict[str, Any]]:
     """构建面向 DeepSeek KV Cache 优化的 OpenAI 格式消息数组。
 
@@ -166,6 +168,7 @@ async def build_prompt(
         reply_context: 当前消息引用的上下文（可选）
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
         query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
+        vision_tool_mode: 是否使用工具调用读图模式。开启时只注入图片索引说明，不嵌入 base64 图片块
 
     Returns:
         OpenAI 格式消息列表 [{role, content}]，当包含图片时 content 为数组格式
@@ -458,7 +461,28 @@ async def build_prompt(
 
     reply_intro_text = "\n".join(reply_intro_lines)
     has_multimodal_content = bool(reply_image_urls or image_urls)
-    if has_multimodal_content:
+    if has_multimodal_content and vision_tool_mode:
+        vision_lines: list[str] = []
+        reply_image_count = len(reply_image_urls or [])
+        current_image_count = len(image_urls or [])
+        total_image_count = reply_image_count + current_image_count
+        if total_image_count > 0:
+            vision_lines.append(
+                f"[系统提示：当前对话包含 {total_image_count} 张可读取图片，你可以使用 read_image 工具按索引查看它们。]"
+            )
+        if reply_image_count > 0:
+            vision_lines.append(
+                f"- 被回复消息有 {reply_image_count} 张图片，可用 read_image 查看，索引范围为 0 到 {reply_image_count - 1}。"
+            )
+        if current_image_count > 0:
+            current_start_index = reply_image_count
+            current_end_index = reply_image_count + current_image_count - 1
+            vision_lines.append(
+                f"- 当前用户发送了 {current_image_count} 张图片，可用 read_image 查看，索引范围为 {current_start_index} 到 {current_end_index}。"
+            )
+        text_parts = [part for part in [reply_intro_text, current_text, *vision_lines] if part]
+        messages.append({"role": "user", "content": "\n".join(text_parts)})
+    elif has_multimodal_content:
         content_parts: list[dict[str, Any]] = []
         if reply_intro_text:
             content_parts.append({"type": "text", "text": reply_intro_text})

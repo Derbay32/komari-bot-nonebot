@@ -15,11 +15,36 @@ from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
 )
 from komari_bot.plugins.komari_memory.core.retry import retry_async
 
+from .vision_service import read_images
+
 if TYPE_CHECKING:
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
+
+READ_IMAGE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_image",
+        "description": (
+            "查看用户发送的图片内容。"
+            "当用户发送了图片但你无法直接看到时，调用此工具获取图片的详细文字描述。"
+            "每次调用只能查看一张图片，通过 image_index 指定要查看的图片序号。"
+            "如果有多张图片需要查看，请分别调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_index": {
+                    "type": "integer",
+                    "description": "要查看的图片序号（从0开始）。0=第一张图片，1=第二张图片，以此类推。",
+                }
+            },
+            "required": ["image_index"],
+        },
+    },
+}
 
 
 def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
@@ -147,6 +172,55 @@ def _extract_tag_content(text: str, tag: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
 
+def _parse_image_index(arguments: dict[str, Any] | None, raw_arguments: str) -> int | None:
+    """从工具调用参数中解析图片索引。"""
+    payload = arguments
+    if payload is None and raw_arguments:
+        try:
+            loaded = json.loads(raw_arguments)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError:
+            return None
+
+    if not payload:
+        return None
+
+    value = payload.get("image_index")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+async def _build_image_tool_result(
+    *,
+    raw_arguments: str,
+    parsed_arguments: dict[str, Any] | None,
+    base64_images: list[str],
+    vision_model: str,
+    vision_temperature: float,
+    vision_max_tokens: int,
+) -> str:
+    """执行 read_image 工具并返回工具消息内容。"""
+    image_index = _parse_image_index(parsed_arguments, raw_arguments)
+    if image_index is None:
+        return "[图片读取失败: image_index 参数缺失或格式错误]"
+    if image_index < 0 or image_index >= len(base64_images):
+        return f"[图片读取失败: image_index={image_index} 超出范围，当前可读图片数量为 {len(base64_images)}]"
+
+    descriptions = await read_images(
+        [base64_images[image_index]],
+        vision_model=vision_model,
+        temperature=vision_temperature,
+        max_tokens=vision_max_tokens,
+    )
+    return descriptions[0] if descriptions else "[图片读取失败: 视觉服务未返回结果]"
+
+
 @retry_async(max_attempts=3, base_delay=1.0)
 async def generate_reply(
     config: KomariMemoryConfigSchema,
@@ -199,6 +273,116 @@ async def generate_reply(
 
     # 提取 XML 标签内容
     return _extract_tag_content(raw_response, config.response_tag)
+
+
+@retry_async(max_attempts=3, base_delay=1.0)
+async def generate_reply_with_vision_tool(
+    config: KomariMemoryConfigSchema,
+    messages: list[dict],
+    base64_images: list[str],
+    vision_model: str,
+    vision_temperature: float,
+    vision_max_tokens: int,
+    request_trace_id: str | None = None,
+    max_tool_rounds: int = 3,
+) -> str:
+    """通过 read_image 工具调用模式生成带图片回复。"""
+    working_messages = list(messages)
+    final_content = ""
+    tool_rounds = 0
+
+    logger.info(
+        "[KomariChat] Vision Tool 回复请求追踪: trace_id={} images={} max_rounds={}",
+        request_trace_id or "-",
+        len(base64_images),
+        max_tool_rounds,
+    )
+
+    for round_index in range(max_tool_rounds):
+        completion = await llm_provider.generate_messages_completion(
+            messages=working_messages,
+            model=config.llm_model_chat,
+            temperature=config.llm_temperature_chat,
+            max_tokens=config.llm_max_tokens_chat,
+            tools=[READ_IMAGE_TOOL],
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            request_trace_id=request_trace_id,
+            request_phase=f"vision_tool_round_{round_index + 1}",
+            record_chat_log=True,
+        )
+        final_content = completion.content or final_content
+        if not completion.tool_calls:
+            logger.info(
+                "[KomariChat] Vision Tool 无需继续调用: trace_id={} rounds={}",
+                request_trace_id or "-",
+                tool_rounds,
+            )
+            return _extract_tag_content(final_content, config.response_tag)
+
+        tool_rounds += 1
+        logger.info(
+            "[KomariChat] Vision Tool 调用: trace_id={} round={} tool_calls={}",
+            request_trace_id or "-",
+            round_index + 1,
+            len(completion.tool_calls),
+        )
+        working_messages.append(
+            {
+                "role": "assistant",
+                "content": completion.content or "",
+                "tool_calls": [
+                    {
+                        "id": tool_call.id or tool_call.function.name,
+                        "type": tool_call.type,
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.raw_arguments
+                            or tool_call.function.arguments,
+                        },
+                    }
+                    for tool_call in completion.tool_calls
+                ],
+            }
+        )
+
+        for tool_call in completion.tool_calls:
+            tool_call_id = tool_call.id or tool_call.function.name
+            if tool_call.function.name != "read_image":
+                tool_content = f"[工具调用失败: 不支持的工具 {tool_call.function.name}]"
+            else:
+                tool_content = await _build_image_tool_result(
+                    raw_arguments=tool_call.raw_arguments
+                    or tool_call.function.arguments,
+                    parsed_arguments=tool_call.parsed_arguments,
+                    base64_images=base64_images,
+                    vision_model=vision_model,
+                    vision_temperature=vision_temperature,
+                    vision_max_tokens=vision_max_tokens,
+                )
+            working_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_content,
+                }
+            )
+
+    logger.warning(
+        "[KomariChat] Vision Tool 达到最大调用轮数，执行最终无工具回复: trace_id={} rounds={}",
+        request_trace_id or "-",
+        tool_rounds,
+    )
+    raw_response = await llm_provider.generate_text_with_messages(
+        messages=working_messages,
+        model=config.llm_model_chat,
+        temperature=config.llm_temperature_chat,
+        max_tokens=config.llm_max_tokens_chat,
+        request_trace_id=request_trace_id,
+        request_phase="vision_tool_final",
+        record_chat_log=True,
+    )
+    return _extract_tag_content(raw_response or final_content, config.response_tag)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)

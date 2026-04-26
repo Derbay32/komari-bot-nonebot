@@ -25,9 +25,10 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
 from komari_bot.plugins.komari_memory.services.token_counter import (
     estimate_text_tokens,
 )
+from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
-from ..services.llm_service import generate_reply
+from ..services.llm_service import generate_reply, generate_reply_with_vision_tool
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
@@ -36,6 +37,12 @@ try:
     user_data_plugin = require("user_data")
 except Exception:
     user_data_plugin = None
+
+config_manager_plugin = require("config_manager")
+llm_provider_config_manager = config_manager_plugin.get_config_manager(
+    "llm_provider",
+    DynamicConfigSchema,
+)
 
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
@@ -528,6 +535,10 @@ class MessageHandler:
             reply_image_urls = await download_images_as_base64(
                 list(reply_context.image_sources)
             )
+        all_base64_images = (reply_image_urls or []) + (base64_image_urls or [])
+        use_vision_tool = getattr(config, "vision_tool_enabled", True) and bool(
+            all_base64_images
+        )
 
         if reply_context_requested:
             logger.info(
@@ -545,7 +556,7 @@ class MessageHandler:
 
         if image_urls or reply_image_urls:
             logger.info(
-                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={}",
+                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} vision_tool_mode={}",
                 request_trace_id,
                 message.group_id,
                 message.message_id,
@@ -557,6 +568,7 @@ class MessageHandler:
                 sum(len(url) for url in (reply_image_urls or []))
                 + sum(len(url) for url in (base64_image_urls or [])),
                 len(memories),
+                use_vision_tool,
             )
 
         if user_data_plugin is not None:
@@ -588,13 +600,26 @@ class MessageHandler:
             query_embedding=query_embedding,
             favor_daily=favor_daily,
             favor_user_id=message.user_id,
+            vision_tool_mode=use_vision_tool,
         )
 
-        reply = await generate_reply(
-            config=config,
-            messages=prompt_messages,
-            request_trace_id=request_trace_id,
-        )
+        if use_vision_tool:
+            vision_config = llm_provider_config_manager.get()
+            reply = await generate_reply_with_vision_tool(
+                config=config,
+                messages=prompt_messages,
+                base64_images=all_base64_images,
+                vision_model=vision_config.vision_model,
+                vision_temperature=vision_config.vision_temperature,
+                vision_max_tokens=vision_config.vision_max_tokens,
+                request_trace_id=request_trace_id,
+            )
+        else:
+            reply = await generate_reply(
+                config=config,
+                messages=prompt_messages,
+                request_trace_id=request_trace_id,
+            )
         if reply is None:
             logger.warning(
                 "[KomariMemory] 回复生成失败: group={} reason={} score={}",

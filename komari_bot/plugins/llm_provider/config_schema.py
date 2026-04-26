@@ -67,6 +67,22 @@ class DynamicConfigSchema(BaseModel):
             '例如：{"enable_thinking": false} 或 {"thinking": {"type": "disabled"}}'
         ),
     )
+    vision_model: str = Field(
+        default="gemini-2.0-flash-exp",
+        description="多模态视觉模型名",
+    )
+    vision_temperature: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=2.0,
+        description="视觉模型温度",
+    )
+    vision_max_tokens: int = Field(
+        default=1024,
+        ge=20,
+        le=8192,
+        description="视觉模型最大 token 数",
+    )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
