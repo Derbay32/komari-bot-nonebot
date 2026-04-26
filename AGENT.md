@@ -43,7 +43,7 @@ komari-bot/
 │   │   ├── profile_compaction.py         #   用户画像 LLM 压缩
 │   │   ├── onebot_rules.py               #   group_message_rule() 等
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
-│   └── plugins/                          # NoneBot 插件（19个）
+│   └── plugins/                          # NoneBot 插件（18个）
 │
 ├── config/                               # 运行时配置
 │   ├── config_manager/                   #   各插件的 JSON 配置 + .example
