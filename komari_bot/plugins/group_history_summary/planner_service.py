@@ -271,7 +271,7 @@ def _serialize_tool_result(result: SummaryToolResult) -> str:
 def _build_planning_messages(user_request: str) -> list[dict[str, Any]]:
     template = get_template()
     return [
-        {"role": "system", "content": template["planning_system_prompt"]},
+        {"role": "user", "content": template["planning_system_prompt"]},
         {"role": "user", "content": user_request},
     ]
 

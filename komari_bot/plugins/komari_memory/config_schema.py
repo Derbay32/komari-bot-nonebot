@@ -77,23 +77,23 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 记忆管理配置
-    summary_token_threshold: int = Field(
-        default=1000, ge=100, le=10000, description="触发总结的 Token 阈值"
+    summary_idle_timeout: int = Field(
+        default=1800,
+        ge=300,
+        le=7200,
+        description="群组空闲超时触发总结的时间（秒）。自最后一条消息后超过该时间且消息数达标时才触发",
     )
-    summary_time_threshold: int = Field(
-        default=3600, ge=300, le=86400, description="触发总结的时间阈值（秒）"
-    )
-    message_buffer_size: int = Field(
-        default=200, ge=50, le=1000, description="Redis 消息缓存大小"
-    )
-    summary_message_threshold: int = Field(
-        default=50,
-        ge=10,
+    summary_min_messages: int = Field(
+        default=100,
+        ge=50,
         le=500,
-        description="触发总结的消息数量阈值（优先于 token 阈值）",
+        description="触发总结所需的最小消息条数。不足此数不总结（每日跨天清理除外）",
     )
-    summary_max_messages: int = Field(
-        default=200, ge=50, le=500, description="总结时从缓冲区获取的最大消息数"
+    summary_max_buffer_size: int = Field(
+        default=500,
+        ge=100,
+        le=2000,
+        description="消息缓冲区的最大消息条数安全上限。达到后即使未空闲也会强制触发总结",
     )
     summary_chunk_token_limit: int = Field(
         default=3000,

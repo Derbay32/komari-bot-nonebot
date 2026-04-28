@@ -63,11 +63,11 @@ async def summarize_history_messages(
 
     messages = [
         {
-            "role": "system",
+            "role": "user",
             "content": template["system_prompt"],
         },
         {
-            "role": "system",
+            "role": "user",
             "content": template["output_instruction"],
         },
         {

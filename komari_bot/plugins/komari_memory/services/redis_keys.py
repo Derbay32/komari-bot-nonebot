@@ -13,14 +13,14 @@ class RedisKeys:
     BUFFER = f"{PREFIX}:buffer:%s"
     BUFFER_PATTERN = f"{PREFIX}:buffer:*"
 
-    # Token 计数
-    TOKENS = f"{PREFIX}:tokens:%s"
-
-    # 消息计数
-    MESSAGES = f"{PREFIX}:messages:%s"
-
     # 最后总结时间
     LAST_SUMMARY = f"{PREFIX}:last_summary:%s"
+
+    # 最后一条消息时间
+    LAST_MESSAGE = f"{PREFIX}:last_message:%s"
+
+    # 当前会话开始时间
+    SESSION_START = f"{PREFIX}:session_start:%s"
 
     # 主动回复冷却
     PROACTIVE_COOLDOWN = f"{PREFIX}:proactive:cd:%s"
@@ -44,30 +44,6 @@ class RedisKeys:
         return cls.BUFFER % group_id
 
     @classmethod
-    def tokens(cls, group_id: str) -> str:
-        """获取 token 计数键。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            Redis 键
-        """
-        return cls.TOKENS % group_id
-
-    @classmethod
-    def messages(cls, group_id: str) -> str:
-        """获取消息计数键。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            Redis 键
-        """
-        return cls.MESSAGES % group_id
-
-    @classmethod
     def last_summary(cls, group_id: str) -> str:
         """获取最后总结时间键。
 
@@ -78,6 +54,30 @@ class RedisKeys:
             Redis 键
         """
         return cls.LAST_SUMMARY % group_id
+
+    @classmethod
+    def last_message(cls, group_id: str) -> str:
+        """获取最后一条消息时间键。
+
+        Args:
+            group_id: 群组 ID
+
+        Returns:
+            Redis 键
+        """
+        return cls.LAST_MESSAGE % group_id
+
+    @classmethod
+    def session_start(cls, group_id: str) -> str:
+        """获取当前会话开始时间键。
+
+        Args:
+            group_id: 群组 ID
+
+        Returns:
+            Redis 键
+        """
+        return cls.SESSION_START % group_id
 
     @classmethod
     def proactive_cooldown(cls, group_id: str) -> str:

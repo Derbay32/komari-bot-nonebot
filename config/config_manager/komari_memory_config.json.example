@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-04-12T04:32:00+08:00",
+  "last_updated": "2026-04-28T18:13:10+08:00",
   "plugin_enable": true,
   "user_whitelist": [],
   "group_whitelist": [],
@@ -11,6 +11,7 @@
   "llm_max_tokens_chat": 4000,
   "assistant_prefill_enabled": false,
   "dsv4_roleplay_instruct_mode": "inner_os",
+  "vision_tool_enabled": true,
 
   "llm_model_summary": "gemini-3-flash-preview",
   "llm_temperature_summary": 0.3,
@@ -19,10 +20,9 @@
   "knowledge_enabled": true,
   "knowledge_limit": 3,
 
-  "summary_message_threshold": 50,
-  "summary_token_threshold": 1000,
-  "summary_time_threshold": 3600,
-  "summary_max_messages": 200,
+  "summary_idle_timeout": 1800,
+  "summary_min_messages": 100,
+  "summary_max_buffer_size": 500,
   "summary_chunk_token_limit": 3000,
   "profile_trait_limit": 20,
   "memory_search_limit": 3,

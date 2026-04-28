@@ -149,8 +149,8 @@ async def build_prompt(
     结构：
     ① system    — 静态角色设定
     ② system    — 静态输出格式指令
-    ③ system    — 动态上下文（时间、记忆、知识库、实体、好感度）
-    ④ user/asst — 对话历史（Redis buffer 交替构造）
+    ③ user/asst — 对话历史（Redis buffer 交替构造）
+    ④ user      — 动态上下文（时间、记忆、知识库、实体、好感度）
     ⑤ user      — 当前用户消息
     ⑥ assistant — 旧版预填充（可选）
 
@@ -183,7 +183,60 @@ async def build_prompt(
     messages.append({"role": "system", "content": template["output_instruction"]})
 
     # ═══════════════════════════════════════
-    # ③ 动态 system — 时间 + 记忆 + 实体 + 知识库
+    # ③ user/assistant — 对话历史
+    # ═══════════════════════════════════════
+    if recent_messages:
+        current_block: list[str] = []
+        current_side: str | None = None  # "user" 或 "assistant"
+
+        for msg in recent_messages:
+            this_side = "assistant" if msg.is_bot else "user"
+
+            if msg.is_bot:
+                # assistant 侧：直接使用原始回复内容
+                msg_text = msg.content
+            else:
+                # user 侧：添加角色名前缀
+                character_name = character_binding.get_character_name(
+                    user_id=msg.user_id,
+                    fallback_nickname=msg.user_nickname,
+                )
+                msg_text = f"- {character_name}: {msg.content}"
+
+            # 切换侧时，保存当前块
+            if current_side is not None and this_side != current_side:
+                block_text = "\n".join(current_block)
+                messages.append({"role": current_side, "content": block_text})
+                current_block = []
+
+            current_block.append(msg_text)
+            current_side = this_side
+
+        # 保存最后一个块
+        if current_block and current_side:
+            block_text = "\n".join(current_block)
+            messages.append({"role": current_side, "content": block_text})
+
+    if reply_context is not None and reply_context.source_side == "assistant":
+        assistant_reply_parts: list[str] = []
+        if reply_context.text:
+            assistant_reply_parts.append(reply_context.text)
+        if reply_context.image_count > 0:
+            if reply_image_urls:
+                assistant_reply_parts.append(
+                    f"（你上一条还发了 {reply_context.image_count} 张图片，下面附上用户正在回复的引用图片。）"
+                )
+            else:
+                assistant_reply_parts.append(
+                    f"（你上一条发了 {reply_context.image_count} 张图片，但当前引用图不可直接查看。）"
+                )
+        if assistant_reply_parts:
+            messages.append(
+                {"role": "assistant", "content": "\n".join(assistant_reply_parts)}
+            )
+
+    # ═══════════════════════════════════════
+    # ④ 动态 user — 时间 + 记忆 + 实体 + 知识库
     # ═══════════════════════════════════════
     dynamic_parts: list[str] = []
 
@@ -357,60 +410,7 @@ async def build_prompt(
         )
 
     if dynamic_parts:
-        messages.append({"role": "system", "content": "\n\n".join(dynamic_parts)})
-
-    # ═══════════════════════════════════════
-    # ④ user/assistant — 对话历史
-    # ═══════════════════════════════════════
-    if recent_messages:
-        current_block: list[str] = []
-        current_side: str | None = None  # "user" 或 "assistant"
-
-        for msg in recent_messages:
-            this_side = "assistant" if msg.is_bot else "user"
-
-            if msg.is_bot:
-                # assistant 侧：直接使用原始回复内容
-                msg_text = msg.content
-            else:
-                # user 侧：添加角色名前缀
-                character_name = character_binding.get_character_name(
-                    user_id=msg.user_id,
-                    fallback_nickname=msg.user_nickname,
-                )
-                msg_text = f"- {character_name}: {msg.content}"
-
-            # 切换侧时，保存当前块
-            if current_side is not None and this_side != current_side:
-                block_text = "\n".join(current_block)
-                messages.append({"role": current_side, "content": block_text})
-                current_block = []
-
-            current_block.append(msg_text)
-            current_side = this_side
-
-        # 保存最后一个块
-        if current_block and current_side:
-            block_text = "\n".join(current_block)
-            messages.append({"role": current_side, "content": block_text})
-
-    if reply_context is not None and reply_context.source_side == "assistant":
-        assistant_reply_parts: list[str] = []
-        if reply_context.text:
-            assistant_reply_parts.append(reply_context.text)
-        if reply_context.image_count > 0:
-            if reply_image_urls:
-                assistant_reply_parts.append(
-                    f"（你上一条还发了 {reply_context.image_count} 张图片，下面附上用户正在回复的引用图片。）"
-                )
-            else:
-                assistant_reply_parts.append(
-                    f"（你上一条发了 {reply_context.image_count} 张图片，但当前引用图不可直接查看。）"
-                )
-        if assistant_reply_parts:
-            messages.append(
-                {"role": "assistant", "content": "\n".join(assistant_reply_parts)}
-            )
+        messages.append({"role": "user", "content": "\n\n".join(dynamic_parts)})
 
     # 当前用户消息（使用 <user_input> 标签防止提示词注入）
     current_character_name = (

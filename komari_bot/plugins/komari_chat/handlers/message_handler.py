@@ -22,9 +22,6 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
     RedisManager,
 )
-from komari_bot.plugins.komari_memory.services.token_counter import (
-    estimate_text_tokens,
-)
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
@@ -431,11 +428,8 @@ class MessageHandler:
         logger.debug("[KomariMemory] 低价值消息已丢弃: {}...", message.content[:30])
 
     async def _handle_normal_message(self, message: MessageSchema) -> None:
-        """处理普通消息（存储缓冲并计数）。"""
+        """处理普通消息（连续追加到当前会话缓冲区）。"""
         await self.redis.push_message(message.group_id, message)
-        await self.redis.increment_message_count(message.group_id)
-        token_count = estimate_text_tokens(message.content)
-        await self.redis.increment_tokens(message.group_id, token_count)
 
     async def _store_ai_reply(
         self,
@@ -498,7 +492,7 @@ class MessageHandler:
                 return None, stored
 
         recent_messages = await self.redis.get_buffer(
-            message.group_id, limit=config.context_messages_limit
+            message.group_id, limit=config.summary_max_buffer_size
         )
 
         if store_current:

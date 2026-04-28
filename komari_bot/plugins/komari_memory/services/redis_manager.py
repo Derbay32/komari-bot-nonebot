@@ -4,6 +4,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import cast
 
 import redis.asyncio as aioredis
 from nonebot import logger
@@ -26,6 +27,13 @@ class MessageSchema:
     timestamp: float
     message_id: str
     is_bot: bool = False
+
+
+def _get_today_4am_timestamp() -> float:
+    """获取当前时区今日凌晨 4:00 的时间戳。"""
+    now = datetime.now().astimezone()
+    today_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    return today_4am.timestamp()
 
 
 class RedisManager:
@@ -87,7 +95,7 @@ class RedisManager:
         group_id: str,
         message: MessageSchema,
     ) -> None:
-        """推入消息到缓冲区，并执行 LTRIM。
+        """推入消息到缓冲区（连续追加，不再截断）。
 
         Args:
             group_id: 群组 ID
@@ -104,10 +112,13 @@ class RedisManager:
             "is_bot": message.is_bot,
         }
 
+        buffer_len = cast("int", await self.redis.execute_command("LLEN", key))
+        now = time.time()
         pipe = self.redis.pipeline()
+        if buffer_len == 0:
+            pipe.set(RedisKeys.session_start(group_id), now)
         pipe.rpush(key, json.dumps(data))
-        # 列表保持“旧 -> 新”顺序，只保留尾部最新 N 条消息。
-        pipe.ltrim(key, -self.config.message_buffer_size, -1)
+        pipe.set(RedisKeys.last_message(group_id), now)
         await pipe.execute()
 
     async def get_buffer(
@@ -175,81 +186,15 @@ class RedisManager:
 
         return all_messages[start:end]
 
-    async def increment_tokens(
-        self,
-        group_id: str,
-        count: int,
-    ) -> int:
-        """增加 Token 计数。
+    async def get_last_message_time(self, group_id: str) -> float | None:
+        """获取群组最后一条消息的时间戳。"""
+        value = await self.redis.get(RedisKeys.last_message(group_id))
+        return float(value) if value else None
 
-        Args:
-            group_id: 群组 ID
-            count: 增加的数量
-
-        Returns:
-            当前计数值
-        """
-        key = RedisKeys.tokens(group_id)
-        return await self.redis.incrby(key, count)
-
-    async def get_tokens(self, group_id: str) -> int:
-        """获取当前 Token 计数。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            当前计数值
-        """
-        key = RedisKeys.tokens(group_id)
-        value = await self.redis.get(key)
-        return int(value) if value else 0
-
-    async def reset_tokens(self, group_id: str) -> None:
-        """重置 Token 计数。
-
-        Args:
-            group_id: 群组 ID
-        """
-        key = RedisKeys.tokens(group_id)
-        await self.redis.delete(key)
-
-    async def increment_message_count(
-        self,
-        group_id: str,
-    ) -> int:
-        """增加消息计数。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            当前计数值
-        """
-        key = RedisKeys.messages(group_id)
-        return await self.redis.incrby(key, 1)
-
-    async def get_message_count(self, group_id: str) -> int:
-        """获取当前消息计数。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            当前计数值
-        """
-        key = RedisKeys.messages(group_id)
-        value = await self.redis.get(key)
-        return int(value) if value else 0
-
-    async def reset_message_count(self, group_id: str) -> None:
-        """重置消息计数。
-
-        Args:
-            group_id: 群组 ID
-        """
-        key = RedisKeys.messages(group_id)
-        await self.redis.delete(key)
+    async def get_session_start_time(self, group_id: str) -> float | None:
+        """获取群组当前会话的开始时间戳。"""
+        value = await self.redis.get(RedisKeys.session_start(group_id))
+        return float(value) if value else None
 
     async def should_trigger_summary(
         self,
@@ -263,37 +208,45 @@ class RedisManager:
         Returns:
             是否触发总结
         """
-        # 1. 检查消息数量阈值（优先级最高）
-        message_count = await self.get_message_count(group_id)
-        if message_count >= self.config.summary_message_threshold:
+        buffer_key = RedisKeys.buffer(group_id)
+        buffer_len = cast("int", await self.redis.execute_command("LLEN", buffer_key))
+        should_trigger = False
+
+        if buffer_len == 0:
+            return should_trigger
+
+        if buffer_len >= self.config.summary_max_buffer_size:
+            # 1. 安全上限：防止连续活跃导致缓冲区无限增长。
             logger.debug(
-                f"[KomariMemory] 群组 {group_id} 消息数达标: "
-                f"{message_count}/{self.config.summary_message_threshold}"
+                f"[KomariMemory] 群组 {group_id} buffer 达安全上限: "
+                f"{buffer_len}/{self.config.summary_max_buffer_size}"
             )
-            return True
-
-        # 2. 检查时间阈值（优先级次之）
-        last_key = RedisKeys.last_summary(group_id)
-        last_summary = await self.redis.get(last_key)
-        if last_summary:
-            elapsed = time.time() - float(last_summary)
-            if elapsed >= self.config.summary_time_threshold:
-                logger.debug(
-                    f"[KomariMemory] 群组 {group_id} 时间达标: "
-                    f"{elapsed:.0f}/{self.config.summary_time_threshold} 秒"
-                )
-                return True
-
-        # 3. 检查 Token 阈值（备用触发条件）
-        token_count = await self.get_tokens(group_id)
-        if token_count >= self.config.summary_token_threshold:
+            should_trigger = True
+        elif (
+            (session_start := await self.get_session_start_time(group_id)) is not None
+            and session_start < _get_today_4am_timestamp()
+        ):
+            # 2. 每日 4:00 跨天清理：避免低活跃群多天消息堆积。
+            current_tz = datetime.now().astimezone().tzinfo
             logger.debug(
-                f"[KomariMemory] 群组 {group_id} Token 数达标: "
-                f"{token_count}/{self.config.summary_token_threshold}"
+                f"[KomariMemory] 群组 {group_id} 跨天清理: "
+                f"buffer={buffer_len} 条（会话自 {datetime.fromtimestamp(session_start, tz=current_tz)}）"
             )
-            return True
+            should_trigger = True
+        elif buffer_len >= self.config.summary_min_messages:
+            # 3. 主触发：消息数达标且群聊已空闲足够久。
+            last_msg_time = await self.get_last_message_time(group_id)
+            if last_msg_time is not None:
+                idle_seconds = time.time() - last_msg_time
+                if idle_seconds >= self.config.summary_idle_timeout:
+                    logger.debug(
+                        f"[KomariMemory] 群组 {group_id} 空闲触发总结: "
+                        f"buffer={buffer_len}/{self.config.summary_min_messages} "
+                        f"idle={idle_seconds:.0f}/{self.config.summary_idle_timeout}s"
+                    )
+                    should_trigger = True
 
-        return False
+        return should_trigger
 
     async def update_last_summary(self, group_id: str) -> None:
         """更新最后总结时间。
@@ -385,13 +338,16 @@ class RedisManager:
         self,
         group_id: str,
     ) -> None:
-        """清空消息缓冲区。
+        """清空消息缓冲区及相关元数据。
 
         Args:
             group_id: 群组 ID
         """
-        key = RedisKeys.buffer(group_id)
-        await self.redis.delete(key)
+        pipe = self.redis.pipeline()
+        pipe.delete(RedisKeys.buffer(group_id))
+        pipe.delete(RedisKeys.last_message(group_id))
+        pipe.delete(RedisKeys.session_start(group_id))
+        await pipe.execute()
 
     async def get_active_groups(self) -> list[str]:
         """获取有活跃消息缓冲的群组列表。

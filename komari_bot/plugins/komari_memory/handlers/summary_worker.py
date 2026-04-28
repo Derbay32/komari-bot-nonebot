@@ -613,7 +613,7 @@ async def perform_summary(
     logger.info("[KomariMemory] 开始总结群组 {} 的对话", group_id)
     config = get_config()
 
-    messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_messages)
+    messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_buffer_size)
     if not messages_buffer:
         logger.warning("[KomariMemory] 群组 {} 消息缓冲为空", group_id)
         return
@@ -813,8 +813,6 @@ async def perform_summary(
             importance=5,
         )
 
-    await redis.reset_message_count(group_id)
-    await redis.reset_tokens(group_id)
     await redis.delete_buffer(group_id)
     await redis.update_last_summary(group_id)
 
