@@ -123,14 +123,6 @@ class _FakeRedis:
         self.pushed_messages.append(message)
         self.history.append(message)
 
-    async def increment_message_count(self, group_id: str) -> int:
-        del group_id
-        return 1
-
-    async def increment_tokens(self, group_id: str, count: int) -> int:
-        del group_id
-        return count
-
 
 class _FakeMemory:
     async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
@@ -235,6 +227,7 @@ def test_attempt_reply_only_rewrites_current_message(
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
+            summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
         ),

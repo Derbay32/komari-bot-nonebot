@@ -110,20 +110,12 @@ def _load_summary_worker_module(monkeypatch: Any) -> Any:
 class _FakeRedis:
     def __init__(self, messages: list[MessageSchema]) -> None:
         self._messages = messages
-        self.reset_message_count_calls: list[str] = []
-        self.reset_tokens_calls: list[str] = []
         self.delete_buffer_calls: list[str] = []
         self.update_last_summary_calls: list[str] = []
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
         del group_id, limit
         return list(self._messages)
-
-    async def reset_message_count(self, group_id: str) -> None:
-        self.reset_message_count_calls.append(group_id)
-
-    async def reset_tokens(self, group_id: str) -> None:
-        self.reset_tokens_calls.append(group_id)
 
     async def delete_buffer(self, group_id: str) -> None:
         self.delete_buffer_calls.append(group_id)
@@ -282,7 +274,7 @@ def test_perform_summary_appends_interaction_records_and_preserves_metadata(
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -386,7 +378,7 @@ def test_perform_summary_keeps_existing_interaction_when_model_returns_no_update
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -428,7 +420,7 @@ def test_perform_summary_remaps_hallucinated_uid_by_display_name_and_drops_unkno
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -579,7 +571,7 @@ def test_perform_summary_refreshes_binding_before_prompt_and_syncs_context_names
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
 
     class _FakeBinding:
@@ -663,7 +655,7 @@ def test_perform_summary_skips_bot_entries_from_model_output(
         module,
         "get_config",
         lambda: KomariMemoryConfigSchema(
-            summary_max_messages=50,
+            summary_max_buffer_size=100,
             profile_trait_limit=20,
             bot_nickname="小鞠知花",
             bot_aliases=["小鞠", "小鞠知花", "komari"],

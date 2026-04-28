@@ -17,7 +17,7 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
 
 
 def _redis_range(items: list[str], start: int, stop: int) -> list[str]:
-    """模拟 Redis 的 LRANGE/LTRIM 索引语义。"""
+    """模拟 Redis 的 LRANGE 索引语义。"""
     if not items:
         return []
 
@@ -43,8 +43,12 @@ class _FakePipeline:
         self._ops.append(("rpush", (key, value)))
         return self
 
-    def ltrim(self, key: str, start: int, stop: int) -> "_FakePipeline":
-        self._ops.append(("ltrim", (key, start, stop)))
+    def set(self, key: str, value: object) -> "_FakePipeline":
+        self._ops.append(("set", (key, value)))
+        return self
+
+    def delete(self, key: str) -> "_FakePipeline":
+        self._ops.append(("delete", (key,)))
         return self
 
     async def execute(self) -> list[object]:
@@ -54,23 +58,32 @@ class _FakePipeline:
                 key, value = args
                 self._redis.data.setdefault(str(key), []).append(str(value))
                 results.append(len(self._redis.data[str(key)]))
-            elif op == "ltrim":
-                key, start, stop = args
-                current = self._redis.data.get(str(key), [])
-                self._redis.data[str(key)] = _redis_range(current, int(start), int(stop))
+            elif op == "set":
+                key, value = args
+                self._redis.values[str(key)] = str(value)
                 results.append(True)
+            elif op == "delete":
+                (key,) = args
+                self._redis.data.pop(str(key), None)
+                self._redis.values.pop(str(key), None)
+                results.append(1)
         return results
 
 
 class _FakeRedis:
     def __init__(self) -> None:
         self.data: dict[str, list[str]] = {}
+        self.values: dict[str, str] = {}
 
     def pipeline(self) -> _FakePipeline:
         return _FakePipeline(self)
 
     async def lrange(self, key: str, start: int, stop: int) -> list[str]:
         return _redis_range(self.data.get(key, []), start, stop)
+
+    async def execute_command(self, command: str, key: str) -> int:
+        assert command == "LLEN"
+        return len(self.data.get(key, []))
 
 
 def _build_message(index: int) -> MessageSchema:
@@ -84,8 +97,8 @@ def _build_message(index: int) -> MessageSchema:
     )
 
 
-def _build_manager(monkeypatch: Any, *, buffer_size: int = 3) -> RedisManager:
-    config = KomariMemoryConfigSchema.model_construct(message_buffer_size=buffer_size)
+def _build_manager(monkeypatch: Any) -> RedisManager:
+    config = KomariMemoryConfigSchema.model_construct()
     monkeypatch.setattr(
         redis_manager_module,
         "get_config",
@@ -100,8 +113,8 @@ def _get_fake_redis(manager: RedisManager) -> _FakeRedis:
     return cast("_FakeRedis", manager._redis)
 
 
-def test_push_message_keeps_latest_messages(monkeypatch: Any) -> None:
-    manager = _build_manager(monkeypatch, buffer_size=3)
+def test_push_message_appends_messages_without_trimming(monkeypatch: Any) -> None:
+    manager = _build_manager(monkeypatch)
 
     asyncio.run(manager.push_message("group-1", _build_message(1)))
     asyncio.run(manager.push_message("group-1", _build_message(2)))
@@ -110,11 +123,15 @@ def test_push_message_keeps_latest_messages(monkeypatch: Any) -> None:
 
     messages = asyncio.run(manager.get_buffer("group-1", limit=10))
 
-    assert [msg.content for msg in messages] == ["消息2", "消息3", "消息4"]
+    assert [msg.content for msg in messages] == ["消息1", "消息2", "消息3", "消息4"]
+
+    fake_redis = _get_fake_redis(manager)
+    assert redis_manager_module.RedisKeys.session_start("group-1") in fake_redis.values
+    assert redis_manager_module.RedisKeys.last_message("group-1") in fake_redis.values
 
 
 def test_get_buffer_returns_latest_window_in_time_order(monkeypatch: Any) -> None:
-    manager = _build_manager(monkeypatch, buffer_size=5)
+    manager = _build_manager(monkeypatch)
     key = redis_manager_module.RedisKeys.buffer("group-1")
     _get_fake_redis(manager).data[key] = [
         json.dumps(_build_message(index).__dict__, ensure_ascii=False)

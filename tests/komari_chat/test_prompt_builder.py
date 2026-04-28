@@ -92,7 +92,7 @@ def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
 
     assert messages[0] == {"role": "system", "content": "system"}
     assert messages[1] == {"role": "system", "content": "output"}
-    assert messages[3] == {"role": "assistant", "content": "上一条是机器人说的话"}
+    assert messages[2] == {"role": "assistant", "content": "上一条是机器人说的话"}
     assert messages[4] == {
         "role": "user",
         "content": "- 阿虚: <user_input>继续说</user_input>",
@@ -127,8 +127,8 @@ def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
         )
     )
 
-    assert messages[3]["role"] == "assistant"
-    assert "你上一条还发了 1 张图片" in messages[3]["content"]
+    assert messages[2]["role"] == "assistant"
+    assert "你上一条还发了 1 张图片" in messages[2]["content"]
     assert messages[4]["role"] == "user"
     assert messages[4]["content"] == [
         {"type": "text", "text": "（以下是你上一条被引用的 1 张图片）"},
@@ -249,3 +249,4 @@ def test_build_prompt_injects_dsv4_marker_to_first_user_message(
 
     user_message = next(message for message in messages if message["role"] == "user")
     assert "【角色沉浸要求】" in user_message["content"]
+    assert "【角色沉浸要求】" not in messages[0]["content"]
