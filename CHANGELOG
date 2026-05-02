@@ -1,0 +1,300 @@
+# CHANGELOG
+
+## [Unreleased]
+
+> 当前 `dev` 分支上尚未发版的变更。
+
+### Added
+- **V4 多模态模式**：`komari_chat` 支持通过工具调用读取图片，实现图文混合对话能力。
+- **消息缓冲重构**：`komari_memory` 改用空闲超时 + 最小消息数替代旧的 token 计数机制来触发总结，prompt 构建顺序也做了调整。
+- `AGENTS.md`：新增 AI 智能体上下文文档，描述项目架构、插件依赖、编码规范和开发流程。
+
+### Changed
+- **依赖更新**：不再直接计算 token 数量，转而使用 `summary_max_buffer_size` 配置项控制总结触发窗口。
+
+### Fixed
+- AGENTS.md 中插件数量从 17 修正为 18。
+
+### Test
+- 更新 `komari_memory` 和 `komari_chat` 的测试用例，适配上述重构变更。
+
+---
+
+## [v1.2.0-beta.3] - 2026-04-25
+
+### Added
+- **LLM 推理内容日志**：`llm_provider` 在调用日志中记录并展示 DeepSeek 的 `reasoning_content` 推理内容。
+- **DeepSeek V4 角色扮演指令**：`komari_chat` 新增 V4 角色扮演指令注入功能，重构消息构建结构以适配 KV Cache。
+- **群聊总结增强**：`group_history_summary` 集成 DeepSeek V4 角色扮演指令与 `assistant` 预填充配置项。
+
+### Changed
+- `group_history_summary` 拆解总结请求判定逻辑，添加详细调试日志。
+- `group_history_summary` 将规划阶段系统提示词抽取到配置文件并添加默认值。
+
+### Fixed
+- `komari_decision` 补充 `komari_memory` 插件依赖声明，确保插件正确加载顺序。
+
+### Docs
+- 补充 `assistant` 预填充与 DeepSeek V4 角色扮演指令的配置示例项。
+
+---
+
+## [v1.2.0-beta.2] - 2026-04-23
+
+### Added
+- **维护通知推送**：`komari_management` 新增维护通知推送接口与群组查询 API。
+- **状态监控插件**：新增 `komari_status`，集成 Uptime Kuma API 实现服务状态查询。
+
+### Changed
+- `komari_help` 命令重命名为 `docs`，新增列表分页功能。
+- `komari_help` 提取渲染逻辑至独立模块，新增 `max_reply_result_count` 配置项。
+- `komari_help` 新增按插件名称删除自动生成帮助文档的方法，同步时自动清理已禁用插件的帮助条目。
+- `komari_help` 新增 `disabled_auto_generate_plugins` 配置项，支持跳过指定插件的帮助文档同步。
+
+### Fixed
+- 修正帮助文档命令前缀为点号格式，优化日志字符串格式化。
+
+---
+
+## [v1.2.0-beta.1] - 2026-04-21
+
+### Added
+- **健康检查插件**：新增 `komari_healthcheck`，提供无认证状态探测端点。
+- `komari_management` 配置 API 响应新增字段描述信息，便于前端展示。
+- `decision` 插件新增示例配置文件。
+
+### Changed
+- `komari_help` 优化自动帮助条目同步逻辑，避免重复更新并减少索引重建开销。
+- `jrhg` 移除独立的 LLM 调用与提示词构建模块，简化插件架构。
+- **好感度系统迁移**：好感度功能从 `jrhg` 迁移至 `komari_chat`，统一等级划分标准。
+- **数据库配置统一**：Redis 连接配置统一至共享配置，移除各插件冗余的数据库配置覆盖机制。
+
+### Fixed
+- `sr` 插件补充插件描述与使用说明，统一指令前缀为点号格式。
+
+### Style / Refactor
+- `komari_help` 日志格式化统一改为 f-string 语法。
+- `komari_help` 调整 `TYPE_CHECKING` 导入结构，细化序列类型提示为 `list`。
+
+### Docs
+- `character_binding`、`jrhg` 优化插件使用说明，统一多行指令展示风格。
+- 新增 `komari_help` 插件实现帮助文档向量检索与统一管理 API 集成的文档。
+
+---
+
+## [v1.1.0] - 2026-04-19
+
+> **首个正式发布的 v1.1 稳定版**，合并自 v1.1.0-rc.2。
+
+### Added (自 v1.0.0 以来的累积变更)
+- **配置管理接口**：新增配置管理 REST API 并补全测试。
+- **DeepSeek extra_params**：`llm_provider` 为 DeepSeek 客户端添加 `extra_params` 自定义参数支持。
+- **提示词模板化**：记忆确认与 CoT 前缀角色提取为可配置项。
+- **工具调用能力**：`llm_provider` 统一接口新增工具调用能力；群聊总结插件同步接入工具调用。
+- **实体增量更新**：实体压缩从全量改写改为增量更新方案。
+- **忘却模糊化优化**：修复忘却模块数据类型错误，新增模糊化处理并发功能。
+- **角色名绑定**：总结前自动查询群内角色名绑定，优化提示词效果。
+
+### Changed (自 v1.0.0 以来的累积变更)
+- **LLM 接口迁移**：从自建客户端迁移至 `openai` 库，统一接口。
+- **插件解耦**：`decision` 与 `memory` 插件通过 NoneBot2 标准插件间引用方式解耦。
+- **配置解耦**：`decision` 与 `memory` 插件配置完全独立。
+- **数据库增量写入**：优化数据库写入为增量方案，并添加迁移脚本。
+- **日志级别调整**：部分循环监听日志从 INFO 下调为 DEBUG。
+
+### Fixed
+- 早期版本的多个 message/onebot 类型注解问题。
+- 停用 LLM 请求中的 `response_format` 字段以避免兼容性问题。
+- 图片下载器 EOF 读取和重试处理。
+- Sentry 日志过滤与初始化逻辑完善。
+
+### Removed
+- **移除本地向量支持**，统一使用远程 embedding 服务。
+- **移除内置 WebUI**，使用 REST API 暴露外部管理接口。
+- 删除过时的 `not_related` 空回功能。
+
+---
+
+## [v1.1.0-rc.2] - 2026-04-18
+
+### Changed
+- 优化提示词。
+- 记忆确认与 CoT 前缀角色提取为可配置项。
+
+### Fixed
+- 修复 `deepseek_client` 额外参数可能覆盖 SDK 请求字段的问题。
+
+---
+
+## [v1.1.0-rc.1] - 2026-04-18
+
+### Added
+- `llm_provider` 为 DeepSeek 客户端添加 `extra_params` 自定义参数支持。
+
+---
+
+## [v1.1.0-beta.7] - 2026-04-14
+
+### Added
+- 新增配置管理接口并补全测试。
+
+### Fixed
+- 修复 `komari_decision` 插件根模块未导出服务类的问题。
+- 修复配置 schema 命名不统一的问题。
+
+---
+
+## [v1.1.0-beta.6] - 2026-04-13
+
+### Changed
+- 部分循环监听日志下调为 DEBUG 级别。
+- 更新示例配置文件。
+- 聊天记录总结插件与 chat 插件改用标准 NB2 插件间引用方法。
+
+---
+
+## [v1.1.0-beta.5] - 2026-04-12
+
+### Added
+- 实体压缩改为增量更新方案。
+- 为忘却模块新增模糊化处理并发功能。
+
+### Fixed
+- 修正忘却模块因数据类型错误无法正常工作的问题。
+- 修复 management 日志格式问题。
+
+---
+
+## [v1.1.0-beta.4] - 2026-04-12
+
+### Added
+- 新增总结前查询角色名绑定。
+- 优化提示词。
+- 数据库写入优化为增量写入，添加迁移脚本。
+
+### Fixed
+- 修正忘却模块数据类型错误问题。
+
+---
+
+## [v1.1.0-beta.3] - 2026-04-11
+
+### Added
+- 新增独立管理页面插件，统一挂载管理接口与 Swagger/OpenAPI。
+- 交互历史改为增量追加。
+- 新增回复日志本地管理 REST 接口。
+- 新增记忆库本地管理 REST 接口。
+
+### Changed
+- 重构知识库管理接口共享鉴权逻辑。
+- 简化日志记录，仅记录回复文本。
+- 移除内部 WebUI，使用 REST API 暴露外部管理接口。
+
+### Removed
+- 删除过时配置。
+
+### Test
+- 迁移单元测试至 NoneBug 框架。
+
+---
+
+## [v1.1.0-beta.2] - 2026-04-09
+
+### Added
+- 为 `jrhg` 新增独立配置。
+
+---
+
+## [v1.1.0-beta.1] - 2026-04-08
+
+### Added
+- `jrhg` 请求 LLM 生成问好回复。
+- 支持引用消息注入 `komari_chat` 上下文功能。
+
+### Fixed
+- 修复提示词中 XML 标签格式问题。
+
+---
+
+## [v1.0.0] - 2026-03-31
+
+> **首个稳定版（v1.0.0）发布**。
+
+### Core
+- **NoneBot2** 框架 + **OneBot V11** 适配器，QQ 机器人基础架构。
+- **插件体系**：18 个插件，分为基础服务层、核心功能层、辅助功能层。
+
+### Major Features
+- **AI 聊天**（`komari_chat`）：LLM 驱动的对话能力，支持 @触发、主动回复。
+- **四层记忆系统**（`komari_memory`）：对话摘要、用户画像、互动历史、实体知识。
+- **RAG 知识库**（`komari_knowledge`）：向量检索 + 关键词匹配，提供 REST 管理 API。
+- **智能帮助**（`komari_help`）：基于向量检索的帮助文档系统。
+- **群聊总结**（`group_history_summary`）：@机器人后自动总结聊天记录，图片输出。
+- **好感度系统**：`.jrhg` 命令，LLM 生成个性化问好。
+- **角色绑定**：`.nn` 指令，自定义群内昵称。
+- **神人榜**：`.sr` 指令，随机抽取群友。
+- **Sentinel/运维**：Sentry 集成、Bark 推送、健康检查。
+
+### Infrastructure
+- **PostgreSQL + pgvector**：HNSW 向量索引，raw SQL（无 ORM）。
+- **Redis 7.1+**：`redis.asyncio` 异步客户端。
+- **FastAPI**：内嵌于 NoneBot2 的管理 API。
+- **Docker + Docker Compose**：容器化部署，Gunicorn + Uvicorn。
+- **GitHub Actions**：CI/CD 自动构建 Docker 镜像。
+
+### Dev
+- Python **3.13+** 专属，零容忍类型错误（Pyright `standard` + Ruff）。
+- Poetry 包管理。
+
+---
+
+## [v0.7.0] - 2026-03-05
+
+> v1.0.0 之前的最后一个 milestone 版本，奠定了核心架构。
+
+### Features
+- 知识库注入（轻量 RAG + 关键词检索）。
+- 四层记忆系统初版。
+- AI 聊天增强（BERT 模型主动回复判定）。
+- `.nn` 指令复刻（自定义昵称）。
+- SR 插件重构（神人榜抽签）。
+- Bot 上下线 Bark 推送。
+- 独立的权限、配置、数据库管理插件。
+- 可自定义字体，图片布局配置驱动。
+
+### Changed
+- 统一数据库接入接口。
+- 总结只传递纯文字。
+- 提示词持续优化。
+- Docker 部署优化（dockerignore、action 构建修复）。
+
+### Fixed
+- 总结时触发主动回复的问题。
+- 总结触发词优化，添加超出范围提醒。
+
+---
+
+## 版本对照表
+
+| 版本 | 日期 | 类型 |
+|------|------|------|
+| Unreleased | - | dev 分支 |
+| v1.2.0-beta.3 | 2026-04-25 | Beta |
+| v1.2.0-beta.2 | 2026-04-23 | Beta |
+| v1.2.0-beta.1 | 2026-04-21 | Beta |
+| v1.1.0 | 2026-04-19 | **Stable** |
+| v1.1.0-rc.2 | 2026-04-18 | RC |
+| v1.1.0-rc.1 | 2026-04-18 | RC |
+| v1.1.0-beta.7 | 2026-04-14 | Beta |
+| v1.1.0-beta.6 | 2026-04-13 | Beta |
+| v1.1.0-beta.5 | 2026-04-12 | Beta |
+| v1.1.0-beta.4 | 2026-04-12 | Beta |
+| v1.1.0-beta.3 | 2026-04-11 | Beta |
+| v1.1.0-beta.2 | 2026-04-09 | Beta |
+| v1.1.0-beta.1 | 2026-04-08 | Beta |
+| v1.0.0 | 2026-03-31 | **Stable** |
+| v0.7.0 | 2026-03-05 | Milestone |
+
+---
+
+*最后更新：2026-05-02*

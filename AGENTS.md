@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 QQ 机器人，核心角色是《败犬女主太多了》中的 **小鞠知花**。项目代号 Project NEON-TAVERN。
+komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 QQ 机器人，核心角色是《败犬女主太多了》中的 **小鞠知花**。
 
 **核心能力**：AI 聊天（LLM 驱动）、四层记忆系统、RAG 知识库、智能帮助、群聊总结、角色绑定、好感度系统、主动回复判定。
 
