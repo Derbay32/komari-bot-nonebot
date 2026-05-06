@@ -43,7 +43,7 @@ komari-bot/
 │   │   ├── profile_compaction.py         #   用户画像 LLM 压缩
 │   │   ├── onebot_rules.py               #   group_message_rule() 等
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
-│   └── plugins/                          # NoneBot 插件（18个）
+│   └── plugins/                          # NoneBot 插件（17个）
 │
 ├── config/                               # 运行时配置
 │   ├── config_manager/                   #   各插件的 JSON 配置 + .example
@@ -86,7 +86,6 @@ komari-bot/
   jrhg ─────────────────────── .jrhg 今日好感
   komari_healthcheck ───────── 健康检查 / Bark 推送
   komari_sentry ────────────── Sentry 集成
-  komari_status ────────────── Uptime Kuma 状态查询
   komari_management ────────── 管理 REST API
 ```
 

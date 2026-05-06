@@ -11,9 +11,10 @@
 
 ### Changed
 - **依赖更新**：不再直接计算 token 数量，转而使用 `summary_max_buffer_size` 配置项控制总结触发窗口。
+- **状态查询迁移**：移除机器人端 `komari_status` / `.status` Uptime Kuma 查询功能，状态查询已迁移至 NapCat 端侧。
 
 ### Fixed
-- AGENTS.md 中插件数量从 17 修正为 18。
+- AGENTS.md 中插件数量同步为当前 17 个插件。
 
 ### Test
 - 更新 `komari_memory` 和 `komari_chat` 的测试用例，适配上述重构变更。
