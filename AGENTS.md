@@ -43,7 +43,7 @@ komari-bot/
 │   │   ├── profile_compaction.py         #   用户画像 LLM 压缩
 │   │   ├── onebot_rules.py               #   group_message_rule() 等
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
-│   └── plugins/                          # NoneBot 插件（17个）
+│   └── plugins/                          # NoneBot 插件模块
 │
 ├── config/                               # 运行时配置
 │   ├── config_manager/                   #   各插件的 JSON 配置 + .example
@@ -70,6 +70,7 @@ komari-bot/
   permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
+  komari_search ────────────── Tavily 联网搜索服务
   user_data ────────────────── 用户好感度数据库（SQLite）
 
 核心功能层
@@ -95,6 +96,7 @@ komari-bot/
 群消息 → komari_chat（MessageHandler）
          ├─ 调用 komari_memory 获取记忆上下文
          ├─ 调用 komari_decision 判定回复策略
+         ├─ 可选调用 komari_search 工具查询实时信息
          ├─ 调用 llm_provider 生成回复
          └─ 调用 komari_memory 写入新记忆
 ```
