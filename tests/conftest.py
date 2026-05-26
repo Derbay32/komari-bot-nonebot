@@ -165,6 +165,16 @@ class _DummyCharacterBindingPlugin:
         return False
 
 
+class _DummySearchPlugin:
+    @staticmethod
+    def is_search_available() -> bool:
+        return False
+
+    @staticmethod
+    async def search_web(_query: str) -> str:
+        return "[测试搜索未启用]"
+
+
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "llm_provider": _DummyLLMProvider(),
@@ -173,6 +183,7 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
+    "komari_search": _DummySearchPlugin(),
 }
 
 

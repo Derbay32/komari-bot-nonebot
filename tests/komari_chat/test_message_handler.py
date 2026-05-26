@@ -238,6 +238,11 @@ def test_attempt_reply_only_rewrites_current_message(
         _fake_build_prompt,
     )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_reply)
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(is_search_available=lambda: False),
+    )
     original_require = nonebot.plugin.require
 
     def _fake_require(name: str) -> object:

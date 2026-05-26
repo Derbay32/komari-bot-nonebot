@@ -100,6 +100,25 @@ def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
     assert messages[-1] == messages[4]
 
 
+def test_build_prompt_injects_search_tool_system_message(monkeypatch: Any) -> None:
+    _patch_dependencies(monkeypatch)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="搜索一下今天的大新闻",
+            memories=[],
+            config=_build_config(),
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            search_tool_mode=True,
+        )
+    )
+
+    assert messages[2]["role"] == "system"
+    assert "search_web" in messages[2]["content"]
+    assert "不要编造" in messages[2]["content"]
+
+
 def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
     monkeypatch: Any,
 ) -> None:
