@@ -25,7 +25,11 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
-from ..services.llm_service import generate_reply, generate_reply_with_vision_tool
+from ..services.llm_service import (
+    generate_reply,
+    generate_reply_with_search_tool,
+    generate_reply_with_vision_tool,
+)
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
@@ -36,6 +40,7 @@ except Exception:
     user_data_plugin = None
 
 config_manager_plugin = require("config_manager")
+komari_search_plugin = require("komari_search")
 llm_provider_config_manager = config_manager_plugin.get_config_manager(
     "llm_provider",
     DynamicConfigSchema,
@@ -533,6 +538,7 @@ class MessageHandler:
         use_vision_tool = getattr(config, "vision_tool_enabled", True) and bool(
             all_base64_images
         )
+        use_search_tool = bool(komari_search_plugin.is_search_available())
 
         if reply_context_requested:
             logger.info(
@@ -595,6 +601,7 @@ class MessageHandler:
             favor_daily=favor_daily,
             favor_user_id=message.user_id,
             vision_tool_mode=use_vision_tool,
+            search_tool_mode=use_search_tool,
         )
 
         if use_vision_tool:
@@ -606,6 +613,13 @@ class MessageHandler:
                 vision_model=vision_config.vision_model,
                 vision_temperature=vision_config.vision_temperature,
                 vision_max_tokens=vision_config.vision_max_tokens,
+                request_trace_id=request_trace_id,
+                search_tool_enabled=use_search_tool,
+            )
+        elif use_search_tool:
+            reply = await generate_reply_with_search_tool(
+                config=config,
+                messages=prompt_messages,
                 request_trace_id=request_trace_id,
             )
         else:

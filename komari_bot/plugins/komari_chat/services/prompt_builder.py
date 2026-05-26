@@ -143,6 +143,7 @@ async def build_prompt(
     favor_user_id: str | None = None,
     *,
     vision_tool_mode: bool = False,
+    search_tool_mode: bool = False,
 ) -> list[dict[str, Any]]:
     """构建面向 DeepSeek KV Cache 优化的 OpenAI 格式消息数组。
 
@@ -169,6 +170,7 @@ async def build_prompt(
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
         query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
         vision_tool_mode: 是否使用工具调用读图模式。开启时只注入图片索引说明，不嵌入 base64 图片块
+        search_tool_mode: 是否启用联网搜索工具声明
 
     Returns:
         OpenAI 格式消息列表 [{role, content}]，当包含图片时 content 为数组格式
@@ -181,6 +183,18 @@ async def build_prompt(
     # ═══════════════════════════════════════
     messages.append({"role": "system", "content": template["system_prompt"]})
     messages.append({"role": "system", "content": template["output_instruction"]})
+    if search_tool_mode:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[系统提示：当前对话启用了联网搜索工具 search_web。"
+                    "当用户明确要求搜索、询问最新资讯/数据、或涉及你不确定的事实时，"
+                    "请先调用 search_web 查询互联网；回答时要基于搜索结果如实说明，"
+                    "不要编造搜索结果中没有的信息。]"
+                ),
+            }
+        )
 
     # ═══════════════════════════════════════
     # ③ user/assistant — 对话历史
