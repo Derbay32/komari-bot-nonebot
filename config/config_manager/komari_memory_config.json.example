@@ -44,5 +44,7 @@
   "filter_history_check_size": 50,
   "query_rewrite_history_limit": 10,
 
-  "bot_aliases": ["小鞠", "小鞠知花", "komari"]
+  "bot_aliases": ["小鞠", "小鞠知花", "komari"],
+  "face_reaction_enabled": false,
+  "face_reaction_id": "76"
 }

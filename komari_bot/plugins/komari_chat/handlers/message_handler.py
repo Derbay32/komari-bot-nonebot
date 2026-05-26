@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -61,6 +62,7 @@ ReplyAction = Literal[
     "not_replied",
     "generation_failed",
 ]
+ReplyTriggeredCallback = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -312,6 +314,7 @@ class MessageHandler:
         self,
         bot: Bot,
         event: GroupMessageEvent,
+        on_reply_triggered: ReplyTriggeredCallback | None = None,
     ) -> dict[str, str] | None:
         """处理群聊消息的主流程。"""
         user_id = str(event.user_id)
@@ -398,6 +401,7 @@ class MessageHandler:
             reply_score=outcome.reply_score,
             store_current=memory_store,
             best_scene_id=outcome.best_scene_id,
+            on_reply_triggered=on_reply_triggered,
         )
         if reply is not None:
             reply_action: ReplyAction = (
@@ -472,6 +476,7 @@ class MessageHandler:
         reply_score: float | None,
         store_current: bool,
         best_scene_id: str | None = None,
+        on_reply_triggered: ReplyTriggeredCallback | None = None,
     ) -> tuple[dict[str, str] | None, bool]:
         """尝试生成并返回回复。
 
@@ -495,6 +500,12 @@ class MessageHandler:
             if current_count >= config.proactive_max_per_hour:
                 logger.debug("[KomariMemory] 主动回复频率超限")
                 return None, stored
+
+        if on_reply_triggered is not None:
+            try:
+                await on_reply_triggered()
+            except Exception:
+                logger.debug("[KomariChat] 回复触发表情反应回调失败", exc_info=True)
 
         recent_messages = await self.redis.get_buffer(
             message.group_id, limit=config.summary_max_buffer_size

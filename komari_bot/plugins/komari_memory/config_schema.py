@@ -168,6 +168,16 @@ class KomariMemoryConfigSchema(BaseModel):
         description="机器人别名列表（用于机器人身份识别）",
     )
 
+    # 表情反应配置
+    face_reaction_enabled: bool = Field(
+        default=False,
+        description="是否在触发聊天回复后对用户消息添加表情反应，用于提示正在生成回复",
+    )
+    face_reaction_id: str = Field(
+        default="76",
+        description="表情反应的 Face ID（QQ 表情 ID），如 76=赞。仅 face_reaction_enabled=true 时生效",
+    )
+
     @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:

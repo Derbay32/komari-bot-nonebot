@@ -61,6 +61,22 @@ def _get_or_build_handler() -> MessageHandler | None:
     return _handler
 
 
+async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
+    """在触发聊天回复后，对触发消息添加表情反应。"""
+    config = get_config()
+    if not config.face_reaction_enabled or not config.face_reaction_id:
+        return
+
+    try:
+        await bot.call_api(
+            "set_msg_emoji_like",
+            message_id=event.message_id,
+            emoji_id=config.face_reaction_id,
+        )
+    except Exception as e:
+        logger.debug("[KomariChat] 表情反应发送失败: {}", e)
+
+
 @matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     """处理群聊消息。"""
@@ -84,7 +100,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
-        result = await handler.process_message(bot, event)
+        result = await handler.process_message(
+            bot,
+            event,
+            on_reply_triggered=lambda: _send_face_reaction(bot, event),
+        )
         if not result:
             return
 
