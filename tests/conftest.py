@@ -175,6 +175,20 @@ class _DummySearchPlugin:
         return "[测试搜索未启用]"
 
 
+class _DummyUnifiedCandidateRerankService:
+    async def rank_message(self, *_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            best_scene_id="scene_group_history_summary",
+            best_scene_score=1.0,
+            meaningful_score=1.0,
+            noise_score=0.0,
+        )
+
+
+class _DummyDecisionPlugin:
+    UnifiedCandidateRerankService = _DummyUnifiedCandidateRerankService
+
+
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "llm_provider": _DummyLLMProvider(),
@@ -184,6 +198,7 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
     "komari_search": _DummySearchPlugin(),
+    "komari_decision": _DummyDecisionPlugin(),
 }
 
 
