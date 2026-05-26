@@ -5,6 +5,7 @@
 > 当前 `dev` 分支上尚未发版的变更。
 
 ### Added
+- **表情反应提示**：`komari_chat` 判定回复后自动对用户消息发送表情反应（NapCat `set_msg_emoji_like`），示意正在生成回复。通过 `face_reaction_enabled` / `face_reaction_id` 配置项控制，默认关闭，reaction 失败不影响回复流程。
 - **联网搜索插件**：新增 `komari_search`，封装 Tavily Search API，供 `komari_chat` 通过 `search_web` 工具调用实现联网搜索。搜索与图片读取工具可在同一轮 tool-calling 循环中共存，不影响总结功能。
 - **V4 多模态模式**：`komari_chat` 支持通过工具调用读取图片，实现图文混合对话能力。
 - **消息缓冲重构**：`komari_memory` 改用空闲超时 + 最小消息数替代旧的 token 计数机制来触发总结，prompt 构建顺序也做了调整。
