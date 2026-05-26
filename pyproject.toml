@@ -1,6 +1,6 @@
 [project]
 name = "komari-bot"
-version = "0.4.0"
+version = "1.2.0"
 description = "komari-bot"
 readme = "README.md"
 requires-python = ">=3.13, <4.0"
@@ -17,6 +17,7 @@ dependencies = [
     "Pillow (>=11.2.1,<12.0.0)",
     "sentry-sdk (>=2.54.0,<3.0.0)",
     "openai (>=2.31.0,<3.0.0)",
+    "tavily-python (>=0.7.24,<0.8.0)",
 ]
 
 [project.optional-dependencies]
