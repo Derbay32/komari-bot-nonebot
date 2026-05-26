@@ -15,6 +15,7 @@
 - **状态查询迁移**：移除机器人端 `komari_status` / `.status` Uptime Kuma 查询功能，状态查询已迁移至 NapCat 端侧。
 
 ### Fixed
+- **总结请求误拦截**：修复 `group_history_summary` 中误用 `meaningful_score` / `noise_score`（记忆价值判定）拦截总结意图的问题，移除该错误分支，总结请求只依赖 scene 识别 + 关键词双重门控。
 - AGENTS.md 中插件数量同步为当前 17 个插件。
 
 ### Test
