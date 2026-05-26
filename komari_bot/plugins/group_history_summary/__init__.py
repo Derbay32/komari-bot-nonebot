@@ -143,12 +143,6 @@ async def _is_summary_request(message_text: str) -> bool:
             "[SummaryCheck] 失败: best_scene_score={:.4f} < 0.6",
             rank_result.best_scene_score,
         )
-    elif rank_result.meaningful_score < rank_result.noise_score:
-        logger.info(
-            "[SummaryCheck] 失败: meaningful={:.4f} < noise={:.4f}",
-            rank_result.meaningful_score,
-            rank_result.noise_score,
-        )
     else:
         logger.info("[SummaryCheck] 全部条件满足，确认为总结请求")
         is_summary_request = True
