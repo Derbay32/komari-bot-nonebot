@@ -27,8 +27,10 @@ __plugin_meta__ = PluginMetadata(
     name="komari-custom",
     description="群成员知识库提案与投票采纳插件",
     usage="""
-.custom new [标题] 发起知识库提案
-.custom confirm 推进标题、正文、最终发布三阶段
+此命令用于发起追加写入知识库公投。
+.custom new [标题] 发起知识库提案(可不输入标题，后续引导流程会要求再次输入)
+直接回复引导消息 向当前提案的标题/内容追加内容，默认换行追加，标题不支持换行
+.custom confirm 确认修改并推进标题、正文、最终发布三阶段
 .custom replace <旧文本> <新文本> 替换当前字段，或只传一个参数全量替换
 .custom undo 撤销上次编辑
 .custom del [文本] 删除当前字段文本，不传则清空
