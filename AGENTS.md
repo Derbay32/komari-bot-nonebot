@@ -50,7 +50,6 @@ komari-bot/
 │   └── prompts/                          #   YAML 提示词模板
 │
 ├── docs/                                 # 文档
-│   ├── ai-context/                       #   AI 上下文（含 handoff.md 交接记录）
 │   ├── local/                            #   本地开发记录
 │   └── *.md                              #   组件文档
 │
@@ -85,6 +84,7 @@ komari-bot/
   character_binding ────────── .nn 昵称指令
   sr ───────────────────────── 神人榜抽签
   jrhg ─────────────────────── .jrhg 今日好感
+  komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_healthcheck ───────── 健康检查 / Bark 推送
   komari_sentry ────────────── Sentry 集成
   komari_management ────────── 管理 REST API
@@ -99,6 +99,13 @@ komari-bot/
          ├─ 可选调用 komari_search 工具查询实时信息
          ├─ 调用 llm_provider 生成回复
          └─ 调用 komari_memory 写入新记忆
+
+.custom 提案流程
+群消息 → komari_custom
+         ├─ Redis 编辑会话（多步标题/正文编辑）
+         ├─ PostgreSQL 提案表（投票追踪、过期清理）
+         ├─ 表情反应监听 + fetch_emoji_like 补偿拉取
+         └─ 投票达标 → komari_knowledge.add_knowledge() 写入知识库
 ```
 
 ## 核心机制详解
@@ -243,7 +250,7 @@ poetry run pytest tests/ -v
 
 | 文档 | 位置 | 用途 |
 |------|------|------|
-| 任务交接记录 | `docs/ai-context/handoff.md` | 历史任务详情、决策记录、注意事项 |
+| 任务交接记录 | `docs/handoff.md` | 历史任务详情、决策记录、注意事项 |
 | 项目结构模板 | `docs/ai-context/project-structure.md` | 项目组织说明 |
 | 集成架构 | `docs/ai-context/system-integration.md` | 跨组件通信模式 |
 | 部署文档 | `docs/ai-context/deployment-infrastructure.md` | 容器化、CI/CD |
@@ -251,4 +258,4 @@ poetry run pytest tests/ -v
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，基于完整的项目探索。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-05-28。发现不一致请以实际代码为准并更新本文档。*
