@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-03-01T12:00:00+08:00",
+  "pg_host": "localhost",
+  "pg_port": 5432,
+  "pg_database": "komari_bot",
+  "pg_user": "your_username",
+  "pg_password": "your_password",
+  "pg_pool_min_size": 2,
+  "pg_pool_max_size": 5
+}

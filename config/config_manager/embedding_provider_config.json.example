@@ -1,0 +1,11 @@
+{
+  "embedding_model": "Qwen/Qwen3-Embedding-8B",
+  "embedding_api_url": "",
+  "embedding_api_key": "",
+  "embedding_dimension": 512,
+  "rerank_enabled": false,
+  "rerank_model": "",
+  "rerank_api_url": "",
+  "rerank_api_key": "",
+  "rerank_top_n": 5
+}
