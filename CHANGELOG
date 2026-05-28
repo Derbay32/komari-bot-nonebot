@@ -4,6 +4,10 @@
 
 > 当前 `dev` 分支上尚未发版的变更。
 
+---
+
+## [v1.2.0-beta.4] - 2026-05-28
+
 ### Added
 - **表情反应提示**：`komari_chat` 判定回复后自动对用户消息发送表情反应（NapCat `set_msg_emoji_like`），示意正在生成回复。通过 `face_reaction_enabled` / `face_reaction_id` 配置项控制，默认关闭，reaction 失败不影响回复流程。
 - **联网搜索插件**：新增 `komari_search`，封装 Tavily Search API，供 `komari_chat` 通过 `search_web` 工具调用实现联网搜索。搜索与图片读取工具可在同一轮 tool-calling 循环中共存，不影响总结功能。
@@ -20,7 +24,7 @@
 
 ### Fixed
 - **总结请求误拦截**：修复 `group_history_summary` 中误用 `meaningful_score` / `noise_score`（记忆价值判定）拦截总结意图的问题，移除该错误分支，总结请求只依赖 scene 识别 + 关键词双重门控。
-- AGENTS.md 中插件数量同步为当前 17 个插件。
+- **修复 Github Action 工作流**: 修复部署包中 Docker 镜像标签包含 v 前缀的问题。
 
 ### Test
 - 更新 `komari_memory` 和 `komari_chat` 的测试用例，适配上述重构变更。
@@ -286,6 +290,7 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
+| v1.2.0-beta.4 | 2026-05-28 | Beta |
 | v1.2.0-beta.3 | 2026-04-25 | Beta |
 | v1.2.0-beta.2 | 2026-04-23 | Beta |
 | v1.2.0-beta.1 | 2026-04-21 | Beta |
