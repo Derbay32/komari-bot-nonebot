@@ -47,6 +47,7 @@ jobs:
       - name: Package and upload deployment files
         run: |
           TAG_NAME="${{ github.event.release.tag_name || github.ref_name }}"
+          IMAGE_TAG="${TAG_NAME#v}"
           
           # 准备打包目录
           mkdir -p komari-bot-deploy/app
@@ -64,7 +65,7 @@ jobs:
           fi
           
           # 复制 docker-compose.yml 并替换镜像标签为当前版本
-          sed "s|derbay32/komari-bot-nonebot:latest|derbay32/komari-bot-nonebot:${TAG_NAME}|g" docker-compose.yml > komari-bot-deploy/docker-compose.yml
+          sed "s|derbay32/komari-bot-nonebot:latest|derbay32/komari-bot-nonebot:${IMAGE_TAG}|g" docker-compose.yml > komari-bot-deploy/docker-compose.yml
           
           # 打包成压缩包
           cd komari-bot-deploy
