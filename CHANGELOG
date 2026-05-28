@@ -9,9 +9,12 @@
 - **联网搜索插件**：新增 `komari_search`，封装 Tavily Search API，供 `komari_chat` 通过 `search_web` 工具调用实现联网搜索。搜索与图片读取工具可在同一轮 tool-calling 循环中共存，不影响总结功能。
 - **V4 多模态模式**：`komari_chat` 支持通过工具调用读取图片，实现图文混合对话能力。
 - **消息缓冲重构**：`komari_memory` 改用空闲超时 + 最小消息数替代旧的 token 计数机制来触发总结，prompt 构建顺序也做了调整。
+- **知识库提案插件**：新增 `komari_custom`，提供 `.custom` 指令组，允许群成员通过多步编辑流程发起知识库提案，经群消息表情投票通过后自动写入 `komari_knowledge` 知识库。默认关闭，需 PostgreSQL + Redis 支持。包含标题正文编辑、撤销、分页列表、投票计数、过期自动清理等功能。
 - `AGENTS.md`：新增 AI 智能体上下文文档，描述项目架构、插件依赖、编码规范和开发流程。
 
 ### Changed
+- **知识库提案提交者展示**：`komari_custom` 投票消息与提案详情中的提交者现在展示名称与 QQ 号，名称优先级为绑定名称 > 用户名 > 群昵称，并持久化到提案表。
+- **KnowledgeCategory 扩展**：`komari_knowledge` 模型的 `KnowledgeCategory` 新增 `"custom"` 分类字面量，用于提案通过后写入知识库。
 - **依赖更新**：不再直接计算 token 数量，转而使用 `summary_max_buffer_size` 配置项控制总结触发窗口。
 - **状态查询迁移**：移除机器人端 `komari_status` / `.status` Uptime Kuma 查询功能，状态查询已迁移至 NapCat 端侧。
 
@@ -301,4 +304,4 @@
 
 ---
 
-*最后更新：2026-05-26*
+*最后更新：2026-05-28*
