@@ -12,6 +12,7 @@ from nonebot import logger
 from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
+from ..agent import run_profile_agent
 from ..core.retry import retry_async
 from ..services.config_interface import get_config
 from ..services.llm_service import summarize_conversation
@@ -64,6 +65,15 @@ def _default_interaction(*, user_id: str, display_name: str) -> dict[str, Any]:
 
 def _normalize_identity_key(value: str) -> str:
     return value.strip().casefold()
+
+
+def _format_summary_message_line(
+    message: Any,
+    config: KomariMemoryConfigSchema,
+) -> str:
+    if getattr(message, "is_bot", False):
+        return f"[bot] {config.bot_nickname}: {message.content}"
+    return f"[user_id:{message.user_id}] {message.user_nickname}: {message.content}"
 
 
 async def _refresh_character_binding_if_needed(*, group_id: str) -> bool:
@@ -401,62 +411,6 @@ def _merge_user_operation_payloads(
     return merged
 
 
-def _apply_profile_operations(
-    base_profile: dict[str, Any],
-    *,
-    user_id: str,
-    display_name: str,
-    operations: list[dict[str, Any]],
-) -> dict[str, Any]:
-    profile = dict(base_profile)
-    profile["version"] = 1
-    profile["user_id"] = user_id
-    resolved_display_name = (
-        str(display_name).strip()
-        or str(profile.get("display_name", "")).strip()
-        or user_id
-    )
-    traits_raw = profile.get("traits")
-    traits = dict(traits_raw) if isinstance(traits_raw, dict) else {}
-
-    for operation in operations:
-        if not isinstance(operation, dict):
-            continue
-        op = str(operation.get("op", "")).strip()
-        field = str(operation.get("field", "")).strip()
-
-        if field != "trait":
-            continue
-
-        key = str(operation.get("key", "")).strip()
-        if not key:
-            continue
-        if op == "delete":
-            traits.pop(key, None)
-            continue
-
-        value = str(operation.get("value", "")).strip()
-        if not value:
-            continue
-        if op == "add" and key in traits:
-            continue
-        try:
-            importance = int(operation.get("importance", 3))
-        except (TypeError, ValueError):
-            importance = 3
-        traits[key] = {
-            "value": value,
-            "category": str(operation.get("category", "general")).strip() or "general",
-            "importance": max(1, min(5, importance)),
-            "updated_at": _now_iso(),
-        }
-
-    profile["display_name"] = resolved_display_name
-    profile["traits"] = traits
-    profile["updated_at"] = _now_iso()
-    return profile
-
-
 def _apply_interaction_operations(
     base_interaction: dict[str, Any] | None,
     *,
@@ -649,16 +603,34 @@ async def perform_summary(
         existing_interactions=existing_interactions,
     )
 
+    bot_user_ids, bot_display_names = _collect_bot_identities(
+        messages_buffer=messages_buffer,
+        config=config,
+    )
+    conversation_text = "\n".join(
+        _format_summary_message_line(message, config) for message in messages_buffer
+    )
+    profile_result = await run_profile_agent(
+        redis=redis.redis,
+        memory=memory,
+        group_id=group_id,
+        conversation_text=conversation_text,
+        participants=participants,
+        display_name_map=nickname_map,
+        bot_user_ids=bot_user_ids,
+        config=config,
+        trace_id=f"profile-agent-{uuid4().hex[:8]}",
+    )
+
     result = await summarize_conversation(
         messages_buffer,
         config,
-        existing_profiles=list(existing_profiles.values()),
+        existing_profiles=[],
         existing_interactions=list(existing_interactions.values()),
     )
 
     summary = str(result.get("summary", "")).strip()
     importance = int(result.get("importance", 3))
-    user_profile_operations = result.get("user_profile_operations", [])
     user_interaction_operations = result.get("user_interaction_operations", [])
 
     if not summary:
@@ -677,46 +649,6 @@ async def perform_summary(
         nickname_map=nickname_map,
     )
     uid_alias_map: dict[str, str] = {}
-    bot_user_ids, bot_display_names = _collect_bot_identities(
-        messages_buffer=messages_buffer,
-        config=config,
-    )
-
-    profile_operations_by_user: dict[str, dict[str, Any]] = {}
-    if isinstance(user_profile_operations, list):
-        for payload in user_profile_operations:
-            if not isinstance(payload, dict):
-                continue
-            raw_uid = str(payload.get("user_id", "")).strip()
-            display_name = str(payload.get("display_name", "")).strip()
-            if _should_skip_bot_summary_entry(
-                raw_uid=raw_uid,
-                display_name=display_name,
-                participant_set=participant_set,
-                bot_user_ids=bot_user_ids,
-                bot_display_names=bot_display_names,
-                group_id=group_id,
-                source="user_profile_operation",
-            ):
-                continue
-            uid = _resolve_summary_uid(
-                raw_uid=raw_uid,
-                display_name=display_name,
-                participant_set=participant_set,
-                display_name_uid_map=display_name_uid_map,
-                uid_alias_map=uid_alias_map,
-                group_id=group_id,
-                source="user_profile_operation",
-            )
-            if uid is None or uid in bot_user_ids:
-                continue
-            normalized_payload = dict(payload)
-            normalized_payload["user_id"] = uid
-            profile_operations_by_user[uid] = _merge_user_operation_payloads(
-                profile_operations_by_user.get(uid),
-                normalized_payload,
-            )
-
     interaction_operations_by_user: dict[str, dict[str, Any]] = {}
     if isinstance(user_interaction_operations, list):
         for payload in user_interaction_operations:
@@ -752,46 +684,31 @@ async def perform_summary(
                 normalized_payload,
             )
 
-    target_users = (
-        set(participants)
-        | set(profile_operations_by_user)
-        | set(interaction_operations_by_user)
-    ) - bot_user_ids
+    for uid in sorted(profile_result.changed_user_ids - bot_user_ids):
+        profile = await memory.get_user_profile(user_id=uid, group_id=group_id)
+        if profile is None:
+            continue
+        compacted_profile = await _enforce_profile_trait_limit(
+            group_id=group_id,
+            user_id=uid,
+            base_profile=existing_profiles.get(uid) or profile,
+            merged_profile=profile,
+            config=config,
+        )
+        if compacted_profile != profile:
+            await memory.upsert_user_profile(
+                user_id=uid,
+                group_id=group_id,
+                profile=compacted_profile,
+                importance=4,
+            )
+
+    target_users = (set(participants) | set(interaction_operations_by_user)) - bot_user_ids
     for uid in sorted(target_users):
         display_name = character_binding.get_character_name(
             user_id=uid,
             fallback_nickname=nickname_map.get(uid),
         )
-        profile_operation_payload = profile_operations_by_user.get(uid)
-        base_profile = existing_profiles.get(uid) or _default_profile(
-            user_id=uid,
-            display_name=display_name,
-        )
-        profile_operations = (
-            profile_operation_payload.get("operations", [])
-            if isinstance(profile_operation_payload, dict)
-            else []
-        )
-        merged_profile = _apply_profile_operations(
-            base_profile,
-            user_id=uid,
-            display_name=display_name,
-            operations=profile_operations if isinstance(profile_operations, list) else [],
-        )
-        merged_profile = await _enforce_profile_trait_limit(
-            group_id=group_id,
-            user_id=uid,
-            base_profile=base_profile,
-            merged_profile=merged_profile,
-            config=config,
-        )
-        await memory.upsert_user_profile(
-            user_id=uid,
-            group_id=group_id,
-            profile=merged_profile,
-            importance=4,
-        )
-
         interaction_operation_payload = interaction_operations_by_user.get(uid)
         interaction_operations = (
             interaction_operation_payload.get("operations", [])
@@ -821,7 +738,7 @@ async def perform_summary(
         group_id,
         conversation_id,
         len(target_users),
-        len(user_profile_operations) if isinstance(user_profile_operations, list) else 0,
+        profile_result.committed_count,
     )
 
 

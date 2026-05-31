@@ -31,6 +31,9 @@ class RedisKeys:
     # 每日好感问候标记
     FAVOR_GREETED = f"{PREFIX}:favor:greeted:%s:%s"
 
+    # 画像 Agent 暂存区
+    STAGING_PROFILE = f"{PREFIX}:staging:profile:%s"
+
     @classmethod
     def buffer(cls, group_id: str) -> str:
         """获取消息缓冲区键。
@@ -116,3 +119,8 @@ class RedisKeys:
             Redis 键
         """
         return cls.FAVOR_GREETED % (group_id, user_id)
+
+    @classmethod
+    def staging_profile(cls, session_id: str) -> str:
+        """获取画像 Agent 暂存区键。"""
+        return cls.STAGING_PROFILE % session_id

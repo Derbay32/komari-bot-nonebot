@@ -34,6 +34,11 @@ class MemoryService:
         self._entity_repo = entity_repo
         self._embedding_plugin: Any = require("embedding_provider")
 
+    @property
+    def pg_pool(self) -> Any:
+        """获取底层 PostgreSQL 连接池，供跨组件生命周期锁复用。"""
+        return self._entity_repo.pg_pool
+
     async def store_conversation(
         self,
         group_id: str,

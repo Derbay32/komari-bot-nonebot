@@ -191,7 +191,10 @@ def _build_existing_context_with_budget(
     existing_interactions: list[dict] | None = None,
     token_budget: int | None,
 ) -> _ExistingContextBuildResult:
-    """构建可控大小的已有画像提示。"""
+    """构建可控大小的已有互动历史提示。
+
+    用户画像已改由画像 Agent 通过 read_profile 工具按需懒加载，旧总结路径不再全量注入画像。
+    """
     template = get_summary_template()
     instruction_block = f"{template['existing_context_instruction_block']}\n\n"
     instruction_tokens = estimate_text_tokens(instruction_block)
@@ -224,24 +227,8 @@ def _build_existing_context_with_budget(
         blocks.append(block)
         return True
 
-    profile_lines = [
-        line
-        for profile in (existing_profiles or [])
-        if (line := _compact_profile_line(profile)) is not None
-    ]
-    if profile_lines:
-        profile_header = template["existing_profiles_header"]
-        header_added = False
-        for line in profile_lines:
-            block = f"{profile_header}\n{line}\n" if not header_added else f"{line}\n"
-            if _append_block(block):
-                header_added = True
-                included_profiles += 1
-            else:
-                truncated = True
-                break
-        if header_added:
-            _append_block("\n")
+    if existing_profiles:
+        truncated = True
 
     interaction_lines = [
         line

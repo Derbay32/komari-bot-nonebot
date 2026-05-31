@@ -61,7 +61,7 @@ class KomariMemoryConfigSchema(BaseModel):
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
     llm_model_summary: str = Field(
-        default="gemini-2.5-flash-lite", description="总结使用模型"
+        default="deepseek-v4-flash", description="总结使用模型"
     )
     llm_temperature_summary: float = Field(
         default=0.3, ge=0.0, le=2.0, description="总结模型温度参数"
@@ -106,6 +106,42 @@ class KomariMemoryConfigSchema(BaseModel):
         ge=1,
         le=100,
         description="每个用户画像允许保留的长期稳定 traits 最大数量",
+    )
+    memory_agent_max_rounds: int = Field(
+        default=12,
+        ge=1,
+        le=50,
+        description="记忆画像 Agent 最大工具调用轮数",
+    )
+    memory_agent_staging_ttl_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=3600,
+        description="记忆画像 Agent Redis 暂存区 TTL（秒）",
+    )
+    memory_agent_max_tool_calls: int = Field(
+        default=24,
+        ge=1,
+        le=200,
+        description="单次记忆画像 Agent 最大工具调用数",
+    )
+    memory_agent_max_read_profiles: int = Field(
+        default=20,
+        ge=0,
+        le=200,
+        description="单次记忆画像 Agent 最大读取用户画像次数",
+    )
+    memory_agent_max_write_operations: int = Field(
+        default=40,
+        ge=0,
+        le=500,
+        description="单次记忆画像 Agent 最大暂存画像操作数",
+    )
+    memory_agent_lock_timeout_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=3600,
+        description="记忆 Agent 生命周期锁等待超时；为空表示一直等待",
     )
     memory_search_limit: int = Field(
         default=3, ge=1, le=10, description="检索相关记忆的最大数量"
