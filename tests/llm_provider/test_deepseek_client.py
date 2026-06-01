@@ -112,7 +112,7 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_text_ignores_response_format(
+def test_deepseek_client_generate_text_passes_response_format(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -163,7 +163,63 @@ def test_deepseek_client_generate_text_ignores_response_format(
         assert result.content == "ok"
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
-        assert "response_format" not in request_data
+        assert request_data["response_format"] == {"type": "json_object"}
+
+    asyncio.run(_run())
+
+
+def test_deepseek_client_generate_text_with_messages_passes_response_format(
+    monkeypatch: Any,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.last_kwargs: dict[str, Any] | None = None
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    async def _run() -> None:
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
+        monkeypatch.setattr(
+            deepseek_client_module,
+            "config_manager",
+            SimpleNamespace(
+                get=lambda: SimpleNamespace(
+                    deepseek_temperature=1.0,
+                    deepseek_max_tokens=8192,
+                    deepseek_frequency_penalty=0.0,
+                    deepseek_api_base="https://example.com/v1",
+                    deepseek_reasoning_effort="",
+                )
+            ),
+        )
+
+        result = await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "请返回 JSON"}],
+            model="deepseek-chat",
+            response_format={"type": "json_object"},
+        )
+
+        assert result.content == "ok"
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert request_data["response_format"] == {"type": "json_object"}
 
     asyncio.run(_run())
 
