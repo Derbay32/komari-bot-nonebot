@@ -99,7 +99,6 @@ def test_search_conversations_touches_results_immediately_without_rerank(
             "group_id": "g1",
             "user_id": "u1",
             "limit": 2,
-            "access_boost": 1.2,
             "touch_results": True,
         }
     ]
@@ -125,13 +124,11 @@ def test_search_conversations_only_touches_reranked_results(monkeypatch: Any) ->
             "group_id": "g1",
             "user_id": "u1",
             "limit": 6,
-            "access_boost": 1.2,
             "touch_results": False,
         }
     ]
     assert repository.touch_calls == [
         {
             "conversation_ids": [103, 101],
-            "access_boost": 1.2,
         }
     ]
