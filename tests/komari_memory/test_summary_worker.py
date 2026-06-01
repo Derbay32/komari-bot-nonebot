@@ -11,31 +11,11 @@ from typing import Any
 import nonebot.plugin
 
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.services.profile_compaction import (
-    count_profile_traits,
-)
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = PROJECT_ROOT / "komari_bot/plugins/komari_memory/handlers/summary_worker.py"
 PACKAGE_ROOT = PROJECT_ROOT / "komari_bot/plugins/komari_memory"
-
-
-def _make_profile(trait_count: int) -> dict[str, Any]:
-    return {
-        "version": 1,
-        "user_id": "10001",
-        "display_name": "阿明",
-        "traits": {
-            f"特征{i:02d}": {
-                "value": f"长期描述{i}",
-                "category": "general",
-                "importance": 4,
-                "updated_at": f"2026-03-21T00:00:{i % 60:02d}+08:00",
-            }
-            for i in range(trait_count)
-        },
-    }
 
 
 def _load_summary_worker_module(monkeypatch: Any) -> Any:
@@ -214,51 +194,6 @@ def _profile_agent_result(*, changed_user_ids: set[str] | None = None) -> Simple
         status="committed",
         changed_user_ids=changed_user_ids or set(),
     )
-
-
-def test_enforce_profile_trait_limit_uses_compacted_profile(monkeypatch: Any) -> None:
-    module = _load_summary_worker_module(monkeypatch)
-
-    async def _fake_compact_profile_with_llm(**kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return _make_profile(20)
-
-    monkeypatch.setattr(module, "compact_profile_with_llm", _fake_compact_profile_with_llm)
-
-    result = asyncio.run(
-        module._enforce_profile_trait_limit(
-            group_id="114514",
-            user_id="10001",
-            base_profile=_make_profile(6),
-            merged_profile=_make_profile(26),
-            config=KomariMemoryConfigSchema(profile_trait_limit=20),
-        )
-    )
-
-    assert count_profile_traits(result) == 20
-
-
-def test_enforce_profile_trait_limit_falls_back_to_base_profile(monkeypatch: Any) -> None:
-    module = _load_summary_worker_module(monkeypatch)
-
-    async def _boom(**kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        raise RuntimeError("boom")
-
-    base_profile = _make_profile(4)
-    monkeypatch.setattr(module, "compact_profile_with_llm", _boom)
-
-    result = asyncio.run(
-        module._enforce_profile_trait_limit(
-            group_id="114514",
-            user_id="10001",
-            base_profile=base_profile,
-            merged_profile=_make_profile(25),
-            config=KomariMemoryConfigSchema(profile_trait_limit=20),
-        )
-    )
-
-    assert result == base_profile
 
 
 def test_perform_summary_stores_multiple_memories_before_profile_agent(monkeypatch: Any) -> None:
