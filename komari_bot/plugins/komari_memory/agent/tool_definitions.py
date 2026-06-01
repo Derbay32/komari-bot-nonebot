@@ -75,4 +75,43 @@ PREVIEW_PROFILE_TOOL: dict[str, Any] = {
     },
 }
 
-PROFILE_AGENT_TOOLS = [READ_PROFILE_TOOL, WRITE_PROFILE_TOOL, PREVIEW_PROFILE_TOOL]
+COUNT_PROFILE_TRAITS_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "count_profile_traits",
+        "description": "统计指定用户在当前群的画像 trait 数量，可选择纳入暂存区未提交的修改。用于判断是否需要压缩画像。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "description": "用户 ID"},
+                "include_staged": {
+                    "type": "boolean",
+                    "description": "是否纳入暂存区未提交的操作来计算有效 trait 数。设为 true 可以判断提交后是否会超出上限。",
+                },
+            },
+            "required": ["user_id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+COMMIT_PROFILE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "commit_profile",
+        "description": "提交当前暂存区画像修改。提交前会校验所有受影响用户的 trait 数量，超限时返回错误并保留暂存区，供继续压缩后重试。",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+}
+
+PROFILE_AGENT_TOOLS = [
+    READ_PROFILE_TOOL,
+    WRITE_PROFILE_TOOL,
+    PREVIEW_PROFILE_TOOL,
+    COUNT_PROFILE_TRAITS_TOOL,
+    COMMIT_PROFILE_TOOL,
+]

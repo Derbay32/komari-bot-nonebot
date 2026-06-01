@@ -31,6 +31,7 @@ class ProfileReadResult:
 
     user_id: str
     group_id: str
+    display_name: str
     traits: list[dict[str, Any]]
     source: str
 
@@ -38,6 +39,7 @@ class ProfileReadResult:
         return {
             "user_id": self.user_id,
             "group_id": self.group_id,
+            "display_name": self.display_name,
             "traits": self.traits,
             "source": self.source,
         }
@@ -137,6 +139,7 @@ class ProfileStaging:
                 user_id=user_id,
                 display_name=str((profile or {}).get("display_name", "")).strip() or user_id,
             )
+        display_name = str((profile or {}).get("display_name", "")).strip() or user_id
         traits = _traits_to_list((profile or {}).get("traits"))
         if keys:
             wanted = {str(key).strip() for key in keys if str(key).strip()}
@@ -144,6 +147,7 @@ class ProfileStaging:
         return ProfileReadResult(
             user_id=user_id,
             group_id=self._group_id,
+            display_name=display_name,
             traits=traits,
             source="effective" if include_staged else "database",
         )

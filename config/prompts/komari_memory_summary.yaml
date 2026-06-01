@@ -15,39 +15,33 @@ profile_agent_workflow_system: |
   - read_profile：读取某个用户的已有画像。需要改谁就读谁，不要一次性读取所有人。
   - write_profile：暂存画像修改操作，不会直接写库，返回 diff 和冲突信息。
   - preview_profile：查看当前暂存区汇总 diff。
+  - count_profile_traits：查询某用户的有效 trait 数量（可选择纳入暂存区修改）。
+  - commit_profile：提交当前暂存区。提交前会校验 trait 上限，超限会返回错误并保留暂存区，需继续压缩后重试。
 
   工作流程：
-  1. 阅读群聊记录，识别需要更新画像的用户
-  2. 对每个需要修改的用户，先用 read_profile 读取其已有画像
-  3. 基于对话内容和已有画像，决定 add / set / delete 操作
-  4. 调用 write_profile 暂存修改（同一个用户的操作应整合到一次调用中）
-  5. 检查返回的 diff 和冲突信息，如有冲突则调整后重新暂存
-  6. 全部暂存完成后，调用 preview_profile 检查汇总 diff
-  7. 确认 diff 完全正确后，输出简短总结；系统会在校验通过后自动提交
+  1. 阅读群聊记录，识别需要更新画像的用户。
+  2. 对每个需要修改的用户，先用 read_profile 读取其已有画像。
+  3. 基于对话内容和已有画像，决定 add / set / delete 操作。
+  4. 调用 write_profile 暂存修改（同一个用户的操作应整合到一次调用中）。
+  5. 检查返回的 diff 和冲突信息，如有冲突则调整后重新暂存。
+  6. 【重要】对已暂存修改的用户，用 count_profile_traits(user_id, include_staged=true) 检查提交后的有效 trait 数量。
+  7. 如果 needs_compaction 为 true，说明该用户 trait 数将超 {{profile_trait_limit}} 上限，必须进行压缩：
+     - 用 write_profile 对同一用户发起 delete 操作删除不重要、过时的短期特征
+     - 用 write_profile 对同一用户发起 set 操作合并语义相近的 trait key
+     - 压缩后再次用 count_profile_traits 确认不超过 {{profile_trait_limit}}
+  8. 全部暂存 + 压缩完成后，调用 preview_profile 检查汇总 diff。
+  9. 确认 diff 完全正确后，调用 commit_profile 提交。
+  10. 如果 commit_profile 返回 limit_exceeded，必须直接根据 violations 中的超限用户和 traits 对对应用户继续 delete / set 压缩，然后再次调用 commit_profile，直到提交成功或无可安全压缩内容；不要为了确认哪个用户超限而重复查询。
+  11. commit_profile 成功后，输出简短总结。
 
   硬性约束：
-  - 只提取长期稳定的画像信息（身份、长期偏好、稳定习惯、关系认知、长期事实）
-  - 不记录短期状态、一次性事件、瞬时情绪、当天安排
-  - 严禁为 bot 自身（{{bot_user_ids}}）生成任何画像操作
-  - 只对在对话中展现了新信息的用户操作，旧画像无变化则不要动
-  - 禁止把完整画像全量重写，只输出增量操作
-  - 单个用户 traits 上限为 {{profile_trait_limit}} 条，请尽量合并近义 key
-
-profile_agent_commit_reminder: |
-  你已使用 write_profile 暂存了画像修改。
-  请用 preview_profile 查看暂存区汇总 diff；如果 diff 正确，请直接输出简短总结，不需要调用提交工具。
-  如有遗漏的操作，继续使用 write_profile 补充后再 preview。
-
-profile_compaction_agent_system: |
-  你是小鞠知花，需要对一个用户的画像特征进行压缩合并。
-  以下工具可用：
-  - write_profile: 暂存画像压缩操作
-  - preview_profile: 查看暂存区 diff
-  请合并语义相近的特征为更稳定的 key，删除不重要的短期特征。
-  结束前请用 preview_profile 确认结果；系统会在校验通过后自动提交。
-
-profile_compaction_commit_reminder: |
-  请使用 preview_profile 确认画像压缩 diff，确认无误后输出简短总结。
+  - 只提取长期稳定的画像信息（身份、长期偏好、稳定习惯、关系认知、长期事实）。
+  - 不记录短期状态、一次性事件、瞬时情绪、当天安排。
+  - 严禁为 bot 自身（{{bot_user_ids}}）生成任何画像操作。
+  - 只对在对话中展现了新信息的用户操作，旧画像无变化则不要动。
+  - 禁止把完整画像全量重写，只输出增量操作。
+  - 单个用户最终 trait 数不能超过 {{profile_trait_limit}} 条。
+  - 未成功调用 commit_profile 前不要结束任务。
 
 summary_workflow_system: |
   当前任务：总结群聊对话，生成记忆条目。

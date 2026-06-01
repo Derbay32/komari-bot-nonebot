@@ -120,26 +120,6 @@ poetry run python scripts/migrate_komari_memory_entity_to_json.py
 poetry run python scripts/migrate_komari_memory_entity_to_json.py --apply
 ```
 
-### 用户画像瘦身脚本
-
-如果库里的 `user_profile.traits` 已经膨胀得过大，可以先做 dry-run：
-
-```bash
-poetry run python scripts/compact_komari_memory_profiles.py
-```
-
-确认输出后执行真实回写：
-
-```bash
-poetry run python scripts/compact_komari_memory_profiles.py --apply
-```
-
-也可以只处理指定群或指定用户：
-
-```bash
-poetry run python scripts/compact_komari_memory_profiles.py --group-id 123456 --user-id 10001
-```
-
 如果只想手工应用约束：
 
 ```bash
@@ -214,7 +194,6 @@ psql -h localhost -U your_username -d komari_bot \
 | `summary_token_threshold` | `1000` | 触发总结的 token 阈值 |
 | `summary_time_threshold` | `3600` | 触发总结的时间阈值（秒） |
 | `summary_max_messages` | `200` | 总结时读取的最大消息数 |
-| `summary_chunk_token_limit` | `3000` | 总结前原文分段的估算 token 上限 |
 | `profile_trait_limit` | `20` | 每个用户画像允许保留的长期稳定 traits 最大数量 |
 | `message_buffer_size` | `200` | Redis 缓冲大小 |
 | `memory_search_limit` | `3` | 记忆检索数量 |
@@ -222,7 +201,7 @@ psql -h localhost -U your_username -d komari_bot \
 | `knowledge_enabled` | `true` | 是否启用常识库联动 |
 | `knowledge_limit` | `3` | 常识库检索数量 |
 
-其中 `summary_token_threshold` 用于决定“什么时候触发总结”，`summary_chunk_token_limit` 用于限制“单次发送给总结模型的原文分段大小”，`profile_trait_limit` 用于限制“每个用户画像最终最多保留多少条长期稳定 traits”，三者职责不同。
+其中 `summary_token_threshold` 用于决定“什么时候触发总结”，`profile_trait_limit` 用于限制“每个用户画像最终最多保留多少条长期稳定 traits”。画像 Agent 会在显式提交前校验该上限，超限时要求先压缩再提交。
 
 ### 忘却策略
 

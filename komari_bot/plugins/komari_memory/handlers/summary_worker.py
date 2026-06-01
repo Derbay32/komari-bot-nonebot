@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from apscheduler.jobstores.base import JobLookupError
@@ -16,15 +16,8 @@ from ..agent import run_profile_agent
 from ..core.retry import retry_async
 from ..services.config_interface import get_config
 from ..services.llm_service import summarize_conversation
-from ..services.profile_compaction import (
-    LoggerLike,
-    compact_profile_with_llm,
-    count_profile_traits,
-    profile_json_length,
-)
 
 character_binding = require("character_binding")
-llm_provider = require("llm_provider")
 
 if TYPE_CHECKING:
     from ..config_schema import KomariMemoryConfigSchema
@@ -120,65 +113,6 @@ def _collect_bot_user_ids(
             bot_user_ids.add(user_id)
 
     return bot_user_ids
-
-
-async def _enforce_profile_trait_limit(
-    *,
-    group_id: str,
-    user_id: str,
-    base_profile: dict[str, Any],
-    merged_profile: dict[str, Any],
-    config: KomariMemoryConfigSchema,
-) -> dict[str, Any]:
-    merged_trait_count = count_profile_traits(merged_profile)
-    if merged_trait_count <= config.profile_trait_limit:
-        return merged_profile
-
-    base_trait_count = count_profile_traits(base_profile)
-    trace_id = f"profilecap-{uuid4().hex[:8]}"
-    logger.warning(
-        "[KomariMemory] 用户画像超过上限，准备压缩: trace_id={} group={} user={} base_traits={} merged_traits={} base_chars={} merged_chars={} limit={}",
-        trace_id,
-        group_id,
-        user_id,
-        base_trait_count,
-        merged_trait_count,
-        profile_json_length(base_profile),
-        profile_json_length(merged_profile),
-        config.profile_trait_limit,
-    )
-
-    try:
-        compacted_profile = await compact_profile_with_llm(
-            profile=merged_profile,
-            config=config,
-            llm_generate_text=llm_provider.generate_text,
-            trace_id=trace_id,
-            source="summary_worker",
-            log=cast("LoggerLike", logger),
-        )
-    except Exception:
-        logger.exception(
-            "[KomariMemory] 用户画像压缩失败，回退旧画像: trace_id={} group={} user={} fallback_traits={} fallback_chars={}",
-            trace_id,
-            group_id,
-            user_id,
-            base_trait_count,
-            profile_json_length(base_profile),
-        )
-        return base_profile
-
-    logger.info(
-        "[KomariMemory] 用户画像压缩完成: trace_id={} group={} user={} before_traits={} after_traits={} before_chars={} after_chars={}",
-        trace_id,
-        group_id,
-        user_id,
-        merged_trait_count,
-        count_profile_traits(compacted_profile),
-        profile_json_length(merged_profile),
-        profile_json_length(compacted_profile),
-    )
-    return compacted_profile
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -287,25 +221,6 @@ async def perform_summary(
         config=config,
         trace_id=f"profile-agent-{uuid4().hex[:8]}",
     )
-
-    for uid in sorted(profile_result.changed_user_ids - bot_user_ids):
-        profile = await memory.get_user_profile(user_id=uid, group_id=group_id)
-        if profile is None:
-            continue
-        compacted_profile = await _enforce_profile_trait_limit(
-            group_id=group_id,
-            user_id=uid,
-            base_profile=existing_profiles.get(uid) or profile,
-            merged_profile=profile,
-            config=config,
-        )
-        if compacted_profile != profile:
-            await memory.upsert_user_profile(
-                user_id=uid,
-                group_id=group_id,
-                profile=compacted_profile,
-                importance=4,
-            )
 
     await redis.delete_buffer(group_id)
     await redis.update_last_summary(group_id)

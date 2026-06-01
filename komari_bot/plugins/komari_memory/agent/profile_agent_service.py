@@ -57,7 +57,7 @@ async def run_profile_agent(
     config: KomariMemoryConfigSchema,
     trace_id: str,
 ) -> ProfileAgentResult:
-    """运行画像维护 Agent，并在程序侧自动提交暂存区。"""
+    """运行画像维护 Agent，由 Agent 显式调用提交工具写入暂存区。"""
     session_id = f"{trace_id}:{uuid4().hex[:8]}"
     staging = ProfileStaging(
         redis,
@@ -163,6 +163,12 @@ async def _run_profile_agent_locked(
                         result = (await staging.stage(operations)).to_dict()
                 case "preview_profile":
                     result = (await staging.preview()).to_dict()
+                case "count_profile_traits":
+                    result = await _execute_count_profile_traits(staging, arguments, config)
+                case "commit_profile":
+                    result = await _execute_commit_profile(staging, config)
+                    if result.get("status") in {"committed", "nothing_to_commit"}:
+                        return _profile_agent_result_from_commit_tool(result, last_content)
                 case _:
                     result = {"status": "error", "message": f"未知工具: {tool_name}"}
             messages.append(_build_tool_result_message(tool_call, result))
@@ -177,22 +183,18 @@ async def _run_profile_agent_locked(
         )
 
     preview = await staging.preview()
+    await staging.discard()
     if preview.staged_count <= 0:
-        await staging.discard()
-        return ProfileAgentResult(
-            committed_count=0,
-            staged_count=0,
-            summary=last_content or "暂存区为空，无画像操作提交",
-            status="nothing_to_commit",
-        )
-
-    commit_result = await staging.commit()
+        summary = last_content or "暂存区为空，无画像操作提交"
+        status = "nothing_to_commit"
+    else:
+        summary = "画像 Agent 未调用 commit_profile，已丢弃暂存区"
+        status = "discarded"
     return ProfileAgentResult(
-        committed_count=commit_result.committed_count,
+        committed_count=0,
         staged_count=preview.staged_count,
-        summary=last_content or commit_result.summary,
-        status=commit_result.status,
-        changed_user_ids=commit_result.changed_user_ids,
+        summary=summary,
+        status=status,
     )
 
 
@@ -234,6 +236,104 @@ async def _execute_read_profile(
     keys = [str(key).strip() for key in keys_raw if str(key).strip()] if isinstance(keys_raw, list) else None
     include_staged = bool(arguments.get("include_staged", False))
     return (await staging.read_profile(user_id, keys, include_staged=include_staged)).to_dict()
+
+
+async def _execute_count_profile_traits(
+    staging: ProfileStaging,
+    arguments: dict[str, Any],
+    config: KomariMemoryConfigSchema,
+) -> dict[str, Any]:
+    """统计用户当前有效画像 trait 数量。"""
+    user_id = str(arguments.get("user_id", "")).strip()
+    if not user_id:
+        return {"status": "error", "message": "缺少 user_id"}
+    include_staged = bool(arguments.get("include_staged", False))
+    profile = await staging.read_profile(user_id, include_staged=include_staged)
+    trait_count = len(profile.traits)
+    return {
+        "user_id": user_id,
+        "trait_count": trait_count,
+        "trait_limit": config.profile_trait_limit,
+        "needs_compaction": trait_count > config.profile_trait_limit,
+        "trait_keys": _extract_trait_keys(profile.traits),
+    }
+
+
+async def _execute_commit_profile(
+    staging: ProfileStaging,
+    config: KomariMemoryConfigSchema,
+) -> dict[str, Any]:
+    """校验 trait 上限，通过后提交当前画像暂存区。"""
+    preview = await staging.preview()
+    if preview.staged_count <= 0:
+        commit_result = await staging.commit()
+        return {**commit_result.to_dict(), "staged_count": preview.staged_count}
+
+    violations: list[dict[str, Any]] = []
+    for user_id in sorted({item.user_id for item in preview.diff}):
+        profile = await staging.read_profile(user_id, include_staged=True)
+        trait_count = len(profile.traits)
+        if trait_count <= config.profile_trait_limit:
+            continue
+        violations.append(
+            {
+                "user_id": user_id,
+                "display_name": profile.display_name,
+                "trait_count": trait_count,
+                "trait_limit": config.profile_trait_limit,
+                "overflow": trait_count - config.profile_trait_limit,
+                "traits": _serialize_traits_for_tool(profile.traits),
+                "trait_keys": _extract_trait_keys(profile.traits),
+            }
+        )
+
+    if violations:
+        return {
+            "status": "limit_exceeded",
+            "message": "部分用户提交后 trait 数量超过上限，请继续压缩后重试 commit_profile",
+            "violations": violations,
+            "staged_count": preview.staged_count,
+        }
+
+    commit_result = await staging.commit()
+    return {**commit_result.to_dict(), "staged_count": preview.staged_count}
+
+
+def _profile_agent_result_from_commit_tool(
+    result: dict[str, Any],
+    last_content: str,
+) -> ProfileAgentResult:
+    return ProfileAgentResult(
+        committed_count=int(result.get("committed_count", 0)),
+        staged_count=int(result.get("staged_count", 0)),
+        summary=last_content or str(result.get("summary", "")),
+        status=str(result.get("status", "committed")),
+        changed_user_ids=set(result.get("changed_user_ids", [])),
+    )
+
+
+def _extract_trait_keys(traits: list[dict[str, Any]]) -> list[str]:
+    return [key for trait in traits if (key := str(trait.get("key", "")).strip())]
+
+
+def _serialize_traits_for_tool(traits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "key": str(trait.get("key", "")).strip(),
+            "value": str(trait.get("value", "")).strip(),
+            "category": str(trait.get("category", "general")).strip() or "general",
+            "importance": _parse_trait_importance(trait.get("importance")),
+        }
+        for trait in traits
+    ]
+
+
+def _parse_trait_importance(value: Any) -> int:
+    try:
+        parsed = int(value or 3)
+    except (TypeError, ValueError):
+        parsed = 3
+    return max(1, min(5, parsed))
 
 
 def _parse_operations(raw: Any) -> list[ProfileOperation]:

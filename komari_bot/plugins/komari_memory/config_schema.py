@@ -95,12 +95,6 @@ class KomariMemoryConfigSchema(BaseModel):
         le=2000,
         description="消息缓冲区的最大消息条数安全上限。达到后即使未空闲也会强制触发总结",
     )
-    summary_chunk_token_limit: int = Field(
-        default=3000,
-        ge=200,
-        le=50000,
-        description="总结前原文分段的估算 token 上限（按当前近似口径计算，不用于触发总结）",
-    )
     profile_trait_limit: int = Field(
         default=20,
         ge=1,
