@@ -64,7 +64,7 @@ class BaseLLMClient(ABC):
             system_instruction: 系统指令
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+            response_format: OpenAI 兼容结构化输出参数；非空时下发到底层 LLM API
             tools: 可用工具定义
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
@@ -95,7 +95,7 @@ class BaseLLMClient(ABC):
             model: 模型名称
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+            response_format: OpenAI 兼容结构化输出参数；非空时下发到底层 LLM API
             tools: 可用工具定义
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
