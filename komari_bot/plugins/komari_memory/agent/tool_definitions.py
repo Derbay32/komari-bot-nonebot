@@ -35,7 +35,13 @@ WRITE_PROFILE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "write_profile",
-        "description": "批量暂存用户画像操作，不会直接写入数据库。",
+        "description": (
+            "批量暂存用户画像操作，不会直接写入数据库。"
+            "画像仅记录用户自身的长期特征，严禁写入 bot（小鞠知花）与用户之间的互动关系（如「经常找小鞠帮忙」）。"
+            "类别说明：preference=长期偏好/兴趣，fact=固定事实/身份，"
+            "relation=仅限用户之间关系（如朋友/同学），general=其他稳定特征（如语气/习惯）。"
+            "relation 类别严禁涉及与 bot 的任何关系。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -48,8 +54,16 @@ WRITE_PROFILE_TOOL: dict[str, Any] = {
                             "user_id": {"type": "string"},
                             "key": {"type": "string"},
                             "value": {"type": "string"},
-                            "category": {"type": "string", "enum": _CATEGORY_ENUM},
-                            "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+                            "category": {
+                                "type": "string",
+                                "enum": _CATEGORY_ENUM,
+                                "description": (
+                                    "preference=长期偏好/兴趣，fact=固定事实/身份，"
+                                    "relation=仅限用户之间关系，general=其他稳定特征。"
+                                    "严禁在 relation 中写入任何与 bot 的关系。"
+                                ),
+                            },
+                            "importance": {"type": "integer", "minimum": 1, "maximum": 5, "description": "1=可有可无, 3=一般, 5=核心特征"},
                         },
                         "required": ["op", "user_id", "key"],
                         "additionalProperties": False,
