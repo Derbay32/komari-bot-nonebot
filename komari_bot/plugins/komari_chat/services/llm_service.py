@@ -18,16 +18,22 @@ from komari_bot.plugins.komari_memory.core.retry import retry_async
 from .vision_service import read_images
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Sequence
+
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
 komari_search = require("komari_search")
 
+READ_IMAGE_TOOL_NAME = "read_image"
+SEARCH_WEB_TOOL_NAME = "search_web"
+_EMPTY_TOOLS_ERROR = "tools 不能为空，无工具场景请使用 generate_reply()"
+
 READ_IMAGE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": "read_image",
+        "name": READ_IMAGE_TOOL_NAME,
         "description": (
             "查看用户发送的图片内容。"
             "当用户发送了图片但你无法直接看到时，调用此工具获取图片的详细文字描述。"
@@ -50,7 +56,7 @@ READ_IMAGE_TOOL: dict[str, Any] = {
 TAVILY_SEARCH_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": "search_web",
+        "name": SEARCH_WEB_TOOL_NAME,
         "description": (
             "搜索互联网获取实时或最新信息。"
             "当用户明确要求搜索、询问最新新闻/数据、"
@@ -195,7 +201,9 @@ def _extract_tag_content(text: str, tag: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
 
-def _parse_image_index(arguments: dict[str, Any] | None, raw_arguments: str) -> int | None:
+def _parse_image_index(
+    arguments: dict[str, Any] | None, raw_arguments: str
+) -> int | None:
     """从工具调用参数中解析图片索引。"""
     payload = arguments
     if payload is None and raw_arguments:
@@ -279,7 +287,9 @@ async def _build_search_tool_result(
     return await komari_search.search_web(query)
 
 
-def _build_tool_call_message(tool_calls: list[Any], content: str = "") -> dict[str, Any]:
+def _build_tool_call_message(
+    tool_calls: list[Any], content: str = ""
+) -> dict[str, Any]:
     """构造可回填给 OpenAI messages 的 assistant tool_calls 消息。"""
     return {
         "role": "assistant",
@@ -290,7 +300,8 @@ def _build_tool_call_message(tool_calls: list[Any], content: str = "") -> dict[s
                 "type": tool_call.type,
                 "function": {
                     "name": tool_call.function.name,
-                    "arguments": tool_call.raw_arguments or tool_call.function.arguments,
+                    "arguments": tool_call.raw_arguments
+                    or tool_call.function.arguments,
                 },
             }
             for tool_call in tool_calls
@@ -352,34 +363,31 @@ async def generate_reply(
     return _extract_tag_content(raw_response, config.response_tag)
 
 
-@retry_async(max_attempts=3, base_delay=1.0)
-async def generate_reply_with_vision_tool(
+def _build_tool_request_phase_prefix(enabled_tool_names: set[str]) -> str:
+    """根据启用工具集合生成稳定的请求阶段前缀。"""
+    if enabled_tool_names == {READ_IMAGE_TOOL_NAME}:
+        return "vision_tool"
+    if enabled_tool_names == {SEARCH_WEB_TOOL_NAME}:
+        return "search_tool"
+    if enabled_tool_names == {READ_IMAGE_TOOL_NAME, SEARCH_WEB_TOOL_NAME}:
+        return "vision_search_tool"
+    return "tool"
+
+
+async def _execute_tool_loop(
     config: KomariMemoryConfigSchema,
-    messages: list[dict],
-    base64_images: list[str],
-    vision_model: str,
-    vision_temperature: float,
-    vision_max_tokens: int,
+    working_messages: list[dict[str, Any]],
+    tools: Sequence[dict[str, Any]],
     *,
-    request_trace_id: str | None = None,
-    max_tool_rounds: int = 3,
-    search_tool_enabled: bool = False,
+    request_trace_id: str | None,
+    max_tool_rounds: int,
+    request_phase_prefix: str,
+    dispatch: Callable[[Any], Awaitable[str]],
 ) -> str:
-    """通过 read_image 工具调用模式生成带图片回复，可同时启用联网搜索。"""
-    working_messages = list(messages)
+    """执行多轮工具调用循环。"""
     final_content = ""
     tool_rounds = 0
-    tools: list[dict[str, Any]] = [READ_IMAGE_TOOL]
-    if search_tool_enabled:
-        tools.append(TAVILY_SEARCH_TOOL)
-
-    logger.info(
-        "[KomariChat] Vision Tool 回复请求追踪: trace_id={} images={} max_rounds={} search_tool={}",
-        request_trace_id or "-",
-        len(base64_images),
-        max_tool_rounds,
-        search_tool_enabled,
-    )
+    tool_definitions = list(tools)
 
     for round_index in range(max_tool_rounds):
         completion = await llm_provider.generate_messages_completion(
@@ -387,17 +395,17 @@ async def generate_reply_with_vision_tool(
             model=config.llm_model_chat,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
-            tools=tools,
+            tools=tool_definitions,
             tool_choice="auto",
             parallel_tool_calls=False,
             request_trace_id=request_trace_id,
-            request_phase=f"vision_tool_round_{round_index + 1}",
+            request_phase=f"{request_phase_prefix}_round_{round_index + 1}",
             record_chat_log=True,
         )
         final_content = completion.content or final_content
         if not completion.tool_calls:
             logger.info(
-                "[KomariChat] Vision Tool 无需继续调用: trace_id={} rounds={}",
+                "[KomariChat] Tool loop 完成: trace_id={} rounds={}",
                 request_trace_id or "-",
                 tool_rounds,
             )
@@ -405,7 +413,7 @@ async def generate_reply_with_vision_tool(
 
         tool_rounds += 1
         logger.info(
-            "[KomariChat] Vision Tool 调用: trace_id={} round={} tool_calls={}",
+            "[KomariChat] Tool 调用: trace_id={} round={} tool_calls={}",
             request_trace_id or "-",
             round_index + 1,
             len(completion.tool_calls),
@@ -416,27 +424,7 @@ async def generate_reply_with_vision_tool(
 
         for tool_call in completion.tool_calls:
             tool_call_id = tool_call.id or tool_call.function.name
-            match tool_call.function.name:
-                case "read_image":
-                    tool_content = await _build_image_tool_result(
-                        raw_arguments=tool_call.raw_arguments
-                        or tool_call.function.arguments,
-                        parsed_arguments=tool_call.parsed_arguments,
-                        base64_images=base64_images,
-                        vision_model=vision_model,
-                        vision_temperature=vision_temperature,
-                        vision_max_tokens=vision_max_tokens,
-                    )
-                case "search_web":
-                    tool_content = await _build_search_tool_result(
-                        raw_arguments=tool_call.raw_arguments
-                        or tool_call.function.arguments,
-                        parsed_arguments=tool_call.parsed_arguments,
-                    )
-                case _:
-                    tool_content = (
-                        f"[工具调用失败: 不支持的工具 {tool_call.function.name}]"
-                    )
+            tool_content = await dispatch(tool_call)
             working_messages.append(
                 {
                     "role": "tool",
@@ -446,7 +434,7 @@ async def generate_reply_with_vision_tool(
             )
 
     logger.warning(
-        "[KomariChat] Vision Tool 达到最大调用轮数，执行最终无工具回复: trace_id={} rounds={}",
+        "[KomariChat] Tool loop 达到最大轮数，执行最终无工具回复: trace_id={} rounds={}",
         request_trace_id or "-",
         tool_rounds,
     )
@@ -456,95 +444,75 @@ async def generate_reply_with_vision_tool(
         temperature=config.llm_temperature_chat,
         max_tokens=config.llm_max_tokens_chat,
         request_trace_id=request_trace_id,
-        request_phase="vision_tool_final",
+        request_phase=f"{request_phase_prefix}_final",
         record_chat_log=True,
     )
     return _extract_tag_content(raw_response or final_content, config.response_tag)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
-async def generate_reply_with_search_tool(
+async def generate_reply_with_tools(
     config: KomariMemoryConfigSchema,
-    messages: list[dict],
+    messages: list[dict[str, Any]],
+    *,
+    tools: Sequence[dict[str, Any]],
     request_trace_id: str | None = None,
+    base64_images: list[str] | None = None,
+    vision_model: str = "",
+    vision_temperature: float = 0.3,
+    vision_max_tokens: int = 1024,
     max_tool_rounds: int = 3,
 ) -> str:
-    """通过 search_web 工具调用模式生成回复。"""
+    """通过工具调用模式生成回复，调用方显式指定启用工具列表。"""
+    if not tools:
+        raise ValueError(_EMPTY_TOOLS_ERROR)
+
     working_messages = list(messages)
-    final_content = ""
-    tool_rounds = 0
+    tool_definitions = list(tools)
+    tool_names = [str(tool["function"]["name"]) for tool in tool_definitions]
+    enabled_tool_names = set(tool_names)
+    request_phase_prefix = _build_tool_request_phase_prefix(enabled_tool_names)
 
     logger.info(
-        "[KomariChat] Search Tool 回复请求追踪: trace_id={} max_rounds={}",
+        "[KomariChat] Tool 回复请求追踪: trace_id={} tools={} images={} max_rounds={}",
         request_trace_id or "-",
+        tool_names,
+        len(base64_images) if base64_images else 0,
         max_tool_rounds,
     )
 
-    for round_index in range(max_tool_rounds):
-        completion = await llm_provider.generate_messages_completion(
-            messages=working_messages,
-            model=config.llm_model_chat,
-            temperature=config.llm_temperature_chat,
-            max_tokens=config.llm_max_tokens_chat,
-            tools=[TAVILY_SEARCH_TOOL],
-            tool_choice="auto",
-            parallel_tool_calls=False,
-            request_trace_id=request_trace_id,
-            request_phase=f"search_tool_round_{round_index + 1}",
-            record_chat_log=True,
-        )
-        final_content = completion.content or final_content
-        if not completion.tool_calls:
-            logger.info(
-                "[KomariChat] Search Tool 无需继续调用: trace_id={} rounds={}",
-                request_trace_id or "-",
-                tool_rounds,
+    async def dispatch(tool_call: Any) -> str:
+        name = tool_call.function.name
+        if name not in enabled_tool_names:
+            return f"[工具调用失败: 当前未启用工具 {name}]"
+
+        raw_arguments = tool_call.raw_arguments or tool_call.function.arguments
+        parsed_arguments = tool_call.parsed_arguments
+        if name == READ_IMAGE_TOOL_NAME:
+            return await _build_image_tool_result(
+                raw_arguments=raw_arguments,
+                parsed_arguments=parsed_arguments,
+                base64_images=base64_images or [],
+                vision_model=vision_model,
+                vision_temperature=vision_temperature,
+                vision_max_tokens=vision_max_tokens,
             )
-            return _extract_tag_content(final_content, config.response_tag)
-
-        tool_rounds += 1
-        logger.info(
-            "[KomariChat] Search Tool 调用: trace_id={} round={} tool_calls={}",
-            request_trace_id or "-",
-            round_index + 1,
-            len(completion.tool_calls),
-        )
-        working_messages.append(
-            _build_tool_call_message(completion.tool_calls, completion.content or "")
-        )
-
-        for tool_call in completion.tool_calls:
-            tool_call_id = tool_call.id or tool_call.function.name
-            if tool_call.function.name == "search_web":
-                tool_content = await _build_search_tool_result(
-                    raw_arguments=tool_call.raw_arguments or tool_call.function.arguments,
-                    parsed_arguments=tool_call.parsed_arguments,
-                )
-            else:
-                tool_content = f"[工具调用失败: 不支持的工具 {tool_call.function.name}]"
-            working_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": tool_content,
-                }
+        if name == SEARCH_WEB_TOOL_NAME:
+            return await _build_search_tool_result(
+                raw_arguments=raw_arguments,
+                parsed_arguments=parsed_arguments,
             )
+        return f"[工具调用失败: 不支持的工具 {name}]"
 
-    logger.warning(
-        "[KomariChat] Search Tool 达到最大调用轮数，执行最终无工具回复: trace_id={} rounds={}",
-        request_trace_id or "-",
-        tool_rounds,
-    )
-    raw_response = await llm_provider.generate_text_with_messages(
-        messages=working_messages,
-        model=config.llm_model_chat,
-        temperature=config.llm_temperature_chat,
-        max_tokens=config.llm_max_tokens_chat,
+    return await _execute_tool_loop(
+        config=config,
+        working_messages=working_messages,
+        tools=tool_definitions,
         request_trace_id=request_trace_id,
-        request_phase="search_tool_final",
-        record_chat_log=True,
+        max_tool_rounds=max_tool_rounds,
+        request_phase_prefix=request_phase_prefix,
+        dispatch=dispatch,
     )
-    return _extract_tag_content(raw_response or final_content, config.response_tag)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)

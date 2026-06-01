@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11.event import Reply
@@ -27,9 +27,10 @@ from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
 from ..services.llm_service import (
+    READ_IMAGE_TOOL,
+    TAVILY_SEARCH_TOOL,
     generate_reply,
-    generate_reply_with_search_tool,
-    generate_reply_with_vision_tool,
+    generate_reply_with_tools,
 )
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
@@ -615,23 +616,31 @@ class MessageHandler:
             search_tool_mode=use_search_tool,
         )
 
+        tools: list[dict[str, Any]] = []
         if use_vision_tool:
-            vision_config = llm_provider_config_manager.get()
-            reply = await generate_reply_with_vision_tool(
+            tools.append(READ_IMAGE_TOOL)
+        if use_search_tool:
+            tools.append(TAVILY_SEARCH_TOOL)
+
+        if tools:
+            vision_model = ""
+            vision_temperature = 0.3
+            vision_max_tokens = 1024
+            if use_vision_tool:
+                vision_config = llm_provider_config_manager.get()
+                vision_model = vision_config.vision_model
+                vision_temperature = vision_config.vision_temperature
+                vision_max_tokens = vision_config.vision_max_tokens
+
+            reply = await generate_reply_with_tools(
                 config=config,
                 messages=prompt_messages,
-                base64_images=all_base64_images,
-                vision_model=vision_config.vision_model,
-                vision_temperature=vision_config.vision_temperature,
-                vision_max_tokens=vision_config.vision_max_tokens,
+                tools=tools,
                 request_trace_id=request_trace_id,
-                search_tool_enabled=use_search_tool,
-            )
-        elif use_search_tool:
-            reply = await generate_reply_with_search_tool(
-                config=config,
-                messages=prompt_messages,
-                request_trace_id=request_trace_id,
+                base64_images=all_base64_images if use_vision_tool else None,
+                vision_model=vision_model,
+                vision_temperature=vision_temperature,
+                vision_max_tokens=vision_max_tokens,
             )
         else:
             reply = await generate_reply(
