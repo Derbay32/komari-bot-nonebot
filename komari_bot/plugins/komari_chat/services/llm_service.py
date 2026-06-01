@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -18,7 +19,7 @@ from komari_bot.plugins.komari_memory.core.retry import retry_async
 from .vision_service import read_images
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Sequence
 
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
@@ -28,7 +29,18 @@ komari_search = require("komari_search")
 
 READ_IMAGE_TOOL_NAME = "read_image"
 SEARCH_WEB_TOOL_NAME = "search_web"
+FINAL_RESPONSE_TOOL_NAME = "final_response"
 _EMPTY_TOOLS_ERROR = "tools 不能为空，无工具场景请使用 generate_reply()"
+_MISSING_FINAL_CONTENT_ERROR = "final_response 缺少有效的 'content' 字段"
+_MISSING_INTERACTION_HISTORY_ERROR = (
+    "final_response 缺少有效的 'interaction_history' 字段"
+)
+_INCOMPLETE_INTERACTION_HISTORY_ERROR = (
+    "final_response.interaction_history 缺少 event/result/emotion"
+)
+_MISSING_MESSAGES_ERROR = (
+    "generate_reply() 需要 messages 参数以强制生成 interaction_history"
+)
 
 READ_IMAGE_TOOL: dict[str, Any] = {
     "type": "function",
@@ -74,6 +86,66 @@ TAVILY_SEARCH_TOOL: dict[str, Any] = {
         },
     },
 }
+
+FINAL_RESPONSE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": FINAL_RESPONSE_TOOL_NAME,
+        "description": (
+            "在所有思考和工具调用完成后，必须调用此工具输出最终回复。"
+            "这是你唯一可以输出回复内容的方式，不调用此工具将导致回复失败。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "给用户看的回复正文（即要发送出去的消息内容）",
+                },
+                "interaction_history": {
+                    "type": "object",
+                    "description": (
+                        "对该用户本轮对话的互动记录。每次回复都必须生成，"
+                        "简单互动也要简短记录。包含 event（该用户做了什么）、"
+                        "result（你的反应）、emotion（你当时的感受）。"
+                    ),
+                    "properties": {
+                        "event": {
+                            "type": "string",
+                            "description": "该用户做了什么（一句话描述）",
+                        },
+                        "result": {
+                            "type": "string",
+                            "description": "你的反应（一句话描述）",
+                        },
+                        "emotion": {
+                            "type": "string",
+                            "description": "你当时的感受（简短情绪词或短语）",
+                        },
+                    },
+                    "required": ["event", "result", "emotion"],
+                },
+            },
+            "required": ["content", "interaction_history"],
+        },
+    },
+}
+
+
+class InteractionHistoryRecord(TypedDict):
+    """单轮聊天同步生成的互动历史记录。"""
+
+    event: str
+    result: str
+    emotion: str
+
+
+@dataclass(frozen=True)
+class ReplyResult:
+    """聊天回复正文与同步生成的互动历史。"""
+
+    content: str
+    interaction_history: InteractionHistoryRecord
 
 
 def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
@@ -181,24 +253,31 @@ def _extract_json_from_markdown(text: str) -> str:
     return text.strip()
 
 
-def _extract_tag_content(text: str, tag: str) -> str:
-    """从 LLM 回复中提取指定 XML 标签内的内容。
+def _parse_reply_result(parsed: dict[str, Any]) -> ReplyResult:
+    """从 final_response 工具参数构造回复结果。"""
+    content_raw = parsed.get("content")
+    if not isinstance(content_raw, str) or not content_raw.strip():
+        raise ValueError(_MISSING_FINAL_CONTENT_ERROR)
 
-    Args:
-        text: LLM 完整回复文本
-        tag: 要提取的标签名（如 "content"）
+    interaction_history_raw = parsed.get("interaction_history")
+    if not isinstance(interaction_history_raw, dict):
+        raise TypeError(_MISSING_INTERACTION_HISTORY_ERROR)
 
-    Returns:
-        标签内的文本，未找到标签则返回原始文本（降级）
-    """
-    pattern = rf"<{tag}>([\s\S]*)</{tag}>"
-    match = re.search(pattern, text)
-    if match:
-        return match.group(1).strip()
+    event = str(interaction_history_raw.get("event", "")).strip()
+    result = str(interaction_history_raw.get("result", "")).strip()
+    emotion = str(interaction_history_raw.get("emotion", "")).strip()
+    if not event or not result or not emotion:
+        raise ValueError(_INCOMPLETE_INTERACTION_HISTORY_ERROR)
 
-    # 降级：未找到标签，返回原文（去掉 <think> 块）
-    logger.warning(f"[KomariMemory] 未找到 <{tag}> 标签，使用原始回复")
-    return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    interaction_history: InteractionHistoryRecord = {
+        "event": event,
+        "result": result,
+        "emotion": emotion,
+    }
+    return ReplyResult(
+        content=content_raw.strip(),
+        interaction_history=interaction_history,
+    )
 
 
 def _parse_image_index(
@@ -312,11 +391,11 @@ def _build_tool_call_message(
 @retry_async(max_attempts=3, base_delay=1.0)
 async def generate_reply(
     config: KomariMemoryConfigSchema,
-    messages: list[dict] | None = None,
+    messages: list[dict[str, Any]] | None = None,
     user_message: str = "",
     system_prompt: str = "",
     request_trace_id: str | None = None,
-) -> str:
+) -> ReplyResult:
     """生成回复（使用 OpenAI messages 格式，带重试机制，支持多模态）。
 
     Args:
@@ -326,7 +405,7 @@ async def generate_reply(
         system_prompt: 系统提示词（兼容旧格式）
 
     Returns:
-        提取 XML 标签后的最终回复
+        结构化回复结果，包含最终正文与互动历史记录
     """
     if messages is not None:
         payload_stats = _summarize_prompt_messages(messages)
@@ -339,115 +418,171 @@ async def generate_reply(
             payload_stats["image_parts"],
             payload_stats["image_url_chars"],
         )
-        raw_response = await llm_provider.generate_text_with_messages(
+        return await _execute_tool_loop(
+            config=config,
             messages=messages,
-            model=config.llm_model_chat,
-            temperature=config.llm_temperature_chat,
-            max_tokens=config.llm_max_tokens_chat,
+            tools=[FINAL_RESPONSE_TOOL],
             request_trace_id=request_trace_id,
-            record_chat_log=True,
-        )
-    else:
-        # 兼容旧格式
-        raw_response = await llm_provider.generate_text(
-            prompt=user_message,
-            model=config.llm_model_chat,
-            system_instruction=system_prompt,
-            temperature=config.llm_temperature_chat,
-            max_tokens=config.llm_max_tokens_chat,
-            request_trace_id=request_trace_id,
-            record_chat_log=True,
+            base64_images=None,
+            vision_model="",
+            vision_temperature=0.3,
+            vision_max_tokens=1024,
+            max_tool_rounds=2,
         )
 
-    # 提取 XML 标签内容
-    return _extract_tag_content(raw_response, config.response_tag)
+    del user_message, system_prompt
+    raise ValueError(_MISSING_MESSAGES_ERROR)
 
 
-def _build_tool_request_phase_prefix(enabled_tool_names: set[str]) -> str:
-    """根据启用工具集合生成稳定的请求阶段前缀。"""
-    if enabled_tool_names == {READ_IMAGE_TOOL_NAME}:
+def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
+    """根据业务工具集合生成稳定的请求阶段前缀。"""
+    tool_names = {
+        str(name)
+        for tool in tools
+        if (name := tool.get("function", {}).get("name"))
+        and name != FINAL_RESPONSE_TOOL_NAME
+    }
+    if not tool_names:
+        return "normal_reply"
+    if tool_names == {READ_IMAGE_TOOL_NAME}:
         return "vision_tool"
-    if enabled_tool_names == {SEARCH_WEB_TOOL_NAME}:
+    if tool_names == {SEARCH_WEB_TOOL_NAME}:
         return "search_tool"
-    if enabled_tool_names == {READ_IMAGE_TOOL_NAME, SEARCH_WEB_TOOL_NAME}:
+    if tool_names == {READ_IMAGE_TOOL_NAME, SEARCH_WEB_TOOL_NAME}:
         return "vision_search_tool"
     return "tool"
 
 
+async def _execute_business_tool(
+    *,
+    tool_call: Any,
+    base64_images: list[str],
+    vision_model: str,
+    vision_temperature: float,
+    vision_max_tokens: int,
+    phase_prefix: str,
+    round_num: int,
+) -> dict[str, Any] | None:
+    """执行业务工具并构造 tool 消息。"""
+    tool_name = tool_call.function.name
+    raw_arguments = tool_call.raw_arguments or tool_call.function.arguments
+    parsed_arguments = tool_call.parsed_arguments
+    tool_call_id = tool_call.id or tool_name
+
+    match tool_name:
+        case "read_image":
+            content = await _build_image_tool_result(
+                raw_arguments=raw_arguments,
+                parsed_arguments=parsed_arguments,
+                base64_images=base64_images,
+                vision_model=vision_model,
+                vision_temperature=vision_temperature,
+                vision_max_tokens=vision_max_tokens,
+            )
+        case "search_web":
+            content = await _build_search_tool_result(
+                raw_arguments=raw_arguments,
+                parsed_arguments=parsed_arguments,
+            )
+        case _:
+            logger.warning(
+                "[KomariChat] {} 第 {} 轮：未知工具 '{}'，跳过",
+                phase_prefix,
+                round_num,
+                tool_name,
+            )
+            return None
+
+    return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
 async def _execute_tool_loop(
     config: KomariMemoryConfigSchema,
-    working_messages: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
     tools: Sequence[dict[str, Any]],
     *,
     request_trace_id: str | None,
+    base64_images: list[str] | None,
+    vision_model: str,
+    vision_temperature: float,
+    vision_max_tokens: int,
     max_tool_rounds: int,
-    request_phase_prefix: str,
-    dispatch: Callable[[Any], Awaitable[str]],
-) -> str:
-    """执行多轮工具调用循环。"""
-    final_content = ""
-    tool_rounds = 0
+) -> ReplyResult:
+    """执行多轮工具调用循环，直到模型调用 final_response。"""
+    current_messages = list(messages)
     tool_definitions = list(tools)
+    request_phase_prefix = _build_tool_request_phase_prefix(tool_definitions)
+    has_vision_tool = any(
+        tool.get("function", {}).get("name") == READ_IMAGE_TOOL_NAME
+        for tool in tool_definitions
+    )
 
-    for round_index in range(max_tool_rounds):
+    for round_num in range(1, max_tool_rounds + 1):
+        model = vision_model if has_vision_tool else config.llm_model_chat
+        temperature = (
+            vision_temperature if has_vision_tool else config.llm_temperature_chat
+        )
+        max_tokens = vision_max_tokens if has_vision_tool else config.llm_max_tokens_chat
         completion = await llm_provider.generate_messages_completion(
-            messages=working_messages,
-            model=config.llm_model_chat,
-            temperature=config.llm_temperature_chat,
-            max_tokens=config.llm_max_tokens_chat,
+            messages=current_messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=int(max_tokens),
             tools=tool_definitions,
-            tool_choice="auto",
+            tool_choice="required",
             parallel_tool_calls=False,
             request_trace_id=request_trace_id,
-            request_phase=f"{request_phase_prefix}_round_{round_index + 1}",
+            request_phase=f"{request_phase_prefix}_round_{round_num}",
             record_chat_log=True,
         )
-        final_content = completion.content or final_content
-        if not completion.tool_calls:
-            logger.info(
-                "[KomariChat] Tool loop 完成: trace_id={} rounds={}",
-                request_trace_id or "-",
-                tool_rounds,
-            )
-            return _extract_tag_content(final_content, config.response_tag)
 
-        tool_rounds += 1
+        if not completion.tool_calls:
+            msg = (
+                f"{request_phase_prefix} 第 {round_num} 轮：模型未调用任何工具，"
+                "但 tool_choice='required' 要求至少调用一个工具"
+            )
+            raise RuntimeError(msg)
+
         logger.info(
             "[KomariChat] Tool 调用: trace_id={} round={} tool_calls={}",
             request_trace_id or "-",
-            round_index + 1,
+            round_num,
             len(completion.tool_calls),
         )
-        working_messages.append(
-            _build_tool_call_message(completion.tool_calls, completion.content or "")
-        )
 
+        business_tool_results: list[dict[str, Any]] = []
         for tool_call in completion.tool_calls:
-            tool_call_id = tool_call.id or tool_call.function.name
-            tool_content = await dispatch(tool_call)
-            working_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": tool_content,
-                }
-            )
+            tool_name = tool_call.function.name
+            if tool_name == FINAL_RESPONSE_TOOL_NAME:
+                if not tool_call.parsed_arguments:
+                    msg = (
+                        f"{request_phase_prefix} 第 {round_num} 轮：final_response 缺少 parsed_arguments"
+                    )
+                    raise RuntimeError(msg)
+                return _parse_reply_result(tool_call.parsed_arguments)
 
-    logger.warning(
-        "[KomariChat] Tool loop 达到最大轮数，执行最终无工具回复: trace_id={} rounds={}",
-        request_trace_id or "-",
-        tool_rounds,
+            result = await _execute_business_tool(
+                tool_call=tool_call,
+                base64_images=base64_images or [],
+                vision_model=vision_model,
+                vision_temperature=vision_temperature,
+                vision_max_tokens=vision_max_tokens,
+                phase_prefix=request_phase_prefix,
+                round_num=round_num,
+            )
+            if result is not None:
+                business_tool_results.append(result)
+
+        if business_tool_results:
+            current_messages.append(
+                _build_tool_call_message(completion.tool_calls, completion.content or "")
+            )
+            current_messages.extend(business_tool_results)
+
+    msg = (
+        f"{request_phase_prefix} 达到最大轮数 {max_tool_rounds}，模型未调用 final_response 工具"
     )
-    raw_response = await llm_provider.generate_text_with_messages(
-        messages=working_messages,
-        model=config.llm_model_chat,
-        temperature=config.llm_temperature_chat,
-        max_tokens=config.llm_max_tokens_chat,
-        request_trace_id=request_trace_id,
-        request_phase=f"{request_phase_prefix}_final",
-        record_chat_log=True,
-    )
-    return _extract_tag_content(raw_response or final_content, config.response_tag)
+    raise RuntimeError(msg)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -462,16 +597,17 @@ async def generate_reply_with_tools(
     vision_temperature: float = 0.3,
     vision_max_tokens: int = 1024,
     max_tool_rounds: int = 3,
-) -> str:
+) -> ReplyResult:
     """通过工具调用模式生成回复，调用方显式指定启用工具列表。"""
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
 
-    working_messages = list(messages)
-    tool_definitions = list(tools)
-    tool_names = [str(tool["function"]["name"]) for tool in tool_definitions]
-    enabled_tool_names = set(tool_names)
-    request_phase_prefix = _build_tool_request_phase_prefix(enabled_tool_names)
+    tool_definitions = [*tools, FINAL_RESPONSE_TOOL]
+    tool_names = [
+        str(tool["function"]["name"])
+        for tool in tool_definitions
+        if str(tool["function"]["name"]) != FINAL_RESPONSE_TOOL_NAME
+    ]
 
     logger.info(
         "[KomariChat] Tool 回复请求追踪: trace_id={} tools={} images={} max_rounds={}",
@@ -481,37 +617,16 @@ async def generate_reply_with_tools(
         max_tool_rounds,
     )
 
-    async def dispatch(tool_call: Any) -> str:
-        name = tool_call.function.name
-        if name not in enabled_tool_names:
-            return f"[工具调用失败: 当前未启用工具 {name}]"
-
-        raw_arguments = tool_call.raw_arguments or tool_call.function.arguments
-        parsed_arguments = tool_call.parsed_arguments
-        if name == READ_IMAGE_TOOL_NAME:
-            return await _build_image_tool_result(
-                raw_arguments=raw_arguments,
-                parsed_arguments=parsed_arguments,
-                base64_images=base64_images or [],
-                vision_model=vision_model,
-                vision_temperature=vision_temperature,
-                vision_max_tokens=vision_max_tokens,
-            )
-        if name == SEARCH_WEB_TOOL_NAME:
-            return await _build_search_tool_result(
-                raw_arguments=raw_arguments,
-                parsed_arguments=parsed_arguments,
-            )
-        return f"[工具调用失败: 不支持的工具 {name}]"
-
     return await _execute_tool_loop(
         config=config,
-        working_messages=working_messages,
+        messages=messages,
         tools=tool_definitions,
         request_trace_id=request_trace_id,
+        base64_images=base64_images,
+        vision_model=vision_model,
+        vision_temperature=vision_temperature,
+        vision_max_tokens=vision_max_tokens,
         max_tool_rounds=max_tool_rounds,
-        request_phase_prefix=request_phase_prefix,
-        dispatch=dispatch,
     )
 
 

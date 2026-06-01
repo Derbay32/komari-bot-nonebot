@@ -14,6 +14,10 @@ from nonebot.adapters.onebot.v11.event import Reply
 from nonebot.compat import type_validate_python
 from nonebot.plugin import require
 
+from komari_bot.common.memory_agent_locks import (
+    MemoryAgentLockScope,
+    acquire_memory_agent_lock,
+)
 from komari_bot.plugins.komari_decision.services.decision_engine import (
     DecisionEngine,
     DecisionOutcome,
@@ -29,6 +33,7 @@ from ..services.image_downloader import download_images_as_base64, extract_image
 from ..services.llm_service import (
     READ_IMAGE_TOOL,
     TAVILY_SEARCH_TOOL,
+    InteractionHistoryRecord,
     generate_reply,
     generate_reply_with_tools,
 )
@@ -463,6 +468,68 @@ class MessageHandler:
         await self.redis.push_message(group_id, bot_message)
         logger.debug("[KomariMemory] AI 回复已存储: {}...", reply_content[:30])
 
+    async def _write_interaction_history(
+        self,
+        *,
+        message: MessageSchema,
+        new_record: InteractionHistoryRecord,
+        lock_timeout_seconds: int | None,
+    ) -> None:
+        """追加写入本轮互动历史，并用用户级记忆锁保护 read-modify-write。"""
+        async with acquire_memory_agent_lock(
+            self.memory.pg_pool,
+            scope=MemoryAgentLockScope.INTERACTION_USER,
+            group_id=message.group_id,
+            user_id=message.user_id,
+            trace_id=f"chat_interaction:{message.group_id}:{message.user_id}:{message.message_id}",
+            timeout_seconds=lock_timeout_seconds,
+        ):
+            existing = await self.memory.get_interaction_history(
+                user_id=message.user_id,
+                group_id=message.group_id,
+            )
+
+            existing_records: list[InteractionHistoryRecord] = []
+            existing_summary = ""
+            version = 1
+            if isinstance(existing, dict):
+                raw_records = existing.get("records")
+                if isinstance(raw_records, list):
+                    for raw_record in raw_records:
+                        if not isinstance(raw_record, dict):
+                            continue
+                        event = str(raw_record.get("event", "")).strip()
+                        result = str(raw_record.get("result", "")).strip()
+                        emotion = str(raw_record.get("emotion", "")).strip()
+                        if event and result and emotion:
+                            existing_records.append(
+                                {
+                                    "event": event,
+                                    "result": result,
+                                    "emotion": emotion,
+                                }
+                            )
+                existing_summary = str(existing.get("summary", ""))
+                raw_version = existing.get("version", 1)
+                version = raw_version if isinstance(raw_version, int) else 1
+
+            existing_records.append(new_record)
+            existing_records = existing_records[-10:]
+            interaction = {
+                "version": version,
+                "user_id": message.user_id,
+                "display_name": message.user_nickname,
+                "file_type": "用户的近期对鞠行为备忘录",
+                "description": "这是我在心里对这个用户近期行为的悄悄记录。",
+                "records": existing_records,
+                "summary": existing_summary,
+            }
+            await self.memory.upsert_interaction_history(
+                user_id=message.user_id,
+                group_id=message.group_id,
+                interaction=interaction,
+            )
+
     async def _attempt_reply(
         self,
         *,
@@ -632,7 +699,7 @@ class MessageHandler:
                 vision_temperature = vision_config.vision_temperature
                 vision_max_tokens = vision_config.vision_max_tokens
 
-            reply = await generate_reply_with_tools(
+            reply_result = await generate_reply_with_tools(
                 config=config,
                 messages=prompt_messages,
                 tools=tools,
@@ -643,11 +710,12 @@ class MessageHandler:
                 vision_max_tokens=vision_max_tokens,
             )
         else:
-            reply = await generate_reply(
+            reply_result = await generate_reply(
                 config=config,
                 messages=prompt_messages,
                 request_trace_id=request_trace_id,
             )
+        reply = reply_result.content
         if reply is None:
             logger.warning(
                 "[KomariMemory] 回复生成失败: group={} reason={} score={}",
@@ -680,6 +748,18 @@ class MessageHandler:
             reply_content=reply,
             bot_nickname=config.bot_nickname,
         )
+        try:
+            await self._write_interaction_history(
+                message=message,
+                new_record=reply_result.interaction_history,
+                lock_timeout_seconds=config.memory_agent_lock_timeout_seconds,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 互动历史写入失败（非致命）: user={}",
+                message.user_id,
+                exc_info=True,
+            )
         if not force_reply:
             await self.redis.set_cooldown(message.group_id, config.proactive_cooldown)
             await self.redis.increment_proactive_count(message.group_id)
