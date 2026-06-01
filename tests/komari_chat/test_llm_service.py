@@ -7,7 +7,10 @@ from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
 
 
 class _FakeLLMProvider:
@@ -40,8 +43,43 @@ def _build_config() -> SimpleNamespace:
     )
 
 
+def _tool_call(
+    name: str,
+    arguments: str,
+    parsed_arguments: dict[str, Any],
+    *,
+    call_id: str = "call-1",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name=name, arguments=arguments),
+        raw_arguments=arguments,
+        parsed_arguments=parsed_arguments,
+    )
+
+
 def test_generate_reply_enables_chat_log_for_messages(monkeypatch: Any) -> None:
-    fake_provider = _FakeLLMProvider("<content>今天就陪陪Master</content>")
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "今天就陪陪Master",
+                        "interaction_history": {
+                            "event": "向我打招呼",
+                            "result": "陪他说话",
+                            "emotion": "开心",
+                        },
+                    },
+                )
+            ],
+        )
+    ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
 
     result = asyncio.run(
@@ -52,27 +90,31 @@ def test_generate_reply_enables_chat_log_for_messages(monkeypatch: Any) -> None:
         )
     )
 
-    assert result == "今天就陪陪Master"
-    assert fake_provider.message_calls[0]["record_chat_log"] is True
-    assert fake_provider.message_calls[0]["request_trace_id"] == "chat-2001"
+    assert result.content == "今天就陪陪Master"
+    assert result.interaction_history == {
+        "event": "向我打招呼",
+        "result": "陪他说话",
+        "emotion": "开心",
+    }
+    assert fake_provider.completion_calls[0]["record_chat_log"] is True
+    assert fake_provider.completion_calls[0]["request_trace_id"] == "chat-2001"
+    assert fake_provider.completion_calls[0]["tool_choice"] == "required"
 
 
-def test_generate_reply_enables_chat_log_for_legacy_prompt(monkeypatch: Any) -> None:
-    fake_provider = _FakeLLMProvider("<content>旧接口也要记聊天日志</content>")
+def test_generate_reply_rejects_legacy_prompt(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
 
-    result = asyncio.run(
-        llm_service_module.generate_reply(
-            config=_build_config(),
-            user_message="你好",
-            system_prompt="你是助手",
-            request_trace_id="chat-2002",
+    with pytest.raises(ValueError, match="messages 参数"):
+        asyncio.run(
+            llm_service_module.generate_reply(
+                config=_build_config(),
+                user_message="你好",
+                system_prompt="你是助手",
+                request_trace_id="chat-2002",
+            )
         )
-    )
-
-    assert result == "旧接口也要记聊天日志"
-    assert fake_provider.text_calls[0]["record_chat_log"] is True
-    assert fake_provider.text_calls[0]["request_trace_id"] == "chat-2002"
+    assert fake_provider.text_calls == []
 
 
 def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -> None:
@@ -81,21 +123,31 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
         SimpleNamespace(
             content="",
             tool_calls=[
-                SimpleNamespace(
-                    id="call-1",
-                    type="function",
-                    function=SimpleNamespace(
-                        name="search_web",
-                        arguments='{"query":"今日新闻"}',
-                    ),
-                    raw_arguments='{"query":"今日新闻"}',
-                    parsed_arguments={"query": "今日新闻"},
+                _tool_call(
+                    "search_web",
+                    '{"query":"今日新闻"}',
+                    {"query": "今日新闻"},
+                    call_id="call-1",
                 )
             ],
         ),
         SimpleNamespace(
-            content="<content>根据搜索结果回答</content>",
-            tool_calls=[],
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "根据搜索结果回答",
+                        "interaction_history": {
+                            "event": "询问今日新闻",
+                            "result": "搜索后回答",
+                            "emotion": "认真",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
         ),
     ]
     searched_queries: list[str] = []
@@ -120,10 +172,11 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
         )
     )
 
-    assert result == "根据搜索结果回答"
+    assert result.content == "根据搜索结果回答"
     assert searched_queries == ["今日新闻"]
     assert fake_provider.completion_calls[0]["tools"] == [
-        llm_service_module.TAVILY_SEARCH_TOOL
+        llm_service_module.TAVILY_SEARCH_TOOL,
+        llm_service_module.FINAL_RESPONSE_TOOL,
     ]
     assert fake_provider.completion_calls[1]["messages"][-1] == {
         "role": "tool",
@@ -132,65 +185,38 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     }
 
 
-def test_generate_reply_with_tools_rejects_disabled_tool(monkeypatch: Any) -> None:
-    fake_provider = _FakeLLMProvider("<content>兜底回答</content>")
+def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         SimpleNamespace(
             content="",
-            tool_calls=[
-                SimpleNamespace(
-                    id="call-image-1",
-                    type="function",
-                    function=SimpleNamespace(
-                        name="read_image",
-                        arguments='{"image_index":0}',
-                    ),
-                    raw_arguments='{"image_index":0}',
-                    parsed_arguments={"image_index": 0},
-                )
-            ],
+            tool_calls=[],
         ),
         SimpleNamespace(
-            content="<content>没有启用图片工具</content>",
+            content="",
+            tool_calls=[],
+        ),
+        SimpleNamespace(
+            content="",
             tool_calls=[],
         ),
     ]
-    read_image_called = False
-
-    async def _fake_read_images(
-        images: list[str],
-        *,
-        vision_model: str,
-        temperature: float,
-        max_tokens: int,
-    ) -> list[str]:
-        nonlocal read_image_called
-        read_image_called = True
-        assert images == []
-        assert vision_model == ""
-        assert temperature == 0.3
-        assert max_tokens == 1024
-        return ["不应读取图片"]
-
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
 
-    result = asyncio.run(
-        llm_service_module.generate_reply_with_tools(
-            config=_build_config(),
-            messages=[{"role": "user", "content": "看看图再搜索"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
-            request_trace_id="chat-disabled-tool-1",
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+
+    with pytest.raises(RuntimeError, match="模型未调用任何工具"):
+        asyncio.run(
+            llm_service_module.generate_reply_with_tools(
+                config=_build_config(),
+                messages=[{"role": "user", "content": "查一下"}],
+                tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+                request_trace_id="chat-no-final-1",
+            )
         )
-    )
-
-    assert result == "没有启用图片工具"
-    assert read_image_called is False
-    assert fake_provider.completion_calls[1]["messages"][-1] == {
-        "role": "tool",
-        "tool_call_id": "call-image-1",
-        "content": "[工具调用失败: 当前未启用工具 read_image]",
-    }
 
 
 def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> None:
@@ -199,31 +225,37 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
         SimpleNamespace(
             content="",
             tool_calls=[
-                SimpleNamespace(
-                    id="call-image-1",
-                    type="function",
-                    function=SimpleNamespace(
-                        name="read_image",
-                        arguments='{"image_index":0}',
-                    ),
-                    raw_arguments='{"image_index":0}',
-                    parsed_arguments={"image_index": 0},
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-image-1",
                 ),
-                SimpleNamespace(
-                    id="call-search-1",
-                    type="function",
-                    function=SimpleNamespace(
-                        name="search_web",
-                        arguments='{"query":"天气"}',
-                    ),
-                    raw_arguments='{"query":"天气"}',
-                    parsed_arguments={"query": "天气"},
+                _tool_call(
+                    "search_web",
+                    '{"query":"天气"}',
+                    {"query": "天气"},
+                    call_id="call-search-1",
                 ),
             ],
         ),
         SimpleNamespace(
-            content="<content>看图并搜索后的回答</content>",
-            tool_calls=[],
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "看图并搜索后的回答",
+                        "interaction_history": {
+                            "event": "让我看图并查询天气",
+                            "result": "查看图片和搜索后回答",
+                            "emotion": "专注",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
         ),
     ]
     searched_queries: list[str] = []
@@ -270,10 +302,11 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
         )
     )
 
-    assert result == "看图并搜索后的回答"
+    assert result.content == "看图并搜索后的回答"
     assert read_images_payloads == [["base64-image-0"]]
     assert searched_queries == ["天气"]
     assert fake_provider.completion_calls[0]["tools"] == [
         llm_service_module.READ_IMAGE_TOOL,
         llm_service_module.TAVILY_SEARCH_TOOL,
+        llm_service_module.FINAL_RESPONSE_TOOL,
     ]

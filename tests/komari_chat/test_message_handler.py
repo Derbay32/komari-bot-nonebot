@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, cast
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
+llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
 
 
 class _FakeEvent:
@@ -125,8 +127,42 @@ class _FakeRedis:
 
 
 class _FakeMemory:
+    def __init__(self) -> None:
+        self.pg_pool = object()
+        self.interaction_history: dict[str, object] | None = None
+        self.upsert_interaction_history_calls: list[dict[str, object]] = []
+
     async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
         return []
+
+    async def get_interaction_history(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, object] | None:
+        del user_id, group_id
+        return self.interaction_history
+
+    async def upsert_interaction_history(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+        interaction: dict[str, object],
+    ) -> None:
+        self.upsert_interaction_history_calls.append(
+            {"user_id": user_id, "group_id": group_id, "interaction": interaction}
+        )
+
+
+@asynccontextmanager
+async def _fake_memory_lock(*_args: object, **kwargs: object):
+    _fake_memory_lock_calls.append(kwargs)
+    yield
+
+
+_fake_memory_lock_calls: list[dict[str, object]] = []
 
 
 class _FakeQueryRewrite:
@@ -218,8 +254,15 @@ def test_attempt_reply_only_rewrites_current_message(
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
         return []
 
-    async def _fake_generate_reply(**_kwargs: object) -> str:
-        return "收到啦"
+    async def _fake_generate_reply(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="收到啦",
+            interaction_history={
+                "event": "发送当前待回复消息",
+                "result": "回复收到啦",
+                "emotion": "平静",
+            },
+        )
 
     monkeypatch.setattr(
         message_handler_module,
@@ -230,6 +273,7 @@ def test_attempt_reply_only_rewrites_current_message(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
         ),
     )
     monkeypatch.setattr(
@@ -238,6 +282,12 @@ def test_attempt_reply_only_rewrites_current_message(
         _fake_build_prompt,
     )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_reply)
+    _fake_memory_lock_calls.clear()
+    monkeypatch.setattr(
+        message_handler_module,
+        "acquire_memory_agent_lock",
+        _fake_memory_lock,
+    )
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
@@ -272,6 +322,78 @@ def test_attempt_reply_only_rewrites_current_message(
         "reply_to_message_id": current_message.message_id,
     }
     assert handler.query_rewrite.current_query == "当前待回复消息"
+    assert handler.memory.upsert_interaction_history_calls == [
+        {
+            "user_id": "user-1",
+            "group_id": "group-1",
+            "interaction": {
+                "version": 1,
+                "user_id": "user-1",
+                "display_name": "阿虚",
+                "file_type": "用户的近期对鞠行为备忘录",
+                "description": "这是我在心里对这个用户近期行为的悄悄记录。",
+                "records": [
+                    {
+                        "event": "发送当前待回复消息",
+                        "result": "回复收到啦",
+                        "emotion": "平静",
+                    }
+                ],
+                "summary": "",
+            },
+        }
+    ]
+    assert _fake_memory_lock_calls[0]["scope"] is message_handler_module.MemoryAgentLockScope.INTERACTION_USER
+    assert _fake_memory_lock_calls[0]["timeout_seconds"] == 5
+
+
+def test_write_interaction_history_keeps_latest_ten_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    memory = _FakeMemory()
+    memory.interaction_history = {
+        "version": 2,
+        "summary": "已有总结",
+        "records": [
+            {"event": f"事件{i}", "result": f"反应{i}", "emotion": f"心情{i}"}
+            for i in range(10)
+        ],
+    }
+    handler.memory = memory
+    _fake_memory_lock_calls.clear()
+    monkeypatch.setattr(
+        message_handler_module,
+        "acquire_memory_agent_lock",
+        _fake_memory_lock,
+    )
+
+    asyncio.run(
+        handler._write_interaction_history(
+            message=MessageSchema(
+                user_id="user-1",
+                user_nickname="阿虚",
+                group_id="group-1",
+                content="当前待回复消息",
+                timestamp=2.0,
+                message_id="msg-2",
+            ),
+            new_record={"event": "新事件", "result": "新反应", "emotion": "新心情"},
+            lock_timeout_seconds=None,
+        )
+    )
+
+    interaction = memory.upsert_interaction_history_calls[0]["interaction"]
+    assert isinstance(interaction, dict)
+    assert interaction["version"] == 2
+    assert interaction["summary"] == "已有总结"
+    records = interaction["records"]
+    assert isinstance(records, list)
+    assert len(records) == 10
+    assert records[0] == {"event": "事件1", "result": "反应1", "emotion": "心情1"}
+    assert records[-1] == {"event": "新事件", "result": "新反应", "emotion": "新心情"}
 
 
 def test_resolve_reply_context_builds_user_side_text_context() -> None:
