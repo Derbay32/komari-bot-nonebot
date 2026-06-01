@@ -149,7 +149,7 @@ class DeepSeekClient(BaseLLMClient):
             system_instruction: 系统指令
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+            response_format: OpenAI 兼容结构化输出参数，非空时会下发到模型
             **kwargs: 其他参数（如 frequency_penalty）
 
         Returns:
@@ -168,8 +168,6 @@ class DeepSeekClient(BaseLLMClient):
                 f"  system_instruction: {system_instruction}\n"
                 f"  prompt: {prompt}"
             )
-            del response_format
-
             messages = []
             if system_instruction:
                 messages.append({"role": "system", "content": system_instruction})
@@ -188,6 +186,9 @@ class DeepSeekClient(BaseLLMClient):
                     "frequency_penalty", config.deepseek_frequency_penalty
                 ),
             }
+
+            if response_format is not None:
+                request_data["response_format"] = response_format
 
             if tools is not None:
                 request_data["tools"] = tools
@@ -254,7 +255,7 @@ class DeepSeekClient(BaseLLMClient):
             model: 模型名称
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
+            response_format: OpenAI 兼容结构化输出参数，非空时会下发到模型
             **kwargs: 其他参数
 
         Returns:
@@ -263,7 +264,6 @@ class DeepSeekClient(BaseLLMClient):
         config = config_manager.get()
         try:
             reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
-            del response_format
 
             request_data = {
                 "model": model,
@@ -278,6 +278,9 @@ class DeepSeekClient(BaseLLMClient):
                     "frequency_penalty", config.deepseek_frequency_penalty
                 ),
             }
+
+            if response_format is not None:
+                request_data["response_format"] = response_format
 
             if tools is not None:
                 request_data["tools"] = tools
