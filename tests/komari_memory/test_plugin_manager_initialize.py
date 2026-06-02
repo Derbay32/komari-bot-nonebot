@@ -140,9 +140,13 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
         expected_dimension: int | None,
         label: str,
     ) -> None:
-        events.append(("validate", expected_dimension))
+        del expected_dimension
+        events.append(("validate", table_name))
         assert pg_pool is fake_pool
-        assert table_name == "komari_memory_conversations"
+        assert table_name in {
+            "komari_memory_conversations",
+            "komari_memory_interaction_history",
+        }
         assert column_name == "embedding"
         assert label == "KomariMemory"
 
@@ -153,8 +157,9 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
         config: object,
         conversation_repo: object,
         entity_repo: object,
+        interaction_event_repo: object,
     ) -> _FakeMemoryService:
-        del config, conversation_repo, entity_repo
+        del config, conversation_repo, entity_repo, interaction_event_repo
         events.append(("memory_service", True))
         return _FakeMemoryService(events)
 
@@ -169,6 +174,11 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
     monkeypatch.setattr(module, "RedisManager", _fake_redis_manager)
     monkeypatch.setattr(module, "ConversationRepository", lambda pool: ("conv", pool))
     monkeypatch.setattr(module, "EntityRepository", lambda pool: ("entity", pool))
+    monkeypatch.setattr(
+        module,
+        "InteractionEventRepository",
+        lambda pool: ("interaction_event", pool),
+    )
     monkeypatch.setattr(module, "MemoryService", _fake_memory_service)
     monkeypatch.setattr(module, "ForgettingService", _fake_forgetting_service)
     monkeypatch.setattr(
@@ -185,6 +195,13 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
             ("register_forgetting", getattr(forgetting, "pg_pool", None) is fake_pool)
         ),
     )
+    monkeypatch.setattr(
+        module,
+        "register_interaction_event_task",
+        lambda redis, memory: events.append(
+            ("register_interaction_event", redis.initialized and isinstance(memory, _FakeMemoryService))
+        ),
+    )
     manager = module.PluginManager(config=SimpleNamespace())
     monkeypatch.setattr(
         manager,
@@ -198,10 +215,12 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
     assert events[:7] == [
         ("create_pool", True),
         ("apply_schema", True),
-        ("validate", 1536),
+        ("validate", "komari_memory_conversations"),
+        ("validate", "komari_memory_interaction_history"),
         ("redis_initialize", True),
         ("memory_service", True),
         ("register_summary", True),
-        ("forgetting_service", True),
     ]
+    assert ("forgetting_service", True) in events
     assert ("register_forgetting", True) in events
+    assert ("register_interaction_event", True) in events

@@ -58,6 +58,22 @@ class _FakeEmbeddingPlugin:
         return [SimpleNamespace(index=2), SimpleNamespace(index=0)][:top_n]
 
 
+class _FakeInteractionEventRepository:
+    def __init__(self) -> None:
+        self.search_calls: list[dict[str, Any]] = []
+        self.touch_calls: list[list[int]] = []
+
+    async def search_interaction_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.search_calls.append(dict(kwargs))
+        return [
+            {"id": 201, "event_summary": "喜欢聊游戏", "similarity": 0.9},
+            {"id": 202, "event_summary": "常常吐槽", "similarity": 0.8},
+        ]
+
+    async def touch_interaction_events(self, event_ids: list[int]) -> None:
+        self.touch_calls.append(list(event_ids))
+
+
 def _make_service(
     *,
     monkeypatch: Any,
@@ -132,3 +148,29 @@ def test_search_conversations_only_touches_reranked_results(monkeypatch: Any) ->
             "conversation_ids": [103, 101],
         }
     ]
+
+
+def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> None:
+    event_repository = _FakeInteractionEventRepository()
+    embedding_plugin = _FakeEmbeddingPlugin(rerank_enabled=False)
+    monkeypatch.setattr(
+        memory_service_module,
+        "require",
+        lambda _name: embedding_plugin,
+    )
+    service = MemoryService(
+        config=cast("Any", SimpleNamespace()),
+        conversation_repo=cast("Any", _FakeConversationRepository()),
+        entity_repo=cast("Any", object()),
+        interaction_event_repo=cast("Any", event_repository),
+    )
+
+    results = asyncio.run(
+        service.search_interaction_events(user_id="u1", query="游戏", limit=2)
+    )
+
+    assert [result["id"] for result in results] == [201, 202]
+    assert event_repository.search_calls == [
+        {"user_id": "u1", "embedding": "[0.1, 0.2]", "limit": 2}
+    ]
+    assert event_repository.touch_calls == [[201, 202]]

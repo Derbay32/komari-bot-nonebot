@@ -115,6 +115,7 @@ class _FakeRedis:
     def __init__(self, history: list[MessageSchema]) -> None:
         self.history = list(history)
         self.pushed_messages: list[MessageSchema] = []
+        self.pushed_global_interactions: list[dict[str, object]] = []
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
         del group_id, limit
@@ -124,6 +125,17 @@ class _FakeRedis:
         del group_id
         self.pushed_messages.append(message)
         self.history.append(message)
+
+    async def push_global_interaction(
+        self,
+        *,
+        user_id: str,
+        record: dict[str, object],
+        trigger_size: int,
+    ) -> None:
+        self.pushed_global_interactions.append(
+            {"user_id": user_id, "record": record, "trigger_size": trigger_size}
+        )
 
 
 class _FakeMemory:
@@ -272,22 +284,18 @@ def test_attempt_reply_only_rewrites_current_message(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
-            bot_nickname="小鞠",
-            memory_agent_lock_timeout_seconds=5,
-        ),
-    )
+                bot_nickname="小鞠",
+                memory_agent_lock_timeout_seconds=5,
+                global_interaction_enabled=True,
+                global_interaction_trigger_size=20,
+            ),
+        )
     monkeypatch.setattr(
         message_handler_module,
         "build_prompt",
         _fake_build_prompt,
     )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_reply)
-    _fake_memory_lock_calls.clear()
-    monkeypatch.setattr(
-        message_handler_module,
-        "acquire_memory_agent_lock",
-        _fake_memory_lock,
-    )
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
@@ -322,52 +330,41 @@ def test_attempt_reply_only_rewrites_current_message(
         "reply_to_message_id": current_message.message_id,
     }
     assert handler.query_rewrite.current_query == "当前待回复消息"
-    assert handler.memory.upsert_interaction_history_calls == [
+    pushed_record = redis.pushed_global_interactions[0]["record"]
+    assert isinstance(pushed_record, dict)
+    assert redis.pushed_global_interactions == [
         {
             "user_id": "user-1",
-            "group_id": "group-1",
-            "interaction": {
+            "trigger_size": 20,
+            "record": {
                 "version": 1,
-                "user_id": "user-1",
+                "event": "发送当前待回复消息",
+                "result": "回复收到啦",
+                "emotion": "平静",
                 "display_name": "阿虚",
-                "file_type": "用户的近期对鞠行为备忘录",
-                "description": "这是我在心里对这个用户近期行为的悄悄记录。",
-                "records": [
-                    {
-                        "event": "发送当前待回复消息",
-                        "result": "回复收到啦",
-                        "emotion": "平静",
-                    }
-                ],
-                "summary": "",
+                "message_id": "msg-2",
+                "timestamp": pushed_record["timestamp"],
             },
         }
     ]
-    assert _fake_memory_lock_calls[0]["scope"] is message_handler_module.MemoryAgentLockScope.INTERACTION_USER
-    assert _fake_memory_lock_calls[0]["timeout_seconds"] == 5
 
 
-def test_write_interaction_history_keeps_latest_ten_records(
+def test_write_interaction_history_pushes_global_redis_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
-    memory = _FakeMemory()
-    memory.interaction_history = {
-        "version": 2,
-        "summary": "已有总结",
-        "records": [
-            {"event": f"事件{i}", "result": f"反应{i}", "emotion": f"心情{i}"}
-            for i in range(10)
-        ],
-    }
-    handler.memory = memory
-    _fake_memory_lock_calls.clear()
+    redis = _FakeRedis([])
+    handler.redis = redis
+    handler.memory = _FakeMemory()
     monkeypatch.setattr(
         message_handler_module,
-        "acquire_memory_agent_lock",
-        _fake_memory_lock,
+        "get_config",
+        lambda: SimpleNamespace(
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+        ),
     )
 
     asyncio.run(
@@ -385,15 +382,18 @@ def test_write_interaction_history_keeps_latest_ten_records(
         )
     )
 
-    interaction = memory.upsert_interaction_history_calls[0]["interaction"]
-    assert isinstance(interaction, dict)
-    assert interaction["version"] == 2
-    assert interaction["summary"] == "已有总结"
-    records = interaction["records"]
-    assert isinstance(records, list)
-    assert len(records) == 10
-    assert records[0] == {"event": "事件1", "result": "反应1", "emotion": "心情1"}
-    assert records[-1] == {"event": "新事件", "result": "新反应", "emotion": "新心情"}
+    assert len(redis.pushed_global_interactions) == 1
+    pushed = redis.pushed_global_interactions[0]
+    assert pushed["user_id"] == "user-1"
+    assert pushed["trigger_size"] == 20
+    record = pushed["record"]
+    assert isinstance(record, dict)
+    assert record["version"] == 1
+    assert record["event"] == "新事件"
+    assert record["result"] == "新反应"
+    assert record["emotion"] == "新心情"
+    assert record["display_name"] == "阿虚"
+    assert record["message_id"] == "msg-2"
 
 
 def test_resolve_reply_context_builds_user_side_text_context() -> None:
