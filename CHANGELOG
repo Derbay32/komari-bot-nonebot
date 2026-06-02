@@ -2,9 +2,19 @@
 
 ## [Unreleased]
 
-> 当前 `dev` 分支上尚未发版的变更。
+> 当前 `dev` 分支上尚未发版的变更。本次更新围绕三大主题：**跨群互动事件记忆**（重构互动历史为跨群事件向量表）、**画像 Agent 化**（LLM tool calling 驱动的画像管理）、**聊天回复工具调用结构化**（统一 `final_response` 工具终结回复流程）。
 
 ### Added
+
+- **跨群用户长期互动事件记忆**：将 `komari_memory_interaction_history` 从旧 `(user_id, group_id)` 主键 JSONB records 表替换为按 `user_id` 分隔的事件向量表，每行存储一条由 LLM 总结出的跨群互动事件记忆，支持 `event_summary` 向量检索与整数忘却模型。
+- **schema 自动迁移**：`vector_storage_schema.py` 启动时自动检测旧表形态（存在 `records` JSONB 列且 `group_id`），自动重命名为 `_legacy_<时间戳>` 并创建新事件表，不破坏旧数据。
+- **Redis 跨群互动缓冲**：新增 `global_interaction:{user_id}` key，`RPUSH` 写入原始互动记录（不含 `group_id`），20 条仅触发 pending 不做 `LTRIM`；快照使用 Lua `RENAME` 原子转移 buffer → processing key，写入新 buffer 不受影响。
+- **`InteractionEventRepository`**：新事件向量表 CRUD，包含按 `user_id` 固定过滤的向量检索、分页列出、`touch_interaction_events()` 刷新（同时更新 `last_accessed` 并恢复 `importance_current = importance_initial`）、模糊化更新。
+- **`summarize_interaction_events()`**：LLM 总结服务，将一批原始互动跨群记录聚合为单条事件记忆，要求 JSON 输出且禁止出现群号/群名。
+- **后台 Worker**：`interaction_event_worker.py` 轮询 pending → 快照转移 → LLM 总结 → 嵌入 → 写 PG → 删除 processing key；失败复用 `retry_async` 重试 3 次，仍失败将 processing 快照恢复回原 buffer 并保持时间顺序。每日 4:00 兜底扫描非空 buffer 加入 pending。
+- **管理 API `/interactions`**：新增事件语义路由 `GET /interactions`、`GET /interactions/{event_id}`、`PATCH /interactions/{event_id}`、`DELETE /interactions/{event_id}`。
+- **配置项**：`global_interaction_enabled`、`global_interaction_trigger_size`（默认 20）、`global_interaction_summary_interval_minutes`（默认 1）。
+- **实现即 touch 测试覆盖**：测试验证了 Redis 缓冲不截断、快照恢复顺序、事件召回后自动 touch 刷新、`/interactions` API CRUD 与校验。
 - **画像 Agent 化**：用户画像总结从旧 JSON 操作数组改为 LLM tool calling Agent 模式。新增 `read_profile`、`write_profile`、`preview_profile`、`count_profile_traits`、`commit_profile` 工具供 LLM 按需操作，程序侧在 `commit_profile` 提交前硬校验 trait 上限，避免"忘记 commit / 错误 commit / commit 后继续写"的不确定性。
 - **Redis 暂存层**：新增 `ProfileStaging`，画像操作先暂存到 Redis（`komari_memory:staging:profile:{session_id}`，TTL 10 分钟），冲突检测 + 规范化合并后通过 `commit()` 写入数据库，异常时 `discard()` 自动清理。
 - **PG Agent 生命周期锁**：新增 `memory_agent_locks.py`，画像 Agent 按 `group_id` 通过 PostgreSQL advisory lock 互斥，同群并发 Agent 后发起者阻塞等待前一个完成；后续互动历史 Agent 可按 `(group_id, user_id)` 复用同一锁库。
@@ -12,39 +22,41 @@
 - **Agent 预算控制**：新增配置项 `memory_agent_max_rounds`、`memory_agent_max_tool_calls`、`memory_agent_max_read_profiles`、`memory_agent_max_write_operations`、`memory_agent_lock_timeout_seconds`，超出预算自动 discard 并告警。
 - **`count_profile_traits` / `commit_profile` 工具**：新增画像计数工具（支持 `include_staged` 纳入暂存区修改）与显式提交工具。`commit_profile` 在真实写库前对所有受影响用户执行 `profile_trait_limit` 硬校验，超限返回 `limit_exceeded`（含超限用户、数量、当前 traits、trait_keys），保留 Redis 暂存区供 LLM 继续压缩后重试，不写 PostgreSQL。
 - **`ProfileReadResult.display_name`**：`read_profile` 工具返回值补充 `display_name` 字段，`commit_profile` 的 `limit_exceeded.violations` 也携带，减少 LLM 为确认超限用户身份的额外查询。
-
-### Changed
-- **总结模型默认值**：`llm_model_summary` 从 `gemini-2.5-flash-lite` 改为 `deepseek-v4-flash`（需 function calling 支持）。
-- **总结提示词拆分**：新增 `memory_summary_common_system`（画像/总结共用前缀）与 `profile_agent_workflow_system`（画像 Agent 专用工具流程）。后续 `summary_prompt` / `merge_prompt`、旧互动历史相关模板字段及未使用的画像提交提醒模板均已移除。
-- **`summary_worker` 路径分叉**：画像路径走 `run_profile_agent()` → Agent + 暂存 + 自动提交；互动路径原保留旧 `summarize_conversation()` → JSON 解析 + `_apply_interaction_operations()`，后续已移除。
-- **记忆总结共用前缀缓存**：`summarize_conversation()` 改为三段式 `messages`（system + user + workflow），前两条与画像 Agent 完全一致以命中 LLM 服务端前缀缓存；输出从旧操作数组合并改为纯 `{"memories": [{"content": ..., "importance": ...}]}` 多段对话记忆，不再产出 `user_profile_operations` / `user_interaction_operations`。
-- **总结三层 fallback**：总结采用 JSON mode → 强制 `output_summary_result` tool calling → markdown JSON 直出解析的三层结构化输出降级链，并修复 `DeepSeekClient` 对 `response_format` 的请求体透传。
-- **总结执行顺序调整**：`perform_summary()` 先执行总结并逐条 `store_conversation()` 写入 PG，再运行画像 Agent；总结失败会记录异常但不阻断画像后续流程。
-- **聊天回复工具调用合并**：合并 `generate_reply_with_vision_tool` 与 `generate_reply_with_search_tool` 为统一的 `generate_reply_with_tools()`，由调用方显式传入 `tools` 列表；提取公共的 `_execute_tool_loop()` 消除 ~190 行重复代码，并支持未启用工具的安全拦截。
-- **画像提交改为显式**：`run_profile_agent()` 不再在 LLM 停止工具调用后自动提交，改为必须由 Agent 显式调用 `commit_profile` 才写库；未成功提交或超过轮数结束会自动丢弃暂存区返回 `discarded` / `nothing_to_commit`。
-- **画像压缩整合进 Agent**：压缩从独立的 LLM 文本 JSON 路径改为 Agent 工具调用循环内完成。LLM 通过 `count_profile_traits(include_staged=true)` 检测超限 → `write_profile`（delete/set）压缩 → `count_profile_traits` 复查 → `commit_profile` 提交；`limit_exceeded` 失败直接根据 violations 继续修正重试。
-- **提示词工作流更新**：`profile_agent_workflow_system` 明确计数、压缩、预览、显式提交和超限重试流程；删除未使用的 `profile_agent_commit_reminder`、`profile_compaction_agent_system`、`profile_compaction_commit_reminder` 模板。
-
-### Removed
-- **旧画像解析**：移除 `summary_worker._apply_profile_operations()`、旧 `user_profile_operations` 解析与聚合逻辑，画像不再通过旧 JSON 操作数组写入。
-- **画像总结全量注入**：`llm_service._build_existing_context_with_budget()` 不再把已有画像全量注入总结 prompt，改由 Agent 通过 `read_profile` 按需懒加载；后续该函数及其调用链已完全删除。
-- **互动历史总结路径**：`perform_summary()` 中移除互动历史读取、LLM `user_interaction_operations` 处理、`upsert_interaction_history()` 写入；`summarize_conversation()` 不再产出互动历史操作，总结专注于纯对话记忆。
-- **总结分段/合并机制**：移除 `_chunk_formatted_messages()`、`_split_oversized_message()`、`_build_merge_prompt()`、`_serialize_chunk_results_for_merge()` 等全部分段与二次汇总逻辑；当前 500 条消息上限远低于模型 40K+ 上下文窗口，分段属过度设计。
-- **旧模板字段**：移除 `summary_prompt`、`merge_prompt`、`existing_context_instruction_block`、`existing_profiles_header`、`existing_interactions_header`、`truncated_context_marker`，新增 `summary_workflow_system` 与纯 `memories` JSON 示例。
-
-### Added
 - **`final_response` 工具**：新增内部终端工具 `final_response`，所有聊天回复（含普通回复与工具回复）均通过 `tool_choice="required"` 强制模型调用以输出结构化结果。
 - **互动历史同步生成**：聊天回复与互动历史绑定在同一结构化输出中，每次回复都同步生成 `interaction_history`（包含 event / result / emotion），不再依赖 XML 标签文本解析。
 - **`ReplyResult` / `InteractionHistoryRecord`**：新增结构化返回值类型，`generate_reply()` 与 `generate_reply_with_tools()` 返回 `ReplyResult`（含 content + interaction_history）。
 - **`_write_interaction_history()`**：新增互动历史写入方法，复用 `MemoryAgentLockScope.INTERACTION_USER`，在 PG advisory lock 内完成 read-modify-write，自动裁剪最近 10 条记录，写入失败不阻塞回复发送。
 
 ### Changed
+
+- **`_write_interaction_history()`**：`komari_chat` 消息处理器中的互动历史写入改为写 Redis 跨群缓冲，不再读取旧 PG records、不再持有 advisory lock、不写 `group_id`；增加 `global_interaction_enabled` 开关控制。
+- **`MemoryService`**：注入 `InteractionEventRepository`；新增 `insert_interaction_event()`、`search_interaction_events()`（内置 touch 刷新）；旧 `get_interaction_history()` 等 old API 安全返回 None。
+- **`ForgettingService`**：对新事件表接入整数衰减、低价值删除、高价值首次归零模糊化与二次归零删除。
+- **`PluginManager`/`__init__.py`**：初始化和注册 interaction event repository 与 worker，并增加新表 embedding 维度校验。
+- **总结模型默认值**：`llm_model_summary` 从 `gemini-2.5-flash-lite` 改为 `deepseek-v4-flash`（需 function calling 支持）。
+- **总结提示词拆分**：新增 `memory_summary_common_system`（画像/总结共用前缀）与 `profile_agent_workflow_system`（画像 Agent 专用工具流程）。后续 `summary_prompt` / `merge_prompt`、旧互动历史相关模板字段及未使用的画像提交提醒模板均已移除。
+- **`summary_worker` 路径分叉**：画像路径走 `run_profile_agent()` → Agent + 暂存 + 自动提交；互动路径原保留旧 `summarize_conversation()` → JSON 解析 + `_apply_interaction_operations()`，后续已移除。
+- **记忆总结共用前缀缓存**：`summarize_conversation()` 改为三段式 `messages`（system + user + workflow），前两条与画像 Agent 完全一致以命中 LLM 服务端前缀缓存；输出从旧操作数组合并改为纯 `{"memories": [{"content": ..., "importance": ...}]}` 多段对话记忆，不再产出 `user_profile_operations` / `user_interaction_operations`。
+- **总结三层 fallback**：总结采用 JSON mode → 强制 `output_summary_result` tool calling → markdown JSON 直出解析的三层结构化输出降级链，并修复 `DeepSeekClient` 对 `response_format` 的请求体透传。
+- **总结执行顺序调整**：`perform_summary()` 先执行总结并逐条 `store_conversation()` 写入 PG，再运行画像 Agent；总结失败会记录异常但不阻断画像后续流程。
+- **画像提交改为显式**：`run_profile_agent()` 不再在 LLM 停止工具调用后自动提交，改为必须由 Agent 显式调用 `commit_profile` 才写库；未成功提交或超过轮数结束会自动丢弃暂存区返回 `discarded` / `nothing_to_commit`。
+- **画像压缩整合进 Agent**：压缩从独立的 LLM 文本 JSON 路径改为 Agent 工具调用循环内完成。LLM 通过 `count_profile_traits(include_staged=true)` 检测超限 → `write_profile`（delete/set）压缩 → `count_profile_traits` 复查 → `commit_profile` 提交；`limit_exceeded` 失败直接根据 violations 继续修正重试。
+- **提示词工作流更新**：`profile_agent_workflow_system` 明确计数、压缩、预览、显式提交和超限重试流程；删除未使用的 `profile_agent_commit_reminder`、`profile_compaction_agent_system`、`profile_compaction_commit_reminder` 模板。
+- **聊天回复工具调用合并**：合并 `generate_reply_with_vision_tool` 与 `generate_reply_with_search_tool` 为统一的 `generate_reply_with_tools()`，由调用方显式传入 `tools` 列表；提取公共的 `_execute_tool_loop()` 消除 ~190 行重复代码，并支持未启用工具的安全拦截。
 - **工具循环重写**：`_execute_tool_loop()` 改为必须收到 `final_response` 才返回，业务工具执行与最终输出分离，达到最大轮数或缺少结构化参数时抛错并触发 `retry_async` 重试；移除最大轮数后纯文本降级路径。
 - **纯聊天也走工具路径**：`generate_reply()` 不再调用 `generate_text_with_messages()`，统一走 `FINAL_RESPONSE_TOOL` 工具循环（`max_tool_rounds=2`），旧 `messages=None` 的兼容路径现在显式抛错。
 - **`generate_reply_with_tools()` 自动追加 `final_response`**：调用方只传入业务工具（read_image / search_web），内部自动追加 `FINAL_RESPONSE_TOOL`；`response_format` docstring 修正以反映非空时实际下放到底层 LLM API 的事实。
 - **锁保护范围扩展**：互动历史写入使用现有 `INTERACTION_USER` 作用域，按 `(group_id, user_id)` 在 PG advisory lock 内完成完整 read-modify-write，避免同一用户的并发回复互相覆盖。
 
 ### Removed
+
+- **旧互动历史 advisory lock**：`_write_interaction_history()` 不再依赖 PostgreSQL `INTERACTION_USER` 锁，旧锁路径已移除。
+- **旧 JSONB records 写入入口**：`MemoryService.upsert_interaction_history()` 已停用（保留签名），`EntityRepository` 旧 interaction 方法保留仅供旧测试渐进清理。
+- **旧画像解析**：移除 `summary_worker._apply_profile_operations()`、旧 `user_profile_operations` 解析与聚合逻辑，画像不再通过旧 JSON 操作数组写入。
+- **画像总结全量注入**：`llm_service._build_existing_context_with_budget()` 不再把已有画像全量注入总结 prompt，改由 Agent 通过 `read_profile` 按需懒加载；后续该函数及其调用链已完全删除。
+- **互动历史总结路径**：`perform_summary()` 中移除互动历史读取、LLM `user_interaction_operations` 处理、`upsert_interaction_history()` 写入；`summarize_conversation()` 不再产出互动历史操作，总结专注于纯对话记忆。
+- **总结分段/合并机制**：移除 `_chunk_formatted_messages()`、`_split_oversized_message()`、`_build_merge_prompt()`、`_serialize_chunk_results_for_merge()` 等全部分段与二次汇总逻辑；当前 500 条消息上限远低于模型 40K+ 上下文窗口，分段属过度设计。
+- **旧模板字段**：移除 `summary_prompt`、`merge_prompt`、`existing_context_instruction_block`、`existing_profiles_header`、`existing_interactions_header`、`truncated_context_marker`，新增 `summary_workflow_system` 与纯 `memories` JSON 示例。
 - **XML 标签提取**：移除 `komari_chat/llm_service._extract_tag_content()`（`komari_memory` 与 `group_history_summary` 中同名函数不受影响）。
 - **旧 dispatch 回调**：`generate_reply_with_tools()` 内联的 `dispatch` 回调被 `_execute_business_tool()` helper 取代。
 - **独立 LLM 文本压缩路径**：移除 `compact_profile_with_llm()`、`_enforce_profile_trait_limit()` 及配套的 prompt 构建、JSON 解析、分批压缩等全部函数与 Protocol；`profile_compaction.py` 精简为纯规范化与统计工具。
@@ -52,6 +64,7 @@
 - **离线画像瘦身脚本**：删除 `scripts/compact_komari_memory_profiles.py` 及其测试，功能已迁移至 Agent 会话内压缩。
 
 ### Fixed
+
 - **陈旧 `access_boost` 测试断言**：`test_memory_service` 两处搜索/触摸调用断言中移除已废弃的 `access_boost` 参数，匹配实际方法签名。
 
 ---
@@ -359,4 +372,4 @@
 
 ---
 
-*最后更新：2026-06-01（互动历史同步生成）*
+*最后更新：2026-06-03（Unreleased 按三大主题重组）*
