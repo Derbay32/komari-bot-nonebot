@@ -143,6 +143,22 @@ class KomariMemoryConfigSchema(BaseModel):
     context_messages_limit: int = Field(
         default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
     )
+    global_interaction_enabled: bool = Field(
+        default=True,
+        description="是否启用跨群互动事件缓冲",
+    )
+    global_interaction_trigger_size: int = Field(
+        default=20,
+        ge=5,
+        le=200,
+        description="触发事件总结的 Redis 缓冲条数阈值，不是 LIST 最大长度",
+    )
+    global_interaction_summary_interval_minutes: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="互动事件 Worker 轮询间隔（分钟）",
+    )
 
     # 主动回复配置
     proactive_enabled: bool = Field(default=False, description="是否启用主动回复")

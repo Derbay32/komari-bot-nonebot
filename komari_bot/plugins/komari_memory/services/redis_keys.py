@@ -34,6 +34,12 @@ class RedisKeys:
     # 画像 Agent 暂存区
     STAGING_PROFILE = f"{PREFIX}:staging:profile:%s"
 
+    # 跨群用户互动事件缓冲
+    GLOBAL_INTERACTION = f"{PREFIX}:global_interaction:%s"
+    GLOBAL_INTERACTION_PATTERN = f"{PREFIX}:global_interaction:*"
+    GLOBAL_INTERACTION_PENDING = f"{PREFIX}:global_interaction:pending"
+    GLOBAL_INTERACTION_PROCESSING = f"{PREFIX}:global_interaction:processing:%s:%s"
+
     @classmethod
     def buffer(cls, group_id: str) -> str:
         """获取消息缓冲区键。
@@ -124,3 +130,13 @@ class RedisKeys:
     def staging_profile(cls, session_id: str) -> str:
         """获取画像 Agent 暂存区键。"""
         return cls.STAGING_PROFILE % session_id
+
+    @classmethod
+    def global_interaction(cls, user_id: str) -> str:
+        """获取跨群用户互动缓冲键。"""
+        return cls.GLOBAL_INTERACTION % user_id
+
+    @classmethod
+    def global_interaction_processing(cls, user_id: str, token: str) -> str:
+        """获取跨群用户互动处理快照键。"""
+        return cls.GLOBAL_INTERACTION_PROCESSING % (user_id, token)

@@ -64,12 +64,15 @@ class ForgettingService:
         try:
             # 1. 每日衰减：所有记忆重要性按整数退一
             await self._daily_decay()
+            await self._daily_decay_interaction_events()
 
             # 2. 删除低价值记忆
             deleted_low = await self._delete_low_value_memories()
+            deleted_low += await self._delete_low_value_interaction_events()
 
             # 3. 模糊化或删除高价值记忆
             processed_high = await self._fuzzify_and_cleanup_high_value_memories()
+            processed_high += await self._fuzzify_and_cleanup_high_value_interaction_events()
 
             logger.info(
                 f"[KomariMemory] 死神脚本完成: "
@@ -89,6 +92,17 @@ class ForgettingService:
                 """,
             )
             logger.debug("[KomariMemory] 已按整数退一衰减所有记忆的重要性")
+
+    async def _daily_decay_interaction_events(self) -> None:
+        """每日衰减跨群互动事件记忆。"""
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE komari_memory_interaction_history
+                SET importance_current = GREATEST(importance_current - 1, 0)
+                """,
+            )
+            logger.debug("[KomariMemory] 已衰减跨群互动事件记忆的重要性")
 
     async def _delete_low_value_memories(self) -> int:
         """删除重要性=0的低价值记忆（初始评分≤配置阈值）。
@@ -117,6 +131,25 @@ class ForgettingService:
                 min_age_days,
             )
             return int(deleted)
+
+    async def _delete_low_value_interaction_events(self) -> int:
+        """删除低价值跨群互动事件记忆。"""
+        threshold = self.config.forgetting_importance_threshold
+        min_age_days = self.config.forgetting_min_age_days
+        async with self.pg_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM komari_memory_interaction_history
+                WHERE importance_current = 0
+                  AND importance_initial <= $1
+                  AND created_at <= NOW() - ($2 * INTERVAL '1 day')
+                """,
+                threshold,
+                min_age_days,
+            )
+        deleted = int(result.split()[-1]) if result else 0
+        logger.debug("[KomariMemory] 删除低价值跨群互动事件: {} 条", deleted)
+        return deleted
 
     async def _fuzzify_and_cleanup_high_value_memories(self) -> int:
         """处理重要性=0的高价值记忆（初始评分>配置阈值）。
@@ -191,6 +224,61 @@ class ForgettingService:
         )
         return deleted_fuzzy + fuzzified_count
 
+    async def _fuzzify_and_cleanup_high_value_interaction_events(self) -> int:
+        """处理高价值跨群互动事件的模糊化或二次删除。"""
+        threshold = self.config.forgetting_importance_threshold
+        min_age_days = self.config.forgetting_min_age_days
+        async with self.pg_pool.acquire() as conn:
+            fuzzy_result = await conn.execute(
+                """
+                DELETE FROM komari_memory_interaction_history
+                WHERE importance_current = 0
+                  AND importance_initial > $1
+                  AND is_fuzzy = TRUE
+                  AND created_at <= NOW() - ($2 * INTERVAL '1 day')
+                """,
+                threshold,
+                min_age_days,
+            )
+            deleted_fuzzy = int(fuzzy_result.split()[-1]) if fuzzy_result else 0
+            rows = await conn.fetch(
+                """
+                SELECT id, event_summary
+                FROM komari_memory_interaction_history
+                WHERE importance_current = 0
+                  AND importance_initial > $1
+                  AND is_fuzzy = FALSE
+                  AND created_at <= NOW() - ($2 * INTERVAL '1 day')
+                """,
+                threshold,
+                min_age_days,
+            )
+
+        if not rows:
+            return deleted_fuzzy
+
+        concurrency = max(1, int(self.config.forgetting_fuzzify_concurrency))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _fuzzify_record(record: asyncpg.Record) -> bool:
+            async with semaphore:
+                return await self._fuzzify_interaction_event(
+                    int(record["id"]),
+                    str(record["event_summary"]),
+                )
+
+        results = await asyncio.gather(
+            *(_fuzzify_record(record) for record in rows),
+            return_exceptions=False,
+        )
+        fuzzified_count = sum(1 for result in results if result)
+        logger.debug(
+            "[KomariMemory] 高价值跨群互动事件处理: 删除 {} 条, 模糊化 {} 条",
+            deleted_fuzzy,
+            fuzzified_count,
+        )
+        return deleted_fuzzy + fuzzified_count
+
     async def _fuzzify_conversation(self, conv_id: int, original_summary: str) -> bool:
         """模糊化对话记忆并重置重要性。"""
         try:
@@ -239,3 +327,52 @@ class ForgettingService:
 
         logger.warning("[KomariMemory] 模糊化结果为空，使用默认占位文本: ID={}", conv_id)
         return "对话内容已模糊化处理"
+
+    async def _fuzzify_interaction_event(self, event_id: int, original_summary: str) -> bool:
+        """模糊化跨群互动事件并重置重要性。"""
+        try:
+            fuzzy_summary = await self._generate_fuzzy_interaction_summary(
+                original_summary,
+                event_id,
+            )
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE komari_memory_interaction_history
+                    SET event_summary = $1,
+                        is_fuzzy = TRUE,
+                        importance_current = importance_initial
+                    WHERE id = $2
+                    """,
+                    fuzzy_summary,
+                    event_id,
+                )
+        except Exception:
+            logger.exception("[KomariMemory] 跨群互动事件模糊化失败 ID={}", event_id)
+            return False
+        else:
+            logger.debug("[KomariMemory] 模糊化跨群互动事件: ID={}", event_id)
+            return True
+
+    async def _generate_fuzzy_interaction_summary(self, original: str, event_id: int) -> str:
+        """生成跨群互动事件模糊化总结。"""
+        tag = (self.config.response_tag or "content").strip() or "content"
+        prompt = (
+            "请将下面的小鞠与某用户的长期互动事件记忆模糊化为一句简短的简体中文概要。\n"
+            "要求：\n"
+            "1. 保留关系基调、用户偏好倾向和互动模式。\n"
+            "2. 淡化具体消息、时间线、可识别细节，不引入群号或群名。\n"
+            f"3. 最终只能输出 <{tag}>模糊化后的结果</{tag}>。\n"
+            "4. 标签外不要输出任何解释。\n\n"
+            f"原始事件：\n{original}"
+        )
+        response = await llm_provider.generate_text(
+            prompt=prompt,
+            model=self.config.llm_model_summary,
+            temperature=self.config.llm_temperature_summary,
+            max_tokens=min(self.config.llm_max_tokens_summary, 120),
+            request_trace_id=f"memfuzzy-interaction-{event_id}",
+            request_phase="forgetting_interaction_fuzzify",
+        )
+        fuzzy_summary = _extract_tag_content(response, tag)
+        return fuzzy_summary or "互动事件已模糊化处理"

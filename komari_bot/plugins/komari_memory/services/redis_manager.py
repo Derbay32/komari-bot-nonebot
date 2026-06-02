@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import cast
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 from nonebot import logger
@@ -334,6 +334,139 @@ class RedisManager:
         ttl = max(1, int((end_of_day - now).total_seconds()) + 1)
         await self.redis.set(key, "1", ex=ttl)
 
+    async def push_global_interaction(
+        self,
+        user_id: str,
+        record: dict[str, Any] | list[dict[str, Any]],
+        trigger_size: int = 20,
+    ) -> None:
+        """写入跨群用户互动缓冲，达到阈值后加入待总结集合。"""
+        records = record if isinstance(record, list) else [record]
+        if not records:
+            return
+
+        key = RedisKeys.global_interaction(user_id)
+        payloads = [json.dumps(item, ensure_ascii=False) for item in records]
+        pipe = self.redis.pipeline()
+        pipe.rpush(key, *payloads)
+        pipe.llen(key)
+        results = await pipe.execute()
+        buffer_len = int(results[-1] or 0)
+        if buffer_len >= trigger_size:
+            await self.add_pending_interaction_summary(user_id)
+
+    async def add_pending_interaction_summary(self, user_id: str) -> None:
+        """加入跨群互动事件待总结集合。"""
+        await self.redis.execute_command(
+            "SADD",
+            RedisKeys.GLOBAL_INTERACTION_PENDING,
+            user_id,
+        )
+
+    async def pop_pending_interaction_summaries(self, count: int = 100) -> list[str]:
+        """批量弹出待总结用户 ID。"""
+        if count <= 0:
+            return []
+        values = await self.redis.execute_command(
+            "SPOP",
+            RedisKeys.GLOBAL_INTERACTION_PENDING,
+            count,
+        )
+        if values is None:
+            return []
+        if isinstance(values, (str, bytes)):
+            values = [values]
+        return [self._decode_redis_text(value) for value in values if value]
+
+    async def snapshot_global_interactions(self, user_id: str, token: str) -> str | None:
+        """原子转移用户互动缓冲到 processing 快照键。"""
+        source_key = RedisKeys.global_interaction(user_id)
+        processing_key = RedisKeys.global_interaction_processing(user_id, token)
+        script = """
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return nil
+        end
+        if redis.call('LLEN', KEYS[1]) == 0 then
+            redis.call('DEL', KEYS[1])
+            return nil
+        end
+        if redis.call('EXISTS', KEYS[2]) ~= 0 then
+            return redis.error_reply('processing key already exists')
+        end
+        redis.call('RENAME', KEYS[1], KEYS[2])
+        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
+        return KEYS[2]
+        """
+        result = await self.redis.execute_command(
+            "EVAL",
+            script,
+            2,
+            source_key,
+            processing_key,
+            86400,
+        )
+        return self._decode_redis_text(result) if result else None
+
+    async def get_processing_global_interactions(
+        self,
+        processing_key: str,
+    ) -> list[dict[str, Any]]:
+        """读取 processing 快照中的全部互动记录。"""
+        raw_items = await self.redis.lrange(processing_key, 0, -1)  # type: ignore[arg-type]
+        records: list[dict[str, Any]] = []
+        for raw_item in raw_items:
+            try:
+                parsed = json.loads(raw_item)
+            except (TypeError, ValueError):
+                logger.warning("[KomariMemory] 跨群互动缓冲 JSON 解析失败: {}", raw_item)
+                continue
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        return records
+
+    async def delete_processing_global_interactions(self, processing_key: str) -> None:
+        """删除 processing 快照键。"""
+        await self.redis.delete(processing_key)
+
+    async def restore_processing_global_interactions(
+        self,
+        user_id: str,
+        processing_key: str,
+    ) -> None:
+        """将 processing 快照恢复回原缓冲，并保持旧记录在新记录之前。"""
+        target_key = RedisKeys.global_interaction(user_id)
+        script = """
+        local old_items = redis.call('LRANGE', KEYS[1], 0, -1)
+        if #old_items == 0 then
+            redis.call('DEL', KEYS[1])
+            return 0
+        end
+        local new_items = redis.call('LRANGE', KEYS[2], 0, -1)
+        redis.call('DEL', KEYS[2])
+        redis.call('RPUSH', KEYS[2], unpack(old_items))
+        if #new_items > 0 then
+            redis.call('RPUSH', KEYS[2], unpack(new_items))
+        end
+        redis.call('DEL', KEYS[1])
+        return #old_items
+        """
+        await self.redis.execute_command("EVAL", script, 2, processing_key, target_key)
+
+    async def get_users_with_global_interaction_buffer(self) -> list[str]:
+        """扫描所有存在跨群互动缓冲的用户 ID。"""
+        users: list[str] = []
+        excluded = {RedisKeys.GLOBAL_INTERACTION_PENDING}
+        processing_prefix = f"{RedisKeys.PREFIX}:global_interaction:processing:"
+        async for key in self.redis.scan_iter(match=RedisKeys.GLOBAL_INTERACTION_PATTERN):
+            key_text = self._decode_redis_text(key)
+            if key_text in excluded or key_text.startswith(processing_prefix):
+                continue
+            user_id = key_text.rsplit(":", 1)[-1]
+            buffer_len = cast("int", await self.redis.execute_command("LLEN", key_text))
+            if user_id and buffer_len > 0:
+                users.append(user_id)
+        return users
+
     async def delete_buffer(
         self,
         group_id: str,
@@ -380,3 +513,9 @@ class RedisManager:
             message_id=data["message_id"],
             is_bot=data.get("is_bot", False),
         )
+
+    @staticmethod
+    def _decode_redis_text(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode()
+        return str(value)

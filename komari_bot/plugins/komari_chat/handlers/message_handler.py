@@ -14,10 +14,6 @@ from nonebot.adapters.onebot.v11.event import Reply
 from nonebot.compat import type_validate_python
 from nonebot.plugin import require
 
-from komari_bot.common.memory_agent_locks import (
-    MemoryAgentLockScope,
-    acquire_memory_agent_lock,
-)
 from komari_bot.plugins.komari_decision.services.decision_engine import (
     DecisionEngine,
     DecisionOutcome,
@@ -475,60 +471,31 @@ class MessageHandler:
         new_record: InteractionHistoryRecord,
         lock_timeout_seconds: int | None,
     ) -> None:
-        """追加写入本轮互动历史，并用用户级记忆锁保护 read-modify-write。"""
-        async with acquire_memory_agent_lock(
-            self.memory.pg_pool,
-            scope=MemoryAgentLockScope.INTERACTION_USER,
-            group_id=message.group_id,
+        """将本轮互动写入跨群 Redis 原始缓冲。"""
+        del lock_timeout_seconds
+        config = get_config()
+        if not config.global_interaction_enabled:
+            return
+
+        global_record = {
+            "version": 1,
+            "event": str(new_record.get("event", "")).strip(),
+            "result": str(new_record.get("result", "")).strip(),
+            "emotion": str(new_record.get("emotion", "")).strip(),
+            "display_name": self._resolve_display_name(message),
+            "timestamp": time.time(),
+            "message_id": message.message_id,
+        }
+        await self.redis.push_global_interaction(
             user_id=message.user_id,
-            trace_id=f"chat_interaction:{message.group_id}:{message.user_id}:{message.message_id}",
-            timeout_seconds=lock_timeout_seconds,
-        ):
-            existing = await self.memory.get_interaction_history(
-                user_id=message.user_id,
-                group_id=message.group_id,
-            )
+            record=global_record,
+            trigger_size=config.global_interaction_trigger_size,
+        )
 
-            existing_records: list[InteractionHistoryRecord] = []
-            existing_summary = ""
-            version = 1
-            if isinstance(existing, dict):
-                raw_records = existing.get("records")
-                if isinstance(raw_records, list):
-                    for raw_record in raw_records:
-                        if not isinstance(raw_record, dict):
-                            continue
-                        event = str(raw_record.get("event", "")).strip()
-                        result = str(raw_record.get("result", "")).strip()
-                        emotion = str(raw_record.get("emotion", "")).strip()
-                        if event and result and emotion:
-                            existing_records.append(
-                                {
-                                    "event": event,
-                                    "result": result,
-                                    "emotion": emotion,
-                                }
-                            )
-                existing_summary = str(existing.get("summary", ""))
-                raw_version = existing.get("version", 1)
-                version = raw_version if isinstance(raw_version, int) else 1
-
-            existing_records.append(new_record)
-            existing_records = existing_records[-10:]
-            interaction = {
-                "version": version,
-                "user_id": message.user_id,
-                "display_name": message.user_nickname,
-                "file_type": "用户的近期对鞠行为备忘录",
-                "description": "这是我在心里对这个用户近期行为的悄悄记录。",
-                "records": existing_records,
-                "summary": existing_summary,
-            }
-            await self.memory.upsert_interaction_history(
-                user_id=message.user_id,
-                group_id=message.group_id,
-                interaction=interaction,
-            )
+    @staticmethod
+    def _resolve_display_name(message: MessageSchema) -> str:
+        """解析写入跨群互动缓冲的用户显示名。"""
+        return str(message.user_nickname or message.user_id).strip() or message.user_id
 
     async def _attempt_reply(
         self,

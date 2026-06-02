@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..config_schema import KomariMemoryConfigSchema
     from ..repositories.conversation_repository import ConversationRepository
     from ..repositories.entity_repository import EntityRepository
+    from ..repositories.interaction_event_repository import InteractionEventRepository
 
 
 class MemoryService:
@@ -21,6 +22,7 @@ class MemoryService:
         config: KomariMemoryConfigSchema,
         conversation_repo: ConversationRepository,
         entity_repo: EntityRepository,
+        interaction_event_repo: InteractionEventRepository | None = None,
     ) -> None:
         """初始化记忆服务。
 
@@ -32,6 +34,7 @@ class MemoryService:
         self.config = config
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
+        self._interaction_event_repo = interaction_event_repo
         self._embedding_plugin: Any = require("embedding_provider")
 
     @property
@@ -264,19 +267,7 @@ class MemoryService:
         interaction: dict[str, Any],
         importance: int = 5,
     ) -> None:
-        """创建或更新互动历史实体。"""
-        interaction_with_meta = dict(interaction)
-        interaction_with_meta.setdefault("version", 1)
-        interaction_with_meta.setdefault("user_id", user_id)
-        interaction_with_meta.setdefault("updated_at", self._now_iso())
-        interaction_with_meta.setdefault("records", [])
-        interaction_with_meta.setdefault("summary", "")
-        await self._entity_repo.upsert_interaction_history(
-            user_id=user_id,
-            group_id=group_id,
-            interaction=interaction_with_meta,
-            importance=importance,
-        )
+        """旧 PG JSONB 互动历史入口已停用。"""
 
     async def get_user_profile(
         self,
@@ -294,11 +285,59 @@ class MemoryService:
         user_id: str,
         group_id: str,
     ) -> dict[str, Any] | None:
-        """获取用户互动历史 JSON。"""
-        return await self._entity_repo.get_interaction_history(
+        """旧 PG JSONB 互动历史入口已停用，prompt_builder 本轮保持空注入。"""
+        del user_id, group_id
+        return None
+
+    async def insert_interaction_event(
+        self,
+        *,
+        user_id: str,
+        display_name: str,
+        event_summary: str,
+        source_message_count: int,
+        first_seen_at: datetime,
+        last_seen_at: datetime,
+        importance_initial: int = 4,
+    ) -> int:
+        """生成向量并写入一条跨群互动事件记忆。"""
+        embedding = await self._embedding_plugin.embed(event_summary)
+        return await self._get_interaction_event_repo().insert_interaction_event(
             user_id=user_id,
-            group_id=group_id,
+            display_name=display_name,
+            event_summary=event_summary,
+            embedding=str(embedding),
+            source_message_count=source_message_count,
+            first_seen_at=first_seen_at,
+            last_seen_at=last_seen_at,
+            importance_initial=importance_initial,
         )
+
+    async def search_interaction_events(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        limit: int = 3,
+        query_embedding: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """检索当前用户的跨群互动事件，并刷新已召回事件重要度。"""
+        query_vec = (
+            query_embedding
+            if query_embedding is not None
+            else await self._embedding_plugin.embed(query)
+        )
+        repo = self._get_interaction_event_repo()
+        results = await repo.search_interaction_events(
+            user_id=user_id,
+            embedding=str(query_vec),
+            limit=limit,
+        )
+        if results:
+            await repo.touch_interaction_events(
+                [int(result["id"]) for result in results],
+            )
+        return results
 
     async def list_user_profile_rows(
         self,
@@ -327,14 +366,15 @@ class MemoryService:
         user_id: str | None = None,
         query: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        """分页获取互动历史文档行。"""
-        return await self._entity_repo.list_interaction_histories(
+        """分页获取跨群互动事件行（保留旧方法名给 API 过渡使用）。"""
+        del group_id
+        rows, total = await self._get_interaction_event_repo().list_interaction_events(
             limit=limit,
             offset=offset,
-            group_id=group_id,
             user_id=user_id,
             query=query,
         )
+        return [self._interaction_event_to_entity(row) for row in rows], total
 
     async def get_user_profile_row(
         self,
@@ -354,11 +394,9 @@ class MemoryService:
         user_id: str,
         group_id: str,
     ) -> dict[str, Any] | None:
-        """获取带元数据的互动历史行。"""
-        return await self._entity_repo.get_interaction_history_row(
-            user_id=user_id,
-            group_id=group_id,
-        )
+        """旧 user+group 互动历史行入口已停用。"""
+        del user_id, group_id
+        return None
 
     async def upsert_user_profile_row(
         self,
@@ -385,16 +423,9 @@ class MemoryService:
         interaction: dict[str, Any],
         importance: int = 5,
     ) -> dict[str, Any] | None:
-        """写入互动历史并返回最新行。"""
-        await self.upsert_interaction_history(
-            user_id=user_id,
-            group_id=group_id,
-            interaction=interaction,
-            importance=importance,
-        )
-        return await self.get_interaction_history_row(
-            user_id=user_id, group_id=group_id
-        )
+        """旧 user+group 互动历史写入入口已停用。"""
+        del user_id, group_id, interaction, importance
+        return None
 
     async def delete_user_profile(
         self,
@@ -414,10 +445,36 @@ class MemoryService:
         user_id: str,
         group_id: str,
     ) -> bool:
-        """删除互动历史文档。"""
-        return await self._entity_repo.delete_interaction_history(
-            user_id=user_id,
-            group_id=group_id,
+        """旧 user+group 互动历史删除入口已停用。"""
+        del user_id, group_id
+        return False
+
+    async def get_interaction_event_entry(self, event_id: int) -> dict[str, Any] | None:
+        """读取跨群互动事件管理行。"""
+        return await self._get_interaction_event_repo().get_interaction_event(event_id)
+
+    async def delete_interaction_event_entry(self, event_id: int) -> bool:
+        """删除跨群互动事件管理行。"""
+        return await self._get_interaction_event_repo().delete_interaction_event(event_id)
+
+    async def update_interaction_event_entry(
+        self,
+        event_id: int,
+        *,
+        event_summary: str | None = None,
+        importance_initial: int | None = None,
+        importance_current: int | None = None,
+    ) -> dict[str, Any] | None:
+        """更新跨群互动事件管理行。"""
+        embedding: str | None = None
+        if event_summary is not None:
+            embedding = str(await self._embedding_plugin.embed(event_summary))
+        return await self._get_interaction_event_repo().update_interaction_event(
+            event_id,
+            event_summary=event_summary,
+            embedding=embedding,
+            importance_initial=importance_initial,
+            importance_current=importance_current,
         )
 
     async def ensure_user_memory_rows(
@@ -443,27 +500,7 @@ class MemoryService:
                 profile=profile,
             )
 
-        interaction = await self.get_interaction_history(
-            user_id=user_id, group_id=group_id
-        )
-        if interaction is None:
-            interaction = {
-                "version": 1,
-                "user_id": user_id,
-                "display_name": display_name,
-                "file_type": "用户的近期对鞠行为备忘录",
-                "description": "暂无互动记录",
-                "records": [],
-                "summary": "",
-                "updated_at": self._now_iso(),
-            }
-            await self.upsert_interaction_history(
-                user_id=user_id,
-                group_id=group_id,
-                interaction=interaction,
-            )
-
-        return profile, interaction
+        return profile, {}
 
     async def cleanup(self) -> None:
         """清理资源。"""
@@ -503,3 +540,36 @@ class MemoryService:
         if value.tzinfo is None:
             return value
         return value.astimezone(UTC).replace(tzinfo=None)
+
+    def _get_interaction_event_repo(self) -> InteractionEventRepository:
+        if self._interaction_event_repo is None:
+            msg = "跨群互动事件仓库未初始化"
+            raise RuntimeError(msg)
+        return self._interaction_event_repo
+
+    @staticmethod
+    def _interaction_event_to_entity(row: dict[str, Any]) -> dict[str, Any]:
+        user_id = str(row.get("user_id", "")).strip()
+        return {
+            "user_id": user_id,
+            "group_id": "",
+            "key": f"interaction_event:{row.get('id')}",
+            "category": "interaction_event",
+            "importance": int(row.get("importance", 4) or 4),
+            "access_count": 0,
+            "last_accessed": row.get("last_accessed"),
+            "value": {
+                "version": 1,
+                "id": row.get("id"),
+                "user_id": user_id,
+                "display_name": str(row.get("display_name", "")).strip() or user_id,
+                "event_summary": str(row.get("event_summary", "")).strip(),
+                "source_message_count": int(row.get("source_message_count", 0) or 0),
+                "first_seen_at": row.get("first_seen_at"),
+                "last_seen_at": row.get("last_seen_at"),
+                "importance_initial": int(row.get("importance_initial", 4) or 4),
+                "importance_current": int(row.get("importance_current", 4) or 4),
+                "is_fuzzy": bool(row.get("is_fuzzy", False)),
+                "created_at": row.get("created_at"),
+            },
+        }
