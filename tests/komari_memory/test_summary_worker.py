@@ -76,15 +76,24 @@ class _FakeRedis:
     def __init__(self, messages: list[MessageSchema]) -> None:
         self._messages = messages
         self.redis = object()
-        self.delete_buffer_calls: list[str] = []
+        self.snapshot_calls: list[dict[str, str]] = []
+        self.delete_processing_calls: list[dict[str, str]] = []
+        self.restore_processing_calls: list[dict[str, str]] = []
         self.update_last_summary_calls: list[str] = []
 
-    async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
-        del group_id, limit
+    async def snapshot_conversation_buffer(self, group_id: str, token: str) -> str | None:
+        self.snapshot_calls.append({"group_id": group_id, "token": token})
+        return f"komari_memory:buffer:processing:{group_id}:{token}" if self._messages else None
+
+    async def get_processing_conversation_buffer(self, processing_key: str) -> list[MessageSchema]:
+        del processing_key
         return list(self._messages)
 
-    async def delete_buffer(self, group_id: str) -> None:
-        self.delete_buffer_calls.append(group_id)
+    async def delete_processing_conversation_buffer(self, group_id: str, processing_key: str) -> None:
+        self.delete_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
+
+    async def restore_processing_conversation_buffer(self, group_id: str, processing_key: str) -> None:
+        self.restore_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
 
     async def update_last_summary(self, group_id: str) -> None:
         self.update_last_summary_calls.append(group_id)
@@ -196,7 +205,7 @@ def _profile_agent_result(*, changed_user_ids: set[str] | None = None) -> Simple
     )
 
 
-def test_perform_summary_stores_multiple_memories_before_profile_agent(monkeypatch: Any) -> None:
+def test_perform_summary_runs_profile_agent_before_storing_memories(monkeypatch: Any) -> None:
     module = _load_summary_worker_module(monkeypatch)
     monkeypatch.setattr(
         module,
@@ -237,7 +246,7 @@ def test_perform_summary_stores_multiple_memories_before_profile_agent(monkeypat
     ]
     assert [call["importance_initial"] for call in memory.store_conversation_calls] == [4, 3]
     assert memory.upsert_interaction_history_calls == []
-    assert redis.delete_buffer_calls == ["114514"]
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
     assert redis.update_last_summary_calls == ["114514"]
 
 
@@ -270,7 +279,7 @@ def test_perform_summary_continues_profile_agent_when_summary_fails(monkeypatch:
 
     assert events == ["summary", "profile_agent"]
     assert memory.store_conversation_calls == []
-    assert redis.delete_buffer_calls == ["114514"]
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
 
 
 def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
