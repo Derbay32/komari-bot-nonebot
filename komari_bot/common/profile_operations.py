@@ -201,14 +201,18 @@ class CommitResult:
     committed_count: int
     changed_user_ids: set[str] = field(default_factory=set)
     summary: str = ""
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "status": self.status,
             "committed_count": self.committed_count,
             "changed_user_ids": sorted(self.changed_user_ids),
             "summary": self.summary,
         }
+        if self.conflicts:
+            data["conflicts"] = self.conflicts
+        return data
 
 
 def normalize_profile_operations(
