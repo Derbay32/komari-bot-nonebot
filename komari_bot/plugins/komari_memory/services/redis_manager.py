@@ -144,6 +144,174 @@ class RedisManager:
 
         return [self._deserialize_message(item) for item in raw_data]
 
+    async def snapshot_conversation_buffer(
+        self,
+        group_id: str,
+        token: str,
+    ) -> str | None:
+        """原子转移群聊消息缓冲到 processing 快照键。"""
+        source_key = RedisKeys.buffer(group_id)
+        processing_key = RedisKeys.buffer_processing(group_id, token)
+        lock_key = RedisKeys.buffer_processing_lock(group_id)
+        last_message_key = RedisKeys.last_message(group_id)
+        session_start_key = RedisKeys.session_start(group_id)
+        meta_last_message_key = RedisKeys.buffer_processing_meta_last_message(group_id, token)
+        meta_session_start_key = RedisKeys.buffer_processing_meta_session_start(group_id, token)
+        script = """
+        local locked_key = redis.call('GET', KEYS[3])
+        if locked_key and locked_key ~= '' then
+            if redis.call('EXISTS', locked_key) ~= 0 then
+                return locked_key
+            end
+            redis.call('DEL', KEYS[3])
+        end
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return nil
+        end
+        if redis.call('LLEN', KEYS[1]) == 0 then
+            redis.call('DEL', KEYS[1])
+            return nil
+        end
+        if redis.call('EXISTS', KEYS[2]) ~= 0 then
+            return redis.error_reply('conversation processing key already exists')
+        end
+        redis.call('RENAME', KEYS[1], KEYS[2])
+        local last_message = redis.call('GET', KEYS[4])
+        if last_message then
+            redis.call('SET', KEYS[6], last_message)
+        end
+        local session_start = redis.call('GET', KEYS[5])
+        if session_start then
+            redis.call('SET', KEYS[7], session_start)
+        end
+        redis.call('DEL', KEYS[4], KEYS[5])
+        redis.call('SET', KEYS[3], KEYS[2])
+        for index = 2, 7 do
+            redis.call('EXPIRE', KEYS[index], tonumber(ARGV[1]))
+        end
+        return KEYS[2]
+        """
+        result = await self.redis.execute_command(
+            "EVAL",
+            script,
+            7,
+            source_key,
+            processing_key,
+            lock_key,
+            last_message_key,
+            session_start_key,
+            meta_last_message_key,
+            meta_session_start_key,
+            self.config.conversation_snapshot_ttl_seconds,
+        )
+        return self._decode_redis_text(result) if result else None
+
+    async def get_processing_conversation_buffer(
+        self,
+        processing_key: str,
+    ) -> list[MessageSchema]:
+        """读取 processing 快照中的全部群聊消息。"""
+        raw_data = await self.redis.lrange(processing_key, 0, -1)  # type: ignore[arg-type]
+        messages: list[MessageSchema] = []
+        for raw_item in raw_data:
+            try:
+                messages.append(self._deserialize_message(raw_item))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                logger.warning("[KomariMemory] 对话 processing 消息 JSON 解析失败: {}", raw_item)
+        return messages
+
+    async def delete_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+    ) -> None:
+        """删除对话 processing 快照及其元数据，不影响新普通缓冲。"""
+        token = self._conversation_processing_token(processing_key)
+        lock_key = RedisKeys.buffer_processing_lock(group_id)
+        meta_last_message_key = RedisKeys.buffer_processing_meta_last_message(group_id, token)
+        meta_session_start_key = RedisKeys.buffer_processing_meta_session_start(group_id, token)
+        script = """
+        redis.call('DEL', KEYS[1], KEYS[3], KEYS[4])
+        if redis.call('GET', KEYS[2]) == KEYS[1] then
+            redis.call('DEL', KEYS[2])
+        end
+        return 1
+        """
+        await self.redis.execute_command(
+            "EVAL",
+            script,
+            4,
+            processing_key,
+            lock_key,
+            meta_last_message_key,
+            meta_session_start_key,
+        )
+
+    async def restore_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+    ) -> None:
+        """将对话 processing 快照恢复回普通缓冲，并保持旧记录在新记录之前。"""
+        token = self._conversation_processing_token(processing_key)
+        target_key = RedisKeys.buffer(group_id)
+        lock_key = RedisKeys.buffer_processing_lock(group_id)
+        last_message_key = RedisKeys.last_message(group_id)
+        session_start_key = RedisKeys.session_start(group_id)
+        meta_last_message_key = RedisKeys.buffer_processing_meta_last_message(group_id, token)
+        meta_session_start_key = RedisKeys.buffer_processing_meta_session_start(group_id, token)
+        script = """
+        local old_items = redis.call('LRANGE', KEYS[1], 0, -1)
+        local new_items = redis.call('LRANGE', KEYS[2], 0, -1)
+        redis.call('DEL', KEYS[2])
+        for _, item in ipairs(old_items) do
+            redis.call('RPUSH', KEYS[2], item)
+        end
+        for _, item in ipairs(new_items) do
+            redis.call('RPUSH', KEYS[2], item)
+        end
+        redis.call('DEL', KEYS[1])
+        if redis.call('GET', KEYS[3]) == KEYS[1] then
+            redis.call('DEL', KEYS[3])
+        end
+        local session_start = redis.call('GET', KEYS[7])
+        if session_start then
+            redis.call('SET', KEYS[5], session_start)
+        elseif #old_items > 0 or #new_items > 0 then
+            local first_item = old_items[1] or new_items[1]
+            local timestamp = string.match(first_item, '"timestamp"%s*:%s*([0-9%.]+)')
+            if timestamp then
+                redis.call('SET', KEYS[5], timestamp)
+            end
+        end
+        local last_item = new_items[#new_items] or old_items[#old_items]
+        if last_item then
+            local timestamp = string.match(last_item, '"timestamp"%s*:%s*([0-9%.]+)')
+            if timestamp then
+                redis.call('SET', KEYS[4], timestamp)
+            end
+        else
+            local last_message = redis.call('GET', KEYS[6])
+            if last_message then
+                redis.call('SET', KEYS[4], last_message)
+            end
+        end
+        redis.call('DEL', KEYS[6], KEYS[7])
+        return #old_items
+        """
+        await self.redis.execute_command(
+            "EVAL",
+            script,
+            7,
+            processing_key,
+            target_key,
+            lock_key,
+            last_message_key,
+            session_start_key,
+            meta_last_message_key,
+            meta_session_start_key,
+        )
+
     async def get_context_around_message(
         self,
         group_id: str,
@@ -490,14 +658,21 @@ class RedisManager:
         """
         pattern = RedisKeys.BUFFER_PATTERN
         keys = []
+        excluded_prefixes = (
+            f"{RedisKeys.PREFIX}:buffer:processing:",
+            f"{RedisKeys.PREFIX}:buffer:processing_lock:",
+            f"{RedisKeys.PREFIX}:buffer:processing_meta:",
+        )
         async for key in self.redis.scan_iter(match=pattern):
-            # 提取 group_id
-            group_id = (
-                key.decode().split(":")[-1]
-                if isinstance(key, bytes)
-                else key.split(":")[-1]
-            )
-            keys.append(group_id)
+            key_text = self._decode_redis_text(key)
+            if any(key_text.startswith(prefix) for prefix in excluded_prefixes):
+                continue
+            prefix = f"{RedisKeys.PREFIX}:buffer:"
+            if not key_text.startswith(prefix):
+                continue
+            group_id = key_text.removeprefix(prefix)
+            if group_id and ":" not in group_id:
+                keys.append(group_id)
         return keys
 
     @staticmethod
@@ -519,3 +694,7 @@ class RedisManager:
         if isinstance(value, bytes):
             return value.decode()
         return str(value)
+
+    @staticmethod
+    def _conversation_processing_token(processing_key: str) -> str:
+        return processing_key.rsplit(":", 1)[-1]

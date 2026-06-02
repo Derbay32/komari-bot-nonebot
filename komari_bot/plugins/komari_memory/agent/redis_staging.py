@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from komari_bot.common.profile_operations import (
@@ -18,6 +19,7 @@ from komari_bot.common.profile_operations import (
 )
 
 from ..services.redis_keys import RedisKeys
+from .profile_snapshot import get_snapshot_group_profile, get_snapshot_group_profiles
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
@@ -56,6 +58,7 @@ class ProfileStaging:
         memory: MemoryService,
         *,
         ttl_seconds: int,
+        snapshot_key: str | None = None,
     ) -> None:
         self._redis = redis
         self._session_id = session_id
@@ -63,6 +66,8 @@ class ProfileStaging:
         self._memory = memory
         self._ttl_seconds = ttl_seconds
         self._key = RedisKeys.staging_profile(session_id)
+        self._snapshot_key = snapshot_key
+        self._snapshot_conflicted_user_ids: set[str] = set()
 
     async def stage(self, operations: list[ProfileOperation]) -> StageResult:
         """校验、冲突检测并暂存画像操作。"""
@@ -130,7 +135,7 @@ class ProfileStaging:
         include_staged: bool = False,
     ) -> ProfileReadResult:
         """读取当前群的用户画像。"""
-        profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
+        profile, source = await self._load_profile(user_id)
         if include_staged:
             staged = [item for item in await self._load_items() if item.user_id == user_id]
             profile = apply_profile_operations(
@@ -139,6 +144,7 @@ class ProfileStaging:
                 user_id=user_id,
                 display_name=str((profile or {}).get("display_name", "")).strip() or user_id,
             )
+            source = f"{source}+staged"
         display_name = str((profile or {}).get("display_name", "")).strip() or user_id
         traits = _traits_to_list((profile or {}).get("traits"))
         if keys:
@@ -149,7 +155,7 @@ class ProfileStaging:
             group_id=self._group_id,
             display_name=display_name,
             traits=traits,
-            source="effective" if include_staged else "database",
+            source=source,
         )
 
     async def preview(self) -> PreviewResult:
@@ -169,7 +175,20 @@ class ProfileStaging:
             )
 
         changed_user_ids: set[str] = set()
-        for user_id in sorted({item.user_id for item in diff}):
+        affected_user_ids = {item.user_id for item in diff}
+        conflicts = await self._detect_snapshot_conflicts(affected_user_ids)
+        if conflicts:
+            self._snapshot_conflicted_user_ids.update(
+                str(conflict["user_id"]) for conflict in conflicts
+            )
+            return CommitResult(
+                status="conflict",
+                committed_count=0,
+                summary="检测到画像在 Agent 会话期间被外部修改，请重新读取并整合后再次提交",
+                conflicts=conflicts,
+            )
+
+        for user_id in sorted(affected_user_ids):
             user_diff = [item for item in diff if item.user_id == user_id]
             base_profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
             display_name = str((base_profile or {}).get("display_name", "")).strip() or user_id
@@ -238,11 +257,65 @@ class ProfileStaging:
         user_ids: set[str],
     ) -> dict[str, dict[str, Any]]:
         existing: dict[str, dict[str, Any]] = {}
+        snapshot_profiles: dict[str, dict[str, Any]] = {}
+        if self._snapshot_key:
+            snapshot_profiles = await get_snapshot_group_profiles(
+                self._redis,
+                self._snapshot_key,
+                user_ids - self._snapshot_conflicted_user_ids,
+            )
         for user_id in sorted(user_ids):
-            profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
+            profile = snapshot_profiles.get(user_id)
+            if profile is None:
+                profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
             traits = (profile or {}).get("traits")
             existing[user_id] = dict(traits) if isinstance(traits, dict) else {}
         return existing
+
+    async def _load_profile(self, user_id: str) -> tuple[dict[str, Any] | None, str]:
+        if self._snapshot_key and user_id not in self._snapshot_conflicted_user_ids:
+            snapshot_profile = await get_snapshot_group_profile(
+                self._redis,
+                self._snapshot_key,
+                user_id,
+            )
+            if snapshot_profile is not None:
+                return snapshot_profile, "snapshot"
+        profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
+        return profile, "database"
+
+    async def _detect_snapshot_conflicts(
+        self,
+        user_ids: set[str],
+    ) -> list[dict[str, str]]:
+        if not self._snapshot_key:
+            return []
+        snapshot_profiles = await get_snapshot_group_profiles(
+            self._redis,
+            self._snapshot_key,
+            user_ids,
+        )
+        conflicts: list[dict[str, str]] = []
+        for user_id in sorted(user_ids):
+            snapshot_updated_at = _parse_datetime(
+                (snapshot_profiles.get(user_id) or {}).get("updated_at")
+            )
+            if snapshot_updated_at is None:
+                continue
+            pg_profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
+            pg_updated_at_raw = (pg_profile or {}).get("updated_at")
+            pg_updated_at = _parse_datetime(pg_updated_at_raw)
+            if pg_updated_at is None or pg_updated_at <= snapshot_updated_at:
+                continue
+            conflicts.append(
+                {
+                    "user_id": user_id,
+                    "snapshot_updated_at": snapshot_updated_at.isoformat(),
+                    "pg_updated_at": pg_updated_at.isoformat(),
+                    "reason": "画像在 Agent 会话期间被外部修改",
+                }
+            )
+        return conflicts
 
 
 def _traits_to_list(raw_traits: Any) -> list[dict[str, Any]]:
@@ -271,6 +344,18 @@ def _trait_value(raw: Any) -> str | None:
         return None
     value = str(raw.get("value", "")).strip()
     return value or None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _stage_summary(*, staged_count: int, conflicts: list[ProfileConflict]) -> str:

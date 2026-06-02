@@ -95,6 +95,22 @@ class KomariMemoryConfigSchema(BaseModel):
         le=2000,
         description="消息缓冲区的最大消息条数安全上限。达到后即使未空闲也会强制触发总结",
     )
+    conversation_snapshot_ttl_seconds: int = Field(
+        default=3600,
+        ge=300,
+        le=86400,
+        description="对话缓冲 processing 快照 TTL（秒）",
+    )
+    profile_snapshot_ttl_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86400,
+        description="画像 Agent 基线快照 TTL（秒）",
+    )
+    profile_snapshot_enable: bool = Field(
+        default=True,
+        description="是否启用画像 Agent 基线快照",
+    )
     profile_trait_limit: int = Field(
         default=20,
         ge=1,

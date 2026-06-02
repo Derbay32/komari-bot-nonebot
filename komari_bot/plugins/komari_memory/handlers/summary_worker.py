@@ -115,7 +115,6 @@ def _collect_bot_user_ids(
     return bot_user_ids
 
 
-@retry_async(max_attempts=3, base_delay=1.0)
 async def summary_worker_task(
     redis: RedisManager,
     memory: MemoryService,
@@ -127,8 +126,11 @@ async def summary_worker_task(
 
     logger.debug("[KomariMemory] 检查 {} 个群组的总结任务...", len(group_ids))
     for group_id in group_ids:
-        if await redis.should_trigger_summary(group_id):
-            await perform_summary(group_id, redis, memory)
+        try:
+            if await redis.should_trigger_summary(group_id):
+                await perform_summary(group_id, redis, memory)
+        except Exception:
+            logger.exception("[KomariMemory] 群组总结失败: group={}", group_id)
 
 
 async def perform_summary(
@@ -138,11 +140,32 @@ async def perform_summary(
 ) -> None:
     """执行群组的对话总结。"""
     logger.info("[KomariMemory] 开始总结群组 {} 的对话", group_id)
+    processing_key = await redis.snapshot_conversation_buffer(group_id, uuid4().hex[:8])
+    if not processing_key:
+        logger.warning("[KomariMemory] 群组 {} 消息缓冲为空或已有处理快照", group_id)
+        return
+
+    try:
+        await _perform_summary_from_processing(group_id, redis, memory, processing_key)
+    except Exception:
+        await redis.restore_processing_conversation_buffer(group_id, processing_key)
+        raise
+
+
+@retry_async(max_attempts=3, base_delay=1.0)
+async def _perform_summary_from_processing(
+    group_id: str,
+    redis: RedisManager,
+    memory: MemoryService,
+    processing_key: str,
+) -> None:
+    """围绕同一个 processing 快照执行可重试的总结流程。"""
     config = get_config()
 
-    messages_buffer = await redis.get_buffer(group_id, limit=config.summary_max_buffer_size)
+    messages_buffer = await redis.get_processing_conversation_buffer(processing_key)
     if not messages_buffer:
         logger.warning("[KomariMemory] 群组 {} 消息缓冲为空", group_id)
+        await redis.delete_processing_conversation_buffer(group_id, processing_key)
         return
 
     await _refresh_character_binding_if_needed(group_id=group_id)
@@ -186,6 +209,18 @@ async def perform_summary(
     except Exception:
         logger.exception("[KomariMemory] 群组 {} 对话总结失败，继续执行画像 Agent", group_id)
 
+    profile_result = await run_profile_agent(
+        redis=redis.redis,
+        memory=memory,
+        group_id=group_id,
+        conversation_text=conversation_text,
+        participants=participants,
+        display_name_map=nickname_map,
+        bot_user_ids=bot_user_ids,
+        config=config,
+        trace_id=f"profile-agent-{uuid4().hex[:8]}",
+    )
+
     conversation_ids: list[int] = []
     if summary_result is not None:
         memories = summary_result.get("memories", [])
@@ -210,19 +245,7 @@ async def perform_summary(
                 )
                 conversation_ids.append(conversation_id)
 
-    profile_result = await run_profile_agent(
-        redis=redis.redis,
-        memory=memory,
-        group_id=group_id,
-        conversation_text=conversation_text,
-        participants=participants,
-        display_name_map=nickname_map,
-        bot_user_ids=bot_user_ids,
-        config=config,
-        trace_id=f"profile-agent-{uuid4().hex[:8]}",
-    )
-
-    await redis.delete_buffer(group_id)
+    await redis.delete_processing_conversation_buffer(group_id, processing_key)
     await redis.update_last_summary(group_id)
 
     logger.info(

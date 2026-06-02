@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -16,12 +17,14 @@ from komari_bot.common.memory_agent_locks import (
 )
 from komari_bot.common.profile_operations import ProfileOperation
 
+from ..services.redis_keys import RedisKeys
 from ..services.summary_prompt_template import (
     get_template as get_summary_template,
 )
 from ..services.summary_prompt_template import (
     render_template as render_summary_template,
 )
+from .profile_snapshot import delete_profile_snapshot, set_profile_snapshot
 from .redis_staging import ProfileStaging
 from .tool_definitions import PROFILE_AGENT_TOOLS
 
@@ -59,13 +62,8 @@ async def run_profile_agent(
 ) -> ProfileAgentResult:
     """运行画像维护 Agent，由 Agent 显式调用提交工具写入暂存区。"""
     session_id = f"{trace_id}:{uuid4().hex[:8]}"
-    staging = ProfileStaging(
-        redis,
-        session_id,
-        group_id,
-        memory,
-        ttl_seconds=config.memory_agent_staging_ttl_seconds,
-    )
+    snapshot_key: str | None = None
+    staging: ProfileStaging | None = None
     async with acquire_memory_agent_lock(
         memory.pg_pool,
         scope=MemoryAgentLockScope.PROFILE_GROUP,
@@ -74,6 +72,32 @@ async def run_profile_agent(
         timeout_seconds=config.memory_agent_lock_timeout_seconds,
     ):
         try:
+            if config.profile_snapshot_enable:
+                token = uuid4().hex[:8]
+                snapshot_key = RedisKeys.snapshot_profile(group_id, token)
+                profiles = await _load_profile_snapshot_profiles(
+                    memory=memory,
+                    group_id=group_id,
+                    participants=participants,
+                    display_name_map=display_name_map,
+                )
+                await set_profile_snapshot(
+                    redis,
+                    snapshot_key,
+                    token=token,
+                    group_id=group_id,
+                    profiles=profiles,
+                    ttl_seconds=config.profile_snapshot_ttl_seconds,
+                )
+
+            staging = ProfileStaging(
+                redis,
+                session_id,
+                group_id,
+                memory,
+                ttl_seconds=config.memory_agent_staging_ttl_seconds,
+                snapshot_key=snapshot_key,
+            )
             return await _run_profile_agent_locked(
                 staging=staging,
                 conversation_text=conversation_text,
@@ -84,13 +108,19 @@ async def run_profile_agent(
                 trace_id=trace_id,
             )
         except Exception:
-            await staging.discard()
+            if staging is not None:
+                await staging.discard()
             logger.exception(
                 "[KomariMemory] 画像 Agent 执行失败，已丢弃暂存区: trace_id={} group={}",
                 trace_id,
                 group_id,
             )
             raise
+        finally:
+            if staging is not None:
+                await staging.discard()
+            if snapshot_key is not None:
+                await delete_profile_snapshot(redis, snapshot_key)
 
 
 async def _run_profile_agent_locked(
@@ -196,6 +226,29 @@ async def _run_profile_agent_locked(
         summary=summary,
         status=status,
     )
+
+
+async def _load_profile_snapshot_profiles(
+    *,
+    memory: MemoryService,
+    group_id: str,
+    participants: list[str],
+    display_name_map: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """读取 Agent 启动时的画像基线快照。"""
+    profiles: dict[str, dict[str, Any]] = {}
+    for user_id in participants:
+        profile = await memory.get_user_profile(user_id=user_id, group_id=group_id)
+        if profile is None:
+            profile = {
+                "version": 1,
+                "user_id": user_id,
+                "display_name": display_name_map.get(user_id, user_id),
+                "traits": {},
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        profiles[user_id] = profile
+    return profiles
 
 
 def _build_initial_messages(

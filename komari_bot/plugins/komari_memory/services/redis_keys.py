@@ -12,6 +12,10 @@ class RedisKeys:
     # 消息缓冲区
     BUFFER = f"{PREFIX}:buffer:%s"
     BUFFER_PATTERN = f"{PREFIX}:buffer:*"
+    BUFFER_PROCESSING = f"{PREFIX}:buffer:processing:%s:%s"
+    BUFFER_PROCESSING_LOCK = f"{PREFIX}:buffer:processing_lock:%s"
+    BUFFER_PROCESSING_META_LAST_MESSAGE = f"{PREFIX}:buffer:processing_meta:%s:%s:last_message"
+    BUFFER_PROCESSING_META_SESSION_START = f"{PREFIX}:buffer:processing_meta:%s:%s:session_start"
 
     # 最后总结时间
     LAST_SUMMARY = f"{PREFIX}:last_summary:%s"
@@ -33,6 +37,8 @@ class RedisKeys:
 
     # 画像 Agent 暂存区
     STAGING_PROFILE = f"{PREFIX}:staging:profile:%s"
+    SNAPSHOT_PROFILE = f"{PREFIX}:snapshot:profile:%s:%s"
+    SNAPSHOT_PROFILE_PATTERN = f"{PREFIX}:snapshot:profile:*"
 
     # 跨群用户互动事件缓冲
     GLOBAL_INTERACTION = f"{PREFIX}:global_interaction:%s"
@@ -51,6 +57,26 @@ class RedisKeys:
             Redis 键
         """
         return cls.BUFFER % group_id
+
+    @classmethod
+    def buffer_processing(cls, group_id: str, token: str) -> str:
+        """获取对话缓冲处理快照键。"""
+        return cls.BUFFER_PROCESSING % (group_id, token)
+
+    @classmethod
+    def buffer_processing_lock(cls, group_id: str) -> str:
+        """获取对话缓冲处理锁键。"""
+        return cls.BUFFER_PROCESSING_LOCK % group_id
+
+    @classmethod
+    def buffer_processing_meta_last_message(cls, group_id: str, token: str) -> str:
+        """获取对话缓冲处理快照的最后消息时间元数据键。"""
+        return cls.BUFFER_PROCESSING_META_LAST_MESSAGE % (group_id, token)
+
+    @classmethod
+    def buffer_processing_meta_session_start(cls, group_id: str, token: str) -> str:
+        """获取对话缓冲处理快照的会话开始时间元数据键。"""
+        return cls.BUFFER_PROCESSING_META_SESSION_START % (group_id, token)
 
     @classmethod
     def last_summary(cls, group_id: str) -> str:
@@ -130,6 +156,11 @@ class RedisKeys:
     def staging_profile(cls, session_id: str) -> str:
         """获取画像 Agent 暂存区键。"""
         return cls.STAGING_PROFILE % session_id
+
+    @classmethod
+    def snapshot_profile(cls, group_id: str, token: str) -> str:
+        """获取画像 Agent 基线快照键。"""
+        return cls.SNAPSHOT_PROFILE % (group_id, token)
 
     @classmethod
     def global_interaction(cls, user_id: str) -> str:

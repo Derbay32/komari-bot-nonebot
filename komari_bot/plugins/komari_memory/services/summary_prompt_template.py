@@ -35,7 +35,8 @@ DEFAULTS: dict[str, str] = {
         "8. 全部暂存 + 压缩完成后，调用 preview_profile 检查汇总 diff。\n"
         "9. 确认 diff 完全正确后，调用 commit_profile 提交。\n"
         "10. 如果 commit_profile 返回 limit_exceeded，必须直接根据 violations 中的超限用户和 traits 对对应用户继续 delete / set 压缩，然后再次调用 commit_profile，直到提交成功或无可安全压缩内容；不要为了确认哪个用户超限而重复查询。\n"
-        "11. commit_profile 成功后，输出简短总结。\n\n"
+        "11. 如果 commit_profile 返回 conflict，说明画像在本次 Agent 会话期间被外部修改。必须重新 read_profile(include_staged=true) 读取冲突用户，整合外部新值与当前暂存修改，再用 write_profile 调整暂存区，最后再次 commit_profile；不要直接结束任务。\n"
+        "12. commit_profile 成功后，输出简短总结。\n\n"
         "硬性约束：\n"
         "- 只提取长期稳定的画像信息（身份、长期偏好、稳定习惯、关系认知、长期事实）。\n"
         "- 不记录短期状态、一次性事件、瞬时情绪、当天安排。\n"
@@ -43,6 +44,7 @@ DEFAULTS: dict[str, str] = {
         "- 只对在对话中展现了新信息的用户操作，旧画像无变化则不要动。\n"
         "- 禁止把完整画像全量重写，只输出增量操作。\n"
         "- 单个用户最终 trait 数不能超过 {{profile_trait_limit}} 条。\n"
+        "- commit_profile 返回 conflict 时，必须重新读取冲突用户并整合后重试提交。\n"
         "- 未成功调用 commit_profile 前不要结束任务。"
     ),
     "summary_workflow_system": (
