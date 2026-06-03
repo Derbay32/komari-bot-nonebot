@@ -13,6 +13,7 @@ class RedisKeys:
     BUFFER = f"{PREFIX}:buffer:%s"
     BUFFER_PATTERN = f"{PREFIX}:buffer:*"
     BUFFER_PROCESSING = f"{PREFIX}:buffer:processing:%s:%s"
+    BUFFER_PROCESSING_PATTERN = f"{PREFIX}:buffer:processing:*"
     BUFFER_PROCESSING_LOCK = f"{PREFIX}:buffer:processing_lock:%s"
     BUFFER_PROCESSING_META_LAST_MESSAGE = f"{PREFIX}:buffer:processing_meta:%s:%s:last_message"
     BUFFER_PROCESSING_META_SESSION_START = f"{PREFIX}:buffer:processing_meta:%s:%s:session_start"

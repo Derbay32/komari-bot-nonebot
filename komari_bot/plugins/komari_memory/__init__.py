@@ -100,7 +100,7 @@ class PluginManager:
 
             # 6. 初始化忘却服务并注册定时任务
             self.forgetting = ForgettingService(self.config, self.pg_pool)
-            register_forgetting_task(self.forgetting)
+            register_forgetting_task(self.forgetting, self.redis)
             register_interaction_event_task(self.redis, self.memory)
         except Exception:
             logger.exception("[KomariMemory] 初始化失败")

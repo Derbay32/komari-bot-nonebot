@@ -1,10 +1,16 @@
 """记忆忘却定时任务。"""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
 from nonebot_plugin_apscheduler import scheduler
 
-from ..services.forgetting_service import ForgettingService
+if TYPE_CHECKING:
+    from ..services.forgetting_service import ForgettingService
+    from ..services.redis_manager import RedisManager
 
 
 class ForgettingTaskManager:
@@ -12,6 +18,7 @@ class ForgettingTaskManager:
 
     _instance: "ForgettingTaskManager | None" = None
     _service: ForgettingService | None = None
+    _redis_manager: RedisManager | None = None
 
     def __new__(cls) -> "ForgettingTaskManager":
         """单例模式。"""
@@ -26,14 +33,50 @@ class ForgettingTaskManager:
             return
 
         await self._service.decay_and_cleanup()
+        await self._recover_orphaned_conversation_processing()
 
-    def register(self, service: ForgettingService) -> None:
+    async def _recover_orphaned_conversation_processing(self) -> None:
+        """恢复遗留的对话 processing 快照。"""
+        if self._redis_manager is None:
+            return
+        try:
+            orphaned_keys = await self._redis_manager.get_orphaned_conversation_processing_keys()
+        except Exception:
+            logger.exception("[KomariMemory] 扫描孤立对话 processing 快照失败")
+            return
+
+        for group_id, processing_key in orphaned_keys:
+            try:
+                await self._redis_manager.restore_processing_conversation_buffer(
+                    group_id,
+                    processing_key,
+                )
+            except Exception:
+                logger.exception(
+                    "[KomariMemory] 恢复孤立对话 processing 快照失败: group={} key={}",
+                    group_id,
+                    processing_key,
+                )
+                continue
+            logger.info(
+                "[KomariMemory] 已恢复孤立对话 processing 快照: group={} key={}",
+                group_id,
+                processing_key,
+            )
+
+    def register(
+        self,
+        service: ForgettingService,
+        redis_manager: RedisManager | None = None,
+    ) -> None:
         """注册忘却定时任务。
 
         Args:
             service: 忘却服务实例
+            redis_manager: Redis 管理器实例，用于巡检 processing 残留
         """
         self._service = service
+        self._redis_manager = redis_manager
 
         # 每天凌晨4点执行
         scheduler.add_job(
@@ -49,6 +92,7 @@ class ForgettingTaskManager:
     def unregister(self) -> None:
         """取消注册忘却定时任务。"""
         self._service = None
+        self._redis_manager = None
         try:
             scheduler.remove_job("komari_memory_forgetting_worker")
         except JobLookupError:
@@ -63,13 +107,17 @@ class ForgettingTaskManager:
 _task_manager = ForgettingTaskManager()
 
 
-def register_forgetting_task(service: ForgettingService) -> None:
+def register_forgetting_task(
+    service: ForgettingService,
+    redis_manager: RedisManager | None = None,
+) -> None:
     """注册忘却定时任务。
 
     Args:
         service: 忘却服务实例
+        redis_manager: Redis 管理器实例，用于巡检 processing 残留
     """
-    _task_manager.register(service)
+    _task_manager.register(service, redis_manager)
 
 
 def unregister_forgetting_task() -> None:

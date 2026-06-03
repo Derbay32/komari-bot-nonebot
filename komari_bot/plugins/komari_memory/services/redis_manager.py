@@ -312,6 +312,27 @@ class RedisManager:
             meta_session_start_key,
         )
 
+    async def get_orphaned_conversation_processing_keys(self) -> list[tuple[str, str]]:
+        """扫描无有效处理锁的对话 processing 快照键。"""
+        orphaned: list[tuple[str, str]] = []
+        async for raw_key in self.redis.scan_iter(match=RedisKeys.BUFFER_PROCESSING_PATTERN):
+            processing_key = self._decode_redis_text(raw_key)
+            group_id = self._conversation_processing_group_id(processing_key)
+            if group_id is None:
+                logger.debug(
+                    "[KomariMemory] 跳过非法对话 processing 键: {}",
+                    processing_key,
+                )
+                continue
+            if not await self.redis.exists(processing_key):
+                continue
+            lock_key = RedisKeys.buffer_processing_lock(group_id)
+            locked_key = await self.redis.get(lock_key)
+            locked_key_text = self._decode_redis_text(locked_key) if locked_key else ""
+            if locked_key_text != processing_key:
+                orphaned.append((group_id, processing_key))
+        return orphaned
+
     async def get_context_around_message(
         self,
         group_id: str,
@@ -698,3 +719,14 @@ class RedisManager:
     @staticmethod
     def _conversation_processing_token(processing_key: str) -> str:
         return processing_key.rsplit(":", 1)[-1]
+
+    @staticmethod
+    def _conversation_processing_group_id(processing_key: str) -> str | None:
+        prefix = f"{RedisKeys.PREFIX}:buffer:processing:"
+        if not processing_key.startswith(prefix):
+            return None
+        remainder = processing_key.removeprefix(prefix)
+        group_id, separator, token = remainder.partition(":")
+        if not group_id or not separator or not token or ":" in token:
+            return None
+        return group_id
