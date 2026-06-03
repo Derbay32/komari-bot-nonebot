@@ -7,9 +7,9 @@
    poetry run python tools/migrate_komari_memory_entity_to_json.py
 2. 执行迁移:
    poetry run python tools/migrate_komari_memory_entity_to_json.py --apply
-3. 自定义配置路径:
+3. 显式使用旧版 JSON 配置路径:
    poetry run python tools/migrate_komari_memory_entity_to_json.py \
-      --db-config-path config/config_manager/database_config.json \
+      --db-config-path /path/to/legacy/database_config.json \
       --bindings-path data/character_binding/bindings.json
 """
 
@@ -29,7 +29,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from komari_bot.common.database_config import load_database_config_from_file
+from komari_bot.common.database_config import (
+    load_database_config_from_env,
+    load_database_config_from_file,
+)
 from komari_bot.common.postgres import create_postgres_pool
 
 logger = logging.getLogger("migrate_memory_entity")
@@ -331,13 +334,17 @@ async def _apply_migration(
 
 async def main_async(
     *,
-    db_config_path: Path,
+    db_config_path: Path | None,
     bindings_path: Path,
     apply: bool,
     create_backup: bool,
     apply_constraints: bool,
 ) -> None:
-    db_config = load_database_config_from_file(db_config_path)
+    db_config = (
+        load_database_config_from_file(db_config_path)
+        if db_config_path is not None
+        else load_database_config_from_env()
+    )
     pool = await create_postgres_pool(db_config, command_timeout=60)
     try:
         rows = await _fetch_all_rows(pool)
@@ -372,8 +379,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-config-path",
         type=Path,
-        default=Path("config/config_manager/database_config.json"),
-        help="数据库配置路径",
+        default=None,
+        help="显式旧版共享数据库 JSON 配置路径；默认从 dotenv / 环境变量读取",
     )
     parser.add_argument(
         "--bindings-path",

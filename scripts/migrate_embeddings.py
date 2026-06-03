@@ -37,12 +37,11 @@ logging.basicConfig(
 
 async def main_async(
     *,
-    shared_db_config_path: Path,
-    embedding_config_path: Path,
+    shared_db_config_path: Path | None,
     targets: set[str],
     apply: bool,
 ) -> None:
-    embed_config = load_embedding_config(embedding_config_path)
+    embed_config = load_embedding_config()
     target_dimension = int(embed_config.embedding_dimension)
     logger.info(
         "当前 Embedding Provider: model=%s dimension=%s",
@@ -126,14 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--database-config-path",
         type=Path,
-        default=Path("config/config_manager/database_config.json"),
-        help="共享数据库配置路径",
-    )
-    parser.add_argument(
-        "--embedding-config-path",
-        type=Path,
-        default=Path("config/config_manager/embedding_provider_config.json"),
-        help="embedding_provider 配置路径",
+        default=None,
+        help="显式旧版共享数据库 JSON 配置路径；默认从 dotenv / 环境变量读取",
     )
     parser.add_argument(
         "--target",
@@ -176,7 +169,6 @@ def main() -> None:
     asyncio.run(
         main_async(
             shared_db_config_path=args.database_config_path,
-            embedding_config_path=args.embedding_config_path,
             targets=set(args.targets or {"knowledge", "memory"}),
             apply=args.apply,
         )
