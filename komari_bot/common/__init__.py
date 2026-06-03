@@ -3,6 +3,7 @@
 from .database_config import (
     DatabaseConfigSchema,
     get_shared_database_config,
+    load_database_config_from_env,
     load_database_config_from_file,
 )
 from .embedding_migration import (
@@ -34,6 +35,7 @@ __all__ = [
     "create_postgres_pool",
     "get_pool_key",
     "get_shared_database_config",
+    "load_database_config_from_env",
     "load_database_config_from_file",
     "load_embedding_config",
     "migrate_table_embeddings",
