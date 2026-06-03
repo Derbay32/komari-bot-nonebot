@@ -314,6 +314,28 @@ def apply_profile_operations(
     return profile
 
 
+def profile_traits_to_list(traits: object) -> list[dict[str, Any]]:
+    """将 PG 画像 traits 精简为可展示条目列表。
+
+    只保留回复上下文真正需要的 key/value/category，过滤内部管理字段，
+    避免 chat prompt 或工具结果暴露 importance、updated_at 等系统参数。
+    """
+    if not isinstance(traits, dict):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for raw_key, raw_payload in traits.items():
+        key = str(raw_key).strip()
+        if not key or not isinstance(raw_payload, dict):
+            continue
+        value = str(raw_payload.get("value", "")).strip()
+        if not value:
+            continue
+        category = str(raw_payload.get("category", "general")).strip() or "general"
+        items.append({"key": key, "value": value, "category": category})
+    return items
+
+
 def _operation_to_diff(
     operation: ProfileOperation,
     *,
