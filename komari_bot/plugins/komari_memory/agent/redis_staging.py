@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ from .profile_snapshot import get_snapshot_group_profile, get_snapshot_group_pro
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
+    from ..repositories.entity_repository import UserProfileUpsertPayload
     from ..services.memory_service import MemoryService
 
 
@@ -174,7 +176,6 @@ class ProfileStaging:
                 summary="暂存区为空，无操作可提交",
             )
 
-        changed_user_ids: set[str] = set()
         affected_user_ids = {item.user_id for item in diff}
         conflicts = await self._detect_snapshot_conflicts(affected_user_ids)
         if conflicts:
@@ -188,6 +189,7 @@ class ProfileStaging:
                 conflicts=conflicts,
             )
 
+        payloads: list[UserProfileUpsertPayload] = []
         for user_id in sorted(affected_user_ids):
             user_diff = [item for item in diff if item.user_id == user_id]
             base_profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
@@ -198,19 +200,22 @@ class ProfileStaging:
                 user_id=user_id,
                 display_name=display_name,
             )
-            await self._memory.upsert_user_profile(
-                user_id=user_id,
-                group_id=self._group_id,
-                profile=merged_profile,
-                importance=4,
+            payloads.append(
+                {
+                    "user_id": user_id,
+                    "group_id": self._group_id,
+                    "profile": merged_profile,
+                    "importance": 4,
+                }
             )
-            changed_user_ids.add(user_id)
+
+        await self._memory.batch_upsert_user_profiles(payloads)
 
         await self.discard()
         return CommitResult(
             status="committed",
             committed_count=len(diff),
-            changed_user_ids=changed_user_ids,
+            changed_user_ids=affected_user_ids,
             summary=f"已写入 {len(diff)} 条画像操作",
         )
 
@@ -287,7 +292,7 @@ class ProfileStaging:
     async def _detect_snapshot_conflicts(
         self,
         user_ids: set[str],
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if not self._snapshot_key:
             return []
         snapshot_profiles = await get_snapshot_group_profiles(
@@ -295,7 +300,7 @@ class ProfileStaging:
             self._snapshot_key,
             user_ids,
         )
-        conflicts: list[dict[str, str]] = []
+        conflicts: list[dict[str, Any]] = []
         for user_id in sorted(user_ids):
             snapshot_updated_at = _parse_datetime(
                 (snapshot_profiles.get(user_id) or {}).get("updated_at")
@@ -313,6 +318,9 @@ class ProfileStaging:
                     "snapshot_updated_at": snapshot_updated_at.isoformat(),
                     "pg_updated_at": pg_updated_at.isoformat(),
                     "reason": "画像在 Agent 会话期间被外部修改",
+                    "pg_current_traits": _compact_conflict_traits(
+                        (pg_profile or {}).get("traits")
+                    ),
                 }
             )
         return conflicts
@@ -337,6 +345,25 @@ def _traits_to_list(raw_traits: Any) -> list[dict[str, Any]]:
             }
         )
     return traits
+
+
+def _compact_conflict_traits(raw_traits: Any) -> dict[str, dict[str, Any]]:
+    """提取冲突返回中给 LLM 看的当前 PG 画像摘要。"""
+    if not isinstance(raw_traits, Mapping):
+        return {}
+    compacted: dict[str, dict[str, Any]] = {}
+    for key, raw in raw_traits.items():
+        if not isinstance(raw, Mapping):
+            continue
+        value = str(raw.get("value", "")).strip()
+        if not value:
+            continue
+        compacted[str(key)] = {
+            "value": value,
+            "category": str(raw.get("category", "general")).strip() or "general",
+            "importance": int(raw.get("importance", 3) or 3),
+        }
+    return compacted
 
 
 def _trait_value(raw: Any) -> str | None:

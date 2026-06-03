@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from nonebot import logger
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import asyncpg
 
 _PROFILE_KEY = "user_profile"
@@ -18,6 +20,15 @@ _PROFILE_TABLE = "komari_memory_user_profile"
 _INTERACTION_KEY = "interaction_history"
 _INTERACTION_CATEGORY = "interaction_history"
 _INTERACTION_TABLE = "komari_memory_interaction_history"
+
+
+class UserProfileUpsertPayload(TypedDict):
+    """批量写入用户画像的轻量载荷。"""
+
+    user_id: str
+    group_id: str
+    profile: dict[str, Any]
+    importance: int
 
 
 class EntityRepository:
@@ -35,44 +46,52 @@ class EntityRepository:
         importance: int = 4,
     ) -> None:
         """写入用户画像。"""
-        display_name = str(profile.get("display_name", "")).strip() or user_id
-        traits = self._normalize_json_object(profile.get("traits"))
-        updated_at = self._normalize_timestamptz(profile.get("updated_at"))
-        version = self._coerce_version(profile.get("version"))
-
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {_PROFILE_TABLE} (
-                    user_id,
-                    group_id,
-                    version,
-                    display_name,
-                    traits,
-                    updated_at,
-                    importance
-                )
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7)
-                ON CONFLICT (user_id, group_id)
-                DO UPDATE SET
-                    version = EXCLUDED.version,
-                    display_name = EXCLUDED.display_name,
-                    traits = EXCLUDED.traits,
-                    updated_at = EXCLUDED.updated_at,
-                    importance = EXCLUDED.importance
-                """,
-                user_id,
-                group_id,
-                version,
-                display_name,
-                json.dumps(traits, ensure_ascii=False),
-                updated_at,
-                importance,
-            )
+        await self.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "profile": profile,
+                    "importance": importance,
+                }
+            ]
+        )
         logger.debug(
             "[KomariMemory] upsert profile row: group={} user={}",
             group_id,
             user_id,
+        )
+
+    async def batch_upsert_user_profiles(
+        self,
+        profiles: Sequence[UserProfileUpsertPayload],
+    ) -> None:
+        """在单个事务中批量写入用户画像。"""
+        if not profiles:
+            return
+
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            for payload in profiles:
+                user_id = payload["user_id"]
+                profile = payload["profile"]
+                display_name = str(profile.get("display_name", "")).strip() or user_id
+                traits = self._normalize_json_object(profile.get("traits"))
+                updated_at = self._normalize_timestamptz(profile.get("updated_at"))
+                version = self._coerce_version(profile.get("version"))
+                await conn.execute(
+                    self._profile_upsert_sql(),
+                    user_id,
+                    payload["group_id"],
+                    version,
+                    display_name,
+                    json.dumps(traits, ensure_ascii=False),
+                    updated_at,
+                    payload["importance"],
+                )
+
+        logger.debug(
+            "[KomariMemory] batch upsert profile rows: count={}",
+            len(profiles),
         )
 
     async def upsert_interaction_history(
@@ -137,6 +156,28 @@ class EntityRepository:
             group_id,
             user_id,
         )
+
+    def _profile_upsert_sql(self) -> str:
+        """返回用户画像 upsert SQL。"""
+        return f"""
+            INSERT INTO {_PROFILE_TABLE} (
+                user_id,
+                group_id,
+                version,
+                display_name,
+                traits,
+                updated_at,
+                importance
+            )
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7)
+            ON CONFLICT (user_id, group_id)
+            DO UPDATE SET
+                version = EXCLUDED.version,
+                display_name = EXCLUDED.display_name,
+                traits = EXCLUDED.traits,
+                updated_at = EXCLUDED.updated_at,
+                importance = EXCLUDED.importance
+            """
 
     async def get_user_profile(
         self,
