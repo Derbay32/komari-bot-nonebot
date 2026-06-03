@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 
 
@@ -15,12 +12,8 @@ def test_config_schema_no_longer_exposes_removed_bert_fields() -> None:
     assert "bert_timeout" not in fields
 
 
-def test_example_config_no_longer_contains_dead_fields() -> None:
-    example_path = (
-        Path(__file__).resolve().parents[2]
-        / "config/config_manager/komari_memory_config.json.example"
-    )
-    config = json.loads(example_path.read_text(encoding="utf-8"))
+def test_config_schema_defaults_no_longer_contain_dead_fields() -> None:
+    config = KomariMemoryConfigSchema().model_dump()
 
     assert "bert_service_url" not in config
     assert "bert_timeout" not in config
