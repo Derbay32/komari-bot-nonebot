@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
+    load_database_config_from_env,
     load_database_config_from_file,
 )
 from komari_bot.common.pgvector_schema import (
@@ -110,9 +110,19 @@ MEMORY_MIGRATION_SPEC = TableMigrationSpec(
 )
 
 
-def load_embedding_config(config_path: Path) -> EmbeddingMigrationConfig:
-    """Load embedding provider config from JSON, or return defaults."""
-    data = _load_optional_json(config_path)
+def load_embedding_config() -> EmbeddingMigrationConfig:
+    """读取 embedding provider 配置。
+
+    只从 PostgreSQL 配置表读取；PG 中缺失配置时使用 schema 默认值。
+    """
+    try:
+        from komari_bot.plugins.config_manager.storage import get_config_storage
+
+        stored = get_config_storage().fetch("embedding_provider")
+        data = stored.config_data if stored is not None else {}
+    except Exception as exc:
+        logger.warning("embedding_provider PG 配置读取失败，使用默认值: %s", exc)
+        data = {}
     return EmbeddingMigrationConfig(
         embedding_model=str(data.get("embedding_model", "BAAI/bge-small-zh-v1.5")),
         embedding_api_url=str(data.get("embedding_api_url", "")),
@@ -121,12 +131,14 @@ def load_embedding_config(config_path: Path) -> EmbeddingMigrationConfig:
     )
 
 
-def resolve_shared_database_config(*, shared_config_path: Path) -> DatabaseConfigSchema:
+def resolve_shared_database_config(
+    *, shared_config_path: Path | None = None
+) -> DatabaseConfigSchema:
     """Resolve the shared DB config used by all modules."""
     return (
         load_database_config_from_file(shared_config_path)
-        if shared_config_path.exists()
-        else DatabaseConfigSchema()
+        if shared_config_path is not None and shared_config_path.exists()
+        else load_database_config_from_env()
     )
 
 
@@ -258,16 +270,6 @@ async def migrate_table_embeddings(
             updated_rows=updated_rows,
             failed_rows=failed_rows,
         )
-
-
-def _load_optional_json(config_path: Path) -> dict[str, Any]:
-    if not config_path.exists():
-        return {}
-    data = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        msg = f"配置文件格式错误，期望 JSON object: {config_path}"
-        raise TypeError(msg)
-    return data
 
 
 async def _table_exists(conn: Any, table_name: str) -> bool:
