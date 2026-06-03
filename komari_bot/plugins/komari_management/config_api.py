@@ -1,4 +1,4 @@
-"""Komari Management 配置文件 REST API。"""
+"""Komari Management 配置 REST API。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class ConfigResourceSummary(BaseModel):
 
     resource_id: str
     display_name: str
-    config_file: str
+    config_source: str
     fields: list[str]
     field_descriptions: dict[str, str]
 
@@ -89,7 +89,7 @@ def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSu
     return ConfigResourceSummary(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
-        config_file=str(manager.config_file),
+        config_source=manager.config_source,
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
     )
@@ -101,7 +101,7 @@ def _build_resource_detail(resource: ManagedConfigResource) -> ConfigResourceDet
     return ConfigResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
-        config_file=str(manager.config_file),
+        config_source=manager.config_source,
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
         values=config.model_dump(),
@@ -153,7 +153,7 @@ def create_config_router(
         resource_id: Annotated[str, Path(min_length=1)],
     ) -> ConfigResourceDetail:
         resource = _resolve_resource(resource_id, resource_map)
-        resource.manager_getter().reload_from_json()
+        resource.manager_getter().reload()
         return _build_resource_detail(resource)
 
     @router.patch(
@@ -183,7 +183,7 @@ def register_config_api(
     allowed_origins: Sequence[str],
     resources: Sequence[ManagedConfigResource],
 ) -> None:
-    """注册配置文件管理 API。"""
+    """注册配置管理 API。"""
     if getattr(app.state, "komari_management_config_api_registered", False):
         return
 
