@@ -63,8 +63,8 @@ class _FakeConfigSchema(BaseModel):
 
 class _FakeConfigManager:
     @property
-    def config_file(self) -> Path:
-        return Path("/tmp/komari_management.json")
+    def config_source(self) -> str:
+        return "postgres:komari_plugin_configs/komari_management"
 
     def get(self) -> BaseModel:
         return _FakeConfigSchema()
@@ -73,7 +73,7 @@ class _FakeConfigManager:
         del field_name, value
         return self.get()
 
-    def reload_from_json(self) -> BaseModel:
+    def reload(self) -> BaseModel:
         return self.get()
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -33,7 +32,7 @@ class _ConfigSchema(BaseModel):
 class _FakeConfigManager:
     def __init__(self) -> None:
         self.config = _ConfigSchema()
-        self.config_file = Path("/tmp/komari_management_test.json")
+        self.config_source = "postgres:komari_plugin_configs/komari_management"
         self.reload_count = 0
 
     def get(self) -> _ConfigSchema:
@@ -48,7 +47,7 @@ class _FakeConfigManager:
         self.config = _ConfigSchema(**data)
         return self.config
 
-    def reload_from_json(self) -> _ConfigSchema:
+    def reload(self) -> _ConfigSchema:
         self.reload_count += 1
         return self.config
 
@@ -86,6 +85,7 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     payload = listed.json()
     assert payload["total"] == 1
     assert payload["items"][0]["resource_id"] == "komari_management"
+    assert payload["items"][0]["config_source"] == manager.config_source
     assert payload["items"][0]["field_descriptions"] == {
         "api_token": "管理接口令牌",
         "last_updated": "最后更新时间",
@@ -115,6 +115,7 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
 
     assert detail.status_code == 200
     assert detail.json()["values"]["api_token"] == "secret"
+    assert detail.json()["config_source"] == manager.config_source
     assert detail.json()["field_descriptions"]["api_token"] == "管理接口令牌"
     assert updated.status_code == 200
     assert updated.json()["values"]["api_token"] == "changed-token"
