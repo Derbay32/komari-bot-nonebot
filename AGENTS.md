@@ -65,7 +65,7 @@ komari-bot/
 
 ```
 基础服务层（被依赖，不应依赖业务插件）
-  config_manager ───────────── 配置热加载（JSON + .env）
+  config_manager ───────────── 动态配置存储（PostgreSQL + .env 初始化）
   permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
@@ -111,15 +111,15 @@ komari-bot/
 
 ### 1. 配置管理 (`config_manager`)
 
-- **三层优先级**：JSON 文件 > `.env` 环境变量 > Pydantic 默认值
-- **热加载**：`ConfigManager.get()` 自动检测文件 mtime 变化
-- **持久化**：`update_field()` → 内存更新 → 写回 JSON（0644）
+- **存储源**：业务插件动态配置统一存储在 PostgreSQL `komari_plugin_configs`
+- **初始化**：PG 中缺失配置时，从 `.env` 环境变量 / Pydantic 默认值生成并写入 PG
+- **持久化**：`update_field()` → Pydantic 校验 → 写回 PostgreSQL
 - **线程安全**：单例 + `RLock`，按 `plugin_name:schema_name` 区分实例
 - **使用模式**：
   ```python
   from komari_bot.plugins.config_manager import get_config_manager
   config = get_config_manager("plugin_name", MyConfigSchema)
-  value = config.get().some_field       # 运行时获取（自动热加载）
+  value = config.get().some_field       # 运行时获取
   config.update_field("some_field", x)  # 更新并持久化
   ```
 
@@ -146,7 +146,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 - **禁止** 在 matcher 创建时用 `rule=` 做静态权限检查（会捕获模块加载时的旧配置）
 - **必须** 在处理器内调用 `check_runtime_permission()` 动态检查
-- `SUPERUSERS` 通过 `.env` 配置，白名单通过 JSON 配置
+- `SUPERUSERS` 通过 `.env` 配置，白名单等动态配置通过 PostgreSQL 管理
 
 ### 4. 四层记忆系统 (`komari_memory`)
 
