@@ -41,10 +41,8 @@ def _format_records(records: list[dict[str, Any]]) -> str:
         event = str(record.get("event", "")).strip()
         result = str(record.get("result", "")).strip()
         emotion = str(record.get("emotion", "")).strip()
-        timestamp = record.get("timestamp")
         lines.append(
-            f"{index}. timestamp={timestamp}\n"
-            f"   用户行为：{event}\n"
+            f"{index}. 用户行为：{event}\n"
             f"   小鞠反应：{result}\n"
             f"   小鞠感受：{emotion}"
         )
