@@ -85,7 +85,6 @@ komari-bot/
   sr ───────────────────────── 神人榜抽签
   jrhg ─────────────────────── .jrhg 今日好感
   komari_custom ────────────── .custom 知识库提案与投票采纳
-  komari_healthcheck ───────── 健康检查 / Bark 推送
   komari_sentry ────────────── Sentry 集成
   komari_management ────────── 管理 REST API
 ```
