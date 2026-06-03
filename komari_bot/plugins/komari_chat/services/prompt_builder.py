@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +10,7 @@ from nonebot.plugin import require
 from zhdate import ZhDate
 
 from komari_bot.common.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
+from komari_bot.common.profile_operations import profile_traits_to_list
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )
@@ -58,6 +58,99 @@ def _resolve_favor_description(daily_favor: int) -> str:
         "今日小鞠格外亲近这位用户，说话时会不自觉地更加坦诚和温柔，"
         "甚至愿意分享一些平时不会说的事"
     )
+
+
+def _clean_yaml_text(value: object) -> str:
+    """清理注入 prompt 的 YAML 风格文本，避免多余转义和空白。"""
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def _format_time(value: object) -> str | None:
+    """把时间戳或 ISO 时间转换为人类可读短时间。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone().strftime("%Y-%m-%d %H:%M")
+    if isinstance(value, int | float):
+        return datetime.fromtimestamp(float(value)).astimezone().strftime("%Y-%m-%d %H:%M")
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            normalized = text.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).astimezone().strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return text[:16]
+    return None
+
+
+def _format_profile_traits_yaml(
+    profile: dict[str, Any],
+    *,
+    fallback_user_id: str | None,
+    fallback_name: str | None,
+) -> str:
+    """将当前用户画像格式化为精简 YAML 风格文本。"""
+    name = _clean_yaml_text(
+        profile.get("display_name") or profile.get("name") or fallback_name or fallback_user_id or "当前用户"
+    )
+    traits = profile_traits_to_list(profile.get("traits"))
+    lines = [f"name: {name}"]
+    if traits:
+        lines.append("traits:")
+        for item in traits:
+            key = _clean_yaml_text(item["key"])
+            value = _clean_yaml_text(item["value"])
+            lines.append(f"  - {key}: {value}")
+    return "\n".join(lines)
+
+
+def _format_user_keyword_knowledge_yaml(items: list[dict[str, Any]]) -> str:
+    lines = ["items:"]
+    for item in items:
+        uid = _clean_yaml_text(item.get("uid", ""))
+        content = _clean_yaml_text(item.get("content", ""))
+        if not uid or not content:
+            continue
+        lines.append(f"  - user_id: {uid}")
+        lines.append(f"    content: {content}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _format_visible_users_yaml(users: dict[str, str]) -> str:
+    lines = ["users:"]
+    for user_id, display_name in users.items():
+        lines.append(f"  - user_id: {_clean_yaml_text(user_id)}")
+        lines.append(f"    name: {_clean_yaml_text(display_name)}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _format_interaction_records_yaml(records: list[dict[str, Any]]) -> str:
+    lines = ["records:"]
+    for record in records:
+        parts = [
+            _clean_yaml_text(record.get("event", "")),
+            _clean_yaml_text(record.get("result", "")),
+            _clean_yaml_text(record.get("emotion", "")),
+        ]
+        content = "；".join(part for part in parts if part)
+        if not content:
+            continue
+        lines.append(f"  - content: {content}")
+        if time_text := _format_time(record.get("timestamp")):
+            lines.append(f"    time: {time_text}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _format_interaction_memories_yaml(memories: list[dict[str, Any]]) -> str:
+    lines = ["memories:"]
+    for memory in memories:
+        content = _clean_yaml_text(memory.get("event_summary", ""))
+        if not content:
+            continue
+        lines.append(f"  - content: {content}")
+        if time_text := _format_time(memory.get("last_seen_at")):
+            lines.append(f"    time: {time_text}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def get_festival_info() -> str | None:
@@ -141,6 +234,9 @@ async def build_prompt(
     query_embedding: list[float] | None = None,
     favor_daily: int | None = None,
     favor_user_id: str | None = None,
+    current_user_profile: dict[str, Any] | None = None,
+    interaction_records: list[dict[str, Any]] | None = None,
+    interaction_memories: list[dict[str, Any]] | None = None,
     *,
     vision_tool_mode: bool = False,
     search_tool_mode: bool = False,
@@ -163,8 +259,8 @@ async def build_prompt(
         current_user_id: 当前用户 ID（可选）
         current_user_nickname: 当前用户昵称（可选）
         search_query: 重写后的搜索查询（用于知识库检索）
-        memory_service: 记忆服务（用于检索用户实体，可选）
-        group_id: 群组 ID（用于检索用户实体，可选）
+        memory_service: 记忆服务（保留兼容参数，prompt_builder 不再主动读取全部用户画像）
+        group_id: 群组 ID（保留兼容参数）
         image_urls: 用户消息中的图片 URL 列表（可选）
         reply_context: 当前消息引用的上下文（可选）
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
@@ -183,6 +279,18 @@ async def build_prompt(
     # ═══════════════════════════════════════
     messages.append({"role": "system", "content": template["system_prompt"]})
     messages.append({"role": "system", "content": template["output_instruction"]})
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "<profile_tool_hint>\n"
+                "当前触发用户画像会在 <current_user_profile> 中给出；"
+                "需要其他用户画像或缺失字段时调用 read_profile(user_id)，"
+                "不要猜测未提供的长期事实。\n"
+                "</profile_tool_hint>"
+            ),
+        }
+    )
     if search_tool_mode:
         messages.append(
             {
@@ -305,20 +413,33 @@ async def build_prompt(
         except Exception:
             logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
 
-    # 收集对话中的用户 ID（供常识检索和实体注入共用）
+    # 收集对话中的用户 ID（供常识检索和 read_profile 工具提示使用）
     all_user_ids: set[str] = set()
+    visible_users: dict[str, str] = {}
     if recent_messages:
         for msg in recent_messages:
             if not msg.is_bot:
                 all_user_ids.add(msg.user_id)
+                visible_users[msg.user_id] = character_binding.get_character_name(
+                    user_id=msg.user_id,
+                    fallback_nickname=msg.user_nickname,
+                )
     if current_user_id:
         all_user_ids.add(current_user_id)
+        visible_users[current_user_id] = character_binding.get_character_name(
+            user_id=current_user_id,
+            fallback_nickname=current_user_nickname,
+        )
     if (
         reply_context is not None
         and reply_context.source_side == "user"
         and reply_context.user_id
     ):
         all_user_ids.add(reply_context.user_id)
+        visible_users[reply_context.user_id] = character_binding.get_character_name(
+            user_id=reply_context.user_id,
+            fallback_nickname=reply_context.user_nickname or reply_context.user_id,
+        )
 
     # 用户常识检索（基于对话中的用户 UID）
     if all_user_ids:
@@ -333,72 +454,40 @@ async def build_prompt(
                 logger.debug(f"[KomariMemory] 用户 {uid} 的常识检索失败", exc_info=True)
 
         if user_profile_results:
-            profile_items = "\n".join(
-                [
-                    f"- 用户({item['uid']}): {item['content']}"
-                    for item in user_profile_results
-                ]
-            )
-            dynamic_parts.append(
-                f"<user_profiles>\n以下是对话中用户的已知信息:\n{profile_items}\n</user_profiles>"
-            )
-
-    # 用户实体注入（从对话总结中提取的结构化实体）
-    if memory_service and group_id and all_user_ids:
-        entity_parts: list[str] = []
-        interaction_parts: list[str] = []
-
-        for uid in all_user_ids:
-            try:
-                profile = await memory_service.get_user_profile(
-                    user_id=uid, group_id=group_id
-                )
-                if profile:
-                    display_name = str(profile.get("display_name") or uid)
-                    traits = profile.get("traits")
-                    if isinstance(traits, dict):
-                        for key, payload in traits.items():
-                            if not isinstance(payload, dict):
-                                continue
-                            value = str(payload.get("value", "")).strip()
-                            if not value:
-                                continue
-                            category = str(payload.get("category", "general"))
-                            entity_parts.append(
-                                f"- 用户({uid}/{display_name}): {key}={value} [{category}]"
-                            )
-            except Exception:
-                logger.debug(
-                    "[KomariMemory] 用户 {} 的画像实体检索失败",
-                    uid,
-                    exc_info=True,
+            profile_items = _format_user_keyword_knowledge_yaml(user_profile_results)
+            if profile_items:
+                dynamic_parts.append(
+                    f"<user_keyword_knowledge>\n{profile_items}\n</user_keyword_knowledge>"
                 )
 
-            try:
-                # 专门获取互动历史记录
-                history_json = await memory_service.get_interaction_history(
-                    user_id=uid, group_id=group_id
-                )
-                if history_json:
-                    interaction_parts.append(
-                        json.dumps(history_json, ensure_ascii=False)
-                    )
-            except Exception:
-                logger.debug(
-                    f"[KomariMemory] 用户 {uid} 的互动历史检索失败", exc_info=True
-                )
+    # 当前触发用户画像：只注入当前用户，其他用户由 read_profile 工具按需读取。
+    if current_user_profile and profile_traits_to_list(current_user_profile.get("traits")):
+        profile_text = _format_profile_traits_yaml(
+            current_user_profile,
+            fallback_user_id=current_user_id,
+            fallback_name=current_user_nickname,
+        )
+        dynamic_parts.append(
+            f"<current_user_profile>\n{profile_text}\n</current_user_profile>"
+        )
 
-        if entity_parts:
-            entity_text = "\n".join(entity_parts)
-            dynamic_parts.append(
-                f"<user_entities>\n以下是从历史对话中提取的用户实体信息:\n{entity_text}\n</user_entities>"
-            )
+    visible_users_text = _format_visible_users_yaml(visible_users)
+    if visible_users_text:
+        dynamic_parts.append(f"<visible_users>\n{visible_users_text}\n</visible_users>")
 
-        if interaction_parts:
-            interaction_text = "\n\n".join(interaction_parts)
-            dynamic_parts.append(
-                f"<user_interaction_history>\n{interaction_text}\n</user_interaction_history>"
-            )
+    interaction_memory_text = _format_interaction_memories_yaml(interaction_memories or [])
+    if interaction_memory_text:
+        dynamic_parts.append(
+            f"<interaction_memory>\n{interaction_memory_text}\n</interaction_memory>"
+        )
+
+    recent_interaction_text = _format_interaction_records_yaml(interaction_records or [])
+    if recent_interaction_text:
+        dynamic_parts.append(
+            f"<recent_interaction_history>\n{recent_interaction_text}\n</recent_interaction_history>"
+        )
+
+    del memory_service, group_id
 
     if favor_daily is not None:
         favor_display_name = (
@@ -415,7 +504,7 @@ async def build_prompt(
             "\n".join(
                 [
                     "<favorability_modifier>",
-                    "[注意：此修饰为基于普通态度的加值，优先级低于<long_term_relation>和<user_interaction_history>中的实际关系描述]",
+                    "[注意：此修饰为基于普通态度的加值，优先级低于<long_term_relation>和<interaction_memory>中的实际关系描述]",
                     f"今日小鞠对用户({favor_display_name})的好感度：{favor_daily}（{favor_level}）",
                     f"影响描述：{favor_description}",
                     "</favorability_modifier>",

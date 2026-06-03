@@ -11,6 +11,7 @@ from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
+from komari_bot.common.profile_operations import profile_traits_to_list
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )
@@ -21,6 +22,7 @@ from .vision_service import read_images
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
@@ -29,6 +31,7 @@ komari_search = require("komari_search")
 
 READ_IMAGE_TOOL_NAME = "read_image"
 SEARCH_WEB_TOOL_NAME = "search_web"
+READ_PROFILE_TOOL_NAME = "read_profile"
 FINAL_RESPONSE_TOOL_NAME = "final_response"
 _EMPTY_TOOLS_ERROR = "tools 不能为空，无工具场景请使用 generate_reply()"
 _MISSING_FINAL_CONTENT_ERROR = "final_response 缺少有效的 'content' 字段"
@@ -83,6 +86,33 @@ TAVILY_SEARCH_TOOL: dict[str, Any] = {
                 }
             },
             "required": ["query"],
+        },
+    },
+}
+
+READ_PROFILE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": READ_PROFILE_TOOL_NAME,
+        "description": (
+            "只读查询已有用户画像，不写入、不修改、不推断新增画像。"
+            "当前触发回复用户的画像通常已在 <current_user_profile> 中提供；"
+            "只有需要查询其他用户画像或补查特定缺失字段时再调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "要查询画像的用户 ID，优先使用 <visible_users> 中的 user_id。",
+                },
+                "keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选，只返回这些画像键。省略时返回该用户全部可展示画像。",
+                },
+            },
+            "required": ["user_id"],
         },
     },
 }
@@ -329,6 +359,82 @@ def _parse_search_query(
     return None
 
 
+def _parse_read_profile_arguments(
+    arguments: dict[str, Any] | None,
+    raw_arguments: str,
+) -> tuple[str | None, set[str] | None]:
+    """解析 read_profile 工具参数。"""
+    payload = arguments
+    if payload is None and raw_arguments:
+        try:
+            loaded = json.loads(raw_arguments)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError:
+            return None, None
+
+    if not payload:
+        return None, None
+
+    user_id_raw = payload.get("user_id")
+    user_id = user_id_raw.strip() if isinstance(user_id_raw, str) else ""
+    keys_raw = payload.get("keys")
+    keys: set[str] | None = None
+    if isinstance(keys_raw, list):
+        keys = {item.strip() for item in keys_raw if isinstance(item, str) and item.strip()}
+    return user_id or None, keys
+
+
+def _clean_yaml_text(value: object) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def _format_read_profile_tool_yaml(
+    *,
+    user_id: str,
+    profile: dict[str, Any],
+    keys: set[str] | None,
+) -> str:
+    traits = profile_traits_to_list(profile.get("traits"))
+    if keys is not None:
+        traits = [item for item in traits if str(item.get("key", "")) in keys]
+
+    lines = [f"user_id: {user_id}"]
+    name = _clean_yaml_text(profile.get("display_name") or profile.get("name") or user_id)
+    lines.append(f"name: {name}")
+    if traits:
+        lines.append("traits:")
+        for item in traits:
+            key = _clean_yaml_text(item["key"])
+            value = _clean_yaml_text(item["value"])
+            lines.append(f"  - {key}: {value}")
+    else:
+        lines.append("traits: []")
+    return "\n".join(lines)
+
+
+async def _build_read_profile_tool_result(
+    *,
+    memory_service: MemoryService | None,
+    group_id: str | None,
+    raw_arguments: str,
+    parsed_arguments: dict[str, Any] | None,
+) -> str:
+    """执行 read_profile 工具并返回 YAML 风格只读画像。"""
+    if memory_service is None or group_id is None:
+        return "error: read_profile 当前不可用"
+
+    user_id, keys = _parse_read_profile_arguments(parsed_arguments, raw_arguments)
+    if user_id is None:
+        return "error: user_id 参数缺失或格式错误"
+
+    profile = await memory_service.get_user_profile(user_id=user_id, group_id=group_id)
+    if profile is None:
+        return "not_found: 用户画像不存在"
+
+    return _format_read_profile_tool_yaml(user_id=user_id, profile=profile, keys=keys)
+
+
 async def _build_image_tool_result(
     *,
     raw_arguments: str,
@@ -428,6 +534,8 @@ async def generate_reply(
             vision_temperature=0.3,
             vision_max_tokens=1024,
             max_tool_rounds=2,
+            memory_service=None,
+            group_id=None,
         )
 
     del user_message, system_prompt
@@ -450,6 +558,8 @@ def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
         return "search_tool"
     if tool_names == {READ_IMAGE_TOOL_NAME, SEARCH_WEB_TOOL_NAME}:
         return "vision_search_tool"
+    if tool_names == {READ_PROFILE_TOOL_NAME}:
+        return "profile_tool"
     return "tool"
 
 
@@ -462,6 +572,8 @@ async def _execute_business_tool(
     vision_max_tokens: int,
     phase_prefix: str,
     round_num: int,
+    memory_service: MemoryService | None,
+    group_id: str | None,
 ) -> dict[str, Any] | None:
     """执行业务工具并构造 tool 消息。"""
     tool_name = tool_call.function.name
@@ -481,6 +593,13 @@ async def _execute_business_tool(
             )
         case "search_web":
             content = await _build_search_tool_result(
+                raw_arguments=raw_arguments,
+                parsed_arguments=parsed_arguments,
+            )
+        case "read_profile":
+            content = await _build_read_profile_tool_result(
+                memory_service=memory_service,
+                group_id=group_id,
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
             )
@@ -507,6 +626,8 @@ async def _execute_tool_loop(
     vision_temperature: float,
     vision_max_tokens: int,
     max_tool_rounds: int,
+    memory_service: MemoryService | None = None,
+    group_id: str | None = None,
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。"""
     current_messages = list(messages)
@@ -569,6 +690,8 @@ async def _execute_tool_loop(
                 vision_max_tokens=vision_max_tokens,
                 phase_prefix=request_phase_prefix,
                 round_num=round_num,
+                memory_service=memory_service,
+                group_id=group_id,
             )
             if result is not None:
                 business_tool_results.append(result)
@@ -597,6 +720,8 @@ async def generate_reply_with_tools(
     vision_temperature: float = 0.3,
     vision_max_tokens: int = 1024,
     max_tool_rounds: int = 3,
+    memory_service: MemoryService | None = None,
+    group_id: str | None = None,
 ) -> ReplyResult:
     """通过工具调用模式生成回复，调用方显式指定启用工具列表。"""
     if not tools:
@@ -627,6 +752,8 @@ async def generate_reply_with_tools(
         vision_temperature=vision_temperature,
         vision_max_tokens=vision_max_tokens,
         max_tool_rounds=max_tool_rounds,
+        memory_service=memory_service,
+        group_id=group_id,
     )
 
 

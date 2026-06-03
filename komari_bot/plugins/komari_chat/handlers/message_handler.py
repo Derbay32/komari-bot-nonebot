@@ -28,6 +28,7 @@ from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
 from ..services.llm_service import (
     READ_IMAGE_TOOL,
+    READ_PROFILE_TOOL,
     TAVILY_SEARCH_TOOL,
     InteractionHistoryRecord,
     generate_reply,
@@ -545,6 +546,18 @@ class MessageHandler:
         recent_messages = await self.redis.get_buffer(
             message.group_id, limit=config.summary_max_buffer_size
         )
+        try:
+            interaction_records = await self.redis.get_global_interaction_buffer(
+                message.user_id,
+                limit=10,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 近期互动原始缓冲读取失败，跳过注入: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+            interaction_records = []
 
         if store_current:
             await self._handle_normal_message(message)
@@ -570,6 +583,33 @@ class MessageHandler:
             limit=config.memory_search_limit,
             query_embedding=query_embedding,
         )
+        try:
+            interaction_memories = await self.memory.search_interaction_events(
+                user_id=message.user_id,
+                query=rewritten_query,
+                limit=config.memory_search_limit,
+                query_embedding=query_embedding,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 长期互动事件记忆检索失败，跳过注入: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+            interaction_memories = []
+
+        try:
+            current_user_profile = await self.memory.get_user_profile(
+                user_id=message.user_id,
+                group_id=message.group_id,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 当前用户画像读取失败，跳过注入: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+            current_user_profile = None
 
         request_trace_id = f"chat-{message.message_id}"
         base64_image_urls: list[str] | None = None
@@ -646,11 +686,14 @@ class MessageHandler:
             query_embedding=query_embedding,
             favor_daily=favor_daily,
             favor_user_id=message.user_id,
+            current_user_profile=current_user_profile,
+            interaction_records=interaction_records,
+            interaction_memories=interaction_memories,
             vision_tool_mode=use_vision_tool,
             search_tool_mode=use_search_tool,
         )
 
-        tools: list[dict[str, Any]] = []
+        tools: list[dict[str, Any]] = [READ_PROFILE_TOOL]
         if use_vision_tool:
             tools.append(READ_IMAGE_TOOL)
         if use_search_tool:
@@ -675,6 +718,9 @@ class MessageHandler:
                 vision_model=vision_model,
                 vision_temperature=vision_temperature,
                 vision_max_tokens=vision_max_tokens,
+                max_tool_rounds=5,
+                memory_service=self.memory,
+                group_id=message.group_id,
             )
         else:
             reply_result = await generate_reply(

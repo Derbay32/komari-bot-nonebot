@@ -544,6 +544,28 @@ class RedisManager:
         if buffer_len >= trigger_size:
             await self.add_pending_interaction_summary(user_id)
 
+    async def get_global_interaction_buffer(
+        self,
+        user_id: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """读取指定用户跨群互动原始缓冲尾部记录。"""
+        if limit <= 0:
+            return []
+
+        key = RedisKeys.global_interaction(user_id)
+        raw_items = await self.redis.lrange(key, -limit, -1)  # type: ignore[arg-type]
+        records: list[dict[str, Any]] = []
+        for raw_item in raw_items:
+            try:
+                parsed = json.loads(raw_item)
+            except (TypeError, ValueError):
+                logger.warning("[KomariMemory] 跨群互动缓冲 JSON 解析失败: {}", raw_item)
+                continue
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        return records
+
     async def add_pending_interaction_summary(self, user_id: str) -> None:
         """加入跨群互动事件待总结集合。"""
         await self.redis.execute_command(
