@@ -28,13 +28,9 @@
 
 ### 1. 配置数据库
 
-共享数据库配置默认读取：
+共享数据库配置从 `.env` / `.env.dev` / `.env.prod` 或进程环境变量读取。
 
-- `config/config_manager/database_config.json`
-
-`komari_knowledge` 也支持在本地配置里用 `pg_*` 字段覆盖共享配置：
-
-- `config/config_manager/komari_knowledge_config.json`
+`komari_knowledge` 的动态配置存储在 PostgreSQL `komari_plugin_configs` 表。
 
 最小可用示例：
 
@@ -53,9 +49,7 @@
 
 ### 2. 配置 embedding_provider
 
-向量维度来自 `embedding_provider`，默认配置文件：
-
-- `config/config_manager/embedding_provider_config.json`
+向量维度来自 `embedding_provider` 的 PostgreSQL 动态配置。
 
 默认本地模型配置对应 512 维向量；如果切换模型或 API，请保持知识库和记忆库使用同一 provider 配置。
 
@@ -287,8 +281,8 @@ for item in results:
 
 处理：检查：
 
-- `config/config_manager/database_config.json`
-- `config/config_manager/komari_knowledge_config.json`
+- `.env` / `.env.prod` 中的 `PG_USER`、`PG_PASSWORD` 等字段
+- PostgreSQL `komari_plugin_configs` 中的 `komari_knowledge` 配置
 
 ### 向量维度不匹配
 
