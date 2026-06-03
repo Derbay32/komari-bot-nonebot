@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,16 +20,12 @@ def test_llm_provider_timeout_defaults_to_300_seconds() -> None:
     assert DynamicConfigSchema().deepseek_extra_params == {}
 
 
-def test_llm_provider_example_includes_timeout_field() -> None:
-    example_path = (
-        Path(__file__).resolve().parents[2]
-        / "config/config_manager/llm_provider_config.json.example"
-    )
-    content = example_path.read_text(encoding="utf-8")
+def test_llm_provider_schema_includes_deepseek_runtime_fields() -> None:
+    config = DynamicConfigSchema()
 
-    assert '"deepseek_timeout_seconds": 300.0' in content
-    assert '"deepseek_reasoning_effort": "medium"' in content
-    assert '"deepseek_extra_params": {}' in content
+    assert config.deepseek_timeout_seconds == 300.0
+    assert config.deepseek_reasoning_effort == ""
+    assert config.deepseek_extra_params == {}
 
 
 def test_deepseek_client_session_uses_configured_timeout() -> None:
