@@ -31,15 +31,9 @@
 
 ### 1. 配置数据库与 Redis
 
-共享数据库配置默认读取：
+共享数据库与 Redis 引导配置从 `.env` / `.env.dev` / `.env.prod` 或进程环境变量读取。
 
-- `config/config_manager/database_config.json`
-
-插件本地配置：
-
-- `config/config_manager/komari_memory_config.json`
-
-其中 `pg_*` 字段会覆盖共享数据库配置。
+插件动态配置存储在 PostgreSQL `komari_plugin_configs` 表，首次缺失时由 schema 默认值或 dotenv 初始化。
 
 最小示例：
 
