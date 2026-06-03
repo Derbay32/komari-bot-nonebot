@@ -3,7 +3,7 @@
 用法：
 python tools/migrate_user_data_sqlite_to_pg.py
 python tools/migrate_user_data_sqlite_to_pg.py --sqlite-path user_data.db
-python tools/migrate_user_data_sqlite_to_pg.py --db-config-path config/config_manager/database_config.json
+python tools/migrate_user_data_sqlite_to_pg.py
 """
 
 from __future__ import annotations
@@ -81,17 +81,17 @@ logging.basicConfig(
 logger = logging.getLogger("migrate_user_data")
 
 
-def resolve_db_config(db_config_path: Path) -> "DatabaseConfigSchema":
+def resolve_db_config(db_config_path: Path | None) -> "DatabaseConfigSchema":
     """解析共享 PostgreSQL 配置。"""
     from komari_bot.common.database_config import (
-        DatabaseConfigSchema,
+        load_database_config_from_env,
         load_database_config_from_file,
     )
 
     return (
         load_database_config_from_file(db_config_path)
-        if db_config_path.exists()
-        else DatabaseConfigSchema()
+        if db_config_path is not None and db_config_path.exists()
+        else load_database_config_from_env()
     )
 
 
@@ -269,7 +269,7 @@ async def migrate_to_postgres(
         await pool.close()
 
 
-async def main_async(sqlite_path: Path, db_config_path: Path) -> None:
+async def main_async(sqlite_path: Path, db_config_path: Path | None) -> None:
     db_config = resolve_db_config(db_config_path)
     if not db_config.pg_user or not db_config.pg_password:
         raise ValueError("pg_user/pg_password 未配置，无法迁移")  # noqa: TRY003
@@ -294,8 +294,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--db-config-path",
-        default="config/config_manager/database_config.json",
-        help="共享 database_config JSON 路径",
+        default=None,
+        help="显式旧版共享 database_config JSON 路径；默认从 dotenv / 环境变量读取",
     )
     return parser.parse_args()
 
@@ -305,7 +305,7 @@ def main() -> None:
     asyncio.run(
         main_async(
             sqlite_path=Path(args.sqlite_path),
-            db_config_path=Path(args.db_config_path),
+            db_config_path=Path(args.db_config_path) if args.db_config_path else None,
         )
     )
 
