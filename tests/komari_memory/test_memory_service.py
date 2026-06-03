@@ -14,8 +14,13 @@ from komari_bot.plugins.komari_memory.services.memory_service import MemoryServi
 
 class _FakeConversationRepository:
     def __init__(self) -> None:
+        self.insert_calls: list[dict[str, Any]] = []
         self.search_calls: list[dict[str, Any]] = []
         self.touch_calls: list[dict[str, Any]] = []
+
+    async def insert_conversation(self, **kwargs: Any) -> int | None:
+        self.insert_calls.append(kwargs)
+        return 321
 
     async def search_by_similarity(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.search_calls.append(kwargs)
@@ -127,6 +132,32 @@ def test_search_conversations_touches_results_immediately_without_rerank(
         }
     ]
     assert repository.touch_calls == []
+
+
+def test_store_conversation_passes_dedup_key(monkeypatch: Any) -> None:
+    service, repository = _make_service(monkeypatch=monkeypatch, rerank_enabled=False)
+
+    result = asyncio.run(
+        service.store_conversation(
+            group_id="g1",
+            summary="大家聊了拉面。",
+            participants=["u1"],
+            importance_initial=4,
+            dedup_key="dedup-1",
+        )
+    )
+
+    assert result == 321
+    assert repository.insert_calls == [
+        {
+            "group_id": "g1",
+            "summary": "大家聊了拉面。",
+            "embedding": "[0.1, 0.2]",
+            "participants": ["u1"],
+            "importance_initial": 4,
+            "dedup_key": "dedup-1",
+        }
+    ]
 
 
 def test_search_conversations_only_touches_reranked_results(monkeypatch: Any) -> None:

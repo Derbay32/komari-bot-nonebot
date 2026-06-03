@@ -105,9 +105,11 @@ class _FakeMemory:
         *,
         profiles: dict[tuple[str, str], dict[str, Any]] | None = None,
         interactions: dict[tuple[str, str], dict[str, Any]] | None = None,
+        duplicate_dedup_keys: set[str] | None = None,
     ) -> None:
         self._profiles = profiles or {}
         self._interactions = interactions or {}
+        self._duplicate_dedup_keys = duplicate_dedup_keys or set()
         self.store_conversation_calls: list[dict[str, Any]] = []
         self.upsert_user_profile_calls: list[dict[str, Any]] = []
         self.upsert_interaction_history_calls: list[dict[str, Any]] = []
@@ -130,15 +132,19 @@ class _FakeMemory:
         summary: str,
         participants: list[str],
         importance_initial: int = 3,
-    ) -> int:
+        dedup_key: str | None = None,
+    ) -> int | None:
         self.store_conversation_calls.append(
             {
                 "group_id": group_id,
                 "summary": summary,
                 "participants": participants,
                 "importance_initial": importance_initial,
+                "dedup_key": dedup_key,
             }
         )
+        if dedup_key in self._duplicate_dedup_keys:
+            return None
         return len(self.store_conversation_calls)
 
     async def upsert_user_profile(
@@ -245,9 +251,177 @@ def test_perform_summary_runs_profile_agent_before_storing_memories(monkeypatch:
         "阿明提到最近在追新番。",
     ]
     assert [call["importance_initial"] for call in memory.store_conversation_calls] == [4, 3]
+    assert all(call["dedup_key"] for call in memory.store_conversation_calls)
+    assert len({call["dedup_key"] for call in memory.store_conversation_calls}) == 2
     assert memory.upsert_interaction_history_calls == []
     assert redis.delete_processing_calls[0]["group_id"] == "114514"
     assert redis.update_last_summary_calls == ["114514"]
+
+
+def test_summary_dedup_key_is_stable_for_same_processing_snapshot(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    messages = [_make_message(), _make_message(content="晚上看新番", user_id="10002")]
+
+    first_fingerprint = module._build_processing_snapshot_fingerprint("114514", messages)
+    second_fingerprint = module._build_processing_snapshot_fingerprint("114514", list(messages))
+
+    assert first_fingerprint == second_fingerprint
+    assert len(first_fingerprint) == 64
+    assert module._build_summary_dedup_key(
+        "114514",
+        first_fingerprint,
+        0,
+    ) == module._build_summary_dedup_key(
+        "114514",
+        second_fingerprint,
+        0,
+    )
+    assert module._build_summary_dedup_key(
+        "114514",
+        first_fingerprint,
+        0,
+    ) != module._build_summary_dedup_key(
+        "114514",
+        first_fingerprint,
+        1,
+    )
+
+
+def test_perform_summary_skips_duplicate_conversation_ids(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
+    )
+    messages = [_make_message()]
+    snapshot_fingerprint = module._build_processing_snapshot_fingerprint("114514", messages)
+    duplicate_key = module._build_summary_dedup_key("114514", snapshot_fingerprint, 0)
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "memories": [
+                {"content": "第一条在之前尝试中已经落库。", "importance": 4},
+                {"content": "第二条本次继续落库。", "importance": 3},
+            ]
+        }
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis(messages)
+    memory = _FakeMemory(duplicate_dedup_keys={duplicate_key})
+
+    asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert [call["summary"] for call in memory.store_conversation_calls] == [
+        "第一条在之前尝试中已经落库。",
+        "第二条本次继续落库。",
+    ]
+    assert memory.store_conversation_calls[0]["dedup_key"] == duplicate_key
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
+    assert redis.update_last_summary_calls == ["114514"]
+
+
+def test_processing_retry_uses_same_dedup_keys_for_partial_success(
+    monkeypatch: Any,
+) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
+    )
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    retry_module = sys.modules["komari_bot.plugins.komari_memory.core.retry"]
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _fake_sleep)
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "memories": [
+                {"content": "A 已写入。", "importance": 4},
+                {"content": "B 已写入。", "importance": 4},
+                {"content": "C 首次失败后重试写入。", "importance": 4},
+            ]
+        }
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
+
+    class _RetryMemory(_FakeMemory):
+        def __init__(self) -> None:
+            super().__init__()
+            self._seen_dedup_keys: set[str] = set()
+            self._failed_once = False
+
+        async def store_conversation(
+            self,
+            *,
+            group_id: str,
+            summary: str,
+            participants: list[str],
+            importance_initial: int = 3,
+            dedup_key: str | None = None,
+        ) -> int | None:
+            self.store_conversation_calls.append(
+                {
+                    "group_id": group_id,
+                    "summary": summary,
+                    "participants": participants,
+                    "importance_initial": importance_initial,
+                    "dedup_key": dedup_key,
+                }
+            )
+            if dedup_key in self._seen_dedup_keys:
+                return None
+            self._seen_dedup_keys.add(str(dedup_key))
+            if summary == "C 首次失败后重试写入。" and not self._failed_once:
+                self._failed_once = True
+                raise RuntimeError("模拟部分写入后的失败")
+            return len(self._seen_dedup_keys)
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis([_make_message()])
+    memory = _RetryMemory()
+
+    asyncio.run(
+        module._perform_summary_from_processing(
+            "114514",
+            redis,
+            memory,
+            "processing-key",
+        )
+    )
+
+    assert [call["summary"] for call in memory.store_conversation_calls] == [
+        "A 已写入。",
+        "B 已写入。",
+        "C 首次失败后重试写入。",
+        "A 已写入。",
+        "B 已写入。",
+        "C 首次失败后重试写入。",
+    ]
+    assert memory.store_conversation_calls[0]["dedup_key"] == memory.store_conversation_calls[3][
+        "dedup_key"
+    ]
+    assert memory.store_conversation_calls[1]["dedup_key"] == memory.store_conversation_calls[4][
+        "dedup_key"
+    ]
+    assert redis.delete_processing_calls == [
+        {"group_id": "114514", "processing_key": "processing-key"}
+    ]
 
 
 def test_perform_summary_continues_profile_agent_when_summary_fails(monkeypatch: Any) -> None:

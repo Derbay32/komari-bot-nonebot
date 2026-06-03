@@ -48,6 +48,13 @@ def test_build_memory_schema_statements_uses_requested_dimension() -> None:
     statements = build_memory_schema_statements(1536)
     assert "VECTOR(1536)" in statements[1]
     assert "importance_current INT DEFAULT 3" in statements[1]
+    assert "dedup_key VARCHAR(64)" in statements[1]
+    assert any("ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)" in statement for statement in statements)
+    assert any(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_conv_dedup_key" in statement
+        and "WHERE dedup_key IS NOT NULL" in statement
+        for statement in statements
+    )
     assert any(
         "ALTER COLUMN importance_current TYPE INTEGER" in statement
         for statement in statements
