@@ -166,12 +166,6 @@ jobs:
 
           mkdir -p komari-bot-deploy/app
 
-          if [ -d config ]; then
-            cp -r config komari-bot-deploy/app/config
-          else
-            mkdir -p komari-bot-deploy/app/config
-          fi
-
           if [ -d data ]; then
             cp -r data komari-bot-deploy/app/data
           else
