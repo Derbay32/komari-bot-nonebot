@@ -152,6 +152,12 @@ class _FakeRedis:
         self.sets.pop(key, None)
         return 1 if existed else 0
 
+    async def exists(self, key: str) -> int:
+        return 1 if key in self.data or key in self.values or key in self.sets else 0
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
     async def scan_iter(self, *, match: str):
         prefix = match.removesuffix("*")
         for key in sorted(self.data):
@@ -274,3 +280,24 @@ def test_get_users_with_global_interaction_buffer_excludes_pending_and_processin
     users = asyncio.run(manager.get_users_with_global_interaction_buffer())
 
     assert users == ["u1"]
+
+
+def test_get_orphaned_conversation_processing_keys_filters_active_locks(
+    monkeypatch: Any,
+) -> None:
+    manager = _build_manager(monkeypatch)
+    fake_redis = _get_fake_redis(manager)
+    active_key = redis_manager_module.RedisKeys.buffer_processing("g1", "token-active")
+    no_lock_key = redis_manager_module.RedisKeys.buffer_processing("g2", "token-orphan")
+    stale_lock_key = redis_manager_module.RedisKeys.buffer_processing("g3", "token-stale")
+    invalid_key = f"{redis_manager_module.RedisKeys.PREFIX}:buffer:processing:broken"
+    fake_redis.data[active_key] = ["record"]
+    fake_redis.data[no_lock_key] = ["record"]
+    fake_redis.data[stale_lock_key] = ["record"]
+    fake_redis.data[invalid_key] = ["record"]
+    fake_redis.values[redis_manager_module.RedisKeys.buffer_processing_lock("g1")] = active_key
+    fake_redis.values[redis_manager_module.RedisKeys.buffer_processing_lock("g3")] = "other-key"
+
+    orphaned = asyncio.run(manager.get_orphaned_conversation_processing_keys())
+
+    assert orphaned == [("g2", no_lock_key), ("g3", stale_lock_key)]

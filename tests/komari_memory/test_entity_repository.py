@@ -17,6 +17,9 @@ class _FakeConnection:
         self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.transaction_commits = 0
+        self.transaction_rollbacks = 0
+        self.fail_execute_at: int | None = None
 
     async def fetchval(self, query: str, *args: object) -> int:
         self.fetchval_calls.append((query, args))
@@ -57,9 +60,30 @@ class _FakeConnection:
 
     async def execute(self, query: str, *args: object) -> str:
         self.execute_calls.append((query, args))
+        if self.fail_execute_at == len(self.execute_calls):
+            msg = "模拟写入失败"
+            raise RuntimeError(msg)
         if "DELETE" in query:
             return "DELETE 1"
         return "INSERT 0 1"
+
+    def transaction(self) -> "_FakeTransaction":
+        return _FakeTransaction(self)
+
+
+class _FakeTransaction:
+    def __init__(self, conn: _FakeConnection) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc, tb
+        if exc_type is None:
+            self._conn.transaction_commits += 1
+        else:
+            self._conn.transaction_rollbacks += 1
 
 
 class _FakeAcquire:
@@ -151,6 +175,69 @@ def test_upsert_user_profile_normalizes_updated_at_string_to_datetime() -> None:
     assert "INSERT INTO komari_memory_user_profile" in query
     assert isinstance(args[5], datetime)
     assert args[5] == datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
+    assert conn.transaction_commits == 1
+
+
+def test_batch_upsert_user_profiles_uses_single_transaction() -> None:
+    conn = _FakeConnection()
+    repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    asyncio.run(
+        repository.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": "u1",
+                    "group_id": "g1",
+                    "profile": {"display_name": "阿明", "traits": {}},
+                    "importance": 4,
+                },
+                {
+                    "user_id": "u2",
+                    "group_id": "g1",
+                    "profile": {"display_name": "阿华", "traits": {}},
+                    "importance": 4,
+                },
+            ]
+        )
+    )
+
+    assert len(conn.execute_calls) == 2
+    assert conn.transaction_commits == 1
+    assert conn.transaction_rollbacks == 0
+
+
+def test_batch_upsert_user_profiles_rolls_back_on_failure() -> None:
+    conn = _FakeConnection()
+    conn.fail_execute_at = 2
+    repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    try:
+        asyncio.run(
+            repository.batch_upsert_user_profiles(
+                [
+                    {
+                        "user_id": "u1",
+                        "group_id": "g1",
+                        "profile": {"display_name": "阿明", "traits": {}},
+                        "importance": 4,
+                    },
+                    {
+                        "user_id": "u2",
+                        "group_id": "g1",
+                        "profile": {"display_name": "阿华", "traits": {}},
+                        "importance": 4,
+                    },
+                ]
+            )
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "模拟写入失败"
+    else:
+        raise AssertionError("批量写入失败时应传播异常")
+
+    assert len(conn.execute_calls) == 2
+    assert conn.transaction_commits == 0
+    assert conn.transaction_rollbacks == 1
 
 
 def test_upsert_interaction_history_normalizes_updated_at_string_to_datetime() -> None:

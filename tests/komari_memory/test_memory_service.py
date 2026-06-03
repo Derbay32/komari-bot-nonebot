@@ -74,6 +74,14 @@ class _FakeInteractionEventRepository:
         self.touch_calls.append(list(event_ids))
 
 
+class _FakeEntityRepository:
+    def __init__(self) -> None:
+        self.batch_profile_calls: list[list[dict[str, Any]]] = []
+
+    async def batch_upsert_user_profiles(self, payloads: list[dict[str, Any]]) -> None:
+        self.batch_profile_calls.append(payloads)
+
+
 def _make_service(
     *,
     monkeypatch: Any,
@@ -174,3 +182,38 @@ def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> 
         {"user_id": "u1", "embedding": "[0.1, 0.2]", "limit": 2}
     ]
     assert event_repository.touch_calls == [[201, 202]]
+
+
+def test_batch_upsert_user_profiles_adds_default_metadata(monkeypatch: Any) -> None:
+    entity_repository = _FakeEntityRepository()
+    monkeypatch.setattr(
+        memory_service_module,
+        "require",
+        lambda _name: _FakeEmbeddingPlugin(rerank_enabled=False),
+    )
+    service = MemoryService(
+        config=cast("Any", SimpleNamespace()),
+        conversation_repo=cast("Any", _FakeConversationRepository()),
+        entity_repo=cast("Any", entity_repository),
+    )
+
+    asyncio.run(
+        service.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": "u1",
+                    "group_id": "g1",
+                    "profile": {"display_name": "阿明", "traits": {"爱好": {"value": "游戏"}}},
+                    "importance": 4,
+                }
+            ]
+        )
+    )
+
+    payload = entity_repository.batch_profile_calls[0][0]
+    assert payload["user_id"] == "u1"
+    assert payload["group_id"] == "g1"
+    assert payload["importance"] == 4
+    assert payload["profile"]["version"] == 1
+    assert payload["profile"]["user_id"] == "u1"
+    assert payload["profile"]["updated_at"]

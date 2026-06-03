@@ -191,8 +191,11 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
     monkeypatch.setattr(
         module,
         "register_forgetting_task",
-        lambda forgetting: events.append(
-            ("register_forgetting", getattr(forgetting, "pg_pool", None) is fake_pool)
+        lambda forgetting, redis: events.append(
+            (
+                "register_forgetting",
+                getattr(forgetting, "pg_pool", None) is fake_pool and redis.initialized,
+            )
         ),
     )
     monkeypatch.setattr(
