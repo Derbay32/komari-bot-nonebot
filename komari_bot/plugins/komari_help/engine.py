@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Final
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
     get_shared_database_config,
-    load_database_config_from_file,
 )
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
@@ -56,19 +53,18 @@ if state.nonebot_mode:
 
 
 def _load_standalone_config() -> DynamicConfigSchema:
-    config_path = Path("config/config_manager/komari_help_config.json")
-    if config_path.exists():
-        try:
-            return DynamicConfigSchema(
-                **json.loads(config_path.read_text(encoding="utf-8"))
-            )
-        except (json.JSONDecodeError, TypeError) as exc:
-            state.logger.warning(f"[Komari Help] 配置文件解析失败: {exc}，使用默认配置")
-    else:
-        state.logger.warning(
-            f"[Komari Help] 配置文件不存在: {config_path}，使用默认配置"
-        )
-    return DynamicConfigSchema()
+    try:
+        from komari_bot.plugins.config_manager.storage import get_config_storage
+
+        stored = get_config_storage().fetch("komari_help")
+    except Exception as exc:
+        state.logger.warning(f"[Komari Help] PG 配置读取失败: {exc}，使用默认配置")
+        return DynamicConfigSchema()
+    if stored is None:
+        state.logger.warning("[Komari Help] PG 中无配置，使用默认配置")
+        return DynamicConfigSchema()
+    state.logger.info("[Komari Help] 已从 PostgreSQL 加载独立模式配置")
+    return DynamicConfigSchema(**stored.config_data)
 
 
 def get_config() -> DynamicConfigSchema:
@@ -86,15 +82,7 @@ def get_db_config() -> DatabaseConfigSchema:
     if state.nonebot_mode:
         return get_shared_database_config()
 
-    shared_config_path = Path("config/config_manager/database_config.json")
-    if shared_config_path.exists():
-        try:
-            return load_database_config_from_file(shared_config_path)
-        except Exception as exc:
-            state.logger.warning(
-                f"[Komari Help] 共享数据库配置解析失败: {exc}，回退到默认共享配置"
-            )
-    return DatabaseConfigSchema()
+    return get_shared_database_config()
 
 
 def get_disabled_auto_help_plugins() -> set[str]:
@@ -135,15 +123,22 @@ class HelpEngine:
                     EmbeddingService,
                 )
 
-                config_path = Path(
-                    "config/config_manager/embedding_provider_config.json"
-                )
-                if config_path.exists():
-                    embed_config = EmbedConfigSchema(
-                        **json.loads(config_path.read_text(encoding="utf-8"))
+                try:
+                    from komari_bot.plugins.config_manager.storage import (
+                        get_config_storage,
                     )
-                else:
-                    embed_config = EmbedConfigSchema()
+
+                    stored = get_config_storage().fetch("embedding_provider")
+                except Exception as exc:
+                    state.logger.warning(
+                        f"[Komari Help] embedding PG 配置读取失败: {exc}，使用默认配置"
+                    )
+                    stored = None
+                embed_config = (
+                    EmbedConfigSchema(**stored.config_data)
+                    if stored is not None
+                    else EmbedConfigSchema()
+                )
 
                 self._embedding_service = EmbeddingService(embed_config)
                 state.logger.info("[Komari Help] 独立嵌入服务初始化完成")
