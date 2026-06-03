@@ -8,9 +8,14 @@ from typing import TYPE_CHECKING, Any
 from nonebot.plugin import require
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..config_schema import KomariMemoryConfigSchema
     from ..repositories.conversation_repository import ConversationRepository
-    from ..repositories.entity_repository import EntityRepository
+    from ..repositories.entity_repository import (
+        EntityRepository,
+        UserProfileUpsertPayload,
+    )
     from ..repositories.interaction_event_repository import InteractionEventRepository
 
 
@@ -259,6 +264,28 @@ class MemoryService:
             profile=profile_with_meta,
             importance=importance,
         )
+
+    async def batch_upsert_user_profiles(
+        self,
+        profiles: Sequence[UserProfileUpsertPayload],
+    ) -> None:
+        """批量创建或更新用户画像实体。"""
+        payloads: list[UserProfileUpsertPayload] = []
+        for payload in profiles:
+            profile_with_meta = dict(payload["profile"])
+            profile_with_meta.setdefault("version", 1)
+            profile_with_meta.setdefault("user_id", payload["user_id"])
+            profile_with_meta.setdefault("updated_at", self._now_iso())
+            profile_with_meta.setdefault("traits", {})
+            payloads.append(
+                {
+                    "user_id": payload["user_id"],
+                    "group_id": payload["group_id"],
+                    "profile": profile_with_meta,
+                    "importance": payload["importance"],
+                }
+            )
+        await self._entity_repo.batch_upsert_user_profiles(payloads)
 
     async def upsert_interaction_history(
         self,
