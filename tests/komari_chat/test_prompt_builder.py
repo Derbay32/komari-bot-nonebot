@@ -92,12 +92,14 @@ def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
 
     assert messages[0] == {"role": "system", "content": "system"}
     assert messages[1] == {"role": "system", "content": "output"}
-    assert messages[2] == {"role": "assistant", "content": "上一条是机器人说的话"}
-    assert messages[4] == {
+    assert messages[2]["role"] == "system"
+    assert "<profile_tool_hint>" in messages[2]["content"]
+    assert messages[3] == {"role": "assistant", "content": "上一条是机器人说的话"}
+    assert messages[5] == {
         "role": "user",
         "content": "- 阿虚: <user_input>继续说</user_input>",
     }
-    assert messages[-1] == messages[4]
+    assert messages[-1] == messages[5]
 
 
 def test_build_prompt_injects_search_tool_system_message(monkeypatch: Any) -> None:
@@ -114,9 +116,131 @@ def test_build_prompt_injects_search_tool_system_message(monkeypatch: Any) -> No
         )
     )
 
-    assert messages[2]["role"] == "system"
-    assert "search_web" in messages[2]["content"]
-    assert "不要编造" in messages[2]["content"]
+    assert messages[3]["role"] == "system"
+    assert "search_web" in messages[3]["content"]
+    assert "不要编造" in messages[3]["content"]
+
+
+def test_build_prompt_injects_only_current_user_profile(monkeypatch: Any) -> None:
+    _patch_dependencies(monkeypatch)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="她喜欢什么",
+            memories=[],
+            config=_build_config(),
+            recent_messages=[
+                SimpleNamespace(
+                    is_bot=False,
+                    user_id="user-2",
+                    user_nickname="长门",
+                    content="我喜欢咖喱",
+                )
+            ],
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            current_user_profile={
+                "display_name": "阿虚",
+                "traits": {
+                    "喜欢的食物": {
+                        "value": "拉面",
+                        "category": "preference",
+                        "importance": 5,
+                        "updated_at": "2026-06-01T00:00:00+00:00",
+                    }
+                },
+                "group_id": "group-1",
+            },
+        )
+    )
+
+    joined = "\n".join(str(message["content"]) for message in messages)
+    assert "<current_user_profile>" in joined
+    assert "喜欢的食物: 拉面" in joined
+    assert "咖喱" in joined  # 只来自近期消息，不是画像块
+    profile_block = joined.rsplit("<current_user_profile>", 1)[1].split(
+        "</current_user_profile>",
+        1,
+    )[0]
+    assert "拉面" in profile_block
+    assert "咖喱" not in profile_block
+    assert "<user_entities>" not in joined
+    assert "importance" not in profile_block
+    assert "updated_at" not in profile_block
+    assert "group_id" not in profile_block
+
+
+def test_build_prompt_does_not_fetch_profiles_for_visible_users(monkeypatch: Any) -> None:
+    _patch_dependencies(monkeypatch)
+
+    class _FailingMemory:
+        async def get_user_profile(self, **_kwargs: object) -> object:
+            raise AssertionError
+
+        async def get_interaction_history(self, **_kwargs: object) -> object:
+            raise AssertionError
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="你好",
+            memories=[],
+            config=_build_config(),
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            memory_service=_FailingMemory(),
+            group_id="group-1",
+            current_user_profile={
+                "display_name": "阿虚",
+                "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
+            },
+        )
+    )
+
+    assert any("<current_user_profile>" in str(message["content"]) for message in messages)
+
+
+def test_build_prompt_injects_interactions_as_yaml_content_time_only(
+    monkeypatch: Any,
+) -> None:
+    _patch_dependencies(monkeypatch)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="继续聊",
+            memories=[],
+            config=_build_config(),
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            interaction_records=[
+                {
+                    "event": "用户问候小鞠",
+                    "result": "小鞠回应",
+                    "emotion": "开心",
+                    "timestamp": 1780495200.0,
+                    "message_id": "msg-1",
+                    "importance": 5,
+                }
+            ],
+            interaction_memories=[
+                {
+                    "event_summary": "用户之前经常用食物话题逗小鞠",
+                    "last_seen_at": "2026-06-01T12:30:00+00:00",
+                    "similarity": 0.9,
+                    "importance_current": 5,
+                }
+            ],
+        )
+    )
+
+    joined = "\n".join(str(message["content"]) for message in messages)
+    assert "<recent_interaction_history>" in joined
+    assert "content: 用户问候小鞠；小鞠回应；开心" in joined
+    assert "<interaction_memory>" in joined
+    assert "content: 用户之前经常用食物话题逗小鞠" in joined
+    assert "timestamp" not in joined
+    assert "message_id" not in joined
+    assert "similarity" not in joined
+    assert "importance_current" not in joined
 
 
 def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
@@ -146,10 +270,10 @@ def test_build_prompt_inserts_bot_reply_image_as_user_attachment(
         )
     )
 
-    assert messages[2]["role"] == "assistant"
-    assert "你上一条还发了 1 张图片" in messages[2]["content"]
-    assert messages[4]["role"] == "user"
-    assert messages[4]["content"] == [
+    assert messages[3]["role"] == "assistant"
+    assert "你上一条还发了 1 张图片" in messages[3]["content"]
+    assert messages[5]["role"] == "user"
+    assert messages[5]["content"] == [
         {"type": "text", "text": "（以下是你上一条被引用的 1 张图片）"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,reply"}},
         {"type": "text", "text": "- 阿虚: <user_input>看看这个</user_input>"},
@@ -180,7 +304,7 @@ def test_build_prompt_merges_user_reply_text_into_user_side(monkeypatch: Any) ->
         )
     )
 
-    assert messages[3] == {
+    assert messages[4] == {
         "role": "user",
         "content": (
             "- 长门（被回复）: 她刚才提到的角色是谁？\n"
@@ -217,8 +341,8 @@ def test_build_prompt_orders_user_reply_images_before_current_images(
         )
     )
 
-    assert messages[3]["role"] == "user"
-    assert messages[3]["content"] == [
+    assert messages[4]["role"] == "user"
+    assert messages[4]["content"] == [
         {
             "type": "text",
             "text": "- 长门（被回复）: 看看这张图\n- 长门（被回复）发送了 1 张图片。",

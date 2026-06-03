@@ -241,6 +241,42 @@ def test_push_global_interaction_triggers_pending_without_trimming(monkeypatch: 
     }
 
 
+def test_get_global_interaction_buffer_returns_tail_in_order(monkeypatch: Any) -> None:
+    manager = _build_manager(monkeypatch)
+    key = redis_manager_module.RedisKeys.global_interaction("u1")
+    _get_fake_redis(manager).data[key] = [
+        json.dumps({"event": f"事件{i}"}, ensure_ascii=False) for i in range(1, 5)
+    ]
+
+    records = asyncio.run(manager.get_global_interaction_buffer("u1", limit=2))
+
+    assert records == [{"event": "事件3"}, {"event": "事件4"}]
+
+
+def test_get_global_interaction_buffer_skips_invalid_json(monkeypatch: Any) -> None:
+    manager = _build_manager(monkeypatch)
+    key = redis_manager_module.RedisKeys.global_interaction("u1")
+    _get_fake_redis(manager).data[key] = [
+        "not-json",
+        json.dumps({"event": "有效"}, ensure_ascii=False),
+        json.dumps([{"event": "列表会跳过"}], ensure_ascii=False),
+    ]
+
+    records = asyncio.run(manager.get_global_interaction_buffer("u1", limit=10))
+
+    assert records == [{"event": "有效"}]
+
+
+def test_get_global_interaction_buffer_limit_zero_returns_empty(
+    monkeypatch: Any,
+) -> None:
+    manager = _build_manager(monkeypatch)
+
+    records = asyncio.run(manager.get_global_interaction_buffer("u1", limit=0))
+
+    assert records == []
+
+
 def test_global_interaction_snapshot_and_restore_keep_new_buffer_order(
     monkeypatch: Any,
 ) -> None:

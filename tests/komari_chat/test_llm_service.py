@@ -185,6 +185,191 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     }
 
 
+def test_generate_reply_with_tools_executes_read_profile_tool(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_profile",
+                    '{"user_id":"user-2"}',
+                    {"user_id": "user-2"},
+                    call_id="call-profile-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "已参考画像回答",
+                        "interaction_history": {
+                            "event": "询问他人信息",
+                            "result": "读取画像后回答",
+                            "emotion": "认真",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+
+    class _FakeMemory:
+        async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any]:
+            assert user_id == "user-2"
+            assert group_id == "group-1"
+            return {
+                "display_name": "长门",
+                "traits": {
+                    "喜欢的食物": {
+                        "value": "咖喱",
+                        "category": "preference",
+                        "importance": 5,
+                        "updated_at": "2026-06-01T00:00:00+00:00",
+                    }
+                },
+                "group_id": "group-1",
+            }
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "她喜欢什么"}],
+            tools=[llm_service_module.READ_PROFILE_TOOL],
+            request_trace_id="chat-profile-1",
+            memory_service=_FakeMemory(),
+            group_id="group-1",
+        )
+    )
+
+    assert result.content == "已参考画像回答"
+    tool_message = fake_provider.completion_calls[1]["messages"][-1]
+    assert tool_message["role"] == "tool"
+    assert "name: 长门" in tool_message["content"]
+    assert "喜欢的食物: 咖喱" in tool_message["content"]
+    assert "importance" not in tool_message["content"]
+    assert "updated_at" not in tool_message["content"]
+    assert "group_id" not in tool_message["content"]
+
+
+def test_read_profile_tool_filters_keys(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_profile",
+                    '{"user_id":"user-2","keys":["性格"]}',
+                    {"user_id": "user-2", "keys": ["性格"]},
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "只看性格回答",
+                        "interaction_history": {
+                            "event": "补查字段",
+                            "result": "按字段回答",
+                            "emotion": "平静",
+                        },
+                    },
+                )
+            ],
+        ),
+    ]
+
+    class _FakeMemory:
+        async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any]:
+            del user_id, group_id
+            return {
+                "display_name": "长门",
+                "traits": {
+                    "喜欢的食物": {"value": "咖喱", "category": "preference"},
+                    "性格": {"value": "冷静", "category": "general"},
+                },
+            }
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "查性格"}],
+            tools=[llm_service_module.READ_PROFILE_TOOL],
+            memory_service=_FakeMemory(),
+            group_id="group-1",
+        )
+    )
+
+    tool_content = fake_provider.completion_calls[1]["messages"][-1]["content"]
+    assert "性格: 冷静" in tool_content
+    assert "喜欢的食物" not in tool_content
+
+
+def test_read_profile_tool_returns_not_found(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_profile",
+                    '{"user_id":"missing"}',
+                    {"user_id": "missing"},
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "没有画像也照常回答",
+                        "interaction_history": {
+                            "event": "查询不存在画像",
+                            "result": "说明后回答",
+                            "emotion": "平静",
+                        },
+                    },
+                )
+            ],
+        ),
+    ]
+
+    class _FakeMemory:
+        async def get_user_profile(self, *, user_id: str, group_id: str) -> None:
+            del user_id, group_id
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "查一下"}],
+            tools=[llm_service_module.READ_PROFILE_TOOL],
+            memory_service=_FakeMemory(),
+            group_id="group-1",
+        )
+    )
+
+    assert "not_found: 用户画像不存在" in fake_provider.completion_calls[1]["messages"][-1]["content"]
+
+
 def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> None:
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
