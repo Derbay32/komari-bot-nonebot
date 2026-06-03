@@ -75,7 +75,7 @@ def test_main_async_apply_reuses_pool_and_cleans_up_resources(
     monkeypatch.setattr(
         module,
         "load_embedding_config",
-        lambda _path: types.SimpleNamespace(
+        lambda: types.SimpleNamespace(
             embedding_model="test-model",
             embedding_dimension=1536,
         ),
@@ -133,7 +133,6 @@ def test_main_async_apply_reuses_pool_and_cleans_up_resources(
     asyncio.run(
         module.main_async(
             shared_db_config_path=tmp_path / "database.json",
-            embedding_config_path=tmp_path / "embedding.json",
             targets={"knowledge", "memory"},
             apply=True,
         )
@@ -158,7 +157,7 @@ def test_main_async_apply_cleans_up_on_migration_failure(
     monkeypatch.setattr(
         module,
         "load_embedding_config",
-        lambda _path: types.SimpleNamespace(
+        lambda: types.SimpleNamespace(
             embedding_model="test-model",
             embedding_dimension=1536,
         ),
@@ -194,7 +193,6 @@ def test_main_async_apply_cleans_up_on_migration_failure(
         asyncio.run(
             module.main_async(
                 shared_db_config_path=tmp_path / "database.json",
-                embedding_config_path=tmp_path / "embedding.json",
                 targets={"knowledge"},
                 apply=True,
             )

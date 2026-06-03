@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any
+import sys
+import types
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -100,8 +102,51 @@ class _FakePool:
         return _FakeAcquire(self._conn)
 
 
-def test_load_embedding_config_returns_default_when_missing(tmp_path: Path) -> None:
-    config = load_embedding_config(tmp_path / "missing.json")
+def test_load_embedding_config_reads_postgres_config(monkeypatch: Any) -> None:
+    fake_storage_module = types.ModuleType(
+        "komari_bot.plugins.config_manager.storage"
+    )
+    fake_storage = types.SimpleNamespace(
+        fetch=lambda plugin_name: types.SimpleNamespace(
+            config_data={
+                "embedding_model": f"{plugin_name}-model",
+                "embedding_api_url": "https://embedding.example",
+                "embedding_api_key": "token",
+                "embedding_dimension": 1536,
+            }
+        )
+    )
+    fake_storage_module_any = cast("Any", fake_storage_module)
+    fake_storage_module_any.get_config_storage = lambda: fake_storage
+    monkeypatch.setitem(
+        sys.modules,
+        "komari_bot.plugins.config_manager.storage",
+        fake_storage_module,
+    )
+
+    config = load_embedding_config()
+
+    assert config.embedding_model == "embedding_provider-model"
+    assert config.embedding_api_url == "https://embedding.example"
+    assert config.embedding_api_key == "token"
+    assert config.embedding_dimension == 1536
+
+
+def test_load_embedding_config_returns_default_when_pg_missing(monkeypatch: Any) -> None:
+    fake_storage_module = types.ModuleType(
+        "komari_bot.plugins.config_manager.storage"
+    )
+    fake_storage = types.SimpleNamespace(fetch=lambda *_args: None)
+    fake_storage_module_any = cast("Any", fake_storage_module)
+    fake_storage_module_any.get_config_storage = lambda: fake_storage
+    monkeypatch.setitem(
+        sys.modules,
+        "komari_bot.plugins.config_manager.storage",
+        fake_storage_module,
+    )
+
+    config = load_embedding_config()
+
     assert config.embedding_dimension == 512
 
 
