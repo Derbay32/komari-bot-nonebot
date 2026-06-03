@@ -26,6 +26,13 @@
 - **互动历史同步生成**：聊天回复与互动历史绑定在同一结构化输出中，每次回复都同步生成 `interaction_history`（包含 event / result / emotion），不再依赖 XML 标签文本解析。
 - **`ReplyResult` / `InteractionHistoryRecord`**：新增结构化返回值类型，`generate_reply()` 与 `generate_reply_with_tools()` 返回 `ReplyResult`（含 content + interaction_history）。
 - **`_write_interaction_history()`**：新增互动历史写入方法，复用 `MemoryAgentLockScope.INTERACTION_USER`，在 PG advisory lock 内完成 read-modify-write，自动裁剪最近 10 条记录，写入失败不阻塞回复发送。
+- **对话总结 Redis processing 快照**：`komari_memory` 新增群对话 buffer → processing key 的原子快照流程，配套 processing lock/meta、TTL、全量读取、成功清理与失败恢复，避免 LLM / Agent 处理期间新消息被误删。
+- **画像 Agent 基线快照**：新增 Redis HASH 画像 snapshot，Agent 启动时固定参与用户画像基线，`read_profile` / `write_profile` 冲突检测优先读取快照，减少重复 PG 查询并固定读写基线。
+- **画像提交冲突检测**：`commit_profile` 新增 `conflict` 返回分支，提交前比较 PG 当前 `updated_at` 与 snapshot `updated_at`，发现外部修改时不写库且保留暂存区，允许 LLM 重新读取、整合后再次提交。
+- **快照配置项**：新增 `conversation_snapshot_ttl_seconds`、`profile_snapshot_ttl_seconds`、`profile_snapshot_enable`，控制对话 processing 与画像基线快照生命周期。
+- **对话 processing 自动恢复**：`ForgettingTaskManager` 每日 4:00 PG 忘却任务完成后扫描 `komari_memory:buffer:processing:*` 孤立快照，识别规则为 processing lock 不存在或锁值不指向当前 key；所有孤立 key 通过既有 `restore_processing_conversation_buffer()` 恢复回普通 buffer，单 key 恢复失败不阻断其余 key。
+- **conflict 返回 `pg_current_traits`**：`ProfileStaging._detect_snapshot_conflicts()` 在冲突条目中附加 PG 当前画像 traits 精简摘要（`value`/`category`/`importance`），减少 LLM 冲突整合时额外调用 `read_profile` 的开销。
+- **对话总结 PG 幂等键**：`komari_memory_conversations` 新增可空 `dedup_key` 字段与 `dedup_key IS NOT NULL` partial unique index，供 summary worker 对同一 processing 快照的多条总结按快照指纹 + memory 下标去重。
 
 ### Changed
 
@@ -38,7 +45,8 @@
 - **`summary_worker` 路径分叉**：画像路径走 `run_profile_agent()` → Agent + 暂存 + 自动提交；互动路径原保留旧 `summarize_conversation()` → JSON 解析 + `_apply_interaction_operations()`，后续已移除。
 - **记忆总结共用前缀缓存**：`summarize_conversation()` 改为三段式 `messages`（system + user + workflow），前两条与画像 Agent 完全一致以命中 LLM 服务端前缀缓存；输出从旧操作数组合并改为纯 `{"memories": [{"content": ..., "importance": ...}]}` 多段对话记忆，不再产出 `user_profile_operations` / `user_interaction_operations`。
 - **总结三层 fallback**：总结采用 JSON mode → 强制 `output_summary_result` tool calling → markdown JSON 直出解析的三层结构化输出降级链，并修复 `DeepSeekClient` 对 `response_format` 的请求体透传。
-- **总结执行顺序调整**：`perform_summary()` 先执行总结并逐条 `store_conversation()` 写入 PG，再运行画像 Agent；总结失败会记录异常但不阻断画像后续流程。
+- **总结执行顺序调整**：`perform_summary()` 改为先生成对话总结结果、再运行画像 Agent，画像 Agent 成功后才写入 conversation memories；若画像 Agent 失败，内部重试不会重复写入同批对话记忆。
+- **总结 Worker 重试粒度**：`summary_worker_task()` 不再用整体 retry 包裹所有群；单群失败只记录日志并继续处理其他群，单群内部围绕同一个 processing key 重试，最终失败才恢复快照。
 - **画像提交改为显式**：`run_profile_agent()` 不再在 LLM 停止工具调用后自动提交，改为必须由 Agent 显式调用 `commit_profile` 才写库；未成功提交或超过轮数结束会自动丢弃暂存区返回 `discarded` / `nothing_to_commit`。
 - **画像压缩整合进 Agent**：压缩从独立的 LLM 文本 JSON 路径改为 Agent 工具调用循环内完成。LLM 通过 `count_profile_traits(include_staged=true)` 检测超限 → `write_profile`（delete/set）压缩 → `count_profile_traits` 复查 → `commit_profile` 提交；`limit_exceeded` 失败直接根据 violations 继续修正重试。
 - **提示词工作流更新**：`profile_agent_workflow_system` 明确计数、压缩、预览、显式提交和超限重试流程；删除未使用的 `profile_agent_commit_reminder`、`profile_compaction_agent_system`、`profile_compaction_commit_reminder` 模板。
@@ -47,6 +55,8 @@
 - **纯聊天也走工具路径**：`generate_reply()` 不再调用 `generate_text_with_messages()`，统一走 `FINAL_RESPONSE_TOOL` 工具循环（`max_tool_rounds=2`），旧 `messages=None` 的兼容路径现在显式抛错。
 - **`generate_reply_with_tools()` 自动追加 `final_response`**：调用方只传入业务工具（read_image / search_web），内部自动追加 `FINAL_RESPONSE_TOOL`；`response_format` docstring 修正以反映非空时实际下放到底层 LLM API 的事实。
 - **锁保护范围扩展**：互动历史写入使用现有 `INTERACTION_USER` 作用域，按 `(group_id, user_id)` 在 PG advisory lock 内完成完整 read-modify-write，避免同一用户的并发回复互相覆盖。
+- **画像 commit 批量事务化**：`ProfileStaging.commit()` 从逐用户独立 `upsert_user_profile()` 改为先构造全部受影响用户的 payload，再统一调用 `MemoryService.batch_upsert_user_profiles()`；单连接单事务包裹，任意用户写入失败触发整体回滚，staging 暂存区不被清理。单条 `entity_repo.upsert_user_profile()` 复用批量入口，消除 SQL 分叉风险。
+- **对话总结写入幂等化**：`ConversationRepository.insert_conversation()` 与 `MemoryService.store_conversation()` 支持透传 `dedup_key`，写入使用 `ON CONFLICT DO NOTHING RETURNING id`，冲突时返回 `None` 并由 `summary_worker` 继续处理后续 memory。
 
 ### Removed
 
@@ -66,6 +76,7 @@
 ### Fixed
 
 - **陈旧 `access_boost` 测试断言**：`test_memory_service` 两处搜索/触摸调用断言中移除已废弃的 `access_boost` 参数，匹配实际方法签名。
+- **对话总结重试重复写入**：修复 `summary_worker` 在部分 conversation summary 已成功落库后失败并重试时，向 `komari_memory_conversations` 重复插入同一 processing 快照总结的问题；相关测试覆盖幂等冲突、`dedup_key=None` 旧路径与部分写入后的内部重试。
 
 ---
 
