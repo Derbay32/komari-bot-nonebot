@@ -29,7 +29,8 @@ class ConversationRepository:
         embedding: str,
         participants: list[str],
         importance_initial: int,
-    ) -> int:
+        dedup_key: str | None = None,
+    ) -> int | None:
         """插入对话记录。
 
         Args:
@@ -38,27 +39,46 @@ class ConversationRepository:
             embedding: 向量嵌入（字符串格式）
             participants: 参与者列表
             importance_initial: 初始重要性评分
+            dedup_key: 幂等键，同一 processing 快照重复写入时用于去重
 
         Returns:
-            创建的对话 ID
+            创建的对话 ID；幂等冲突时返回 None
         """
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO komari_memory_conversations
-                (group_id, summary, embedding, participants, start_time, end_time, importance_initial, importance_current)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (
+                    group_id,
+                    summary,
+                    embedding,
+                    participants,
+                    dedup_key,
+                    start_time,
+                    end_time,
+                    importance_initial,
+                    importance_current
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
                 group_id,
                 summary,
                 embedding,
                 participants,
+                dedup_key,
                 datetime.now() - timedelta(hours=1),  # noqa: DTZ005
                 datetime.now(),  # noqa: DTZ005
                 importance_initial,
                 importance_initial,
             )
+
+            if row is None:
+                logger.info(
+                    f"[KomariMemory] 跳过重复对话总结: group={group_id}, dedup_key={dedup_key}"
+                )
+                return None
 
             logger.info(
                 f"[KomariMemory] 存储对话总结: ID={row['id']}, group={group_id}, importance={importance_initial}"

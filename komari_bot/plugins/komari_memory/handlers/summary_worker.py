@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import json
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -46,6 +48,46 @@ def _format_summary_message_line(
     if getattr(message, "is_bot", False):
         return f"[bot] {config.bot_nickname}: {message.content}"
     return f"[user_id:{message.user_id}] {message.user_nickname}: {message.content}"
+
+
+def _build_processing_snapshot_fingerprint(
+    group_id: str,
+    messages_buffer: list[Any],
+) -> str:
+    """根据 processing 快照内容生成稳定指纹。"""
+    payload = {
+        "group_id": group_id,
+        "messages": [
+            {
+                "index": index,
+                "user_id": str(getattr(message, "user_id", "")),
+                "user_nickname": str(getattr(message, "user_nickname", "")),
+                "content": str(getattr(message, "content", "")),
+                "timestamp": getattr(message, "timestamp", None),
+                "message_id": str(getattr(message, "message_id", "")),
+                "is_bot": bool(getattr(message, "is_bot", False)),
+            }
+            for index, message in enumerate(messages_buffer)
+        ],
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_summary_dedup_key(
+    group_id: str,
+    snapshot_fingerprint: str,
+    index: int,
+) -> str:
+    """生成单条总结记忆的幂等键。"""
+    raw = f"summary:{group_id}:{snapshot_fingerprint}:{index}"
+    return sha256(raw.encode("utf-8")).hexdigest()
 
 
 async def _refresh_character_binding_if_needed(*, group_id: str) -> bool:
@@ -169,6 +211,7 @@ async def _perform_summary_from_processing(
         return
 
     await _refresh_character_binding_if_needed(group_id=group_id)
+    snapshot_fingerprint = _build_processing_snapshot_fingerprint(group_id, messages_buffer)
 
     participants = list({msg.user_id for msg in messages_buffer if not msg.is_bot})
     nickname_map: dict[str, str] = {}
@@ -227,7 +270,7 @@ async def _perform_summary_from_processing(
         if not isinstance(memories, list) or not memories:
             logger.warning("[KomariMemory] 群组 {} 总结无记忆输出，跳过存储", group_id)
         else:
-            for memory_item in memories:
+            for index, memory_item in enumerate(memories):
                 if not isinstance(memory_item, dict):
                     continue
                 content = str(memory_item.get("content", "")).strip()
@@ -242,7 +285,19 @@ async def _perform_summary_from_processing(
                     summary=content,
                     participants=participants,
                     importance_initial=max(1, min(5, importance)),
+                    dedup_key=_build_summary_dedup_key(
+                        group_id,
+                        snapshot_fingerprint,
+                        index,
+                    ),
                 )
+                if conversation_id is None:
+                    logger.info(
+                        "[KomariMemory] 群组 {} 总结记忆已存在，跳过重复写入: index={}",
+                        group_id,
+                        index,
+                    )
+                    continue
                 conversation_ids.append(conversation_id)
 
     await redis.delete_processing_conversation_buffer(group_id, processing_key)

@@ -19,6 +19,7 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             summary TEXT NOT NULL,
             embedding VECTOR({dimension}),
             participants TEXT[],
+            dedup_key VARCHAR(64),
             start_time TIMESTAMP NOT NULL,
             end_time TIMESTAMP NOT NULL,
             importance INT DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
@@ -28,6 +29,10 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             is_fuzzy BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+        """,
+        """
+        ALTER TABLE komari_memory_conversations
+        ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)
         """,
         """
         ALTER TABLE komari_memory_conversations
@@ -63,6 +68,11 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         """
         CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_time
         ON komari_memory_conversations(start_time DESC)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_conv_dedup_key
+        ON komari_memory_conversations (dedup_key)
+        WHERE dedup_key IS NOT NULL
         """,
         """
         CREATE TABLE IF NOT EXISTS komari_memory_user_profile (
