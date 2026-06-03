@@ -20,7 +20,6 @@
     "embedding_provider",
     "komari_chat",
     "komari_decision",
-    "komari_healthcheck",
     "komari_knowledge",
     "komari_management",
     "komari_memory",
