@@ -1,10 +1,6 @@
-"""Komari Memory 总结 YAML 提示词模板加载器（支持热重载）。"""
+"""Komari Memory 总结 PostgreSQL 提示词模板加载器。"""
 
-from pathlib import Path
-from typing import Any
-
-import yaml
-from nonebot import logger
+from komari_bot.common.prompt_storage import PromptTemplateLoader
 
 DEFAULTS: dict[str, str] = {
     "memory_summary_common_system": (
@@ -73,61 +69,6 @@ DEFAULTS: dict[str, str] = {
 }
 
 
-class PromptTemplateLoader:
-    """提示词模板加载器。"""
-
-    def __init__(self, template_path: Path, defaults: dict[str, str]) -> None:
-        self._template_path = template_path
-        self._defaults = defaults
-        self._cache: dict[str, Any] = {}
-        self._cache_mtime: float = 0.0
-
-    def _resolve_path(self) -> Path:
-        if self._template_path.is_absolute():
-            return self._template_path
-        return self._template_path.resolve()
-
-    def get_template(self) -> dict[str, str]:
-        """获取最新提示词模板（基于 mtime 热重载）。"""
-        path = self._resolve_path()
-
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            if not self._cache:
-                logger.warning(
-                    "[KomariMemory] 总结模板文件不存在: {}，使用默认提示词",
-                    path,
-                )
-                self._cache = dict(self._defaults)
-            return self._cache
-
-        if self._cache and mtime == self._cache_mtime:
-            return self._cache
-
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-
-            merged = dict(self._defaults)
-            for key in self._defaults:
-                if key in data and isinstance(data[key], str):
-                    merged[key] = data[key].rstrip("\n")
-
-            self._cache = merged
-            self._cache_mtime = mtime
-            logger.info("[KomariMemory] 总结模板已加载/重载: {}", path)
-        except yaml.YAMLError:
-            logger.warning("[KomariMemory] 总结模板 YAML 解析失败，使用缓存/默认值")
-            if not self._cache:
-                self._cache = dict(self._defaults)
-        except OSError:
-            logger.warning("[KomariMemory] 总结模板文件读取失败，使用缓存/默认值")
-            if not self._cache:
-                self._cache = dict(self._defaults)
-
-        return self._cache
-
-
 def render_template(template: str, **variables: object) -> str:
     """替换模板中的 {{变量}} 占位符。"""
     rendered = template
@@ -136,9 +77,13 @@ def render_template(template: str, **variables: object) -> str:
     return rendered
 
 
+_RESOURCE_ID = "komari_memory_summary"
+
 _loader = PromptTemplateLoader(
-    template_path=Path("config") / "prompts" / "komari_memory_summary.yaml",
+    resource_id=_RESOURCE_ID,
+    display_name="Komari Memory Summary Prompt",
     defaults=DEFAULTS,
+    log_prefix="[KomariMemory]",
 )
 
 
