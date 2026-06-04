@@ -40,14 +40,15 @@ komari-bot/
 │   │   ├── postgres.py                   #   asyncpg 连接池创建
 │   │   ├── vector_storage_schema.py      #   pgvector DDL 构建（HNSW）
 │   │   ├── management_api.py             #   Bearer Token 鉴权 + CORS
+│   │   ├── prompt_storage.py             #   Prompt 专用 PG 表与运行时加载
 │   │   ├── profile_compaction.py         #   用户画像 LLM 压缩
 │   │   ├── onebot_rules.py               #   group_message_rule() 等
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
 │   └── plugins/                          # NoneBot 插件模块
 │
-├── config/                               # 运行时配置
+├── config/                               # 旧版本地配置与迁移输入
 │   ├── config_manager/                   #   各插件的 JSON 配置 + .example
-│   └── prompts/                          #   YAML 提示词模板
+│   └── prompts/                          #   旧版 YAML 提示词备份/显式迁移输入
 │
 ├── docs/                                 # 文档
 │   ├── local/                            #   本地开发记录
@@ -112,6 +113,7 @@ komari-bot/
 ### 1. 配置管理 (`config_manager`)
 
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL `komari_plugin_configs`
+- **Prompt 配置**：字符串 prompt 不存入 `komari_plugin_configs`，统一使用独立 PostgreSQL 表 `komari_prompt_configs`
 - **初始化**：PG 中缺失配置时，从 `.env` 环境变量 / Pydantic 默认值生成并写入 PG
 - **持久化**：`update_field()` → Pydantic 校验 → 写回 PostgreSQL
 - **线程安全**：单例 + `RLock`，按 `plugin_name:schema_name` 区分实例
@@ -122,6 +124,13 @@ komari-bot/
   value = config.get().some_field       # 运行时获取
   config.update_field("some_field", x)  # 更新并持久化
   ```
+
+### 1.1 Prompt 配置 (`komari_prompt_configs`)
+
+- **存储源**：`komari_chat`、`komari_memory_summary`、`group_history_summary` 三组字符串 prompt 运行时从 PostgreSQL `komari_prompt_configs` 读取。
+- **默认值回退**：PG 无记录或读取失败时使用代码内 defaults；读取失败优先回退当前进程缓存，避免聊天主流程中断。
+- **管理 API**：`komari_management` Prompt API 的 GET / PUT / PATCH 均读写 `komari_prompt_configs`，响应中 `config_source` 形如 `postgresql:komari_prompt_configs:<resource_id>`，`file_path` 仅保留为 `null` 兼容字段。
+- **旧 YAML**：`config/prompts/*.yaml` 不再作为运行时来源；如需保留旧值，显式执行 `scripts/migrate_prompt_config_to_pg.py` 导入。`komari_decision` 的 `komari_memory_scenes.yaml` 暂未迁移，仍按原结构化 loader 读取。
 
 ### 2. LLM 网关 (`llm_provider`)
 
