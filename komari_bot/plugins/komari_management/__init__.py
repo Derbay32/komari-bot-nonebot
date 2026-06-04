@@ -173,20 +173,24 @@ def _load_management_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name="Komari Chat Prompt",
-                file_path=Path("config") / "prompts" / "komari_memory.yaml",
                 defaults=KOMARI_CHAT_PROMPT_DEFAULTS,
+                legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
             ),
             ManagedPromptResource(
                 resource_id="komari_memory_summary",
                 display_name="Komari Memory Summary Prompt",
-                file_path=Path("config") / "prompts" / "komari_memory_summary.yaml",
                 defaults=KOMARI_MEMORY_SUMMARY_PROMPT_DEFAULTS,
+                legacy_file_path=Path("config")
+                / "prompts"
+                / "komari_memory_summary.yaml",
             ),
             ManagedPromptResource(
                 resource_id="group_history_summary",
                 display_name="Group History Summary Prompt",
-                file_path=Path("config") / "prompts" / "group_history_summary.yaml",
                 defaults=GROUP_HISTORY_PROMPT_DEFAULTS,
+                legacy_file_path=Path("config")
+                / "prompts"
+                / "group_history_summary.yaml",
             ),
         ),
     )

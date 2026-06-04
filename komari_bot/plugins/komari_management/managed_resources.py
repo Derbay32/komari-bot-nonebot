@@ -40,5 +40,5 @@ class ManagedPromptResource:
 
     resource_id: str
     display_name: str
-    file_path: Path
     defaults: dict[str, str]
+    legacy_file_path: Path | None = None
