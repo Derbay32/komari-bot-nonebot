@@ -106,8 +106,8 @@ def _build_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name="Komari Chat Prompt",
-                file_path=Path("config") / "prompts" / "komari_memory.yaml",
                 defaults={"system_prompt": "默认值"},
+                legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
             ),
         ),
     )
