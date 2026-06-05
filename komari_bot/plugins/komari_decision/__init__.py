@@ -61,7 +61,7 @@ class PluginManager:
 
     async def initialize(self) -> None:
         """初始化 scene 运行时与同步任务。"""
-        from nonebot.plugin import require
+        from nonebot.plugin import require as runtime_require
 
         from .handlers.scene_sync_worker import (
             bootstrap_scene_sync_task,
@@ -74,7 +74,7 @@ class PluginManager:
         from .services.scene_runtime_service import SceneRuntimeService
         from .services.scene_sync_service import SceneSyncService
 
-        require("nonebot_plugin_apscheduler")
+        runtime_require("nonebot_plugin_apscheduler")
         memory_plugin = require("komari_memory")
 
         config = get_config()
@@ -117,6 +117,10 @@ class PluginManager:
 
         try:
             await self.scene_repository.ensure_schema()
+            if not await self.scene_repository.has_any_scene():
+                logger.warning(
+                    "[KomariDecision] komari_decision_scenes 为空；请运行迁移脚本或通过管理 API 初始化 scenes"
+                )
             loaded = await self.scene_runtime.load_active_set_cache()
             if loaded:
                 logger.info("[KomariDecision] scene runtime cache 初始化成功")
