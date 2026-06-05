@@ -2,412 +2,136 @@
 
 ## [Unreleased]
 
-> 当前 `dev` 分支上尚未发版的变更。本次更新围绕四大主题：**跨群互动事件记忆**（重构互动历史为跨群事件向量表）、**画像 Agent 化**（LLM tool calling 驱动的画像管理）、**聊天回复工具调用结构化**（统一 `final_response` 工具终结回复流程）、**chat prompt 画像与互动上下文优化**（首轮只注入当前用户画像、新增 `read_profile` 只读工具、YAML 风格注入、Redis 互动缓冲读取）。
+> 当前 `dev` 分支上尚未发版的变更。围绕五大主题。
 
-### Added
+### 判定场景 PostgreSQL 内容表迁移
+- **`komari_decision_scenes` 内容主表**：独立 PG 表作为 scene 唯一运行时 source of truth，`scene_id` 外键关联向量快照表。
+- **`PostgresSceneTemplateLoader`**：运行时 scene sync 默认从 PG 内容表构建，替代旧 YAML 文件哈希。
+- **管理 Scenes API**：`/api/komari-decision-scenes/v1` 提供 list/detail/PUT/PATCH/sync 端点。
+- **迁移脚本**：`scripts/migrate_komari_decision_scenes_to_pg.py`，支持 `--source-path` / `--dry-run` / `--replace-existing`。
+- **`UnifiedCandidateRerankService` 去除全部 YAML fallback 路径**，无 snapshot 时报错不再降级。
 
-#### 跨群互动事件记忆系统
-- **事件向量表与自动迁移**：将 `komari_memory_interaction_history` 替换为按 `user_id` 分隔的事件向量表，支持 `event_summary` 向量检索与整数忘却模型。`vector_storage_schema.py` 启动时自动将旧表重命名为 `_legacy_<时间戳>` 并创建新表。
-- **Redis 跨群互动缓冲**：新增 `global_interaction:{user_id}` key，20 条触发 pending；Lua `RENAME` 原子转移 buffer → processing key。
-- **CRUD 与总结服务**：`InteractionEventRepository`（向量检索、分页、touch 刷新、模糊化）；`summarize_interaction_events()` LLM 跨群聚合（禁止输出群号/群名）。
-- **后台 Worker**：`interaction_event_worker.py` 轮询 pending → 快照转移 → LLM 总结 → 嵌入 → 写 PG → 清理；失败重试 3 次，仍失败恢复快照。每日 4:00 兜底扫描。
-- **管理 API**：`/interactions` 事件语义路由（GET 列表/详情、PATCH、DELETE）。
-- **配置项**：`global_interaction_enabled`、`global_interaction_trigger_size`（默认 20）、`global_interaction_summary_interval_minutes`（默认 1）。
-- **测试覆盖**：Redis 缓冲不截断、快照恢复顺序、touch 刷新、API CRUD。
+### 跨群互动事件记忆系统
+- **事件向量表**：`komari_memory_interaction_history` 替换为按 `user_id` 分隔的事件向量表，启动时自动旧表重命名。
+- **Redis 跨群互动缓冲**：`global_interaction:{user_id}` key，20 条触发 pending，Lua RENAME 原子转移。
+- **CRUD 与总结**：`InteractionEventRepository` 向量检索/分页/touch/模糊化；LLM 跨群聚合（禁止输出群号/群名）。
+- **后台 Worker**：轮询 pending → LLM 总结 → 嵌入 → 写 PG，失败重试 3 次后恢复快照。每日 4:00 兜底扫描。
 
-#### 画像 Agent 化
-- **Agent 工具调用**：画像总结从旧 JSON 操作数组改为 LLM tool calling 模式。新增 `read_profile`、`write_profile`、`preview_profile`、`count_profile_traits`、`commit_profile` 工具，程序侧在提交前硬校验 trait 上限。
-- **Redis 暂存层**：`ProfileStaging` 操作暂存到 Redis（TTL 10 分钟），冲突检测 + 规范化合并后 `commit()` 写库，异常时 `discard()` 自动清理。
+### 画像 Agent 化
+- **Agent 工具调用**：画像总结改为 LLM tool calling 模式（read/write/preview/count/commit_profile），硬校验 trait 上限。
+- **Redis 暂存层**：`ProfileStaging` 暂存到 Redis（TTL 10 分钟），冲突检测后 commit() 写库。
 - **PG 生命周期锁**：`memory_agent_locks.py` 按 `group_id` 通过 PG advisory lock 互斥。
-- **操作纯函数层**：`profile_operations.py` 提供 `normalize_profile_operations()` 多轮合并与 `apply_profile_operations()` 最终 diff 应用。
-- **Agent 预算控制**：新增 `memory_agent_max_rounds`、`memory_agent_max_tool_calls`、`memory_agent_max_read_profiles`、`memory_agent_max_write_operations`、`memory_agent_lock_timeout_seconds`。
-- **显式提交与超限处理**：`commit_profile` 对所有受影响用户执行 `profile_trait_limit` 硬校验，超限返回 `limit_exceeded`（含超限用户、当前 traits、trait_keys），保留暂存区供 LLM 压缩后重试。
-- **补充字段**：`ProfileReadResult.display_name` 与 `commit_profile` 超限 violations 携带相同字段，减少额外查询。
+- **显式提交**：必须 `commit_profile` 才写库，超限返回 `limit_exceeded` 供 LLM 压缩后重试。
+- **移除**：独立 LLM 压缩路径、JSON 操作数组旧模式、离线瘦身脚本。
 
-#### 聊天回复工具调用结构化
-- **`final_response` 终端工具**：所有聊天回复通过 `tool_choice="required"` 强制模型调用以输出结构化结果。
-- **互动历史同步生成**：每次回复同步生成 `interaction_history`（event / result / emotion），不再依赖 XML 标签解析。
-- **`ReplyResult` / `InteractionHistoryRecord`**：`generate_reply()` 与 `generate_reply_with_tools()` 统一返回结构化结果。
-- **`_write_interaction_history()`**：在 PG advisory lock 内完成 read-modify-write，自动裁剪最近 10 条，写入失败不阻塞回复发送。
+### 聊天回复工具调用结构化
+- **`final_response` 终端工具**：所有回复通过 `tool_choice="required"` 强制结构化输出。
+- **互动历史同步生成**：每次回复同步生成 `interaction_history`（event/result/emotion），不再依赖 XML 标签解析。
+- **工具循环合并**：视觉/搜索工具统一为 `_execute_tool_loop()`，消除 ~190 行重复代码。
 
-#### 对话总结与画像快照
-- **Redis processing 快照**：群对话 buffer → processing key 原子快照，配套 lock/meta、TTL、全量读取、成功清理与失败恢复。
-- **画像基线快照**：Agent 启动时固定参与用户画像基线，冲突检测比较 `updated_at`，外部修改时保留暂存区供重试。
-- **快照配置项**：`conversation_snapshot_ttl_seconds`、`profile_snapshot_ttl_seconds`、`profile_snapshot_enable`。
-- **孤立快照自动恢复**：`ForgettingTaskManager` 每日 4:00 扫描 `komari_memory:buffer:processing:*` 孤立 key 并恢复。
-- **冲突信息增强**：`_detect_snapshot_conflicts()` 在冲突条目中附加 PG 当前画像 traits 摘要。
-- **对话总结幂等键**：`komari_memory_conversations` 新增 `dedup_key` 字段与 partial unique index，按快照指纹 + memory 下标去重。
+### Chat Prompt 上下文优化
+- **首轮只注入当前用户画像**，移除 `<user_profiles>` / `<user_interaction_history>` 块。
+- **YAML 风格格式化**：画像/关键词知识/可见用户/Redis 近期互动/PG 互动事件记忆统一 YAML 风格注入。
+- **新增 `read_profile` 只读工具**，`read_profile` 接入 `_attempt_reply()` 默认工具集。
+- **`<user_profiles>` 重命名 → `<user_keyword_knowledge>`**。
+- **预读取优化**：构建 prompt 前预读 PG 画像、Redis 近期互动缓冲（限 10 条）、PG 长期互动事件记忆。
 
-#### Chat Prompt 上下文优化
-- **`read_profile` 只读工具**：LLM 可在工具循环中查询用户画像，返回 YAML 风格文本，过滤内部字段。
-- **`profile_traits_to_list()` 辅助**：将 PG 画像精简为 `key` / `value` / `category` 展示条目，供 prompt 注入和工具结果公用。
-- **`RedisManager.get_global_interaction_buffer()`**：读取近期原始互动尾部记录，跳过非法 JSON，供 prompt 注入。
+### 配置系统迁移
+- **配置持久化**：`config_manager` 从本地 JSON 迁移到 PG `komari_plugin_configs` 表。
+- **Prompt 存储**：`common/prompt_storage.py` 独立表 `komari_prompt_configs`，管理 Prompt API 读写该表。
+- **旧 YAML prompt 迁移脚本**：`scripts/migrate_prompt_config_to_pg.py`。
 
-#### 迁移脚本与存储层
-- **`scripts/migrate_json_config_to_pg.py`**：将旧 JSON 配置 upsert 到 PostgreSQL `komari_plugin_configs` 表，跳过 `database_config.json`。
-- **`common/prompt_storage.py`**：prompt 专用 PostgreSQL 存储层，自动建表 `komari_prompt_configs`、同步门面、统一默认值合并。
-- **`scripts/migrate_prompt_config_to_pg.py`**：旧 YAML prompt 显式迁移脚本（`--dry-run` 支持），迁移 `komari_chat` / `komari_memory_summary` / `group_history_summary` 三个字符串 prompt。
-
-### Changed
-
-#### 互动历史写入与记忆服务
-- **`_write_interaction_history()`**：改为写 Redis 跨群缓冲，不再读取旧 PG records、不持有 advisory lock、不写 `group_id`；新增 `global_interaction_enabled` 开关。
-- **`MemoryService`**：注入 `InteractionEventRepository`，新增 `insert_interaction_event()`、`search_interaction_events()`（内置 touch 刷新）；旧 API 安全返回 None。
-- **`ForgettingService`**：对新事件表接入整数衰减、低价值删除、高价值模糊化。
-- **`PluginManager`/`__init__.py`**：注册 interaction event repository 与 worker，增加 embedding 维度校验。
-
-#### 总结模型与提示词
+### 总结模型与 Agent 工作流
 - **默认模型**：`llm_model_summary` 从 `gemini-2.5-flash-lite` 改为 `deepseek-v4-flash`。
-- **提示词拆分**：新增 `memory_summary_common_system`（共用前缀）与 `profile_agent_workflow_system`（画像 Agent 专用）；移除旧互动历史模板与画像提交提醒。
-- **`summary_worker` 路径分叉**：画像走 `run_profile_agent()` → Agent + 暂存 + 提交；互动路径原保留旧 `summarize_conversation()` 后已移除。
-- **前缀缓存优化**：`summarize_conversation()` 三段式 messages，前两条与画像 Agent 一致；输出为纯 `{"memories": [...]}` 多段对话记忆。
-- **三层结构化 fallback**：JSON mode → `output_summary_result` tool calling → markdown JSON 直出解析。
-- **执行顺序调整**：`perform_summary()` 先生成对话总结、再运行画像 Agent，Agent 成功后才写入 conversations。
-- **Worker 重试粒度细化**：单群失败只记录日志并继续处理其他群，内部围绕同一 processing key 重试。
-- **画像提交显式化**：必须由 Agent 调用 `commit_profile` 才写库，否则自动 discard。
-- **画像压缩整合进 Agent**：压缩从独立 LLM 路径改为 Agent 循环内完成（count → write → recount → commit）。
-- **工作流提示词更新**：明确计数、压缩、预览、显式提交和超限重试流程；删除未使用模板。
-
-#### 聊天回复工具调用重构
-- **工具合并**：合并 `generate_reply_with_vision_tool` 与 `generate_reply_with_search_tool` 为统一的 `generate_reply_with_tools()`，提取公共 `_execute_tool_loop()` 消除 ~190 行重复代码。
-- **工具循环重写**：`_execute_tool_loop()` 必须收到 `final_response` 才返回，否则抛错触发 `retry_async` 重试；移除纯文本降级路径。
-- **纯聊天也走工具路径**：`generate_reply()` 统一走 `FINAL_RESPONSE_TOOL` 循环（`max_tool_rounds=2`）。
-- **自动追加 `final_response`**：调用方只传入业务工具，内部自动追加终端工具。
-
-#### 锁与事务
-- **锁保护范围扩展**：互动历史写入使用 `INTERACTION_USER` 作用域，在 PG advisory lock 内完成完整 read-modify-write。
-- **画像 commit 批量事务化**：`ProfileStaging.commit()` 先构造全部受影响用户 payload，统一调用 `batch_upsert_user_profiles()`，单连接单事务包裹，任意失败触发整体回滚。
-- **对话总结写入幂等化**：`insert_conversation()` 支持 `dedup_key`，使用 `ON CONFLICT DO NOTHING RETURNING id`。
-
-#### Prompt 注入与格式化
-- **画像注入收窄**：首轮 prompt 只注入当前触发用户 PG 画像，移除 `<user_profiles>` / `<user_interaction_history>` 块。
-- **YAML 风格格式化**：当前用户画像、UID 关键词知识、可见用户列表、Redis 近期互动、PG 长期互动事件记忆统一以 YAML 风格包裹在 XML 标签内注入。
-- **`<profile_tool_hint>` 移到静态前缀**：作为稳定 system 消息以争取 KV cache 命中。
-- **`<user_profiles>` 重命名为 `<user_keyword_knowledge>`**：避免与 PG 画像混淆。
-- **`read_profile` 接入回复路径**：`_attempt_reply()` 默认包含 `READ_PROFILE_TOOL`，`max_tool_rounds` 提升至 5。
-- **`_attempt_reply()` 新增预读取**：构建 prompt 前预读 PG 画像、Redis 近期互动缓冲（限 10 条）、PG 长期互动事件记忆。
-- **互动历史引用更新**：好感度文案中 `<user_interaction_history>` 改为 `<interaction_memory>`。
-
-#### 配置系统迁移
-- **配置持久化**：`config_manager` 从本地 JSON 文件迁移到 `komari_plugin_configs` 表，移除基于 mtime 的 hot reload；`reload()` 替代 `reload_from_json()`。API 响应字段 `config_file` 更名为 `config_source`。
-- **启动配置去循环依赖**：`database_config.py` 新增 `load_database_config_from_env()`，PG/Redis bootstrap 只从环境变量读取，消除启动循环依赖。
-- **Embedding 配置来源**：`load_embedding_config()` 只从 PostgreSQL 读取，删除 JSON 路径与 dotenv 读取路径。
-- **CI 排除 `/config`**：Release zip 不再打包 `config/` 目录。
-- **Env 示例更新**：补充 `PG_*` / `REDIS_*` 字段，移除 `LOCALSTORE`。
-- **Prompt 运行时加载器**：`komari_chat`、`komari_memory_summary`、`group_history_summary` 从 `komari_prompt_configs` 读取，失败回退代码内 defaults / 进程缓存。
-- **管理 Prompt API**：读写来源迁移到 `komari_prompt_configs`，响应新增 `config_source` / `storage_key`；`file_path` 保留为 `null` 兼容字段。
-- **`ManagedPromptResource`**：移除运行时 `file_path`，改为可选 `legacy_file_path`。
+- **Agent 路径分叉**：画像走 `run_profile_agent()` → 暂存 → 提交；对话总结纯 `summarize_conversation()`。
+- **对话总结幂等**：`dedup_key` + partial unique index，`ON CONFLICT DO NOTHING`。
 
 ### Removed
-
-#### 旧插件与配置
-- **`komari_healthcheck` 插件**：健康检查已迁移到 napcat 侧，移除插件代码、配置文件与单元测试。
-- **`nonebot-plugin-localstore` 依赖**：从 `pyproject.toml` 与 `requirements.txt` 中移除。
-- **JSON 配置示例文件**：`config/config_manager/*.json.example` 全部删除，以 Pydantic schema 默认值为准。
-
-#### 旧互动历史与画像代码路径
-- **旧互动历史 advisory lock**：`_write_interaction_history()` 不再依赖 PostgreSQL 锁。
-- **旧 JSONB records 写入入口**：`MemoryService.upsert_interaction_history()` 停用（保留签名），`EntityRepository` 旧方法保留仅供旧测试。
-- **旧画像解析**：移除 `_apply_profile_operations()`、旧 `user_profile_operations` 解析与聚合逻辑。
-- **画像总结全量注入**：`_build_existing_context_with_budget()` 不再全量注入画像，该函数及其调用链已完全删除。
-- **互动历史总结路径**：`perform_summary()` 中移除互动历史读取、`user_interaction_operations` 处理、`upsert_interaction_history()` 写入。
-- **总结分段/合并机制**：移除 `_chunk_formatted_messages()`、`_split_oversized_message()`、`_build_merge_prompt()` 等全部分段与二次汇总逻辑（500 条上限 < 模型 40K+ 上下文窗口）。
-- **旧模板字段**：移除 `summary_prompt`、`merge_prompt`、`existing_context_instruction_block`、`existing_profiles_header`、`existing_interactions_header`、`truncated_context_marker`。
-
-#### 旧代码与工具函数
-- **XML 标签提取**：从 `komari_chat/llm_service` 移除 `_extract_tag_content()`。
-- **旧 dispatch 回调**：`generate_reply_with_tools()` 内联 dispatch 被 `_execute_business_tool()` 取代。
-- **独立 LLM 文本压缩路径**：移除 `compact_profile_with_llm()`、`_enforce_profile_trait_limit()` 及全部配套函数与 Protocol。
-- **`summary_chunk_token_limit` 配置**：删除 schema 字段、运行时 JSON、example、README 和测试中全部残留。
-- **离线画像瘦身脚本**：删除 `scripts/compact_komari_memory_profiles.py` 及其测试。
+- **`komari_healthcheck` 插件**（健康检查已迁移到 napcat 侧）。
+- **`nonebot-plugin-localstore` 依赖**。
+- **JSON 配置示例文件**。
+- **XML 标签提取**、旧 dispatch 回调、旧模板字段、分段/合并机制、`summary_chunk_token_limit` 配置。
 
 ### Fixed
-
-- **陈旧测试断言**：`test_memory_service` 移除已废弃的 `access_boost` 参数。
-- **对话总结重试重复写入**：修复 summary worker 重复插入同一 processing 快照总结的问题；测试覆盖幂等冲突与 `dedup_key=None` 旧路径。
-- **跨群互动事件时间戳泄漏**：移除向 LLM prompt 暴露的原始 Unix 时间戳，改为 `用户行为` / `小鞠反应` / `小鞠感受`。
-- **`PromptStorage` 同步桥接无超时**：`future.result()` 增加 5 秒超时，PG 卡顿时不会无限阻塞调用线程。
-- **`PromptStorage` schema 初始化不可重试**：PG pool 在 DDL 成功后才缓存；初始化失败关闭临时 pool 并允许后续重试。
-- **管理 Prompt API 异常信息泄露**：HTTP 500 不再返回原始内部异常文本。
+- 陈旧测试断言、对话总结重试重复写入、时间戳泄漏、PromptStorage 超时/init 不可重试、API 异常信息泄露。
 
 ---
 
 ## [v1.2.0-beta.4] - 2026-05-28
 
 ### Added
-- **表情反应提示**：`komari_chat` 判定回复后自动对用户消息发送表情反应（NapCat `set_msg_emoji_like`），示意正在生成回复。通过 `face_reaction_enabled` / `face_reaction_id` 配置项控制，默认关闭，reaction 失败不影响回复流程。
-- **联网搜索插件**：新增 `komari_search`，封装 Tavily Search API，供 `komari_chat` 通过 `search_web` 工具调用实现联网搜索。搜索与图片读取工具可在同一轮 tool-calling 循环中共存，不影响总结功能。
-- **V4 多模态模式**：`komari_chat` 支持通过工具调用读取图片，实现图文混合对话能力。
-- **消息缓冲重构**：`komari_memory` 改用空闲超时 + 最小消息数替代旧的 token 计数机制来触发总结，prompt 构建顺序也做了调整。
-- **知识库提案插件**：新增 `komari_custom`，提供 `.custom` 指令组，允许群成员通过多步编辑流程发起知识库提案，经群消息表情投票通过后自动写入 `komari_knowledge` 知识库。默认关闭，需 PostgreSQL + Redis 支持。包含标题正文编辑、撤销、分页列表、投票计数、过期自动清理等功能。
-- `AGENTS.md`：新增 AI 智能体上下文文档，描述项目架构、插件依赖、编码规范和开发流程。
+- **表情反应提示**：`komari_chat` 判定回复后自动 `set_msg_emoji_like`，示意生成中。`face_reaction_enabled` / `face_reaction_id` 配置。
+- **联网搜索**：`komari_search` 封装 Tavily Search API，`search_web` 工具调用。
+- **V4 多模态**：工具调用读取图片，图文混合对话。
+- **知识库提案插件**：`komari_custom`，`.custom` 指令组 → 多步编辑 → 投票通过 → 自动写入知识库。
+- **消息缓冲重构**：空闲超时 + 最小消息数替代 token 计数触发总结。
 
 ### Changed
-- **知识库提案提交者展示**：`komari_custom` 投票消息与提案详情中的提交者现在展示名称与 QQ 号，名称优先级为绑定名称 > 用户名 > 群昵称，并持久化到提案表。
-- **KnowledgeCategory 扩展**：`komari_knowledge` 模型的 `KnowledgeCategory` 新增 `"custom"` 分类字面量，用于提案通过后写入知识库。
-- **依赖更新**：不再直接计算 token 数量，转而使用 `summary_max_buffer_size` 配置项控制总结触发窗口。
-- **状态查询迁移**：移除机器人端 `komari_status` / `.status` Uptime Kuma 查询功能，状态查询已迁移至 NapCat 端侧。
+- 提案提交者展示名称与 QQ 号；KnowledgeCategory 新增 `"custom"` 分类；移除 `komari_status` 状态查询。
 
 ### Fixed
-- **总结请求误拦截**：修复 `group_history_summary` 中误用 `meaningful_score` / `noise_score`（记忆价值判定）拦截总结意图的问题，移除该错误分支，总结请求只依赖 scene 识别 + 关键词双重门控。
-- **修复 Github Action 工作流**: 修复部署包中 Docker 镜像标签包含 v 前缀的问题。
-
-### Test
-- 更新 `komari_memory` 和 `komari_chat` 的测试用例，适配上述重构变更。
-
----
-
-## [v1.2.0-beta.3] - 2026-04-25
-
-### Added
-- **LLM 推理内容日志**：`llm_provider` 在调用日志中记录并展示 DeepSeek 的 `reasoning_content` 推理内容。
-- **DeepSeek V4 角色扮演指令**：`komari_chat` 新增 V4 角色扮演指令注入功能，重构消息构建结构以适配 KV Cache。
-- **群聊总结增强**：`group_history_summary` 集成 DeepSeek V4 角色扮演指令与 `assistant` 预填充配置项。
-
-### Changed
-- `group_history_summary` 拆解总结请求判定逻辑，添加详细调试日志。
-- `group_history_summary` 将规划阶段系统提示词抽取到配置文件并添加默认值。
-
-### Fixed
-- `komari_decision` 补充 `komari_memory` 插件依赖声明，确保插件正确加载顺序。
-
-### Docs
-- 补充 `assistant` 预填充与 DeepSeek V4 角色扮演指令的配置示例项。
-
----
-
-## [v1.2.0-beta.2] - 2026-04-23
-
-### Added
-- **维护通知推送**：`komari_management` 新增维护通知推送接口与群组查询 API。
-- **状态监控插件**：新增 `komari_status`，集成 Uptime Kuma API 实现服务状态查询。
-
-### Changed
-- `komari_help` 命令重命名为 `docs`，新增列表分页功能。
-- `komari_help` 提取渲染逻辑至独立模块，新增 `max_reply_result_count` 配置项。
-- `komari_help` 新增按插件名称删除自动生成帮助文档的方法，同步时自动清理已禁用插件的帮助条目。
-- `komari_help` 新增 `disabled_auto_generate_plugins` 配置项，支持跳过指定插件的帮助文档同步。
-
-### Fixed
-- 修正帮助文档命令前缀为点号格式，优化日志字符串格式化。
-
----
-
-## [v1.2.0-beta.1] - 2026-04-21
-
-### Added
-- **健康检查插件**：新增 `komari_healthcheck`，提供无认证状态探测端点。
-- `komari_management` 配置 API 响应新增字段描述信息，便于前端展示。
-- `decision` 插件新增示例配置文件。
-
-### Changed
-- `komari_help` 优化自动帮助条目同步逻辑，避免重复更新并减少索引重建开销。
-- `jrhg` 移除独立的 LLM 调用与提示词构建模块，简化插件架构。
-- **好感度系统迁移**：好感度功能从 `jrhg` 迁移至 `komari_chat`，统一等级划分标准。
-- **数据库配置统一**：Redis 连接配置统一至共享配置，移除各插件冗余的数据库配置覆盖机制。
-
-### Fixed
-- `sr` 插件补充插件描述与使用说明，统一指令前缀为点号格式。
-
-### Style / Refactor
-- `komari_help` 日志格式化统一改为 f-string 语法。
-- `komari_help` 调整 `TYPE_CHECKING` 导入结构，细化序列类型提示为 `list`。
-
-### Docs
-- `character_binding`、`jrhg` 优化插件使用说明，统一多行指令展示风格。
-- 新增 `komari_help` 插件实现帮助文档向量检索与统一管理 API 集成的文档。
+- 总结请求误拦截（误用 meaningful/noise_score）；GitHub Action v 前缀修复。
 
 ---
 
 ## [v1.1.0] - 2026-04-19
 
-> **首个正式发布的 v1.1 稳定版**，合并自 v1.1.0-rc.2。
+> **首个正式发布的 v1.1 稳定版**。
 
-### Added (自 v1.0.0 以来的累积变更)
-- **配置管理接口**：新增配置管理 REST API 并补全测试。
-- **DeepSeek extra_params**：`llm_provider` 为 DeepSeek 客户端添加 `extra_params` 自定义参数支持。
-- **提示词模板化**：记忆确认与 CoT 前缀角色提取为可配置项。
-- **工具调用能力**：`llm_provider` 统一接口新增工具调用能力；群聊总结插件同步接入工具调用。
-- **实体增量更新**：实体压缩从全量改写改为增量更新方案。
-- **忘却模糊化优化**：修复忘却模块数据类型错误，新增模糊化处理并发功能。
-- **角色名绑定**：总结前自动查询群内角色名绑定，优化提示词效果。
+### Added
+- **配置管理 REST API**；DeepSeek `extra_params` 自定义参数支持。
+- **工具调用能力**：`llm_provider` 统一接口接入工具调用；群聊总结插件同步接入。
+- **实体增量更新**：从全量改写改为增量；忘却模糊化并发优化。
+- **角色名绑定**：总结前查询群内绑定；提示词模板化。
+- **维护通知推送与群组查询 API**；状态监控插件 `komari_status`（Uptime Kuma 集成）。
 
-### Changed (自 v1.0.0 以来的累积变更)
-- **LLM 接口迁移**：从自建客户端迁移至 `openai` 库，统一接口。
-- **插件解耦**：`decision` 与 `memory` 插件通过 NoneBot2 标准插件间引用方式解耦。
-- **配置解耦**：`decision` 与 `memory` 插件配置完全独立。
-- **数据库增量写入**：优化数据库写入为增量方案，并添加迁移脚本。
-- **日志级别调整**：部分循环监听日志从 INFO 下调为 DEBUG。
+### Changed
+- **LLM 接口迁移**：从自建客户端迁移至 `openai` 库。
+- **插件解耦**：`decision` / `memory` 使用 NB2 标准插件间引用；`jrhg` 好感度系统迁移至 `komari_chat`。
+- **`komari_help` 命令重命名 → `docs`**，新增分页、`max_reply_result_count`、`disabled_auto_generate_plugins` 配置。
+- **数据库配置统一**：Redis 配置移至共享层；各插件数据库覆盖机制移除。
+- **数据库增量写入** + 迁移脚本；日志级别下调。
 
 ### Fixed
-- 早期版本的多个 message/onebot 类型注解问题。
-- 停用 LLM 请求中的 `response_format` 字段以避免兼容性问题。
-- 图片下载器 EOF 读取和重试处理。
-- Sentry 日志过滤与初始化逻辑完善。
+- 早期 Message/OneBot 类型注解问题；`response_format` 兼容性；图片下载器 EOF/重试；Sentry 初始化。
 
 ### Removed
-- **移除本地向量支持**，统一使用远程 embedding 服务。
-- **移除内置 WebUI**，使用 REST API 暴露外部管理接口。
-- 删除过时的 `not_related` 空回功能。
-
----
-
-## [v1.1.0-rc.2] - 2026-04-18
-
-### Changed
-- 优化提示词。
-- 记忆确认与 CoT 前缀角色提取为可配置项。
-
-### Fixed
-- 修复 `deepseek_client` 额外参数可能覆盖 SDK 请求字段的问题。
-
----
-
-## [v1.1.0-rc.1] - 2026-04-18
-
-### Added
-- `llm_provider` 为 DeepSeek 客户端添加 `extra_params` 自定义参数支持。
-
----
-
-## [v1.1.0-beta.7] - 2026-04-14
-
-### Added
-- 新增配置管理接口并补全测试。
-
-### Fixed
-- 修复 `komari_decision` 插件根模块未导出服务类的问题。
-- 修复配置 schema 命名不统一的问题。
-
----
-
-## [v1.1.0-beta.6] - 2026-04-13
-
-### Changed
-- 部分循环监听日志下调为 DEBUG 级别。
-- 更新示例配置文件。
-- 聊天记录总结插件与 chat 插件改用标准 NB2 插件间引用方法。
-
----
-
-## [v1.1.0-beta.5] - 2026-04-12
-
-### Added
-- 实体压缩改为增量更新方案。
-- 为忘却模块新增模糊化处理并发功能。
-
-### Fixed
-- 修正忘却模块因数据类型错误无法正常工作的问题。
-- 修复 management 日志格式问题。
-
----
-
-## [v1.1.0-beta.4] - 2026-04-12
-
-### Added
-- 新增总结前查询角色名绑定。
-- 优化提示词。
-- 数据库写入优化为增量写入，添加迁移脚本。
-
-### Fixed
-- 修正忘却模块数据类型错误问题。
-
----
-
-## [v1.1.0-beta.3] - 2026-04-11
-
-### Added
-- 新增独立管理页面插件，统一挂载管理接口与 Swagger/OpenAPI。
-- 交互历史改为增量追加。
-- 新增回复日志本地管理 REST 接口。
-- 新增记忆库本地管理 REST 接口。
-
-### Changed
-- 重构知识库管理接口共享鉴权逻辑。
-- 简化日志记录，仅记录回复文本。
-- 移除内部 WebUI，使用 REST API 暴露外部管理接口。
-
-### Removed
-- 删除过时配置。
-
-### Test
-- 迁移单元测试至 NoneBug 框架。
-
----
-
-## [v1.1.0-beta.2] - 2026-04-09
-
-### Added
-- 为 `jrhg` 新增独立配置。
-
----
-
-## [v1.1.0-beta.1] - 2026-04-08
-
-### Added
-- `jrhg` 请求 LLM 生成问好回复。
-- 支持引用消息注入 `komari_chat` 上下文功能。
-
-### Fixed
-- 修复提示词中 XML 标签格式问题。
+- 本地向量支持、内置 WebUI、过时 `not_related` 空回功能。
 
 ---
 
 ## [v1.0.0] - 2026-03-31
 
-> **首个稳定版（v1.0.0）发布**。
+> **首个稳定版发布**。
 
 ### Core
-- **NoneBot2** 框架 + **OneBot V11** 适配器，QQ 机器人基础架构。
-- **插件体系**：18 个插件，分为基础服务层、核心功能层、辅助功能层。
+- **NoneBot2** + **OneBot V11**，QQ 机器人基础架构。
+- **18 个插件**：基础服务层 / 核心功能层 / 辅助功能层。
 
 ### Major Features
-- **AI 聊天**（`komari_chat`）：LLM 驱动的对话能力，支持 @触发、主动回复。
+- **AI 聊天**（`komari_chat`）：LLM 驱动对话，支持 @触发、主动回复。
 - **四层记忆系统**（`komari_memory`）：对话摘要、用户画像、互动历史、实体知识。
-- **RAG 知识库**（`komari_knowledge`）：向量检索 + 关键词匹配，提供 REST 管理 API。
-- **智能帮助**（`komari_help`）：基于向量检索的帮助文档系统。
-- **群聊总结**（`group_history_summary`）：@机器人后自动总结聊天记录，图片输出。
-- **好感度系统**：`.jrhg` 命令，LLM 生成个性化问好。
-- **角色绑定**：`.nn` 指令，自定义群内昵称。
-- **神人榜**：`.sr` 指令，随机抽取群友。
-- **Sentinel/运维**：Sentry 集成、Bark 推送、健康检查。
+- **RAG 知识库**（`komari_knowledge`）：向量检索 + 关键词匹配，REST 管理 API。
+- **智能帮助**（`komari_help`）：基于向量检索的帮助文档。
+- **群聊总结**（`group_history_summary`）：@触发自动总结，图片输出。
+- **好感度系统**（`.jrhg`）、角色绑定（`.nn`）、神人榜（`.sr`）。
+- **运维**：Sentry 集成、Bark 推送、健康检查。
 
 ### Infrastructure
-- **PostgreSQL + pgvector**：HNSW 向量索引，raw SQL（无 ORM）。
-- **Redis 7.1+**：`redis.asyncio` 异步客户端。
-- **FastAPI**：内嵌于 NoneBot2 的管理 API。
-- **Docker + Docker Compose**：容器化部署，Gunicorn + Uvicorn。
-- **GitHub Actions**：CI/CD 自动构建 Docker 镜像。
-
-### Dev
-- Python **3.13+** 专属，零容忍类型错误（Pyright `standard` + Ruff）。
-- Poetry 包管理。
+- **PostgreSQL + pgvector**（HNSW 索引，raw SQL）、**Redis 7.1+**（`redis.asyncio`）。
+- **FastAPI** 内嵌管理 API、**Docker Compose** 部署、**GitHub Actions** CI/CD。
+- Python **3.13+**，Pyright `standard` + Ruff 零容忍类型错误。
 
 ---
 
 ## [v0.7.0] - 2026-03-05
 
-> v1.0.0 之前的最后一个 milestone 版本，奠定了核心架构。
+> v1.0.0 之前的最后一个 milestone。
 
-### Features
-- 知识库注入（轻量 RAG + 关键词检索）。
-- 四层记忆系统初版。
-- AI 聊天增强（BERT 模型主动回复判定）。
-- `.nn` 指令复刻（自定义昵称）。
-- SR 插件重构（神人榜抽签）。
-- Bot 上下线 Bark 推送。
-- 独立的权限、配置、数据库管理插件。
-- 可自定义字体，图片布局配置驱动。
-
-### Changed
-- 统一数据库接入接口。
-- 总结只传递纯文字。
-- 提示词持续优化。
-- Docker 部署优化（dockerignore、action 构建修复）。
-
-### Fixed
-- 总结时触发主动回复的问题。
-- 总结触发词优化，添加超出范围提醒。
+- 知识库注入（RAG + 关键词检索）；四层记忆系统初版。
+- AI 聊天增强（BERT 主动回复判定）；`.nn` / `.sr` 复刻。
+- Bot 上下线 Bark 推送；权限/配置/数据库管理插件独立。
+- Docker 部署优化；统一数据库接入；提示词持续优化。
 
 ---
 
@@ -435,4 +159,4 @@
 
 ---
 
-*最后更新：2026-06-04（Unreleased 项精简化，新增子标题分类）*
+*压缩自原始 CHANGELOG（469 行 → 当前版本），保留关键变更条目，移除过度细化的子项目录和重复性 rc/beta 描述。完整历史可追溯 git log。*
