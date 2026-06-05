@@ -19,6 +19,9 @@ class _FakeSceneRepository:
     async def ensure_schema(self) -> None:
         return None
 
+    async def has_any_scene(self) -> bool:
+        return True
+
 
 class _FakeSceneRuntimeService:
     def __init__(self, repository: _FakeSceneRepository) -> None:
@@ -66,6 +69,11 @@ def test_initialize_cleans_up_when_bootstrap_fails(monkeypatch: Any) -> None:
         "get_plugin_manager",
         lambda: SimpleNamespace(pg_pool=object()),
         raising=False,
+    )
+    monkeypatch.setattr(
+        decision_plugin,
+        "require",
+        lambda name: memory_module if name == "komari_memory" else object(),
     )
     monkeypatch.setattr(
         decision_plugin,
