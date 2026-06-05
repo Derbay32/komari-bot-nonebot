@@ -11,6 +11,7 @@ from .announce_api import register_announce_api
 from .config_api import register_config_api
 from .config_schema import DEFAULT_ANNOUNCE_STATUS_PAGE_URL
 from .prompt_api import register_prompt_api
+from .scene_api import register_scene_api
 
 KNOWLEDGE_API_PREFIX = "/api/komari-knowledge/v1"
 HELP_API_PREFIX = "/api/komari-help/v1"
@@ -19,6 +20,7 @@ LLM_PROVIDER_API_PREFIX = "/api/llm-provider/v1"
 ANNOUNCE_API_PREFIX = "/api/komari-announce/v1"
 MANAGEMENT_CONFIG_API_PREFIX = "/api/komari-management-config/v1"
 MANAGEMENT_PROMPT_API_PREFIX = "/api/komari-management-prompt/v1"
+DECISION_SCENE_API_PREFIX = "/api/komari-decision-scenes/v1"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -115,12 +117,18 @@ def register_management_api_for_driver(
             DEFAULT_ANNOUNCE_STATUS_PAGE_URL,
         ),
     )
+    register_scene_api(
+        server_app,
+        api_token=settings.api_token,
+        allowed_origins=settings.allowed_origins,
+    )
     docs_url = getattr(server_app, "docs_url", None) or "未启用"
     openapi_url = getattr(server_app, "openapi_url", None) or "未启用"
     logger.info(
         "[Komari Management] 管理 API 已注册: "
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}, "
-        f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}"
+        f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
+        f"{DECISION_SCENE_API_PREFIX}"
     )
     logger.info(
         f"[Komari Management] 管理文档入口: docs={docs_url}, openapi={openapi_url}"

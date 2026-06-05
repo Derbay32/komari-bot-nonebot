@@ -1,0 +1,276 @@
+"""Komari Decision scenes 管理 REST API。"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
+from fastapi import Path as ApiPath
+from nonebot import logger
+from nonebot.plugin import require
+from pydantic import BaseModel, ConfigDict, Field
+from starlette import status
+
+from komari_bot.common.management_api import (
+    create_bearer_auth_dependency,
+    ensure_management_cors,
+)
+from komari_bot.plugins.komari_decision.repositories.scene_repository import (
+    SceneRepository,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+API_PREFIX = "/api/komari-decision-scenes/v1"
+_REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
+
+
+class SceneSummary(BaseModel):
+    """Scene 摘要。"""
+
+    scene_key: str
+    scene_type: Literal["fixed", "general"]
+    enabled: bool
+    order_index: int
+    content_hash: str
+    updated_at: str
+
+
+class SceneDetail(SceneSummary):
+    """Scene 详情。"""
+
+    content_text: str
+
+
+class SceneListResponse(BaseModel):
+    """Scene 列表响应。"""
+
+    items: list[SceneSummary]
+    total: int
+
+
+class ScenePutRequest(BaseModel):
+    """Scene 全量更新请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scene_type: Literal["fixed", "general"]
+    content_text: str = Field(min_length=1)
+    enabled: bool = True
+    order_index: int = 0
+
+
+class ScenePatchRequest(BaseModel):
+    """Scene 局部更新请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content_text: str | None = Field(default=None, min_length=1)
+    enabled: bool | None = None
+    order_index: int | None = None
+
+
+class SceneSyncResponse(BaseModel):
+    """Scene 同步触发响应。"""
+
+    triggered: bool
+    set_id: int | None = None
+    created: bool | None = None
+    reused_existing_set: bool | None = None
+    inserted_count: int | None = None
+    ready_count: int | None = None
+    pending_count: int | None = None
+    detail: str
+
+
+def _validation_error(message: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=message)
+
+
+def _not_found(message: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message)
+
+
+def _serialize_summary(row: dict[str, Any]) -> SceneSummary:
+    return SceneSummary(
+        scene_key=str(row["scene_key"]),
+        scene_type=cast("Literal['fixed', 'general']", str(row["scene_type"])),
+        enabled=bool(row["enabled"]),
+        order_index=int(row["order_index"]),
+        content_hash=str(row["content_hash"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _serialize_detail(row: dict[str, Any]) -> SceneDetail:
+    summary = _serialize_summary(row)
+    return SceneDetail(
+        **summary.model_dump(),
+        content_text=str(row["content_text"]),
+    )
+
+
+def _get_repository() -> SceneRepository:
+    decision_plugin = require("komari_decision")
+    manager_getter = getattr(decision_plugin, "get_plugin_manager", None)
+    if callable(manager_getter):
+        manager = manager_getter()
+        repository = getattr(manager, "scene_repository", None) if manager is not None else None
+        if repository is not None:
+            return cast("SceneRepository", repository)
+
+    memory_plugin = require("komari_memory")
+    memory_manager_getter = getattr(memory_plugin, "get_plugin_manager", None)
+    if not callable(memory_manager_getter):
+        msg = "KomariMemory 未导出 get_plugin_manager"
+        raise TypeError(msg)
+    memory_manager = memory_manager_getter()
+    pg_pool = getattr(memory_manager, "pg_pool", None) if memory_manager is not None else None
+    if pg_pool is None:
+        msg = "KomariMemory PostgreSQL 连接池未就绪"
+        raise RuntimeError(msg)
+    return SceneRepository(pg_pool)
+
+
+async def _prepare_repository() -> SceneRepository:
+    try:
+        repository = _get_repository()
+        await repository.ensure_schema()
+    except Exception as exc:
+        logger.exception("[Komari Management] 获取 scene repository 失败")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="scene repository 不可用",
+        ) from exc
+    else:
+        return repository
+
+
+def _validate_required_fixed_update(scene_key: str, scene_type: str, *, enabled: bool) -> None:
+    if scene_key not in _REQUIRED_FIXED_KEYS:
+        return
+    if scene_type != "fixed":
+        msg = f"必需 fixed scene 不允许改为其他类型: {scene_key}"
+        raise _validation_error(msg)
+    if not enabled:
+        msg = f"必需 fixed scene 不允许禁用: {scene_key}"
+        raise _validation_error(msg)
+
+
+def create_scene_router(*, api_token: str) -> APIRouter:
+    """创建 Komari Decision scenes 管理路由。"""
+    auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权访问 Komari Decision Scenes 接口",
+    )
+    router = APIRouter(
+        prefix=API_PREFIX,
+        dependencies=[Depends(auth_dependency)],
+        tags=["komari-decision-scenes"],
+    )
+
+    @router.get("/scenes", response_model=SceneListResponse)
+    async def list_scenes() -> SceneListResponse:
+        repository = await _prepare_repository()
+        rows = await repository.list_scenes(enabled_only=False)
+        items = [_serialize_summary(row) for row in rows]
+        return SceneListResponse(items=items, total=len(items))
+
+    @router.get("/scenes/{scene_key}", response_model=SceneDetail)
+    async def get_scene(scene_key: Annotated[str, ApiPath(min_length=1)]) -> SceneDetail:
+        repository = await _prepare_repository()
+        row = await repository.get_scene_by_key(scene_key)
+        if row is None:
+            detail = f"scene 不存在: {scene_key}"
+            raise _not_found(detail)
+        return _serialize_detail(row)
+
+    @router.put("/scenes/{scene_key}", response_model=SceneDetail)
+    async def put_scene(
+        scene_key: Annotated[str, ApiPath(min_length=1)],
+        payload: Annotated[ScenePutRequest, Body()],
+    ) -> SceneDetail:
+        _validate_required_fixed_update(scene_key, payload.scene_type, enabled=payload.enabled)
+        repository = await _prepare_repository()
+        try:
+            row = await repository.upsert_scene(
+                scene_key=scene_key,
+                scene_type=payload.scene_type,
+                content_text=payload.content_text,
+                enabled=payload.enabled,
+                order_index=payload.order_index,
+            )
+        except ValueError as exc:
+            raise _validation_error(str(exc)) from exc
+        return _serialize_detail(row)
+
+    @router.patch("/scenes/{scene_key}", response_model=SceneDetail)
+    async def patch_scene(
+        scene_key: Annotated[str, ApiPath(min_length=1)],
+        payload: Annotated[ScenePatchRequest, Body()],
+    ) -> SceneDetail:
+        repository = await _prepare_repository()
+        current = await repository.get_scene_by_key(scene_key)
+        if current is None:
+            detail = f"scene 不存在: {scene_key}"
+            raise _not_found(detail)
+        scene_type = str(current["scene_type"])
+        content_text = (
+            payload.content_text if payload.content_text is not None else str(current["content_text"])
+        )
+        enabled = payload.enabled if payload.enabled is not None else bool(current["enabled"])
+        order_index = (
+            payload.order_index if payload.order_index is not None else int(current["order_index"])
+        )
+        _validate_required_fixed_update(scene_key, scene_type, enabled=enabled)
+        try:
+            row = await repository.upsert_scene(
+                scene_key=scene_key,
+                scene_type=scene_type,
+                content_text=content_text,
+                enabled=enabled,
+                order_index=order_index,
+            )
+        except ValueError as exc:
+            raise _validation_error(str(exc)) from exc
+        return _serialize_detail(row)
+
+    @router.post("/sync", response_model=SceneSyncResponse)
+    async def sync_scenes() -> SceneSyncResponse:
+        decision_plugin = require("komari_decision")
+        manager_getter = getattr(decision_plugin, "get_plugin_manager", None)
+        manager = manager_getter() if callable(manager_getter) else None
+        scene_sync = getattr(manager, "scene_sync", None) if manager is not None else None
+        if scene_sync is None:
+            return SceneSyncResponse(
+                triggered=False,
+                detail="scene sync 服务未就绪；请确认 komari_decision scene 持久化已启用",
+            )
+        result = await scene_sync.build_scene_set()
+        return SceneSyncResponse(
+            triggered=True,
+            set_id=result.set_id,
+            created=result.created,
+            reused_existing_set=result.reused_existing_set,
+            inserted_count=result.inserted_count,
+            ready_count=result.ready_count,
+            pending_count=result.pending_count,
+            detail="scene sync 已触发，embedding 可能由后台任务异步完成",
+        )
+
+    return router
+
+
+def register_scene_api(
+    app: FastAPI,
+    *,
+    api_token: str,
+    allowed_origins: Sequence[str],
+) -> None:
+    """注册 Komari Decision scenes 管理 API。"""
+    if getattr(app.state, "komari_decision_scene_api_registered", False):
+        return
+    ensure_management_cors(app, allowed_origins)
+    app.include_router(create_scene_router(api_token=api_token))
+    app.state.komari_decision_scene_api_registered = True
