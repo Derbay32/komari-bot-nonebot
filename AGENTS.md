@@ -71,7 +71,7 @@ komari-bot/
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
   komari_search ────────────── Tavily 联网搜索服务
-  user_data ────────────────── 用户好感度数据库（SQLite）
+  user_data ────────────────── 当前好感度/用户属性 PostgreSQL 服务
 
 核心功能层
   komari_memory ────────────── 四层记忆系统
@@ -84,7 +84,6 @@ komari-bot/
 辅助功能层
   character_binding ────────── .nn 昵称指令
   sr ───────────────────────── 神人榜抽签
-  jrhg ─────────────────────── .jrhg 今日好感
   komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_sentry ────────────── Sentry 集成
   komari_management ────────── 管理 REST API
