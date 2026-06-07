@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          python - <<'PY'
+          python3 - <<'PY'
           from __future__ import annotations
 
           import json
@@ -180,7 +180,7 @@ jobs:
             mkdir -p komari-bot-deploy/app/data
           fi
 
-          python - <<'PY'
+          python3 - <<'PY'
           from __future__ import annotations
 
           import os
@@ -197,7 +197,7 @@ jobs:
           target.write_text(content, encoding="utf-8")
           PY
 
-          python - <<'PY'
+          python3 - <<'PY'
           from __future__ import annotations
 
           import os
