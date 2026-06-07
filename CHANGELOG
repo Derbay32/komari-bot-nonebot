@@ -36,6 +36,14 @@
 - **`<user_profiles>` 重命名 → `<user_keyword_knowledge>`**。
 - **预读取优化**：构建 prompt 前预读 PG 画像、Redis 近期互动缓冲（限 10 条）、PG 长期互动事件记忆。
 
+### 好感度系统重构
+- **当前值模型**：`user_data` 好感度从旧每日随机/累计/历史记录改为单一当前值，范围 `[0, 400]`，默认初始值 `100`。
+- **破坏性表重建**：启动时检测旧 `daily_favor` / `cumulative_favor` / `last_updated` 结构后直接重建 `user_favorability`，旧好感度历史不迁移。
+- **四阶段提示词**：统一 `0-99`、`100-199`、`200-299`、`300-400` 阶段定义，聊天 prompt 注入 `<favorability_stage>` 替代旧 `<favorability_modifier>`。
+- **LLM delta 工具**：新增并强制 `record_favorability_delta`，模型必须先记录本轮好感度变化再 `final_response`；业务代码仅在回复成功后提交 delta，避免重试重复写库。
+- **`user_data` API 更新**：新增/保留 `get_user_favorability()`、`adjust_user_favorability()`、`get_favorability_stage()`，移除旧每日生成、历史查询与格式化回复 API。
+- **迁移工具精简**：`tools/migrate_user_data_sqlite_to_pg.py` 只迁移 `user_attributes`，不再迁移旧好感度历史。
+
 ### 配置系统迁移
 - **配置持久化**：`config_manager` 从本地 JSON 迁移到 PG `komari_plugin_configs` 表。
 - **Prompt 存储**：`common/prompt_storage.py` 独立表 `komari_prompt_configs`，管理 Prompt API 读写该表。
@@ -47,6 +55,7 @@
 - **对话总结幂等**：`dedup_key` + partial unique index，`ON CONFLICT DO NOTHING`。
 
 ### Removed
+- **`.jrhg` 今日好感插件与命令**，好感度只随聊天回复自动调整，不再提供独立查询命令。
 - **`komari_healthcheck` 插件**（健康检查已迁移到 napcat 侧）。
 - **`nonebot-plugin-localstore` 依赖**。
 - **JSON 配置示例文件**。
