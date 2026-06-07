@@ -18,7 +18,7 @@ env:
 
 jobs:
   docker:
-    runs-on: docker
+    runs-on: codeberg-medium
 
     steps:
       - name: 检出代码
