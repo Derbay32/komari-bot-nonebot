@@ -123,9 +123,10 @@ class PluginManager:
                 )
             try:
                 loaded = await self.scene_runtime.load_active_set_cache()
-            except RuntimeError:
-                logger.exception(
-                    "[KomariDecision] 旧 active scene set 不可用，将进入 bootstrap 重建"
+            except RuntimeError as exc:
+                logger.warning(
+                    "[KomariDecision] 旧 active scene set 不可用，将进入 bootstrap 重建: {}",
+                    exc,
                 )
             else:
                 if loaded:
