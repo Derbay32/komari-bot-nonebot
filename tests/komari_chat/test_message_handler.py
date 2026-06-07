@@ -309,6 +309,8 @@ def test_attempt_reply_only_rewrites_current_message(
                 "result": "回复收到啦",
                 "emotion": "平静",
             },
+            favorability_delta=1,
+            favorability_reason="正常互动",
         )
 
     monkeypatch.setattr(
@@ -388,9 +390,13 @@ def test_attempt_reply_only_rewrites_current_message(
     ]
     assert build_prompt_kwargs["interaction_memories"] == [{"event_summary": "长期互动事件"}]
     assert llm_service_module.READ_PROFILE_TOOL in generate_with_tools_kwargs["tools"]
+    assert llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL in generate_with_tools_kwargs["tools"]
     assert generate_with_tools_kwargs["memory_service"] is memory
     assert generate_with_tools_kwargs["group_id"] == "group-1"
     assert generate_with_tools_kwargs["max_tool_rounds"] == 5
+    injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
+    assert injected_favorability.favorability == 100
+    assert generate_with_tools_kwargs["max_favorability_delta"] == 5
     pushed_record = redis.pushed_global_interactions[0]["record"]
     assert isinstance(pushed_record, dict)
     assert redis.pushed_global_interactions == [

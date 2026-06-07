@@ -121,6 +121,34 @@ def test_build_prompt_injects_search_tool_system_message(monkeypatch: Any) -> No
     assert "不要编造" in messages[3]["content"]
 
 
+def test_build_prompt_injects_current_favorability_stage(monkeypatch: Any) -> None:
+    _patch_dependencies(monkeypatch)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="你好",
+            memories=[],
+            config=_build_config(),
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            favorability=SimpleNamespace(
+                user_id="user-1",
+                favorability=123,
+                stage_index=2,
+                stage_name="普通熟人",
+                stage_prompt="正常交流，不额外亲昵。",
+            ),
+        )
+    )
+
+    joined = "\n".join(str(message["content"]) for message in messages)
+    assert "<favorability_stage>" in joined
+    assert "好感度：123/400" in joined
+    assert "阶段：2/4 普通熟人" in joined
+    assert "阶段提示：正常交流，不额外亲昵。" in joined
+    assert "<favorability_modifier>" not in joined
+
+
 def test_build_prompt_injects_only_current_user_profile(monkeypatch: Any) -> None:
     _patch_dependencies(monkeypatch)
 

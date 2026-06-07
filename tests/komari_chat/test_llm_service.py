@@ -259,6 +259,132 @@ def test_generate_reply_with_tools_executes_read_profile_tool(monkeypatch: Any) 
     assert "group_id" not in tool_message["content"]
 
 
+def test_generate_reply_with_tools_records_favorability_delta(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "record_favorability_delta",
+                    '{"delta":2,"reason":"友好互动"}',
+                    {"delta": 2, "reason": "友好互动"},
+                    call_id="call-favor",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "好吧，陪你说一会儿。",
+                        "interaction_history": {
+                            "event": "友好问候",
+                            "result": "正常回应",
+                            "emotion": "放松",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "你好"}],
+            tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
+        )
+    )
+
+    assert result.content == "好吧，陪你说一会儿。"
+    assert result.favorability_delta == 2
+    assert result.favorability_reason == "友好互动"
+    assert fake_provider.completion_calls[1]["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "call-favor",
+        "content": "已记录本轮好感度变化，最终回复生成成功后提交。",
+    }
+
+
+def test_generate_reply_with_tools_requires_favorability_before_final(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "先输出会被拒绝",
+                        "interaction_history": {
+                            "event": "直接输出",
+                            "result": "被要求补记录",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "record_favorability_delta",
+                    '{"delta":-1,"reason":"普通纠正"}',
+                    {"delta": -1, "reason": "普通纠正"},
+                    call_id="call-favor",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "补完记录后输出",
+                        "interaction_history": {
+                            "event": "补完记录",
+                            "result": "正常回复",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-2",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "纠错"}],
+            tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
+            max_tool_rounds=3,
+        )
+    )
+
+    assert result.content == "补完记录后输出"
+    assert result.favorability_delta == -1
+    round_two_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        "必须先调用 record_favorability_delta" in str(message.get("content", ""))
+        for message in round_two_messages
+    )
+
+
 def test_read_profile_tool_filters_keys(monkeypatch: Any) -> None:
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
