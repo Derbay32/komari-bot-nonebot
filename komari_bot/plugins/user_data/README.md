@@ -5,7 +5,7 @@
 ## 功能特性
 
 - 用户属性管理：按 `user_id + attribute_name` 存储通用属性。
-- 当前好感度：每个用户一个 `0-400` 的当前值，默认初始值为 `100`。
+- 当前好感度：每个用户一个 `0-400` 的当前值，默认初始值为 `0`。
 - 四阶段判定：`0-99`、`100-199`、`200-299`、`300-400`。
 - PostgreSQL 持久化：使用共享 PostgreSQL 连接池，无 SQLite 运行时依赖。
 - 原子调整：好感度增减在 SQL 事务中完成，并 clamp 到 `[0, 400]`。
@@ -17,7 +17,7 @@
 ```python
 plugin_enable = True
 data_retention_days = 30              # 用户属性保留天数
-initial_favorability = 100            # 新用户初始当前好感度
+initial_favorability = 0              # 新用户初始当前好感度
 max_favorability_delta_per_reply = 5  # 单次回复最大变化绝对值
 ```
 
