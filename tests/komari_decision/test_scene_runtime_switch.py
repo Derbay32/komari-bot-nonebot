@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, cast
 
+import pytest
+
 from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
     SceneRuntimeService,
 )
@@ -120,3 +122,12 @@ def test_runtime_load_and_switch() -> None:
 
     changed_after = asyncio.run(service.refresh_if_runtime_updated())
     assert changed_after is False
+
+
+def test_runtime_load_keeps_strict_fixed_embedding_validation() -> None:
+    repository = FakeSceneRepository()
+    repository.items[1][0]["embedding"] = None
+    service = SceneRuntimeService(cast("Any", repository))
+
+    with pytest.raises(RuntimeError, match="active set 缺少固定候选或 embedding"):
+        asyncio.run(service.load_active_set_cache())

@@ -44,15 +44,26 @@ class FakeEmbeddingWorker:
 
 
 class FakeRuntimeService:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_load: bool = False, fail_refresh: bool = False) -> None:
         self.switched_ids: list[int] = []
+        self.load_calls = 0
         self.refresh_calls = 0
+        self.fail_load = fail_load
+        self.fail_refresh = fail_refresh
+
+    async def load_active_set_cache(self) -> bool:
+        self.load_calls += 1
+        if self.fail_load:
+            raise RuntimeError
+        return True
 
     async def switch_active_set(self, set_id: int) -> None:
         self.switched_ids.append(set_id)
 
     async def refresh_if_runtime_updated(self) -> bool:
         self.refresh_calls += 1
+        if self.fail_refresh:
+            raise RuntimeError
         return True
 
 
@@ -135,6 +146,68 @@ def test_execute_task_skips_prune_when_set_not_new_and_not_activated(
     assert runtime_service.switched_ids == []
     assert runtime_service.refresh_calls == 1
     assert admin_service.prune_calls == 0
+
+
+def test_bootstrap_continues_when_active_cache_is_broken(monkeypatch: Any) -> None:
+    manager = SceneSyncTaskManager()
+    repository = FakeRepository(active_set_id=2)
+    runtime_service = FakeRuntimeService(fail_load=True)
+    embedding_worker = FakeEmbeddingWorker()
+    _patch_config(monkeypatch)
+    manager.register(
+        cast("Any", repository),
+        cast("Any", FakeAdminService()),
+        cast(
+            "Any",
+            FakeSyncService(
+                SimpleNamespace(
+                    set_id=3,
+                    created=False,
+                    reused_existing_set=False,
+                    pending_count=1,
+                )
+            ),
+        ),
+        cast("Any", embedding_worker),
+        cast("Any", runtime_service),
+    )
+
+    asyncio.run(manager.bootstrap())
+
+    assert runtime_service.load_calls == 1
+    assert embedding_worker.calls == [3]
+
+
+def test_execute_task_keeps_task_when_runtime_refresh_fails(monkeypatch: Any) -> None:
+    manager = SceneSyncTaskManager()
+    repository = FakeRepository(active_set_id=2)
+    runtime_service = FakeRuntimeService(fail_refresh=True)
+    admin_service = FakeAdminService()
+    _patch_config(monkeypatch)
+    manager.register(
+        cast("Any", repository),
+        cast("Any", admin_service),
+        cast(
+            "Any",
+            FakeSyncService(
+                SimpleNamespace(
+                    set_id=3,
+                    created=True,
+                    reused_existing_set=False,
+                    pending_count=0,
+                )
+            ),
+        ),
+        cast("Any", FakeEmbeddingWorker()),
+        cast("Any", runtime_service),
+    )
+
+    asyncio.run(manager._execute_task())
+
+    assert runtime_service.switched_ids == [3]
+    assert runtime_service.refresh_calls == 1
+    assert admin_service.prune_calls == 1
+    assert manager._runtime_service is runtime_service
 
 
 def test_unregister_clears_state_when_job_missing(monkeypatch: Any) -> None:

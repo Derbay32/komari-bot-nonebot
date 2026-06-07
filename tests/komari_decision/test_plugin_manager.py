@@ -24,10 +24,14 @@ class _FakeSceneRepository:
 
 
 class _FakeSceneRuntimeService:
+    fail_load = False
+
     def __init__(self, repository: _FakeSceneRepository) -> None:
         self.repository = repository
 
     async def load_active_set_cache(self) -> bool:
+        if self.fail_load:
+            raise RuntimeError
         return True
 
 
@@ -125,3 +129,82 @@ def test_initialize_cleans_up_when_bootstrap_fails(monkeypatch: Any) -> None:
     assert manager.scene_runtime is None
     assert manager.scene_sync is None
     assert manager.scene_embedding_worker is None
+
+
+def test_initialize_keeps_services_when_active_cache_is_broken(
+    monkeypatch: Any,
+) -> None:
+    manager = decision_plugin.PluginManager()
+    memory_module = sys.modules["komari_bot.plugins.komari_memory"]
+    calls = {"register": 0, "bootstrap": 0, "unregister": 0}
+    _FakeSceneRuntimeService.fail_load = True
+
+    monkeypatch.setattr(
+        nonebot.plugin,
+        "require",
+        lambda _name: object(),
+    )
+    monkeypatch.setattr(
+        memory_module,
+        "get_plugin_manager",
+        lambda: SimpleNamespace(pg_pool=object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        decision_plugin,
+        "require",
+        lambda name: memory_module if name == "komari_memory" else object(),
+    )
+    monkeypatch.setattr(
+        decision_plugin,
+        "get_config",
+        lambda: SimpleNamespace(scene_persist_enabled=True),
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.repositories.scene_repository.SceneRepository",
+        _FakeSceneRepository,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_runtime_service.SceneRuntimeService",
+        _FakeSceneRuntimeService,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_sync_service.SceneSyncService",
+        _FakeSceneSyncService,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_embedding_worker.SceneEmbeddingWorker",
+        _FakeSceneEmbeddingWorker,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_admin_service.SceneAdminService",
+        _FakeSceneAdminService,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.register_scene_sync_task",
+        lambda *_args: calls.__setitem__("register", calls["register"] + 1),
+    )
+
+    async def _bootstrap() -> None:
+        calls["bootstrap"] += 1
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.bootstrap_scene_sync_task",
+        _bootstrap,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.unregister_scene_sync_task",
+        lambda: calls.__setitem__("unregister", calls["unregister"] + 1),
+    )
+
+    try:
+        asyncio.run(manager.initialize())
+    finally:
+        _FakeSceneRuntimeService.fail_load = False
+
+    assert calls == {"register": 1, "bootstrap": 1, "unregister": 0}
+    assert manager.scene_repository is not None
+    assert manager.scene_admin is not None
+    assert manager.scene_runtime is not None
+    assert manager.scene_sync is not None
+    assert manager.scene_embedding_worker is not None
