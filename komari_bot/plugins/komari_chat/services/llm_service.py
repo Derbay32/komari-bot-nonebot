@@ -33,6 +33,7 @@ READ_IMAGE_TOOL_NAME = "read_image"
 SEARCH_WEB_TOOL_NAME = "search_web"
 READ_PROFILE_TOOL_NAME = "read_profile"
 FINAL_RESPONSE_TOOL_NAME = "final_response"
+RECORD_FAVORABILITY_DELTA_TOOL_NAME = "record_favorability_delta"
 _EMPTY_TOOLS_ERROR = "tools 不能为空，无工具场景请使用 generate_reply()"
 _MISSING_FINAL_CONTENT_ERROR = "final_response 缺少有效的 'content' 字段"
 _MISSING_INTERACTION_HISTORY_ERROR = (
@@ -44,6 +45,12 @@ _INCOMPLETE_INTERACTION_HISTORY_ERROR = (
 _MISSING_MESSAGES_ERROR = (
     "generate_reply() 需要 messages 参数以强制生成 interaction_history"
 )
+_INVALID_FAVORABILITY_DELTA_JSON_ERROR = "record_favorability_delta 参数不是合法 JSON"
+_MISSING_FAVORABILITY_DELTA_ARGUMENTS_ERROR = "record_favorability_delta 参数缺失"
+_INVALID_FAVORABILITY_DELTA_TYPE_ERROR = (
+    "record_favorability_delta.delta 必须是整数且不能是 bool"
+)
+_INVALID_FAVORABILITY_REASON_ERROR = "record_favorability_delta.reason 不能为空"
 
 READ_IMAGE_TOOL: dict[str, Any] = {
     "type": "function",
@@ -161,6 +168,33 @@ FINAL_RESPONSE_TOOL: dict[str, Any] = {
     },
 }
 
+RECORD_FAVORABILITY_DELTA_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": RECORD_FAVORABILITY_DELTA_TOOL_NAME,
+        "description": (
+            "记录本轮回复对当前触发用户好感度造成的变化。"
+            "每次最终回复前必须调用一次；只记录待提交结果，不会立即写入数据库。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "delta": {
+                    "type": "integer",
+                    "minimum": -5,
+                    "maximum": 3,
+                    "description": "本轮好感度变化值，负向最低 -5，正向最高 3。",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "一句话说明本轮变化原因，仅用于日志，不会展示给用户。",
+                },
+            },
+            "required": ["delta", "reason"],
+        },
+    },
+}
+
 
 class InteractionHistoryRecord(TypedDict):
     """单轮聊天同步生成的互动历史记录。"""
@@ -176,6 +210,8 @@ class ReplyResult:
 
     content: str
     interaction_history: InteractionHistoryRecord
+    favorability_delta: int | None = None
+    favorability_reason: str | None = None
 
 
 def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
@@ -283,7 +319,12 @@ def _extract_json_from_markdown(text: str) -> str:
     return text.strip()
 
 
-def _parse_reply_result(parsed: dict[str, Any]) -> ReplyResult:
+def _parse_reply_result(
+    parsed: dict[str, Any],
+    *,
+    favorability_delta: int | None = None,
+    favorability_reason: str | None = None,
+) -> ReplyResult:
     """从 final_response 工具参数构造回复结果。"""
     content_raw = parsed.get("content")
     if not isinstance(content_raw, str) or not content_raw.strip():
@@ -307,6 +348,8 @@ def _parse_reply_result(parsed: dict[str, Any]) -> ReplyResult:
     return ReplyResult(
         content=content_raw.strip(),
         interaction_history=interaction_history,
+        favorability_delta=favorability_delta,
+        favorability_reason=favorability_reason,
     )
 
 
@@ -357,6 +400,42 @@ def _parse_search_query(
     if isinstance(query, str) and query.strip():
         return query.strip()
     return None
+
+
+def _parse_favorability_delta(
+    arguments: dict[str, Any] | None,
+    raw_arguments: str,
+    *,
+    max_abs_delta: int,
+) -> tuple[int, str]:
+    """解析并校验本轮好感度变化工具参数。"""
+    payload = arguments
+    if payload is None and raw_arguments:
+        try:
+            loaded = json.loads(raw_arguments)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError as exc:
+            raise ValueError(_INVALID_FAVORABILITY_DELTA_JSON_ERROR) from exc
+
+    if not payload:
+        raise ValueError(_MISSING_FAVORABILITY_DELTA_ARGUMENTS_ERROR)
+
+    delta_raw = payload.get("delta")
+    if isinstance(delta_raw, bool) or not isinstance(delta_raw, int):
+        raise TypeError(_INVALID_FAVORABILITY_DELTA_TYPE_ERROR)
+    if abs(delta_raw) > max_abs_delta:
+        msg = f"record_favorability_delta.delta 超出允许范围 ±{max_abs_delta}"
+        raise ValueError(
+            msg
+        )
+
+    reason_raw = payload.get("reason")
+    reason = reason_raw.strip() if isinstance(reason_raw, str) else ""
+    if not reason:
+        raise ValueError(_INVALID_FAVORABILITY_REASON_ERROR)
+
+    return delta_raw, reason
 
 
 def _parse_read_profile_arguments(
@@ -548,7 +627,8 @@ def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
         str(name)
         for tool in tools
         if (name := tool.get("function", {}).get("name"))
-        and name != FINAL_RESPONSE_TOOL_NAME
+        and name
+        not in {FINAL_RESPONSE_TOOL_NAME, RECORD_FAVORABILITY_DELTA_TOOL_NAME}
     }
     if not tool_names:
         return "normal_reply"
@@ -628,6 +708,7 @@ async def _execute_tool_loop(
     max_tool_rounds: int,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
+    max_favorability_delta: int = 5,
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。"""
     current_messages = list(messages)
@@ -637,6 +718,12 @@ async def _execute_tool_loop(
         tool.get("function", {}).get("name") == READ_IMAGE_TOOL_NAME
         for tool in tool_definitions
     )
+    requires_favorability_delta = any(
+        tool.get("function", {}).get("name") == RECORD_FAVORABILITY_DELTA_TOOL_NAME
+        for tool in tool_definitions
+    )
+    pending_favorability_delta: int | None = None
+    pending_favorability_reason: str | None = None
 
     for round_num in range(1, max_tool_rounds + 1):
         model = vision_model if has_vision_tool else config.llm_model_chat
@@ -680,7 +767,43 @@ async def _execute_tool_loop(
                         f"{request_phase_prefix} 第 {round_num} 轮：final_response 缺少 parsed_arguments"
                     )
                     raise RuntimeError(msg)
-                return _parse_reply_result(tool_call.parsed_arguments)
+                if requires_favorability_delta and pending_favorability_delta is None:
+                    current_messages.append(
+                        _build_tool_call_message(
+                            completion.tool_calls,
+                            completion.content or "",
+                        )
+                    )
+                    current_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id or tool_name,
+                            "content": "必须先调用 record_favorability_delta 记录本轮好感度变化，再调用 final_response。",
+                        }
+                    )
+                    continue
+                return _parse_reply_result(
+                    tool_call.parsed_arguments,
+                    favorability_delta=pending_favorability_delta,
+                    favorability_reason=pending_favorability_reason,
+                )
+
+            if tool_name == RECORD_FAVORABILITY_DELTA_TOOL_NAME:
+                delta, reason = _parse_favorability_delta(
+                    tool_call.parsed_arguments,
+                    tool_call.raw_arguments or tool_call.function.arguments,
+                    max_abs_delta=max_favorability_delta,
+                )
+                pending_favorability_delta = delta
+                pending_favorability_reason = reason
+                business_tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id or tool_name,
+                        "content": "已记录本轮好感度变化，最终回复生成成功后提交。",
+                    }
+                )
+                continue
 
             result = await _execute_business_tool(
                 tool_call=tool_call,
@@ -722,6 +845,7 @@ async def generate_reply_with_tools(
     max_tool_rounds: int = 3,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
+    max_favorability_delta: int = 5,
 ) -> ReplyResult:
     """通过工具调用模式生成回复，调用方显式指定启用工具列表。"""
     if not tools:
@@ -754,6 +878,7 @@ async def generate_reply_with_tools(
         max_tool_rounds=max_tool_rounds,
         memory_service=memory_service,
         group_id=group_id,
+        max_favorability_delta=max_favorability_delta,
     )
 
 

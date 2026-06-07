@@ -20,44 +20,13 @@ from .reply_context import ReplyContext  # noqa: TC001
 
 if TYPE_CHECKING:
     from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
+    from komari_bot.plugins.user_data.models import UserFavorability
 
 # 获取常识库插件
 komari_knowledge = require("komari_knowledge")
 
 # 获取角色绑定插件
 character_binding = require("character_binding")
-
-
-def _resolve_favor_level(daily_favor: int) -> str:
-    if daily_favor <= 25:
-        return "冷淡"
-    if daily_favor <= 50:
-        return "中性"
-    if daily_favor <= 75:
-        return "友好"
-    return "非常友好"
-
-
-def _resolve_favor_description(daily_favor: int) -> str:
-    if daily_favor <= 25:
-        return (
-            "今日小鞠对这位用户兴致不高，态度偏淡漠，不会有太多主动交流的意愿，"
-            "回复保持礼貌但疏远"
-        )
-    if daily_favor <= 50:
-        return (
-            "今日小鞠对这位用户的态度正常，没有特别的亲近或疏远，"
-            "按照平时的关系和印象来互动即可"
-        )
-    if daily_favor <= 75:
-        return (
-            "今日小鞠对这位用户心情不错，比平时更愿意多聊几句，"
-            "语气中带着一些亲近感，偶尔会主动关心"
-        )
-    return (
-        "今日小鞠格外亲近这位用户，说话时会不自觉地更加坦诚和温柔，"
-        "甚至愿意分享一些平时不会说的事"
-    )
 
 
 def _clean_yaml_text(value: object) -> str:
@@ -232,8 +201,7 @@ async def build_prompt(
     reply_context: ReplyContext | None = None,
     reply_image_urls: list[str] | None = None,
     query_embedding: list[float] | None = None,
-    favor_daily: int | None = None,
-    favor_user_id: str | None = None,
+    favorability: UserFavorability | None = None,
     current_user_profile: dict[str, Any] | None = None,
     interaction_records: list[dict[str, Any]] | None = None,
     interaction_memories: list[dict[str, Any]] | None = None,
@@ -247,7 +215,7 @@ async def build_prompt(
     ① system    — 静态角色设定
     ② system    — 静态输出格式指令
     ③ user/asst — 对话历史（Redis buffer 交替构造）
-    ④ user      — 动态上下文（时间、记忆、知识库、实体、好感度）
+    ④ user      — 动态上下文（时间、记忆、知识库、实体、当前好感度阶段）
     ⑤ user      — 当前用户消息
     ⑥ assistant — 旧版预填充（可选）
 
@@ -489,25 +457,22 @@ async def build_prompt(
 
     del memory_service, group_id
 
-    if favor_daily is not None:
+    if favorability is not None:
         favor_display_name = (
             character_binding.get_character_name(
-                user_id=favor_user_id,
+                user_id=favorability.user_id,
                 fallback_nickname=current_user_nickname,
             )
-            if favor_user_id
-            else (current_user_nickname or "当前用户")
         )
-        favor_level = _resolve_favor_level(favor_daily)
-        favor_description = _resolve_favor_description(favor_daily)
         dynamic_parts.append(
             "\n".join(
                 [
-                    "<favorability_modifier>",
-                    "[注意：此修饰为基于普通态度的加值，优先级低于<long_term_relation>和<interaction_memory>中的实际关系描述]",
-                    f"今日小鞠对用户({favor_display_name})的好感度：{favor_daily}（{favor_level}）",
-                    f"影响描述：{favor_description}",
-                    "</favorability_modifier>",
+                    "<favorability_stage>",
+                    f"当前用户：{favor_display_name}",
+                    f"好感度：{favorability.favorability}/400",
+                    f"阶段：{favorability.stage_index}/4 {favorability.stage_name}",
+                    f"阶段提示：{favorability.stage_prompt}",
+                    "</favorability_stage>",
                 ]
             )
         )

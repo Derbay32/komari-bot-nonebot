@@ -29,6 +29,7 @@ from ..services.image_downloader import download_images_as_base64, extract_image
 from ..services.llm_service import (
     READ_IMAGE_TOOL,
     READ_PROFILE_TOOL,
+    RECORD_FAVORABILITY_DELTA_TOOL,
     TAVILY_SEARCH_TOOL,
     InteractionHistoryRecord,
     generate_reply,
@@ -38,10 +39,7 @@ from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
 
-try:
-    user_data_plugin = require("user_data")
-except Exception:
-    user_data_plugin = None
+user_data_plugin = require("user_data")
 
 config_manager_plugin = require("config_manager")
 komari_search_plugin = require("komari_search")
@@ -403,7 +401,6 @@ class MessageHandler:
             reason=reason,
             reply_score=outcome.reply_score,
             store_current=memory_store,
-            best_scene_id=outcome.best_scene_id,
             on_reply_triggered=on_reply_triggered,
         )
         if reply is not None:
@@ -498,7 +495,7 @@ class MessageHandler:
         """解析写入跨群互动缓冲的用户显示名。"""
         return str(message.user_nickname or message.user_id).strip() or message.user_id
 
-    async def _attempt_reply(
+    async def _attempt_reply(  # noqa: PLR0911
         self,
         *,
         message: MessageSchema,
@@ -511,7 +508,6 @@ class MessageHandler:
         reason: AttemptReplyReason,
         reply_score: float | None,
         store_current: bool,
-        best_scene_id: str | None = None,
         on_reply_triggered: ReplyTriggeredCallback | None = None,
     ) -> tuple[dict[str, str] | None, bool]:
         """尝试生成并返回回复。
@@ -521,8 +517,6 @@ class MessageHandler:
         """
         config = get_config()
         stored = False
-        favor_daily: int | None = None
-        favor_level: str | None = None
 
         if not force_reply:
             if not config.proactive_enabled:
@@ -657,18 +651,11 @@ class MessageHandler:
                 use_vision_tool,
             )
 
-        if user_data_plugin is not None:
-            try:
-                favor_result = await user_data_plugin.generate_or_update_favorability(
-                    message.user_id
-                )
-                favor_daily = favor_result.daily_favor
-                favor_level = favor_result.favor_level
-            except Exception:
-                logger.debug(
-                    "[KomariChat] 获取今日好感度失败，跳过好感度注入",
-                    exc_info=True,
-                )
+        try:
+            favorability = await user_data_plugin.get_user_favorability(message.user_id)
+        except Exception as exc:
+            logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
+            return None, stored
 
         prompt_messages = await build_prompt(
             user_message=message.content,
@@ -684,8 +671,7 @@ class MessageHandler:
             reply_context=reply_context,
             reply_image_urls=reply_image_urls,
             query_embedding=query_embedding,
-            favor_daily=favor_daily,
-            favor_user_id=message.user_id,
+            favorability=favorability,
             current_user_profile=current_user_profile,
             interaction_records=interaction_records,
             interaction_memories=interaction_memories,
@@ -693,7 +679,7 @@ class MessageHandler:
             search_tool_mode=use_search_tool,
         )
 
-        tools: list[dict[str, Any]] = [READ_PROFILE_TOOL]
+        tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
         if use_vision_tool:
             tools.append(READ_IMAGE_TOOL)
         if use_search_tool:
@@ -721,6 +707,7 @@ class MessageHandler:
                 max_tool_rounds=5,
                 memory_service=self.memory,
                 group_id=message.group_id,
+                max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
             )
         else:
             reply_result = await generate_reply(
@@ -738,23 +725,26 @@ class MessageHandler:
             )
             return None, stored
 
-        if best_scene_id == "scene_direct_interaction" and favor_daily is not None:
-            try:
-                is_first_greeting = not await self.redis.is_favor_greeted(
-                    message.group_id,
-                    message.user_id,
-                )
-                if is_first_greeting:
-                    reply = (
-                        f"{reply}\n【小鞠对{message.user_nickname}今日的好感为"
-                        f"{favor_daily}，态度：{favor_level or '中性'}】"
-                    )
-                    await self.redis.mark_favor_greeted(
-                        message.group_id,
-                        message.user_id,
-                    )
-            except Exception:
-                logger.warning("[KomariChat] 好感文案追加失败，跳过", exc_info=True)
+        if reply_result.favorability_delta is None:
+            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
+            return None, stored
+
+        try:
+            adjust_result = await user_data_plugin.adjust_user_favorability(
+                message.user_id,
+                reply_result.favorability_delta,
+            )
+            logger.info(
+                "[KomariChat] 好感度已更新: user={} before={} delta={} after={} reason={}",
+                message.user_id,
+                adjust_result.before,
+                adjust_result.delta,
+                adjust_result.after,
+                reply_result.favorability_reason or "-",
+            )
+        except Exception:
+            logger.warning("[KomariChat] 好感度提交失败，按生成失败处理", exc_info=True)
+            return None, stored
 
         await self._store_ai_reply(
             group_id=message.group_id,
