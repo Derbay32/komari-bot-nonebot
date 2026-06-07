@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-> 当前 `dev` 分支上尚未发版的变更。围绕五大主题。
+> 当前 `dev` 分支上尚未发版的变更。
+
+---
+
+## [v1.2.0-rc.1] - 2026-06-08
 
 ### 判定场景 PostgreSQL 内容表迁移
 - **`komari_decision_scenes` 内容主表**：独立 PG 表作为 scene 唯一运行时 source of truth，`scene_id` 外键关联向量快照表。
@@ -63,6 +67,7 @@
 
 ### Fixed
 - 陈旧测试断言、对话总结重试重复写入、时间戳泄漏、PromptStorage 超时/init 不可重试、API 异常信息泄露。
+- 修复无法加载旧 scene set 时，不会自动重建 embedding 的问题
 
 ---
 
