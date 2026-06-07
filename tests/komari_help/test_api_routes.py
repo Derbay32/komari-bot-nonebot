@@ -42,7 +42,7 @@ class _FakeEngine:
     def __init__(self) -> None:
         self.entries = {
             1: _build_entry(),
-            2: _build_entry(hid=2, title="今日好感", plugin_name="jrhg"),
+            2: _build_entry(hid=2, title="神人榜", plugin_name="sr"),
         }
         self.list_calls: list[tuple[int, int, str | None, str | None]] = []
         self.add_calls: list[
