@@ -112,10 +112,10 @@ class _DummyUserDataPlugin:
     async def get_user_favorability(user_id: str) -> object:
         return SimpleNamespace(
             user_id=user_id,
-            favorability=100,
-            stage_index=2,
-            stage_name="普通熟人",
-            stage_prompt="正常交流即可，不额外亲昵。",
+            favorability=0,
+            stage_index=1,
+            stage_name="疏离戒备",
+            stage_prompt="当前关系偏疏离和戒备，回复应克制、保持距离，不主动表现亲昵。",
             updated_at="2026-06-07T00:00:00+00:00",
         )
 
@@ -123,11 +123,11 @@ class _DummyUserDataPlugin:
     async def adjust_user_favorability(user_id: str, delta: int) -> object:
         return SimpleNamespace(
             user_id=user_id,
-            before=100,
+            before=0,
             delta=delta,
-            after=max(0, min(400, 100 + delta)),
-            stage_index=2,
-            stage_name="普通熟人",
+            after=max(0, min(400, delta)),
+            stage_index=1,
+            stage_name="疏离戒备",
             updated_at="2026-06-07T00:00:00+00:00",
         )
 

@@ -395,7 +395,7 @@ def test_attempt_reply_only_rewrites_current_message(
     assert generate_with_tools_kwargs["group_id"] == "group-1"
     assert generate_with_tools_kwargs["max_tool_rounds"] == 5
     injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
-    assert injected_favorability.favorability == 100
+    assert injected_favorability.favorability == 0
     assert generate_with_tools_kwargs["max_favorability_delta"] == 5
     pushed_record = redis.pushed_global_interactions[0]["record"]
     assert isinstance(pushed_record, dict)
