@@ -95,7 +95,12 @@ class SceneSyncTaskManager:
             return
 
         try:
-            await self._runtime_service.load_active_set_cache()
+            try:
+                await self._runtime_service.load_active_set_cache()
+            except RuntimeError:
+                logger.exception(
+                    "[KomariDecision] bootstrap 预热 active scene set 失败，将继续重建"
+                )
             await self._execute_task(max_batches=self._MAX_BATCHES_BOOTSTRAP)
         except Exception:
             logger.exception("[KomariDecision] scene bootstrap 失败")
@@ -167,7 +172,10 @@ class SceneSyncTaskManager:
                 )
 
             activated = await self._activate_if_ready(sync_result.set_id)
-            await self._runtime_service.refresh_if_runtime_updated()
+            try:
+                await self._runtime_service.refresh_if_runtime_updated()
+            except RuntimeError:
+                logger.exception("[KomariDecision] scene runtime cache 刷新失败")
             if sync_result.created or activated:
                 await self._prune_ready_sets()
         except Exception:

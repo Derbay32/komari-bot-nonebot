@@ -121,13 +121,19 @@ class PluginManager:
                 logger.warning(
                     "[KomariDecision] komari_decision_scenes 为空；请运行迁移脚本或通过管理 API 初始化 scenes"
                 )
-            loaded = await self.scene_runtime.load_active_set_cache()
-            if loaded:
-                logger.info("[KomariDecision] scene runtime cache 初始化成功")
-            else:
-                logger.warning(
-                    "[KomariDecision] 当前无 active scene set，runtime cache 为空"
+            try:
+                loaded = await self.scene_runtime.load_active_set_cache()
+            except RuntimeError:
+                logger.exception(
+                    "[KomariDecision] 旧 active scene set 不可用，将进入 bootstrap 重建"
                 )
+            else:
+                if loaded:
+                    logger.info("[KomariDecision] scene runtime cache 初始化成功")
+                else:
+                    logger.warning(
+                        "[KomariDecision] 当前无 active scene set，runtime cache 为空"
+                    )
             register_scene_sync_task(
                 scene_repository,
                 scene_admin,
