@@ -147,6 +147,7 @@ class PromptMigrationResource:
     resource_id: str
     display_name: str
     legacy_file_path: Path
+    default_file_name: str
     defaults: dict[str, str]
 
 
@@ -155,21 +156,34 @@ _RESOURCES = (
         resource_id="komari_chat",
         display_name="Komari Chat Prompt",
         legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
+        default_file_name="komari_memory.yaml",
         defaults=KOMARI_CHAT_PROMPT_DEFAULTS,
     ),
     PromptMigrationResource(
         resource_id="komari_memory_summary",
         display_name="Komari Memory Summary Prompt",
         legacy_file_path=Path("config") / "prompts" / "komari_memory_summary.yaml",
+        default_file_name="komari_memory_summary.yaml",
         defaults=KOMARI_MEMORY_SUMMARY_PROMPT_DEFAULTS,
     ),
     PromptMigrationResource(
         resource_id="group_history_summary",
         display_name="Group History Summary Prompt",
         legacy_file_path=Path("config") / "prompts" / "group_history_summary.yaml",
+        default_file_name="group_history_summary.yaml",
         defaults=GROUP_HISTORY_PROMPT_DEFAULTS,
     ),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PromptPathConfig:
+    """迁移脚本使用的提示词文件路径配置。"""
+
+    prompt_dir: Path | None
+    komari_chat: Path | None
+    komari_memory_summary: Path | None
+    group_history_summary: Path | None
 
 
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
@@ -281,13 +295,33 @@ def validate_prompt_values(
     return cleaned
 
 
-def _collect_prompt_values(resource: PromptMigrationResource) -> dict[str, str] | None:
-    legacy_file_path = PROJECT_ROOT / resource.legacy_file_path
-    if not legacy_file_path.exists():
-        logger.info("跳过不存在的提示词文件: %s", legacy_file_path)
+def _resolve_project_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def _resolve_prompt_path(
+    resource: PromptMigrationResource,
+    prompt_paths: PromptPathConfig,
+) -> Path:
+    resource_path = getattr(prompt_paths, resource.resource_id)
+    if resource_path is not None:
+        return _resolve_project_path(resource_path)
+    if prompt_paths.prompt_dir is not None:
+        return _resolve_project_path(prompt_paths.prompt_dir / resource.default_file_name)
+    return PROJECT_ROOT / resource.legacy_file_path
+
+
+def _collect_prompt_values(
+    resource: PromptMigrationResource,
+    prompt_path: Path,
+) -> dict[str, str] | None:
+    if not prompt_path.exists():
+        logger.info("跳过不存在的提示词文件: %s", prompt_path)
         return None
 
-    data = _load_yaml_mapping(legacy_file_path)
+    data = _load_yaml_mapping(prompt_path)
     allowed_data = {
         key: value
         for key, value in data.items()
@@ -330,7 +364,12 @@ async def _upsert_prompt(
     )
 
 
-async def migrate_prompts(*, dry_run: bool, dotenv_path: Path) -> dict[str, int]:
+async def migrate_prompts(
+    *,
+    dry_run: bool,
+    dotenv_path: Path,
+    prompt_paths: PromptPathConfig,
+) -> dict[str, int]:
     """迁移本轮支持的字符串 prompt。"""
     stats = {"success": 0, "skipped": 0, "failed": 0}
     conn: asyncpg.Connection | None = None
@@ -350,8 +389,9 @@ async def migrate_prompts(*, dry_run: bool, dotenv_path: Path) -> dict[str, int]
 
     try:
         for resource in _RESOURCES:
+            prompt_path = _resolve_prompt_path(resource, prompt_paths)
             try:
-                values = _collect_prompt_values(resource)
+                values = _collect_prompt_values(resource, prompt_path)
                 if values is None:
                     stats["skipped"] += 1
                     continue
@@ -371,13 +411,13 @@ async def migrate_prompts(*, dry_run: bool, dotenv_path: Path) -> dict[str, int]
                     )
                     logger.info(
                         "已导入提示词: %s -> %s",
-                        PROJECT_ROOT / resource.legacy_file_path,
+                        prompt_path,
                         resource.resource_id,
                     )
             except Exception:
                 logger.exception(
                     "迁移提示词失败: %s",
-                    PROJECT_ROOT / resource.legacy_file_path,
+                    prompt_path,
                 )
                 stats["failed"] += 1
                 continue
@@ -402,13 +442,43 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DOTENV_PATH,
         help="dotenv 配置文件路径，默认读取项目根目录 .env",
     )
+    parser.add_argument(
+        "--prompt-dir",
+        type=Path,
+        help="提示词 YAML 目录，默认读取项目根目录 config/prompts",
+    )
+    parser.add_argument(
+        "--komari-chat-prompt",
+        type=Path,
+        help="komari_chat 提示词 YAML 路径",
+    )
+    parser.add_argument(
+        "--komari-memory-summary-prompt",
+        type=Path,
+        help="komari_memory_summary 提示词 YAML 路径",
+    )
+    parser.add_argument(
+        "--group-history-summary-prompt",
+        type=Path,
+        help="group_history_summary 提示词 YAML 路径",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    prompt_paths = PromptPathConfig(
+        prompt_dir=args.prompt_dir,
+        komari_chat=args.komari_chat_prompt,
+        komari_memory_summary=args.komari_memory_summary_prompt,
+        group_history_summary=args.group_history_summary_prompt,
+    )
     stats = asyncio.run(
-        migrate_prompts(dry_run=args.dry_run, dotenv_path=args.dotenv)
+        migrate_prompts(
+            dry_run=args.dry_run,
+            dotenv_path=args.dotenv,
+            prompt_paths=prompt_paths,
+        )
     )
     logger.info(
         "迁移统计: success=%s skipped=%s failed=%s",
