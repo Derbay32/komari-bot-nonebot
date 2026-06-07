@@ -67,7 +67,7 @@ _ensure_package_shim("llm_provider")
 _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
-_ensure_package_shim("jrhg")
+_ensure_package_shim("user_data")
 
 
 class _DummyConfigManager:
@@ -103,22 +103,33 @@ class _DummyLLMProvider:
 
 class _DummyUserDataPlugin:
     @staticmethod
-    async def generate_or_update_favorability(_user_id: str) -> object:
+    def get_config() -> object:
         return SimpleNamespace(
-            daily_favor=50,
-            cumulative_favor=50,
-            is_new_day=False,
-            favor_level="中性",
+            max_favorability_delta_per_reply=5,
         )
 
     @staticmethod
-    async def format_favor_response(
-        ai_response: str,
-        user_nickname: str,
-        daily_favor: int,
-    ) -> str:
-        del user_nickname, daily_favor
-        return ai_response
+    async def get_user_favorability(user_id: str) -> object:
+        return SimpleNamespace(
+            user_id=user_id,
+            favorability=100,
+            stage_index=2,
+            stage_name="普通熟人",
+            stage_prompt="正常交流即可，不额外亲昵。",
+            updated_at="2026-06-07T00:00:00+00:00",
+        )
+
+    @staticmethod
+    async def adjust_user_favorability(user_id: str, delta: int) -> object:
+        return SimpleNamespace(
+            user_id=user_id,
+            before=100,
+            delta=delta,
+            after=max(0, min(400, 100 + delta)),
+            stage_index=2,
+            stage_name="普通熟人",
+            updated_at="2026-06-07T00:00:00+00:00",
+        )
 
 
 class _DummyPermissionManagerPlugin:
