@@ -84,7 +84,7 @@ def _is_command_message(text: str) -> bool:
 
     规则：
     1. 匹配“总结过去XX条 / 总结XX条”
-    2. 以 。/.// 开头（如 .jrhg、/bind、。help）
+    2. 以 。/.// 开头（如 .sr、/bind、。help）
     """
     normalized = "".join(text.split())
     if not normalized:
