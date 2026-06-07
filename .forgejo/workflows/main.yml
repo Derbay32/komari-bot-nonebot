@@ -67,6 +67,14 @@ jobs:
           apt-get update
           apt-get install -y docker-ce-cli docker-buildx-plugin
 
+      - name: 检查 Docker-in-Docker 连接
+        run: |
+          set -euo pipefail
+          node --version
+          docker version
+          docker info
+          docker buildx version
+
       - name: 设置 QEMU
         run: |
           set -euo pipefail
