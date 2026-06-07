@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import random
-from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
-from .models import FavorGenerationResult, UserAttribute, UserFavorability
+from .models import FavorabilityAdjustmentResult, UserAttribute, UserFavorability
 
 if TYPE_CHECKING:
     import asyncpg
@@ -48,14 +47,14 @@ class UserDataDB:
                 """
             )
 
+            await self._rebuild_legacy_favorability_table(conn)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_favorability (
-                    user_id TEXT NOT NULL,
-                    daily_favor INTEGER DEFAULT 0,
-                    cumulative_favor INTEGER DEFAULT 0,
-                    last_updated DATE NOT NULL,
-                    PRIMARY KEY (user_id, last_updated)
+                    user_id TEXT PRIMARY KEY,
+                    favorability INTEGER NOT NULL DEFAULT 100
+                        CHECK (favorability >= 0 AND favorability <= 400),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -67,12 +66,20 @@ class UserDataDB:
                 """
             )
 
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_user_favorability_composite
-                ON user_favorability(user_id, last_updated)
-                """
-            )
+    async def _rebuild_legacy_favorability_table(self, conn: Any) -> None:
+        """检测旧版每日好感表并破坏性重建。"""
+        legacy_columns = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'user_favorability'
+              AND column_name = ANY($1::text[])
+            """,
+            ["last_updated", "daily_favor", "cumulative_favor"],
+        )
+        if legacy_columns:
+            await conn.execute("DROP TABLE IF EXISTS user_favorability")
 
     async def close(self) -> None:
         """关闭数据库连接池。"""
@@ -138,155 +145,91 @@ class UserDataDB:
                 user_id,
             )
 
-        attributes: list[UserAttribute] = []
-        for row in rows:
-            created_at = row["created_at"].isoformat() if row["created_at"] else None
-            updated_at = row["updated_at"].isoformat() if row["updated_at"] else None
-            attributes.append(
-                UserAttribute(
-                    user_id=row["user_id"],
-                    attribute_name=row["attribute_name"],
-                    attribute_value=row["attribute_value"],
-                    created_at=created_at,
-                    updated_at=updated_at,
-                )
-            )
-        return attributes
-
-    async def get_user_favorability(
-        self,
-        user_id: str,
-        target_date: date | None = None,
-    ) -> UserFavorability | None:
-        """获取用户好感度。"""
-        assert self._pool is not None
-        if target_date is None:
-            target_date = datetime.now().astimezone().date()
-
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT user_id, daily_favor, cumulative_favor, last_updated
-                FROM user_favorability
-                WHERE user_id = $1 AND last_updated = $2
-                """,
-                user_id,
-                target_date,
-            )
-
-        if not row:
-            return None
-
-        return UserFavorability(
-            user_id=row["user_id"],
-            daily_favor=row["daily_favor"],
-            cumulative_favor=row["cumulative_favor"],
-            last_updated=row["last_updated"],
-        )
-
-    async def generate_or_update_favorability(
-        self,
-        user_id: str,
-    ) -> FavorGenerationResult:
-        """生成或更新用户好感度。"""
-        assert self._pool is not None
-        today = datetime.now().astimezone().date()
-        existing_favor = await self.get_user_favorability(user_id, today)
-
-        is_new_day = False
-        daily_favor = 0
-        cumulative_favor = 0
-
-        if existing_favor:
-            daily_favor = existing_favor.daily_favor
-            cumulative_favor = existing_favor.cumulative_favor
-        else:
-            is_new_day = True
-            daily_favor = random.randint(1, 100)
-            cumulative_favor = await self._get_cumulative_favor(user_id) + daily_favor
-
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO user_favorability
-                    (user_id, daily_favor, cumulative_favor, last_updated)
-                    VALUES ($1, $2, $3, $4)
-                    """,
-                    user_id,
-                    daily_favor,
-                    cumulative_favor,
-                    today,
-                )
-
-        favor_obj = UserFavorability(
-            user_id=user_id,
-            daily_favor=daily_favor,
-            cumulative_favor=cumulative_favor,
-            last_updated=today,
-        )
-
-        return FavorGenerationResult(
-            user_id=user_id,
-            daily_favor=daily_favor,
-            cumulative_favor=cumulative_favor,
-            is_new_day=is_new_day,
-            favor_level=favor_obj.favor_level,
-        )
-
-    async def _get_cumulative_favor(self, user_id: str) -> int:
-        """获取用户累计好感度（不包括今天）。"""
-        assert self._pool is not None
-        today = datetime.now().astimezone().date()
-        async with self._pool.acquire() as conn:
-            value = await conn.fetchval(
-                """
-                SELECT COALESCE(MAX(cumulative_favor), 0)
-                FROM user_favorability
-                WHERE user_id = $1 AND last_updated < $2
-                """,
-                user_id,
-                today,
-            )
-        return int(value or 0)
-
-    async def get_favor_history(
-        self,
-        user_id: str,
-        days: int = 7,
-    ) -> list[UserFavorability]:
-        """获取用户好感度历史记录。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT user_id, daily_favor, cumulative_favor, last_updated
-                FROM user_favorability
-                WHERE user_id = $1
-                ORDER BY last_updated DESC
-                LIMIT $2
-                """,
-                user_id,
-                days,
-            )
-
         return [
-            UserFavorability(
+            UserAttribute(
                 user_id=row["user_id"],
-                daily_favor=row["daily_favor"],
-                cumulative_favor=row["cumulative_favor"],
-                last_updated=row["last_updated"],
+                attribute_name=row["attribute_name"],
+                attribute_value=row["attribute_value"],
+                created_at=row["created_at"].isoformat() if row["created_at"] else None,
+                updated_at=row["updated_at"].isoformat() if row["updated_at"] else None,
             )
             for row in rows
         ]
 
-    async def cleanup_old_data(self, retention_days: int = 7) -> bool:
-        """清理旧数据。"""
+    async def get_user_favorability(self, user_id: str) -> UserFavorability:
+        """获取用户当前好感度，无记录时创建初始值。"""
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_favorability (user_id, favorability)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+                RETURNING user_id, favorability, updated_at
+                """,
+                user_id,
+                self.config.initial_favorability,
+            )
+
+        return UserFavorability.from_score(
+            user_id=row["user_id"],
+            favorability=row["favorability"],
+            updated_at=row["updated_at"].isoformat(),
+        )
+
+    async def adjust_user_favorability(
+        self,
+        user_id: str,
+        delta: int,
+    ) -> FavorabilityAdjustmentResult:
+        """原子调整用户当前好感度，并限制在 [0, 400]。"""
+        assert self._pool is not None
+        async with self._pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO user_favorability (user_id, favorability)
+                    VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    user_id,
+                    self.config.initial_favorability,
+                )
+                before = await conn.fetchval(
+                    """
+                    SELECT favorability
+                    FROM user_favorability
+                    WHERE user_id = $1
+                    FOR UPDATE
+                    """,
+                    user_id,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE user_favorability
+                    SET favorability = LEAST(400, GREATEST(0, favorability + $2)),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = $1
+                    RETURNING user_id, favorability, updated_at
+                    """,
+                    user_id,
+                    delta,
+                )
+
+        return FavorabilityAdjustmentResult.from_values(
+            user_id=row["user_id"],
+            before=int(before or self.config.initial_favorability),
+            delta=delta,
+            after=row["after"],
+            updated_at=row["updated_at"].isoformat(),
+        )
+
+    async def cleanup_old_attributes(self, retention_days: int = 30) -> bool:
+        """清理长期未更新的用户属性。"""
         assert self._pool is not None
         if retention_days <= 0:
             return False
 
         cutoff_date = datetime.now().astimezone() - timedelta(days=retention_days)
-
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
@@ -294,13 +237,6 @@ class UserDataDB:
                 WHERE updated_at < $1
                 """,
                 cutoff_date,
-            )
-            await conn.execute(
-                """
-                DELETE FROM user_favorability
-                WHERE last_updated < $1
-                """,
-                cutoff_date.date(),
             )
         return True
 
