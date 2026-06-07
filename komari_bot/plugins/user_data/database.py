@@ -56,10 +56,16 @@ class UserDataDB:
                 """
                 CREATE TABLE IF NOT EXISTS user_favorability (
                     user_id TEXT PRIMARY KEY,
-                    favorability INTEGER NOT NULL DEFAULT 100
+                    favorability INTEGER NOT NULL DEFAULT 0
                         CHECK (favorability >= 0 AND favorability <= 400),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+            await conn.execute(
+                f"""
+                ALTER TABLE user_favorability
+                ALTER COLUMN favorability SET DEFAULT {self.config.initial_favorability}
                 """
             )
 

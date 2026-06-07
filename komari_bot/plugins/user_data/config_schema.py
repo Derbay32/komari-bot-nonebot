@@ -22,7 +22,7 @@ class DynamicConfigSchema(BaseModel):
         description="用户属性保留天数",
     )
     initial_favorability: int = Field(
-        default=100,
+        default=0,
         ge=0,
         le=400,
         description="新用户初始当前好感度",
