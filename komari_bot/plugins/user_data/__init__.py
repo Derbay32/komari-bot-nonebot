@@ -33,9 +33,11 @@ async def get_db() -> UserDataDB:
     """获取数据库实例。"""
     global _db  # noqa: PLW0603
     if _db is None:
+        logger.debug("[UserData] 首次获取数据库实例，开始初始化")
         db = UserDataDB(get_config())
         await db.initialize()
         _db = db
+        logger.debug("[UserData] 数据库实例初始化完成")
     return _db
 
 
@@ -101,8 +103,17 @@ async def adjust_user_favorability(
     delta: int,
 ) -> FavorabilityAdjustmentResult:
     """调整用户当前好感度并限制在 [0, 400]。"""
+    logger.debug("[UserData] 收到好感度调整请求: user={} delta={}", user_id, delta)
     db = await get_db()
-    return await db.adjust_user_favorability(user_id, delta)
+    result = await db.adjust_user_favorability(user_id, delta)
+    logger.debug(
+        "[UserData] 好感度调整请求完成: user={} before={} delta={} after={}",
+        result.user_id,
+        result.before,
+        result.delta,
+        result.after,
+    )
+    return result
 
 
 async def get_user_attribute(user_id: str, attribute_name: str) -> str | None:

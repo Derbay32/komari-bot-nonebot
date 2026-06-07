@@ -729,6 +729,13 @@ class MessageHandler:
             logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
             return None, stored
 
+        logger.debug(
+            "[KomariChat] 准备提交好感度变化: group={} user={} delta={} reason={}",
+            message.group_id,
+            message.user_id,
+            reply_result.favorability_delta,
+            reply_result.favorability_reason or "-",
+        )
         try:
             adjust_result = await user_data_plugin.adjust_user_favorability(
                 message.user_id,
@@ -742,8 +749,18 @@ class MessageHandler:
                 adjust_result.after,
                 reply_result.favorability_reason or "-",
             )
-        except Exception:
-            logger.warning("[KomariChat] 好感度提交失败，按生成失败处理", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "[KomariChat] 好感度提交失败，按生成失败处理: "
+                "group={} user={} delta={} reason={} error_type={} error={}",
+                message.group_id,
+                message.user_id,
+                reply_result.favorability_delta,
+                reply_result.favorability_reason or "-",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             return None, stored
 
         await self._store_ai_reply(

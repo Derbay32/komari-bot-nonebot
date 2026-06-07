@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from nonebot import logger
+
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
@@ -26,8 +28,10 @@ class UserDataDB:
     async def initialize(self) -> None:
         """初始化数据库连接和表结构。"""
         db_config = get_shared_database_config()
+        logger.debug("[UserDataDB] 开始初始化 PostgreSQL 连接池")
         self._pool = await create_postgres_pool(db_config)
         await self._create_tables()
+        logger.debug("[UserDataDB] PostgreSQL 连接池与表结构初始化完成")
 
     async def _create_tables(self) -> None:
         """创建数据库表结构。"""
@@ -183,43 +187,83 @@ class UserDataDB:
         delta: int,
     ) -> FavorabilityAdjustmentResult:
         """原子调整用户当前好感度，并限制在 [0, 400]。"""
-        assert self._pool is not None
+        if self._pool is None:
+            logger.error(
+                "[UserDataDB] 好感度调整失败：连接池未初始化 user={} delta={}",
+                user_id,
+                delta,
+            )
+            msg = "UserDataDB 连接池未初始化"
+            raise RuntimeError(msg)
+
+        logger.debug(
+            "[UserDataDB] 开始调整好感度: user={} delta={} initial={}",
+            user_id,
+            delta,
+            self.config.initial_favorability,
+        )
         async with self._pool.acquire() as conn, conn.transaction():
-                await conn.execute(
-                    """
-                    INSERT INTO user_favorability (user_id, favorability)
-                    VALUES ($1, $2)
-                    ON CONFLICT (user_id) DO NOTHING
-                    """,
-                    user_id,
-                    self.config.initial_favorability,
-                )
-                before = await conn.fetchval(
-                    """
-                    SELECT favorability
-                    FROM user_favorability
-                    WHERE user_id = $1
-                    FOR UPDATE
-                    """,
-                    user_id,
-                )
-                row = await conn.fetchrow(
-                    """
-                    UPDATE user_favorability
-                    SET favorability = LEAST(400, GREATEST(0, favorability + $2)),
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = $1
-                    RETURNING user_id, favorability, updated_at
-                    """,
-                    user_id,
-                    delta,
-                )
+            await conn.execute(
+                """
+                INSERT INTO user_favorability (user_id, favorability)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                user_id,
+                self.config.initial_favorability,
+            )
+            before = await conn.fetchval(
+                """
+                SELECT favorability
+                FROM user_favorability
+                WHERE user_id = $1
+                FOR UPDATE
+                """,
+                user_id,
+            )
+            logger.debug(
+                "[UserDataDB] 已锁定好感度行: user={} before={}",
+                user_id,
+                before,
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE user_favorability
+                SET favorability = LEAST(400, GREATEST(0, favorability + $2)),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = $1
+                RETURNING user_id, favorability, updated_at
+                """,
+                user_id,
+                delta,
+            )
+
+        if row is None:
+            logger.error(
+                "[UserDataDB] 好感度 UPDATE 未返回记录: user={} before={} delta={}",
+                user_id,
+                before,
+                delta,
+            )
+            msg = "好感度 UPDATE 未返回记录"
+            raise RuntimeError(msg)
+
+        after = int(row["favorability"])
+        before_value = int(before or self.config.initial_favorability)
+        logger.debug(
+            "[UserDataDB] 好感度调整完成: user={} before={} delta={} after={} updated_at={}",
+            row["user_id"],
+            before_value,
+            delta,
+            after,
+            row["updated_at"],
+        )
 
         return FavorabilityAdjustmentResult.from_values(
             user_id=row["user_id"],
-            before=int(before or self.config.initial_favorability),
+            before=before_value,
             delta=delta,
-            after=row["after"],
+            after=after,
             updated_at=row["updated_at"].isoformat(),
         )
 
