@@ -6,6 +6,26 @@
 
 ---
 
+## [v1.2.0-rc.2] - 2026-06-09
+
+### Fixed
+- **用户画像 JSONB 增量写入**：`komari_memory_user_profile.traits` 改为 PostgreSQL 侧原子 patch，避免并发提交不同 trait key 时后写覆盖前写。
+- **画像 Agent 提交竞态**：`ProfileStaging.commit()` 将 snapshot 基线时间传入 `ON CONFLICT DO UPDATE ... WHERE`，关闭预检查与最终写入之间的 TOCTOU 窗口。
+- **旧互动历史写入路径**：停用旧 `komari_memory_interaction_history.records` JSONB 写入入口，避免废弃整列覆盖路径继续误导维护。
+- **`.custom` 编辑缓冲污染**：移除回复引导消息自动追加入口，新增 `.custom append <文本>` 显式追加标题/正文，避免普通回复、引用消息或命令文本误写入 Redis session。
+
+### Changed
+- **画像写入载荷语义**：`MemoryService` / `EntityRepository` 保留原入口名称，内部改用 `set_traits` / `delete_keys` patch；完整 profile payload 只表示“设置本次出现的 key”，不再隐式删除缺失 key。
+- **`user_data` 当前好感度服务收敛**：运行时代码只保留 `user_favorability` 当前好感度能力，`get_user_count()` 改为只统计当前好感度表；新增 `scripts/drop_legacy_user_attributes_table.py` 供维护者显式删除旧 `user_attributes` 表。
+- **记忆向量表拆分**：`komari_memory_conversations` 与 `komari_memory_interaction_history` 不再内联 `embedding` 列，改由 `komari_memory_conversation_embeddings` / `komari_memory_interaction_embeddings` 通过外键保存向量、内容哈希与维度元数据；schema 初始化会删除旧主表向量列并重建新向量索引。
+- **记忆向量读写路径**：对话记忆与跨群互动事件的创建、更新、相似度搜索均改为事务内维护独立 embedding 表，搜索通过 join 新表并保持上层返回结构不变。
+- **向量迁移脚本独立化**：`scripts/migrate_embeddings.py` 不再导入 `komari_bot` 包，配置仅从命令行参数和环境变量读取；`--target memory` 会分别重建 conversation 与 interaction 两类历史向量，`knowledge` 目标语义保持不变。
+
+### Removed
+- **旧用户属性 API 与清理配置**：移除 `UserAttribute`、`get_user_attribute()`、`set_user_attribute()`、`get_user_attributes()`、`cleanup_old_attributes()`、`data_retention_days` 与 APScheduler 属性清理任务注册逻辑。
+
+---
+
 ## [v1.2.0-rc.1] - 2026-06-08
 
 ### 判定场景 PostgreSQL 内容表迁移
@@ -154,6 +174,8 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
+| v1.2.0-rc.2 | 2026-06-09 | RC |
+| v1.2.0-rc.1 | 2026-06-08 | RC |
 | v1.2.0-beta.4 | 2026-05-28 | Beta |
 | v1.2.0-beta.3 | 2026-04-25 | Beta |
 | v1.2.0-beta.2 | 2026-04-23 | Beta |
