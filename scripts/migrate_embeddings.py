@@ -18,6 +18,7 @@ from typing import Any
 import aiohttp
 import asyncpg
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS = 2000
 
 logger = logging.getLogger("migrate_embeddings")
@@ -110,20 +111,111 @@ TARGET_GROUPS: dict[str, tuple[MigrationTarget, ...]] = {
 }
 
 
+def _load_dotenv_file(env_path: Path) -> None:
+    """加载最小 dotenv 配置，且不覆盖已有环境变量。"""
+    if not env_path.exists():
+        logger.info("dotenv 文件不存在，跳过: %s", env_path)
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+
+        key, value = stripped.split("=", 1)
+        key = key.removeprefix("export ").strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _env_value(*keys: str, default: str = "") -> str:
+    for key in keys:
+        if value := os.getenv(key):
+            return value
+    return default
+
+
+def _env_int(*keys: str, default: int) -> int:
+    raw_value = _env_value(*keys, default=str(default))
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        joined_keys = "/".join(keys)
+        msg = f"环境变量 {joined_keys} 必须是整数: {raw_value}"
+        raise ValueError(msg) from exc
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Komari Bot 独立向量嵌入迁移工具")
-    parser.add_argument("--database-config-path", type=Path, default=None, help="兼容旧参数；本脚本不读取项目配置文件")
-    parser.add_argument("--pg-host", default=os.getenv("POSTGRES_HOST", os.getenv("PGHOST", "localhost")))
-    parser.add_argument("--pg-port", type=int, default=int(os.getenv("POSTGRES_PORT", os.getenv("PGPORT", "5432"))))
-    parser.add_argument("--pg-database", default=os.getenv("POSTGRES_DB", os.getenv("PGDATABASE", "komari_bot")))
-    parser.add_argument("--pg-user", default=os.getenv("POSTGRES_USER", os.getenv("PGUSER", "")))
-    parser.add_argument("--pg-password", default=os.getenv("POSTGRES_PASSWORD", os.getenv("PGPASSWORD", "")))
-    parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"))
-    parser.add_argument("--embedding-dimension", type=int, default=int(os.getenv("EMBEDDING_DIMENSION", "512")))
-    parser.add_argument("--embedding-api-url", default=os.getenv("EMBEDDING_API_URL", ""))
-    parser.add_argument("--embedding-api-key", default=os.getenv("EMBEDDING_API_KEY", ""))
-    parser.add_argument("--target", dest="targets", action="append", choices=("knowledge", "memory", "all"), help="迁移目标，可重复传入；默认 all")
-    parser.add_argument("--apply", action="store_true", help="执行数据库写入（默认 dry-run）")
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument(
+        "--env-file",
+        "--dotenv",
+        dest="env_file",
+        type=Path,
+        default=PROJECT_ROOT / ".env",
+        help="dotenv 配置文件路径，默认读取项目根目录 .env",
+    )
+    env_args, _ = env_parser.parse_known_args()
+    _load_dotenv_file(env_args.env_file)
+
+    parser = argparse.ArgumentParser(
+        description="Komari Bot 独立向量嵌入迁移工具",
+        parents=[env_parser],
+    )
+    parser.add_argument(
+        "--database-config-path",
+        type=Path,
+        default=None,
+        help="兼容旧参数；本脚本不读取项目配置文件",
+    )
+    parser.add_argument(
+        "--pg-host",
+        default=_env_value("PG_HOST", "POSTGRES_HOST", "PGHOST", default="localhost"),
+    )
+    parser.add_argument(
+        "--pg-port",
+        type=int,
+        default=_env_int("PG_PORT", "POSTGRES_PORT", "PGPORT", default=5432),
+    )
+    parser.add_argument(
+        "--pg-database",
+        default=_env_value(
+            "PG_DATABASE",
+            "PG_DB",
+            "POSTGRES_DB",
+            "PGDATABASE",
+            default="komari_bot",
+        ),
+    )
+    parser.add_argument(
+        "--pg-user", default=_env_value("PG_USER", "POSTGRES_USER", "PGUSER")
+    )
+    parser.add_argument(
+        "--pg-password",
+        default=_env_value("PG_PASSWORD", "POSTGRES_PASSWORD", "PGPASSWORD"),
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=_env_value("EMBEDDING_MODEL", default="BAAI/bge-small-zh-v1.5"),
+    )
+    parser.add_argument(
+        "--embedding-dimension",
+        type=int,
+        default=_env_int("EMBEDDING_DIMENSION", default=512),
+    )
+    parser.add_argument("--embedding-api-url", default=_env_value("EMBEDDING_API_URL"))
+    parser.add_argument("--embedding-api-key", default=_env_value("EMBEDDING_API_KEY"))
+    parser.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        choices=("knowledge", "memory", "all"),
+        help="迁移目标，可重复传入；默认 all",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="执行数据库写入（默认 dry-run）"
+    )
     return parser.parse_args()
 
 
@@ -155,14 +247,18 @@ def build_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
 def expand_targets(targets: set[str]) -> tuple[MigrationTarget, ...]:
     selected = targets or {"all"}
     expanded: list[MigrationTarget] = []
-    for target_name in ("memory", "knowledge") if "all" in selected else sorted(selected):
+    for target_name in (
+        ("memory", "knowledge") if "all" in selected else sorted(selected)
+    ):
         for target in TARGET_GROUPS[target_name]:
             if target not in expanded:
                 expanded.append(target)
     return tuple(expanded)
 
 
-async def create_postgres_pool(config: DatabaseConfig, *, command_timeout: int = 60) -> asyncpg.Pool:
+async def create_postgres_pool(
+    config: DatabaseConfig, *, command_timeout: int = 60
+) -> asyncpg.Pool:
     return await asyncpg.create_pool(
         host=config.pg_host,
         port=config.pg_port,
@@ -263,7 +359,9 @@ async def migrate_target(
             text = str(row["text"] or "")
             try:
                 embedding = await request_embedding(text, embedding_config)
-                await _write_embedding(conn, target, int(row["row_id"]), text, embedding)
+                await _write_embedding(
+                    conn, target, int(row["row_id"]), text, embedding
+                )
                 updated_rows += 1
             except Exception:
                 failed_rows += 1
@@ -289,7 +387,10 @@ async def request_embedding(text: str, config: EmbeddingConfig) -> str:
         raise RuntimeError(msg)
     payload = {"model": config.model, "input": text}
     headers = {"Authorization": f"Bearer {config.api_key}"}
-    async with aiohttp.ClientSession() as session, session.post(config.api_url, json=payload, headers=headers) as response:
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(config.api_url, json=payload, headers=headers) as response,
+    ):
         response.raise_for_status()
         data = await response.json()
     embedding = data["data"][0]["embedding"]
@@ -319,7 +420,9 @@ async def _current_dimension(conn: Any, target: MigrationTarget) -> int | None:
     return typmod if typmod > 0 else None
 
 
-async def _ensure_target_schema(conn: Any, target: MigrationTarget, dimension: int) -> None:
+async def _ensure_target_schema(
+    conn: Any, target: MigrationTarget, dimension: int
+) -> None:
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     if target.embedding_table is None:
         await conn.execute(
@@ -359,7 +462,9 @@ async def _ensure_target_schema(conn: Any, target: MigrationTarget, dimension: i
             )
 
 
-async def _write_embedding(conn: Any, target: MigrationTarget, row_id: int, text: str, embedding: str) -> None:
+async def _write_embedding(
+    conn: Any, target: MigrationTarget, row_id: int, text: str, embedding: str
+) -> None:
     if target.embedding_table is None:
         await conn.execute(
             f"UPDATE {target.source_table} SET {target.embedding_column} = $1 WHERE {target.id_column} = $2",
