@@ -71,7 +71,7 @@ komari-bot/
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
   komari_search ────────────── Tavily 联网搜索服务
-  user_data ────────────────── 当前好感度/用户属性 PostgreSQL 服务
+  user_data ────────────────── 当前好感度 PostgreSQL 服务
 
 核心功能层
   komari_memory ────────────── 四层记忆系统
