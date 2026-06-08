@@ -12,12 +12,11 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
     dimension = _normalize_dimension(embedding_dimension)
     return (
         "CREATE EXTENSION IF NOT EXISTS vector",
-        f"""
+        """
         CREATE TABLE IF NOT EXISTS komari_memory_conversations (
             id SERIAL PRIMARY KEY,
             group_id VARCHAR(64) NOT NULL,
             summary TEXT NOT NULL,
-            embedding VECTOR({dimension}),
             participants TEXT[],
             dedup_key VARCHAR(64),
             start_time TIMESTAMP NOT NULL,
@@ -28,6 +27,17 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_fuzzy BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS komari_memory_conversation_embeddings (
+            id BIGSERIAL PRIMARY KEY,
+            conversation_id INT NOT NULL REFERENCES komari_memory_conversations(id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            embedding VECTOR({dimension}) NOT NULL,
+            embedding_dim INT NOT NULL,
+            embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (conversation_id)
         )
         """,
         """
@@ -103,13 +113,12 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         ON komari_memory_user_profile(display_name)
         """,
         _build_legacy_interaction_history_migration_statement(),
-        f"""
+        """
         CREATE TABLE IF NOT EXISTS komari_memory_interaction_history (
             id SERIAL PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             display_name TEXT NOT NULL,
             event_summary TEXT NOT NULL,
-            embedding VECTOR({dimension}),
             source_message_count INT NOT NULL DEFAULT 0,
             first_seen_at TIMESTAMPTZ NOT NULL,
             last_seen_at TIMESTAMPTZ NOT NULL,
@@ -128,10 +137,6 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         """
         ALTER TABLE komari_memory_interaction_history
         ADD COLUMN IF NOT EXISTS event_summary TEXT NOT NULL DEFAULT ''
-        """,
-        f"""
-        ALTER TABLE komari_memory_interaction_history
-        ADD COLUMN IF NOT EXISTS embedding VECTOR({dimension})
         """,
         """
         ALTER TABLE komari_memory_interaction_history
@@ -181,6 +186,22 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_importance
         ON komari_memory_interaction_history(importance_current DESC)
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS komari_memory_interaction_embeddings (
+            id BIGSERIAL PRIMARY KEY,
+            interaction_id INT NOT NULL REFERENCES komari_memory_interaction_history(id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            embedding VECTOR({dimension}) NOT NULL,
+            embedding_dim INT NOT NULL,
+            embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (interaction_id)
+        )
+        """,
+        """
+        DROP INDEX IF EXISTS idx_komari_memory_interaction_embedding
+        """,
+        _build_memory_embedding_column_cleanup_statement(),
+        *(_build_memory_conversation_embedding_index_statements(dimension)),
         *(_build_memory_interaction_embedding_index_statements(dimension)),
     )
 
@@ -229,17 +250,64 @@ def _build_legacy_interaction_history_migration_statement() -> str:
         """
 
 
-def _build_memory_interaction_embedding_index_statements(dimension: int) -> tuple[str, ...]:
-    if dimension > PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
-        return ()
-    return (
+def _build_memory_embedding_column_cleanup_statement() -> str:
+    return """
+        DO $$
+        BEGIN
+            IF to_regclass('komari_memory_conversation_embeddings') IS NOT NULL
+               AND to_regclass('komari_memory_interaction_embeddings') IS NOT NULL THEN
+                ALTER TABLE komari_memory_conversations DROP COLUMN IF EXISTS embedding;
+                ALTER TABLE komari_memory_interaction_history DROP COLUMN IF EXISTS embedding;
+            END IF;
+        END
+        $$;
         """
-        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_embedding
-        ON komari_memory_interaction_history
+
+
+def _build_memory_conversation_embedding_index_statements(dimension: int) -> tuple[str, ...]:
+    statements = [
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_embedding_conversation_id
+        ON komari_memory_conversation_embeddings(conversation_id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_embedding_content_hash
+        ON komari_memory_conversation_embeddings(content_hash)
+        """,
+    ]
+    if dimension <= PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
+        statements.append(
+            """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_conv_embedding_vector
+        ON komari_memory_conversation_embeddings
         USING hnsw (embedding vector_cosine_ops)
         WITH (m = 16, ef_construction = 64)
+        """
+        )
+    return tuple(statements)
+
+
+def _build_memory_interaction_embedding_index_statements(dimension: int) -> tuple[str, ...]:
+    statements = [
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_embedding_interaction_id
+        ON komari_memory_interaction_embeddings(interaction_id)
         """,
-    )
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_embedding_content_hash
+        ON komari_memory_interaction_embeddings(content_hash)
+        """,
+    ]
+    if dimension <= PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
+        statements.append(
+            """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_embedding_vector
+        ON komari_memory_interaction_embeddings
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64)
+        """
+        )
+    return tuple(statements)
 
 
 def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
