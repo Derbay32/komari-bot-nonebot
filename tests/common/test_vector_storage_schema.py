@@ -46,9 +46,19 @@ class _FakePool:
 
 def test_build_memory_schema_statements_uses_requested_dimension() -> None:
     statements = build_memory_schema_statements(1536)
-    assert "VECTOR(1536)" in statements[1]
+    assert "VECTOR(1536)" not in statements[1]
     assert "importance_current INT DEFAULT 3" in statements[1]
     assert "dedup_key VARCHAR(64)" in statements[1]
+    assert any(
+        "CREATE TABLE IF NOT EXISTS komari_memory_conversation_embeddings" in statement
+        and "embedding VECTOR(1536) NOT NULL" in statement
+        for statement in statements
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS komari_memory_interaction_embeddings" in statement
+        and "embedding VECTOR(1536) NOT NULL" in statement
+        for statement in statements
+    )
     assert any("ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)" in statement for statement in statements)
     assert any(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_conv_dedup_key" in statement
@@ -62,6 +72,20 @@ def test_build_memory_schema_statements_uses_requested_dimension() -> None:
     assert any("komari_memory_user_profile" in statement for statement in statements)
     assert any(
         "komari_memory_interaction_history" in statement for statement in statements
+    )
+    assert any(
+        "DROP INDEX IF EXISTS idx_komari_memory_interaction_embedding" in statement
+        for statement in statements
+    )
+    assert any(
+        "DROP COLUMN IF EXISTS embedding" in statement for statement in statements
+    )
+    assert any(
+        "idx_komari_memory_conv_embedding_vector" in statement for statement in statements
+    )
+    assert any(
+        "idx_komari_memory_interaction_embedding_vector" in statement
+        for statement in statements
     )
 
 
