@@ -68,6 +68,7 @@ class _FakeEntityRepository:
         self.list_profile_calls: list[dict[str, Any]] = []
         self.delete_profile_calls: list[dict[str, Any]] = []
         self.upsert_profile_calls: list[dict[str, Any]] = []
+        self.batch_profile_calls: list[list[dict[str, Any]]] = []
 
     async def list_user_profiles(self, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
         self.list_profile_calls.append(dict(kwargs))
@@ -93,6 +94,9 @@ class _FakeEntityRepository:
                 "importance": importance,
             }
         )
+
+    async def batch_upsert_user_profiles(self, payloads: list[dict[str, Any]]) -> None:
+        self.batch_profile_calls.append(payloads)
 
     async def get_user_profile_row(
         self,
@@ -203,6 +207,7 @@ def test_entity_management_methods_delegate_to_repository(monkeypatch: Any) -> N
         {"limit": 10, "offset": 5, "group_id": "g1", "user_id": None, "query": "阿明"}
     ]
     assert upserted is not None
-    assert entity_repo.upsert_profile_calls[0]["profile"]["user_id"] == "u1"
+    assert entity_repo.batch_profile_calls[0][0]["user_id"] == "u1"
+    assert entity_repo.batch_profile_calls[0][0]["display_name"] == "阿明"
     assert deleted is True
     assert entity_repo.delete_profile_calls == [{"user_id": "u1", "group_id": "g1"}]

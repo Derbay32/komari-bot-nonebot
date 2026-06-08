@@ -10,6 +10,9 @@ import pytest
 
 from komari_bot.common.profile_operations import ProfileOperation
 from komari_bot.plugins.komari_memory.agent.redis_staging import ProfileStaging
+from komari_bot.plugins.komari_memory.repositories.entity_repository import (
+    UserProfileConcurrentUpdateError,
+)
 
 
 class _FakeRedis:
@@ -46,6 +49,7 @@ class _FakeMemory:
         self.profiles: dict[str, dict[str, Any]] = {}
         self.batch_calls: list[list[dict[str, Any]]] = []
         self.raise_on_batch = False
+        self.conflict_on_batch = False
 
     async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any] | None:
         del group_id
@@ -53,6 +57,8 @@ class _FakeMemory:
 
     async def batch_upsert_user_profiles(self, payloads: list[dict[str, Any]]) -> None:
         self.batch_calls.append(payloads)
+        if self.conflict_on_batch:
+            raise UserProfileConcurrentUpdateError(user_id="u1", group_id="g1")
         if self.raise_on_batch:
             msg = "批量写入失败"
             raise RuntimeError(msg)
@@ -156,6 +162,8 @@ def test_commit_uses_single_batch_call_for_multiple_users() -> None:
     assert result.changed_user_ids == {"u1", "u2"}
     assert len(memory.batch_calls) == 1
     assert [payload["user_id"] for payload in memory.batch_calls[0]] == ["u1", "u2"]
+    assert memory.batch_calls[0][0]["set_traits"]["特征1"]["value"] == "喜欢 RPG"
+    assert "profile" not in memory.batch_calls[0][0]
     assert redis.values == {}
 
 
@@ -181,4 +189,28 @@ def test_commit_keeps_staging_when_batch_fails() -> None:
         asyncio.run(staging.commit())
 
     assert len(memory.batch_calls) == 1
+    assert redis.values
+
+
+def test_commit_repository_conflict_keeps_staging() -> None:
+    redis = _FakeRedis()
+    memory = _FakeMemory()
+    memory.conflict_on_batch = True
+    staging = ProfileStaging(
+        redis,  # type: ignore[arg-type]
+        "session-1",
+        "g1",
+        memory,  # type: ignore[arg-type]
+        ttl_seconds=3600,
+    )
+
+    asyncio.run(
+        staging.stage(
+            [ProfileOperation(op="add", user_id="u1", key="特征1", value="喜欢 RPG")]
+        )
+    )
+    result = asyncio.run(staging.commit())
+
+    assert result.status == "conflict"
+    assert result.committed_count == 0
     assert redis.values

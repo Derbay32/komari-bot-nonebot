@@ -6,8 +6,11 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 from komari_bot.plugins.komari_memory.repositories.entity_repository import (
     EntityRepository,
+    UserProfileConcurrentUpdateError,
 )
 
 
@@ -20,6 +23,8 @@ class _FakeConnection:
         self.transaction_commits = 0
         self.transaction_rollbacks = 0
         self.fail_execute_at: int | None = None
+        self.fail_fetchrow_at: int | None = None
+        self.return_none_fetchrow_at: int | None = None
 
     async def fetchval(self, query: str, *args: object) -> int:
         self.fetchval_calls.append((query, args))
@@ -43,6 +48,11 @@ class _FakeConnection:
 
     async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
         self.fetchrow_calls.append((query, args))
+        if self.fail_fetchrow_at == len(self.fetchrow_calls):
+            msg = "模拟写入失败"
+            raise RuntimeError(msg)
+        if self.return_none_fetchrow_at == len(self.fetchrow_calls):
+            return None
         return {
             "user_id": "u1",
             "group_id": "g1",
@@ -171,8 +181,12 @@ def test_upsert_user_profile_normalizes_updated_at_string_to_datetime() -> None:
         )
     )
 
-    query, args = conn.execute_calls[0]
+    query, args = conn.fetchrow_calls[0]
     assert "INSERT INTO komari_memory_user_profile" in query
+    assert "traits = EXCLUDED.traits" not in query
+    assert "traits || $4::jsonb" in query
+    assert "- $5::text[]" in query
+    assert "RETURNING" in query
     assert isinstance(args[5], datetime)
     assert args[5] == datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
     assert conn.transaction_commits == 1
@@ -201,14 +215,14 @@ def test_batch_upsert_user_profiles_uses_single_transaction() -> None:
         )
     )
 
-    assert len(conn.execute_calls) == 2
+    assert len(conn.fetchrow_calls) == 2
     assert conn.transaction_commits == 1
     assert conn.transaction_rollbacks == 0
 
 
 def test_batch_upsert_user_profiles_rolls_back_on_failure() -> None:
     conn = _FakeConnection()
-    conn.fail_execute_at = 2
+    conn.fail_fetchrow_at = 2
     repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
 
     try:
@@ -235,33 +249,60 @@ def test_batch_upsert_user_profiles_rolls_back_on_failure() -> None:
     else:
         raise AssertionError("批量写入失败时应传播异常")
 
-    assert len(conn.execute_calls) == 2
+    assert len(conn.fetchrow_calls) == 2
     assert conn.transaction_commits == 0
     assert conn.transaction_rollbacks == 1
 
 
-def test_upsert_interaction_history_normalizes_updated_at_string_to_datetime() -> None:
+def test_user_profile_delete_patch_uses_text_array() -> None:
     conn = _FakeConnection()
     repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
 
     asyncio.run(
-        repository.upsert_interaction_history(
-            user_id="u1",
-            group_id="g1",
-            interaction={
-                "version": 1,
-                "display_name": "阿明",
-                "file_type": "用户的近期对鞠行为备忘录",
-                "description": "会聊天",
-                "summary": "最近常聊天",
-                "records": [],
-                "updated_at": "2026-04-10T12:00:00Z",
-            },
-            importance=5,
+        repository.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": "u1",
+                    "group_id": "g1",
+                    "display_name": "阿明",
+                    "set_traits": {},
+                    "delete_keys": ["喜欢的食物"],
+                    "updated_at": "2026-04-10T12:00:00Z",
+                    "snapshot_updated_at": None,
+                    "importance": 4,
+                }
+            ]
         )
     )
 
-    query, args = conn.execute_calls[0]
-    assert "INSERT INTO komari_memory_interaction_history" in query
-    assert isinstance(args[8], datetime)
-    assert args[8] == datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
+    _query, args = conn.fetchrow_calls[0]
+    assert args[4] == ["喜欢的食物"]
+    assert isinstance(args[5], datetime)
+    assert args[5] == datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
+
+
+def test_user_profile_snapshot_conflict_raises_and_rolls_back() -> None:
+    conn = _FakeConnection()
+    conn.return_none_fetchrow_at = 1
+    repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    with pytest.raises(UserProfileConcurrentUpdateError):
+        asyncio.run(
+            repository.batch_upsert_user_profiles(
+                [
+                    {
+                        "user_id": "u1",
+                        "group_id": "g1",
+                        "display_name": "阿明",
+                        "set_traits": {},
+                        "delete_keys": [],
+                        "updated_at": "2026-04-10T12:00:00Z",
+                        "snapshot_updated_at": "2026-04-10T11:00:00Z",
+                        "importance": 4,
+                    }
+                ]
+            )
+        )
+
+    assert conn.transaction_commits == 0
+    assert conn.transaction_rollbacks == 1

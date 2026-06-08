@@ -245,6 +245,8 @@ def test_batch_upsert_user_profiles_adds_default_metadata(monkeypatch: Any) -> N
     assert payload["user_id"] == "u1"
     assert payload["group_id"] == "g1"
     assert payload["importance"] == 4
-    assert payload["profile"]["version"] == 1
-    assert payload["profile"]["user_id"] == "u1"
-    assert payload["profile"]["updated_at"]
+    assert payload["display_name"] == "阿明"
+    assert payload["set_traits"] == {"爱好": {"value": "游戏"}}
+    assert payload["delete_keys"] == []
+    assert payload["updated_at"]
+    assert payload["snapshot_updated_at"] is None
