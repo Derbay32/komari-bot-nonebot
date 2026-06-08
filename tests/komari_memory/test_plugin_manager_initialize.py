@@ -130,7 +130,7 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
 
     async def _fake_apply_schema(pg_pool: object, *, statements: tuple[str, ...]) -> None:
         events.append(("apply_schema", pg_pool is fake_pool))
-        assert "VECTOR(1536)" in statements[1]
+        assert any("komari_memory_conversation_embeddings" in statement for statement in statements)
 
     async def _fake_validate(
         pg_pool: object,
@@ -144,8 +144,8 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
         events.append(("validate", table_name))
         assert pg_pool is fake_pool
         assert table_name in {
-            "komari_memory_conversations",
-            "komari_memory_interaction_history",
+            "komari_memory_conversation_embeddings",
+            "komari_memory_interaction_embeddings",
         }
         assert column_name == "embedding"
         assert label == "KomariMemory"
@@ -218,8 +218,8 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
     assert events[:7] == [
         ("create_pool", True),
         ("apply_schema", True),
-        ("validate", "komari_memory_conversations"),
-        ("validate", "komari_memory_interaction_history"),
+        ("validate", "komari_memory_conversation_embeddings"),
+        ("validate", "komari_memory_interaction_embeddings"),
         ("redis_initialize", True),
         ("memory_service", True),
         ("register_summary", True),

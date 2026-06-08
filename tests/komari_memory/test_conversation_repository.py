@@ -34,6 +34,17 @@ class _FakeConnection:
             return self._fetchrow_results.pop(0)
         return {"id": 1001}
 
+    def transaction(self) -> "_FakeTransaction":
+        return _FakeTransaction()
+
+
+class _FakeTransaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
 
 class _FakeAcquire:
     def __init__(self, conn: _FakeConnection) -> None:
@@ -109,7 +120,10 @@ def test_insert_conversation_passes_dedup_key_and_returns_id() -> None:
     query, args = conn.fetchrow_calls[0]
     assert "dedup_key" in query
     assert "ON CONFLICT DO NOTHING" in query
-    assert args[4] == "dedup-1"
+    assert args[3] == "dedup-1"
+    embedding_query, embedding_args = conn.execute_calls[0]
+    assert "komari_memory_conversation_embeddings" in embedding_query
+    assert embedding_args[0] == 42
 
 
 def test_insert_conversation_returns_none_on_dedup_conflict() -> None:
@@ -154,4 +168,8 @@ def test_insert_conversation_allows_none_dedup_key() -> None:
     )
 
     assert (first_id, second_id) == (43, 44)
-    assert [call[1][4] for call in conn.fetchrow_calls] == [None, None]
+    assert [call[1][3] for call in conn.fetchrow_calls] == [None, None]
+    assert all(
+        "komari_memory_conversation_embeddings" in call[0]
+        for call in conn.execute_calls
+    )

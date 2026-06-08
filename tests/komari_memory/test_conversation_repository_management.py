@@ -71,6 +71,17 @@ class _FakeConnection:
         self.execute_calls.append((query, args))
         return "DELETE 1"
 
+    def transaction(self) -> "_FakeTransaction":
+        return _FakeTransaction()
+
+
+class _FakeTransaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
 
 class _FakeAcquire:
     def __init__(self, conn: _FakeConnection) -> None:
@@ -134,9 +145,12 @@ def test_update_and_delete_conversation() -> None:
     assert updated is not None
     update_query, update_args = conn.fetchrow_calls[0]
     assert "summary = $2" in update_query
-    assert "embedding = $3" in update_query
-    assert update_args == (11, "更新后的总结", "[0.1, 0.2]", 4, 4)
+    assert "embedding =" not in update_query
+    assert update_args == (11, "更新后的总结", 4, 4)
+    embedding_query, embedding_args = conn.execute_calls[0]
+    assert "komari_memory_conversation_embeddings" in embedding_query
+    assert embedding_args[0] == 11
     assert deleted is True
-    delete_query, delete_args = conn.execute_calls[0]
+    delete_query, delete_args = conn.execute_calls[1]
     assert "DELETE FROM komari_memory_conversations" in delete_query
     assert delete_args == (11,)
