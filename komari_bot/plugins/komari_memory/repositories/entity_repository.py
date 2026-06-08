@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 from nonebot import logger
 
@@ -29,6 +29,28 @@ class UserProfileUpsertPayload(TypedDict):
     group_id: str
     profile: dict[str, Any]
     importance: int
+
+
+class UserProfileTraitsPatchPayload(TypedDict):
+    """批量增量写入用户画像 traits 的载荷。"""
+
+    user_id: str
+    group_id: str
+    display_name: str
+    set_traits: dict[str, dict[str, Any]]
+    delete_keys: list[str]
+    importance: int
+    updated_at: NotRequired[datetime | str | None]
+    snapshot_updated_at: NotRequired[datetime | str | None]
+
+
+class UserProfileConcurrentUpdateError(RuntimeError):
+    """画像写入时检测到 snapshot 条件冲突。"""
+
+    def __init__(self, user_id: str, group_id: str) -> None:
+        super().__init__(f"用户画像已被并发更新: group={group_id} user={user_id}")
+        self.user_id = user_id
+        self.group_id = group_id
 
 
 class EntityRepository:
@@ -64,30 +86,34 @@ class EntityRepository:
 
     async def batch_upsert_user_profiles(
         self,
-        profiles: Sequence[UserProfileUpsertPayload],
+        profiles: Sequence[UserProfileTraitsPatchPayload | UserProfileUpsertPayload],
     ) -> None:
-        """在单个事务中批量写入用户画像。"""
+        """在单个事务中批量增量写入用户画像。"""
         if not profiles:
             return
 
         async with self.pg_pool.acquire() as conn, conn.transaction():
-            for payload in profiles:
+            for raw_payload in profiles:
+                payload = self._normalize_profile_patch_payload(raw_payload)
                 user_id = payload["user_id"]
-                profile = payload["profile"]
-                display_name = str(profile.get("display_name", "")).strip() or user_id
-                traits = self._normalize_json_object(profile.get("traits"))
-                updated_at = self._normalize_timestamptz(profile.get("updated_at"))
-                version = self._coerce_version(profile.get("version"))
-                await conn.execute(
+                row = await conn.fetchrow(
                     self._profile_upsert_sql(),
                     user_id,
                     payload["group_id"],
-                    version,
-                    display_name,
-                    json.dumps(traits, ensure_ascii=False),
-                    updated_at,
+                    payload["display_name"],
+                    json.dumps(payload["set_traits"], ensure_ascii=False),
+                    payload["delete_keys"],
+                    self._normalize_timestamptz(payload.get("updated_at")),
                     payload["importance"],
+                    self._normalize_optional_timestamptz(
+                        payload.get("snapshot_updated_at")
+                    ),
                 )
+                if row is None:
+                    raise UserProfileConcurrentUpdateError(
+                        user_id=user_id,
+                        group_id=payload["group_id"],
+                    )
 
         logger.debug(
             "[KomariMemory] batch upsert profile rows: count={}",
@@ -102,60 +128,10 @@ class EntityRepository:
         interaction: dict[str, Any],
         importance: int = 5,
     ) -> None:
-        """写入互动历史。"""
-        display_name = str(interaction.get("display_name", "")).strip() or user_id
-        file_type = (
-            str(interaction.get("file_type", "")).strip() or "用户的近期对鞠行为备忘录"
-        )
-        description = str(interaction.get("description", "")).strip()
-        summary = str(interaction.get("summary", "")).strip()
-        records = self._normalize_json_array(interaction.get("records"))
-        updated_at = self._normalize_timestamptz(interaction.get("updated_at"))
-        version = self._coerce_version(interaction.get("version"))
-
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {_INTERACTION_TABLE} (
-                    user_id,
-                    group_id,
-                    version,
-                    display_name,
-                    file_type,
-                    description,
-                    summary,
-                    records,
-                    updated_at,
-                    importance
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::timestamptz, $10)
-                ON CONFLICT (user_id, group_id)
-                DO UPDATE SET
-                    version = EXCLUDED.version,
-                    display_name = EXCLUDED.display_name,
-                    file_type = EXCLUDED.file_type,
-                    description = EXCLUDED.description,
-                    summary = EXCLUDED.summary,
-                    records = EXCLUDED.records,
-                    updated_at = EXCLUDED.updated_at,
-                    importance = EXCLUDED.importance
-                """,
-                user_id,
-                group_id,
-                version,
-                display_name,
-                file_type,
-                description,
-                summary,
-                json.dumps(records, ensure_ascii=False),
-                updated_at,
-                importance,
-            )
-        logger.debug(
-            "[KomariMemory] upsert interaction row: group={} user={}",
-            group_id,
-            user_id,
-        )
+        """旧 PG JSONB 互动历史写入入口已停用。"""
+        del user_id, group_id, interaction, importance
+        msg = "旧 interaction_history records JSONB 写入入口已停用"
+        raise RuntimeError(msg)
 
     def _profile_upsert_sql(self) -> str:
         """返回用户画像 upsert SQL。"""
@@ -169,15 +145,49 @@ class EntityRepository:
                 updated_at,
                 importance
             )
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7)
+            VALUES ($1, $2, 1, $3, ($4::jsonb - $5::text[]), $6::timestamptz, $7)
             ON CONFLICT (user_id, group_id)
             DO UPDATE SET
-                version = EXCLUDED.version,
+                version = {_PROFILE_TABLE}.version + 1,
                 display_name = EXCLUDED.display_name,
-                traits = EXCLUDED.traits,
+                traits = (({_PROFILE_TABLE}.traits || $4::jsonb) - $5::text[]),
                 updated_at = EXCLUDED.updated_at,
                 importance = EXCLUDED.importance
+            WHERE $8::timestamptz IS NULL
+               OR {_PROFILE_TABLE}.updated_at <= $8::timestamptz
+            RETURNING user_id, group_id, version, traits, updated_at
             """
+
+    def _normalize_profile_patch_payload(
+        self,
+        payload: UserProfileTraitsPatchPayload | UserProfileUpsertPayload,
+    ) -> UserProfileTraitsPatchPayload:
+        user_id = payload["user_id"]
+        group_id = payload["group_id"]
+        importance = payload["importance"]
+        if "profile" not in payload:
+            return {
+                "user_id": user_id,
+                "group_id": group_id,
+                "display_name": str(payload.get("display_name", "")).strip() or user_id,
+                "set_traits": self._normalize_traits_patch(payload.get("set_traits")),
+                "delete_keys": self._normalize_delete_keys(payload.get("delete_keys")),
+                "updated_at": payload.get("updated_at"),
+                "snapshot_updated_at": payload.get("snapshot_updated_at"),
+                "importance": importance,
+            }
+
+        profile = payload["profile"]
+        return {
+            "user_id": user_id,
+            "group_id": group_id,
+            "display_name": str(profile.get("display_name", "")).strip() or user_id,
+            "set_traits": self._normalize_traits_patch(profile.get("traits")),
+            "delete_keys": [],
+            "updated_at": profile.get("updated_at"),
+            "snapshot_updated_at": None,
+            "importance": importance,
+        }
 
     async def get_user_profile(
         self,
@@ -520,6 +530,27 @@ class EntityRepository:
                 parsed = None
         return list(parsed) if isinstance(parsed, list) else []
 
+    def _normalize_traits_patch(self, value: Any) -> dict[str, dict[str, Any]]:
+        traits = self._normalize_json_object(value)
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_key, raw_payload in traits.items():
+            key = str(raw_key).strip()
+            if key and isinstance(raw_payload, dict):
+                normalized[key] = dict(raw_payload)
+        return normalized
+
+    def _normalize_delete_keys(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        seen: set[str] = set()
+        keys: list[str] = []
+        for raw_key in value:
+            key = str(raw_key).strip()
+            if key and key not in seen:
+                keys.append(key)
+                seen.add(key)
+        return keys
+
     def _coerce_version(self, value: Any) -> int:
         try:
             return max(1, int(value))
@@ -550,3 +581,8 @@ class EntityRepository:
                     parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
                 )
         return datetime.now(UTC)
+
+    def _normalize_optional_timestamptz(self, value: Any) -> datetime | None:
+        if value is None or str(value).strip() == "":
+            return None
+        return self._normalize_timestamptz(value)

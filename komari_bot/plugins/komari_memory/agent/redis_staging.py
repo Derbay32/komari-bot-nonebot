@@ -16,16 +16,18 @@ from komari_bot.common.profile_operations import (
     ProfileOperation,
     StageResult,
     apply_profile_operations,
+    build_profile_traits_patch,
     normalize_profile_operations,
 )
 
+from ..repositories.entity_repository import UserProfileConcurrentUpdateError
 from ..services.redis_keys import RedisKeys
 from .profile_snapshot import get_snapshot_group_profile, get_snapshot_group_profiles
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
-    from ..repositories.entity_repository import UserProfileUpsertPayload
+    from ..repositories.entity_repository import UserProfileTraitsPatchPayload
     from ..services.memory_service import MemoryService
 
 
@@ -189,27 +191,44 @@ class ProfileStaging:
                 conflicts=conflicts,
             )
 
-        payloads: list[UserProfileUpsertPayload] = []
+        payloads: list[UserProfileTraitsPatchPayload] = []
         for user_id in sorted(affected_user_ids):
             user_diff = [item for item in diff if item.user_id == user_id]
-            base_profile = await self._memory.get_user_profile(user_id=user_id, group_id=self._group_id)
+            base_profile, source = await self._load_profile(user_id)
             display_name = str((base_profile or {}).get("display_name", "")).strip() or user_id
-            merged_profile = apply_profile_operations(
-                base_profile,
-                user_diff,
-                user_id=user_id,
-                display_name=display_name,
+            snapshot_updated_at = (
+                (base_profile or {}).get("updated_at") if source == "snapshot" else None
             )
+            set_traits, delete_keys = build_profile_traits_patch(user_diff)
             payloads.append(
                 {
                     "user_id": user_id,
                     "group_id": self._group_id,
-                    "profile": merged_profile,
+                    "display_name": display_name,
+                    "set_traits": set_traits,
+                    "delete_keys": delete_keys,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                    "snapshot_updated_at": snapshot_updated_at,
                     "importance": 4,
                 }
             )
 
-        await self._memory.batch_upsert_user_profiles(payloads)
+        try:
+            await self._memory.batch_upsert_user_profiles(payloads)
+        except UserProfileConcurrentUpdateError as exc:
+            self._snapshot_conflicted_user_ids.add(exc.user_id)
+            return CommitResult(
+                status="conflict",
+                committed_count=0,
+                summary="画像提交时检测到并发更新，请重新读取并整合后再次提交",
+                conflicts=[
+                    {
+                        "user_id": exc.user_id,
+                        "group_id": exc.group_id,
+                        "reason": "画像提交时检测到并发更新",
+                    }
+                ],
+            )
 
         await self.discard()
         return CommitResult(

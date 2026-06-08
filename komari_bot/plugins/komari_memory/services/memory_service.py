@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..repositories.conversation_repository import ConversationRepository
     from ..repositories.entity_repository import (
         EntityRepository,
+        UserProfileTraitsPatchPayload,
         UserProfileUpsertPayload,
     )
     from ..repositories.interaction_event_repository import InteractionEventRepository
@@ -257,37 +258,34 @@ class MemoryService:
             importance: 重要性 (1-5)
         """
         profile_with_meta = dict(profile)
-        profile_with_meta.setdefault("version", 1)
-        profile_with_meta.setdefault("user_id", user_id)
         profile_with_meta.setdefault("updated_at", self._now_iso())
-        profile_with_meta.setdefault("traits", {})
-        await self._entity_repo.upsert_user_profile(
-            user_id=user_id,
-            group_id=group_id,
-            profile=profile_with_meta,
-            importance=importance,
+        await self.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "display_name": str(profile_with_meta.get("display_name", "")).strip()
+                    or user_id,
+                    "set_traits": self._normalize_traits_patch(
+                        profile_with_meta.get("traits")
+                    ),
+                    "delete_keys": [],
+                    "updated_at": profile_with_meta.get("updated_at"),
+                    "snapshot_updated_at": None,
+                    "importance": importance,
+                }
+            ]
         )
 
     async def batch_upsert_user_profiles(
         self,
-        profiles: Sequence[UserProfileUpsertPayload],
+        profiles: Sequence[UserProfileTraitsPatchPayload | UserProfileUpsertPayload],
     ) -> None:
         """批量创建或更新用户画像实体。"""
-        payloads: list[UserProfileUpsertPayload] = []
-        for payload in profiles:
-            profile_with_meta = dict(payload["profile"])
-            profile_with_meta.setdefault("version", 1)
-            profile_with_meta.setdefault("user_id", payload["user_id"])
-            profile_with_meta.setdefault("updated_at", self._now_iso())
-            profile_with_meta.setdefault("traits", {})
-            payloads.append(
-                {
-                    "user_id": payload["user_id"],
-                    "group_id": payload["group_id"],
-                    "profile": profile_with_meta,
-                    "importance": payload["importance"],
-                }
-            )
+        payloads = [
+            self._normalize_profile_patch_payload(raw_payload)
+            for raw_payload in profiles
+        ]
         await self._entity_repo.batch_upsert_user_profiles(payloads)
 
     async def upsert_interaction_history(
@@ -538,6 +536,59 @@ class MemoryService:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(UTC).isoformat()
+
+    def _normalize_profile_patch_payload(
+        self,
+        payload: UserProfileTraitsPatchPayload | UserProfileUpsertPayload,
+    ) -> UserProfileTraitsPatchPayload:
+        user_id = payload["user_id"]
+        if "profile" in payload:
+            profile = payload["profile"]
+            return {
+                "user_id": user_id,
+                "group_id": payload["group_id"],
+                "display_name": str(profile.get("display_name", "")).strip() or user_id,
+                "set_traits": self._normalize_traits_patch(profile.get("traits")),
+                "delete_keys": [],
+                "updated_at": profile.get("updated_at") or self._now_iso(),
+                "snapshot_updated_at": None,
+                "importance": payload["importance"],
+            }
+
+        return {
+            "user_id": user_id,
+            "group_id": payload["group_id"],
+            "display_name": str(payload.get("display_name", "")).strip() or user_id,
+            "set_traits": self._normalize_traits_patch(payload.get("set_traits")),
+            "delete_keys": self._normalize_delete_keys(payload.get("delete_keys")),
+            "updated_at": payload.get("updated_at") or self._now_iso(),
+            "snapshot_updated_at": payload.get("snapshot_updated_at"),
+            "importance": payload["importance"],
+        }
+
+    @staticmethod
+    def _normalize_traits_patch(value: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_key, raw_payload in value.items():
+            key = str(raw_key).strip()
+            if key and isinstance(raw_payload, dict):
+                normalized[key] = dict(raw_payload)
+        return normalized
+
+    @staticmethod
+    def _normalize_delete_keys(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        seen: set[str] = set()
+        keys: list[str] = []
+        for raw_key in value:
+            key = str(raw_key).strip()
+            if key and key not in seen:
+                keys.append(key)
+                seen.add(key)
+        return keys
 
     @staticmethod
     def _now_naive() -> datetime:
