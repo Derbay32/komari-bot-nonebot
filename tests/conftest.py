@@ -68,6 +68,7 @@ _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
 _ensure_package_shim("user_data")
+_ensure_package_shim("komari_custom")
 
 
 class _DummyConfigManager:
