@@ -90,11 +90,11 @@ class _DummyConfigManagerPlugin:
 class _DummyLLMProvider:
     @staticmethod
     async def generate_text(**_kwargs: object) -> str:
-        return "对话内容已模糊化处理"
+        return "<content>有效的模糊化测试内容</content>"
 
     @staticmethod
     async def generate_text_with_messages(**_kwargs: object) -> str:
-        return "<content>对话内容已模糊化处理</content>"
+        return "<content>有效的模糊化测试内容</content>"
 
     @staticmethod
     async def generate_messages_completion(**_kwargs: object) -> object:
