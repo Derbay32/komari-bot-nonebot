@@ -401,6 +401,27 @@ async def _table_exists(conn: Any, table_name: str) -> bool:
     return bool(await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", table_name))
 
 
+async def _column_exists(conn: Any, table_name: str, column_name: str) -> bool:
+    if not await _table_exists(conn, table_name):
+        return False
+
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_attribute
+                WHERE attrelid = $1::regclass
+                  AND attname = $2
+                  AND NOT attisdropped
+            )
+            """,
+            table_name,
+            column_name,
+        )
+    )
+
+
 async def _current_dimension(conn: Any, target: MigrationTarget) -> int | None:
     table_name = target.embedding_table or target.source_table
     if not await _table_exists(conn, table_name):
@@ -451,6 +472,10 @@ async def _ensure_target_schema(
         await conn.execute(
             f"ALTER TABLE {target.embedding_table} ALTER COLUMN {target.embedding_column} TYPE VECTOR({dimension})"
         )
+        if await _column_exists(conn, target.source_table, target.embedding_column):
+            await conn.execute(
+                f"ALTER TABLE {target.source_table} DROP COLUMN {target.embedding_column}"
+            )
     if target.vector_index_name:
         await conn.execute(f"DROP INDEX IF EXISTS {target.vector_index_name}")
         if dimension <= PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
