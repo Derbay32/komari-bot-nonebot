@@ -1,16 +1,6 @@
 from pydantic import BaseModel
 
 
-class UserAttribute(BaseModel):
-    """用户属性模型。"""
-
-    user_id: str
-    attribute_name: str
-    attribute_value: str | None = None
-    created_at: str | None = None
-    updated_at: str | None = None
-
-
 class FavorabilityStage(BaseModel):
     """当前好感度阶段。"""
 

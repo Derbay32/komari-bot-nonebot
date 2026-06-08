@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
@@ -10,7 +9,7 @@ from nonebot import logger
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
-from .models import FavorabilityAdjustmentResult, UserAttribute, UserFavorability
+from .models import FavorabilityAdjustmentResult, UserFavorability
 
 if TYPE_CHECKING:
     import asyncpg
@@ -37,20 +36,6 @@ class UserDataDB:
         """创建数据库表结构。"""
         assert self._pool is not None
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_attributes (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    attribute_name TEXT NOT NULL,
-                    attribute_value TEXT,
-                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, attribute_name)
-                )
-                """
-            )
-
             await self._rebuild_legacy_favorability_table(conn)
             await conn.execute(
                 """
@@ -66,13 +51,6 @@ class UserDataDB:
                 f"""
                 ALTER TABLE user_favorability
                 ALTER COLUMN favorability SET DEFAULT {self.config.initial_favorability}
-                """
-            )
-
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_user_attributes_composite
-                ON user_attributes(user_id, attribute_name)
                 """
             )
 
@@ -96,75 +74,6 @@ class UserDataDB:
         if self._pool:
             await self._pool.close()
             self._pool = None
-
-    async def get_user_attribute(self, user_id: str, attribute_name: str) -> str | None:
-        """获取用户属性值。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT attribute_value
-                FROM user_attributes
-                WHERE user_id = $1 AND attribute_name = $2
-                """,
-                user_id,
-                attribute_name,
-            )
-        return (
-            str(row["attribute_value"])
-            if row and row["attribute_value"] is not None
-            else None
-        )
-
-    async def set_user_attribute(
-        self,
-        user_id: str,
-        attribute_name: str,
-        attribute_value: str,
-    ) -> bool:
-        """设置用户属性值。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO user_attributes
-                (user_id, attribute_name, attribute_value, updated_at)
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-                ON CONFLICT (user_id, attribute_name)
-                DO UPDATE SET
-                    attribute_value = EXCLUDED.attribute_value,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                user_id,
-                attribute_name,
-                attribute_value,
-            )
-        return True
-
-    async def get_user_attributes(self, user_id: str) -> list[UserAttribute]:
-        """获取用户的所有属性。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT user_id, attribute_name, attribute_value, created_at, updated_at
-                FROM user_attributes
-                WHERE user_id = $1
-                ORDER BY updated_at DESC
-                """,
-                user_id,
-            )
-
-        return [
-            UserAttribute(
-                user_id=row["user_id"],
-                attribute_name=row["attribute_name"],
-                attribute_value=row["attribute_value"],
-                created_at=row["created_at"].isoformat() if row["created_at"] else None,
-                updated_at=row["updated_at"].isoformat() if row["updated_at"] else None,
-            )
-            for row in rows
-        ]
 
     async def get_user_favorability(self, user_id: str) -> UserFavorability:
         """获取用户当前好感度，无记录时创建初始值。"""
@@ -273,34 +182,13 @@ class UserDataDB:
             updated_at=row["updated_at"].isoformat(),
         )
 
-    async def cleanup_old_attributes(self, retention_days: int = 30) -> bool:
-        """清理长期未更新的用户属性。"""
-        assert self._pool is not None
-        if retention_days <= 0:
-            return False
-
-        cutoff_date = datetime.now().astimezone() - timedelta(days=retention_days)
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                DELETE FROM user_attributes
-                WHERE updated_at < $1
-                """,
-                cutoff_date,
-            )
-        return True
-
     async def get_user_count(self) -> int:
         """获取总用户数。"""
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             value = await conn.fetchval(
                 """
-                SELECT COUNT(*) FROM (
-                    SELECT user_id FROM user_attributes
-                    UNION
-                    SELECT user_id FROM user_favorability
-                ) AS users
+                SELECT COUNT(*) FROM user_favorability
                 """
             )
         return int(value or 0)

@@ -6,15 +6,14 @@ from .database import UserDataDB
 from .models import (
     FavorabilityAdjustmentResult,
     FavorabilityStage,
-    UserAttribute,
     UserFavorability,
     get_favorability_stage,
 )
 
 __plugin_meta__ = PluginMetadata(
     name="user_data",
-    description="通用用户数据管理插件，提供用户属性存储和当前好感度管理功能",
-    usage="提供 API 供其他插件调用，管理用户数据",
+    description="当前好感度数据服务插件",
+    usage="提供 API 供其他插件调用，管理用户当前好感度数据",
     config=DynamicConfigSchema,
 )
 
@@ -41,13 +40,6 @@ async def get_db() -> UserDataDB:
     return _db
 
 
-_scheduler = None
-try:
-    _scheduler = require("nonebot_plugin_apscheduler").scheduler
-except Exception:
-    _scheduler = None
-
-
 async def on_startup() -> None:
     """插件启动时的初始化。"""
     config = get_config()
@@ -61,26 +53,7 @@ async def on_startup() -> None:
         logger.error(f"用户数据插件数据库初始化失败: {e}")
         return
 
-    if _scheduler:
-        _scheduler.add_job(
-            _scheduled_cleanup,
-            "cron",
-            hour=2,
-            minute=0,
-            id="cleanup_user_data",
-        )
-        logger.info("用户数据插件已启动 (已注册用户属性清理任务)")
-    else:
-        logger.warning("用户数据插件已启动 (scheduler 不可用，请手动清理用户属性)")
-
-
-async def _scheduled_cleanup() -> None:
-    """定时清理长期未更新的用户属性。"""
-    try:
-        db = await get_db()
-        await db.cleanup_old_attributes(retention_days=get_config().data_retention_days)
-    except Exception as e:
-        logger.error(f"清理用户属性时出错: {e}")
+    logger.info("用户数据插件已启动")
 
 
 async def on_shutdown() -> None:
@@ -116,28 +89,6 @@ async def adjust_user_favorability(
     return result
 
 
-async def get_user_attribute(user_id: str, attribute_name: str) -> str | None:
-    """获取用户属性。"""
-    db = await get_db()
-    return await db.get_user_attribute(user_id, attribute_name)
-
-
-async def set_user_attribute(
-    user_id: str,
-    attribute_name: str,
-    attribute_value: str,
-) -> bool:
-    """设置用户属性。"""
-    db = await get_db()
-    return await db.set_user_attribute(user_id, attribute_name, attribute_value)
-
-
-async def get_user_attributes(user_id: str) -> list[UserAttribute]:
-    """获取用户的所有属性。"""
-    db = await get_db()
-    return await db.get_user_attributes(user_id)
-
-
 async def get_user_count() -> int:
     """获取总用户数。"""
     db = await get_db()
@@ -147,15 +98,11 @@ async def get_user_count() -> int:
 __all__ = [
     "FavorabilityAdjustmentResult",
     "FavorabilityStage",
-    "UserAttribute",
     "UserFavorability",
     "adjust_user_favorability",
     "get_favorability_stage",
-    "get_user_attribute",
-    "get_user_attributes",
     "get_user_count",
     "get_user_favorability",
-    "set_user_attribute",
 ]
 
 __plugin_startup__ = on_startup

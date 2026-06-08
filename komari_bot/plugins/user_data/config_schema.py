@@ -15,12 +15,6 @@ class DynamicConfigSchema(BaseModel):
     )
 
     plugin_enable: bool = Field(default=True, description="插件启用状态")
-    data_retention_days: int = Field(
-        default=30,
-        ge=1,
-        le=3650,
-        description="用户属性保留天数",
-    )
     initial_favorability: int = Field(
         default=0,
         ge=0,
