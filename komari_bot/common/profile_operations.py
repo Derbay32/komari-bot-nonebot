@@ -297,7 +297,7 @@ def apply_profile_operations(
             traits.pop(operation.key, None)
             continue
 
-        value = operation.value if isinstance(operation, ProfileOperation) else operation.value or operation.new_value
+        value = _operation_value(operation)
         if not value:
             continue
         category = operation.category or "general"
@@ -312,6 +312,41 @@ def apply_profile_operations(
     profile["traits"] = traits
     profile["updated_at"] = datetime.now(UTC).isoformat()
     return profile
+
+
+def build_profile_traits_patch(
+    operations: Sequence[ProfileDiffItem | ProfileOperation],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """把画像 diff 转换为 PostgreSQL JSONB 增量 patch。"""
+    set_traits: dict[str, dict[str, Any]] = {}
+    delete_keys: list[str] = []
+    delete_key_set: set[str] = set()
+
+    for operation in operations:
+        key = str(operation.key).strip()
+        if not key:
+            continue
+
+        if operation.op == "delete":
+            if key not in delete_key_set:
+                delete_keys.append(key)
+                delete_key_set.add(key)
+            set_traits.pop(key, None)
+            continue
+
+        value = str(_operation_value(operation) or "").strip()
+        if not value or key in delete_key_set:
+            continue
+
+        importance = operation.importance or 3
+        set_traits[key] = {
+            "value": value,
+            "category": operation.category or "general",
+            "importance": max(1, min(5, int(importance))),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+
+    return set_traits, delete_keys
 
 
 def profile_traits_to_list(traits: object) -> list[dict[str, Any]]:
@@ -370,6 +405,12 @@ def _operation_to_diff(
         category=operation.category or "general",
         importance=operation.importance or 3,
     )
+
+
+def _operation_value(operation: ProfileDiffItem | ProfileOperation) -> str | None:
+    if isinstance(operation, ProfileOperation):
+        return operation.value
+    return operation.value or operation.new_value
 
 
 def _trait_value(raw: Any) -> str | None:
