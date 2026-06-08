@@ -8,6 +8,7 @@ from nonebot import logger
 from nonebot.plugin import require
 
 from ..config_schema import KomariMemoryConfigSchema
+from ..core.retry import retry_async
 
 llm_provider = require("llm_provider")
 
@@ -27,6 +28,16 @@ def _extract_tag_content(text: str, tag: str) -> str:
     if len(lines) > 1:
         logger.warning("[KomariMemory] 模糊化返回多行内容，降级使用首行")
     return re.sub(r"\s+", " ", lines[0]).strip()
+
+
+def _is_invalid_fuzzy_summary(value: str) -> bool:
+    """判断模糊化结果是否为空或已知占位文本。"""
+    normalized = value.strip()
+    return normalized in {
+        "",
+        "对话内容已模糊化处理",
+        "互动事件已模糊化处理",
+    }
 
 
 class ForgettingService:
@@ -283,7 +294,14 @@ class ForgettingService:
         """模糊化对话记忆并重置重要性。"""
         try:
             fuzzy_summary = await self._generate_fuzzy_summary(original_summary, conv_id)
+        except Exception:
+            logger.exception(
+                "[KomariMemory] 模糊化重试失败，删除记忆且不写入占位文本: ID={}",
+                conv_id,
+            )
+            return await self._delete_conversation_after_fuzzify_failure(conv_id)
 
+        try:
             async with self.pg_pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -297,9 +315,10 @@ class ForgettingService:
                 logger.debug("[KomariMemory] 模糊化记忆: ID={}", conv_id)
                 return True
         except Exception:
-            logger.exception("[KomariMemory] 模糊化失败 ID={}", conv_id)
+            logger.exception("[KomariMemory] 模糊化记忆写入失败 ID={}", conv_id)
             return False
 
+    @retry_async(max_attempts=3, base_delay=1.0)
     async def _generate_fuzzy_summary(self, original: str, conv_id: int) -> str:
         """生成模糊化总结，并只保留正文。"""
         tag = (self.config.response_tag or "content").strip() or "content"
@@ -322,11 +341,29 @@ class ForgettingService:
             request_phase="forgetting_fuzzify",
         )
         fuzzy_summary = _extract_tag_content(response, tag)
-        if fuzzy_summary:
-            return fuzzy_summary
+        if _is_invalid_fuzzy_summary(fuzzy_summary):
+            msg = f"模糊化结果无效: ID={conv_id}"
+            raise ValueError(msg)
 
-        logger.warning("[KomariMemory] 模糊化结果为空，使用默认占位文本: ID={}", conv_id)
-        return "对话内容已模糊化处理"
+        return fuzzy_summary
+
+    async def _delete_conversation_after_fuzzify_failure(self, conv_id: int) -> bool:
+        """模糊化重试失败后删除对话记忆。"""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    DELETE FROM komari_memory_conversations
+                    WHERE id = $1
+                    """,
+                    conv_id,
+                )
+        except Exception:
+            logger.exception("[KomariMemory] 模糊化失败后的记忆删除失败 ID={}", conv_id)
+            return False
+
+        logger.info("[KomariMemory] 模糊化重试失败，已删除记忆 ID={}", conv_id)
+        return True
 
     async def _fuzzify_interaction_event(self, event_id: int, original_summary: str) -> bool:
         """模糊化跨群互动事件并重置重要性。"""
@@ -335,6 +372,14 @@ class ForgettingService:
                 original_summary,
                 event_id,
             )
+        except Exception:
+            logger.exception(
+                "[KomariMemory] 跨群互动事件模糊化重试失败，删除事件且不写入占位文本: ID={}",
+                event_id,
+            )
+            return await self._delete_interaction_after_fuzzify_failure(event_id)
+
+        try:
             async with self.pg_pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -348,12 +393,13 @@ class ForgettingService:
                     event_id,
                 )
         except Exception:
-            logger.exception("[KomariMemory] 跨群互动事件模糊化失败 ID={}", event_id)
+            logger.exception("[KomariMemory] 跨群互动事件模糊化写入失败 ID={}", event_id)
             return False
         else:
             logger.debug("[KomariMemory] 模糊化跨群互动事件: ID={}", event_id)
             return True
 
+    @retry_async(max_attempts=3, base_delay=1.0)
     async def _generate_fuzzy_interaction_summary(self, original: str, event_id: int) -> str:
         """生成跨群互动事件模糊化总结。"""
         tag = (self.config.response_tag or "content").strip() or "content"
@@ -375,4 +421,29 @@ class ForgettingService:
             request_phase="forgetting_interaction_fuzzify",
         )
         fuzzy_summary = _extract_tag_content(response, tag)
-        return fuzzy_summary or "互动事件已模糊化处理"
+        if _is_invalid_fuzzy_summary(fuzzy_summary):
+            msg = f"跨群互动事件模糊化结果无效: ID={event_id}"
+            raise ValueError(msg)
+
+        return fuzzy_summary
+
+    async def _delete_interaction_after_fuzzify_failure(self, event_id: int) -> bool:
+        """模糊化重试失败后删除跨群互动事件。"""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    DELETE FROM komari_memory_interaction_history
+                    WHERE id = $1
+                    """,
+                    event_id,
+                )
+        except Exception:
+            logger.exception(
+                "[KomariMemory] 跨群互动事件模糊化失败后的删除失败 ID={}",
+                event_id,
+            )
+            return False
+
+        logger.info("[KomariMemory] 跨群互动事件模糊化重试失败，已删除事件 ID={}", event_id)
+        return True
