@@ -157,14 +157,14 @@ class PluginManager:
 
         await ensure_vector_column_dimension(
             self.pg_pool,
-            table_name="komari_memory_conversations",
+            table_name="komari_memory_conversation_embeddings",
             column_name="embedding",
             expected_dimension=expected_dimension,
             label="KomariMemory",
         )
         await ensure_vector_column_dimension(
             self.pg_pool,
-            table_name="komari_memory_interaction_history",
+            table_name="komari_memory_interaction_embeddings",
             column_name="embedding",
             expected_dimension=expected_dimension,
             label="KomariMemory",
