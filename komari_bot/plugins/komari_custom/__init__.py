@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from nonebot import get_driver, logger, on_command, on_message
+from nonebot import get_driver, logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message  # noqa: TC002
 from nonebot.exception import FinishedException
 from nonebot.params import Command, CommandArg
@@ -29,7 +29,7 @@ __plugin_meta__ = PluginMetadata(
     usage="""
 此命令用于发起追加写入知识库公投。
 .custom new [标题] 发起知识库提案(可不输入标题，后续引导流程会要求再次输入)
-直接回复引导消息 向当前提案的标题/内容追加内容，默认换行追加，标题不支持换行
+.custom append <文本> 向当前标题/正文追加内容，默认换行追加，标题不支持换行
 .custom confirm 确认修改并推进标题、正文、最终发布三阶段
 .custom replace <旧文本> <新文本> 替换当前字段，或只传一个参数全量替换
 .custom undo 撤销上次编辑
@@ -65,6 +65,7 @@ custom_action = on_command(
         ("custom", "replace"),
         ("custom", "undo"),
         ("custom", "del"),
+        ("custom", "append"),
         ("custom", "confirm"),
         ("custom", "cancel"),
         ("custom", "list"),
@@ -102,20 +103,6 @@ async def on_shutdown() -> None:
     await custom_sessions.close()
 
 
-async def _is_custom_prompt_reply(event: GroupMessageEvent) -> bool:
-    reply = event.reply
-    if reply is None:
-        return False
-    return await custom_sessions.is_prompt_reply(
-        int(event.group_id),
-        event.get_user_id(),
-        int(reply.message_id),
-    )
-
-
-reply_append = on_message(rule=_is_custom_prompt_reply, priority=5, block=True)
-
-
 @custom.handle()
 async def handle_custom_help(
     bot: Bot,
@@ -131,37 +118,9 @@ async def handle_custom_help(
     arg_text = args.extract_plain_text().strip()
     if arg_text:
         await custom.finish(
-            "❌ 未知子命令，请使用 .custom new/list/show/status/confirm"
+            "❌ 未知子命令，请使用 .custom new/append/list/show/status/confirm"
         )
     await custom.finish(__plugin_meta__.usage.strip())
-
-
-@reply_append.handle()
-async def handle_reply_append(bot: Bot, event: GroupMessageEvent) -> None:
-    """处理对 bot 引导消息的回复追加。"""
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config_manager.get()
-    )
-    if not can_use:
-        await reply_append.finish(f"❌ {reason}")
-
-    text = event.get_plaintext().strip()
-    if not text:
-        await reply_append.finish("❌ 追加内容不能为空")
-    try:
-        session = await custom_sessions.append_text(
-            int(event.group_id), event.get_user_id(), text
-        )
-        response = _format_edit_state(session)
-        sent = await reply_append.send(response)
-        await custom_sessions.remember_prompt_message(
-            int(event.group_id), event.get_user_id(), _extract_message_id(sent)
-        )
-        await reply_append.finish()
-    except Exception as e:
-        if not isinstance(e, FinishedException):
-            logger.exception("[KomariCustom] 追加编辑内容失败")
-            await reply_append.finish(f"❌ {e}")
 
 
 @custom_action.handle()
@@ -195,6 +154,8 @@ async def handle_custom_action(
                 await _handle_undo(group_id, user_id)
             case "del":
                 await _handle_delete(group_id, user_id, text)
+            case "append":
+                await _handle_append(group_id, user_id, text)
             case "confirm":
                 await _handle_confirm(bot, event, group_id, user_id)
             case "cancel":
@@ -232,15 +193,19 @@ async def _handle_new(group_id: int, user_id: str, title: str) -> None:
     if title:
         response = (
             f"已记录标题：{title}\n"
-            "继续回复这条消息补充标题，或使用 .custom confirm 进入正文阶段。"
+            "可使用 .custom append <文本> 继续补充标题，或使用 .custom confirm 进入正文阶段。"
         )
     else:
-        response = "已开始新的知识库提案，请回复这条消息输入标题。"
-    sent = await custom_action.send(response)
-    await custom_sessions.remember_prompt_message(
-        group_id, user_id, _extract_message_id(sent)
-    )
+        response = "已开始新的知识库提案，请使用 .custom append <标题> 输入标题。"
+    await custom_action.send(response)
     await custom_action.finish()
+
+
+async def _handle_append(group_id: int, user_id: str, text: str) -> None:
+    if not text:
+        await custom_action.finish("❌ 请输入要追加的文本")
+    session = await custom_sessions.append_text(group_id, user_id, text)
+    await custom_action.finish(_format_edit_state(session))
 
 
 async def _handle_replace(group_id: int, user_id: str, text: str) -> None:
@@ -276,18 +241,15 @@ async def _handle_confirm(
     match session.phase:
         case "title":
             if not session.title:
-                await custom_action.finish("❌ 标题不能为空，请回复引导消息输入标题")
+                await custom_action.finish("❌ 标题不能为空，请使用 .custom append <标题> 输入标题")
             session = await custom_sessions.set_phase(group_id, user_id, "content")
-            sent = await custom_action.send(
-                f"标题已确认：{session.title}\n请回复这条消息输入提案正文。"
-            )
-            await custom_sessions.remember_prompt_message(
-                group_id, user_id, _extract_message_id(sent)
+            await custom_action.send(
+                f"标题已确认：{session.title}\n请使用 .custom append <正文> 输入提案正文。"
             )
             await custom_action.finish()
         case "content":
             if not session.content:
-                await custom_action.finish("❌ 正文不能为空，请回复引导消息输入内容")
+                await custom_action.finish("❌ 正文不能为空，请使用 .custom append <正文> 输入内容")
             session = await custom_sessions.set_phase(group_id, user_id, "review")
             await custom_action.finish(_format_review(session))
         case "review":
@@ -411,7 +373,7 @@ def _format_edit_state(session: SessionData) -> str:
     return (
         f"当前阶段：{_phase_name(session.phase)}\n"
         f"当前{field_name}：\n{current or '（空）'}\n\n"
-        "可继续回复引导消息追加，或使用 .custom replace / undo / del / confirm。"
+        "可使用 .custom append <文本> 追加，或使用 .custom replace / undo / del / confirm。"
     )
 
 

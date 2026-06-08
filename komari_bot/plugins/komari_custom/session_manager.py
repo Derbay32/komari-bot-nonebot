@@ -79,41 +79,18 @@ class CustomSessionManager:
         user_id: str,
         *,
         title: str = "",
-        prompt_message_id: int | None = None,
     ) -> SessionData:
         """创建新会话。"""
         session = SessionData(title=title)
-        if prompt_message_id is not None:
-            session.prompt_message_ids.append(prompt_message_id)
         await self.save_session(group_id, user_id, session)
         return session
-
-    async def remember_prompt_message(
-        self,
-        group_id: int,
-        user_id: str,
-        message_id: int | None,
-    ) -> None:
-        """记录 bot 引导消息 ID，用于回复追加判定。"""
-        if message_id is None:
-            return
-        session = await self.get_session(group_id, user_id)
-        if session is None:
-            return
-        if message_id not in session.prompt_message_ids:
-            session.prompt_message_ids.append(message_id)
-        await self.save_session(group_id, user_id, session)
-
-    async def is_prompt_reply(self, group_id: int, user_id: str, message_id: int) -> bool:
-        """判断消息是否回复了当前用户会话中的引导消息。"""
-        session = await self.get_session(group_id, user_id)
-        if session is None or session.phase not in {"title", "content"}:
-            return False
-        return message_id in session.prompt_message_ids
 
     async def append_text(self, group_id: int, user_id: str, text: str) -> SessionData:
         """向当前阶段字段追加文本。"""
         session = await self._require_session(group_id, user_id)
+        if session.phase not in {"title", "content"}:
+            msg = "当前阶段不能追加内容"
+            raise ValueError(msg)
         field = session.current_field()
         old_value = getattr(session, field)
         new_value = f"{old_value}\n{text}".strip() if old_value else text.strip()

@@ -49,7 +49,6 @@ class SessionData(BaseModel):
     phase: SessionPhase = "title"
     title: str = ""
     content: str = ""
-    prompt_message_ids: list[int] = Field(default_factory=list)
     undo_stack: list[UndoRecord] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now().astimezone().isoformat())
 
