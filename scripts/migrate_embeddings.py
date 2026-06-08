@@ -403,6 +403,9 @@ async def _table_exists(conn: Any, table_name: str) -> bool:
 
 async def _current_dimension(conn: Any, target: MigrationTarget) -> int | None:
     table_name = target.embedding_table or target.source_table
+    if not await _table_exists(conn, table_name):
+        return None
+
     row = await conn.fetchrow(
         """
         SELECT atttypmod
