@@ -160,3 +160,10 @@ def test_append_command_is_registered_and_documented() -> None:
     assert ".custom append <文本> 向当前标题/正文追加内容" in source
     assert "请回复这条消息" not in source
     assert "回复引导消息" not in source
+
+
+def test_custom_action_fallback_error_message_hides_exception_detail() -> None:
+    source = CUSTOM_INIT.read_text(encoding="utf-8")
+
+    assert 'await custom_action.finish("❌ 处理请求失败，请稍后再试")' in source
+    assert 'await custom_action.finish(f"❌ 处理请求失败：{e}")' not in source
