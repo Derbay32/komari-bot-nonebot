@@ -7,6 +7,7 @@ from pathlib import Path
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.prompt_storage import close_prompt_storage_if_created
 from komari_bot.plugins.embedding_provider.config_schema import (
     DynamicConfigSchema as EmbeddingProviderConfigSchema,
 )
@@ -204,3 +205,9 @@ state.api_registered = register_management_api_for_driver(
     component_loader=_load_management_components,
     logger=logger,
 )
+
+
+@driver.on_shutdown
+def _close_prompt_storage() -> None:
+    """关闭已创建的 Prompt 存储。"""
+    close_prompt_storage_if_created()
