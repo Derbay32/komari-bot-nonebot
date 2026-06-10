@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 class _ConfigSchema(BaseModel):
     plugin_enable: bool = Field(default=True, description="插件启用状态")
     api_token: str = Field(default="secret", description="管理接口令牌")
+    embedding_api_key: str = Field(default="embedding-secret", description="嵌入 API 密钥")
+    db_password: str = Field(default="database-secret", description="数据库密码")
     last_updated: str = Field(
         default="2026-04-14T00:00:00+08:00",
         description="最后更新时间",
@@ -88,6 +90,8 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     assert payload["items"][0]["config_source"] == manager.config_source
     assert payload["items"][0]["field_descriptions"] == {
         "api_token": "管理接口令牌",
+        "db_password": "数据库密码",
+        "embedding_api_key": "嵌入 API 密钥",
         "last_updated": "最后更新时间",
         "plugin_enable": "插件启用状态",
     }
@@ -114,13 +118,18 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
         )
 
     assert detail.status_code == 200
-    assert detail.json()["values"]["api_token"] == "secret"
+    assert detail.json()["values"]["api_token"] == "******"
+    assert detail.json()["values"]["embedding_api_key"] == "******"
+    assert detail.json()["values"]["db_password"] == "******"
+    assert detail.json()["values"]["plugin_enable"] is True
+    assert detail.json()["values"]["last_updated"] == "2026-04-14T00:00:00+08:00"
     assert detail.json()["config_source"] == manager.config_source
     assert detail.json()["field_descriptions"]["api_token"] == "管理接口令牌"
     assert updated.status_code == 200
-    assert updated.json()["values"]["api_token"] == "changed-token"
+    assert updated.json()["values"]["api_token"] == "******"
     assert updated.json()["field_descriptions"]["api_token"] == "管理接口令牌"
     assert reloaded.status_code == 200
+    assert reloaded.json()["values"]["api_token"] == "******"
     assert reloaded.json()["field_descriptions"]["plugin_enable"] == "插件启用状态"
     assert manager.reload_count == 1
 
