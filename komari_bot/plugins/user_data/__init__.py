@@ -1,3 +1,5 @@
+import asyncio
+
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
@@ -21,6 +23,18 @@ config_manager_plugin = require("config_manager")
 config_manager = config_manager_plugin.get_config_manager("user_data", DynamicConfigSchema)
 
 _db: UserDataDB | None = None
+_db_init_lock: asyncio.Lock | None = None
+_db_init_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_db_init_lock() -> asyncio.Lock:
+    """获取绑定到当前事件循环的数据库初始化锁。"""
+    global _db_init_lock, _db_init_lock_loop  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    if _db_init_lock is None or _db_init_lock_loop is not loop:
+        _db_init_lock = asyncio.Lock()
+        _db_init_lock_loop = loop
+    return _db_init_lock
 
 
 def get_config() -> DynamicConfigSchema:
@@ -32,11 +46,13 @@ async def get_db() -> UserDataDB:
     """获取数据库实例。"""
     global _db  # noqa: PLW0603
     if _db is None:
-        logger.debug("[UserData] 首次获取数据库实例，开始初始化")
-        db = UserDataDB(get_config())
-        await db.initialize()
-        _db = db
-        logger.debug("[UserData] 数据库实例初始化完成")
+        async with _get_db_init_lock():
+            if _db is None:
+                logger.debug("[UserData] 首次获取数据库实例，开始初始化")
+                db = UserDataDB(get_config())
+                await db.initialize()
+                _db = db
+                logger.debug("[UserData] 数据库实例初始化完成")
     return _db
 
 
