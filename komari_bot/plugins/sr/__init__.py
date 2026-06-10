@@ -118,6 +118,9 @@ async def sr_function(
         config = config_manager.get()
         sr_list = config.sr_list
         sr_num = len(sr_list)
+        if not sr_list:
+            await sr.finish("神人榜为空，请先配置名单")
+            return
 
         sr_target = randint(0, sr_num - 1)
 
