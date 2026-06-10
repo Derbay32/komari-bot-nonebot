@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 from nonebot import logger
 
+from komari_bot.common.sql_like_utils import escape_like_pattern
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -237,12 +239,12 @@ class EntityRepository:
             user_id=user_id,
         )
         if query:
-            params.append(f"%{query}%")
+            params.append(f"%{escape_like_pattern(query)}%")
             placeholder = len(params)
             filters.append(
-                f"(user_id ILIKE ${placeholder} "
-                f"OR display_name ILIKE ${placeholder} "
-                f"OR traits::text ILIKE ${placeholder})"
+                f"(user_id ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR display_name ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR traits::text ILIKE ${placeholder} ESCAPE '\\')"
             )
 
         where_sql = self._build_where_sql(filters)
@@ -300,15 +302,15 @@ class EntityRepository:
             user_id=user_id,
         )
         if query:
-            params.append(f"%{query}%")
+            params.append(f"%{escape_like_pattern(query)}%")
             placeholder = len(params)
             filters.append(
-                f"(user_id ILIKE ${placeholder} "
-                f"OR display_name ILIKE ${placeholder} "
-                f"OR file_type ILIKE ${placeholder} "
-                f"OR description ILIKE ${placeholder} "
-                f"OR summary ILIKE ${placeholder} "
-                f"OR records::text ILIKE ${placeholder})"
+                f"(user_id ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR display_name ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR file_type ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR description ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR summary ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR records::text ILIKE ${placeholder} ESCAPE '\\')"
             )
 
         where_sql = self._build_where_sql(filters)

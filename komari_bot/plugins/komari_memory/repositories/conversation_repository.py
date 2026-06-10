@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
+from komari_bot.common.sql_like_utils import escape_like_pattern
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -111,8 +113,8 @@ class ConversationRepository:
             filters.append(f"${len(params) + 1} = ANY(participants)")
             params.append(participant)
         if query:
-            filters.append(f"summary ILIKE ${len(params) + 1}")
-            params.append(f"%{query}%")
+            filters.append(f"summary ILIKE ${len(params) + 1} ESCAPE '\\'")
+            params.append(f"%{escape_like_pattern(query)}%")
 
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 

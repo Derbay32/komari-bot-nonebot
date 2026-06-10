@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
+from komari_bot.common.sql_like_utils import escape_like_pattern
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -160,12 +162,12 @@ class InteractionEventRepository:
             params.append(user_id)
             filters.append(f"user_id = ${len(params)}")
         if query:
-            params.append(f"%{query}%")
+            params.append(f"%{escape_like_pattern(query)}%")
             placeholder = len(params)
             filters.append(
-                f"(user_id ILIKE ${placeholder} "
-                f"OR display_name ILIKE ${placeholder} "
-                f"OR event_summary ILIKE ${placeholder})"
+                f"(user_id ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR display_name ILIKE ${placeholder} ESCAPE '\\' "
+                f"OR event_summary ILIKE ${placeholder} ESCAPE '\\')"
             )
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 
