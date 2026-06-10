@@ -232,7 +232,7 @@ def test_download_single_image_rejects_redirect_to_blocked_network() -> None:
 
 
 def test_download_single_image_rejects_too_many_redirects() -> None:
-    responses = [
+    responses: list[_FakeResponse | Exception] = [
         _FakeResponse(
             status=302,
             content_length=0,
