@@ -37,3 +37,38 @@ def test_run_timeout_cancels_future_and_raises_runtime_error(
         assert cancelled.wait(timeout=1.0) is True
     finally:
         storage.close()
+
+
+class _FakePool:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_get_pool_closes_temporary_pool_when_schema_initialization_fails(
+    storage_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    pool = _FakePool()
+
+    async def fake_create_postgres_pool(_config: object) -> _FakePool:
+        return pool
+
+    async def fail_ensure_schema(_pool: _FakePool) -> None:
+        msg = "建表失败"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(storage_module, "create_postgres_pool", fake_create_postgres_pool)
+    monkeypatch.setattr(storage, "_ensure_schema", fail_ensure_schema)
+
+    try:
+        with pytest.raises(RuntimeError, match="建表失败"):
+            storage._run(storage._get_pool())
+
+        assert pool.closed is True
+        assert storage._pool is None
+    finally:
+        storage.close()
