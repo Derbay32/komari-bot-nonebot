@@ -21,6 +21,7 @@ from komari_bot.common.database_config import (
 )
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.sql_like_utils import escape_like_pattern
 from komari_bot.common.vector_storage_schema import (
     PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
     apply_schema_statements,
@@ -657,16 +658,17 @@ class KnowledgeEngine:
         param_idx = 1
 
         if query is not None:
-            keyword_pattern = f"%{query.strip()}%"
-            if keyword_pattern != "%%":
+            keyword = query.strip()
+            if keyword:
+                keyword_pattern = f"%{escape_like_pattern(keyword)}%"
                 conditions.append(
                     f"""
                     (
-                        content ILIKE ${param_idx}
+                        content ILIKE ${param_idx} ESCAPE '\\'
                         OR EXISTS (
                             SELECT 1
                             FROM unnest(COALESCE(keywords, ARRAY[]::text[])) AS keyword
-                            WHERE keyword ILIKE ${param_idx}
+                            WHERE keyword ILIKE ${param_idx} ESCAPE '\\'
                         )
                     )
                     """
