@@ -85,15 +85,17 @@ class ConfigStorage:
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is None:
             config = get_shared_database_config()
-            self._pool = await create_postgres_pool(config)
-            await self._ensure_schema()
+            pool = await create_postgres_pool(config)
+            try:
+                await self._ensure_schema(pool)
+            except Exception:
+                await pool.close()
+                raise
+            self._pool = pool
         return self._pool
 
-    async def _ensure_schema(self) -> None:
-        if self._pool is None:
-            msg = "配置存储连接池未初始化"
-            raise RuntimeError(msg)
-        async with self._pool.acquire() as conn:
+    async def _ensure_schema(self, pool: asyncpg.Pool) -> None:
+        async with pool.acquire() as conn:
             await conn.execute(_CONFIG_TABLE_DDL)
             await conn.execute(_CONFIG_TABLE_UPDATED_AT_INDEX_DDL)
 
