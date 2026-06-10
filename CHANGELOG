@@ -4,11 +4,27 @@
 
 > 当前 `dev` 分支上尚未发版的变更。
 
+---
+
+## [v1.2.0-rc.3] - 2026-06-10
+
 ### Fixed
+- **昵称 fallback 格式化崩溃**：`get_user_nickname()` 移除 `:.0f` 格式符，字符串用户 ID 不再引发 `ValueError`。
+- **`.sr` 空列表崩溃**：主指令读取 sr_list 后检查空列表并提前 finish，避免 `randint(0, -1)` 崩溃。
+- **`user_data.get_db()` 初始化竞态**：新增 `asyncio.Lock` 双重检查，防止并发初始化创建多余连接池；初始化失败时保留 `_db = None`，允许下次重试。
+- **`user_data.database` 连接池运行时 assert**：新增 `_require_pool()` 私有方法，统一替换三处 `assert self._pool is not None`，生产环境不再依赖 `-O` 标志。
+- **`ConfigStorage._run()` 同步桥接无超时**：新增 5 秒超时，超时时 cancel future 并抛 `RuntimeError`。
+- **`ConfigStorage._get_pool()` 初始化失败残留 pool**：schema 初始化失败时关闭临时连接池，不留下半初始化 pool。
+- **配置/Prompt 存储 shutdown hook**：新增 `close_config_storage_if_created()` / `close_prompt_storage_if_created()`，分别在 `config_manager` 与 `komari_management` 插件入口注册 NoneBot `on_shutdown` 钩子，避免 shutdown 阶段创建新资源。
+- **LLM / Vision / Tavily 外部调用并发控制**：模块级 `asyncio.Semaphore` 限制 LLM completion（4）、视觉模型读取（2）、Tavily 搜索（2），避免单进程内突发打满外部 API。
+- **Tavily 查询长度限制与短期缓存**：query 截断至 200 字符；60 秒进程内缓存，key 包含 `query`/`search_depth`/`max_results`/`include_answer`/`result_content_limit` 且不含 API key；异常响应不写入缓存。
 - **管理配置 API 凭据脱敏**：配置详情、reload 与 patch 响应中的 token/password/secret/key/credential 字段统一返回 `******`，避免管理接口明文泄露密钥。
 - **配置更新日志安全**：`ConfigManager.update_field()` 日志仅记录插件名与字段名，不再输出敏感或普通配置的新值。
 - **图片下载 SSRF 防护**：图片下载器移除 `data:` 输入下载路径，下载前校验 URL、DNS 解析结果与每一跳重定向，阻断内网、环回、链路本地、保留地址等目标并限制重定向次数。
 - **聊天 Prompt 注入隔离**：历史消息、引用消息、当前输入、记忆、知识库、画像、互动历史与好感度上下文统一转义并包裹不可信数据边界；对话总结 prompt 同步转义外部文本并使用 `ConversationSummarySchema` 校验 LLM JSON 输出。
+- **修复komari_custom 用户侧暴露内部异常**：将兜底异常提示从 `❌ 处理请求失败：{e}` 改成固定安全文案 `❌ 处理请求失败，请稍后再试`。
+- **记忆遗忘批处理单任务异常中断整批**：修复记忆遗忘批处理时，单任务异常会直接中断整批的问题。
+- **ILIKE 查询存在通配符模式注入**：新增 `escape_like_pattern()` 统一转义 \、%、_ ，并修复所有计划内 ILIKE 搜索。
 
 ---
 
@@ -180,6 +196,7 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
+| v1.2.0-rc.3 | 2026-06-10 | RC |
 | v1.2.0-rc.2 | 2026-06-09 | RC |
 | v1.2.0-rc.1 | 2026-06-08 | RC |
 | v1.2.0-beta.4 | 2026-05-28 | Beta |
@@ -201,4 +218,4 @@
 
 ---
 
-*压缩自原始 CHANGELOG（469 行 → 当前版本），保留关键变更条目，移除过度细化的子项目录和重复性 rc/beta 描述。完整历史可追溯 git log。*
+*本 CHANGELOG 最后更新于 2026-06-10*
