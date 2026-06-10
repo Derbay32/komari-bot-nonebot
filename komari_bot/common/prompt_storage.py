@@ -236,6 +236,15 @@ def get_prompt_storage() -> PromptStorage:
     return _StorageState.storage
 
 
+def close_prompt_storage_if_created() -> None:
+    """关闭已创建的全局 Prompt 存储，不在关闭阶段创建新实例。"""
+    with _StorageState.lock:
+        storage = _StorageState.storage
+        if storage is not None:
+            storage.close()
+            _StorageState.storage = None
+
+
 def merge_prompt_values(
     defaults: dict[str, str],
     prompt_data: dict[str, Any] | None,
