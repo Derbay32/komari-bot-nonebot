@@ -32,10 +32,17 @@ class UserDataDB:
         await self._create_tables()
         logger.debug("[UserDataDB] PostgreSQL 连接池与表结构初始化完成")
 
+    def _require_pool(self) -> "asyncpg.Pool":
+        """获取已初始化的数据库连接池。"""
+        if self._pool is None:
+            msg = "UserDataDB 连接池未初始化"
+            raise RuntimeError(msg)
+        return self._pool
+
     async def _create_tables(self) -> None:
         """创建数据库表结构。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
             await self._rebuild_legacy_favorability_table(conn)
             await conn.execute(
                 """
@@ -77,8 +84,8 @@ class UserDataDB:
 
     async def get_user_favorability(self, user_id: str) -> UserFavorability:
         """获取用户当前好感度，无记录时创建初始值。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO user_favorability (user_id, favorability)
@@ -108,8 +115,7 @@ class UserDataDB:
                 user_id,
                 delta,
             )
-            msg = "UserDataDB 连接池未初始化"
-            raise RuntimeError(msg)
+        pool = self._require_pool()
 
         logger.debug(
             "[UserDataDB] 开始调整好感度: user={} delta={} initial={}",
@@ -117,7 +123,7 @@ class UserDataDB:
             delta,
             self.config.initial_favorability,
         )
-        async with self._pool.acquire() as conn, conn.transaction():
+        async with pool.acquire() as conn, conn.transaction():
             await conn.execute(
                 """
                 INSERT INTO user_favorability (user_id, favorability)
@@ -184,8 +190,8 @@ class UserDataDB:
 
     async def get_user_count(self) -> int:
         """获取总用户数。"""
-        assert self._pool is not None
-        async with self._pool.acquire() as conn:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
             value = await conn.fetchval(
                 """
                 SELECT COUNT(*) FROM user_favorability
