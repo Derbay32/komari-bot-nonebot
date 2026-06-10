@@ -220,3 +220,12 @@ def get_config_storage() -> ConfigStorage:
                 _StorageState.storage = ConfigStorage()
     assert _StorageState.storage is not None
     return _StorageState.storage
+
+
+def close_config_storage_if_created() -> None:
+    """关闭已创建的全局配置存储，不在关闭阶段创建新实例。"""
+    with _StorageState.lock:
+        storage = _StorageState.storage
+        if storage is not None:
+            storage.close()
+            _StorageState.storage = None

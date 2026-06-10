@@ -29,9 +29,11 @@ config_manager.update_field("timeout", 60)
 config = config_manager.reload()
 ```
 """
+from nonebot import get_driver
 from nonebot.plugin import PluginMetadata
 
 from .manager import ConfigManager, get_config_manager
+from .storage import close_config_storage_if_created
 
 __plugin_meta__ = PluginMetadata(
     name="config_manager",
@@ -43,3 +45,12 @@ __all__ = [
     "ConfigManager",
     "get_config_manager",
 ]
+
+
+driver = get_driver()
+
+
+@driver.on_shutdown
+def _close_config_storage() -> None:
+    """关闭已创建的配置存储。"""
+    close_config_storage_if_created()
