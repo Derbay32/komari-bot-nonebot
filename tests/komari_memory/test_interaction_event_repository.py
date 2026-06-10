@@ -13,9 +13,14 @@ from komari_bot.plugins.komari_memory.repositories.interaction_event_repository 
 
 class _FakeConnection:
     def __init__(self) -> None:
+        self.fetchval_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchval(self, query: str, *args: object) -> int:
+        self.fetchval_calls.append((query, args))
+        return 1
 
     async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
         self.fetch_calls.append((query, args))
@@ -129,3 +134,27 @@ def test_update_interaction_event_upserts_embedding_table() -> None:
     embedding_query, embedding_args = conn.execute_calls[0]
     assert "komari_memory_interaction_embeddings" in embedding_query
     assert embedding_args[0] == 1
+
+
+def test_list_interaction_events_escapes_like_wildcards() -> None:
+    conn = _FakeConnection()
+    repository = InteractionEventRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    items, total = asyncio.run(
+        repository.list_interaction_events(
+            limit=10,
+            offset=0,
+            query=r"100%_x\tag",
+        )
+    )
+
+    count_query, count_args = conn.fetchval_calls[0]
+    _data_query, data_args = conn.fetch_calls[0]
+
+    assert total == 1
+    assert items[0]["event_summary"] == "聊了轻小说"
+    assert "user_id ILIKE $1 ESCAPE '\\'" in count_query
+    assert "display_name ILIKE $1 ESCAPE '\\'" in count_query
+    assert "event_summary ILIKE $1 ESCAPE '\\'" in count_query
+    assert count_args == (r"%100\%\_x\\tag%",)
+    assert data_args == (r"%100\%\_x\\tag%", 10, 0)

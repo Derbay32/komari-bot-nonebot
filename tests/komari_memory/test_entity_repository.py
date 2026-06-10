@@ -143,6 +143,53 @@ def test_list_user_profiles_supports_filters_and_parses_profile_columns() -> Non
     assert data_args == ("g1", "u1", "%布丁%", 10, 5)
 
 
+def test_list_user_profiles_escapes_like_wildcards() -> None:
+    conn = _FakeConnection()
+    repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    asyncio.run(
+        repository.list_user_profiles(
+            limit=10,
+            offset=0,
+            query=r"100%_x\tag",
+        )
+    )
+
+    count_query, count_args = conn.fetchval_calls[0]
+    _data_query, data_args = conn.fetch_calls[0]
+
+    assert "user_id ILIKE $1 ESCAPE '\\'" in count_query
+    assert "display_name ILIKE $1 ESCAPE '\\'" in count_query
+    assert "traits::text ILIKE $1 ESCAPE '\\'" in count_query
+    assert count_args == (r"%100\%\_x\\tag%",)
+    assert data_args == (r"%100\%\_x\\tag%", 10, 0)
+
+
+def test_list_interaction_histories_escapes_like_wildcards() -> None:
+    conn = _FakeConnection()
+    repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    asyncio.run(
+        repository.list_interaction_histories(
+            limit=10,
+            offset=0,
+            query=r"100%_x\tag",
+        )
+    )
+
+    count_query, count_args = conn.fetchval_calls[0]
+    _data_query, data_args = conn.fetch_calls[0]
+
+    assert "user_id ILIKE $1 ESCAPE '\\'" in count_query
+    assert "display_name ILIKE $1 ESCAPE '\\'" in count_query
+    assert "file_type ILIKE $1 ESCAPE '\\'" in count_query
+    assert "description ILIKE $1 ESCAPE '\\'" in count_query
+    assert "summary ILIKE $1 ESCAPE '\\'" in count_query
+    assert "records::text ILIKE $1 ESCAPE '\\'" in count_query
+    assert count_args == (r"%100\%\_x\\tag%",)
+    assert data_args == (r"%100\%\_x\\tag%", 10, 0)
+
+
 def test_get_and_delete_interaction_history_row() -> None:
     conn = _FakeConnection()
     repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
