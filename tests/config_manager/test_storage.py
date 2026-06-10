@@ -72,3 +72,33 @@ def test_get_pool_closes_temporary_pool_when_schema_initialization_fails(
         assert storage._pool is None
     finally:
         storage.close()
+
+
+class _FakeStorage:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_close_config_storage_if_created_does_not_create_storage(
+    storage_module: Any,
+) -> None:
+    storage_module._StorageState.storage = None
+
+    storage_module.close_config_storage_if_created()
+
+    assert storage_module._StorageState.storage is None
+
+
+def test_close_config_storage_if_created_closes_and_clears_storage(
+    storage_module: Any,
+) -> None:
+    storage = _FakeStorage()
+    storage_module._StorageState.storage = storage
+
+    storage_module.close_config_storage_if_created()
+
+    assert storage.closed is True
+    assert storage_module._StorageState.storage is None
