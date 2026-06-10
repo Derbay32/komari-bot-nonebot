@@ -20,6 +20,8 @@ _IMAGE_READ_PROMPT = (
     "请详细描述这张图片的内容，重点说明画面主体、文字、人物动作、表情、场景、"
     "可能的梗图含义，以及用户可能想表达的意思。请使用简体中文，避免编造看不到的细节。"
 )
+_VISION_READ_CONCURRENCY_LIMIT = 2
+_VISION_READ_SEMAPHORE = asyncio.Semaphore(_VISION_READ_CONCURRENCY_LIMIT)
 
 
 def _format_error(error: Exception) -> str:
@@ -55,23 +57,24 @@ async def _read_single_image(
             vision_model,
             len(image_data_uri),
         )
-        response = await client.chat.completions.create(
-            model=vision_model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _IMAGE_READ_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_uri},
-                        },
-                    ],
-                }
-            ],
-        )
+        async with _VISION_READ_SEMAPHORE:
+            response = await client.chat.completions.create(
+                model=vision_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _IMAGE_READ_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_data_uri},
+                            },
+                        ],
+                    }
+                ],
+            )
         content = response.choices[0].message.content or ""
         description = content.strip() or "[图片读取失败: 视觉模型返回空内容]"
         logger.info(
