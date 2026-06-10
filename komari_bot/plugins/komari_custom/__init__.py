@@ -172,7 +172,7 @@ async def handle_custom_action(
     except Exception as e:
         if not isinstance(e, FinishedException):
             logger.exception("[KomariCustom] 处理 custom 子命令失败")
-            await custom_action.finish(f"❌ 处理请求失败：{e}")
+            await custom_action.finish("❌ 处理请求失败，请稍后再试")
 
 
 async def _handle_new(group_id: int, user_id: str, title: str) -> None:
