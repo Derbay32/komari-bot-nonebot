@@ -141,7 +141,7 @@ class ConfigManager:
             stored = self._save_to_pg(new_config)
             self._last_loaded_at = stored.updated_at
 
-            logger.info(f"[{self._plugin_name}] 配置已更新: {field_name} = {value}")
+            logger.info(f"[{self._plugin_name}] 配置已更新: {field_name}")
             assert self._dynamic_config is not None
             return self._dynamic_config
 
