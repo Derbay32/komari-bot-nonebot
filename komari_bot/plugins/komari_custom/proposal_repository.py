@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.sql_like_utils import escape_like_pattern
 
 from .models import Proposal
 
@@ -238,18 +239,19 @@ class ProposalRepository:
             return proposals[index - 1] if index <= total and index <= len(proposals) else None
 
         pool = self._require_pool()
+        keyword_pattern = f"%{escape_like_pattern(selector)}%"
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT * FROM komari_custom_proposals
                 WHERE group_id = $1
-                  AND title ILIKE $2
+                  AND title ILIKE $2 ESCAPE '\\'
                   AND (status = 'approved' OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW())))
                 ORDER BY id DESC
                 LIMIT 1
                 """,
                 group_id,
-                f"%{selector}%",
+                keyword_pattern,
             )
         return self._row_to_proposal(row) if row is not None else None
 
