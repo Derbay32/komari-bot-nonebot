@@ -57,6 +57,14 @@ class _FakePromptStorage:
         return self.stored
 
 
+class _ClosablePromptStorage:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_merge_prompt_values_only_accepts_known_string_fields() -> None:
     merged = merge_prompt_values(
         {"system_prompt": "默认", "memory_ack": "收到"},
@@ -133,3 +141,21 @@ def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
 
     assert loader.get_template() == {"system_prompt": "PG 值"}
     assert loader.get_template() == {"system_prompt": "PG 值"}
+
+
+def test_close_prompt_storage_if_created_does_not_create_storage() -> None:
+    prompt_storage._StorageState.storage = None
+
+    prompt_storage.close_prompt_storage_if_created()
+
+    assert prompt_storage._StorageState.storage is None
+
+
+def test_close_prompt_storage_if_created_closes_and_clears_storage() -> None:
+    storage = _ClosablePromptStorage()
+    prompt_storage._StorageState.storage = storage
+
+    prompt_storage.close_prompt_storage_if_created()
+
+    assert storage.closed is True
+    assert prompt_storage._StorageState.storage is None
