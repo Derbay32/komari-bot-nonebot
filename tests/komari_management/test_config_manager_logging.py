@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pytest
 from pydantic import BaseModel
 
 from komari_bot.plugins.config_manager import manager as manager_module
 from komari_bot.plugins.config_manager.manager import ConfigManager
 from komari_bot.plugins.config_manager.storage import StoredConfig
+
+if TYPE_CHECKING:
+    import pytest
 
 
 class _ConfigSchema(BaseModel):
