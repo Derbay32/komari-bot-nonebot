@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from .managed_resources import ManagedConfigResource
 
 API_PREFIX = "/api/komari-management-config/v1"
+_SENSITIVE_FIELD_KEYWORDS = ("password", "token", "secret", "key", "credential")
+_MASKED_CONFIG_VALUE = "******"
 
 
 class ConfigResourceSummary(BaseModel):
@@ -83,6 +85,18 @@ def _get_field_descriptions(config: BaseModel) -> dict[str, str]:
     }
 
 
+def _is_sensitive_field(field_name: str) -> bool:
+    lower_name = field_name.lower()
+    return any(keyword in lower_name for keyword in _SENSITIVE_FIELD_KEYWORDS)
+
+
+def _mask_config_values(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field_name: _MASKED_CONFIG_VALUE if _is_sensitive_field(field_name) else value
+        for field_name, value in values.items()
+    }
+
+
 def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSummary:
     manager = resource.manager_getter()
     config = manager.get()
@@ -104,7 +118,7 @@ def _build_resource_detail(resource: ManagedConfigResource) -> ConfigResourceDet
         config_source=manager.config_source,
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
-        values=config.model_dump(),
+        values=_mask_config_values(config.model_dump()),
     )
 
 
