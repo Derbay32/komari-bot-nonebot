@@ -32,7 +32,7 @@ def get_user_nickname(event: Obv11MessageEvent) -> str:
 
     # 最后返回用户 ID
     if hasattr(event, "get_user_id"):
-        return f"用户（{event.get_user_id():.0f}）"
+        return f"用户（{event.get_user_id()}）"
 
     return "用户"
 
