@@ -36,6 +36,18 @@ class _FakeLLMProvider:
         return self.completions.pop(0)
 
 
+class _ObservableSemaphore:
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self) -> None:
+        self.entered = True
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.exited = True
+
+
 def _build_config() -> SimpleNamespace:
     return SimpleNamespace(
         llm_model_chat="chat-model",
@@ -105,6 +117,96 @@ def test_generate_reply_enables_chat_log_for_messages(monkeypatch: Any) -> None:
     assert fake_provider.completion_calls[0]["record_chat_log"] is True
     assert fake_provider.completion_calls[0]["request_trace_id"] == "chat-2001"
     assert fake_provider.completion_calls[0]["tool_choice"] == "required"
+
+
+def test_execute_tool_loop_enters_llm_completion_gate(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "门控内生成",
+                        "interaction_history": {
+                            "event": "测试门控",
+                            "result": "正常回复",
+                            "emotion": "平静",
+                        },
+                    },
+                )
+            ],
+        )
+    ]
+    semaphore = _ObservableSemaphore()
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    monkeypatch.setattr(llm_service_module, "_LLM_COMPLETION_SEMAPHORE", semaphore)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "你好"}],
+        )
+    )
+
+    assert result.content == "门控内生成"
+    assert semaphore.entered is True
+    assert semaphore.exited is True
+
+
+def test_generate_reply_with_tools_limits_llm_provider_concurrency(
+    monkeypatch: Any,
+) -> None:
+    class _ConcurrentProvider:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def generate_messages_completion(self, **_kwargs: Any) -> SimpleNamespace:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return SimpleNamespace(
+                content="",
+                tool_calls=[
+                    _tool_call(
+                        "final_response",
+                        "{}",
+                        {
+                            "content": "并发回复",
+                            "interaction_history": {
+                                "event": "并发请求",
+                                "result": "完成回复",
+                                "emotion": "平静",
+                            },
+                        },
+                    )
+                ],
+            )
+
+    async def _run_concurrent_replies() -> list[Any]:
+        return await asyncio.gather(
+            *(
+                llm_service_module.generate_reply_with_tools(
+                    config=_build_config(),
+                    messages=[{"role": "user", "content": f"你好{index}"}],
+                    tools=[llm_service_module.FINAL_RESPONSE_TOOL],
+                )
+                for index in range(4)
+            )
+        )
+
+    provider = _ConcurrentProvider()
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+    monkeypatch.setattr(llm_service_module, "_LLM_COMPLETION_SEMAPHORE", asyncio.Semaphore(2))
+
+    results = asyncio.run(_run_concurrent_replies())
+
+    assert [result.content for result in results] == ["并发回复"] * 4
+    assert provider.max_active <= 2
 
 
 def test_generate_reply_rejects_legacy_prompt(monkeypatch: Any) -> None:
