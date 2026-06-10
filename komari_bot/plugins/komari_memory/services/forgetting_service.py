@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from typing import Any
 
 import asyncpg
 from nonebot import logger
@@ -38,6 +39,51 @@ def _is_invalid_fuzzy_summary(value: str) -> bool:
         "对话内容已模糊化处理",
         "互动事件已模糊化处理",
     }
+
+
+def _safe_record_value(record: asyncpg.Record | dict[str, Any], key: str) -> Any:
+    """安全读取 asyncpg.Record 或测试替身中的字段。"""
+    try:
+        return record[key]
+    except (KeyError, TypeError):
+        return None
+
+
+def _safe_record_id_for_log(record: asyncpg.Record | dict[str, Any]) -> str:
+    """生成用于日志的记录 ID，坏行也不影响批处理。"""
+    value = _safe_record_value(record, "id")
+    return "<missing>" if value is None else str(value)
+
+
+def _parse_fuzzify_record(
+    record: asyncpg.Record | dict[str, Any],
+    summary_key: str,
+    task_label: str,
+) -> tuple[int, str] | None:
+    """解析待模糊化记录，坏行返回 None 而不是抛出异常。"""
+    raw_id = _safe_record_value(record, "id")
+    raw_summary = _safe_record_value(record, summary_key)
+
+    try:
+        record_id = int(raw_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[KomariMemory] 跳过无效{}模糊化记录: id={}",
+            task_label,
+            raw_id,
+        )
+        return None
+
+    if not isinstance(raw_summary, str):
+        logger.warning(
+            "[KomariMemory] 跳过无效{}模糊化记录: id={}, {} 不是字符串",
+            task_label,
+            record_id,
+            summary_key,
+        )
+        return None
+
+    return record_id, raw_summary
 
 
 class ForgettingService:
@@ -208,11 +254,16 @@ class ForgettingService:
         concurrency = max(1, int(self.config.forgetting_fuzzify_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def _fuzzify_record(record: asyncpg.Record) -> bool:
+        async def _fuzzify_record(record: asyncpg.Record | dict[str, Any]) -> bool:
+            parsed = _parse_fuzzify_record(record, "summary", "对话记忆")
+            if parsed is None:
+                return False
+
+            record_id, summary = parsed
             async with semaphore:
                 return await self._fuzzify_conversation(
-                    int(record["id"]),
-                    str(record["summary"]),
+                    record_id,
+                    summary,
                 )
 
         logger.debug(
@@ -222,9 +273,17 @@ class ForgettingService:
         )
         results = await asyncio.gather(
             *(_fuzzify_record(record) for record in rows),
-            return_exceptions=False,
+            return_exceptions=True,
         )
-        fuzzified_count = sum(1 for result in results if result)
+        fuzzified_count = 0
+        for record, result in zip(rows, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.opt(exception=result).error(
+                    "[KomariMemory] 对话记忆模糊化任务异常，跳过当前记录: ID={}",
+                    _safe_record_id_for_log(record),
+                )
+            elif result:
+                fuzzified_count += 1
 
         logger.debug(
             "[KomariMemory] 高价值记忆处理: 删除 {} 条, 模糊化 {} 条 (最小保留天数: {}, 并发上限: {})",
@@ -271,18 +330,31 @@ class ForgettingService:
         concurrency = max(1, int(self.config.forgetting_fuzzify_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def _fuzzify_record(record: asyncpg.Record) -> bool:
+        async def _fuzzify_record(record: asyncpg.Record | dict[str, Any]) -> bool:
+            parsed = _parse_fuzzify_record(record, "event_summary", "跨群互动事件")
+            if parsed is None:
+                return False
+
+            record_id, summary = parsed
             async with semaphore:
                 return await self._fuzzify_interaction_event(
-                    int(record["id"]),
-                    str(record["event_summary"]),
+                    record_id,
+                    summary,
                 )
 
         results = await asyncio.gather(
             *(_fuzzify_record(record) for record in rows),
-            return_exceptions=False,
+            return_exceptions=True,
         )
-        fuzzified_count = sum(1 for result in results if result)
+        fuzzified_count = 0
+        for record, result in zip(rows, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.opt(exception=result).error(
+                    "[KomariMemory] 跨群互动事件模糊化任务异常，跳过当前记录: ID={}",
+                    _safe_record_id_for_log(record),
+                )
+            elif result:
+                fuzzified_count += 1
         logger.debug(
             "[KomariMemory] 高价值跨群互动事件处理: 删除 {} 条, 模糊化 {} 条",
             deleted_fuzzy,
