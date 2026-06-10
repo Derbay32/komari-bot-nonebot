@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from komari_bot.plugins.komari_custom.models import SessionData
+from komari_bot.plugins.komari_custom.proposal_repository import ProposalRepository
 from komari_bot.plugins.komari_custom.session_manager import CustomSessionManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +39,33 @@ class _FakeRedis:
 class _FakeConfigManager:
     def get(self) -> object:
         return SimpleNamespace(redis_db=0)
+
+
+class _FakeProposalConnection:
+    def __init__(self) -> None:
+        self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: object) -> None:
+        self.fetchrow_calls.append((query, args))
+
+
+class _FakeProposalAcquire:
+    def __init__(self, conn: _FakeProposalConnection) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _FakeProposalConnection:
+        return self._conn
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
+
+class _FakeProposalPool:
+    def __init__(self, conn: _FakeProposalConnection) -> None:
+        self._conn = conn
+
+    def acquire(self) -> _FakeProposalAcquire:
+        return _FakeProposalAcquire(self._conn)
 
 
 @pytest.fixture
@@ -167,3 +195,21 @@ def test_custom_action_fallback_error_message_hides_exception_detail() -> None:
 
     assert 'await custom_action.finish("❌ 处理请求失败，请稍后再试")' in source
     assert 'await custom_action.finish(f"❌ 处理请求失败：{e}")' not in source
+
+
+@pytest.mark.asyncio
+async def test_find_proposal_by_keyword_escapes_like_wildcards() -> None:
+    conn = _FakeProposalConnection()
+    repository = ProposalRepository()
+    repository._pool = _FakeProposalPool(conn)  # type: ignore[assignment]
+
+    result = await repository.find_in_group_by_index_or_keyword(
+        group_id=100,
+        selector=r"100%_x\tag",
+        limit_for_index=10,
+    )
+
+    query, args = conn.fetchrow_calls[0]
+    assert result is None
+    assert "title ILIKE $2 ESCAPE '\\'" in query
+    assert args == (100, r"%100\%\_x\\tag%")
