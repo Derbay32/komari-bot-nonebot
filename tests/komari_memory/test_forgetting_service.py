@@ -142,6 +142,51 @@ def test_fuzzify_and_cleanup_high_value_memories_limits_concurrency() -> None:
     assert fetch_args == (3, 7)
 
 
+def test_fuzzify_and_cleanup_high_value_memories_continues_after_task_error() -> None:
+    rows = [
+        {"id": 21, "summary": "第一条"},
+        {"id": 22, "summary": "第二条"},
+        {"id": 23, "summary": "第三条"},
+    ]
+    conn = _FakeConnection(fetch_rows=rows)
+    service = _make_service(conn)
+
+    async def _fake_fuzzify(conv_id: int, original_summary: str) -> bool:
+        del original_summary
+        if conv_id == 22:
+            raise RuntimeError("单条模糊化失败")
+        return True
+
+    service._fuzzify_conversation = _fake_fuzzify  # type: ignore[method-assign]
+
+    total = asyncio.run(service._fuzzify_and_cleanup_high_value_memories())
+
+    assert total == 2
+
+
+def test_fuzzify_and_cleanup_high_value_memories_skips_bad_records() -> None:
+    rows = [
+        {"id": 31, "summary": "正常记录"},
+        {"id": "bad", "summary": "坏 ID"},
+        {"id": 33, "summary": None},
+    ]
+    conn = _FakeConnection(fetch_rows=rows)
+    service = _make_service(conn)
+    fuzzified_ids: list[int] = []
+
+    async def _fake_fuzzify(conv_id: int, original_summary: str) -> bool:
+        fuzzified_ids.append(conv_id)
+        assert original_summary == "正常记录"
+        return True
+
+    service._fuzzify_conversation = _fake_fuzzify  # type: ignore[method-assign]
+
+    total = asyncio.run(service._fuzzify_and_cleanup_high_value_memories())
+
+    assert total == 1
+    assert fuzzified_ids == [31]
+
+
 def test_fuzzify_conversation_extracts_only_tag_content(monkeypatch: Any) -> None:
     conn = _FakeConnection(execute_results=["UPDATE 1"])
     service = _make_service(conn)
@@ -315,6 +360,51 @@ def test_fuzzify_interaction_event_deletes_after_placeholder_retries(
     assert "DELETE FROM komari_memory_interaction_history" in delete_query
     assert "WHERE id = $1" in delete_query
     assert delete_args == (31,)
+
+
+def test_fuzzify_and_cleanup_interaction_events_continues_after_task_error() -> None:
+    rows = [
+        {"id": 51, "event_summary": "第一条"},
+        {"id": 52, "event_summary": "第二条"},
+        {"id": 53, "event_summary": "第三条"},
+    ]
+    conn = _FakeConnection(fetch_rows=rows)
+    service = _make_service(conn)
+
+    async def _fake_fuzzify(event_id: int, original_summary: str) -> bool:
+        del original_summary
+        if event_id == 52:
+            raise RuntimeError("单条互动事件模糊化失败")
+        return True
+
+    service._fuzzify_interaction_event = _fake_fuzzify  # type: ignore[method-assign]
+
+    total = asyncio.run(service._fuzzify_and_cleanup_high_value_interaction_events())
+
+    assert total == 2
+
+
+def test_fuzzify_and_cleanup_interaction_events_skips_bad_records() -> None:
+    rows = [
+        {"id": 61, "event_summary": "正常事件"},
+        {"id": None, "event_summary": "坏 ID"},
+        {"id": 63, "event_summary": 123},
+    ]
+    conn = _FakeConnection(fetch_rows=rows)
+    service = _make_service(conn)
+    fuzzified_ids: list[int] = []
+
+    async def _fake_fuzzify(event_id: int, original_summary: str) -> bool:
+        fuzzified_ids.append(event_id)
+        assert original_summary == "正常事件"
+        return True
+
+    service._fuzzify_interaction_event = _fake_fuzzify  # type: ignore[method-assign]
+
+    total = asyncio.run(service._fuzzify_and_cleanup_high_value_interaction_events())
+
+    assert total == 1
+    assert fuzzified_ids == [61]
 
 
 def test_fuzzify_and_cleanup_counts_updates_and_retry_deletes(monkeypatch: Any) -> None:
