@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import re
@@ -52,6 +53,8 @@ _INVALID_FAVORABILITY_DELTA_TYPE_ERROR = (
     "record_favorability_delta.delta 必须是整数且不能是 bool"
 )
 _INVALID_FAVORABILITY_REASON_ERROR = "record_favorability_delta.reason 不能为空"
+_LLM_COMPLETION_CONCURRENCY_LIMIT = 4
+_LLM_COMPLETION_SEMAPHORE = asyncio.Semaphore(_LLM_COMPLETION_CONCURRENCY_LIMIT)
 
 READ_IMAGE_TOOL: dict[str, Any] = {
     "type": "function",
@@ -737,18 +740,19 @@ async def _execute_tool_loop(
             vision_temperature if has_vision_tool else config.llm_temperature_chat
         )
         max_tokens = vision_max_tokens if has_vision_tool else config.llm_max_tokens_chat
-        completion = await llm_provider.generate_messages_completion(
-            messages=current_messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=int(max_tokens),
-            tools=tool_definitions,
-            tool_choice="required",
-            parallel_tool_calls=False,
-            request_trace_id=request_trace_id,
-            request_phase=f"{request_phase_prefix}_round_{round_num}",
-            record_chat_log=True,
-        )
+        async with _LLM_COMPLETION_SEMAPHORE:
+            completion = await llm_provider.generate_messages_completion(
+                messages=current_messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=int(max_tokens),
+                tools=tool_definitions,
+                tool_choice="required",
+                parallel_tool_calls=False,
+                request_trace_id=request_trace_id,
+                request_phase=f"{request_phase_prefix}_round_{round_num}",
+                record_chat_log=True,
+            )
 
         if not completion.tool_calls:
             msg = (
