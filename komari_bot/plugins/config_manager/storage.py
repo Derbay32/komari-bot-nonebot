@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
@@ -36,6 +37,7 @@ _CONFIG_TABLE_UPDATED_AT_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_komari_plugin_configs_updated_at
     ON komari_plugin_configs (updated_at DESC);
 """
+_CONFIG_STORAGE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +75,12 @@ class ConfigStorage:
 
     def _run(self, coro: Coroutine[Any, Any, T]) -> T:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()
+        try:
+            return future.result(timeout=_CONFIG_STORAGE_TIMEOUT_SECONDS)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            msg = "配置存储操作超时"
+            raise RuntimeError(msg) from exc
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is None:
