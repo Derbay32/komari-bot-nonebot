@@ -1,4 +1,4 @@
-name: Docker Hub 发布
+name: Codeberg 容器注册表发布
 
 on:
   # 正式版本：在 Forgejo/Codeberg 发布 Release 时触发
@@ -11,7 +11,7 @@ on:
       - "v*-rc*"
 
 env:
-  DOCKER_IMAGE: derbay32/komari-bot-nonebot
+  DOCKER_IMAGE: codeberg.org/derbay32/komari-bot-nonebot
   FORGEJO_API_URL: ${{ forgejo.server_url }}/api/v1
   FORGEJO_REPOSITORY: ${{ forgejo.repository }}
   FORGEJO_SERVER_URL: ${{ forgejo.server_url }}
@@ -73,15 +73,15 @@ jobs:
           docker buildx use forgejo-builder
           docker buildx inspect --bootstrap
 
-      - name: 登录 Docker Hub
+      - name: 登录 Codeberg 容器注册表
         run: |
           set -euo pipefail
-          printf '%s' "$DOCKERHUB_TOKEN" | docker login \
-            --username "$DOCKERHUB_USERNAME" \
-            --password-stdin
+          printf '%s' "$CODEBERG_TOKEN" | docker login \
+            --username "$CODEBERG_USERNAME" \
+            --password-stdin codeberg.org
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          CODEBERG_USERNAME: ${{ secrets.CODEBERG_USERNAME }}
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
 
       - name: 准备 Forgejo Release
         id: forgejo_release
@@ -191,8 +191,8 @@ jobs:
           target = Path("komari-bot-deploy/docker-compose.yml")
           content = source.read_text(encoding="utf-8")
           content = content.replace(
-              "derbay32/komari-bot-nonebot:latest",
-              f"derbay32/komari-bot-nonebot:{image_tag}",
+              "codeberg.org/derbay32/komari-bot-nonebot:latest",
+              f"codeberg.org/derbay32/komari-bot-nonebot:{image_tag}",
           )
           target.write_text(content, encoding="utf-8")
           PY
