@@ -34,6 +34,9 @@ def test_management_config_schema_defaults_are_safe() -> None:
     assert config.api_allowed_origins == []
     assert isinstance(config.announce_status_page_url, str)
     assert config.announce_status_page_url
+    assert config.announce_max_group_count == 20
+    assert config.announce_send_interval_seconds == 1.0
+    assert config.announce_request_cooldown_seconds == 30.0
 
 
 def test_management_config_schema_rejects_blank_status_page_url() -> None:

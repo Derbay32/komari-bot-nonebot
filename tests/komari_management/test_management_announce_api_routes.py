@@ -43,13 +43,21 @@ class _FakeBot:
         raise AssertionError
 
 
-def _build_app() -> FastAPI:
+def _build_app(
+    *,
+    announce_max_group_count: int = 20,
+    announce_send_interval_seconds: float = 0.0,
+    announce_request_cooldown_seconds: float = 0.0,
+) -> FastAPI:
     api_app = FastAPI()
     register_announce_api(
         api_app,
         api_token="secret-token",
         allowed_origins=["https://ui.example.com"],
         status_page_url="https://status.example.com/komari",
+        announce_max_group_count=announce_max_group_count,
+        announce_send_interval_seconds=announce_send_interval_seconds,
+        announce_request_cooldown_seconds=announce_request_cooldown_seconds,
     )
     return api_app
 
@@ -160,3 +168,116 @@ async def test_announce_routes_handle_offline_bot(
     assert groups.json() == {"groups": [], "total": 0}
     assert maintenance.status_code == 503
     assert maintenance.json()["detail"] == "Bot 不在线，无法发送消息"
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_reject_group_count_over_limit(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot = _FakeBot()
+    _patch_bots(monkeypatch, {"bot": bot})
+    headers = {"Authorization": "Bearer secret-token"}
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(announce_max_group_count=1))
+    ) as ctx:
+        client = ctx.get_client()
+        response = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=headers,
+            json={
+                "title": "数据库维护",
+                "content": "- 更新索引",
+                "scheduled_time": "2026-04-24 02:00",
+                "group_ids": [10001, 10002],
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "目标群数量超过上限 1"
+    assert bot.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_apply_request_cooldown(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot = _FakeBot()
+    _patch_bots(monkeypatch, {"bot": bot})
+    headers = {"Authorization": "Bearer secret-token"}
+    payload = {
+        "title": "数据库维护",
+        "content": "- 更新索引",
+        "scheduled_time": "2026-04-24 02:00",
+        "group_ids": [10001],
+    }
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(announce_request_cooldown_seconds=60.0))
+    ) as ctx:
+        client = ctx.get_client()
+        first = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=headers,
+            json=payload,
+        )
+        second = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=headers,
+            json=payload,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    detail = second.json()["detail"]
+    assert detail["message"] == "维护通知发送过于频繁，请稍后再试"
+    assert 0 < detail["remaining_seconds"] <= 60.0
+    assert len(bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_throttle_between_group_sends(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from komari_bot.plugins.komari_management import announce_api
+
+    bot = _FakeBot(fail_group_ids={10002})
+    _patch_bots(monkeypatch, {"bot": bot})
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(announce_api.asyncio, "sleep", _fake_sleep)
+    headers = {"Authorization": "Bearer secret-token"}
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(announce_send_interval_seconds=2.5))
+    ) as ctx:
+        client = ctx.get_client()
+        response = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=headers,
+            json={
+                "title": "数据库维护",
+                "content": "- 更新索引",
+                "scheduled_time": "2026-04-24 02:00",
+                "group_ids": [10001, 10002, 10003],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 3
+    assert payload["success_count"] == 2
+    assert payload["failed_count"] == 1
+    assert payload["results"][1] == {
+        "group_id": 10002,
+        "success": False,
+        "error": "发送失败",
+    }
+    assert sleep_calls == [2.5, 2.5]
+    assert len(bot.sent_messages) == 3
