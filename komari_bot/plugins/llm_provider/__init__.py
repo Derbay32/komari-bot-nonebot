@@ -108,6 +108,87 @@ def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int
     }
 
 
+def _build_log_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """构造写入 JSONL 的剩余调用参数，排除追踪专用字段。"""
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"request_trace_id", "request_phase"}
+    }
+
+
+def _build_prompt_log_input(
+    *,
+    trace_id: str,
+    phase: str,
+    prompt: str,
+    system_instruction: str,
+    temperature: float | None,
+    max_tokens: int | None,
+    response_format: dict | None,
+    enable_knowledge: bool,
+    knowledge_query: str | None,
+    knowledge_limit: int,
+    kwargs: dict[str, Any],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    parallel_tool_calls: bool | None = None,
+) -> dict[str, Any]:
+    """构造 prompt 路径完整 JSONL 请求体。"""
+    input_data: dict[str, Any] = {
+        "trace_id": trace_id,
+        "phase": phase,
+        "prompt": prompt,
+        "system_instruction": system_instruction,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": response_format,
+        "enable_knowledge": enable_knowledge,
+        "knowledge_query": knowledge_query,
+        "knowledge_limit": knowledge_limit,
+        "kwargs": _build_log_kwargs(kwargs),
+    }
+    if tools is not None:
+        input_data["tools"] = tools
+    if tool_choice is not None:
+        input_data["tool_choice"] = tool_choice
+    if parallel_tool_calls is not None:
+        input_data["parallel_tool_calls"] = parallel_tool_calls
+    return input_data
+
+
+def _build_messages_log_input(
+    *,
+    trace_id: str,
+    payload_summary: dict[str, int],
+    messages: list[dict],
+    temperature: float | None,
+    max_tokens: int | None,
+    response_format: dict | None,
+    kwargs: dict[str, Any],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    parallel_tool_calls: bool | None = None,
+) -> dict[str, Any]:
+    """构造 messages 路径完整 JSONL 请求体。"""
+    input_data: dict[str, Any] = {
+        "trace_id": trace_id,
+        "payload_summary": payload_summary,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": response_format,
+        "kwargs": _build_log_kwargs(kwargs),
+    }
+    if tools is not None:
+        input_data["tools"] = tools
+    if tool_choice is not None:
+        input_data["tool_choice"] = tool_choice
+    if parallel_tool_calls is not None:
+        input_data["parallel_tool_calls"] = parallel_tool_calls
+    return input_data
+
+
 def _get_client() -> DeepSeekClient:
     """获取 LLM 客户端实例。"""
     config = config_manager.get()
@@ -173,6 +254,7 @@ async def generate_text(
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
+    final_system_instruction = system_instruction or ""
 
     try:
         # 知识库检索
@@ -219,12 +301,19 @@ async def generate_text(
             await log_llm_call(
                 method="generate_text",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "phase": request_phase,
-                    "prompt": prompt,
-                    "system_instruction": system_instruction,
-                },
+                input_data=_build_prompt_log_input(
+                    trace_id=request_trace_id,
+                    phase=request_phase,
+                    prompt=prompt,
+                    system_instruction=final_system_instruction,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    enable_knowledge=enable_knowledge,
+                    knowledge_query=knowledge_query,
+                    knowledge_limit=knowledge_limit,
+                    kwargs=kwargs,
+                ),
                 error=str(e),
                 duration_ms=duration_ms,
             )
@@ -243,12 +332,19 @@ async def generate_text(
             await log_llm_call(
                 method="generate_text",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "phase": request_phase,
-                    "prompt": prompt,
-                    "system_instruction": final_system_instruction,
-                },
+                input_data=_build_prompt_log_input(
+                    trace_id=request_trace_id,
+                    phase=request_phase,
+                    prompt=prompt,
+                    system_instruction=final_system_instruction,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    enable_knowledge=enable_knowledge,
+                    knowledge_query=knowledge_query,
+                    knowledge_limit=knowledge_limit,
+                    kwargs=kwargs,
+                ),
                 output=content,
                 reasoning_content=reasoning_content,
                 duration_ms=duration_ms,
@@ -280,6 +376,7 @@ async def generate_completion(
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
+    final_system_instruction = system_instruction or ""
 
     try:
         knowledge_context = ""
@@ -328,14 +425,22 @@ async def generate_completion(
             await log_llm_call(
                 method="generate_completion",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "phase": request_phase,
-                    "prompt": prompt,
-                    "system_instruction": system_instruction,
-                    "tools": tools,
-                    "tool_choice": tool_choice,
-                },
+                input_data=_build_prompt_log_input(
+                    trace_id=request_trace_id,
+                    phase=request_phase,
+                    prompt=prompt,
+                    system_instruction=final_system_instruction,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    enable_knowledge=enable_knowledge,
+                    knowledge_query=knowledge_query,
+                    knowledge_limit=knowledge_limit,
+                    kwargs=kwargs,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                ),
                 error=str(e),
                 duration_ms=duration_ms,
             )
@@ -346,14 +451,22 @@ async def generate_completion(
             await log_llm_call(
                 method="generate_completion",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "phase": request_phase,
-                    "prompt": prompt,
-                    "system_instruction": final_system_instruction,
-                    "tools": tools,
-                    "tool_choice": tool_choice,
-                },
+                input_data=_build_prompt_log_input(
+                    trace_id=request_trace_id,
+                    phase=request_phase,
+                    prompt=prompt,
+                    system_instruction=final_system_instruction,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    enable_knowledge=enable_knowledge,
+                    knowledge_query=knowledge_query,
+                    knowledge_limit=knowledge_limit,
+                    kwargs=kwargs,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                ),
                 output=json.dumps(result.model_dump(), ensure_ascii=False),
                 reasoning_content=result.reasoning_content,
                 duration_ms=duration_ms,
@@ -417,11 +530,15 @@ async def generate_text_with_messages(
             await log_llm_call(
                 method="generate_text_with_messages",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "payload_summary": payload_summary,
-                    "messages": messages,
-                },
+                input_data=_build_messages_log_input(
+                    trace_id=request_trace_id,
+                    payload_summary=payload_summary,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    kwargs=kwargs,
+                ),
                 error=str(e),
                 duration_ms=duration_ms,
             )
@@ -441,11 +558,15 @@ async def generate_text_with_messages(
             await log_llm_call(
                 method="generate_text_with_messages",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "payload_summary": payload_summary,
-                    "messages": messages,
-                },
+                input_data=_build_messages_log_input(
+                    trace_id=request_trace_id,
+                    payload_summary=payload_summary,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    kwargs=kwargs,
+                ),
                 output=content,
                 reasoning_content=reasoning_content,
                 duration_ms=duration_ms,
@@ -503,13 +624,18 @@ async def generate_messages_completion(
             await log_llm_call(
                 method="generate_messages_completion",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "payload_summary": payload_summary,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": tool_choice,
-                },
+                input_data=_build_messages_log_input(
+                    trace_id=request_trace_id,
+                    payload_summary=payload_summary,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    kwargs=kwargs,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                ),
                 error=str(e),
                 duration_ms=duration_ms,
             )
@@ -520,13 +646,18 @@ async def generate_messages_completion(
             await log_llm_call(
                 method="generate_messages_completion",
                 model=model,
-                input_data={
-                    "trace_id": request_trace_id,
-                    "payload_summary": payload_summary,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": tool_choice,
-                },
+                input_data=_build_messages_log_input(
+                    trace_id=request_trace_id,
+                    payload_summary=payload_summary,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    kwargs=kwargs,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                ),
                 output=json.dumps(result.model_dump(), ensure_ascii=False),
                 reasoning_content=result.reasoning_content,
                 duration_ms=duration_ms,

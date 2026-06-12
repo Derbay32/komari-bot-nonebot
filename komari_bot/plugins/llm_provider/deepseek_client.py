@@ -165,8 +165,10 @@ class DeepSeekClient(BaseLLMClient):
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
-                f"  system_instruction: {system_instruction}\n"
-                f"  prompt: {prompt}"
+                f"  prompt_chars: {len(prompt)}\n"
+                f"  system_instruction_chars: {len(system_instruction or '')}\n"
+                f"  tools_count: {len(tools or [])}\n"
+                f"  has_response_format: {response_format is not None}"
             )
             messages = []
             if system_instruction:
@@ -208,7 +210,7 @@ class DeepSeekClient(BaseLLMClient):
                         "DeepSeek 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
                         ", ".join(conflict_keys),
                     )
-                logger.debug("注入 DeepSeek 额外参数: {}", extra_params)
+                logger.debug("注入 DeepSeek 额外参数键名: {}", sorted(extra_params))
                 request_data["extra_body"] = dict(extra_params)
 
             response = await self.client.chat.completions.create(**request_data)
@@ -300,7 +302,7 @@ class DeepSeekClient(BaseLLMClient):
                         "DeepSeek 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
                         ", ".join(conflict_keys),
                     )
-                logger.debug("注入 DeepSeek 额外参数: {}", extra_params)
+                logger.debug("注入 DeepSeek 额外参数键名: {}", sorted(extra_params))
                 request_data["extra_body"] = dict(extra_params)
 
             logger.debug(
@@ -309,7 +311,11 @@ class DeepSeekClient(BaseLLMClient):
                 f"  messages: {len(messages)} turns\n"
                 f"  temperature: {request_data['temperature']}\n"
                 f"  max_tokens: {request_data['max_tokens']}\n"
-                f"  reasoning_effort: {reasoning_effort}"
+                f"  reasoning_effort: {reasoning_effort}\n"
+                f"  frequency_penalty: {request_data['frequency_penalty']}\n"
+                f"  tools_count: {len(tools or [])}\n"
+                f"  has_response_format: {response_format is not None}\n"
+                f"  has_parallel_tool_calls: {parallel_tool_calls is not None}"
             )
 
             response = await self.client.chat.completions.create(**request_data)

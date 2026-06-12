@@ -2,6 +2,7 @@
 llm provider 配置 Schema 实现。
 """
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -84,6 +85,21 @@ class DynamicConfigSchema(BaseModel):
         description="视觉模型最大 token 数",
     )
 
+    # LLM 调用日志配置
+    llm_log_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=90,
+        description="logs/llm_provider/*.jsonl 自动清理的日志保留天数",
+    )
+    llm_log_dir_permission_mode: str = Field(
+        default="0o700",
+        description=(
+            "LLM 日志目录首次创建时应用的八进制权限字符串，"
+            "例如 0o700、0o750；为空字符串时禁用 chmod 权限收敛"
+        ),
+    )
+
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
@@ -103,4 +119,15 @@ class DynamicConfigSchema(BaseModel):
                 return [str(item) for item in parsed]
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("llm_log_dir_permission_mode")
+    @classmethod
+    def validate_log_dir_permission_mode(cls, v: str) -> str:
+        """校验 LLM 日志目录权限模式。"""
+        if v == "":
+            return v
+        if not re.fullmatch(r"0o[0-7]{3,4}", v):
+            msg = "llm_log_dir_permission_mode 必须为空或八进制权限字符串"
+            raise ValueError(msg)
         return v
