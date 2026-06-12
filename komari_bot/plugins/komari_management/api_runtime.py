@@ -116,6 +116,17 @@ def register_management_api_for_driver(
             "announce_status_page_url",
             DEFAULT_ANNOUNCE_STATUS_PAGE_URL,
         ),
+        announce_max_group_count=getattr(config, "announce_max_group_count", 20),
+        announce_send_interval_seconds=getattr(
+            config,
+            "announce_send_interval_seconds",
+            1.0,
+        ),
+        announce_request_cooldown_seconds=getattr(
+            config,
+            "announce_request_cooldown_seconds",
+            30.0,
+        ),
     )
     register_scene_api(
         server_app,

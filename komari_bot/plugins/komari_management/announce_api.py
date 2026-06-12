@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
@@ -91,8 +93,17 @@ def _build_group_info(raw_group: dict[str, Any]) -> GroupInfo:
     )
 
 
-def create_announce_router(*, api_token: str, status_page_url: str) -> APIRouter:
+def create_announce_router(
+    *,
+    api_token: str,
+    status_page_url: str,
+    announce_max_group_count: int = 20,
+    announce_send_interval_seconds: float = 1.0,
+    announce_request_cooldown_seconds: float = 30.0,
+) -> APIRouter:
     """创建维护通知路由。"""
+    cooldown_lock = asyncio.Lock()
+    last_send_started_at: float | None = None
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问维护通知接口",
@@ -124,9 +135,31 @@ def create_announce_router(*, api_token: str, status_page_url: str) -> APIRouter
         """向指定群发送维护通知。"""
         from nonebot import get_bots
 
+        if len(payload.group_ids) > announce_max_group_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"目标群数量超过上限 {announce_max_group_count}",
+            )
+
         bots = get_bots()
         if not bots:
             raise HTTPException(status_code=503, detail="Bot 不在线，无法发送消息")
+
+        nonlocal last_send_started_at
+        async with cooldown_lock:
+            now = time.monotonic()
+            if last_send_started_at is not None:
+                elapsed = now - last_send_started_at
+                remaining_seconds = announce_request_cooldown_seconds - elapsed
+                if remaining_seconds > 0:
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "message": "维护通知发送过于频繁，请稍后再试",
+                            "remaining_seconds": round(remaining_seconds, 3),
+                        },
+                    )
+            last_send_started_at = now
 
         bot = next(iter(bots.values()))
         message_text = _build_maintenance_message(
@@ -136,7 +169,7 @@ def create_announce_router(*, api_token: str, status_page_url: str) -> APIRouter
             status_page_url,
         )
         results: list[AnnounceResult] = []
-        for group_id in payload.group_ids:
+        for index, group_id in enumerate(payload.group_ids):
             try:
                 await bot.call_api(
                     "send_group_msg",
@@ -152,6 +185,8 @@ def create_announce_router(*, api_token: str, status_page_url: str) -> APIRouter
                         error=str(exc),
                     )
                 )
+            if announce_send_interval_seconds > 0 and index < len(payload.group_ids) - 1:
+                await asyncio.sleep(announce_send_interval_seconds)
 
         success_count = sum(1 for result in results if result.success)
         failed_count = len(results) - success_count
@@ -171,6 +206,9 @@ def register_announce_api(
     api_token: str,
     allowed_origins: Sequence[str],
     status_page_url: str,
+    announce_max_group_count: int = 20,
+    announce_send_interval_seconds: float = 1.0,
+    announce_request_cooldown_seconds: float = 30.0,
 ) -> None:
     """注册维护通知 API。"""
     if getattr(app.state, "komari_announce_api_registered", False):
@@ -181,6 +219,9 @@ def register_announce_api(
         create_announce_router(
             api_token=api_token,
             status_page_url=status_page_url,
+            announce_max_group_count=announce_max_group_count,
+            announce_send_interval_seconds=announce_send_interval_seconds,
+            announce_request_cooldown_seconds=announce_request_cooldown_seconds,
         )
     )
     app.state.komari_announce_api_registered = True
