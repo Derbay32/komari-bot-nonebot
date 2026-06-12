@@ -6,6 +6,9 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
+from komari_bot.plugins.komari_memory.repositories.entity_repository import (
+    UserProfileBatchUpsertResult,
+)
 from komari_bot.plugins.komari_memory.services import (
     memory_service as memory_service_module,
 )
@@ -83,8 +86,11 @@ class _FakeEntityRepository:
     def __init__(self) -> None:
         self.batch_profile_calls: list[list[dict[str, Any]]] = []
 
-    async def batch_upsert_user_profiles(self, payloads: list[dict[str, Any]]) -> None:
+    async def batch_upsert_user_profiles(
+        self, payloads: list[dict[str, Any]]
+    ) -> UserProfileBatchUpsertResult:
         self.batch_profile_calls.append(payloads)
+        return UserProfileBatchUpsertResult()
 
 
 def _make_service(

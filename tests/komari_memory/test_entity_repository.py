@@ -10,7 +10,7 @@ import pytest
 
 from komari_bot.plugins.komari_memory.repositories.entity_repository import (
     EntityRepository,
-    UserProfileConcurrentUpdateError,
+    UserProfileBatchUpsertError,
 )
 
 
@@ -54,8 +54,8 @@ class _FakeConnection:
         if self.return_none_fetchrow_at == len(self.fetchrow_calls):
             return None
         return {
-            "user_id": "u1",
-            "group_id": "g1",
+            "user_id": str(args[0]) if args else "u1",
+            "group_id": str(args[1]) if len(args) > 1 else "g1",
             "version": 1,
             "display_name": "阿明",
             "file_type": "用户的近期对鞠行为备忘录",
@@ -239,11 +239,11 @@ def test_upsert_user_profile_normalizes_updated_at_string_to_datetime() -> None:
     assert conn.transaction_commits == 1
 
 
-def test_batch_upsert_user_profiles_uses_single_transaction() -> None:
+def test_batch_upsert_user_profiles_uses_per_row_transactions() -> None:
     conn = _FakeConnection()
     repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
 
-    asyncio.run(
+    result = asyncio.run(
         repository.batch_upsert_user_profiles(
             [
                 {
@@ -263,16 +263,18 @@ def test_batch_upsert_user_profiles_uses_single_transaction() -> None:
     )
 
     assert len(conn.fetchrow_calls) == 2
-    assert conn.transaction_commits == 1
+    assert [row.user_id for row in result.upserted] == ["u1", "u2"]
+    assert result.conflicts == []
+    assert conn.transaction_commits == 2
     assert conn.transaction_rollbacks == 0
 
 
-def test_batch_upsert_user_profiles_rolls_back_on_failure() -> None:
+def test_batch_upsert_user_profiles_keeps_committed_rows_on_failure() -> None:
     conn = _FakeConnection()
     conn.fail_fetchrow_at = 2
     repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
 
-    try:
+    with pytest.raises(UserProfileBatchUpsertError) as exc_info:
         asyncio.run(
             repository.batch_upsert_user_profiles(
                 [
@@ -291,13 +293,12 @@ def test_batch_upsert_user_profiles_rolls_back_on_failure() -> None:
                 ]
             )
         )
-    except RuntimeError as exc:
-        assert str(exc) == "模拟写入失败"
-    else:
-        raise AssertionError("批量写入失败时应传播异常")
 
     assert len(conn.fetchrow_calls) == 2
-    assert conn.transaction_commits == 0
+    assert [row.user_id for row in exc_info.value.upserted] == ["u1"]
+    assert exc_info.value.errors[0].user_id == "u2"
+    assert exc_info.value.errors[0].message == "模拟写入失败"
+    assert conn.transaction_commits == 1
     assert conn.transaction_rollbacks == 1
 
 
@@ -328,28 +329,70 @@ def test_user_profile_delete_patch_uses_text_array() -> None:
     assert args[5] == datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
 
 
-def test_user_profile_snapshot_conflict_raises_and_rolls_back() -> None:
+def test_user_profile_snapshot_conflict_returns_result_without_rollback() -> None:
     conn = _FakeConnection()
     conn.return_none_fetchrow_at = 1
     repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
 
-    with pytest.raises(UserProfileConcurrentUpdateError):
-        asyncio.run(
-            repository.batch_upsert_user_profiles(
-                [
-                    {
-                        "user_id": "u1",
-                        "group_id": "g1",
-                        "display_name": "阿明",
-                        "set_traits": {},
-                        "delete_keys": [],
-                        "updated_at": "2026-04-10T12:00:00Z",
-                        "snapshot_updated_at": "2026-04-10T11:00:00Z",
-                        "importance": 4,
-                    }
-                ]
-            )
+    result = asyncio.run(
+        repository.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": "u1",
+                    "group_id": "g1",
+                    "display_name": "阿明",
+                    "set_traits": {},
+                    "delete_keys": [],
+                    "updated_at": "2026-04-10T12:00:00Z",
+                    "snapshot_updated_at": "2026-04-10T11:00:00Z",
+                    "importance": 4,
+                }
+            ]
         )
+    )
 
-    assert conn.transaction_commits == 0
-    assert conn.transaction_rollbacks == 1
+    assert result.upserted == []
+    assert result.conflicts[0].user_id == "u1"
+    assert result.conflicts[0].snapshot_updated_at == "2026-04-10T11:00:00Z"
+    assert conn.transaction_commits == 1
+    assert conn.transaction_rollbacks == 0
+
+
+def test_batch_upsert_user_profiles_commits_non_conflicting_rows() -> None:
+    conn = _FakeConnection()
+    conn.return_none_fetchrow_at = 2
+    repository = EntityRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        repository.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": "u1",
+                    "group_id": "g1",
+                    "profile": {"display_name": "阿明", "traits": {}},
+                    "importance": 4,
+                },
+                {
+                    "user_id": "u2",
+                    "group_id": "g1",
+                    "display_name": "阿华",
+                    "set_traits": {},
+                    "delete_keys": [],
+                    "updated_at": "2026-04-10T12:00:00Z",
+                    "snapshot_updated_at": "2026-04-10T11:00:00Z",
+                    "importance": 4,
+                },
+                {
+                    "user_id": "u3",
+                    "group_id": "g1",
+                    "profile": {"display_name": "阿强", "traits": {}},
+                    "importance": 4,
+                },
+            ]
+        )
+    )
+
+    assert [row.user_id for row in result.upserted] == ["u1", "u3"]
+    assert [conflict.user_id for conflict in result.conflicts] == ["u2"]
+    assert conn.transaction_commits == 3
+    assert conn.transaction_rollbacks == 0
