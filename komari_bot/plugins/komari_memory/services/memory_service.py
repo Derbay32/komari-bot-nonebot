@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..repositories.conversation_repository import ConversationRepository
     from ..repositories.entity_repository import (
         EntityRepository,
+        UserProfileBatchUpsertResult,
         UserProfileTraitsPatchPayload,
         UserProfileUpsertPayload,
     )
@@ -280,13 +281,13 @@ class MemoryService:
     async def batch_upsert_user_profiles(
         self,
         profiles: Sequence[UserProfileTraitsPatchPayload | UserProfileUpsertPayload],
-    ) -> None:
+    ) -> UserProfileBatchUpsertResult:
         """批量创建或更新用户画像实体。"""
         payloads = [
             self._normalize_profile_patch_payload(raw_payload)
             for raw_payload in profiles
         ]
-        await self._entity_repo.batch_upsert_user_profiles(payloads)
+        return await self._entity_repo.batch_upsert_user_profiles(payloads)
 
     async def upsert_interaction_history(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
@@ -55,6 +56,54 @@ class UserProfileConcurrentUpdateError(RuntimeError):
         self.group_id = group_id
 
 
+@dataclass(frozen=True)
+class UserProfileRow:
+    """用户画像写入返回行。"""
+
+    user_id: str
+    group_id: str
+    version: int
+    traits: dict[str, Any]
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class UserProfileConflict:
+    """用户画像乐观锁冲突。"""
+
+    user_id: str
+    group_id: str
+    snapshot_updated_at: datetime | str | None = None
+
+
+@dataclass(frozen=True)
+class UserProfileUpsertError:
+    """用户画像单条写入错误。"""
+
+    user_id: str
+    group_id: str
+    message: str
+
+
+@dataclass(frozen=True)
+class UserProfileBatchUpsertResult:
+    """用户画像批量写入结果。"""
+
+    upserted: list[UserProfileRow] = field(default_factory=list)
+    conflicts: list[UserProfileConflict] = field(default_factory=list)
+    errors: list[UserProfileUpsertError] = field(default_factory=list)
+
+
+class UserProfileBatchUpsertError(RuntimeError):
+    """用户画像批量写入存在单条数据库错误。"""
+
+    def __init__(self, result: UserProfileBatchUpsertResult) -> None:
+        super().__init__("用户画像批量写入存在部分失败")
+        self.result = result
+        self.upserted = result.upserted
+        self.errors = result.errors
+
+
 class EntityRepository:
     """画像与互动历史数据访问仓库。"""
 
@@ -70,7 +119,7 @@ class EntityRepository:
         importance: int = 4,
     ) -> None:
         """写入用户画像。"""
-        await self.batch_upsert_user_profiles(
+        result = await self.batch_upsert_user_profiles(
             [
                 {
                     "user_id": user_id,
@@ -80,6 +129,12 @@ class EntityRepository:
                 }
             ]
         )
+        if result.conflicts:
+            conflict = result.conflicts[0]
+            raise UserProfileConcurrentUpdateError(
+                user_id=conflict.user_id,
+                group_id=conflict.group_id,
+            )
         logger.debug(
             "[KomariMemory] upsert profile row: group={} user={}",
             group_id,
@@ -89,37 +144,77 @@ class EntityRepository:
     async def batch_upsert_user_profiles(
         self,
         profiles: Sequence[UserProfileTraitsPatchPayload | UserProfileUpsertPayload],
-    ) -> None:
-        """在单个事务中批量增量写入用户画像。"""
+    ) -> UserProfileBatchUpsertResult:
+        """逐条隔离事务批量增量写入用户画像。"""
+        result = UserProfileBatchUpsertResult()
         if not profiles:
-            return
+            return result
 
-        async with self.pg_pool.acquire() as conn, conn.transaction():
+        async with self.pg_pool.acquire() as conn:
             for raw_payload in profiles:
                 payload = self._normalize_profile_patch_payload(raw_payload)
-                user_id = payload["user_id"]
-                row = await conn.fetchrow(
-                    self._profile_upsert_sql(),
-                    user_id,
-                    payload["group_id"],
-                    payload["display_name"],
-                    json.dumps(payload["set_traits"], ensure_ascii=False),
-                    payload["delete_keys"],
-                    self._normalize_timestamptz(payload.get("updated_at")),
-                    payload["importance"],
-                    self._normalize_optional_timestamptz(
-                        payload.get("snapshot_updated_at")
-                    ),
-                )
-                if row is None:
-                    raise UserProfileConcurrentUpdateError(
-                        user_id=user_id,
-                        group_id=payload["group_id"],
+                try:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            self._profile_upsert_sql(),
+                            payload["user_id"],
+                            payload["group_id"],
+                            payload["display_name"],
+                            json.dumps(payload["set_traits"], ensure_ascii=False),
+                            payload["delete_keys"],
+                            self._normalize_timestamptz(payload.get("updated_at")),
+                            payload["importance"],
+                            self._normalize_optional_timestamptz(
+                                payload.get("snapshot_updated_at")
+                            ),
+                        )
+                except Exception as exc:
+                    logger.exception(
+                        "[KomariMemory] profile row upsert failed: group={} user={}",
+                        payload["group_id"],
+                        payload["user_id"],
                     )
+                    result.errors.append(
+                        UserProfileUpsertError(
+                            user_id=payload["user_id"],
+                            group_id=payload["group_id"],
+                            message=str(exc),
+                        )
+                    )
+                    continue
+
+                if row is None:
+                    result.conflicts.append(
+                        UserProfileConflict(
+                            user_id=payload["user_id"],
+                            group_id=payload["group_id"],
+                            snapshot_updated_at=payload.get("snapshot_updated_at"),
+                        )
+                    )
+                    continue
+
+                result.upserted.append(self._parse_profile_upsert_row(dict(row)))
+
+        if result.errors:
+            raise UserProfileBatchUpsertError(result)
 
         logger.debug(
-            "[KomariMemory] batch upsert profile rows: count={}",
-            len(profiles),
+            "[KomariMemory] batch upsert profile rows: upserted={}, conflicts={}",
+            len(result.upserted),
+            len(result.conflicts),
+        )
+        return result
+
+    def _parse_profile_upsert_row(self, row: dict[str, Any]) -> UserProfileRow:
+        """解析 profile upsert RETURNING 行。"""
+        traits = row.get("traits")
+        updated_at = row.get("updated_at")
+        return UserProfileRow(
+            user_id=str(row["user_id"]),
+            group_id=str(row["group_id"]),
+            version=int(row["version"]),
+            traits=dict(traits) if isinstance(traits, dict) else {},
+            updated_at=updated_at if isinstance(updated_at, datetime) else datetime.now(UTC),
         )
 
     async def upsert_interaction_history(

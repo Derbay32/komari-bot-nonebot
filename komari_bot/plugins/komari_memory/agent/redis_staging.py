@@ -20,14 +20,20 @@ from komari_bot.common.profile_operations import (
     normalize_profile_operations,
 )
 
-from ..repositories.entity_repository import UserProfileConcurrentUpdateError
+from ..repositories.entity_repository import (
+    UserProfileBatchUpsertError,
+    UserProfileConcurrentUpdateError,
+)
 from ..services.redis_keys import RedisKeys
 from .profile_snapshot import get_snapshot_group_profile, get_snapshot_group_profiles
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
-    from ..repositories.entity_repository import UserProfileTraitsPatchPayload
+    from ..repositories.entity_repository import (
+        UserProfileBatchUpsertResult,
+        UserProfileTraitsPatchPayload,
+    )
     from ..services.memory_service import MemoryService
 
 
@@ -214,7 +220,12 @@ class ProfileStaging:
             )
 
         try:
-            await self._memory.batch_upsert_user_profiles(payloads)
+            batch_result = await self._memory.batch_upsert_user_profiles(payloads)
+        except UserProfileBatchUpsertError as exc:
+            return await self._handle_batch_errors(
+                diff=diff,
+                batch_result=exc.result,
+            )
         except UserProfileConcurrentUpdateError as exc:
             self._snapshot_conflicted_user_ids.add(exc.user_id)
             return CommitResult(
@@ -230,12 +241,98 @@ class ProfileStaging:
                 ],
             )
 
+        if batch_result.conflicts:
+            return await self._handle_batch_conflicts(
+                diff=diff,
+                batch_result=batch_result,
+            )
+
         await self.discard()
         return CommitResult(
             status="committed",
             committed_count=len(diff),
             changed_user_ids=affected_user_ids,
             summary=f"已写入 {len(diff)} 条画像操作",
+        )
+
+    async def _handle_batch_conflicts(
+        self,
+        *,
+        diff: list[ProfileDiffItem],
+        batch_result: UserProfileBatchUpsertResult,
+    ) -> CommitResult:
+        """处理仓库层部分提交后的乐观锁冲突。"""
+        conflict_user_ids = {conflict.user_id for conflict in batch_result.conflicts}
+        upserted_user_ids = {row.user_id for row in batch_result.upserted}
+        self._snapshot_conflicted_user_ids.update(conflict_user_ids)
+
+        remaining_diff = [item for item in diff if item.user_id in conflict_user_ids]
+        if remaining_diff:
+            await self._save_items(remaining_diff)
+        else:
+            await self.discard()
+
+        committed_count = sum(1 for item in diff if item.user_id in upserted_user_ids)
+        return CommitResult(
+            status="conflict",
+            committed_count=committed_count,
+            changed_user_ids=upserted_user_ids,
+            summary=f"已写入 {committed_count} 条画像操作，{len(conflict_user_ids)} 个用户存在并发冲突",
+            conflicts=[
+                {
+                    "user_id": conflict.user_id,
+                    "group_id": conflict.group_id,
+                    "snapshot_updated_at": conflict.snapshot_updated_at,
+                    "reason": "画像提交时检测到并发更新",
+                }
+                for conflict in batch_result.conflicts
+            ],
+        )
+
+    async def _handle_batch_errors(
+        self,
+        *,
+        diff: list[ProfileDiffItem],
+        batch_result: UserProfileBatchUpsertResult,
+    ) -> CommitResult:
+        """处理仓库层部分提交后的单条数据库错误。"""
+        error_user_ids = {error.user_id for error in batch_result.errors}
+        conflict_user_ids = {conflict.user_id for conflict in batch_result.conflicts}
+        retry_user_ids = error_user_ids | conflict_user_ids
+        upserted_user_ids = {row.user_id for row in batch_result.upserted}
+        self._snapshot_conflicted_user_ids.update(conflict_user_ids)
+
+        remaining_diff = [item for item in diff if item.user_id in retry_user_ids]
+        if remaining_diff:
+            await self._save_items(remaining_diff)
+        else:
+            await self.discard()
+
+        committed_count = sum(1 for item in diff if item.user_id in upserted_user_ids)
+        issues: list[dict[str, Any]] = [
+            {
+                "user_id": error.user_id,
+                "group_id": error.group_id,
+                "reason": f"画像提交时数据库写入失败: {error.message}",
+            }
+            for error in batch_result.errors
+        ]
+        issues.extend(
+            {
+                "user_id": conflict.user_id,
+                "group_id": conflict.group_id,
+                "snapshot_updated_at": conflict.snapshot_updated_at,
+                "reason": "画像提交时检测到并发更新",
+            }
+            for conflict in batch_result.conflicts
+        )
+
+        return CommitResult(
+            status="partial_error",
+            committed_count=committed_count,
+            changed_user_ids=upserted_user_ids,
+            summary=f"已写入 {committed_count} 条画像操作，{len(error_user_ids)} 个用户写入失败",
+            conflicts=issues,
         )
 
     async def discard(self) -> None:
