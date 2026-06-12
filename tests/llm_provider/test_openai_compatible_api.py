@@ -1,4 +1,4 @@
-"""LLM provider timeout configuration tests."""
+"""OpenAI 兼容 API 客户端配置与请求测试。"""
 
 from __future__ import annotations
 
@@ -6,29 +6,29 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from komari_bot.plugins.llm_provider import deepseek_client as deepseek_client_module
+from komari_bot.plugins.llm_provider import openai_compatible_api as openai_api_module
 from komari_bot.plugins.llm_provider.config import Config
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
-from komari_bot.plugins.llm_provider.deepseek_client import DeepSeekClient
+from komari_bot.plugins.llm_provider.openai_compatible_api import OpenAICompatibleClient
 
 
 def test_llm_provider_timeout_defaults_to_300_seconds() -> None:
-    assert DynamicConfigSchema().deepseek_timeout_seconds == 300.0
-    assert Config().deepseek_timeout_seconds == 300.0
-    assert DynamicConfigSchema().deepseek_reasoning_effort == ""
-    assert Config().deepseek_reasoning_effort == ""
-    assert DynamicConfigSchema().deepseek_extra_params == {}
+    assert DynamicConfigSchema().timeout_seconds == 300.0
+    assert Config().timeout_seconds == 300.0
+    assert DynamicConfigSchema().reasoning_effort == ""
+    assert Config().reasoning_effort == ""
+    assert DynamicConfigSchema().extra_params == {}
 
 
-def test_llm_provider_schema_includes_deepseek_runtime_fields() -> None:
+def test_llm_provider_schema_includes_runtime_fields() -> None:
     config = DynamicConfigSchema()
 
-    assert config.deepseek_timeout_seconds == 300.0
-    assert config.deepseek_reasoning_effort == ""
-    assert config.deepseek_extra_params == {}
+    assert config.timeout_seconds == 300.0
+    assert config.reasoning_effort == ""
+    assert config.extra_params == {}
 
 
-def test_deepseek_client_session_uses_configured_timeout() -> None:
+def test_openai_compatible_client_session_uses_configured_timeout() -> None:
     class _FakeAsyncOpenAI:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
@@ -37,8 +37,8 @@ def test_deepseek_client_session_uses_configured_timeout() -> None:
             return None
 
     async def _run() -> None:
-        deepseek_client_module.AsyncOpenAI = _FakeAsyncOpenAI  # type: ignore[method-assign]
-        client = DeepSeekClient(
+        openai_api_module.AsyncOpenAI = _FakeAsyncOpenAI  # type: ignore[method-assign]
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
@@ -54,7 +54,7 @@ def test_deepseek_client_session_uses_configured_timeout() -> None:
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_text_includes_reasoning_effort(
+def test_openai_compatible_client_generate_text_includes_reasoning_effort(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -75,7 +75,7 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
             return None
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
@@ -83,15 +83,15 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="medium",
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="medium",
                 )
             ),
         )
@@ -107,7 +107,7 @@ def test_deepseek_client_generate_text_includes_reasoning_effort(
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_text_passes_response_format(
+def test_openai_compatible_client_generate_text_passes_response_format(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -128,7 +128,7 @@ def test_deepseek_client_generate_text_passes_response_format(
             return None
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
@@ -136,15 +136,15 @@ def test_deepseek_client_generate_text_passes_response_format(
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="",
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="",
                 )
             ),
         )
@@ -163,7 +163,7 @@ def test_deepseek_client_generate_text_passes_response_format(
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_text_with_messages_passes_response_format(
+def test_openai_compatible_client_generate_text_with_messages_passes_response_format(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -184,7 +184,7 @@ def test_deepseek_client_generate_text_with_messages_passes_response_format(
             return None
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
@@ -192,15 +192,15 @@ def test_deepseek_client_generate_text_with_messages_passes_response_format(
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="",
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="",
                 )
             ),
         )
@@ -219,7 +219,7 @@ def test_deepseek_client_generate_text_with_messages_passes_response_format(
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_messages_completion_parses_tool_calls(
+def test_openai_compatible_client_generate_messages_completion_parses_tool_calls(
     monkeypatch: Any,
 ) -> None:
     class _FakeToolCall:
@@ -252,22 +252,22 @@ def test_deepseek_client_generate_messages_completion_parses_tool_calls(
             return None
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
         )
         monkeypatch.setattr(client, "client", _FakeClient())
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="",
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="",
                 )
             ),
         )
@@ -293,7 +293,7 @@ def test_deepseek_client_generate_messages_completion_parses_tool_calls(
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_messages_completion_keeps_invalid_json_arguments(
+def test_openai_compatible_client_generate_messages_completion_keeps_invalid_json_arguments(
     monkeypatch: Any,
 ) -> None:
     class _FakeToolCall:
@@ -326,22 +326,22 @@ def test_deepseek_client_generate_messages_completion_keeps_invalid_json_argumen
             return None
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
         )
         monkeypatch.setattr(client, "client", _FakeClient())
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="",
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="",
                 )
             ),
         )
@@ -358,7 +358,7 @@ def test_deepseek_client_generate_messages_completion_keeps_invalid_json_argumen
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_text_sends_extra_params_via_extra_body(
+def test_openai_compatible_client_generate_text_sends_extra_params_via_extra_body(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -379,7 +379,7 @@ def test_deepseek_client_generate_text_sends_extra_params_via_extra_body(
             return None
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
@@ -387,16 +387,16 @@ def test_deepseek_client_generate_text_sends_extra_params_via_extra_body(
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="",
-                    deepseek_extra_params={
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="",
+                    extra_params={
                         "enable_thinking": False,
                         "thinking": {"type": "disabled"},
                     },
@@ -418,7 +418,7 @@ def test_deepseek_client_generate_text_sends_extra_params_via_extra_body(
     asyncio.run(_run())
 
 
-def test_deepseek_client_generate_text_debug_log_uses_statistics(
+def test_openai_compatible_client_generate_text_debug_log_uses_statistics(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -440,24 +440,24 @@ def test_deepseek_client_generate_text_debug_log_uses_statistics(
         debug_messages.append(message.format(*args) if args else message)
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
         )
         monkeypatch.setattr(client, "client", _FakeClient())
-        monkeypatch.setattr(deepseek_client_module.logger, "debug", _fake_debug)
+        monkeypatch.setattr(openai_api_module.logger, "debug", _fake_debug)
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.0,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="medium",
-                    deepseek_extra_params={},
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.0,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="medium",
+                    extra_params={},
                 )
             ),
         )
@@ -472,7 +472,7 @@ def test_deepseek_client_generate_text_debug_log_uses_statistics(
 
     asyncio.run(_run())
 
-    request_log = next(message for message in debug_messages if "DeepSeek API 请求" in message)
+    request_log = next(message for message in debug_messages if "OpenAI 兼容 API 请求" in message)
     assert "prompt_chars: 12" in request_log
     assert "system_instruction_chars: 12" in request_log
     assert "tools_count: 1" in request_log
@@ -482,7 +482,7 @@ def test_deepseek_client_generate_text_debug_log_uses_statistics(
     assert "绝密 system 原文" not in request_log
 
 
-def test_deepseek_client_generate_messages_debug_log_includes_request_flags(
+def test_openai_compatible_client_generate_messages_debug_log_includes_request_flags(
     monkeypatch: Any,
 ) -> None:
     class _FakeCompletions:
@@ -504,24 +504,24 @@ def test_deepseek_client_generate_messages_debug_log_includes_request_flags(
         debug_messages.append(message.format(*args) if args else message)
 
     async def _run() -> None:
-        client = DeepSeekClient(
+        client = OpenAICompatibleClient(
             "token",
             base_url="https://example.com/v1",
             timeout_seconds=300.0,
         )
         monkeypatch.setattr(client, "client", _FakeClient())
-        monkeypatch.setattr(deepseek_client_module.logger, "debug", _fake_debug)
+        monkeypatch.setattr(openai_api_module.logger, "debug", _fake_debug)
         monkeypatch.setattr(
-            deepseek_client_module,
+            openai_api_module,
             "config_manager",
             SimpleNamespace(
                 get=lambda: SimpleNamespace(
-                    deepseek_temperature=1.0,
-                    deepseek_max_tokens=8192,
-                    deepseek_frequency_penalty=0.1,
-                    deepseek_api_base="https://example.com/v1",
-                    deepseek_reasoning_effort="low",
-                    deepseek_extra_params={},
+                    temperature=1.0,
+                    max_tokens=8192,
+                    frequency_penalty=0.1,
+                    api_base="https://example.com/v1",
+                    reasoning_effort="low",
+                    extra_params={},
                 )
             ),
         )
@@ -537,7 +537,7 @@ def test_deepseek_client_generate_messages_debug_log_includes_request_flags(
     asyncio.run(_run())
 
     request_log = next(
-        message for message in debug_messages if "DeepSeek API 请求 (messages)" in message
+        message for message in debug_messages if "OpenAI 兼容 API 请求 (messages)" in message
     )
     assert "tools_count: 1" in request_log
     assert "has_response_format: True" in request_log

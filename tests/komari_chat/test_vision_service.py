@@ -16,9 +16,9 @@ class _FakeConfigManager:
     @staticmethod
     def get() -> SimpleNamespace:
         return SimpleNamespace(
-            deepseek_api_token="token",
-            deepseek_api_base="https://example.test/v1",
-            deepseek_timeout_seconds=30,
+            api_token="token",
+            api_base="https://example.test/v1",
+            timeout_seconds=30,
         )
 
 
