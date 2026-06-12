@@ -42,13 +42,13 @@ async def _read_single_image(
 ) -> str:
     """调用视觉模型读取单张图片。"""
     config = llm_provider_config_manager.get()
-    if not config.deepseek_api_token:
-        return "[图片读取失败: 未配置 deepseek_api_token]"
+    if not config.api_token:
+        return "[图片读取失败: 未配置 api_token]"
 
     client = AsyncOpenAI(
-        api_key=config.deepseek_api_token,
-        base_url=str(config.deepseek_api_base),
-        timeout=float(config.deepseek_timeout_seconds),
+        api_key=config.api_token,
+        base_url=str(config.api_base),
+        timeout=float(config.timeout_seconds),
     )
     try:
         logger.info(

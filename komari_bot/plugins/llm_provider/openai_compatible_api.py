@@ -1,4 +1,4 @@
-"""DeepSeek API 客户端。"""
+"""OpenAI 兼容 API 客户端。"""
 
 import json
 from typing import Any, Never
@@ -24,10 +24,10 @@ config_manager = config_manager_plugin.get_config_manager(
 )
 
 
-class DeepSeekClient(BaseLLMClient):
-    """DeepSeek API 客户端。"""
+class OpenAICompatibleClient(BaseLLMClient):
+    """OpenAI 兼容 API 客户端。"""
 
-    _INVALID_RESPONSE_MESSAGE = "DeepSeek API 响应格式异常"
+    _INVALID_RESPONSE_MESSAGE = "OpenAI 兼容 API 响应格式异常"
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class DeepSeekClient(BaseLLMClient):
         """初始化客户端。
 
         Args:
-            api_token: DeepSeek API Token
+            api_token: OpenAI 兼容 API Token
             base_url: OpenAI 兼容 API Base URL
             timeout_seconds: 请求总超时时间（秒）
         """
@@ -56,7 +56,7 @@ class DeepSeekClient(BaseLLMClient):
         config: DynamicConfigSchema, **kwargs: object
     ) -> str | None:
         """解析 OpenAI 兼容的 reasoning_effort 请求参数。"""
-        raw_value = kwargs.get("reasoning_effort", config.deepseek_reasoning_effort)
+        raw_value = kwargs.get("reasoning_effort", config.reasoning_effort)
         if raw_value is None:
             return None
         value = str(raw_value).strip()
@@ -81,13 +81,13 @@ class DeepSeekClient(BaseLLMClient):
     def _build_completion_result(self, response: Any) -> LLMCompletionResultSchema:
         """将 OpenAI 兼容响应转换为统一结果。"""
         if not getattr(response, "choices", None):
-            logger.error(f"DeepSeek API 响应格式异常: {response}")
+            logger.error(f"OpenAI 兼容 API 响应格式异常: {response}")
             self._raise_invalid_response()
 
         choice = response.choices[0]
         message = getattr(choice, "message", None)
         if message is None:
-            logger.error(f"DeepSeek API 响应缺少 message: {response}")
+            logger.error(f"OpenAI 兼容 API 响应缺少 message: {response}")
             self._raise_invalid_response()
 
         content = getattr(message, "content", None) or ""
@@ -159,12 +159,12 @@ class DeepSeekClient(BaseLLMClient):
         try:
             reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
             logger.debug(
-                f"DeepSeek API 请求:\n"
+                f"OpenAI 兼容 API 请求:\n"
                 f"  model: {model}\n"
-                f"  temperature: {temperature if temperature is not None else config.deepseek_temperature}\n"
-                f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
+                f"  temperature: {temperature if temperature is not None else config.temperature}\n"
+                f"  max_tokens: {max_tokens if max_tokens is not None else config.max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
-                f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
+                f"  frequency_penalty: {kwargs.get('frequency_penalty', config.frequency_penalty)}\n"
                 f"  prompt_chars: {len(prompt)}\n"
                 f"  system_instruction_chars: {len(system_instruction or '')}\n"
                 f"  tools_count: {len(tools or [])}\n"
@@ -180,12 +180,12 @@ class DeepSeekClient(BaseLLMClient):
                 "messages": messages,
                 "temperature": temperature
                 if temperature is not None
-                else config.deepseek_temperature,
+                else config.temperature,
                 "max_tokens": max_tokens
                 if max_tokens is not None
-                else config.deepseek_max_tokens,
+                else config.max_tokens,
                 "frequency_penalty": kwargs.get(
-                    "frequency_penalty", config.deepseek_frequency_penalty
+                    "frequency_penalty", config.frequency_penalty
                 ),
             }
 
@@ -202,34 +202,34 @@ class DeepSeekClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_params = getattr(config, "deepseek_extra_params", {})
+            extra_params = getattr(config, "extra_params", {})
             if extra_params:
                 conflict_keys = sorted(set(request_data) & set(extra_params))
                 if conflict_keys:
                     logger.warning(
-                        "DeepSeek 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
+                        "OpenAI 兼容 API 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
                         ", ".join(conflict_keys),
                     )
-                logger.debug("注入 DeepSeek 额外参数键名: {}", sorted(extra_params))
+                logger.debug("注入 OpenAI 兼容 API 额外参数键名: {}", sorted(extra_params))
                 request_data["extra_body"] = dict(extra_params)
 
             response = await self.client.chat.completions.create(**request_data)
         except APITimeoutError:
-            logger.error("DeepSeek API 请求超时")
+            logger.error("OpenAI 兼容 API 请求超时")
             raise
         except APIConnectionError as e:
-            logger.error(f"DeepSeek API 网络错误: {e}")
+            logger.error(f"OpenAI 兼容 API 网络错误: {e}")
             raise
         except OpenAIError as e:
-            logger.error(f"DeepSeek API 调用失败: {e}")
+            logger.error(f"OpenAI 兼容 API 调用失败: {e}")
             raise
         except Exception as e:
-            logger.error(f"DeepSeek API 未知错误: {e}")
+            logger.error(f"OpenAI 兼容 API 未知错误: {e}")
             raise
         else:
             result = self._build_completion_result(response)
             logger.debug(
-                "DeepSeek API 响应: content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
+                "OpenAI 兼容 API 响应: content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
                 len(result.content),
                 len(result.reasoning_content or ""),
                 len(result.tool_calls),
@@ -272,12 +272,12 @@ class DeepSeekClient(BaseLLMClient):
                 "messages": messages,
                 "temperature": temperature
                 if temperature is not None
-                else config.deepseek_temperature,
+                else config.temperature,
                 "max_tokens": max_tokens
                 if max_tokens is not None
-                else config.deepseek_max_tokens,
+                else config.max_tokens,
                 "frequency_penalty": kwargs.get(
-                    "frequency_penalty", config.deepseek_frequency_penalty
+                    "frequency_penalty", config.frequency_penalty
                 ),
             }
 
@@ -294,19 +294,19 @@ class DeepSeekClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_params = getattr(config, "deepseek_extra_params", {})
+            extra_params = getattr(config, "extra_params", {})
             if extra_params:
                 conflict_keys = sorted(set(request_data) & set(extra_params))
                 if conflict_keys:
                     logger.warning(
-                        "DeepSeek 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
+                        "OpenAI 兼容 API 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
                         ", ".join(conflict_keys),
                     )
-                logger.debug("注入 DeepSeek 额外参数键名: {}", sorted(extra_params))
+                logger.debug("注入 OpenAI 兼容 API 额外参数键名: {}", sorted(extra_params))
                 request_data["extra_body"] = dict(extra_params)
 
             logger.debug(
-                f"DeepSeek API 请求 (messages):\n"
+                f"OpenAI 兼容 API 请求 (messages):\n"
                 f"  model: {model}\n"
                 f"  messages: {len(messages)} turns\n"
                 f"  temperature: {request_data['temperature']}\n"
@@ -321,18 +321,18 @@ class DeepSeekClient(BaseLLMClient):
             response = await self.client.chat.completions.create(**request_data)
 
         except APITimeoutError:
-            logger.error("DeepSeek API 请求超时")
+            logger.error("OpenAI 兼容 API 请求超时")
             raise
         except APIConnectionError as e:
-            logger.error(f"DeepSeek API 网络错误: {e}")
+            logger.error(f"OpenAI 兼容 API 网络错误: {e}")
             raise
         except OpenAIError as e:
-            logger.error(f"DeepSeek API 调用失败: {e}")
+            logger.error(f"OpenAI 兼容 API 调用失败: {e}")
             raise
         else:
             result = self._build_completion_result(response)
             logger.debug(
-                "DeepSeek API 响应: content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
+                "OpenAI 兼容 API 响应: content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
                 len(result.content),
                 len(result.reasoning_content or ""),
                 len(result.tool_calls),
@@ -349,13 +349,13 @@ class DeepSeekClient(BaseLLMClient):
         config = config_manager.get()
         try:
             await self.client.chat.completions.create(
-                model=config.deepseek_model,
+                model=config.model,
                 messages=[{"role": "user", "content": "你好"}],
                 temperature=0.1,
                 max_tokens=10,
             )
         except Exception as e:
-            logger.error(f"DeepSeek API 连接测试失败: {e}")
+            logger.error(f"OpenAI 兼容 API 连接测试失败: {e}")
             return False
         else:
             return True

@@ -11,8 +11,8 @@ from .api import register_llm_provider_api
 from .base_client import LLMCompletionResultSchema
 from .config import Config
 from .config_schema import DynamicConfigSchema
-from .deepseek_client import DeepSeekClient
 from .llm_logger import log_llm_call
+from .openai_compatible_api import OpenAICompatibleClient
 from .reply_log_reader import ReplyLogReader
 
 __plugin_meta__ = PluginMetadata(
@@ -189,16 +189,16 @@ def _build_messages_log_input(
     return input_data
 
 
-def _get_client() -> DeepSeekClient:
+def _get_client() -> OpenAICompatibleClient:
     """获取 LLM 客户端实例。"""
     config = config_manager.get()
-    token = config.deepseek_api_token
+    token = config.api_token
     if not token:
-        raise ValueError("API Token 未配置，请在配置中设置 deepseek_api_token")  # noqa: TRY003
-    return DeepSeekClient(
+        raise ValueError("API Token 未配置，请在配置中设置 api_token")  # noqa: TRY003
+    return OpenAICompatibleClient(
         token,
-        base_url=str(config.deepseek_api_base),
-        timeout_seconds=float(config.deepseek_timeout_seconds),
+        base_url=str(config.api_base),
+        timeout_seconds=float(config.timeout_seconds),
     )
 
 
@@ -674,15 +674,15 @@ async def test_connection() -> bool:
         连接是否成功
     """
     config = config_manager.get()
-    token = config.deepseek_api_token
+    token = config.api_token
     if not token:
         logger.warning("API Token 未配置，跳过连接测试")
         return False
 
-    client = DeepSeekClient(
+    client = OpenAICompatibleClient(
         token,
-        base_url=str(config.deepseek_api_base),
-        timeout_seconds=float(config.deepseek_timeout_seconds),
+        base_url=str(config.api_base),
+        timeout_seconds=float(config.timeout_seconds),
     )
     try:
         return await client.test_connection()

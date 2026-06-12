@@ -32,38 +32,38 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    # DeepSeek 配置
-    deepseek_api_token: str = Field(default="", description="DeepSeek API Token")
-    deepseek_api_base: str = Field(
+    # OpenAI 兼容 API 配置
+    api_token: str = Field(default="", description="OpenAI 兼容 API Token")
+    api_base: str = Field(
         default="https://api.deepseek.com/v1",
-        description="DeepSeek OpenAI 兼容 API Base URL",
+        description="OpenAI 兼容 API Base URL",
     )
-    deepseek_model: str = Field(
-        default="deepseek-chat", description="DeepSeek 使用模型"
+    model: str = Field(
+        default="deepseek-chat", description="OpenAI 兼容 API 使用模型"
     )
-    deepseek_temperature: float = Field(
-        default=1.0, ge=0.0, le=2.0, description="DeepSeek 调用温度参数"
+    temperature: float = Field(
+        default=1.0, ge=0.0, le=2.0, description="OpenAI 兼容 API 调用温度参数"
     )
-    deepseek_max_tokens: int = Field(
-        default=8192, ge=20, le=8192, description="DeepSeek 最大token数量"
+    max_tokens: int = Field(
+        default=8192, ge=20, le=8192, description="OpenAI 兼容 API 最大 token 数量"
     )
-    deepseek_timeout_seconds: float = Field(
-        default=300.0, gt=0.0, description="DeepSeek 请求总超时时间（秒）"
+    timeout_seconds: float = Field(
+        default=300.0, gt=0.0, description="OpenAI 兼容 API 请求总超时时间（秒）"
     )
-    deepseek_reasoning_effort: str = Field(
+    reasoning_effort: str = Field(
         default="",
         description=(
-            "DeepSeek OpenAI 兼容请求的 reasoning_effort。"
+            "OpenAI 兼容 API 请求的 reasoning_effort。"
             "可选：none/minimal/low/medium/high/xhigh；为空时不发送"
         ),
     )
-    deepseek_frequency_penalty: float = Field(
-        default=0.0, description="DeepSeek 重复内容惩罚"
+    frequency_penalty: float = Field(
+        default=0.0, description="OpenAI 兼容 API 重复内容惩罚"
     )
-    deepseek_extra_params: dict[str, Any] = Field(
+    extra_params: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "DeepSeek API 请求的额外自定义参数，"
+            "OpenAI 兼容 API 请求的额外自定义参数，"
             "会合并到每次请求体中。支持简单值和嵌套结构。"
             '例如：{"enable_thinking": false} 或 {"thinking": {"type": "disabled"}}'
         ),
