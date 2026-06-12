@@ -416,3 +416,130 @@ def test_deepseek_client_generate_text_sends_extra_params_via_extra_body(
         assert "enable_thinking" not in request_data
 
     asyncio.run(_run())
+
+
+def test_deepseek_client_generate_text_debug_log_uses_statistics(
+    monkeypatch: Any,
+) -> None:
+    class _FakeCompletions:
+        async def create(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    debug_messages: list[str] = []
+
+    def _fake_debug(message: str, *args: Any) -> None:
+        debug_messages.append(message.format(*args) if args else message)
+
+    async def _run() -> None:
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        monkeypatch.setattr(client, "client", _FakeClient())
+        monkeypatch.setattr(deepseek_client_module.logger, "debug", _fake_debug)
+        monkeypatch.setattr(
+            deepseek_client_module,
+            "config_manager",
+            SimpleNamespace(
+                get=lambda: SimpleNamespace(
+                    deepseek_temperature=1.0,
+                    deepseek_max_tokens=8192,
+                    deepseek_frequency_penalty=0.0,
+                    deepseek_api_base="https://example.com/v1",
+                    deepseek_reasoning_effort="medium",
+                    deepseek_extra_params={},
+                )
+            ),
+        )
+
+        await client.generate_text(
+            prompt="绝密 prompt 原文",
+            model="deepseek-chat",
+            system_instruction="绝密 system 原文",
+            response_format={"type": "json_object"},
+            tools=[{"type": "function", "function": {"name": "query"}}],
+        )
+
+    asyncio.run(_run())
+
+    request_log = next(message for message in debug_messages if "DeepSeek API 请求" in message)
+    assert "prompt_chars: 12" in request_log
+    assert "system_instruction_chars: 12" in request_log
+    assert "tools_count: 1" in request_log
+    assert "reasoning_effort: medium" in request_log
+    assert "has_response_format: True" in request_log
+    assert "绝密 prompt 原文" not in request_log
+    assert "绝密 system 原文" not in request_log
+
+
+def test_deepseek_client_generate_messages_debug_log_includes_request_flags(
+    monkeypatch: Any,
+) -> None:
+    class _FakeCompletions:
+        async def create(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    debug_messages: list[str] = []
+
+    def _fake_debug(message: str, *args: Any) -> None:
+        debug_messages.append(message.format(*args) if args else message)
+
+    async def _run() -> None:
+        client = DeepSeekClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        monkeypatch.setattr(client, "client", _FakeClient())
+        monkeypatch.setattr(deepseek_client_module.logger, "debug", _fake_debug)
+        monkeypatch.setattr(
+            deepseek_client_module,
+            "config_manager",
+            SimpleNamespace(
+                get=lambda: SimpleNamespace(
+                    deepseek_temperature=1.0,
+                    deepseek_max_tokens=8192,
+                    deepseek_frequency_penalty=0.1,
+                    deepseek_api_base="https://example.com/v1",
+                    deepseek_reasoning_effort="low",
+                    deepseek_extra_params={},
+                )
+            ),
+        )
+
+        await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "你好"}],
+            model="deepseek-chat",
+            response_format={"type": "json_object"},
+            tools=[{"type": "function", "function": {"name": "query"}}],
+            parallel_tool_calls=False,
+        )
+
+    asyncio.run(_run())
+
+    request_log = next(
+        message for message in debug_messages if "DeepSeek API 请求 (messages)" in message
+    )
+    assert "tools_count: 1" in request_log
+    assert "has_response_format: True" in request_log
+    assert "has_parallel_tool_calls: True" in request_log
+    assert "frequency_penalty: 0.1" in request_log
