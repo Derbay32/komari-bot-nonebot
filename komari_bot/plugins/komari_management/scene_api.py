@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
 from fastapi import Path as ApiPath
 from nonebot import logger
-from nonebot.plugin import require
+from nonebot.plugin import get_plugin, require
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
 
 API_PREFIX = "/api/komari-decision-scenes/v1"
 _REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
+_fallback_repository: SceneRepository | None = None
+_fallback_repository_lock = asyncio.Lock()
 
 
 class SceneSummary(BaseModel):
@@ -111,31 +114,40 @@ def _serialize_detail(row: dict[str, Any]) -> SceneDetail:
     )
 
 
-def _get_repository() -> SceneRepository:
-    decision_plugin = require("komari_decision")
-    manager_getter = getattr(decision_plugin, "get_plugin_manager", None)
-    if callable(manager_getter):
-        manager = manager_getter()
-        repository = getattr(manager, "scene_repository", None) if manager is not None else None
-        if repository is not None:
-            return cast("SceneRepository", repository)
+async def _get_repository() -> SceneRepository:
+    global _fallback_repository  # noqa: PLW0603
 
-    memory_plugin = require("komari_memory")
-    memory_manager_getter = getattr(memory_plugin, "get_plugin_manager", None)
-    if not callable(memory_manager_getter):
-        msg = "KomariMemory 未导出 get_plugin_manager"
-        raise TypeError(msg)
-    memory_manager = memory_manager_getter()
-    pg_pool = getattr(memory_manager, "pg_pool", None) if memory_manager is not None else None
-    if pg_pool is None:
-        msg = "KomariMemory PostgreSQL 连接池未就绪"
-        raise RuntimeError(msg)
-    return SceneRepository(pg_pool)
+    decision_plugin = get_plugin("komari_decision")
+    if decision_plugin is not None:
+        manager_getter = getattr(decision_plugin.module, "get_plugin_manager", None)
+        if callable(manager_getter):
+            manager = manager_getter()
+            repository = getattr(manager, "scene_repository", None) if manager is not None else None
+            if repository is not None:
+                return cast("SceneRepository", repository)
+
+    async with _fallback_repository_lock:
+        if _fallback_repository is not None:
+            return _fallback_repository
+
+        memory_plugin = require("komari_memory")
+        memory_manager_getter = getattr(memory_plugin, "get_plugin_manager", None)
+        if not callable(memory_manager_getter):
+            msg = "KomariMemory 未导出 get_plugin_manager"
+            raise TypeError(msg)
+        memory_manager = memory_manager_getter()
+        pg_pool = getattr(memory_manager, "pg_pool", None) if memory_manager is not None else None
+        if pg_pool is None:
+            msg = "KomariMemory PostgreSQL 连接池未就绪"
+            raise RuntimeError(msg)
+
+        _fallback_repository = SceneRepository(pg_pool)
+        return _fallback_repository
 
 
 async def _prepare_repository() -> SceneRepository:
     try:
-        repository = _get_repository()
+        repository = await _get_repository()
         await repository.ensure_schema()
     except Exception as exc:
         logger.exception("[Komari Management] 获取 scene repository 失败")
