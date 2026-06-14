@@ -1,8 +1,11 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口（OpenAI 兼容格式）。"""
 
+import asyncio
 import json
 import time
-from typing import Any
+from collections import deque
+from collections.abc import Callable
+from typing import Any, Literal
 
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
@@ -63,6 +66,99 @@ config_manager = config_manager_plugin.get_config_manager(
     "llm_provider", DynamicConfigSchema
 )
 _reply_log_reader = ReplyLogReader()
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+
+class _AsyncSlidingWindowRateLimiter:
+    """基于单进程滑动窗口的异步 RPM 限流器。"""
+
+    def __init__(self, limit_getter: Callable[[], int]) -> None:
+        self._limit_getter = limit_getter
+        self._condition = asyncio.Condition()
+        self._timestamps: deque[float] = deque()
+
+    def _prune(self, now: float) -> None:
+        """移除当前窗口之外的请求时间戳。"""
+        while self._timestamps and now - self._timestamps[0] >= _RATE_LIMIT_WINDOW_SECONDS:
+            self._timestamps.popleft()
+
+    async def wait(self) -> None:
+        """等待直到当前滑动窗口存在可用请求额度。"""
+        async with self._condition:
+            while True:
+                now = time.monotonic()
+                self._prune(now)
+                limit = max(1, int(self._limit_getter()))
+                if len(self._timestamps) < limit:
+                    self._timestamps.append(now)
+                    self._condition.notify_all()
+                    return
+
+                delay = _RATE_LIMIT_WINDOW_SECONDS - (now - self._timestamps[0])
+                try:
+                    await asyncio.wait_for(
+                        self._condition.wait(),
+                        timeout=max(delay, 0.01),
+                    )
+                except TimeoutError:
+                    continue
+
+
+def _resolve_rate_limit_bucket(request_phase: str) -> Literal["summary", "chat"]:
+    """根据 request_phase 选择互相独立的 RPM 限流桶。"""
+    phase = request_phase.strip().lower()
+    summary_prefixes = (
+        "summary_",
+        "profile_agent",
+        "forgetting_",
+        "interaction_event_summary",
+        "chat_memory_summary",
+        "group_history_summary",
+    )
+    chat_prefixes = (
+        "normal_reply_",
+        "vision_tool_",
+        "vision_search_tool_",
+        "search_tool_",
+        "profile_tool_",
+        "tool_",
+        "query_rewrite",
+        "memory_reply",
+        "chat_reply",
+    )
+
+    if phase.startswith(summary_prefixes):
+        return "summary"
+    if phase.startswith(chat_prefixes):
+        return "chat"
+
+    logger.warning("[LLM Provider] 未识别 request_phase，按 chat RPM 限流: {}", phase or "-")
+    return "chat"
+
+
+def _get_summary_task_rpm_limit() -> int:
+    """读取总结桶 RPM 配置，兼容测试替身与旧运行时缓存。"""
+    return int(getattr(config_manager.get(), "summary_task_rpm_limit", 20))
+
+
+def _get_chat_rpm_limit() -> int:
+    """读取聊天桶 RPM 配置，兼容测试替身与旧运行时缓存。"""
+    return int(getattr(config_manager.get(), "chat_rpm_limit", 60))
+
+
+_summary_task_rate_limiter = _AsyncSlidingWindowRateLimiter(
+    _get_summary_task_rpm_limit
+)
+_chat_rate_limiter = _AsyncSlidingWindowRateLimiter(_get_chat_rpm_limit)
+
+
+async def _wait_for_llm_rate_limit(request_phase: str) -> None:
+    """按请求阶段等待对应的 LLM RPM 额度。"""
+    bucket = _resolve_rate_limit_bucket(request_phase)
+    if bucket == "summary":
+        await _summary_task_rate_limiter.wait()
+    else:
+        await _chat_rate_limiter.wait()
 
 
 def get_reply_log_reader() -> ReplyLogReader:
@@ -250,7 +346,7 @@ async def generate_text(
     Returns:
         生成的文本
     """
-    client = _get_client()
+    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -286,6 +382,8 @@ async def generate_text(
                 len(final_system_instruction),
             )
 
+        await _wait_for_llm_rate_limit(request_phase)
+        client = _get_client()
         result = await client.generate_text(
             prompt=prompt,
             model=model,
@@ -351,7 +449,8 @@ async def generate_text(
             )
         return content
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
 
 async def generate_completion(
@@ -372,7 +471,7 @@ async def generate_completion(
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """生成统一完成结果。"""
-    client = _get_client()
+    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -407,6 +506,8 @@ async def generate_completion(
                 len(tools or []),
             )
 
+        await _wait_for_llm_rate_limit(request_phase)
+        client = _get_client()
         result = await client.generate_text(
             prompt=prompt,
             model=model,
@@ -473,7 +574,8 @@ async def generate_completion(
             )
         return result
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
 
 async def generate_text_with_messages(
@@ -500,15 +602,17 @@ async def generate_text_with_messages(
     Returns:
         生成的文本
     """
-    client = _get_client()
+    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
+    request_phase = str(kwargs.get("request_phase", "")).strip()
     payload_summary = _summarize_messages_payload(messages)
 
     try:
         logger.info(
-            "[LLM Provider] Messages 请求追踪: trace_id={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={}",
+            "[LLM Provider] Messages 请求追踪: trace_id={} phase={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={}",
             request_trace_id or "-",
+            request_phase or "-",
             model,
             payload_summary["turns"],
             payload_summary["text_parts"],
@@ -516,6 +620,8 @@ async def generate_text_with_messages(
             payload_summary["image_parts"],
             payload_summary["image_url_chars"],
         )
+        await _wait_for_llm_rate_limit(request_phase)
+        client = _get_client()
         result = await client.generate_text_with_messages(
             messages=messages,
             model=model,
@@ -573,7 +679,8 @@ async def generate_text_with_messages(
             )
         return content
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
 
 async def generate_messages_completion(
@@ -590,15 +697,17 @@ async def generate_messages_completion(
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """使用 messages 生成统一完成结果。"""
-    client = _get_client()
+    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
+    request_phase = str(kwargs.get("request_phase", "")).strip()
     payload_summary = _summarize_messages_payload(messages)
 
     try:
         logger.info(
-            "[LLM Provider] Completion(messages) 请求追踪: trace_id={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={} tools={}",
+            "[LLM Provider] Completion(messages) 请求追踪: trace_id={} phase={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={} tools={}",
             request_trace_id or "-",
+            request_phase or "-",
             model,
             payload_summary["turns"],
             payload_summary["text_parts"],
@@ -607,6 +716,8 @@ async def generate_messages_completion(
             payload_summary["image_url_chars"],
             len(tools or []),
         )
+        await _wait_for_llm_rate_limit(request_phase)
+        client = _get_client()
         result = await client.generate_text_with_messages(
             messages=messages,
             model=model,
@@ -664,7 +775,8 @@ async def generate_messages_completion(
             )
         return result
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
 
 async def test_connection() -> bool:

@@ -35,9 +35,16 @@ _CLEANUP_PROBABILITY = 0.01
 # 日志目录权限收敛缓存时间，避免每次写日志都重复读取动态配置与 stat/chmod
 _LOG_DIR_ENSURE_INTERVAL_SECONDS = 60.0
 
-# 日志目录权限收敛缓存状态
-_last_ensured_log_dir: Path | None = None
-_last_log_dir_ensure_at = 0.0
+
+class _LogDirEnsureState:
+    """日志目录权限收敛缓存状态。"""
+
+    def __init__(self) -> None:
+        self.last_ensured_log_dir: Path | None = None
+        self.last_log_dir_ensure_at = 0.0
+
+
+_log_dir_ensure_state = _LogDirEnsureState()
 
 
 def _get_runtime_config() -> DynamicConfigSchema:
@@ -98,12 +105,11 @@ def _parse_permission_mode(mode: str) -> int | None:
 
 def _ensure_private_log_dir() -> None:
     """确保 LLM JSONL 日志目录存在，并按配置收敛权限。"""
-    global _last_ensured_log_dir, _last_log_dir_ensure_at
-
     now = time.monotonic()
     if (
-        _last_ensured_log_dir == _LOG_DIR
-        and now - _last_log_dir_ensure_at < _LOG_DIR_ENSURE_INTERVAL_SECONDS
+        _log_dir_ensure_state.last_ensured_log_dir == _LOG_DIR
+        and now - _log_dir_ensure_state.last_log_dir_ensure_at
+        < _LOG_DIR_ENSURE_INTERVAL_SECONDS
     ):
         return
 
@@ -112,8 +118,8 @@ def _ensure_private_log_dir() -> None:
 
     _LOG_DIR.mkdir(mode=mkdir_mode, parents=True, exist_ok=True)
 
-    _last_ensured_log_dir = _LOG_DIR
-    _last_log_dir_ensure_at = now
+    _log_dir_ensure_state.last_ensured_log_dir = _LOG_DIR
+    _log_dir_ensure_state.last_log_dir_ensure_at = now
 
     if permission_mode is None:
         return

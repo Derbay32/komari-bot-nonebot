@@ -50,6 +50,18 @@ class DynamicConfigSchema(BaseModel):
     timeout_seconds: float = Field(
         default=300.0, gt=0.0, description="OpenAI 兼容 API 请求总超时时间（秒）"
     )
+    summary_task_rpm_limit: int = Field(
+        default=20,
+        ge=1,
+        le=600,
+        description="总结任务 LLM 请求每分钟上限",
+    )
+    chat_rpm_limit: int = Field(
+        default=60,
+        ge=1,
+        le=600,
+        description="聊天 LLM 请求每分钟上限",
+    )
     reasoning_effort: str = Field(
         default="",
         description=(
