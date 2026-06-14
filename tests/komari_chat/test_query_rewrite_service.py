@@ -19,9 +19,11 @@ class _FakeLLMProvider:
         self._responses = list(responses)
         self.calls = 0
         self.prompts: list[str] = []
+        self.kwargs_calls: list[dict[str, object]] = []
 
     async def generate_text(self, **kwargs: object) -> str:
         self.calls += 1
+        self.kwargs_calls.append(kwargs)
         self.prompts.append(str(kwargs.get("prompt", "")))
         response = self._responses.pop(0)
         if isinstance(response, Exception):
@@ -115,3 +117,4 @@ def test_rewrite_query_still_calls_llm_for_non_empty_input(monkeypatch: Any) -> 
 
     assert result == "帮我看看这张图是什么"
     assert fake_provider.calls == 1
+    assert fake_provider.kwargs_calls[0]["request_phase"] == "query_rewrite"
