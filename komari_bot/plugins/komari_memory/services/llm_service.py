@@ -320,6 +320,7 @@ async def generate_reply(
             model=config.llm_model_chat,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            request_phase="memory_reply",
         )
     else:
         raw_response = await llm_provider.generate_text(
@@ -328,6 +329,7 @@ async def generate_reply(
             system_instruction=system_prompt,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            request_phase="memory_reply",
         )
 
     return _extract_tag_content(raw_response, config.response_tag)
