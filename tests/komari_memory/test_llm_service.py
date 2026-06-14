@@ -16,6 +16,7 @@ class _FakeLLMProvider:
         self._responses = list(responses)
         self.messages_calls: list[dict[str, Any]] = []
         self.completion_calls: list[dict[str, Any]] = []
+        self.text_calls: list[dict[str, Any]] = []
 
     async def generate_text_with_messages(self, **kwargs: Any) -> str:
         self.messages_calls.append(kwargs)
@@ -29,6 +30,12 @@ class _FakeLLMProvider:
     async def generate_messages_completion(self, **kwargs: Any) -> Any:
         self.completion_calls.append(kwargs)
         return SimpleNamespace(tool_calls=[])
+
+    async def generate_text(self, **kwargs: Any) -> str:
+        self.text_calls.append(kwargs)
+        if not self._responses:
+            raise AssertionError
+        return self._responses.pop(0)
 
 
 class _ToolFakeLLMProvider(_FakeLLMProvider):
@@ -227,3 +234,19 @@ def test_build_summary_messages_keeps_profile_agent_user_prefix(monkeypatch: Any
     )
     assert messages[1]["content"].endswith("请生成对话总结。")
     assert messages[2] == {"role": "system", "content": '工作流 {"memories": []}'}
+
+
+def test_generate_reply_marks_memory_reply_phase(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider(["<content>记忆回复</content>"])
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    async def _run() -> str:
+        return await llm_service_module.generate_reply(
+            config=_make_config(response_tag="content"),
+            messages=[{"role": "user", "content": "你好"}],
+        )
+
+    result = asyncio.run(_run())
+
+    assert result == "记忆回复"
+    assert fake_provider.messages_calls[0]["request_phase"] == "memory_reply"
