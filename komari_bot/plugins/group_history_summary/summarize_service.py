@@ -100,6 +100,7 @@ async def summarize_history_messages(
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        request_phase="group_history_summary",
     )
     summary_text = _extract_tag_content(raw_result, "content")
 
