@@ -45,6 +45,7 @@ class QueryRewriteService:
             model=model,
             temperature=0.3,
             max_tokens=256,
+            request_phase="query_rewrite",
         )
 
     async def rewrite_query(

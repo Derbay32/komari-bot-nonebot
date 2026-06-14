@@ -1001,6 +1001,7 @@ async def summarize_conversation(
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=config.llm_max_tokens_summary,
+        request_phase="chat_memory_summary",
     )
 
     # 提取 JSON
