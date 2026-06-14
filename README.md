@@ -22,6 +22,8 @@ docker compose up
 
 **Tips：更新只需要更新容器的镜像即可**
 
+**注意：LLM RPM 限流目前是单进程/单 worker 内限流。默认镜像通过 `MAX_WORKERS=1` 保证限流值等同于全局值；如果自行把 `MAX_WORKERS` 或 `WEB_CONCURRENCY` 调高到多个 worker，需要按 worker 数折算限流配置，或者改用 Redis 等跨进程限流方案。**
+
 ## 文档
 
 _文档？这就是个自用库能有什么文档。_
