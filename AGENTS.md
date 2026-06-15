@@ -20,16 +20,16 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | 数据库 | PostgreSQL + **pgvector** | raw SQL（无 ORM），HNSW 向量索引 |
 | 缓存 | Redis >=7.1.0 | `redis.asyncio`（**禁止**使用 `aioredis`） |
 | LLM | OpenAI 兼容接口 | DeepSeek / Gemini 双后端 |
-| Embedding | fastembed（本地） | 默认 `BAAI/bge-small-zh-v1.5` |
+| Embedding | OpenAI 兼容 API（远程） | 默认 `BAAI/bge-small-zh-v1.5` |
 | 部署 | Docker + Docker Compose | Gunicorn + Uvicorn |
-| CI/CD | Forgejo CI → Docker Hub | 发布 tag 自动构建 |
+| CI/CD | Forgejo CI → Codeberg 容器注册表 | 发布 tag 自动构建 |
 | Lint | Ruff (py313) + Pyright `standard` | 零容忍类型错误 |
 
 ## 目录结构
 
 ```
 komari-bot/
-├── AGENT.md                              # ← 本文件
+├── AGENTS.md                             # ← 本文件
 ├── pyproject.toml                        # 项目元数据、依赖、ruff/pyright 配置
 ├── Dockerfile / docker-compose.yml       # 容器化部署
 ├── .env / .env.dev / .env.prod           # 环境变量（SUPERUSERS, SENTRY_DSN 等）
@@ -46,12 +46,11 @@ komari-bot/
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
 │   └── plugins/                          # NoneBot 插件模块
 │
-├── config/                               # 旧版本地配置与迁移输入
-│   ├── config_manager/                   #   各插件的 JSON 配置 + .example
-│   └── prompts/                          #   旧版 YAML 提示词备份/显式迁移输入
-│
-├── docs/                                 # 文档
-│   ├── local/                            #   本地开发记录
+├── docs/
+│   ├── config/                           #   旧版配置归档（迁移输入源）
+│   ├── local/                            #   本地工具脚本
+│   ├── reviews/                          #   代码审查记录
+│   ├── handoff.md                        #   任务交接记录
 │   └── *.md                              #   组件文档
 │
 ├── data/ / scripts/ / tools/ / tests/    # 数据 / 脚本 / 工具 / 测试
@@ -129,7 +128,7 @@ komari-bot/
 - **存储源**：`komari_chat`、`komari_memory_summary`、`group_history_summary` 三组字符串 prompt 运行时从 PostgreSQL `komari_prompt_configs` 读取。
 - **默认值回退**：PG 无记录或读取失败时使用代码内 defaults；读取失败优先回退当前进程缓存，避免聊天主流程中断。
 - **管理 API**：`komari_management` Prompt API 的 GET / PUT / PATCH 均读写 `komari_prompt_configs`，响应中 `config_source` 形如 `postgresql:komari_prompt_configs:<resource_id>`，`file_path` 仅保留为 `null` 兼容字段。
-- **旧 YAML**：`config/prompts/*.yaml` 不再作为运行时来源；如需保留旧值，显式执行 `scripts/migrate_prompt_config_to_pg.py` 导入。`komari_decision` 的 `komari_memory_scenes.yaml` 暂未迁移，仍按原结构化 loader 读取。
+- **旧 YAML**：`config/prompts/*.yaml` 不再作为运行时来源；如需保留旧值，显式执行 `scripts/migrate_prompt_config_to_pg.py` 导入。`komari_decision` 的 `komari_memory_scenes.yaml` 已迁移到 PostgreSQL `komari_decision_scenes` 表，运行时默认使用 `PostgresSceneTemplateLoader`；YAML loader 仅供迁移脚本和测试使用。
 
 ### 2. LLM 网关 (`llm_provider`)
 
@@ -258,11 +257,8 @@ poetry run pytest tests/ -v
 | 文档 | 位置 | 用途 |
 |------|------|------|
 | 任务交接记录 | `docs/handoff.md` | 历史任务详情、决策记录、注意事项 |
-| 项目结构模板 | `docs/ai-context/project-structure.md` | 项目组织说明 |
-| 集成架构 | `docs/ai-context/system-integration.md` | 跨组件通信模式 |
-| 部署文档 | `docs/ai-context/deployment-infrastructure.md` | 容器化、CI/CD |
 | 组件文档 | `docs/*.md` | 各插件的详细设计文档 |
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-05-28。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-06-15。发现不一致请以实际代码为准并更新本文档。*

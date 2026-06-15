@@ -266,7 +266,7 @@ poetry run python scripts/migrate_embeddings.py --apply --target memory
 检查：
 
 1. `scene_persist_enabled=true`
-2. `config/prompts/komari_memory_scenes.yaml` 格式是否正确
+2. 确认 PostgreSQL `komari_decision_scenes` 表中是否有数据（首次需运行 `poetry run python scripts/migrate_komari_decision_scenes_to_pg.py` 或通过管理 API 初始化）
 3. `komari_memory_scene_set` / `komari_memory_scene_item` 是否存在 FAILED 记录
 
 ### 忘却策略看起来没生效
