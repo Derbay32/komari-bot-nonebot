@@ -193,6 +193,8 @@ async def _request_via_json_mode(
             model=config.llm_model_summary,
             temperature=config.llm_temperature_summary,
             max_tokens=config.llm_max_tokens_summary,
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
             response_format={"type": "json_object"},
             request_trace_id=trace_id,
             request_phase="summary_json_mode",
@@ -234,6 +236,8 @@ async def _request_via_tool_calling(
                 "function": {"name": "output_summary_result"},
             },
             parallel_tool_calls=False,
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
             request_trace_id=trace_id,
             request_phase="summary_tool_calling",
         )
@@ -262,6 +266,8 @@ async def _request_via_direct_output(
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=config.llm_max_tokens_summary,
+        thinking_mode=config.llm_thinking_mode_summary,
+        reasoning_effort=config.llm_reasoning_effort_summary,
         request_trace_id=trace_id,
         request_phase="summary_direct_output",
     )
@@ -320,6 +326,8 @@ async def generate_reply(
             model=config.llm_model_chat,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            thinking_mode=config.llm_thinking_mode_chat,
+            reasoning_effort=config.llm_reasoning_effort_chat,
             request_phase="memory_reply",
         )
     else:
@@ -329,6 +337,8 @@ async def generate_reply(
             system_instruction=system_prompt,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            thinking_mode=config.llm_thinking_mode_chat,
+            reasoning_effort=config.llm_reasoning_effort_chat,
             request_phase="memory_reply",
         )
 

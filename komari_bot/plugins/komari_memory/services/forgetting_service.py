@@ -409,6 +409,8 @@ class ForgettingService:
             model=self.config.llm_model_summary,
             temperature=self.config.llm_temperature_summary,
             max_tokens=min(self.config.llm_max_tokens_summary, 120),
+            thinking_mode=self.config.llm_thinking_mode_summary,
+            reasoning_effort=self.config.llm_reasoning_effort_summary,
             request_trace_id=f"memfuzzy-{conv_id}",
             request_phase="forgetting_fuzzify",
         )
@@ -489,6 +491,8 @@ class ForgettingService:
             model=self.config.llm_model_summary,
             temperature=self.config.llm_temperature_summary,
             max_tokens=min(self.config.llm_max_tokens_summary, 120),
+            thinking_mode=self.config.llm_thinking_mode_summary,
+            reasoning_effort=self.config.llm_reasoning_effort_summary,
             request_trace_id=f"memfuzzy-interaction-{event_id}",
             request_phase="forgetting_interaction_fuzzify",
         )

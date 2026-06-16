@@ -75,6 +75,8 @@ async def summarize_interaction_events(
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=min(config.llm_max_tokens_summary, 800),
+        thinking_mode=config.llm_thinking_mode_summary,
+        reasoning_effort=config.llm_reasoning_effort_summary,
         request_trace_id=f"interaction-event-summary-{user_id}",
         request_phase="interaction_event_summary",
     )

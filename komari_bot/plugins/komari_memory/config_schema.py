@@ -42,6 +42,22 @@ class KomariMemoryConfigSchema(BaseModel):
     llm_max_tokens_chat: int = Field(
         default=4000, ge=20, le=8192, description="对话模型最大 token 数"
     )
+    llm_thinking_mode_chat: bool = Field(
+        default=False,
+        description=(
+            "聊天主模型是否处于思考模式。"
+            "deepseek-v4 系模型默认开启思考，置 False 会注入 thinking:disabled 关闭；"
+            "其他模型置 True 时按 llm_reasoning_effort_chat 开启思考。"
+            "思考模式启用时将跳过 tool_choice 注入。"
+        ),
+    )
+    llm_reasoning_effort_chat: str = Field(
+        default="",
+        description=(
+            "聊天主模型思考强度（仅 thinking_mode=True 且非 deepseek-v4 系时生效）。"
+            "可选：minimal/low/medium/high；为空时不发送 reasoning_effort。"
+        ),
+    )
     assistant_prefill_enabled: bool = Field(
         default=False,
         description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
@@ -68,6 +84,14 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     llm_max_tokens_summary: int = Field(
         default=2048, ge=20, le=8192, description="总结模型最大 token 数"
+    )
+    llm_thinking_mode_summary: bool = Field(
+        default=False,
+        description="总结/记忆/画像模型是否处于思考模式。语义同 llm_thinking_mode_chat。",
+    )
+    llm_reasoning_effort_summary: str = Field(
+        default="",
+        description="总结/记忆/画像模型思考强度。语义同 llm_reasoning_effort_chat。",
     )
 
     # 常识库集成配置

@@ -154,6 +154,8 @@ async def _run_profile_agent_locked(
             tools=PROFILE_AGENT_TOOLS,
             tool_choice="auto",
             parallel_tool_calls=False,
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
             request_trace_id=trace_id,
             request_phase="profile_agent",
             request_round_index=round_index + 1,
