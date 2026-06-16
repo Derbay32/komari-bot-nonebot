@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import pytest
 from pydantic import BaseModel
 
 from komari_bot.plugins.config_manager import manager as manager_module
@@ -12,7 +13,7 @@ from komari_bot.plugins.config_manager.manager import ConfigManager
 from komari_bot.plugins.config_manager.storage import StoredConfig
 
 if TYPE_CHECKING:
-    import pytest
+    from collections.abc import Iterator
 
 
 class _ConfigSchema(BaseModel):
@@ -20,17 +21,31 @@ class _ConfigSchema(BaseModel):
     public_name: str = "old-name"
 
 
+class _NormalizedConfigSchema(BaseModel):
+    retry_count: int = 3
+    public_name: str = "默认名称"
+
+
 class _FakeStorage:
-    def __init__(self) -> None:
-        self.config_data: dict[str, Any] = {
+    def __init__(
+        self,
+        config_data: dict[str, Any] | None = None,
+        *,
+        fail_upsert: bool = False,
+        conflict_data: dict[str, Any] | None = None,
+    ) -> None:
+        self.config_data: dict[str, Any] = config_data or {
             "api_token": "old-token",
             "public_name": "old-name",
         }
+        self.fail_upsert = fail_upsert
+        self.conflict_data = conflict_data
+        self.saved_payloads: list[dict[str, Any]] = []
 
     def fetch(self, plugin_name: str) -> StoredConfig:
         return StoredConfig(
             plugin_name=plugin_name,
-            schema_name=_ConfigSchema.__name__,
+            schema_name="TestSchema",
             config_data=self.config_data,
             version="1.0",
             updated_at=datetime.now().astimezone(),
@@ -44,7 +59,11 @@ class _FakeStorage:
         config_data: dict[str, Any],
         version: str,
     ) -> StoredConfig:
+        if self.fail_upsert:
+            msg = "写入失败"
+            raise RuntimeError(msg)
         self.config_data = config_data
+        self.saved_payloads.append(config_data)
         return StoredConfig(
             plugin_name=plugin_name,
             schema_name=schema_name,
@@ -53,10 +72,31 @@ class _FakeStorage:
             updated_at=datetime.now().astimezone(),
         )
 
+    def update_if_unchanged(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredConfig | None:
+        del expected_updated_at
+        if self.conflict_data is not None:
+            self.config_data = self.conflict_data
+            return None
+        return self.upsert(
+            plugin_name=plugin_name,
+            schema_name=schema_name,
+            config_data=config_data,
+            version=version,
+        )
+
 
 class _FakeLogger:
     def __init__(self) -> None:
         self.info_messages: list[str] = []
+        self.warning_messages: list[str] = []
 
     def info(self, message: str) -> None:
         self.info_messages.append(message)
@@ -65,7 +105,98 @@ class _FakeLogger:
         return None
 
     def warning(self, _message: str) -> None:
-        return None
+        self.warning_messages.append(_message)
+
+
+@pytest.fixture(autouse=True)
+def _clear_config_manager_singletons() -> Iterator[None]:
+    ConfigManager._instances.clear()
+    manager_module._config_managers.clear()
+    yield
+    ConfigManager._instances.clear()
+    manager_module._config_managers.clear()
+
+
+def test_initialize_syncs_added_removed_and_converted_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_storage = _FakeStorage(
+        {
+            "retry_count": "7",
+            "legacy_field": "旧字段",
+        }
+    )
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
+    monkeypatch.setattr(manager_module, "logger", fake_logger)
+
+    manager = ConfigManager("test_normalize_initialize", _NormalizedConfigSchema)
+    config = cast("_NormalizedConfigSchema", manager.initialize())
+
+    assert isinstance(config, _NormalizedConfigSchema)
+    assert config.retry_count == 7
+    assert config.public_name == "默认名称"
+    assert fake_storage.saved_payloads == [
+        {"retry_count": 7, "legacy_field": "旧字段", "public_name": "默认名称"}
+    ]
+    assert fake_storage.config_data == {
+        "retry_count": 7,
+        "legacy_field": "旧字段",
+        "public_name": "默认名称",
+    }
+    assert any("sync_result=success" in msg for msg in fake_logger.info_messages)
+
+
+def test_reload_syncs_stored_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_storage = _FakeStorage({"legacy_field": "旧字段"})
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
+
+    manager = ConfigManager("test_normalize_reload", _NormalizedConfigSchema)
+    config = cast("_NormalizedConfigSchema", manager.reload())
+
+    assert config.retry_count == 3
+    assert fake_storage.saved_payloads == [
+        {"legacy_field": "旧字段", "retry_count": 3, "public_name": "默认名称"}
+    ]
+
+
+def test_sync_failure_keeps_memory_config_and_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_storage = _FakeStorage({"legacy_field": "旧字段"}, fail_upsert=True)
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
+    monkeypatch.setattr(manager_module, "logger", fake_logger)
+
+    manager = ConfigManager("test_normalize_failure", _NormalizedConfigSchema)
+    config = cast("_NormalizedConfigSchema", manager.initialize())
+
+    assert config.retry_count == 3
+    assert fake_storage.saved_payloads == []
+    assert fake_storage.config_data == {"legacy_field": "旧字段"}
+    assert any("sync_result=failed" in msg for msg in fake_logger.warning_messages)
+
+
+def test_sync_conflict_uses_latest_config_without_overwriting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_storage = _FakeStorage(
+        {"legacy_field": "旧字段"},
+        conflict_data={"retry_count": 9, "public_name": "管理员新值"},
+    )
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
+    monkeypatch.setattr(manager_module, "logger", fake_logger)
+
+    manager = ConfigManager("test_normalize_conflict", _NormalizedConfigSchema)
+    config = cast("_NormalizedConfigSchema", manager.initialize())
+
+    assert config.retry_count == 9
+    assert config.public_name == "管理员新值"
+    assert fake_storage.saved_payloads == []
+    assert any("reason=stored_changed" in msg for msg in fake_logger.warning_messages)
 
 
 def test_update_field_log_does_not_include_new_value(
