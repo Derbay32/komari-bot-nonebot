@@ -689,11 +689,15 @@ class MessageHandler:
             vision_model = ""
             vision_temperature = 0.3
             vision_max_tokens = 1024
+            vision_thinking_mode = False
+            vision_reasoning_effort = ""
             if use_vision_tool:
                 vision_config = llm_provider_config_manager.get()
                 vision_model = vision_config.vision_model
                 vision_temperature = vision_config.vision_temperature
                 vision_max_tokens = vision_config.vision_max_tokens
+                vision_thinking_mode = vision_config.vision_thinking_mode
+                vision_reasoning_effort = vision_config.vision_reasoning_effort
 
             reply_result = await generate_reply_with_tools(
                 config=config,
@@ -708,6 +712,8 @@ class MessageHandler:
                 memory_service=self.memory,
                 group_id=message.group_id,
                 max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
+                vision_thinking_mode=vision_thinking_mode,
+                vision_reasoning_effort=vision_reasoning_effort,
             )
         else:
             reply_result = await generate_reply(

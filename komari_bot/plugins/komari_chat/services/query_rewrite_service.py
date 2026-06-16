@@ -38,6 +38,8 @@ class QueryRewriteService:
         *,
         rewrite_prompt: str,
         model: str,
+        thinking_mode: bool,
+        reasoning_effort: str,
     ) -> str:
         """调用 LLM 生成重写后的查询。"""
         return await llm_provider.generate_text(
@@ -45,6 +47,8 @@ class QueryRewriteService:
             model=model,
             temperature=0.3,
             max_tokens=256,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
             request_phase="query_rewrite",
         )
 
@@ -76,6 +80,8 @@ class QueryRewriteService:
             rewritten = await self._generate_rewritten_query(
                 rewrite_prompt=rewrite_prompt,
                 model=config.llm_model_summary,
+                thinking_mode=config.llm_thinking_mode_summary,
+                reasoning_effort=config.llm_reasoning_effort_summary,
             )
         except Exception as e:
             # 降级：返回原始查询

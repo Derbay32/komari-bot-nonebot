@@ -718,6 +718,8 @@ async def _execute_tool_loop(
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
     max_favorability_delta: int = 5,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。"""
     current_messages = list(messages)
@@ -735,11 +737,18 @@ async def _execute_tool_loop(
     pending_favorability_reason: str | None = None
 
     for round_num in range(1, max_tool_rounds + 1):
-        model = vision_model if has_vision_tool else config.llm_model_chat
-        temperature = (
-            vision_temperature if has_vision_tool else config.llm_temperature_chat
-        )
-        max_tokens = vision_max_tokens if has_vision_tool else config.llm_max_tokens_chat
+        if has_vision_tool:
+            model = vision_model
+            temperature = vision_temperature
+            max_tokens = vision_max_tokens
+            thinking_mode = vision_thinking_mode
+            reasoning_effort = vision_reasoning_effort
+        else:
+            model = config.llm_model_chat
+            temperature = config.llm_temperature_chat
+            max_tokens = config.llm_max_tokens_chat
+            thinking_mode = config.llm_thinking_mode_chat
+            reasoning_effort = config.llm_reasoning_effort_chat
         async with _LLM_COMPLETION_SEMAPHORE:
             completion = await llm_provider.generate_messages_completion(
                 messages=current_messages,
@@ -749,6 +758,8 @@ async def _execute_tool_loop(
                 tools=tool_definitions,
                 tool_choice="required",
                 parallel_tool_calls=False,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
                 request_trace_id=request_trace_id,
                 request_phase=f"{request_phase_prefix}_round_{round_num}",
                 record_chat_log=True,
@@ -856,6 +867,8 @@ async def generate_reply_with_tools(
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
     max_favorability_delta: int = 5,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
 ) -> ReplyResult:
     """通过工具调用模式生成回复，调用方显式指定启用工具列表。"""
     if not tools:
@@ -889,6 +902,8 @@ async def generate_reply_with_tools(
         memory_service=memory_service,
         group_id=group_id,
         max_favorability_delta=max_favorability_delta,
+        vision_thinking_mode=vision_thinking_mode,
+        vision_reasoning_effort=vision_reasoning_effort,
     )
 
 
@@ -1001,6 +1016,8 @@ async def summarize_conversation(
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=config.llm_max_tokens_summary,
+        thinking_mode=config.llm_thinking_mode_summary,
+        reasoning_effort=config.llm_reasoning_effort_summary,
         request_phase="chat_memory_summary",
     )
 
