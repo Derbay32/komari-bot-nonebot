@@ -6,6 +6,20 @@
 
 ---
 
+## [v1.2.0-rc.6] - 2026-06-17
+
+### Fixed
+- **思考模式与 `tool_choice` 参数冲突**：`thinking_mode` / `reasoning_effort` 从 `llm_provider` 全局字段改为各业务插件 per-call 配置，`thinking_mode=True` 时自动跳过 `tool_choice` 注入；`deepseek-v4` 系模型 `thinking_mode=False` 时注入 `thinking:disabled` 关闭默认思考。涉及 `komari_memory`、`komari_chat`、`group_history_summary` 三个插件的 15 处 LLM 调用点透传。
+
+### Changed
+- **`thinking_mode` / `reasoning_effort` per-call 化**：`komari_memory` 新增 `llm_thinking_mode_chat` / `llm_reasoning_effort_chat` / `llm_thinking_mode_summary` / `llm_reasoning_effort_summary`；`group_history_summary` 新增 `summary_planning_thinking_mode` / `summary_planning_reasoning_effort` / `summary_thinking_mode` / `summary_reasoning_effort`；`llm_provider` 新增 `vision_thinking_mode` / `vision_reasoning_effort`。所有默认值为 `False` / `""`，未配置时行为与改造前完全一致。
+- **视觉模型思考参数透传**：`message_handler` → `generate_reply_with_tools` → `_execute_tool_loop` 链路新增 `vision_thinking_mode` / `vision_reasoning_effort` 参数，聊天循环中 `has_vision_tool=True` 时按视觉模型独立配置选择思考参数。
+
+### Removed
+- **`llm_provider` 全局 `reasoning_effort` 字段**（破坏性变更）：`DynamicConfigSchema` 与 `Config` 中的 `reasoning_effort` 字段被删除。若管理员曾通过管理 API 设置过全局 `reasoning_effort`，需迁移到各业务插件的 `*_reasoning_effort` 字段。
+
+---
+
 ## [v1.2.0-rc.5] - 2026-06-14
 
 ### Fixed
@@ -214,6 +228,7 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
+| v1.2.0-rc.6 | 2026-06-17 | RC |
 | v1.2.0-rc.5 | 2026-06-14 | RC |
 | v1.2.0-rc.4 | 2026-06-12 | RC |
 | v1.2.0-rc.3 | 2026-06-10 | RC |
@@ -238,4 +253,4 @@
 
 ---
 
-*本 CHANGELOG 最后更新于 2026-06-10*
+*本 CHANGELOG 最后更新于 2026-06-17*
