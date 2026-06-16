@@ -12,20 +12,39 @@ from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 from komari_bot.plugins.llm_provider.openai_compatible_api import OpenAICompatibleClient
 
 
+def _patch_config_manager(monkeypatch: Any, **overrides: Any) -> None:
+    """注入测试用 config_manager，返回带默认字段的 SimpleNamespace 配置。"""
+
+    base: dict[str, Any] = {
+        "temperature": 1.0,
+        "max_tokens": 8192,
+        "frequency_penalty": 0.0,
+        "api_base": "https://example.com/v1",
+        "extra_params": {},
+    }
+    base.update(overrides)
+    monkeypatch.setattr(
+        openai_api_module,
+        "config_manager",
+        SimpleNamespace(get=lambda: SimpleNamespace(**base)),
+    )
+
+
 def test_llm_provider_timeout_defaults_to_300_seconds() -> None:
     assert DynamicConfigSchema().timeout_seconds == 300.0
     assert Config().timeout_seconds == 300.0
-    assert DynamicConfigSchema().reasoning_effort == ""
-    assert Config().reasoning_effort == ""
     assert DynamicConfigSchema().extra_params == {}
+    assert DynamicConfigSchema().vision_thinking_mode is False
+    assert DynamicConfigSchema().vision_reasoning_effort == ""
 
 
 def test_llm_provider_schema_includes_runtime_fields() -> None:
     config = DynamicConfigSchema()
 
     assert config.timeout_seconds == 300.0
-    assert config.reasoning_effort == ""
     assert config.extra_params == {}
+    assert config.vision_thinking_mode is False
+    assert config.vision_reasoning_effort == ""
 
 
 def test_openai_compatible_client_session_uses_configured_timeout() -> None:
@@ -54,9 +73,7 @@ def test_openai_compatible_client_session_uses_configured_timeout() -> None:
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_text_includes_reasoning_effort(
-    monkeypatch: Any,
-) -> None:
+def test_generate_text_injects_per_call_reasoning_effort(monkeypatch: Any) -> None:
     class _FakeCompletions:
         def __init__(self) -> None:
             self.last_kwargs: dict[str, Any] | None = None
@@ -82,34 +99,26 @@ def test_openai_compatible_client_generate_text_includes_reasoning_effort(
         )
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="medium",
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch)
 
-        result = await client.generate_text(prompt="你好", model="deepseek-chat")
+        result = await client.generate_text(
+            prompt="你好",
+            model="deepseek-chat",
+            thinking_mode=True,
+            reasoning_effort="medium",
+        )
 
         assert result.content == "ok"
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
         assert request_data["reasoning_effort"] == "medium"
+        assert "extra_body" not in request_data
         assert "response_format" not in request_data
 
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_text_passes_response_format(
-    monkeypatch: Any,
-) -> None:
+def test_generate_text_passes_response_format(monkeypatch: Any) -> None:
     class _FakeCompletions:
         def __init__(self) -> None:
             self.last_kwargs: dict[str, Any] | None = None
@@ -135,19 +144,7 @@ def test_openai_compatible_client_generate_text_passes_response_format(
         )
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="",
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch)
 
         result = await client.generate_text(
             prompt="请返回 JSON，对象字段为 name 和 age",
@@ -163,9 +160,7 @@ def test_openai_compatible_client_generate_text_passes_response_format(
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_text_with_messages_passes_response_format(
-    monkeypatch: Any,
-) -> None:
+def test_generate_text_with_messages_passes_response_format(monkeypatch: Any) -> None:
     class _FakeCompletions:
         def __init__(self) -> None:
             self.last_kwargs: dict[str, Any] | None = None
@@ -191,19 +186,7 @@ def test_openai_compatible_client_generate_text_with_messages_passes_response_fo
         )
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="",
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch)
 
         result = await client.generate_text_with_messages(
             messages=[{"role": "user", "content": "请返回 JSON"}],
@@ -219,9 +202,7 @@ def test_openai_compatible_client_generate_text_with_messages_passes_response_fo
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_messages_completion_parses_tool_calls(
-    monkeypatch: Any,
-) -> None:
+def test_generate_messages_completion_parses_tool_calls(monkeypatch: Any) -> None:
     class _FakeToolCall:
         def __init__(self) -> None:
             self.id = "call_1"
@@ -258,19 +239,7 @@ def test_openai_compatible_client_generate_messages_completion_parses_tool_calls
             timeout_seconds=300.0,
         )
         monkeypatch.setattr(client, "client", _FakeClient())
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="",
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch)
 
         result = await client.generate_text_with_messages(
             messages=[{"role": "user", "content": "总结最近 50 条"}],
@@ -293,7 +262,7 @@ def test_openai_compatible_client_generate_messages_completion_parses_tool_calls
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_messages_completion_keeps_invalid_json_arguments(
+def test_generate_messages_completion_keeps_invalid_json_arguments(
     monkeypatch: Any,
 ) -> None:
     class _FakeToolCall:
@@ -332,19 +301,7 @@ def test_openai_compatible_client_generate_messages_completion_keeps_invalid_jso
             timeout_seconds=300.0,
         )
         monkeypatch.setattr(client, "client", _FakeClient())
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="",
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch)
 
         result = await client.generate_text_with_messages(
             messages=[{"role": "user", "content": "总结最近关于发布的讨论"}],
@@ -358,9 +315,7 @@ def test_openai_compatible_client_generate_messages_completion_keeps_invalid_jso
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_text_sends_extra_params_via_extra_body(
-    monkeypatch: Any,
-) -> None:
+def test_generate_text_sends_extra_params_via_extra_body(monkeypatch: Any) -> None:
     class _FakeCompletions:
         def __init__(self) -> None:
             self.last_kwargs: dict[str, Any] | None = None
@@ -386,22 +341,9 @@ def test_openai_compatible_client_generate_text_sends_extra_params_via_extra_bod
         )
         fake_client = _FakeClient()
         monkeypatch.setattr(client, "client", fake_client)
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="",
-                    extra_params={
-                        "enable_thinking": False,
-                        "thinking": {"type": "disabled"},
-                    },
-                )
-            ),
+        _patch_config_manager(
+            monkeypatch,
+            extra_params={"custom_flag": True, "top_p": 0.9},
         )
 
         result = await client.generate_text(prompt="你好", model="deepseek-chat")
@@ -409,18 +351,142 @@ def test_openai_compatible_client_generate_text_sends_extra_params_via_extra_bod
         assert result.content == "ok"
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
-        assert request_data["extra_body"] == {
-            "enable_thinking": False,
-            "thinking": {"type": "disabled"},
-        }
-        assert "enable_thinking" not in request_data
+        assert request_data["extra_body"] == {"custom_flag": True, "top_p": 0.9}
+        assert "custom_flag" not in request_data
 
     asyncio.run(_run())
 
 
-def test_openai_compatible_client_generate_text_debug_log_uses_statistics(
-    monkeypatch: Any,
-) -> None:
+def test_thinking_mode_suppresses_tool_choice(monkeypatch: Any) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.last_kwargs: dict[str, Any] | None = None
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    async def _run() -> None:
+        client = OpenAICompatibleClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
+        _patch_config_manager(monkeypatch)
+
+        await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "你好"}],
+            model="deepseek-chat",
+            tools=[{"type": "function", "function": {"name": "query"}}],
+            tool_choice="required",
+            thinking_mode=True,
+            reasoning_effort="high",
+        )
+
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert "tool_choice" not in request_data
+        assert request_data["reasoning_effort"] == "high"
+
+    asyncio.run(_run())
+
+
+def test_deepseek_v4_disabled_thinking_injects_extra_body(monkeypatch: Any) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.last_kwargs: dict[str, Any] | None = None
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    async def _run() -> None:
+        client = OpenAICompatibleClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
+        _patch_config_manager(monkeypatch)
+
+        await client.generate_text(
+            prompt="你好",
+            model="deepseek-v4-flash",
+            thinking_mode=False,
+        )
+
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert request_data["extra_body"] == {"thinking": {"type": "disabled"}}
+        assert "reasoning_effort" not in request_data
+
+    asyncio.run(_run())
+
+
+def test_deepseek_v4_thinking_mode_enabled_does_not_disable(monkeypatch: Any) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.last_kwargs: dict[str, Any] | None = None
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.last_kwargs = kwargs
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    async def _run() -> None:
+        client = OpenAICompatibleClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        fake_client = _FakeClient()
+        monkeypatch.setattr(client, "client", fake_client)
+        _patch_config_manager(monkeypatch)
+
+        await client.generate_text(
+            prompt="你好",
+            model="deepseek-v4-flash",
+            thinking_mode=True,
+        )
+
+        request_data = fake_client.chat.completions.last_kwargs
+        assert request_data is not None
+        assert "extra_body" not in request_data
+        assert "reasoning_effort" not in request_data
+
+    asyncio.run(_run())
+
+
+def test_generate_text_debug_log_uses_statistics(monkeypatch: Any) -> None:
     class _FakeCompletions:
         async def create(self, **_kwargs: Any) -> Any:
             return SimpleNamespace(
@@ -447,20 +513,7 @@ def test_openai_compatible_client_generate_text_debug_log_uses_statistics(
         )
         monkeypatch.setattr(client, "client", _FakeClient())
         monkeypatch.setattr(openai_api_module.logger, "debug", _fake_debug)
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.0,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="medium",
-                    extra_params={},
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch)
 
         await client.generate_text(
             prompt="绝密 prompt 原文",
@@ -468,6 +521,8 @@ def test_openai_compatible_client_generate_text_debug_log_uses_statistics(
             system_instruction="绝密 system 原文",
             response_format={"type": "json_object"},
             tools=[{"type": "function", "function": {"name": "query"}}],
+            thinking_mode=True,
+            reasoning_effort="medium",
         )
 
     asyncio.run(_run())
@@ -477,14 +532,14 @@ def test_openai_compatible_client_generate_text_debug_log_uses_statistics(
     assert "system_instruction_chars: 12" in request_log
     assert "tools_count: 1" in request_log
     assert "reasoning_effort: medium" in request_log
+    assert "thinking_disabled: False" in request_log
+    assert "suppress_tool_choice: True" in request_log
     assert "has_response_format: True" in request_log
     assert "绝密 prompt 原文" not in request_log
     assert "绝密 system 原文" not in request_log
 
 
-def test_openai_compatible_client_generate_messages_debug_log_includes_request_flags(
-    monkeypatch: Any,
-) -> None:
+def test_generate_messages_debug_log_includes_request_flags(monkeypatch: Any) -> None:
     class _FakeCompletions:
         async def create(self, **_kwargs: Any) -> Any:
             return SimpleNamespace(
@@ -511,20 +566,7 @@ def test_openai_compatible_client_generate_messages_debug_log_includes_request_f
         )
         monkeypatch.setattr(client, "client", _FakeClient())
         monkeypatch.setattr(openai_api_module.logger, "debug", _fake_debug)
-        monkeypatch.setattr(
-            openai_api_module,
-            "config_manager",
-            SimpleNamespace(
-                get=lambda: SimpleNamespace(
-                    temperature=1.0,
-                    max_tokens=8192,
-                    frequency_penalty=0.1,
-                    api_base="https://example.com/v1",
-                    reasoning_effort="low",
-                    extra_params={},
-                )
-            ),
-        )
+        _patch_config_manager(monkeypatch, frequency_penalty=0.1)
 
         await client.generate_text_with_messages(
             messages=[{"role": "user", "content": "你好"}],
@@ -543,3 +585,5 @@ def test_openai_compatible_client_generate_messages_debug_log_includes_request_f
     assert "has_response_format: True" in request_log
     assert "has_parallel_tool_calls: True" in request_log
     assert "frequency_penalty: 0.1" in request_log
+    assert "thinking_disabled: False" in request_log
+    assert "suppress_tool_choice: False" in request_log
