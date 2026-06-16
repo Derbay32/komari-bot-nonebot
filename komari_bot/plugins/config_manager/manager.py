@@ -6,6 +6,7 @@ NoneBot dotenv 或进程环境变量提供，不进入本管理器。
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -16,6 +17,17 @@ from .storage import StoredConfig, get_config_storage
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigSyncResult:
+    """一次配置存储归一化的结果。"""
+
+    normalized_data: dict[str, Any]
+    added_keys: set[str]
+    removed_keys: set[str]
+    value_changed: bool
+    changed: bool
 
 
 class ConfigManager:
@@ -81,7 +93,9 @@ class ConfigManager:
 
             stored = get_config_storage().fetch(self._plugin_name)
             if stored is not None:
-                self._dynamic_config = self._config_schema(**stored.config_data)
+                config, synced_stored = self._load_and_sync_stored_config(stored)
+                self._dynamic_config = config
+                stored = synced_stored
                 self._last_loaded_at = stored.updated_at
                 logger.info(f"[{self._plugin_name}] 已从 PostgreSQL 加载配置")
                 return self._dynamic_config
@@ -119,6 +133,96 @@ class ConfigManager:
         logger.debug(f"[{self._plugin_name}] 配置已保存到 PostgreSQL")
         return stored
 
+    def _build_sync_result(
+        self,
+        *,
+        config: BaseModel,
+        stored_data: dict[str, Any],
+    ) -> _ConfigSyncResult:
+        """计算存储数据相对当前 Schema 的归一化差异。"""
+        normalized_data = config.model_dump(mode="json")
+        stored_keys = set(stored_data)
+        normalized_keys = set(normalized_data)
+        added_keys = normalized_keys - stored_keys
+        removed_keys = stored_keys - normalized_keys
+        value_changed = any(
+            stored_data.get(key) != normalized_data[key]
+            for key in stored_keys & normalized_keys
+        )
+        return _ConfigSyncResult(
+            normalized_data=normalized_data,
+            added_keys=added_keys,
+            removed_keys=removed_keys,
+            value_changed=value_changed,
+            changed=bool(added_keys or removed_keys or value_changed),
+        )
+
+    def _load_and_sync_stored_config(
+        self,
+        stored: StoredConfig,
+    ) -> tuple[BaseModel, StoredConfig]:
+        """加载 PG 配置，并在字段或值需要归一化时尽力写回。"""
+        config = self._config_schema(**stored.config_data)
+        sync_result = self._build_sync_result(
+            config=config,
+            stored_data=stored.config_data,
+        )
+        if not sync_result.changed:
+            return config, stored
+        if not sync_result.added_keys and not sync_result.value_changed:
+            logger.warning(
+                f"[{self._plugin_name}] 配置项包含当前 Schema 未使用字段，已跳过自动删除: "
+                f"schema_name={self._config_schema.__name__}, "
+                f"removed_keys={sorted(sync_result.removed_keys)}"
+            )
+            return config, stored
+
+        normalized_data = dict(stored.config_data)
+        normalized_data.update(sync_result.normalized_data)
+
+        try:
+            storage = get_config_storage()
+            synced = storage.update_if_unchanged(
+                plugin_name=self._plugin_name,
+                schema_name=self._config_schema.__name__,
+                config_data=normalized_data,
+                version=stored.version,
+                expected_updated_at=stored.updated_at,
+            )
+            if synced is None:
+                latest = storage.fetch(self._plugin_name)
+                if latest is not None:
+                    logger.warning(
+                        f"[{self._plugin_name}] 配置项自动同步跳过: "
+                        f"schema_name={self._config_schema.__name__}, "
+                        "reason=stored_changed"
+                    )
+                    return self._config_schema(**latest.config_data), latest
+                logger.warning(
+                    f"[{self._plugin_name}] 配置项自动同步跳过: "
+                    f"schema_name={self._config_schema.__name__}, "
+                    "reason=stored_missing"
+                )
+                return config, stored
+        except Exception as exc:
+            logger.warning(
+                f"[{self._plugin_name}] 配置项自动同步失败: "
+                f"schema_name={self._config_schema.__name__}, "
+                f"added_keys={sorted(sync_result.added_keys)}, "
+                f"removed_keys={sorted(sync_result.removed_keys)}, "
+                f"sync_result=failed, error={exc}"
+            )
+            return config, stored
+
+        logger.info(
+            f"[{self._plugin_name}] 配置项已自动同步: "
+            f"schema_name={self._config_schema.__name__}, "
+            f"added_keys={sorted(sync_result.added_keys)}, "
+            f"removed_keys={sorted(sync_result.removed_keys)}, "
+            "sync_result=success"
+        )
+        return self._config_schema(**synced.config_data), synced
+
     def get(self) -> BaseModel:
         """获取当前的动态配置。"""
         if self._dynamic_config is None:
@@ -154,7 +258,8 @@ class ConfigManager:
                 stored = self._save_to_pg(self._dynamic_config)
                 logger.info(f"[{self._plugin_name}] PostgreSQL 无配置，已从 .env 重新初始化")
             else:
-                self._dynamic_config = self._config_schema(**stored.config_data)
+                config, stored = self._load_and_sync_stored_config(stored)
+                self._dynamic_config = config
                 logger.info(f"[{self._plugin_name}] 已从 PostgreSQL 重新加载配置")
             self._last_loaded_at = stored.updated_at
             return self._dynamic_config

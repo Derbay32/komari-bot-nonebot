@@ -193,6 +193,67 @@ class ConfigStorage:
             updated_at=row["updated_at"],
         )
 
+    def update_if_unchanged(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredConfig | None:
+        """仅在记录未被其他写入修改时更新插件配置。"""
+        return self._run(
+            self._update_if_unchanged(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_data=config_data,
+                version=version,
+                expected_updated_at=expected_updated_at,
+            )
+        )
+
+    async def _update_if_unchanged(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredConfig | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE komari_plugin_configs
+                SET
+                    schema_name = $2,
+                    config_data = $3::jsonb,
+                    version = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE plugin_name = $1
+                  AND updated_at = $5
+                RETURNING plugin_name, schema_name, config_data, version, updated_at
+                """,
+                plugin_name,
+                schema_name,
+                json.dumps(config_data, ensure_ascii=False),
+                version,
+                expected_updated_at,
+            )
+        if row is None:
+            return None
+        raw_config = row["config_data"]
+        stored_data = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+        return StoredConfig(
+            plugin_name=str(row["plugin_name"]),
+            schema_name=str(row["schema_name"]),
+            config_data=dict(stored_data),
+            version=str(row["version"]),
+            updated_at=row["updated_at"],
+        )
+
     def close(self) -> None:
         """关闭后台连接池和事件循环。"""
         if not self._loop.is_running():
