@@ -195,6 +195,59 @@ class PromptStorage:
             raise RuntimeError(msg)
         return _stored_prompt_from_row(row)
 
+    def update_if_unchanged(
+        self,
+        *,
+        resource_id: str,
+        display_name: str,
+        prompt_data: dict[str, str],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredPrompt | None:
+        """仅在记录未被其他写入修改时更新 prompt 配置。"""
+        return self._run(
+            self._update_if_unchanged(
+                resource_id=resource_id,
+                display_name=display_name,
+                prompt_data=prompt_data,
+                version=version,
+                expected_updated_at=expected_updated_at,
+            )
+        )
+
+    async def _update_if_unchanged(
+        self,
+        *,
+        resource_id: str,
+        display_name: str,
+        prompt_data: dict[str, str],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredPrompt | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE komari_prompt_configs
+                SET
+                    display_name = $2,
+                    prompt_data = $3::jsonb,
+                    version = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE resource_id = $1
+                  AND updated_at = $5
+                RETURNING resource_id, display_name, prompt_data, version, updated_at
+                """,
+                resource_id,
+                display_name,
+                json.dumps(prompt_data, ensure_ascii=False),
+                version,
+                expected_updated_at,
+            )
+        if row is None:
+            return None
+        return _stored_prompt_from_row(row)
+
     def close(self) -> None:
         """关闭后台连接池和事件循环。"""
         if not self._loop.is_running():
@@ -282,11 +335,65 @@ def validate_prompt_values(
 
 def load_prompt_values(resource: PromptResourceProtocol) -> PromptValues:
     """从 PG 读取 prompt，并与 defaults 合并。"""
-    stored = get_prompt_storage().fetch(resource.resource_id)
+    storage = get_prompt_storage()
+    stored = storage.fetch(resource.resource_id)
     values = merge_prompt_values(
         defaults=resource.defaults,
         prompt_data=stored.prompt_data if stored is not None else None,
     )
+    if stored is not None:
+        stored_keys = set(stored.prompt_data)
+        merged_keys = set(values)
+        added_keys = merged_keys - stored_keys
+        removed_keys = stored_keys - merged_keys
+        value_changed = any(
+            stored.prompt_data.get(key) != values[key]
+            for key in stored_keys & merged_keys
+        )
+        if added_keys or value_changed:
+            synced: StoredPrompt | None = None
+            try:
+                prompt_data = dict(stored.prompt_data)
+                prompt_data.update(validate_prompt_values(resource.defaults, values))
+                synced = storage.update_if_unchanged(
+                    resource_id=resource.resource_id,
+                    display_name=resource.display_name,
+                    prompt_data=prompt_data,
+                    version=stored.version,
+                    expected_updated_at=stored.updated_at,
+                )
+                if synced is None:
+                    latest = storage.fetch(resource.resource_id)
+                    if latest is not None:
+                        stored = latest
+                        values = merge_prompt_values(
+                            defaults=resource.defaults,
+                            prompt_data=latest.prompt_data,
+                        )
+                    logger.warning(
+                        f"Prompt 配置自动同步跳过: "
+                        f"resource_id={resource.resource_id}, "
+                        "reason=stored_changed"
+                    )
+                else:
+                    stored = synced
+            except Exception as exc:
+                logger.warning(
+                    f"Prompt 配置自动同步失败: "
+                    f"resource_id={resource.resource_id}, "
+                    f"added_keys={sorted(added_keys)}, "
+                    f"removed_keys={sorted(removed_keys)}, "
+                    f"sync_result=failed, error={exc}"
+                )
+            else:
+                if synced is not None:
+                    logger.info(
+                        f"Prompt 配置已自动同步: "
+                        f"resource_id={resource.resource_id}, "
+                        f"added_keys={sorted(added_keys)}, "
+                        f"removed_keys={sorted(removed_keys)}, "
+                        "sync_result=success"
+                    )
     return PromptValues(values=values, stored=stored)
 
 
