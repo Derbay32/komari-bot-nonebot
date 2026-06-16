@@ -69,6 +69,10 @@ def _make_service(conn: _FakeConnection) -> ForgettingService:
         llm_model_summary="summary-model",
         llm_temperature_summary=0.3,
         llm_max_tokens_summary=256,
+        llm_thinking_mode_chat=False,
+        llm_reasoning_effort_chat="",
+        llm_thinking_mode_summary=False,
+        llm_reasoning_effort_summary="",
     )
     return ForgettingService(
         config=cast("Any", config),
