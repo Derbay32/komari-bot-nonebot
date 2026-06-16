@@ -132,7 +132,9 @@ def test_main_async_dry_run_reuses_pool_and_reports_memory_targets(monkeypatch: 
     assert pool.closed is True
     assert [call[1][0] for call in conn.fetchval_calls if "to_regclass" in call[0]] == [
         "komari_memory_conversations",
+        "komari_memory_conversation_embeddings",
         "komari_memory_interaction_history",
+        "komari_memory_interaction_embeddings",
     ]
     assert conn.execute_calls == []
 

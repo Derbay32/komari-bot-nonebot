@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 
@@ -28,12 +29,27 @@ class _Resource:
 
 
 class _FakePromptStorage:
-    def __init__(self, stored: StoredPrompt | None = None) -> None:
+    def __init__(
+        self,
+        stored: StoredPrompt | None = None,
+        *,
+        fail_fetch: bool = False,
+        fail_upsert: bool = False,
+        conflict_stored: StoredPrompt | None = None,
+    ) -> None:
         self.stored = stored
+        self.fail_fetch = fail_fetch
+        self.fail_upsert = fail_upsert
+        self.conflict_stored = conflict_stored
         self.saved: dict[str, str] | None = None
+        self.saved_payloads: list[dict[str, str]] = []
+        self.upsert_calls = 0
 
     def fetch(self, resource_id: str) -> StoredPrompt | None:
         assert resource_id == "test_prompt"
+        if self.fail_fetch:
+            msg = "读取失败"
+            raise RuntimeError(msg)
         return self.stored
 
     def upsert(
@@ -46,7 +62,12 @@ class _FakePromptStorage:
     ) -> StoredPrompt:
         assert resource_id == "test_prompt"
         assert display_name == "测试 Prompt"
+        self.upsert_calls += 1
+        if self.fail_upsert:
+            msg = "写入失败"
+            raise RuntimeError(msg)
         self.saved = prompt_data
+        self.saved_payloads.append(prompt_data)
         self.stored = StoredPrompt(
             resource_id=resource_id,
             display_name=display_name,
@@ -55,6 +76,27 @@ class _FakePromptStorage:
             updated_at=datetime.now(UTC),
         )
         return self.stored
+
+    def update_if_unchanged(
+        self,
+        *,
+        resource_id: str,
+        display_name: str,
+        prompt_data: dict[str, str],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredPrompt | None:
+        assert self.stored is not None
+        assert expected_updated_at == self.stored.updated_at
+        if self.conflict_stored is not None:
+            self.stored = self.conflict_stored
+            return None
+        return self.upsert(
+            resource_id=resource_id,
+            display_name=display_name,
+            prompt_data=prompt_data,
+            version=version,
+        )
 
 
 class _ClosablePromptStorage:
@@ -108,6 +150,92 @@ def test_load_and_save_prompt_values_use_prompt_storage(
     assert saved.prompt_data == fake_storage.saved
 
 
+def test_load_prompt_values_syncs_added_and_removed_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = _Resource()
+    stored = StoredPrompt(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        prompt_data={"system_prompt": "PG 值\n", "legacy": "旧字段"},
+        version="1.0",
+        updated_at=datetime.now(UTC),
+    )
+    fake_storage = _FakePromptStorage(stored)
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: fake_storage)
+
+    loaded = load_prompt_values(resource)
+
+    assert loaded.values == {"system_prompt": "PG 值", "memory_ack": "收到"}
+    assert fake_storage.saved_payloads == [
+        {"system_prompt": "PG 值", "legacy": "旧字段", "memory_ack": "收到"}
+    ]
+    assert loaded.stored == fake_storage.stored
+
+
+def test_load_prompt_values_returns_merged_values_when_sync_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = _Resource()
+    stored = StoredPrompt(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        prompt_data={"legacy": "旧字段"},
+        version="1.0",
+        updated_at=datetime.now(UTC),
+    )
+    fake_storage = _FakePromptStorage(stored, fail_upsert=True)
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: fake_storage)
+
+    loaded = load_prompt_values(resource)
+
+    assert loaded.values == {"system_prompt": "默认", "memory_ack": "收到"}
+    assert loaded.stored == stored
+    assert fake_storage.upsert_calls == 1
+    assert fake_storage.saved_payloads == []
+
+
+def test_load_prompt_values_refetches_when_sync_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = _Resource()
+    stored = StoredPrompt(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        prompt_data={"legacy": "旧字段"},
+        version="1.0",
+        updated_at=datetime.now(UTC),
+    )
+    latest = StoredPrompt(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        prompt_data={"system_prompt": "管理员新值", "memory_ack": "收到"},
+        version="1.0",
+        updated_at=datetime.now(UTC),
+    )
+    fake_storage = _FakePromptStorage(stored, conflict_stored=latest)
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: fake_storage)
+
+    loaded = load_prompt_values(resource)
+
+    assert loaded.values == {"system_prompt": "管理员新值", "memory_ack": "收到"}
+    assert loaded.stored == latest
+    assert fake_storage.saved_payloads == []
+
+
+def test_load_prompt_values_does_not_write_when_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = _Resource()
+    fake_storage = _FakePromptStorage(fail_fetch=True)
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: fake_storage)
+
+    with pytest.raises(RuntimeError, match="读取失败"):
+        load_prompt_values(resource)
+
+    assert fake_storage.upsert_calls == 0
+
+
 def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -153,7 +281,7 @@ def test_close_prompt_storage_if_created_does_not_create_storage() -> None:
 
 def test_close_prompt_storage_if_created_closes_and_clears_storage() -> None:
     storage = _ClosablePromptStorage()
-    prompt_storage._StorageState.storage = storage
+    cast("Any", prompt_storage._StorageState).storage = storage
 
     prompt_storage.close_prompt_storage_if_created()
 

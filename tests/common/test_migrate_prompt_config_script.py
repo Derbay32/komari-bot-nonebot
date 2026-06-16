@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
-
-from komari_bot.common import prompt_storage
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/migrate_prompt_config_to_pg.py"
@@ -27,21 +26,17 @@ def _load_script_module() -> Any:
     return module
 
 
-class _FakePromptStorage:
+class _FakePromptConnection:
     def __init__(self) -> None:
-        self.upserts: list[tuple[str, dict[str, str]]] = []
+        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.closed = False
 
-    def upsert(
-        self,
-        *,
-        resource_id: str,
-        display_name: str,
-        prompt_data: dict[str, str],
-        version: str = "1.0",
-    ) -> object:
-        del display_name, version
-        self.upserts.append((resource_id, prompt_data))
-        return object()
+    async def execute(self, query: str, *args: object) -> str:
+        self.execute_calls.append((query, args))
+        return "OK"
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def test_migrate_prompts_dry_run_skips_missing_yaml(
@@ -54,10 +49,22 @@ def test_migrate_prompts_dry_run_skips_missing_yaml(
         display_name="Komari Chat Prompt",
         legacy_file_path=tmp_path / "missing.yaml",
         defaults={"system_prompt": "默认"},
+        default_file_name="komari_chat.yaml",
     )
     monkeypatch.setattr(module, "_RESOURCES", (resource,))
 
-    stats = module.migrate_prompts(dry_run=True)
+    stats = asyncio.run(
+        module.migrate_prompts(
+            dry_run=True,
+            dotenv_path=tmp_path / ".env",
+            prompt_paths=module.PromptPathConfig(
+                prompt_dir=None,
+                komari_chat=None,
+                komari_memory_summary=None,
+                group_history_summary=None,
+            ),
+        )
+    )
 
     assert stats == {"success": 0, "skipped": 1, "failed": 0}
 
@@ -77,17 +84,40 @@ def test_migrate_prompts_imports_only_supported_string_fields(
         display_name="Komari Chat Prompt",
         legacy_file_path=prompt_file,
         defaults={"system_prompt": "默认", "memory_ack": "默认确认"},
+        default_file_name="komari_chat.yaml",
     )
-    fake_storage = _FakePromptStorage()
-    monkeypatch.setattr(module, "_RESOURCES", (resource,))
-    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: fake_storage)
+    fake_conn = _FakePromptConnection()
 
-    stats = module.migrate_prompts(dry_run=False)
+    async def _fake_connect(**_kwargs: object) -> _FakePromptConnection:
+        return fake_conn
+
+    monkeypatch.setattr(module, "_RESOURCES", (resource,))
+    monkeypatch.setattr(module.asyncpg, "connect", _fake_connect)
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text(
+        "PG_HOST=localhost\nPG_PORT=5432\nPG_DATABASE=komari_bot\nPG_USER=user\nPG_PASSWORD=pass\n",
+        encoding="utf-8",
+    )
+
+    stats = asyncio.run(
+        module.migrate_prompts(
+            dry_run=False,
+            dotenv_path=dotenv_path,
+            prompt_paths=module.PromptPathConfig(
+                prompt_dir=None,
+                komari_chat=None,
+                komari_memory_summary=None,
+                group_history_summary=None,
+            ),
+        )
+    )
 
     assert stats == {"success": 1, "skipped": 0, "failed": 0}
-    assert fake_storage.upserts == [
-        (
-            "komari_chat",
-            {"system_prompt": "新系统提示词", "memory_ack": "默认确认"},
-        )
-    ]
+    assert fake_conn.closed is True
+    assert any("CREATE TABLE IF NOT EXISTS komari_prompt_configs" in call[0] for call in fake_conn.execute_calls)
+    assert (
+        "komari_chat",
+        "Komari Chat Prompt",
+        '{"system_prompt": "新系统提示词", "memory_ack": "默认确认"}',
+        "1.0",
+    ) in [call[1] for call in fake_conn.execute_calls]
