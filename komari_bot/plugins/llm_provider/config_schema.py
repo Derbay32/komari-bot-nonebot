@@ -62,13 +62,6 @@ class DynamicConfigSchema(BaseModel):
         le=600,
         description="聊天 LLM 请求每分钟上限",
     )
-    reasoning_effort: str = Field(
-        default="",
-        description=(
-            "OpenAI 兼容 API 请求的 reasoning_effort。"
-            "可选：none/minimal/low/medium/high/xhigh；为空时不发送"
-        ),
-    )
     frequency_penalty: float = Field(
         default=0.0, description="OpenAI 兼容 API 重复内容惩罚"
     )
@@ -76,8 +69,9 @@ class DynamicConfigSchema(BaseModel):
         default_factory=dict,
         description=(
             "OpenAI 兼容 API 请求的额外自定义参数，"
-            "会合并到每次请求体中。支持简单值和嵌套结构。"
-            '例如：{"enable_thinking": false} 或 {"thinking": {"type": "disabled"}}'
+            "会合并到每次请求体的 extra_body 中。"
+            "思考模式控制请使用各业务插件的 *_thinking_mode / *_reasoning_effort 字段，"
+            "勿在此处配置 thinking/enable_thinking/reasoning_effort。"
         ),
     )
     vision_model: str = Field(
@@ -95,6 +89,14 @@ class DynamicConfigSchema(BaseModel):
         ge=20,
         le=8192,
         description="视觉模型最大 token 数",
+    )
+    vision_thinking_mode: bool = Field(
+        default=False,
+        description="视觉模型是否处于思考模式（仅在聊天循环 has_vision_tool=True 切到 vision_model 时生效）。",
+    )
+    vision_reasoning_effort: str = Field(
+        default="",
+        description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
     )
 
     # LLM 调用日志配置

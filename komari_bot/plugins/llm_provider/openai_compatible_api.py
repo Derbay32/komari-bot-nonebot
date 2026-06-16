@@ -52,15 +52,43 @@ class OpenAICompatibleClient(BaseLLMClient):
         )
 
     @staticmethod
-    def _resolve_reasoning_effort(
-        config: DynamicConfigSchema, **kwargs: object
-    ) -> str | None:
-        """解析 OpenAI 兼容的 reasoning_effort 请求参数。"""
-        raw_value = kwargs.get("reasoning_effort", config.reasoning_effort)
-        if raw_value is None:
-            return None
-        value = str(raw_value).strip()
-        return value or None
+    def _is_deepseek_v4_model(model: str) -> bool:
+        """判断是否 deepseek-v4 系模型（默认开启思考，需主动关闭）。"""
+        return "deepseek-v4" in model.lower()
+
+    @staticmethod
+    def _resolve_thinking_params(
+        model: str,
+        **kwargs: object,
+    ) -> tuple[str | None, bool, bool]:
+        """解析思考模式相关参数。
+
+        thinking_mode 与 reasoning_effort 均由调用方通过 kwargs 传入（per-call），
+        不再读取任何全局配置。
+
+        Returns:
+            (reasoning_effort, thinking_disabled, suppress_tool_choice)
+            - reasoning_effort: 非 deepseek-v4 系且思考开启时返回 effort 值，否则 None
+            - thinking_disabled: deepseek-v4 系且思考关闭时返回 True（注入 thinking:disabled）
+            - suppress_tool_choice: 思考模式启用时返回 True（跳过 tool_choice 注入）
+        """
+        thinking_mode = bool(kwargs.get("thinking_mode", False))
+        raw_effort = kwargs.get("reasoning_effort", "")
+        is_v4 = OpenAICompatibleClient._is_deepseek_v4_model(model)
+
+        if is_v4:
+            thinking_disabled = not thinking_mode
+            reasoning_effort = None
+        else:
+            thinking_disabled = False
+            if thinking_mode:
+                effort = str(raw_effort).strip() if raw_effort is not None else ""
+                reasoning_effort = effort or None
+            else:
+                reasoning_effort = None
+
+        suppress_tool_choice = thinking_mode
+        return reasoning_effort, thinking_disabled, suppress_tool_choice
 
     @classmethod
     def _raise_invalid_response(cls) -> "Never":
@@ -157,13 +185,17 @@ class OpenAICompatibleClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
-            reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
+            reasoning_effort, thinking_disabled, suppress_tool_choice = (
+                self._resolve_thinking_params(model, **kwargs)
+            )
             logger.debug(
                 f"OpenAI 兼容 API 请求:\n"
                 f"  model: {model}\n"
                 f"  temperature: {temperature if temperature is not None else config.temperature}\n"
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
+                f"  thinking_disabled: {thinking_disabled}\n"
+                f"  suppress_tool_choice: {suppress_tool_choice}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.frequency_penalty)}\n"
                 f"  prompt_chars: {len(prompt)}\n"
                 f"  system_instruction_chars: {len(system_instruction or '')}\n"
@@ -194,24 +226,33 @@ class OpenAICompatibleClient(BaseLLMClient):
 
             if tools is not None:
                 request_data["tools"] = tools
-            if tool_choice is not None:
+            if tool_choice is not None and not suppress_tool_choice:
                 request_data["tool_choice"] = tool_choice
+            elif tool_choice is not None and suppress_tool_choice:
+                logger.warning(
+                    "思考模式启用，已跳过 tool_choice 注入 (model={}, tool_choice={})",
+                    model,
+                    tool_choice,
+                )
             if parallel_tool_calls is not None:
                 request_data["parallel_tool_calls"] = parallel_tool_calls
 
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
+            extra_body: dict[str, Any] = {}
+            if thinking_disabled:
+                extra_body["thinking"] = {"type": "disabled"}
             extra_params = getattr(config, "extra_params", {})
             if extra_params:
-                conflict_keys = sorted(set(request_data) & set(extra_params))
-                if conflict_keys:
-                    logger.warning(
-                        "OpenAI 兼容 API 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
-                        ", ".join(conflict_keys),
-                    )
-                logger.debug("注入 OpenAI 兼容 API 额外参数键名: {}", sorted(extra_params))
-                request_data["extra_body"] = dict(extra_params)
+                for key, value in extra_params.items():
+                    if key in ("thinking", "enable_thinking") and extra_body:
+                        logger.warning("extra_params 中的 {} 与思考模式控制冲突，已忽略", key)
+                        continue
+                    extra_body[key] = value
+            if extra_body:
+                logger.debug("注入 OpenAI 兼容 API extra_body 键名: {}", sorted(extra_body))
+                request_data["extra_body"] = extra_body
 
             response = await self.client.chat.completions.create(**request_data)
         except APITimeoutError:
@@ -265,7 +306,9 @@ class OpenAICompatibleClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
-            reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
+            reasoning_effort, thinking_disabled, suppress_tool_choice = (
+                self._resolve_thinking_params(model, **kwargs)
+            )
 
             request_data = {
                 "model": model,
@@ -286,24 +329,33 @@ class OpenAICompatibleClient(BaseLLMClient):
 
             if tools is not None:
                 request_data["tools"] = tools
-            if tool_choice is not None:
+            if tool_choice is not None and not suppress_tool_choice:
                 request_data["tool_choice"] = tool_choice
+            elif tool_choice is not None and suppress_tool_choice:
+                logger.warning(
+                    "思考模式启用，已跳过 tool_choice 注入 (model={}, tool_choice={})",
+                    model,
+                    tool_choice,
+                )
             if parallel_tool_calls is not None:
                 request_data["parallel_tool_calls"] = parallel_tool_calls
 
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
+            extra_body: dict[str, Any] = {}
+            if thinking_disabled:
+                extra_body["thinking"] = {"type": "disabled"}
             extra_params = getattr(config, "extra_params", {})
             if extra_params:
-                conflict_keys = sorted(set(request_data) & set(extra_params))
-                if conflict_keys:
-                    logger.warning(
-                        "OpenAI 兼容 API 额外参数与已有请求字段重名，将通过 extra_body 发送且不覆盖 SDK 显式参数: {}",
-                        ", ".join(conflict_keys),
-                    )
-                logger.debug("注入 OpenAI 兼容 API 额外参数键名: {}", sorted(extra_params))
-                request_data["extra_body"] = dict(extra_params)
+                for key, value in extra_params.items():
+                    if key in ("thinking", "enable_thinking") and extra_body:
+                        logger.warning("extra_params 中的 {} 与思考模式控制冲突，已忽略", key)
+                        continue
+                    extra_body[key] = value
+            if extra_body:
+                logger.debug("注入 OpenAI 兼容 API extra_body 键名: {}", sorted(extra_body))
+                request_data["extra_body"] = extra_body
 
             logger.debug(
                 f"OpenAI 兼容 API 请求 (messages):\n"
@@ -312,6 +364,8 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  temperature: {request_data['temperature']}\n"
                 f"  max_tokens: {request_data['max_tokens']}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
+                f"  thinking_disabled: {thinking_disabled}\n"
+                f"  suppress_tool_choice: {suppress_tool_choice}\n"
                 f"  frequency_penalty: {request_data['frequency_penalty']}\n"
                 f"  tools_count: {len(tools or [])}\n"
                 f"  has_response_format: {response_format is not None}\n"
