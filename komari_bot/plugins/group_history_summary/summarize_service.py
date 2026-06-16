@@ -53,6 +53,8 @@ async def summarize_history_messages(
     *,
     assistant_prefill_enabled: bool = False,
     dsv4_roleplay_instruct_mode: str = "auto",
+    thinking_mode: bool = False,
+    reasoning_effort: str = "",
 ) -> str:
     """总结历史消息，返回总结正文。"""
     if not history_messages:
@@ -100,6 +102,8 @@ async def summarize_history_messages(
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        thinking_mode=thinking_mode,
+        reasoning_effort=reasoning_effort,
         request_phase="group_history_summary",
     )
     summary_text = _extract_tag_content(raw_result, "content")

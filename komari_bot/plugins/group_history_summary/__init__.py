@@ -204,6 +204,8 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 max_summary_count=config.max_summary_count,
                 summary_tool_scan_limit=config.summary_tool_scan_limit,
                 fetch_batch_size=config.fetch_batch_size,
+                planning_thinking_mode=config.summary_planning_thinking_mode,
+                planning_reasoning_effort=config.summary_planning_reasoning_effort,
             )
 
             filtered_messages = plan_result.messages
@@ -219,6 +221,8 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 max_tokens=config.summary_max_tokens,
                 assistant_prefill_enabled=config.assistant_prefill_enabled,
                 dsv4_roleplay_instruct_mode=config.dsv4_roleplay_instruct_mode,
+                thinking_mode=config.summary_thinking_mode,
+                reasoning_effort=config.summary_reasoning_effort,
             )
 
             body_lines = summary_text_to_lines(summary_text)

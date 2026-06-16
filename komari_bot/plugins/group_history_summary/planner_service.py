@@ -437,6 +437,8 @@ async def plan_summary_request(
     max_summary_count: int,
     summary_tool_scan_limit: int,
     fetch_batch_size: int,
+    planning_thinking_mode: bool = False,
+    planning_reasoning_effort: str = "",
 ) -> SummaryPlanResult:
     """使用工具调用规划总结所需的历史记录。"""
     messages = _build_planning_messages(user_request)
@@ -490,6 +492,8 @@ async def plan_summary_request(
                 tools=tools,
                 tool_choice="auto",
                 parallel_tool_calls=False,
+                thinking_mode=planning_thinking_mode,
+                reasoning_effort=planning_reasoning_effort,
             ),
         )
 
