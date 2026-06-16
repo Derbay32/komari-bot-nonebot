@@ -6,7 +6,7 @@ import asyncio
 import sys
 from importlib import import_module
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 
@@ -20,9 +20,10 @@ def user_data_module(app: App) -> Any:
     module_name = "komari_bot.plugins.user_data.__init__"
     sys.modules.pop(module_name, None)
     module = import_module(module_name)
-    module._db = None
-    module._db_init_lock = None
-    module._db_init_lock_loop = None
+    module_any = cast("Any", module)
+    module_any._db = None
+    module_any._db_init_lock = None
+    module_any._db_init_lock_loop = None
     return module
 
 
