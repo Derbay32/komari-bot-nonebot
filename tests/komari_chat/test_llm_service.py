@@ -56,6 +56,10 @@ def _build_config() -> SimpleNamespace:
         llm_model_summary="summary-model",
         llm_temperature_summary=0.3,
         llm_max_tokens_summary=2048,
+        llm_thinking_mode_chat=False,
+        llm_reasoning_effort_chat="",
+        llm_thinking_mode_summary=False,
+        llm_reasoning_effort_summary="",
         bot_nickname="小鞠",
         response_tag="content",
     )

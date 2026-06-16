@@ -41,6 +41,8 @@ def _patch_config(monkeypatch: Any) -> None:
         "get_config",
         lambda: SimpleNamespace(
             llm_model_summary="summary-model",
+            llm_thinking_mode_summary=False,
+            llm_reasoning_effort_summary="",
         ),
     )
     monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
