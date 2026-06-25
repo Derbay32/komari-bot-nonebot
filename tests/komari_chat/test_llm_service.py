@@ -641,6 +641,336 @@ def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> 
             )
         )
 
+    # 三轮空 tool_calls 在同一 _execute_tool_loop 内被纠错，不再触发外层重试。
+    assert len(fake_provider.completion_calls) == 3
+    messages_lengths = [len(call["messages"]) for call in fake_provider.completion_calls]
+    assert messages_lengths == sorted(messages_lengths)
+    for call in fake_provider.completion_calls[1:]:
+        assert any(
+            "必须调用" in str(message.get("content", ""))
+            for message in call["messages"]
+        )
+
+
+def test_generate_reply_with_tools_recovers_when_model_omits_tool_call(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "纠错后输出",
+                        "interaction_history": {
+                            "event": "未先调用工具",
+                            "result": "纠错后正常输出",
+                            "emotion": "平静",
+                        },
+                    },
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "随便说点"}],
+            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            request_trace_id="chat-omit-1",
+        )
+    )
+
+    assert result.content == "纠错后输出"
+    assert len(fake_provider.completion_calls) == 2
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        "必须调用" in str(message.get("content", ""))
+        for message in second_messages
+        if message.get("role") == "user"
+    )
+
+
+def test_generate_reply_with_tools_retries_invalid_final_response_in_same_session(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "interaction_history": {
+                            "event": "校验失败示例",
+                            "result": "缺少 content",
+                            "emotion": "中性",
+                        }
+                    },
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "补完 content 后输出",
+                        "interaction_history": {
+                            "event": "首次校验失败",
+                            "result": "补完 content 后正常输出",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-2",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "再试一次"}],
+            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            request_trace_id="chat-invalid-final-1",
+        )
+    )
+
+    assert result.content == "补完 content 后输出"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and "final_response" in str(message.get("content", ""))
+        and "content" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_generate_reply_with_tools_does_not_repeat_successful_search_after_final_response_error(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "search_web",
+                    '{"query":"新闻"}',
+                    {"query": "新闻"},
+                    call_id="call-search-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "interaction_history": {
+                            "event": "缺 content",
+                            "result": "等待纠错",
+                            "emotion": "中性",
+                        }
+                    },
+                    call_id="call-final-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "基于已有搜索结果回答",
+                        "interaction_history": {
+                            "event": "已搜索",
+                            "result": "纠错后输出",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-2",
+                )
+            ],
+        ),
+    ]
+    searched_queries: list[str] = []
+
+    async def _fake_search_web(query: str) -> str:
+        searched_queries.append(query)
+        return "搜索结果：今日新闻摘要"
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    monkeypatch.setattr(
+        llm_service_module,
+        "komari_search",
+        SimpleNamespace(search_web=_fake_search_web),
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "搜一下新闻"}],
+            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            request_trace_id="chat-no-repeat-search-1",
+            max_tool_rounds=3,
+        )
+    )
+
+    assert result.content == "基于已有搜索结果回答"
+    assert searched_queries == ["新闻"]
+
+
+def test_generate_reply_with_tools_reports_search_failure_to_model(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "search_web",
+                    '{"query":"天气"}',
+                    {"query": "天气"},
+                    call_id="call-search-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "搜索失败，已有上下文继续回答",
+                        "interaction_history": {
+                            "event": "搜索失败",
+                            "result": "基于已有信息回答",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-1",
+                )
+            ],
+        ),
+    ]
+
+    async def _fake_search_web(_query: str) -> str:
+        raise RuntimeError("网络中断")
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    monkeypatch.setattr(
+        llm_service_module,
+        "komari_search",
+        SimpleNamespace(search_web=_fake_search_web),
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "搜一下天气"}],
+            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            request_trace_id="chat-search-failure-1",
+        )
+    )
+
+    assert result.content == "搜索失败，已有上下文继续回答"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and "search_web" in str(message.get("content", ""))
+        and "RuntimeError" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_generate_reply_with_tools_recovers_invalid_favorability_delta(
+    monkeypatch: Any,
+) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "record_favorability_delta",
+                    '{"delta":"bad","reason":"非法参数"}',
+                    {"delta": "bad", "reason": "非法参数"},
+                    call_id="call-favor-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "record_favorability_delta",
+                    '{"delta":2,"reason":"友好互动"}',
+                    {"delta": 2, "reason": "友好互动"},
+                    call_id="call-favor-2",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "所需好感度修正后回复",
+                        "interaction_history": {
+                            "event": "好感度工具纠错",
+                            "result": "合法记录后回复",
+                            "emotion": "放松",
+                        },
+                    },
+                    call_id="call-final-1",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "打招呼"}],
+            tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
+            request_trace_id="chat-favor-recover-1",
+            max_tool_rounds=3,
+        )
+    )
+
+    assert result.content == "所需好感度修正后回复"
+    assert result.favorability_delta == 2
+    assert result.favorability_reason == "友好互动"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-favor-1"
+        and "record_favorability_delta" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
 
 def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> None:
     fake_provider = _FakeLLMProvider("<content>组合工具最终回答</content>")
