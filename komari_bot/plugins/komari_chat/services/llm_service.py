@@ -582,6 +582,59 @@ def _build_tool_call_message(
     }
 
 
+def _append_tool_retry_instruction(
+    current_messages: list[dict[str, Any]],
+    *,
+    reason: str,
+    expected_action: str,
+) -> None:
+    """追加 user 纠错消息，让模型在同一会话内继续修正上一轮错误。
+
+    用于没有 ``tool_call_id`` 可关联的情况（例如模型未调用任何工具、
+    或调用了未声明的工具），消息只描述问题与期望动作。
+    """
+    current_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "上一轮工具调用存在错误，请修正后在同一会话内继续。"
+                f"错误原因：{reason}\n"
+                f"必须：{expected_action}\n"
+                "要求：仍旧必须调用工具；已成功执行的工具结果会保留在上下文中，"
+                "除非确实需要重新查询，否则请直接基于已有上下文调用 "
+                f"{FINAL_RESPONSE_TOOL_NAME} 完成回复。"
+            ),
+        }
+    )
+
+
+def _build_tool_error_result(
+    tool_call: Any,
+    error: BaseException | str,
+) -> dict[str, Any]:
+    """构造工具执行失败的 tool 消息，保留原 ``tool_call_id`` 供模型继续。"""
+    tool_name = tool_call.function.name
+    tool_call_id = tool_call.id or tool_name
+    if isinstance(error, BaseException):
+        error_text = f"{type(error).__name__}: {error}"
+    else:
+        error_text = str(error)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": (
+            f"工具 {tool_name} 执行失败：{error_text}。"
+            "请修正参数或改用已有上下文继续。"
+        ),
+    }
+
+
+@retry_async(max_attempts=3, base_delay=1.0)
+async def _call_llm_completion(**kwargs: Any) -> Any:
+    """对 LLM completion 单次请求做瞬时失败重试，不包裹业务工具/解析逻辑。"""
+    return await llm_provider.generate_messages_completion(**kwargs)
+
+
 @retry_async(max_attempts=3, base_delay=1.0)
 async def generate_reply(
     config: KomariMemoryConfigSchema,
@@ -733,8 +786,14 @@ async def _execute_tool_loop(
         tool.get("function", {}).get("name") == RECORD_FAVORABILITY_DELTA_TOOL_NAME
         for tool in tool_definitions
     )
+    known_business_tool_names: set[str] = {
+        READ_IMAGE_TOOL_NAME,
+        SEARCH_WEB_TOOL_NAME,
+        READ_PROFILE_TOOL_NAME,
+    }
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
+    last_retry_reason: str | None = None
 
     for round_num in range(1, max_tool_rounds + 1):
         if has_vision_tool:
@@ -749,8 +808,9 @@ async def _execute_tool_loop(
             max_tokens = config.llm_max_tokens_chat
             thinking_mode = config.llm_thinking_mode_chat
             reasoning_effort = config.llm_reasoning_effort_chat
+
         async with _LLM_COMPLETION_SEMAPHORE:
-            completion = await llm_provider.generate_messages_completion(
+            completion = await _call_llm_completion(
                 messages=current_messages,
                 model=model,
                 temperature=temperature,
@@ -766,11 +826,23 @@ async def _execute_tool_loop(
             )
 
         if not completion.tool_calls:
-            msg = (
+            last_retry_reason = (
                 f"{request_phase_prefix} 第 {round_num} 轮：模型未调用任何工具，"
                 "但 tool_choice='required' 要求至少调用一个工具"
             )
-            raise RuntimeError(msg)
+            if completion.content:
+                current_messages.append(
+                    {"role": "assistant", "content": completion.content}
+                )
+            _append_tool_retry_instruction(
+                current_messages,
+                reason=last_retry_reason,
+                expected_action=(
+                    f"必须调用某个工具；如果已有足够信息完成回复，"
+                    f"必须调用 {FINAL_RESPONSE_TOOL_NAME}。"
+                ),
+            )
+            continue
 
         logger.info(
             "[KomariChat] Tool 调用: trace_id={} round={} tool_calls={}",
@@ -780,41 +852,77 @@ async def _execute_tool_loop(
         )
 
         business_tool_results: list[dict[str, Any]] = []
+        tool_error_results: list[dict[str, Any]] = []
+        saw_unknown_tool = False
+
         for tool_call in completion.tool_calls:
             tool_name = tool_call.function.name
             if tool_name == FINAL_RESPONSE_TOOL_NAME:
-                if not tool_call.parsed_arguments:
-                    msg = (
-                        f"{request_phase_prefix} 第 {round_num} 轮：final_response 缺少 parsed_arguments"
-                    )
-                    raise RuntimeError(msg)
                 if requires_favorability_delta and pending_favorability_delta is None:
-                    current_messages.append(
-                        _build_tool_call_message(
-                            completion.tool_calls,
-                            completion.content or "",
-                        )
-                    )
-                    current_messages.append(
+                    tool_error_results.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id or tool_name,
-                            "content": "必须先调用 record_favorability_delta 记录本轮好感度变化，再调用 final_response。",
+                            "content": (
+                                "必须先调用 record_favorability_delta 记录本轮好感度变化，"
+                                "再调用 final_response。"
+                            ),
                         }
                     )
-                    continue
-                return _parse_reply_result(
-                    tool_call.parsed_arguments,
-                    favorability_delta=pending_favorability_delta,
-                    favorability_reason=pending_favorability_reason,
-                )
+                    last_retry_reason = (
+                        f"{request_phase_prefix} 第 {round_num} 轮："
+                        "final_response 在 record_favorability_delta 之前被调用"
+                    )
+                    break
+                if not tool_call.parsed_arguments:
+                    tool_error_results.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id or tool_name,
+                            "content": (
+                                "final_response 缺少 JSON 参数。请重新调用 final_response，"
+                                "并提供符合 schema 的 JSON：必须包含 content（字符串）"
+                                "与 interaction_history（含 event、result、emotion）。"
+                            ),
+                        }
+                    )
+                    last_retry_reason = (
+                        f"{request_phase_prefix} 第 {round_num} 轮："
+                        "final_response 缺少 parsed_arguments"
+                    )
+                    break
+                try:
+                    return _parse_reply_result(
+                        tool_call.parsed_arguments,
+                        favorability_delta=pending_favorability_delta,
+                        favorability_reason=pending_favorability_reason,
+                    )
+                except (ValueError, TypeError) as exc:
+                    tool_error_results.append(
+                        _build_tool_error_result(tool_call, exc)
+                    )
+                    last_retry_reason = (
+                        f"{request_phase_prefix} 第 {round_num} 轮："
+                        f"final_response 内容校验失败：{exc}"
+                    )
+                    break
 
             if tool_name == RECORD_FAVORABILITY_DELTA_TOOL_NAME:
-                delta, reason = _parse_favorability_delta(
-                    tool_call.parsed_arguments,
-                    tool_call.raw_arguments or tool_call.function.arguments,
-                    max_abs_delta=max_favorability_delta,
-                )
+                try:
+                    delta, reason = _parse_favorability_delta(
+                        tool_call.parsed_arguments,
+                        tool_call.raw_arguments or tool_call.function.arguments,
+                        max_abs_delta=max_favorability_delta,
+                    )
+                except (ValueError, TypeError) as exc:
+                    tool_error_results.append(
+                        _build_tool_error_result(tool_call, exc)
+                    )
+                    last_retry_reason = (
+                        f"{request_phase_prefix} 第 {round_num} 轮："
+                        f"record_favorability_delta 参数校验失败：{exc}"
+                    )
+                    continue
                 pending_favorability_delta = delta
                 pending_favorability_reason = reason
                 business_tool_results.append(
@@ -826,33 +934,73 @@ async def _execute_tool_loop(
                 )
                 continue
 
-            result = await _execute_business_tool(
-                tool_call=tool_call,
-                base64_images=base64_images or [],
-                vision_model=vision_model,
-                vision_temperature=vision_temperature,
-                vision_max_tokens=vision_max_tokens,
-                phase_prefix=request_phase_prefix,
-                round_num=round_num,
-                memory_service=memory_service,
-                group_id=group_id,
-            )
+            if tool_name not in known_business_tool_names:
+                saw_unknown_tool = True
+                logger.warning(
+                    "[KomariChat] {} 第 {} 轮：未知工具 '{}'，跳过",
+                    request_phase_prefix,
+                    round_num,
+                    tool_name,
+                )
+                continue
+
+            try:
+                result = await _execute_business_tool(
+                    tool_call=tool_call,
+                    base64_images=base64_images or [],
+                    vision_model=vision_model,
+                    vision_temperature=vision_temperature,
+                    vision_max_tokens=vision_max_tokens,
+                    phase_prefix=request_phase_prefix,
+                    round_num=round_num,
+                    memory_service=memory_service,
+                    group_id=group_id,
+                )
+            except Exception as exc:  # 向模型回写后继续会话
+                tool_error_results.append(_build_tool_error_result(tool_call, exc))
+                last_retry_reason = (
+                    f"{request_phase_prefix} 第 {round_num} 轮："
+                    f"工具 {tool_name} 执行失败：{type(exc).__name__}: {exc}"
+                )
+                continue
             if result is not None:
                 business_tool_results.append(result)
 
-        if business_tool_results:
+        has_messages_to_send = (
+            bool(business_tool_results)
+            or bool(tool_error_results)
+            or saw_unknown_tool
+        )
+        if has_messages_to_send:
             current_messages.append(
                 _build_tool_call_message(completion.tool_calls, completion.content or "")
             )
             current_messages.extend(business_tool_results)
+            current_messages.extend(tool_error_results)
+            if saw_unknown_tool and not tool_error_results:
+                _append_tool_retry_instruction(
+                    current_messages,
+                    reason=(
+                        f"{request_phase_prefix} 第 {round_num} 轮："
+                        "调用了未在工具列表中声明的工具"
+                    ),
+                    expected_action=(
+                        "只使用已声明的工具；"
+                        f"若已有足够信息，请直接调用 {FINAL_RESPONSE_TOOL_NAME}。"
+                    ),
+                )
+                last_retry_reason = (
+                    f"{request_phase_prefix} 第 {round_num} 轮："
+                    "调用了未声明工具"
+                )
 
     msg = (
-        f"{request_phase_prefix} 达到最大轮数 {max_tool_rounds}，模型未调用 final_response 工具"
+        f"{request_phase_prefix} 达到最大轮数 {max_tool_rounds}，"
+        f"模型仍未完成 final_response：{last_retry_reason or '未知原因'}"
     )
     raise RuntimeError(msg)
 
 
-@retry_async(max_attempts=3, base_delay=1.0)
 async def generate_reply_with_tools(
     config: KomariMemoryConfigSchema,
     messages: list[dict[str, Any]],
@@ -870,7 +1018,15 @@ async def generate_reply_with_tools(
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
 ) -> ReplyResult:
-    """通过工具调用模式生成回复，调用方显式指定启用工具列表。"""
+    """通过工具调用模式生成回复，调用方显式指定启用工具列表。
+
+    Note:
+        与 ``generate_reply`` 不同，此处不再包裹整段会话重试。
+        工具调用会话内的格式错误、未调用工具、业务工具执行失败
+        都会在同一 ``current_messages`` 中追加纠错消息继续下一轮；
+        LLM completion 单次请求的瞬时网络/接口异常通过
+        ``_call_llm_completion`` 内部局部重试。
+    """
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
 
