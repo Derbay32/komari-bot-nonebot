@@ -6,6 +6,120 @@
 
 ---
 
+## [v1.2.0] - 2026-06-27
+
+> **v1.2.0 正式版**
+
+### 🚨 破坏性变更
+
+- **好感度系统完全重构**：从旧每日随机/累计/历史记录改为单一当前值模型（范围 `[0, 400]`，默认 `100`），启动时检测旧结构后直接重建 `user_favorability` 表，旧好感度历史**不迁移**。
+- **`.jrhg` 命令移除**：好感度只随聊天回复自动调整，不再提供独立查询命令。
+- **`llm_provider` 全局 `reasoning_effort` 字段删除**：改为各业务插件 per-call 配置（如 `llm_thinking_mode_chat`、`summary_thinking_mode` 等）。
+- **旧用户属性 API 移除**：`UserAttribute`、`get_user_attribute()`、`set_user_attribute()` 等全部删除。
+- **记忆向量表拆分**：`komari_memory_conversations` 与 `komari_memory_interaction_history` 不再内联 `embedding` 列，改由独立外键表保存向量。
+
+### ✨ 新增功能
+
+#### 聊天与交互
+- **表情反应提示**：判定回复后自动 `set_msg_emoji_like`，示意生成中。
+- **联网搜索**：`komari_search` 封装 Tavily Search API，提供 `search_web` 工具调用。
+- **V4 多模态**：工具调用支持读取图片，实现图文混合对话。
+- **`final_response` 终端工具**：所有回复通过 `tool_choice="required"` 强制结构化输出，互动历史同步生成。
+- **`read_profile` 只读工具**：接入聊天默认工具集。
+
+#### 知识库与社区
+- **知识库提案插件**（`komari_custom`）：`.custom` 指令组 → 多步编辑 → 投票通过 → 自动写入知识库。
+
+#### 记忆系统
+- **跨群互动事件记忆**：Redis 缓冲 → LLM 跨群聚合（禁止输出群号/群名） → PG 向量存储，后台 Worker 自动处理。
+- **画像 Agent 化**：LLM tool calling 模式（read/write/preview/count/commit_profile），Redis 暂存 + PG advisory lock 互斥。
+- **四阶段好感度提示词**：统一 `0-99`、`100-199`、`200-299`、`300-400` 阶段定义，LLM delta 工具强制记录好感度变化。
+
+#### 基础设施
+- **判定场景 PostgreSQL 内容表迁移**：`komari_decision_scenes` 作为唯一运行时 source of truth，配套管理 API。
+- **配置系统迁移**：`config_manager` 从本地 JSON 迁移到 PG `komari_plugin_configs`；Prompt 存储独立表 `komari_prompt_configs`。
+- **消息缓冲重构**：空闲超时 + 最小消息数替代 token 计数触发总结。
+
+### 🔧 改进
+
+#### 思考模式
+- **`thinking_mode` / `reasoning_effort` per-call 化**：`komari_memory`、`group_history_summary`、`llm_provider` 新增独立思考参数配置，`thinking_mode=True` 时自动跳过 `tool_choice` 注入。
+- **视觉模型思考参数透传**：聊天循环中 `has_vision_tool=True` 时按视觉模型独立配置选择思考参数。
+
+#### 画像与记忆
+- **画像写入载荷语义调整**：内部改用 `set_traits` / `delete_keys` patch，完整 profile payload 只表示"设置本次出现的 key"，不再隐式删除缺失 key。
+- **`user_data` 好感度服务收敛**：运行时代码只保留 `user_favorability` 当前好感度能力。
+- **记忆向量读写路径重构**：对话记忆与跨群互动事件改为事务内维护独立 embedding 表。
+- **向量迁移脚本独立化**：`scripts/migrate_embeddings.py` 不再导入 `komari_bot` 包。
+
+#### Chat Prompt
+- **首轮只注入当前用户画像**，移除冗余块。
+- **YAML 风格格式化**：画像/关键词知识/可见用户/Redis 近期互动/PG 互动事件记忆统一格式。
+- **预读取优化**：构建 prompt 前预读 PG 画像、Redis 近期互动缓冲（限 10 条）、PG 长期互动事件记忆。
+
+#### 工具执行
+- **重构工具执行循环**：将硬失败改为发送纠错重试消息，抽取工具辅助函数。
+- **工具循环合并**：视觉/搜索工具统一为 `_execute_tool_loop()`，消除 ~190 行重复代码。
+
+#### 其他
+- **默认总结模型**：`llm_model_summary` 从 `gemini-2.5-flash-lite` 改为 `deepseek-v4-flash`。
+- **对话总结幂等**：`dedup_key` + partial unique index，`ON CONFLICT DO NOTHING`。
+
+### 🛡️ 安全加固
+
+- **图片下载 SSRF 防护**：校验 URL、DNS 解析结果与每一跳重定向，阻断内网/环回/链路本地/保留地址。
+- **聊天 Prompt 注入隔离**：历史消息、引用消息、当前输入等不可信数据统一转义并包裹边界。
+- **管理配置 API 凭据脱敏**：token/password/secret/key/credential 字段统一返回 `******`。
+- **配置更新日志安全**：`ConfigManager.update_field()` 日志仅记录插件名与字段名。
+- **LLM 日志保存安全**：对日志记录结构化与敏感内容进行脱敏处理。
+- **ILIKE 查询注入防护**：新增 `escape_like_pattern()` 统一转义 `\`、`%`、`_`。
+- **`komari_custom` 异常泄露修复**：兜底异常提示改为固定安全文案。
+
+### 🐛 修复
+
+#### 并发与竞态
+- **用户画像 JSONB 增量写入**：改为 PostgreSQL 侧原子 patch，避免并发覆盖。
+- **画像 Agent 提交竞态**：`ProfileStaging.commit()` 关闭 TOCTOU 窗口。
+- **`user_data.get_db()` 初始化竞态**：新增 `asyncio.Lock` 双重检查。
+- **`ConfigStorage._run()` 同步桥接无超时**：新增 5 秒超时。
+- **`ConfigStorage._get_pool()` 初始化失败残留 pool**：schema 初始化失败时关闭临时连接池。
+- **LLM / Vision / Tavily 外部调用并发控制**：模块级 `asyncio.Semaphore` 限制并发。
+
+#### 崩溃与稳定性
+- **昵称 fallback 格式化崩溃**：移除 `:.0f` 格式符。
+- **`.sr` 空列表崩溃**：检查空列表并提前 finish。
+- **`user_data.database` 连接池运行时 assert**：新增 `_require_pool()` 私有方法。
+- **记忆遗忘批处理单任务异常中断整批**：修复单任务异常直接中断整批的问题。
+- **总结时过高并发导致 429 错误**：引入总结服务、聊天服务全局 RPM 上限。
+
+#### API 与配置
+- **Scene API 回退路径重复执行 DDL**：重构场景仓储获取逻辑。
+- **公告 API 无组数量限制与限流**：引入发送限流与可配置参数。
+- **profile 批量 upsert 一个冲突会回滚整批**：重构为逐条隔离事务。
+- **LLM Provider 模块名修正**：DeepSeek 专属命名泛化为 OpenAI 兼容 API 统一接口。
+- **配置/Prompt 存储 shutdown hook**：新增 `close_config_storage_if_created()` / `close_prompt_storage_if_created()`。
+
+#### 其他修复
+- **旧互动历史写入路径**：停用旧 JSONB 写入入口。
+- **`.custom` 编辑缓冲污染**：移除回复引导消息自动追加入口，新增 `.custom append <文本>` 显式追加。
+- **Tavily 查询长度限制与短期缓存**：query 截断至 200 字符，60 秒进程内缓存。
+- **思考模式与 `tool_choice` 参数冲突**：`thinking_mode=True` 时自动跳过 `tool_choice` 注入。
+- 陈旧测试断言、对话总结重试重复写入、时间戳泄漏、PromptStorage 超时/init 不可重试、API 异常信息泄露。
+
+### 🗑️ 移除
+
+- **`.jrhg` 今日好感插件与命令**。
+- **`komari_healthcheck` 插件**（健康检查已迁移到 napcat 侧）。
+- **`nonebot-plugin-localstore` 依赖**。
+- **JSON 配置示例文件**。
+- **XML 标签提取**、旧 dispatch 回调、旧模板字段、分段/合并机制、`summary_chunk_token_limit` 配置。
+- **旧用户属性 API 与清理配置**：`UserAttribute`、相关 getter/setter、`data_retention_days` 与 APScheduler 属性清理任务。
+- **`komari_status` 状态查询插件**。
+- **独立 LLM 压缩路径**、JSON 操作数组旧模式、离线瘦身脚本。
+- **`llm_provider` 全局 `reasoning_effort` 字段**。
+
+---
+
 ## [v1.2.0-rc.7] - 2026-06-25
 
 ### Changed
@@ -235,6 +349,7 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
+| v1.2.0 | 2026-06-27 | **Stable** |
 | v1.2.0-rc.7 | 2026-06-25 | RC |
 | v1.2.0-rc.6 | 2026-06-17 | RC |
 | v1.2.0-rc.5 | 2026-06-14 | RC |
@@ -261,4 +376,4 @@
 
 ---
 
-*本 CHANGELOG 最后更新于 2026-06-25*
+*本 CHANGELOG 最后更新于 2026-06-27*
