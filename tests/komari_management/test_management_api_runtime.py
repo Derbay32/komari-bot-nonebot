@@ -22,6 +22,7 @@ from komari_bot.plugins.komari_management.managed_resources import (
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
 from komari_bot.plugins.llm_provider.api import register_llm_provider_api
+from komari_bot.plugins.user_ban.api import register_user_ban_api
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -95,6 +96,8 @@ def _build_components() -> ManagementApiComponents:
         memory_service_getter=lambda: None,
         register_llm_provider_api=register_llm_provider_api,
         reply_log_reader_getter=lambda: None,
+        register_user_ban_api=register_user_ban_api,
+        user_ban_service_getter=lambda: None,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -141,6 +144,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/komari-announce/v1/groups" in route_paths
     assert "/api/komari-announce/v1/maintenance" in route_paths
     assert "/api/komari-decision-scenes/v1/scenes" in route_paths
+    assert "/api/komari-user-bans/v1/bans" in route_paths
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
@@ -159,6 +163,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/komari-announce/v1/groups" in schema["paths"]
     assert "/api/komari-announce/v1/maintenance" in schema["paths"]
     assert "/api/komari-decision-scenes/v1/scenes" in schema["paths"]
+    assert "/api/komari-user-bans/v1/bans" in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(
         item.get("type") == "http" and item.get("scheme") == "bearer"
@@ -168,7 +173,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "[Komari Management] 管理 API 已注册: "
         "/api/komari-knowledge/v1, /api/komari-help/v1, /api/komari-memory/v1, /api/llm-provider/v1, "
         "/api/komari-management-config/v1, /api/komari-management-prompt/v1, /api/komari-announce/v1, "
-        "/api/komari-decision-scenes/v1"
+        "/api/komari-decision-scenes/v1, /api/komari-user-bans/v1"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "
