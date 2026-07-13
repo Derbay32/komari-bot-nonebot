@@ -73,6 +73,7 @@ def _load_management_components() -> ManagementApiComponents:
     help_plugin = require("komari_help")
     memory_plugin = require("komari_memory")
     llm_provider_plugin = require("llm_provider")
+    user_ban_plugin = require("user_ban")
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
@@ -83,6 +84,8 @@ def _load_management_components() -> ManagementApiComponents:
         memory_service_getter=memory_plugin.get_memory_service,
         register_llm_provider_api=llm_provider_plugin.register_llm_provider_api,
         reply_log_reader_getter=llm_provider_plugin.get_reply_log_reader,
+        register_user_ban_api=user_ban_plugin.register_user_ban_api,
+        user_ban_service_getter=user_ban_plugin.get_service,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",

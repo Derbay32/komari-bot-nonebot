@@ -21,6 +21,7 @@ ANNOUNCE_API_PREFIX = "/api/komari-announce/v1"
 MANAGEMENT_CONFIG_API_PREFIX = "/api/komari-management-config/v1"
 MANAGEMENT_PROMPT_API_PREFIX = "/api/komari-management-prompt/v1"
 DECISION_SCENE_API_PREFIX = "/api/komari-decision-scenes/v1"
+USER_BAN_API_PREFIX = "/api/komari-user-bans/v1"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -40,6 +41,8 @@ class ManagementApiComponents:
     memory_service_getter: Callable[[], object | None]
     register_llm_provider_api: Callable[..., None]
     reply_log_reader_getter: Callable[[], object | None]
+    register_user_ban_api: Callable[..., None]
+    user_ban_service_getter: Callable[[], object]
     config_resources: tuple[ManagedConfigResource, ...]
     prompt_resources: tuple[ManagedPromptResource, ...]
 
@@ -95,6 +98,12 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         reader_getter=components.reply_log_reader_getter,
     )
+    components.register_user_ban_api(
+        server_app,
+        api_token=settings.api_token,
+        allowed_origins=settings.allowed_origins,
+        service_getter=components.user_ban_service_getter,
+    )
     register_config_api(
         server_app,
         api_token=settings.api_token,
@@ -139,7 +148,7 @@ def register_management_api_for_driver(
         "[Komari Management] 管理 API 已注册: "
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, {MEMORY_API_PREFIX}, {LLM_PROVIDER_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
-        f"{DECISION_SCENE_API_PREFIX}"
+        f"{DECISION_SCENE_API_PREFIX}, {USER_BAN_API_PREFIX}"
     )
     logger.info(
         f"[Komari Management] 管理文档入口: docs={docs_url}, openapi={openapi_url}"
