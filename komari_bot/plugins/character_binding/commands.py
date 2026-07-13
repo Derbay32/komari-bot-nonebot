@@ -9,7 +9,6 @@ from nonebot import on_command
 # NoneBot 会在运行时解析处理函数注解，这里必须导入真实类型。
 from nonebot.adapters.onebot.v11 import Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg, Depends
-from nonebot.permission import SUPERUSER
 
 from .manager import CharacterBindingManager, get_manager
 
@@ -55,49 +54,10 @@ def parse_self_bind_set_request(
     )
 
 
-def parse_superuser_bind_set_request(
-    user_id: str = Depends(get_event_user_id),
-    arg_text: str = Depends(get_command_text),
-) -> BindSetRequest:
-    """解析超级用户设置绑定请求。"""
-    parts = arg_text.split(maxsplit=1)
-    if len(parts) == 2 and parts[0].isdigit():
-        return BindSetRequest(
-            operator_user_id=user_id,
-            target_user_id=parts[0],
-            character_name=parts[1],
-            specified_target=True,
-        )
-
-    return BindSetRequest(
-        operator_user_id=user_id,
-        target_user_id=user_id,
-        character_name=arg_text,
-    )
-
-
 def parse_self_bind_delete_request(
     user_id: str = Depends(get_event_user_id),
 ) -> BindDeleteRequest:
     """解析普通用户删除绑定请求。"""
-    return BindDeleteRequest(
-        operator_user_id=user_id,
-        target_user_id=user_id,
-    )
-
-
-def parse_superuser_bind_delete_request(
-    user_id: str = Depends(get_event_user_id),
-    arg_text: str = Depends(get_command_text),
-) -> BindDeleteRequest:
-    """解析超级用户删除绑定请求。"""
-    if arg_text.isdigit():
-        return BindDeleteRequest(
-            operator_user_id=user_id,
-            target_user_id=arg_text,
-            specified_target=True,
-        )
-
     return BindDeleteRequest(
         operator_user_id=user_id,
         target_user_id=user_id,
@@ -141,35 +101,8 @@ async def handle_bind_help(event: MessageEvent) -> None:
     await bind.finish(help_text)
 
 
-# /bind set <角色名> 或 /bind set <用户ID> <角色名>
-bind_set_superuser = on_command(
-    ("bind", "set"), permission=SUPERUSER, priority=9, block=True
-)
+# /bind set <角色名>
 bind_set = on_command(("bind", "set"), priority=10, block=True)
-
-
-@bind_set_superuser.handle()
-async def handle_set_superuser(
-    request: BindSetRequest = Depends(parse_superuser_bind_set_request),
-    manager: CharacterBindingManager = Depends(get_manager),
-) -> None:
-    """处理超级用户设置绑定命令。"""
-    if not request.character_name:
-        await bind_set_superuser.finish(
-            "❌ 请提供角色名\n"
-            "用法: .bind set <角色名>\n"
-            "SUPERUSER 用法: .bind set <用户ID> <角色名>"
-        )
-
-    await manager.set_character_name(request.target_user_id, request.character_name)
-
-    if request.specified_target:
-        await bind_set_superuser.finish(
-            f"✅ 已为用户 {request.target_user_id} 设置角色名为 "
-            f"{request.character_name}"
-        )
-
-    await bind_set_superuser.finish(f"✅ 已设置您的角色名为 {request.character_name}")
 
 
 @bind_set.handle()
@@ -185,35 +118,8 @@ async def handle_set(
     await bind_set.finish(f"✅ 已设置您的角色名为 {request.character_name}")
 
 
-# /bind del [用户ID]
-bind_del_superuser = on_command(
-    ("bind", "del"), permission=SUPERUSER, priority=9, block=True
-)
+# /bind del
 bind_del = on_command(("bind", "del"), priority=10, block=True)
-
-
-@bind_del_superuser.handle()
-async def handle_del_superuser(
-    request: BindDeleteRequest = Depends(parse_superuser_bind_delete_request),
-    manager: CharacterBindingManager = Depends(get_manager),
-) -> None:
-    """处理超级用户删除绑定命令。"""
-    success = await manager.remove_character_name(request.target_user_id)
-
-    if request.specified_target:
-        if success:
-            await bind_del_superuser.finish(
-                f"✅ 已删除用户 {request.target_user_id} 的角色绑定"
-            )
-        else:
-            await bind_del_superuser.finish(
-                f"❌ 用户 {request.target_user_id} 没有角色绑定"
-            )
-
-    if success:
-        await bind_del_superuser.finish("✅ 已删除您的角色绑定")
-
-    await bind_del_superuser.finish("❌ 您还没有设置角色绑定")
 
 
 @bind_del.handle()
@@ -230,26 +136,7 @@ async def handle_del(
 
 
 # /bind list
-bind_list_superuser = on_command(
-    ("bind", "list"), permission=SUPERUSER, priority=9, block=True
-)
 bind_list = on_command(("bind", "list"), priority=10, block=True)
-
-
-@bind_list_superuser.handle()
-async def handle_list_superuser(
-    manager: CharacterBindingManager = Depends(get_manager),
-) -> None:
-    """处理超级用户查看绑定列表命令。"""
-    bindings = manager.list_bindings()
-
-    if not bindings:
-        await bind_list_superuser.finish("📋 当前没有任何角色绑定")
-
-    lines = ["📋 所有角色绑定列表："]
-    for uid, name in bindings.items():
-        lines.append(f"  {uid}: {name}")
-    await bind_list_superuser.finish("\n".join(lines))
 
 
 @bind_list.handle()
