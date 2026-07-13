@@ -46,6 +46,9 @@ class _FakeUserDataDB:
             raise RuntimeError(msg)
         self.initialized = True
 
+    async def set_user_favorability(self, user_id: str, value: int) -> object:
+        raise NotImplementedError
+
 
 def _patch_fake_db(user_data_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeUserDataDB.instances = []
@@ -91,3 +94,44 @@ async def test_get_db_failed_initialize_does_not_cache_db(
     assert db.initialized is True
     assert len(_FakeUserDataDB.instances) == 2
     assert _FakeUserDataDB.initialize_calls == 2
+
+
+def test_set_user_favorability_is_exported_in_all(user_data_module: Any) -> None:
+    """验证 set_user_favorability 和 FavorabilitySetResult 已加入 __all__。"""
+    assert "set_user_favorability" in user_data_module.__all__
+    assert "FavorabilitySetResult" in user_data_module.__all__
+
+
+@pytest.mark.asyncio
+async def test_set_user_favorability_calls_db_method(
+    user_data_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """导出函数 set_user_favorability 应委托给 UserDataDB.set_user_favorability。"""
+    _patch_fake_db(user_data_module, monkeypatch)
+
+    call_record: dict[str, object] = {}
+
+    async def fake_set(_self: object, user_id: str, value: int) -> object:
+        call_record["user_id"] = user_id
+        call_record["value"] = value
+        from komari_bot.plugins.user_data.models import FavorabilitySetResult
+        return FavorabilitySetResult.from_values(
+            user_id=user_id,
+            before=0,
+            after=value,
+            updated_at="2026-07-11T23:00:00+08:00",
+        )
+
+    monkeypatch.setattr(
+        user_data_module.UserDataDB,
+        "set_user_favorability",
+        fake_set,
+    )
+
+    result = await user_data_module.set_user_favorability("42", 300)
+
+    assert call_record == {"user_id": "42", "value": 300}
+    assert result.user_id == "42"
+    assert result.after == 300
+    assert result.stage_index == 4
