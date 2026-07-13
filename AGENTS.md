@@ -82,6 +82,7 @@ komari-bot/
 基础服务层（被依赖，不应依赖业务插件）
   config_manager ───────────── 动态配置存储（PostgreSQL + .env 初始化）
   permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
+  user_ban ─────────────────── 全局 QQ 用户封禁（chat / command）
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
   komari_search ────────────── Tavily 联网搜索服务
@@ -108,11 +109,17 @@ komari-bot/
 
 ```
 群消息 → komari_chat（MessageHandler）
+         ├─ 调用 user_ban 判断是否允许实际聊天回复
          ├─ 调用 komari_memory 获取记忆上下文
          ├─ 调用 komari_decision 判定回复策略
          ├─ 可选调用 komari_search 工具查询实时信息
          ├─ 调用 llm_provider 生成回复
          └─ 调用 komari_memory 写入新记忆
+
+用户事件 → user_ban（run_preprocessor）
+         ├─ SUPERUSER 或无可靠 QQ 号 → 直接放行
+         ├─ komari_chat → 由聊天流程单独检查 chat 封禁
+         └─ 其他 matcher → 检查 command 封禁，静默清空处理链并保留 block
 
 .custom 提案流程
 群消息 → komari_custom
@@ -203,6 +210,16 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **必须** 在处理器内调用 `check_runtime_permission()` 动态检查
 - `SUPERUSERS` 通过 `.env` 配置，白名单等动态配置通过 PostgreSQL 管理
 
+### 3.1 用户封禁 (`user_ban`)
+
+- **持久化**：PostgreSQL 表 `komari_user_bans`，以 `(user_id, ban_scope)` 为主键；记录可选理由与到期时间，空到期时间表示永久
+- **运行时缓存**：启动加载有效记录快照，5 秒过期后按需刷新；每次命中仍即时判断到期时间，存储不可用时故障关闭
+- **自然解封**：APScheduler 每 30 秒原子删除到期记录并按用户合并发送一次普通文本私信；发送失败不回滚且不重试
+- **command 拦截**：全局 `run_preprocessor` 检查除 `komari_chat` 外的用户 matcher，封禁时静默清空 `remain_handlers`，保留 matcher 原有 `block`
+- **chat 拦截**：聊天消息仍参与判定和记忆；只有实际准备回复时通过 `reply_allowed=False` 压制生成及全部回复副作用
+- **管理入口**：SUPERUSER 命令支持永久或 `m/h/d/w` 临时封禁和理由；统一管理 API 通过 `/api/komari-user-bans/v1` 提供查询、封禁与解封
+- **SUPERUSER**：管理命令仅限 SUPERUSER，且 SUPERUSER 运行时始终绕过封禁；管理操作和生命周期变化会尝试发送一次私信
+
 ### 4. 四层记忆系统 (`komari_memory`)
 
 | 层 | 存储 | 表 | 说明 |
@@ -231,6 +248,8 @@ ok, reason = await check_runtime_permission(bot, event, config)
 1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
 2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `LLMDiagnosticCollector`
 3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储、互动历史写入、冷却与频控
+
+`process_message(..., reply_allowed=False)` 用于 chat 封禁：保留原消息的判定和缓冲写入，但在 `_attempt_reply()` 前返回，并记录 `blocked_by_user_ban`。
 
 公开 debug 入口：
 - `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动历史、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
@@ -332,6 +351,7 @@ poetry run pytest tests/ -v
 8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
 9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
 10. **诊断结构**：诊断报告只含 call/tool trace 摘要与聚合 token，绝不包含完整 prompt、reasoning content、base64、历史或画像正文
+11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
 
 ## 相关文档
 
