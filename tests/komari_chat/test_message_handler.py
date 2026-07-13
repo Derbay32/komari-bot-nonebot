@@ -6,13 +6,14 @@ import asyncio
 from contextlib import asynccontextmanager
 from importlib import import_module
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import nonebot.plugin
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 if TYPE_CHECKING:
     import pytest
@@ -210,12 +211,22 @@ _fake_memory_lock_calls: list[dict[str, object]] = []
 class _FakeQueryRewrite:
     def __init__(self) -> None:
         self.current_query: str | None = None
+        self.request_trace_id: str | None = None
+        self.parent_call_id: str | None = None
+        self.collector: object = None
 
     async def rewrite_query(
         self,
         current_query: str,
+        *,
+        request_trace_id: str | None = None,
+        parent_call_id: str | None = None,
+        collector: object = None,
     ) -> str:
         self.current_query = current_query
+        self.request_trace_id = request_trace_id
+        self.parent_call_id = parent_call_id
+        self.collector = collector
         return "重写后的查询"
 
 
@@ -226,6 +237,8 @@ class _FakeEmbeddingProvider:
 
 
 class _FakeBot:
+    self_id = "669293859"
+
     def __init__(self, payload: dict[str, object] | Exception | None = None) -> None:
         self.payload = payload
         self.calls: list[int] = []
@@ -643,3 +656,593 @@ def test_resolve_reply_context_skips_when_message_is_not_to_bot() -> None:
     assert result.context is None
     assert result.refetched is False
     assert bot.calls == []
+
+
+# ── debug reply 测试 ──
+
+
+class _FakeRedisForDebug:
+    """Debug 测试用 Redis：记录所有副作用调用。"""
+
+    def __init__(self, history: list[MessageSchema] | None = None) -> None:
+        self.history = list(history or [])
+        self.pushed_messages: list[MessageSchema] = []
+        self.pushed_global_interactions: list[dict[str, object]] = []
+        self.global_interaction_buffer_calls: list[dict[str, object]] = []
+        self.cooldown_calls: list[str] = []
+        self.increment_proactive_calls: list[str] = []
+
+    async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
+        del group_id, limit
+        return list(self.history)
+
+    async def push_message(self, group_id: str, message: MessageSchema) -> None:
+        del group_id
+        self.pushed_messages.append(message)
+
+    async def get_global_interaction_buffer(
+        self, user_id: str, limit: int = 10
+    ) -> list[dict[str, object]]:
+        self.global_interaction_buffer_calls.append({"user_id": user_id, "limit": limit})
+        return []
+
+    async def push_global_interaction(
+        self, *, user_id: str, record: dict[str, object], trigger_size: int
+    ) -> None:
+        self.pushed_global_interactions.append(
+            {"user_id": user_id, "record": record, "trigger_size": trigger_size}
+        )
+
+    async def is_on_cooldown(self, _group_id: str) -> bool:
+        return False
+
+    async def get_proactive_count(self, _group_id: str) -> int:
+        return 0
+
+    async def set_cooldown(self, group_id: str, seconds: int) -> None:
+        del seconds
+        self.cooldown_calls.append(group_id)
+
+    async def increment_proactive_count(self, group_id: str) -> None:
+        self.increment_proactive_calls.append(group_id)
+
+
+class _FakeMemoryForDebug:
+    def __init__(self) -> None:
+        self.search_conversation_calls: list[dict[str, object]] = []
+        self.get_user_profile_calls: list[dict[str, object]] = []
+
+    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
+        self.search_conversation_calls.append(dict(_kwargs))
+        return []
+
+    async def search_interaction_events(
+        self, **_kwargs: object
+    ) -> list[dict[str, object]]:
+        return []
+
+    async def get_user_profile(
+        self, *, user_id: str, group_id: str
+    ) -> dict[str, object] | None:
+        self.get_user_profile_calls.append({"user_id": user_id, "group_id": group_id})
+        return {"display_name": "test_user", "traits": {}}
+
+
+class _FakeUserDataForDebug:
+    """记录 adjust 调用，验证 debug 路径不调 adjust。"""
+
+    def __init__(self) -> None:
+        self.adjust_calls: list[dict[str, object]] = []
+        self.favorability_calls: list[str] = []
+
+    def get_config(self) -> SimpleNamespace:
+        return SimpleNamespace(max_favorability_delta_per_reply=5)
+
+    async def get_user_favorability(self, user_id: str) -> SimpleNamespace:
+        self.favorability_calls.append(user_id)
+        return SimpleNamespace(
+            user_id=user_id,
+            favorability=0,
+            stage_index=1,
+            stage_name="疏离戒备",
+            stage_prompt="保持距离",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+
+    async def adjust_user_favorability(self, user_id: str, delta: int) -> SimpleNamespace:
+        self.adjust_calls.append({"user_id": user_id, "delta": delta})
+        return SimpleNamespace(
+            user_id=user_id, before=0, delta=delta, after=delta, stage_index=1
+        )
+
+
+def test_generate_debug_reply_skips_all_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 debug reply 路径不触发 Redis push、好感度 adjust、互动写入、冷却/频控。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    fake_user_data = _FakeUserDataForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(is_search_available=lambda: False),
+    )
+
+    # 注入必要的全局配置
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            vision_tool_enabled=False,
+        ),
+    )
+
+    # 注入 fake build_prompt 和 generate_reply_with_tools
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="debug测试回复",
+            interaction_history={"event": "测试", "result": "测试回复", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="debug测试",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group",
+            user_id="user-debug",
+            user_nickname="测试用户",
+            content="这是一条debug测试消息",
+            image_urls=None,
+            reply_context=None,
+        )
+    )
+
+    # 断言返回结构完整
+    assert result.reply == "debug测试回复"
+    assert result.favorability_delta == 1
+    assert result.favorability_reason == "debug测试"
+    assert result.interaction_history == {
+        "event": "测试",
+        "result": "测试回复",
+        "emotion": "平静",
+    }
+    assert result.collector is not None
+    assert result.collector.request_id.startswith("debug-reply-")
+    assert result.reply_to_message_id is None
+
+    # 断言零副作用
+    assert redis.pushed_messages == []  # 没有 push 当前消息或 AI 回复
+    assert redis.pushed_global_interactions == []  # 没有写互动历史
+    assert redis.cooldown_calls == []  # 没有设冷却
+    assert redis.increment_proactive_calls == []  # 没有频控计数
+    assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
+
+
+def test_generate_debug_reply_collector_has_query_rewrite_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 debug reply 的 collector 包含查询重写和生成阶段的 trace。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(is_search_available=lambda: False),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            vision_tool_enabled=False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    collector_from_generate: object = None
+    trace_id_from_generate: str | None = None
+
+    async def _fake_generate_with_tools(**kwargs: object) -> object:
+        nonlocal collector_from_generate, trace_id_from_generate
+        collector_from_generate = kwargs.get("collector")
+        trace_id_from_generate = cast("str | None", kwargs.get("request_trace_id"))
+        return llm_service_module.ReplyResult(
+            content="带trace的回复",
+            interaction_history={"event": "trace", "result": "trace回复", "emotion": "平静"},
+            favorability_delta=2,
+            favorability_reason="trace测试",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_with_tools)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+
+    supplied_collector = LLMDiagnosticCollector(request_id="debug-reply-supplied")
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-2",
+            user_id="user-trace",
+            user_nickname="trace用户",
+            content="debug trace测试",
+            collector=supplied_collector,
+        )
+    )
+
+    assert result.collector is supplied_collector
+    assert result.collector.request_id == "debug-reply-supplied"
+    assert collector_from_generate is result.collector
+    assert handler.query_rewrite.request_trace_id == result.collector.request_id
+    assert trace_id_from_generate == result.collector.request_id
+
+
+def test_generate_debug_reply_with_images_and_reply_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 debug reply 附带引用消息和图片时仍正确工作且无副作用。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(is_search_available=lambda: False),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            vision_tool_enabled=False,
+        ),
+    )
+
+    build_prompt_kwargs: dict[str, object] = {}
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        build_prompt_kwargs.update(_kwargs)
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="附图debug回复",
+            interaction_history={"event": "附图测试", "result": "附图回复", "emotion": "平静"},
+            favorability_delta=0,
+            favorability_reason="无变化",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+    async def _download_images(urls: list[str]) -> list[str]:
+        return [f"base64:{url}" for url in urls]
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "download_images_as_base64",
+        _download_images,
+    )
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+
+    from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
+
+    reply_ctx = ReplyContext(
+        source_side="user",
+        message_id="ref-msg-1",
+        user_id="ref-user",
+        user_nickname="引用用户",
+        text="被引用的消息",
+        image_sources=("https://example.com/ref.png",),
+        image_count=1,
+        has_visible_image=True,
+    )
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-3",
+            user_id="user-img",
+            user_nickname="图片用户",
+            content="看看这张图是什么意思",
+            image_urls=["https://example.com/img.png"],
+            reply_context=reply_ctx,
+        )
+    )
+
+    assert result.reply == "附图debug回复"
+    assert result.collector is not None
+    assert redis.pushed_messages == []
+    assert redis.pushed_global_interactions == []
+    assert build_prompt_kwargs.get("reply_context") is reply_ctx
+    assert build_prompt_kwargs.get("image_urls") is not None
+
+
+def test_normal_attempt_reply_still_commits_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证正常 _attempt_reply 路径仍正确提交所有副作用。"""
+    current_message = MessageSchema(
+        user_id="user-1",
+        user_nickname="阿虚",
+        group_id="group-1",
+        content="当前待回复消息",
+        timestamp=2.0,
+        message_id="msg-normal-1",
+    )
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    fake_user_data = _FakeUserDataForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(is_search_available=lambda: False),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            vision_tool_enabled=False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="正常回复",
+            interaction_history={"event": "正常消息", "result": "正常回复", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="正常互动",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+
+    result = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=0.9,
+            store_current=True,
+        )
+    )
+
+    assert result[0] == {"reply": "正常回复", "reply_to_message_id": "msg-normal-1"}
+    assert result[1] is True
+
+    # 验证副作用已提交
+    assert fake_user_data.adjust_calls == [{"user_id": "user-1", "delta": 1}]
+    assert len(redis.pushed_messages) >= 2  # 至少：当前消息 + AI 回复
+    assert len(redis.pushed_global_interactions) >= 1
+    pushed_record = redis.pushed_global_interactions[0]["record"]
+    assert isinstance(pushed_record, dict)
+    assert pushed_record["event"] == "正常消息"
+    assert pushed_record["result"] == "正常回复"
+    assert pushed_record["emotion"] == "平静"
+
+
+def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正常聊天读取好感度失败时保持旧语义：返回生成失败而非向上抛出。"""
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+        return [], [], True
+
+    async def _fake_generate_core(**_kwargs: object) -> object:
+        msg = "好感度服务不可用"
+        raise message_handler_module._FavorabilityReadError(msg)
+
+    monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
+    monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(bot_nickname="小鞠"),
+    )
+
+    message = MessageSchema(
+        user_id="user-favor-error",
+        user_nickname="测试用户",
+        group_id="group-favor-error",
+        content="你好",
+        timestamp=1.0,
+        message_id="msg-favor-error",
+    )
+    result = asyncio.run(
+        handler._attempt_reply(
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+        )
+    )
+
+    assert result == (None, True)
+
+
+def test_generate_debug_reply_refetches_quoted_image_without_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """引用图片缺少可下载 URL 时，debug reply 通过 get_msg 补取完整上下文。"""
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+        return [], [], False
+
+    async def _fake_generate_core(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return llm_service_module.ReplyResult(
+            content="已读取引用图片",
+            interaction_history={
+                "event": "引用图片",
+                "result": "读取完成",
+                "emotion": "平静",
+            },
+            favorability_delta=0,
+            favorability_reason="无变化",
+        )
+
+    monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
+    monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
+
+    from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
+
+    original_context = ReplyContext(
+        source_side="user",
+        message_id="456",
+        user_id="42",
+        user_nickname="引用用户",
+        text="图呢",
+        image_sources=(),
+        image_count=1,
+        has_visible_image=False,
+    )
+    bot = _FakeBot(
+        {
+            "time": 1,
+            "message_type": "group",
+            "message_id": 456,
+            "real_id": 456,
+            "sender": {"user_id": 42, "nickname": "引用用户"},
+            "message": [
+                {
+                    "type": "image",
+                    "data": {"url": "https://example.com/refetched.png"},
+                }
+            ],
+        }
+    )
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-refetch",
+            user_id="42",
+            user_nickname="测试用户",
+            content="看看引用图片",
+            _bot=cast("Any", bot),
+            reply_context=original_context,
+        )
+    )
+
+    refetched_context = cast("ReplyContext", captured["reply_context"])
+    assert bot.calls == [456]
+    assert refetched_context.image_sources == (
+        "https://example.com/refetched.png",
+    )
+    assert captured["reply_context_refetched"] is True
+    assert result.reply_to_message_id == "456"
