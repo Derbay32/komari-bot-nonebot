@@ -11,7 +11,7 @@ from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
 from .api import register_llm_provider_api
-from .base_client import LLMCompletionResultSchema
+from .base_client import LLMCompletionResultSchema, UnifiedUsageSchema
 from .config import Config
 from .config_schema import DynamicConfigSchema
 from .llm_logger import log_llm_call
@@ -314,6 +314,15 @@ def _get_completion_reasoning_content(
     return result.reasoning_content
 
 
+def _get_completion_usage(
+    result: LLMCompletionResultSchema | str,
+) -> UnifiedUsageSchema | None:
+    """兼容测试替身与真实客户端的用量信息。"""
+    if isinstance(result, LLMCompletionResultSchema):
+        return result.usage
+    return None
+
+
 async def generate_text(
     prompt: str,
     model: str,
@@ -426,6 +435,7 @@ async def generate_text(
         duration_ms = (time.monotonic() - start_time) * 1000
         content = _get_completion_content(result)
         reasoning_content = _get_completion_reasoning_content(result)
+        usage = _get_completion_usage(result)
         if record_chat_log:
             await log_llm_call(
                 method="generate_text",
@@ -446,6 +456,7 @@ async def generate_text(
                 output=content,
                 reasoning_content=reasoning_content,
                 duration_ms=duration_ms,
+                usage=usage,
             )
         return content
     finally:
@@ -548,6 +559,7 @@ async def generate_completion(
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
+        result.duration_ms = duration_ms
         if record_chat_log:
             await log_llm_call(
                 method="generate_completion",
@@ -571,6 +583,7 @@ async def generate_completion(
                 output=json.dumps(result.model_dump(), ensure_ascii=False),
                 reasoning_content=result.reasoning_content,
                 duration_ms=duration_ms,
+                usage=result.usage,
             )
         return result
     finally:
@@ -660,6 +673,7 @@ async def generate_text_with_messages(
         duration_ms = (time.monotonic() - start_time) * 1000
         content = _get_completion_content(result)
         reasoning_content = _get_completion_reasoning_content(result)
+        usage = _get_completion_usage(result)
         if record_chat_log:
             await log_llm_call(
                 method="generate_text_with_messages",
@@ -676,6 +690,7 @@ async def generate_text_with_messages(
                 output=content,
                 reasoning_content=reasoning_content,
                 duration_ms=duration_ms,
+                usage=usage,
             )
         return content
     finally:
@@ -753,6 +768,7 @@ async def generate_messages_completion(
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
+        result.duration_ms = duration_ms
         if record_chat_log:
             await log_llm_call(
                 method="generate_messages_completion",
@@ -772,6 +788,7 @@ async def generate_messages_completion(
                 output=json.dumps(result.model_dump(), ensure_ascii=False),
                 reasoning_content=result.reasoning_content,
                 duration_ms=duration_ms,
+                usage=result.usage,
             )
         return result
     finally:

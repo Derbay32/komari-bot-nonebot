@@ -6,6 +6,27 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class UnifiedUsageSchema(BaseModel):
+    """统一的 LLM 用量模型。
+
+    所有字段为 int | None，以 None 表示后端未报告该字段，
+    避免用 0 冒充缺失数据。
+    """
+
+    input_tokens: int | None = Field(default=None, description="输入 token 数")
+    cached_input_tokens: int | None = Field(
+        default=None, description="缓存命中的输入 token 数"
+    )
+    cache_miss_input_tokens: int | None = Field(
+        default=None, description="缓存未命中的输入 token 数"
+    )
+    output_tokens: int | None = Field(default=None, description="输出 token 数")
+    reasoning_output_tokens: int | None = Field(
+        default=None, description="推理输出 token 数"
+    )
+    total_tokens: int | None = Field(default=None, description="总 token 数")
+
+
 class LLMToolCallFunctionSchema(BaseModel):
     """LLM 工具调用中的函数信息。"""
 
@@ -36,6 +57,8 @@ class LLMCompletionResultSchema(BaseModel):
         default_factory=list, description="工具调用列表"
     )
     finish_reason: str | None = Field(default=None, description="结束原因")
+    usage: UnifiedUsageSchema | None = Field(default=None, description="用量信息")
+    duration_ms: float | None = Field(default=None, description="调用耗时（毫秒）")
 
 
 class BaseLLMClient(ABC):

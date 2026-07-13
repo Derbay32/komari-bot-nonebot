@@ -11,11 +11,15 @@ import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from nonebot import logger
 from nonebot.plugin import require
 
 from .config_schema import DynamicConfigSchema
+
+if TYPE_CHECKING:
+    from .base_client import UnifiedUsageSchema
 
 # 日志目录
 _LOG_DIR = Path("logs") / "llm_provider"
@@ -141,6 +145,7 @@ async def log_llm_call(
     reasoning_content: str | None = None,
     error: str | None = None,
     duration_ms: float | None = None,
+    usage: "UnifiedUsageSchema | None" = None,
 ) -> None:
     """记录一次 LLM 调用的输入与输出。
 
@@ -152,6 +157,7 @@ async def log_llm_call(
         reasoning_content: LLM 返回的推理内容（成功时）
         error: 错误信息（失败时）
         duration_ms: 调用耗时（毫秒）
+        usage: 后端实际返回的统一用量信息（仅写入已报告字段）
     """
     try:
         _ensure_private_log_dir()
@@ -174,6 +180,24 @@ async def log_llm_call(
             record["error"] = error
         if duration_ms is not None:
             record["duration_ms"] = round(duration_ms, 2)
+
+        # 仅写入后端已报告的 usage 字段，None 不写入 JSONL
+        if usage is not None:
+            usage_data: dict[str, int] = {}
+            if usage.input_tokens is not None:
+                usage_data["input_tokens"] = usage.input_tokens
+            if usage.cached_input_tokens is not None:
+                usage_data["cached_input_tokens"] = usage.cached_input_tokens
+            if usage.cache_miss_input_tokens is not None:
+                usage_data["cache_miss_input_tokens"] = usage.cache_miss_input_tokens
+            if usage.output_tokens is not None:
+                usage_data["output_tokens"] = usage.output_tokens
+            if usage.reasoning_output_tokens is not None:
+                usage_data["reasoning_output_tokens"] = usage.reasoning_output_tokens
+            if usage.total_tokens is not None:
+                usage_data["total_tokens"] = usage.total_tokens
+            if usage_data:
+                record["usage"] = usage_data
 
         line = json.dumps(record, ensure_ascii=False) + "\n"
 

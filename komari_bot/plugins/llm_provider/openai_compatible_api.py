@@ -12,6 +12,7 @@ from .base_client import (
     LLMCompletionResultSchema,
     LLMToolCallFunctionSchema,
     LLMToolCallSchema,
+    UnifiedUsageSchema,
 )
 from .config_schema import DynamicConfigSchema
 
@@ -96,6 +97,96 @@ class OpenAICompatibleClient(BaseLLMClient):
         raise RuntimeError(cls._INVALID_RESPONSE_MESSAGE)
 
     @staticmethod
+    def _safe_get_int(obj: Any, key: str) -> int | None:
+        """从对象、字典或 model_extra 中安全提取整数值。"""
+        val = OpenAICompatibleClient._safe_get_value(obj, key)
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _safe_get_value(obj: Any, key: str) -> Any:
+        """从对象、普通字典或 Pydantic model_extra 中安全取值。"""
+        if isinstance(obj, dict):
+            val = obj.get(key)
+            model_extra = obj.get("model_extra")
+        else:
+            val = getattr(obj, key, None)
+            model_extra = getattr(obj, "model_extra", None)
+        if val is None and isinstance(model_extra, dict):
+            val = model_extra.get(key)
+        return val
+
+    @staticmethod
+    def _extract_unified_usage(response: Any) -> UnifiedUsageSchema | None:
+        """从 OpenAI 兼容响应中安全提取统一用量信息。
+
+        支持标准 OpenAI 格式、DeepSeek 扩展字段（prompt_cache_hit_tokens /
+        prompt_cache_miss_tokens）和 Pydantic model_extra。
+        缺失或异常字段不影响解析，对应位置保留 None。
+        """
+        usage_obj = OpenAICompatibleClient._safe_get_value(response, "usage")
+        if usage_obj is None:
+            return None
+
+        try:
+            input_tokens = OpenAICompatibleClient._safe_get_int(
+                usage_obj, "prompt_tokens"
+            )
+            output_tokens = OpenAICompatibleClient._safe_get_int(
+                usage_obj, "completion_tokens"
+            )
+            total_tokens = OpenAICompatibleClient._safe_get_int(
+                usage_obj, "total_tokens"
+            )
+
+            # 缓存命中：优先 DeepSeek prompt_cache_hit_tokens，
+            # 不存在时回退 OpenAI prompt_tokens_details.cached_tokens
+            cached_input_tokens = OpenAICompatibleClient._safe_get_int(
+                usage_obj, "prompt_cache_hit_tokens"
+            )
+            if cached_input_tokens is None:
+                details = OpenAICompatibleClient._safe_get_value(
+                    usage_obj, "prompt_tokens_details"
+                )
+                if details is not None:
+                    cached_input_tokens = OpenAICompatibleClient._safe_get_int(
+                        details, "cached_tokens"
+                    )
+
+            # 缓存未命中：仅 DeepSeek 报告
+            cache_miss_input_tokens = OpenAICompatibleClient._safe_get_int(
+                usage_obj, "prompt_cache_miss_tokens"
+            )
+
+            # 推理输出 token
+            reasoning_output_tokens = None
+            completion_details = OpenAICompatibleClient._safe_get_value(
+                usage_obj, "completion_tokens_details"
+            )
+            if completion_details is not None:
+                reasoning_output_tokens = OpenAICompatibleClient._safe_get_int(
+                    completion_details, "reasoning_tokens"
+                )
+
+            return UnifiedUsageSchema(
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                cache_miss_input_tokens=cache_miss_input_tokens,
+                output_tokens=output_tokens,
+                reasoning_output_tokens=reasoning_output_tokens,
+                total_tokens=total_tokens,
+            )
+        except Exception:
+            logger.warning(
+                "[LLM Provider] usage 提取异常，已忽略", exc_info=True
+            )
+            return None
+
+    @staticmethod
     def _parse_tool_arguments(raw_arguments: str) -> dict[str, Any] | None:
         """安全解析工具参数 JSON。"""
         if not raw_arguments.strip():
@@ -148,11 +239,13 @@ class OpenAICompatibleClient(BaseLLMClient):
             )
 
         finish_reason = getattr(choice, "finish_reason", None)
+        usage = self._extract_unified_usage(response)
         return LLMCompletionResultSchema(
             content=content.strip(),
             reasoning_content=reasoning_content,
             tool_calls=tool_calls,
             finish_reason=str(finish_reason) if finish_reason is not None else None,
+            usage=usage,
         )
 
     async def generate_text(
