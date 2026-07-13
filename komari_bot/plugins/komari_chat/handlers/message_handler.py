@@ -67,6 +67,7 @@ ReplyAction = Literal[
     "replied_forced",
     "not_replied",
     "generation_failed",
+    "blocked_by_user_ban",
 ]
 ReplyTriggeredCallback = Callable[[], Awaitable[None]]
 
@@ -360,6 +361,8 @@ class MessageHandler:
         bot: Bot,
         event: GroupMessageEvent,
         on_reply_triggered: ReplyTriggeredCallback | None = None,
+        *,
+        reply_allowed: bool = True,
     ) -> dict[str, str] | None:
         """处理群聊消息的主流程。"""
         user_id = str(event.user_id)
@@ -427,6 +430,22 @@ class MessageHandler:
                     message_id=message_id,
                     outcome=outcome,
                     reply_action="not_replied",
+                )
+            )
+            return None
+
+        if not reply_allowed:
+            if memory_store:
+                await self._handle_normal_message(message)
+            else:
+                await self._handle_low_value(message)
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    outcome=outcome,
+                    reply_action="blocked_by_user_ban",
                 )
             )
             return None

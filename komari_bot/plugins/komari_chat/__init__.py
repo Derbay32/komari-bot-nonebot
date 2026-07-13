@@ -12,6 +12,7 @@ from .handlers.message_handler import DebugReplyResult, MessageHandler
 
 # 依赖插件
 permission_manager_plugin = require("permission_manager")
+user_ban_plugin = require("user_ban")
 memory_plugin = require("komari_memory")
 decision_plugin = require("komari_decision")
 
@@ -151,10 +152,17 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
+        reply_allowed = not await user_ban_plugin.is_event_banned(bot, event, "chat")
+    except user_ban_plugin.BanServiceUnavailableError as error:
+        logger.error("[KomariChat] 用户封禁存储不可用，按故障关闭压制回复：{}", error)
+        reply_allowed = False
+
+    try:
         result = await handler.process_message(
             bot,
             event,
             on_reply_triggered=lambda: _send_face_reaction(bot, event),
+            reply_allowed=reply_allowed,
         )
         if not result:
             return
