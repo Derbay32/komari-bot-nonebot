@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
     from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
@@ -216,6 +217,17 @@ class ReplyResult:
     interaction_history: InteractionHistoryRecord
     favorability_delta: int | None = None
     favorability_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _BusinessToolExecution:
+    """业务工具执行结果及其安全诊断元数据。"""
+
+    message: dict[str, Any] | None
+    tool_name: str
+    status: str
+    result_summary: str | None = None
+    error_summary: str | None = None
 
 
 def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
@@ -531,6 +543,9 @@ async def _build_image_tool_result(
     vision_model: str,
     vision_temperature: float,
     vision_max_tokens: int,
+    request_trace_id: str | None = None,
+    parent_call_id: str | None = None,
+    collector: "LLMDiagnosticCollector | None" = None,
 ) -> str:
     """执行 read_image 工具并返回工具消息内容。"""
     image_index = _parse_image_index(parsed_arguments, raw_arguments)
@@ -544,6 +559,9 @@ async def _build_image_tool_result(
         vision_model=vision_model,
         temperature=vision_temperature,
         max_tokens=vision_max_tokens,
+        request_trace_id=request_trace_id if collector is not None else None,
+        parent_call_id=parent_call_id if collector is not None else None,
+        collector=collector,
     )
     return descriptions[0] if descriptions else "[图片读取失败: 视觉服务未返回结果]"
 
@@ -642,6 +660,8 @@ async def generate_reply(
     user_message: str = "",
     system_prompt: str = "",
     request_trace_id: str | None = None,
+    collector: "LLMDiagnosticCollector | None" = None,
+    parent_call_id: str | None = None,
 ) -> ReplyResult:
     """生成回复（使用 OpenAI messages 格式，带重试机制，支持多模态）。
 
@@ -650,6 +670,8 @@ async def generate_reply(
         messages: OpenAI 格式消息列表 [{role, content}]（优先使用），content 可以是字符串或数组
         user_message: 用户消息（兼容旧格式）
         system_prompt: 系统提示词（兼容旧格式）
+        collector: 可选的诊断收集器
+        parent_call_id: 父调用 ID
 
     Returns:
         结构化回复结果，包含最终正文与互动历史记录
@@ -677,6 +699,8 @@ async def generate_reply(
             max_tool_rounds=2,
             memory_service=None,
             group_id=None,
+            collector=collector,
+            parent_call_id=parent_call_id,
         )
 
     del user_message, system_prompt
@@ -705,6 +729,51 @@ def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
     return "tool"
 
 
+def _build_safe_tool_args(tool_call: Any) -> dict[str, Any]:
+    """从工具调用中提取安全的参数字典（不含敏感内容）。"""
+    parsed = tool_call.parsed_arguments
+    if parsed is None:
+        raw = tool_call.raw_arguments or tool_call.function.arguments
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    tool_name = tool_call.function.name
+    safe: dict[str, Any] = {}
+    match tool_name:
+        case "read_image":
+            image_index = parsed.get("image_index")
+            if isinstance(image_index, int):
+                safe["image_index"] = image_index
+        case "search_web":
+            query = parsed.get("query")
+            if isinstance(query, str):
+                safe["query_chars"] = len(query)
+        case "read_profile":
+            keys = parsed.get("keys")
+            if isinstance(keys, list):
+                safe["requested_key_count"] = len(keys)
+        case "record_favorability_delta":
+            delta = parsed.get("delta")
+            if isinstance(delta, int):
+                safe["delta"] = delta
+        case "final_response":
+            content = parsed.get("content")
+            safe["content_chars"] = len(content) if isinstance(content, str) else 0
+            safe["has_interaction_history"] = isinstance(
+                parsed.get("interaction_history"),
+                dict,
+            )
+        case _:
+            pass
+    return safe
+
+
 async def _execute_business_tool(
     *,
     tool_call: Any,
@@ -716,12 +785,22 @@ async def _execute_business_tool(
     round_num: int,
     memory_service: MemoryService | None,
     group_id: str | None,
-) -> dict[str, Any] | None:
-    """执行业务工具并构造 tool 消息。"""
+    request_trace_id: str | None = None,
+    parent_call_id: str | None = None,
+    collector: "LLMDiagnosticCollector | None" = None,
+) -> _BusinessToolExecution:
+    """执行业务工具并构造 tool 消息。
+
+    Returns:
+        工具消息与安全诊断元数据
+    """
     tool_name = tool_call.function.name
     raw_arguments = tool_call.raw_arguments or tool_call.function.arguments
     parsed_arguments = tool_call.parsed_arguments
     tool_call_id = tool_call.id or tool_name
+    status = "success"
+    result_summary: str | None = None
+    error_summary: str | None = None
 
     match tool_name:
         case "read_image":
@@ -732,12 +811,35 @@ async def _execute_business_tool(
                 vision_model=vision_model,
                 vision_temperature=vision_temperature,
                 vision_max_tokens=vision_max_tokens,
+                request_trace_id=request_trace_id,
+                parent_call_id=parent_call_id,
+                collector=collector,
             )
+            message = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+            if content.startswith("[图片读取失败:"):
+                status = "error"
+                error_summary = "图片读取失败"
+            else:
+                result_summary = f"description_chars={len(content)}"
         case "search_web":
             content = await _build_search_tool_result(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
             )
+            message = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+            if content.startswith("[搜索失败"):
+                status = "error"
+                error_summary = "联网搜索失败"
+            else:
+                result_summary = f"result_chars={len(content)}"
         case "read_profile":
             content = await _build_read_profile_tool_result(
                 memory_service=memory_service,
@@ -745,6 +847,20 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
             )
+            message = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+            if content.startswith("error:"):
+                status = "error"
+                error_summary = "读取用户画像失败"
+            else:
+                result_summary = (
+                    "profile_found=false"
+                    if content.startswith("not_found:")
+                    else "profile_found=true"
+                )
         case _:
             logger.warning(
                 "[KomariChat] {} 第 {} 轮：未知工具 '{}'，跳过",
@@ -752,9 +868,20 @@ async def _execute_business_tool(
                 round_num,
                 tool_name,
             )
-            return None
+            return _BusinessToolExecution(
+                message=None,
+                tool_name=tool_name,
+                status="error",
+                error_summary="未知工具",
+            )
 
-    return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+    return _BusinessToolExecution(
+        message=message,
+        tool_name=tool_name,
+        status=status,
+        result_summary=result_summary,
+        error_summary=error_summary,
+    )
 
 
 async def _execute_tool_loop(
@@ -773,6 +900,8 @@ async def _execute_tool_loop(
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
+    collector: "LLMDiagnosticCollector | None" = None,
+    parent_call_id: str | None = None,
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。"""
     current_messages = list(messages)
@@ -794,6 +923,11 @@ async def _execute_tool_loop(
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
     last_retry_reason: str | None = None
+
+    from komari_bot.plugins.llm_provider.diagnostic import (
+        LLMCallTrace,
+        ToolExecutionTrace,
+    )
 
     for round_num in range(1, max_tool_rounds + 1):
         if has_vision_tool:
@@ -825,6 +959,22 @@ async def _execute_tool_loop(
                 record_chat_log=True,
             )
 
+        # 记录本轮 LLM 调用 trace
+        if collector is not None:
+            call_trace = LLMCallTrace(
+                parent_call_id=parent_call_id,
+                phase=f"{request_phase_prefix}_round_{round_num}",
+                round_index=round_num - 1,
+                model=model,
+                finish_reason=completion.finish_reason,
+                duration_ms=completion.duration_ms,
+                usage=completion.usage,
+            )
+            collector.add_call(call_trace)
+            round_call_id = call_trace.call_id
+        else:
+            round_call_id = None
+
         if not completion.tool_calls:
             last_retry_reason = (
                 f"{request_phase_prefix} 第 {round_num} 轮：模型未调用任何工具，"
@@ -842,6 +992,15 @@ async def _execute_tool_loop(
                     f"必须调用 {FINAL_RESPONSE_TOOL_NAME}。"
                 ),
             )
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=round_call_id or "",
+                        tool_name="<no_tool_calls>",
+                        status="error",
+                        error_summary=last_retry_reason,
+                    )
+                )
             continue
 
         logger.info(
@@ -857,46 +1016,83 @@ async def _execute_tool_loop(
 
         for tool_call in completion.tool_calls:
             tool_name = tool_call.function.name
+
             if tool_name == FINAL_RESPONSE_TOOL_NAME:
                 if requires_favorability_delta and pending_favorability_delta is None:
+                    err_msg = (
+                        "必须先调用 record_favorability_delta 记录本轮好感度变化，"
+                        "再调用 final_response。"
+                    )
                     tool_error_results.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id or tool_name,
-                            "content": (
-                                "必须先调用 record_favorability_delta 记录本轮好感度变化，"
-                                "再调用 final_response。"
-                            ),
+                            "content": err_msg,
                         }
                     )
                     last_retry_reason = (
                         f"{request_phase_prefix} 第 {round_num} 轮："
                         "final_response 在 record_favorability_delta 之前被调用"
                     )
+                    if collector is not None:
+                        collector.add_tool(
+                            ToolExecutionTrace(
+                                call_id=round_call_id or "",
+                                tool_name=tool_name,
+                                parsed_arguments=_build_safe_tool_args(tool_call),
+                                status="error",
+                                error_summary=err_msg,
+                            )
+                        )
                     break
                 if not tool_call.parsed_arguments:
+                    err_msg = (
+                        "final_response 缺少 JSON 参数。请重新调用 final_response，"
+                        "并提供符合 schema 的 JSON：必须包含 content（字符串）"
+                        "与 interaction_history（含 event、result、emotion）。"
+                    )
                     tool_error_results.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id or tool_name,
-                            "content": (
-                                "final_response 缺少 JSON 参数。请重新调用 final_response，"
-                                "并提供符合 schema 的 JSON：必须包含 content（字符串）"
-                                "与 interaction_history（含 event、result、emotion）。"
-                            ),
+                            "content": err_msg,
                         }
                     )
                     last_retry_reason = (
                         f"{request_phase_prefix} 第 {round_num} 轮："
                         "final_response 缺少 parsed_arguments"
                     )
+                    if collector is not None:
+                        collector.add_tool(
+                            ToolExecutionTrace(
+                                call_id=round_call_id or "",
+                                tool_name=tool_name,
+                                parsed_arguments={},
+                                status="error",
+                                error_summary="缺少 parsed_arguments",
+                            )
+                        )
                     break
                 try:
-                    return _parse_reply_result(
+                    result = _parse_reply_result(
                         tool_call.parsed_arguments,
                         favorability_delta=pending_favorability_delta,
                         favorability_reason=pending_favorability_reason,
                     )
+                    if collector is not None:
+                        collector.add_tool(
+                            ToolExecutionTrace(
+                                call_id=round_call_id or "",
+                                tool_name=tool_name,
+                                parsed_arguments={
+                                    "content_chars": len(result.content),
+                                    "has_interaction_history": True,
+                                },
+                                status="success",
+                                result_summary=f"content_chars={len(result.content)}",
+                            )
+                        )
+                    return result  # noqa: TRY300
                 except (ValueError, TypeError) as exc:
                     tool_error_results.append(
                         _build_tool_error_result(tool_call, exc)
@@ -905,6 +1101,16 @@ async def _execute_tool_loop(
                         f"{request_phase_prefix} 第 {round_num} 轮："
                         f"final_response 内容校验失败：{exc}"
                     )
+                    if collector is not None:
+                        collector.add_tool(
+                            ToolExecutionTrace(
+                                call_id=round_call_id or "",
+                                tool_name=tool_name,
+                                parsed_arguments=_build_safe_tool_args(tool_call),
+                                status="error",
+                                error_summary=str(exc),
+                            )
+                        )
                     break
 
             if tool_name == RECORD_FAVORABILITY_DELTA_TOOL_NAME:
@@ -922,6 +1128,16 @@ async def _execute_tool_loop(
                         f"{request_phase_prefix} 第 {round_num} 轮："
                         f"record_favorability_delta 参数校验失败：{exc}"
                     )
+                    if collector is not None:
+                        collector.add_tool(
+                            ToolExecutionTrace(
+                                call_id=round_call_id or "",
+                                tool_name=tool_name,
+                                parsed_arguments=_build_safe_tool_args(tool_call),
+                                status="error",
+                                error_summary=str(exc),
+                            )
+                        )
                     continue
                 pending_favorability_delta = delta
                 pending_favorability_reason = reason
@@ -932,6 +1148,16 @@ async def _execute_tool_loop(
                         "content": "已记录本轮好感度变化，最终回复生成成功后提交。",
                     }
                 )
+                if collector is not None:
+                    collector.add_tool(
+                        ToolExecutionTrace(
+                            call_id=round_call_id or "",
+                            tool_name=tool_name,
+                            parsed_arguments={"delta": delta},
+                            status="success",
+                            result_summary="pending (debug 路径不会提交)",
+                        )
+                    )
                 continue
 
             if tool_name not in known_business_tool_names:
@@ -942,10 +1168,20 @@ async def _execute_tool_loop(
                     round_num,
                     tool_name,
                 )
+                if collector is not None:
+                    collector.add_tool(
+                        ToolExecutionTrace(
+                            call_id=round_call_id or "",
+                            tool_name=tool_name,
+                            parsed_arguments=_build_safe_tool_args(tool_call),
+                            status="error",
+                            error_summary=f"未知工具 '{tool_name}'",
+                        )
+                    )
                 continue
 
             try:
-                result = await _execute_business_tool(
+                execution = await _execute_business_tool(
                     tool_call=tool_call,
                     base64_images=base64_images or [],
                     vision_model=vision_model,
@@ -955,6 +1191,9 @@ async def _execute_tool_loop(
                     round_num=round_num,
                     memory_service=memory_service,
                     group_id=group_id,
+                    request_trace_id=request_trace_id,
+                    parent_call_id=round_call_id,
+                    collector=collector,
                 )
             except Exception as exc:  # 向模型回写后继续会话
                 tool_error_results.append(_build_tool_error_result(tool_call, exc))
@@ -962,9 +1201,30 @@ async def _execute_tool_loop(
                     f"{request_phase_prefix} 第 {round_num} 轮："
                     f"工具 {tool_name} 执行失败：{type(exc).__name__}: {exc}"
                 )
+                if collector is not None:
+                    collector.add_tool(
+                        ToolExecutionTrace(
+                            call_id=round_call_id or "",
+                            tool_name=tool_name,
+                            parsed_arguments=_build_safe_tool_args(tool_call),
+                            status="error",
+                            error_summary=str(exc),
+                        )
+                    )
                 continue
-            if result is not None:
-                business_tool_results.append(result)
+            if execution.message is not None:
+                business_tool_results.append(execution.message)
+                if collector is not None:
+                    collector.add_tool(
+                        ToolExecutionTrace(
+                            call_id=round_call_id or "",
+                            tool_name=execution.tool_name,
+                            parsed_arguments=_build_safe_tool_args(tool_call),
+                            status=execution.status,
+                            error_summary=execution.error_summary,
+                            result_summary=execution.result_summary,
+                        )
+                    )
 
         has_messages_to_send = (
             bool(business_tool_results)
@@ -998,6 +1258,12 @@ async def _execute_tool_loop(
         f"{request_phase_prefix} 达到最大轮数 {max_tool_rounds}，"
         f"模型仍未完成 final_response：{last_retry_reason or '未知原因'}"
     )
+    if collector is not None:
+        collector.add_error(
+            phase=request_phase_prefix,
+            error_type="MaxRoundsExceeded",
+            message=msg,
+        )
     raise RuntimeError(msg)
 
 
@@ -1017,6 +1283,8 @@ async def generate_reply_with_tools(
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
+    collector: "LLMDiagnosticCollector | None" = None,
+    parent_call_id: str | None = None,
 ) -> ReplyResult:
     """通过工具调用模式生成回复，调用方显式指定启用工具列表。
 
@@ -1060,6 +1328,8 @@ async def generate_reply_with_tools(
         max_favorability_delta=max_favorability_delta,
         vision_thinking_mode=vision_thinking_mode,
         vision_reasoning_effort=vision_reasoning_effort,
+        collector=collector,
+        parent_call_id=parent_call_id,
     )
 
 

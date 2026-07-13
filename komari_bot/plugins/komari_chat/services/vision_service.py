@@ -6,11 +6,14 @@ import asyncio
 
 from nonebot import logger
 from nonebot.plugin import require
-from openai import AsyncOpenAI
 
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
+if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
+    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+
 config_manager_plugin = require("config_manager")
+llm_provider = require("llm_provider")
 llm_provider_config_manager = config_manager_plugin.get_config_manager(
     "llm_provider",
     DynamicConfigSchema,
@@ -39,17 +42,15 @@ async def _read_single_image(
     vision_model: str,
     temperature: float,
     max_tokens: int,
+    request_trace_id: str | None = None,
+    parent_call_id: str | None = None,
+    collector: "LLMDiagnosticCollector | None" = None,
 ) -> str:
     """调用视觉模型读取单张图片。"""
     config = llm_provider_config_manager.get()
     if not config.api_token:
         return "[图片读取失败: 未配置 api_token]"
 
-    client = AsyncOpenAI(
-        api_key=config.api_token,
-        base_url=str(config.api_base),
-        timeout=float(config.timeout_seconds),
-    )
     try:
         logger.info(
             "[VisionService] 开始读取图片: index={} model={} base64_chars={}",
@@ -58,10 +59,7 @@ async def _read_single_image(
             len(image_data_uri),
         )
         async with _VISION_READ_SEMAPHORE:
-            response = await client.chat.completions.create(
-                model=vision_model,
-                temperature=temperature,
-                max_tokens=max_tokens,
+            completion = await llm_provider.generate_messages_completion(
                 messages=[
                     {
                         "role": "user",
@@ -74,9 +72,29 @@ async def _read_single_image(
                         ],
                     }
                 ],
+                model=vision_model,
+                temperature=temperature,
+                max_tokens=int(max_tokens),
+                request_trace_id=request_trace_id or "",
+                request_phase="vision_read_image",
             )
-        content = response.choices[0].message.content or ""
+        content = completion.content or ""
         description = content.strip() or "[图片读取失败: 视觉模型返回空内容]"
+
+        if collector is not None:
+            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
+
+            vision_call = LLMCallTrace(
+                parent_call_id=parent_call_id,
+                phase="vision_read_image",
+                round_index=image_index,
+                model=vision_model,
+                finish_reason=completion.finish_reason,
+                duration_ms=completion.duration_ms,
+                usage=completion.usage,
+            )
+            collector.add_call(vision_call)
+
         logger.info(
             "[VisionService] 图片读取完成: index={} model={} description_chars={}",
             image_index,
@@ -91,11 +109,15 @@ async def _read_single_image(
             error,
             exc_info=True,
         )
+        if collector is not None:
+            collector.add_error(
+                phase="vision_read_image",
+                error_type=type(error).__name__,
+                message=_format_error(error),
+            )
         return f"[图片读取失败: {_format_error(error)}]"
     else:
         return description
-    finally:
-        await client.close()
 
 
 async def read_images(
@@ -103,6 +125,10 @@ async def read_images(
     vision_model: str,
     temperature: float = 0.3,
     max_tokens: int = 1024,
+    *,
+    request_trace_id: str | None = None,
+    parent_call_id: str | None = None,
+    collector: "LLMDiagnosticCollector | None" = None,
 ) -> list[str]:
     """调用多模态 AI 读取图片，返回图片描述列表。"""
     if not base64_images:
@@ -116,6 +142,9 @@ async def read_images(
                 vision_model=vision_model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                request_trace_id=request_trace_id,
+                parent_call_id=parent_call_id,
+                collector=collector,
             )
             for index, image_data_uri in enumerate(base64_images)
         )

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import time
+import traceback
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
@@ -12,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from nonebot import logger
 from nonebot.adapters.onebot.v11.event import Reply
 from nonebot.compat import type_validate_python
+from nonebot.exception import FinishedException
 from nonebot.plugin import require
 
 from komari_bot.plugins.komari_decision.services.decision_engine import (
@@ -24,6 +27,7 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
     RedisManager,
 )
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
+from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
 from ..services.llm_service import (
@@ -32,6 +36,7 @@ from ..services.llm_service import (
     RECORD_FAVORABILITY_DELTA_TOOL,
     TAVILY_SEARCH_TOOL,
     InteractionHistoryRecord,
+    ReplyResult,
     generate_reply,
     generate_reply_with_tools,
 )
@@ -77,6 +82,22 @@ class ResolvedReplyContext:
 @runtime_checkable
 class _PlainTextExtractable(Protocol):
     def extract_plain_text(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class DebugReplyResult:
+    """debug 回复干跑结果。"""
+
+    reply: str
+    reply_to_message_id: str | None
+    favorability_delta: int | None
+    favorability_reason: str | None
+    interaction_history: InteractionHistoryRecord | None
+    collector: LLMDiagnosticCollector
+
+
+class _FavorabilityReadError(RuntimeError):
+    """读取当前好感度失败。"""
 
 
 class MessageHandler:
@@ -228,6 +249,29 @@ class MessageHandler:
                 exc_info=True,
             )
             return None
+
+    @staticmethod
+    async def _refetch_reply_context_by_message_id(
+        *,
+        bot: Bot,
+        message_id: str,
+    ) -> ReplyContext | None:
+        """按消息 ID 补取引用消息并构造上下文。"""
+        try:
+            payload = await bot.get_msg(message_id=int(message_id))
+            reply = type_validate_python(Reply, payload)
+        except Exception:
+            logger.debug(
+                "[KomariMemory] 补取 debug 引用消息失败: message_id={}",
+                message_id,
+                exc_info=True,
+            )
+            return None
+
+        return MessageHandler._build_reply_context(
+            reply=reply,
+            bot_self_id=str(bot.self_id),
+        )
 
     async def _resolve_reply_context(
         self,
@@ -447,8 +491,6 @@ class MessageHandler:
         bot_nickname: str,
     ) -> None:
         """存储 AI 回复到缓冲区。"""
-        import uuid
-
         bot_message = MessageSchema(
             user_id="bot",
             user_nickname=bot_nickname,
@@ -495,60 +537,34 @@ class MessageHandler:
         """解析写入跨群互动缓冲的用户显示名。"""
         return str(message.user_nickname or message.user_id).strip() or message.user_id
 
-    async def _attempt_reply(  # noqa: PLR0911
+    async def _read_buffers(
         self,
         *,
+        group_id: str,
+        user_id: str,
         message: MessageSchema,
-        reply_to_message_id: str,
-        image_urls: list[str] | None,
-        reply_context: ReplyContext | None,
-        reply_context_requested: bool,
-        reply_context_refetched: bool,
-        force_reply: bool,
-        reason: AttemptReplyReason,
-        reply_score: float | None,
         store_current: bool,
-        on_reply_triggered: ReplyTriggeredCallback | None = None,
-    ) -> tuple[dict[str, str] | None, bool]:
-        """尝试生成并返回回复。
+    ) -> tuple[list[MessageSchema], list[dict[str, object]], bool]:
+        """读取已有缓冲：recent messages + global interaction buffer。
 
         Returns:
-            (回复结果, 当前消息是否已存储)
+            (recent_messages, interaction_records, stored)
         """
         config = get_config()
         stored = False
 
-        if not force_reply:
-            if not config.proactive_enabled:
-                return None, stored
-
-            if await self.redis.is_on_cooldown(message.group_id):
-                logger.debug("[KomariMemory] 主动回复冷却中")
-                return None, stored
-
-            current_count = await self.redis.get_proactive_count(message.group_id)
-            if current_count >= config.proactive_max_per_hour:
-                logger.debug("[KomariMemory] 主动回复频率超限")
-                return None, stored
-
-        if on_reply_triggered is not None:
-            try:
-                await on_reply_triggered()
-            except Exception:
-                logger.debug("[KomariChat] 回复触发表情反应回调失败", exc_info=True)
-
         recent_messages = await self.redis.get_buffer(
-            message.group_id, limit=config.summary_max_buffer_size
+            group_id, limit=config.summary_max_buffer_size
         )
         try:
             interaction_records = await self.redis.get_global_interaction_buffer(
-                message.user_id,
+                user_id,
                 limit=10,
             )
         except Exception:
             logger.debug(
                 "[KomariChat] 近期互动原始缓冲读取失败，跳过注入: user={}",
-                message.user_id,
+                user_id,
                 exc_info=True,
             )
             interaction_records = []
@@ -557,8 +573,40 @@ class MessageHandler:
             await self._handle_normal_message(message)
             stored = True
 
+        return recent_messages, interaction_records, stored
+
+    async def _generate_reply_core(
+        self,
+        *,
+        message: MessageSchema,
+        recent_messages: list[MessageSchema],
+        interaction_records: list[dict[str, object]],
+        image_urls: list[str] | None,
+        reply_context: ReplyContext | None,
+        reply_context_requested: bool,
+        reply_context_refetched: bool,
+        _reason: AttemptReplyReason,
+        _reply_score: float | None,
+        request_trace_id: str,
+        collector: LLMDiagnosticCollector | None = None,
+    ) -> ReplyResult:
+        """纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成。
+
+        不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
+        """
+        config = get_config()
+
+        # 查询重写（带 trace）
+        if collector is not None:
+            rewrite_parent_call_id = f"rewrite-{uuid.uuid4().hex[:8]}"
+        else:
+            rewrite_parent_call_id = None
+
         rewritten_query = await self.query_rewrite.rewrite_query(
             current_query=message.content,
+            request_trace_id=request_trace_id,
+            parent_call_id=rewrite_parent_call_id,
+            collector=collector,
         )
 
         try:
@@ -605,7 +653,6 @@ class MessageHandler:
             )
             current_user_profile = None
 
-        request_trace_id = f"chat-{message.message_id}"
         base64_image_urls: list[str] | None = None
         if image_urls:
             base64_image_urls = await download_images_as_base64(image_urls)
@@ -655,7 +702,7 @@ class MessageHandler:
             favorability = await user_data_plugin.get_user_favorability(message.user_id)
         except Exception as exc:
             logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
-            return None, stored
+            raise _FavorabilityReadError(str(exc)) from exc
 
         prompt_messages = await build_prompt(
             user_message=message.content,
@@ -714,13 +761,150 @@ class MessageHandler:
                 max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
                 vision_thinking_mode=vision_thinking_mode,
                 vision_reasoning_effort=vision_reasoning_effort,
+                collector=collector,
+                parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
             )
         else:
             reply_result = await generate_reply(
                 config=config,
                 messages=prompt_messages,
                 request_trace_id=request_trace_id,
+                collector=collector,
+                parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
             )
+
+        logger.info(
+            "[KomariChat] 生成回复成功: len={} favorability_delta={}",
+            len(reply_result.content),
+            reply_result.favorability_delta,
+        )
+        return reply_result
+
+    async def _commit_side_effects(
+        self,
+        *,
+        message: MessageSchema,
+        reply_result: ReplyResult,
+        force_reply: bool,
+        group_id: str,
+        bot_nickname: str,
+    ) -> None:
+        """提交正常聊天副作用：好感度 adjust、AI 回复存储、互动历史写入、冷却与频控。"""
+        if reply_result.favorability_delta is None:
+            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
+            msg = "favorability_delta missing"
+            raise ValueError(msg)
+
+        logger.debug(
+            "[KomariChat] 准备提交好感度变化: group={} user={} delta={} reason={}",
+            group_id,
+            message.user_id,
+            reply_result.favorability_delta,
+            reply_result.favorability_reason or "-",
+        )
+        adjust_result = await user_data_plugin.adjust_user_favorability(
+            message.user_id,
+            reply_result.favorability_delta,
+        )
+        logger.info(
+            "[KomariChat] 好感度已更新: user={} before={} delta={} after={} reason={}",
+            message.user_id,
+            adjust_result.before,
+            adjust_result.delta,
+            adjust_result.after,
+            reply_result.favorability_reason or "-",
+        )
+
+        await self._store_ai_reply(
+            group_id=group_id,
+            reply_content=reply_result.content,
+            bot_nickname=bot_nickname,
+        )
+        try:
+            await self._write_interaction_history(
+                message=message,
+                new_record=reply_result.interaction_history,
+                lock_timeout_seconds=get_config().memory_agent_lock_timeout_seconds,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 互动历史写入失败（非致命）: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+        if not force_reply:
+            config = get_config()
+            await self.redis.set_cooldown(group_id, config.proactive_cooldown)
+            await self.redis.increment_proactive_count(group_id)
+
+    async def _attempt_reply(  # noqa: PLR0911
+        self,
+        *,
+        message: MessageSchema,
+        reply_to_message_id: str,
+        image_urls: list[str] | None,
+        reply_context: ReplyContext | None,
+        reply_context_requested: bool,
+        reply_context_refetched: bool,
+        force_reply: bool,
+        reason: AttemptReplyReason,
+        reply_score: float | None,
+        store_current: bool,
+        on_reply_triggered: ReplyTriggeredCallback | None = None,
+    ) -> tuple[dict[str, str] | None, bool]:
+        """尝试生成并返回回复。
+
+        Returns:
+            (回复结果, 当前消息是否已存储)
+        """
+        config = get_config()
+
+        if not force_reply:
+            if not config.proactive_enabled:
+                return None, False
+
+            if await self.redis.is_on_cooldown(message.group_id):
+                logger.debug("[KomariMemory] 主动回复冷却中")
+                return None, False
+
+            current_count = await self.redis.get_proactive_count(message.group_id)
+            if current_count >= config.proactive_max_per_hour:
+                logger.debug("[KomariMemory] 主动回复频率超限")
+                return None, False
+
+        if on_reply_triggered is not None:
+            try:
+                await on_reply_triggered()
+            except Exception:
+                logger.debug("[KomariChat] 回复触发表情反应回调失败", exc_info=True)
+
+        # === 读取已有缓冲 ===
+        recent_messages, interaction_records, stored = await self._read_buffers(
+            group_id=message.group_id,
+            user_id=message.user_id,
+            message=message,
+            store_current=store_current,
+        )
+
+        # === 纯读取/生成核心 ===
+        request_trace_id = f"chat-{message.message_id}"
+        try:
+            reply_result = await self._generate_reply_core(
+                message=message,
+                recent_messages=recent_messages,
+                interaction_records=interaction_records,
+                image_urls=image_urls,
+                reply_context=reply_context,
+                reply_context_requested=reply_context_requested,
+                reply_context_refetched=reply_context_refetched,
+                _reason=reason,
+                _reply_score=reply_score,
+                request_trace_id=request_trace_id,
+                collector=None,
+            )
+        except _FavorabilityReadError:
+            return None, stored
+
         reply = reply_result.content
         if reply is None:
             logger.warning(
@@ -731,64 +915,28 @@ class MessageHandler:
             )
             return None, stored
 
-        if reply_result.favorability_delta is None:
-            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
-            return None, stored
-
-        logger.debug(
-            "[KomariChat] 准备提交好感度变化: group={} user={} delta={} reason={}",
-            message.group_id,
-            message.user_id,
-            reply_result.favorability_delta,
-            reply_result.favorability_reason or "-",
-        )
+        # === 提交正常聊天副作用 ===
         try:
-            adjust_result = await user_data_plugin.adjust_user_favorability(
-                message.user_id,
-                reply_result.favorability_delta,
-            )
-            logger.info(
-                "[KomariChat] 好感度已更新: user={} before={} delta={} after={} reason={}",
-                message.user_id,
-                adjust_result.before,
-                adjust_result.delta,
-                adjust_result.after,
-                reply_result.favorability_reason or "-",
+            await self._commit_side_effects(
+                message=message,
+                reply_result=reply_result,
+                force_reply=force_reply,
+                group_id=message.group_id,
+                bot_nickname=config.bot_nickname,
             )
         except Exception as exc:
+            if isinstance(exc, FinishedException):
+                raise
             logger.warning(
-                "[KomariChat] 好感度提交失败，按生成失败处理: "
-                "group={} user={} delta={} reason={} error_type={} error={}",
+                "[KomariChat] 副作用提交失败，按生成失败处理: "
+                "group={} user={} error_type={} error={}",
                 message.group_id,
                 message.user_id,
-                reply_result.favorability_delta,
-                reply_result.favorability_reason or "-",
                 type(exc).__name__,
                 exc,
                 exc_info=True,
             )
             return None, stored
-
-        await self._store_ai_reply(
-            group_id=message.group_id,
-            reply_content=reply,
-            bot_nickname=config.bot_nickname,
-        )
-        try:
-            await self._write_interaction_history(
-                message=message,
-                new_record=reply_result.interaction_history,
-                lock_timeout_seconds=config.memory_agent_lock_timeout_seconds,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 互动历史写入失败（非致命）: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-        if not force_reply:
-            await self.redis.set_cooldown(message.group_id, config.proactive_cooldown)
-            await self.redis.increment_proactive_count(message.group_id)
 
         logger.info(
             "[KomariMemory] 回复成功: group={} reason={} score={}",
@@ -797,3 +945,115 @@ class MessageHandler:
             f"{reply_score:.3f}" if reply_score is not None else "-",
         )
         return {"reply": reply, "reply_to_message_id": reply_to_message_id}, stored
+
+    async def generate_debug_reply(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        user_nickname: str,
+        content: str,
+        _bot: Bot | None = None,
+        image_urls: list[str] | None = None,
+        reply_context: ReplyContext | None = None,
+        collector: LLMDiagnosticCollector | None = None,
+    ) -> DebugReplyResult:
+        """debug 干跑回复生成：以命令发起者身份、当前群上下文执行纯读取/生成，
+        完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动写入、冷却/频控。
+
+        Args:
+            group_id: 群 ID
+            user_id: 命令发起者 ID
+            user_nickname: 命令发起者昵称
+            content: 测试文本
+            _bot: Bot 实例（用于 refetch reply；可省略）
+            image_urls: 命令附图的 URL 列表
+            reply_context: 引用消息上下文（如有）
+            collector: 可选的诊断收集器，缺省时自行创建
+
+        Returns:
+            DebugReplyResult（reply, favorability_delta, favorability_reason,
+            interaction_history, collector）
+
+        Raises:
+            RuntimeError: 底层服务未初始化
+        """
+        if collector is None:
+            collector = LLMDiagnosticCollector(
+                request_id=f"debug-reply-{uuid.uuid4().hex[:12]}"
+            )
+        request_trace_id = collector.request_id
+
+        reply_context_refetched = False
+        if (
+            _bot is not None
+            and reply_context is not None
+            and self._should_refetch_reply_context(context=reply_context)
+        ):
+            refetched_context = await self._refetch_reply_context_by_message_id(
+                bot=_bot,
+                message_id=reply_context.message_id,
+            )
+            reply_context_refetched = True
+            if refetched_context is not None:
+                reply_context = refetched_context
+
+        # 构造测试 MessageSchema
+        message = MessageSchema(
+            user_id=user_id,
+            user_nickname=user_nickname,
+            group_id=group_id,
+            content=content,
+            timestamp=time.time(),
+            message_id=f"debug-{uuid.uuid4().hex[:8]}",
+        )
+
+        # === 读取已有缓冲（不 store_current，不写当前消息） ===
+        recent_messages, interaction_records, _stored = await self._read_buffers(
+            group_id=group_id,
+            user_id=user_id,
+            message=message,
+            store_current=False,
+        )
+
+        # === 纯读取/生成核心 ===
+        try:
+            reply_result = await self._generate_reply_core(
+                message=message,
+                recent_messages=recent_messages,
+                interaction_records=interaction_records,
+                image_urls=image_urls,
+                reply_context=reply_context,
+                reply_context_requested=reply_context is not None,
+                reply_context_refetched=reply_context_refetched,
+                _reason="direct_call",
+                _reply_score=None,
+                request_trace_id=request_trace_id,
+                collector=collector,
+            )
+        except Exception as exc:
+            if isinstance(exc, FinishedException):
+                raise
+            collector.add_error(
+                phase="generate_reply_core",
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+            logger.warning(
+                "[KomariChat] debug 回复生成失败: user={} error={}\n{}",
+                user_id,
+                exc,
+                traceback.format_exc(),
+            )
+            raise
+
+        return DebugReplyResult(
+            reply=reply_result.content,
+            reply_to_message_id=(
+                reply_context.message_id if reply_context is not None else None
+            ),
+            favorability_delta=reply_result.favorability_delta,
+            favorability_reason=reply_result.favorability_reason,
+            interaction_history=reply_result.interaction_history,
+            collector=collector,
+        )

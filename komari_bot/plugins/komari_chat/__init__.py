@@ -8,7 +8,7 @@ from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.onebot_rules import group_message_rule
 
-from .handlers.message_handler import MessageHandler
+from .handlers.message_handler import DebugReplyResult, MessageHandler
 
 # 依赖插件
 permission_manager_plugin = require("permission_manager")
@@ -75,6 +75,57 @@ async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
         )
     except Exception as e:
         logger.debug("[KomariChat] 表情反应发送失败: {}", e)
+
+
+async def generate_debug_reply(
+    *,
+    group_id: str,
+    user_id: str,
+    user_nickname: str,
+    content: str,
+    bot: Bot | None = None,
+    image_urls: list[str] | None = None,
+    reply_context: Any = None,
+    collector: Any = None,
+) -> DebugReplyResult:
+    """debug 干跑回复生成：复用 ``_get_or_build_handler()`` 获取 handler，
+    调用 ``generate_debug_reply()`` 执行纯读取/生成，不执行任何副作用。
+
+    此 API 不检查聊天插件开关、群白名单或正常权限配置。
+    底层依赖未初始化时抛出 RuntimeError。
+
+    Args:
+        group_id: 群 ID
+        user_id: 命令发起者 ID
+        user_nickname: 命令发起者昵称
+        content: 测试文本
+        bot: Bot 实例（可选）
+        image_urls: 命令附图的 URL 列表
+        reply_context: 引用消息上下文（ReplyContext），可为 None
+        collector: 可选的 LLMDiagnosticCollector，缺省时自行创建
+
+    Returns:
+        DebugReplyResult
+
+    Raises:
+        RuntimeError: 底层服务（Redis / Memory）未初始化
+    """
+    handler = _get_or_build_handler()
+    if handler is None:
+        raise RuntimeError(  # noqa: TRY003
+            "KomariChat 底层服务未初始化（Redis 或 Memory 未就绪），无法执行 debug reply。"
+        )
+
+    return await handler.generate_debug_reply(
+        group_id=group_id,
+        user_id=user_id,
+        user_nickname=user_nickname,
+        content=content,
+        _bot=bot,
+        image_urls=image_urls,
+        reply_context=reply_context,
+        collector=collector,
+    )
 
 
 @matcher.handle()
