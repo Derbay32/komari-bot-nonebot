@@ -13,7 +13,10 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from pathlib import Path
 
-from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
+from komari_bot.plugins.llm_provider.base_client import (
+    LLMCompletionResultSchema,
+    UnifiedUsageSchema,
+)
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 llm_provider_module = import_module("komari_bot.plugins.llm_provider.__init__")
@@ -39,6 +42,9 @@ class _FakeCompletionClient:
     def __init__(self, response: LLMCompletionResultSchema) -> None:
         self.response = response
         self.closed = False
+
+    async def generate_text(self, **_kwargs: Any) -> LLMCompletionResultSchema:
+        return self.response
 
     async def generate_text_with_messages(self, **_kwargs: Any) -> LLMCompletionResultSchema:
         return self.response
@@ -432,3 +438,174 @@ def test_generate_messages_completion_records_full_request_and_output(
     assert input_data["kwargs"] == {"top_p": 0.9}
     assert json.loads(log_call["output"])["content"] == "完整 completion 输出"
     assert log_call["reasoning_content"] == "完整思考内容"
+
+
+def test_log_llm_call_records_full_usage_fields(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setattr(llm_logger_module, "_LOG_DIR", tmp_path / "llm_provider")
+    monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
+
+    usage = UnifiedUsageSchema(
+        input_tokens=100,
+        cached_input_tokens=60,
+        cache_miss_input_tokens=40,
+        output_tokens=50,
+        reasoning_output_tokens=20,
+        total_tokens=150,
+    )
+
+    asyncio.run(
+        llm_logger_module.log_llm_call(
+            method="generate_completion",
+            model="deepseek-chat",
+            input_data={"prompt": "测试"},
+            output="回复",
+            duration_ms=99.99,
+            usage=usage,
+        )
+    )
+
+    log_dir = tmp_path / "llm_provider"
+    [log_file] = list(log_dir.glob("*.jsonl"))
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+
+    assert record["usage"] == {
+        "input_tokens": 100,
+        "cached_input_tokens": 60,
+        "cache_miss_input_tokens": 40,
+        "output_tokens": 50,
+        "reasoning_output_tokens": 20,
+        "total_tokens": 150,
+    }
+    assert record["duration_ms"] == 99.99
+
+
+def test_log_llm_call_skips_none_usage_fields(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setattr(llm_logger_module, "_LOG_DIR", tmp_path / "llm_provider")
+    monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
+
+    usage = UnifiedUsageSchema(
+        input_tokens=10,
+        output_tokens=5,
+    )
+
+    asyncio.run(
+        llm_logger_module.log_llm_call(
+            method="generate_text",
+            model="deepseek-chat",
+            input_data="prompt",
+            output="回复",
+            usage=usage,
+        )
+    )
+
+    log_dir = tmp_path / "llm_provider"
+    [log_file] = list(log_dir.glob("*.jsonl"))
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+
+    assert "input_tokens" in record["usage"]
+    assert record["usage"]["input_tokens"] == 10
+    assert "output_tokens" in record["usage"]
+    assert record["usage"]["output_tokens"] == 5
+    # 未报告的字段不应出现在 JSONL 中
+    assert "cached_input_tokens" not in record["usage"]
+    assert "cache_miss_input_tokens" not in record["usage"]
+    assert "reasoning_output_tokens" not in record["usage"]
+    assert "total_tokens" not in record["usage"]
+
+
+def test_log_llm_call_without_usage_omits_usage_key(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setattr(llm_logger_module, "_LOG_DIR", tmp_path / "llm_provider")
+    monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
+
+    asyncio.run(
+        llm_logger_module.log_llm_call(
+            method="generate_text",
+            model="deepseek-chat",
+            input_data="prompt",
+            output="回复",
+        )
+    )
+
+    log_dir = tmp_path / "llm_provider"
+    [log_file] = list(log_dir.glob("*.jsonl"))
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+
+    assert "usage" not in record
+
+
+def test_generate_completion_records_usage_in_jsonl(monkeypatch: Any) -> None:
+    usage = UnifiedUsageSchema(
+        input_tokens=20,
+        output_tokens=10,
+        total_tokens=30,
+    )
+    response = LLMCompletionResultSchema(
+        content="completion 输出",
+        finish_reason="stop",
+        usage=usage,
+    )
+    fake_client = _FakeCompletionClient(response)
+    log_calls: list[dict[str, Any]] = []
+
+    async def _fake_log_llm_call(**kwargs: Any) -> None:
+        log_calls.append(kwargs)
+
+    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
+
+    result = asyncio.run(
+        llm_provider_module.generate_completion(
+            prompt="测试",
+            model="deepseek-chat",
+            record_chat_log=True,
+            request_trace_id="trace-3",
+            tools=[{"type": "function", "function": {"name": "query"}}],
+        )
+    )
+
+    assert result.usage is not None
+    assert result.usage.input_tokens == 20
+    assert result.duration_ms is not None
+    assert result.duration_ms > 0
+
+    log_call = log_calls[0]
+    assert log_call["usage"] == usage
+    assert log_call["duration_ms"] is not None
+
+
+def test_generate_messages_completion_records_usage_with_duration(
+    monkeypatch: Any,
+) -> None:
+    usage = UnifiedUsageSchema(
+        input_tokens=30,
+        cached_input_tokens=10,
+        output_tokens=15,
+        total_tokens=45,
+    )
+    response = LLMCompletionResultSchema(
+        content="messages completion 输出",
+        finish_reason="stop",
+        usage=usage,
+    )
+    fake_client = _FakeCompletionClient(response)
+    log_calls: list[dict[str, Any]] = []
+
+    async def _fake_log_llm_call(**kwargs: Any) -> None:
+        log_calls.append(kwargs)
+
+    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
+
+    result = asyncio.run(
+        llm_provider_module.generate_messages_completion(
+            messages=[{"role": "user", "content": "你好"}],
+            model="deepseek-chat",
+            record_chat_log=True,
+            request_trace_id="trace-4",
+        )
+    )
+
+    assert result.usage is not None
+    assert result.usage.input_tokens == 30
+    assert result.duration_ms is not None
+    assert log_calls[0]["usage"] == usage

@@ -587,3 +587,267 @@ def test_generate_messages_debug_log_includes_request_flags(monkeypatch: Any) ->
     assert "frequency_penalty: 0.1" in request_log
     assert "thinking_disabled: False" in request_log
     assert "suppress_tool_choice: False" in request_log
+
+
+# ======================== 统一 usage 提取测试 ========================
+
+
+class TestUnifiedUsageExtraction:
+    """从 OpenAI 兼容响应中安全提取统一用量。"""
+
+    @staticmethod
+    def _make_response(
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        prompt_cache_hit_tokens: int | None = None,
+        prompt_cache_miss_tokens: int | None = None,
+        *,
+        use_deepseek_extra: bool = False,
+    ) -> Any:
+        usage_attrs: dict[str, Any] = {}
+        if prompt_tokens is not None:
+            usage_attrs["prompt_tokens"] = prompt_tokens
+        if completion_tokens is not None:
+            usage_attrs["completion_tokens"] = completion_tokens
+        if total_tokens is not None:
+            usage_attrs["total_tokens"] = total_tokens
+
+        if cached_tokens is not None:
+            cached_details = SimpleNamespace(cached_tokens=cached_tokens)
+            usage_attrs["prompt_tokens_details"] = cached_details
+
+        if reasoning_tokens is not None:
+            reasoning_details = SimpleNamespace(reasoning_tokens=reasoning_tokens)
+            usage_attrs["completion_tokens_details"] = reasoning_details
+
+        if use_deepseek_extra and prompt_cache_hit_tokens is not None:
+            usage_attrs["model_extra"] = {
+                "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+            }
+        elif prompt_cache_hit_tokens is not None:
+            usage_attrs["prompt_cache_hit_tokens"] = prompt_cache_hit_tokens
+
+        if use_deepseek_extra and prompt_cache_miss_tokens is not None:
+            extra = usage_attrs.get("model_extra", {})
+            if isinstance(extra, dict):
+                extra["prompt_cache_miss_tokens"] = prompt_cache_miss_tokens
+            usage_attrs["model_extra"] = extra
+        elif prompt_cache_miss_tokens is not None:
+            usage_attrs["prompt_cache_miss_tokens"] = prompt_cache_miss_tokens
+
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(**usage_attrs),
+        )
+
+    def test_extract_standard_openai_usage(self) -> None:
+        response = self._make_response(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.input_tokens == 100
+        assert usage.output_tokens == 50
+        assert usage.total_tokens == 150
+        assert usage.cached_input_tokens is None
+        assert usage.cache_miss_input_tokens is None
+        assert usage.reasoning_output_tokens is None
+
+    def test_extract_openai_cached_tokens(self) -> None:
+        response = self._make_response(
+            prompt_tokens=200,
+            completion_tokens=80,
+            total_tokens=280,
+            cached_tokens=120,
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.input_tokens == 200
+        assert usage.cached_input_tokens == 120
+        assert usage.output_tokens == 80
+        assert usage.total_tokens == 280
+
+    def test_extract_openai_reasoning_tokens(self) -> None:
+        response = self._make_response(
+            prompt_tokens=50,
+            completion_tokens=100,
+            total_tokens=150,
+            reasoning_tokens=40,
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.reasoning_output_tokens == 40
+
+    def test_extract_deepseek_cache_hit_via_attribute(self) -> None:
+        response = self._make_response(
+            prompt_tokens=300,
+            completion_tokens=100,
+            total_tokens=400,
+            prompt_cache_hit_tokens=200,
+            prompt_cache_miss_tokens=100,
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.cached_input_tokens == 200
+        assert usage.cache_miss_input_tokens == 100
+
+    def test_extract_deepseek_cache_hit_via_model_extra(self) -> None:
+        response = self._make_response(
+            prompt_tokens=300,
+            completion_tokens=100,
+            total_tokens=400,
+            prompt_cache_hit_tokens=200,
+            prompt_cache_miss_tokens=100,
+            use_deepseek_extra=True,
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.cached_input_tokens == 200
+        assert usage.cache_miss_input_tokens == 100
+
+    def test_deepseek_cache_hit_priority_over_openai_cached(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=300,
+                completion_tokens=100,
+                total_tokens=400,
+                prompt_cache_hit_tokens=250,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=100),
+            ),
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.cached_input_tokens == 250
+
+    def test_extract_no_usage_field(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                    finish_reason="stop",
+                )
+            ]
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is None
+
+    def test_extract_empty_usage(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(),
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.input_tokens is None
+        assert usage.output_tokens is None
+        assert usage.total_tokens is None
+
+    def test_extract_usage_with_invalid_int_values(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens="not_a_number",
+                completion_tokens=None,
+                total_tokens=100,
+            ),
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.input_tokens is None
+        assert usage.output_tokens is None
+        assert usage.total_tokens == 100
+
+    def test_build_completion_result_includes_usage(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="hello"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+                prompt_cache_hit_tokens=3,
+            ),
+        )
+        result = OpenAICompatibleClient._build_completion_result(
+            OpenAICompatibleClient("tk", "https://x.com/v1"), response
+        )
+        assert result.content == "hello"
+        assert result.usage is not None
+        assert result.usage.input_tokens == 10
+        assert result.usage.output_tokens == 5
+        assert result.usage.total_tokens == 15
+        assert result.usage.cached_input_tokens == 3
+        assert result.duration_ms is None
+
+    def test_extract_usage_survives_unexpected_response_structure(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+                prompt_tokens_details=None,
+                completion_tokens_details=None,
+            ),
+        )
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+        assert usage is not None
+        assert usage.input_tokens == 1
+        assert usage.cached_input_tokens is None
+        assert usage.reasoning_output_tokens is None
+
+    def test_extract_usage_from_plain_dict_and_nested_details(self) -> None:
+        response = {
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 80,
+                "total_tokens": 200,
+                "prompt_tokens_details": {"cached_tokens": 70},
+                "completion_tokens_details": {"reasoning_tokens": 30},
+                "model_extra": {"prompt_cache_miss_tokens": 50},
+            }
+        }
+
+        usage = OpenAICompatibleClient._extract_unified_usage(response)
+
+        assert usage is not None
+        assert usage.input_tokens == 120
+        assert usage.cached_input_tokens == 70
+        assert usage.cache_miss_input_tokens == 50
+        assert usage.output_tokens == 80
+        assert usage.reasoning_output_tokens == 30
+        assert usage.total_tokens == 200
