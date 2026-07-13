@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot
 
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
+    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
     from .history_service import HistoryMessage
 
@@ -439,6 +441,8 @@ async def plan_summary_request(
     fetch_batch_size: int,
     planning_thinking_mode: bool = False,
     planning_reasoning_effort: str = "",
+    request_trace_id: str | None = None,
+    collector: "LLMDiagnosticCollector | None" = None,
 ) -> SummaryPlanResult:
     """使用工具调用规划总结所需的历史记录。"""
     messages = _build_planning_messages(user_request)
@@ -482,6 +486,7 @@ async def plan_summary_request(
 
     for round_index in range(1, planning_round_limit + 1):
         rounds_used = round_index
+        trace_phase = f"group_history_summary_plan_round_{round_index - 1}"
         completion = cast(
             "LLMCompletionResultSchema",
             await llm_provider.generate_messages_completion(
@@ -494,8 +499,26 @@ async def plan_summary_request(
                 parallel_tool_calls=False,
                 thinking_mode=planning_thinking_mode,
                 reasoning_effort=planning_reasoning_effort,
+                request_trace_id=request_trace_id,
+                request_phase=trace_phase,
             ),
         )
+
+        if collector is not None:
+            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
+
+            collector.add_call(
+                LLMCallTrace(
+                    call_id=uuid.uuid4().hex[:12],
+                    parent_call_id=request_trace_id,
+                    phase=trace_phase,
+                    round_index=round_index - 1,
+                    model=planning_model,
+                    finish_reason=completion.finish_reason,
+                    duration_ms=completion.duration_ms,
+                    usage=completion.usage,
+                )
+            )
 
         if not completion.tool_calls:
             return SummaryPlanResult(
@@ -531,9 +554,68 @@ async def plan_summary_request(
                     "[GroupHistorySummary] 收到未知工具调用: {}",
                     tool_call.function.name,
                 )
+                if collector is not None:
+                    from komari_bot.plugins.llm_provider.diagnostic import (
+                        ToolExecutionTrace,
+                    )
+
+                    collector.add_tool(
+                        ToolExecutionTrace(
+                            call_id=collector.calls[-1].call_id,
+                            tool_name=tool_call.function.name,
+                            parsed_arguments=tool_call.parsed_arguments or {},
+                            status="error",
+                            error_summary=f"未知工具: {tool_call.function.name}",
+                        )
+                    )
                 continue
             arguments = tool_call.parsed_arguments or {}
-            tool_result = await executor(arguments)
+            try:
+                tool_result = await executor(arguments)
+                tool_status = "success"
+                tool_error = None
+            except Exception as exc:
+                tool_status = "error"
+                tool_error = str(exc)[:200]
+                if collector is not None:
+                    from komari_bot.plugins.llm_provider.diagnostic import (
+                        ToolExecutionTrace,
+                    )
+
+                    collector.add_tool(
+                        ToolExecutionTrace(
+                            call_id=collector.calls[-1].call_id,
+                            tool_name=tool_call.function.name,
+                            parsed_arguments=arguments,
+                            status="error",
+                            error_summary=tool_error,
+                        )
+                    )
+                raise
+
+            if collector is not None:
+                from komari_bot.plugins.llm_provider.diagnostic import (
+                    ToolExecutionTrace,
+                )
+
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=collector.calls[-1].call_id,
+                        tool_name=tool_call.function.name,
+                        parsed_arguments=arguments,
+                        status=tool_status,
+                        error_summary=tool_error,
+                        result_summary=json.dumps(
+                            {
+                                "source": tool_result.source,
+                                "matched_count": tool_result.matched_count,
+                                "filters": tool_result.filters,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
+
             serialized_tool_result = _serialize_tool_result(tool_result)
             messages.append(
                 {
@@ -560,6 +642,28 @@ async def plan_summary_request(
         max_summary_count=max_summary_count,
         arguments={"count": summary_default_count, "include_bot_replies": False},
     )
+    if collector is not None:
+        from komari_bot.plugins.llm_provider.diagnostic import ToolExecutionTrace
+
+        collector.add_tool(
+            ToolExecutionTrace(
+                call_id=(collector.calls[-1].call_id if collector.calls else ""),
+                tool_name="fetch_recent_group_messages",
+                parsed_arguments={
+                    "count": summary_default_count,
+                    "include_bot_replies": False,
+                },
+                status="success",
+                result_summary=json.dumps(
+                    {
+                        "source": fallback_result.source,
+                        "matched_count": fallback_result.matched_count,
+                        "filters": fallback_result.filters,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
     return SummaryPlanResult(
         messages=fallback_result.messages,
         tool_result=fallback_result,
