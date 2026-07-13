@@ -69,6 +69,7 @@ _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
 _ensure_package_shim("user_data")
+_ensure_package_shim("user_ban")
 _ensure_package_shim("komari_custom")
 _ensure_package_shim("config_manager")
 
@@ -192,6 +193,19 @@ class _DummyPermissionManagerPlugin:
         return "权限正常"
 
 
+class _DummyUserBanPlugin:
+    class BanServiceUnavailableError(RuntimeError):
+        pass
+
+    @staticmethod
+    async def is_event_banned(
+        _bot: object,
+        _event: object,
+        _scope: object,
+    ) -> bool:
+        return False
+
+
 class _DummyMemoryPlugin:
     @staticmethod
     def get_plugin_manager() -> object | None:
@@ -306,6 +320,7 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "llm_provider": _DummyLLMProvider(),
     "user_data": _DummyUserDataPlugin(),
     "permission_manager": _DummyPermissionManagerPlugin(),
+    "user_ban": _DummyUserBanPlugin(),
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
