@@ -25,6 +25,21 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | CI/CD | Forgejo CI → Codeberg 容器注册表 | 发布 tag 自动构建 |
 | Lint | Ruff (py313) + Pyright `standard` | 零容忍类型错误 |
 
+| 层次 | 技术 | 说明 |
+|------|------|------|
+| 语言 | Python **3.13+**（禁止兼容旧版） | 强制使用 `X \| Y`、`list[T]`、`match-case` |
+| 包管理 | Poetry | `pyproject.toml` + `poetry.lock` |
+| Bot 框架 | NoneBot2 >=2.4.4 | 插件通过 `require()` 声明依赖 |
+| 适配器 | OneBot V11 | QQ 协议适配 |
+| Web | FastAPI（内嵌于 NoneBot2） | 管理 API、知识库 WebUI |
+| 数据库 | PostgreSQL + **pgvector** | raw SQL（无 ORM），HNSW 向量索引 |
+| 缓存 | Redis >=7.1.0 | `redis.asyncio`（**禁止**使用 `aioredis`） |
+| LLM | OpenAI 兼容接口 | DeepSeek / Gemini 双后端 |
+| Embedding | OpenAI 兼容 API（远程） | 默认 `BAAI/bge-small-zh-v1.5` |
+| 部署 | Docker + Docker Compose | Gunicorn + Uvicorn |
+| CI/CD | Forgejo CI → Codeberg 容器注册表 | 发布 tag 自动构建 |
+| Lint | Ruff (py313) + Pyright `standard` | 零容忍类型错误 |
+
 ## 目录结构
 
 ```
@@ -81,11 +96,12 @@ komari-bot/
   group_history_summary ────── 群聊历史总结
 
 辅助功能层
-  character_binding ────────── .nn 昵称指令
+  character_binding ────────── .nn 昵称指令（普通用户 self-only；跨用户管理入口已移至 `.debug bind ...`）
   sr ───────────────────────── 神人榜抽签
   komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_sentry ────────────── Sentry 集成
   komari_management ────────── 管理 REST API
+  komari_debug ─────────────── SUPERUSER 调试命令（好感度/绑定/回复干跑/总结诊断）
 ```
 
 ### 数据流路径
@@ -104,6 +120,17 @@ komari-bot/
          ├─ PostgreSQL 提案表（投票追踪、过期清理）
          ├─ 表情反应监听 + fetch_emoji_like 补偿拉取
          └─ 投票达标 → komari_knowledge.add_knowledge() 写入知识库
+
+.debug 调试命令流程
+SUPERUSER 消息 → komari_debug（命令处理器）
+         ├─ 运行时 await SUPERUSER(bot, event) 校验（不在 matcher 层）
+         ├─ favor — 调用 user_data.get/set_user_favorability
+         ├─ bind — 通过 character_binding.get_binding_manager() 操作
+         ├─ reply — 调用 komari_chat.generate_debug_reply，走纯读取/生成核心，
+         │         跳过决策引擎、Redis push、好感度 adjust、互动写入、冷却/频控，
+         │         读取真实群上下文与附图/引用消息，发送诊断报告（合并转发）
+         └─ summary — 调用 group_history_summary.execute_group_summary 共享服务，
+                      先发送总结图片，再发送诊断合并转发报告
 ```
 
 ## 核心机制详解
@@ -136,13 +163,34 @@ komari-bot/
 - `generate_text(prompt, model, ...)` → `str`
 - `generate_completion(...)` → `LLMCompletionResultSchema`（含 thinking 内容）
 - `generate_text_with_messages(messages, model, ...)` → `str`
+- `generate_messages_completion(messages, model, ...)` → `LLMCompletionResultSchema`
 - `test_connection()` → `bool`
+
+`LLMCompletionResultSchema` 新增字段：
+- `usage: UnifiedUsageSchema | None` — 后端实际返回的 token 用量
+- `duration_ms: float | None` — 网关测得的调用耗时（毫秒）
+
+`UnifiedUsageSchema` 字段（全部 `int | None`，`None` 表示后端未报告）：
+- `input_tokens`、`cached_input_tokens`、`cache_miss_input_tokens`
+- `output_tokens`、`reasoning_output_tokens`、`total_tokens`
+
+用量提取（`openai_compatible_api.py`）：
+- 支持对象属性、普通字典、Pydantic `model_extra` 三种形式
+- DeepSeek `prompt_cache_hit_tokens` 优先于 OpenAI `prompt_tokens_details.cached_tokens`
+- `completion_tokens_details.reasoning_tokens` 映射到 `reasoning_output_tokens`
+- 缺失或异常字段不阻断解析，对应位置保留 `None`
+
+诊断模型（`diagnostic.py`）：
+- `LLMCallTrace`：call ID、父 call ID、阶段、轮次、模型、finish reason、耗时、usage
+- `ToolExecutionTrace`：所属 call ID、工具名、解析参数、状态、错误/结果摘要（不含敏感正文）
+- `LLMDiagnosticCollector`：按请求保存调用与工具记录，按阶段及全链路聚合 token，逐字段标注完整性
+- collector 由 debug 命令创建并显式向下传递；正常业务调用传 `None`
 
 关键规则：
 - **防注入指令** 在 `_build_safe_system_instruction()` 中注入到 system 角色
 - `max_tokens` 必须为 **`int`**（不能是 `float`），默认 8192
 - 知识库注入：`enable_knowledge=True` 时自动检索并注入到 system prompt
-- 调用日志：所有请求记录到 `logs/llm_provider/`
+- 调用日志：所有请求记录到 `logs/llm_provider/`，JSONL 只写入已报告字段
 
 ### 3. 权限管理 (`permission_manager`)
 
@@ -176,7 +224,37 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - `SocialTimingService` — 社交时机判定（主动回复冷却、频控）
 - `MessageFilter` — 消息过滤
 
-### 6. 编码规范（必须遵守）
+### 6. 聊天处理器拆解 (`komari_chat`)
+
+`message_handler.py` 的 `_attempt_reply()` 已拆分为三个边界：
+
+1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
+2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `LLMDiagnosticCollector`
+3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储、互动历史写入、冷却与频控
+
+公开 debug 入口：
+- `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动历史、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
+- 底层依赖未初始化时抛出 `RuntimeError`（可展示的错误信息）
+
+视觉服务（`vision_service.py`）：
+- 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`
+- 保留原 prompt、模型参数、并发信号量、空结果和错误文本语义
+- 视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace
+
+### 7. 群聊总结执行服务 (`group_history_summary`)
+
+`execution_service.py` 提供共享执行服务 `execute_group_summary()`：
+- 输入 bot、group ID、bot self ID、自然语言总结要求、动态配置、可选 collector
+- 复用 `_running_groups` 集合（非 TOCTOU）+ 共享 `_group_locks` 双重保障
+- 正常 handler 保留场景识别、权限、范围校验，仅发送图片
+- debug 入口直接调用共享服务，跳过场景识别与业务权限，但仍执行能力检查与群锁
+- 返回结构化 `SummaryExecutionResult`：正文、筛选数、规划结果、图片 base64、过滤标签、时间范围
+
+规划与总结阶段采集诊断：
+- 每轮传入 `request_trace_id` 和 `request_phase`
+- 规划工具结果摘要仅包含 source、matched count、filters，不含消息正文
+
+### 8. 编码规范（必须遵守）
 
 ```python
 # ✅ 现代类型注解
@@ -208,7 +286,7 @@ state = PluginState()
 # args: str = CommandArg()  # CommandArg 返回 Message，不是 str
 ```
 
-### 7. 数据库操作模式
+### 9. 数据库操作模式
 
 ```python
 # PostgreSQL（通过 asyncpg，无 ORM）
@@ -251,6 +329,9 @@ poetry run pytest tests/ -v
 5. **提前返回**：条件检查不通过时添加 `return`，避免继续执行
 6. **Python 3.13 特有**：本项目不兼容 Python 3.12 及以下
 7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤
+8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
+9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
+10. **诊断结构**：诊断报告只含 call/tool trace 摘要与聚合 token，绝不包含完整 prompt、reasoning content、base64、历史或画像正文
 
 ## 相关文档
 
@@ -261,4 +342,4 @@ poetry run pytest tests/ -v
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-06-15。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-07-13。发现不一致请以实际代码为准并更新本文档。*
