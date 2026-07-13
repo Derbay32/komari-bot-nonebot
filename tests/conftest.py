@@ -28,6 +28,7 @@ def pytest_configure(config: object) -> None:
         "driver": "~fastapi",
         "command_start": ["。", "."],
         "command_sep": [" "],
+        "superusers": {"42", "669293859"},
         "fastapi_docs_url": "/api/komari-management/docs",
         "fastapi_openapi_url": "/api/komari-management/openapi.json",
         "fastapi_redoc_url": None,
@@ -72,6 +73,15 @@ _ensure_package_shim("komari_custom")
 _ensure_package_shim("config_manager")
 
 
+def _inject_package_exports(plugin_name: str, exports: dict[str, object]) -> None:
+    """向已 shim 化的包模块注入导出以供测试使用。"""
+    package_name = f"komari_bot.plugins.{plugin_name}"
+    mod = sys.modules.get(package_name)
+    if mod is not None:
+        for name, val in exports.items():
+            setattr(mod, name, val)
+
+
 class _DummyConfigManager:
     def get(self) -> object:
         return SimpleNamespace(
@@ -100,7 +110,22 @@ class _DummyLLMProvider:
 
     @staticmethod
     async def generate_messages_completion(**_kwargs: object) -> object:
-        return SimpleNamespace(content="规划完成", tool_calls=[], finish_reason="stop")
+        return SimpleNamespace(
+            content="规划完成",
+            tool_calls=[],
+            finish_reason="stop",
+            duration_ms=100.0,
+            usage=None,
+        )
+
+    @staticmethod
+    async def generate_completion(**_kwargs: object) -> object:
+        return SimpleNamespace(
+            content="重写后查询",
+            finish_reason="stop",
+            duration_ms=50.0,
+            usage=None,
+        )
 
 
 class _DummyUserDataPlugin:
@@ -132,6 +157,21 @@ class _DummyUserDataPlugin:
             stage_name="疏离戒备",
             updated_at="2026-06-07T00:00:00+00:00",
         )
+
+    @staticmethod
+    async def set_user_favorability(user_id: str, value: int) -> object:
+        return SimpleNamespace(
+            user_id=user_id,
+            before=0,
+            after=value,
+            stage_index=1 if value < 100 else 2,
+            stage_name="疏离戒备" if value < 100 else "普通熟人",
+            updated_at="2026-06-07T00:00:00+00:00",
+        )
+
+    @staticmethod
+    async def get_user_count() -> int:
+        return 0
 
 
 class _DummyPermissionManagerPlugin:
@@ -177,6 +217,65 @@ class _DummyCharacterBindingPlugin:
     def refresh_if_file_updated() -> bool:
         return False
 
+    @staticmethod
+    def get_binding_manager() -> object:
+        return _DummyBindingManager()
+
+
+class _DummyBindingManager:
+    def __init__(self) -> None:
+        self._bindings: dict[str, str] = {}
+
+    def has_binding(self, user_id: str) -> bool:
+        return user_id in self._bindings
+
+    def get_character_name(
+        self, user_id: str, fallback_nickname: str | None = None
+    ) -> str:
+        if user_id in self._bindings:
+            return self._bindings[user_id]
+        if fallback_nickname:
+            return fallback_nickname
+        return user_id
+
+    async def set_character_name(self, user_id: str, character_name: str) -> None:
+        self._bindings[user_id] = character_name
+
+    async def remove_character_name(self, user_id: str) -> bool:
+        if user_id not in self._bindings:
+            return False
+        del self._bindings[user_id]
+        return True
+
+    def list_bindings(self) -> dict[str, str]:
+        return self._bindings.copy()
+
+
+class _DummyChatPlugin:
+    @staticmethod
+    async def generate_debug_reply(**kwargs: object) -> object:
+        from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+
+        collector = kwargs.get("collector")
+        if collector is None:
+            collector = LLMDiagnosticCollector(request_id="test-debug")
+        return SimpleNamespace(
+            reply="测试回复内容",
+            reply_to_message_id=None,
+            favorability_delta=5,
+            favorability_reason="测试好感度变化",
+            interaction_history=None,
+            collector=collector,
+        )
+
+
+class _DummyGroupHistorySummaryPlugin:
+    class SummaryBusyError(Exception):
+        pass
+
+    class CapabilityNotSupportedError(Exception):
+        pass
+
 
 class _DummySearchPlugin:
     @staticmethod
@@ -212,6 +311,8 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "character_binding": _DummyCharacterBindingPlugin(),
     "komari_search": _DummySearchPlugin(),
     "komari_decision": _DummyDecisionPlugin(),
+    "komari_chat": _DummyChatPlugin(),
+    "group_history_summary": _DummyGroupHistorySummaryPlugin(),
 }
 
 
@@ -225,3 +326,26 @@ def _fake_require(name: str) -> object:
 
 
 nonebot.plugin.require = _fake_require
+
+
+# 为 komari_debug 测试注入包级导出到 shim
+_inject_package_exports(
+    "config_manager",
+    {"get_config_manager": _DummyConfigManagerPlugin.get_config_manager},
+)
+_inject_package_exports(
+    "character_binding",
+    {"get_binding_manager": _DummyCharacterBindingPlugin.get_binding_manager},
+)
+_inject_package_exports(
+    "user_data",
+    {
+        "get_user_favorability": _DummyUserDataPlugin.get_user_favorability,
+        "set_user_favorability": _DummyUserDataPlugin.set_user_favorability,
+        "get_user_count": _DummyUserDataPlugin.get_user_count,
+    },
+)
+_inject_package_exports(
+    "komari_chat",
+    {"generate_debug_reply": _DummyChatPlugin.generate_debug_reply},
+)
