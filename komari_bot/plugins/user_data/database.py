@@ -9,7 +9,11 @@ from nonebot import logger
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
-from .models import FavorabilityAdjustmentResult, UserFavorability
+from .models import (
+    FavorabilityAdjustmentResult,
+    FavorabilitySetResult,
+    UserFavorability,
+)
 
 if TYPE_CHECKING:
     import asyncpg
@@ -186,6 +190,90 @@ class UserDataDB:
             delta=delta,
             after=after,
             updated_at=row["updated_at"].isoformat(),
+        )
+
+    async def set_user_favorability(
+        self,
+        user_id: str,
+        value: int,
+    ) -> FavorabilitySetResult:
+        """原子设置用户当前好感度为绝对值。
+
+        对新用户以配置中的 initial_favorability 作为 before；
+        已有用户以当前实际值作为 before。通过行锁与 adjust 串行化。
+        """
+        if not 0 <= value <= 400:
+            msg = f"好感度值 {value} 越界，需在 [0, 400] 范围内"
+            raise ValueError(msg)
+
+        pool = self._require_pool()
+
+        logger.debug(
+            "[UserDataDB] 开始设置好感度: user={} value={} initial={}",
+            user_id,
+            value,
+            self.config.initial_favorability,
+        )
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO user_favorability (user_id, favorability)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                user_id,
+                self.config.initial_favorability,
+            )
+            before_row = await conn.fetchrow(
+                """
+                SELECT favorability
+                FROM user_favorability
+                WHERE user_id = $1
+                FOR UPDATE
+                """,
+                user_id,
+            )
+            before = int(before_row["favorability"] if before_row else self.config.initial_favorability)
+            logger.debug(
+                "[UserDataDB] 已锁定好感度行: user={} before={}",
+                user_id,
+                before,
+            )
+            updated = await conn.fetchrow(
+                """
+                UPDATE user_favorability
+                SET favorability = $2,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = $1
+                RETURNING user_id, favorability, updated_at
+                """,
+                user_id,
+                value,
+            )
+
+        if updated is None:
+            logger.error(
+                "[UserDataDB] 好感度 SET 未返回记录: user={} value={}",
+                user_id,
+                value,
+            )
+            msg = "好感度 SET 未返回记录"
+            raise RuntimeError(msg)
+
+        after = int(updated["favorability"])
+        logger.debug(
+            "[UserDataDB] 好感度设置完成: user={} before={} after={} updated_at={}",
+            updated["user_id"],
+            before,
+            after,
+            updated["updated_at"],
+        )
+
+        return FavorabilitySetResult.from_values(
+            user_id=updated["user_id"],
+            before=before,
+            after=after,
+            updated_at=updated["updated_at"].isoformat(),
         )
 
     async def get_user_count(self) -> int:

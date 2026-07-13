@@ -112,3 +112,33 @@ class FavorabilityAdjustmentResult(BaseModel):
             stage_name=stage.name,
             updated_at=updated_at,
         )
+
+
+class FavorabilitySetResult(BaseModel):
+    """好感度绝对值设置结果，语义独立于 delta 调整结果。"""
+
+    user_id: str
+    before: int
+    after: int
+    stage_index: int
+    stage_name: str
+    updated_at: str
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        user_id: str,
+        before: int,
+        after: int,
+        updated_at: str,
+    ) -> "FavorabilitySetResult":
+        stage = get_favorability_stage(after)
+        return cls(
+            user_id=user_id,
+            before=before,
+            after=after,
+            stage_index=stage.index,
+            stage_name=stage.name,
+            updated_at=updated_at,
+        )

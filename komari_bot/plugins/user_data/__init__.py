@@ -7,6 +7,7 @@ from .config_schema import DynamicConfigSchema
 from .database import UserDataDB
 from .models import (
     FavorabilityAdjustmentResult,
+    FavorabilitySetResult,
     FavorabilityStage,
     UserFavorability,
     get_favorability_stage,
@@ -111,14 +112,36 @@ async def get_user_count() -> int:
     return await db.get_user_count()
 
 
+async def set_user_favorability(
+    user_id: str,
+    value: int,
+) -> FavorabilitySetResult:
+    """设置用户当前好感度为绝对值（0-400）。
+
+    对新用户以 initial_favorability 作为 before；通过行锁与 adjust 串行化。
+    """
+    logger.debug("[UserData] 收到好感度设置请求: user={} value={}", user_id, value)
+    db = await get_db()
+    result = await db.set_user_favorability(user_id, value)
+    logger.debug(
+        "[UserData] 好感度设置请求完成: user={} before={} after={}",
+        result.user_id,
+        result.before,
+        result.after,
+    )
+    return result
+
+
 __all__ = [
     "FavorabilityAdjustmentResult",
+    "FavorabilitySetResult",
     "FavorabilityStage",
     "UserFavorability",
     "adjust_user_favorability",
     "get_favorability_stage",
     "get_user_count",
     "get_user_favorability",
+    "set_user_favorability",
 ]
 
 __plugin_startup__ = on_startup
