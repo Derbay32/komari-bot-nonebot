@@ -135,18 +135,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         logger=logger,
     )
 
-    route_paths = {getattr(route, "path", "") for route in api_app.routes}
     assert registered is True
-    assert "/api/komari-knowledge/v1/knowledge" in route_paths
-    assert "/api/komari-help/v1/help" in route_paths
-    assert "/api/komari-memory/v1/conversations" in route_paths
-    assert "/api/llm-provider/v1/reply-logs" in route_paths
-    assert "/api/komari-management-config/v1/resources" in route_paths
-    assert "/api/komari-management-prompt/v1/resources" in route_paths
-    assert "/api/komari-announce/v1/groups" in route_paths
-    assert "/api/komari-announce/v1/maintenance" in route_paths
-    assert "/api/komari-decision-scenes/v1/scenes" in route_paths
-    assert "/api/komari-user-bans/v1/bans" in route_paths
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()

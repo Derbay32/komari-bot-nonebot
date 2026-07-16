@@ -369,8 +369,8 @@ redis_client = aioredis.Redis(host=..., port=..., db=..., password=...)
 ## 开发流程
 
 ```bash
-# 安装依赖
-poetry install --with dev
+# 严格按 lock 同步开发依赖
+poetry sync --with dev
 
 # 类型检查
 poetry run pyright
