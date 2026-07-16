@@ -228,6 +228,13 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **管理入口**：SUPERUSER 命令支持永久或 `m/h/d/w` 临时封禁和理由；统一管理 API 通过 `/api/komari-user-bans/v1` 提供查询、封禁与解封
 - **SUPERUSER**：管理命令仅限 SUPERUSER，且 SUPERUSER 运行时始终绕过封禁；管理操作和生命周期变化会尝试发送一次私信
 
+### 3.2 用户数据 (`user_data`)
+
+- **生命周期**：仅通过 NoneBot Driver 的 `on_startup` / `on_shutdown` 钩子初始化与关闭，不使用框架不会识别的模块魔术变量
+- **动态禁用**：每次数据库入口（包括已有缓存）都实时检查 `plugin_enable`；禁用时抛出 `UserDataDisabledError`，禁止通过懒加载绕过开关
+- **原子初始化**：PostgreSQL 连接池仅在表结构创建成功后发布；建表失败必须立即关闭局部连接池并保持实例未初始化
+- **并发清理**：关闭流程与懒初始化共用初始化锁，先清空全局引用再关闭连接池，避免继续分发正在关闭的实例
+
 ### 4. 四层记忆系统 (`komari_memory`)
 
 | 层 | 存储 | 表 | 说明 |

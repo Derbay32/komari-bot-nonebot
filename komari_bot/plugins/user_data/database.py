@@ -30,10 +30,21 @@ class UserDataDB:
 
     async def initialize(self) -> None:
         """初始化数据库连接和表结构。"""
+        if self._pool is not None:
+            return
+
         db_config = get_shared_database_config()
         logger.debug("[UserDataDB] 开始初始化 PostgreSQL 连接池")
-        self._pool = await create_postgres_pool(db_config)
-        await self._create_tables()
+        pool = await create_postgres_pool(db_config)
+        try:
+            await self._create_tables(pool)
+        except BaseException:
+            try:
+                await pool.close()
+            except Exception:
+                logger.exception("[UserDataDB] 初始化失败后的连接池关闭失败")
+            raise
+        self._pool = pool
         logger.debug("[UserDataDB] PostgreSQL 连接池与表结构初始化完成")
 
     def _require_pool(self) -> "asyncpg.Pool":
@@ -43,9 +54,8 @@ class UserDataDB:
             raise RuntimeError(msg)
         return self._pool
 
-    async def _create_tables(self) -> None:
+    async def _create_tables(self, pool: asyncpg.Pool) -> None:
         """创建数据库表结构。"""
-        pool = self._require_pool()
         async with pool.acquire() as conn:
             await self._rebuild_legacy_favorability_table(conn)
             await conn.execute(
@@ -82,9 +92,10 @@ class UserDataDB:
 
     async def close(self) -> None:
         """关闭数据库连接池。"""
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            await pool.close()
 
     async def get_user_favorability(self, user_id: str) -> UserFavorability:
         """获取用户当前好感度，无记录时创建初始值。"""

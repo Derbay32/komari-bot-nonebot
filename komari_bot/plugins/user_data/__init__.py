@@ -1,6 +1,9 @@
-import asyncio
+from __future__ import annotations
 
-from nonebot import logger
+import asyncio
+from typing import TYPE_CHECKING
+
+from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import DynamicConfigSchema
@@ -12,6 +15,13 @@ from .models import (
     UserFavorability,
     get_favorability_stage,
 )
+
+if TYPE_CHECKING:
+    from nonebot.internal.driver import Driver
+
+
+class UserDataDisabledError(RuntimeError):
+    """user_data 已被动态配置关闭。"""
 
 __plugin_meta__ = PluginMetadata(
     name="user_data",
@@ -46,8 +56,15 @@ def get_config() -> DynamicConfigSchema:
 async def get_db() -> UserDataDB:
     """获取数据库实例。"""
     global _db  # noqa: PLW0603
+    if not get_config().plugin_enable:
+        msg = "user_data 插件已禁用"
+        raise UserDataDisabledError(msg)
+
     if _db is None:
         async with _get_db_init_lock():
+            if not get_config().plugin_enable:
+                msg = "user_data 插件已禁用"
+                raise UserDataDisabledError(msg)
             if _db is None:
                 logger.debug("[UserData] 首次获取数据库实例，开始初始化")
                 db = UserDataDB(get_config())
@@ -61,25 +78,36 @@ async def on_startup() -> None:
     """插件启动时的初始化。"""
     config = get_config()
     if not config.plugin_enable:
-        logger.info("用户数据插件未启用，跳过初始化")
+        logger.info("[UserData] 插件未启用，跳过初始化")
         return
 
     try:
         await get_db()
-    except Exception as e:
-        logger.error(f"用户数据插件数据库初始化失败: {e}")
+    except Exception as error:
+        logger.error(
+            "[UserData] 数据库初始化失败: error_type={}",
+            type(error).__name__,
+        )
         return
 
-    logger.info("用户数据插件已启动")
+    logger.info("[UserData] 插件已启动")
 
 
 async def on_shutdown() -> None:
     """插件关闭时的清理。"""
     global _db  # noqa: PLW0603
-    if _db:
-        await _db.close()
+    async with _get_db_init_lock():
+        db = _db
         _db = None
-        logger.info("用户数据插件已关闭")
+        if db is not None:
+            await db.close()
+            logger.info("[UserData] 插件已关闭")
+
+
+def _register_lifecycle(driver: Driver) -> None:
+    """把 user_data 生命周期接入 NoneBot Driver。"""
+    driver.on_startup(on_startup)
+    driver.on_shutdown(on_shutdown)
 
 
 async def get_user_favorability(user_id: str) -> UserFavorability:
@@ -136,6 +164,7 @@ __all__ = [
     "FavorabilityAdjustmentResult",
     "FavorabilitySetResult",
     "FavorabilityStage",
+    "UserDataDisabledError",
     "UserFavorability",
     "adjust_user_favorability",
     "get_favorability_stage",
@@ -144,5 +173,10 @@ __all__ = [
     "set_user_favorability",
 ]
 
-__plugin_startup__ = on_startup
-__plugin_shutdown__ = on_shutdown
+try:
+    _driver = get_driver()
+except ValueError:
+    _driver = None
+
+if _driver is not None:
+    _register_lifecycle(_driver)
