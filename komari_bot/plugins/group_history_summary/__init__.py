@@ -7,6 +7,7 @@ import re
 from nonebot import logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.exception import FinishedException
+from nonebot.matcher import current_matcher
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.onebot_rules import group_message_to_me_rule
@@ -20,6 +21,7 @@ from .execution_service import (
 from .execution_service import (
     SummaryExecutionResult as SummaryExecutionResult,
 )
+from .history_service import check_group_history_supported
 
 config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
@@ -48,7 +50,7 @@ summary_matcher = on_regex(
     r".*总结.*",
     rule=group_message_to_me_rule(),
     priority=9,
-    block=True,
+    block=False,
 )
 
 _scene_rerank_service = UnifiedCandidateRerankService()
@@ -116,18 +118,32 @@ async def _is_summary_request(message_text: str) -> bool:
 
 
 @summary_matcher.handle()
-async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> None:
+async def handle_group_history_summary(
+    bot: Bot,
+    event: GroupMessageEvent,
+) -> None:
     """处理群聊历史总结请求。"""
+    config = config_manager.get()
+    if not config.plugin_enable:
+        return
+
+    can_use, _ = await permission_manager_plugin.check_runtime_permission(
+        bot, event, config
+    )
+    if not can_use:
+        return
+
+    if not await check_group_history_supported(bot):
+        logger.info(
+            "[GroupHistorySummary] 当前 OneBot 实现不支持群历史，放行消息传播"
+        )
+        return
+
     plain_text = event.get_plaintext().strip()
     if not await _is_summary_request(plain_text):
         return
 
-    config = config_manager.get()
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config
-    )
-    if not can_use:
-        await summary_matcher.finish(f"❌ {reason}")
+    current_matcher.get().stop_propagation()
 
     requested_count = _extract_requested_count(plain_text)
     if requested_count is not None and not (
@@ -149,6 +165,7 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
             user_request=plain_text,
             config=config,
             requested_count=requested_count,
+            history_capability_confirmed=True,
         )
     except SummaryBusyError as exc:
         await summary_matcher.finish(str(exc))

@@ -77,11 +77,14 @@ async def execute_group_summary(
     config: DynamicConfigSchema,
     requested_count: int | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
+    *,
+    history_capability_confirmed: bool = False,
 ) -> SummaryExecutionResult:
     """群聊历史总结的共享执行入口。
 
     由正常 handler 与 debug 插件共同调用，内部处理能力检查、群锁、
-    规划、总结和图片渲染。
+    规划、总结和图片渲染。正常入口已完成能力检查时，可通过
+    ``history_capability_confirmed`` 避免对同一请求重复探测。
 
     Raises:
         SummaryBusyError: 同群已有总结任务运行中
@@ -92,7 +95,9 @@ async def execute_group_summary(
     _running_groups.add(group_id)
 
     try:
-        is_supported = await check_group_history_supported(bot)
+        is_supported = history_capability_confirmed
+        if not is_supported:
+            is_supported = await check_group_history_supported(bot)
         if not is_supported:
             logger.error(
                 "[GroupHistorySummary] 当前 Onebot/Napcat 实现尚未支持获取群聊记录能力"

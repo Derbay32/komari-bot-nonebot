@@ -271,7 +271,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 `execution_service.py` 提供共享执行服务 `execute_group_summary()`：
 - 输入 bot、group ID、bot self ID、自然语言总结要求、动态配置、可选 collector
 - 复用 `_running_groups` 集合（非 TOCTOU）+ 共享 `_group_locks` 双重保障
-- 正常 handler 保留场景识别、权限、范围校验，仅发送图片
+- 正常 handler 必须按“动态开关 → 运行时权限 → 平台能力 → 场景识别”顺序检查；matcher 默认 `block=False`，只有确认接管总结请求后才对当前实例调用 `stop_propagation()`
 - debug 入口直接调用共享服务，跳过场景识别与业务权限，但仍执行能力检查与群锁
 - 返回结构化 `SummaryExecutionResult`：正文、筛选数、规划结果、图片 base64、过滤标签、时间范围
 

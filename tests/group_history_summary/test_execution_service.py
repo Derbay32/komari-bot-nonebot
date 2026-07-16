@@ -586,6 +586,41 @@ async def test_capability_not_supported_raises(monkeypatch: Any) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_confirmed_capability_is_not_checked_twice(monkeypatch: Any) -> None:
+    """入口已确认能力时，共享执行服务不再重复调用平台能力接口。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    async def _fail_capability_check(_bot: object) -> bool:
+        raise AssertionError
+
+    async def _empty_plan(*_args: Any, **_kwargs: Any) -> object:
+        return SimpleNamespace(
+            messages=[],
+            tool_result=None,
+            planner_note="",
+            rounds_used=0,
+        )
+
+    monkeypatch.setattr(
+        exec_module,
+        "check_group_history_supported",
+        _fail_capability_check,
+    )
+    monkeypatch.setattr(exec_module, "plan_summary_request", _empty_plan)
+
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="capability-confirmed-group",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+        history_capability_confirmed=True,
+    )
+
+    assert result.filtered_message_count == 0
+
+
 # ======================== 正常 handler 端到端测试 ========================
 
 
