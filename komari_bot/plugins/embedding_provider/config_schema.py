@@ -27,7 +27,42 @@ class DynamicConfigSchema(BaseModel):
         description="API 地址，例如 https://api.openai.com/v1/embeddings",
     )
     embedding_api_key: str = Field(default="", description="API 密钥")
-    embedding_dimension: int = Field(default=512, description="向量维度")
+    embedding_dimension: int = Field(
+        default=512,
+        ge=1,
+        le=65_536,
+        description="向量维度",
+    )
+    request_connect_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=60.0,
+        description="Embedding/Rerank API 连接超时（秒）",
+    )
+    request_read_timeout_seconds: float = Field(
+        default=30.0,
+        ge=0.1,
+        le=300.0,
+        description="Embedding/Rerank API 单次读取超时（秒）",
+    )
+    request_total_timeout_seconds: float = Field(
+        default=45.0,
+        ge=0.1,
+        le=600.0,
+        description="Embedding/Rerank API 单次请求总超时（秒）",
+    )
+    request_retry_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        description="瞬时网络、限流和服务端故障的最大尝试次数",
+    )
+    request_retry_backoff_seconds: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=5.0,
+        description="远程请求指数退避基准秒数",
+    )
     # Rerank 配置
     rerank_enabled: bool = Field(default=False, description="是否启用 rerank")
     rerank_model: str = Field(default="", description="Rerank 模型名称")

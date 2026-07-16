@@ -200,6 +200,13 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - 知识库注入：`enable_knowledge=True` 时自动检索并注入到 system prompt
 - 调用日志：所有请求记录到 `logs/llm_provider/`，JSONL 只写入已报告字段
 
+### 2.1 Embedding / Rerank 远程协议
+
+- HTTP 客户端必须同时配置连接、读取和总超时；只对网络中断、超时、限流及 5xx 做有限重试。
+- Embedding 响应必须与输入数量一致，`index` 唯一且保持输入顺序，向量维度等于配置值，所有元素均为有限数。
+- Rerank 响应的索引必须唯一且在候选范围内，分数必须为有限数，返回条数不得超过 `top_n`。
+- 日志只允许模型、数量、字符数、内容哈希、尝试次数、错误类型和状态码；禁止记录输入正文、query、payload、响应正文或 API Key。
+
 ### 3. 权限管理 (`permission_manager`)
 
 ```python
