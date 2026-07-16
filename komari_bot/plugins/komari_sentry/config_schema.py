@@ -65,7 +65,10 @@ class KomariSentryConfigSchema(BaseModel):
         description="性能 profile 采样率（profiles_sample_rate）",
     )
     attach_stacktrace: bool = Field(default=True, description="是否附加堆栈")
-    send_default_pii: bool = Field(default=False, description="是否发送默认 PII")
+    send_default_pii: bool = Field(
+        default=False,
+        description="是否显式保留 Sentry 用户上下文；日志与请求正文始终脱敏",
+    )
     max_breadcrumbs: int = Field(
         default=100,
         ge=0,
@@ -80,11 +83,11 @@ class KomariSentryConfigSchema(BaseModel):
     )
 
     breadcrumb_level: str = Field(
-        default="INFO",
+        default="WARNING",
         description="记录为 breadcrumb 的日志级别",
     )
     sentry_logs_level: str = Field(
-        default="INFO",
+        default="WARNING",
         description="发送到 Sentry Logs 的日志级别",
     )
     event_level: str = Field(
@@ -96,13 +99,13 @@ class KomariSentryConfigSchema(BaseModel):
     @classmethod
     def normalize_breadcrumb_level(cls, value: object) -> str:
         """规范化 breadcrumb 日志级别字段。"""
-        return _normalize_log_level(value, "INFO")
+        return _normalize_log_level(value, "WARNING")
 
     @field_validator("sentry_logs_level", mode="before")
     @classmethod
     def normalize_sentry_logs_level(cls, value: object) -> str:
         """规范化 Sentry Logs 日志级别字段。"""
-        return _normalize_log_level(value, "INFO")
+        return _normalize_log_level(value, "WARNING")
 
     @field_validator("event_level", mode="before")
     @classmethod

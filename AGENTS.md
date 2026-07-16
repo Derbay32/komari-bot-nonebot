@@ -389,7 +389,7 @@ poetry run pytest tests/ -v
 4. **资源清理**：`close()` 方法必须清理所有资源引用（连接池、模型、文件句柄）
 5. **提前返回**：条件检查不通过时添加 `return`，避免继续执行
 6. **Python 3.13 特有**：本项目不兼容 Python 3.12 及以下
-7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤
+7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤；breadcrumb、Sentry Logs 和错误事件发送前必须隐藏正文、插值参数、请求数据与堆栈局部变量，用户上下文仅在显式启用 `send_default_pii` 时保留
 8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
 9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
