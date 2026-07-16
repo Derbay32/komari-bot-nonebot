@@ -114,6 +114,131 @@ local now_ms = tonumber(redis_time[1]) * 1000
 redis.call("ZREMRANGEBYSCORE", slots_key, "-inf", now_ms)
 return redis.call("ZCARD", slots_key)
 """
+_INTERACTION_CLAIM_SCRIPT = """
+-- interaction_summary_claim
+local pending_key = KEYS[1]
+local leases_key = KEYS[2]
+local owners_key = KEYS[3]
+local owner_token = ARGV[1]
+local count = tonumber(ARGV[2])
+local lease_ms = tonumber(ARGV[3])
+local redis_time = redis.call("TIME")
+local now_ms = tonumber(redis_time[1]) * 1000
+    + math.floor(tonumber(redis_time[2]) / 1000)
+
+local expired = redis.call("ZRANGEBYSCORE", leases_key, "-inf", now_ms)
+for _, user_id in ipairs(expired) do
+    redis.call("ZREM", leases_key, user_id)
+    redis.call("HDEL", owners_key, user_id)
+    redis.call("SADD", pending_key, user_id)
+end
+
+local claimed = {}
+local candidates = redis.call("SMEMBERS", pending_key)
+for _, user_id in ipairs(candidates) do
+    if #claimed >= count then
+        break
+    end
+    if not redis.call("ZSCORE", leases_key, user_id) then
+        redis.call("SREM", pending_key, user_id)
+        redis.call("ZADD", leases_key, now_ms + lease_ms, user_id)
+        redis.call("HSET", owners_key, user_id, owner_token)
+        table.insert(claimed, user_id)
+    end
+end
+return claimed
+"""
+_INTERACTION_SNAPSHOT_SCRIPT = """
+-- interaction_summary_snapshot
+local source_key = KEYS[1]
+local snapshots_key = KEYS[2]
+local user_id = ARGV[1]
+local processing_key = ARGV[2]
+local snapshot_ttl_seconds = tonumber(ARGV[3])
+
+local existing_key = redis.call("HGET", snapshots_key, user_id)
+if existing_key then
+    if redis.call("EXISTS", existing_key) == 1
+       and redis.call("LLEN", existing_key) > 0 then
+        return existing_key
+    end
+    redis.call("HDEL", snapshots_key, user_id)
+end
+
+if redis.call("EXISTS", source_key) == 0 then
+    return nil
+end
+if redis.call("LLEN", source_key) == 0 then
+    redis.call("DEL", source_key)
+    return nil
+end
+if redis.call("EXISTS", processing_key) ~= 0 then
+    return redis.error_reply('processing key already exists')
+end
+redis.call("RENAME", source_key, processing_key)
+redis.call("EXPIRE", processing_key, snapshot_ttl_seconds)
+redis.call("HSET", snapshots_key, user_id, processing_key)
+return processing_key
+"""
+_INTERACTION_ACK_SCRIPT = """
+-- interaction_summary_ack
+local leases_key = KEYS[1]
+local owners_key = KEYS[2]
+local snapshots_key = KEYS[3]
+local user_id = ARGV[1]
+local owner_token = ARGV[2]
+local processing_key = ARGV[3]
+
+if redis.call("HGET", owners_key, user_id) ~= owner_token then
+    return 0
+end
+local mapped_key = redis.call("HGET", snapshots_key, user_id)
+if mapped_key and mapped_key ~= processing_key then
+    return 0
+end
+if mapped_key and mapped_key == processing_key then
+    redis.call("DEL", processing_key)
+    redis.call("HDEL", snapshots_key, user_id)
+end
+redis.call("ZREM", leases_key, user_id)
+redis.call("HDEL", owners_key, user_id)
+return 1
+"""
+_INTERACTION_REQUEUE_SCRIPT = """
+-- interaction_summary_requeue
+local leases_key = KEYS[1]
+local owners_key = KEYS[2]
+local snapshots_key = KEYS[3]
+local pending_key = KEYS[4]
+local target_key = KEYS[5]
+local user_id = ARGV[1]
+local owner_token = ARGV[2]
+local processing_key = ARGV[3]
+
+if redis.call("HGET", owners_key, user_id) ~= owner_token then
+    return 0
+end
+local mapped_key = redis.call("HGET", snapshots_key, user_id)
+if mapped_key and mapped_key == processing_key then
+    local old_items = redis.call("LRANGE", processing_key, 0, -1)
+    local new_items = redis.call("LRANGE", target_key, 0, -1)
+    redis.call("DEL", target_key)
+    for _, item in ipairs(old_items) do
+        redis.call("RPUSH", target_key, item)
+    end
+    for _, item in ipairs(new_items) do
+        redis.call("RPUSH", target_key, item)
+    end
+    redis.call("DEL", processing_key)
+    redis.call("HDEL", snapshots_key, user_id)
+end
+redis.call("ZREM", leases_key, user_id)
+redis.call("HDEL", owners_key, user_id)
+redis.call("SADD", pending_key, user_id)
+return 1
+"""
+
+_GLOBAL_INTERACTION_SNAPSHOT_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -718,14 +843,26 @@ class RedisManager:
             user_id,
         )
 
-    async def pop_pending_interaction_summaries(self, count: int = 100) -> list[str]:
-        """批量弹出待总结用户 ID。"""
+    async def claim_pending_interaction_summaries(
+        self,
+        *,
+        owner_token: str,
+        count: int = 100,
+        lease_seconds: int = 1800,
+    ) -> list[str]:
+        """原子认领待总结用户，并回收超过可见性超时的旧租约。"""
         if count <= 0:
             return []
         values = await self.redis.execute_command(
-            "SPOP",
+            "EVAL",
+            _INTERACTION_CLAIM_SCRIPT,
+            3,
             RedisKeys.GLOBAL_INTERACTION_PENDING,
+            RedisKeys.GLOBAL_INTERACTION_LEASES,
+            RedisKeys.GLOBAL_INTERACTION_LEASE_OWNERS,
+            owner_token,
             count,
+            max(1, lease_seconds) * 1000,
         )
         if values is None:
             return []
@@ -734,31 +871,18 @@ class RedisManager:
         return [self._decode_redis_text(value) for value in values if value]
 
     async def snapshot_global_interactions(self, user_id: str, token: str) -> str | None:
-        """原子转移用户互动缓冲到 processing 快照键。"""
+        """复用尚存的 processing 快照，或原子转移当前互动缓冲。"""
         source_key = RedisKeys.global_interaction(user_id)
         processing_key = RedisKeys.global_interaction_processing(user_id, token)
-        script = """
-        if redis.call('EXISTS', KEYS[1]) == 0 then
-            return nil
-        end
-        if redis.call('LLEN', KEYS[1]) == 0 then
-            redis.call('DEL', KEYS[1])
-            return nil
-        end
-        if redis.call('EXISTS', KEYS[2]) ~= 0 then
-            return redis.error_reply('processing key already exists')
-        end
-        redis.call('RENAME', KEYS[1], KEYS[2])
-        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
-        return KEYS[2]
-        """
         result = await self.redis.execute_command(
             "EVAL",
-            script,
+            _INTERACTION_SNAPSHOT_SCRIPT,
             2,
             source_key,
+            RedisKeys.GLOBAL_INTERACTION_SNAPSHOTS,
+            user_id,
             processing_key,
-            86400,
+            _GLOBAL_INTERACTION_SNAPSHOT_TTL_SECONDS,
         )
         return self._decode_redis_text(result) if result else None
 
@@ -779,38 +903,60 @@ class RedisManager:
                 records.append(parsed)
         return records
 
-    async def delete_processing_global_interactions(self, processing_key: str) -> None:
-        """删除 processing 快照键。"""
-        await self.redis.delete(processing_key)
-
-    async def restore_processing_global_interactions(
+    async def ack_processing_global_interactions(
         self,
+        *,
         user_id: str,
+        owner_token: str,
         processing_key: str,
-    ) -> None:
-        """将 processing 快照恢复回原缓冲，并保持旧记录在新记录之前。"""
+    ) -> bool:
+        """仅由当前租约 owner 删除快照并确认成功。"""
+        result = await self.redis.execute_command(
+            "EVAL",
+            _INTERACTION_ACK_SCRIPT,
+            3,
+            RedisKeys.GLOBAL_INTERACTION_LEASES,
+            RedisKeys.GLOBAL_INTERACTION_LEASE_OWNERS,
+            RedisKeys.GLOBAL_INTERACTION_SNAPSHOTS,
+            user_id,
+            owner_token,
+            processing_key,
+        )
+        return int(cast("int | str | bytes", result)) == 1
+
+    async def requeue_processing_global_interactions(
+        self,
+        *,
+        user_id: str,
+        owner_token: str,
+        processing_key: str,
+    ) -> bool:
+        """仅由当前 owner 恢复快照、释放租约并立即重新入队。"""
         target_key = RedisKeys.global_interaction(user_id)
-        script = """
-        local old_items = redis.call('LRANGE', KEYS[1], 0, -1)
-        if #old_items == 0 then
-            redis.call('DEL', KEYS[1])
-            return 0
-        end
-        local new_items = redis.call('LRANGE', KEYS[2], 0, -1)
-        redis.call('DEL', KEYS[2])
-        redis.call('RPUSH', KEYS[2], unpack(old_items))
-        if #new_items > 0 then
-            redis.call('RPUSH', KEYS[2], unpack(new_items))
-        end
-        redis.call('DEL', KEYS[1])
-        return #old_items
-        """
-        await self.redis.execute_command("EVAL", script, 2, processing_key, target_key)
+        result = await self.redis.execute_command(
+            "EVAL",
+            _INTERACTION_REQUEUE_SCRIPT,
+            5,
+            RedisKeys.GLOBAL_INTERACTION_LEASES,
+            RedisKeys.GLOBAL_INTERACTION_LEASE_OWNERS,
+            RedisKeys.GLOBAL_INTERACTION_SNAPSHOTS,
+            RedisKeys.GLOBAL_INTERACTION_PENDING,
+            target_key,
+            user_id,
+            owner_token,
+            processing_key,
+        )
+        return int(cast("int | str | bytes", result)) == 1
 
     async def get_users_with_global_interaction_buffer(self) -> list[str]:
         """扫描所有存在跨群互动缓冲的用户 ID。"""
         users: list[str] = []
-        excluded = {RedisKeys.GLOBAL_INTERACTION_PENDING}
+        excluded = {
+            RedisKeys.GLOBAL_INTERACTION_PENDING,
+            RedisKeys.GLOBAL_INTERACTION_LEASES,
+            RedisKeys.GLOBAL_INTERACTION_LEASE_OWNERS,
+            RedisKeys.GLOBAL_INTERACTION_SNAPSHOTS,
+        }
         processing_prefix = f"{RedisKeys.PREFIX}:global_interaction:processing:"
         async for key in self.redis.scan_iter(match=RedisKeys.GLOBAL_INTERACTION_PATTERN):
             key_text = self._decode_redis_text(key)

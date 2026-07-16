@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import (
@@ -84,6 +87,7 @@ class _FakeRedis:
         self.values: dict[str, str] = {}
         self.sets: dict[str, set[str]] = {}
         self.zsets: dict[str, dict[str, float]] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.now_ms = 1_000_000.0
 
     def pipeline(self) -> _FakePipeline:
@@ -121,21 +125,27 @@ class _FakeRedis:
         self.sets.setdefault(str(key), set()).difference_update(values)
         return values
 
-    def _eval(self, args: tuple[object, ...]) -> str | int | None:
+    def _eval(self, args: tuple[object, ...]) -> object:
         script, key_count, *rest = args
-        if "proactive_reserve" in str(script):
-            return self._eval_proactive_reserve(rest)
-        if "proactive_confirm" in str(script):
-            return self._eval_proactive_confirm(rest)
-        if "proactive_release" in str(script):
-            return self._eval_proactive_release(rest)
-        if "proactive_count" in str(script):
-            return self._eval_proactive_count(rest)
+        script_text = str(script)
+        evaluators: tuple[tuple[str, Callable[[list[object]], object]], ...] = (
+            ("proactive_reserve", self._eval_proactive_reserve),
+            ("proactive_confirm", self._eval_proactive_confirm),
+            ("proactive_release", self._eval_proactive_release),
+            ("proactive_count", self._eval_proactive_count),
+            ("interaction_summary_claim", self._eval_interaction_claim),
+            ("interaction_summary_snapshot", self._eval_interaction_snapshot),
+            ("interaction_summary_ack", self._eval_interaction_ack),
+            ("interaction_summary_requeue", self._eval_interaction_requeue),
+        )
+        for marker, evaluator in evaluators:
+            if marker in script_text:
+                return evaluator(rest)
 
         assert int(str(key_count)) == 2
         key1 = str(rest[0])
         key2 = str(rest[1])
-        if "RENAME" in str(script):
+        if "RENAME" in script_text:
             return self._eval_snapshot(key1, key2)
         return self._eval_restore(key1, key2)
 
@@ -199,6 +209,100 @@ class _FakeRedis:
         self._prune_proactive_slots(slots_key, self.now_ms)
         return len(self.zsets[slots_key])
 
+    def _eval_interaction_claim(self, rest: list[object]) -> list[str]:
+        pending_key, leases_key, owners_key = map(str, rest[:3])
+        owner_token = str(rest[3])
+        count = int(str(rest[4]))
+        lease_ms = float(str(rest[5]))
+        leases = self.zsets.setdefault(leases_key, {})
+        owners = self.hashes.setdefault(owners_key, {})
+        pending = self.sets.setdefault(pending_key, set())
+
+        expired = [
+            user_id
+            for user_id, expires_at in leases.items()
+            if expires_at <= self.now_ms
+        ]
+        for user_id in expired:
+            leases.pop(user_id, None)
+            owners.pop(user_id, None)
+            pending.add(user_id)
+
+        claimed: list[str] = []
+        for user_id in sorted(pending):
+            if len(claimed) >= count:
+                break
+            if user_id in leases:
+                continue
+            pending.remove(user_id)
+            leases[user_id] = self.now_ms + lease_ms
+            owners[user_id] = owner_token
+            claimed.append(user_id)
+        return claimed
+
+    def _eval_interaction_snapshot(self, rest: list[object]) -> str | None:
+        source_key, snapshots_key = map(str, rest[:2])
+        user_id = str(rest[2])
+        processing_key = str(rest[3])
+        snapshots = self.hashes.setdefault(snapshots_key, {})
+        existing_key = snapshots.get(user_id)
+        if existing_key:
+            if self.data.get(existing_key):
+                return existing_key
+            snapshots.pop(user_id, None)
+
+        if not self.data.get(source_key):
+            self.data.pop(source_key, None)
+            return None
+        assert processing_key not in self.data
+        self.data[processing_key] = self.data.pop(source_key)
+        snapshots[user_id] = processing_key
+        return processing_key
+
+    def _eval_interaction_ack(self, rest: list[object]) -> int:
+        leases_key, owners_key, snapshots_key = map(str, rest[:3])
+        user_id = str(rest[3])
+        owner_token = str(rest[4])
+        processing_key = str(rest[5])
+        owners = self.hashes.setdefault(owners_key, {})
+        if owners.get(user_id) != owner_token:
+            return 0
+
+        snapshots = self.hashes.setdefault(snapshots_key, {})
+        if snapshots.get(user_id) not in (None, processing_key):
+            return 0
+        if snapshots.get(user_id) == processing_key:
+            self.data.pop(processing_key, None)
+            snapshots.pop(user_id, None)
+        self.zsets.setdefault(leases_key, {}).pop(user_id, None)
+        owners.pop(user_id, None)
+        return 1
+
+    def _eval_interaction_requeue(self, rest: list[object]) -> int:
+        leases_key, owners_key, snapshots_key, pending_key, target_key = map(
+            str, rest[:5]
+        )
+        user_id = str(rest[5])
+        owner_token = str(rest[6])
+        processing_key = str(rest[7])
+        owners = self.hashes.setdefault(owners_key, {})
+        if owners.get(user_id) != owner_token:
+            return 0
+
+        snapshots = self.hashes.setdefault(snapshots_key, {})
+        if snapshots.get(user_id) == processing_key:
+            old_items = list(self.data.get(processing_key, []))
+            new_items = list(self.data.get(target_key, []))
+            self.data.pop(target_key, None)
+            if old_items or new_items:
+                self.data[target_key] = [*old_items, *new_items]
+            self.data.pop(processing_key, None)
+            snapshots.pop(user_id, None)
+        self.zsets.setdefault(leases_key, {}).pop(user_id, None)
+        owners.pop(user_id, None)
+        self.sets.setdefault(pending_key, set()).add(user_id)
+        return 1
+
     def _eval_snapshot(self, source_key: str, processing_key: str) -> str | None:
         if not self.data.get(source_key):
             self.data.pop(source_key, None)
@@ -223,11 +327,13 @@ class _FakeRedis:
             or key in self.values
             or key in self.sets
             or key in self.zsets
+            or key in self.hashes
         )
         self.data.pop(key, None)
         self.values.pop(key, None)
         self.sets.pop(key, None)
         self.zsets.pop(key, None)
+        self.hashes.pop(key, None)
         return 1 if existed else 0
 
     async def exists(self, key: str) -> int:
@@ -237,6 +343,7 @@ class _FakeRedis:
             or key in self.values
             or key in self.sets
             or key in self.zsets
+            or key in self.hashes
             else 0
         )
 
@@ -501,13 +608,20 @@ def test_get_global_interaction_buffer_limit_zero_returns_empty(
     assert records == []
 
 
-def test_global_interaction_snapshot_and_restore_keep_new_buffer_order(
+def test_global_interaction_requeue_keeps_old_and_new_buffer_order(
     monkeypatch: Any,
 ) -> None:
     manager = _build_manager(monkeypatch)
     fake_redis = _get_fake_redis(manager)
     buffer_key = redis_manager_module.RedisKeys.global_interaction("u1")
     fake_redis.data[buffer_key] = ["old-1", "old-2"]
+    asyncio.run(manager.add_pending_interaction_summary("u1"))
+    claimed = asyncio.run(
+        manager.claim_pending_interaction_summaries(
+            owner_token="owner-1",
+            lease_seconds=60,
+        )
+    )
 
     processing_key = asyncio.run(manager.snapshot_global_interactions("u1", "token"))
 
@@ -519,10 +633,137 @@ def test_global_interaction_snapshot_and_restore_keep_new_buffer_order(
     assert fake_redis.data[str(processing_key)] == ["old-1", "old-2"]
 
     fake_redis.data[buffer_key] = ["new-1"]
-    asyncio.run(manager.restore_processing_global_interactions("u1", str(processing_key)))
+    requeued = asyncio.run(
+        manager.requeue_processing_global_interactions(
+            user_id="u1",
+            owner_token="owner-1",
+            processing_key=str(processing_key),
+        )
+    )
 
+    assert claimed == ["u1"]
+    assert requeued is True
     assert fake_redis.data[buffer_key] == ["old-1", "old-2", "new-1"]
     assert str(processing_key) not in fake_redis.data
+    assert fake_redis.sets[RedisKeys.GLOBAL_INTERACTION_PENDING] == {"u1"}
+
+
+def test_global_interaction_active_lease_cannot_be_claimed_twice(
+    monkeypatch: Any,
+) -> None:
+    manager = _build_manager(monkeypatch)
+    asyncio.run(manager.add_pending_interaction_summary("u1"))
+
+    first = asyncio.run(
+        manager.claim_pending_interaction_summaries(
+            owner_token="owner-1",
+            lease_seconds=60,
+        )
+    )
+    asyncio.run(manager.add_pending_interaction_summary("u1"))
+    second = asyncio.run(
+        manager.claim_pending_interaction_summaries(
+            owner_token="owner-2",
+            lease_seconds=60,
+        )
+    )
+
+    assert first == ["u1"]
+    assert second == []
+
+
+def test_global_interaction_expired_lease_reuses_snapshot_and_rejects_old_owner(
+    monkeypatch: Any,
+) -> None:
+    manager = _build_manager(monkeypatch)
+    fake_redis = _get_fake_redis(manager)
+    buffer_key = RedisKeys.global_interaction("u1")
+    fake_redis.data[buffer_key] = ["old-1"]
+    asyncio.run(manager.add_pending_interaction_summary("u1"))
+    asyncio.run(
+        manager.claim_pending_interaction_summaries(
+            owner_token="owner-1",
+            lease_seconds=60,
+        )
+    )
+    first_key = asyncio.run(manager.snapshot_global_interactions("u1", "token-1"))
+
+    fake_redis.now_ms += 61_000
+    claimed = asyncio.run(
+        manager.claim_pending_interaction_summaries(
+            owner_token="owner-2",
+            lease_seconds=60,
+        )
+    )
+    second_key = asyncio.run(manager.snapshot_global_interactions("u1", "token-2"))
+    old_ack = asyncio.run(
+        manager.ack_processing_global_interactions(
+            user_id="u1",
+            owner_token="owner-1",
+            processing_key=str(first_key),
+        )
+    )
+    wrong_snapshot_ack = asyncio.run(
+        manager.ack_processing_global_interactions(
+            user_id="u1",
+            owner_token="owner-2",
+            processing_key="processing:wrong",
+        )
+    )
+    new_ack = asyncio.run(
+        manager.ack_processing_global_interactions(
+            user_id="u1",
+            owner_token="owner-2",
+            processing_key=str(second_key),
+        )
+    )
+
+    assert claimed == ["u1"]
+    assert second_key == first_key
+    assert old_ack is False
+    assert wrong_snapshot_ack is False
+    assert new_ack is True
+    assert str(first_key) not in fake_redis.data
+
+
+def test_global_interaction_new_buffer_remains_pending_until_lease_ack(
+    monkeypatch: Any,
+) -> None:
+    manager = _build_manager(monkeypatch)
+    asyncio.run(manager.add_pending_interaction_summary("u1"))
+    asyncio.run(
+        manager.claim_pending_interaction_summaries(
+            owner_token="owner-1",
+            lease_seconds=60,
+        )
+    )
+    asyncio.run(manager.add_pending_interaction_summary("u1"))
+
+    assert (
+        asyncio.run(
+            manager.claim_pending_interaction_summaries(
+                owner_token="owner-2",
+                lease_seconds=60,
+            )
+        )
+        == []
+    )
+    assert asyncio.run(
+        manager.ack_processing_global_interactions(
+            user_id="u1",
+            owner_token="owner-1",
+            processing_key="",
+        )
+    )
+    assert (
+        asyncio.run(
+            manager.claim_pending_interaction_summaries(
+                owner_token="owner-2",
+                lease_seconds=60,
+            )
+        )
+        == ["u1"]
+    )
 
 
 def test_get_users_with_global_interaction_buffer_excludes_pending_and_processing(

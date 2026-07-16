@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -56,6 +58,20 @@ def _filter_valid_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sorted(valid_records, key=_record_timestamp)
 
 
+def _build_snapshot_dedup_key(
+    user_id: str,
+    records: list[dict[str, Any]],
+) -> str:
+    """根据用户与规范化快照生成稳定幂等键。"""
+    payload = json.dumps(
+        {"user_id": user_id, "records": records},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 async def interaction_event_worker_task(
     redis: RedisManager,
     memory: MemoryService,
@@ -65,26 +81,71 @@ async def interaction_event_worker_task(
     if not config.global_interaction_enabled:
         return
 
-    user_ids = await redis.pop_pending_interaction_summaries(count=100)
+    owner_token = uuid4().hex
+    user_ids = await redis.claim_pending_interaction_summaries(
+        owner_token=owner_token,
+        count=100,
+        lease_seconds=config.global_interaction_processing_lease_seconds,
+    )
     if not user_ids:
         return
 
     logger.debug("[KomariMemory] 检查 {} 个待总结跨群互动用户", len(user_ids))
     for user_id in user_ids:
         token = uuid4().hex
-        processing_key = await redis.snapshot_global_interactions(user_id, token)
-        if processing_key is None:
-            continue
+        processing_key: str | None = None
         try:
+            processing_key = await redis.snapshot_global_interactions(user_id, token)
+            if processing_key is None:
+                acknowledged = await redis.ack_processing_global_interactions(
+                    user_id=user_id,
+                    owner_token=owner_token,
+                    processing_key="",
+                )
+                if not acknowledged:
+                    logger.warning(
+                        "[KomariMemory] 空互动快照确认失败，租约已被接管: user={}",
+                        user_id,
+                    )
+                continue
             await _summarize_processing_key(
                 redis=redis,
                 memory=memory,
                 user_id=user_id,
                 processing_key=processing_key,
             )
+            acknowledged = await redis.ack_processing_global_interactions(
+                user_id=user_id,
+                owner_token=owner_token,
+                processing_key=processing_key,
+            )
+            if not acknowledged:
+                logger.warning(
+                    "[KomariMemory] 互动快照确认失败，租约已被接管: user={}",
+                    user_id,
+                )
         except Exception:
-            logger.exception("[KomariMemory] 跨群互动事件总结最终失败，恢复快照: user={}", user_id)
-            await redis.restore_processing_global_interactions(user_id, processing_key)
+            logger.exception(
+                "[KomariMemory] 跨群互动事件总结最终失败，重新入队: user={}",
+                user_id,
+            )
+            try:
+                requeued = await redis.requeue_processing_global_interactions(
+                    user_id=user_id,
+                    owner_token=owner_token,
+                    processing_key=processing_key or "",
+                )
+            except Exception:
+                logger.exception(
+                    "[KomariMemory] 互动快照重新入队失败，等待租约到期接管: user={}",
+                    user_id,
+                )
+            else:
+                if not requeued:
+                    logger.warning(
+                        "[KomariMemory] 互动快照重新入队被拒绝，租约已被接管: user={}",
+                        user_id,
+                    )
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -99,7 +160,16 @@ async def _summarize_processing_key(
     raw_records = await redis.get_processing_global_interactions(processing_key)
     records = _filter_valid_records(raw_records)
     if not records:
-        await redis.delete_processing_global_interactions(processing_key)
+        return
+
+    dedup_key = _build_snapshot_dedup_key(user_id, records)
+    existing_event_id = await memory.get_interaction_event_id_by_dedup_key(dedup_key)
+    if existing_event_id is not None:
+        logger.info(
+            "[KomariMemory] 互动快照已落库，跳过重复总结: user={} event_id={}",
+            user_id,
+            existing_event_id,
+        )
         return
 
     display_name = _resolve_display_name(user_id, records)
@@ -118,8 +188,8 @@ async def _summarize_processing_key(
         first_seen_at=first_seen_at,
         last_seen_at=last_seen_at,
         importance_initial=summary.importance,
+        dedup_key=dedup_key,
     )
-    await redis.delete_processing_global_interactions(processing_key)
 
 
 async def daily_enqueue_global_interactions(redis: RedisManager) -> None:

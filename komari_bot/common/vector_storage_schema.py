@@ -119,6 +119,7 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             user_id VARCHAR(64) NOT NULL,
             display_name TEXT NOT NULL,
             event_summary TEXT NOT NULL,
+            source_dedup_key VARCHAR(64),
             source_message_count INT NOT NULL DEFAULT 0,
             first_seen_at TIMESTAMPTZ NOT NULL,
             last_seen_at TIMESTAMPTZ NOT NULL,
@@ -137,6 +138,10 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         """
         ALTER TABLE komari_memory_interaction_history
         ADD COLUMN IF NOT EXISTS event_summary TEXT NOT NULL DEFAULT ''
+        """,
+        """
+        ALTER TABLE komari_memory_interaction_history
+        ADD COLUMN IF NOT EXISTS source_dedup_key VARCHAR(64)
         """,
         """
         ALTER TABLE komari_memory_interaction_history
@@ -185,6 +190,11 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         """
         CREATE INDEX IF NOT EXISTS idx_komari_memory_interaction_importance
         ON komari_memory_interaction_history(importance_current DESC)
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_interaction_source_dedup
+        ON komari_memory_interaction_history(source_dedup_key)
+        WHERE source_dedup_key IS NOT NULL
         """,
         f"""
         CREATE TABLE IF NOT EXISTS komari_memory_interaction_embeddings (

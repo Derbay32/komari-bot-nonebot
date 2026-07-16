@@ -42,6 +42,9 @@ class RedisKeys:
     GLOBAL_INTERACTION = f"{PREFIX}:global_interaction:%s"
     GLOBAL_INTERACTION_PATTERN = f"{PREFIX}:global_interaction:*"
     GLOBAL_INTERACTION_PENDING = f"{PREFIX}:global_interaction:pending"
+    GLOBAL_INTERACTION_LEASES = f"{PREFIX}:global_interaction:leases"
+    GLOBAL_INTERACTION_LEASE_OWNERS = f"{PREFIX}:global_interaction:lease_owners"
+    GLOBAL_INTERACTION_SNAPSHOTS = f"{PREFIX}:global_interaction:snapshots"
     GLOBAL_INTERACTION_PROCESSING = f"{PREFIX}:global_interaction:processing:%s:%s"
 
     @classmethod

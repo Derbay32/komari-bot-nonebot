@@ -74,6 +74,16 @@ def test_build_memory_schema_statements_uses_requested_dimension() -> None:
         "komari_memory_interaction_history" in statement for statement in statements
     )
     assert any(
+        "ADD COLUMN IF NOT EXISTS source_dedup_key VARCHAR(64)" in statement
+        for statement in statements
+    )
+    assert any(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_komari_memory_interaction_source_dedup" in statement
+        and "WHERE source_dedup_key IS NOT NULL" in statement
+        for statement in statements
+    )
+    assert any(
         "DROP INDEX IF EXISTS idx_komari_memory_interaction_embedding" in statement
         for statement in statements
     )

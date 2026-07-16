@@ -54,6 +54,23 @@ def test_proactive_reservation_ttl_has_bounded_immediate_config() -> None:
         KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=901)
 
 
+def test_interaction_processing_lease_has_bounded_immediate_config() -> None:
+    import pytest
+
+    config = KomariMemoryConfigSchema()
+    field_extra = KomariMemoryConfigSchema.model_fields[
+        "global_interaction_processing_lease_seconds"
+    ].json_schema_extra
+
+    assert config.global_interaction_processing_lease_seconds == 1800
+    assert isinstance(field_extra, dict)
+    assert field_extra["apply_mode"] == "immediate"
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=59)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=7201)
+
+
 def test_vision_image_download_limits_are_bounded_and_immediate() -> None:
     config = KomariMemoryConfigSchema()
     expected_defaults = {

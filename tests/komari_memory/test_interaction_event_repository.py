@@ -17,6 +17,10 @@ class _FakeConnection:
         self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.insert_result: dict[str, object] | None = {
+            "id": 1,
+            "event_summary": "旧总结",
+        }
 
     async def fetchval(self, query: str, *args: object) -> int:
         self.fetchval_calls.append((query, args))
@@ -30,6 +34,8 @@ class _FakeConnection:
         self.fetchrow_calls.append((query, args))
         if query.lstrip().startswith("UPDATE"):
             return {"id": 1, "event_summary": "新总结"}
+        if query.lstrip().startswith("INSERT INTO komari_memory_interaction_history"):
+            return self.insert_result
         return {"id": 1, "event_summary": "旧总结"}
 
     async def execute(self, query: str, *args: object) -> str:
@@ -81,6 +87,7 @@ def test_insert_interaction_event_writes_embedding_table() -> None:
             first_seen_at=datetime(2026, 6, 1, tzinfo=UTC),
             last_seen_at=datetime(2026, 6, 2, tzinfo=UTC),
             importance_initial=4,
+            dedup_key="snapshot-hash",
         )
     )
 
@@ -88,10 +95,39 @@ def test_insert_interaction_event_writes_embedding_table() -> None:
     insert_query, insert_args = conn.fetchrow_calls[0]
     assert "komari_memory_interaction_history" in insert_query
     assert "embedding" not in insert_query
+    assert "ON CONFLICT (source_dedup_key)" in insert_query
     assert insert_args[3] == 3
+    assert insert_args[-1] == "snapshot-hash"
     embedding_query, embedding_args = conn.execute_calls[0]
     assert "komari_memory_interaction_embeddings" in embedding_query
     assert embedding_args[0] == 1
+
+
+def test_duplicate_interaction_event_returns_existing_without_overwriting_embedding() -> (
+    None
+):
+    conn = _FakeConnection()
+    conn.insert_result = None
+    repository = InteractionEventRepository(_FakePool(conn))  # type: ignore[arg-type]
+
+    event_id = asyncio.run(
+        repository.insert_interaction_event(
+            user_id="u1",
+            display_name="小鞠",
+            event_summary="重复总结",
+            embedding="[0.3, 0.4]",
+            source_message_count=3,
+            first_seen_at=datetime(2026, 6, 1, tzinfo=UTC),
+            last_seen_at=datetime(2026, 6, 2, tzinfo=UTC),
+            importance_initial=4,
+            dedup_key="snapshot-hash",
+        )
+    )
+
+    assert event_id == 1
+    assert len(conn.fetchval_calls) == 1
+    assert "source_dedup_key = $1" in conn.fetchval_calls[0][0]
+    assert conn.execute_calls == []
 
 
 def test_search_interaction_events_joins_embedding_table() -> None:

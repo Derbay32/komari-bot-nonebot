@@ -259,6 +259,13 @@ class KomariMemoryConfigSchema(BaseModel):
         le=10,
         description="互动事件 Worker 轮询间隔（分钟）",
     )
+    global_interaction_processing_lease_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=7200,
+        description="互动事件 processing 租约的可见性超时（秒）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
 
     # 主动回复配置
     proactive_enabled: bool = Field(

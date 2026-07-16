@@ -37,8 +37,9 @@ class InteractionEventRepository:
         first_seen_at: datetime,
         last_seen_at: datetime,
         importance_initial: int,
+        dedup_key: str,
     ) -> int:
-        """插入一条总结后的跨群互动事件记忆。"""
+        """幂等插入一条总结后的跨群互动事件记忆。"""
         importance = max(1, min(5, int(importance_initial)))
         async with self.pg_pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -52,9 +53,13 @@ class InteractionEventRepository:
                     last_seen_at,
                     importance,
                     importance_initial,
-                    importance_current
+                    importance_current,
+                    source_dedup_key
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $7, $8)
+                ON CONFLICT (source_dedup_key)
+                    WHERE source_dedup_key IS NOT NULL
+                    DO NOTHING
                 RETURNING id
                 """,
                 user_id,
@@ -64,21 +69,47 @@ class InteractionEventRepository:
                 first_seen_at,
                 last_seen_at,
                 importance,
+                dedup_key,
             )
             if row is not None:
-                await self._upsert_embedding(conn, int(row["id"]), event_summary, embedding)
-        if row is None:
-            msg = "插入跨群互动事件记忆失败"
-            raise RuntimeError(msg)
-        event_id = int(row["id"])
-        logger.info(
-            "[KomariMemory] 写入跨群互动事件记忆: id={} user={} count={} importance={}",
-            event_id,
-            user_id,
-            source_message_count,
-            importance,
-        )
+                event_id = int(row["id"])
+                await self._upsert_embedding(conn, event_id, event_summary, embedding)
+            else:
+                existing_id = await conn.fetchval(
+                    """
+                    SELECT id
+                    FROM komari_memory_interaction_history
+                    WHERE source_dedup_key = $1
+                    """,
+                    dedup_key,
+                )
+                if existing_id is None:
+                    msg = "插入跨群互动事件记忆失败"
+                    raise RuntimeError(msg)
+                event_id = int(existing_id)
+        if row is not None:
+            logger.info(
+                "[KomariMemory] 写入跨群互动事件记忆: "
+                "id={} user={} count={} importance={}",
+                event_id,
+                user_id,
+                source_message_count,
+                importance,
+            )
         return event_id
+
+    async def get_event_id_by_dedup_key(self, dedup_key: str) -> int | None:
+        """按来源快照幂等键查询事件 ID。"""
+        async with self.pg_pool.acquire() as conn:
+            event_id = await conn.fetchval(
+                """
+                SELECT id
+                FROM komari_memory_interaction_history
+                WHERE source_dedup_key = $1
+                """,
+                dedup_key,
+            )
+        return int(event_id) if event_id is not None else None
 
     async def get_interaction_event(self, event_id: int) -> dict[str, Any] | None:
         """按 ID 读取事件记忆。"""

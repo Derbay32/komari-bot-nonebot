@@ -327,6 +327,7 @@ class MemoryService:
         source_message_count: int,
         first_seen_at: datetime,
         last_seen_at: datetime,
+        dedup_key: str,
         importance_initial: int = 4,
     ) -> int:
         """生成向量并写入一条跨群互动事件记忆。"""
@@ -340,6 +341,16 @@ class MemoryService:
             first_seen_at=first_seen_at,
             last_seen_at=last_seen_at,
             importance_initial=importance_initial,
+            dedup_key=dedup_key,
+        )
+
+    async def get_interaction_event_id_by_dedup_key(
+        self,
+        dedup_key: str,
+    ) -> int | None:
+        """按来源快照幂等键查询已经写入的事件。"""
+        return await self._get_interaction_event_repo().get_event_id_by_dedup_key(
+            dedup_key
         )
 
     async def search_interaction_events(
