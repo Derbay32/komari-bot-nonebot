@@ -80,10 +80,6 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent) -> None:
         if proposal is None or proposal.status != "voting":
             return
 
-        if _event_contains_target_emoji(event, str(config.vote_emoji_id)):
-            updated = await state.repository.add_vote(proposal.id, str(user_id))
-            proposal = updated or proposal
-
         fetched = await fetch_and_update_votes(
             bot,
             message_id=message_id,
@@ -119,9 +115,10 @@ async def fetch_and_update_votes(
     if proposal is None:
         return None
     user_ids = _extract_vote_user_ids(result)
-    valid_users = sorted({uid for uid in user_ids if uid != str(proposal.proposer_id)})
-    if not valid_users:
-        return None
+    excluded_user_ids = {str(proposal.proposer_id), str(bot.self_id)}
+    valid_users = sorted(
+        {user_id for user_id in user_ids if user_id not in excluded_user_ids}
+    )
     return await state.repository.replace_votes(proposal_id, valid_users)
 
 
@@ -172,19 +169,6 @@ def _get_int_attr(event: NoticeEvent, name: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _event_contains_target_emoji(event: NoticeEvent, target_emoji_id: str) -> bool:
-    emoji_id = getattr(event, "emoji_id", None)
-    if emoji_id is not None:
-        return str(emoji_id) == target_emoji_id
-    likes = getattr(event, "likes", None)
-    if not isinstance(likes, list):
-        return True
-    for item in likes:
-        if isinstance(item, dict) and str(item.get("emoji_id")) == target_emoji_id:
-            return True
-    return False
 
 
 def _extract_vote_user_ids(result: Any) -> list[str]:
