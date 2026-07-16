@@ -16,6 +16,8 @@ from komari_bot.common.management_api import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
     from .managed_resources import ManagedConfigResource
 
 API_PREFIX = "/api/komari-management-config/v1"
@@ -135,7 +137,7 @@ def _resolve_resource(
 
 def create_config_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     resources: Sequence[ManagedConfigResource],
 ) -> APIRouter:
     """创建配置文件管理路由。"""
@@ -193,7 +195,7 @@ def create_config_router(
 def register_config_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     resources: Sequence[ManagedConfigResource],
 ) -> None:

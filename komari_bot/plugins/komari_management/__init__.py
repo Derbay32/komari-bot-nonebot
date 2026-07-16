@@ -207,6 +207,7 @@ state.api_registered = register_management_api_for_driver(
     config=config_manager.get(),
     component_loader=_load_management_components,
     logger=logger,
+    api_token_getter=lambda: config_manager.get().api_token,
 )
 
 

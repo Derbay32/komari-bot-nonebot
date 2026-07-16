@@ -19,6 +19,8 @@ from komari_bot.common.prompt_storage import load_prompt_values, save_prompt_val
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
     from .managed_resources import ManagedPromptResource
 
 API_PREFIX = "/api/komari-management-prompt/v1"
@@ -144,7 +146,7 @@ def _resolve_resource(
 
 def create_prompt_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     resources: Sequence[ManagedPromptResource],
 ) -> APIRouter:
     """创建提示词管理路由。"""
@@ -204,7 +206,7 @@ def create_prompt_router(
 def register_prompt_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     resources: Sequence[ManagedPromptResource],
 ) -> None:

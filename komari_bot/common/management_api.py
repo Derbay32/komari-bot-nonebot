@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette import status
 
+type ManagementTokenSource = str | Callable[[], str]
+
 
 @dataclass(frozen=True, slots=True)
 class SharedManagementSettings:
@@ -22,7 +24,7 @@ class SharedManagementSettings:
 
 
 def create_bearer_auth_dependency(
-    api_token: str,
+    api_token: ManagementTokenSource,
     *,
     detail: str = "未授权访问管理接口",
 ) -> Callable[[HTTPAuthorizationCredentials | None], Any]:
@@ -45,7 +47,13 @@ def create_bearer_auth_dependency(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=detail,
             )
-        if not secrets.compare_digest(token, api_token):
+        current_token = api_token() if callable(api_token) else api_token
+        if not isinstance(current_token, str) or not current_token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=detail,
+            )
+        if not secrets.compare_digest(token, current_token.strip()):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=detail,

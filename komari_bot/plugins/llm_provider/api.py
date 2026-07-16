@@ -16,6 +16,8 @@ from komari_bot.common.management_api import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/llm-provider/v1"
 
 
@@ -99,7 +101,7 @@ def _reply_log_not_found(date: str, line_number: int) -> HTTPException:
 
 def create_llm_provider_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     reader_getter: Callable[[], ReplyLogReaderProtocol | None],
 ) -> APIRouter:
     """创建 llm_provider reply 日志路由。"""
@@ -180,7 +182,7 @@ def create_llm_provider_router(
 def register_llm_provider_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     reader_getter: Callable[[], ReplyLogReaderProtocol | None],
 ) -> None:

@@ -27,6 +27,8 @@ from .api_models import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/komari-memory/v1"
 
 
@@ -265,7 +267,7 @@ def _resolve_interaction_event_patch_params(
 
 def create_memory_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     service_getter: Callable[[], MemoryServiceProtocol | None],
 ) -> APIRouter:
     """创建记忆库管理路由。"""
@@ -588,7 +590,7 @@ def create_memory_router(
 def register_memory_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     service_getter: Callable[[], MemoryServiceProtocol | None],
 ) -> None:

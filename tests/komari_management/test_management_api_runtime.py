@@ -183,6 +183,48 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert logger.warning_messages == []
 
 
+@pytest.mark.asyncio
+async def test_registered_api_uses_current_token_after_rotation(app: App) -> None:
+    api_app = _build_api_app()
+    logger = _FakeLogger()
+    token_state = {"value": "old-token"}
+    config = SimpleNamespace(
+        plugin_enable=True,
+        api_token="old-token",
+        api_allowed_origins=[],
+    )
+
+    registered = register_management_api_for_driver(
+        driver=_FakeDriver("fastapi", api_app),
+        config=config,
+        component_loader=_build_components,
+        logger=logger,
+        api_token_getter=lambda: token_state["value"],
+    )
+
+    assert registered is True
+    async with app.test_server(asgi=cast("Any", api_app)) as ctx:
+        client = ctx.get_client()
+        before_rotation = await client.get(
+            "/api/komari-knowledge/v1/knowledge",
+            headers={"Authorization": "Bearer old-token"},
+        )
+
+        token_state["value"] = "new-token"
+        old_token_after_rotation = await client.get(
+            "/api/komari-knowledge/v1/knowledge",
+            headers={"Authorization": "Bearer old-token"},
+        )
+        new_token_after_rotation = await client.get(
+            "/api/komari-knowledge/v1/knowledge",
+            headers={"Authorization": "Bearer new-token"},
+        )
+
+    assert before_rotation.status_code == 503
+    assert old_token_after_rotation.status_code == 401
+    assert new_token_after_rotation.status_code == 503
+
+
 def test_register_management_api_skips_disabled_config() -> None:
     logger = _FakeLogger()
 

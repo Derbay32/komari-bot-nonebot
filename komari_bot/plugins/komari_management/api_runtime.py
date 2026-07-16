@@ -26,6 +26,8 @@ USER_BAN_API_PREFIX = "/api/komari-user-bans/v1"
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
     from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
 
@@ -53,6 +55,7 @@ def register_management_api_for_driver(
     config: object,
     component_loader: Callable[[], ManagementApiComponents],
     logger: Any,
+    api_token_getter: Callable[[], str] | None = None,
 ) -> bool:
     """按驱动与集中配置决定是否挂载统一管理 API。"""
     if not getattr(config, "plugin_enable", False):
@@ -74,51 +77,54 @@ def register_management_api_for_driver(
         return False
 
     components = component_loader()
+    token_source: ManagementTokenSource = (
+        settings.api_token if api_token_getter is None else api_token_getter
+    )
     components.register_knowledge_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         engine_getter=components.knowledge_engine_getter,
     )
     components.register_help_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         engine_getter=components.help_engine_getter,
     )
     components.register_memory_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         service_getter=components.memory_service_getter,
     )
     components.register_llm_provider_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         reader_getter=components.reply_log_reader_getter,
     )
     components.register_user_ban_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         service_getter=components.user_ban_service_getter,
     )
     register_config_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         resources=components.config_resources,
     )
     register_prompt_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         resources=components.prompt_resources,
     )
     register_announce_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
         status_page_url=getattr(
             config,
@@ -139,7 +145,7 @@ def register_management_api_for_driver(
     )
     register_scene_api(
         server_app,
-        api_token=settings.api_token,
+        api_token=token_source,
         allowed_origins=settings.allowed_origins,
     )
     docs_url = getattr(server_app, "docs_url", None) or "未启用"

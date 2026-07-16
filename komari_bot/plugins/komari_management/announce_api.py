@@ -17,6 +17,8 @@ from komari_bot.common.management_api import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/komari-announce/v1"
 
 
@@ -95,7 +97,7 @@ def _build_group_info(raw_group: dict[str, Any]) -> GroupInfo:
 
 def create_announce_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     status_page_url: str,
     announce_max_group_count: int = 20,
     announce_send_interval_seconds: float = 1.0,
@@ -203,7 +205,7 @@ def create_announce_router(
 def register_announce_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     status_page_url: str,
     announce_max_group_count: int = 20,

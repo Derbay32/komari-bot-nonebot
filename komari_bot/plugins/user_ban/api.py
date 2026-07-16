@@ -36,6 +36,8 @@ from .service import BanServiceUnavailableError, UserBanService, get_service
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/komari-user-bans/v1"
 MANAGEMENT_API_OPERATOR_ID = "management_api"
 
@@ -182,7 +184,7 @@ def _storage_error(error: BanServiceUnavailableError) -> HTTPException:
 
 def create_user_ban_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     service_getter: Callable[[], UserBanService] = get_service,
 ) -> APIRouter:
     """创建用户封禁管理路由。"""
@@ -290,7 +292,7 @@ def create_user_ban_router(
 def register_user_ban_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     service_getter: Callable[[], UserBanService] = get_service,
 ) -> None:

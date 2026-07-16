@@ -28,6 +28,8 @@ from .scanner import scan_and_sync
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/komari-help/v1"
 
 
@@ -116,7 +118,7 @@ def _resolve_update_params(payload: HelpUpdateRequest) -> dict[str, Any]:
 
 def create_help_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     engine_getter: Callable[[], HelpEngineProtocol | None],
 ) -> APIRouter:
     auth_dependency = create_bearer_auth_dependency(
@@ -223,7 +225,7 @@ def create_help_router(
 def register_help_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     engine_getter: Callable[[], HelpEngineProtocol | None],
 ) -> None:

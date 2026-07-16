@@ -23,6 +23,8 @@ from komari_bot.plugins.komari_decision.repositories.scene_repository import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/komari-decision-scenes/v1"
 _REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
 _fallback_repository: SceneRepository | None = None
@@ -170,7 +172,7 @@ def _validate_required_fixed_update(scene_key: str, scene_type: str, *, enabled:
         raise _validation_error(msg)
 
 
-def create_scene_router(*, api_token: str) -> APIRouter:
+def create_scene_router(*, api_token: ManagementTokenSource) -> APIRouter:
     """创建 Komari Decision scenes 管理路由。"""
     auth_dependency = create_bearer_auth_dependency(
         api_token,
@@ -277,7 +279,7 @@ def create_scene_router(*, api_token: str) -> APIRouter:
 def register_scene_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
 ) -> None:
     """注册 Komari Decision scenes 管理 API。"""
