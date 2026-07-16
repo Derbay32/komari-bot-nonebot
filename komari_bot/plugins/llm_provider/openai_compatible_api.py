@@ -527,7 +527,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             )
             return result
 
-    async def test_connection(self) -> bool:
+    async def test_connection(self, model: str | None = None) -> bool:
         """测试 API 连接。
 
         Returns:
@@ -536,7 +536,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         config = config_manager.get()
         try:
             await self.client.chat.completions.create(
-                model=config.model,
+                model=model or config.model,
                 messages=cast(
                     "Any",
                     apply_llm_security_boundary(

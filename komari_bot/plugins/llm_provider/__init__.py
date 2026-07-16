@@ -6,16 +6,21 @@ from collections import deque
 from collections.abc import Callable
 from typing import Any, Literal
 
-from nonebot import logger
+from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.untrusted_context import UntrustedContext
 
 from .api import register_llm_provider_api
 from .base_client import LLMCompletionResultSchema, UnifiedUsageSchema
+from .client_pool import ClientSettings, LLMClientPool
 from .config import Config
 from .config_schema import DynamicConfigSchema
-from .llm_logger import build_content_summary, log_llm_call
+from .llm_logger import (
+    build_content_summary,
+    log_llm_call,
+    shutdown_llm_logging,
+)
 from .openai_compatible_api import OpenAICompatibleClient
 from .reply_log_reader import ReplyLogReader
 
@@ -325,17 +330,24 @@ def _build_messages_log_input(
     return input_data
 
 
-def _get_client() -> OpenAICompatibleClient:
-    """获取 LLM 客户端实例。"""
-    config = config_manager.get()
-    token = config.api_token
-    if not token:
-        raise ValueError("API Token 未配置，请在配置中设置 api_token")  # noqa: TRY003
+def _get_client_settings() -> ClientSettings:
+    """读取影响 HTTP 连接的动态配置快照。"""
+    return ClientSettings.from_config(config_manager.get())
+
+
+def _create_client(settings: ClientSettings) -> OpenAICompatibleClient:
+    """按配置快照创建候选客户端。"""
     return OpenAICompatibleClient(
-        token,
-        base_url=str(config.api_base),
-        timeout_seconds=float(config.timeout_seconds),
+        settings.api_token,
+        base_url=settings.base_url,
+        timeout_seconds=settings.timeout_seconds,
     )
+
+
+_client_pool = LLMClientPool(
+    settings_getter=_get_client_settings,
+    client_factory=_create_client,
+)
 
 
 def _get_completion_content(result: LLMCompletionResultSchema | str) -> str:
@@ -467,7 +479,6 @@ async def generate_text(
     Returns:
         生成的文本
     """
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -497,17 +508,17 @@ async def generate_text(
             )
 
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text(
-            prompt=prompt,
-            model=model,
-            system_instruction=final_system_instruction,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            untrusted_contexts=request_contexts,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=final_system_instruction,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                untrusted_contexts=request_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -568,9 +579,6 @@ async def generate_text(
                 usage=usage,
             )
         return content
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def generate_completion(
@@ -592,7 +600,6 @@ async def generate_completion(
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """生成统一完成结果。"""
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -623,20 +630,20 @@ async def generate_completion(
             )
 
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text(
-            prompt=prompt,
-            model=model,
-            system_instruction=final_system_instruction,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            untrusted_contexts=request_contexts,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=final_system_instruction,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                untrusted_contexts=request_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -695,9 +702,6 @@ async def generate_completion(
                 usage=result.usage,
             )
         return result
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def generate_text_with_messages(
@@ -725,7 +729,6 @@ async def generate_text_with_messages(
     Returns:
         生成的文本
     """
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -744,16 +747,16 @@ async def generate_text_with_messages(
             payload_summary["image_url_chars"],
         )
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text_with_messages(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            untrusted_contexts=untrusted_contexts,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text_with_messages(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                untrusted_contexts=untrusted_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -805,9 +808,6 @@ async def generate_text_with_messages(
                 usage=usage,
             )
         return content
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def generate_messages_completion(
@@ -825,7 +825,6 @@ async def generate_messages_completion(
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """使用 messages 生成统一完成结果。"""
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -845,19 +844,19 @@ async def generate_messages_completion(
             len(tools or []),
         )
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text_with_messages(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            untrusted_contexts=untrusted_contexts,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text_with_messages(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                untrusted_contexts=untrusted_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -906,9 +905,6 @@ async def generate_messages_completion(
                 usage=result.usage,
             )
         return result
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def test_connection() -> bool:
@@ -923,12 +919,19 @@ async def test_connection() -> bool:
         logger.warning("API Token 未配置，跳过连接测试")
         return False
 
-    client = OpenAICompatibleClient(
-        token,
-        base_url=str(config.api_base),
-        timeout_seconds=float(config.timeout_seconds),
-    )
-    try:
-        return await client.test_connection()
-    finally:
-        await client.close()
+    async with _client_pool.acquire() as client:
+        return await client.test_connection(config.model)
+
+
+try:
+    driver = get_driver()
+except ValueError:
+    driver = None
+
+if driver is not None:
+
+    @driver.on_shutdown
+    async def _shutdown_provider_resources() -> None:
+        """在进程退出时排空日志，并关闭复用的 HTTP 连接。"""
+        await shutdown_llm_logging()
+        await _client_pool.close()

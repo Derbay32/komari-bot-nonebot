@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
+from contextlib import asynccontextmanager
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +16,7 @@ from pydantic import ValidationError
 from komari_bot.common.llm_log_safety import sanitize_log_text
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
 from komari_bot.plugins.llm_provider.base_client import (
@@ -23,6 +27,20 @@ from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 llm_provider_module = import_module("komari_bot.plugins.llm_provider.__init__")
 llm_logger_module = import_module("komari_bot.plugins.llm_provider.llm_logger")
+
+
+async def _log_and_flush(**kwargs: Any) -> None:
+    await llm_logger_module.log_llm_call(**kwargs)
+    await llm_logger_module.flush_llm_logs()
+
+
+class _FakeClientPool:
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        yield self.client
 
 
 class _FakeClient:
@@ -51,7 +69,9 @@ class _FakeCompletionClient:
     async def generate_text(self, **_kwargs: Any) -> LLMCompletionResultSchema:
         return self.response
 
-    async def generate_text_with_messages(self, **_kwargs: Any) -> LLMCompletionResultSchema:
+    async def generate_text_with_messages(
+        self, **_kwargs: Any
+    ) -> LLMCompletionResultSchema:
         return self.response
 
     async def close(self) -> None:
@@ -84,7 +104,7 @@ def test_log_llm_call_persists_only_fingerprints_and_private_directory(
     }
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data=full_input,
@@ -122,7 +142,12 @@ def test_dynamic_config_schema_accepts_log_settings() -> None:
     assert config.llm_log_retention_days == 30
 
     for mode in ("0o700", "0o750", ""):
-        assert DynamicConfigSchema(llm_log_dir_permission_mode=mode).llm_log_dir_permission_mode == mode
+        assert (
+            DynamicConfigSchema(
+                llm_log_dir_permission_mode=mode
+            ).llm_log_dir_permission_mode
+            == mode
+        )
 
 
 def test_log_file_contains_no_sensitive_canary_from_any_payload_layer(
@@ -143,7 +168,7 @@ def test_log_file_contains_no_sensitive_canary_from_any_payload_layer(
     monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_messages_completion",
             model="deepseek-chat",
             input_data={
@@ -352,7 +377,7 @@ def test_log_llm_call_tightens_existing_directory_permission(
     )
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data="prompt",
@@ -366,13 +391,14 @@ def test_log_llm_call_tightens_existing_directory_permission(
     chmod_calls: list[int] = []
 
     def _count_chmod(self: Path, mode: int) -> None:
-        chmod_calls.append(mode)
+        if self == log_dir:
+            chmod_calls.append(mode)
         original_chmod(self, mode)
 
     monkeypatch.setattr(type(log_dir), "chmod", _count_chmod)
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data="prompt",
@@ -393,13 +419,14 @@ def test_log_llm_call_skips_chmod_when_permission_mode_is_empty(
     monkeypatch.setattr(llm_logger_module, "_get_log_dir_permission_mode", lambda: "")
     chmod_calls: list[int] = []
 
-    def _count_chmod(_self: Path, mode: int) -> None:
-        chmod_calls.append(mode)
+    def _count_chmod(self: Path, mode: int) -> None:
+        if self == log_dir:
+            chmod_calls.append(mode)
 
     monkeypatch.setattr(type(log_dir), "chmod", _count_chmod)
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data="prompt",
@@ -418,16 +445,19 @@ def test_log_llm_call_continues_when_permission_mode_is_invalid(
     log_dir = tmp_path / "llm_provider"
     monkeypatch.setattr(llm_logger_module, "_LOG_DIR", log_dir)
     monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
-    monkeypatch.setattr(llm_logger_module, "_get_log_dir_permission_mode", lambda: "bad")
+    monkeypatch.setattr(
+        llm_logger_module, "_get_log_dir_permission_mode", lambda: "bad"
+    )
     chmod_calls: list[int] = []
 
-    def _count_chmod(_self: Path, mode: int) -> None:
-        chmod_calls.append(mode)
+    def _count_chmod(self: Path, mode: int) -> None:
+        if self == log_dir:
+            chmod_calls.append(mode)
 
     monkeypatch.setattr(type(log_dir), "chmod", _count_chmod)
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data="prompt",
@@ -446,7 +476,9 @@ def test_generate_text_does_not_record_log_by_default(monkeypatch: Any) -> None:
     async def _fake_log_llm_call(**kwargs: Any) -> None:
         log_calls.append(kwargs)
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
 
     result = asyncio.run(
@@ -457,7 +489,7 @@ def test_generate_text_does_not_record_log_by_default(monkeypatch: Any) -> None:
     )
 
     assert result == "普通调用结果"
-    assert fake_client.closed is True
+    assert fake_client.closed is False
     assert log_calls == []
 
 
@@ -471,7 +503,9 @@ def test_generate_text_error_log_does_not_include_upstream_body(
     def capture_error(message: object, *args: object, **_kwargs: object) -> None:
         logged_parts.append(f"{message!s} {args!r}")
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module.logger, "error", capture_error)
 
     with pytest.raises(RuntimeError, match=canary):
@@ -482,7 +516,7 @@ def test_generate_text_error_log_does_not_include_upstream_body(
             )
         )
 
-    assert fake_client.closed is True
+    assert fake_client.closed is False
     assert canary not in " ".join(logged_parts)
     assert "RuntimeError" in " ".join(logged_parts)
 
@@ -496,7 +530,9 @@ def test_generate_text_with_messages_records_log_for_chat_reply(
     async def _fake_log_llm_call(**kwargs: Any) -> None:
         log_calls.append(kwargs)
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
 
     result = asyncio.run(
@@ -509,7 +545,7 @@ def test_generate_text_with_messages_records_log_for_chat_reply(
     )
 
     assert result == "<content>聊天回复</content>"
-    assert fake_client.closed is True
+    assert fake_client.closed is False
     assert len(log_calls) == 1
     assert log_calls[0]["method"] == "generate_text_with_messages"
     assert log_calls[0]["input_data"]["trace_id"] == "chat-1001"
@@ -526,7 +562,9 @@ def test_generate_text_records_only_request_fingerprints(monkeypatch: Any) -> No
         assert limit == 2
         return [type("Knowledge", (), {"content": "知识库内容"})()]
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
     monkeypatch.setattr(
         llm_provider_module.knowledge_plugin,
@@ -597,7 +635,9 @@ def test_generate_messages_completion_records_only_safe_metadata(
     async def _fake_log_llm_call(**kwargs: Any) -> None:
         log_calls.append(kwargs)
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
 
     messages = [{"role": "user", "content": "完整 messages 原文"}]
@@ -619,17 +659,16 @@ def test_generate_messages_completion_records_only_safe_metadata(
     )
 
     assert result == response
-    assert fake_client.closed is True
+    assert fake_client.closed is False
     log_call = log_calls[0]
     input_data = log_call["input_data"]
     serialized_input = json.dumps(input_data, ensure_ascii=False)
-    assert input_data["payload_summary"]["sha256"] == (
-        llm_logger_module.build_content_summary(messages)["sha256"]
+    assert (
+        input_data["payload_summary"]["sha256"]
+        == (llm_logger_module.build_content_summary(messages)["sha256"])
     )
     assert input_data["tools_count"] == 1
-    assert input_data["tools_summary"] == llm_logger_module.build_content_summary(
-        tools
-    )
+    assert input_data["tools_summary"] == llm_logger_module.build_content_summary(tools)
     assert input_data["tool_choice_summary"] == (
         llm_logger_module.build_content_summary("auto")
     )
@@ -648,7 +687,9 @@ def test_generate_messages_completion_records_only_safe_metadata(
     assert log_call["finish_reason"] == "stop"
 
 
-def test_log_llm_call_records_full_usage_fields(monkeypatch: Any, tmp_path: Path) -> None:
+def test_log_llm_call_records_full_usage_fields(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
     monkeypatch.setattr(llm_logger_module, "_LOG_DIR", tmp_path / "llm_provider")
     monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
 
@@ -662,7 +703,7 @@ def test_log_llm_call_records_full_usage_fields(monkeypatch: Any, tmp_path: Path
     )
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_completion",
             model="deepseek-chat",
             input_data={"prompt": "测试"},
@@ -697,7 +738,7 @@ def test_log_llm_call_skips_none_usage_fields(monkeypatch: Any, tmp_path: Path) 
     )
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data="prompt",
@@ -721,12 +762,14 @@ def test_log_llm_call_skips_none_usage_fields(monkeypatch: Any, tmp_path: Path) 
     assert "total_tokens" not in record["usage"]
 
 
-def test_log_llm_call_without_usage_omits_usage_key(monkeypatch: Any, tmp_path: Path) -> None:
+def test_log_llm_call_without_usage_omits_usage_key(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
     monkeypatch.setattr(llm_logger_module, "_LOG_DIR", tmp_path / "llm_provider")
     monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
 
     asyncio.run(
-        llm_logger_module.log_llm_call(
+        _log_and_flush(
             method="generate_text",
             model="deepseek-chat",
             input_data="prompt",
@@ -758,7 +801,9 @@ def test_generate_completion_records_usage_in_jsonl(monkeypatch: Any) -> None:
     async def _fake_log_llm_call(**kwargs: Any) -> None:
         log_calls.append(kwargs)
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
 
     result = asyncio.run(
@@ -801,7 +846,9 @@ def test_generate_messages_completion_records_usage_with_duration(
     async def _fake_log_llm_call(**kwargs: Any) -> None:
         log_calls.append(kwargs)
 
-    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        llm_provider_module, "_client_pool", _FakeClientPool(fake_client)
+    )
     monkeypatch.setattr(llm_provider_module, "log_llm_call", _fake_log_llm_call)
 
     result = asyncio.run(
@@ -817,3 +864,48 @@ def test_generate_messages_completion_records_usage_with_duration(
     assert result.usage.input_tokens == 30
     assert result.duration_ms is not None
     assert log_calls[0]["usage"] == usage
+
+
+def test_bounded_log_writer_never_blocks_producer_when_queue_is_full(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    written_batches: list[int] = []
+
+    def _slow_write(batch: list[Any]) -> None:
+        written_batches.append(len(batch))
+        started.set()
+        release.wait(timeout=2)
+
+    monkeypatch.setattr(llm_logger_module, "_LOG_QUEUE_MAX_SIZE", 1)
+    monkeypatch.setattr(llm_logger_module, "_write_log_batch_sync", _slow_write)
+    writer = llm_logger_module._AsyncLogWriter()
+    item = llm_logger_module._LogWriteItem(
+        log_file=tmp_path / "2026-07-16.jsonl",
+        line="{}\n",
+        permission_mode="0o700",
+    )
+
+    async def _run() -> None:
+        assert writer.enqueue(item) is True
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+
+        started_at = time.monotonic()
+        assert writer.enqueue(item) is True
+        assert writer.enqueue(item) is False
+        assert time.monotonic() - started_at < 0.05
+        assert writer.dropped_count == 1
+
+        release.set()
+        await writer.flush()
+        await writer.shutdown()
+
+    asyncio.run(_run())
+
+    assert written_batches == [1, 1]
