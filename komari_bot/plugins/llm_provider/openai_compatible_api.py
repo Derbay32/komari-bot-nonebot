@@ -1,11 +1,16 @@
 """OpenAI 兼容 API 客户端。"""
 
 import json
-from typing import Any, Never
+from typing import Any, Never, cast
 
 from nonebot import logger
 from nonebot.plugin import require
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, OpenAIError
+
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    apply_llm_security_boundary,
+)
 
 from .base_client import (
     BaseLLMClient,
@@ -266,6 +271,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """生成文本（支持 JSON 模式）。
@@ -301,10 +307,14 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  tools_count: {len(tools or [])}\n"
                 f"  has_response_format: {response_format is not None}"
             )
-            messages = []
+            messages: list[dict[str, Any]] = []
             if system_instruction:
                 messages.append({"role": "system", "content": system_instruction})
             messages.append({"role": "user", "content": prompt})
+            messages = apply_llm_security_boundary(
+                messages,
+                untrusted_contexts=untrusted_contexts,
+            )
 
             request_data = {
                 "model": model,
@@ -399,6 +409,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 直接生成文本（支持多模态）。
@@ -420,9 +431,13 @@ class OpenAICompatibleClient(BaseLLMClient):
                 self._resolve_thinking_params(model, **kwargs)
             )
 
+            safe_messages = apply_llm_security_boundary(
+                messages,
+                untrusted_contexts=untrusted_contexts,
+            )
             request_data = {
                 "model": model,
-                "messages": messages,
+                "messages": safe_messages,
                 "temperature": temperature
                 if temperature is not None
                 else config.temperature,
@@ -470,7 +485,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             logger.debug(
                 f"OpenAI 兼容 API 请求 (messages):\n"
                 f"  model: {model}\n"
-                f"  messages: {len(messages)} turns\n"
+                f"  messages: {len(safe_messages)} turns\n"
                 f"  temperature: {request_data['temperature']}\n"
                 f"  max_tokens: {request_data['max_tokens']}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
@@ -522,7 +537,12 @@ class OpenAICompatibleClient(BaseLLMClient):
         try:
             await self.client.chat.completions.create(
                 model=config.model,
-                messages=[{"role": "user", "content": "你好"}],
+                messages=cast(
+                    "Any",
+                    apply_llm_security_boundary(
+                        [{"role": "user", "content": "你好"}]
+                    ),
+                ),
                 temperature=0.1,
                 max_tokens=10,
             )

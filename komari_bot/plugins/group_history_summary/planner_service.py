@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING, Any, cast
 from nonebot import logger
 from nonebot.plugin import require
 
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    render_untrusted_context,
+)
+
 from .prompt_template import get_template
 
 if TYPE_CHECKING:
@@ -28,6 +33,9 @@ character_binding = require("character_binding")
 RECENT_SOURCE = "recent_group_messages"
 USER_SOURCE = "messages_by_user"
 TOPIC_SOURCE = "messages_by_topic"
+_PLANNER_MESSAGE_PREVIEW_LIMIT = 12
+_PLANNER_MESSAGE_CONTENT_LIMIT = 240
+_PLANNER_TOOL_RESULT_MAX_CHARS = 8_000
 
 
 @dataclass(slots=True)
@@ -253,27 +261,37 @@ async def _fetch_history_window(
 
 
 def _serialize_tool_result(result: SummaryToolResult) -> str:
+    preview_messages = result.messages[-_PLANNER_MESSAGE_PREVIEW_LIMIT:]
     payload = {
         "source": result.source,
         "matched_count": result.matched_count,
+        "preview_count": len(preview_messages),
+        "omitted_count": max(0, len(result.messages) - len(preview_messages)),
         "filters": result.filters,
         "messages": [
             {
                 "timestamp": message.timestamp,
                 "user_id": message.user_id,
                 "nickname": message.nickname,
-                "content": message.content,
+                "content": message.content[:_PLANNER_MESSAGE_CONTENT_LIMIT],
             }
-            for message in result.messages
+            for message in preview_messages
         ],
     }
-    return json.dumps(payload, ensure_ascii=False)
+    return render_untrusted_context(
+        UntrustedContext(
+            source_type="group_history",
+            source_id=result.source,
+            content=json.dumps(payload, ensure_ascii=False),
+        ),
+        max_chars=_PLANNER_TOOL_RESULT_MAX_CHARS,
+    )
 
 
 def _build_planning_messages(user_request: str) -> list[dict[str, Any]]:
     template = get_template()
     return [
-        {"role": "user", "content": template["planning_system_prompt"]},
+        {"role": "system", "content": template["planning_system_prompt"]},
         {"role": "user", "content": user_request},
     ]
 

@@ -29,11 +29,14 @@ class _FakeClient:
     def __init__(self, response: str) -> None:
         self.response = response
         self.closed = False
+        self.calls: list[dict[str, Any]] = []
 
-    async def generate_text(self, **_kwargs: Any) -> str:
+    async def generate_text(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
         return self.response
 
-    async def generate_text_with_messages(self, **_kwargs: Any) -> str:
+    async def generate_text_with_messages(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
         return self.response
 
     async def close(self) -> None:
@@ -556,7 +559,9 @@ def test_generate_text_records_only_request_fingerprints(monkeypatch: Any) -> No
         "完整 prompt"
     )
     assert input_data["system_instruction_summary"] == (
-        llm_logger_module.build_content_summary("系统 知识库内容")
+        llm_logger_module.build_content_summary(
+            "系统 相关知识已作为独立的不可信数据块提供。"
+        )
     )
     assert input_data["temperature"] == 1
     assert input_data["max_tokens"] == 128
@@ -572,6 +577,10 @@ def test_generate_text_records_only_request_fingerprints(monkeypatch: Any) -> No
     assert "完整 prompt" not in serialized_input
     assert "知识库内容" not in serialized_input
     assert "查询词" not in serialized_input
+    assert "知识库内容" not in fake_client.calls[0]["system_instruction"]
+    [knowledge_context] = fake_client.calls[0]["untrusted_contexts"]
+    assert knowledge_context.source_type == "knowledge"
+    assert knowledge_context.content == "知识库内容"
 
 
 def test_generate_messages_completion_records_only_safe_metadata(

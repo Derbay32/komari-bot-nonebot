@@ -9,6 +9,8 @@ from typing import Any, Literal
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.untrusted_context import UntrustedContext
+
 from .api import register_llm_provider_api
 from .base_client import LLMCompletionResultSchema, UnifiedUsageSchema
 from .config import Config
@@ -48,6 +50,7 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
+    "UntrustedContext",
     "generate_completion",
     "generate_messages_completion",
     "generate_text",
@@ -66,6 +69,10 @@ config_manager = config_manager_plugin.get_config_manager(
 )
 _reply_log_reader = ReplyLogReader()
 _RATE_LIMIT_WINDOW_SECONDS = 60.0
+_KNOWLEDGE_PLACEHOLDER = "{{DYNAMIC_KNOWLEDGE_BASE}}"
+_KNOWLEDGE_CONTEXT_NOTICE = "相关知识已作为独立的不可信数据块提供。"
+_MAX_KNOWLEDGE_CONTEXTS = 10
+_MAX_KNOWLEDGE_CONTEXT_CHARS = 4_000
 
 
 class _AsyncSlidingWindowRateLimiter:
@@ -370,6 +377,63 @@ def _get_tool_calls_count(result: LLMCompletionResultSchema | str) -> int:
     return 0
 
 
+async def _load_knowledge_contexts(
+    *,
+    enabled: bool,
+    query: str,
+    limit: int,
+) -> list[UntrustedContext]:
+    """检索知识并保留来源信息，不拼入 system prompt。"""
+    if not enabled:
+        return []
+
+    try:
+        results = await knowledge_plugin.search_knowledge(query, limit=limit)
+    except Exception as exc:
+        logger.warning(
+            "[LLM Provider] 知识库检索失败: error_type={}",
+            type(exc).__name__,
+        )
+        return []
+
+    contexts: list[UntrustedContext] = []
+    for index, result in enumerate(results[:_MAX_KNOWLEDGE_CONTEXTS], start=1):
+        content = getattr(result, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        contexts.append(
+            UntrustedContext(
+                source_type="knowledge",
+                source_id=(
+                    f"{getattr(result, 'source', 'unknown')}:"
+                    f"{getattr(result, 'id', index)}"
+                ),
+                content=content,
+                trust_level="low",
+                max_chars=_MAX_KNOWLEDGE_CONTEXT_CHARS,
+            )
+        )
+    if contexts:
+        logger.info("[LLM Provider] 已检索到 {} 条相关知识", len(contexts))
+    return contexts
+
+
+def _prepare_untrusted_request_contexts(
+    *,
+    system_instruction: str | None,
+    provided_contexts: list[UntrustedContext] | None,
+    knowledge_contexts: list[UntrustedContext],
+) -> tuple[str, list[UntrustedContext]]:
+    """移除旧知识占位符，并合并调用方与检索上下文。"""
+    contexts = [*(provided_contexts or []), *knowledge_contexts]
+    replacement = _KNOWLEDGE_CONTEXT_NOTICE if knowledge_contexts else ""
+    final_system_instruction = (system_instruction or "").replace(
+        _KNOWLEDGE_PLACEHOLDER,
+        replacement,
+    )
+    return final_system_instruction, contexts
+
+
 async def generate_text(
     prompt: str,
     model: str,
@@ -382,6 +446,7 @@ async def generate_text(
     enable_knowledge: bool = False,
     response_format: dict | None = None,
     record_chat_log: bool = False,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """生成文本（简单 prompt 模式）。
@@ -409,27 +474,17 @@ async def generate_text(
     final_system_instruction = system_instruction or ""
 
     try:
-        # 知识库检索
-        knowledge_context = ""
-        if enable_knowledge:
-            try:
-                query = knowledge_query or prompt
-                results = await knowledge_plugin.search_knowledge(
-                    query, limit=knowledge_limit
-                )
-                if results:
-                    knowledge_context = "\n".join(result.content for result in results)
-                    logger.info(f"[LLM Provider] 已检索到 {len(results)} 条相关知识")
-            except Exception as exc:
-                logger.warning(
-                    "[LLM Provider] 知识库检索失败: error_type={}",
-                    type(exc).__name__,
-                )
-
-        # 构建系统指令：处理占位符
-        placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
-        final_system_instruction = (system_instruction or "").replace(
-            placeholder, knowledge_context
+        knowledge_contexts = await _load_knowledge_contexts(
+            enabled=enable_knowledge,
+            query=knowledge_query or prompt,
+            limit=knowledge_limit,
+        )
+        final_system_instruction, request_contexts = (
+            _prepare_untrusted_request_contexts(
+                system_instruction=system_instruction,
+                provided_contexts=untrusted_contexts,
+                knowledge_contexts=knowledge_contexts,
+            )
         )
         if request_trace_id:
             logger.info(
@@ -450,6 +505,7 @@ async def generate_text(
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            untrusted_contexts=request_contexts,
             **kwargs,
         )
     except Exception as e:
@@ -532,6 +588,7 @@ async def generate_completion(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """生成统一完成结果。"""
@@ -542,25 +599,17 @@ async def generate_completion(
     final_system_instruction = system_instruction or ""
 
     try:
-        knowledge_context = ""
-        if enable_knowledge:
-            try:
-                query = knowledge_query or prompt
-                results = await knowledge_plugin.search_knowledge(
-                    query, limit=knowledge_limit
-                )
-                if results:
-                    knowledge_context = "\n".join(result.content for result in results)
-                    logger.info(f"[LLM Provider] 已检索到 {len(results)} 条相关知识")
-            except Exception as exc:
-                logger.warning(
-                    "[LLM Provider] 知识库检索失败: error_type={}",
-                    type(exc).__name__,
-                )
-
-        placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
-        final_system_instruction = (system_instruction or "").replace(
-            placeholder, knowledge_context
+        knowledge_contexts = await _load_knowledge_contexts(
+            enabled=enable_knowledge,
+            query=knowledge_query or prompt,
+            limit=knowledge_limit,
+        )
+        final_system_instruction, request_contexts = (
+            _prepare_untrusted_request_contexts(
+                system_instruction=system_instruction,
+                provided_contexts=untrusted_contexts,
+                knowledge_contexts=knowledge_contexts,
+            )
         )
         if request_trace_id:
             logger.info(
@@ -585,6 +634,7 @@ async def generate_completion(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
+            untrusted_contexts=request_contexts,
             **kwargs,
         )
     except Exception as e:
@@ -658,6 +708,7 @@ async def generate_text_with_messages(
     response_format: dict | None = None,
     *,
     record_chat_log: bool = False,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -700,6 +751,7 @@ async def generate_text_with_messages(
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            untrusted_contexts=untrusted_contexts,
             **kwargs,
         )
     except Exception as e:
@@ -769,6 +821,7 @@ async def generate_messages_completion(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """使用 messages 生成统一完成结果。"""
@@ -802,6 +855,7 @@ async def generate_messages_completion(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
+            untrusted_contexts=untrusted_contexts,
             **kwargs,
         )
     except Exception as e:

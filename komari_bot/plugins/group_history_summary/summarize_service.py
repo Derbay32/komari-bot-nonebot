@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING
 from nonebot.plugin import require
 
 from komari_bot.common.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    render_untrusted_context,
+)
 
 from .history_service import HistoryMessage, format_message_for_prompt
 from .prompt_template import get_template
@@ -74,11 +78,18 @@ async def _summarize_history_internal(
 
     template = get_template()
     transcript = _build_transcript(history_messages)
+    transcript_context = render_untrusted_context(
+        UntrustedContext(
+            source_type="group_history",
+            source_id=request_trace_id or "group-summary",
+            content=transcript,
+        )
+    )
 
     messages: list[dict[str, object]] = [
-        {"role": "user", "content": template["system_prompt"]},
-        {"role": "user", "content": template["output_instruction"]},
-        {"role": "user", "content": f"<history_messages>\n{transcript}\n</history_messages>"},
+        {"role": "system", "content": template["system_prompt"]},
+        {"role": "system", "content": template["output_instruction"]},
+        {"role": "user", "content": transcript_context},
     ]
     messages = inject_dsv4_instruct_to_first_user_message(
         messages,  # type: ignore[arg-type]

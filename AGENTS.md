@@ -194,7 +194,8 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - collector 由 debug 命令创建并显式向下传递；正常业务调用传 `None`
 
 关键规则：
-- **防注入指令** 在 `_build_safe_system_instruction()` 中注入到 system 角色
+- `llm_provider` 最底层通过 `apply_llm_security_boundary()` 强制追加不可覆盖的安全 system 边界；知识、网页、群历史、引用、画像、视觉描述和工具结果必须使用 `UntrustedContext` 或统一不可信标签传入，禁止拼进 system prompt
+- 不可信上下文必须保留来源类型、来源 ID、信任级别并限制正文长度；工具调用必须使用白名单、对象参数 schema、轮数与总调用预算
 - `max_tokens` 必须为 **`int`**（不能是 `float`），默认 8192
 - 知识库注入：`enable_knowledge=True` 时自动检索并注入到 system prompt
 - 调用日志：所有请求记录到 `logs/llm_provider/`，JSONL 只写入已报告字段

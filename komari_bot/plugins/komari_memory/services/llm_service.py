@@ -8,6 +8,11 @@ from uuid import uuid4
 from nonebot import logger
 from nonebot.plugin import require
 
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    render_untrusted_context,
+)
+
 from ..config_schema import KomariMemoryConfigSchema
 from ..core.retry import retry_async
 from .summary_prompt_template import get_template as get_summary_template
@@ -132,8 +137,21 @@ def _build_summary_messages(
 ) -> list[dict[str, str]]:
     """构建与画像 Agent 共享前缀的三段式总结 messages。"""
     template = get_summary_template()
-    user_content = _build_user_message(conversation_text, participants, display_name_map)
-    user_content += "\n\n请生成对话总结。"
+    external_context = _build_user_message(
+        conversation_text,
+        participants,
+        display_name_map,
+    )
+    user_content = (
+        render_untrusted_context(
+            UntrustedContext(
+                source_type="conversation_history",
+                source_id="memory-summary-input",
+                content=external_context,
+            )
+        )
+        + "\n\n请生成对话总结。"
+    )
     workflow = render_summary_template(
         template["summary_workflow_system"],
         json_response_example=template["json_response_example"],

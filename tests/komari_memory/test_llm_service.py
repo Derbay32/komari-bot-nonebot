@@ -129,14 +129,9 @@ def test_summarize_conversation_uses_json_mode_messages(monkeypatch: Any) -> Non
     assert call["request_phase"] == "summary_json_mode"
     messages = call["messages"]
     assert messages[0]["role"] == "system"
-    assert messages[1]["content"] == (
-        "【群聊记录】\n"
-        "[user_id:10001] 阿明: 周末一起吃拉面吧\n"
-        "[user_id:10002] 小绿: 好呀\n\n"
-        '【参与用户 user_id】\n["10001", "10002"]\n\n'
-        '【昵称映射】\n{"10001": "阿明", "10002": "小绿"}\n\n'
-        "请生成对话总结。"
-    )
+    assert 'source_type="conversation_history"' in messages[1]["content"]
+    assert "[user_id:10001] 阿明: 周末一起吃拉面吧" in messages[1]["content"]
+    assert "请生成对话总结。" in messages[1]["content"]
     assert "summary_workflow" not in messages[2]["content"]
 
 
@@ -228,10 +223,10 @@ def test_build_summary_messages_keeps_profile_agent_user_prefix(monkeypatch: Any
 
     assert messages[0] == {"role": "system", "content": "共用系统提示"}
     assert messages[1]["content"].startswith(
-        "【群聊记录】\n[user_id:10001] 阿明: 你好\n\n"
-        '【参与用户 user_id】\n["10001"]\n\n'
-        '【昵称映射】\n{"10001": "阿明"}'
+        '<untrusted_context source_type="conversation_history"'
     )
+    assert "[user_id:10001] 阿明: 你好" in messages[1]["content"]
+    assert '["10001"]' in messages[1]["content"]
     assert messages[1]["content"].endswith("请生成对话总结。")
     assert messages[2] == {"role": "system", "content": '工作流 {"memories": []}'}
 

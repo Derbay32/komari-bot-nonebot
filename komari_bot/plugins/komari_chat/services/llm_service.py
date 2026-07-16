@@ -14,6 +14,11 @@ from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
 from komari_bot.common.profile_operations import profile_traits_to_list
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    UntrustedSourceType,
+    render_untrusted_context,
+)
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )
@@ -54,8 +59,22 @@ _INVALID_FAVORABILITY_DELTA_TYPE_ERROR = (
     "record_favorability_delta.delta 必须是整数且不能是 bool"
 )
 _INVALID_FAVORABILITY_REASON_ERROR = "record_favorability_delta.reason 不能为空"
+_MISSING_TOOL_FUNCTION_ERROR = "工具定义缺少 function"
+_DISALLOWED_TOOL_ERROR = "不允许声明工具"
+_INVALID_TOOL_TYPE_ERROR = "工具类型必须为 function"
+_INVALID_TOOL_SCHEMA_ERROR = "工具缺少对象参数 schema"
+_TOOL_SCHEMA_MISMATCH_ERROR = "工具参数 schema 与内置定义不一致"
 _LLM_COMPLETION_CONCURRENCY_LIMIT = 4
 _LLM_COMPLETION_SEMAPHORE = asyncio.Semaphore(_LLM_COMPLETION_CONCURRENCY_LIMIT)
+_MAX_TOOL_ROUNDS = 6
+_MAX_TOOL_CALLS_PER_ROUND = 4
+_MAX_TOTAL_TOOL_CALLS = 12
+_MAX_TOOL_RESULT_CHARS = 8_000
+_TOOL_SOURCE_TYPES: dict[str, UntrustedSourceType] = {
+    READ_IMAGE_TOOL_NAME: "vision",
+    SEARCH_WEB_TOOL_NAME: "web",
+    READ_PROFILE_TOOL_NAME: "profile",
+}
 
 READ_IMAGE_TOOL: dict[str, Any] = {
     "type": "function",
@@ -72,10 +91,12 @@ READ_IMAGE_TOOL: dict[str, Any] = {
             "properties": {
                 "image_index": {
                     "type": "integer",
+                    "minimum": 0,
                     "description": "要查看的图片序号（从0开始）。0=第一张图片，1=第二张图片，以此类推。",
                 }
             },
             "required": ["image_index"],
+            "additionalProperties": False,
         },
     },
 }
@@ -94,10 +115,13 @@ TAVILY_SEARCH_TOOL: dict[str, Any] = {
             "properties": {
                 "query": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
                     "description": "搜索查询关键词或问题，需简洁准确",
                 }
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
     },
 }
@@ -116,15 +140,19 @@ READ_PROFILE_TOOL: dict[str, Any] = {
             "properties": {
                 "user_id": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
                     "description": "要查询画像的用户 ID，优先使用 <visible_users> 中的 user_id。",
                 },
                 "keys": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": 64},
+                    "maxItems": 16,
                     "description": "可选，只返回这些画像键。省略时返回该用户全部可展示画像。",
                 },
             },
             "required": ["user_id"],
+            "additionalProperties": False,
         },
     },
 }
@@ -142,6 +170,8 @@ FINAL_RESPONSE_TOOL: dict[str, Any] = {
             "properties": {
                 "content": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2_000,
                     "description": "给用户看的回复正文（即要发送出去的消息内容）",
                 },
                 "interaction_history": {
@@ -154,21 +184,26 @@ FINAL_RESPONSE_TOOL: dict[str, Any] = {
                     "properties": {
                         "event": {
                             "type": "string",
+                            "maxLength": 500,
                             "description": "该用户做了什么（一句话描述）",
                         },
                         "result": {
                             "type": "string",
+                            "maxLength": 500,
                             "description": "你的反应（一句话描述）",
                         },
                         "emotion": {
                             "type": "string",
+                            "maxLength": 100,
                             "description": "你当时的感受（简短情绪词或短语）",
                         },
                     },
                     "required": ["event", "result", "emotion"],
+                    "additionalProperties": False,
                 },
             },
             "required": ["content", "interaction_history"],
+            "additionalProperties": False,
         },
     },
 }
@@ -192,12 +227,23 @@ RECORD_FAVORABILITY_DELTA_TOOL: dict[str, Any] = {
                 },
                 "reason": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
                     "description": "一句话说明本轮变化原因，仅用于日志，不会展示给用户。",
                 },
             },
             "required": ["delta", "reason"],
+            "additionalProperties": False,
         },
     },
+}
+
+_CANONICAL_TOOLS = {
+    READ_IMAGE_TOOL_NAME: READ_IMAGE_TOOL,
+    SEARCH_WEB_TOOL_NAME: TAVILY_SEARCH_TOOL,
+    READ_PROFILE_TOOL_NAME: READ_PROFILE_TOOL,
+    FINAL_RESPONSE_TOOL_NAME: FINAL_RESPONSE_TOOL,
+    RECORD_FAVORABILITY_DELTA_TOOL_NAME: RECORD_FAVORABILITY_DELTA_TOOL,
 }
 
 
@@ -647,6 +693,56 @@ def _build_tool_error_result(
     }
 
 
+def _wrap_external_tool_result(
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    content: str,
+) -> str:
+    """把外部工具正文转换为带来源的不可信数据块。"""
+    source_type = _TOOL_SOURCE_TYPES.get(tool_name, "tool_result")
+    return render_untrusted_context(
+        UntrustedContext(
+            source_type=source_type,
+            source_id=f"{tool_name}:{tool_call_id}",
+            content=content,
+        ),
+        max_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+
+def _validate_tool_definitions(
+    tools: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """校验工具白名单和对象参数 schema，并移除重复定义。"""
+    validated: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for tool in tools:
+        if tool.get("type") != "function":
+            raise ValueError(_INVALID_TOOL_TYPE_ERROR)
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise TypeError(_MISSING_TOOL_FUNCTION_ERROR)
+        name = str(function.get("name", "")).strip()
+        canonical_tool = _CANONICAL_TOOLS.get(name)
+        if canonical_tool is None:
+            msg = f"{_DISALLOWED_TOOL_ERROR}: {name or '<empty>'}"
+            raise ValueError(msg)
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict) or parameters.get("type") != "object":
+            msg = f"{_INVALID_TOOL_SCHEMA_ERROR}: {name}"
+            raise ValueError(msg)
+        canonical_parameters = canonical_tool["function"]["parameters"]
+        if parameters != canonical_parameters:
+            msg = f"{_TOOL_SCHEMA_MISMATCH_ERROR}: {name}"
+            raise ValueError(msg)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        validated.append(canonical_tool)
+    return validated
+
+
 @retry_async(max_attempts=3, base_delay=1.0)
 async def _call_llm_completion(**kwargs: Any) -> Any:
     """对 LLM completion 单次请求做瞬时失败重试，不包裹业务工具/解析逻辑。"""
@@ -815,11 +911,6 @@ async def _execute_business_tool(
                 parent_call_id=parent_call_id,
                 collector=collector,
             )
-            message = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }
             if content.startswith("[图片读取失败:"):
                 status = "error"
                 error_summary = "图片读取失败"
@@ -830,11 +921,6 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
             )
-            message = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }
             if content.startswith("[搜索失败"):
                 status = "error"
                 error_summary = "联网搜索失败"
@@ -847,11 +933,6 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
             )
-            message = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }
             if content.startswith("error:"):
                 status = "error"
                 error_summary = "读取用户画像失败"
@@ -874,6 +955,16 @@ async def _execute_business_tool(
                 status="error",
                 error_summary="未知工具",
             )
+
+    message = {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": _wrap_external_tool_result(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            content=content,
+        ),
+    }
 
     return _BusinessToolExecution(
         message=message,
@@ -905,7 +996,8 @@ async def _execute_tool_loop(
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。"""
     current_messages = list(messages)
-    tool_definitions = list(tools)
+    tool_definitions = _validate_tool_definitions(tools)
+    round_limit = max(1, min(max_tool_rounds, _MAX_TOOL_ROUNDS))
     request_phase_prefix = _build_tool_request_phase_prefix(tool_definitions)
     has_vision_tool = any(
         tool.get("function", {}).get("name") == READ_IMAGE_TOOL_NAME
@@ -923,13 +1015,14 @@ async def _execute_tool_loop(
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
     last_retry_reason: str | None = None
+    total_tool_calls = 0
 
     from komari_bot.plugins.llm_provider.diagnostic import (
         LLMCallTrace,
         ToolExecutionTrace,
     )
 
-    for round_num in range(1, max_tool_rounds + 1):
+    for round_num in range(1, round_limit + 1):
         if has_vision_tool:
             model = vision_model
             temperature = vision_temperature
@@ -1002,6 +1095,45 @@ async def _execute_tool_loop(
                     )
                 )
             continue
+
+        if len(completion.tool_calls) > _MAX_TOOL_CALLS_PER_ROUND:
+            last_retry_reason = (
+                f"{request_phase_prefix} 第 {round_num} 轮工具调用数超过 "
+                f"{_MAX_TOOL_CALLS_PER_ROUND}"
+            )
+            _append_tool_retry_instruction(
+                current_messages,
+                reason=last_retry_reason,
+                expected_action=(
+                    f"每轮调用不超过 {_MAX_TOOL_CALLS_PER_ROUND} 个且只调用必要工具"
+                ),
+            )
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=round_call_id or "",
+                        tool_name="<tool_budget>",
+                        status="error",
+                        error_summary=last_retry_reason,
+                    )
+                )
+            continue
+
+        total_tool_calls += len(completion.tool_calls)
+        if total_tool_calls > _MAX_TOTAL_TOOL_CALLS:
+            last_retry_reason = (
+                f"{request_phase_prefix} 工具调用总数超过 {_MAX_TOTAL_TOOL_CALLS}"
+            )
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=round_call_id or "",
+                        tool_name="<tool_budget>",
+                        status="error",
+                        error_summary=last_retry_reason,
+                    )
+                )
+            break
 
         logger.info(
             "[KomariChat] Tool 调用: trace_id={} round={} tool_calls={}",
@@ -1196,10 +1328,12 @@ async def _execute_tool_loop(
                     collector=collector,
                 )
             except Exception as exc:  # 向模型回写后继续会话
-                tool_error_results.append(_build_tool_error_result(tool_call, exc))
+                tool_error_results.append(
+                    _build_tool_error_result(tool_call, type(exc).__name__)
+                )
                 last_retry_reason = (
                     f"{request_phase_prefix} 第 {round_num} 轮："
-                    f"工具 {tool_name} 执行失败：{type(exc).__name__}: {exc}"
+                    f"工具 {tool_name} 执行失败：{type(exc).__name__}"
                 )
                 if collector is not None:
                     collector.add_tool(
@@ -1208,7 +1342,7 @@ async def _execute_tool_loop(
                             tool_name=tool_name,
                             parsed_arguments=_build_safe_tool_args(tool_call),
                             status="error",
-                            error_summary=str(exc),
+                            error_summary=type(exc).__name__,
                         )
                     )
                 continue
@@ -1255,7 +1389,7 @@ async def _execute_tool_loop(
                 )
 
     msg = (
-        f"{request_phase_prefix} 达到最大轮数 {max_tool_rounds}，"
+        f"{request_phase_prefix} 达到最大轮数或工具预算上限 {round_limit}，"
         f"模型仍未完成 final_response：{last_retry_reason or '未知原因'}"
     )
     if collector is not None:
@@ -1298,7 +1432,8 @@ async def generate_reply_with_tools(
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
 
-    tool_definitions = [*tools, FINAL_RESPONSE_TOOL]
+    tool_definitions = _validate_tool_definitions([*tools, FINAL_RESPONSE_TOOL])
+    round_limit = max(1, min(max_tool_rounds, _MAX_TOOL_ROUNDS))
     tool_names = [
         str(tool["function"]["name"])
         for tool in tool_definitions
@@ -1310,7 +1445,7 @@ async def generate_reply_with_tools(
         request_trace_id or "-",
         tool_names,
         len(base64_images) if base64_images else 0,
-        max_tool_rounds,
+        round_limit,
     )
 
     return await _execute_tool_loop(
@@ -1322,7 +1457,7 @@ async def generate_reply_with_tools(
         vision_model=vision_model,
         vision_temperature=vision_temperature,
         vision_max_tokens=vision_max_tokens,
-        max_tool_rounds=max_tool_rounds,
+        max_tool_rounds=round_limit,
         memory_service=memory_service,
         group_id=group_id,
         max_favorability_delta=max_favorability_delta,
