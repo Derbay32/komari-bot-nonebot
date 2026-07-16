@@ -616,12 +616,16 @@ async def _build_search_tool_result(
     *,
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
+    request_trace_id: str | None = None,
 ) -> str:
     """执行 search_web 工具并返回工具消息内容。"""
     query = _parse_search_query(parsed_arguments, raw_arguments)
     if query is None:
         return "[搜索失败：query 参数缺失或格式错误]"
-    return await komari_search.search_web(query)
+    return await komari_search.search_web(
+        query,
+        request_trace_id=request_trace_id,
+    )
 
 
 def _build_tool_call_message(
@@ -920,6 +924,7 @@ async def _execute_business_tool(
             content = await _build_search_tool_result(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
+                request_trace_id=request_trace_id,
             )
             if content.startswith("[搜索失败"):
                 status = "error"

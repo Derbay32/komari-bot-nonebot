@@ -300,7 +300,7 @@ class _DummySearchPlugin:
         return False
 
     @staticmethod
-    async def search_web(_query: str) -> str:
+    async def search_web(_query: str, **_kwargs: object) -> str:
         return "[测试搜索未启用]"
 
 
