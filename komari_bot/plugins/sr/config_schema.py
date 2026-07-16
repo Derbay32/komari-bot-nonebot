@@ -5,7 +5,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class DynamicConfigSchema(BaseModel):
@@ -13,6 +13,10 @@ class DynamicConfigSchema(BaseModel):
 
     此模型表示可在运行时修改并在机器人重启后持久化的配置。
     """
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     # 元数据
     version: str = Field(default="1.0", description="配置架构版本")

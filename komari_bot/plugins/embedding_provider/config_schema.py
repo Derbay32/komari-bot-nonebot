@@ -4,13 +4,17 @@ Komari Bot Embedding Provider 配置 Schema。
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DynamicConfigSchema(BaseModel):
     """
     Embedding Provider 配置 Schema。
     """
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "restart"},
+    )
 
     # 元数据
     version: str = Field(default="1.0", description="配置架构版本")
@@ -26,7 +30,11 @@ class DynamicConfigSchema(BaseModel):
         default="",
         description="API 地址，例如 https://api.openai.com/v1/embeddings",
     )
-    embedding_api_key: str = Field(default="", description="API 密钥")
+    embedding_api_key: str = Field(
+        default="",
+        description="API 密钥",
+        json_schema_extra={"secret": True},
+    )
     embedding_dimension: int = Field(
         default=512,
         ge=1,
@@ -69,5 +77,9 @@ class DynamicConfigSchema(BaseModel):
     rerank_api_url: str = Field(
         default="", description="Rerank API 地址 (Jina/Cohere 兼容格式)"
     )
-    rerank_api_key: str = Field(default="", description="Rerank API 密钥")
+    rerank_api_key: str = Field(
+        default="",
+        description="Rerank API 密钥",
+        json_schema_extra={"secret": True},
+    )
     rerank_top_n: int = Field(default=5, ge=1, le=50, description="Rerank 默认返回数量")

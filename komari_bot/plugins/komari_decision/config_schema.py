@@ -3,11 +3,15 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class KomariDecisionConfigSchema(BaseModel):
     """Komari Decision 插件配置。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(

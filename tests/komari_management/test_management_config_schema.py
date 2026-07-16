@@ -2,11 +2,83 @@
 
 from __future__ import annotations
 
+import importlib.util
+from functools import cache
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from komari_bot.plugins.komari_management.config_schema import DynamicConfigSchema
+
+
+@cache
+def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "komari_bot"
+        / "plugins"
+        / plugin_name
+        / "config_schema.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"managed_{plugin_name}_config_schema",
+        module_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return cast("type[Any]", getattr(module, class_name))
+
+
+@pytest.mark.parametrize(
+    ("plugin_name", "class_name", "expected_mode"),
+    [
+        ("komari_management", "DynamicConfigSchema", "restart"),
+        ("embedding_provider", "DynamicConfigSchema", "restart"),
+        ("komari_memory", "KomariMemoryConfigSchema", "restart"),
+        ("komari_sentry", "KomariSentryConfigSchema", "restart"),
+        ("user_data", "DynamicConfigSchema", "restart"),
+        ("group_history_summary", "DynamicConfigSchema", "immediate"),
+        ("komari_decision", "KomariDecisionConfigSchema", "immediate"),
+        ("komari_help", "DynamicConfigSchema", "immediate"),
+        ("komari_knowledge", "DynamicConfigSchema", "immediate"),
+        ("llm_provider", "DynamicConfigSchema", "immediate"),
+        ("sr", "DynamicConfigSchema", "immediate"),
+    ],
+)
+def test_managed_config_schemas_declare_default_apply_mode(
+    plugin_name: str,
+    class_name: str,
+    expected_mode: str,
+) -> None:
+    schema = _load_schema_class(plugin_name, class_name)
+    schema_extra = schema.model_config["json_schema_extra"]
+
+    assert isinstance(schema_extra, dict)
+    assert schema_extra["default_apply_mode"] == expected_mode
+
+
+@pytest.mark.parametrize(
+    ("plugin_name", "class_name", "field_name"),
+    [
+        ("komari_management", "DynamicConfigSchema", "api_token"),
+        ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
+        ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
+        ("komari_sentry", "KomariSentryConfigSchema", "dsn"),
+        ("llm_provider", "DynamicConfigSchema", "api_token"),
+    ],
+)
+def test_managed_secret_fields_use_explicit_schema_metadata(
+    plugin_name: str,
+    class_name: str,
+    field_name: str,
+) -> None:
+    schema = _load_schema_class(plugin_name, class_name)
+    field_extra = schema.model_fields[field_name].json_schema_extra
+
+    assert isinstance(field_extra, dict)
+    assert field_extra["secret"] is True
 
 
 def test_management_config_schema_parses_origin_list_string() -> None:

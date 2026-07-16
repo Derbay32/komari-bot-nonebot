@@ -5,11 +5,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class DynamicConfigSchema(BaseModel):
     """Komari Help 配置 Schema。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
@@ -52,7 +56,9 @@ class DynamicConfigSchema(BaseModel):
         description="查询重写规则",
     )
     auto_scan_on_startup: bool = Field(
-        default=True, description="启动时是否自动扫描插件元数据"
+        default=True,
+        description="启动时是否自动扫描插件元数据",
+        json_schema_extra={"apply_mode": "restart"},
     )
     disabled_auto_help_plugins: list[str] = Field(
         default_factory=list,

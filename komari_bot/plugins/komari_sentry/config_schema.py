@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
@@ -20,6 +20,10 @@ def _normalize_log_level(value: object, default: str) -> str:
 class KomariSentryConfigSchema(BaseModel):
     """Komari Sentry 动态配置。"""
 
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "restart"},
+    )
+
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
         default_factory=lambda: datetime.now().astimezone().isoformat(),
@@ -27,7 +31,11 @@ class KomariSentryConfigSchema(BaseModel):
     )
 
     plugin_enable: bool = Field(default=False, description="是否启用 Sentry 插件")
-    dsn: str = Field(default="", description="Sentry DSN（为空时不会初始化）")
+    dsn: str = Field(
+        default="",
+        description="Sentry DSN（为空时不会初始化）",
+        json_schema_extra={"secret": True},
+    )
     environment: str = Field(
         default="",
         description="Sentry environment（为空时回退 ENVIRONMENT 环境变量）",

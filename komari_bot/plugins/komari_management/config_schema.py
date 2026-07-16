@@ -5,13 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
 
 
 class DynamicConfigSchema(BaseModel):
     """Komari Management 配置模型。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "restart"},
+    )
 
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
@@ -20,7 +24,11 @@ class DynamicConfigSchema(BaseModel):
     )
 
     plugin_enable: bool = Field(default=False, description="是否启用统一管理 API 插件")
-    api_token: str = Field(default="", description="管理 API Bearer Token")
+    api_token: str = Field(
+        default="",
+        description="管理 API Bearer Token",
+        json_schema_extra={"secret": True, "apply_mode": "immediate"},
+    )
     api_allowed_origins: list[str] = Field(
         default_factory=list,
         description="允许访问管理 API 的前端 Origin 白名单",

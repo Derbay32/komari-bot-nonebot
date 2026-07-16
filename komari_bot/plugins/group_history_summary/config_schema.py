@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LayoutParamsSchema(BaseModel):
@@ -34,6 +34,10 @@ class LayoutParamsSchema(BaseModel):
 
 class DynamicConfigSchema(BaseModel):
     """群聊历史总结插件动态配置。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(

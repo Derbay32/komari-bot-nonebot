@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 from komari_bot.plugins.komari_management.config_api import (
@@ -22,10 +22,40 @@ if TYPE_CHECKING:
 
 
 class _ConfigSchema(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
+
     plugin_enable: bool = Field(default=True, description="插件启用状态")
-    api_token: str = Field(default="secret", description="管理接口令牌")
-    embedding_api_key: str = Field(default="embedding-secret", description="嵌入 API 密钥")
-    db_password: str = Field(default="database-secret", description="数据库密码")
+    api_token: str = Field(
+        default="secret",
+        description="管理接口令牌",
+        json_schema_extra={"secret": True},
+    )
+    embedding_api_key: str = Field(
+        default="embedding-secret",
+        description="嵌入 API 密钥",
+        json_schema_extra={"secret": True},
+    )
+    db_password: str = Field(
+        default="database-secret",
+        description="数据库密码",
+        json_schema_extra={"secret": True},
+    )
+    dsn: str = Field(
+        default="https://sentry-canary@example.invalid/1",
+        description="Sentry DSN",
+        json_schema_extra={"secret": True},
+    )
+    monkey_mode: str = Field(
+        default="visible",
+        description="名称含 key 但不是秘密的普通字段",
+    )
+    api_allowed_origins: list[str] = Field(
+        default_factory=lambda: ["https://old.example.com"],
+        description="管理接口 CORS Origin",
+        json_schema_extra={"apply_mode": "restart"},
+    )
     last_updated: str = Field(
         default="2026-04-14T00:00:00+08:00",
         description="最后更新时间",
@@ -101,11 +131,22 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     assert payload["items"][0]["resource_id"] == "komari_management"
     assert payload["items"][0]["config_source"] == manager.config_source
     assert payload["items"][0]["field_descriptions"] == {
+        "api_allowed_origins": "管理接口 CORS Origin",
         "api_token": "管理接口令牌",
         "db_password": "数据库密码",
+        "dsn": "Sentry DSN",
         "embedding_api_key": "嵌入 API 密钥",
         "last_updated": "最后更新时间",
+        "monkey_mode": "名称含 key 但不是秘密的普通字段",
         "plugin_enable": "插件启用状态",
+    }
+    assert payload["items"][0]["field_metadata"]["dsn"] == {
+        "secret": True,
+        "apply_mode": "immediate",
+    }
+    assert payload["items"][0]["field_metadata"]["api_allowed_origins"] == {
+        "secret": False,
+        "apply_mode": "restart",
     }
 
 
@@ -124,6 +165,11 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
             json={"value": "changed-token"},
             headers=headers,
         )
+        restart_updated = await client.patch(
+            f"{API_PREFIX}/resources/komari_management/fields/api_allowed_origins",
+            json={"value": ["https://new.example.com"]},
+            headers=headers,
+        )
         reloaded = await client.post(
             f"{API_PREFIX}/resources/komari_management/reload",
             headers=headers,
@@ -133,6 +179,8 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
     assert detail.json()["values"]["api_token"] == "******"
     assert detail.json()["values"]["embedding_api_key"] == "******"
     assert detail.json()["values"]["db_password"] == "******"
+    assert detail.json()["values"]["dsn"] == "******"
+    assert detail.json()["values"]["monkey_mode"] == "visible"
     assert detail.json()["values"]["plugin_enable"] is True
     assert detail.json()["values"]["last_updated"] == "2026-04-14T00:00:00+08:00"
     assert detail.json()["config_source"] == manager.config_source
@@ -140,6 +188,25 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
     assert updated.status_code == 200
     assert updated.json()["values"]["api_token"] == "******"
     assert updated.json()["field_descriptions"]["api_token"] == "管理接口令牌"
+    assert updated.json()["field_states"]["api_token"] == {
+        "secret": True,
+        "apply_mode": "immediate",
+        "configured_value": "******",
+        "effective_value": "******",
+        "source": manager.config_source,
+        "effective_source": "dynamic_config",
+        "restart_required": False,
+    }
+    assert restart_updated.status_code == 200
+    assert restart_updated.json()["field_states"]["api_allowed_origins"] == {
+        "secret": False,
+        "apply_mode": "restart",
+        "configured_value": ["https://new.example.com"],
+        "effective_value": None,
+        "source": manager.config_source,
+        "effective_source": "process_startup_snapshot",
+        "restart_required": True,
+    }
     assert reloaded.status_code == 200
     assert reloaded.json()["values"]["api_token"] == "******"
     assert reloaded.json()["field_descriptions"]["plugin_enable"] == "插件启用状态"

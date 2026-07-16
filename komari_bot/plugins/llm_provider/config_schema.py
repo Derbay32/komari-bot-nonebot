@@ -6,13 +6,17 @@ import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class DynamicConfigSchema(BaseModel):
     """
     llm provider 配置 Schema。
     """
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     # 元数据
     version: str = Field(default="1.0", description="配置架构版本")
@@ -33,7 +37,11 @@ class DynamicConfigSchema(BaseModel):
     )
 
     # OpenAI 兼容 API 配置
-    api_token: str = Field(default="", description="OpenAI 兼容 API Token")
+    api_token: str = Field(
+        default="",
+        description="OpenAI 兼容 API Token",
+        json_schema_extra={"secret": True},
+    )
     api_base: str = Field(
         default="https://api.deepseek.com/v1",
         description="OpenAI 兼容 API Base URL",

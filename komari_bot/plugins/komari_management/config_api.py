@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,8 +22,32 @@ if TYPE_CHECKING:
     from .managed_resources import ManagedConfigResource
 
 API_PREFIX = "/api/komari-management-config/v1"
-_SENSITIVE_FIELD_KEYWORDS = ("password", "token", "secret", "key", "credential")
 _MASKED_CONFIG_VALUE = "******"
+
+ConfigApplyMode = Literal["immediate", "rebuild", "restart"]
+EffectiveValueSource = Literal[
+    "dynamic_config",
+    "service_snapshot",
+    "process_startup_snapshot",
+]
+_DEFAULT_APPLY_MODE: ConfigApplyMode = "restart"
+
+
+class ConfigFieldMetadata(BaseModel):
+    """配置字段的安全与生效方式元数据。"""
+
+    secret: bool
+    apply_mode: ConfigApplyMode
+
+
+class ConfigFieldState(ConfigFieldMetadata):
+    """配置字段的持久化值与当前可确认生效状态。"""
+
+    configured_value: Any
+    effective_value: Any
+    source: str
+    effective_source: EffectiveValueSource
+    restart_required: bool
 
 
 class ConfigResourceSummary(BaseModel):
@@ -34,12 +58,14 @@ class ConfigResourceSummary(BaseModel):
     config_source: str
     fields: list[str]
     field_descriptions: dict[str, str]
+    field_metadata: dict[str, ConfigFieldMetadata]
 
 
 class ConfigResourceDetail(ConfigResourceSummary):
     """配置资源详情。"""
 
     values: dict[str, Any]
+    field_states: dict[str, ConfigFieldState]
 
 
 class ConfigResourceListResponse(BaseModel):
@@ -95,16 +121,85 @@ def _get_field_descriptions(config: BaseModel) -> dict[str, str]:
     }
 
 
-def _is_sensitive_field(field_name: str) -> bool:
-    lower_name = field_name.lower()
-    return any(keyword in lower_name for keyword in _SENSITIVE_FIELD_KEYWORDS)
+def _parse_apply_mode(value: object) -> ConfigApplyMode:
+    """解析生效模式；无效或缺失声明按需重启处理。"""
+    match value:
+        case "immediate":
+            return "immediate"
+        case "rebuild":
+            return "rebuild"
+        case "restart":
+            return "restart"
+        case _:
+            return _DEFAULT_APPLY_MODE
 
 
-def _mask_config_values(values: dict[str, Any]) -> dict[str, Any]:
+def _get_default_apply_mode(config: BaseModel) -> ConfigApplyMode:
+    schema_extra = config.__class__.model_config.get("json_schema_extra")
+    if not isinstance(schema_extra, dict):
+        return _DEFAULT_APPLY_MODE
+    return _parse_apply_mode(schema_extra.get("default_apply_mode"))
+
+
+def _get_field_metadata(config: BaseModel) -> dict[str, ConfigFieldMetadata]:
+    default_apply_mode = _get_default_apply_mode(config)
+    metadata: dict[str, ConfigFieldMetadata] = {}
+    for field_name, field_info in config.__class__.model_fields.items():
+        field_extra = field_info.json_schema_extra
+        extra = field_extra if isinstance(field_extra, dict) else {}
+        metadata[field_name] = ConfigFieldMetadata(
+            secret=extra.get("secret") is True,
+            apply_mode=_parse_apply_mode(
+                extra.get("apply_mode", default_apply_mode),
+            ),
+        )
+    return metadata
+
+
+def _mask_config_values(
+    values: dict[str, Any],
+    field_metadata: dict[str, ConfigFieldMetadata],
+) -> dict[str, Any]:
     return {
-        field_name: _MASKED_CONFIG_VALUE if _is_sensitive_field(field_name) else value
+        field_name: (
+            _MASKED_CONFIG_VALUE
+            if field_metadata[field_name].secret
+            else value
+        )
         for field_name, value in values.items()
     }
+
+
+def _build_field_states(
+    *,
+    values: dict[str, Any],
+    field_metadata: dict[str, ConfigFieldMetadata],
+    config_source: str,
+) -> dict[str, ConfigFieldState]:
+    masked_values = _mask_config_values(values, field_metadata)
+    states: dict[str, ConfigFieldState] = {}
+    for field_name, configured_value in masked_values.items():
+        metadata = field_metadata[field_name]
+        match metadata.apply_mode:
+            case "immediate":
+                effective_value = configured_value
+                effective_source: EffectiveValueSource = "dynamic_config"
+            case "rebuild":
+                effective_value = None
+                effective_source = "service_snapshot"
+            case "restart":
+                effective_value = None
+                effective_source = "process_startup_snapshot"
+        states[field_name] = ConfigFieldState(
+            configured_value=configured_value,
+            effective_value=effective_value,
+            source=config_source,
+            effective_source=effective_source,
+            secret=metadata.secret,
+            apply_mode=metadata.apply_mode,
+            restart_required=metadata.apply_mode == "restart",
+        )
+    return states
 
 
 async def _build_resource_summary(
@@ -112,12 +207,14 @@ async def _build_resource_summary(
 ) -> ConfigResourceSummary:
     manager = resource.manager_getter()
     config = await manager.get_async()
+    field_metadata = _get_field_metadata(config)
     return ConfigResourceSummary(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
         config_source=manager.config_source,
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
+        field_metadata=field_metadata,
     )
 
 
@@ -126,13 +223,21 @@ async def _build_resource_detail(
 ) -> ConfigResourceDetail:
     manager = resource.manager_getter()
     config = await manager.get_async()
+    values = config.model_dump()
+    field_metadata = _get_field_metadata(config)
     return ConfigResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
         config_source=manager.config_source,
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
-        values=_mask_config_values(config.model_dump()),
+        field_metadata=field_metadata,
+        values=_mask_config_values(values, field_metadata),
+        field_states=_build_field_states(
+            values=values,
+            field_metadata=field_metadata,
+            config_source=manager.config_source,
+        ),
     )
 
 
