@@ -24,7 +24,7 @@ class _StubConfigManager:
     def __init__(self, sr_list: list[str]) -> None:
         self._config = SimpleNamespace(plugin_enable=True, sr_list=sr_list)
 
-    def get(self) -> object:
+    async def get_async(self) -> object:
         return self._config
 
 
@@ -145,7 +145,7 @@ async def test_sr_manage_rejects_non_superuser_before_reading_config(
 ) -> None:
     class _FailConfigManager:
         @staticmethod
-        def get() -> object:
+        async def get_async() -> object:
             msg = "非超级用户不应读取配置"
             raise AssertionError(msg)
 

@@ -11,7 +11,7 @@ from komari_bot.common.database_config import get_shared_database_config
 _redis_client: aioredis.Redis | None = None
 
 
-def get_redis_config(config_manager: Any) -> Any:
+async def get_redis_config(config_manager: Any) -> Any:
     """从 config_manager 获取插件 Redis 配置。
 
     Args:
@@ -20,7 +20,7 @@ def get_redis_config(config_manager: Any) -> Any:
     Returns:
         配置对象，包含插件级 Redis 配置
     """
-    return config_manager.get()
+    return await config_manager.get_async()
 
 
 async def get_redis_client(config_manager: Any) -> aioredis.Redis:
@@ -34,7 +34,7 @@ async def get_redis_client(config_manager: Any) -> aioredis.Redis:
     """
     global _redis_client  # noqa: PLW0603
     if _redis_client is None:
-        config = get_redis_config(config_manager)
+        config = await get_redis_config(config_manager)
         db_config = get_shared_database_config()
 
         # 构建连接 URL

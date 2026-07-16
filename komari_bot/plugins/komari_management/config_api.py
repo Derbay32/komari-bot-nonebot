@@ -12,6 +12,7 @@ from komari_bot.common.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
+from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -70,6 +71,13 @@ def _not_found(detail: str) -> HTTPException:
     )
 
 
+def _conflict(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=detail,
+    )
+
+
 def _get_resource_map(
     resources: Sequence[ManagedConfigResource],
 ) -> dict[str, ManagedConfigResource]:
@@ -99,9 +107,11 @@ def _mask_config_values(values: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSummary:
+async def _build_resource_summary(
+    resource: ManagedConfigResource,
+) -> ConfigResourceSummary:
     manager = resource.manager_getter()
-    config = manager.get()
+    config = await manager.get_async()
     return ConfigResourceSummary(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
@@ -111,9 +121,11 @@ def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSu
     )
 
 
-def _build_resource_detail(resource: ManagedConfigResource) -> ConfigResourceDetail:
+async def _build_resource_detail(
+    resource: ManagedConfigResource,
+) -> ConfigResourceDetail:
     manager = resource.manager_getter()
-    config = manager.get()
+    config = await manager.get_async()
     return ConfigResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
@@ -154,7 +166,7 @@ def create_config_router(
 
     @router.get("/resources", response_model=ConfigResourceListResponse)
     async def list_config_resources() -> ConfigResourceListResponse:
-        items = [_build_resource_summary(resource) for resource in resources]
+        items = [await _build_resource_summary(resource) for resource in resources]
         return ConfigResourceListResponse(items=items, total=len(items))
 
     @router.get("/resources/{resource_id}", response_model=ConfigResourceDetail)
@@ -162,15 +174,15 @@ def create_config_router(
         resource_id: Annotated[str, Path(min_length=1)],
     ) -> ConfigResourceDetail:
         resource = _resolve_resource(resource_id, resource_map)
-        return _build_resource_detail(resource)
+        return await _build_resource_detail(resource)
 
     @router.post("/resources/{resource_id}/reload", response_model=ConfigResourceDetail)
     async def reload_config_resource(
         resource_id: Annotated[str, Path(min_length=1)],
     ) -> ConfigResourceDetail:
         resource = _resolve_resource(resource_id, resource_map)
-        resource.manager_getter().reload()
-        return _build_resource_detail(resource)
+        await resource.manager_getter().reload_async()
+        return await _build_resource_detail(resource)
 
     @router.patch(
         "/resources/{resource_id}/fields/{field_name}",
@@ -184,10 +196,12 @@ def create_config_router(
         resource = _resolve_resource(resource_id, resource_map)
         manager = resource.manager_getter()
         try:
-            manager.update_field(field_name, payload.value)
+            await manager.update_field_async(field_name, payload.value)
         except ValueError as exc:
             raise _validation_error(str(exc)) from exc
-        return _build_resource_detail(resource)
+        except ConfigUpdateConflictError as exc:
+            raise _conflict(str(exc)) from exc
+        return await _build_resource_detail(resource)
 
     return router
 

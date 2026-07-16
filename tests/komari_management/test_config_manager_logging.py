@@ -40,6 +40,7 @@ class _FakeStorage:
         }
         self.fail_upsert = fail_upsert
         self.conflict_data = conflict_data
+        self.revision = 1
         self.saved_payloads: list[dict[str, Any]] = []
 
     def fetch(self, plugin_name: str) -> StoredConfig:
@@ -48,8 +49,12 @@ class _FakeStorage:
             schema_name="TestSchema",
             config_data=self.config_data,
             version="1.0",
+            revision=self.revision,
             updated_at=datetime.now().astimezone(),
         )
+
+    async def fetch_async(self, plugin_name: str) -> StoredConfig:
+        return self.fetch(plugin_name)
 
     def upsert(
         self,
@@ -63,13 +68,30 @@ class _FakeStorage:
             msg = "写入失败"
             raise RuntimeError(msg)
         self.config_data = config_data
+        self.revision += 1
         self.saved_payloads.append(config_data)
         return StoredConfig(
             plugin_name=plugin_name,
             schema_name=schema_name,
             config_data=config_data,
             version=version,
+            revision=self.revision,
             updated_at=datetime.now().astimezone(),
+        )
+
+    async def upsert_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+    ) -> StoredConfig:
+        return self.upsert(
+            plugin_name=plugin_name,
+            schema_name=schema_name,
+            config_data=config_data,
+            version=version,
         )
 
     def update_if_unchanged(
@@ -92,6 +114,59 @@ class _FakeStorage:
             version=version,
         )
 
+    async def update_if_unchanged_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredConfig | None:
+        return self.update_if_unchanged(
+            plugin_name=plugin_name,
+            schema_name=schema_name,
+            config_data=config_data,
+            version=version,
+            expected_updated_at=expected_updated_at,
+        )
+
+    def update_fields_if_revision(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_patch: dict[str, Any],
+        version: str,
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        if expected_revision != self.revision:
+            return None
+        updated_data = {**self.config_data, **config_patch}
+        return self.upsert(
+            plugin_name=plugin_name,
+            schema_name=schema_name,
+            config_data=updated_data,
+            version=version,
+        )
+
+    async def update_fields_if_revision_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_patch: dict[str, Any],
+        version: str,
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        return self.update_fields_if_revision(
+            plugin_name=plugin_name,
+            schema_name=schema_name,
+            config_patch=config_patch,
+            version=version,
+            expected_revision=expected_revision,
+        )
+
 
 class _FakeLogger:
     def __init__(self) -> None:
@@ -106,6 +181,37 @@ class _FakeLogger:
 
     def warning(self, _message: str) -> None:
         self.warning_messages.append(_message)
+
+    def error(self, _message: str) -> None:
+        self.warning_messages.append(_message)
+
+
+class _SingleConflictStorage(_FakeStorage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conflict_injected = False
+
+    def update_fields_if_revision(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_patch: dict[str, Any],
+        version: str,
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        if not self.conflict_injected:
+            self.conflict_injected = True
+            self.config_data = {**self.config_data, "public_name": "并发更新值"}
+            self.revision += 1
+            return None
+        return super().update_fields_if_revision(
+            plugin_name=plugin_name,
+            schema_name=schema_name,
+            config_patch=config_patch,
+            version=version,
+            expected_revision=expected_revision,
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -218,3 +324,49 @@ def test_update_field_log_does_not_include_new_value(
     ]
     assert all("new-sensitive-token" not in msg for msg in update_logs)
     assert all("new-public-name" not in msg for msg in update_logs)
+
+
+@pytest.mark.asyncio
+async def test_async_field_updates_from_two_workers_preserve_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_storage = _FakeStorage()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
+
+    first_manager = ConfigManager("test_multi_worker", _ConfigSchema)
+    await first_manager.initialize_async()
+
+    ConfigManager._instances.clear()
+    manager_module._config_managers.clear()
+    second_manager = ConfigManager("test_multi_worker", _ConfigSchema)
+    await second_manager.initialize_async()
+
+    await first_manager.update_field_async("api_token", "new-token")
+    await second_manager.update_field_async("public_name", "new-name")
+
+    assert fake_storage.config_data == {
+        "api_token": "new-token",
+        "public_name": "new-name",
+    }
+
+
+@pytest.mark.asyncio
+async def test_async_field_update_reloads_and_retries_after_revision_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_storage = _SingleConflictStorage()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
+
+    manager = ConfigManager("test_revision_retry", _ConfigSchema)
+    updated = cast(
+        "_ConfigSchema",
+        await manager.update_field_async("api_token", "new-token"),
+    )
+
+    assert fake_storage.conflict_injected is True
+    assert updated.api_token == "new-token"
+    assert updated.public_name == "并发更新值"
+    assert fake_storage.config_data == {
+        "api_token": "new-token",
+        "public_name": "并发更新值",
+    }

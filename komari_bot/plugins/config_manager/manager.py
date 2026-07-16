@@ -6,10 +6,11 @@ NoneBot dotenv 或进程环境变量提供，不进入本管理器。
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Never
 
 from nonebot import get_plugin_config, logger
 
@@ -17,6 +18,12 @@ from .storage import StoredConfig, get_config_storage
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
+
+_CONFIG_UPDATE_MAX_ATTEMPTS = 3
+
+
+class ConfigUpdateConflictError(RuntimeError):
+    """配置在连续重试期间仍被其他进程修改。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +72,9 @@ class ConfigManager:
         self._env_config: Any | None = None
         self._dynamic_config: BaseModel | None = None
         self._last_loaded_at: datetime | None = None
+        self._revision: int | None = None
+        self._state_lock = RLock()
+        self._async_lock = asyncio.Lock()
         self._initialized = True
 
         logger.info(f"配置管理器已初始化 [{plugin_name}], 配置源: {self.config_source}")
@@ -93,17 +103,15 @@ class ConfigManager:
 
             stored = get_config_storage().fetch(self._plugin_name)
             if stored is not None:
-                config, synced_stored = self._load_and_sync_stored_config(stored)
-                self._dynamic_config = config
-                stored = synced_stored
-                self._last_loaded_at = stored.updated_at
+                _, stored = self._load_and_sync_stored_config(stored)
+                config = self._cache_stored_config(stored)
                 logger.info(f"[{self._plugin_name}] 已从 PostgreSQL 加载配置")
-                return self._dynamic_config
+                return config
 
-            self._dynamic_config = self._initialize_from_env()
-            stored = self._save_to_pg(self._dynamic_config)
-            self._last_loaded_at = stored.updated_at
+            config = self._initialize_from_env()
+            self._save_to_pg(config)
             logger.info(f"[{self._plugin_name}] 已从 .env 初始化配置并写入 PostgreSQL")
+            assert self._dynamic_config is not None
             return self._dynamic_config
 
     def _initialize_from_env(self) -> BaseModel:
@@ -129,9 +137,38 @@ class ConfigManager:
             config_data=data,
             version=version,
         )
-        self._dynamic_config = self._config_schema(**stored.config_data)
+        self._cache_stored_config(stored)
         logger.debug(f"[{self._plugin_name}] 配置已保存到 PostgreSQL")
         return stored
+
+    async def _save_to_pg_async(self, config: BaseModel) -> StoredConfig:
+        """异步保存配置，不阻塞调用方事件循环。"""
+        data = self._config_to_storage_data(config)
+        version = str(data.get("version", "1.0"))
+        stored = await get_config_storage().upsert_async(
+            plugin_name=self._plugin_name,
+            schema_name=self._config_schema.__name__,
+            config_data=data,
+            version=version,
+        )
+        self._cache_stored_config(stored)
+        logger.debug(f"[{self._plugin_name}] 配置已异步保存到 PostgreSQL")
+        return stored
+
+    def _cache_stored_config(self, stored: StoredConfig) -> BaseModel:
+        """用数据库返回值刷新当前进程缓存。"""
+        config = self._config_schema(**stored.config_data)
+        with self._state_lock:
+            if (
+                self._revision is not None
+                and stored.revision < self._revision
+                and self._dynamic_config is not None
+            ):
+                return self._dynamic_config
+            self._dynamic_config = config
+            self._last_loaded_at = stored.updated_at
+            self._revision = stored.revision
+            return config
 
     def _build_sync_result(
         self,
@@ -223,31 +260,208 @@ class ConfigManager:
         )
         return self._config_schema(**synced.config_data), synced
 
+    async def _load_and_sync_stored_config_async(
+        self,
+        stored: StoredConfig,
+    ) -> tuple[BaseModel, StoredConfig]:
+        """异步加载 PG 配置，并在需要时以 CAS 方式归一化。"""
+        config = self._config_schema(**stored.config_data)
+        sync_result = self._build_sync_result(
+            config=config,
+            stored_data=stored.config_data,
+        )
+        if not sync_result.changed:
+            return config, stored
+        if not sync_result.added_keys and not sync_result.value_changed:
+            logger.warning(
+                f"[{self._plugin_name}] 配置项包含当前 Schema 未使用字段，已跳过自动删除: "
+                f"schema_name={self._config_schema.__name__}, "
+                f"removed_keys={sorted(sync_result.removed_keys)}"
+            )
+            return config, stored
+
+        normalized_data = dict(stored.config_data)
+        normalized_data.update(sync_result.normalized_data)
+
+        try:
+            storage = get_config_storage()
+            synced = await storage.update_if_unchanged_async(
+                plugin_name=self._plugin_name,
+                schema_name=self._config_schema.__name__,
+                config_data=normalized_data,
+                version=stored.version,
+                expected_updated_at=stored.updated_at,
+            )
+            if synced is None:
+                latest = await storage.fetch_async(self._plugin_name)
+                if latest is not None:
+                    logger.warning(
+                        f"[{self._plugin_name}] 配置项自动同步跳过: "
+                        f"schema_name={self._config_schema.__name__}, "
+                        "reason=stored_changed"
+                    )
+                    return self._config_schema(**latest.config_data), latest
+                logger.warning(
+                    f"[{self._plugin_name}] 配置项自动同步跳过: "
+                    f"schema_name={self._config_schema.__name__}, "
+                    "reason=stored_missing"
+                )
+                return config, stored
+        except Exception as exc:
+            logger.warning(
+                f"[{self._plugin_name}] 配置项自动同步失败: "
+                f"schema_name={self._config_schema.__name__}, "
+                f"added_keys={sorted(sync_result.added_keys)}, "
+                f"removed_keys={sorted(sync_result.removed_keys)}, "
+                f"sync_result=failed, error={exc}"
+            )
+            return config, stored
+
+        logger.info(
+            f"[{self._plugin_name}] 配置项已自动同步: "
+            f"schema_name={self._config_schema.__name__}, "
+            f"added_keys={sorted(sync_result.added_keys)}, "
+            f"removed_keys={sorted(sync_result.removed_keys)}, "
+            "sync_result=success"
+        )
+        return self._config_schema(**synced.config_data), synced
+
+    def _build_field_patch(
+        self,
+        *,
+        stored: StoredConfig,
+        field_name: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], str]:
+        """根据数据库最新快照校验字段，并生成顶层 JSONB 补丁。"""
+        current_dict = self._config_schema(**stored.config_data).model_dump(mode="json")
+        if field_name not in current_dict:
+            raise ValueError(f"未知的配置字段: {field_name}")  # noqa: TRY003
+
+        current_dict[field_name] = value
+        patch_fields = {field_name}
+        if "last_updated" in current_dict:
+            current_dict["last_updated"] = datetime.now().astimezone().isoformat()
+            patch_fields.add("last_updated")
+
+        new_config = self._config_schema(**current_dict)
+        normalized_data = new_config.model_dump(mode="json")
+        config_patch = {
+            name: normalized_data[name]
+            for name in patch_fields
+            if name in normalized_data
+        }
+        version = str(normalized_data.get("version", stored.version))
+        return config_patch, version
+
+    def _raise_update_conflict(self, field_name: str) -> Never:
+        logger.error(
+            f"[{self._plugin_name}] 配置更新连续发生并发冲突: field={field_name}"
+        )
+        msg = "配置已被其他进程连续修改，请重试"
+        raise ConfigUpdateConflictError(msg)
+
     def get(self) -> BaseModel:
         """获取当前的动态配置。"""
         if self._dynamic_config is None:
             return self.initialize()
         return self._dynamic_config
 
-    def update_field(self, field_name: str, value: Any) -> BaseModel:
-        """更新单个配置字段。"""
-        with self._lock:
-            config = self.get()
-            current_dict = config.model_dump(mode="json")
-            if field_name not in current_dict:
-                raise ValueError(f"未知的配置字段: {field_name}")  # noqa: TRY003
+    async def initialize_async(self) -> BaseModel:
+        """异步从 PostgreSQL 或 .env 初始化配置。"""
+        async with self._async_lock:
+            if self._dynamic_config is not None:
+                return self._dynamic_config
 
-            current_dict[field_name] = value
-            if "last_updated" in current_dict:
-                current_dict["last_updated"] = datetime.now().astimezone().isoformat()
+            storage = get_config_storage()
+            stored = await storage.fetch_async(self._plugin_name)
+            if stored is not None:
+                _, stored = await self._load_and_sync_stored_config_async(stored)
+                config = self._cache_stored_config(stored)
+                logger.info(f"[{self._plugin_name}] 已异步从 PostgreSQL 加载配置")
+                return config
 
-            new_config = self._config_schema(**current_dict)
-            stored = self._save_to_pg(new_config)
-            self._last_loaded_at = stored.updated_at
-
-            logger.info(f"[{self._plugin_name}] 配置已更新: {field_name}")
+            config = self._initialize_from_env()
+            await self._save_to_pg_async(config)
+            logger.info(
+                f"[{self._plugin_name}] 已从 .env 初始化配置并异步写入 PostgreSQL"
+            )
             assert self._dynamic_config is not None
             return self._dynamic_config
+
+    async def get_async(self) -> BaseModel:
+        """异步获取当前动态配置，首次加载不会阻塞事件循环。"""
+        if self._dynamic_config is None:
+            return await self.initialize_async()
+        return self._dynamic_config
+
+    def update_field(self, field_name: str, value: Any) -> BaseModel:
+        """以字段级 CAS 更新单个配置字段。"""
+        with self._lock:
+            storage = get_config_storage()
+            for attempt in range(1, _CONFIG_UPDATE_MAX_ATTEMPTS + 1):
+                stored = storage.fetch(self._plugin_name)
+                if stored is None:
+                    initial = self._dynamic_config or self._initialize_from_env()
+                    stored = self._save_to_pg(initial)
+
+                config_patch, version = self._build_field_patch(
+                    stored=stored,
+                    field_name=field_name,
+                    value=value,
+                )
+                updated = storage.update_fields_if_revision(
+                    plugin_name=self._plugin_name,
+                    schema_name=self._config_schema.__name__,
+                    config_patch=config_patch,
+                    version=version,
+                    expected_revision=stored.revision,
+                )
+                if updated is not None:
+                    config = self._cache_stored_config(updated)
+                    logger.info(f"[{self._plugin_name}] 配置已更新: {field_name}")
+                    return config
+
+                logger.warning(
+                    f"[{self._plugin_name}] 配置更新发生并发冲突，将重试: "
+                    f"field={field_name}, attempt={attempt}"
+                )
+
+            return self._raise_update_conflict(field_name)
+
+    async def update_field_async(self, field_name: str, value: Any) -> BaseModel:
+        """异步以字段级 CAS 更新单个配置字段。"""
+        async with self._async_lock:
+            storage = get_config_storage()
+            for attempt in range(1, _CONFIG_UPDATE_MAX_ATTEMPTS + 1):
+                stored = await storage.fetch_async(self._plugin_name)
+                if stored is None:
+                    initial = self._dynamic_config or self._initialize_from_env()
+                    stored = await self._save_to_pg_async(initial)
+
+                config_patch, version = self._build_field_patch(
+                    stored=stored,
+                    field_name=field_name,
+                    value=value,
+                )
+                updated = await storage.update_fields_if_revision_async(
+                    plugin_name=self._plugin_name,
+                    schema_name=self._config_schema.__name__,
+                    config_patch=config_patch,
+                    version=version,
+                    expected_revision=stored.revision,
+                )
+                if updated is not None:
+                    config = self._cache_stored_config(updated)
+                    logger.info(f"[{self._plugin_name}] 配置已更新: {field_name}")
+                    return config
+
+                logger.warning(
+                    f"[{self._plugin_name}] 配置更新发生并发冲突，将重试: "
+                    f"field={field_name}, attempt={attempt}"
+                )
+
+            return self._raise_update_conflict(field_name)
 
     def reload(self) -> BaseModel:
         """从 PostgreSQL 重新加载配置。"""
@@ -258,10 +472,27 @@ class ConfigManager:
                 stored = self._save_to_pg(self._dynamic_config)
                 logger.info(f"[{self._plugin_name}] PostgreSQL 无配置，已从 .env 重新初始化")
             else:
-                config, stored = self._load_and_sync_stored_config(stored)
-                self._dynamic_config = config
+                _, stored = self._load_and_sync_stored_config(stored)
                 logger.info(f"[{self._plugin_name}] 已从 PostgreSQL 重新加载配置")
-            self._last_loaded_at = stored.updated_at
+            return self._cache_stored_config(stored)
+
+    async def reload_async(self) -> BaseModel:
+        """异步从 PostgreSQL 重新加载配置。"""
+        async with self._async_lock:
+            storage = get_config_storage()
+            stored = await storage.fetch_async(self._plugin_name)
+            if stored is None:
+                config = self._initialize_from_env()
+                stored = await self._save_to_pg_async(config)
+                logger.info(
+                    f"[{self._plugin_name}] PostgreSQL 无配置，已从 .env 异步重新初始化"
+                )
+            else:
+                _, stored = await self._load_and_sync_stored_config_async(stored)
+                logger.info(f"[{self._plugin_name}] 已异步从 PostgreSQL 重新加载配置")
+
+            self._cache_stored_config(stored)
+            assert self._dynamic_config is not None
             return self._dynamic_config
 
     def reload_from_json(self) -> BaseModel:

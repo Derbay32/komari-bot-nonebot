@@ -39,6 +39,26 @@ def test_run_timeout_cancels_future_and_raises_runtime_error(
         storage.close()
 
 
+@pytest.mark.asyncio
+async def test_run_async_does_not_block_caller_event_loop(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+
+    async def delayed_result() -> str:
+        await asyncio.sleep(0.1)
+        return "完成"
+
+    try:
+        operation = asyncio.create_task(storage._run_async(delayed_result()))
+        await asyncio.sleep(0)
+
+        assert operation.done() is False
+        assert await operation == "完成"
+    finally:
+        storage.close()
+
+
 class _FakePool:
     def __init__(self) -> None:
         self.closed = False

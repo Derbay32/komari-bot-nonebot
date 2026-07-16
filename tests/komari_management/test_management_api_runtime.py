@@ -67,15 +67,17 @@ class _FakeConfigManager:
     def config_source(self) -> str:
         return "postgres:komari_plugin_configs/komari_management"
 
-    def get(self) -> BaseModel:
+    async def get_async(self) -> BaseModel:
         return _FakeConfigSchema()
 
-    def update_field(self, field_name: str, value: object) -> BaseModel:
+    async def update_field_async(
+        self, field_name: str, value: object
+    ) -> BaseModel:
         del field_name, value
-        return self.get()
+        return await self.get_async()
 
-    def reload(self) -> BaseModel:
-        return self.get()
+    async def reload_async(self) -> BaseModel:
+        return await self.get_async()
 
 
 def _build_api_app() -> FastAPI:

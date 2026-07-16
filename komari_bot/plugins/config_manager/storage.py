@@ -28,9 +28,15 @@ CREATE TABLE IF NOT EXISTS komari_plugin_configs (
     schema_name VARCHAR(128) NOT NULL,
     config_data JSONB NOT NULL DEFAULT '{}'::jsonb,
     version VARCHAR(32) NOT NULL DEFAULT '1.0',
+    revision BIGINT NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+"""
+
+_CONFIG_TABLE_REVISION_DDL = """
+ALTER TABLE komari_plugin_configs
+    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 """
 
 _CONFIG_TABLE_UPDATED_AT_INDEX_DDL = """
@@ -48,14 +54,15 @@ class StoredConfig:
     schema_name: str
     config_data: dict[str, Any]
     version: str
+    revision: int
     updated_at: datetime
 
 
 class ConfigStorage:
-    """PostgreSQL 配置存储同步门面。
+    """PostgreSQL 配置存储门面。
 
-    ConfigManager 的对外接口仍是同步方法，因此这里使用后台事件循环承载
-    asyncpg 连接池，并通过 ``run_coroutine_threadsafe`` 完成同步桥接。
+    后台事件循环承载 asyncpg 连接池；同步启动代码与异步业务代码分别通过
+    阻塞和非阻塞桥接方法访问同一连接池。
     """
 
     def __init__(self) -> None:
@@ -66,6 +73,7 @@ class ConfigStorage:
             daemon=True,
         )
         self._pool: asyncpg.Pool | None = None
+        self._pool_lock = asyncio.Lock()
         self._init_lock = threading.RLock()
         self._thread.start()
 
@@ -82,21 +90,40 @@ class ConfigStorage:
             msg = "配置存储操作超时"
             raise RuntimeError(msg) from exc
 
+    async def _run_async(self, coro: Coroutine[Any, Any, T]) -> T:
+        """在调用方事件循环中无阻塞地等待后台存储操作。"""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=_CONFIG_STORAGE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            future.cancel()
+            msg = "配置存储操作超时"
+            raise RuntimeError(msg) from exc
+
     async def _get_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
-            config = get_shared_database_config()
-            pool = await create_postgres_pool(config)
-            try:
-                await self._ensure_schema(pool)
-            except Exception:
-                await pool.close()
-                raise
-            self._pool = pool
+        if self._pool is not None:
+            return self._pool
+
+        async with self._pool_lock:
+            if self._pool is None:
+                config = get_shared_database_config()
+                pool = await create_postgres_pool(config)
+                try:
+                    await self._ensure_schema(pool)
+                except Exception:
+                    await pool.close()
+                    raise
+                self._pool = pool
+        assert self._pool is not None
         return self._pool
 
     async def _ensure_schema(self, pool: asyncpg.Pool) -> None:
         async with pool.acquire() as conn:
             await conn.execute(_CONFIG_TABLE_DDL)
+            await conn.execute(_CONFIG_TABLE_REVISION_DDL)
             await conn.execute(_CONFIG_TABLE_UPDATED_AT_INDEX_DDL)
 
     def ensure_schema(self) -> None:
@@ -108,12 +135,22 @@ class ConfigStorage:
         """按插件名读取配置。"""
         return self._run(self._fetch(plugin_name))
 
+    async def fetch_async(self, plugin_name: str) -> StoredConfig | None:
+        """按插件名异步读取配置。"""
+        return await self._run_async(self._fetch(plugin_name))
+
     async def _fetch(self, plugin_name: str) -> StoredConfig | None:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT plugin_name, schema_name, config_data, version, updated_at
+                SELECT
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version,
+                    revision,
+                    updated_at
                 FROM komari_plugin_configs
                 WHERE plugin_name = $1
                 """,
@@ -128,6 +165,7 @@ class ConfigStorage:
             schema_name=str(row["schema_name"]),
             config_data=dict(config_data),
             version=str(row["version"]),
+            revision=int(row["revision"]),
             updated_at=row["updated_at"],
         )
 
@@ -141,6 +179,24 @@ class ConfigStorage:
     ) -> StoredConfig:
         """写入或更新插件配置。"""
         return self._run(
+            self._upsert(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_data=config_data,
+                version=version,
+            )
+        )
+
+    async def upsert_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+    ) -> StoredConfig:
+        """异步写入或更新插件配置。"""
+        return await self._run_async(
             self._upsert(
                 plugin_name=plugin_name,
                 schema_name=schema_name,
@@ -172,8 +228,15 @@ class ConfigStorage:
                     schema_name = EXCLUDED.schema_name,
                     config_data = EXCLUDED.config_data,
                     version = EXCLUDED.version,
+                    revision = komari_plugin_configs.revision + 1,
                     updated_at = CURRENT_TIMESTAMP
-                RETURNING plugin_name, schema_name, config_data, version, updated_at
+                RETURNING
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version,
+                    revision,
+                    updated_at
                 """,
                 plugin_name,
                 schema_name,
@@ -190,6 +253,7 @@ class ConfigStorage:
             schema_name=str(row["schema_name"]),
             config_data=dict(stored_data),
             version=str(row["version"]),
+            revision=int(row["revision"]),
             updated_at=row["updated_at"],
         )
 
@@ -204,6 +268,26 @@ class ConfigStorage:
     ) -> StoredConfig | None:
         """仅在记录未被其他写入修改时更新插件配置。"""
         return self._run(
+            self._update_if_unchanged(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_data=config_data,
+                version=version,
+                expected_updated_at=expected_updated_at,
+            )
+        )
+
+    async def update_if_unchanged_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+        expected_updated_at: datetime,
+    ) -> StoredConfig | None:
+        """记录未变化时异步更新整份配置。"""
+        return await self._run_async(
             self._update_if_unchanged(
                 plugin_name=plugin_name,
                 schema_name=schema_name,
@@ -231,10 +315,17 @@ class ConfigStorage:
                     schema_name = $2,
                     config_data = $3::jsonb,
                     version = $4,
+                    revision = revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE plugin_name = $1
                   AND updated_at = $5
-                RETURNING plugin_name, schema_name, config_data, version, updated_at
+                RETURNING
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version,
+                    revision,
+                    updated_at
                 """,
                 plugin_name,
                 schema_name,
@@ -251,6 +342,96 @@ class ConfigStorage:
             schema_name=str(row["schema_name"]),
             config_data=dict(stored_data),
             version=str(row["version"]),
+            revision=int(row["revision"]),
+            updated_at=row["updated_at"],
+        )
+
+    def update_fields_if_revision(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_patch: dict[str, Any],
+        version: str,
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        """仅在修订号匹配时原子更新指定顶层字段。"""
+        return self._run(
+            self._update_fields_if_revision(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_patch=config_patch,
+                version=version,
+                expected_revision=expected_revision,
+            )
+        )
+
+    async def update_fields_if_revision_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_patch: dict[str, Any],
+        version: str,
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        """异步原子更新指定顶层字段，并校验修订号。"""
+        return await self._run_async(
+            self._update_fields_if_revision(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_patch=config_patch,
+                version=version,
+                expected_revision=expected_revision,
+            )
+        )
+
+    async def _update_fields_if_revision(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_patch: dict[str, Any],
+        version: str,
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE komari_plugin_configs
+                SET
+                    schema_name = $2,
+                    config_data = config_data || $3::jsonb,
+                    version = $4,
+                    revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE plugin_name = $1
+                  AND revision = $5
+                RETURNING
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version,
+                    revision,
+                    updated_at
+                """,
+                plugin_name,
+                schema_name,
+                json.dumps(config_patch, ensure_ascii=False),
+                version,
+                expected_revision,
+            )
+        if row is None:
+            return None
+        raw_config = row["config_data"]
+        stored_data = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+        return StoredConfig(
+            plugin_name=str(row["plugin_name"]),
+            schema_name=str(row["schema_name"]),
+            config_data=dict(stored_data),
+            version=str(row["version"]),
+            revision=int(row["revision"]),
             updated_at=row["updated_at"],
         )
 

@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 from komari_bot.plugins.komari_management.config_api import (
     API_PREFIX,
     register_config_api,
@@ -37,10 +38,12 @@ class _FakeConfigManager:
         self.config_source = "postgres:komari_plugin_configs/komari_management"
         self.reload_count = 0
 
-    def get(self) -> _ConfigSchema:
+    async def get_async(self) -> _ConfigSchema:
         return self.config
 
-    def update_field(self, field_name: str, value: object) -> _ConfigSchema:
+    async def update_field_async(
+        self, field_name: str, value: object
+    ) -> _ConfigSchema:
         data = self.config.model_dump()
         if field_name not in data:
             detail = f"未知的配置字段: {field_name}"
@@ -49,9 +52,18 @@ class _FakeConfigManager:
         self.config = _ConfigSchema(**data)
         return self.config
 
-    def reload(self) -> _ConfigSchema:
+    async def reload_async(self) -> _ConfigSchema:
         self.reload_count += 1
         return self.config
+
+
+class _ConflictConfigManager(_FakeConfigManager):
+    async def update_field_async(
+        self, field_name: str, value: object
+    ) -> _ConfigSchema:
+        del field_name, value
+        msg = "配置已被其他进程连续修改，请重试"
+        raise ConfigUpdateConflictError(msg)
 
 
 def _build_app(manager: _FakeConfigManager) -> FastAPI:
@@ -153,3 +165,19 @@ async def test_config_routes_report_validation_and_not_found(app: App) -> None:
 
     assert missing_resource.status_code == 404
     assert missing_field.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_config_route_reports_revision_conflict_as_409(app: App) -> None:
+    headers = {"Authorization": "Bearer secret-token"}
+    manager = _ConflictConfigManager()
+
+    async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
+        response = await ctx.get_client().patch(
+            f"{API_PREFIX}/resources/komari_management/fields/plugin_enable",
+            json={"value": False},
+            headers=headers,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "配置已被其他进程连续修改，请重试"

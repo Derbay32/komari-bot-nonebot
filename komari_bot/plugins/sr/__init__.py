@@ -69,7 +69,7 @@ async def sr_switch(
         await sr_manage.finish("❌ 仅限 SUPERUSER 使用")
 
     _, action = cmd
-    config = config_manager.get()
+    config = await config_manager.get_async()
 
     match action:
         case "status":
@@ -87,8 +87,7 @@ async def sr_switch(
                     f"插件已经是{'开启' if new_status else '关闭'}状态"
                 )
 
-            # 持久化到 JSON
-            config_manager.update_field("plugin_enable", new_status)
+            await config_manager.update_field_async("plugin_enable", new_status)
 
             status_text = "开启" if new_status else "关闭"
             await sr_manage.finish(f"SR 插件已{status_text}")
@@ -112,7 +111,7 @@ async def sr_function(
 
     # 使用运行时配置进行权限检查
     can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config_manager.get()
+        bot, event, await config_manager.get_async()
     )
     if not can_use:
         logger.info(f"用户 {username}({user_id}) 请求被拒绝，原因：{reason}。")
@@ -123,7 +122,7 @@ async def sr_function(
         custom_message = args.extract_plain_text().strip() if args else None
 
         # 获取神人榜与其长度
-        config = config_manager.get()
+        config = await config_manager.get_async()
         sr_list = config.sr_list
         sr_num = len(sr_list)
         if not sr_list:
@@ -168,7 +167,7 @@ async def sr_usrcustom(
 
     # 使用运行时配置进行权限检查
     can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config_manager.get()
+        bot, event, await config_manager.get_async()
     )
     if not can_use:
         logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
@@ -178,7 +177,7 @@ async def sr_usrcustom(
         match action:
             case "list":
                 # 获取神人榜
-                config = config_manager.get()
+                config = await config_manager.get_async()
                 sr_list = config.sr_list
 
                 if not sr_list:

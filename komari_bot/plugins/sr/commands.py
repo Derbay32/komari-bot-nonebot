@@ -50,14 +50,14 @@ class AddCommand(Command):
         Returns:
             执行结果消息
         """
-        config = self.config_manager.get()
-        sr_list = config.sr_list
+        config = await self.config_manager.get_async()
+        sr_list = list(config.sr_list)
 
         if self.item in sr_list:
             return f"❌ '{self.item}' 已在神人榜中"
 
         sr_list.append(self.item)
-        self.config_manager.update_field("sr_list", sr_list)
+        await self.config_manager.update_field_async("sr_list", sr_list)
 
         return f"✅ 已添加 '{self.item}' 到神人榜"
 
@@ -67,14 +67,14 @@ class AddCommand(Command):
         Returns:
             撤销结果消息
         """
-        config = self.config_manager.get()
-        sr_list = config.sr_list
+        config = await self.config_manager.get_async()
+        sr_list = list(config.sr_list)
 
         if self.item not in sr_list:
             return f"⚠️ 无法撤销：'{self.item}' 不在列表中（可能已被其他操作修改）"
 
         sr_list.remove(self.item)
-        self.config_manager.update_field("sr_list", sr_list)
+        await self.config_manager.update_field_async("sr_list", sr_list)
 
         return f"↩️ 已撤销添加 '{self.item}'"
 
@@ -118,15 +118,15 @@ class DeleteCommand(Command):
         Returns:
             执行结果消息
         """
-        config = self.config_manager.get()
-        sr_list = config.sr_list
+        config = await self.config_manager.get_async()
+        sr_list = list(config.sr_list)
 
         # 序号删除模式
         if self.index is not None:
             if 1 <= self.index <= len(sr_list):
                 self.item = sr_list[self.index - 1]  # 保存用于 undo
                 sr_list.pop(self.index - 1)
-                self.config_manager.update_field("sr_list", sr_list)
+                await self.config_manager.update_field_async("sr_list", sr_list)
                 return f"✅ 已删除第 {self.index} 位: '{self.item}'"
             return f"❌ 序号 {self.index} 超出范围（1-{len(sr_list)}）"
 
@@ -138,7 +138,7 @@ class DeleteCommand(Command):
             return f"❌ '{self.item}' 不在神人榜中"
 
         sr_list.remove(self.item)
-        self.config_manager.update_field("sr_list", sr_list)
+        await self.config_manager.update_field_async("sr_list", sr_list)
 
         return f"✅ 已删除 '{self.item}'"
 
@@ -151,8 +151,8 @@ class DeleteCommand(Command):
         if self.item is None:
             return "⚠️ 无法撤销：删除时未记录名称"
 
-        config = self.config_manager.get()
-        sr_list = config.sr_list
+        config = await self.config_manager.get_async()
+        sr_list = list(config.sr_list)
 
         if self.item in sr_list:
             return f"⚠️ 无法撤销：'{self.item}' 已在列表中（可能已被其他操作添加）"
@@ -163,7 +163,7 @@ class DeleteCommand(Command):
         else:
             sr_list.append(self.item)
 
-        self.config_manager.update_field("sr_list", sr_list)
+        await self.config_manager.update_field_async("sr_list", sr_list)
 
         return f"↩️ 已撤销删除 '{self.item}'"
 

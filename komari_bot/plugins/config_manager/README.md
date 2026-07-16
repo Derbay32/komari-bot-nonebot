@@ -39,9 +39,14 @@ class MyConfig(BaseModel):
     timeout: int = Field(default=30)
 
 config_manager = config_manager_plugin.get_config_manager("my_plugin", MyConfig)
+
+# 模块加载阶段的同步用法
 config = config_manager.get()
-config_manager.update_field("timeout", 60)
-config = config_manager.reload()
+
+# 异步处理器与 FastAPI 路由必须使用异步接口
+config = await config_manager.get_async()
+await config_manager.update_field_async("timeout", 60)
+config = await config_manager.reload_async()
 ```
 
 ## API 参考
@@ -53,14 +58,18 @@ config = config_manager.reload()
 ### `initialize()` / `get()`
 
 从 PostgreSQL 读取配置；如果 PG 中没有对应插件配置，则从 dotenv / schema 默认值初始化并写入 PG。
+同步接口只用于模块加载等非异步阶段；事件处理器应使用 `initialize_async()` / `get_async()`。
 
 ### `update_field(field_name, value)`
 
 更新单个字段，使用 Pydantic schema 重新校验后写入 PG。
+写入采用 JSONB 字段补丁和递增修订号，检测到并发更新时会重载并重试；异步代码使用
+`update_field_async()`，避免阻塞事件循环。
 
 ### `reload()`
 
 从 PostgreSQL 重新读取配置。`reload_from_json()` 仅作为临时兼容别名存在，内部同样调用 `reload()`。
+异步代码使用 `reload_async()`。
 
 ### `config_source`
 
