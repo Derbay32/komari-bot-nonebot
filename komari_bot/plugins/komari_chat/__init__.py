@@ -141,10 +141,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         logger.debug("[KomariChat] KomariMemory 未就绪，跳过消息处理")
         return
 
-    group_id = str(event.group_id)
-    if group_id not in config.group_whitelist:
-        return
-
     can_use, _ = await permission_manager_plugin.check_runtime_permission(
         bot, event, config
     )
