@@ -108,20 +108,14 @@ class PermissionManager:
         if await SUPERUSER(bot, event):
             return True, ""
 
-        # 检查用户白名单
-        is_user_whitelisted = self.is_user_whitelisted(user_id)
-
-        # 如果是群聊消息，检查群组白名单
-        group_id = getattr(event, "group_id", None)
-        is_group_whitelisted = True
-        if group_id is not None:
-            is_group_whitelisted = self.is_group_whitelisted(str(group_id))
-            # 群聊：用户或群组任一在白名单中即可
-            if not (is_user_whitelisted or is_group_whitelisted):
-                return False, "用户和群组均不在白名单中，无法使用此命令"
-        # 私聊：只检查用户白名单
-        elif not is_user_whitelisted:
+        # 仅对已配置的白名单施加约束；多个已配置约束必须同时满足
+        if not self.is_user_whitelisted(user_id):
             return False, "您不在用户白名单中，无法使用此命令"
+
+        # 群白名单只约束群聊，私聊不受群白名单影响
+        group_id = getattr(event, "group_id", None)
+        if group_id is not None and not self.is_group_whitelisted(str(group_id)):
+            return False, "当前群组不在群组白名单中，无法使用此命令"
 
         return True, ""
 
