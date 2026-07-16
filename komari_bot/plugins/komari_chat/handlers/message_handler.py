@@ -21,6 +21,10 @@ from komari_bot.plugins.komari_decision.services.decision_engine import (
     DecisionEngine,
     DecisionOutcome,
 )
+from komari_bot.plugins.komari_decision.services.runtime_state import (
+    DecisionRuntimeState,
+    DecisionRuntimeStatus,
+)
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
@@ -68,6 +72,7 @@ ReplyAction = Literal[
     "not_replied",
     "generation_failed",
     "blocked_by_user_ban",
+    "decision_unavailable",
 ]
 ReplyTriggeredCallback = Callable[[], Awaitable[None]]
 
@@ -125,16 +130,31 @@ class MessageHandler:
         redis: RedisManager,
         memory: MemoryService,
         scene_runtime: SceneRuntimeService | None = None,
+        decision_runtime_state_provider: Callable[[], DecisionRuntimeState]
+        | None = None,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
+        self.scene_runtime = scene_runtime
         self.query_rewrite = QueryRewriteService()
-        self.decision_engine = DecisionEngine(redis, scene_runtime)
+        self.decision_engine = DecisionEngine(
+            redis,
+            scene_runtime,
+            runtime_state_provider=decision_runtime_state_provider,
+        )
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。"""
         return bool(hasattr(event, "to_me") and event.to_me)
+
+    @staticmethod
+    def _is_reply_to_bot(event: GroupMessageEvent) -> bool:
+        """检查当前消息是否引用了机器人消息。"""
+        reply = event.reply
+        if reply is None or reply.sender.user_id is None:
+            return False
+        return str(reply.sender.user_id) == str(event.self_id)
 
     @staticmethod
     def _strip_text_at_alias_prefix(
@@ -168,7 +188,7 @@ class MessageHandler:
     ) -> tuple[bool, str]:
         """解析当前消息是否应按 `@机器人` 直通处理，并返回清洗后的文本。"""
         message_content = event.get_plaintext()
-        if self._is_at_trigger(event):
+        if self._is_at_trigger(event) or self._is_reply_to_bot(event):
             return True, message_content
 
         config = get_config()
@@ -348,6 +368,8 @@ class MessageHandler:
             "meaningful_score": self._safe_round(outcome.meaningful_score),
             "call_direct_score": self._safe_round(outcome.call_direct_score),
             "call_mention_score": self._safe_round(outcome.call_mention_score),
+            "decision_runtime_status": outcome.runtime_status.value,
+            "decision_runtime_reason": outcome.runtime_reason,
         }
 
     def _log_decision(self, payload: dict[str, object]) -> None:
@@ -445,7 +467,11 @@ class MessageHandler:
                     user_id=user_id,
                     message_id=message_id,
                     outcome=outcome,
-                    reply_action="not_replied",
+                    reply_action=(
+                        "not_replied"
+                        if outcome.runtime_status is DecisionRuntimeStatus.READY
+                        else "decision_unavailable"
+                    ),
                 )
             )
             return None

@@ -5,15 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from nonebot import logger
+
 from .config_interface import get_config
 from .message_filter import preprocess_message
+from .runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
 from .social_timing_service import SocialTimingService, TimingScoreBreakdown
 from .unified_candidate_rerank import (
+    SceneRuntimeUnavailableError,
     UnifiedCandidateRerankService,
     UnifiedRerankResult,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
         SceneRuntimeService,
     )
@@ -47,6 +53,8 @@ class DecisionOutcome:
     filter_reason: Literal["short", "history_repeat", "none", "command"] | None
     rank_result: UnifiedRerankResult | None
     timing_breakdown: TimingScoreBreakdown | None
+    runtime_status: DecisionRuntimeStatus
+    runtime_reason: str
 
 
 class DecisionEngine:
@@ -59,10 +67,59 @@ class DecisionEngine:
         self,
         redis: RedisManager,
         scene_runtime: SceneRuntimeService | None = None,
+        runtime_state_provider: Callable[[], DecisionRuntimeState] | None = None,
     ) -> None:
         self._redis = redis
+        self._scene_runtime = scene_runtime
+        self._runtime_state_provider = runtime_state_provider
         self._unified_rerank = UnifiedCandidateRerankService(runtime_service=scene_runtime)
         self._social_timing = SocialTimingService(redis)
+
+    def _get_runtime_state(self) -> DecisionRuntimeState:
+        """读取运行时状态；状态提供器异常时按 failed 降级。"""
+        if self._runtime_state_provider is not None:
+            try:
+                return self._runtime_state_provider()
+            except Exception as exc:
+                logger.exception("[KomariDecision] 读取运行时状态失败")
+                return DecisionRuntimeState.failed(
+                    f"运行时状态读取失败：{type(exc).__name__}"
+                )
+
+        if self._scene_runtime is None:
+            return DecisionRuntimeState.disabled("scene runtime 未配置")
+        if self._scene_runtime.get_scene_candidates() is None:
+            return DecisionRuntimeState.failed("scene runtime snapshot 暂不可用")
+        return DecisionRuntimeState.ready()
+
+    @staticmethod
+    def _build_degraded_outcome(
+        runtime_state: DecisionRuntimeState,
+    ) -> DecisionOutcome:
+        """scene 不可用时保留消息，但禁止主动回复。"""
+        return DecisionOutcome(
+            memory_action="store",
+            should_reply=False,
+            force_reply=False,
+            reply_reason="none",
+            forced_reply_reason="none",
+            reply_score=None,
+            alias_hit=None,
+            call_intent="none",
+            call_margin=None,
+            best_scene_id=None,
+            scene_score=None,
+            timing_score=None,
+            noise_score=None,
+            meaningful_score=None,
+            call_direct_score=None,
+            call_mention_score=None,
+            filter_reason=None,
+            rank_result=None,
+            timing_breakdown=None,
+            runtime_status=runtime_state.status,
+            runtime_reason=runtime_state.reason,
+        )
 
     async def evaluate(
         self,
@@ -73,6 +130,7 @@ class DecisionEngine:
     ) -> DecisionOutcome:
         """执行完整判定流程。"""
         config = get_config()
+        runtime_state = self._get_runtime_state()
 
         if at_trigger:
             return DecisionOutcome(
@@ -95,6 +153,8 @@ class DecisionEngine:
                 filter_reason=None,
                 rank_result=None,
                 timing_breakdown=None,
+                runtime_status=runtime_state.status,
+                runtime_reason=runtime_state.reason,
             )
 
         filter_result = await preprocess_message(
@@ -124,9 +184,27 @@ class DecisionEngine:
                 filter_reason=filter_result.reason,
                 rank_result=None,
                 timing_breakdown=None,
+                runtime_status=runtime_state.status,
+                runtime_reason=runtime_state.reason,
             )
 
-        rank_result = await self._unified_rerank.rank_message(message_content)
+        if not runtime_state.is_ready:
+            logger.debug(
+                "[KomariDecision] 主动回复判定降级跳过: status={} reason={}",
+                runtime_state.status,
+                runtime_state.reason,
+            )
+            return self._build_degraded_outcome(runtime_state)
+
+        try:
+            rank_result = await self._unified_rerank.rank_message(message_content)
+        except SceneRuntimeUnavailableError as exc:
+            unavailable_state = DecisionRuntimeState.failed(str(exc))
+            logger.warning(
+                "[KomariDecision] scene runtime 暂不可用，跳过主动回复判定: {}",
+                exc,
+            )
+            return self._build_degraded_outcome(unavailable_state)
         memory_action: MemoryAction = (
             "drop" if self._should_drop_memory(rank_result) else "store"
         )
@@ -165,6 +243,8 @@ class DecisionEngine:
                 filter_reason=None,
                 rank_result=rank_result,
                 timing_breakdown=timing_result,
+                runtime_status=runtime_state.status,
+                runtime_reason=runtime_state.reason,
             )
 
         should_reply = reply_score >= config.reply_threshold
@@ -188,6 +268,8 @@ class DecisionEngine:
             filter_reason=None,
             rank_result=rank_result,
             timing_breakdown=timing_result,
+            runtime_status=runtime_state.status,
+            runtime_reason=runtime_state.reason,
         )
 
     @staticmethod

@@ -18,6 +18,7 @@ decision_plugin = require("komari_decision")
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
 get_decision_plugin_manager = decision_plugin.get_plugin_manager
+get_decision_runtime_state = getattr(decision_plugin, "get_runtime_state", None)
 
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
@@ -32,7 +33,7 @@ matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 _handler: MessageHandler | None = None
 
 
-def _resolve_runtime_components() -> tuple[Any, Any, Any | None] | None:
+def _resolve_runtime_components() -> tuple[Any, Any, Any | None, Any] | None:
     memory_manager = get_memory_plugin_manager()
     if (
         memory_manager is None
@@ -42,7 +43,10 @@ def _resolve_runtime_components() -> tuple[Any, Any, Any | None] | None:
         return None
     decision_manager = get_decision_plugin_manager()
     scene_runtime = None if decision_manager is None else decision_manager.scene_runtime
-    return memory_manager.redis, memory_manager.memory, scene_runtime
+    state_provider = (
+        get_decision_runtime_state if callable(get_decision_runtime_state) else None
+    )
+    return memory_manager.redis, memory_manager.memory, scene_runtime, state_provider
 
 
 def _get_or_build_handler() -> MessageHandler | None:
@@ -51,13 +55,19 @@ def _get_or_build_handler() -> MessageHandler | None:
     components = _resolve_runtime_components()
     if components is None:
         return None
-    redis, memory, scene_runtime = components
+    redis, memory, scene_runtime, state_provider = components
 
-    if _handler is None or _handler.redis is not redis or _handler.memory is not memory:
+    if (
+        _handler is None
+        or _handler.redis is not redis
+        or _handler.memory is not memory
+        or _handler.scene_runtime is not scene_runtime
+    ):
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
             scene_runtime=scene_runtime,
+            decision_runtime_state_provider=state_provider,
         )
     return _handler
 

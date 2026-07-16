@@ -147,6 +147,51 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
     assert calls.process
 
 
+def test_handler_rebuilds_when_decision_runtime_changes(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = object()
+    memory = object()
+    runtime_ref = SimpleNamespace(value=object())
+    built_runtimes: list[object | None] = []
+
+    class _Handler:
+        def __init__(
+            self,
+            *,
+            redis: object,
+            memory: object,
+            scene_runtime: object | None,
+            decision_runtime_state_provider: object,
+        ) -> None:
+            del decision_runtime_state_provider
+            self.redis = redis
+            self.memory = memory
+            self.scene_runtime = scene_runtime
+            built_runtimes.append(scene_runtime)
+
+    monkeypatch.setattr(
+        chat_module,
+        "get_memory_plugin_manager",
+        lambda: SimpleNamespace(redis=redis, memory=memory),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "get_decision_plugin_manager",
+        lambda: SimpleNamespace(scene_runtime=runtime_ref.value),
+    )
+    monkeypatch.setattr(chat_module, "MessageHandler", _Handler)
+    monkeypatch.setattr(chat_module, "_handler", None)
+
+    first = chat_module._get_or_build_handler()
+    runtime_ref.value = object()
+    second = chat_module._get_or_build_handler()
+
+    assert first is not second
+    assert built_runtimes == [first.scene_runtime, second.scene_runtime]
+
+
 @pytest.mark.asyncio
 async def test_send_failure_does_not_commit_reply_side_effects(
     chat_module: Any,

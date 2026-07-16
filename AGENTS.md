@@ -242,6 +242,11 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - `SocialTimingService` — 社交时机判定（主动回复冷却、频控）
 - `MessageFilter` — 消息过滤
 
+运行时契约：
+- `get_runtime_state()` 明确返回 `ready` / `disabled` / `failed`，禁止再用 `None` 混合表达状态。
+- `disabled` 或 `failed` 时，显式 @、文本 @ 别名和回复机器人仍由 `komari_chat` 直通；普通非 @ 消息仅保留必要缓冲，不执行 embedding/rerank，也不主动回复。
+- `plugin_enable=true` 但初始化异常或 scene snapshot 缺失必须报告 `failed`；只有 snapshot 可用时才记录 `ready`。
+
 ### 6. 聊天处理器拆解 (`komari_chat`)
 
 `message_handler.py` 的 `_attempt_reply()` 已拆分为三个边界：

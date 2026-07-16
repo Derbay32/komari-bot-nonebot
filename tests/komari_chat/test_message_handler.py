@@ -84,6 +84,24 @@ def test_resolve_trigger_message_uses_nonebot_to_me(
     assert message_content == "我不吃药！"
 
 
+def test_resolve_trigger_message_detects_reply_to_bot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = _build_handler()
+    _patch_config(monkeypatch)
+    reply = _build_reply(
+        sender_user_id=669293859,
+        message=Message("机器人上一条回复"),
+    )
+
+    at_trigger, message_content = handler._resolve_trigger_message(
+        _FakeEvent("接着说", reply=reply)
+    )
+
+    assert at_trigger is True
+    assert message_content == "接着说"
+
+
 def test_resolve_trigger_message_detects_plain_text_at_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
