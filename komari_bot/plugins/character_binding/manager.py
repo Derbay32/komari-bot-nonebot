@@ -4,12 +4,44 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import unicodedata
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from nonebot import logger
 
 # 模块级单例实例
 _manager_instance: CharacterBindingManager | None = None
+
+MAX_CHARACTER_NAME_LENGTH = 64
+_EMPTY_NAME_ERROR = "角色名不能为空"
+_NAME_TOO_LONG_ERROR = (
+    f"角色名不能超过 {MAX_CHARACTER_NAME_LENGTH} 个 Unicode 字符"
+)
+_UNSAFE_NAME_ERROR = "角色名不能包含换行或控制字符"
+
+
+class CharacterNameValidationError(ValueError):
+    """角色名不满足输入约束。"""
+
+
+class BindingPersistenceError(RuntimeError):
+    """角色绑定无法安全持久化。"""
+
+
+def validate_character_name(character_name: str) -> str:
+    """校验角色名并返回原值。"""
+    if not character_name.strip():
+        raise CharacterNameValidationError(_EMPTY_NAME_ERROR)
+    if len(character_name) > MAX_CHARACTER_NAME_LENGTH:
+        raise CharacterNameValidationError(_NAME_TOO_LONG_ERROR)
+    if any(
+        unicodedata.category(char) in {"Cc", "Zl", "Zp"}
+        for char in character_name
+    ):
+        raise CharacterNameValidationError(_UNSAFE_NAME_ERROR)
+    return character_name
 
 
 def get_manager() -> CharacterBindingManager:
@@ -27,10 +59,10 @@ def get_manager() -> CharacterBindingManager:
 class CharacterBindingManager:
     """角色名绑定管理器。"""
 
-    def __init__(self) -> None:
+    def __init__(self, binding_file: Path | None = None) -> None:
         """初始化绑定管理器。"""
         # 使用独立的 data 目录存储绑定数据
-        self.binding_file = Path("data/character_binding/bindings.json")
+        self.binding_file = binding_file or Path("data/character_binding/bindings.json")
         self.binding_file.parent.mkdir(parents=True, exist_ok=True)
         self._bindings: dict[str, str] = {}
         self._binding_mtime_ns: int | None = None
@@ -53,11 +85,10 @@ class CharacterBindingManager:
             self._bindings = {}
             # 初始化时同步写入空文件
             try:
-                with Path.open(self.binding_file, "w", encoding="utf-8") as f:
-                    json.dump({}, f, ensure_ascii=False, indent=2)
+                self._write_bindings_atomically({})
                 self._binding_mtime_ns = self._get_binding_mtime_ns()
                 logger.info("[CharacterBinding] 初始化角色绑定文件")
-            except OSError:
+            except BindingPersistenceError:
                 logger.exception("[CharacterBinding] 初始化绑定文件失败")
                 self._binding_mtime_ns = None
 
@@ -67,14 +98,72 @@ class CharacterBindingManager:
         except OSError:
             return None
 
-    async def _save_bindings(self) -> None:
-        """保存绑定数据到文件。"""
+    def _write_bindings_atomically(self, bindings: dict[str, str]) -> None:
+        """通过同目录临时文件原子替换绑定文件。"""
+        temporary_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.binding_file.parent,
+                prefix=f".{self.binding_file.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                json.dump(bindings, temporary_file, ensure_ascii=False, indent=2)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+
+            temporary_path.replace(self.binding_file)
+        except (OSError, TypeError, UnicodeError) as exc:
+            raise BindingPersistenceError("角色绑定保存失败") from exc
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        f"[CharacterBinding] 清理绑定临时文件失败: "
+                        f"path={temporary_path}",
+                        exc_info=True,
+                    )
+
+    async def _persist_bindings(self, bindings: dict[str, str]) -> None:
+        """在线程中持久化不可变绑定快照。"""
+        try:
+            await asyncio.to_thread(self._write_bindings_atomically, bindings)
+        except BindingPersistenceError:
+            logger.exception("[CharacterBinding] 绑定文件保存失败")
+            raise
+
+    async def set_character_name(self, user_id: str, character_name: str) -> None:
+        """设置用户的角色名绑定。"""
+        validated_name = validate_character_name(character_name)
         async with self._lock:
-            try:
-                with Path.open(self.binding_file, "w", encoding="utf-8") as f:
-                    json.dump(self._bindings, f, ensure_ascii=False, indent=2)
-            except OSError:
-                logger.exception("[CharacterBinding] 绑定文件保存失败")
+            updated_bindings = self._bindings.copy()
+            updated_bindings[user_id] = validated_name
+            await self._persist_bindings(updated_bindings)
+            self._bindings = updated_bindings
+
+        logger.info(
+            f"[CharacterBinding] 绑定角色: user_id={user_id}, "
+            f"name_length={len(validated_name)}"
+        )
+
+    async def remove_character_name(self, user_id: str) -> bool:
+        """移除用户的角色名绑定。"""
+        async with self._lock:
+            if user_id not in self._bindings:
+                return False
+
+            updated_bindings = self._bindings.copy()
+            del updated_bindings[user_id]
+            await self._persist_bindings(updated_bindings)
+            self._bindings = updated_bindings
+
+        logger.info(f"[CharacterBinding] 解除绑定: {user_id}")
+        return True
 
     def get_character_name(
         self,
@@ -102,33 +191,6 @@ class CharacterBindingManager:
 
         # 3. 最后回退到user_id
         return user_id
-
-    async def set_character_name(self, user_id: str, character_name: str) -> None:
-        """设置用户的角色名绑定。
-
-        Args:
-            user_id: 用户ID
-            character_name: 角色名称
-        """
-        self._bindings[user_id] = character_name
-        await self._save_bindings()
-        logger.info(f"[CharacterBinding] 绑定角色: {user_id} -> {character_name}")
-
-    async def remove_character_name(self, user_id: str) -> bool:
-        """移除用户的角色名绑定。
-
-        Args:
-            user_id: 用户ID
-
-        Returns:
-            是否成功移除
-        """
-        if user_id in self._bindings:
-            del self._bindings[user_id]
-            await self._save_bindings()
-            logger.info(f"[CharacterBinding] 解除绑定: {user_id}")
-            return True
-        return False
 
     def list_bindings(self) -> dict[str, str]:
         """获取所有绑定。
