@@ -61,7 +61,7 @@ class PluginManager:
         Args:
             config: 插件配置
         """
-        self.config = config
+        self.startup_config = config
         self.redis: RedisManager | None = None
         self.memory: MemoryService | None = None
         self.forgetting: ForgettingService | None = None
@@ -73,7 +73,7 @@ class PluginManager:
 
         try:
             # 1. 初始化 PostgreSQL 连接池 (用于向量检索)
-            self.pg_pool = await create_pool(self.config)
+            self.pg_pool = await create_pool()
             logger.info("[KomariMemory] PostgreSQL 连接池已建立")
 
             expected_dimension = self._resolve_expected_embedding_dimension()
@@ -81,7 +81,7 @@ class PluginManager:
             await self._validate_embedding_dimension(expected_dimension)
 
             # 2. 初始化 Redis 管理器
-            self.redis = RedisManager(self.config)
+            self.redis = RedisManager(self.startup_config)
             await self.redis.initialize()
             # 3. 初始化数据访问层
             conversation_repo = ConversationRepository(self.pg_pool)
@@ -89,7 +89,6 @@ class PluginManager:
             interaction_event_repo = InteractionEventRepository(self.pg_pool)
             # 4. 初始化记忆服务
             self.memory = MemoryService(
-                self.config,
                 conversation_repo,
                 entity_repo,
                 interaction_event_repo,
@@ -99,7 +98,7 @@ class PluginManager:
             register_summary_task(self.redis, self.memory)
 
             # 6. 初始化忘却服务并注册定时任务
-            self.forgetting = ForgettingService(self.config, self.pg_pool)
+            self.forgetting = ForgettingService(self.pg_pool)
             register_forgetting_task(self.forgetting, self.redis)
             register_interaction_event_task(self.redis, self.memory)
         except Exception:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from typing import Any, cast
 
 from komari_bot.plugins.komari_memory.repositories.entity_repository import (
@@ -131,7 +130,6 @@ def _make_service(
     embedding_plugin = _FakeEmbeddingPlugin()
     monkeypatch.setattr(memory_service_module, "require", lambda _name: embedding_plugin)
     service = MemoryService(
-        config=cast("Any", SimpleNamespace(forgetting_access_boost=1.2)),
         conversation_repo=cast("Any", conversation_repo),
         entity_repo=cast("Any", entity_repo),
     )

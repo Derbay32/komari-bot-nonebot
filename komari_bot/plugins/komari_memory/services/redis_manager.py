@@ -1,5 +1,6 @@
 """Komari Memory Redis 操作管理器。"""
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -261,16 +262,33 @@ def _get_today_4am_timestamp() -> float:
     return today_4am.timestamp()
 
 
+def _log_redis_json_error(*, context: str, key: str, raw_item: object) -> None:
+    """记录可关联但不包含原始正文的 Redis 反序列化错误。"""
+    raw_bytes = (
+        raw_item
+        if isinstance(raw_item, bytes)
+        else str(raw_item).encode("utf-8", errors="replace")
+    )
+    logger.warning(
+        "[KomariMemory] Redis JSON 解析失败: "
+        "context={} key={} bytes={} sha256={}",
+        context,
+        key,
+        len(raw_bytes),
+        hashlib.sha256(raw_bytes).hexdigest(),
+    )
+
+
 class RedisManager:
     """Redis 操作管理器。"""
 
-    def __init__(self, config: KomariMemoryConfigSchema) -> None:
+    def __init__(self, connection_config: KomariMemoryConfigSchema) -> None:
         """初始化 Redis 管理器。
 
         Args:
-            config: 插件配置
+            connection_config: 仅用于建立连接的启动配置快照
         """
-        self._config = config
+        self._connection_config = connection_config
         self._redis: aioredis.Redis | None = None
 
     @property
@@ -285,25 +303,26 @@ class RedisManager:
     async def initialize(self) -> None:
         """初始化 Redis 连接。"""
         db_config = get_shared_database_config()
-
-        # 构建连接 URL
-        password_part = (
-            f":{db_config.redis_password}@" if db_config.redis_password else ""
+        client = aioredis.Redis(
+            host=db_config.redis_host,
+            port=db_config.redis_port,
+            db=self._connection_config.redis_db,
+            password=db_config.redis_password or None,
+            decode_responses=True,
+            encoding="utf-8",
         )
-        redis_url = (
-            f"redis://{password_part}{db_config.redis_host}:"
-            f"{db_config.redis_port}/{self.config.redis_db}"
-        )
-
-        self._redis = await aioredis.from_url(
-            redis_url, decode_responses=True, encoding="utf-8"
-        )
+        try:
+            await cast("Any", client.ping())
+        except Exception:
+            await client.aclose()
+            raise
+        self._redis = client
         logger.info("[KomariMemory] Redis 连接已建立")
 
     async def close(self) -> None:
         """关闭 Redis 连接。"""
         if self._redis:
-            await self._redis.close()
+            await self._redis.aclose()
             self._redis = None
             logger.info("[KomariMemory] Redis 连接已关闭")
 
@@ -442,7 +461,11 @@ class RedisManager:
             try:
                 messages.append(self._deserialize_message(raw_item))
             except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                logger.warning("[KomariMemory] 对话 processing 消息 JSON 解析失败: {}", raw_item)
+                _log_redis_json_error(
+                    context="conversation_processing",
+                    key=processing_key,
+                    raw_item=raw_item,
+                )
         return messages
 
     async def delete_processing_conversation_buffer(
@@ -625,15 +648,16 @@ class RedisManager:
         buffer_key = RedisKeys.buffer(group_id)
         buffer_len = cast("int", await self.redis.execute_command("LLEN", buffer_key))
         should_trigger = False
+        config = self.config
 
         if buffer_len == 0:
             return should_trigger
 
-        if buffer_len >= self.config.summary_max_buffer_size:
+        if buffer_len >= config.summary_max_buffer_size:
             # 1. 安全上限：防止连续活跃导致缓冲区无限增长。
             logger.debug(
                 f"[KomariMemory] 群组 {group_id} buffer 达安全上限: "
-                f"{buffer_len}/{self.config.summary_max_buffer_size}"
+                f"{buffer_len}/{config.summary_max_buffer_size}"
             )
             should_trigger = True
         elif (
@@ -647,16 +671,16 @@ class RedisManager:
                 f"buffer={buffer_len} 条（会话自 {datetime.fromtimestamp(session_start, tz=current_tz)}）"
             )
             should_trigger = True
-        elif buffer_len >= self.config.summary_min_messages:
+        elif buffer_len >= config.summary_min_messages:
             # 3. 主触发：消息数达标且群聊已空闲足够久。
             last_msg_time = await self.get_last_message_time(group_id)
             if last_msg_time is not None:
                 idle_seconds = time.time() - last_msg_time
-                if idle_seconds >= self.config.summary_idle_timeout:
+                if idle_seconds >= config.summary_idle_timeout:
                     logger.debug(
                         f"[KomariMemory] 群组 {group_id} 空闲触发总结: "
-                        f"buffer={buffer_len}/{self.config.summary_min_messages} "
-                        f"idle={idle_seconds:.0f}/{self.config.summary_idle_timeout}s"
+                        f"buffer={buffer_len}/{config.summary_min_messages} "
+                        f"idle={idle_seconds:.0f}/{config.summary_idle_timeout}s"
                     )
                     should_trigger = True
 
@@ -829,7 +853,11 @@ class RedisManager:
             try:
                 parsed = json.loads(raw_item)
             except (TypeError, ValueError):
-                logger.warning("[KomariMemory] 跨群互动缓冲 JSON 解析失败: {}", raw_item)
+                _log_redis_json_error(
+                    context="global_interaction_buffer",
+                    key=key,
+                    raw_item=raw_item,
+                )
                 continue
             if isinstance(parsed, dict):
                 records.append(parsed)
@@ -897,7 +925,11 @@ class RedisManager:
             try:
                 parsed = json.loads(raw_item)
             except (TypeError, ValueError):
-                logger.warning("[KomariMemory] 跨群互动缓冲 JSON 解析失败: {}", raw_item)
+                _log_redis_json_error(
+                    context="global_interaction_processing",
+                    key=processing_key,
+                    raw_item=raw_item,
+                )
                 continue
             if isinstance(parsed, dict):
                 records.append(parsed)

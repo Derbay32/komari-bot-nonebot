@@ -10,7 +10,7 @@ class KomariMemoryConfigSchema(BaseModel):
     """Komari Memory 插件配置。"""
 
     model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "restart"},
+        json_schema_extra={"default_apply_mode": "immediate"},
     )
 
     # 元数据
@@ -21,7 +21,11 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 插件控制
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    plugin_enable: bool = Field(
+        default=False,
+        description="插件启用状态",
+        json_schema_extra={"apply_mode": "restart"},
+    )
 
     # 白名单配置
     user_whitelist: list[str] = Field(
@@ -33,7 +37,9 @@ class KomariMemoryConfigSchema(BaseModel):
 
     # Redis 配置
     redis_db: int = Field(
-        default=1, description="Redis 数据库编号 (避免与其他插件冲突)"
+        default=1,
+        description="Redis 数据库编号 (避免与其他插件冲突)",
+        json_schema_extra={"apply_mode": "rebuild"},
     )
 
     # LLM 配置 - 对话模型（用于生成回复）
@@ -258,6 +264,7 @@ class KomariMemoryConfigSchema(BaseModel):
         ge=1,
         le=10,
         description="互动事件 Worker 轮询间隔（分钟）",
+        json_schema_extra={"apply_mode": "rebuild"},
     )
     global_interaction_processing_lease_seconds: int = Field(
         default=1800,

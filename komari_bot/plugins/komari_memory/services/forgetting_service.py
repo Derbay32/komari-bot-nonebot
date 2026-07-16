@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from collections.abc import Callable
 from typing import Any
 
 import asyncpg
@@ -10,6 +11,7 @@ from nonebot.plugin import require
 
 from ..config_schema import KomariMemoryConfigSchema
 from ..core.retry import retry_async
+from .config_interface import get_config
 
 llm_provider = require("llm_provider")
 
@@ -91,17 +93,23 @@ class ForgettingService:
 
     def __init__(
         self,
-        config: KomariMemoryConfigSchema,
         pg_pool: asyncpg.Pool,
+        *,
+        config_provider: Callable[[], KomariMemoryConfigSchema] = get_config,
     ) -> None:
         """初始化忘却服务。
 
         Args:
-            config: 插件配置
             pg_pool: PostgreSQL连接池
+            config_provider: 每次执行时读取当前配置的函数
         """
-        self.config = config
         self.pg_pool = pg_pool
+        self._config_provider = config_provider
+
+    @property
+    def config(self) -> KomariMemoryConfigSchema:
+        """获取当前动态配置，避免服务长期持有启动快照。"""
+        return self._config_provider()
 
     async def decay_and_cleanup(self) -> None:
         """执行死神脚本（每天凌晨4点）。
@@ -112,7 +120,8 @@ class ForgettingService:
         3. 删除低价值记忆
         4. 高价值记忆第一次归零时模糊化并恢复重要性，第二次归零删除
         """
-        if not self.config.forgetting_enabled:
+        config = self.config
+        if not config.forgetting_enabled:
             logger.debug("[KomariMemory] 忘却功能未启用，跳过")
             return
 
@@ -167,8 +176,9 @@ class ForgettingService:
         Returns:
             删除的记录数
         """
-        threshold = self.config.forgetting_importance_threshold
-        min_age_days = self.config.forgetting_min_age_days
+        config = self.config
+        threshold = config.forgetting_importance_threshold
+        min_age_days = config.forgetting_min_age_days
         async with self.pg_pool.acquire() as conn:
             result = await conn.execute(
                 """
@@ -191,8 +201,9 @@ class ForgettingService:
 
     async def _delete_low_value_interaction_events(self) -> int:
         """删除低价值跨群互动事件记忆。"""
-        threshold = self.config.forgetting_importance_threshold
-        min_age_days = self.config.forgetting_min_age_days
+        config = self.config
+        threshold = config.forgetting_importance_threshold
+        min_age_days = config.forgetting_min_age_days
         async with self.pg_pool.acquire() as conn:
             result = await conn.execute(
                 """
@@ -214,8 +225,9 @@ class ForgettingService:
         Returns:
             处理的记录数（删除+模糊化）
         """
-        threshold = self.config.forgetting_importance_threshold
-        min_age_days = self.config.forgetting_min_age_days
+        config = self.config
+        threshold = config.forgetting_importance_threshold
+        min_age_days = config.forgetting_min_age_days
         async with self.pg_pool.acquire() as conn:
             fuzzy_result = await conn.execute(
                 """
@@ -251,7 +263,7 @@ class ForgettingService:
             )
             return deleted_fuzzy
 
-        concurrency = max(1, int(self.config.forgetting_fuzzify_concurrency))
+        concurrency = max(1, int(config.forgetting_fuzzify_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _fuzzify_record(record: asyncpg.Record | dict[str, Any]) -> bool:
@@ -296,8 +308,9 @@ class ForgettingService:
 
     async def _fuzzify_and_cleanup_high_value_interaction_events(self) -> int:
         """处理高价值跨群互动事件的模糊化或二次删除。"""
-        threshold = self.config.forgetting_importance_threshold
-        min_age_days = self.config.forgetting_min_age_days
+        config = self.config
+        threshold = config.forgetting_importance_threshold
+        min_age_days = config.forgetting_min_age_days
         async with self.pg_pool.acquire() as conn:
             fuzzy_result = await conn.execute(
                 """
@@ -327,7 +340,7 @@ class ForgettingService:
         if not rows:
             return deleted_fuzzy
 
-        concurrency = max(1, int(self.config.forgetting_fuzzify_concurrency))
+        concurrency = max(1, int(config.forgetting_fuzzify_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _fuzzify_record(record: asyncpg.Record | dict[str, Any]) -> bool:
@@ -393,7 +406,8 @@ class ForgettingService:
     @retry_async(max_attempts=3, base_delay=1.0)
     async def _generate_fuzzy_summary(self, original: str, conv_id: int) -> str:
         """生成模糊化总结，并只保留正文。"""
-        tag = (self.config.response_tag or "content").strip() or "content"
+        config = self.config
+        tag = (config.response_tag or "content").strip() or "content"
         prompt = (
             "请将下面的对话总结模糊化为一句简短的简体中文概要。\n"
             "要求：\n"
@@ -406,11 +420,11 @@ class ForgettingService:
 
         response = await llm_provider.generate_text(
             prompt=prompt,
-            model=self.config.llm_model_summary,
-            temperature=self.config.llm_temperature_summary,
-            max_tokens=min(self.config.llm_max_tokens_summary, 120),
-            thinking_mode=self.config.llm_thinking_mode_summary,
-            reasoning_effort=self.config.llm_reasoning_effort_summary,
+            model=config.llm_model_summary,
+            temperature=config.llm_temperature_summary,
+            max_tokens=min(config.llm_max_tokens_summary, 120),
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
             request_trace_id=f"memfuzzy-{conv_id}",
             request_phase="forgetting_fuzzify",
         )
@@ -476,7 +490,8 @@ class ForgettingService:
     @retry_async(max_attempts=3, base_delay=1.0)
     async def _generate_fuzzy_interaction_summary(self, original: str, event_id: int) -> str:
         """生成跨群互动事件模糊化总结。"""
-        tag = (self.config.response_tag or "content").strip() or "content"
+        config = self.config
+        tag = (config.response_tag or "content").strip() or "content"
         prompt = (
             "请将下面的小鞠与某用户的长期互动事件记忆模糊化为一句简短的简体中文概要。\n"
             "要求：\n"
@@ -488,11 +503,11 @@ class ForgettingService:
         )
         response = await llm_provider.generate_text(
             prompt=prompt,
-            model=self.config.llm_model_summary,
-            temperature=self.config.llm_temperature_summary,
-            max_tokens=min(self.config.llm_max_tokens_summary, 120),
-            thinking_mode=self.config.llm_thinking_mode_summary,
-            reasoning_effort=self.config.llm_reasoning_effort_summary,
+            model=config.llm_model_summary,
+            temperature=config.llm_temperature_summary,
+            max_tokens=min(config.llm_max_tokens_summary, 120),
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
             request_trace_id=f"memfuzzy-interaction-{event_id}",
             request_phase="forgetting_interaction_fuzzify",
         )

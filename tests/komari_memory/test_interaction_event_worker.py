@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from komari_bot.plugins.komari_memory.handlers import (
     interaction_event_worker as worker_module,
@@ -170,3 +170,32 @@ def test_snapshot_dedup_key_is_independent_of_dictionary_key_order() -> None:
     assert worker_module._build_snapshot_dedup_key(
         "u1", [first]
     ) != worker_module._build_snapshot_dedup_key("u2", [first])
+
+
+def test_disabled_interaction_worker_is_registered_dormant_for_hot_enable(
+    monkeypatch: Any,
+) -> None:
+    add_job_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    scheduler = SimpleNamespace(
+        add_job=lambda *args, **kwargs: add_job_calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(worker_module, "scheduler", scheduler)
+    monkeypatch.setattr(
+        worker_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            global_interaction_enabled=False,
+            global_interaction_summary_interval_minutes=3,
+        ),
+    )
+
+    worker_module.register_interaction_event_task(
+        cast("Any", SimpleNamespace()),
+        cast("Any", SimpleNamespace()),
+    )
+
+    assert len(add_job_calls) == 2
+    interval_args, interval_kwargs = add_job_calls[0]
+    assert interval_args[1] == "interval"
+    assert interval_kwargs["minutes"] == 3
+    assert interval_kwargs["id"] == worker_module._JOB_ID

@@ -36,7 +36,7 @@ def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
     [
         ("komari_management", "DynamicConfigSchema", "restart"),
         ("embedding_provider", "DynamicConfigSchema", "restart"),
-        ("komari_memory", "KomariMemoryConfigSchema", "restart"),
+        ("komari_memory", "KomariMemoryConfigSchema", "immediate"),
         ("komari_sentry", "KomariSentryConfigSchema", "restart"),
         ("user_data", "DynamicConfigSchema", "restart"),
         ("group_history_summary", "DynamicConfigSchema", "immediate"),

@@ -75,8 +75,8 @@ def _make_service(conn: _FakeConnection) -> ForgettingService:
         llm_reasoning_effort_summary="",
     )
     return ForgettingService(
-        config=cast("Any", config),
         pg_pool=cast("Any", _FakePool(conn)),
+        config_provider=lambda: cast("Any", config),
     )
 
 
@@ -92,6 +92,29 @@ def test_delete_low_value_memories_respects_min_age_days() -> None:
     assert "importance_initial <= $1" in query
     assert "created_at <= NOW() - ($2 * INTERVAL '1 day')" in query
     assert args == (3, 7)
+
+
+def test_forgetting_service_reads_current_config_for_each_execution() -> None:
+    conn = _FakeConnection(execute_results=["DELETE 1", "DELETE 1"])
+    current = {
+        "config": SimpleNamespace(
+            forgetting_importance_threshold=2,
+            forgetting_min_age_days=5,
+        )
+    }
+    service = ForgettingService(
+        pg_pool=cast("Any", _FakePool(conn)),
+        config_provider=lambda: cast("Any", current["config"]),
+    )
+
+    asyncio.run(service._delete_low_value_memories())
+    current["config"] = SimpleNamespace(
+        forgetting_importance_threshold=4,
+        forgetting_min_age_days=9,
+    )
+    asyncio.run(service._delete_low_value_memories())
+
+    assert [args for _query, args in conn.execute_calls] == [(2, 5), (4, 9)]
 
 
 def test_daily_decay_uses_integer_step_down() -> None:

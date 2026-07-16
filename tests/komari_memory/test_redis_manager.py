@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
+
+import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -384,6 +388,111 @@ def _get_fake_redis(manager: RedisManager) -> _FakeRedis:
     return cast("_FakeRedis", manager._redis)
 
 
+def _capture_warning_logs(monkeypatch: Any) -> list[str]:
+    logs: list[str] = []
+
+    def _warning(message: str, *args: object) -> None:
+        logs.append(message.format(*args))
+
+    monkeypatch.setattr(redis_manager_module.logger, "warning", _warning)
+    return logs
+
+
+def test_initialize_uses_structured_redis_connection_parameters(
+    monkeypatch: Any,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    class _Connection:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+            self.pinged = False
+            self.closed = False
+
+        async def ping(self) -> bool:
+            self.pinged = True
+            return True
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    connections: list[_Connection] = []
+
+    def _connection_factory(**kwargs: object) -> _Connection:
+        connection = _Connection(**kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        redis_manager_module,
+        "get_shared_database_config",
+        lambda: SimpleNamespace(
+            redis_host="redis.internal",
+            redis_port=6380,
+            redis_password="p@ss:/?#word",
+        ),
+    )
+    monkeypatch.setattr(
+        redis_manager_module.aioredis,
+        "Redis",
+        _connection_factory,
+    )
+    manager = RedisManager(KomariMemoryConfigSchema(redis_db=6))
+
+    asyncio.run(manager.initialize())
+
+    connection = connections[0]
+    assert connection.pinged is True
+    assert captured_kwargs == {
+        "host": "redis.internal",
+        "port": 6380,
+        "db": 6,
+        "password": "p@ss:/?#word",
+        "decode_responses": True,
+        "encoding": "utf-8",
+    }
+    assert manager.redis is connection
+
+    asyncio.run(manager.close())
+    assert connection.closed is True
+
+
+def test_initialize_closes_redis_client_when_ping_fails(monkeypatch: Any) -> None:
+    class _Connection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def ping(self) -> bool:
+            msg = "连接失败"
+            raise ConnectionError(msg)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    connection = _Connection()
+    monkeypatch.setattr(
+        redis_manager_module,
+        "get_shared_database_config",
+        lambda: SimpleNamespace(
+            redis_host="redis.internal",
+            redis_port=6380,
+            redis_password="secret",
+        ),
+    )
+    monkeypatch.setattr(
+        redis_manager_module.aioredis,
+        "Redis",
+        lambda **_kwargs: connection,
+    )
+    manager = RedisManager(KomariMemoryConfigSchema(redis_db=6))
+
+    with pytest.raises(ConnectionError, match="连接失败"):
+        asyncio.run(manager.initialize())
+
+    assert connection.closed is True
+    assert manager._redis is None
+
+
 def test_proactive_reservation_is_atomic_for_concurrent_requests(
     monkeypatch: Any,
 ) -> None:
@@ -587,15 +696,41 @@ def test_get_global_interaction_buffer_returns_tail_in_order(monkeypatch: Any) -
 def test_get_global_interaction_buffer_skips_invalid_json(monkeypatch: Any) -> None:
     manager = _build_manager(monkeypatch)
     key = redis_manager_module.RedisKeys.global_interaction("u1")
+    secret_payload = '{"event":"绝不能出现在日志里"'
     _get_fake_redis(manager).data[key] = [
-        "not-json",
+        secret_payload,
         json.dumps({"event": "有效"}, ensure_ascii=False),
         json.dumps([{"event": "列表会跳过"}], ensure_ascii=False),
     ]
+    warning_logs = _capture_warning_logs(monkeypatch)
 
     records = asyncio.run(manager.get_global_interaction_buffer("u1", limit=10))
 
     assert records == [{"event": "有效"}]
+    assert len(warning_logs) == 1
+    assert secret_payload not in warning_logs[0]
+    assert f"key={key}" in warning_logs[0]
+    assert f"bytes={len(secret_payload.encode('utf-8'))}" in warning_logs[0]
+    assert hashlib.sha256(secret_payload.encode()).hexdigest() in warning_logs[0]
+
+
+def test_processing_conversation_json_error_log_is_redacted(monkeypatch: Any) -> None:
+    manager = _build_manager(monkeypatch)
+    processing_key = RedisKeys.buffer_processing("g1", "token")
+    secret_payload = '{"content":"用户私密消息"'
+    _get_fake_redis(manager).data[processing_key] = [secret_payload]
+    warning_logs = _capture_warning_logs(monkeypatch)
+
+    messages = asyncio.run(
+        manager.get_processing_conversation_buffer(processing_key)
+    )
+
+    assert messages == []
+    assert len(warning_logs) == 1
+    assert secret_payload not in warning_logs[0]
+    assert "context=conversation_processing" in warning_logs[0]
+    assert f"key={processing_key}" in warning_logs[0]
+    assert hashlib.sha256(secret_payload.encode()).hexdigest() in warning_logs[0]
 
 
 def test_get_global_interaction_buffer_limit_zero_returns_empty(

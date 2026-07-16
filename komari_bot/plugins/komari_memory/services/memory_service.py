@@ -10,7 +10,6 @@ from nonebot.plugin import require
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..config_schema import KomariMemoryConfigSchema
     from ..repositories.conversation_repository import ConversationRepository
     from ..repositories.entity_repository import (
         EntityRepository,
@@ -26,7 +25,6 @@ class MemoryService:
 
     def __init__(
         self,
-        config: KomariMemoryConfigSchema,
         conversation_repo: ConversationRepository,
         entity_repo: EntityRepository,
         interaction_event_repo: InteractionEventRepository | None = None,
@@ -34,11 +32,9 @@ class MemoryService:
         """初始化记忆服务。
 
         Args:
-            config: 插件配置
             conversation_repo: 对话仓库
             entity_repo: 实体仓库
         """
-        self.config = config
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
         self._interaction_event_repo = interaction_event_repo

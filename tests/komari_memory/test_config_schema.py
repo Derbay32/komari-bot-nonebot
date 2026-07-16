@@ -29,6 +29,24 @@ def test_config_schema_exposes_profile_trait_limit() -> None:
     assert config.profile_trait_limit == 20
 
 
+def test_config_schema_declares_non_immediate_lifecycle_fields() -> None:
+    expected_modes = {
+        "plugin_enable": "restart",
+        "redis_db": "rebuild",
+        "global_interaction_summary_interval_minutes": "rebuild",
+    }
+
+    assert KomariMemoryConfigSchema.model_config.get("json_schema_extra") == {
+        "default_apply_mode": "immediate"
+    }
+    for field_name, expected_mode in expected_modes.items():
+        field_extra = KomariMemoryConfigSchema.model_fields[
+            field_name
+        ].json_schema_extra
+        assert isinstance(field_extra, dict)
+        assert field_extra["apply_mode"] == expected_mode
+
+
 def test_config_schema_rejects_too_small_profile_trait_limit() -> None:
     import pytest
 

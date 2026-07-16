@@ -206,12 +206,8 @@ async def daily_enqueue_global_interactions(redis: RedisManager) -> None:
 
 
 def register_interaction_event_task(redis: RedisManager, memory: MemoryService) -> None:
-    """注册跨群互动事件总结任务。"""
+    """注册跨群互动事件总结任务；禁用时保留休眠任务以支持即时启用。"""
     config = get_config()
-    if not config.global_interaction_enabled:
-        logger.info("[KomariMemory] 跨群互动事件缓冲未启用，跳过 worker 注册")
-        return
-
     scheduler.add_job(
         interaction_event_worker_task,
         "interval",
@@ -229,7 +225,10 @@ def register_interaction_event_task(redis: RedisManager, memory: MemoryService) 
         id=_DAILY_JOB_ID,
         replace_existing=True,
     )
-    logger.info("[KomariMemory] 跨群互动事件总结任务已注册")
+    if config.global_interaction_enabled:
+        logger.info("[KomariMemory] 跨群互动事件总结任务已注册")
+    else:
+        logger.info("[KomariMemory] 跨群互动事件总结任务已休眠注册，启用后即时生效")
 
 
 def unregister_interaction_event_task() -> None:

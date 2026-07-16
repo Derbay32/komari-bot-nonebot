@@ -106,7 +106,6 @@ def _make_service(
         lambda _name: embedding_plugin,
     )
     service = MemoryService(
-        config=cast("Any", SimpleNamespace(forgetting_access_boost=1.2)),
         conversation_repo=cast("Any", repository),
         entity_repo=cast("Any", object()),
     )
@@ -204,7 +203,6 @@ def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> 
         lambda _name: embedding_plugin,
     )
     service = MemoryService(
-        config=cast("Any", SimpleNamespace()),
         conversation_repo=cast("Any", _FakeConversationRepository()),
         entity_repo=cast("Any", object()),
         interaction_event_repo=cast("Any", event_repository),
@@ -229,7 +227,6 @@ def test_batch_upsert_user_profiles_adds_default_metadata(monkeypatch: Any) -> N
         lambda _name: _FakeEmbeddingPlugin(rerank_enabled=False),
     )
     service = MemoryService(
-        config=cast("Any", SimpleNamespace()),
         conversation_repo=cast("Any", _FakeConversationRepository()),
         entity_repo=cast("Any", entity_repository),
     )

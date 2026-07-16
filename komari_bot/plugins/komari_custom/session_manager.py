@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, ClassVar, Literal
 
@@ -24,33 +25,44 @@ class CustomSessionManager:
     """基于 Redis 的提案编辑会话管理器。"""
 
     _redis_client: ClassVar[aioredis.Redis | None] = None
+    _redis_client_lock: ClassVar[asyncio.Lock | None] = None
+    _redis_client_lock_loop: ClassVar[asyncio.AbstractEventLoop | None] = None
 
     def __init__(self, config_manager: Any) -> None:
         self.config_manager = config_manager
 
     async def close(self) -> None:
         """关闭共享 Redis 连接。"""
-        if self.__class__._redis_client is not None:
-            await self.__class__._redis_client.close()
+        async with self._get_client_lock():
+            client = self.__class__._redis_client
             self.__class__._redis_client = None
+            if client is not None:
+                await client.aclose()
 
     async def _get_client(self) -> aioredis.Redis:
         if self.__class__._redis_client is None:
-            config = self.config_manager.get()
-            db_config = get_shared_database_config()
-            password_part = (
-                f":{db_config.redis_password}@" if db_config.redis_password else ""
-            )
-            redis_url = (
-                f"redis://{password_part}{db_config.redis_host}:"
-                f"{db_config.redis_port}/{config.redis_db}"
-            )
-            self.__class__._redis_client = await aioredis.from_url(
-                redis_url,
-                decode_responses=True,
-                encoding="utf-8",
-            )
+            async with self._get_client_lock():
+                if self.__class__._redis_client is None:
+                    config = await self.config_manager.get_async()
+                    db_config = get_shared_database_config()
+                    self.__class__._redis_client = aioredis.Redis(
+                        host=db_config.redis_host,
+                        port=db_config.redis_port,
+                        db=config.redis_db,
+                        password=db_config.redis_password or None,
+                        decode_responses=True,
+                        encoding="utf-8",
+                    )
         return self.__class__._redis_client
+
+    @classmethod
+    def _get_client_lock(cls) -> asyncio.Lock:
+        """获取绑定到当前事件循环的共享客户端初始化锁。"""
+        loop = asyncio.get_running_loop()
+        if cls._redis_client_lock is None or cls._redis_client_lock_loop is not loop:
+            cls._redis_client_lock = asyncio.Lock()
+            cls._redis_client_lock_loop = loop
+        return cls._redis_client_lock
 
     @staticmethod
     def _key(group_id: int, user_id: str) -> str:
