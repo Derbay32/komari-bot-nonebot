@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,36 +24,51 @@ user_id, ban_scope, operator_id, reason, expires_at, created_at, updated_at
 _ACTIVE_PREDICATE = "(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)"
 
 
+@dataclass(frozen=True, slots=True)
+class BanCacheSnapshot:
+    """与单个数据库快照一致的缓存版本和有效封禁记录。"""
+
+    revision: int
+    records: tuple[BanRecord, ...]
+
+
 class UserBanRepository:
     """用户封禁数据仓储。"""
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
+        self._initialize_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """初始化连接池和表结构。"""
         if self._pool is not None:
             return
 
-        pool = await create_postgres_pool(
-            get_shared_database_config(),
-            command_timeout=30,
-        )
-        try:
-            sql = Path(__file__).with_name("init_db.sql").read_text(encoding="utf-8")
-            async with pool.acquire() as conn:
-                await conn.execute(sql)
-        except Exception:
-            await pool.close()
-            raise
-        self._pool = pool
+        async with self._initialize_lock:
+            if self._pool is not None:
+                return
+            pool = await create_postgres_pool(
+                get_shared_database_config(),
+                command_timeout=30,
+            )
+            try:
+                sql = Path(__file__).with_name("init_db.sql").read_text(
+                    encoding="utf-8"
+                )
+                async with pool.acquire() as conn:
+                    await conn.execute(sql)
+            except Exception:
+                await pool.close()
+                raise
+            self._pool = pool
 
     async def close(self) -> None:
         """关闭数据库连接池。"""
-        if self._pool is None:
-            return
-        await self._pool.close()
-        self._pool = None
+        async with self._initialize_lock:
+            pool = self._pool
+            self._pool = None
+            if pool is not None:
+                await pool.close()
 
     def _require_pool(self) -> asyncpg.Pool:
         if self._pool is None:
@@ -87,10 +104,39 @@ class UserBanRepository:
             for user_id in user_order
         )
 
-    async def load_all(self) -> tuple[BanRecord, ...]:
-        """读取全部当前有效的封禁记录。"""
+    async def get_cache_revision(self) -> int:
+        """读取轻量缓存版本水位，不传输封禁明细。"""
         pool = self._require_pool()
         async with pool.acquire() as conn:
+            revision = await conn.fetchval(
+                """
+                SELECT revision
+                FROM komari_user_ban_cache_state
+                WHERE singleton_id = 1
+                """
+            )
+        if revision is None:
+            msg = "user_ban 缓存版本记录不存在"
+            raise RuntimeError(msg)
+        return int(revision)
+
+    async def load_snapshot(self) -> BanCacheSnapshot:
+        """在可重复读事务中读取缓存版本与全部有效记录。"""
+        pool = self._require_pool()
+        async with pool.acquire() as conn, conn.transaction(
+            isolation="repeatable_read",
+            readonly=True,
+        ):
+            revision = await conn.fetchval(
+                """
+                SELECT revision
+                FROM komari_user_ban_cache_state
+                WHERE singleton_id = 1
+                """
+            )
+            if revision is None:
+                msg = "user_ban 缓存版本记录不存在"
+                raise RuntimeError(msg)
             rows = await conn.fetch(
                 f"""
                 SELECT {_RECORD_COLUMNS}
@@ -99,7 +145,29 @@ class UserBanRepository:
                 ORDER BY user_id, ban_scope
                 """
             )
-        return tuple(self._row_to_record(row) for row in rows)
+        return BanCacheSnapshot(
+            revision=int(revision),
+            records=tuple(self._row_to_record(row) for row in rows),
+        )
+
+    async def load_all(self) -> tuple[BanRecord, ...]:
+        """兼容旧调用：读取一致快照中的全部有效记录。"""
+        return (await self.load_snapshot()).records
+
+    @staticmethod
+    async def _bump_cache_revision(conn: Any) -> None:
+        """在业务写事务中推进跨 worker 缓存版本。"""
+        result = await conn.execute(
+            """
+            UPDATE komari_user_ban_cache_state
+            SET revision = revision + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE singleton_id = 1
+            """
+        )
+        if result != "UPDATE 1":
+            msg = "user_ban 缓存版本推进失败"
+            raise RuntimeError(msg)
 
     async def add_scopes(
         self,
@@ -165,6 +233,8 @@ class UserBanRepository:
                 """,
                 user_id,
             )
+            if changed_rows:
+                await self._bump_cache_revision(conn)
 
         if not changed_rows:
             mutation_kind: BanMutationKind = "unchanged"
@@ -205,6 +275,8 @@ class UserBanRepository:
                 """,
                 user_id,
             )
+            if deleted_rows:
+                await self._bump_cache_revision(conn)
         deleted = tuple(self._row_to_record(row) for row in deleted_rows)
         current = tuple(self._row_to_record(row) for row in current_rows)
         return deleted, current
@@ -221,6 +293,8 @@ class UserBanRepository:
                 RETURNING {_RECORD_COLUMNS}
                 """
             )
+            if rows:
+                await self._bump_cache_revision(conn)
         records = [self._row_to_record(row) for row in rows]
         records.sort(key=lambda record: (record.user_id, record.ban_scope))
         return tuple(records)

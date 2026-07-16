@@ -38,6 +38,7 @@ class UserBanService:
         self.repository = repository or UserBanRepository()
         self.cache_ttl_seconds = cache_ttl_seconds
         self._cache: dict[str, UserBanStatus] = {}
+        self._cache_revision: int | None = None
         self._refreshed_at: float | None = None
         self._refresh_lock = asyncio.Lock()
         self._mutation_lock = asyncio.Lock()
@@ -82,7 +83,7 @@ class UserBanService:
             raise ValueError(msg)
 
     async def refresh(self, *, force: bool = False) -> None:
-        """按需刷新全部有效封禁快照。"""
+        """按需检查版本，仅在变化时刷新全部有效封禁快照。"""
         now = time.monotonic()
         if not force and self._cache_is_fresh(now):
             return
@@ -93,20 +94,27 @@ class UserBanService:
                 return
             try:
                 await self.repository.initialize()
-                records = await self.repository.load_all()
+                if not force and self._cache_revision is not None:
+                    revision = await self.repository.get_cache_revision()
+                    if revision == self._cache_revision:
+                        self._refreshed_at = time.monotonic()
+                        return
+                snapshot = await self.repository.load_snapshot()
             except Exception as error:
                 raise self._unavailable("刷新", error) from error
-            self._cache = self._build_cache(records)
+            self._cache = self._build_cache(snapshot.records)
+            self._cache_revision = snapshot.revision
             self._refreshed_at = time.monotonic()
 
     async def initialize(self) -> None:
         """初始化仓储并建立首份快照。"""
-        await self.refresh(force=True)
+        await self.refresh()
 
     async def close(self) -> None:
         """清理缓存和数据库资源。"""
         await self.repository.close()
         self._cache.clear()
+        self._cache_revision = None
         self._refreshed_at = None
 
     async def is_user_banned(self, user_id: str, scope: BanScope) -> bool:
@@ -134,6 +142,11 @@ class UserBanService:
             return
         self._cache.pop(status.user_id, None)
 
+    def _mark_snapshot_stale(self) -> None:
+        """本地局部写入后要求下次读取重建全局一致快照。"""
+        self._cache_revision = None
+        self._refreshed_at = None
+
     async def ban_user(
         self,
         *,
@@ -160,6 +173,8 @@ class UserBanService:
                 raise self._unavailable("写入", error) from error
             status = UserBanStatus(user_id=user_id, records=records)
             self._replace_cached_status(status)
+            if mutation_kind != "unchanged":
+                self._mark_snapshot_stale()
             return BanMutationResult(
                 status=status,
                 target_scope=target_scope,
@@ -186,6 +201,8 @@ class UserBanService:
                 raise self._unavailable("删除", error) from error
             status = UserBanStatus(user_id=user_id, records=records)
             self._replace_cached_status(status)
+            if removed:
+                self._mark_snapshot_stale()
             return BanMutationResult(
                 status=status,
                 target_scope=target_scope,
@@ -215,6 +232,8 @@ class UserBanService:
                 self._replace_cached_status(
                     UserBanStatus(user_id=record.user_id, records=remaining)
                 )
+            if expired:
+                self._mark_snapshot_stale()
             return expired
 
     async def list_bans(

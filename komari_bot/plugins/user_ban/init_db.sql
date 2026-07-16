@@ -21,3 +21,13 @@ ON komari_user_bans (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_komari_user_bans_expires_at
 ON komari_user_bans (expires_at)
 WHERE expires_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS komari_user_ban_cache_state (
+    singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+    revision BIGINT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO komari_user_ban_cache_state (singleton_id, revision)
+VALUES (1, 1)
+ON CONFLICT (singleton_id) DO NOTHING;

@@ -229,7 +229,8 @@ ok, reason = await check_runtime_permission(bot, event, config)
 ### 3.1 用户封禁 (`user_ban`)
 
 - **持久化**：PostgreSQL 表 `komari_user_bans`，以 `(user_id, ban_scope)` 为主键；记录可选理由与到期时间，空到期时间表示永久
-- **运行时缓存**：启动加载有效记录快照，5 秒过期后按需刷新；每次命中仍即时判断到期时间，存储不可用时故障关闭
+- **运行时缓存**：启动加载有效记录快照；之后每 5 秒仅检查单行 revision，变化时才以 `REPEATABLE READ` 重载全表；每次命中仍即时判断到期时间，存储不可用时故障关闭
+- **初始化并发**：Repository 建池/建表和 Service 首份快照都必须单飞，禁止并发首次调用创建多份 pool 或重复全表加载
 - **自然解封**：APScheduler 每 30 秒原子删除到期记录并按用户合并发送一次普通文本私信；发送失败不回滚且不重试
 - **command 拦截**：全局 `run_preprocessor` 检查除 `komari_chat` 外的用户 matcher，封禁时静默清空 `remain_handlers`，保留 matcher 原有 `block`
 - **chat 拦截**：聊天消息仍参与判定和记忆；只有实际准备回复时通过 `reply_allowed=False` 压制生成及全部回复副作用
