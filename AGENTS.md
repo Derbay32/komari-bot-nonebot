@@ -124,7 +124,9 @@ komari-bot/
 .custom 提案流程
 群消息 → komari_custom
          ├─ Redis 编辑会话（多步标题/正文编辑）
-         ├─ PostgreSQL 提案表（投票追踪、过期清理）
+         ├─ PostgreSQL 提案表（publishing/failed/voting/approving/approved 状态机）
+         ├─ 稳定编辑会话幂等键 + 发布租约（失败重试复用同一 proposal）
+         ├─ 平台消息 ID 先暂存 Redis，数据库回填失败时无重复发送地恢复
          ├─ 表情反应监听 + fetch_emoji_like 补偿拉取
          └─ 投票达标 → komari_knowledge.add_knowledge() 写入知识库
 

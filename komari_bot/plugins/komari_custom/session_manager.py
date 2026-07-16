@@ -73,6 +73,18 @@ class CustomSessionManager:
         client = await self._get_client()
         await client.delete(self._key(group_id, user_id))
 
+    async def remember_publication_message_id(
+        self,
+        group_id: int,
+        user_id: str,
+        message_id: int,
+    ) -> SessionData:
+        """在提案发布完成前暂存平台消息 ID，供数据库失败后恢复。"""
+        session = await self._require_session(group_id, user_id)
+        session.publication_message_id = message_id
+        await self.save_session(group_id, user_id, session)
+        return session
+
     async def create_session(
         self,
         group_id: int,

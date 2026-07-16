@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-ProposalStatus = Literal["voting", "approving", "approved"]
+ProposalStatus = Literal["publishing", "failed", "voting", "approving", "approved"]
 SessionPhase = Literal["title", "content", "review"]
 UndoAction = Literal["append", "replace", "delete"]
 
@@ -22,6 +22,11 @@ class Proposal(BaseModel):
     title: str
     content: str
     status: ProposalStatus
+    publication_key: str
+    publication_token: str | None = None
+    publication_started_at: datetime | None = None
+    publication_attempts: int = 0
+    publication_error_code: str | None = None
     vote_message_id: int | None = None
     vote_count: int = 0
     required_votes: int
@@ -53,6 +58,7 @@ class SessionData(BaseModel):
     content: str = ""
     undo_stack: list[UndoRecord] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now().astimezone().isoformat())
+    publication_message_id: int | None = None
 
     @field_validator("title", "content")
     @classmethod

@@ -171,7 +171,7 @@ async def test_legacy_prompt_message_ids_are_ignored(
 def test_no_reply_append_entry_or_prompt_tracking_api() -> None:
     source = CUSTOM_INIT.read_text(encoding="utf-8")
 
-    assert "on_message" not in source
+    assert "on_message(" not in source
     assert "reply_append" not in source
     assert "_is_custom_prompt_reply" not in source
     assert "remember_prompt_message" not in source
@@ -233,3 +233,17 @@ async def test_claim_for_approval_is_atomic_and_lease_guarded() -> None:
     assert "vote_count >= required_votes" in query
     assert "approval_started_at <" in query
     assert args == (9, "claim-token", 300)
+
+
+@pytest.mark.asyncio
+async def test_publication_message_id_is_saved_in_editing_session(
+    manager: CustomSessionManager,
+) -> None:
+    await manager.create_session(100, "200", title="标题")
+
+    session = await manager.remember_publication_message_id(100, "200", 9988)
+
+    assert session.publication_message_id == 9988
+    saved = await manager.get_session(100, "200")
+    assert saved is not None
+    assert saved.publication_message_id == 9988

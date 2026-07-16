@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import cast
 
 from nonebot import get_driver, logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message  # noqa: TC002
@@ -15,6 +15,13 @@ from komari_bot.common.database_config import get_shared_database_config
 from .config_schema import DynamicConfigSchema
 from .models import Proposal, SessionData  # noqa: TC001
 from .proposal_repository import ProposalRepository
+from .publication_service import (
+    ProposalPublicationDraft,
+    ProposalPublicationError,
+    ProposalPublicationInProgressError,
+    ProposalPublicationService,
+    build_publication_key,
+)
 from .session_manager import CustomSessionManager, split_replace_args
 from .vote_handler import (
     KnowledgePlugin,
@@ -51,6 +58,7 @@ config_manager = config_manager_plugin.get_config_manager(
     "komari_custom", DynamicConfigSchema
 )
 repository = ProposalRepository()
+proposal_publisher = ProposalPublicationService(repository)
 custom_sessions = CustomSessionManager(config_manager)
 setup_vote_handler(
     repository, config_manager, cast("KnowledgePlugin", knowledge_plugin)
@@ -265,7 +273,12 @@ async def _commit_proposal(
 ) -> None:
     config = config_manager.get()
     proposer_name = _resolve_proposer_name(event)
-    proposal = await repository.create_proposal(
+    draft = ProposalPublicationDraft(
+        publication_key=build_publication_key(
+            group_id,
+            user_id,
+            session.created_at,
+        ),
         group_id=group_id,
         proposer_id=int(user_id),
         proposer_name=proposer_name,
@@ -274,19 +287,47 @@ async def _commit_proposal(
         required_votes=config.required_votes,
         expire_hours=config.proposal_expire_hours,
     )
-    vote_message = _format_vote_message(proposal)
-    sent = await bot.call_api("send_group_msg", group_id=group_id, message=vote_message)
-    message_id = _extract_message_id(sent)
-    if message_id is not None:
-        await repository.set_vote_message_id(proposal.id, message_id)
-        try:
-            await bot.call_api(
-                "set_msg_emoji_like",
-                message_id=message_id,
-                emoji_id=str(config.vote_emoji_id),
-            )
-        except Exception as e:
-            logger.debug("[KomariCustom] 给投票消息添加默认表情失败: {}", e)
+
+    async def _send_vote_message(proposal: Proposal) -> object:
+        return await bot.call_api(
+            "send_group_msg",
+            group_id=group_id,
+            message=_format_vote_message(proposal),
+        )
+
+    async def _remember_message_id(message_id: int) -> None:
+        await custom_sessions.remember_publication_message_id(
+            group_id,
+            user_id,
+            message_id,
+        )
+
+    try:
+        proposal = await proposal_publisher.publish(
+            draft,
+            remembered_message_id=session.publication_message_id,
+            send_message=_send_vote_message,
+            remember_message_id=_remember_message_id,
+        )
+    except ProposalPublicationInProgressError:
+        await custom_action.finish("⏳ 这个提案正在发布中，请稍后再次确认")
+    except ProposalPublicationError:
+        await custom_action.finish(
+            "❌ 提案发布失败，编辑内容已保留；可再次使用 .custom confirm 重试"
+        )
+
+    message_id = proposal.vote_message_id
+    if message_id is None:
+        msg = "已发布提案缺少投票消息 ID"
+        raise RuntimeError(msg)
+    try:
+        await bot.call_api(
+            "set_msg_emoji_like",
+            message_id=message_id,
+            emoji_id=str(config.vote_emoji_id),
+        )
+    except Exception as e:
+        logger.debug("[KomariCustom] 给投票消息添加默认表情失败: {}", e)
     await custom_sessions.delete_session(group_id, user_id)
     await custom_action.finish(
         f"提案 #{proposal.id} 已发布，达到 {proposal.required_votes} 票后会自动加入知识库。"
@@ -450,16 +491,3 @@ def _phase_name(phase: str) -> str:
             return "最终确认"
         case _:
             return phase
-
-
-def _extract_message_id(sent: Any) -> int | None:
-    if isinstance(sent, dict):
-        value = sent.get("message_id")
-    else:
-        value = getattr(sent, "message_id", None)
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
