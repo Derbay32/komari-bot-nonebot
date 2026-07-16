@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -19,6 +20,8 @@ from komari_bot.plugins.komari_management.managed_resources import (
 
 if TYPE_CHECKING:
     from nonebug import App
+
+    from komari_bot.common.management_audit import ManagementAuditEvent
 
 
 class _ConfigSchema(BaseModel):
@@ -96,7 +99,22 @@ class _ConflictConfigManager(_FakeConfigManager):
         raise ConfigUpdateConflictError(msg)
 
 
-def _build_app(manager: _FakeConfigManager) -> FastAPI:
+def _write_headers(request_id: str) -> dict[str, str]:
+    return {
+        "Authorization": "Bearer secret-token",
+        "X-Komari-Change-Reason": "验证配置变更",
+        "X-Request-ID": request_id,
+    }
+
+
+def _build_app(
+    manager: _FakeConfigManager,
+    audit_events: list[ManagementAuditEvent] | None = None,
+) -> FastAPI:
+    async def _record_audit(event: ManagementAuditEvent) -> None:
+        if audit_events is not None:
+            audit_events.append(event)
+
     api_app = FastAPI()
     register_config_api(
         api_app,
@@ -109,6 +127,7 @@ def _build_app(manager: _FakeConfigManager) -> FastAPI:
                 manager_getter=lambda: manager,
             ),
         ),
+        audit_recorder=_record_audit,
     )
     return api_app
 
@@ -153,26 +172,29 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
 @pytest.mark.asyncio
 async def test_config_routes_support_detail_reload_and_field_update(app: App) -> None:
     manager = _FakeConfigManager()
-    headers = {"Authorization": "Bearer secret-token"}
+    audit_events: list[ManagementAuditEvent] = []
+    read_headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
+    async with app.test_server(
+        asgi=cast("Any", _build_app(manager, audit_events))
+    ) as ctx:
         client = ctx.get_client()
         detail = await client.get(
-            f"{API_PREFIX}/resources/komari_management", headers=headers
+            f"{API_PREFIX}/resources/komari_management", headers=read_headers
         )
         updated = await client.patch(
             f"{API_PREFIX}/resources/komari_management/fields/api_token",
             json={"value": "changed-token"},
-            headers=headers,
+            headers=_write_headers("config-token-update"),
         )
         restart_updated = await client.patch(
             f"{API_PREFIX}/resources/komari_management/fields/api_allowed_origins",
             json={"value": ["https://new.example.com"]},
-            headers=headers,
+            headers=_write_headers("config-origin-update"),
         )
         reloaded = await client.post(
             f"{API_PREFIX}/resources/komari_management/reload",
-            headers=headers,
+            headers=_write_headers("config-reload"),
         )
 
     assert detail.status_code == 200
@@ -211,23 +233,42 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
     assert reloaded.json()["values"]["api_token"] == "******"
     assert reloaded.json()["field_descriptions"]["plugin_enable"] == "插件启用状态"
     assert manager.reload_count == 1
+    assert [event.outcome for event in audit_events] == [
+        "started",
+        "succeeded",
+        "started",
+        "succeeded",
+        "started",
+        "succeeded",
+    ]
+    token_events = [
+        event for event in audit_events if event.request_id == "config-token-update"
+    ]
+    assert {event.operator_id for event in token_events} == {"legacy-api-token"}
+    assert {event.resource for event in token_events} == {"komari_management"}
+    assert {event.field_name for event in token_events} == {"api_token"}
+    serialized_events = json.dumps(
+        [event.to_dict() for event in audit_events],
+        ensure_ascii=False,
+    )
+    assert "changed-token" not in serialized_events
 
 
 @pytest.mark.asyncio
 async def test_config_routes_report_validation_and_not_found(app: App) -> None:
     manager = _FakeConfigManager()
-    headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token"}
 
     async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
         client = ctx.get_client()
         missing_resource = await client.get(
             f"{API_PREFIX}/resources/missing",
-            headers=headers,
+            headers=read_headers,
         )
         missing_field = await client.patch(
             f"{API_PREFIX}/resources/komari_management/fields/missing_field",
             json={"value": "anything"},
-            headers=headers,
+            headers=_write_headers("config-missing-field"),
         )
 
     assert missing_resource.status_code == 404
@@ -236,15 +277,35 @@ async def test_config_routes_report_validation_and_not_found(app: App) -> None:
 
 @pytest.mark.asyncio
 async def test_config_route_reports_revision_conflict_as_409(app: App) -> None:
-    headers = {"Authorization": "Bearer secret-token"}
     manager = _ConflictConfigManager()
+    audit_events: list[ManagementAuditEvent] = []
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(manager, audit_events))
+    ) as ctx:
+        response = await ctx.get_client().patch(
+            f"{API_PREFIX}/resources/komari_management/fields/plugin_enable",
+            json={"value": False},
+            headers=_write_headers("config-conflict"),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "配置已被其他进程连续修改，请重试"
+    assert [event.outcome for event in audit_events] == ["started", "failed"]
+    assert audit_events[-1].status_code == 409
+    assert audit_events[-1].request_id == "config-conflict"
+
+
+@pytest.mark.asyncio
+async def test_config_write_requires_change_reason(app: App) -> None:
+    manager = _FakeConfigManager()
 
     async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
         response = await ctx.get_client().patch(
             f"{API_PREFIX}/resources/komari_management/fields/plugin_enable",
             json={"value": False},
-            headers=headers,
+            headers={"Authorization": "Bearer secret-token"},
         )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "配置已被其他进程连续修改，请重试"
+    assert response.status_code == 400
+    assert manager.config.plugin_enable is True

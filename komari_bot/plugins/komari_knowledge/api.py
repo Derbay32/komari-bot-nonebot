@@ -145,6 +145,12 @@ def create_knowledge_router(
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Knowledge 管理接口",
+        required_permission="knowledge:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权修改 Komari Knowledge",
+        required_permission="knowledge:write",
     )
     engine_dependency = _build_engine_dependency(engine_getter)
     router = APIRouter(
@@ -188,6 +194,7 @@ def create_knowledge_router(
         "/knowledge",
         response_model=KnowledgeEntry,
         status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def create_knowledge(
         payload: KnowledgeCreateRequest,
@@ -207,7 +214,11 @@ def create_knowledge_router(
             )
         return item
 
-    @router.patch("/knowledge/{kid}", response_model=KnowledgeEntry)
+    @router.patch(
+        "/knowledge/{kid}",
+        response_model=KnowledgeEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_knowledge(
         kid: int,
         payload: KnowledgeUpdateRequest,
@@ -225,6 +236,7 @@ def create_knowledge_router(
         "/knowledge/{kid}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_knowledge(
         kid: int,

@@ -19,13 +19,27 @@ from komari_bot.plugins.komari_management.prompt_api import (
 if TYPE_CHECKING:
     from nonebug import App
 
+    from komari_bot.common.management_audit import ManagementAuditEvent
+
 
 @dataclass
 class _PromptStore:
     values: dict[str, str]
 
 
-def _build_app(monkeypatch: pytest.MonkeyPatch, store: _PromptStore) -> FastAPI:
+def _write_headers(request_id: str) -> dict[str, str]:
+    return {
+        "Authorization": "Bearer secret-token",
+        "X-Komari-Change-Reason": "验证提示词变更",
+        "X-Request-ID": request_id,
+    }
+
+
+def _build_app(
+    monkeypatch: pytest.MonkeyPatch,
+    store: _PromptStore,
+    audit_events: list[ManagementAuditEvent] | None = None,
+) -> FastAPI:
     from komari_bot.plugins.komari_management import prompt_api
 
     def fake_load_prompt_values(resource: ManagedPromptResource) -> PromptValues:
@@ -67,6 +81,10 @@ def _build_app(monkeypatch: pytest.MonkeyPatch, store: _PromptStore) -> FastAPI:
     monkeypatch.setattr(prompt_api, "load_prompt_values", fake_load_prompt_values)
     monkeypatch.setattr(prompt_api, "save_prompt_values", fake_save_prompt_values)
 
+    async def _record_audit(event: ManagementAuditEvent) -> None:
+        if audit_events is not None:
+            audit_events.append(event)
+
     api_app = FastAPI()
     register_prompt_api(
         api_app,
@@ -82,6 +100,7 @@ def _build_app(monkeypatch: pytest.MonkeyPatch, store: _PromptStore) -> FastAPI:
                 },
             ),
         ),
+        audit_recorder=_record_audit,
     )
     return api_app
 
@@ -114,22 +133,22 @@ async def test_prompt_routes_support_detail_replace_and_field_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _PromptStore(values={"system_prompt": "你好", "memory_ack": "收到"})
-    headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token"}
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
         detail = await client.get(
-            f"{API_PREFIX}/resources/komari_chat", headers=headers
+            f"{API_PREFIX}/resources/komari_chat", headers=read_headers
         )
         updated = await client.patch(
             f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
             json={"value": "新的系统提示词"},
-            headers=headers,
+            headers=_write_headers("prompt-field-update"),
         )
         replaced = await client.put(
             f"{API_PREFIX}/resources/komari_chat",
             json={"system_prompt": "完整替换", "memory_ack": "也替换"},
-            headers=headers,
+            headers=_write_headers("prompt-replace"),
         )
 
     assert detail.status_code == 200
@@ -146,23 +165,23 @@ async def test_prompt_routes_report_validation_and_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _PromptStore(values={"system_prompt": "你好", "memory_ack": "收到"})
-    headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token"}
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
         missing_resource = await client.get(
             f"{API_PREFIX}/resources/missing",
-            headers=headers,
+            headers=read_headers,
         )
         missing_field = await client.patch(
             f"{API_PREFIX}/resources/komari_chat/fields/missing_field",
             json={"value": "anything"},
-            headers=headers,
+            headers=_write_headers("prompt-missing-field"),
         )
         invalid_replace = await client.put(
             f"{API_PREFIX}/resources/komari_chat",
             json={"unknown": "anything"},
-            headers=headers,
+            headers=_write_headers("prompt-invalid-replace"),
         )
 
     assert missing_resource.status_code == 404

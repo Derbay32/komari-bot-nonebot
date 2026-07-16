@@ -63,6 +63,7 @@ def test_managed_config_schemas_declare_default_apply_mode(
     ("plugin_name", "class_name", "field_name"),
     [
         ("komari_management", "DynamicConfigSchema", "api_token"),
+        ("komari_management", "DynamicConfigSchema", "api_credentials"),
         ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
         ("komari_sentry", "KomariSentryConfigSchema", "dsn"),
@@ -103,6 +104,7 @@ def test_management_config_schema_defaults_are_safe() -> None:
 
     assert config.plugin_enable is False
     assert config.api_token == ""
+    assert config.api_credentials == []
     assert config.api_allowed_origins == []
     assert isinstance(config.announce_status_page_url, str)
     assert config.announce_status_page_url
@@ -114,3 +116,99 @@ def test_management_config_schema_defaults_are_safe() -> None:
 def test_management_config_schema_rejects_blank_status_page_url() -> None:
     with pytest.raises(ValueError, match="announce_status_page_url 不能为空"):
         DynamicConfigSchema(announce_status_page_url="   ")
+
+
+def test_management_config_schema_normalizes_named_credentials() -> None:
+    config = DynamicConfigSchema(
+        api_token="legacy-token",
+        api_credentials=cast(
+            "Any",
+            [
+                {
+                    "credential_id": " release-operator ",
+                    "token": "  token-value-00000000  ",
+                    "permissions": [
+                        "CONFIG:WRITE",
+                        "config:write",
+                        "announce:send",
+                    ],
+                    "revoked_at": "2999-01-01T00:00:00Z",
+                }
+            ],
+        ),
+    )
+
+    credential = config.api_credentials[0]
+    assert credential.credential_id == "release-operator"
+    assert credential.token == "token-value-00000000"
+    assert credential.permissions == ["config:write", "announce:send"]
+    assert credential.revoked_at is not None
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        [
+            {
+                "credential_id": "duplicate",
+                "token": "first-token-00000000",
+                "permissions": ["config:read"],
+            },
+            {
+                "credential_id": "duplicate",
+                "token": "second-token-0000000",
+                "permissions": ["config:read"],
+            },
+        ],
+        [
+            {
+                "credential_id": "first",
+                "token": "duplicate-token-0000",
+                "permissions": ["config:read"],
+            },
+            {
+                "credential_id": "second",
+                "token": "duplicate-token-0000",
+                "permissions": ["config:write"],
+            },
+        ],
+    ],
+)
+def test_management_config_schema_rejects_duplicate_credentials(
+    credentials: list[dict[str, object]],
+) -> None:
+    with pytest.raises(ValueError, match=r"不允许重复|不允许复用"):
+        DynamicConfigSchema(api_credentials=cast("Any", credentials))
+
+
+def test_management_config_schema_rejects_invalid_permission() -> None:
+    with pytest.raises(ValueError, match="无效的管理权限范围"):
+        DynamicConfigSchema(
+            api_credentials=cast(
+                "Any",
+                [
+                    {
+                        "credential_id": "operator",
+                        "token": "operator-token-000000",
+                        "permissions": ["CONFIG ADMIN"],
+                    }
+                ],
+            )
+        )
+
+
+def test_management_config_schema_rejects_ambiguous_revocation_time() -> None:
+    with pytest.raises(ValueError, match="revoked_at 必须包含明确时区"):
+        DynamicConfigSchema(
+            api_credentials=cast(
+                "Any",
+                [
+                    {
+                        "credential_id": "operator",
+                        "token": "operator-token-000000",
+                        "permissions": ["config:write"],
+                        "revoked_at": "2026-07-17T03:00:00",
+                    }
+                ],
+            )
+        )

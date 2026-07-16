@@ -11,8 +11,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
 from komari_bot.common.management_api import (
+    ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
+)
+from komari_bot.common.management_audit import (
+    hash_management_target,
+    management_audit_span,
+    record_management_audit_event,
+    require_management_change_reason,
+    resolve_management_request_id,
 )
 from komari_bot.common.prompt_storage import load_prompt_values, save_prompt_values
 
@@ -20,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.common.management_audit import ManagementAuditRecorder
 
     from .managed_resources import ManagedPromptResource
 
@@ -148,12 +157,20 @@ def create_prompt_router(
     *,
     api_token: ManagementTokenSource,
     resources: Sequence[ManagedPromptResource],
+    audit_recorder: ManagementAuditRecorder | None = None,
 ) -> APIRouter:
     """创建提示词管理路由。"""
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Management Prompt 接口",
+        required_permission="prompt:read",
     )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权修改 Komari Management Prompt",
+        required_permission="prompt:write",
+    )
+    recorder = audit_recorder or record_management_audit_event
     resource_map = _get_resource_map(resources)
     router = APIRouter(
         prefix=API_PREFIX,
@@ -177,10 +194,22 @@ def create_prompt_router(
     async def replace_prompt_resource(
         resource_id: Annotated[str, ApiPath(min_length=1)],
         payload: Annotated[dict[str, object], Body()],
+        principal: ManagementPrincipal = Depends(write_auth_dependency),  # noqa: FAST002
+        reason: str = Depends(require_management_change_reason),  # noqa: FAST002
+        request_id: str = Depends(resolve_management_request_id),  # noqa: FAST002
     ) -> PromptResourceDetail:
-        resource = _resolve_resource(resource_id, resource_map)
-        _save_prompt_values(resource, payload)
-        return _build_resource_detail(resource)
+        async with management_audit_span(
+            principal=principal,
+            request_id=request_id,
+            reason=reason,
+            action="prompt.replace",
+            resource=resource_id,
+            target_hash=hash_management_target(resource_id),
+            recorder=recorder,
+        ):
+            resource = _resolve_resource(resource_id, resource_map)
+            _save_prompt_values(resource, payload)
+            return _build_resource_detail(resource)
 
     @router.patch(
         "/resources/{resource_id}/fields/{field_name}",
@@ -190,15 +219,28 @@ def create_prompt_router(
         resource_id: Annotated[str, ApiPath(min_length=1)],
         field_name: Annotated[str, ApiPath(min_length=1)],
         payload: Annotated[PromptFieldUpdateRequest, Body()],
+        principal: ManagementPrincipal = Depends(write_auth_dependency),  # noqa: FAST002
+        reason: str = Depends(require_management_change_reason),  # noqa: FAST002
+        request_id: str = Depends(resolve_management_request_id),  # noqa: FAST002
     ) -> PromptResourceDetail:
-        resource = _resolve_resource(resource_id, resource_map)
-        if field_name not in resource.defaults:
-            detail = f"未找到提示词字段: {field_name}"
-            raise _not_found(detail)
-        values = _load_prompt_values(resource)
-        values[field_name] = payload.value.rstrip("\n")
-        _save_prompt_values(resource, dict(values))
-        return _build_resource_detail(resource)
+        async with management_audit_span(
+            principal=principal,
+            request_id=request_id,
+            reason=reason,
+            action="prompt.update_field",
+            resource=resource_id,
+            field_name=field_name,
+            target_hash=hash_management_target(resource_id, field_name),
+            recorder=recorder,
+        ):
+            resource = _resolve_resource(resource_id, resource_map)
+            if field_name not in resource.defaults:
+                detail = f"未找到提示词字段: {field_name}"
+                raise _not_found(detail)
+            values = _load_prompt_values(resource)
+            values[field_name] = payload.value.rstrip("\n")
+            _save_prompt_values(resource, dict(values))
+            return _build_resource_detail(resource)
 
     return router
 
@@ -209,11 +251,18 @@ def register_prompt_api(
     api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     resources: Sequence[ManagedPromptResource],
+    audit_recorder: ManagementAuditRecorder | None = None,
 ) -> None:
     """注册提示词管理 API。"""
     if getattr(app.state, "komari_management_prompt_api_registered", False):
         return
 
     ensure_management_cors(app, allowed_origins)
-    app.include_router(create_prompt_router(api_token=api_token, resources=resources))
+    app.include_router(
+        create_prompt_router(
+            api_token=api_token,
+            resources=resources,
+            audit_recorder=audit_recorder,
+        )
+    )
     app.state.komari_management_prompt_api_registered = True

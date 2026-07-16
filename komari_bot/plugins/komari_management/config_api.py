@@ -9,8 +9,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
 from komari_bot.common.management_api import (
+    ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
+)
+from komari_bot.common.management_audit import (
+    hash_management_target,
+    management_audit_span,
+    record_management_audit_event,
+    require_management_change_reason,
+    resolve_management_request_id,
 )
 from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 
@@ -18,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.common.management_audit import ManagementAuditRecorder
 
     from .managed_resources import ManagedConfigResource
 
@@ -256,12 +265,20 @@ def create_config_router(
     *,
     api_token: ManagementTokenSource,
     resources: Sequence[ManagedConfigResource],
+    audit_recorder: ManagementAuditRecorder | None = None,
 ) -> APIRouter:
     """创建配置文件管理路由。"""
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Management 配置接口",
+        required_permission="config:read",
     )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权修改 Komari Management 配置",
+        required_permission="config:write",
+    )
+    recorder = audit_recorder or record_management_audit_event
     resource_map = _get_resource_map(resources)
     router = APIRouter(
         prefix=API_PREFIX,
@@ -284,10 +301,22 @@ def create_config_router(
     @router.post("/resources/{resource_id}/reload", response_model=ConfigResourceDetail)
     async def reload_config_resource(
         resource_id: Annotated[str, Path(min_length=1)],
+        principal: ManagementPrincipal = Depends(write_auth_dependency),  # noqa: FAST002
+        reason: str = Depends(require_management_change_reason),  # noqa: FAST002
+        request_id: str = Depends(resolve_management_request_id),  # noqa: FAST002
     ) -> ConfigResourceDetail:
-        resource = _resolve_resource(resource_id, resource_map)
-        await resource.manager_getter().reload_async()
-        return await _build_resource_detail(resource)
+        async with management_audit_span(
+            principal=principal,
+            request_id=request_id,
+            reason=reason,
+            action="config.reload",
+            resource=resource_id,
+            target_hash=hash_management_target(resource_id),
+            recorder=recorder,
+        ):
+            resource = _resolve_resource(resource_id, resource_map)
+            await resource.manager_getter().reload_async()
+            return await _build_resource_detail(resource)
 
     @router.patch(
         "/resources/{resource_id}/fields/{field_name}",
@@ -297,16 +326,29 @@ def create_config_router(
         resource_id: Annotated[str, Path(min_length=1)],
         field_name: Annotated[str, Path(min_length=1)],
         payload: Annotated[ConfigFieldUpdateRequest, Body()],
+        principal: ManagementPrincipal = Depends(write_auth_dependency),  # noqa: FAST002
+        reason: str = Depends(require_management_change_reason),  # noqa: FAST002
+        request_id: str = Depends(resolve_management_request_id),  # noqa: FAST002
     ) -> ConfigResourceDetail:
-        resource = _resolve_resource(resource_id, resource_map)
-        manager = resource.manager_getter()
-        try:
-            await manager.update_field_async(field_name, payload.value)
-        except ValueError as exc:
-            raise _validation_error(str(exc)) from exc
-        except ConfigUpdateConflictError as exc:
-            raise _conflict(str(exc)) from exc
-        return await _build_resource_detail(resource)
+        async with management_audit_span(
+            principal=principal,
+            request_id=request_id,
+            reason=reason,
+            action="config.update_field",
+            resource=resource_id,
+            field_name=field_name,
+            target_hash=hash_management_target(resource_id, field_name),
+            recorder=recorder,
+        ):
+            resource = _resolve_resource(resource_id, resource_map)
+            manager = resource.manager_getter()
+            try:
+                await manager.update_field_async(field_name, payload.value)
+            except ValueError as exc:
+                raise _validation_error(str(exc)) from exc
+            except ConfigUpdateConflictError as exc:
+                raise _conflict(str(exc)) from exc
+            return await _build_resource_detail(resource)
 
     return router
 
@@ -317,11 +359,18 @@ def register_config_api(
     api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     resources: Sequence[ManagedConfigResource],
+    audit_recorder: ManagementAuditRecorder | None = None,
 ) -> None:
     """注册配置管理 API。"""
     if getattr(app.state, "komari_management_config_api_registered", False):
         return
 
     ensure_management_cors(app, allowed_origins)
-    app.include_router(create_config_router(api_token=api_token, resources=resources))
+    app.include_router(
+        create_config_router(
+            api_token=api_token,
+            resources=resources,
+            audit_recorder=audit_recorder,
+        )
+    )
     app.state.komari_management_config_api_registered = True

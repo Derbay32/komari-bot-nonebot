@@ -271,14 +271,20 @@ def create_memory_router(
     service_getter: Callable[[], MemoryServiceProtocol | None],
 ) -> APIRouter:
     """创建记忆库管理路由。"""
-    auth_dependency = create_bearer_auth_dependency(
+    read_auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Memory 管理接口",
+        required_permission="memory:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="没有修改 Komari Memory 的权限",
+        required_permission="memory:write",
     )
     service_dependency = _build_service_dependency(service_getter)
     router = APIRouter(
         prefix=API_PREFIX,
-        dependencies=[Depends(auth_dependency)],
+        dependencies=[Depends(read_auth_dependency)],
         tags=["komari-memory"],
     )
 
@@ -319,6 +325,7 @@ def create_memory_router(
         "/conversations",
         response_model=ConversationEntry,
         status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def create_conversation(
         payload: ConversationCreateRequest,
@@ -339,7 +346,11 @@ def create_memory_router(
             raise _validation_error(str(exc)) from exc
         return ConversationEntry.model_validate(item)
 
-    @router.patch("/conversations/{conversation_id}", response_model=ConversationEntry)
+    @router.patch(
+        "/conversations/{conversation_id}",
+        response_model=ConversationEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_conversation(
         conversation_id: int,
         payload: ConversationUpdateRequest,
@@ -360,6 +371,7 @@ def create_memory_router(
         "/conversations/{conversation_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_conversation(
         conversation_id: int,
@@ -410,6 +422,7 @@ def create_memory_router(
     @router.put(
         "/user-profiles/{group_id}/{user_id}",
         response_model=MemoryEntityEntry,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def put_user_profile(
         group_id: str,
@@ -433,6 +446,7 @@ def create_memory_router(
         "/user-profiles/{group_id}/{user_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_user_profile(
         group_id: str,
@@ -499,7 +513,11 @@ def create_memory_router(
             raise _interaction_event_not_found(event_id)
         return InteractionEventEntry.model_validate(item)
 
-    @router.patch("/interactions/{event_id}", response_model=InteractionEventEntry)
+    @router.patch(
+        "/interactions/{event_id}",
+        response_model=InteractionEventEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_interaction_event(
         event_id: int,
         payload: InteractionEventUpdateRequest,
@@ -517,6 +535,7 @@ def create_memory_router(
         "/interactions/{event_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_interaction_event(
         event_id: int,
@@ -547,6 +566,7 @@ def create_memory_router(
     @router.put(
         "/interaction-histories/{group_id}/{user_id}",
         response_model=MemoryEntityEntry,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def put_interaction_history(
         group_id: str,
@@ -570,6 +590,7 @@ def create_memory_router(
         "/interaction-histories/{group_id}/{user_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_interaction_history(
         group_id: str,

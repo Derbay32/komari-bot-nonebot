@@ -2,12 +2,90 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
+_CREDENTIAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_PERMISSION_PATTERN = re.compile(r"^(?:\*|[a-z][a-z0-9_-]*:(?:\*|[a-z][a-z0-9_-]*))$")
+_TOKEN_PATTERN = re.compile(r"^[!-~]+$")
+
+
+class ManagementCredentialSchema(BaseModel):
+    """一条具名、可限权和可定时撤销的管理凭据。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    credential_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="稳定的管理操作者或自动化凭据 ID",
+    )
+    token: str = Field(
+        min_length=16,
+        max_length=512,
+        description="Bearer Token 正文",
+        json_schema_extra={"secret": True},
+    )
+    permissions: list[str] = Field(
+        min_length=1,
+        max_length=64,
+        description="权限范围，例如 config:read、config:write、announce:send 或 *",
+    )
+    revoked_at: datetime | None = Field(
+        default=None,
+        description="到达该时间后自动撤销；空值表示持续有效",
+    )
+
+    @field_validator("credential_id")
+    @classmethod
+    def validate_credential_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not _CREDENTIAL_ID_PATTERN.fullmatch(normalized):
+            msg = "credential_id 只能包含字母、数字、点、下划线和短横线"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("token")
+    @classmethod
+    def normalize_token(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 16:
+            msg = "管理凭据 Token 长度不能少于 16"
+            raise ValueError(msg)
+        if not _TOKEN_PATTERN.fullmatch(normalized):
+            msg = "管理凭据 Token 只能包含不带空格的 ASCII 可打印字符"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("permissions")
+    @classmethod
+    def normalize_permissions(cls, value: list[str]) -> list[str]:
+        permissions: list[str] = []
+        for item in value:
+            permission = item.strip().lower()
+            if not _PERMISSION_PATTERN.fullmatch(permission):
+                msg = f"无效的管理权限范围: {permission}"
+                raise ValueError(msg)
+            if permission not in permissions:
+                permissions.append(permission)
+        if not permissions:
+            msg = "管理凭据至少需要一项权限"
+            raise ValueError(msg)
+        return permissions
+
+    @field_validator("revoked_at")
+    @classmethod
+    def normalize_revoked_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            msg = "revoked_at 必须包含明确时区"
+            raise ValueError(msg)
+        return value.astimezone(UTC)
 
 
 class DynamicConfigSchema(BaseModel):
@@ -26,7 +104,13 @@ class DynamicConfigSchema(BaseModel):
     plugin_enable: bool = Field(default=False, description="是否启用统一管理 API 插件")
     api_token: str = Field(
         default="",
-        description="管理 API Bearer Token",
+        description="旧版单一管理 API Bearer Token；api_credentials 非空时不再接受",
+        json_schema_extra={"secret": True, "apply_mode": "immediate"},
+    )
+    api_credentials: list[ManagementCredentialSchema] = Field(
+        default_factory=list,
+        max_length=32,
+        description="具名管理凭据；非空时完全替代旧版 api_token",
         json_schema_extra={"secret": True, "apply_mode": "immediate"},
     )
     api_allowed_origins: list[str] = Field(
@@ -79,3 +163,15 @@ class DynamicConfigSchema(BaseModel):
             msg = "announce_status_page_url 不能为空"
             raise ValueError(msg)
         return normalized
+
+    @model_validator(mode="after")
+    def validate_unique_credentials(self) -> DynamicConfigSchema:
+        credential_ids = [item.credential_id for item in self.api_credentials]
+        if len(credential_ids) != len(set(credential_ids)):
+            msg = "api_credentials 的 credential_id 不允许重复"
+            raise ValueError(msg)
+        tokens = [item.token for item in self.api_credentials]
+        if len(tokens) != len(set(tokens)):
+            msg = "api_credentials 不允许复用同一个 Token"
+            raise ValueError(msg)
+        return self

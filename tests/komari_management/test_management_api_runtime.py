@@ -227,6 +227,145 @@ async def test_registered_api_uses_current_token_after_rotation(app: App) -> Non
     assert new_token_after_rotation.status_code == 503
 
 
+@pytest.mark.asyncio
+async def test_registered_api_prefers_named_credentials_over_legacy_token(
+    app: App,
+) -> None:
+    api_app = _build_api_app()
+    logger = _FakeLogger()
+    config = SimpleNamespace(
+        plugin_enable=True,
+        api_token="legacy-token",
+        api_credentials=[
+            {
+                "credential_id": "knowledge-reader",
+                "token": "knowledge-token-00000",
+                "permissions": ["knowledge:read"],
+            }
+        ],
+        api_allowed_origins=[],
+    )
+
+    registered = register_management_api_for_driver(
+        driver=_FakeDriver("fastapi", api_app),
+        config=config,
+        component_loader=_build_components,
+        logger=logger,
+    )
+
+    assert registered is True
+    async with app.test_server(asgi=cast("Any", api_app)) as ctx:
+        client = ctx.get_client()
+        legacy = await client.get(
+            "/api/komari-knowledge/v1/knowledge",
+            headers={"Authorization": "Bearer legacy-token"},
+        )
+        named = await client.get(
+            "/api/komari-knowledge/v1/knowledge",
+            headers={"Authorization": "Bearer knowledge-token-00000"},
+        )
+
+    assert legacy.status_code == 401
+    assert named.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_read_only_credential_cannot_mutate_any_management_resource(
+    app: App,
+) -> None:
+    api_app = _build_api_app()
+    logger = _FakeLogger()
+    config = SimpleNamespace(
+        plugin_enable=True,
+        api_token="",
+        api_credentials=[
+            {
+                "credential_id": "dashboard-reader",
+                "token": "read-only-token-000000",
+                "permissions": [
+                    "knowledge:read",
+                    "help:read",
+                    "memory:read",
+                    "llm_logs:read",
+                    "config:read",
+                    "prompt:read",
+                    "announce:read",
+                    "scene:read",
+                    "user_ban:read",
+                ],
+            }
+        ],
+        api_allowed_origins=[],
+    )
+    assert register_management_api_for_driver(
+        driver=_FakeDriver("fastapi", api_app),
+        config=config,
+        component_loader=_build_components,
+        logger=logger,
+    )
+    headers = {
+        "Authorization": "Bearer read-only-token-000000",
+        "X-Komari-Change-Reason": "权限边界验证",
+        "X-Request-ID": "read-only-boundary",
+    }
+
+    async with app.test_server(asgi=cast("Any", api_app)) as ctx:
+        client = ctx.get_client()
+        responses = [
+            await client.post(
+                "/api/komari-knowledge/v1/knowledge",
+                headers=headers,
+                json={"content": "测试", "keywords": ["测试"]},
+            ),
+            await client.post(
+                "/api/komari-help/v1/help",
+                headers=headers,
+                json={"title": "测试", "content": "测试"},
+            ),
+            await client.post(
+                "/api/komari-memory/v1/conversations",
+                headers=headers,
+                json={
+                    "group_id": "1",
+                    "summary": "测试",
+                    "participants": ["1"],
+                },
+            ),
+            await client.patch(
+                "/api/komari-management-config/v1/resources/komari_management/fields/plugin_enable",
+                headers=headers,
+                json={"value": False},
+            ),
+            await client.patch(
+                "/api/komari-management-prompt/v1/resources/komari_chat/fields/system_prompt",
+                headers=headers,
+                json={"value": "测试"},
+            ),
+            await client.post(
+                "/api/komari-announce/v1/maintenance",
+                headers=headers,
+                json={
+                    "title": "测试",
+                    "content": "测试",
+                    "scheduled_time": "2026-07-17 03:00",
+                    "group_ids": [1],
+                },
+            ),
+            await client.put(
+                "/api/komari-decision-scenes/v1/scenes/TEST",
+                headers=headers,
+                json={"scene_type": "general", "content_text": "测试"},
+            ),
+            await client.post(
+                "/api/komari-user-bans/v1/bans",
+                headers=headers,
+                json={"user_id": "10086", "scope": "chat"},
+            ),
+        ]
+
+    assert [response.status_code for response in responses] == [403] * len(responses)
+
+
 def test_register_management_api_skips_disabled_config() -> None:
     logger = _FakeLogger()
 
@@ -259,7 +398,7 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         logger=logger,
     )
     assert registered_missing_token is False
-    assert "未配置 api_token" in logger.warning_messages[0]
+    assert "未配置有效管理凭据" in logger.warning_messages[0]
 
     non_fastapi_logger = _FakeLogger()
     registered_non_fastapi = register_management_api_for_driver(

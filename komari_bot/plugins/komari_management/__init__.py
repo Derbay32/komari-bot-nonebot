@@ -43,7 +43,7 @@ from komari_bot.plugins.user_data.config_schema import (
 )
 
 from .api_runtime import ManagementApiComponents, register_management_api_for_driver
-from .config_schema import DynamicConfigSchema
+from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
 config_manager_plugin = require("config_manager")
@@ -202,12 +202,20 @@ def _load_management_components() -> ManagementApiComponents:
 
 driver = get_driver()
 state = PluginState()
+
+
+def _get_management_credential_source() -> str | list[ManagementCredentialSchema]:
+    """动态返回多凭据配置，未迁移时回退旧单 Token。"""
+    config = config_manager.get()
+    return config.api_credentials or config.api_token
+
+
 state.api_registered = register_management_api_for_driver(
     driver=driver,
     config=config_manager.get(),
     component_loader=_load_management_components,
     logger=logger,
-    api_token_getter=lambda: config_manager.get().api_token,
+    api_token_getter=_get_management_credential_source,
 )
 
 

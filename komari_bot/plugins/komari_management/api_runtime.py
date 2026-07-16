@@ -26,7 +26,10 @@ USER_BAN_API_PREFIX = "/api/komari-user-bans/v1"
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.common.management_api import (
+        ManagementCredentialSourceValue,
+        ManagementTokenSource,
+    )
 
     from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
@@ -55,7 +58,7 @@ def register_management_api_for_driver(
     config: object,
     component_loader: Callable[[], ManagementApiComponents],
     logger: Any,
-    api_token_getter: Callable[[], str] | None = None,
+    api_token_getter: Callable[[], ManagementCredentialSourceValue] | None = None,
 ) -> bool:
     """按驱动与集中配置决定是否挂载统一管理 API。"""
     if not getattr(config, "plugin_enable", False):
@@ -78,7 +81,7 @@ def register_management_api_for_driver(
 
     components = component_loader()
     token_source: ManagementTokenSource = (
-        settings.api_token if api_token_getter is None else api_token_getter
+        settings.credential_source if api_token_getter is None else api_token_getter
     )
     components.register_knowledge_api(
         server_app,

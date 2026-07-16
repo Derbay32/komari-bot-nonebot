@@ -188,13 +188,19 @@ def create_user_ban_router(
     service_getter: Callable[[], UserBanService] = get_service,
 ) -> APIRouter:
     """创建用户封禁管理路由。"""
-    auth_dependency = create_bearer_auth_dependency(
+    read_auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问用户封禁接口",
+        required_permission="user_ban:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="没有修改用户封禁的权限",
+        required_permission="user_ban:write",
     )
     router = APIRouter(
         prefix=API_PREFIX,
-        dependencies=[Depends(auth_dependency)],
+        dependencies=[Depends(read_auth_dependency)],
         tags=["komari-user-bans"],
     )
 
@@ -233,7 +239,11 @@ def create_user_ban_router(
             raise _storage_error(error) from error
         return _status_response(status)
 
-    @router.post("/bans", response_model=BanMutationResponse)
+    @router.post(
+        "/bans",
+        response_model=BanMutationResponse,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def create_or_update_ban(
         payload: Annotated[CreateBanRequest, Body()],
     ) -> BanMutationResponse:
@@ -263,6 +273,7 @@ def create_user_ban_router(
     @router.delete(
         "/bans/{user_id}/{scope}",
         response_model=BanMutationResponse,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_ban(
         user_id: Annotated[str, Path()],

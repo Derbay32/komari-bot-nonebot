@@ -135,6 +135,12 @@ def create_help_router(
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Help 管理接口",
+        required_permission="help:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权修改 Komari Help",
+        required_permission="help:write",
     )
     engine_dependency = _build_engine_dependency(engine_getter)
     router = APIRouter(
@@ -169,7 +175,12 @@ def create_help_router(
             raise _not_found(hid)
         return item
 
-    @router.post("/help", response_model=HelpEntry, status_code=status.HTTP_201_CREATED)
+    @router.post(
+        "/help",
+        response_model=HelpEntry,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def create_help(
         payload: HelpCreateRequest,
         engine: HelpEngineProtocol = Depends(engine_dependency),  # noqa: FAST002
@@ -190,7 +201,11 @@ def create_help_router(
             )
         return item
 
-    @router.patch("/help/{hid}", response_model=HelpEntry)
+    @router.patch(
+        "/help/{hid}",
+        response_model=HelpEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_help(
         hid: int,
         payload: HelpUpdateRequest,
@@ -205,7 +220,10 @@ def create_help_router(
         return item
 
     @router.delete(
-        "/help/{hid}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response
+        "/help/{hid}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_help(
         hid: int,
@@ -223,7 +241,11 @@ def create_help_router(
     ) -> list[HelpSearchResult]:
         return await engine.search(payload.query, limit=payload.limit)
 
-    @router.post("/scan", response_model=HelpScanResponse)
+    @router.post(
+        "/scan",
+        response_model=HelpScanResponse,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def scan_help(
         engine: HelpEngineProtocol = Depends(engine_dependency),  # noqa: FAST002
     ) -> HelpScanResponse:

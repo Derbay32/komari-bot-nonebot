@@ -107,6 +107,7 @@ def create_llm_provider_router(
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 LLM Provider 管理接口",
+        required_permission="llm_logs:read",
     )
 
     def _get_reader() -> ReplyLogReaderProtocol:
