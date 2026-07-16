@@ -106,6 +106,17 @@ def _resolve_update_params(payload: HelpUpdateRequest) -> dict[str, Any]:
     if not fields_set:
         raise _validation_error("至少提供一个要更新的字段")
 
+    required_fields = {
+        "title": payload.title,
+        "content": payload.content,
+        "keywords": payload.keywords,
+        "category": payload.category,
+    }
+    for field_name, value in required_fields.items():
+        if field_name in fields_set and value is None:
+            message = f"{field_name} 不能为空"
+            raise _validation_error(message)
+
     return {
         "title": payload.title if "title" in fields_set else UNSET,
         "content": payload.content if "content" in fields_set else UNSET,

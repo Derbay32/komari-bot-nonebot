@@ -10,6 +10,11 @@ from nonebot.exception import FinishedException
 from nonebot.params import Command, CommandArg
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.content_budget import (
+    QUERY_TEXT_BUDGET,
+    ContentValidationError,
+    normalize_required_text,
+)
 from komari_bot.common.database_config import get_shared_database_config
 
 from .config_schema import DynamicConfigSchema
@@ -177,6 +182,8 @@ async def handle_custom_action(
                 await _handle_status(group_id, user_id)
             case _:
                 await custom_action.finish("❌ 未知子命令")
+    except ContentValidationError as exc:
+        await custom_action.finish(f"❌ {exc}")
     except Exception as e:
         if not isinstance(e, FinishedException):
             logger.exception("[KomariCustom] 处理 custom 子命令失败")
@@ -381,6 +388,11 @@ async def _handle_list(bot: Bot, group_id: int, text: str) -> None:
 async def _handle_show(bot: Bot, group_id: int, selector: str) -> None:
     if not selector:
         await custom_action.finish("❌ 请输入提案序号或标题关键词")
+    selector = normalize_required_text(
+        selector,
+        label="提案查询文本",
+        budget=QUERY_TEXT_BUDGET,
+    )
     config = config_manager.get()
     proposal = await repository.find_in_group_by_index_or_keyword(
         group_id=group_id,

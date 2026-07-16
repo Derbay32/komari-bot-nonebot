@@ -296,3 +296,33 @@ async def test_update_validation_errors_are_reported(app: App) -> None:
     assert "至少提供一个要更新的字段" in empty_patch.json()["detail"]
     assert missing_content.status_code == 422
     assert "content 不能为空" in missing_content.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_routes_reject_over_budget_before_engine_call(app: App) -> None:
+    engine = _FakeEngine()
+    headers = {"Authorization": "Bearer secret-token"}
+
+    async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
+        client = ctx.get_client()
+        oversized_content = await client.post(
+            f"{API_PREFIX}/knowledge",
+            json={"content": "测" * 6_001, "keywords": ["测试"]},
+            headers=headers,
+        )
+        oversized_keywords = await client.post(
+            f"{API_PREFIX}/knowledge",
+            json={"content": "内容", "keywords": ["词" * 129]},
+            headers=headers,
+        )
+        oversized_query = await client.post(
+            f"{API_PREFIX}/search",
+            json={"query": "查" * 513},
+            headers=headers,
+        )
+
+    assert oversized_content.status_code == 422
+    assert oversized_keywords.status_code == 422
+    assert oversized_query.status_code == 422
+    assert engine.add_calls == []
+    assert engine.search_calls == []

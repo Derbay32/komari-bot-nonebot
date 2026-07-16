@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from komari_bot.common.content_budget import ContentValidationError
 from komari_bot.plugins.komari_knowledge.engine import KnowledgeEngine
 
 
@@ -191,3 +194,21 @@ def test_add_knowledge_uses_source_key_for_idempotent_insert() -> None:
     assert "ON CONFLICT (source_key) WHERE source_key IS NOT NULL" in query
     assert args[-1] == "komari_custom:proposal:9"
     assert rebuild_calls == 1
+
+
+def test_add_knowledge_direct_call_rejects_budget_before_embedding() -> None:
+    engine = KnowledgeEngine()
+    engine._pool = object()
+    embedding_called = False
+
+    async def _unexpected_embedding(_text: str) -> list[float]:
+        nonlocal embedding_called
+        embedding_called = True
+        return []
+
+    engine._get_embedding = _unexpected_embedding  # type: ignore[method-assign]
+
+    with pytest.raises(ContentValidationError, match="估算 token 上限"):
+        asyncio.run(engine.add_knowledge("测" * 6_001, ["测试"]))
+
+    assert embedding_called is False

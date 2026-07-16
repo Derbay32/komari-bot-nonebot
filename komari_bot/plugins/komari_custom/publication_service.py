@@ -9,6 +9,12 @@ from uuid import uuid4
 
 from nonebot import logger
 
+from komari_bot.common.content_budget import (
+    PROPOSAL_CONTENT_TEXT_BUDGET,
+    TITLE_TEXT_BUDGET,
+    normalize_required_text,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
@@ -30,6 +36,27 @@ class ProposalPublicationDraft:
     content: str
     required_votes: int
     expire_hours: int
+
+    def __post_init__(self) -> None:
+        """防止绕过命令编辑路径写入超预算提案。"""
+        object.__setattr__(
+            self,
+            "title",
+            normalize_required_text(
+                self.title,
+                label="提案标题",
+                budget=TITLE_TEXT_BUDGET,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "content",
+            normalize_required_text(
+                self.content,
+                label="提案正文",
+                budget=PROPOSAL_CONTENT_TEXT_BUDGET,
+            ),
+        )
 
 
 class PublicationRepository(Protocol):

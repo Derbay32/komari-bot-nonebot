@@ -392,6 +392,7 @@ poetry run pytest tests/ -v
 9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
 10. **诊断结构**：诊断报告只含 call/tool trace 摘要与聚合 token，绝不包含完整 prompt、reasoning content、base64、历史或画像正文
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
+12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.common.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
 
 ## 相关文档
 

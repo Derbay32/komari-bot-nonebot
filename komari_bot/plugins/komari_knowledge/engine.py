@@ -16,6 +16,16 @@ import sys
 from collections import defaultdict
 from typing import Any, Final
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    KEYWORD_TEXT_BUDGET,
+    NOTES_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    normalize_keywords,
+    normalize_optional_text,
+    normalize_required_text,
+    validate_text_budget,
+)
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
     get_shared_database_config,
@@ -376,6 +386,14 @@ class KnowledgeEngine:
         """
         if not query or not query.strip():
             return []
+        raw_query = query
+        query = normalize_required_text(
+            query,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
+        if query != raw_query:
+            query_vec = None
 
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")  # noqa:TRY003
@@ -390,6 +408,11 @@ class KnowledgeEngine:
         # 应用查询重写
         original_query = query
         query = self._rewrite_query(query)
+        validate_text_budget(
+            query,
+            label="改写后查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
 
         if query != original_query:
             state.logger.info(
@@ -435,6 +458,13 @@ class KnowledgeEngine:
         Returns:
             检索结果列表
         """
+        if not keyword.strip():
+            return []
+        keyword = normalize_required_text(
+            keyword,
+            label="关键词查询",
+            budget=KEYWORD_TEXT_BUDGET,
+        )
         await self._ensure_keyword_index_fresh()
         if not self._keyword_index.loaded:
             return []
@@ -618,6 +648,18 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
+        content = normalize_required_text(
+            content,
+            label="知识内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        keywords = normalize_keywords(keywords, require_nonempty=True)
+        notes = normalize_optional_text(
+            notes,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
+
         # 生成向量
         embedding = await self._get_embedding(content)
 
@@ -713,6 +755,11 @@ class KnowledgeEngine:
         if query is not None:
             keyword = query.strip()
             if keyword:
+                validate_text_budget(
+                    keyword,
+                    label="列表查询文本",
+                    budget=QUERY_TEXT_BUDGET,
+                )
                 keyword_pattern = f"%{escape_like_pattern(keyword)}%"
                 conditions.append(
                     f"""
@@ -840,6 +887,11 @@ class KnowledgeEngine:
             # 内容改变需要重新生成向量
             if content is not UNSET:
                 assert isinstance(content, str), "content 更新值必须是字符串"
+                content = normalize_required_text(
+                    content,
+                    label="知识内容",
+                    budget=CONTENT_TEXT_BUDGET,
+                )
                 embedding = await self._get_embedding(content)
                 updates.append(f"content = ${param_idx}")
                 params.append(content)
@@ -850,6 +902,7 @@ class KnowledgeEngine:
 
             if keywords is not UNSET:
                 assert isinstance(keywords, list), "keywords 更新值必须是字符串列表"
+                keywords = normalize_keywords(keywords, require_nonempty=True)
                 updates.append(f"keywords = ${param_idx}")
                 params.append(keywords)
                 param_idx += 1
@@ -861,6 +914,14 @@ class KnowledgeEngine:
                 param_idx += 1
 
             if notes is not UNSET:
+                assert notes is None or isinstance(notes, str), (
+                    "notes 更新值必须是字符串或 None"
+                )
+                notes = normalize_optional_text(
+                    notes,
+                    label="备注",
+                    budget=NOTES_TEXT_BUDGET,
+                )
                 updates.append(f"notes = ${param_idx}")
                 params.append(notes)
                 param_idx += 1

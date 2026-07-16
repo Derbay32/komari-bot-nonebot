@@ -8,6 +8,18 @@ import sys
 from collections import defaultdict
 from typing import Any, Final
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    IDENTIFIER_TEXT_BUDGET,
+    KEYWORD_TEXT_BUDGET,
+    NOTES_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    TITLE_TEXT_BUDGET,
+    normalize_keywords,
+    normalize_optional_text,
+    normalize_required_text,
+    validate_text_budget,
+)
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
     get_shared_database_config,
@@ -315,6 +327,14 @@ class HelpEngine:
     ) -> list[HelpSearchResult]:
         if not query or not query.strip():
             return []
+        raw_query = query
+        query = normalize_required_text(
+            query,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
+        if query != raw_query:
+            query_vec = None
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
@@ -324,6 +344,11 @@ class HelpEngine:
 
         original_query = query
         query = self._rewrite_query(query)
+        validate_text_budget(
+            query,
+            label="改写后查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
         if query != original_query and query_vec is not None:
             query_vec = None
 
@@ -356,6 +381,13 @@ class HelpEngine:
         return results[:result_limit]
 
     async def search_by_keyword(self, keyword: str) -> list[HelpSearchResult]:
+        if not keyword.strip():
+            return []
+        keyword = normalize_required_text(
+            keyword,
+            label="关键词查询",
+            budget=KEYWORD_TEXT_BUDGET,
+        )
         await self._ensure_keyword_index_fresh()
         if not self._keyword_index.loaded:
             return []
@@ -469,6 +501,27 @@ class HelpEngine:
     ) -> int:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
+        title = normalize_required_text(
+            title,
+            label="帮助标题",
+            budget=TITLE_TEXT_BUDGET,
+        )
+        content = normalize_required_text(
+            content,
+            label="帮助内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        keywords = normalize_keywords(keywords, require_nonempty=False)
+        plugin_name = normalize_optional_text(
+            plugin_name,
+            label="插件名",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+        notes = normalize_optional_text(
+            notes,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
         embedding = await self._get_embedding(f"{title}\n{content}")
         async with self._pool.acquire() as conn:
             help_id = await conn.fetchval(
@@ -507,6 +560,28 @@ class HelpEngine:
 
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
+
+        plugin_name = normalize_required_text(
+            plugin_name,
+            label="插件名",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+        title = normalize_required_text(
+            title,
+            label="帮助标题",
+            budget=TITLE_TEXT_BUDGET,
+        )
+        content = normalize_required_text(
+            content,
+            label="帮助内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        keywords = normalize_keywords(keywords, require_nonempty=False)
+        notes = normalize_optional_text(
+            notes,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
 
         async with self._pool.acquire() as conn:
             existing_row = await conn.fetchrow(
@@ -612,6 +687,11 @@ class HelpEngine:
         if query is not None:
             keyword = query.strip()
             if keyword:
+                validate_text_budget(
+                    keyword,
+                    label="列表查询文本",
+                    budget=QUERY_TEXT_BUDGET,
+                )
                 pattern = f"%{escape_like_pattern(keyword)}%"
                 conditions.append(
                     f"""
@@ -730,24 +810,38 @@ class HelpEngine:
 
             current_title = str(row["title"])
             current_content = str(row["content"])
-            next_title = title if title is not UNSET else current_title
-            next_content = content if content is not UNSET else current_content
-            assert isinstance(next_title, str)
-            assert isinstance(next_content, str)
+            next_title = current_title
+            next_content = current_content
 
             updates: list[str] = []
             params: list[object] = []
             param_idx = 2
 
             if title is not UNSET:
+                assert isinstance(title, str)
+                title = normalize_required_text(
+                    title,
+                    label="帮助标题",
+                    budget=TITLE_TEXT_BUDGET,
+                )
+                next_title = title
                 updates.append(f"title = ${param_idx}")
-                params.append(next_title)
+                params.append(title)
                 param_idx += 1
             if content is not UNSET:
+                assert isinstance(content, str)
+                content = normalize_required_text(
+                    content,
+                    label="帮助内容",
+                    budget=CONTENT_TEXT_BUDGET,
+                )
+                next_content = content
                 updates.append(f"content = ${param_idx}")
-                params.append(next_content)
+                params.append(content)
                 param_idx += 1
             if keywords is not UNSET:
+                assert isinstance(keywords, list)
+                keywords = normalize_keywords(keywords, require_nonempty=False)
                 updates.append(f"keywords = ${param_idx}")
                 params.append(keywords)
                 param_idx += 1
@@ -756,10 +850,22 @@ class HelpEngine:
                 params.append(category)
                 param_idx += 1
             if plugin_name is not UNSET:
+                assert plugin_name is None or isinstance(plugin_name, str)
+                plugin_name = normalize_optional_text(
+                    plugin_name,
+                    label="插件名",
+                    budget=IDENTIFIER_TEXT_BUDGET,
+                )
                 updates.append(f"plugin_name = ${param_idx}")
                 params.append(plugin_name)
                 param_idx += 1
             if notes is not UNSET:
+                assert notes is None or isinstance(notes, str)
+                notes = normalize_optional_text(
+                    notes,
+                    label="备注",
+                    budget=NOTES_TEXT_BUDGET,
+                )
                 updates.append(f"notes = ${param_idx}")
                 params.append(notes)
                 param_idx += 1

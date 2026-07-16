@@ -7,16 +7,17 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    NOTES_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    normalize_keywords,
+    normalize_optional_text,
+    normalize_required_text,
+)
+
 KnowledgeCategory = Literal["general", "character", "setting", "plot", "other", "custom"]
 KnowledgeSource = Literal["keyword", "vector"]
-
-
-def _normalize_keywords(value: list[str]) -> list[str]:
-    """清理关键词中的空白条目。"""
-    normalized = [keyword.strip() for keyword in value if keyword.strip()]
-    if not normalized:
-        raise ValueError("关键词不能为空")
-    return normalized
 
 
 class KnowledgeEntry(BaseModel):
@@ -51,26 +52,28 @@ class KnowledgeCreateRequest(BaseModel):
     @field_validator("content")
     @classmethod
     def validate_content(cls, value: str) -> str:
-        """拒绝空内容。"""
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("知识内容不能为空")
-        return normalized
+        """清理内容并执行统一预算。"""
+        return normalize_required_text(
+            value,
+            label="知识内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
 
     @field_validator("keywords")
     @classmethod
     def validate_keywords(cls, value: list[str]) -> list[str]:
-        """拒绝空关键词列表。"""
-        return _normalize_keywords(value)
+        """清理关键词并执行统一预算。"""
+        return normalize_keywords(value, require_nonempty=True)
 
     @field_validator("notes")
     @classmethod
     def normalize_notes(cls, value: str | None) -> str | None:
         """把空备注归一为 None。"""
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return normalize_optional_text(
+            value,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
 
 
 class KnowledgeUpdateRequest(BaseModel):
@@ -87,10 +90,11 @@ class KnowledgeUpdateRequest(BaseModel):
         """拒绝仅包含空白的内容。"""
         if value is None:
             return None
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("知识内容不能为空")
-        return normalized
+        return normalize_required_text(
+            value,
+            label="知识内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
 
     @field_validator("keywords")
     @classmethod
@@ -98,16 +102,17 @@ class KnowledgeUpdateRequest(BaseModel):
         """拒绝显式传入空关键词列表。"""
         if value is None:
             return None
-        return _normalize_keywords(value)
+        return normalize_keywords(value, require_nonempty=True)
 
     @field_validator("notes")
     @classmethod
     def normalize_optional_notes(cls, value: str | None) -> str | None:
         """把空字符串备注归一为 None。"""
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return normalize_optional_text(
+            value,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
 
 
 class KnowledgeSearchRequest(BaseModel):
@@ -120,10 +125,11 @@ class KnowledgeSearchRequest(BaseModel):
     @classmethod
     def validate_query(cls, value: str) -> str:
         """拒绝空查询。"""
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("查询文本不能为空")
-        return normalized
+        return normalize_required_text(
+            value,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
 
 
 class KnowledgeSearchHit(BaseModel):

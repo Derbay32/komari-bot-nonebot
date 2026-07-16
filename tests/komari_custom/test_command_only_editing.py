@@ -6,9 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
+from komari_bot.common.content_budget import ContentValidationError
 from komari_bot.plugins.komari_custom.models import SessionData
 from komari_bot.plugins.komari_custom.proposal_repository import ProposalRepository
+from komari_bot.plugins.komari_custom.publication_service import (
+    ProposalPublicationDraft,
+)
 from komari_bot.plugins.komari_custom.session_manager import CustomSessionManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -151,6 +156,57 @@ async def test_append_rejected_in_review_phase(
 
 
 @pytest.mark.asyncio
+async def test_oversized_append_keeps_saved_draft_unchanged(
+    manager: CustomSessionManager,
+) -> None:
+    await manager.create_session(100, "200", title="原标题")
+
+    with pytest.raises(ContentValidationError, match="提案标题超过"):
+        await manager.append_text(100, "200", "新" * 129)
+
+    saved = await manager.get_session(100, "200")
+    assert saved is not None
+    assert saved.title == "原标题"
+    assert saved.undo_stack == []
+
+
+@pytest.mark.asyncio
+async def test_proposal_content_enforces_estimated_token_budget(
+    manager: CustomSessionManager,
+) -> None:
+    await manager.create_session(100, "200", title="标题")
+    await manager.set_phase(100, "200", "content")
+
+    with pytest.raises(ContentValidationError, match="估算 token 上限"):
+        await manager.append_text(100, "200", "测" * 4_097)
+
+    saved = await manager.get_session(100, "200")
+    assert saved is not None
+    assert saved.content == ""
+
+
+def test_session_model_validates_assignment_and_publication_draft() -> None:
+    with pytest.raises(ValidationError, match="提案标题超过"):
+        SessionData(title="题" * 129)
+
+    session = SessionData(title="标题")
+    with pytest.raises(ValidationError, match="提案正文超过"):
+        session.content = "正" * 8_001
+
+    with pytest.raises(ContentValidationError, match="提案标题超过"):
+        ProposalPublicationDraft(
+            publication_key="key",
+            group_id=100,
+            proposer_id=200,
+            proposer_name="测试用户",
+            title="题" * 129,
+            content="正文",
+            required_votes=3,
+            expire_hours=2,
+        )
+
+
+@pytest.mark.asyncio
 async def test_legacy_prompt_message_ids_are_ignored(
     fake_redis: _FakeRedis,
     manager: CustomSessionManager,
@@ -195,6 +251,8 @@ def test_custom_action_fallback_error_message_hides_exception_detail() -> None:
 
     assert 'await custom_action.finish("❌ 处理请求失败，请稍后再试")' in source
     assert 'await custom_action.finish(f"❌ 处理请求失败：{e}")' not in source
+    assert "except ContentValidationError as exc:" in source
+    assert 'await custom_action.finish(f"❌ {exc}")' in source
 
 
 @pytest.mark.asyncio

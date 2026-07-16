@@ -7,6 +7,11 @@ from typing import Any, ClassVar, Literal
 
 import redis.asyncio as aioredis
 
+from komari_bot.common.content_budget import (
+    PROPOSAL_CONTENT_TEXT_BUDGET,
+    TITLE_TEXT_BUDGET,
+    normalize_required_text,
+)
 from komari_bot.common.database_config import get_shared_database_config
 
 from .models import SessionData, UndoRecord
@@ -93,7 +98,10 @@ class CustomSessionManager:
         title: str = "",
     ) -> SessionData:
         """创建新会话。"""
-        session = SessionData(title=title)
+        normalized_title = (
+            self._validate_field_text("title", title) if title.strip() else ""
+        )
+        session = SessionData(title=normalized_title)
         await self.save_session(group_id, user_id, session)
         return session
 
@@ -106,6 +114,7 @@ class CustomSessionManager:
         field = session.current_field()
         old_value = getattr(session, field)
         new_value = f"{old_value}\n{text}".strip() if old_value else text.strip()
+        new_value = self._validate_field_text(field, new_value)
         setattr(session, field, new_value)
         self._push_undo(session, UndoRecord(action="append", field=field, text=text))
         await self.save_session(group_id, user_id, session)
@@ -129,10 +138,11 @@ class CustomSessionManager:
             updated = current.replace(old, new, 1)
         else:
             updated = new
-        setattr(session, field, updated.strip())
+        updated = self._validate_field_text(field, updated)
+        setattr(session, field, updated)
         self._push_undo(
             session,
-            UndoRecord(action="replace", field=field, old=current, new=updated.strip()),
+            UndoRecord(action="replace", field=field, old=current, new=updated),
         )
         await self.save_session(group_id, user_id, session)
         return session
@@ -161,7 +171,7 @@ class CustomSessionManager:
         session = await self._require_session(group_id, user_id)
         if not session.undo_stack:
             return None
-        record = session.undo_stack.pop()
+        record = session.undo_stack[-1]
         current = getattr(session, record.field)
         match record.action:
             case "append":
@@ -172,6 +182,9 @@ class CustomSessionManager:
             case "delete":
                 text = record.text or ""
                 updated = f"{current}\n{text}".strip() if current else text
+        if updated:
+            updated = self._validate_field_text(record.field, updated)
+        session.undo_stack.pop()
         setattr(session, record.field, updated)
         await self.save_session(group_id, user_id, session)
         return session
@@ -184,6 +197,10 @@ class CustomSessionManager:
     ) -> SessionData:
         """推进会话阶段。"""
         session = await self._require_session(group_id, user_id)
+        if phase == "content":
+            self._validate_field_text("title", session.title)
+        elif phase == "review":
+            self._validate_field_text("content", session.content)
         session.phase = phase
         await self.save_session(group_id, user_id, session)
         return session
@@ -200,6 +217,24 @@ class CustomSessionManager:
         session.undo_stack.append(record)
         if len(session.undo_stack) > MAX_UNDO_RECORDS:
             session.undo_stack = session.undo_stack[-MAX_UNDO_RECORDS:]
+
+    @staticmethod
+    def _validate_field_text(
+        field: Literal["title", "content"],
+        value: str,
+    ) -> str:
+        """按当前编辑字段应用对应内容预算。"""
+        if field == "title":
+            return normalize_required_text(
+                value,
+                label="提案标题",
+                budget=TITLE_TEXT_BUDGET,
+            )
+        return normalize_required_text(
+            value,
+            label="提案正文",
+            budget=PROPOSAL_CONTENT_TEXT_BUDGET,
+        )
 
 
 def split_replace_args(text: str) -> tuple[str, str]:

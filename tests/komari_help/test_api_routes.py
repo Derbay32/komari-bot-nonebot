@@ -235,3 +235,37 @@ async def test_help_routes_return_503_when_engine_unavailable(app: App) -> None:
 
     assert response.status_code == 503
     assert "引擎未初始化" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_help_routes_reject_over_budget_and_null_required_fields(
+    app: App,
+) -> None:
+    engine = _FakeEngine()
+    headers = {"Authorization": "Bearer secret-token"}
+
+    async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
+        client = ctx.get_client()
+        oversized = await client.post(
+            f"{API_PREFIX}/help",
+            json={"title": "题" * 129, "content": "内容"},
+            headers=headers,
+        )
+        null_title = await client.patch(
+            f"{API_PREFIX}/help/1",
+            json={"title": None},
+            headers=headers,
+        )
+        oversized_query = await client.post(
+            f"{API_PREFIX}/search",
+            json={"query": "查" * 513},
+            headers=headers,
+        )
+
+    assert oversized.status_code == 422
+    assert null_title.status_code == 422
+    assert "title 不能为空" in null_title.json()["detail"]
+    assert oversized_query.status_code == 422
+    assert engine.add_calls == []
+    assert engine.update_calls == []
+    assert engine.search_calls == []
