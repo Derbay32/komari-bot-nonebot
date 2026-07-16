@@ -11,9 +11,9 @@ from typing import Any
 
 from nonebot import logger
 
-from .llm_logger import _LOG_DIR
+from komari_bot.common.llm_log_safety import sanitize_persisted_log_record
 
-_PREVIEW_LIMIT = 240
+from .llm_logger import _LOG_DIR
 
 
 class ReplyLogReader:
@@ -59,7 +59,7 @@ class ReplyLogReader:
         date: str,
         line_number: int,
     ) -> dict[str, Any] | None:
-        """按日期与行号读取完整日志。"""
+        """按日期与行号读取脱敏日志详情。"""
         return await asyncio.to_thread(
             self._get_log_sync,
             date=date,
@@ -134,7 +134,7 @@ class ReplyLogReader:
                 )
                 if raw_record is None:
                     return None
-                return self._build_detail_entry(
+                return self._build_summary_entry(
                     date=date,
                     line_number=current_line_number,
                     record=raw_record,
@@ -213,7 +213,7 @@ class ReplyLogReader:
                 line_number,
             )
             return None
-        return record
+        return sanitize_persisted_log_record(record)
 
     def _build_summary_entry(
         self,
@@ -222,59 +222,22 @@ class ReplyLogReader:
         line_number: int,
         record: dict[str, Any],
     ) -> dict[str, Any]:
-        input_data = record.get("input")
-        trace_id = ""
-        phase = ""
-        if isinstance(input_data, dict):
-            trace_id = str(input_data.get("trace_id", "")).strip()
-            phase = str(input_data.get("phase", "")).strip()
-
-        error_text = str(record.get("error", "")).strip()
-        output_text = record.get("output")
         return {
             "date": date,
             "line_number": line_number,
+            "schema_version": int(record.get("schema_version", 2)),
             "timestamp": str(record.get("timestamp", "")).strip(),
             "method": str(record.get("method", "")).strip(),
             "model": str(record.get("model", "")).strip(),
-            "trace_id": trace_id,
-            "phase": phase,
+            "trace_id": str(record.get("trace_id", "")).strip(),
+            "phase": str(record.get("phase", "")).strip(),
             "duration_ms": record.get("duration_ms"),
-            "status": "error" if error_text else "success",
-            "input_preview": self._build_preview(input_data),
-            "output_preview": self._build_preview(output_text),
-            "reasoning_content_preview": self._build_preview(
-                record.get("reasoning_content")
-            ),
-            "error_preview": self._build_preview(error_text),
+            "status": record.get("status", "success"),
+            "finish_reason": record.get("finish_reason"),
+            "tool_calls_count": record.get("tool_calls_count"),
+            "reasoning_chars": int(record.get("reasoning_chars", 0)),
+            "input_summary": record.get("input_summary", {}),
+            "output_summary": record.get("output_summary"),
+            "error_summary": record.get("error_summary"),
+            "usage": record.get("usage"),
         }
-
-    def _build_detail_entry(
-        self,
-        *,
-        date: str,
-        line_number: int,
-        record: dict[str, Any],
-    ) -> dict[str, Any]:
-        summary = self._build_summary_entry(
-            date=date,
-            line_number=line_number,
-            record=record,
-        )
-        summary["input"] = record.get("input")
-        summary["output"] = record.get("output")
-        summary["reasoning_content"] = record.get("reasoning_content")
-        summary["error"] = record.get("error")
-        return summary
-
-    def _build_preview(self, value: Any) -> str:
-        if value in (None, ""):
-            return ""
-        if isinstance(value, str):
-            text = value
-        else:
-            text = json.dumps(value, ensure_ascii=False)
-        text = " ".join(text.split())
-        if len(text) <= _PREVIEW_LIMIT:
-            return text
-        return f"{text[:_PREVIEW_LIMIT]}..."

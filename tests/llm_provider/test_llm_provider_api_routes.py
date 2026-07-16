@@ -39,9 +39,11 @@ class _FakeReader:
                     "phase": "reply",
                     "duration_ms": 123.4,
                     "status": "success",
-                    "input_preview": "hello",
-                    "output_preview": "<content>你好</content>",
-                    "error_preview": "",
+                    "reasoning_chars": 0,
+                    "input_summary": {
+                        "payload_fingerprint": {"chars": 5, "sha256": "a" * 64}
+                    },
+                    "output_summary": {"chars": 21, "sha256": "b" * 64},
                 }
             ],
             1,
@@ -61,12 +63,12 @@ class _FakeReader:
             "phase": "reply",
             "duration_ms": 123.4,
             "status": "success",
-            "input_preview": "hello",
-            "output_preview": "<content>你好</content>",
-            "error_preview": "",
-            "input": {"trace_id": "chat-1"},
-            "output": "<content>你好</content>",
-            "error": None,
+            "reasoning_chars": 0,
+            "input_summary": {
+                "payload_fingerprint": {"chars": 5, "sha256": "a" * 64}
+            },
+            "output_summary": {"chars": 21, "sha256": "b" * 64},
+            "output": "不应由 API 暴露的旧版正文",
         }
 
 
@@ -146,7 +148,8 @@ async def test_llm_provider_routes_support_list_and_detail_filters(app: App) -> 
         }
     ]
     assert detail.status_code == 200
-    assert detail.json()["output"] == "<content>你好</content>"
+    assert detail.json()["output_summary"] == {"chars": 21, "sha256": "b" * 64}
+    assert "output" not in detail.json()
     assert missing.status_code == 404
 
 

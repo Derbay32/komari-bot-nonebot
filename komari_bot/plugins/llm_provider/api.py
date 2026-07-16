@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette import status
 
 from komari_bot.common.management_api import (
@@ -50,6 +50,7 @@ class ReplyLogListItem(BaseModel):
 
     date: str
     line_number: int
+    schema_version: int = 2
     timestamp: str
     method: str
     model: str
@@ -57,10 +58,13 @@ class ReplyLogListItem(BaseModel):
     phase: str = ""
     duration_ms: float | None = None
     status: Literal["success", "error"]
-    input_preview: str = ""
-    output_preview: str = ""
-    reasoning_content_preview: str = ""
-    error_preview: str = ""
+    finish_reason: str | None = None
+    tool_calls_count: int | None = None
+    reasoning_chars: int = 0
+    input_summary: dict[str, Any] = Field(default_factory=dict)
+    output_summary: dict[str, Any] | None = None
+    error_summary: dict[str, Any] | None = None
+    usage: dict[str, int] | None = None
 
 
 class ReplyLogListResponse(BaseModel):
@@ -73,12 +77,7 @@ class ReplyLogListResponse(BaseModel):
 
 
 class ReplyLogDetail(ReplyLogListItem):
-    """reply 日志详情。"""
-
-    input: Any = None
-    output: str | None = None
-    reasoning_content: str | None = None
-    error: str | None = None
+    """reply 日志详情，仅包含脱敏元数据。"""
 
 
 def _validation_error(message: str) -> HTTPException:

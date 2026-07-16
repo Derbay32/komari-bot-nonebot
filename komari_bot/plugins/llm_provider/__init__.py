@@ -1,7 +1,6 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口（OpenAI 兼容格式）。"""
 
 import asyncio
-import json
 import time
 from collections import deque
 from collections.abc import Callable
@@ -14,7 +13,7 @@ from .api import register_llm_provider_api
 from .base_client import LLMCompletionResultSchema, UnifiedUsageSchema
 from .config import Config
 from .config_schema import DynamicConfigSchema
-from .llm_logger import log_llm_call
+from .llm_logger import build_content_summary, log_llm_call
 from .openai_compatible_api import OpenAICompatibleClient
 from .reply_log_reader import ReplyLogReader
 
@@ -165,12 +164,28 @@ def get_reply_log_reader() -> ReplyLogReader:
     return _reply_log_reader
 
 
-def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int]:
+def _estimate_base64_data_url_bytes(image_url: str) -> int:
+    """不解码图片正文，按 base64 长度估算原始字节数。"""
+    header, separator, payload = image_url.partition(",")
+    if not separator or ";base64" not in header.lower():
+        return 0
+
+    compact_payload = "".join(payload.split())
+    padding = len(compact_payload) - len(compact_payload.rstrip("="))
+    return max(len(compact_payload) * 3 // 4 - padding, 0)
+
+
+def _summarize_messages_payload(
+    messages: list[dict[str, Any]],
+) -> dict[str, int | str]:
     """统计 messages 请求中的文本与图片体量。"""
     text_parts = 0
     text_chars = 0
     image_parts = 0
+    image_data_url_parts = 0
+    image_remote_url_parts = 0
     image_url_chars = 0
+    image_bytes = 0
 
     for message in messages:
         content = message.get("content")
@@ -193,24 +208,36 @@ def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int
                 image_parts += 1
                 image_data = part.get("image_url")
                 if isinstance(image_data, dict):
-                    image_url_chars += len(str(image_data.get("url", "")))
+                    image_url = str(image_data.get("url", ""))
+                    image_url_chars += len(image_url)
+                    if image_url.startswith("data:"):
+                        image_data_url_parts += 1
+                        image_bytes += _estimate_base64_data_url_bytes(image_url)
+                    elif image_url:
+                        image_remote_url_parts += 1
 
+    content_summary = build_content_summary(messages)
     return {
         "turns": len(messages),
         "text_parts": text_parts,
         "text_chars": text_chars,
         "image_parts": image_parts,
+        "image_data_url_parts": image_data_url_parts,
+        "image_remote_url_parts": image_remote_url_parts,
         "image_url_chars": image_url_chars,
+        "image_bytes": image_bytes,
+        "chars": content_summary["chars"],
+        "sha256": content_summary["sha256"],
     }
 
 
-def _build_log_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """构造写入 JSONL 的剩余调用参数，排除追踪专用字段。"""
-    return {
-        key: value
-        for key, value in kwargs.items()
+def _build_log_parameter_keys(kwargs: dict[str, Any]) -> list[str]:
+    """仅记录非追踪调用参数的键名。"""
+    return sorted(
+        key
+        for key in kwargs
         if key not in {"request_trace_id", "request_phase"}
-    }
+    )
 
 
 def _build_prompt_log_input(
@@ -230,24 +257,28 @@ def _build_prompt_log_input(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
 ) -> dict[str, Any]:
-    """构造 prompt 路径完整 JSONL 请求体。"""
+    """构造 prompt 路径的脱敏日志摘要。"""
     input_data: dict[str, Any] = {
         "trace_id": trace_id,
         "phase": phase,
-        "prompt": prompt,
-        "system_instruction": system_instruction,
+        "prompt_summary": build_content_summary(prompt),
+        "system_instruction_summary": build_content_summary(system_instruction),
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": response_format,
         "enable_knowledge": enable_knowledge,
-        "knowledge_query": knowledge_query,
         "knowledge_limit": knowledge_limit,
-        "kwargs": _build_log_kwargs(kwargs),
+        "parameter_keys": _build_log_parameter_keys(kwargs),
     }
+    if knowledge_query is not None:
+        input_data["knowledge_query_summary"] = build_content_summary(knowledge_query)
+    if response_format is not None:
+        input_data["response_format_summary"] = build_content_summary(response_format)
+        input_data["response_format_keys"] = sorted(response_format)
     if tools is not None:
-        input_data["tools"] = tools
+        input_data["tools_count"] = len(tools)
+        input_data["tools_summary"] = build_content_summary(tools)
     if tool_choice is not None:
-        input_data["tool_choice"] = tool_choice
+        input_data["tool_choice_summary"] = build_content_summary(tool_choice)
     if parallel_tool_calls is not None:
         input_data["parallel_tool_calls"] = parallel_tool_calls
     return input_data
@@ -256,8 +287,7 @@ def _build_prompt_log_input(
 def _build_messages_log_input(
     *,
     trace_id: str,
-    payload_summary: dict[str, int],
-    messages: list[dict],
+    payload_summary: dict[str, int | str],
     temperature: float | None,
     max_tokens: int | None,
     response_format: dict | None,
@@ -266,20 +296,23 @@ def _build_messages_log_input(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
 ) -> dict[str, Any]:
-    """构造 messages 路径完整 JSONL 请求体。"""
+    """构造 messages 路径的脱敏日志摘要。"""
     input_data: dict[str, Any] = {
         "trace_id": trace_id,
+        "phase": str(kwargs.get("request_phase", "")).strip(),
         "payload_summary": payload_summary,
-        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": response_format,
-        "kwargs": _build_log_kwargs(kwargs),
+        "parameter_keys": _build_log_parameter_keys(kwargs),
     }
+    if response_format is not None:
+        input_data["response_format_summary"] = build_content_summary(response_format)
+        input_data["response_format_keys"] = sorted(response_format)
     if tools is not None:
-        input_data["tools"] = tools
+        input_data["tools_count"] = len(tools)
+        input_data["tools_summary"] = build_content_summary(tools)
     if tool_choice is not None:
-        input_data["tool_choice"] = tool_choice
+        input_data["tool_choice_summary"] = build_content_summary(tool_choice)
     if parallel_tool_calls is not None:
         input_data["parallel_tool_calls"] = parallel_tool_calls
     return input_data
@@ -321,6 +354,20 @@ def _get_completion_usage(
     if isinstance(result, LLMCompletionResultSchema):
         return result.usage
     return None
+
+
+def _get_completion_finish_reason(
+    result: LLMCompletionResultSchema | str,
+) -> str | None:
+    if isinstance(result, LLMCompletionResultSchema):
+        return result.finish_reason
+    return None
+
+
+def _get_tool_calls_count(result: LLMCompletionResultSchema | str) -> int:
+    if isinstance(result, LLMCompletionResultSchema):
+        return len(result.tool_calls)
+    return 0
 
 
 async def generate_text(
@@ -373,8 +420,11 @@ async def generate_text(
                 if results:
                     knowledge_context = "\n".join(result.content for result in results)
                     logger.info(f"[LLM Provider] 已检索到 {len(results)} 条相关知识")
-            except Exception as e:
-                logger.warning(f"[LLM Provider] 知识库检索失败: {e}")
+            except Exception as exc:
+                logger.warning(
+                    "[LLM Provider] 知识库检索失败: error_type={}",
+                    type(exc).__name__,
+                )
 
         # 构建系统指令：处理占位符
         placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
@@ -422,13 +472,14 @@ async def generate_text(
                     kwargs=kwargs,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         logger.error(
-            "[LLM Provider] 文本请求失败: trace_id={} phase={} error={}",
+            "[LLM Provider] 文本请求失败: trace_id={} phase={} error_type={}",
             request_trace_id or "-",
             request_phase or "-",
-            e,
+            type(e).__name__,
         )
         raise
     else:
@@ -454,7 +505,9 @@ async def generate_text(
                     kwargs=kwargs,
                 ),
                 output=content,
-                reasoning_content=reasoning_content,
+                reasoning_chars=len(reasoning_content or ""),
+                finish_reason=_get_completion_finish_reason(result),
+                tool_calls_count=_get_tool_calls_count(result),
                 duration_ms=duration_ms,
                 usage=usage,
             )
@@ -499,8 +552,11 @@ async def generate_completion(
                 if results:
                     knowledge_context = "\n".join(result.content for result in results)
                     logger.info(f"[LLM Provider] 已检索到 {len(results)} 条相关知识")
-            except Exception as e:
-                logger.warning(f"[LLM Provider] 知识库检索失败: {e}")
+            except Exception as exc:
+                logger.warning(
+                    "[LLM Provider] 知识库检索失败: error_type={}",
+                    type(exc).__name__,
+                )
 
         placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
         final_system_instruction = (system_instruction or "").replace(
@@ -554,6 +610,7 @@ async def generate_completion(
                     parallel_tool_calls=parallel_tool_calls,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         raise
@@ -580,8 +637,10 @@ async def generate_completion(
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
                 ),
-                output=json.dumps(result.model_dump(), ensure_ascii=False),
-                reasoning_content=result.reasoning_content,
+                output=result.content,
+                reasoning_chars=len(result.reasoning_content or ""),
+                finish_reason=result.finish_reason,
+                tool_calls_count=len(result.tool_calls),
                 duration_ms=duration_ms,
                 usage=result.usage,
             )
@@ -652,20 +711,20 @@ async def generate_text_with_messages(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
                     kwargs=kwargs,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         logger.error(
-            "[LLM Provider] Messages 请求失败: trace_id={} model={} error={} payload={}",
+            "[LLM Provider] Messages 请求失败: trace_id={} model={} error_type={} payload={}",
             request_trace_id or "-",
             model,
-            e,
+            type(e).__name__,
             payload_summary,
         )
         raise
@@ -681,14 +740,15 @@ async def generate_text_with_messages(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
                     kwargs=kwargs,
                 ),
                 output=content,
-                reasoning_content=reasoning_content,
+                reasoning_chars=len(reasoning_content or ""),
+                finish_reason=_get_completion_finish_reason(result),
+                tool_calls_count=_get_tool_calls_count(result),
                 duration_ms=duration_ms,
                 usage=usage,
             )
@@ -753,7 +813,6 @@ async def generate_messages_completion(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
@@ -763,6 +822,7 @@ async def generate_messages_completion(
                     parallel_tool_calls=parallel_tool_calls,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         raise
@@ -776,7 +836,6 @@ async def generate_messages_completion(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
@@ -785,8 +844,10 @@ async def generate_messages_completion(
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
                 ),
-                output=json.dumps(result.model_dump(), ensure_ascii=False),
-                reasoning_content=result.reasoning_content,
+                output=result.content,
+                reasoning_chars=len(result.reasoning_content or ""),
+                finish_reason=result.finish_reason,
+                tool_calls_count=len(result.tool_calls),
                 duration_ms=duration_ms,
                 usage=result.usage,
             )

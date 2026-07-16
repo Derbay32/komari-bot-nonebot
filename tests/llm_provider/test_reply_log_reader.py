@@ -163,9 +163,16 @@ def test_get_log_returns_detail_and_handles_invalid_date_and_missing_line(
     missing = asyncio.run(reader.get_log(date="2026-04-10", line_number=99))
 
     assert detail is not None
-    assert detail["input"] == full_input
-    assert detail["output"] == "<content>你好</content>"
-    assert detail["reasoning_content"] == "完整思考内容"
+    serialized_detail = json.dumps(detail, ensure_ascii=False)
+    assert detail["schema_version"] == 2
+    assert detail["input_summary"]["payload_fingerprint"]["chars"] > 0
+    assert detail["output_summary"]["chars"] == len("<content>你好</content>")
+    assert detail["reasoning_chars"] == len("完整思考内容")
+    assert "完整 prompt" not in serialized_detail
+    assert "完整消息" not in serialized_detail
+    assert "<content>你好</content>" not in serialized_detail
+    assert "完整思考内容" not in serialized_detail
+    assert "reasoning_content" not in detail
     assert missing is None
     with pytest.raises(ValueError):
         asyncio.run(reader.list_logs(date="20260410"))

@@ -1,6 +1,6 @@
 """LLM Provider 调用日志记录器。
 
-按天记录每次 LLM 调用的完整输入与输出，JSONL 格式，并按动态配置自动清理过期日志。
+按天记录脱敏后的调用元数据，禁止持久化 prompt、消息正文、模型输出和推理正文。
 """
 
 from __future__ import annotations
@@ -11,12 +11,20 @@ import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.plugin import require
 
+from komari_bot.common.llm_log_safety import (
+    build_content_summary,
+    sanitize_persisted_log_record,
+    scrub_log_directory,
+)
+
 from .config_schema import DynamicConfigSchema
+
+__all__ = ["build_content_summary", "log_llm_call", "scrub_legacy_logs"]
 
 if TYPE_CHECKING:
     from .base_client import UnifiedUsageSchema
@@ -136,26 +144,43 @@ def _ensure_private_log_dir() -> None:
         logger.warning("[LLM Provider] 日志目录权限收敛失败", exc_info=True)
 
 
+async def scrub_legacy_logs() -> int:
+    """原地移除历史 JSONL 中的正文和 reasoning。"""
+    if not _LOG_DIR.exists():
+        return 0
+    async with _write_lock:
+        scrubbed = await asyncio.to_thread(scrub_log_directory, _LOG_DIR)
+    if scrubbed:
+        logger.warning("[LLM Provider] 已净化 {} 个历史调用日志文件", scrubbed)
+    return scrubbed
+
+
 async def log_llm_call(
     *,
     method: str,
     model: str,
-    input_data: dict | list | str,
+    input_data: object,
     output: str | None = None,
-    reasoning_content: str | None = None,
+    reasoning_chars: int = 0,
+    finish_reason: str | None = None,
+    tool_calls_count: int | None = None,
     error: str | None = None,
+    error_type: str | None = None,
     duration_ms: float | None = None,
     usage: "UnifiedUsageSchema | None" = None,
 ) -> None:
-    """记录一次 LLM 调用的输入与输出。
+    """仅记录一次 LLM 调用的安全元数据。
 
     Args:
         method: 调用方法名（generate_text / generate_text_with_messages）
         model: 模型名称
-        input_data: 输入内容（messages 列表、prompt 字符串或结构化字典）
-        output: LLM 返回的文本（成功时）
-        reasoning_content: LLM 返回的推理内容（成功时）
-        error: 错误信息（失败时）
+        input_data: 输入摘要；即使误传正文，落盘前也只保留哈希和安全字段
+        output: LLM 返回文本，仅用于计算长度和哈希
+        reasoning_chars: 推理正文字符数，正文不得传入记录器
+        finish_reason: LLM 完成原因
+        tool_calls_count: 工具调用数量
+        error: 错误文本，仅用于计算长度和哈希
+        error_type: 异常类型名
         duration_ms: 调用耗时（毫秒）
         usage: 后端实际返回的统一用量信息（仅写入已报告字段）
     """
@@ -166,20 +191,24 @@ async def log_llm_call(
         today = now.strftime("%Y-%m-%d")
         log_file = _LOG_DIR / f"{today}.jsonl"
 
-        record = {
+        raw_record: dict[str, Any] = {
             "timestamp": now.isoformat(),
             "method": method,
             "model": model,
             "input": input_data,
+            "reasoning_chars": max(0, reasoning_chars),
         }
         if output is not None:
-            record["output"] = output
-        if reasoning_content is not None:
-            record["reasoning_content"] = reasoning_content
+            raw_record["output"] = output
+        if finish_reason is not None:
+            raw_record["finish_reason"] = finish_reason
+        if tool_calls_count is not None:
+            raw_record["tool_calls_count"] = max(0, tool_calls_count)
         if error is not None:
-            record["error"] = error
+            raw_record["error"] = error
+            raw_record["error_type"] = error_type or "Exception"
         if duration_ms is not None:
-            record["duration_ms"] = round(duration_ms, 2)
+            raw_record["duration_ms"] = round(duration_ms, 2)
 
         # 仅写入后端已报告的 usage 字段，None 不写入 JSONL
         if usage is not None:
@@ -197,8 +226,9 @@ async def log_llm_call(
             if usage.total_tokens is not None:
                 usage_data["total_tokens"] = usage.total_tokens
             if usage_data:
-                record["usage"] = usage_data
+                raw_record["usage"] = usage_data
 
+        record = sanitize_persisted_log_record(raw_record)
         line = json.dumps(record, ensure_ascii=False) + "\n"
 
         async with _write_lock:

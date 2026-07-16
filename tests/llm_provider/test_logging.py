@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from pydantic import ValidationError
 
+from komari_bot.common.llm_log_safety import sanitize_log_text
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -53,7 +55,19 @@ class _FakeCompletionClient:
         self.closed = True
 
 
-def test_log_llm_call_keeps_full_payload_and_private_directory(
+class _FailingClient:
+    def __init__(self, error_message: str) -> None:
+        self.error_message = error_message
+        self.closed = False
+
+    async def generate_text(self, **_kwargs: Any) -> str:
+        raise RuntimeError(self.error_message)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_log_llm_call_persists_only_fingerprints_and_private_directory(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -72,7 +86,7 @@ def test_log_llm_call_keeps_full_payload_and_private_directory(
             model="deepseek-chat",
             input_data=full_input,
             output="完整 output 原文",
-            reasoning_content="完整 reasoning 原文",
+            reasoning_chars=len("完整 reasoning 原文"),
             duration_ms=12.345,
         )
     )
@@ -81,9 +95,21 @@ def test_log_llm_call_keeps_full_payload_and_private_directory(
     [log_file] = list(log_dir.glob("*.jsonl"))
     record = json.loads(log_file.read_text(encoding="utf-8"))
 
-    assert record["input"] == full_input
-    assert record["output"] == "完整 output 原文"
-    assert record["reasoning_content"] == "完整 reasoning 原文"
+    serialized_record = json.dumps(record, ensure_ascii=False)
+    assert record["schema_version"] == 2
+    assert record["input_summary"]["payload_fingerprint"] == (
+        llm_logger_module.build_content_summary(full_input)
+    )
+    assert record["output_summary"] == llm_logger_module.build_content_summary(
+        "完整 output 原文"
+    )
+    assert record["reasoning_chars"] == len("完整 reasoning 原文")
+    assert "完整 prompt 原文" not in serialized_record
+    assert "完整 system prompt 原文" not in serialized_record
+    assert "完整 messages 原文" not in serialized_record
+    assert "完整 output 原文" not in serialized_record
+    assert "完整 reasoning 原文" not in serialized_record
+    assert "reasoning_content" not in record
     assert log_dir.stat().st_mode & 0o777 == 0o700
 
 
@@ -94,6 +120,127 @@ def test_dynamic_config_schema_accepts_log_settings() -> None:
 
     for mode in ("0o700", "0o750", ""):
         assert DynamicConfigSchema(llm_log_dir_permission_mode=mode).llm_log_dir_permission_mode == mode
+
+
+def test_log_file_contains_no_sensitive_canary_from_any_payload_layer(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    canaries = {
+        "group": "CANARY_GROUP_MESSAGE_9f3a",
+        "profile": "CANARY_USER_PROFILE_7c2b",
+        "knowledge": "CANARY_KNOWLEDGE_4d8e",
+        "web": "CANARY_WEB_RESULT_1a6f",
+        "token": "CANARY_API_TOKEN_5b9c",
+        "base64": "CANARY_IMAGE_BASE64_3e7d",
+        "output": "CANARY_MODEL_OUTPUT_8a4c",
+        "error": "CANARY_ERROR_BODY_2f6b",
+    }
+    monkeypatch.setattr(llm_logger_module, "_LOG_DIR", tmp_path / "llm_provider")
+    monkeypatch.setattr(llm_logger_module.random, "random", lambda: 1.0)
+
+    asyncio.run(
+        llm_logger_module.log_llm_call(
+            method="generate_messages_completion",
+            model="deepseek-chat",
+            input_data={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": canaries["group"]},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{canaries['base64']}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "profile": canaries["profile"],
+                "knowledge": canaries["knowledge"],
+                "web_result": canaries["web"],
+                "api_token": canaries["token"],
+            },
+            output=canaries["output"],
+            error=canaries["error"],
+            error_type="UpstreamError",
+        )
+    )
+
+    [log_file] = list((tmp_path / "llm_provider").glob("*.jsonl"))
+    persisted_text = log_file.read_text(encoding="utf-8")
+    assert all(canary not in persisted_text for canary in canaries.values())
+
+
+def test_scrub_legacy_logs_removes_historical_plaintext(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    log_dir = tmp_path / "llm_provider"
+    log_dir.mkdir()
+    legacy_file = log_dir / "2026-06-12.jsonl"
+    legacy_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-06-12T12:00:00+08:00",
+                "method": "generate_messages_completion",
+                "model": "deepseek-chat",
+                "input": {
+                    "trace_id": "chat-legacy",
+                    "phase": "reply",
+                    "messages": [{"role": "user", "content": "历史私密消息"}],
+                },
+                "output": "历史私密回复",
+                "reasoning_content": "历史私密推理",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(llm_logger_module, "_LOG_DIR", log_dir)
+
+    scrubbed = asyncio.run(llm_logger_module.scrub_legacy_logs())
+
+    sanitized_text = legacy_file.read_text(encoding="utf-8")
+    record = json.loads(sanitized_text)
+    assert scrubbed == 1
+    assert record["schema_version"] == 2
+    assert record["trace_id"] == "chat-legacy"
+    assert record["reasoning_chars"] == len("历史私密推理")
+    assert "历史私密消息" not in sanitized_text
+    assert "历史私密回复" not in sanitized_text
+    assert "历史私密推理" not in sanitized_text
+    assert sanitize_log_text(sanitized_text) == sanitized_text
+
+
+def test_messages_payload_summary_keeps_only_image_volume_metadata() -> None:
+    canary = "CANARY_IMAGE_BODY_5a2d"
+    summary = llm_provider_module._summarize_messages_payload(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,QUJDRA=="},
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"https://example.com/{canary}.png"},
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert summary["image_parts"] == 2
+    assert summary["image_data_url_parts"] == 1
+    assert summary["image_remote_url_parts"] == 1
+    assert summary["image_bytes"] == 4
+    assert canary not in json.dumps(summary, ensure_ascii=False)
 
 
 @pytest.mark.parametrize("retention_days", [0, 91])
@@ -311,6 +458,32 @@ def test_generate_text_does_not_record_log_by_default(monkeypatch: Any) -> None:
     assert log_calls == []
 
 
+def test_generate_text_error_log_does_not_include_upstream_body(
+    monkeypatch: Any,
+) -> None:
+    canary = "CANARY_UPSTREAM_ERROR_BODY_6d4a"
+    fake_client = _FailingClient(canary)
+    logged_parts: list[str] = []
+
+    def capture_error(message: object, *args: object, **_kwargs: object) -> None:
+        logged_parts.append(f"{message!s} {args!r}")
+
+    monkeypatch.setattr(llm_provider_module, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(llm_provider_module.logger, "error", capture_error)
+
+    with pytest.raises(RuntimeError, match=canary):
+        asyncio.run(
+            llm_provider_module.generate_text(
+                prompt="测试",
+                model="deepseek-chat",
+            )
+        )
+
+    assert fake_client.closed is True
+    assert canary not in " ".join(logged_parts)
+    assert "RuntimeError" in " ".join(logged_parts)
+
+
 def test_generate_text_with_messages_records_log_for_chat_reply(
     monkeypatch: Any,
 ) -> None:
@@ -339,7 +512,7 @@ def test_generate_text_with_messages_records_log_for_chat_reply(
     assert log_calls[0]["input_data"]["trace_id"] == "chat-1001"
 
 
-def test_generate_text_records_full_actual_request_payload(monkeypatch: Any) -> None:
+def test_generate_text_records_only_request_fingerprints(monkeypatch: Any) -> None:
     fake_client = _FakeClient("聊天回复")
     log_calls: list[dict[str, Any]] = []
 
@@ -378,18 +551,30 @@ def test_generate_text_records_full_actual_request_payload(monkeypatch: Any) -> 
 
     assert result == "聊天回复"
     input_data = log_calls[0]["input_data"]
-    assert input_data["prompt"] == "完整 prompt"
-    assert input_data["system_instruction"] == "系统 知识库内容"
+    serialized_input = json.dumps(input_data, ensure_ascii=False)
+    assert input_data["prompt_summary"] == llm_logger_module.build_content_summary(
+        "完整 prompt"
+    )
+    assert input_data["system_instruction_summary"] == (
+        llm_logger_module.build_content_summary("系统 知识库内容")
+    )
     assert input_data["temperature"] == 1
     assert input_data["max_tokens"] == 128
-    assert input_data["response_format"] == {"type": "json_object"}
+    assert input_data["response_format_summary"] == (
+        llm_logger_module.build_content_summary({"type": "json_object"})
+    )
     assert input_data["enable_knowledge"] is True
-    assert input_data["knowledge_query"] == "查询词"
+    assert input_data["knowledge_query_summary"] == (
+        llm_logger_module.build_content_summary("查询词")
+    )
     assert input_data["knowledge_limit"] == 2
-    assert input_data["kwargs"] == {"frequency_penalty": 0.2}
+    assert input_data["parameter_keys"] == ["frequency_penalty"]
+    assert "完整 prompt" not in serialized_input
+    assert "知识库内容" not in serialized_input
+    assert "查询词" not in serialized_input
 
 
-def test_generate_messages_completion_records_full_request_and_output(
+def test_generate_messages_completion_records_only_safe_metadata(
     monkeypatch: Any,
 ) -> None:
     response = LLMCompletionResultSchema(
@@ -428,16 +613,30 @@ def test_generate_messages_completion_records_full_request_and_output(
     assert fake_client.closed is True
     log_call = log_calls[0]
     input_data = log_call["input_data"]
-    assert input_data["messages"] == messages
-    assert input_data["tools"] == tools
-    assert input_data["tool_choice"] == "auto"
+    serialized_input = json.dumps(input_data, ensure_ascii=False)
+    assert input_data["payload_summary"]["sha256"] == (
+        llm_logger_module.build_content_summary(messages)["sha256"]
+    )
+    assert input_data["tools_count"] == 1
+    assert input_data["tools_summary"] == llm_logger_module.build_content_summary(
+        tools
+    )
+    assert input_data["tool_choice_summary"] == (
+        llm_logger_module.build_content_summary("auto")
+    )
     assert input_data["parallel_tool_calls"] is True
     assert input_data["temperature"] == 0.7
     assert input_data["max_tokens"] == 256
-    assert input_data["response_format"] == {"type": "json_object"}
-    assert input_data["kwargs"] == {"top_p": 0.9}
-    assert json.loads(log_call["output"])["content"] == "完整 completion 输出"
-    assert log_call["reasoning_content"] == "完整思考内容"
+    assert input_data["response_format_summary"] == (
+        llm_logger_module.build_content_summary({"type": "json_object"})
+    )
+    assert input_data["parameter_keys"] == ["top_p"]
+    assert "完整 messages 原文" not in serialized_input
+    assert "query" not in serialized_input
+    assert log_call["output"] == "完整 completion 输出"
+    assert log_call["reasoning_chars"] == len("完整思考内容")
+    assert "reasoning_content" not in log_call
+    assert log_call["finish_reason"] == "stop"
 
 
 def test_log_llm_call_records_full_usage_fields(monkeypatch: Any, tmp_path: Path) -> None:
