@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -26,6 +27,19 @@ class _StubConfigManager:
 
     async def get_async(self) -> object:
         return self._config
+
+
+class _AtomicListConfigManager:
+    def __init__(self, sr_list: list[str]) -> None:
+        self.sr_list = list(sr_list)
+        self._lock = asyncio.Lock()
+
+    async def mutate_field_async(self, field_name: str, mutator: Any) -> object:
+        assert field_name == "sr_list"
+        async with self._lock:
+            await asyncio.sleep(0)
+            self.sr_list = list(mutator(list(self.sr_list)))
+            return SimpleNamespace(sr_list=list(self.sr_list))
 
 
 class _StubPermissionManagerPlugin:
@@ -185,3 +199,50 @@ async def test_sr_manage_allows_superuser_to_read_status(
         ctx.should_pass_rule(matcher=sr_module.sr_manage)
         ctx.should_call_send(event, "SR 已启用", bot=bot)
         ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_add_commands_preserve_both_items(sr_module: Any) -> None:
+    manager = _AtomicListConfigManager(["甲"])
+
+    first, second = await asyncio.gather(
+        sr_module.AddCommand("乙", manager).execute(),
+        sr_module.AddCommand("丙", manager).execute(),
+    )
+
+    assert first.startswith("✅")
+    assert second.startswith("✅")
+    assert manager.sr_list == ["甲", "乙", "丙"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_add_and_delete_do_not_overwrite_each_other(
+    sr_module: Any,
+) -> None:
+    manager = _AtomicListConfigManager(["甲"])
+    delete_command = sr_module.DeleteCommand(item="甲", config_manager=manager)
+
+    add_result, delete_result = await asyncio.gather(
+        sr_module.AddCommand("乙", manager).execute(),
+        delete_command.execute(),
+    )
+
+    assert add_result.startswith("✅")
+    assert delete_result.startswith("✅")
+    assert manager.sr_list == ["乙"]
+    assert delete_command.item == "甲"
+
+
+@pytest.mark.asyncio
+async def test_delete_undo_restores_position_without_losing_new_items(
+    sr_module: Any,
+) -> None:
+    manager = _AtomicListConfigManager(["甲", "乙"])
+    delete_command = sr_module.DeleteCommand(index=1, config_manager=manager)
+
+    assert (await delete_command.execute()).startswith("✅")
+    await sr_module.AddCommand("丙", manager).execute()
+    undo_result = await delete_command.undo()
+
+    assert undo_result.startswith("↩️")
+    assert manager.sr_list == ["甲", "乙", "丙"]

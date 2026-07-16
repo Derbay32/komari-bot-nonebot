@@ -161,6 +161,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
   value = config.get().some_field       # 运行时获取
   config.update_field("some_field", x)  # 更新并持久化
   ```
+- 列表、字典等读改写字段必须使用 `mutate_field_async()`，变换函数会在 CAS 冲突后基于数据库最新值重跑；禁止先 `get_async()` 计算整份新值再 `update_field_async()` 覆盖
 
 ### 1.1 Prompt 配置 (`komari_prompt_configs`)
 

@@ -1,6 +1,6 @@
 from random import randint
 
-from nonebot import get_plugin_config, logger, on_command
+from nonebot import get_driver, get_plugin_config, logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.exception import FinishedException
 from nonebot.params import Command, CommandArg
@@ -10,7 +10,7 @@ from nonebot.plugin import PluginMetadata, require
 from .commands import AddCommand, DeleteCommand
 from .config import Config
 from .config_schema import DynamicConfigSchema
-from .redis_undo_stack import pop_undo, push_undo
+from .redis_undo_stack import close_redis, pop_undo, push_undo
 
 __plugin_meta__ = PluginMetadata(
     name="sr",
@@ -41,6 +41,13 @@ character_binding = require("character_binding")
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("sr", DynamicConfigSchema)
+driver = get_driver()
+
+
+@driver.on_shutdown
+async def on_shutdown() -> None:
+    """关闭撤销栈 Redis 客户端。"""
+    await close_redis()
 
 # 注册 sr 主指令
 sr = on_command("sr", priority=10, block=True)

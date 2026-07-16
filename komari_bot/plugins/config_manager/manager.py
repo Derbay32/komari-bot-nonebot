@@ -7,6 +7,7 @@ NoneBot dotenv 或进程环境变量提供，不进入本管理器。
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
@@ -17,6 +18,8 @@ from nonebot import get_plugin_config, logger
 from .storage import StoredConfig, get_config_storage
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pydantic import BaseModel
 
 _CONFIG_UPDATE_MAX_ATTEMPTS = 3
@@ -458,6 +461,62 @@ class ConfigManager:
 
                 logger.warning(
                     f"[{self._plugin_name}] 配置更新发生并发冲突，将重试: "
+                    f"field={field_name}, attempt={attempt}"
+                )
+
+            return self._raise_update_conflict(field_name)
+
+    async def mutate_field_async(
+        self,
+        field_name: str,
+        mutator: Callable[[Any], Any],
+    ) -> BaseModel:
+        """基于数据库最新字段值执行纯变换，并以 CAS 原子提交。
+
+        发生跨进程冲突时会重新读取最新值并再次调用 ``mutator``，因此调用方
+        不应在变换函数中执行外部 I/O 或不可重复副作用。
+        """
+        async with self._async_lock:
+            storage = get_config_storage()
+            for attempt in range(1, _CONFIG_UPDATE_MAX_ATTEMPTS + 1):
+                stored = await storage.fetch_async(self._plugin_name)
+                if stored is None:
+                    initial = self._dynamic_config or self._initialize_from_env()
+                    stored = await self._save_to_pg_async(initial)
+
+                current_data = self._config_schema(
+                    **stored.config_data
+                ).model_dump(mode="json")
+                if field_name not in current_data:
+                    msg = f"未知的配置字段: {field_name}"
+                    raise ValueError(msg)
+
+                mutated_value = mutator(deepcopy(current_data[field_name]))
+                config_patch, version = self._build_field_patch(
+                    stored=stored,
+                    field_name=field_name,
+                    value=mutated_value,
+                )
+                if config_patch[field_name] == current_data[field_name]:
+                    logger.debug(
+                        f"[{self._plugin_name}] 配置字段变换无变化: {field_name}"
+                    )
+                    return self._cache_stored_config(stored)
+
+                updated = await storage.update_fields_if_revision_async(
+                    plugin_name=self._plugin_name,
+                    schema_name=self._config_schema.__name__,
+                    config_patch=config_patch,
+                    version=version,
+                    expected_revision=stored.revision,
+                )
+                if updated is not None:
+                    config = self._cache_stored_config(updated)
+                    logger.info(f"[{self._plugin_name}] 配置字段已原子变换: {field_name}")
+                    return config
+
+                logger.warning(
+                    f"[{self._plugin_name}] 配置字段变换发生并发冲突，将基于最新值重试: "
                     f"field={field_name}, attempt={attempt}"
                 )
 

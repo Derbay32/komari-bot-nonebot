@@ -49,6 +49,15 @@ await config_manager.update_field_async("timeout", 60)
 config = await config_manager.reload_async()
 ```
 
+对列表、映射等需要“读取当前值后再修改”的字段，必须使用原子变换接口。变换函数可能在跨进程 CAS 冲突后基于最新值重新执行，因此只能做纯内存变换：
+
+```python
+def append_unique(current: list[str]) -> list[str]:
+    return current if "new-item" in current else [*current, "new-item"]
+
+await config_manager.mutate_field_async("items", append_unique)
+```
+
 ## API 参考
 
 ### `get_config_manager(plugin_name, config_schema)`
@@ -65,6 +74,10 @@ config = await config_manager.reload_async()
 更新单个字段，使用 Pydantic schema 重新校验后写入 PG。
 写入采用 JSONB 字段补丁和递增修订号，检测到并发更新时会重载并重试；异步代码使用
 `update_field_async()`，避免阻塞事件循环。
+
+### `mutate_field_async(field_name, mutator)`
+
+从 PostgreSQL 最新修订读取字段，应用纯变换后使用修订号 CAS 提交。遇到冲突会重新读取并重跑变换；字段值未变化时不创建无意义的新修订。适用于列表追加、删除和映射局部修改。
 
 ### `reload()`
 

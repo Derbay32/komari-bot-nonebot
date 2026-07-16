@@ -45,7 +45,7 @@ class DynamicConfigSchema(BaseModel):
     )
 
     # Redis 配置
-    redis_db: int = Field(default=0, description="Redis 数据库编号")
+    redis_db: int = Field(default=0, ge=0, le=15, description="Redis 数据库编号")
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod

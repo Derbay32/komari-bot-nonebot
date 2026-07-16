@@ -1,14 +1,36 @@
 """基于 Redis 的撤销栈实现。"""
 
+from __future__ import annotations
+
+import asyncio
 import json
-from typing import Any
+from typing import Any, TypedDict
 
 import redis.asyncio as aioredis
 
 from komari_bot.common.database_config import get_shared_database_config
 
-# Redis 客户端单例
 _redis_client: aioredis.Redis | None = None
+_redis_client_lock: asyncio.Lock | None = None
+_redis_client_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+class UndoCommandData(TypedDict):
+    """Redis 撤销栈中的命令快照。"""
+
+    type: str
+    item: str | None
+    index: int | None
+
+
+def _get_redis_client_lock() -> asyncio.Lock:
+    """获取绑定到当前事件循环的 Redis 客户端锁。"""
+    global _redis_client_lock, _redis_client_lock_loop  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    if _redis_client_lock is None or _redis_client_lock_loop is not loop:
+        _redis_client_lock = asyncio.Lock()
+        _redis_client_lock_loop = loop
+    return _redis_client_lock
 
 
 async def get_redis_config(config_manager: Any) -> Any:
@@ -33,22 +55,21 @@ async def get_redis_client(config_manager: Any) -> aioredis.Redis:
         Redis 客户端实例
     """
     global _redis_client  # noqa: PLW0603
-    if _redis_client is None:
-        config = await get_redis_config(config_manager)
-        db_config = get_shared_database_config()
+    if _redis_client is not None:
+        return _redis_client
 
-        # 构建连接 URL
-        password_part = (
-            f":{db_config.redis_password}@" if db_config.redis_password else ""
-        )
-        redis_url = (
-            f"redis://{password_part}{db_config.redis_host}:"
-            f"{db_config.redis_port}/{config.redis_db}"
-        )
-
-        _redis_client = await aioredis.from_url(
-            redis_url, decode_responses=True, encoding="utf-8"
-        )
+    async with _get_redis_client_lock():
+        if _redis_client is None:
+            config = await get_redis_config(config_manager)
+            db_config = get_shared_database_config()
+            _redis_client = aioredis.Redis(
+                host=db_config.redis_host,
+                port=db_config.redis_port,
+                db=config.redis_db,
+                password=db_config.redis_password or None,
+                decode_responses=True,
+                encoding="utf-8",
+            )
     return _redis_client
 
 
@@ -77,7 +98,7 @@ async def push_undo(user_id: str, command: Any, config_manager: Any) -> None:
     await pipe.execute()
 
 
-async def pop_undo(user_id: str, config_manager: Any) -> dict | None:
+async def pop_undo(user_id: str, config_manager: Any) -> UndoCommandData | None:
     """从用户撤销栈弹出一个命令。
 
     Args:
@@ -89,10 +110,30 @@ async def pop_undo(user_id: str, config_manager: Any) -> dict | None:
     """
     client = await get_redis_client(config_manager)
     key = f"sr:undo:{user_id}"
-    data = await client.lpop(key)  # type: ignore[misc] - 谁家 lpop 不是异步啊为什么说我类型检查不过
+    data = await client.lpop(key)  # type: ignore[misc]
     if data is None:
         return None
-    return json.loads(data)  # type: ignore[arg-type] - 反正不是空
+    try:
+        raw_text = data.decode() if isinstance(data, bytes) else str(data)
+        decoded = json.loads(raw_text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    command_type = decoded.get("type")
+    if command_type not in {"AddCommand", "DeleteCommand"}:
+        return None
+    raw_index = decoded.get("index")
+    try:
+        index = int(raw_index) if isinstance(raw_index, int | str) else None
+    except ValueError:
+        return None
+    raw_item = decoded.get("item")
+    return UndoCommandData(
+        type=command_type,
+        item=str(raw_item) if raw_item is not None else None,
+        index=index,
+    )
 
 
 async def clear_undo(user_id: str, config_manager: Any) -> None:
@@ -109,6 +150,8 @@ async def clear_undo(user_id: str, config_manager: Any) -> None:
 async def close_redis() -> None:
     """关闭 Redis 连接。"""
     global _redis_client  # noqa: PLW0603
-    if _redis_client:
-        await _redis_client.close()
+    async with _get_redis_client_lock():
+        client = _redis_client
         _redis_client = None
+        if client is not None:
+            await client.aclose()

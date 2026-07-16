@@ -4,9 +4,14 @@ SR 插件的命令模式实现。
 提供可撤销的 add/del 操作，使用命令模式封装操作逻辑。
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class Command(ABC):
@@ -50,15 +55,19 @@ class AddCommand(Command):
         Returns:
             执行结果消息
         """
-        config = await self.config_manager.get_async()
-        sr_list = list(config.sr_list)
+        added = False
 
-        if self.item in sr_list:
+        def _add_item(current_value: Any) -> list[str]:
+            nonlocal added
+            sr_list = [str(item) for item in current_value]
+            added = self.item not in sr_list
+            if added:
+                sr_list.append(self.item)
+            return sr_list
+
+        await self.config_manager.mutate_field_async("sr_list", _add_item)
+        if not added:
             return f"❌ '{self.item}' 已在神人榜中"
-
-        sr_list.append(self.item)
-        await self.config_manager.update_field_async("sr_list", sr_list)
-
         return f"✅ 已添加 '{self.item}' 到神人榜"
 
     async def undo(self) -> str:
@@ -67,19 +76,23 @@ class AddCommand(Command):
         Returns:
             撤销结果消息
         """
-        config = await self.config_manager.get_async()
-        sr_list = list(config.sr_list)
+        removed = False
 
-        if self.item not in sr_list:
+        def _remove_item(current_value: Any) -> list[str]:
+            nonlocal removed
+            sr_list = [str(item) for item in current_value]
+            removed = self.item in sr_list
+            if removed:
+                sr_list.remove(self.item)
+            return sr_list
+
+        await self.config_manager.mutate_field_async("sr_list", _remove_item)
+        if not removed:
             return f"⚠️ 无法撤销：'{self.item}' 不在列表中（可能已被其他操作修改）"
-
-        sr_list.remove(self.item)
-        await self.config_manager.update_field_async("sr_list", sr_list)
-
         return f"↩️ 已撤销添加 '{self.item}'"
 
     @classmethod
-    def from_dict(cls, data: dict, config_manager: Any) -> "AddCommand":
+    def from_dict(cls, data: Mapping[str, Any], config_manager: Any) -> "AddCommand":
         """从字典恢复命令对象。
 
         Args:
@@ -118,29 +131,39 @@ class DeleteCommand(Command):
         Returns:
             执行结果消息
         """
-        config = await self.config_manager.get_async()
-        sr_list = list(config.sr_list)
-
-        # 序号删除模式
-        if self.index is not None:
-            if 1 <= self.index <= len(sr_list):
-                self.item = sr_list[self.index - 1]  # 保存用于 undo
-                sr_list.pop(self.index - 1)
-                await self.config_manager.update_field_async("sr_list", sr_list)
-                return f"✅ 已删除第 {self.index} 位: '{self.item}'"
-            return f"❌ 序号 {self.index} 超出范围（1-{len(sr_list)}）"
-
-        # 名称删除模式（原有逻辑）
-        if self.item is None:
+        if self.index is None and self.item is None:
             return "❌ 删除失败：未指定名称或序号"
 
-        if self.item not in sr_list:
-            return f"❌ '{self.item}' 不在神人榜中"
+        requested_item = self.item
+        removed_item: str | None = None
+        observed_length = 0
 
-        sr_list.remove(self.item)
-        await self.config_manager.update_field_async("sr_list", sr_list)
+        def _delete_item(current_value: Any) -> list[str]:
+            nonlocal observed_length, removed_item
+            sr_list = [str(item) for item in current_value]
+            observed_length = len(sr_list)
+            removed_item = None
 
-        return f"✅ 已删除 '{self.item}'"
+            if self.index is not None:
+                if 1 <= self.index <= len(sr_list):
+                    removed_item = sr_list.pop(self.index - 1)
+                return sr_list
+
+            if requested_item in sr_list:
+                removed_item = requested_item
+                sr_list.remove(requested_item)
+            return sr_list
+
+        await self.config_manager.mutate_field_async("sr_list", _delete_item)
+        if removed_item is None:
+            if self.index is not None:
+                return f"❌ 序号 {self.index} 超出范围（1-{observed_length}）"
+            return f"❌ '{requested_item}' 不在神人榜中"
+
+        self.item = removed_item
+        if self.index is not None:
+            return f"✅ 已删除第 {self.index} 位: '{removed_item}'"
+        return f"✅ 已删除 '{removed_item}'"
 
     async def undo(self) -> str:
         """撤销删除操作（重新添加到列表）。
@@ -151,24 +174,29 @@ class DeleteCommand(Command):
         if self.item is None:
             return "⚠️ 无法撤销：删除时未记录名称"
 
-        config = await self.config_manager.get_async()
-        sr_list = list(config.sr_list)
+        item = self.item
+        restored = False
 
-        if self.item in sr_list:
+        def _restore_item(current_value: Any) -> list[str]:
+            nonlocal restored
+            sr_list = [str(item) for item in current_value]
+            restored = item not in sr_list
+            if not restored:
+                return sr_list
+
+            if self.index is not None and 1 <= self.index <= len(sr_list) + 1:
+                sr_list.insert(self.index - 1, item)
+            else:
+                sr_list.append(item)
+            return sr_list
+
+        await self.config_manager.mutate_field_async("sr_list", _restore_item)
+        if not restored:
             return f"⚠️ 无法撤销：'{self.item}' 已在列表中（可能已被其他操作添加）"
-
-        # 如果是序号删除，尝试恢复到原位置；否则追加到末尾
-        if self.index is not None and 1 <= self.index <= len(sr_list) + 1:
-            sr_list.insert(self.index - 1, self.item)
-        else:
-            sr_list.append(self.item)
-
-        await self.config_manager.update_field_async("sr_list", sr_list)
-
         return f"↩️ 已撤销删除 '{self.item}'"
 
     @classmethod
-    def from_dict(cls, data: dict, config_manager: Any) -> "DeleteCommand":
+    def from_dict(cls, data: Mapping[str, Any], config_manager: Any) -> "DeleteCommand":
         """从字典恢复命令对象。
 
         Args:
