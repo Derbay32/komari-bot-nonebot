@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections import defaultdict
 
 from nonebot import logger, on_command
-from nonebot.adapters.onebot.v11 import Message  # noqa: TC002
+from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
+from nonebot.plugin import require
 
+from .config_schema import DynamicConfigSchema
 from .engine import get_engine
 from .rendering import (
     LIST_PAGE_SIZE,
@@ -18,14 +20,29 @@ from .rendering import (
 )
 from .scanner import scan_and_sync
 
+config_manager_plugin = require("config_manager")
+permission_manager_plugin = require("permission_manager")
+config_manager = config_manager_plugin.get_config_manager(
+    "komari_help",
+    DynamicConfigSchema,
+)
+
 help_cmd = on_command("docs", aliases={"帮助"}, priority=10, block=True)
 help_list_cmd = on_command(("docs", "list"), priority=9, block=True)
 help_refresh_cmd = on_command(
     ("docs", "refresh"),
-    permission=SUPERUSER,
     priority=5,
     block=True,
 )
+
+
+async def _check_runtime_permission(
+    bot: Bot,
+    event: MessageEvent,
+) -> tuple[bool, str]:
+    """读取当前配置并执行统一权限检查。"""
+    config = await config_manager.get_async()
+    return await permission_manager_plugin.check_runtime_permission(bot, event, config)
 
 
 async def _build_overview() -> str:
@@ -49,7 +66,15 @@ async def _build_overview() -> str:
 
 
 @help_cmd.handle()
-async def handle_help(args: Message = CommandArg()) -> None:
+async def handle_help(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    can_use, reason = await _check_runtime_permission(bot, event)
+    if not can_use:
+        await help_cmd.finish(f"❌ {reason}")
+
     query = args.extract_plain_text().strip()
     engine = get_engine()
     if engine is None:
@@ -66,7 +91,15 @@ async def handle_help(args: Message = CommandArg()) -> None:
 
 
 @help_list_cmd.handle()
-async def handle_help_list(args: Message = CommandArg()) -> None:
+async def handle_help_list(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    can_use, reason = await _check_runtime_permission(bot, event)
+    if not can_use:
+        await help_list_cmd.finish(f"❌ {reason}")
+
     engine = get_engine()
     if engine is None:
         await help_list_cmd.finish("帮助引擎尚未初始化，请稍后再试。")
@@ -95,7 +128,14 @@ async def handle_help_list(args: Message = CommandArg()) -> None:
 
 
 @help_refresh_cmd.handle()
-async def handle_help_refresh() -> None:
+async def handle_help_refresh(bot: Bot, event: MessageEvent) -> None:
+    if not await SUPERUSER(bot, event):
+        await help_refresh_cmd.finish("❌ 仅限 SUPERUSER 使用")
+
+    can_use, reason = await _check_runtime_permission(bot, event)
+    if not can_use:
+        await help_refresh_cmd.finish(f"❌ {reason}")
+
     engine = get_engine()
     if engine is None:
         await help_refresh_cmd.finish("帮助引擎尚未初始化，请稍后再试。")

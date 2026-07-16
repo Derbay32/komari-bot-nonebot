@@ -3,14 +3,79 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from importlib import import_module
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11.event import Sender
 
 from komari_bot.plugins.komari_help import rendering as rendering_module
 from komari_bot.plugins.komari_help.models import HelpEntry, HelpSearchResult
 
 if TYPE_CHECKING:
-    import pytest
+    from nonebug import App
+
+
+class _StubConfigManager:
+    def __init__(self, config: object) -> None:
+        self.config = config
+
+    async def get_async(self) -> object:
+        return self.config
+
+
+class _StubPermissionManager:
+    def __init__(self, result: tuple[bool, str]) -> None:
+        self.result = result
+        self.seen_configs: list[object] = []
+
+    async def check_runtime_permission(
+        self,
+        _bot: object,
+        _event: object,
+        config: object,
+    ) -> tuple[bool, str]:
+        self.seen_configs.append(config)
+        return self.result
+
+
+def _create_onebot_bot(ctx: Any) -> Bot:
+    adapter = ctx.create_adapter(base=Adapter)
+    return cast("Bot", ctx.create_bot(base=Bot, adapter=adapter, self_id="669293859"))
+
+
+def _build_group_event(message_text: str) -> GroupMessageEvent:
+    message = Message(message_text)
+    return GroupMessageEvent.model_construct(
+        time=1,
+        self_id=669293859,
+        post_type="message",
+        sub_type="normal",
+        user_id=1047195267,
+        message_type="group",
+        message_id=123,
+        message=message,
+        original_message=message,
+        raw_message=message_text,
+        font=14,
+        sender=Sender.model_construct(
+            user_id=1047195267,
+            nickname="测试用户",
+            card="",
+        ),
+        to_me=False,
+        reply=None,
+        group_id=114514,
+        anonymous=None,
+    )
+
+
+@pytest.fixture
+def commands_module(app: App) -> Any:
+    del app
+    return import_module("komari_bot.plugins.komari_help.commands")
 
 
 def _build_config(**overrides: object) -> SimpleNamespace:
@@ -127,3 +192,124 @@ def test_format_list_page_shows_page_navigation(
     assert "⌨️ 指令 1" in rendered
     assert "(plugin_1)" not in rendered
     assert "查看下一页请使用 .docs list 3" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("matcher_name", "message_text"),
+    [
+        ("help_cmd", ".docs 神人榜"),
+        ("help_list_cmd", ".docs list"),
+    ],
+)
+async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
+    app: App,
+    commands_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    matcher_name: str,
+    message_text: str,
+) -> None:
+    config = SimpleNamespace(
+        plugin_enable=False,
+        user_whitelist=[],
+        group_whitelist=[],
+    )
+    permission_manager = _StubPermissionManager((False, "插件当前已禁用"))
+
+    def fail_get_engine() -> None:
+        msg = "权限拒绝后不应访问帮助引擎"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        commands_module,
+        "config_manager",
+        _StubConfigManager(config),
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "permission_manager_plugin",
+        permission_manager,
+    )
+    monkeypatch.setattr(commands_module, "get_engine", fail_get_engine)
+
+    matcher = getattr(commands_module, matcher_name)
+    async with app.test_matcher(matcher) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(message_text)
+        ctx.receive_event(bot, event)
+        ctx.should_ignore_permission(matcher=matcher)
+        ctx.should_pass_rule(matcher=matcher)
+        ctx.should_call_send(event, "❌ 插件当前已禁用", bot=bot)
+        ctx.should_finished()
+
+    assert permission_manager.seen_configs == [config]
+
+
+@pytest.mark.asyncio
+async def test_docs_refresh_checks_superuser_at_runtime_before_reading_config(
+    app: App,
+    commands_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailConfigManager:
+        @staticmethod
+        async def get_async() -> object:
+            msg = "非超级用户不应读取刷新配置"
+            raise AssertionError(msg)
+
+    async def reject_superuser(_bot: object, _event: object) -> bool:
+        return False
+
+    monkeypatch.setattr(commands_module, "config_manager", _FailConfigManager())
+    monkeypatch.setattr(commands_module, "SUPERUSER", reject_superuser)
+
+    matcher = commands_module.help_refresh_cmd
+    async with app.test_matcher(matcher) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".docs refresh")
+        ctx.receive_event(bot, event)
+        ctx.should_ignore_permission(matcher=matcher)
+        ctx.should_pass_rule(matcher=matcher)
+        ctx.should_call_send(event, "❌ 仅限 SUPERUSER 使用", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
+    app: App,
+    commands_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        plugin_enable=False,
+        user_whitelist=[],
+        group_whitelist=[],
+    )
+    permission_manager = _StubPermissionManager((False, "插件当前已禁用"))
+
+    async def allow_superuser(_bot: object, _event: object) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        commands_module,
+        "config_manager",
+        _StubConfigManager(config),
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "permission_manager_plugin",
+        permission_manager,
+    )
+    monkeypatch.setattr(commands_module, "SUPERUSER", allow_superuser)
+
+    matcher = commands_module.help_refresh_cmd
+    async with app.test_matcher(matcher) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".docs refresh")
+        ctx.receive_event(bot, event)
+        ctx.should_ignore_permission(matcher=matcher)
+        ctx.should_pass_rule(matcher=matcher)
+        ctx.should_call_send(event, "❌ 插件当前已禁用", bot=bot)
+        ctx.should_finished()
+
+    assert permission_manager.seen_configs == [config]

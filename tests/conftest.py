@@ -92,6 +92,9 @@ class _DummyConfigManager:
             llm_max_tokens=8192,
         )
 
+    async def get_async(self) -> object:
+        return self.get()
+
 
 class _DummyConfigManagerPlugin:
     @staticmethod
