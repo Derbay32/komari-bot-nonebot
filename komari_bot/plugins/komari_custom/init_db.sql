@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS komari_custom_proposals (
 ALTER TABLE komari_custom_proposals
     ADD COLUMN IF NOT EXISTS proposer_name TEXT;
 
+ALTER TABLE komari_custom_proposals
+    ADD COLUMN IF NOT EXISTS approval_token TEXT;
+
+ALTER TABLE komari_custom_proposals
+    ADD COLUMN IF NOT EXISTS approval_started_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_custom_proposals_status
     ON komari_custom_proposals(status);
 

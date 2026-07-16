@@ -311,12 +311,13 @@ async def _handle_list(bot: Bot, group_id: int, text: str) -> None:
         await custom_action.finish(f"❌ 只有 {total_pages} 页哦")
 
     for proposal in proposals:
-        if proposal.vote_message_id is not None and proposal.status == "voting":
-            await fetch_and_update_votes(
-                bot,
-                message_id=proposal.vote_message_id,
-                proposal_id=proposal.id,
-            )
+        if proposal.status in {"voting", "approving"}:
+            if proposal.vote_message_id is not None and proposal.status == "voting":
+                await fetch_and_update_votes(
+                    bot,
+                    message_id=proposal.vote_message_id,
+                    proposal_id=proposal.id,
+                )
             await approve_if_ready(bot, proposal.id)
     proposals, total = await repository.list_proposals(
         group_id=group_id,
@@ -347,14 +348,15 @@ async def _handle_show(bot: Bot, group_id: int, selector: str) -> None:
     )
     if proposal is None:
         await custom_action.finish("❌ 没找到对应提案")
-    if proposal.vote_message_id is not None and proposal.status == "voting":
-        updated = await fetch_and_update_votes(
-            bot,
-            message_id=proposal.vote_message_id,
-            proposal_id=proposal.id,
-        )
-        if updated is not None:
-            proposal = updated
+    if proposal.status in {"voting", "approving"}:
+        if proposal.vote_message_id is not None and proposal.status == "voting":
+            updated = await fetch_and_update_votes(
+                bot,
+                message_id=proposal.vote_message_id,
+                proposal_id=proposal.id,
+            )
+            if updated is not None:
+                proposal = updated
         await approve_if_ready(bot, proposal.id)
         proposal = await repository.get_by_id(proposal.id, group_id) or proposal
     await custom_action.finish(_format_proposal_detail(proposal))

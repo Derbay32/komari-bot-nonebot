@@ -76,6 +76,8 @@ class ProposalRepository:
             approved_at=row["approved_at"],
             knowledge_id=int(row["knowledge_id"]) if row["knowledge_id"] is not None else None,
             expired_at=row["expired_at"],
+            approval_token=row["approval_token"],
+            approval_started_at=row["approval_started_at"],
         )
 
     async def cleanup_expired(self) -> int:
@@ -100,7 +102,7 @@ class ProposalRepository:
                 FROM komari_custom_proposals
                 WHERE group_id = $1
                   AND proposer_id = $2
-                  AND status = 'voting'
+                  AND status IN ('voting', 'approving')
                   AND (expired_at IS NULL OR expired_at > NOW())
                 """,
                 group_id,
@@ -201,7 +203,10 @@ class ProposalRepository:
                 """
                 SELECT * FROM komari_custom_proposals
                 WHERE group_id = $1
-                  AND (status = 'approved' OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW())))
+                  AND (
+                      status IN ('approved', 'approving')
+                      OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW()))
+                  )
                 ORDER BY id DESC
                 LIMIT $2 OFFSET $3
                 """,
@@ -213,7 +218,10 @@ class ProposalRepository:
                 """
                 SELECT COUNT(*) FROM komari_custom_proposals
                 WHERE group_id = $1
-                  AND (status = 'approved' OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW())))
+                  AND (
+                      status IN ('approved', 'approving')
+                      OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW()))
+                  )
                 """,
                 group_id,
             )
@@ -246,7 +254,10 @@ class ProposalRepository:
                 SELECT * FROM komari_custom_proposals
                 WHERE group_id = $1
                   AND title ILIKE $2 ESCAPE '\\'
-                  AND (status = 'approved' OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW())))
+                  AND (
+                      status IN ('approved', 'approving')
+                      OR (status = 'voting' AND (expired_at IS NULL OR expired_at > NOW()))
+                  )
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -297,7 +308,68 @@ class ProposalRepository:
             )
         return self._row_to_proposal(row) if row is not None else None
 
-    async def mark_approved(self, proposal_id: int, knowledge_id: int) -> Proposal | None:
+    async def claim_for_approval(
+        self,
+        proposal_id: int,
+        approval_token: str,
+        *,
+        lease_seconds: int,
+    ) -> Proposal | None:
+        """原子认领达到票数的提案，并允许接管已过期的认领。"""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE komari_custom_proposals
+                SET status = 'approving',
+                    approval_token = $2,
+                    approval_started_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND vote_count >= required_votes
+                  AND (
+                      (
+                          status = 'voting'
+                          AND (expired_at IS NULL OR expired_at > NOW())
+                      )
+                      OR (
+                          status = 'approving'
+                          AND approval_started_at < NOW() - ($3 * INTERVAL '1 second')
+                      )
+                  )
+                RETURNING *
+                """,
+                proposal_id,
+                approval_token,
+                lease_seconds,
+            )
+        return self._row_to_proposal(row) if row is not None else None
+
+    async def release_approval(self, proposal_id: int, approval_token: str) -> None:
+        """采纳失败时释放当前认领，让后续通知可以重试。"""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE komari_custom_proposals
+                SET status = 'voting',
+                    approval_token = NULL,
+                    approval_started_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND status = 'approving'
+                  AND approval_token = $2
+                """,
+                proposal_id,
+                approval_token,
+            )
+
+    async def mark_approved(
+        self,
+        proposal_id: int,
+        knowledge_id: int,
+        approval_token: str,
+    ) -> Proposal | None:
         """标记提案已通过并回填知识 ID。"""
         pool = self._require_pool()
         async with pool.acquire() as conn:
@@ -307,11 +379,16 @@ class ProposalRepository:
                 SET status = 'approved',
                     knowledge_id = $2,
                     approved_at = NOW(),
+                    approval_token = NULL,
+                    approval_started_at = NULL,
                     updated_at = NOW()
                 WHERE id = $1
+                  AND status = 'approving'
+                  AND approval_token = $3
                 RETURNING *
                 """,
                 proposal_id,
                 knowledge_id,
+                approval_token,
             )
         return self._row_to_proposal(row) if row is not None else None

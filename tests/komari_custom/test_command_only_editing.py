@@ -213,3 +213,23 @@ async def test_find_proposal_by_keyword_escapes_like_wildcards() -> None:
     assert result is None
     assert "title ILIKE $2 ESCAPE '\\'" in query
     assert args == (100, r"%100\%\_x\\tag%")
+
+
+@pytest.mark.asyncio
+async def test_claim_for_approval_is_atomic_and_lease_guarded() -> None:
+    conn = _FakeProposalConnection()
+    repository = ProposalRepository()
+    repository._pool = _FakeProposalPool(conn)  # type: ignore[assignment]
+
+    result = await repository.claim_for_approval(
+        9,
+        "claim-token",
+        lease_seconds=300,
+    )
+
+    assert result is None
+    query, args = conn.fetchrow_calls[0]
+    assert "status = 'approving'" in query
+    assert "vote_count >= required_votes" in query
+    assert "approval_started_at <" in query
+    assert args == (9, "claim-token", 300)

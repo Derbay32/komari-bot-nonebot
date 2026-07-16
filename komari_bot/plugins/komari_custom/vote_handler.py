@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Protocol
+from uuid import uuid4
 
 from nonebot import logger, on_notice
 from nonebot.adapters.onebot.v11 import Bot, NoticeEvent  # noqa: TC002
@@ -26,6 +27,8 @@ class KnowledgePlugin(Protocol):
         keywords: list[str],
         category: str,
         notes: str | None = None,
+        *,
+        source_key: str | None = None,
     ) -> int: ...
 
 
@@ -39,6 +42,7 @@ class VoteHandlerState:
 
 
 state = VoteHandlerState()
+APPROVAL_LEASE_SECONDS = 300
 
 
 def setup_vote_handler(
@@ -77,15 +81,16 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent) -> None:
     try:
         await state.repository.initialize()
         proposal = await state.repository.find_by_vote_message_id(message_id)
-        if proposal is None or proposal.status != "voting":
+        if proposal is None or proposal.status not in {"voting", "approving"}:
             return
 
-        fetched = await fetch_and_update_votes(
-            bot,
-            message_id=message_id,
-            proposal_id=proposal.id,
-        )
-        proposal = fetched or proposal
+        if proposal.status == "voting":
+            fetched = await fetch_and_update_votes(
+                bot,
+                message_id=message_id,
+                proposal_id=proposal.id,
+            )
+            proposal = fetched or proposal
         await approve_if_ready(bot, proposal.id)
     except Exception:
         logger.exception("[KomariCustom] 处理提案投票事件失败")
@@ -127,20 +132,39 @@ async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
     if state.repository is None or state.knowledge_plugin is None:
         return
     proposal = await state.repository.get_by_id(proposal_id)
-    if proposal is None or proposal.status != "voting":
+    if proposal is None or proposal.status == "approved":
         return
-    if proposal.vote_count < proposal.required_votes:
+    if proposal.status not in {"voting", "approving"}:
         return
 
-    keywords = extract_keywords(proposal.title)
-    content = f"【{proposal.title}】\n{proposal.content}"
-    knowledge_id = await state.knowledge_plugin.add_knowledge(
-        content=content,
-        keywords=keywords,
-        category="custom",
-        notes=f"由群成员(QQ:{proposal.proposer_id})提交，经投票通过加入",
+    approval_token = uuid4().hex
+    claimed = await state.repository.claim_for_approval(
+        proposal_id,
+        approval_token,
+        lease_seconds=APPROVAL_LEASE_SECONDS,
     )
-    approved = await state.repository.mark_approved(proposal.id, knowledge_id)
+    if claimed is None:
+        return
+
+    try:
+        keywords = extract_keywords(claimed.title)
+        content = f"【{claimed.title}】\n{claimed.content}"
+        knowledge_id = await state.knowledge_plugin.add_knowledge(
+            content=content,
+            keywords=keywords,
+            category="custom",
+            notes=f"由群成员(QQ:{claimed.proposer_id})提交，经投票通过加入",
+            source_key=f"komari_custom:proposal:{claimed.id}",
+        )
+        approved = await state.repository.mark_approved(
+            claimed.id,
+            knowledge_id,
+            approval_token,
+        )
+    except Exception:
+        await state.repository.release_approval(claimed.id, approval_token)
+        raise
+
     if approved is None:
         return
 

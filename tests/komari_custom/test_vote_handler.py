@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,6 +13,10 @@ from komari_bot.plugins.komari_custom import vote_handler
 
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, NoticeEvent
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Failing to pass a value to the 'type_params'.*:DeprecationWarning"
+)
 
 
 class _ConfigManager:
@@ -24,8 +30,12 @@ class _Bot:
 
     def __init__(self, users: list[object]) -> None:
         self.users = users
+        self.sent_messages: list[dict[str, object]] = []
 
-    async def call_api(self, _api: str, **_kwargs: object) -> object:
+    async def call_api(self, api: str, **kwargs: object) -> object:
+        if api == "send_group_msg":
+            self.sent_messages.append(kwargs)
+            return {"message_id": 1}
         return {"users": self.users}
 
 
@@ -132,3 +142,120 @@ async def test_emoji_notice_uses_authoritative_snapshot_without_speculative_vote
     )
 
     assert repository.replaced_votes == [[]]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_approval_only_writes_one_knowledge_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposal = SimpleNamespace(
+        id=9,
+        status="voting",
+        proposer_id=10001,
+        title="并发提案",
+        content="只能写入一次",
+        vote_count=3,
+        required_votes=3,
+        group_id=456,
+    )
+
+    class _ApprovalRepository:
+        def __init__(self) -> None:
+            self.claimed = False
+            self.mark_calls: list[tuple[int, int, str]] = []
+
+        async def get_by_id(self, _proposal_id: int) -> object:
+            return proposal
+
+        async def claim_for_approval(
+            self,
+            _proposal_id: int,
+            _approval_token: str,
+            *,
+            lease_seconds: int,
+        ) -> object | None:
+            assert lease_seconds == vote_handler.APPROVAL_LEASE_SECONDS
+            if self.claimed:
+                return None
+            self.claimed = True
+            return SimpleNamespace(**{**vars(proposal), "status": "approving"})
+
+        async def mark_approved(
+            self,
+            proposal_id: int,
+            knowledge_id: int,
+            approval_token: str,
+        ) -> object:
+            self.mark_calls.append((proposal_id, knowledge_id, approval_token))
+            return SimpleNamespace(**{**vars(proposal), "status": "approved"})
+
+        async def release_approval(
+            self,
+            _proposal_id: int,
+            _approval_token: str,
+        ) -> None:
+            return None
+
+    class _KnowledgePlugin:
+        def __init__(self) -> None:
+            self.source_keys: list[str | None] = []
+
+        async def add_knowledge(self, **kwargs: object) -> int:
+            self.source_keys.append(cast("str | None", kwargs.get("source_key")))
+            await asyncio.sleep(0)
+            return 88
+
+    repository = _ApprovalRepository()
+    knowledge_plugin = _KnowledgePlugin()
+    bot = _Bot([])
+    monkeypatch.setattr(vote_handler.state, "repository", repository)
+    monkeypatch.setattr(vote_handler.state, "config_manager", _ConfigManager())
+    monkeypatch.setattr(vote_handler.state, "knowledge_plugin", knowledge_plugin)
+
+    await asyncio.gather(
+        vote_handler.approve_if_ready(cast("Bot", cast("Any", bot)), 9),
+        vote_handler.approve_if_ready(cast("Bot", cast("Any", bot)), 9),
+    )
+
+    assert knowledge_plugin.source_keys == ["komari_custom:proposal:9"]
+    assert len(repository.mark_calls) == 1
+    assert len(bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_knowledge_write_releases_approval_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposal = SimpleNamespace(
+        id=10,
+        status="voting",
+        proposer_id=10001,
+        title="失败提案",
+        content="等待重试",
+        vote_count=3,
+        required_votes=3,
+        group_id=456,
+    )
+    repository = SimpleNamespace(
+        get_by_id=AsyncMock(return_value=proposal),
+        claim_for_approval=AsyncMock(
+            return_value=SimpleNamespace(**{**vars(proposal), "status": "approving"})
+        ),
+        mark_approved=AsyncMock(),
+        release_approval=AsyncMock(),
+    )
+    knowledge_plugin = SimpleNamespace(
+        add_knowledge=AsyncMock(side_effect=RuntimeError("模拟知识写入失败"))
+    )
+    monkeypatch.setattr(vote_handler.state, "repository", repository)
+    monkeypatch.setattr(vote_handler.state, "config_manager", _ConfigManager())
+    monkeypatch.setattr(vote_handler.state, "knowledge_plugin", knowledge_plugin)
+
+    with pytest.raises(RuntimeError, match="模拟知识写入失败"):
+        await vote_handler.approve_if_ready(
+            cast("Bot", cast("Any", _Bot([]))),
+            10,
+        )
+
+    repository.release_approval.assert_awaited_once()
+    repository.mark_approved.assert_not_awaited()

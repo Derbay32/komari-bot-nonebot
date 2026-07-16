@@ -67,6 +67,24 @@ class _FakeUpdatePool:
         self.execute_calls.append((query, args))
 
 
+class _FakeAddPool:
+    def __init__(self) -> None:
+        self.fetchval_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def acquire(self) -> "_FakeAddPool":
+        return self
+
+    async def __aenter__(self) -> "_FakeAddPool":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
+    async def fetchval(self, query: str, *args: object) -> int:
+        self.fetchval_calls.append((query, args))
+        return 42
+
+
 def test_list_knowledge_supports_filters_and_pagination() -> None:
     engine = KnowledgeEngine()
     pool = _FakeListPool()
@@ -132,3 +150,28 @@ def test_update_knowledge_allows_clearing_notes_without_touching_embedding() -> 
     update_query, update_args = pool.execute_calls[0]
     assert "notes = $2" in update_query
     assert update_args == (1, None)
+
+
+def test_add_knowledge_uses_source_key_for_idempotent_insert() -> None:
+    engine = KnowledgeEngine()
+    pool = _FakeAddPool()
+    engine._pool = pool
+
+    async def _get_embedding(_text: str) -> list[float]:
+        return [0.1, 0.2]
+
+    engine._get_embedding = _get_embedding  # type: ignore[method-assign]
+
+    knowledge_id = asyncio.run(
+        engine.add_knowledge(
+            "提案内容",
+            ["提案"],
+            "custom",
+            source_key="komari_custom:proposal:9",
+        )
+    )
+
+    query, args = pool.fetchval_calls[0]
+    assert knowledge_id == 42
+    assert "ON CONFLICT (source_key) WHERE source_key IS NOT NULL" in query
+    assert args[-1] == "komari_custom:proposal:9"

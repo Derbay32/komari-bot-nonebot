@@ -551,6 +551,8 @@ class KnowledgeEngine:
         keywords: list[str],
         category: KnowledgeCategory = "general",
         notes: str | None = None,
+        *,
+        source_key: str | None = None,
     ) -> int:
         """
         添加知识到数据库。
@@ -560,6 +562,7 @@ class KnowledgeEngine:
             keywords: 关键词列表
             category: 分类
             notes: 备注
+            source_key: 外部来源幂等键
 
         Returns:
             新知识的 ID
@@ -573,8 +576,12 @@ class KnowledgeEngine:
         async with self._pool.acquire() as conn:
             kid = await conn.fetchval(
                 """
-                INSERT INTO komari_knowledge (content, keywords, category, embedding, notes)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO komari_knowledge (
+                    content, keywords, category, embedding, notes, source_key
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (source_key) WHERE source_key IS NOT NULL
+                DO UPDATE SET source_key = EXCLUDED.source_key
                 RETURNING id
                 """,
                 content,
@@ -582,6 +589,7 @@ class KnowledgeEngine:
                 category,
                 str(embedding),
                 notes,
+                source_key,
             )
 
         # 更新内存索引

@@ -324,7 +324,8 @@ def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ..
             embedding VECTOR({dimension}),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            notes TEXT
+            notes TEXT,
+            source_key TEXT
         )
         """,
     ]
@@ -333,6 +334,15 @@ def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ..
         statements.append(embedding_index_statement)
     statements.extend(
         [
+            """
+        ALTER TABLE komari_knowledge
+        ADD COLUMN IF NOT EXISTS source_key TEXT
+        """,
+            """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_knowledge_source_key
+        ON komari_knowledge(source_key)
+        WHERE source_key IS NOT NULL
+        """,
             """
         CREATE INDEX IF NOT EXISTS idx_komari_knowledge_keywords
         ON komari_knowledge

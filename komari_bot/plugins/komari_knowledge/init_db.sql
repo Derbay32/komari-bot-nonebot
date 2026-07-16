@@ -42,8 +42,14 @@ CREATE TABLE IF NOT EXISTS komari_knowledge (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     -- 备注
-    notes TEXT
+    notes TEXT,
+
+    -- 外部幂等来源键，例如群提案 ID
+    source_key TEXT
 );
+
+ALTER TABLE komari_knowledge
+ADD COLUMN IF NOT EXISTS source_key TEXT;
 
 -- ============================================
 -- 2. 创建索引
@@ -72,6 +78,11 @@ END AS sql_to_execute
 CREATE INDEX IF NOT EXISTS idx_komari_knowledge_keywords
 ON komari_knowledge
 USING gin (keywords);
+
+-- 外部来源幂等索引
+CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_knowledge_source_key
+ON komari_knowledge(source_key)
+WHERE source_key IS NOT NULL;
 
 -- 分类索引
 CREATE INDEX IF NOT EXISTS idx_komari_knowledge_category
