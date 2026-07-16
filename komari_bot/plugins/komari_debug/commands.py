@@ -7,6 +7,7 @@ SUPERUSER 不放进 matcher 的 permission=/rule=。
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 from nonebot import logger, on_command
 from nonebot.adapters.onebot.v11 import (
@@ -40,7 +41,15 @@ from komari_bot.plugins.user_data import (
     set_user_favorability,
 )
 
-from .reporting import build_and_send_diagnostic_report
+from .reporting import (
+    DiagnosticDeliveryResult,
+    build_and_send_diagnostic_report,
+    send_group_text,
+    send_private_message,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 FAVOR_MIN = 0
 FAVOR_MAX = 400
@@ -51,9 +60,11 @@ HELP_TEXT = """🔧 Komari Debug 子命令：
 .debug favor set <用户ID> <0-400> — 设置好感度
 .debug bind set <用户ID> <角色名> — 设置角色绑定
 .debug bind del <用户ID> — 删除角色绑定
-.debug bind list — 查看全部绑定
-.debug reply <测试文本> — 群聊干跑回复（仅群聊）
-.debug summary <总结要求> — 群聊诊断总结（仅群聊）"""
+.debug bind list [--public] — 查看全部绑定（明细默认私聊）
+.debug reply [--public] <测试文本> — 群聊干跑回复（完整报告默认私聊）
+.debug summary [--public] <总结要求> — 群聊诊断总结（完整报告默认私聊）
+
+--public 只向当前群额外展示二次脱敏摘要。"""
 
 
 def _get_arg_text(args: Message = CommandArg()) -> str:
@@ -80,6 +91,89 @@ def _parse_favor_value(raw: str) -> int | None:
     if val < FAVOR_MIN or val > FAVOR_MAX:
         return None
     return val
+
+
+def _extract_public_flag(arg_text: str) -> tuple[bool, str]:
+    """提取仅允许位于参数开头的 --public 标志。"""
+    normalized = arg_text.strip()
+    if normalized == "--public":
+        return True, ""
+    prefix = "--public "
+    if normalized.startswith(prefix):
+        return True, normalized[len(prefix) :].strip()
+    return False, normalized
+
+
+def _build_group_receipt(
+    *,
+    request_id: str,
+    succeeded: bool,
+    private_delivered: bool,
+    public_requested: bool,
+    public_delivered: bool | None,
+) -> str:
+    """构建不含输入、输出、用户标识或异常正文的群内回执。"""
+    lines = [
+        "🔒 调试请求已处理",
+        f"请求 ID: {request_id}",
+        f"执行状态: {'成功' if succeeded else '失败'}",
+        f"完整结果: {'已私聊' if private_delivered else '私聊投递失败'}",
+    ]
+    if public_requested:
+        lines.append(
+            "公开脱敏摘要: "
+            + ("已发送" if public_delivered else "发送失败")
+        )
+    return "\n".join(lines)
+
+
+async def _deliver_debug_report(
+    *,
+    bot: Bot,
+    event: GroupMessageEvent,
+    collector: LLMDiagnosticCollector,
+    result_type: str,
+    succeeded: bool,
+    public_requested: bool,
+    error: str | None = None,
+    extra_info: Mapping[str, object] | None = None,
+    final_result_info: Mapping[str, object] | None = None,
+    private_artifact_delivered: bool = True,
+) -> DiagnosticDeliveryResult:
+    """投递私聊完整报告、可选公开摘要，并始终发送安全群回执。"""
+    try:
+        delivery = await build_and_send_diagnostic_report(
+            bot=bot,
+            user_id=int(event.user_id),
+            collector=collector,
+            result_type=result_type,
+            succeeded=succeeded,
+            error=error,
+            extra_info=extra_info,
+            final_result_info=final_result_info,
+            public_group_id=int(event.group_id) if public_requested else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[KomariDebug] 诊断报告构建失败: request_id={} error_type={}",
+            collector.request_id,
+            type(exc).__name__,
+        )
+        delivery = DiagnosticDeliveryResult(
+            private_delivered=False,
+            public_delivered=False if public_requested else None,
+        )
+
+    private_delivered = delivery.private_delivered and private_artifact_delivered
+    receipt = _build_group_receipt(
+        request_id=collector.request_id,
+        succeeded=succeeded,
+        private_delivered=private_delivered,
+        public_requested=public_requested,
+        public_delivered=delivery.public_delivered,
+    )
+    await send_group_text(bot, int(event.group_id), receipt)
+    return delivery
 
 
 def _gather_image_urls(event: GroupMessageEvent) -> list[str]:
@@ -345,24 +439,63 @@ async def handle_debug_bind_list(
     if not await SUPERUSER(bot, event):
         await debug_bind_list.finish("❌ 仅限 SUPERUSER 使用")
 
-    if arg_text:
-        await debug_bind_list.finish("❌ 参数过多\n用法: .debug bind list")
+    public_requested, remaining = _extract_public_flag(arg_text)
+    if remaining:
+        await debug_bind_list.finish(
+            "❌ 参数过多\n用法: .debug bind list [--public]"
+        )
+    if public_requested and not isinstance(event, GroupMessageEvent):
+        await debug_bind_list.finish("❌ --public 仅可在群聊中使用")
+
+    request_id = f"debug-bind-list-{uuid.uuid4().hex[:12]}"
 
     try:
         manager = get_binding_manager()
         bindings = manager.list_bindings()
     except Exception as e:
         logger.exception("[KomariDebug] bind list 失败")
-        await debug_bind_list.finish(f"❌ 查询绑定列表失败: {e}")
+        if not isinstance(event, GroupMessageEvent):
+            await debug_bind_list.finish(f"❌ 查询绑定列表失败: {e}")
+        private_delivered = await send_private_message(
+            bot,
+            int(event.user_id),
+            f"❌ 查询绑定列表失败\n请求 ID: {request_id}\n错误: {e}",
+        )
+        receipt = _build_group_receipt(
+            request_id=request_id,
+            succeeded=False,
+            private_delivered=private_delivered,
+            public_requested=public_requested,
+            public_delivered=False if public_requested else None,
+        )
+        await debug_bind_list.finish(receipt)
 
-    if not bindings:
-        await debug_bind_list.finish("📋 当前没有任何角色绑定")
+    if bindings:
+        lines = ["📋 全部角色绑定:"]
+        for uid, name in sorted(bindings.items(), key=lambda item: item[0]):
+            lines.append(f"  {uid}: {name}")
+        private_text = "\n".join(lines)
+    else:
+        private_text = "📋 当前没有任何角色绑定"
 
-    lines = ["📋 全部角色绑定:"]
-    for uid, name in sorted(bindings.items(), key=lambda item: item[0]):
-        lines.append(f"  {uid}: {name}")
+    if not isinstance(event, GroupMessageEvent):
+        await debug_bind_list.finish(private_text)
 
-    await debug_bind_list.finish("\n".join(lines))
+    private_delivered = await send_private_message(
+        bot,
+        int(event.user_id),
+        f"请求 ID: {request_id}\n{private_text}",
+    )
+    receipt = _build_group_receipt(
+        request_id=request_id,
+        succeeded=True,
+        private_delivered=private_delivered,
+        public_requested=public_requested,
+        public_delivered=True if public_requested else None,
+    )
+    if public_requested:
+        receipt += f"\n公开摘要: 共 {len(bindings)} 条绑定，明细已隐藏"
+    await debug_bind_list.finish(receipt)
 
 
 # ─── .debug reply ──────────────────────────────────────────────
@@ -382,9 +515,10 @@ async def handle_debug_reply(
     if not isinstance(event, GroupMessageEvent):
         await debug_reply.finish("❌ .debug reply 仅支持群聊")
 
-    if not arg_text:
+    public_requested, debug_content = _extract_public_flag(arg_text)
+    if not debug_content:
         await debug_reply.finish(
-            "❌ 请提供测试文本\n用法: .debug reply <测试文本>"
+            "❌ 请提供测试文本\n用法: .debug reply [--public] <测试文本>"
         )
 
     group_id = str(event.group_id)
@@ -406,7 +540,7 @@ async def handle_debug_reply(
             group_id=group_id,
             user_id=user_id,
             user_nickname=user_nickname,
-            content=arg_text,
+            content=debug_content,
             bot=bot,
             image_urls=image_urls if image_urls else None,
             reply_context=reply_context,
@@ -421,16 +555,17 @@ async def handle_debug_reply(
             error_type=type(e).__name__,
             message=str(e),
         )
-        await build_and_send_diagnostic_report(
+        await _deliver_debug_report(
             bot=bot,
-            group_id=int(event.group_id),
+            event=event,
             collector=collector,
             result_type="reply",
             succeeded=False,
+            public_requested=public_requested,
             error=str(e),
-            final_result_info={
+            extra_info={
                 "user_id": user_id,
-                "content": arg_text[:200],
+                "content": debug_content[:200],
             },
         )
         return
@@ -444,12 +579,13 @@ async def handle_debug_reply(
     if result.favorability_reason:
         favor_delta_str += f"（{result.favorability_reason}）"
 
-    await build_and_send_diagnostic_report(
+    await _deliver_debug_report(
         bot=bot,
-        group_id=int(event.group_id),
+        event=event,
         collector=result.collector,
         result_type="reply",
         succeeded=True,
+        public_requested=public_requested,
         final_result_info={
             "reply_text": reply_text,
             "favorability_delta": favor_delta_str,
@@ -457,7 +593,7 @@ async def handle_debug_reply(
         },
         extra_info={
             "user_id": user_id,
-            "content": arg_text[:200],
+            "content": debug_content[:200],
         },
     )
 
@@ -491,9 +627,10 @@ async def handle_debug_summary(
     if not isinstance(event, GroupMessageEvent):
         await debug_summary.finish("❌ .debug summary 仅支持群聊")
 
-    if not arg_text:
+    public_requested, summary_request = _extract_public_flag(arg_text)
+    if not summary_request:
         await debug_summary.finish(
-            "❌ 请提供总结要求\n用法: .debug summary <总结要求>"
+            "❌ 请提供总结要求\n用法: .debug summary [--public] <总结要求>"
         )
 
     request_trace_id = f"debug-summary-{uuid.uuid4().hex[:12]}"
@@ -509,12 +646,13 @@ async def handle_debug_summary(
             error_type=type(e).__name__,
             message=str(e),
         )
-        await build_and_send_diagnostic_report(
+        await _deliver_debug_report(
             bot=bot,
-            group_id=int(event.group_id),
+            event=event,
             collector=collector,
             result_type="summary",
             succeeded=False,
+            public_requested=public_requested,
             error=str(e),
             extra_info={"user_id": str(event.user_id)},
         )
@@ -525,7 +663,7 @@ async def handle_debug_summary(
             bot=bot,
             group_id=group_id,
             bot_self_id=str(bot.self_id),
-            user_request=arg_text,
+            user_request=summary_request,
             config=summary_config,
             collector=collector,
         )
@@ -535,14 +673,18 @@ async def handle_debug_summary(
             error_type="SummaryBusyError",
             message=str(e),
         )
-        await build_and_send_diagnostic_report(
+        await _deliver_debug_report(
             bot=bot,
-            group_id=int(event.group_id),
+            event=event,
             collector=collector,
             result_type="summary",
             succeeded=False,
+            public_requested=public_requested,
             error=str(e),
-            extra_info={"user_id": str(event.user_id), "request": arg_text[:200]},
+            extra_info={
+                "user_id": str(event.user_id),
+                "request": summary_request[:200],
+            },
         )
         return
     except CapabilityNotSupportedError:
@@ -551,14 +693,18 @@ async def handle_debug_summary(
             error_type="CapabilityNotSupportedError",
             message="当前 OneBot 实现不支持获取群聊记录",
         )
-        await build_and_send_diagnostic_report(
+        await _deliver_debug_report(
             bot=bot,
-            group_id=int(event.group_id),
+            event=event,
             collector=collector,
             result_type="summary",
             succeeded=False,
+            public_requested=public_requested,
             error="当前 OneBot 实现不支持获取群聊记录",
-            extra_info={"user_id": str(event.user_id), "request": arg_text[:200]},
+            extra_info={
+                "user_id": str(event.user_id),
+                "request": summary_request[:200],
+            },
         )
         return
     except FinishedException:
@@ -570,34 +716,38 @@ async def handle_debug_summary(
             error_type=type(e).__name__,
             message=str(e),
         )
-        await build_and_send_diagnostic_report(
+        await _deliver_debug_report(
             bot=bot,
-            group_id=int(event.group_id),
+            event=event,
             collector=collector,
             result_type="summary",
             succeeded=False,
+            public_requested=public_requested,
             error=str(e),
-            extra_info={"user_id": str(event.user_id), "request": arg_text[:200]},
+            extra_info={
+                "user_id": str(event.user_id),
+                "request": summary_request[:200],
+            },
         )
         return
 
+    image_delivered = True
     if result.image_base64:
-        try:
-            await bot.send(
-                event,
-                MessageSegment.image(file=f"base64://{result.image_base64}"),
-            )
-        except Exception as e:
-            logger.exception("[KomariDebug] 总结图片发送失败")
+        image_delivered = await send_private_message(
+            bot,
+            int(event.user_id),
+            MessageSegment.image(file=f"base64://{result.image_base64}"),
+        )
+        if not image_delivered:
             collector.add_error(
                 phase="debug_summary_image_send",
-                error_type=type(e).__name__,
-                message=str(e),
+                error_type="PrivateDeliveryError",
+                message="总结图片私聊投递失败",
             )
 
     extra_info = {
         "user_id": str(event.user_id),
-        "request": arg_text[:200],
+        "request": summary_request[:200],
         "filtered_message_count": str(result.filtered_message_count),
         "filter_label": result.filter_label,
         "time_range": result.time_range,
@@ -613,11 +763,13 @@ async def handle_debug_summary(
             }
         )
 
-    await build_and_send_diagnostic_report(
+    await _deliver_debug_report(
         bot=bot,
-        group_id=int(event.group_id),
+        event=event,
         collector=collector,
         result_type="summary",
         succeeded=True,
+        public_requested=public_requested,
         extra_info=extra_info,
+        private_artifact_delivered=image_delivered,
     )

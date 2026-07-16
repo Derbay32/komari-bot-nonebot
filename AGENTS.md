@@ -134,12 +134,13 @@ komari-bot/
 SUPERUSER 消息 → komari_debug（命令处理器）
          ├─ 运行时 await SUPERUSER(bot, event) 校验（不在 matcher 层）
          ├─ favor — 调用 user_data.get/set_user_favorability
-         ├─ bind — 通过 character_binding.get_binding_manager() 操作
+         ├─ bind — 通过 character_binding.get_binding_manager() 操作；list 明细默认私聊
          ├─ reply — 调用 komari_chat.generate_debug_reply，走纯读取/生成核心，
          │         跳过决策引擎、Redis push、好感度 adjust、互动写入、冷却/频控，
-         │         读取真实群上下文与附图/引用消息，发送诊断报告（合并转发）
+         │         读取真实群上下文与附图/引用消息；完整诊断报告仅私聊 SUPERUSER，
+         │         群内默认只发 request ID/状态，`--public` 仅追加二次脱敏摘要
          └─ summary — 调用 group_history_summary.execute_group_summary 共享服务，
-                      先发送总结图片，再发送诊断合并转发报告
+                      总结图片与完整诊断报告按顺序私聊 SUPERUSER；群内遵循相同回执/脱敏规则
 ```
 
 ## 核心机制详解
@@ -390,7 +391,7 @@ poetry run pytest tests/ -v
 7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤
 8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
 9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
-10. **诊断结构**：诊断报告只含 call/tool trace 摘要与聚合 token，绝不包含完整 prompt、reasoning content、base64、历史或画像正文
+10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.common.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
 
