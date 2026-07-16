@@ -4,6 +4,7 @@ from nonebot import get_plugin_config, logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.exception import FinishedException
 from nonebot.params import Command, CommandArg
+from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata, require
 
 from .commands import AddCommand, DeleteCommand
@@ -59,7 +60,14 @@ sr_manage = on_command(
 
 
 @sr_manage.handle()
-async def sr_switch(cmd: tuple[str, ...] = Command()) -> None:
+async def sr_switch(
+    bot: Bot,
+    event: MessageEvent,
+    cmd: tuple[str, ...] = Command(),
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await sr_manage.finish("❌ 仅限 SUPERUSER 使用")
+
     _, action = cmd
     config = config_manager.get()
 

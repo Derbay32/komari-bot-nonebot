@@ -37,6 +37,10 @@ class _StubPermissionManagerPlugin:
     ) -> tuple[bool, str]:
         return True, ""
 
+    @staticmethod
+    def format_permission_info(_config: object) -> str:
+        return "已启用"
+
 
 class _StubCharacterBinding:
     @staticmethod
@@ -130,4 +134,54 @@ async def test_sr_non_empty_list_draws_item(
         ctx.should_ignore_permission(matcher=sr_module.sr)
         ctx.should_pass_rule(matcher=sr_module.sr)
         ctx.should_call_send(event, "测试用户抽到的神人是——\n2. 乙", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_sr_manage_rejects_non_superuser_before_reading_config(
+    app: App,
+    sr_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailConfigManager:
+        @staticmethod
+        def get() -> object:
+            msg = "非超级用户不应读取配置"
+            raise AssertionError(msg)
+
+    async def _reject_superuser(_bot: object, _event: object) -> bool:
+        return False
+
+    monkeypatch.setattr(sr_module, "config_manager", _FailConfigManager())
+    monkeypatch.setattr(sr_module, "SUPERUSER", _reject_superuser)
+
+    async with app.test_matcher(sr_module.sr_manage) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".sr status")
+        ctx.receive_event(bot, event)
+        ctx.should_ignore_permission(matcher=sr_module.sr_manage)
+        ctx.should_pass_rule(matcher=sr_module.sr_manage)
+        ctx.should_call_send(event, "❌ 仅限 SUPERUSER 使用", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_sr_manage_allows_superuser_to_read_status(
+    app: App,
+    sr_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _allow_superuser(_bot: object, _event: object) -> bool:
+        return True
+
+    _patch_sr_dependencies(sr_module, monkeypatch, sr_list=[])
+    monkeypatch.setattr(sr_module, "SUPERUSER", _allow_superuser)
+
+    async with app.test_matcher(sr_module.sr_manage) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".sr status")
+        ctx.receive_event(bot, event)
+        ctx.should_ignore_permission(matcher=sr_module.sr_manage)
+        ctx.should_pass_rule(matcher=sr_module.sr_manage)
+        ctx.should_call_send(event, "SR 已启用", bot=bot)
         ctx.should_finished()
