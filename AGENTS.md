@@ -151,7 +151,8 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - **Prompt 配置**：字符串 prompt 不存入 `komari_plugin_configs`，统一使用独立 PostgreSQL 表 `komari_prompt_configs`
 - **初始化**：PG 中缺失配置时，从 `.env` 环境变量 / Pydantic 默认值生成并写入 PG
 - **持久化**：`update_field()` → Pydantic 校验 → 写回 PostgreSQL
-- **线程安全**：单例 + `RLock`，按 `plugin_name:schema_name` 区分实例
+- **线程安全**：唯一工厂注册表仅锁定实例创建；各配置资源使用独立同步/异步锁，互不串行
+- **资源清理**：同步兼容桥的专用事件循环线程在应用关闭时依次关闭连接池、停止循环、join 线程并关闭 loop
 - **管理元数据**：受 `komari_management` 管理的 Schema 必须在 `model_config.json_schema_extra.default_apply_mode` 声明默认 `immediate | rebuild | restart`；例外字段通过 `Field(json_schema_extra={"apply_mode": ...})` 覆盖
 - **秘密字段**：API Token、API Key、密码、凭据和 DSN 必须用 `Field(json_schema_extra={"secret": True})` 显式标记；管理响应中的配置值与可确认生效值均只返回掩码
 - **生效状态**：管理配置详情通过 `field_states` 返回配置来源、生效来源和 `restart_required`；无法观测的启动/服务快照以 `effective_value=null` 表示，禁止宣称已即时生效

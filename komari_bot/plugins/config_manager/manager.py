@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
-from typing import TYPE_CHECKING, Any, ClassVar, Never
+from typing import TYPE_CHECKING, Any, Never
 
 from nonebot import get_plugin_config, logger
 
@@ -50,26 +50,8 @@ class ConfigManager:
     - 支持自定义配置 Schema（任何 BaseModel 子类）
     """
 
-    _instances: ClassVar[dict[str, "ConfigManager"]] = {}
-    _lock: ClassVar[RLock] = RLock()
-
-    def __new__(
-        cls, plugin_name: str, config_schema: type[BaseModel]
-    ) -> "ConfigManager":
-        """单例模式实现，按插件名称区分。"""
-        key = f"{plugin_name}:{config_schema.__name__}"
-        if key not in cls._instances:
-            with cls._lock:
-                if key not in cls._instances:
-                    instance = super().__new__(cls)
-                    cls._instances[key] = instance
-        return cls._instances[key]
-
     def __init__(self, plugin_name: str, config_schema: type[BaseModel]) -> None:
         """初始化配置管理器。"""
-        if hasattr(self, "_initialized"):
-            return
-
         self._plugin_name = plugin_name
         self._config_schema = config_schema
         self._env_config: Any | None = None
@@ -77,8 +59,8 @@ class ConfigManager:
         self._last_loaded_at: datetime | None = None
         self._revision: int | None = None
         self._state_lock = RLock()
+        self._sync_lock = RLock()
         self._async_lock = asyncio.Lock()
-        self._initialized = True
 
         logger.info(f"配置管理器已初始化 [{plugin_name}], 配置源: {self.config_source}")
 
@@ -100,7 +82,7 @@ class ConfigManager:
 
     def initialize(self) -> BaseModel:
         """从 PostgreSQL 或 .env 初始化配置。"""
-        with self._lock:
+        with self._sync_lock:
             if self._dynamic_config is not None:
                 return self._dynamic_config
 
@@ -400,7 +382,7 @@ class ConfigManager:
 
     def update_field(self, field_name: str, value: Any) -> BaseModel:
         """以字段级 CAS 更新单个配置字段。"""
-        with self._lock:
+        with self._sync_lock:
             storage = get_config_storage()
             for attempt in range(1, _CONFIG_UPDATE_MAX_ATTEMPTS + 1):
                 stored = storage.fetch(self._plugin_name)
@@ -524,7 +506,7 @@ class ConfigManager:
 
     def reload(self) -> BaseModel:
         """从 PostgreSQL 重新加载配置。"""
-        with self._lock:
+        with self._sync_lock:
             stored = get_config_storage().fetch(self._plugin_name)
             if stored is None:
                 self._dynamic_config = self._initialize_from_env()
@@ -563,13 +545,22 @@ class ConfigManager:
 
 
 _config_managers: dict[str, ConfigManager] = {}
+_config_managers_lock = RLock()
 
 
 def get_config_manager(
     plugin_name: str, config_schema: type[BaseModel]
 ) -> ConfigManager:
-    """获取配置管理器实例。"""
-    key = f"{plugin_name}:{config_schema.__name__}"
-    if key not in _config_managers:
-        _config_managers[key] = ConfigManager(plugin_name, config_schema)
-    return _config_managers[key]
+    """从唯一注册表获取配置管理器实例。"""
+    with _config_managers_lock:
+        manager = _config_managers.get(plugin_name)
+        if manager is None:
+            manager = ConfigManager(plugin_name, config_schema)
+            _config_managers[plugin_name] = manager
+        elif manager._config_schema is not config_schema:
+            msg = (
+                f"插件 {plugin_name} 已注册配置 Schema "
+                f"{manager._config_schema.__name__}，不能改用 {config_schema.__name__}"
+            )
+            raise ValueError(msg)
+        return manager

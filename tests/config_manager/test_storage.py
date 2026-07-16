@@ -67,6 +67,39 @@ class _FakePool:
         self.closed = True
 
 
+def test_close_reclaims_pool_thread_and_event_loop(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    pool = _FakePool()
+    storage._pool = pool
+    thread = storage._thread
+    loop = storage._loop
+
+    storage.close()
+    storage.close()
+
+    assert pool.closed is True
+    assert thread.is_alive() is False
+    assert loop.is_closed() is True
+
+
+def test_closed_storage_rejects_new_operations_and_closes_coroutine(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    storage.close()
+
+    async def _completed() -> str:
+        return "不应执行"
+
+    coro = _completed()
+    with pytest.raises(RuntimeError, match="配置存储已关闭"):
+        storage._run(coro)
+
+    assert coro.cr_frame is None
+
+
 def test_get_pool_closes_temporary_pool_when_schema_initialization_fails(
     storage_module: Any,
     monkeypatch: pytest.MonkeyPatch,

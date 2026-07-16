@@ -7,7 +7,8 @@
 - **PostgreSQL 持久化**：配置存储在 `komari_plugin_configs` 表。
 - **dotenv 初始化**：PG 中缺少配置时，从 NoneBot 已加载的 `.env` / schema 默认值初始化。
 - **运行时更新**：`update_field()` 会校验字段并写回 PostgreSQL。
-- **线程安全**：使用锁机制保证多线程环境下的配置访问安全。
+- **资源级并发**：工厂注册表只锁定实例创建，各插件管理器使用独立操作锁。
+- **完整生命周期**：同步兼容桥使用专用事件循环线程，应用关闭时会回收连接池、线程和事件循环。
 - **通用设计**：接受任何 Pydantic `BaseModel` 子类作为配置 Schema。
 
 ## 配置表
@@ -62,7 +63,7 @@ await config_manager.mutate_field_async("items", append_unique)
 
 ### `get_config_manager(plugin_name, config_schema)`
 
-获取配置管理器单例实例。
+从唯一工厂注册表获取配置管理器实例；相同插件名返回同一实例，重复注册不同 Schema 会被拒绝。注册表锁只保护实例创建，不会串行化不同插件的配置读写。
 
 ### `initialize()` / `get()`
 

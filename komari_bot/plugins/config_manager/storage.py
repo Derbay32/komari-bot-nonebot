@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
@@ -67,6 +69,11 @@ class ConfigStorage:
 
     def __init__(self) -> None:
         self._loop = asyncio.new_event_loop()
+        self._started = threading.Event()
+        self._stopped = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._closing = False
+        self._closed = False
         self._thread = threading.Thread(
             target=self._run_loop,
             name="komari-config-storage",
@@ -76,13 +83,46 @@ class ConfigStorage:
         self._pool_lock = asyncio.Lock()
         self._init_lock = threading.RLock()
         self._thread.start()
+        if not self._started.wait(timeout=_CONFIG_STORAGE_TIMEOUT_SECONDS):
+            self.close()
+            msg = "配置存储后台线程启动超时"
+            raise RuntimeError(msg)
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        self._started.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            asyncio.set_event_loop(None)
+            self._loop.close()
+            with self._lifecycle_lock:
+                self._closed = True
+            self._stopped.set()
+
+    def _submit(self, coro: Coroutine[Any, Any, T]) -> Future[T]:
+        """向存储循环提交任务，并拒绝关闭阶段的新操作。"""
+        with self._lifecycle_lock:
+            if self._closing or self._closed or self._loop.is_closed():
+                coro.close()
+                msg = "配置存储已关闭"
+                raise RuntimeError(msg)
+            try:
+                return asyncio.run_coroutine_threadsafe(coro, self._loop)
+            except RuntimeError:
+                coro.close()
+                raise
 
     def _run(self, coro: Coroutine[Any, Any, T]) -> T:
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future = self._submit(coro)
         try:
             return future.result(timeout=_CONFIG_STORAGE_TIMEOUT_SECONDS)
         except FutureTimeoutError as exc:
@@ -92,7 +132,7 @@ class ConfigStorage:
 
     async def _run_async(self, coro: Coroutine[Any, Any, T]) -> T:
         """在调用方事件循环中无阻塞地等待后台存储操作。"""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future = self._submit(coro)
         try:
             return await asyncio.wait_for(
                 asyncio.wrap_future(future),
@@ -435,18 +475,53 @@ class ConfigStorage:
             updated_at=row["updated_at"],
         )
 
+    async def _close_pool(self) -> None:
+        """在连接池所属事件循环中关闭并解除引用。"""
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            await pool.close()
+
     def close(self) -> None:
-        """关闭后台连接池和事件循环。"""
-        if not self._loop.is_running():
+        """关闭连接池，停止并回收后台线程及其事件循环。"""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._closing:
+                wait_for_other_close = True
+            else:
+                self._closing = True
+                wait_for_other_close = False
+
+        shutdown_timeout = _CONFIG_STORAGE_TIMEOUT_SECONDS + 1.0
+        if wait_for_other_close:
+            self._stopped.wait(timeout=shutdown_timeout)
             return
+
         try:
-            if self._pool is not None:
-                self._run(self._pool.close())
-                self._pool = None
+            if not self._loop.is_closed():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._close_pool(),
+                    self._loop,
+                )
+                try:
+                    future.result(timeout=_CONFIG_STORAGE_TIMEOUT_SECONDS)
+                except FutureTimeoutError as exc:
+                    future.cancel()
+                    logger.warning("配置存储关闭连接池超时: {}", type(exc).__name__)
+                except Exception as exc:
+                    logger.warning("配置存储关闭连接池失败: {}", type(exc).__name__)
         except Exception as exc:
-            logger.warning(f"配置存储关闭连接池失败: {exc}")
+            logger.warning("配置存储提交关闭任务失败: {}", type(exc).__name__)
         finally:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            if not self._loop.is_closed():
+                with suppress(RuntimeError):
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+
+            if threading.current_thread() is not self._thread:
+                self._thread.join(timeout=shutdown_timeout)
+                if self._thread.is_alive():
+                    logger.error("配置存储后台线程未在超时内停止")
 
 
 class _StorageState:

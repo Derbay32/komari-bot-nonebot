@@ -57,7 +57,6 @@ class _ConflictOnceStorage:
 async def test_mutate_field_reapplies_transform_to_latest_value_after_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ConfigManager._instances.clear()
     storage = _ConflictOnceStorage()
     monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
     manager = ConfigManager("sr-mutation-test", _ListConfig)
@@ -74,7 +73,6 @@ async def test_mutate_field_reapplies_transform_to_latest_value_after_conflict(
     assert storage.update_patches[0]["sr_list"] == ["甲", "丙"]
     assert storage.update_patches[1]["sr_list"] == ["甲", "乙", "丙"]
     assert cast("_ListConfig", result).sr_list == ["甲", "乙", "丙"]
-    ConfigManager._instances.clear()
 
 
 @pytest.mark.asyncio
@@ -88,7 +86,6 @@ async def test_mutate_field_skips_revision_write_when_value_is_unchanged(
         async def update_fields_if_revision_async(self, **_kwargs: Any) -> None:
             raise AssertionError("无变化的字段不应写入新修订")
 
-    ConfigManager._instances.clear()
     monkeypatch.setattr(
         manager_module,
         "get_config_storage",
@@ -99,4 +96,3 @@ async def test_mutate_field_skips_revision_write_when_value_is_unchanged(
     result = await manager.mutate_field_async("sr_list", lambda value: value)
 
     assert cast("_ListConfig", result).sr_list == ["甲"]
-    ConfigManager._instances.clear()

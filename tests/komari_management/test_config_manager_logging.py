@@ -216,10 +216,8 @@ class _SingleConflictStorage(_FakeStorage):
 
 @pytest.fixture(autouse=True)
 def _clear_config_manager_singletons() -> Iterator[None]:
-    ConfigManager._instances.clear()
     manager_module._config_managers.clear()
     yield
-    ConfigManager._instances.clear()
     manager_module._config_managers.clear()
 
 
@@ -336,8 +334,6 @@ async def test_async_field_updates_from_two_workers_preserve_each_other(
     first_manager = ConfigManager("test_multi_worker", _ConfigSchema)
     await first_manager.initialize_async()
 
-    ConfigManager._instances.clear()
-    manager_module._config_managers.clear()
     second_manager = ConfigManager("test_multi_worker", _ConfigSchema)
     await second_manager.initialize_async()
 
