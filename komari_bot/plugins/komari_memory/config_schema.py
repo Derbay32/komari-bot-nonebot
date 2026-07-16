@@ -1,9 +1,9 @@
 """Komari Memory 配置 Schema。"""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class KomariMemoryConfigSchema(BaseModel):
@@ -77,6 +77,62 @@ class KomariMemoryConfigSchema(BaseModel):
     vision_tool_enabled: bool = Field(
         default=True,
         description="是否启用 V4 工具调用读图模式",
+    )
+    vision_image_download_max_count: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="单条消息最多下载的当前消息与引用消息图片总数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=64 * 1024,
+        le=16 * 1024 * 1024,
+        description="单张图片响应体最大字节数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_total_max_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=64 * 1024,
+        le=32 * 1024 * 1024,
+        description="单条消息全部图片响应体累计最大字节数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_pixels: int = Field(
+        default=40_000_000,
+        ge=1_000_000,
+        le=100_000_000,
+        description="单张静态图片或动画全部帧的累计像素上限",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="单条消息图片下载最大并发数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_connect_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=15.0,
+        description="单次图片连接超时秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_read_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=60.0,
+        description="单次图片响应读取停顿超时秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_total_timeout_seconds: float = Field(
+        default=45.0,
+        ge=5.0,
+        le=90.0,
+        description="单条消息全部图片下载总时限秒数",
+        json_schema_extra={"apply_mode": "immediate"},
     )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
@@ -320,3 +376,16 @@ class KomariMemoryConfigSchema(BaseModel):
         if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
             return "auto"
         return normalized
+
+    @model_validator(mode="after")
+    def validate_vision_image_download_budget(self) -> Self:
+        """确保单图预算和连接阶段能被整批预算完整容纳。"""
+        if self.vision_image_download_total_max_bytes < (
+            self.vision_image_download_max_bytes
+        ):
+            raise ValueError("图片总字节上限不能小于单图字节上限")
+        if self.vision_image_download_total_timeout_seconds < (
+            self.vision_image_download_connect_timeout_seconds
+        ):
+            raise ValueError("图片下载总时限不能小于连接超时")
+        return self

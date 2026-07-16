@@ -224,6 +224,23 @@ psql -h localhost -U your_username -d komari_bot \
 
 非强制主动回复会在调用 LLM 前通过 Redis Lua 原子检查冷却与最近一小时名额，并用平台消息 ID 建立有 TTL 的预占。生成失败、回复为空或 QQ 发送失败会幂等释放预占；发送成功后将同一预占原子确认为一小时滑动窗口记录，并开始正式冷却。进程中断遗留的生成中预占会在 TTL 到期后由下一次操作清理。
 
+### 视觉图片下载
+
+当前消息和引用消息中的图片共用一组下载预算，引用图片优先进入预算。动态配置更新后立即生效。
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `vision_image_download_max_count` | `4` | 单条消息最多下载的图片总数 |
+| `vision_image_download_max_bytes` | `8388608` | 单张图片响应体上限（字节） |
+| `vision_image_download_total_max_bytes` | `20971520` | 单条消息全部图片响应体累计上限（字节） |
+| `vision_image_download_max_pixels` | `40000000` | 单张静态图或动画全部帧的累计像素上限 |
+| `vision_image_download_concurrency` | `2` | 下载并发上限 |
+| `vision_image_download_connect_timeout_seconds` | `5` | 单次连接超时（秒） |
+| `vision_image_download_read_timeout_seconds` | `30` | 单次响应读取停顿超时（秒） |
+| `vision_image_download_total_timeout_seconds` | `45` | 整批图片下载总时限（秒） |
+
+下载器只允许 HTTP/HTTPS 的 80/443 端口；DNS 地址在实际建连阶段校验，任何内网、回环、链路本地或保留地址都会拒绝。每一跳重定向都会重新经过相同边界。响应头和文件后缀不作为图片类型依据，下载完成后会按真实文件格式、完整解码结果及像素规模验图，只接受 JPEG、PNG、GIF 和 WebP。
+
 ## 对外使用方式
 
 `komari_memory` 没有稳定的用户命令接口，主要作为内部服务插件使用。

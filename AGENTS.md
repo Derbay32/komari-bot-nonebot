@@ -287,6 +287,9 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`
 - 保留原 prompt、模型参数、并发信号量、空结果和错误文本语义
 - 视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace
+- 图片下载器对当前消息和引用消息应用同一批次预算：默认最多 4 张、单图 8 MiB、总计 20 MiB、并发 2、总时限 45 秒；配置更新即时生效
+- 域名必须由 aiohttp 建连阶段的受控 resolver 解析并校验，禁止恢复“预解析后再由客户端重新解析”的 DNS 重绑定窗口；每一跳重定向都执行同样校验
+- 图片 MIME 必须来自 Pillow 对真实文件的识别与解码结果，禁止信任响应 `Content-Type` 或 URL 后缀；仅接受 JPEG、PNG、GIF、WebP，并执行累计像素限制
 
 ### 7. 群聊总结执行服务 (`group_history_summary`)
 

@@ -33,7 +33,11 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
-from ..services.image_downloader import download_images_as_base64, extract_image_sources
+from ..services.image_downloader import (
+    ImageDownloadPolicy,
+    download_images_as_base64_aligned,
+    extract_image_sources,
+)
 from ..services.llm_service import (
     READ_IMAGE_TOOL,
     READ_PROFILE_TOOL,
@@ -715,14 +719,28 @@ class MessageHandler:
             )
             current_user_profile = None
 
-        base64_image_urls: list[str] | None = None
-        if image_urls:
-            base64_image_urls = await download_images_as_base64(image_urls)
+        reply_sources = list(reply_context.image_sources) if reply_context else []
+        current_sources = image_urls or []
+        combined_sources = [*reply_sources, *current_sources]
+
         reply_image_urls: list[str] | None = None
-        if reply_context and reply_context.image_sources:
-            reply_image_urls = await download_images_as_base64(
-                list(reply_context.image_sources)
+        base64_image_urls: list[str] | None = None
+        if combined_sources:
+            aligned_images = await download_images_as_base64_aligned(
+                combined_sources,
+                ImageDownloadPolicy.from_config(config),
             )
+            reply_boundary = len(reply_sources)
+            reply_image_urls = [
+                image
+                for image in aligned_images[:reply_boundary]
+                if image is not None
+            ] or None
+            base64_image_urls = [
+                image
+                for image in aligned_images[reply_boundary:]
+                if image is not None
+            ] or None
         all_base64_images = (reply_image_urls or []) + (base64_image_urls or [])
         use_vision_tool = getattr(config, "vision_tool_enabled", True) and bool(
             all_base64_images

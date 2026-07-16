@@ -1032,12 +1032,18 @@ def test_generate_debug_reply_with_images_and_reply_context(
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-    async def _download_images(urls: list[str]) -> list[str]:
+    download_batches: list[list[str]] = []
+
+    async def _download_images(
+        urls: list[str],
+        _policy: object,
+    ) -> list[str | None]:
+        download_batches.append(urls)
         return [f"base64:{url}" for url in urls]
 
     monkeypatch.setattr(
         message_handler_module,
-        "download_images_as_base64",
+        "download_images_as_base64_aligned",
         _download_images,
     )
 
@@ -1078,8 +1084,16 @@ def test_generate_debug_reply_with_images_and_reply_context(
     assert result.collector is not None
     assert redis.pushed_messages == []
     assert redis.pushed_global_interactions == []
+    assert download_batches == [
+        ["https://example.com/ref.png", "https://example.com/img.png"]
+    ]
     assert build_prompt_kwargs.get("reply_context") is reply_ctx
-    assert build_prompt_kwargs.get("image_urls") is not None
+    assert build_prompt_kwargs.get("reply_image_urls") == [
+        "base64:https://example.com/ref.png"
+    ]
+    assert build_prompt_kwargs.get("image_urls") == [
+        "base64:https://example.com/img.png"
+    ]
 
 
 def test_normal_attempt_reply_defers_side_effects_until_delivery(

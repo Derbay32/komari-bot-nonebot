@@ -52,3 +52,40 @@ def test_proactive_reservation_ttl_has_bounded_immediate_config() -> None:
         KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=29)
     with pytest.raises(ValueError):
         KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=901)
+
+
+def test_vision_image_download_limits_are_bounded_and_immediate() -> None:
+    config = KomariMemoryConfigSchema()
+    expected_defaults = {
+        "vision_image_download_max_count": 4,
+        "vision_image_download_max_bytes": 8 * 1024 * 1024,
+        "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+        "vision_image_download_max_pixels": 40_000_000,
+        "vision_image_download_concurrency": 2,
+        "vision_image_download_connect_timeout_seconds": 5.0,
+        "vision_image_download_read_timeout_seconds": 30.0,
+        "vision_image_download_total_timeout_seconds": 45.0,
+    }
+
+    for field_name, expected_default in expected_defaults.items():
+        assert getattr(config, field_name) == expected_default
+        field_extra = KomariMemoryConfigSchema.model_fields[
+            field_name
+        ].json_schema_extra
+        assert isinstance(field_extra, dict)
+        assert field_extra["apply_mode"] == "immediate"
+
+
+def test_vision_image_download_rejects_inconsistent_batch_budgets() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="总字节上限"):
+        KomariMemoryConfigSchema(
+            vision_image_download_max_bytes=2 * 1024 * 1024,
+            vision_image_download_total_max_bytes=1024 * 1024,
+        )
+    with pytest.raises(ValueError, match="总时限"):
+        KomariMemoryConfigSchema(
+            vision_image_download_connect_timeout_seconds=10,
+            vision_image_download_total_timeout_seconds=5,
+        )
