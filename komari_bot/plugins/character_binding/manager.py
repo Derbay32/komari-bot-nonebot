@@ -11,10 +11,13 @@ from tempfile import NamedTemporaryFile
 
 from nonebot import logger
 
+from komari_bot.common.project_paths import DATA_DIR
+
 # 模块级单例实例
 _manager_instance: CharacterBindingManager | None = None
 
 MAX_CHARACTER_NAME_LENGTH = 64
+DEFAULT_BINDING_FILE = DATA_DIR / "character_binding" / "bindings.json"
 _EMPTY_NAME_ERROR = "角色名不能为空"
 _NAME_TOO_LONG_ERROR = (
     f"角色名不能超过 {MAX_CHARACTER_NAME_LENGTH} 个 Unicode 字符"
@@ -61,8 +64,8 @@ class CharacterBindingManager:
 
     def __init__(self, binding_file: Path | None = None) -> None:
         """初始化绑定管理器。"""
-        # 使用独立的 data 目录存储绑定数据
-        self.binding_file = binding_file or Path("data/character_binding/bindings.json")
+        # 使用项目根目录下的独立 data 目录，不受进程工作目录影响。
+        self.binding_file = binding_file or DEFAULT_BINDING_FILE
         self.binding_file.parent.mkdir(parents=True, exist_ok=True)
         self._bindings: dict[str, str] = {}
         self._binding_mtime_ns: int | None = None

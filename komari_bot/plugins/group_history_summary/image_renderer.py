@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import base64
 import io
-from pathlib import Path
 from typing import Any
 
 from nonebot import logger
 from PIL import Image, ImageDraw, ImageFont
 
+from komari_bot.common.project_paths import DATA_DIR
+
 FontLike = ImageFont.FreeTypeFont | ImageFont.ImageFont
 
-CHARACTER_IMAGE_PATH = Path("data") / "image-summary.png"
-FONT_DIR = Path("data") / "fonts"
+CHARACTER_IMAGE_PATH = DATA_DIR / "image-summary.png"
+FONT_DIR = DATA_DIR / "fonts"
 FONT_EXTENSIONS = (".ttf", ".otf", ".ttc")
 DEFAULT_LAYOUT_PARAMS: dict[str, Any] = {
     "canvas_width": 1365,

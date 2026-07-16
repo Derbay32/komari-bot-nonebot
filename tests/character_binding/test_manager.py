@@ -11,6 +11,7 @@ import pytest
 
 from komari_bot.plugins.character_binding import manager as manager_module
 from komari_bot.plugins.character_binding.manager import (
+    DEFAULT_BINDING_FILE,
     MAX_CHARACTER_NAME_LENGTH,
     BindingPersistenceError,
     CharacterBindingManager,
@@ -24,6 +25,18 @@ if TYPE_CHECKING:
 @pytest.fixture
 def binding_file(tmp_path: Path) -> Path:
     return tmp_path / "character_binding" / "bindings.json"
+
+
+def test_default_binding_path_is_independent_of_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    manager = CharacterBindingManager()
+
+    assert manager.binding_file == DEFAULT_BINDING_FILE
+    assert manager.binding_file.is_absolute()
 
 
 @pytest.mark.asyncio
