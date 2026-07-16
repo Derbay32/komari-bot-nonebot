@@ -197,7 +197,7 @@ async def test_send_failure_does_not_commit_reply_side_effects(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = SimpleNamespace(send=False, commit=False)
+    calls = SimpleNamespace(send=False, commit=False, discard=False)
     pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
 
     class _Handler:
@@ -212,6 +212,11 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         @staticmethod
         async def commit_delivered_reply(_pending_reply: object) -> None:
             calls.commit = True
+
+        @staticmethod
+        async def discard_pending_reply(actual_pending_reply: object) -> None:
+            assert actual_pending_reply is pending_reply
+            calls.discard = True
 
     async def _fail_send(_message: object) -> None:
         calls.send = True
@@ -228,6 +233,7 @@ async def test_send_failure_does_not_commit_reply_side_effects(
 
     assert calls.send
     assert not calls.commit
+    assert calls.discard
 
 
 @pytest.mark.asyncio
@@ -264,3 +270,44 @@ async def test_successful_send_commits_reply_side_effects_after_delivery(
     )
 
     assert order == ["发送", "提交"]
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_after_delivery_does_not_release_reservation(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = SimpleNamespace(send=False, discard=False)
+    pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
+
+    class _Handler:
+        @staticmethod
+        async def process_message(
+            _bot: object,
+            _event: object,
+            **_kwargs: object,
+        ) -> object:
+            return pending_reply
+
+        @staticmethod
+        async def commit_delivered_reply(_pending_reply: object) -> None:
+            msg = "模拟送达后的提交失败"
+            raise RuntimeError(msg)
+
+        @staticmethod
+        async def discard_pending_reply(_pending_reply: object) -> None:
+            calls.discard = True
+
+    async def _send(_message: object) -> None:
+        calls.send = True
+
+    _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
+    monkeypatch.setattr(chat_module.matcher, "send", _send)
+
+    await chat_module.handle_group_message(
+        cast("Bot", cast("Any", object())),
+        cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+    )
+
+    assert calls.send
+    assert not calls.discard

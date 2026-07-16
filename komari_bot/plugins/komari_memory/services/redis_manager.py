@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import redis.asyncio as aioredis
 from nonebot import logger
@@ -14,6 +14,106 @@ from komari_bot.common.database_config import get_shared_database_config
 from ..config_schema import KomariMemoryConfigSchema
 from .config_interface import get_config
 from .redis_keys import RedisKeys
+
+ProactiveReservationStatus = Literal[
+    "reserved",
+    "cooldown",
+    "rate_limited",
+    "duplicate",
+]
+
+_PROACTIVE_RATE_WINDOW_MS = 3_600_000
+_PROACTIVE_SLOTS_TTL_GRACE_MS = 60_000
+_PROACTIVE_RESERVE_SCRIPT = """
+-- proactive_reserve
+local cooldown_key = KEYS[1]
+local slots_key = KEYS[2]
+local reservation_id = ARGV[1]
+local max_slots = tonumber(ARGV[2])
+local reservation_ttl_ms = tonumber(ARGV[3])
+local slots_ttl_ms = tonumber(ARGV[4])
+local pending_member = "pending:" .. reservation_id
+local confirmed_member = "confirmed:" .. reservation_id
+local redis_time = redis.call("TIME")
+local now_ms = tonumber(redis_time[1]) * 1000
+    + math.floor(tonumber(redis_time[2]) / 1000)
+local pending_until_ms = now_ms + reservation_ttl_ms
+
+redis.call("ZREMRANGEBYSCORE", slots_key, "-inf", now_ms)
+if redis.call("ZSCORE", slots_key, pending_member)
+    or redis.call("ZSCORE", slots_key, confirmed_member) then
+    return 3
+end
+if redis.call("EXISTS", cooldown_key) == 1 then
+    return 1
+end
+if redis.call("ZCARD", slots_key) >= max_slots then
+    return 2
+end
+
+redis.call("ZADD", slots_key, pending_until_ms, pending_member)
+redis.call("PEXPIRE", slots_key, slots_ttl_ms)
+redis.call("SET", cooldown_key, reservation_id, "PX", reservation_ttl_ms)
+return 0
+"""
+_PROACTIVE_CONFIRM_SCRIPT = """
+-- proactive_confirm
+local cooldown_key = KEYS[1]
+local slots_key = KEYS[2]
+local reservation_id = ARGV[1]
+local cooldown_ttl_ms = tonumber(ARGV[2])
+local slots_ttl_ms = tonumber(ARGV[3])
+local rate_window_ms = tonumber(ARGV[4])
+local pending_member = "pending:" .. reservation_id
+local confirmed_member = "confirmed:" .. reservation_id
+local redis_time = redis.call("TIME")
+local now_ms = tonumber(redis_time[1]) * 1000
+    + math.floor(tonumber(redis_time[2]) / 1000)
+local confirmed_until_ms = now_ms + rate_window_ms
+
+redis.call("ZREMRANGEBYSCORE", slots_key, "-inf", now_ms)
+if redis.call("ZSCORE", slots_key, confirmed_member) then
+    return 2
+end
+
+local had_pending = redis.call("ZREM", slots_key, pending_member)
+redis.call("ZADD", slots_key, confirmed_until_ms, confirmed_member)
+redis.call("PEXPIRE", slots_key, slots_ttl_ms)
+
+local current_cooldown = redis.call("GET", cooldown_key)
+if not current_cooldown or current_cooldown == reservation_id then
+    redis.call(
+        "SET",
+        cooldown_key,
+        "confirmed:" .. reservation_id,
+        "PX",
+        cooldown_ttl_ms
+    )
+end
+return had_pending
+"""
+_PROACTIVE_RELEASE_SCRIPT = """
+-- proactive_release
+local cooldown_key = KEYS[1]
+local slots_key = KEYS[2]
+local reservation_id = ARGV[1]
+local pending_member = "pending:" .. reservation_id
+
+local removed = redis.call("ZREM", slots_key, pending_member)
+if redis.call("GET", cooldown_key) == reservation_id then
+    redis.call("DEL", cooldown_key)
+end
+return removed
+"""
+_PROACTIVE_COUNT_SCRIPT = """
+-- proactive_count
+local slots_key = KEYS[1]
+local redis_time = redis.call("TIME")
+local now_ms = tonumber(redis_time[1]) * 1000
+    + math.floor(tonumber(redis_time[2]) / 1000)
+redis.call("ZREMRANGEBYSCORE", slots_key, "-inf", now_ms)
+return redis.call("ZCARD", slots_key)
+"""
 
 
 @dataclass(frozen=True)
@@ -446,56 +546,112 @@ class RedisManager:
         key = RedisKeys.last_summary(group_id)
         await self.redis.set(key, time.time())
 
-    async def set_cooldown(
+    async def reserve_proactive_reply(
         self,
         group_id: str,
-        seconds: int,
+        reservation_id: str,
+        *,
+        max_per_hour: int,
+        reservation_ttl_seconds: int,
+    ) -> ProactiveReservationStatus:
+        """原子检查冷却与滑动窗口上限，并预占一个主动回复名额。
+
+        Args:
+            group_id: 群组 ID
+            reservation_id: 稳定的回复预占 ID
+            max_per_hour: 最近一小时允许的最大主动回复数
+            reservation_ttl_seconds: 生成与发送阶段的预占有效期
+        """
+        reservation_ttl_ms = max(1, int(reservation_ttl_seconds * 1000))
+        slots_ttl_ms = (
+            max(_PROACTIVE_RATE_WINDOW_MS, reservation_ttl_ms)
+            + _PROACTIVE_SLOTS_TTL_GRACE_MS
+        )
+        result = await self.redis.execute_command(
+            "EVAL",
+            _PROACTIVE_RESERVE_SCRIPT,
+            2,
+            RedisKeys.proactive_cooldown(group_id),
+            RedisKeys.proactive_slots(group_id),
+            reservation_id,
+            max(1, int(max_per_hour)),
+            reservation_ttl_ms,
+            slots_ttl_ms,
+        )
+        match int(cast("int | str | bytes", result)):
+            case 0:
+                return "reserved"
+            case 1:
+                return "cooldown"
+            case 2:
+                return "rate_limited"
+            case 3:
+                return "duplicate"
+            case code:
+                msg = f"Redis 返回未知的主动回复预占状态: {code}"
+                raise RuntimeError(msg)
+
+    async def confirm_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+        *,
+        cooldown_seconds: int,
     ) -> None:
-        """设置主动回复冷却。
+        """把预占名额原子转换为已送达记录，并开始正式冷却。
 
         Args:
             group_id: 群组 ID
-            seconds: 冷却时间（秒）
+            reservation_id: 预占 ID
+            cooldown_seconds: 回复送达后的冷却秒数
         """
-        key = RedisKeys.proactive_cooldown(group_id)
-        await self.redis.set(key, "1", ex=seconds)
+        result = await self.redis.execute_command(
+            "EVAL",
+            _PROACTIVE_CONFIRM_SCRIPT,
+            2,
+            RedisKeys.proactive_cooldown(group_id),
+            RedisKeys.proactive_slots(group_id),
+            reservation_id,
+            max(1, int(cooldown_seconds * 1000)),
+            _PROACTIVE_RATE_WINDOW_MS + _PROACTIVE_SLOTS_TTL_GRACE_MS,
+            _PROACTIVE_RATE_WINDOW_MS,
+        )
+        code = int(cast("int | str | bytes", result))
+        if code == 0:
+            logger.warning(
+                "[KomariMemory] 主动回复预占已过期，按已送达补记: group={}",
+                group_id,
+            )
+        elif code not in {1, 2}:
+            msg = f"Redis 返回未知的主动回复确认状态: {code}"
+            raise RuntimeError(msg)
 
-    async def is_on_cooldown(self, group_id: str) -> bool:
-        """检查是否在冷却中。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            是否在冷却中
-        """
-        key = RedisKeys.proactive_cooldown(group_id)
-        return await self.redis.exists(key) > 0
-
-    async def increment_proactive_count(
+    async def release_proactive_reply(
         self,
         group_id: str,
-    ) -> int:
-        """增加当前小时的主动回复计数。
+        reservation_id: str,
+    ) -> bool:
+        """释放尚未确认送达的主动回复预占；重复释放安全。
 
         Args:
             group_id: 群组 ID
+            reservation_id: 预占 ID
 
         Returns:
-            当前计数值
+            是否移除了待确认名额
         """
-        current_hour = int(time.time() // 3600)
-        key = RedisKeys.proactive_count(group_id, current_hour)
-
-        pipe = self.redis.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, 3600)
-        results = await pipe.execute()
-
-        return results[0]
+        result = await self.redis.execute_command(
+            "EVAL",
+            _PROACTIVE_RELEASE_SCRIPT,
+            2,
+            RedisKeys.proactive_cooldown(group_id),
+            RedisKeys.proactive_slots(group_id),
+            reservation_id,
+        )
+        return int(cast("int | str | bytes", result)) > 0
 
     async def get_proactive_count(self, group_id: str) -> int:
-        """获取当前小时的主动回复计数。
+        """获取最近一小时已送达与正在生成的主动回复名额数。
 
         Args:
             group_id: 群组 ID
@@ -503,10 +659,13 @@ class RedisManager:
         Returns:
             当前计数值
         """
-        current_hour = int(time.time() // 3600)
-        key = RedisKeys.proactive_count(group_id, current_hour)
-        value = await self.redis.get(key)
-        return int(value) if value else 0
+        result = await self.redis.execute_command(
+            "EVAL",
+            _PROACTIVE_COUNT_SCRIPT,
+            1,
+            RedisKeys.proactive_slots(group_id),
+        )
+        return int(cast("int | str | bytes", result))
 
     async def push_global_interaction(
         self,

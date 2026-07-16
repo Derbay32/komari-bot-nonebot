@@ -8,7 +8,7 @@ from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.onebot_rules import group_message_rule
 
-from .handlers.message_handler import DebugReplyResult, MessageHandler
+from .handlers.message_handler import DebugReplyResult, MessageHandler, PendingReply
 
 # 依赖插件
 permission_manager_plugin = require("permission_manager")
@@ -163,19 +163,22 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         logger.error("[KomariChat] 用户封禁存储不可用，按故障关闭压制回复：{}", error)
         reply_allowed = False
 
+    pending_reply: PendingReply | None = None
+    reply_delivered = False
     try:
-        result = await handler.process_message(
+        pending_reply = await handler.process_message(
             bot,
             event,
             on_reply_triggered=lambda: _send_face_reaction(bot, event),
             reply_allowed=reply_allowed,
         )
-        if not result:
+        if pending_reply is None:
             return
 
-        reply = result.reply
-        reply_to_message_id = result.reply_to_message_id
+        reply = pending_reply.reply
+        reply_to_message_id = pending_reply.reply_to_message_id
         if not reply:
+            await handler.discard_pending_reply(pending_reply)
             return
 
         if reply_to_message_id:
@@ -194,6 +197,9 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                 await matcher.send(reply)
         else:
             await matcher.send(reply)
-        await handler.commit_delivered_reply(result)
+        reply_delivered = True
+        await handler.commit_delivered_reply(pending_reply)
     except Exception:
+        if pending_reply is not None and not reply_delivered:
+            await handler.discard_pending_reply(pending_reply)
         logger.exception("[KomariChat] 消息处理失败")

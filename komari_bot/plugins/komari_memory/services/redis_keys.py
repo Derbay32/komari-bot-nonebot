@@ -30,8 +30,8 @@ class RedisKeys:
     # 主动回复冷却
     PROACTIVE_COOLDOWN = f"{PREFIX}:proactive:cd:%s"
 
-    # 每小时主动回复计数
-    PROACTIVE_COUNT = f"{PREFIX}:proactive:count:%s:%s"
+    # 主动回复滑动窗口名额（含生成中的预占与已送达回复）
+    PROACTIVE_SLOTS = f"{PREFIX}:proactive:slots:%s"
 
     # 画像 Agent 暂存区
     STAGING_PROFILE = f"{PREFIX}:staging:profile:%s"
@@ -125,17 +125,16 @@ class RedisKeys:
         return cls.PROACTIVE_COOLDOWN % group_id
 
     @classmethod
-    def proactive_count(cls, group_id: str, hour: int) -> str:
-        """获取每小时主动回复计数键。
+    def proactive_slots(cls, group_id: str) -> str:
+        """获取主动回复滑动窗口名额键。
 
         Args:
             group_id: 群组 ID
-            hour: 小时时间戳
 
         Returns:
             Redis 键
         """
-        return cls.PROACTIVE_COUNT % (group_id, hour)
+        return cls.PROACTIVE_SLOTS % group_id
 
     @classmethod
     def staging_profile(cls, session_id: str) -> str:

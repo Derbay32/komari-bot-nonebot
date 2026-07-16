@@ -214,12 +214,15 @@ psql -h localhost -U your_username -d komari_bot \
 | --- | --- | --- |
 | `proactive_enabled` | `false` | 是否启用主动回复 |
 | `proactive_score_threshold` | `0.8` | 主动回复阈值 |
-| `proactive_cooldown` | `300` | 主动回复冷却时间 |
-| `proactive_max_per_hour` | `400` | 每小时最大主动回复次数 |
+| `proactive_cooldown` | `300` | 主动回复确认送达后的冷却时间（秒） |
+| `proactive_max_per_hour` | `400` | 最近一小时最大主动回复次数，包含生成中的预占 |
+| `proactive_reservation_ttl_seconds` | `360` | 生成与发送阶段的 Redis 预占有效期（秒） |
 | `reply_threshold` | `0.72` | 回复阈值 |
 | `noise_conf_threshold` | `0.76` | NOISE 置信度阈值 |
 | `noise_margin_threshold` | `0.1` | NOISE 领先阈值 |
 | `call_margin_threshold` | `0.08` | call intent 领先阈值 |
+
+非强制主动回复会在调用 LLM 前通过 Redis Lua 原子检查冷却与最近一小时名额，并用平台消息 ID 建立有 TTL 的预占。生成失败、回复为空或 QQ 发送失败会幂等释放预占；发送成功后将同一预占原子确认为一小时滑动窗口记录，并开始正式冷却。进程中断遗留的生成中预占会在 TTL 到期后由下一次操作清理。
 
 ## 对外使用方式
 

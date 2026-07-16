@@ -270,7 +270,12 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
 2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `LLMDiagnosticCollector`
-3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储、互动历史写入、冷却与频控
+3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储与互动历史写入；主动回复冷却/频控不在这里重复记账
+
+主动回复频控契约：
+- 非强制回复在生成前调用 Redis Lua 原子预占，同时检查冷却、最近一小时已确认名额与生成中名额；预占 ID 使用平台消息 ID，重复投递不会重复生成。
+- 生成失败、空回复或发送失败调用 `release_proactive_reply()` 幂等释放；发送成功后先调用 `confirm_proactive_reply()`，再提交其他聊天副作用。
+- 预占带 `proactive_reservation_ttl_seconds`；进程崩溃后的孤儿预占按 TTL 淘汰。已确认名额进入一小时滑动窗口，释放接口不得撤销已确认名额。
 
 `process_message(..., reply_allowed=False)` 用于 chat 封禁：保留原消息的判定和缓冲写入，但在 `_attempt_reply()` 前返回，并记录 `blocked_by_user_ban`。
 

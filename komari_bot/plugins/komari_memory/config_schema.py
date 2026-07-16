@@ -205,15 +205,38 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 主动回复配置
-    proactive_enabled: bool = Field(default=False, description="是否启用主动回复")
+    proactive_enabled: bool = Field(
+        default=False,
+        description="是否启用主动回复",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
     proactive_score_threshold: float = Field(
-        default=0.8, ge=0.0, le=1.0, description="触发主动回复的评分阈值"
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="触发主动回复的评分阈值",
+        json_schema_extra={"apply_mode": "immediate"},
     )
     proactive_cooldown: int = Field(
-        default=300, ge=5, le=3600, description="主动回复冷却时间（秒）"
+        default=300,
+        ge=5,
+        le=3600,
+        description="主动回复送达后的冷却时间（秒）",
+        json_schema_extra={"apply_mode": "immediate"},
     )
     proactive_max_per_hour: int = Field(
-        default=400, ge=1, le=800, description="每小时最大主动回复次数"
+        default=400,
+        ge=1,
+        le=800,
+        description="最近一小时最大主动回复次数（包含生成中的预占）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    proactive_reservation_ttl_seconds: int = Field(
+        default=360,
+        ge=30,
+        le=900,
+        description="主动回复生成与发送阶段的 Redis 预占有效期（秒）",
+        json_schema_extra={"apply_mode": "immediate"},
     )
 
     # 提示词模板配置

@@ -34,3 +34,21 @@ def test_config_schema_rejects_too_small_profile_trait_limit() -> None:
 
     with pytest.raises(ValueError):
         KomariMemoryConfigSchema(profile_trait_limit=0)
+
+
+def test_proactive_reservation_ttl_has_bounded_immediate_config() -> None:
+    config = KomariMemoryConfigSchema()
+    field_extra = KomariMemoryConfigSchema.model_fields[
+        "proactive_reservation_ttl_seconds"
+    ].json_schema_extra
+
+    assert config.proactive_reservation_ttl_seconds == 360
+    assert isinstance(field_extra, dict)
+    assert field_extra["apply_mode"] == "immediate"
+
+    import pytest
+
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=29)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=901)
