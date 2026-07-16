@@ -595,17 +595,29 @@ async def handle_debug_summary(
                 message=str(e),
             )
 
+    extra_info = {
+        "user_id": str(event.user_id),
+        "request": arg_text[:200],
+        "filtered_message_count": str(result.filtered_message_count),
+        "filter_label": result.filter_label,
+        "time_range": result.time_range,
+    }
+    history_fetch = getattr(result, "history_fetch", None)
+    if history_fetch is not None:
+        extra_info.update(
+            {
+                "history_status": str(history_fetch.status),
+                "history_coverage_ratio": f"{history_fetch.coverage_ratio:.2%}",
+                "history_completed_batches": str(history_fetch.completed_batches),
+                "history_failed_batch": str(history_fetch.failed_batch or ""),
+            }
+        )
+
     await build_and_send_diagnostic_report(
         bot=bot,
         group_id=int(event.group_id),
         collector=collector,
         result_type="summary",
         succeeded=True,
-        extra_info={
-            "user_id": str(event.user_id),
-            "request": arg_text[:200],
-            "filtered_message_count": str(result.filtered_message_count),
-            "filter_label": result.filter_label,
-            "time_range": result.time_range,
-        },
+        extra_info=extra_info,
     )

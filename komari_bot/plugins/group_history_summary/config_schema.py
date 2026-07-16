@@ -54,6 +54,26 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
+    redis_db: int = Field(
+        default=0,
+        ge=0,
+        le=15,
+        description="群总结分布式锁使用的 Redis 数据库编号",
+        json_schema_extra={"apply_mode": "restart"},
+    )
+    summary_lock_ttl_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3600,
+        description="群总结分布式锁租约时长（秒），运行中会自动续租",
+    )
+    history_min_coverage_ratio: float = Field(
+        default=0.8,
+        ge=0.1,
+        le=1.0,
+        description="历史分页失败时允许继续总结的最低已覆盖比例",
+    )
+
     min_summary_count: int = Field(
         default=10, ge=1, le=1000, description="最少总结条数"
     )

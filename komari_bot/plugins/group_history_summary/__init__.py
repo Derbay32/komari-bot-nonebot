@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from nonebot import logger, on_regex
+from nonebot import get_driver, logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.exception import FinishedException
 from nonebot.matcher import current_matcher
@@ -15,12 +15,15 @@ from komari_bot.common.onebot_rules import group_message_to_me_rule
 from .config_schema import DynamicConfigSchema
 from .execution_service import (
     CapabilityNotSupportedError,
+    HistoryIncompleteError,
     SummaryBusyError,
+    SummaryServiceUnavailableError,
     execute_group_summary,
 )
 from .execution_service import (
     SummaryExecutionResult as SummaryExecutionResult,
 )
+from .group_lock import close_group_summary_lock_manager
 from .history_service import check_group_history_supported
 
 config_manager_plugin = require("config_manager")
@@ -54,6 +57,17 @@ summary_matcher = on_regex(
 )
 
 _scene_rerank_service = UnifiedCandidateRerankService()
+try:
+    driver = get_driver()
+except ValueError:
+    driver = None
+
+if driver is not None:
+
+    @driver.on_shutdown
+    async def _close_group_summary_resources() -> None:
+        """关闭群总结分布式锁连接。"""
+        await close_group_summary_lock_manager()
 
 
 def _extract_requested_count(text: str) -> int | None:
@@ -168,6 +182,10 @@ async def handle_group_history_summary(
             history_capability_confirmed=True,
         )
     except SummaryBusyError as exc:
+        await summary_matcher.finish(str(exc))
+    except HistoryIncompleteError:
+        await summary_matcher.finish("群历史记录没能完整取回，暂时不能可靠地总结……")
+    except SummaryServiceUnavailableError as exc:
         await summary_matcher.finish(str(exc))
     except CapabilityNotSupportedError:
         return
