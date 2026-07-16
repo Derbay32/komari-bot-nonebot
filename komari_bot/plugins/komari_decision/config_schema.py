@@ -131,6 +131,24 @@ class KomariDecisionConfigSchema(BaseModel):
     scene_sync_poll_seconds: int = Field(
         default=30, ge=5, le=3600, description="scene runtime 指针轮询间隔（秒）"
     )
+    scene_embedding_lease_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=1800,
+        description="scene embedding 条目认领租约时长（秒）",
+    )
+    scene_embedding_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="scene embedding 条目进入失败状态前的最大认领次数",
+    )
+    scene_embedding_retry_base_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+        description="scene embedding 失败后的指数退避基础秒数",
+    )
     scene_keep_versions: int = Field(
         default=3, ge=1, le=20, description="保留的 READY scene 版本数量"
     )

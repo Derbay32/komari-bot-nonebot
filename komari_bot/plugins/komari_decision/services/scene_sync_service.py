@@ -79,46 +79,27 @@ class SceneSyncService:
         embedding_model = self._resolve_embedding_model()
         instruction_hash = self._instruction_hash(config.embedding_instruction_scene)
 
-        latest_ready = await self.repository.get_latest_ready_set()
-        if (
-            latest_ready is not None
-            and latest_ready.get("source_hash") == template.source_hash
-            and latest_ready.get("embedding_model") == embedding_model
-            and latest_ready.get("embedding_instruction_hash") == instruction_hash
-        ):
-            existing_set_id = int(latest_ready["id"])
-            logger.debug(
-                "[KomariDecision] Scene 模板未变化，复用现有 set: id={}",
-                existing_set_id,
-            )
-            return SceneSyncResult(
-                set_id=existing_set_id,
-                created=False,
-                reused_existing_set=True,
-                inserted_count=0,
-                ready_count=int(latest_ready.get("item_ready") or 0),
-                pending_count=0,
-            )
-
-        latest_building = await self.repository.get_latest_set_by_fingerprint(
+        scene_set, created = await self.repository.get_or_create_scene_set(
+            source_path=template.source_path,
             source_hash=template.source_hash,
             embedding_model=embedding_model,
             embedding_instruction_hash=instruction_hash,
             status="BUILDING",
         )
-        if latest_building is not None:
-            existing_set_id = int(latest_building["id"])
-            total = int(latest_building.get("item_total") or 0)
-            ready = int(latest_building.get("item_ready") or 0)
-            failed = int(latest_building.get("item_failed") or 0)
+        set_id = int(scene_set["id"])
+        existing_status = str(scene_set.get("status") or "BUILDING")
+        if not created and existing_status in {"READY", "FAILED"}:
+            total = int(scene_set.get("item_total") or 0)
+            ready = int(scene_set.get("item_ready") or 0)
+            failed = int(scene_set.get("item_failed") or 0)
             pending = max(total - ready - failed, 0)
             logger.debug(
-                "[KomariDecision] 复用构建中的 scene set: id={} pending={}",
-                existing_set_id,
-                pending,
+                "[KomariDecision] Scene fingerprint 已存在，复用 set: id={} status={}",
+                set_id,
+                existing_status,
             )
             return SceneSyncResult(
-                set_id=existing_set_id,
+                set_id=set_id,
                 created=False,
                 reused_existing_set=True,
                 inserted_count=0,
@@ -126,17 +107,7 @@ class SceneSyncService:
                 pending_count=pending,
             )
 
-        set_id = await self.repository.create_scene_set(
-            source_path=template.source_path,
-            source_hash=template.source_hash,
-            embedding_model=embedding_model,
-            embedding_instruction_hash=instruction_hash,
-            status="BUILDING",
-        )
-
         items_payload: list[dict] = []
-        ready_count = 0
-        pending_count = 0
 
         for item in template.items:
             if item.scene_id is None:
@@ -174,17 +145,15 @@ class SceneSyncService:
                 payload["embedding_dim"] = reusable.get("embedding_dim")
                 payload["status"] = "READY"
                 payload["embedded_at"] = reusable.get("embedded_at")
-                ready_count += 1
-            else:
-                pending_count += 1
 
             items_payload.append(payload)
 
         inserted_count = await self.repository.insert_scene_items(set_id, items_payload)
-        await self.repository.update_set_counters(set_id)
-
-        if pending_count == 0:
-            await self.repository.mark_set_ready(set_id)
+        progress = await self.repository.refresh_set_progress(set_id)
+        total = int(progress.get("item_total") or 0)
+        ready_count = int(progress.get("item_ready") or 0)
+        failed_count = int(progress.get("item_failed") or 0)
+        pending_count = max(total - ready_count - failed_count, 0)
 
         logger.info(
             "[KomariDecision] 构建 scene set 完成: id={} inserted={} ready={} pending={}",
@@ -195,8 +164,8 @@ class SceneSyncService:
         )
         return SceneSyncResult(
             set_id=set_id,
-            created=True,
-            reused_existing_set=False,
+            created=created,
+            reused_existing_set=not created,
             inserted_count=inserted_count,
             ready_count=ready_count,
             pending_count=pending_count,

@@ -49,4 +49,9 @@ def test_ensure_schema_uses_decision_owned_statements_once() -> None:
 
     assert len(conn.executed) == len(SCENE_SCHEMA_STATEMENTS)
     assert conn.executed[0].startswith("CREATE TABLE IF NOT EXISTS komari_memory_scene_set")
-    assert conn.executed[-1].startswith("INSERT INTO komari_memory_scene_runtime")
+    assert any("lease_owner TEXT" in statement for statement in conn.executed)
+    assert any("attempt_count INT NOT NULL DEFAULT 0" in statement for statement in conn.executed)
+    assert any("'PROCESSING'" in statement for statement in conn.executed)
+    assert conn.executed[-1].startswith(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_scene_set_fingerprint"
+    )

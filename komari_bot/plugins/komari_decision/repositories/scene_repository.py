@@ -161,22 +161,30 @@ class SceneRepository:
             value = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM komari_decision_scenes)")
             return bool(value)
 
-    async def create_scene_set(
+    async def get_or_create_scene_set(
         self,
+        *,
         source_path: str,
         source_hash: str,
         embedding_model: str,
         embedding_instruction_hash: str,
         status: str = "BUILDING",
-    ) -> int:
-        """创建 scene set 版本记录。"""
-        async with self.pg_pool.acquire() as conn:
+    ) -> tuple[dict[str, Any], bool]:
+        """按唯一 fingerprint 原子创建或返回已有 scene set。"""
+        async with self.pg_pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
                 INSERT INTO komari_memory_scene_set
                 (source_path, source_hash, embedding_model, embedding_instruction_hash, status)
                 VALUES ($1, $2, $3, $4, $5)
-                RETURNING id
+                ON CONFLICT (
+                    source_hash,
+                    embedding_model,
+                    embedding_instruction_hash
+                ) DO NOTHING
+                RETURNING id, source_path, source_hash, embedding_model,
+                          embedding_instruction_hash, status, item_total, item_ready,
+                          item_failed, error_message, created_at, ready_at
                 """,
                 source_path,
                 source_hash,
@@ -184,14 +192,35 @@ class SceneRepository:
                 embedding_instruction_hash,
                 status,
             )
-            set_id = int(row["id"])
+            created = row is not None
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, source_path, source_hash, embedding_model,
+                           embedding_instruction_hash, status, item_total, item_ready,
+                           item_failed, error_message, created_at, ready_at
+                    FROM komari_memory_scene_set
+                    WHERE source_hash = $1
+                      AND embedding_model = $2
+                      AND embedding_instruction_hash = $3
+                    """,
+                    source_hash,
+                    embedding_model,
+                    embedding_instruction_hash,
+                )
+            if row is None:
+                msg = "scene set fingerprint 写入后无法读取"
+                raise RuntimeError(msg)
+
+        scene_set = dict(row)
+        if created:
             logger.info(
                 "[KomariDecision] 创建 scene set: id={} status={} model={}",
-                set_id,
+                scene_set["id"],
                 status,
                 embedding_model,
             )
-            return set_id
+        return scene_set, created
 
     async def insert_scene_items(
         self,
@@ -223,33 +252,29 @@ class SceneRepository:
                     item.get("embedded_at"),
                 )
             )
-        async with self.pg_pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO komari_memory_scene_item
-                (set_id, scene_id, content_hash, embedding, embedding_dim,
-                 status, error_message, embedded_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                """,
-                values,
-            )
-
-            await conn.execute(
-                """
-                UPDATE komari_memory_scene_set
-                SET item_total = item_total + $2
-                WHERE id = $1
-                """,
-                set_id,
-                len(values),
-            )
+        inserted_count = 0
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            for value in values:
+                inserted_id = await conn.fetchval(
+                    """
+                    INSERT INTO komari_memory_scene_item
+                    (set_id, scene_id, content_hash, embedding, embedding_dim,
+                     status, error_message, embedded_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (set_id, scene_id) DO NOTHING
+                    RETURNING id
+                    """,
+                    *value,
+                )
+                if inserted_id is not None:
+                    inserted_count += 1
 
         logger.info(
             "[KomariDecision] 批量插入 scene item: set={} count={}",
             set_id,
-            len(values),
+            inserted_count,
         )
-        return len(values)
+        return inserted_count
 
     async def get_scene_set(self, set_id: int) -> dict[str, Any] | None:
         """获取指定 scene set。"""
@@ -340,8 +365,8 @@ class SceneRepository:
         )
 
     async def get_active_set(self) -> dict[str, Any] | None:
-        """获取当前 active scene set。"""
-        async with self.pg_pool.acquire() as conn:
+        """在事务中读取当前 active scene set 指针。"""
+        async with self.pg_pool.acquire() as conn, conn.transaction():
             await self._ensure_runtime_row(conn)
             row = await conn.fetchrow(
                 """
@@ -352,26 +377,12 @@ class SceneRepository:
                 FROM komari_memory_scene_runtime r
                 LEFT JOIN komari_memory_scene_set s ON s.id = r.active_set_id
                 WHERE r.id = 1
+                FOR SHARE OF r
                 """
             )
             if not row or row["id"] is None:
                 return None
             return dict(row)
-
-    async def set_active_set(self, set_id: int) -> None:
-        """设置 active scene set 指针。"""
-        async with self.pg_pool.acquire() as conn:
-            await self._ensure_runtime_row(conn)
-            await conn.execute(
-                """
-                UPDATE komari_memory_scene_runtime
-                SET active_set_id = $1,
-                    updated_at = NOW()
-                WHERE id = 1
-                """,
-                set_id,
-            )
-        logger.info("[KomariDecision] 激活 scene set: id={}", set_id)
 
     async def switch_active_set(self, set_id: int) -> None:
         """原子切换 active set（仅允许 READY 版本）。"""
@@ -394,6 +405,14 @@ class SceneRepository:
                 raise ValueError(msg)
 
             await self._ensure_runtime_row(conn)
+            await conn.fetchval(
+                """
+                SELECT active_set_id
+                FROM komari_memory_scene_runtime
+                WHERE id = 1
+                FOR UPDATE
+                """
+            )
             await conn.execute(
                 """
                 UPDATE komari_memory_scene_runtime
@@ -417,7 +436,9 @@ class SceneRepository:
         sql = """
             SELECT i.id, i.set_id, i.scene_id, s.scene_key, s.scene_type,
                    s.content_text, i.content_hash, s.enabled, s.order_index,
-                   i.embedding, i.embedding_dim, i.status, i.error_message, i.embedded_at
+                   i.embedding, i.embedding_dim, i.status, i.error_message,
+                   i.last_error_code, i.attempt_count, i.next_retry_at,
+                   i.lease_owner, i.lease_expires_at, i.embedded_at
             FROM komari_memory_scene_item i
             JOIN komari_decision_scenes s ON s.id = i.scene_id
             WHERE i.set_id = $1
@@ -487,75 +508,193 @@ class SceneRepository:
             )
             return dict(row) if row else None
 
-    async def fetch_pending_items(
+    async def claim_pending_items(
         self,
         set_id: int,
         *,
+        owner_token: str,
         limit: int = 32,
+        lease_seconds: int = 120,
+        max_attempts: int = 3,
+        retry_base_seconds: int = 30,
     ) -> list[dict[str, Any]]:
-        """拉取待嵌入的 PENDING 条目。"""
+        """回收过期租约，并用 SKIP LOCKED 原子认领待嵌入条目。"""
         if limit <= 0:
             return []
 
-        async with self.pg_pool.acquire() as conn:
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                UPDATE komari_memory_scene_item
+                SET status = CASE
+                        WHEN attempt_count >= $2 THEN 'FAILED'
+                        ELSE 'PENDING'
+                    END,
+                    error_message = CASE
+                        WHEN attempt_count >= $2
+                        THEN 'embedding 处理租约超过最大重试次数'
+                        ELSE error_message
+                    END,
+                    last_error_code = 'lease_expired',
+                    next_retry_at = CASE
+                        WHEN attempt_count >= $2 THEN NULL
+                        ELSE NOW() + (
+                            LEAST(
+                                $3 * POWER(2, GREATEST(attempt_count - 1, 0)),
+                                3600
+                            ) * INTERVAL '1 second'
+                        )
+                    END,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL
+                WHERE set_id = $1
+                  AND status = 'PROCESSING'
+                  AND lease_expires_at <= NOW()
+                """,
+                set_id,
+                max(1, max_attempts),
+                max(1, retry_base_seconds),
+            )
             rows = await conn.fetch(
                 """
-                SELECT i.id, i.set_id, i.scene_id, s.scene_key, s.scene_type,
-                       s.content_text, i.content_hash, s.enabled, s.order_index,
-                       i.embedding, i.embedding_dim, i.status, i.error_message, i.embedded_at
-                FROM komari_memory_scene_item i
-                JOIN komari_decision_scenes s ON s.id = i.scene_id
-                WHERE i.set_id = $1
-                  AND i.status = 'PENDING'
-                ORDER BY s.order_index ASC, i.id ASC
-                LIMIT $2
+                WITH candidates AS (
+                    SELECT i.id
+                    FROM komari_memory_scene_item i
+                    JOIN komari_decision_scenes s ON s.id = i.scene_id
+                    JOIN komari_memory_scene_set scene_set ON scene_set.id = i.set_id
+                    WHERE i.set_id = $1
+                      AND scene_set.status = 'BUILDING'
+                      AND i.status = 'PENDING'
+                      AND (i.next_retry_at IS NULL OR i.next_retry_at <= NOW())
+                    ORDER BY s.order_index ASC, i.id ASC
+                    FOR UPDATE OF i SKIP LOCKED
+                    LIMIT $2
+                ), claimed AS (
+                    UPDATE komari_memory_scene_item item
+                    SET status = 'PROCESSING',
+                        lease_owner = $3,
+                        lease_expires_at = NOW() + ($4 * INTERVAL '1 second'),
+                        next_retry_at = NULL,
+                        attempt_count = item.attempt_count + 1
+                    FROM candidates
+                    WHERE item.id = candidates.id
+                    RETURNING item.*
+                )
+                SELECT claimed.id, claimed.set_id, claimed.scene_id,
+                       s.scene_key, s.scene_type, s.content_text,
+                       claimed.content_hash, s.enabled, s.order_index,
+                       claimed.embedding, claimed.embedding_dim, claimed.status,
+                       claimed.error_message, claimed.last_error_code,
+                       claimed.attempt_count, claimed.next_retry_at,
+                       claimed.lease_owner, claimed.lease_expires_at,
+                       claimed.embedded_at
+                FROM claimed
+                JOIN komari_decision_scenes s ON s.id = claimed.scene_id
+                ORDER BY s.order_index ASC, claimed.id ASC
                 """,
                 set_id,
                 limit,
+                owner_token,
+                max(1, lease_seconds),
             )
             return [dict(row) for row in rows]
 
     async def mark_item_ready(
         self,
         item_id: int,
+        owner_token: str,
         embedding: list[float],
         embedding_dim: int,
-    ) -> None:
-        """将条目标记为 READY。"""
+    ) -> bool:
+        """仅允许当前租约 owner 将条目标记为 READY。"""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
+            updated_id = await conn.fetchval(
                 """
                 UPDATE komari_memory_scene_item
                 SET embedding = $2,
                     embedding_dim = $3,
                     status = 'READY',
                     error_message = NULL,
+                    last_error_code = NULL,
+                    next_retry_at = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
                     embedded_at = NOW()
                 WHERE id = $1
+                  AND status = 'PROCESSING'
+                  AND lease_owner = $4
+                RETURNING id
                 """,
                 item_id,
                 embedding,
                 embedding_dim,
+                owner_token,
             )
+        return updated_id is not None
 
-    async def mark_item_failed(self, item_id: int, error_message: str) -> None:
-        """将条目标记为 FAILED。"""
+    async def complete_item_failure(
+        self,
+        item_id: int,
+        *,
+        owner_token: str,
+        error_code: str,
+        error_message: str,
+        max_attempts: int,
+        retry_base_seconds: int,
+    ) -> str:
+        """按尝试次数将当前 owner 的失败条目退避重试或转为 FAILED。"""
         async with self.pg_pool.acquire() as conn:
-            await conn.execute(
+            status = await conn.fetchval(
                 """
                 UPDATE komari_memory_scene_item
-                SET status = 'FAILED',
-                    error_message = $2
+                SET status = CASE
+                        WHEN attempt_count >= $5 THEN 'FAILED'
+                        ELSE 'PENDING'
+                    END,
+                    error_message = $3,
+                    last_error_code = $4,
+                    next_retry_at = CASE
+                        WHEN attempt_count >= $5 THEN NULL
+                        ELSE NOW() + (
+                            LEAST(
+                                $6 * POWER(2, GREATEST(attempt_count - 1, 0)),
+                                3600
+                            ) * INTERVAL '1 second'
+                        )
+                    END,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL
                 WHERE id = $1
+                  AND status = 'PROCESSING'
+                  AND lease_owner = $2
+                RETURNING status
                 """,
                 item_id,
+                owner_token,
                 error_message,
+                error_code,
+                max(1, max_attempts),
+                max(1, retry_base_seconds),
             )
+        return str(status).lower() if status is not None else "stale"
 
-    async def update_set_counters(self, set_id: int) -> None:
-        """基于 item 状态刷新 set 计数。"""
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
+    async def refresh_set_progress(self, set_id: int) -> dict[str, Any]:
+        """锁住 set 后重算计数，并原子收敛 BUILDING 状态。"""
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            set_row = await conn.fetchrow(
+                """
+                SELECT id, status
+                FROM komari_memory_scene_set
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                set_id,
+            )
+            if set_row is None:
+                msg = f"scene set 不存在: {set_id}"
+                raise ValueError(msg)
+
+            counts = await conn.fetchrow(
                 """
                 SELECT
                     COUNT(*) AS total,
@@ -566,53 +705,50 @@ class SceneRepository:
                 """,
                 set_id,
             )
-            await conn.execute(
+            total = int(counts["total"])
+            ready = int(counts["ready_count"])
+            failed = int(counts["failed_count"])
+            previous_status = str(set_row["status"])
+            next_status = previous_status
+            if previous_status == "BUILDING" and total > 0 and ready + failed == total:
+                next_status = "FAILED" if failed > 0 else "READY"
+
+            row = await conn.fetchrow(
                 """
                 UPDATE komari_memory_scene_set
                 SET item_total = $2,
                     item_ready = $3,
-                    item_failed = $4
+                    item_failed = $4,
+                    status = $5,
+                    error_message = CASE
+                        WHEN $5 = 'FAILED'
+                        THEN 'scene embedding 存在最终失败条目'
+                        WHEN $5 = 'READY' THEN NULL
+                        ELSE error_message
+                    END,
+                    ready_at = CASE
+                        WHEN $5 = 'READY' THEN COALESCE(ready_at, NOW())
+                        WHEN $5 = 'BUILDING' THEN NULL
+                        ELSE ready_at
+                    END
                 WHERE id = $1
+                RETURNING id, source_path, source_hash, embedding_model,
+                          embedding_instruction_hash, status, item_total, item_ready,
+                          item_failed, error_message, created_at, ready_at
                 """,
                 set_id,
-                int(row["total"]),
-                int(row["ready_count"]),
-                int(row["failed_count"]),
+                total,
+                ready,
+                failed,
+                next_status,
             )
+            if row is None:
+                msg = f"scene set 进度刷新失败: {set_id}"
+                raise RuntimeError(msg)
 
-    async def mark_set_ready(self, set_id: int) -> None:
-        """将 set 标记为 READY。"""
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE komari_memory_scene_set
-                SET status = 'READY',
-                    ready_at = NOW(),
-                    error_message = NULL
-                WHERE id = $1
-                """,
-                set_id,
-            )
-        logger.info("[KomariDecision] scene set 就绪: id={}", set_id)
-
-    async def mark_set_failed(self, set_id: int, error_message: str) -> None:
-        """将 set 标记为 FAILED。"""
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE komari_memory_scene_set
-                SET status = 'FAILED',
-                    error_message = $2
-                WHERE id = $1
-                """,
-                set_id,
-                error_message,
-            )
-        logger.warning(
-            "[KomariDecision] scene set 失败: id={} error={}",
-            set_id,
-            error_message,
-        )
+        result = dict(row)
+        result["previous_status"] = previous_status
+        return result
 
     async def reopen_failed_set(self, set_id: int) -> int:
         """将 FAILED set 重置为 BUILDING，并将 FAILED item 置回 PENDING。"""
@@ -638,6 +774,7 @@ class SceneRepository:
                 UPDATE komari_memory_scene_set
                 SET status = 'BUILDING',
                     error_message = NULL,
+                    item_failed = 0,
                     ready_at = NULL
                 WHERE id = $1
                 """,
@@ -648,7 +785,12 @@ class SceneRepository:
                 """
                 UPDATE komari_memory_scene_item
                 SET status = 'PENDING',
-                    error_message = NULL
+                    error_message = NULL,
+                    last_error_code = NULL,
+                    attempt_count = 0,
+                    next_retry_at = NOW(),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL
                 WHERE set_id = $1
                   AND status = 'FAILED'
                 """,

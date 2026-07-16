@@ -69,11 +69,52 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         content_hash TEXT NOT NULL,
         embedding REAL[],
         embedding_dim INT,
-        status TEXT NOT NULL CHECK (status IN ('PENDING', 'READY', 'FAILED')),
+        status TEXT NOT NULL,
         error_message TEXT,
+        last_error_code TEXT,
+        attempt_count INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_retry_at TIMESTAMPTZ,
+        lease_owner TEXT,
+        lease_expires_at TIMESTAMPTZ,
         embedded_at TIMESTAMPTZ,
+        CONSTRAINT ck_komari_memory_scene_item_status
+            CHECK (status IN ('PENDING', 'PROCESSING', 'READY', 'FAILED')),
         UNIQUE (set_id, scene_id)
     )
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS last_error_code TEXT
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0
+    CHECK (attempt_count >= 0)
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS lease_owner TEXT
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    DROP CONSTRAINT IF EXISTS komari_memory_scene_item_status_check
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    DROP CONSTRAINT IF EXISTS ck_komari_memory_scene_item_status
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD CONSTRAINT ck_komari_memory_scene_item_status
+    CHECK (status IN ('PENDING', 'PROCESSING', 'READY', 'FAILED'))
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_scene_id
@@ -82,6 +123,10 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_set_status
     ON komari_memory_scene_item(set_id, status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_claim
+    ON komari_memory_scene_item(set_id, status, next_retry_at, lease_expires_at)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_reuse
@@ -98,6 +143,42 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     INSERT INTO komari_memory_scene_runtime (id, active_set_id)
     VALUES (1, NULL)
     ON CONFLICT (id) DO NOTHING
+    """,
+    """
+    WITH ranked_sets AS (
+        SELECT
+            s.id,
+            ROW_NUMBER() OVER (
+                PARTITION BY
+                    s.source_hash,
+                    s.embedding_model,
+                    s.embedding_instruction_hash
+                ORDER BY
+                    CASE
+                        WHEN s.id = r.active_set_id THEN 0
+                        WHEN s.status = 'READY' THEN 1
+                        WHEN s.status = 'BUILDING' THEN 2
+                        ELSE 3
+                    END,
+                    COALESCE(s.ready_at, s.created_at) DESC,
+                    s.id DESC
+            ) AS duplicate_rank
+        FROM komari_memory_scene_set s
+        CROSS JOIN komari_memory_scene_runtime r
+        WHERE r.id = 1
+    )
+    DELETE FROM komari_memory_scene_set target
+    USING ranked_sets ranked
+    WHERE target.id = ranked.id
+      AND ranked.duplicate_rank > 1
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_scene_set_fingerprint
+    ON komari_memory_scene_set(
+        source_hash,
+        embedding_model,
+        embedding_instruction_hash
+    )
     """,
 )
 
