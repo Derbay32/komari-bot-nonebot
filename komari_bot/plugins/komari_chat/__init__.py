@@ -163,8 +163,8 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         if not result:
             return
 
-        reply = result.get("reply")
-        reply_to_message_id = result.get("reply_to_message_id")
+        reply = result.reply
+        reply_to_message_id = result.reply_to_message_id
         if not reply:
             return
 
@@ -184,5 +184,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                 await matcher.send(reply)
         else:
             await matcher.send(reply)
+        await handler.commit_delivered_reply(result)
     except Exception:
         logger.exception("[KomariChat] 消息处理失败")

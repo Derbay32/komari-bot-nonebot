@@ -17,6 +17,40 @@ if TYPE_CHECKING:
     from nonebug import App
 
 
+def _install_allowed_entry_dependencies(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    handler: object,
+) -> None:
+    config = SimpleNamespace(plugin_enable=True, group_whitelist=[])
+
+    class _PermissionPlugin:
+        @staticmethod
+        async def check_runtime_permission(
+            _bot: object,
+            _event: object,
+            _config: object,
+        ) -> tuple[bool, str]:
+            return True, ""
+
+    class _BanPlugin:
+        class BanServiceUnavailableError(Exception):
+            pass
+
+        @staticmethod
+        async def is_event_banned(
+            _bot: object,
+            _event: object,
+            _scope: str,
+        ) -> bool:
+            return False
+
+    monkeypatch.setattr(chat_module, "get_config", lambda: config)
+    monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: handler)
+    monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
+    monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
+
+
 @pytest.fixture
 def chat_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
     del app
@@ -111,3 +145,77 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
 
     assert calls.permission
     assert calls.process
+
+
+@pytest.mark.asyncio
+async def test_send_failure_does_not_commit_reply_side_effects(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = SimpleNamespace(send=False, commit=False)
+    pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
+
+    class _Handler:
+        @staticmethod
+        async def process_message(
+            _bot: object,
+            _event: object,
+            **_kwargs: object,
+        ) -> object:
+            return pending_reply
+
+        @staticmethod
+        async def commit_delivered_reply(_pending_reply: object) -> None:
+            calls.commit = True
+
+    async def _fail_send(_message: object) -> None:
+        calls.send = True
+        msg = "模拟发送失败"
+        raise RuntimeError(msg)
+
+    _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
+    monkeypatch.setattr(chat_module.matcher, "send", _fail_send)
+
+    await chat_module.handle_group_message(
+        cast("Bot", cast("Any", object())),
+        cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+    )
+
+    assert calls.send
+    assert not calls.commit
+
+
+@pytest.mark.asyncio
+async def test_successful_send_commits_reply_side_effects_after_delivery(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
+
+    class _Handler:
+        @staticmethod
+        async def process_message(
+            _bot: object,
+            _event: object,
+            **_kwargs: object,
+        ) -> object:
+            return pending_reply
+
+        @staticmethod
+        async def commit_delivered_reply(actual_pending_reply: object) -> None:
+            assert actual_pending_reply is pending_reply
+            order.append("提交")
+
+    async def _send(_message: object) -> None:
+        order.append("发送")
+
+    _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
+    monkeypatch.setattr(chat_module.matcher, "send", _send)
+
+    await chat_module.handle_group_message(
+        cast("Bot", cast("Any", object())),
+        cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+    )
+
+    assert order == ["发送", "提交"]

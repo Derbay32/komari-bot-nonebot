@@ -379,10 +379,10 @@ def test_attempt_reply_only_rewrites_current_message(
         )
     )
 
-    assert result[0] == {
-        "reply": "收到啦",
-        "reply_to_message_id": current_message.message_id,
-    }
+    pending_reply = result[0]
+    assert pending_reply is not None
+    assert pending_reply.reply == "收到啦"
+    assert pending_reply.reply_to_message_id == current_message.message_id
     assert handler.query_rewrite.current_query == "当前待回复消息"
     assert redis.global_interaction_buffer_calls == [{"user_id": "user-1", "limit": 10}]
     assert memory.get_user_profile_calls == [{"user_id": "user-1", "group_id": "group-1"}]
@@ -410,6 +410,10 @@ def test_attempt_reply_only_rewrites_current_message(
     injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
     assert injected_favorability.favorability == 0
     assert generate_with_tools_kwargs["max_favorability_delta"] == 5
+    assert redis.pushed_global_interactions == []
+
+    asyncio.run(handler.commit_delivered_reply(pending_reply))
+
     pushed_record = redis.pushed_global_interactions[0]["record"]
     assert isinstance(pushed_record, dict)
     assert redis.pushed_global_interactions == [
@@ -1027,10 +1031,10 @@ def test_generate_debug_reply_with_images_and_reply_context(
     assert build_prompt_kwargs.get("image_urls") is not None
 
 
-def test_normal_attempt_reply_still_commits_side_effects(
+def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证正常 _attempt_reply 路径仍正确提交所有副作用。"""
+    """验证正常回复仅在确认送达后提交副作用。"""
     current_message = MessageSchema(
         user_id="user-1",
         user_nickname="阿虚",
@@ -1109,10 +1113,20 @@ def test_normal_attempt_reply_still_commits_side_effects(
         )
     )
 
-    assert result[0] == {"reply": "正常回复", "reply_to_message_id": "msg-normal-1"}
+    pending_reply = result[0]
+    assert pending_reply is not None
+    assert pending_reply.reply == "正常回复"
+    assert pending_reply.reply_to_message_id == "msg-normal-1"
     assert result[1] is True
 
-    # 验证副作用已提交
+    # 当前用户消息属于输入缓冲，不是回复副作用；其余写入必须等待送达确认
+    assert len(redis.pushed_messages) == 1
+    assert fake_user_data.adjust_calls == []
+    assert redis.pushed_global_interactions == []
+
+    asyncio.run(handler.commit_delivered_reply(pending_reply))
+
+    # 确认送达后提交回复副作用
     assert fake_user_data.adjust_calls == [{"user_id": "user-1", "delta": 1}]
     assert len(redis.pushed_messages) >= 2  # 至少：当前消息 + AI 回复
     assert len(redis.pushed_global_interactions) >= 1

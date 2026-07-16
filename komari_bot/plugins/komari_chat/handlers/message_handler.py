@@ -8,7 +8,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from nonebot import logger
@@ -95,6 +95,22 @@ class DebugReplyResult:
     favorability_reason: str | None
     interaction_history: InteractionHistoryRecord | None
     collector: LLMDiagnosticCollector
+
+
+@dataclass(frozen=True)
+class PendingReply:
+    """已生成但尚未确认送达的回复及其待提交副作用。"""
+
+    reply: str
+    reply_to_message_id: str
+    message: MessageSchema
+    reply_result: ReplyResult
+    force_reply: bool
+    bot_nickname: str
+    reason: AttemptReplyReason
+    reply_score: float | None
+    on_reply_triggered: ReplyTriggeredCallback | None = None
+    decision_payload: dict[str, object] | None = None
 
 
 class _FavorabilityReadError(RuntimeError):
@@ -363,7 +379,7 @@ class MessageHandler:
         on_reply_triggered: ReplyTriggeredCallback | None = None,
         *,
         reply_allowed: bool = True,
-    ) -> dict[str, str] | None:
+    ) -> PendingReply | None:
         """处理群聊消息的主流程。"""
         user_id = str(event.user_id)
         group_id = str(event.group_id)
@@ -453,7 +469,7 @@ class MessageHandler:
         reason: AttemptReplyReason = (
             outcome.reply_reason if outcome.reply_reason != "none" else "score"
         )
-        reply, stored = await self._attempt_reply(
+        pending_reply, stored = await self._attempt_reply(
             message=message,
             reply_to_message_id=message_id,
             image_urls=image_urls,
@@ -466,20 +482,20 @@ class MessageHandler:
             store_current=memory_store,
             on_reply_triggered=on_reply_triggered,
         )
-        if reply is not None:
+        if pending_reply is not None:
             reply_action: ReplyAction = (
                 "replied_forced" if outcome.force_reply else "replied"
             )
-            self._log_decision(
-                self._build_decision_payload(
+            return replace(
+                pending_reply,
+                decision_payload=self._build_decision_payload(
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
                     outcome=outcome,
                     reply_action=reply_action,
-                )
+                ),
             )
-            return reply
 
         if memory_store and not stored:
             await self._handle_normal_message(message)
@@ -856,6 +872,35 @@ class MessageHandler:
             await self.redis.set_cooldown(group_id, config.proactive_cooldown)
             await self.redis.increment_proactive_count(group_id)
 
+    async def commit_delivered_reply(self, pending_reply: PendingReply) -> None:
+        """在回复确认送达后提交反应、决策日志及聊天副作用。"""
+        if pending_reply.on_reply_triggered is not None:
+            try:
+                await pending_reply.on_reply_triggered()
+            except Exception:
+                logger.debug("[KomariChat] 回复触发表情反应回调失败", exc_info=True)
+
+        if pending_reply.decision_payload is not None:
+            self._log_decision(pending_reply.decision_payload)
+
+        await self._commit_side_effects(
+            message=pending_reply.message,
+            reply_result=pending_reply.reply_result,
+            force_reply=pending_reply.force_reply,
+            group_id=pending_reply.message.group_id,
+            bot_nickname=pending_reply.bot_nickname,
+        )
+        logger.info(
+            "[KomariMemory] 回复已送达并提交副作用: group={} reason={} score={}",
+            pending_reply.message.group_id,
+            pending_reply.reason,
+            (
+                f"{pending_reply.reply_score:.3f}"
+                if pending_reply.reply_score is not None
+                else "-"
+            ),
+        )
+
     async def _attempt_reply(  # noqa: PLR0911
         self,
         *,
@@ -870,7 +915,7 @@ class MessageHandler:
         reply_score: float | None,
         store_current: bool,
         on_reply_triggered: ReplyTriggeredCallback | None = None,
-    ) -> tuple[dict[str, str] | None, bool]:
+    ) -> tuple[PendingReply | None, bool]:
         """尝试生成并返回回复。
 
         Returns:
@@ -890,12 +935,6 @@ class MessageHandler:
             if current_count >= config.proactive_max_per_hour:
                 logger.debug("[KomariMemory] 主动回复频率超限")
                 return None, False
-
-        if on_reply_triggered is not None:
-            try:
-                await on_reply_triggered()
-            except Exception:
-                logger.debug("[KomariChat] 回复触发表情反应回调失败", exc_info=True)
 
         # === 读取已有缓冲 ===
         recent_messages, interaction_records, stored = await self._read_buffers(
@@ -934,36 +973,30 @@ class MessageHandler:
             )
             return None, stored
 
-        # === 提交正常聊天副作用 ===
-        try:
-            await self._commit_side_effects(
-                message=message,
-                reply_result=reply_result,
-                force_reply=force_reply,
-                group_id=message.group_id,
-                bot_nickname=config.bot_nickname,
-            )
-        except Exception as exc:
-            if isinstance(exc, FinishedException):
-                raise
-            logger.warning(
-                "[KomariChat] 副作用提交失败，按生成失败处理: "
-                "group={} user={} error_type={} error={}",
-                message.group_id,
-                message.user_id,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
+        if reply_result.favorability_delta is None:
+            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
             return None, stored
 
         logger.info(
-            "[KomariMemory] 回复成功: group={} reason={} score={}",
+            "[KomariMemory] 回复生成完成，等待发送: group={} reason={} score={}",
             message.group_id,
             reason,
             f"{reply_score:.3f}" if reply_score is not None else "-",
         )
-        return {"reply": reply, "reply_to_message_id": reply_to_message_id}, stored
+        return (
+            PendingReply(
+                reply=reply,
+                reply_to_message_id=reply_to_message_id,
+                message=message,
+                reply_result=reply_result,
+                force_reply=force_reply,
+                bot_nickname=config.bot_nickname,
+                reason=reason,
+                reply_score=reply_score,
+                on_reply_triggered=on_reply_triggered,
+            ),
+            stored,
+        )
 
     async def generate_debug_reply(
         self,
