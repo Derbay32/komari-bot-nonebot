@@ -143,6 +143,13 @@ def test_update_knowledge_allows_clearing_notes_without_touching_embedding() -> 
         raise AssertionError
 
     engine._get_embedding = _unexpected_get_embedding  # type: ignore[method-assign]
+    rebuild_calls = 0
+
+    async def _rebuild_index() -> None:
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+
+    engine._build_keyword_index = _rebuild_index  # type: ignore[method-assign]
 
     updated = asyncio.run(engine.update_knowledge(1, notes=None))
 
@@ -150,6 +157,7 @@ def test_update_knowledge_allows_clearing_notes_without_touching_embedding() -> 
     update_query, update_args = pool.execute_calls[0]
     assert "notes = $2" in update_query
     assert update_args == (1, None)
+    assert rebuild_calls == 1
 
 
 def test_add_knowledge_uses_source_key_for_idempotent_insert() -> None:
@@ -161,6 +169,13 @@ def test_add_knowledge_uses_source_key_for_idempotent_insert() -> None:
         return [0.1, 0.2]
 
     engine._get_embedding = _get_embedding  # type: ignore[method-assign]
+    rebuild_calls = 0
+
+    async def _rebuild_index() -> None:
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+
+    engine._build_keyword_index = _rebuild_index  # type: ignore[method-assign]
 
     knowledge_id = asyncio.run(
         engine.add_knowledge(
@@ -175,3 +190,4 @@ def test_add_knowledge_uses_source_key_for_idempotent_insert() -> None:
     assert knowledge_id == 42
     assert "ON CONFLICT (source_key) WHERE source_key IS NOT NULL" in query
     assert args[-1] == "komari_custom:proposal:9"
+    assert rebuild_calls == 1

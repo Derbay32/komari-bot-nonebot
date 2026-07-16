@@ -96,7 +96,14 @@ def test_build_knowledge_schema_statements_uses_requested_dimension() -> None:
         "CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding" in statement
         for statement in statements
     )
-    assert "trigger_komari_knowledge_updated_at" in statements[-1]
+    assert any(
+        "trigger_komari_knowledge_updated_at" in statement for statement in statements
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS komari_search_index_versions" in statement
+        for statement in statements
+    )
+    assert "trigger_komari_knowledge_index_version" in statements[-1]
 
 
 def test_build_knowledge_schema_statements_skips_hnsw_for_unsupported_dimension() -> (
@@ -125,7 +132,12 @@ def test_build_help_schema_statements_uses_requested_dimension() -> None:
         "CREATE INDEX IF NOT EXISTS idx_komari_help_embedding" in statement
         for statement in statements
     )
-    assert "trigger_komari_help_updated_at" in statements[-1]
+    assert any("trigger_komari_help_updated_at" in statement for statement in statements)
+    assert any(
+        "CREATE TABLE IF NOT EXISTS komari_search_index_versions" in statement
+        for statement in statements
+    )
+    assert "trigger_komari_help_index_version" in statements[-1]
 
 
 def test_build_help_schema_statements_skip_hnsw_for_unsupported_dimension() -> None:

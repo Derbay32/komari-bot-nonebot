@@ -253,6 +253,12 @@ ok, reason = await check_runtime_permission(bot, event, config)
 关键类：`PluginManager` → `MemoryService` → `ConversationRepository` / `EntityRepository` + `ForgettingService`
 注意：EntityRepository 是跟 komari_knowledge 共享知识表还是独立管理需确认。
 
+### 4.1 知识与帮助关键词索引
+
+- `komari_knowledge` 与 `komari_help` 使用不可变内存快照，重建完成后一次性替换，查询不得观察到半成品索引。
+- PostgreSQL 语句级触发器在业务写入事务内递增 `komari_search_index_versions`；其他 worker 最多 1 秒轮询到变化并重建。
+- 初始化与索引重建必须走单飞锁；重建失败继续保留旧快照，关闭时等待在途重建结束后清空。
+
 ### 5. 判定引擎 (`komari_decision`)
 
 核心服务：

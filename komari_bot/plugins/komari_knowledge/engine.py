@@ -10,6 +10,7 @@ Komari Knowledge 常识库核心引擎。
 2. 独立模式：从 PostgreSQL 读取配置，缺失时使用 schema 默认值
 """
 
+import asyncio
 import logging
 import sys
 from collections import defaultdict
@@ -28,6 +29,7 @@ from komari_bot.common.vector_storage_schema import (
     build_knowledge_embedding_index_statement,
     build_knowledge_schema_statements,
 )
+from komari_bot.common.versioned_keyword_index import VersionedKeywordIndex
 
 from .config_schema import DynamicConfigSchema
 from .models import KnowledgeCategory, KnowledgeEntry, SearchResult
@@ -46,6 +48,18 @@ class PluginState:
 
 # 初始化全局状态单例
 state = PluginState()
+_engine_initialize_lock: asyncio.Lock | None = None
+_engine_initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_engine_initialize_lock() -> asyncio.Lock:
+    """获取绑定当前事件循环的全局初始化锁。"""
+    global _engine_initialize_lock, _engine_initialize_lock_loop  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    if _engine_initialize_lock is None or _engine_initialize_lock_loop is not loop:
+        _engine_initialize_lock = asyncio.Lock()
+        _engine_initialize_lock_loop = loop
+    return _engine_initialize_lock
 
 # 只有在 NoneBot 环境中才尝试加载 config_manager
 if state.nonebot_mode:
@@ -120,10 +134,27 @@ class KnowledgeEngine:
         """初始化引擎。"""
         self._pool: Any = None
         self._embedding_service: Any = None
-        self._keyword_index: dict[str, set[int]] = defaultdict(set)
-        self._index_loaded = False
+        self._keyword_index = VersionedKeywordIndex("komari_knowledge")
+        self._initialize_lock: asyncio.Lock | None = None
+        self._initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._initialized = False
 
     async def initialize(self) -> None:
+        """单飞初始化引擎。"""
+        async with self._get_initialize_lock():
+            if self._initialized:
+                return
+            await self._initialize_once()
+
+    def _get_initialize_lock(self) -> asyncio.Lock:
+        """获取绑定当前事件循环的实例初始化锁。"""
+        loop = asyncio.get_running_loop()
+        if self._initialize_lock is None or self._initialize_lock_loop is not loop:
+            self._initialize_lock = asyncio.Lock()
+            self._initialize_lock_loop = loop
+        return self._initialize_lock
+
+    async def _initialize_once(self) -> None:
         """初始化引擎（加载模型、建立连接池、构建索引）。"""
         state.logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
 
@@ -174,6 +205,7 @@ class KnowledgeEngine:
 
             # 3. 构建关键词索引（内存预热）
             await self._build_keyword_index()
+            self._initialized = True
             state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
         except Exception:
             try:
@@ -252,30 +284,43 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
-        state.logger.info("[Komari Knowledge] 正在构建关键词索引...")
-        self._keyword_index.clear()
-        self._index_loaded = False
-
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, keywords
-                FROM komari_knowledge
-                WHERE keywords IS NOT NULL AND array_length(keywords, 1) > 0
-                """
+        rebuilt = await self._keyword_index.rebuild(
+            self._pool,
+            self._load_keyword_index_entries,
+        )
+        if rebuilt:
+            entry_ids = {
+                entry_id
+                for indexed_ids in self._keyword_index.entries.values()
+                for entry_id in indexed_ids
+            }
+            state.logger.info(
+                f"[Komari Knowledge] 关键词索引构建完成，共 {len(entry_ids)} 条知识"
             )
 
-            for row in rows:
-                kid: int = row["id"]
-                keywords: list[str] = row["keywords"]
+    async def _load_keyword_index_entries(self, conn: Any) -> dict[str, set[int]]:
+        """从同一数据库快照加载关键词映射。"""
+        rows = await conn.fetch(
+            """
+            SELECT id, keywords
+            FROM komari_knowledge
+            WHERE keywords IS NOT NULL AND array_length(keywords, 1) > 0
+            """
+        )
+        entries: dict[str, set[int]] = defaultdict(set)
+        for row in rows:
+            kid = int(row["id"])
+            for keyword in list(row["keywords"] or []):
+                entries[str(keyword).lower()].add(kid)
+        return entries
 
-                for kw in keywords:
-                    kw_lower = kw.lower()
-                    self._keyword_index[kw_lower].add(kid)
-
-        self._index_loaded = True
-        state.logger.info(
-            f"[Komari Knowledge] 关键词索引构建完成，共 {len(rows)} 条知识"
+    async def _ensure_keyword_index_fresh(self) -> None:
+        """按版本戳刷新其他 worker 已修改的索引。"""
+        if self._pool is None:
+            return
+        await self._keyword_index.ensure_fresh(
+            self._pool,
+            self._load_keyword_index_entries,
         )
 
     async def _get_embedding(self, text: str) -> list[float]:
@@ -390,15 +435,17 @@ class KnowledgeEngine:
         Returns:
             检索结果列表
         """
-        if not self._index_loaded:
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded:
             return []
 
         # 在内存索引中查找
         keyword_lower = keyword.lower()
-        if keyword_lower not in self._keyword_index:
+        entries = self._keyword_index.entries
+        if keyword_lower not in entries:
             return []
 
-        matched_ids = self._keyword_index[keyword_lower]
+        matched_ids = entries[keyword_lower]
 
         # 从数据库获取完整内容
         if self._pool is None:
@@ -440,14 +487,15 @@ class KnowledgeEngine:
         Returns:
             检索结果列表
         """
-        if not self._index_loaded:
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded:
             return []
 
         matched_ids: set[int] = set()
 
         # 检查查询中是否包含已知关键词
         query_lower = query.lower()
-        for kw, kid_set in self._keyword_index.items():
+        for kw, kid_set in self._keyword_index.entries.items():
             if kw in query_lower:
                 matched_ids.update(kid_set)
 
@@ -592,10 +640,7 @@ class KnowledgeEngine:
                 source_key,
             )
 
-        # 更新内存索引
-        for kw in keywords:
-            kw_lower = kw.lower()
-            self._keyword_index[kw_lower].add(kid)
+        await self._build_keyword_index()
 
         state.logger.info(f"[Komari Knowledge] 添加知识: ID={kid}, keywords={keywords}")
         return kid
@@ -734,24 +779,17 @@ class KnowledgeEngine:
             raise RuntimeError("数据库连接池未初始化")
 
         async with self._pool.acquire() as conn:
-            # 先获取关键词，用于更新内存索引
             row = await conn.fetchrow(
-                "SELECT keywords FROM komari_knowledge WHERE id = $1", kid
+                "SELECT id FROM komari_knowledge WHERE id = $1", kid
             )
 
             if row is None:
                 return False
 
-            keywords = row["keywords"] or []
-
             # 删除记录
             await conn.execute("DELETE FROM komari_knowledge WHERE id = $1", kid)
 
-        # 更新内存索引
-        for kw in keywords:
-            kw_lower = kw.lower()
-            if kw_lower in self._keyword_index:
-                self._keyword_index[kw_lower].discard(kid)
+        await self._build_keyword_index()
 
         state.logger.info(f"[Komari Knowledge] 删除知识: ID={kid}")
         return True
@@ -834,21 +872,7 @@ class KnowledgeEngine:
             query = f"UPDATE komari_knowledge SET {', '.join(updates)} WHERE id = $1"
             await conn.execute(query, kid, *params)
 
-        # 更新内存关键词索引
-        old_keywords = row["keywords"] or []
-        new_keywords = keywords if keywords is not UNSET else old_keywords
-        assert isinstance(new_keywords, list), "keywords 更新值必须是字符串列表"
-
-        # 移除旧关键词索引
-        for kw in old_keywords:
-            kw_lower = kw.lower()
-            if kw_lower in self._keyword_index:
-                self._keyword_index[kw_lower].discard(kid)
-
-        # 添加新关键词索引
-        for kw in new_keywords:
-            kw_lower = kw.lower()
-            self._keyword_index[kw_lower].add(kid)
+        await self._build_keyword_index()
 
         state.logger.info(f"[Komari Knowledge] 更新知识: ID={kid}")
         return True
@@ -889,8 +913,8 @@ class KnowledgeEngine:
             finally:
                 self._pool = None
 
-        self._keyword_index.clear()
-        self._index_loaded = False
+        await self._keyword_index.reset()
+        self._initialized = False
         if state.engine is self:
             state.engine = None
 
@@ -909,9 +933,10 @@ async def initialize_engine() -> KnowledgeEngine:
     Returns:
         引擎实例
     """
-    if state.engine is None:
-        engine = KnowledgeEngine()
-        await engine.initialize()
-        state.engine = engine
+    async with _get_engine_initialize_lock():
+        if state.engine is None:
+            engine = KnowledgeEngine()
+            await engine.initialize()
+            state.engine = engine
 
     return state.engine

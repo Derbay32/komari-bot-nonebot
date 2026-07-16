@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from collections import defaultdict
@@ -20,6 +21,7 @@ from komari_bot.common.vector_storage_schema import (
     build_help_embedding_index_statement,
     build_help_schema_statements,
 )
+from komari_bot.common.versioned_keyword_index import VersionedKeywordIndex
 
 from .config_schema import DynamicConfigSchema
 from .models import HelpCategory, HelpEntry, HelpSearchResult
@@ -36,6 +38,18 @@ class PluginState:
 
 
 state = PluginState()
+_engine_initialize_lock: asyncio.Lock | None = None
+_engine_initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_engine_initialize_lock() -> asyncio.Lock:
+    """获取绑定当前事件循环的全局初始化锁。"""
+    global _engine_initialize_lock, _engine_initialize_lock_loop  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    if _engine_initialize_lock is None or _engine_initialize_lock_loop is not loop:
+        _engine_initialize_lock = asyncio.Lock()
+        _engine_initialize_lock_loop = loop
+    return _engine_initialize_lock
 
 if state.nonebot_mode:
     try:
@@ -106,10 +120,27 @@ class HelpEngine:
     def __init__(self) -> None:
         self._pool: Any = None
         self._embedding_service: Any = None
-        self._keyword_index: dict[str, set[int]] = defaultdict(set)
-        self._index_loaded = False
+        self._keyword_index = VersionedKeywordIndex("komari_help")
+        self._initialize_lock: asyncio.Lock | None = None
+        self._initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._initialized = False
 
     async def initialize(self) -> None:
+        """单飞初始化帮助引擎。"""
+        async with self._get_initialize_lock():
+            if self._initialized:
+                return
+            await self._initialize_once()
+
+    def _get_initialize_lock(self) -> asyncio.Lock:
+        """获取绑定当前事件循环的实例初始化锁。"""
+        loop = asyncio.get_running_loop()
+        if self._initialize_lock is None or self._initialize_lock_loop is not loop:
+            self._initialize_lock = asyncio.Lock()
+            self._initialize_lock_loop = loop
+        return self._initialize_lock
+
+    async def _initialize_once(self) -> None:
         state.logger.info("[Komari Help] 正在初始化帮助引擎...")
         get_config()
 
@@ -152,6 +183,7 @@ class HelpEngine:
                 await self._validate_embedding_dimension(expected_dimension)
 
             await self._build_keyword_index()
+            self._initialized = True
             state.logger.info("[Komari Help] 帮助引擎初始化完成")
         except Exception:
             try:
@@ -212,15 +244,20 @@ class HelpEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
-        self._keyword_index.clear()
-        self._index_loaded = False
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, title, plugin_name, keywords
-                FROM komari_help
-                """
-            )
+        await self._keyword_index.rebuild(
+            self._pool,
+            self._load_keyword_index_entries,
+        )
+
+    async def _load_keyword_index_entries(self, conn: Any) -> dict[str, set[int]]:
+        """从同一数据库快照加载帮助关键词映射。"""
+        rows = await conn.fetch(
+            """
+            SELECT id, title, plugin_name, keywords
+            FROM komari_help
+            """
+        )
+        entries: dict[str, set[int]] = defaultdict(set)
         for row in rows:
             help_id = int(row["id"])
             pieces = [
@@ -230,8 +267,17 @@ class HelpEngine:
             ]
             for piece in pieces:
                 for token in self._tokenize(piece):
-                    self._keyword_index[token].add(help_id)
-        self._index_loaded = True
+                    entries[token].add(help_id)
+        return entries
+
+    async def _ensure_keyword_index_fresh(self) -> None:
+        """按版本戳刷新其他 worker 已修改的索引。"""
+        if self._pool is None:
+            return
+        await self._keyword_index.ensure_fresh(
+            self._pool,
+            self._load_keyword_index_entries,
+        )
 
     async def _get_embedding(self, text: str) -> list[float]:
         if state.nonebot_mode:
@@ -310,10 +356,12 @@ class HelpEngine:
         return results[:result_limit]
 
     async def search_by_keyword(self, keyword: str) -> list[HelpSearchResult]:
-        if not self._index_loaded:
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded:
             return []
         keyword_lower = keyword.lower().strip()
-        if keyword_lower not in self._keyword_index:
+        entries = self._keyword_index.entries
+        if keyword_lower not in entries:
             return []
         if self._pool is None:
             return []
@@ -326,7 +374,7 @@ class HelpEngine:
                 WHERE id = ANY($1)
                 ORDER BY created_at DESC
                 """,
-                list(self._keyword_index[keyword_lower]),
+                list(entries[keyword_lower]),
             )
         return [
             self._build_search_result(dict(row), similarity=1.0, source="keyword")
@@ -336,13 +384,15 @@ class HelpEngine:
     async def _layer1_keyword_search(
         self, query: str, limit: int
     ) -> list[HelpSearchResult]:
-        if not self._index_loaded or limit <= 0:
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded or limit <= 0:
             return []
         query_tokens = self._tokenize(query)
         matched_ids: set[int] = set()
+        entries = self._keyword_index.entries
         for token in query_tokens:
-            matched_ids.update(self._keyword_index.get(token, set()))
-            for indexed_token, help_ids in self._keyword_index.items():
+            matched_ids.update(entries.get(token, frozenset()))
+            for indexed_token, help_ids in entries.items():
                 if token and token in indexed_token:
                     matched_ids.update(help_ids)
         if not matched_ids or self._pool is None:
@@ -780,8 +830,8 @@ class HelpEngine:
             finally:
                 self._pool = None
 
-        self._keyword_index.clear()
-        self._index_loaded = False
+        await self._keyword_index.reset()
+        self._initialized = False
         if state.engine is self:
             state.engine = None
         if errors:
@@ -795,8 +845,9 @@ def get_engine() -> HelpEngine | None:
 
 async def initialize_engine() -> HelpEngine:
     """初始化全局引擎实例。"""
-    if state.engine is None:
-        engine = HelpEngine()
-        await engine.initialize()
-        state.engine = engine
+    async with _get_engine_initialize_lock():
+        if state.engine is None:
+            engine = HelpEngine()
+            await engine.initialize()
+            state.engine = engine
     return state.engine

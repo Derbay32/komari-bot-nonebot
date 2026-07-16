@@ -262,7 +262,10 @@ for item in results:
 2. Layer 2：pgvector 向量检索补充召回
 3. 合并结果后按相似度/来源返回
 
-`KnowledgeEngine` 在启动时会预热关键词索引，并在增删改知识后同步更新内存索引。
+`KnowledgeEngine` 在启动时会预热不可变关键词索引快照。`komari_knowledge`
+表的语句级触发器会在同一事务中递增 `komari_search_index_versions` 版本；
+本 worker 写入后立即检查并重建，其他 worker 最多 1 秒发现版本变化并原子替换快照。
+并发重建由单飞锁合并，加载失败时继续保留上一份完整快照。
 
 ## 排障
 

@@ -382,6 +382,10 @@ def build_knowledge_schema_statements(embedding_dimension: int) -> tuple[str, ..
         END
         $$;
         """,
+            *_build_search_index_version_statements(
+                table_name="komari_knowledge",
+                index_name="komari_knowledge",
+            ),
         ]
     )
     return tuple(statements)
@@ -471,6 +475,10 @@ def build_help_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         END
         $$;
         """,
+            *_build_search_index_version_statements(
+                table_name="komari_help",
+                index_name="komari_help",
+            ),
         ]
     )
     return tuple(statements)
@@ -489,6 +497,57 @@ def build_help_embedding_index_statement(
         USING hnsw (embedding vector_cosine_ops)
         WITH (m = 16, ef_construction = 64)
         """
+
+
+def _build_search_index_version_statements(
+    *,
+    table_name: str,
+    index_name: str,
+) -> tuple[str, ...]:
+    """为关键词索引构建事务版本戳与语句级触发器。"""
+    allowed_names = {"komari_knowledge", "komari_help"}
+    if table_name not in allowed_names or index_name not in allowed_names:
+        msg = f"不支持的搜索索引名称: table={table_name}, index={index_name}"
+        raise ValueError(msg)
+
+    trigger_name = f"trigger_{table_name}_index_version"
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS komari_search_index_versions (
+            index_name TEXT PRIMARY KEY,
+            version BIGINT NOT NULL DEFAULT 0 CHECK (version >= 0),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        f"""
+        INSERT INTO komari_search_index_versions (index_name, version)
+        VALUES ('{index_name}', 0)
+        ON CONFLICT (index_name) DO NOTHING
+        """,
+        """
+        CREATE OR REPLACE FUNCTION bump_komari_search_index_version()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            INSERT INTO komari_search_index_versions (
+                index_name,
+                version,
+                updated_at
+            )
+            VALUES (TG_ARGV[0], 1, CURRENT_TIMESTAMP)
+            ON CONFLICT (index_name) DO UPDATE
+            SET version = komari_search_index_versions.version + 1,
+                updated_at = CURRENT_TIMESTAMP;
+            RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        f"""
+        CREATE OR REPLACE TRIGGER {trigger_name}
+        AFTER INSERT OR UPDATE OR DELETE ON {table_name}
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION bump_komari_search_index_version('{index_name}')
+        """,
+    )
 
 
 async def apply_schema_statements(
