@@ -61,7 +61,7 @@ if driver is not None:
 
     @driver.on_startup
     async def on_startup() -> None:
-        config = config_manager.get()
+        config = await config_manager.get_async()
         if not config.plugin_enable:
             logger.info("[Komari Help] 插件未启用，跳过初始化")
             return

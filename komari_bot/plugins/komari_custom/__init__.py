@@ -116,7 +116,7 @@ async def on_startup() -> None:
         max_instances=1,
         coalesce=True,
     )
-    config = config_manager.get()
+    config = await config_manager.get_async()
     if not config.plugin_enable:
         logger.info("[KomariCustom] 插件未启用，跳过初始化")
         return

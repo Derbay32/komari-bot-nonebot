@@ -32,7 +32,7 @@ from .handlers.summary_worker import register_summary_task, unregister_summary_t
 from .repositories.conversation_repository import ConversationRepository
 from .repositories.entity_repository import EntityRepository
 from .repositories.interaction_event_repository import InteractionEventRepository
-from .services.config_interface import get_config
+from .services.config_interface import get_config_async
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
 from .services.redis_manager import RedisManager
@@ -232,7 +232,7 @@ async def startup() -> None:
     """启动时初始化。"""
     global _plugin_manager  # noqa: PLW0603
 
-    config = get_config()
+    config = await get_config_async()
 
     if config.plugin_enable:
         logger.info("[KomariMemory] 插件已启用（记忆/持久化子系统）")

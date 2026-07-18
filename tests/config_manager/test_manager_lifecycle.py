@@ -14,6 +14,7 @@ from komari_bot.plugins.config_manager import manager as manager_module
 from komari_bot.plugins.config_manager.manager import (
     ConfigManager,
     get_config_manager,
+    initialize_registered_config_managers_async,
 )
 from komari_bot.plugins.config_manager.storage import StoredConfig
 
@@ -113,6 +114,32 @@ class _InitializationRaceStorage:
         return self.current
 
 
+class _AsyncStartupStorage:
+    def __init__(self) -> None:
+        self.fetch_calls: list[str] = []
+
+    def register_watcher(
+        self,
+        _plugin_name: str,
+        _callback: object,
+        *,
+        max_staleness_seconds: float,
+    ) -> None:
+        assert max_staleness_seconds == 1.0
+
+    async def fetch_async(self, plugin_name: str) -> StoredConfig:
+        self.fetch_calls.append(plugin_name)
+        value = 1 if plugin_name == "startup-first" else 2
+        return StoredConfig(
+            plugin_name=plugin_name,
+            schema_name="_ConfigSchema",
+            config_data={"value": value},
+            version="1.0",
+            revision=1,
+            updated_at=datetime.now().astimezone(),
+        )
+
+
 def test_concurrent_initialization_never_overwrites_existing_database_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -153,6 +180,22 @@ def test_external_revision_notification_atomically_replaces_cached_snapshot(
     )
 
     assert cast("_ConfigSchema", manager.get()).value == 100
+
+
+@pytest.mark.asyncio
+async def test_startup_preheats_registered_managers_before_sync_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _AsyncStartupStorage()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+    first = get_config_manager("startup-first", _ConfigSchema)
+    second = get_config_manager("startup-second", _ConfigSchema)
+
+    await initialize_registered_config_managers_async()
+
+    assert storage.fetch_calls == ["startup-first", "startup-second"]
+    assert cast("_ConfigSchema", first.get()).value == 1
+    assert cast("_ConfigSchema", second.get()).value == 2
 
 
 def test_sync_operations_for_different_plugins_do_not_share_a_global_lock(

@@ -64,10 +64,16 @@ def get_config() -> DynamicConfigSchema:
     return config_manager.get()
 
 
+async def _get_config_async() -> DynamicConfigSchema:
+    """在事件循环内异步获取 user_data 动态配置。"""
+    return await config_manager.get_async()
+
+
 async def get_db() -> UserDataDB:
     """获取数据库实例。"""
     global _db, _lifecycle_state  # noqa: PLW0603
-    if not get_config().plugin_enable:
+    config = await _get_config_async()
+    if not config.plugin_enable:
         msg = "user_data 插件已禁用"
         raise UserDataDisabledError(msg)
     if _lifecycle_state in {"stopping", "stopped"}:
@@ -79,14 +85,15 @@ async def get_db() -> UserDataDB:
             if _lifecycle_state in {"stopping", "stopped"}:
                 msg = "user_data 正在或已经关闭"
                 raise UserDataStoppingError(msg)
-            if not get_config().plugin_enable:
+            config = await _get_config_async()
+            if not config.plugin_enable:
                 msg = "user_data 插件已禁用"
                 raise UserDataDisabledError(msg)
             if _db is None:
                 logger.debug("[UserData] 首次获取数据库实例，开始初始化")
                 previous_state = _lifecycle_state
                 _lifecycle_state = "starting"
-                db = UserDataDB(get_config())
+                db = UserDataDB(config)
                 try:
                     await db.initialize()
                 except BaseException:
@@ -112,7 +119,7 @@ async def on_startup() -> None:
         msg = "user_data 已完成 shutdown，不能在同一生命周期内重启"
         raise UserDataStoppingError(msg)
     _lifecycle_state = "starting"
-    config = get_config()
+    config = await _get_config_async()
     if not config.plugin_enable:
         _lifecycle_state = "running"
         logger.info("[UserData] 插件未启用，跳过初始化")

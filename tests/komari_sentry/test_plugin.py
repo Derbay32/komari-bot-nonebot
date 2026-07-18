@@ -40,7 +40,11 @@ def sentry_plugin(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
     sys.modules.pop(module_name, None)
     module = import_module(module_name)
     module_any = cast("Any", module)
-    monkeypatch.setattr(module_any, "get_config", _config)
+
+    async def _get_config_async() -> SimpleNamespace:
+        return _config()
+
+    monkeypatch.setattr(module_any, "get_config_async", _get_config_async)
     module_any._initialized_by_plugin = False
     return module_any
 

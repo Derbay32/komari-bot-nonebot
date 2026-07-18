@@ -34,7 +34,11 @@ from nonebot.plugin import PluginMetadata
 
 from komari_bot.common.prompt_storage import close_prompt_storage_if_created
 
-from .manager import ConfigManager, get_config_manager
+from .manager import (
+    ConfigManager,
+    get_config_manager,
+    initialize_registered_config_managers_async,
+)
 from .storage import close_config_storage_if_created
 
 __plugin_meta__ = PluginMetadata(
@@ -46,10 +50,17 @@ __plugin_meta__ = PluginMetadata(
 __all__ = [
     "ConfigManager",
     "get_config_manager",
+    "initialize_registered_config_managers_async",
 ]
 
 
 driver = get_driver()
+
+
+@driver.on_startup
+async def _initialize_registered_configs() -> None:
+    """先于依赖本插件的业务启动钩子异步预热配置。"""
+    await initialize_registered_config_managers_async()
 
 
 @driver.on_shutdown

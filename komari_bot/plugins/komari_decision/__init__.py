@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
-from .services.config_interface import get_config
+from .services.config_interface import get_config, get_config_async
 from .services.runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
 from .services.unified_candidate_rerank import (
     CandidateSchema,
@@ -111,7 +111,7 @@ class PluginManager:
 
     async def initialize(self) -> None:
         """初始化 scene 运行时与同步任务。"""
-        config = get_config()
+        config = await get_config_async()
         if not config.plugin_enable:
             self._runtime_state = DecisionRuntimeState.disabled(
                 "komari_decision 已关闭"

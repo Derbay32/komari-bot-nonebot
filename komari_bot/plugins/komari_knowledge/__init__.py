@@ -63,7 +63,7 @@ driver = get_driver()
 @driver.on_startup
 async def on_startup() -> None:
     """Bot 启动时初始化常识库引擎。"""
-    config = config_manager.get()
+    config = await config_manager.get_async()
 
     if not config.plugin_enable:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")

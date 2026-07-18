@@ -61,10 +61,14 @@ def _patch_fake_db(user_data_module: Any, monkeypatch: pytest.MonkeyPatch) -> No
     _FakeUserDataDB.close_calls = 0
     _FakeUserDataDB.fail_next_initialize = False
     monkeypatch.setattr(user_data_module, "UserDataDB", _FakeUserDataDB)
+
+    async def _get_config_async() -> SimpleNamespace:
+        return SimpleNamespace(plugin_enable=True)
+
     monkeypatch.setattr(
         user_data_module,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=True),
+        "_get_config_async",
+        _get_config_async,
     )
 
 
@@ -126,10 +130,14 @@ async def test_get_db_rejects_disabled_plugin_before_lazy_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_fake_db(user_data_module, monkeypatch)
+
+    async def _get_disabled_config() -> SimpleNamespace:
+        return SimpleNamespace(plugin_enable=False)
+
     monkeypatch.setattr(
         user_data_module,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=False),
+        "_get_config_async",
+        _get_disabled_config,
     )
 
     with pytest.raises(user_data_module.UserDataDisabledError, match="已禁用"):
@@ -146,10 +154,14 @@ async def test_get_db_does_not_return_cached_db_after_dynamic_disable(
 ) -> None:
     _patch_fake_db(user_data_module, monkeypatch)
     cached = await user_data_module.get_db()
+
+    async def _get_disabled_config() -> SimpleNamespace:
+        return SimpleNamespace(plugin_enable=False)
+
     monkeypatch.setattr(
         user_data_module,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=False),
+        "_get_config_async",
+        _get_disabled_config,
     )
 
     with pytest.raises(user_data_module.UserDataDisabledError, match="已禁用"):
@@ -212,10 +224,14 @@ async def test_shutdown_during_lazy_initialize_never_publishes_new_pool(
             self.close_calls += 1
 
     monkeypatch.setattr(user_data_module, "UserDataDB", _BlockingDB)
+
+    async def _get_config_async() -> SimpleNamespace:
+        return SimpleNamespace(plugin_enable=True)
+
     monkeypatch.setattr(
         user_data_module,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=True),
+        "_get_config_async",
+        _get_config_async,
     )
 
     get_task = asyncio.create_task(user_data_module.get_db())

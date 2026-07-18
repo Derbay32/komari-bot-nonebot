@@ -14,7 +14,7 @@ from komari_bot.common.sentry_support import (
     ensure_sentry_privacy_hooks,
 )
 
-from .config_interface import get_config
+from .config_interface import get_config, get_config_async
 from .config_schema import KomariSentryConfigSchema
 
 try:
@@ -64,7 +64,7 @@ async def startup() -> None:
     """初始化 Sentry SDK。"""
     global _initialized_by_plugin  # noqa: PLW0603
 
-    config = get_config()
+    config = await get_config_async()
     if not config.plugin_enable:
         logger.info("[KomariSentry] 插件未启用，跳过初始化")
         return

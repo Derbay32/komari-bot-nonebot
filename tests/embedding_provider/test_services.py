@@ -112,6 +112,53 @@ def test_request_timeout_limits_connect_read_and_total() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plugin_startup_uses_async_config_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import komari_bot.plugins.embedding_provider as plugin_module
+
+    class _Manager:
+        def __init__(self) -> None:
+            self.async_calls = 0
+
+        def get(self) -> object:
+            raise AssertionError
+
+        async def get_async(self) -> DynamicConfigSchema:
+            self.async_calls += 1
+            return _config()
+
+    services: list[object] = []
+
+    class _Service:
+
+        def __init__(self, config: DynamicConfigSchema) -> None:
+            self.config = config
+            self.cleaned = False
+            services.append(self)
+
+        async def cleanup(self) -> None:
+            self.cleaned = True
+
+    manager = _Manager()
+    monkeypatch.setattr(plugin_module, "config_manager", manager)
+    monkeypatch.setattr(plugin_module, "EmbeddingService", _Service)
+    monkeypatch.setattr(plugin_module, "RerankService", _Service)
+    plugin_module.state.embedding_service = None
+    plugin_module.state.rerank_service = None
+
+    try:
+        await plugin_module._startup()
+
+        assert manager.async_calls == 1
+        assert len(services) == 2
+    finally:
+        await plugin_module._shutdown()
+
+    assert all(cast("Any", service).cleaned for service in services)
+
+
+@pytest.mark.asyncio
 async def test_bounded_json_reader_accepts_streamed_response() -> None:
     response = cast(
         "aiohttp.ClientResponse",

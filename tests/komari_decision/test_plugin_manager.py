@@ -66,6 +66,24 @@ class _FakeSceneAdminService:
         self.embedding_worker = embedding_worker
 
 
+def _patch_config(
+    monkeypatch: Any,
+    *,
+    plugin_enable: bool,
+    scene_persist_enabled: bool,
+) -> None:
+    config = SimpleNamespace(
+        plugin_enable=plugin_enable,
+        scene_persist_enabled=scene_persist_enabled,
+    )
+    monkeypatch.setattr(decision_plugin, "get_config", lambda: config)
+
+    async def _get_config_async() -> object:
+        return config
+
+    monkeypatch.setattr(decision_plugin, "get_config_async", _get_config_async)
+
+
 def test_initialize_cleans_up_when_bootstrap_fails(monkeypatch: Any) -> None:
     manager = decision_plugin.PluginManager()
     memory_module = sys.modules["komari_bot.plugins.komari_memory"]
@@ -87,10 +105,10 @@ def test_initialize_cleans_up_when_bootstrap_fails(monkeypatch: Any) -> None:
         "require",
         lambda name: memory_module if name == "komari_memory" else object(),
     )
-    monkeypatch.setattr(
-        decision_plugin,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=True, scene_persist_enabled=True),
+    _patch_config(
+        monkeypatch,
+        plugin_enable=True,
+        scene_persist_enabled=True,
     )
     monkeypatch.setattr(
         "komari_bot.plugins.komari_decision.repositories.scene_repository.SceneRepository",
@@ -165,10 +183,10 @@ def test_initialize_recovers_active_cache_during_bootstrap(
         "require",
         lambda name: memory_module if name == "komari_memory" else object(),
     )
-    monkeypatch.setattr(
-        decision_plugin,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=True, scene_persist_enabled=True),
+    _patch_config(
+        monkeypatch,
+        plugin_enable=True,
+        scene_persist_enabled=True,
     )
     monkeypatch.setattr(
         "komari_bot.plugins.komari_decision.repositories.scene_repository.SceneRepository",
@@ -233,10 +251,10 @@ def test_initialize_marks_plugin_disabled_without_loading_services(
     monkeypatch: Any,
 ) -> None:
     manager = decision_plugin.PluginManager()
-    monkeypatch.setattr(
-        decision_plugin,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=False, scene_persist_enabled=True),
+    _patch_config(
+        monkeypatch,
+        plugin_enable=False,
+        scene_persist_enabled=True,
     )
 
     asyncio.run(manager.initialize())
@@ -249,10 +267,10 @@ def test_initialize_marks_scene_persistence_disabled(
     monkeypatch: Any,
 ) -> None:
     manager = decision_plugin.PluginManager()
-    monkeypatch.setattr(
-        decision_plugin,
-        "get_config",
-        lambda: SimpleNamespace(plugin_enable=True, scene_persist_enabled=False),
+    _patch_config(
+        monkeypatch,
+        plugin_enable=True,
+        scene_persist_enabled=False,
     )
 
     asyncio.run(manager.initialize())

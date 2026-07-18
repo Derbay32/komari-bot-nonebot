@@ -633,6 +633,32 @@ _config_managers: dict[str, ConfigManager] = {}
 _config_managers_lock = RLock()
 
 
+async def initialize_registered_config_managers_async() -> None:
+    """在业务插件启动前异步预热全部已注册配置管理器。"""
+    initialized_names: set[str] = set()
+    while True:
+        with _config_managers_lock:
+            pending = sorted(
+                (
+                    (plugin_name, manager)
+                    for plugin_name, manager in _config_managers.items()
+                    if plugin_name not in initialized_names
+                ),
+                key=lambda item: item[0],
+            )
+        if not pending:
+            break
+
+        for plugin_name, manager in pending:
+            await manager.initialize_async()
+            initialized_names.add(plugin_name)
+
+    logger.info(
+        "配置管理器启动预热完成，共初始化 {} 个配置资源",
+        len(initialized_names),
+    )
+
+
 def get_config_manager(
     plugin_name: str, config_schema: type[BaseModel]
 ) -> ConfigManager:

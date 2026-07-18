@@ -42,7 +42,7 @@ async def _startup() -> None:
     if config_manager is None:
         msg = "EmbeddingProvider 只能在 NoneBot 环境中自动初始化"
         raise RuntimeError(msg)
-    config = config_manager.get()
+    config = await config_manager.get_async()
 
     state.embedding_service = EmbeddingService(config)
     state.rerank_service = RerankService(config)
