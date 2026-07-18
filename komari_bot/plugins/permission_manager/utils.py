@@ -82,6 +82,21 @@ def format_permission_info(config: ConfigType) -> str:
     )
 
 
+def check_context_permission(
+    config: ConfigType,
+    *,
+    user_id: str,
+    group_id: str | None,
+    is_superuser: bool = False,
+) -> tuple[bool, str]:
+    """对已认证的用户/群上下文执行与消息事件一致的动态权限检查。"""
+    return PermissionManager(config).can_use_context(
+        user_id=user_id,
+        group_id=group_id,
+        is_superuser=is_superuser,
+    )
+
+
 async def check_runtime_permission(
     bot: Bot,
     event: Obv11MessageEvent,

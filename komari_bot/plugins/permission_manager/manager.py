@@ -5,6 +5,7 @@
 """
 
 from typing import Protocol, runtime_checkable
+from warnings import warn
 
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent
@@ -83,6 +84,24 @@ class PermissionManager:
             return True
         return group_id in whitelist
 
+    def can_use_context(
+        self,
+        *,
+        user_id: str,
+        group_id: str | None,
+        is_superuser: bool = False,
+    ) -> tuple[bool, str]:
+        """使用已经认证的调用者上下文执行统一开关与白名单检查。"""
+        if not self.is_plugin_enabled():
+            return False, "插件当前已禁用"
+        if is_superuser:
+            return True, ""
+        if not self.is_user_whitelisted(user_id):
+            return False, "您不在用户白名单中，无法使用此命令"
+        if group_id is not None and not self.is_group_whitelisted(group_id):
+            return False, "当前群组不在群组白名单中，无法使用此命令"
+        return True, ""
+
     async def can_use_command(
         self,
         bot: Bot,
@@ -97,27 +116,13 @@ class PermissionManager:
         Returns:
             tuple[是否可以使用, 拒绝原因]
         """
-        # 检查插件是否启用
-        if not self.is_plugin_enabled():
-            return False, "插件当前已禁用"
-
-        # 检查用户权限
         user_id = event.get_user_id()
-
-        # SUPER 用户绕过所有检查
-        if await SUPERUSER(bot, event):
-            return True, ""
-
-        # 仅对已配置的白名单施加约束；多个已配置约束必须同时满足
-        if not self.is_user_whitelisted(user_id):
-            return False, "您不在用户白名单中，无法使用此命令"
-
-        # 群白名单只约束群聊，私聊不受群白名单影响
         group_id = getattr(event, "group_id", None)
-        if group_id is not None and not self.is_group_whitelisted(str(group_id)):
-            return False, "当前群组不在群组白名单中，无法使用此命令"
-
-        return True, ""
+        return self.can_use_context(
+            user_id=user_id,
+            group_id=str(group_id) if group_id is not None else None,
+            is_superuser=await SUPERUSER(bot, event),
+        )
 
 
 def create_whitelist_rule(config: ConfigType) -> Rule:
@@ -129,6 +134,12 @@ def create_whitelist_rule(config: ConfigType) -> Rule:
     Returns:
         nonebot.rule.Rule 实例
     """
+    warn(
+        "create_whitelist_rule() 会在 matcher 创建时捕获静态配置，已弃用；"
+        "请在处理器内调用 check_runtime_permission()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     permission_manager = PermissionManager(config)
 
     async def check_whitelist(bot: Bot, event: Obv11MessageEvent) -> bool:
