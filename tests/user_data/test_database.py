@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -86,6 +87,47 @@ async def test_get_user_favorability_requires_initialized_pool() -> None:
 
     with pytest.raises(RuntimeError, match="UserDataDB 连接池未初始化"):
         await db.get_user_favorability("1047195267")
+
+
+@pytest.mark.asyncio
+async def test_get_user_favorability_uses_insert_do_nothing_without_dummy_update() -> None:
+    class _Connection:
+        query = ""
+
+        async def fetchrow(self, query: str, *_args: object) -> dict[str, object]:
+            self.query = query
+            return {
+                "user_id": "u1",
+                "favorability": 0,
+                "updated_at": SimpleNamespace(isoformat=lambda: "2026-07-17T00:00:00Z"),
+            }
+
+    class _Acquire:
+        def __init__(self, connection: _Connection) -> None:
+            self.connection = connection
+
+        async def __aenter__(self) -> _Connection:
+            return self.connection
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Pool:
+        def __init__(self, connection: _Connection) -> None:
+            self.connection = connection
+
+        def acquire(self) -> _Acquire:
+            return _Acquire(self.connection)
+
+    connection = _Connection()
+    db = _build_db()
+    db._pool = cast("Any", _Pool(connection))
+
+    result = await db.get_user_favorability("u1")
+
+    assert result.favorability == 0
+    assert "ON CONFLICT (user_id) DO NOTHING" in connection.query
+    assert "DO UPDATE" not in connection.query
 
 
 @pytest.mark.asyncio

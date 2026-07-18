@@ -24,6 +24,7 @@ def user_data_module(app: App) -> Any:
     module_any._db = None
     module_any._db_init_lock = None
     module_any._db_init_lock_loop = None
+    module_any._lifecycle_state = "new"
     return module
 
 
@@ -180,6 +181,57 @@ async def test_shutdown_closes_and_clears_cached_db(
 
     assert db.close_calls == 1
     assert user_data_module._db is None
+    assert user_data_module._lifecycle_state == "stopped"
+
+    with pytest.raises(user_data_module.UserDataStoppingError, match="已经关闭"):
+        await user_data_module.get_db()
+
+    assert len(_FakeUserDataDB.instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_lazy_initialize_never_publishes_new_pool(
+    user_data_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingDB:
+        instances: ClassVar[list[_BlockingDB]] = []
+
+        def __init__(self, _config: object) -> None:
+            self.close_calls = 0
+            self.instances.append(self)
+
+        async def initialize(self) -> None:
+            started.set()
+            await release.wait()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(user_data_module, "UserDataDB", _BlockingDB)
+    monkeypatch.setattr(
+        user_data_module,
+        "get_config",
+        lambda: SimpleNamespace(plugin_enable=True),
+    )
+
+    get_task = asyncio.create_task(user_data_module.get_db())
+    await started.wait()
+    shutdown_task = asyncio.create_task(user_data_module.on_shutdown())
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(user_data_module.UserDataStoppingError, match="关闭状态"):
+        await get_task
+    await shutdown_task
+
+    assert user_data_module._db is None
+    assert user_data_module._lifecycle_state == "stopped"
+    assert len(_BlockingDB.instances) == 1
+    assert _BlockingDB.instances[0].close_calls == 1
 
 
 def test_set_user_favorability_is_exported_in_all(user_data_module: Any) -> None:
