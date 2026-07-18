@@ -9,6 +9,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
 from nonebot.adapters.onebot.v11.event import Sender
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.plugins.character_binding.manager import (
     BindingPersistenceError,
     CharacterBindingManager,
@@ -137,7 +138,11 @@ async def test_handle_set_reports_validation_failure(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_set)
         ctx.should_pass_rule(matcher=commands_module.bind_set)
-        ctx.should_call_send(event, "❌ 角色名不能包含换行或控制字符", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 角色名不能包含换行或控制字符"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -207,7 +212,35 @@ async def test_handle_list_only_returns_current_user_binding_with_nonebug(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_list)
         ctx.should_pass_rule(matcher=commands_module.bind_list)
-        ctx.should_call_send(event, "📋 您的角色绑定: 泉此方", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 您的角色绑定: 泉此方"),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_list_treats_stored_cq_code_as_plain_text(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager({"42": "[CQ:at,qq=all]"})
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_list) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind list")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_list)
+        ctx.should_pass_rule(matcher=commands_module.bind_list)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 您的角色绑定: [CQ:at,qq=all]"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 

@@ -31,11 +31,14 @@ def test_default_binding_path_is_independent_of_working_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    temporary_default = tmp_path / "app-data" / "character_binding" / "bindings.json"
+    monkeypatch.setattr(manager_module, "DEFAULT_BINDING_FILE", temporary_default)
     monkeypatch.chdir(tmp_path)
 
     manager = CharacterBindingManager()
 
-    assert manager.binding_file == DEFAULT_BINDING_FILE
+    assert DEFAULT_BINDING_FILE.is_absolute()
+    assert manager.binding_file == temporary_default
     assert manager.binding_file.is_absolute()
 
 
@@ -127,6 +130,37 @@ async def test_concurrent_updates_are_serialized(binding_file: Path) -> None:
         "42": "泉此方",
         "10086": "柊镜",
     }
+
+
+@pytest.mark.asyncio
+async def test_two_managers_reload_under_file_lock_without_lost_update(
+    binding_file: Path,
+) -> None:
+    first = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
+    second = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
+
+    await asyncio.gather(
+        first.set_character_name("42", "泉此方"),
+        second.set_character_name("10086", "柊镜"),
+    )
+
+    expected = {"42": "泉此方", "10086": "柊镜"}
+    assert json.loads(binding_file.read_text(encoding="utf-8")) == expected
+    assert first.list_bindings() == expected
+    assert second.list_bindings() == expected
+
+
+@pytest.mark.asyncio
+async def test_regular_reads_refresh_external_updates_with_bounded_interval(
+    binding_file: Path,
+) -> None:
+    writer = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
+    reader = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
+
+    await writer.set_character_name("42", "泉此方")
+
+    assert reader.get_character_name("42") == "泉此方"
+    assert reader.has_binding("42") is True
 
 
 @pytest.mark.asyncio
