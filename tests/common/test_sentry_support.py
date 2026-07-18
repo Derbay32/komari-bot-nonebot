@@ -18,10 +18,12 @@ from nonebot.exception import (
 
 from komari_bot.common.sentry_support import (
     build_sentry_init_options,
+    ensure_sentry_privacy_hooks,
     get_ignored_sentry_exceptions,
     sentry_before_breadcrumb,
     sentry_before_send,
     sentry_before_send_log,
+    sentry_before_send_transaction,
 )
 
 
@@ -227,6 +229,133 @@ def test_sentry_before_send_keeps_explicit_user_context_when_pii_is_enabled() ->
     assert sentry_before_send(event, {}, allow_user_context=True) == event
 
 
+def test_sentry_transaction_hook_hides_transaction_spans_and_request_content() -> None:
+    event = {
+        "transaction": "GET /users/transaction-name-canary",
+        "transaction_info": {"source": "route"},
+        "request": {
+            "method": "get",
+            "url": "https://example.invalid/request-url-canary",
+            "query_string": "request-query-canary",
+            "headers": {"authorization": "request-header-canary"},
+        },
+        "spans": [
+            {
+                "trace_id": "safe-trace-id",
+                "span_id": "safe-span-id",
+                "op": "http.client",
+                "description": "SELECT span-description-canary",
+                "data": {
+                    "http.method": "POST",
+                    "http.response.status_code": 200,
+                    "db.statement": "span-data-canary",
+                    "http.request.header.authorization": "span-header-canary",
+                },
+                "tags": {
+                    "component": "database",
+                    "user_id": "span-tag-canary",
+                },
+            }
+        ],
+        "measurements": {"measurement-canary": {"value": 1.0}},
+        "breadcrumbs": {
+            "values": [{"message": "transaction-breadcrumb-canary"}]
+        },
+    }
+
+    sanitized = sentry_before_send_transaction(event, {})
+
+    assert sanitized["request"] == {"method": "GET"}
+    assert sanitized["transaction_info"] == {"source": "route"}
+    assert "measurements" not in sanitized
+    assert sanitized["spans"][0]["data"] == {
+        "http.method": "POST",
+        "http.response.status_code": 200,
+    }
+    assert sanitized["spans"][0]["tags"] == {"component": "database"}
+    serialized = str(sanitized)
+    for canary in (
+        "transaction-name-canary",
+        "request-url-canary",
+        "request-query-canary",
+        "request-header-canary",
+        "span-description-canary",
+        "span-data-canary",
+        "span-header-canary",
+        "span-tag-canary",
+        "measurement-canary",
+        "transaction-breadcrumb-canary",
+    ):
+        assert canary not in serialized
+
+
+def test_ensure_sentry_privacy_hooks_composes_external_hooks_and_is_idempotent() -> (
+    None
+):
+    external_calls: list[str] = []
+
+    def _external_hook(
+        payload: dict[str, Any],
+        _hint: dict[str, Any],
+    ) -> dict[str, Any]:
+        external_calls.append("called")
+        payload["extra"] = {"secret": "external-hook-canary"}
+        return payload
+
+    client = SimpleNamespace(
+        options={
+            "before_send": _external_hook,
+            "before_breadcrumb": _external_hook,
+            "before_send_transaction": _external_hook,
+            "before_send_log": _external_hook,
+            "ignore_errors": [ValueError],
+        }
+    )
+
+    ensure_sentry_privacy_hooks(client, allow_user_context=False)
+    installed_hooks = {
+        name: client.options[name]
+        for name in (
+            "before_send",
+            "before_breadcrumb",
+            "before_send_transaction",
+            "before_send_log",
+        )
+    }
+    ensure_sentry_privacy_hooks(client, allow_user_context=False)
+
+    assert installed_hooks == {
+        name: client.options[name] for name in installed_hooks
+    }
+    assert ValueError in client.options["ignore_errors"]
+    assert set(get_ignored_sentry_exceptions()).issubset(
+        client.options["ignore_errors"]
+    )
+
+    sanitized_event = client.options["before_send"](
+        {"message": "event-canary"},
+        {},
+    )
+    sanitized_breadcrumb = client.options["before_breadcrumb"](
+        {"message": "breadcrumb-canary"},
+        {},
+    )
+    sanitized_transaction = client.options["before_send_transaction"](
+        {"transaction": "transaction-canary"},
+        {},
+    )
+    sanitized_log = client.options["before_send_log"](
+        {"body": "log-canary"},
+        {},
+    )
+
+    assert external_calls == ["called"] * 4
+    assert "external-hook-canary" not in str(sanitized_event)
+    assert "breadcrumb-canary" not in str(sanitized_breadcrumb)
+    assert "transaction-canary" not in str(sanitized_transaction)
+    assert "log-canary" not in str(sanitized_log)
+
+
 def test_build_sentry_init_options_builds_log_integrations_and_filters() -> None:
     captured_logging_kwargs: dict[str, int] = {}
     captured_loguru_kwargs: dict[str, int] = {}
@@ -293,6 +422,10 @@ def test_build_sentry_init_options_builds_log_integrations_and_filters() -> None
     assert before_send.func is sentry_before_send
     assert before_send.keywords == {"allow_user_context": False}
     assert options["before_breadcrumb"] is sentry_before_breadcrumb
+    before_send_transaction = options["before_send_transaction"]
+    assert isinstance(before_send_transaction, partial)
+    assert before_send_transaction.func is sentry_before_send_transaction
+    assert before_send_transaction.keywords == {"allow_user_context": False}
     assert options["before_send_log"] is sentry_before_send_log
     assert options["ignore_errors"] == list(get_ignored_sentry_exceptions())
     assert options["integrations"] == [

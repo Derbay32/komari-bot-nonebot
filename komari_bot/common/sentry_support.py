@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -128,13 +128,53 @@ def sentry_before_send_log(
     _hint: dict[str, Any],
 ) -> dict[str, Any]:
     """隐藏 Sentry Logs 正文和插值参数。"""
-    sanitized = dict(log)
+    sanitized = {
+        key: log[key]
+        for key in ("severity_number", "severity_text", "timestamp", "trace_id")
+        if key in log and isinstance(log[key], (str, int, float, bool))
+    }
     sanitized["body"] = _redacted_text_summary(
         log.get("body"),
         label="日志正文",
     )
     sanitized["attributes"] = _safe_telemetry_attributes(log.get("attributes"))
     return sanitized
+
+
+def sentry_before_send_transaction(
+    event: dict[str, Any],
+    _hint: dict[str, Any],
+    *,
+    allow_user_context: bool = False,
+) -> dict[str, Any]:
+    """净化事务、span 与请求上下文，阻止 tracing 绕过错误事件钩子。"""
+    _sanitize_event(event, allow_user_context=allow_user_context)
+
+    if "transaction" in event:
+        event["transaction"] = _redacted_text_summary(
+            event.get("transaction"),
+            label="事务名称",
+        )
+
+    transaction_info = event.get("transaction_info")
+    if isinstance(transaction_info, dict):
+        source = transaction_info.get("source")
+        event["transaction_info"] = (
+            {"source": source}
+            if source in {"component", "custom", "route", "task", "url"}
+            else {}
+        )
+
+    spans = event.get("spans")
+    if isinstance(spans, list):
+        event["spans"] = [
+            _sanitize_transaction_span(span)
+            for span in spans
+            if isinstance(span, dict)
+        ]
+
+    event.pop("measurements", None)
+    return event
 
 
 def _redacted_text_summary(value: object, *, label: str) -> str:
@@ -154,6 +194,44 @@ def _safe_telemetry_attributes(value: object) -> dict[str, Any]:
         if str(key) in _SAFE_TELEMETRY_ATTRIBUTE_KEYS
         and isinstance(item, (str, int, float, bool))
     }
+
+
+def _sanitize_transaction_span(span: dict[str, Any]) -> dict[str, Any]:
+    """仅保留 span 的低敏标识和状态，并摘要 description。"""
+    sanitized = {
+        key: span[key]
+        for key in (
+            "exclusive_time",
+            "op",
+            "origin",
+            "parent_span_id",
+            "span_id",
+            "start_timestamp",
+            "status",
+            "timestamp",
+            "trace_id",
+        )
+        if key in span and isinstance(span[key], (str, int, float, bool))
+    }
+    if "description" in span:
+        sanitized["description"] = _redacted_text_summary(
+            span.get("description"),
+            label="span 描述",
+        )
+    safe_data = _safe_telemetry_attributes(span.get("data"))
+    if safe_data:
+        sanitized["data"] = safe_data
+    tags = span.get("tags")
+    if isinstance(tags, dict):
+        safe_tags = {
+            str(key): value
+            for key, value in tags.items()
+            if str(key) in _SAFE_EVENT_TAG_KEYS
+            and isinstance(value, (str, int, float, bool))
+        }
+        if safe_tags:
+            sanitized["tags"] = safe_tags
+    return sanitized
 
 
 def _sanitize_event(
@@ -270,6 +348,111 @@ def _sanitize_event_breadcrumbs(container: object) -> None:
     ]
 
 
+def ensure_sentry_privacy_hooks(
+    client: object,
+    *,
+    allow_user_context: bool,
+) -> None:
+    """为已经初始化的 Sentry Client 合并并验证项目隐私钩子。"""
+    options = getattr(client, "options", None)
+    if not isinstance(options, dict):
+        message = "Sentry Client 未公开可验证的 options，无法安装隐私钩子"
+        raise TypeError(message)
+
+    sanitizers = {
+        "before_send": partial(
+            sentry_before_send,
+            allow_user_context=allow_user_context,
+        ),
+        "before_breadcrumb": sentry_before_breadcrumb,
+        "before_send_transaction": partial(
+            sentry_before_send_transaction,
+            allow_user_context=allow_user_context,
+        ),
+        "before_send_log": sentry_before_send_log,
+    }
+    for option_name, sanitizer in sanitizers.items():
+        existing = options.get(option_name)
+        if _contains_komari_privacy_hook(existing, option_name, sanitizer):
+            continue
+        options[option_name] = _compose_sentry_privacy_hook(
+            existing,
+            sanitizer,
+            option_name=option_name,
+        )
+
+    ignored = options.get("ignore_errors")
+    ignored_types = list(ignored) if isinstance(ignored, (list, tuple)) else []
+    for exception_type in get_ignored_sentry_exceptions():
+        if exception_type not in ignored_types:
+            ignored_types.append(exception_type)
+    options["ignore_errors"] = ignored_types
+
+    missing = [
+        option_name
+        for option_name, sanitizer in sanitizers.items()
+        if not _contains_komari_privacy_hook(
+            options.get(option_name),
+            option_name,
+            sanitizer,
+        )
+    ]
+    if missing:
+        message = f"Sentry 隐私钩子安装验证失败: {', '.join(missing)}"
+        raise RuntimeError(message)
+
+
+def _contains_komari_privacy_hook(
+    hook: object,
+    option_name: str,
+    sanitizer: object,
+) -> bool:
+    if getattr(hook, "__komari_privacy_hook__", None) == option_name:
+        return True
+    hook_function = getattr(hook, "func", hook)
+    sanitizer_function = getattr(sanitizer, "func", sanitizer)
+    return hook_function is sanitizer_function
+
+
+def _compose_sentry_privacy_hook(
+    existing: object,
+    sanitizer: object,
+    *,
+    option_name: str,
+) -> object:
+    sanitizer_hook = cast(
+        "Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None]",
+        sanitizer,
+    )
+    existing_hook = (
+        cast(
+            "Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None]",
+            existing,
+        )
+        if callable(existing)
+        else None
+    )
+
+    def _combined(
+        payload: dict[str, Any],
+        hint: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        current = payload
+        if existing_hook is not None:
+            try:
+                existing_result = existing_hook(current, hint)
+            except Exception:
+                # 外部钩子异常时故障关闭，绝不把未经净化的 payload 继续发送。
+                return None
+            if not isinstance(existing_result, dict):
+                return None
+            current = existing_result
+        return sanitizer_hook(current, hint)
+
+    _combined.__komari_privacy_hook__ = option_name  # type: ignore[attr-defined]
+    return _combined
+
+
 def build_sentry_init_options(
     *,
     config: SentryConfigProtocol,
@@ -306,6 +489,10 @@ def build_sentry_init_options(
             allow_user_context=config.send_default_pii,
         ),
         "before_breadcrumb": sentry_before_breadcrumb,
+        "before_send_transaction": partial(
+            sentry_before_send_transaction,
+            allow_user_context=config.send_default_pii,
+        ),
         "before_send_log": sentry_before_send_log,
         "ignore_errors": list(get_ignored_sentry_exceptions()),
         "integrations": [
