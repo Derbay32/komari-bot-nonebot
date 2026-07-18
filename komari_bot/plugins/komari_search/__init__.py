@@ -35,6 +35,7 @@ __all__ = [
 ]
 
 config_manager_plugin = require("config_manager")
+permission_manager_plugin = require("permission_manager")
 config_manager = config_manager_plugin.get_config_manager(
     "komari_search",
     DynamicConfigSchema,
@@ -50,6 +51,7 @@ _search_cache: dict[SearchCacheKey, tuple[float, str]] = {}
 _search_inflight: dict[SearchCacheKey, asyncio.Task[str]] = {}
 
 _SEARCH_ERROR_DISABLED = "[搜索失败：DISABLED]"
+_SEARCH_ERROR_PERMISSION = "[搜索失败：PERMISSION_DENIED]"
 _SEARCH_ERROR_CONFIG = "[搜索失败：CONFIG_ERROR]"
 _SEARCH_ERROR_INVALID_QUERY = "[搜索失败：INVALID_QUERY]"
 _SEARCH_ERROR_TIMEOUT = "[搜索失败：TIMEOUT]"
@@ -147,10 +149,46 @@ def _get_config() -> DynamicConfigSchema:
     return config.model_copy(update={"tavily_api_key": env_key})
 
 
-def is_search_available() -> bool:
-    """判断是否具备注册 search_web 工具的条件。"""
+def _is_caller_allowed(
+    config: DynamicConfigSchema,
+    *,
+    caller_user_id: str | None,
+    caller_group_id: str | None,
+    caller_is_superuser: bool,
+) -> bool:
+    """对搜索调用者执行统一动态权限检查；缺失受限上下文时默认拒绝。"""
+    if not caller_is_superuser:
+        if config.user_whitelist and not caller_user_id:
+            return False
+        if config.group_whitelist and not caller_group_id:
+            return False
+    allowed, _reason = permission_manager_plugin.check_context_permission(
+        config,
+        user_id=caller_user_id or "",
+        group_id=caller_group_id,
+        is_superuser=caller_is_superuser,
+    )
+    return bool(allowed)
+
+
+def is_search_available(
+    *,
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
+) -> bool:
+    """判断当前调用者是否具备注册 search_web 工具的条件。"""
     config = _get_config()
-    return config.search_enabled and bool(config.tavily_api_key.strip())
+    return (
+        config.search_enabled
+        and bool(config.tavily_api_key.strip())
+        and _is_caller_allowed(
+            config,
+            caller_user_id=caller_user_id,
+            caller_group_id=caller_group_id,
+            caller_is_superuser=caller_is_superuser,
+        )
+    )
 
 
 def _normalize_query(query: str) -> str:
@@ -222,10 +260,22 @@ def _get_search_precheck_error(
     config: DynamicConfigSchema,
     api_key: str,
     normalized_query: str,
+    caller_user_id: str | None,
+    caller_group_id: str | None,
+    caller_is_superuser: bool,
 ) -> str | None:
     """返回搜索调用前的配置/查询错误。"""
+    if not config.plugin_enable:
+        return _SEARCH_ERROR_DISABLED
     if not config.search_enabled:
         return _SEARCH_ERROR_DISABLED
+    if not _is_caller_allowed(
+        config,
+        caller_user_id=caller_user_id,
+        caller_group_id=caller_group_id,
+        caller_is_superuser=caller_is_superuser,
+    ):
+        return _SEARCH_ERROR_PERMISSION
     if not api_key:
         return _SEARCH_ERROR_CONFIG
     if not normalized_query:
@@ -455,6 +505,9 @@ async def search_web(
     query: str,
     *,
     request_trace_id: str | None = None,
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
 ) -> str:
     """调用 Tavily API 搜索互联网并返回格式化结果文本。"""
     config = _get_config()
@@ -470,6 +523,9 @@ async def search_web(
         config=config,
         api_key=api_key,
         normalized_query=normalized_query,
+        caller_user_id=caller_user_id,
+        caller_group_id=caller_group_id,
+        caller_is_superuser=caller_is_superuser,
     )
     if precheck_error is not None:
         return precheck_error

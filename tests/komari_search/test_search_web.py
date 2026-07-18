@@ -20,6 +20,9 @@ search_module = import_module("komari_bot.plugins.komari_search")
 class _FakeConfigManager:
     def __init__(self, **overrides: object) -> None:
         defaults: dict[str, object] = {
+            "plugin_enable": True,
+            "user_whitelist": [],
+            "group_whitelist": [],
             "search_enabled": True,
             "tavily_api_key": "token",
             "search_depth": "basic",
@@ -94,6 +97,129 @@ def test_search_resilience_config_has_safe_bounds() -> None:
         DynamicConfigSchema(search_timeout_seconds=0.5)
     with pytest.raises(ValidationError):
         DynamicConfigSchema(circuit_breaker_failure_threshold=0)
+
+
+def test_search_availability_enforces_switch_and_caller_whitelists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_search_dependencies(monkeypatch, plugin_enable=False)
+    assert search_module.is_search_available(
+        caller_user_id="1001",
+        caller_group_id="2001",
+    ) is False
+
+    _patch_search_dependencies(
+        monkeypatch,
+        user_whitelist=["1001"],
+        group_whitelist=["2001"],
+    )
+    assert search_module.is_search_available(
+        caller_user_id="1001",
+        caller_group_id="2001",
+    ) is True
+    assert search_module.is_search_available(
+        caller_user_id="1002",
+        caller_group_id="2001",
+    ) is False
+    assert search_module.is_search_available(
+        caller_user_id="1001",
+        caller_group_id="2002",
+    ) is False
+    assert search_module.is_search_available() is False
+    assert search_module.is_search_available(caller_is_superuser=True) is True
+
+
+@pytest.mark.parametrize(
+    (
+        "user_whitelist",
+        "group_whitelist",
+        "caller_user_id",
+        "caller_group_id",
+        "expected",
+    ),
+    [
+        ([], [], "1001", "2001", True),
+        (["1001"], [], "1001", "2002", True),
+        (["1001"], [], "1002", "2001", False),
+        ([], ["2001"], "1002", "2001", True),
+        ([], ["2001"], "1001", "2002", False),
+        (["1001"], ["2001"], "1001", "2001", True),
+        (["1001"], ["2001"], "1002", "2001", False),
+        (["1001"], ["2001"], "1001", "2002", False),
+    ],
+)
+def test_search_availability_whitelist_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    user_whitelist: list[str],
+    group_whitelist: list[str],
+    caller_user_id: str,
+    caller_group_id: str,
+    *,
+    expected: bool,
+) -> None:
+    _patch_search_dependencies(
+        monkeypatch,
+        user_whitelist=user_whitelist,
+        group_whitelist=group_whitelist,
+    )
+
+    assert search_module.is_search_available(
+        caller_user_id=caller_user_id,
+        caller_group_id=caller_group_id,
+    ) is expected
+
+
+@pytest.mark.asyncio
+async def test_search_web_denies_missing_or_disallowed_caller_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_search_dependencies(
+        monkeypatch,
+        user_whitelist=["1001"],
+        group_whitelist=["2001"],
+    )
+
+    missing = await search_module.search_web("今日新闻")
+    wrong_user = await search_module.search_web(
+        "今日新闻",
+        caller_user_id="1002",
+        caller_group_id="2001",
+    )
+    wrong_group = await search_module.search_web(
+        "今日新闻",
+        caller_user_id="1001",
+        caller_group_id="2002",
+    )
+
+    assert missing == "[搜索失败：PERMISSION_DENIED]"
+    assert wrong_user == "[搜索失败：PERMISSION_DENIED]"
+    assert wrong_group == "[搜索失败：PERMISSION_DENIED]"
+    assert _FakeTavilyClient.attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_search_web_allows_authenticated_context_and_superuser_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_search_dependencies(
+        monkeypatch,
+        user_whitelist=["1001"],
+        group_whitelist=["2001"],
+    )
+
+    allowed = await search_module.search_web(
+        "普通调用",
+        caller_user_id="1001",
+        caller_group_id="2001",
+    )
+    superuser = await search_module.search_web(
+        "超级用户调用",
+        caller_is_superuser=True,
+    )
+
+    assert "搜索结果" in allowed
+    assert "搜索结果" in superuser
+    assert _FakeTavilyClient.attempts == 2
 
 
 @pytest.mark.asyncio
