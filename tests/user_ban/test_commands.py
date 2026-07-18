@@ -10,6 +10,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
 from nonebot.adapters.onebot.v11.event import Sender
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.plugins.user_ban.models import (
     BanMutationResult,
     BanRecord,
@@ -112,8 +113,10 @@ async def test_superuser_can_ban_chat_scope_with_legacy_format(
         ctx.should_pass_rule(matcher=commands_module.ban_matcher)
         ctx.should_call_send(
             event,
-            "✅ 用户 10086 的聊天回复权限已封禁。\n"
-            "当前状态：chat\n私信：已发送",
+            plain_text_message(
+                "✅ 用户 10086 的聊天回复权限已封禁。\n"
+                "当前状态：chat\n私信：已发送"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -150,8 +153,10 @@ async def test_superuser_can_set_duration_and_reason(
         ctx.should_pass_rule(matcher=commands_module.ban_matcher)
         ctx.should_call_send(
             event,
-            "✅ 用户 10086 的聊天回复权限已封禁。\n"
-            "当前状态：chat\n私信：已发送",
+            plain_text_message(
+                "✅ 用户 10086 的聊天回复权限已封禁。\n"
+                "当前状态：chat\n私信：已发送"
+            ),
             bot=bot,
         )
         ctx.should_finished()

@@ -8,7 +8,7 @@ from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -49,7 +49,7 @@ class DatabaseConfigSchema(BaseModel):
         description="数据库密码",
     )
     pg_pool_min_size: int = Field(
-        default=2,
+        default=1,
         ge=1,
         le=10,
         validation_alias=AliasChoices("pg_pool_min_size", "PG_POOL_MIN_SIZE"),
@@ -61,6 +61,16 @@ class DatabaseConfigSchema(BaseModel):
         le=50,
         validation_alias=AliasChoices("pg_pool_max_size", "PG_POOL_MAX_SIZE"),
         description="PostgreSQL 连接池最大连接数",
+    )
+    pg_pool_process_budget: int = Field(
+        default=20,
+        ge=1,
+        le=500,
+        validation_alias=AliasChoices(
+            "pg_pool_process_budget",
+            "PG_POOL_PROCESS_BUDGET",
+        ),
+        description="单进程所有物理 PostgreSQL 池的最大连接数预算",
     )
 
     redis_host: str = Field(
@@ -78,6 +88,17 @@ class DatabaseConfigSchema(BaseModel):
         validation_alias=AliasChoices("redis_password", "REDIS_PASSWORD"),
         description="Redis 密码（空字符串表示无密码）",
     )
+
+    @model_validator(mode="after")
+    def validate_pool_budget(self) -> "DatabaseConfigSchema":
+        """拒绝单池范围和进程预算互相矛盾的配置。"""
+        if self.pg_pool_min_size > self.pg_pool_max_size:
+            message = "pg_pool_min_size 不能大于 pg_pool_max_size"
+            raise ValueError(message)
+        if self.pg_pool_max_size > self.pg_pool_process_budget:
+            message = "pg_pool_max_size 不能大于 pg_pool_process_budget"
+            raise ValueError(message)
+        return self
 
 
 def load_database_config_from_file(config_path: "Path") -> DatabaseConfigSchema:
@@ -103,6 +124,7 @@ def load_database_config_from_env() -> DatabaseConfigSchema:
         "PG_PASSWORD",
         "PG_POOL_MIN_SIZE",
         "PG_POOL_MAX_SIZE",
+        "PG_POOL_PROCESS_BUDGET",
         "REDIS_HOST",
         "REDIS_PORT",
         "REDIS_PASSWORD",
@@ -121,8 +143,12 @@ def get_shared_database_config() -> DatabaseConfigSchema:
     直接读取进程环境变量。两种路径都不会访问 ``database_config.json``。
     """
     try:
-        from nonebot import get_plugin_config
-
-        return get_plugin_config(DatabaseConfigSchema)
-    except Exception:
+        from nonebot import get_driver, get_plugin_config
+    except ImportError:
         return load_database_config_from_env()
+
+    try:
+        get_driver()
+    except ValueError:
+        return load_database_config_from_env()
+    return get_plugin_config(DatabaseConfigSchema)

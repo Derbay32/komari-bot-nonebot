@@ -9,7 +9,12 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.plugins.character_binding.manager import (
+    BindingPersistenceError,
+    CharacterBindingManager,
+    CharacterNameValidationError,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -113,6 +118,85 @@ def test_parse_self_bind_set_request_always_targets_self(
 
 
 @pytest.mark.asyncio
+async def test_handle_set_reports_validation_failure(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager()
+
+    async def reject_name(_user_id: str, _character_name: str) -> None:
+        raise CharacterNameValidationError("角色名不能包含换行或控制字符")
+
+    monkeypatch.setattr(manager, "set_character_name", reject_name)
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_set) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind set 角色名")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_set)
+        ctx.should_pass_rule(matcher=commands_module.bind_set)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 角色名不能包含换行或控制字符"),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_set_reports_persistence_failure(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager()
+
+    async def fail_to_save(_user_id: str, _character_name: str) -> None:
+        raise BindingPersistenceError("角色绑定保存失败")
+
+    monkeypatch.setattr(manager, "set_character_name", fail_to_save)
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_set) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind set 泉此方")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_set)
+        ctx.should_pass_rule(matcher=commands_module.bind_set)
+        ctx.should_call_send(event, "❌ 角色绑定保存失败，请稍后重试", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_delete_reports_persistence_failure(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager({"42": "泉此方"})
+
+    async def fail_to_delete(_user_id: str) -> bool:
+        raise BindingPersistenceError("角色绑定保存失败")
+
+    monkeypatch.setattr(manager, "remove_character_name", fail_to_delete)
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_del) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind del")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_del)
+        ctx.should_pass_rule(matcher=commands_module.bind_del)
+        ctx.should_call_send(event, "❌ 角色绑定删除失败，请稍后重试", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
 async def test_handle_list_only_returns_current_user_binding_with_nonebug(
     app: App,
     commands_module: Any,
@@ -128,7 +212,35 @@ async def test_handle_list_only_returns_current_user_binding_with_nonebug(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_list)
         ctx.should_pass_rule(matcher=commands_module.bind_list)
-        ctx.should_call_send(event, "📋 您的角色绑定: 泉此方", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 您的角色绑定: 泉此方"),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_list_treats_stored_cq_code_as_plain_text(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager({"42": "[CQ:at,qq=all]"})
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_list) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind list")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_list)
+        ctx.should_pass_rule(matcher=commands_module.bind_list)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 您的角色绑定: [CQ:at,qq=all]"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 

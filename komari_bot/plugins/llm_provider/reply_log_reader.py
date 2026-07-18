@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable  # noqa: TC003
 from datetime import datetime, timedelta
 from pathlib import Path  # noqa: TC003
@@ -11,9 +12,10 @@ from typing import Any
 
 from nonebot import logger
 
-from .llm_logger import _LOG_DIR
+from komari_bot.common.llm_log_safety import sanitize_persisted_log_record
 
-_PREVIEW_LIMIT = 240
+from .llm_logger import _LOG_DIR, flush_llm_logs
+from .reply_log_index import LogReference, ReplyLogIndex
 
 
 class ReplyLogReader:
@@ -27,6 +29,7 @@ class ReplyLogReader:
     ) -> None:
         self._log_dir = log_dir or _LOG_DIR
         self._now_factory = now_factory or (lambda: datetime.now().astimezone())
+        self._index = ReplyLogIndex(self._log_dir)
 
     async def list_logs(
         self,
@@ -40,7 +43,8 @@ class ReplyLogReader:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """分页扫描 reply 日志摘要。"""
+        """通过轻量索引分页读取 reply 日志摘要。"""
+        await flush_llm_logs()
         return await asyncio.to_thread(
             self._list_logs_sync,
             date=date,
@@ -59,7 +63,8 @@ class ReplyLogReader:
         date: str,
         line_number: int,
     ) -> dict[str, Any] | None:
-        """按日期与行号读取完整日志。"""
+        """按日期与行号读取脱敏日志详情。"""
+        await flush_llm_logs()
         return await asyncio.to_thread(
             self._get_log_sync,
             date=date,
@@ -79,39 +84,27 @@ class ReplyLogReader:
         offset: int,
     ) -> tuple[list[dict[str, Any]], int]:
         candidates = self._resolve_candidate_files(date=date, days=days)
-        items: list[dict[str, Any]] = []
-        for log_date, log_file in candidates:
-            if not log_file.exists():
-                continue
-            with log_file.open(encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    entry = self._parse_log_line(
-                        date=log_date,
-                        line_number=line_number,
-                        line=line,
-                    )
-                    if entry is None:
-                        continue
-                    if trace_id and entry.get("trace_id") != trace_id:
-                        continue
-                    if model and entry.get("model") != model:
-                        continue
-                    if method and entry.get("method") != method:
-                        continue
-                    if status and entry.get("status") != status:
-                        continue
-                    items.append(entry)
+        existing = [item for item in candidates if item[1].exists()]
 
-        items.sort(
-            key=lambda item: (
-                str(item.get("timestamp", "")),
-                str(item.get("date", "")),
-                int(item.get("line_number", 0)),
-            ),
-            reverse=True,
-        )
-        total = len(items)
-        return items[offset : offset + limit], total
+        def _query_index() -> tuple[list[LogReference], int]:
+            self._index.sync_files(existing)
+            return self._index.list_references(
+                dates=[log_date for log_date, _ in existing],
+                trace_id=trace_id,
+                model=model,
+                method=method,
+                status=status,
+                limit=limit,
+                offset=offset,
+            )
+
+        references, total = self._with_index_recovery(_query_index)
+        items = [
+            entry
+            for reference in references
+            if (entry := self._read_reference(reference)) is not None
+        ]
+        return items, total
 
     def _get_log_sync(
         self,
@@ -123,23 +116,20 @@ class ReplyLogReader:
         if not log_file.exists():
             return None
 
-        with log_file.open(encoding="utf-8") as handle:
-            for current_line_number, line in enumerate(handle, start=1):
-                if current_line_number != line_number:
-                    continue
-                raw_record = self._parse_json_line(
-                    date=date,
-                    line_number=current_line_number,
-                    line=line,
-                )
-                if raw_record is None:
-                    return None
-                return self._build_detail_entry(
-                    date=date,
-                    line_number=current_line_number,
-                    record=raw_record,
-                )
-        return None
+        def _query_index() -> LogReference | None:
+            self._index.sync_files([(date, log_file)])
+            return self._index.get_reference(date=date, line_number=line_number)
+
+        reference = self._with_index_recovery(_query_index)
+        return self._read_reference(reference) if reference is not None else None
+
+    def _with_index_recovery[T](self, operation: Callable[[], T]) -> T:
+        try:
+            return operation()
+        except sqlite3.DatabaseError:
+            logger.warning("[LLM Provider] 回复日志索引损坏，正在自动重建")
+            self._index.reset()
+            return operation()
 
     def _resolve_candidate_files(
         self,
@@ -173,19 +163,30 @@ class ReplyLogReader:
     def _parse_date(self, value: str) -> datetime:
         return datetime.strptime(value, "%Y-%m-%d")  # noqa: DTZ007
 
-    def _parse_log_line(
-        self,
-        *,
-        date: str,
-        line_number: int,
-        line: str,
-    ) -> dict[str, Any] | None:
-        record = self._parse_json_line(date=date, line_number=line_number, line=line)
+    def _read_reference(self, reference: LogReference) -> dict[str, Any] | None:
+        log_file = self._resolve_log_file(reference.date)
+        try:
+            with log_file.open("rb") as handle:
+                handle.seek(reference.byte_offset)
+                raw_line = handle.read(reference.byte_length)
+            line = raw_line.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            logger.warning(
+                "[LLM Provider] 回复日志定位读取失败: date={} line={}",
+                reference.date,
+                reference.line_number,
+            )
+            return None
+        record = self._parse_json_line(
+            date=reference.date,
+            line_number=reference.line_number,
+            line=line,
+        )
         if record is None:
             return None
         return self._build_summary_entry(
-            date=date,
-            line_number=line_number,
+            date=reference.date,
+            line_number=reference.line_number,
             record=record,
         )
 
@@ -213,7 +214,7 @@ class ReplyLogReader:
                 line_number,
             )
             return None
-        return record
+        return sanitize_persisted_log_record(record)
 
     def _build_summary_entry(
         self,
@@ -222,59 +223,22 @@ class ReplyLogReader:
         line_number: int,
         record: dict[str, Any],
     ) -> dict[str, Any]:
-        input_data = record.get("input")
-        trace_id = ""
-        phase = ""
-        if isinstance(input_data, dict):
-            trace_id = str(input_data.get("trace_id", "")).strip()
-            phase = str(input_data.get("phase", "")).strip()
-
-        error_text = str(record.get("error", "")).strip()
-        output_text = record.get("output")
         return {
             "date": date,
             "line_number": line_number,
+            "schema_version": int(record.get("schema_version", 2)),
             "timestamp": str(record.get("timestamp", "")).strip(),
             "method": str(record.get("method", "")).strip(),
             "model": str(record.get("model", "")).strip(),
-            "trace_id": trace_id,
-            "phase": phase,
+            "trace_id": str(record.get("trace_id", "")).strip(),
+            "phase": str(record.get("phase", "")).strip(),
             "duration_ms": record.get("duration_ms"),
-            "status": "error" if error_text else "success",
-            "input_preview": self._build_preview(input_data),
-            "output_preview": self._build_preview(output_text),
-            "reasoning_content_preview": self._build_preview(
-                record.get("reasoning_content")
-            ),
-            "error_preview": self._build_preview(error_text),
+            "status": record.get("status", "success"),
+            "finish_reason": record.get("finish_reason"),
+            "tool_calls_count": record.get("tool_calls_count"),
+            "reasoning_chars": int(record.get("reasoning_chars", 0)),
+            "input_summary": record.get("input_summary", {}),
+            "output_summary": record.get("output_summary"),
+            "error_summary": record.get("error_summary"),
+            "usage": record.get("usage"),
         }
-
-    def _build_detail_entry(
-        self,
-        *,
-        date: str,
-        line_number: int,
-        record: dict[str, Any],
-    ) -> dict[str, Any]:
-        summary = self._build_summary_entry(
-            date=date,
-            line_number=line_number,
-            record=record,
-        )
-        summary["input"] = record.get("input")
-        summary["output"] = record.get("output")
-        summary["reasoning_content"] = record.get("reasoning_content")
-        summary["error"] = record.get("error")
-        return summary
-
-    def _build_preview(self, value: Any) -> str:
-        if value in (None, ""):
-            return ""
-        if isinstance(value, str):
-            text = value
-        else:
-            text = json.dumps(value, ensure_ascii=False)
-        text = " ".join(text.split())
-        if len(text) <= _PREVIEW_LIMIT:
-            return text
-        return f"{text[:_PREVIEW_LIMIT]}..."

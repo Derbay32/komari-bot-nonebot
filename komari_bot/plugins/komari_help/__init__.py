@@ -13,7 +13,7 @@ from .api import register_help_api
 from .config_schema import DynamicConfigSchema
 from .engine import UNSET, HelpEngine, get_engine, initialize_engine
 from .models import HelpCategory, HelpEntry, HelpListResponse, HelpSearchResult
-from .scanner import scan_and_sync
+from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 
 config_manager_plugin = require("config_manager")
 try:
@@ -76,10 +76,16 @@ if driver is not None:
         try:
             engine = await initialize_engine()
             if config.auto_scan_on_startup:
-                updated_count = await scan_and_sync(engine)
-                logger.info(
-                    f"[Komari Help] 启动扫描完成，同步 {updated_count} 条帮助条目"
-                )
+                try:
+                    updated_count = await scan_and_sync(engine)
+                except HelpScanAlreadyRunningError:
+                    logger.info(
+                        "[Komari Help] 其他 worker 正在执行启动扫描，本 worker 跳过"
+                    )
+                else:
+                    logger.info(
+                        f"[Komari Help] 启动扫描完成，同步 {updated_count} 条帮助条目"
+                    )
             logger.info("[Komari Help] 插件启动完成")
         except Exception as exc:
             logger.error(f"[Komari Help] 初始化失败: {exc}")

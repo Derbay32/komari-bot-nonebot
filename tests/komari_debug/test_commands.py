@@ -377,7 +377,7 @@ async def test_reply_empty_content(app: App, debug_commands: Any) -> None:
         ctx.should_pass_rule(matcher=debug_commands.debug_reply)
         ctx.should_call_send(
             event,
-            "❌ 请提供测试文本\n用法: .debug reply <测试文本>",
+            "❌ 请提供测试文本\n用法: .debug reply [--public] <测试文本>",
             bot=bot,
         )
         ctx.should_finished()
@@ -394,7 +394,7 @@ async def test_summary_empty_content(app: App, debug_commands: Any) -> None:
         ctx.should_pass_rule(matcher=debug_commands.debug_summary)
         ctx.should_call_send(
             event,
-            "❌ 请提供总结要求\n用法: .debug summary <总结要求>",
+            "❌ 请提供总结要求\n用法: .debug summary [--public] <总结要求>",
             bot=bot,
         )
         ctx.should_finished()
@@ -635,6 +635,18 @@ def test_parse_favor_value_invalid(debug_commands: Any) -> None:
     assert debug_commands._parse_favor_value("401") is None
     assert debug_commands._parse_favor_value("abc") is None
     assert debug_commands._parse_favor_value("") is None
+
+
+def test_extract_public_flag_only_consumes_leading_flag(debug_commands: Any) -> None:
+    assert debug_commands._extract_public_flag("--public 私密输入") == (
+        True,
+        "私密输入",
+    )
+    assert debug_commands._extract_public_flag("--public") == (True, "")
+    assert debug_commands._extract_public_flag("内容 --public") == (
+        False,
+        "内容 --public",
+    )
 
 
 def test_reply_context_extracts_message_text_and_images(debug_commands: Any) -> None:

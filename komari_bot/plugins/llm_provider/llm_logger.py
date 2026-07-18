@@ -1,6 +1,6 @@
 """LLM Provider 调用日志记录器。
 
-按天记录每次 LLM 调用的完整输入与输出，JSONL 格式，并按动态配置自动清理过期日志。
+按天记录脱敏后的调用元数据，禁止持久化 prompt、消息正文、模型输出和推理正文。
 """
 
 from __future__ import annotations
@@ -9,14 +9,31 @@ import asyncio
 import json
 import random
 import time
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.plugin import require
 
+from komari_bot.common.llm_log_safety import (
+    build_content_summary,
+    sanitize_persisted_log_record,
+    scrub_log_directory,
+)
+
 from .config_schema import DynamicConfigSchema
+from .reply_log_index import ReplyLogIndex
+
+__all__ = [
+    "build_content_summary",
+    "flush_llm_logs",
+    "log_llm_call",
+    "scrub_legacy_logs",
+    "shutdown_llm_logging",
+]
 
 if TYPE_CHECKING:
     from .base_client import UnifiedUsageSchema
@@ -26,6 +43,10 @@ _LOG_DIR = Path("logs") / "llm_provider"
 
 # 写入锁（防止并发写入文件损坏）
 _write_lock = asyncio.Lock()
+
+# 日志队列只允许占用有限内存；满载时聊天主流程优先于低价值元数据
+_LOG_QUEUE_MAX_SIZE = 1024
+_LOG_WRITE_BATCH_SIZE = 64
 
 # 安全回退日志保留天数
 _FALLBACK_RETENTION_DAYS = 30
@@ -49,6 +70,122 @@ class _LogDirEnsureState:
 
 
 _log_dir_ensure_state = _LogDirEnsureState()
+
+
+@dataclass(frozen=True, slots=True)
+class _LogWriteItem:
+    log_file: Path
+    line: str
+    permission_mode: str
+
+
+class _AsyncLogWriter:
+    """按事件循环懒启动的有界后台日志写入器。"""
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._queue: asyncio.Queue[_LogWriteItem | None] | None = None
+        self._worker: asyncio.Task[None] | None = None
+        self._dropped_count = 0
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped_count
+
+    def enqueue(self, item: _LogWriteItem) -> bool:
+        queue = self._ensure_worker()
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._dropped_count += 1
+            if (
+                self._dropped_count == 1
+                or self._dropped_count & (self._dropped_count - 1) == 0
+            ):
+                logger.warning(
+                    "[LLM Provider] 日志队列已满，累计丢弃 {} 条元数据日志",
+                    self._dropped_count,
+                )
+            return False
+        return True
+
+    async def flush(self) -> None:
+        """等待当前事件循环已接收的日志全部写入。"""
+        if self._queue is None or self._loop is not asyncio.get_running_loop():
+            return
+        await self._queue.join()
+
+    async def shutdown(self) -> None:
+        """排空队列并停止当前事件循环的 writer。"""
+        if self._queue is None or self._loop is not asyncio.get_running_loop():
+            return
+        await self.flush()
+        self._queue.put_nowait(None)
+        worker = self._worker
+        if worker is not None:
+            await worker
+        self._queue = None
+        self._worker = None
+        self._loop = None
+
+    def _ensure_worker(self) -> asyncio.Queue[_LogWriteItem | None]:
+        loop = asyncio.get_running_loop()
+        if self._loop is loop and self._queue is not None:
+            return self._queue
+
+        if self._queue is not None and not self._queue.empty():
+            abandoned = self._queue.qsize()
+            self._dropped_count += abandoned
+            logger.warning(
+                "[LLM Provider] 事件循环已替换，丢弃 {} 条未落盘日志",
+                abandoned,
+            )
+
+        self._loop = loop
+        self._queue = asyncio.Queue(maxsize=_LOG_QUEUE_MAX_SIZE)
+        self._worker = loop.create_task(
+            self._run(self._queue),
+            name="llm-provider-log-writer",
+        )
+        return self._queue
+
+    async def _run(self, queue: asyncio.Queue[_LogWriteItem | None]) -> None:
+        while True:
+            first = await queue.get()
+            if first is None:
+                queue.task_done()
+                return
+
+            batch = [first]
+            while len(batch) < _LOG_WRITE_BATCH_SIZE:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item is None:
+                    queue.task_done()
+                    break
+                batch.append(item)
+
+            try:
+                async with _write_lock:
+                    await asyncio.to_thread(_write_log_batch_sync, batch)
+            except Exception:
+                logger.warning("[LLM Provider] 后台日志写入失败", exc_info=True)
+            finally:
+                for _ in batch:
+                    queue.task_done()
+
+
+_log_writer = _AsyncLogWriter()
+
+
+class _CleanupState:
+    def __init__(self) -> None:
+        self.task: asyncio.Task[None] | None = None
+
+
+_cleanup_state = _CleanupState()
 
 
 def _get_runtime_config() -> DynamicConfigSchema:
@@ -102,84 +239,129 @@ def _parse_permission_mode(mode: str) -> int | None:
         logger.warning("[LLM Provider] 日志目录权限模式无效，已跳过 chmod: {}", mode)
         return None
     if parsed_mode < 0 or parsed_mode > 0o7777:
-        logger.warning("[LLM Provider] 日志目录权限模式超出范围，已跳过 chmod: {}", mode)
+        logger.warning(
+            "[LLM Provider] 日志目录权限模式超出范围，已跳过 chmod: {}", mode
+        )
         return None
     return parsed_mode
 
 
-def _ensure_private_log_dir() -> None:
+def _ensure_private_log_dir(log_dir: Path, permission_mode_value: str) -> None:
     """确保 LLM JSONL 日志目录存在，并按配置收敛权限。"""
     now = time.monotonic()
     if (
-        _log_dir_ensure_state.last_ensured_log_dir == _LOG_DIR
+        _log_dir_ensure_state.last_ensured_log_dir == log_dir
         and now - _log_dir_ensure_state.last_log_dir_ensure_at
         < _LOG_DIR_ENSURE_INTERVAL_SECONDS
     ):
         return
 
-    permission_mode = _parse_permission_mode(_get_log_dir_permission_mode())
+    permission_mode = _parse_permission_mode(permission_mode_value)
     mkdir_mode = permission_mode if permission_mode is not None else 0o777
 
-    _LOG_DIR.mkdir(mode=mkdir_mode, parents=True, exist_ok=True)
+    log_dir.mkdir(mode=mkdir_mode, parents=True, exist_ok=True)
 
-    _log_dir_ensure_state.last_ensured_log_dir = _LOG_DIR
+    _log_dir_ensure_state.last_ensured_log_dir = log_dir
     _log_dir_ensure_state.last_log_dir_ensure_at = now
 
     if permission_mode is None:
         return
 
     try:
-        current_mode = _LOG_DIR.stat().st_mode & 0o7777
+        current_mode = log_dir.stat().st_mode & 0o7777
         if current_mode != permission_mode:
-            _LOG_DIR.chmod(permission_mode)
+            log_dir.chmod(permission_mode)
     except OSError:
         logger.warning("[LLM Provider] 日志目录权限收敛失败", exc_info=True)
+
+
+def _write_log_batch_sync(batch: list[_LogWriteItem]) -> None:
+    """在线程中批量追加 JSONL，并同步轻量分页索引。"""
+    grouped: dict[Path, list[_LogWriteItem]] = defaultdict(list)
+    for item in batch:
+        grouped[item.log_file].append(item)
+
+    for log_file, items in grouped.items():
+        _ensure_private_log_dir(log_file.parent, items[-1].permission_mode)
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.writelines(item.line for item in items)
+        ReplyLogIndex(log_file.parent).sync_files([(log_file.stem, log_file)])
+
+
+async def flush_llm_logs() -> None:
+    """等待后台日志落盘，供关闭流程与强一致读取使用。"""
+    await _log_writer.flush()
+
+
+async def shutdown_llm_logging() -> None:
+    """关闭后台日志 writer。"""
+    await _log_writer.shutdown()
+
+
+async def scrub_legacy_logs() -> int:
+    """原地移除历史 JSONL 中的正文和 reasoning。"""
+    if not _LOG_DIR.exists():
+        return 0
+    await flush_llm_logs()
+    async with _write_lock:
+        scrubbed = await asyncio.to_thread(scrub_log_directory, _LOG_DIR)
+    if scrubbed:
+        logger.warning("[LLM Provider] 已净化 {} 个历史调用日志文件", scrubbed)
+    return scrubbed
 
 
 async def log_llm_call(
     *,
     method: str,
     model: str,
-    input_data: dict | list | str,
+    input_data: object,
     output: str | None = None,
-    reasoning_content: str | None = None,
+    reasoning_chars: int = 0,
+    finish_reason: str | None = None,
+    tool_calls_count: int | None = None,
     error: str | None = None,
+    error_type: str | None = None,
     duration_ms: float | None = None,
     usage: "UnifiedUsageSchema | None" = None,
 ) -> None:
-    """记录一次 LLM 调用的输入与输出。
+    """仅记录一次 LLM 调用的安全元数据。
 
     Args:
         method: 调用方法名（generate_text / generate_text_with_messages）
         model: 模型名称
-        input_data: 输入内容（messages 列表、prompt 字符串或结构化字典）
-        output: LLM 返回的文本（成功时）
-        reasoning_content: LLM 返回的推理内容（成功时）
-        error: 错误信息（失败时）
+        input_data: 输入摘要；即使误传正文，落盘前也只保留哈希和安全字段
+        output: LLM 返回文本，仅用于计算长度和哈希
+        reasoning_chars: 推理正文字符数，正文不得传入记录器
+        finish_reason: LLM 完成原因
+        tool_calls_count: 工具调用数量
+        error: 错误文本，仅用于计算长度和哈希
+        error_type: 异常类型名
         duration_ms: 调用耗时（毫秒）
         usage: 后端实际返回的统一用量信息（仅写入已报告字段）
     """
     try:
-        _ensure_private_log_dir()
-
         now = datetime.now().astimezone()
         today = now.strftime("%Y-%m-%d")
         log_file = _LOG_DIR / f"{today}.jsonl"
 
-        record = {
+        raw_record: dict[str, Any] = {
             "timestamp": now.isoformat(),
             "method": method,
             "model": model,
             "input": input_data,
+            "reasoning_chars": max(0, reasoning_chars),
         }
         if output is not None:
-            record["output"] = output
-        if reasoning_content is not None:
-            record["reasoning_content"] = reasoning_content
+            raw_record["output"] = output
+        if finish_reason is not None:
+            raw_record["finish_reason"] = finish_reason
+        if tool_calls_count is not None:
+            raw_record["tool_calls_count"] = max(0, tool_calls_count)
         if error is not None:
-            record["error"] = error
+            raw_record["error"] = error
+            raw_record["error_type"] = error_type or "Exception"
         if duration_ms is not None:
-            record["duration_ms"] = round(duration_ms, 2)
+            raw_record["duration_ms"] = round(duration_ms, 2)
 
         # 仅写入后端已报告的 usage 字段，None 不写入 JSONL
         if usage is not None:
@@ -197,19 +379,28 @@ async def log_llm_call(
             if usage.total_tokens is not None:
                 usage_data["total_tokens"] = usage.total_tokens
             if usage_data:
-                record["usage"] = usage_data
+                raw_record["usage"] = usage_data
 
+        record = sanitize_persisted_log_record(raw_record)
         line = json.dumps(record, ensure_ascii=False) + "\n"
 
-        async with _write_lock:
-            with log_file.open("a", encoding="utf-8") as f:
-                f.write(line)
-
-        logger.debug("[LLM Provider] 日志已记录: method={}, model={}", method, model)
+        queued = _log_writer.enqueue(
+            _LogWriteItem(
+                log_file=log_file,
+                line=line,
+                permission_mode=_get_log_dir_permission_mode(),
+            )
+        )
+        if queued:
+            logger.debug(
+                "[LLM Provider] 日志已进入写入队列: method={}, model={}",
+                method,
+                model,
+            )
 
         # 概率触发清理
         if random.random() < _CLEANUP_PROBABILITY:
-            await cleanup_old_logs()
+            _schedule_cleanup()
 
     except Exception:
         logger.warning("[LLM Provider] 日志写入失败", exc_info=True)
@@ -225,21 +416,40 @@ async def cleanup_old_logs(retention_days: int | None = None) -> None:
         if retention_days is None:
             retention_days = _get_retention_days()
 
-        if not _LOG_DIR.exists():
-            return
-
-        cutoff = datetime.now().astimezone() - timedelta(days=retention_days)
-        cutoff_str = cutoff.strftime("%Y-%m-%d")
-        removed = 0
-
-        for log_file in _LOG_DIR.glob("*.jsonl"):
-            # 文件名格式: YYYY-MM-DD.jsonl
-            date_str = log_file.stem
-            if date_str < cutoff_str:
-                log_file.unlink()
-                removed += 1
+        await flush_llm_logs()
+        async with _write_lock:
+            removed = await asyncio.to_thread(
+                _cleanup_old_logs_sync,
+                retention_days,
+            )
 
         if removed > 0:
             logger.info("[LLM Provider] 已清理 {} 个过期日志文件", removed)
     except Exception:
         logger.warning("[LLM Provider] 日志清理失败", exc_info=True)
+
+
+def _cleanup_old_logs_sync(retention_days: int) -> int:
+    if not _LOG_DIR.exists():
+        return 0
+
+    cutoff = datetime.now().astimezone() - timedelta(days=retention_days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+    removed_dates: list[str] = []
+    for log_file in _LOG_DIR.glob("*.jsonl"):
+        date_str = log_file.stem
+        if date_str < cutoff_str:
+            log_file.unlink()
+            removed_dates.append(date_str)
+
+    ReplyLogIndex(_LOG_DIR).delete_dates(removed_dates)
+    return len(removed_dates)
+
+
+def _schedule_cleanup() -> None:
+    if _cleanup_state.task is not None and not _cleanup_state.task.done():
+        return
+    _cleanup_state.task = asyncio.create_task(
+        cleanup_old_logs(),
+        name="llm-provider-log-cleanup",
+    )

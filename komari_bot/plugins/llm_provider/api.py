@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette import status
 
 from komari_bot.common.management_api import (
@@ -15,6 +15,8 @@ from komari_bot.common.management_api import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from komari_bot.common.management_api import ManagementTokenSource
 
 API_PREFIX = "/api/llm-provider/v1"
 
@@ -48,6 +50,7 @@ class ReplyLogListItem(BaseModel):
 
     date: str
     line_number: int
+    schema_version: int = 2
     timestamp: str
     method: str
     model: str
@@ -55,10 +58,13 @@ class ReplyLogListItem(BaseModel):
     phase: str = ""
     duration_ms: float | None = None
     status: Literal["success", "error"]
-    input_preview: str = ""
-    output_preview: str = ""
-    reasoning_content_preview: str = ""
-    error_preview: str = ""
+    finish_reason: str | None = None
+    tool_calls_count: int | None = None
+    reasoning_chars: int = 0
+    input_summary: dict[str, Any] = Field(default_factory=dict)
+    output_summary: dict[str, Any] | None = None
+    error_summary: dict[str, Any] | None = None
+    usage: dict[str, int] | None = None
 
 
 class ReplyLogListResponse(BaseModel):
@@ -71,12 +77,7 @@ class ReplyLogListResponse(BaseModel):
 
 
 class ReplyLogDetail(ReplyLogListItem):
-    """reply 日志详情。"""
-
-    input: Any = None
-    output: str | None = None
-    reasoning_content: str | None = None
-    error: str | None = None
+    """reply 日志详情，仅包含脱敏元数据。"""
 
 
 def _validation_error(message: str) -> HTTPException:
@@ -99,13 +100,14 @@ def _reply_log_not_found(date: str, line_number: int) -> HTTPException:
 
 def create_llm_provider_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     reader_getter: Callable[[], ReplyLogReaderProtocol | None],
 ) -> APIRouter:
     """创建 llm_provider reply 日志路由。"""
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 LLM Provider 管理接口",
+        required_permission="llm_logs:read",
     )
 
     def _get_reader() -> ReplyLogReaderProtocol:
@@ -180,7 +182,7 @@ def create_llm_provider_router(
 def register_llm_provider_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     reader_getter: Callable[[], ReplyLogReaderProtocol | None],
 ) -> None:

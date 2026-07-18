@@ -33,6 +33,24 @@ class DynamicConfigSchema(BaseModel):
         le=1000,
         description="每条搜索结果正文截断长度",
     )
+    search_timeout_seconds: float = Field(
+        default=12.0,
+        ge=1.0,
+        le=60.0,
+        description="联网搜索排队与请求共享的业务截止时间（秒）",
+    )
+    circuit_breaker_failure_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="连续失败多少次后暂时熔断搜索服务",
+    )
+    circuit_breaker_recovery_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+        description="搜索服务熔断后的探测等待时间（秒）",
+    )
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod

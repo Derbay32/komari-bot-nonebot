@@ -154,6 +154,16 @@ class NotificationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpiredBanNotification:
+    """从持久 outbox 领取的一条自然解封通知。"""
+
+    notification_id: str
+    user_id: str
+    records: tuple[BanRecord, ...]
+    attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class BanListPage:
     """用户封禁分页结果。"""
 

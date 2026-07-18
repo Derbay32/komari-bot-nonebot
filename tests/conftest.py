@@ -9,12 +9,19 @@ from types import SimpleNamespace
 from typing import Any, Protocol, cast
 
 import nonebot.plugin
-from nonebug import NONEBOT_INIT_KWARGS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from komari_bot.common.nonebot_compat import (
+    install_nonebot_forwardref_compatibility,
+)
+
+install_nonebot_forwardref_compatibility()
+
+from nonebug import NONEBOT_INIT_KWARGS
 
 
 class _PytestConfigWithStash(Protocol):
@@ -91,6 +98,9 @@ class _DummyConfigManager:
             llm_temperature=1.0,
             llm_max_tokens=8192,
         )
+
+    async def get_async(self) -> object:
+        return self.get()
 
 
 class _DummyConfigManagerPlugin:
@@ -176,6 +186,26 @@ class _DummyUserDataPlugin:
 
 
 class _DummyPermissionManagerPlugin:
+    @staticmethod
+    def check_context_permission(
+        config: object,
+        *,
+        user_id: str,
+        group_id: str | None,
+        is_superuser: bool = False,
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "plugin_enable", True)):
+            return False, "插件当前已禁用"
+        if is_superuser:
+            return True, ""
+        user_whitelist = getattr(config, "user_whitelist", [])
+        group_whitelist = getattr(config, "group_whitelist", [])
+        if user_whitelist and user_id not in user_whitelist:
+            return False, "用户不在白名单"
+        if group_id is not None and group_whitelist and group_id not in group_whitelist:
+            return False, "群组不在白名单"
+        return True, ""
+
     @staticmethod
     async def check_runtime_permission(
         _bot: object,
@@ -293,12 +323,19 @@ class _DummyGroupHistorySummaryPlugin:
 
 class _DummySearchPlugin:
     @staticmethod
-    def is_search_available() -> bool:
+    def is_search_available(**_kwargs: object) -> bool:
         return False
 
     @staticmethod
-    async def search_web(_query: str) -> str:
+    async def search_web(_query: str, **_kwargs: object) -> str:
         return "[测试搜索未启用]"
+
+
+class _DummyEmbeddingPlugin:
+    @staticmethod
+    async def embed(_text: str, instruction: str = "") -> list[float]:
+        del instruction
+        return [0.1, 0.2, 0.3]
 
 
 class _DummyUnifiedCandidateRerankService:
@@ -318,6 +355,7 @@ class _DummyDecisionPlugin:
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "llm_provider": _DummyLLMProvider(),
+    "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "permission_manager": _DummyPermissionManagerPlugin(),
     "user_ban": _DummyUserBanPlugin(),

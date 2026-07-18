@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -106,7 +107,6 @@ def _make_service(
         lambda _name: embedding_plugin,
     )
     service = MemoryService(
-        config=cast("Any", SimpleNamespace(forgetting_access_boost=1.2)),
         conversation_repo=cast("Any", repository),
         entity_repo=cast("Any", object()),
     )
@@ -140,8 +140,10 @@ def test_search_conversations_touches_results_immediately_without_rerank(
     assert repository.touch_calls == []
 
 
-def test_store_conversation_passes_dedup_key(monkeypatch: Any) -> None:
+def test_store_conversation_passes_dedup_key_and_time_range(monkeypatch: Any) -> None:
     service, repository = _make_service(monkeypatch=monkeypatch, rerank_enabled=False)
+    start_time = datetime(2026, 7, 16, 8, 0, tzinfo=UTC)
+    end_time = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
 
     result = asyncio.run(
         service.store_conversation(
@@ -150,6 +152,8 @@ def test_store_conversation_passes_dedup_key(monkeypatch: Any) -> None:
             participants=["u1"],
             importance_initial=4,
             dedup_key="dedup-1",
+            start_time=start_time,
+            end_time=end_time,
         )
     )
 
@@ -162,6 +166,8 @@ def test_store_conversation_passes_dedup_key(monkeypatch: Any) -> None:
             "participants": ["u1"],
             "importance_initial": 4,
             "dedup_key": "dedup-1",
+            "start_time": start_time.replace(tzinfo=None),
+            "end_time": end_time.replace(tzinfo=None),
         }
     ]
 
@@ -204,7 +210,6 @@ def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> 
         lambda _name: embedding_plugin,
     )
     service = MemoryService(
-        config=cast("Any", SimpleNamespace()),
         conversation_repo=cast("Any", _FakeConversationRepository()),
         entity_repo=cast("Any", object()),
         interaction_event_repo=cast("Any", event_repository),
@@ -229,7 +234,6 @@ def test_batch_upsert_user_profiles_adds_default_metadata(monkeypatch: Any) -> N
         lambda _name: _FakeEmbeddingPlugin(rerank_enabled=False),
     )
     service = MemoryService(
-        config=cast("Any", SimpleNamespace()),
         conversation_repo=cast("Any", _FakeConversationRepository()),
         entity_repo=cast("Any", entity_repository),
     )

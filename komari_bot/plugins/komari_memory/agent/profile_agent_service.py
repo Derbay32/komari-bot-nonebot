@@ -16,6 +16,10 @@ from komari_bot.common.memory_agent_locks import (
     acquire_memory_agent_lock,
 )
 from komari_bot.common.profile_operations import ProfileOperation
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    render_untrusted_context,
+)
 
 from ..services.redis_keys import RedisKeys
 from ..services.summary_prompt_template import (
@@ -34,7 +38,10 @@ if TYPE_CHECKING:
     from ..config_schema import KomariMemoryConfigSchema
     from ..services.memory_service import MemoryService
 
+from ..services.message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
+
 llm_provider = require("llm_provider")
+_PROFILE_TOOL_RESULT_MAX_CHARS = 12_000
 
 
 @dataclass(frozen=True)
@@ -133,7 +140,7 @@ async def _run_profile_agent_locked(
     config: KomariMemoryConfigSchema,
     trace_id: str,
 ) -> ProfileAgentResult:
-    messages = _build_initial_messages(
+    messages = await _build_initial_messages(
         conversation_text=conversation_text,
         participants=participants,
         display_name_map=display_name_map,
@@ -253,7 +260,7 @@ async def _load_profile_snapshot_profiles(
     return profiles
 
 
-def _build_initial_messages(
+async def _build_initial_messages(
     *,
     conversation_text: str,
     participants: list[str],
@@ -261,17 +268,27 @@ def _build_initial_messages(
     bot_user_ids: set[str],
     config: KomariMemoryConfigSchema,
 ) -> list[dict[str, Any]]:
-    template = get_summary_template()
+    template = await get_summary_template()
     workflow = render_summary_template(
         template["profile_agent_workflow_system"],
         bot_user_ids=", ".join(sorted(bot_user_ids)) or "无",
         profile_trait_limit=config.profile_trait_limit,
     )
-    user_content = (
+    external_context = (
         f"【群聊记录】\n{conversation_text}\n\n"
         f"【参与用户 user_id】\n{json.dumps(participants, ensure_ascii=False)}\n\n"
-        f"【昵称映射】\n{json.dumps(display_name_map, ensure_ascii=False)}\n\n"
-        "请维护用户画像。"
+        f"【昵称映射】\n{json.dumps(display_name_map, ensure_ascii=False)}"
+    )
+    user_content = (
+        render_untrusted_context(
+            UntrustedContext(
+                source_type="conversation_history",
+                source_id="profile-agent-input",
+                content=external_context,
+                max_chars=MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS,
+            )
+        )
+        + "\n\n请维护用户画像。"
     )
     return [
         {"role": "system", "content": template["memory_summary_common_system"]},
@@ -424,9 +441,17 @@ def _build_assistant_tool_call_message(completion: Any) -> dict[str, Any]:
 
 
 def _build_tool_result_message(tool_call: Any, result: dict[str, Any]) -> dict[str, Any]:
+    tool_name = tool_call.function.name
     return {
         "role": "tool",
         "tool_call_id": tool_call.id or "",
-        "name": tool_call.function.name,
-        "content": json.dumps(result, ensure_ascii=False),
+        "name": tool_name,
+        "content": render_untrusted_context(
+            UntrustedContext(
+                source_type="profile",
+                source_id=f"profile-agent:{tool_name}:{tool_call.id or 'unknown'}",
+                content=json.dumps(result, ensure_ascii=False),
+            ),
+            max_chars=_PROFILE_TOOL_RESULT_MAX_CHARS,
+        ),
     }

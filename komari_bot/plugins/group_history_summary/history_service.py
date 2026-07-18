@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from nonebot import logger
 
@@ -26,6 +26,58 @@ class HistoryMessage:
     message_id: str | None
     # 当前消息 reply 的目标 message_id（用于识别“机器人回复某条命令”）
     reply_to_message_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryFetchMetadata:
+    """一次群历史分页拉取的完整度元数据。"""
+
+    status: Literal["complete", "partial"]
+    requested_count: int
+    retrieved_item_count: int
+    missing_count: int
+    completed_batches: int
+    failed_batch: int | None = None
+    failure_code: str | None = None
+
+    @property
+    def coverage_ratio(self) -> float:
+        """返回分页失败前已覆盖的目标比例。"""
+        if self.status == "complete" or self.requested_count <= 0:
+            return 1.0
+        return min(1.0, self.retrieved_item_count / self.requested_count)
+
+    def to_public_dict(self) -> dict[str, int | float | str | None]:
+        """返回不包含群消息正文和外部异常详情的诊断数据。"""
+        return {
+            "status": self.status,
+            "requested_count": self.requested_count,
+            "retrieved_item_count": self.retrieved_item_count,
+            "missing_count": self.missing_count,
+            "completed_batches": self.completed_batches,
+            "failed_batch": self.failed_batch,
+            "failure_code": self.failure_code,
+            "coverage_ratio": round(self.coverage_ratio, 4),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryFetchResult:
+    """群历史消息及其分页完整度。"""
+
+    messages: list[HistoryMessage]
+    metadata: HistoryFetchMetadata
+
+
+class HistoryIncompleteError(RuntimeError):
+    """群历史分页失败且已取回数据低于安全完整度。"""
+
+    def __init__(self, metadata: HistoryFetchMetadata) -> None:
+        self.metadata = metadata
+        super().__init__(
+            "群历史读取不完整："
+            f"已覆盖 {metadata.coverage_ratio:.0%}，低于总结所需完整度"
+        )
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -84,18 +136,22 @@ async def check_group_history_supported(bot: Bot) -> bool:
     return "get_group_msg_history" in set(actions)
 
 
-def _extract_message_items(payload: Any) -> list[dict[str, Any]]:
+def _extract_message_items(payload: Any) -> tuple[list[dict[str, Any]], bool]:
     if isinstance(payload, dict):
         if isinstance(payload.get("messages"), list):
-            return [
-                item for item in payload["messages"] if isinstance(item, dict)
-            ]
+            return (
+                [item for item in payload["messages"] if isinstance(item, dict)],
+                True,
+            )
 
         data = payload.get("data")
         if isinstance(data, dict) and isinstance(data.get("messages"), list):
-            return [item for item in data["messages"] if isinstance(item, dict)]
+            return (
+                [item for item in data["messages"] if isinstance(item, dict)],
+                True,
+            )
 
-    return []
+    return [], False
 
 
 CQ_CODE_PATTERN = re.compile(r"\[CQ:[^\]]+\]")
@@ -180,16 +236,20 @@ async def fetch_group_history_messages(
     count: int,
     batch_size: int,
     name_resolver: Any,
-) -> list[HistoryMessage]:
-    """拉取群最近 N 条历史消息。"""
+) -> HistoryFetchResult:
+    """拉取群最近 N 条历史消息，并返回分页完整度。"""
     target_count = max(1, count)
     current_seq = 0
     seen_keys: set[tuple[int, str, int]] = set()
     collected: list[HistoryMessage] = []
+    retrieved_item_count = 0
+    completed_batches = 0
+    failed_batch: int | None = None
+    failure_code: str | None = None
 
     max_rounds = (target_count // max(1, batch_size)) + 8
 
-    for _ in range(max_rounds):
+    for round_index in range(max_rounds):
         try:
             result = await bot.call_api(
                 "get_group_msg_history",
@@ -199,10 +259,28 @@ async def fetch_group_history_messages(
                 reverseOrder=True,
             )
         except Exception as exc:
-            logger.warning(f"[GroupHistorySummary] 拉取群历史失败: group={group_id}, {exc}")
+            failed_batch = round_index + 1
+            failure_code = "history_api_error"
+            logger.warning(
+                "[GroupHistorySummary] 拉取群历史失败: group={} batch={} error_type={}",
+                group_id,
+                failed_batch,
+                type(exc).__name__,
+            )
             break
 
-        items = _extract_message_items(result)
+        items, response_valid = _extract_message_items(result)
+        if not response_valid:
+            failed_batch = round_index + 1
+            failure_code = "history_response_invalid"
+            logger.warning(
+                "[GroupHistorySummary] 群历史响应结构无效: group={} batch={}",
+                group_id,
+                failed_batch,
+            )
+            break
+
+        completed_batches += 1
         if not items:
             break
 
@@ -223,6 +301,7 @@ async def fetch_group_history_messages(
                 continue
             seen_keys.add(unique_key)
             fetched_item_count += 1
+            retrieved_item_count += 1
 
             fallback_nickname = user_id
             sender = item.get("sender")
@@ -251,21 +330,51 @@ async def fetch_group_history_messages(
         if len(collected) >= target_count:
             break
 
-        if fetched_item_count == 0 or min_seq is None or min_seq <= 1:
+        if min_seq is None or min_seq <= 1:
+            break
+
+        if fetched_item_count == 0:
+            failed_batch = round_index + 1
+            failure_code = "history_pagination_stalled"
             break
 
         next_seq = min_seq - 1
         if next_seq == current_seq:
+            failed_batch = round_index + 1
+            failure_code = "history_pagination_stalled"
             break
         current_seq = next_seq
+    else:
+        if len(collected) < target_count:
+            failed_batch = completed_batches + 1
+            failure_code = "history_round_limit"
 
     ordered = sorted(collected, key=lambda msg: (msg.timestamp, msg.message_seq))
-    return ordered[-target_count:]
+    status: Literal["complete", "partial"] = (
+        "partial" if failed_batch is not None else "complete"
+    )
+    missing_count = (
+        max(target_count - retrieved_item_count, 0) if status == "partial" else 0
+    )
+    return HistoryFetchResult(
+        messages=ordered[-target_count:],
+        metadata=HistoryFetchMetadata(
+            status=status,
+            requested_count=target_count,
+            retrieved_item_count=retrieved_item_count,
+            missing_count=missing_count,
+            completed_batches=completed_batches,
+            failed_batch=failed_batch,
+            failure_code=failure_code,
+        ),
+    )
 
 
 def format_message_for_prompt(message: HistoryMessage) -> str:
     """将历史消息格式化为 LLM 输入文本。"""
-    dt = datetime.fromtimestamp(message.timestamp, tz=UTC).astimezone().strftime(
-        "%m-%d %H:%M"
+    dt = (
+        datetime.fromtimestamp(message.timestamp, tz=UTC)
+        .astimezone()
+        .strftime("%m-%d %H:%M")
     )
     return f"[{dt}] {message.nickname}({message.user_id}): {message.content}"

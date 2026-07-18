@@ -1,9 +1,14 @@
 """LLM 客户端抽象基类。"""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from komari_bot.common.untrusted_context import UntrustedContext
 
 
 class UnifiedUsageSchema(BaseModel):
@@ -77,6 +82,7 @@ class BaseLLMClient(ABC):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """生成文本。
@@ -91,6 +97,7 @@ class BaseLLMClient(ABC):
             tools: 可用工具定义
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
+            untrusted_contexts: 由 provider 作为独立数据块注入的不可信上下文
             **kwargs: 其他 provider 特定参数
 
         Returns:
@@ -109,6 +116,7 @@ class BaseLLMClient(ABC):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -122,6 +130,7 @@ class BaseLLMClient(ABC):
             tools: 可用工具定义
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
+            untrusted_contexts: 由 provider 作为独立数据块注入的不可信上下文
             **kwargs: 其他参数
 
         Returns:

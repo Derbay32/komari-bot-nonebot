@@ -6,11 +6,20 @@ from datetime import datetime  # noqa: TC003
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Query
+from nonebot import logger
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
 from komari_bot.common.management_api import (
+    ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
+)
+from komari_bot.common.management_audit import (
+    hash_management_target,
+    management_audit_span,
+    record_management_audit_event,
+    require_management_change_reason,
+    resolve_management_request_id,
 )
 
 from .event_support import is_configured_superuser_id
@@ -35,6 +44,9 @@ from .service import BanServiceUnavailableError, UserBanService, get_service
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.common.management_audit import ManagementAuditRecorder
 
 API_PREFIX = "/api/komari-user-bans/v1"
 MANAGEMENT_API_OPERATOR_ID = "management_api"
@@ -177,22 +189,34 @@ def _validated_path_user_id(value: str) -> str:
 
 
 def _storage_error(error: BanServiceUnavailableError) -> HTTPException:
-    return HTTPException(status_code=503, detail=str(error))
+    logger.error(
+        "[UserBan] 管理 API 存储操作失败: error_type={}",
+        type(error).__name__,
+    )
+    return HTTPException(status_code=503, detail="用户封禁存储暂不可用")
 
 
 def create_user_ban_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     service_getter: Callable[[], UserBanService] = get_service,
+    audit_recorder: ManagementAuditRecorder | None = None,
 ) -> APIRouter:
     """创建用户封禁管理路由。"""
-    auth_dependency = create_bearer_auth_dependency(
+    read_auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问用户封禁接口",
+        required_permission="user_ban:read",
     )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="没有修改用户封禁的权限",
+        required_permission="user_ban:write",
+    )
+    recorder = audit_recorder or record_management_audit_event
     router = APIRouter(
         prefix=API_PREFIX,
-        dependencies=[Depends(auth_dependency)],
+        dependencies=[Depends(read_auth_dependency)],
         tags=["komari-user-bans"],
     )
 
@@ -231,58 +255,107 @@ def create_user_ban_router(
             raise _storage_error(error) from error
         return _status_response(status)
 
-    @router.post("/bans", response_model=BanMutationResponse)
+    @router.post(
+        "/bans",
+        response_model=BanMutationResponse,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def create_or_update_ban(
         payload: Annotated[CreateBanRequest, Body()],
+        principal: ManagementPrincipal = Depends(write_auth_dependency),  # noqa: FAST002
+        change_reason: str = Depends(require_management_change_reason),  # noqa: FAST002
+        request_id: str = Depends(resolve_management_request_id),  # noqa: FAST002
     ) -> BanMutationResponse:
         """创建或覆盖指定用户封禁。"""
-        try:
-            expires_at = parse_ban_duration(payload.duration)
-            result = await service_getter().ban_user(
-                user_id=payload.user_id,
-                target_scope=payload.scope,
-                operator_id=MANAGEMENT_API_OPERATOR_ID,
-                expires_at=expires_at,
-                reason=payload.reason,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        except BanServiceUnavailableError as error:
-            raise _storage_error(error) from error
+        async with management_audit_span(
+            principal=principal,
+            request_id=request_id,
+            reason=change_reason,
+            action="user_ban.upsert",
+            resource="user_ban",
+            target_hash=hash_management_target(payload.user_id),
+            recorder=recorder,
+        ) as audit:
+            try:
+                expires_at = parse_ban_duration(payload.duration)
+                result = await service_getter().ban_user(
+                    user_id=payload.user_id,
+                    target_scope=payload.scope,
+                    operator_id=principal.operator_id,
+                    expires_at=expires_at,
+                    reason=payload.reason,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            except BanServiceUnavailableError as error:
+                raise _storage_error(error) from error
 
-        superuser_bypass = is_configured_superuser_id(payload.user_id)
-        notification = await notify_ban_result(
-            get_first_available_bot(),
-            result,
-            superuser_bypass=superuser_bypass,
-        )
-        return _mutation_response(result, notification)
+            superuser_bypass = is_configured_superuser_id(payload.user_id)
+            notification = await notify_ban_result(
+                get_first_available_bot(),
+                result,
+                superuser_bypass=superuser_bypass,
+            )
+            audit.metadata.update(
+                {
+                    "target_scope": payload.scope,
+                    "mutation_kind": result.mutation_kind,
+                    "changed": result.changed,
+                    "notification_attempted": notification.attempted,
+                    "notification_sent": notification.sent,
+                    "superuser_bypass": superuser_bypass,
+                }
+            )
+            return _mutation_response(result, notification)
 
     @router.delete(
         "/bans/{user_id}/{scope}",
         response_model=BanMutationResponse,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_ban(
         user_id: Annotated[str, Path()],
         scope: Annotated[BanTargetScope, Path()],
+        principal: ManagementPrincipal = Depends(write_auth_dependency),  # noqa: FAST002
+        change_reason: str = Depends(require_management_change_reason),  # noqa: FAST002
+        request_id: str = Depends(resolve_management_request_id),  # noqa: FAST002
     ) -> BanMutationResponse:
         """手动解除指定用户封禁。"""
         normalized_user_id = _validated_path_user_id(user_id)
-        try:
-            result = await service_getter().unban_user(
-                user_id=normalized_user_id,
-                target_scope=scope,
-            )
-        except BanServiceUnavailableError as error:
-            raise _storage_error(error) from error
+        async with management_audit_span(
+            principal=principal,
+            request_id=request_id,
+            reason=change_reason,
+            action="user_ban.delete",
+            resource="user_ban",
+            target_hash=hash_management_target(normalized_user_id),
+            recorder=recorder,
+        ) as audit:
+            try:
+                result = await service_getter().unban_user(
+                    user_id=normalized_user_id,
+                    target_scope=scope,
+                )
+            except BanServiceUnavailableError as error:
+                raise _storage_error(error) from error
 
-        superuser_bypass = is_configured_superuser_id(normalized_user_id)
-        notification = await notify_unban_result(
-            get_first_available_bot(),
-            result,
-            superuser_bypass=superuser_bypass,
-        )
-        return _mutation_response(result, notification)
+            superuser_bypass = is_configured_superuser_id(normalized_user_id)
+            notification = await notify_unban_result(
+                get_first_available_bot(),
+                result,
+                superuser_bypass=superuser_bypass,
+            )
+            audit.metadata.update(
+                {
+                    "target_scope": scope,
+                    "mutation_kind": result.mutation_kind,
+                    "changed": result.changed,
+                    "notification_attempted": notification.attempted,
+                    "notification_sent": notification.sent,
+                    "superuser_bypass": superuser_bypass,
+                }
+            )
+            return _mutation_response(result, notification)
 
     return router
 
@@ -290,9 +363,10 @@ def create_user_ban_router(
 def register_user_ban_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     service_getter: Callable[[], UserBanService] = get_service,
+    audit_recorder: ManagementAuditRecorder | None = None,
 ) -> None:
     """在统一管理应用上注册用户封禁 API。"""
     if getattr(app.state, "komari_user_ban_api_registered", False):
@@ -303,6 +377,7 @@ def register_user_ban_api(
         create_user_ban_router(
             api_token=api_token,
             service_getter=service_getter,
+            audit_recorder=audit_recorder,
         )
     )
     app.state.komari_user_ban_api_registered = True

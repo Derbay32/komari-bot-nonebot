@@ -1,10 +1,11 @@
-"""诊断报告发送测试：合并转发节点结构、多批、文本降级。
+"""诊断报告发送测试：私聊默认、公开脱敏、多批和文本降级。
 
 覆盖：
 - node_custom 结构正确
 - 批次 ≤50 节点时单批发送
 - 超过 50 节点时多批发送
-- API 失败后文本降级（调用 send_group_msg）
+- 私聊合并转发失败后仅向同一用户文本降级
+- 显式公开报告不包含敏感 canary
 - 错误/降级章节在失败报告中存在
 """
 
@@ -15,6 +16,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
 from komari_bot.plugins.llm_provider.diagnostic import (
     LLMCallTrace,
@@ -149,10 +151,12 @@ def test_build_chapters_failure_includes_error_chapter(debug_reporting: Any) -> 
     assert "错误/降级" in titles
     error_chapter = chapters[titles.index("错误/降级")][1]
     assert "APITimeoutError" in error_chapter
-    assert "请求超时 30s" in error_chapter
+    assert "请求超时 30s" not in error_chapter
+    assert "异常正文: 已隐藏" in error_chapter
 
     final_chapter = chapters[titles.index("最终结果")][1]
-    assert "LLM API 超时" in final_chapter
+    assert "LLM API 超时" not in final_chapter
+    assert "错误码: internal_error" in final_chapter
     assert "执行失败" in final_chapter
 
 
@@ -364,17 +368,19 @@ async def test_build_and_send_within_50_nodes_single_batch(
 
     await debug_reporting.build_and_send_diagnostic_report(
         bot=_FakeBot(),
-        group_id=12345,
+        user_id=42,
         collector=collector,
         result_type="reply",
         succeeded=True,
         extra_info={"user_id": "42"},
     )
 
-    # 应该只有 send_group_forward_msg 调用
-    forward_calls = [c for c in api_calls if c["api"] == "send_group_forward_msg"]
+    # 默认只向 SUPERUSER 私聊投递
+    forward_calls = [c for c in api_calls if c["api"] == "send_private_forward_msg"]
     assert len(forward_calls) == 1
+    assert forward_calls[0]["user_id"] == 42
     assert len(forward_calls[0]["messages"]) <= 50
+    assert not any(call["api"].startswith("send_group") for call in api_calls)
 
 
 @pytest.mark.asyncio
@@ -396,7 +402,7 @@ async def test_build_and_send_splits_reports_into_multiple_batches(
 
     await debug_reporting.build_and_send_diagnostic_report(
         bot=_FakeBot(),
-        group_id=12345,
+        user_id=42,
         collector=collector,
         result_type="reply",
         succeeded=True,
@@ -404,17 +410,17 @@ async def test_build_and_send_splits_reports_into_multiple_batches(
     )
 
     forward_calls = [
-        call for call in api_calls if call["api"] == "send_group_forward_msg"
+        call for call in api_calls if call["api"] == "send_private_forward_msg"
     ]
     assert len(forward_calls) > 1
     assert all(len(call["messages"]) <= 2 for call in forward_calls)
 
 
 @pytest.mark.asyncio
-async def test_send_group_forward_msg_failure_falls_back_to_text(
+async def test_send_private_forward_msg_failure_falls_back_to_private_text(
     debug_reporting: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """合并转发 API 失败后降级为 send_group_msg 文本。"""
+    """私聊合并转发失败后只降级为 send_private_msg。"""
     collector = _make_collector_with_data()
     api_calls: list[dict[str, Any]] = []
 
@@ -422,7 +428,7 @@ async def test_send_group_forward_msg_failure_falls_back_to_text(
         self_id = "669293859"
 
         async def call_api(self, api: str, **kwargs: Any) -> None:
-            if api == "send_group_forward_msg":
+            if api == "send_private_forward_msg":
                 msg = "API 不可用"
                 raise RuntimeError(msg)
             api_calls.append({"api": api, **kwargs})
@@ -431,18 +437,86 @@ async def test_send_group_forward_msg_failure_falls_back_to_text(
 
     await debug_reporting.build_and_send_diagnostic_report(
         bot=_FakeBot(),
-        group_id=12345,
+        user_id=42,
         collector=collector,
         result_type="reply",
         succeeded=True,
         extra_info={"user_id": "42"},
     )
 
-    # 应该有 send_group_msg 调用（文本降级）
-    text_calls = [c for c in api_calls if c["api"] == "send_group_msg"]
+    text_calls = [c for c in api_calls if c["api"] == "send_private_msg"]
     assert len(text_calls) > 0
-    # 每个节点都应有文本降级
-    assert all(isinstance(c.get("message"), str) for c in text_calls)
+    assert all(c["user_id"] == 42 for c in text_calls)
+    assert all(
+        isinstance(c.get("message"), Message)
+        and len(c["message"]) == 1
+        and c["message"][0].type == "text"
+        for c in text_calls
+    )
+    assert not any(call["api"].startswith("send_group") for call in api_calls)
+
+
+@pytest.mark.asyncio
+async def test_explicit_public_report_is_redacted_and_private_copy_is_complete(
+    debug_reporting: Any,
+) -> None:
+    """--public 只额外公开结构化元数据，完整敏感内容仍只进私聊。"""
+    collector = _make_collector_with_data()
+    collector.add_error(
+        "generate_reply",
+        "SensitiveFailure",
+        "error-canary-private-991",
+    )
+    api_calls: list[dict[str, Any]] = []
+
+    class _FakeBot:
+        self_id = "669293859"
+
+        async def call_api(self, api: str, **kwargs: Any) -> None:
+            api_calls.append({"api": api, **kwargs})
+
+    result = await debug_reporting.build_and_send_diagnostic_report(
+        bot=_FakeBot(),
+        user_id=42,
+        public_group_id=12345,
+        collector=collector,
+        result_type="reply",
+        succeeded=False,
+        error="top-error-canary-992",
+        extra_info={
+            "user_id": "user-canary-993",
+            "content": "input-canary-private-994",
+        },
+        final_result_info={"reply_text": "reply-canary-private-995"},
+    )
+
+    private_calls = [
+        call for call in api_calls if call["api"] == "send_private_forward_msg"
+    ]
+    public_calls = [
+        call for call in api_calls if call["api"] == "send_group_forward_msg"
+    ]
+    assert result.private_delivered is True
+    assert result.public_delivered is True
+    assert len(private_calls) == 1
+    assert len(public_calls) == 1
+    private_payload = str(private_calls[0]["messages"])
+    public_payload = str(public_calls[0]["messages"])
+    assert "input-canary-private-994" in private_payload
+    assert "SensitiveFailure" in private_payload
+    assert "error-canary-private-991" not in private_payload
+    assert "top-error-canary-992" not in private_payload
+    for canary in [
+        "SensitiveFailure",
+        "error-canary-private-991",
+        "top-error-canary-992",
+        "user-canary-993",
+        "input-canary-private-994",
+        "reply-canary-private-995",
+    ]:
+        assert canary not in public_payload
+    assert "test-collector" in public_payload
+    assert "输入、输出、用户标识与异常正文已隐藏" in public_payload
 
 
 # ─── _send_text_fallback 公共函数测试 ────────────────────────
@@ -459,12 +533,17 @@ async def test_send_group_text_success(debug_reporting: Any) -> None:
         async def call_api(self, api: str, **kwargs: Any) -> None:
             api_calls.append({"api": api, **kwargs})
 
-    await debug_reporting.send_group_text(_FakeBot(), 12345, "测试文本")
+    delivered = await debug_reporting.send_group_text(
+        _FakeBot(),
+        12345,
+        "测试文本",
+    )
 
+    assert delivered is True
     assert len(api_calls) == 1
     assert api_calls[0]["api"] == "send_group_msg"
     assert api_calls[0]["group_id"] == 12345
-    assert api_calls[0]["message"] == "测试文本"
+    assert api_calls[0]["message"] == Message(MessageSegment.text("测试文本"))
 
 
 @pytest.mark.asyncio
@@ -478,8 +557,35 @@ async def test_send_group_text_failure_does_not_crash(debug_reporting: Any) -> N
             msg = "连接断开了"
             raise RuntimeError(msg)
 
-    # 不应抛出异常
-    await debug_reporting.send_group_text(_FakeBot(), 12345, "测试")
+    delivered = await debug_reporting.send_group_text(_FakeBot(), 12345, "测试")
+
+    assert delivered is False
+
+
+@pytest.mark.asyncio
+async def test_send_private_message_targets_only_the_superuser(
+    debug_reporting: Any,
+) -> None:
+    api_calls: list[dict[str, Any]] = []
+
+    class _FakeBot:
+        async def call_api(self, api: str, **kwargs: Any) -> None:
+            api_calls.append({"api": api, **kwargs})
+
+    delivered = await debug_reporting.send_private_message(
+        _FakeBot(),
+        42,
+        "private-canary",
+    )
+
+    assert delivered is True
+    assert api_calls == [
+        {
+            "api": "send_private_msg",
+            "user_id": 42,
+            "message": Message(MessageSegment.text("private-canary")),
+        }
+    ]
 
 
 # ─── helpers ──────────────────────────────────────────────────

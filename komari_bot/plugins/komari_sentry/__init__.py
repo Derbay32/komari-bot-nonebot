@@ -9,7 +9,10 @@ from typing import Any, Literal
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata
 
-from komari_bot.common.sentry_support import build_sentry_init_options
+from komari_bot.common.sentry_support import (
+    build_sentry_init_options,
+    ensure_sentry_privacy_hooks,
+)
 
 from .config_interface import get_config
 from .config_schema import KomariSentryConfigSchema
@@ -85,7 +88,20 @@ async def startup() -> None:
         return
 
     if sentry_sdk.is_initialized():
-        logger.info("[KomariSentry] 检测到 Sentry 已初始化，跳过重复初始化")
+        client = sentry_sdk.get_client()
+        try:
+            ensure_sentry_privacy_hooks(
+                client,
+                allow_user_context=config.send_default_pii,
+            )
+        except Exception:
+            logger.critical(
+                "[KomariSentry] 外部 Sentry Client 无法安装或验证隐私钩子，拒绝继续启动"
+            )
+            raise
+        logger.info(
+            "[KomariSentry] 检测到外部 Sentry Client，已合并并验证项目隐私钩子"
+        )
         return
 
     init_options = build_sentry_init_options(
@@ -100,6 +116,16 @@ async def startup() -> None:
         environ=os.environ,
     )
     sentry_sdk.init(**init_options)
+    client = sentry_sdk.get_client()
+    try:
+        ensure_sentry_privacy_hooks(
+            client,
+            allow_user_context=config.send_default_pii,
+        )
+    except Exception:
+        client.close(timeout=0)
+        logger.critical("[KomariSentry] 初始化后隐私钩子验证失败，已关闭 Client")
+        raise
     _initialized_by_plugin = True
     logger.info(
         "[KomariSentry] 初始化完成 env={} traces={:.3f} profiles={:.3f}",

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from komari_bot.plugins.user_ban.models import BanRecord, BanScope
+from komari_bot.plugins.user_ban.repository import BanCacheSnapshot
 from komari_bot.plugins.user_ban.service import (
     BanServiceUnavailableError,
     UserBanService,
@@ -38,8 +40,12 @@ class _Repository:
         self.records = list(records)
         self.initialize_calls = 0
         self.load_calls = 0
+        self.revision_calls = 0
+        self.revision = 1
+        self.snapshot_delay = 0.0
         self.closed = False
         self.load_error: Exception | None = None
+        self.revision_error: Exception | None = None
 
     async def initialize(self) -> None:
         self.initialize_calls += 1
@@ -47,11 +53,22 @@ class _Repository:
     async def close(self) -> None:
         self.closed = True
 
-    async def load_all(self) -> tuple[BanRecord, ...]:
+    async def get_cache_revision(self) -> int:
+        self.revision_calls += 1
+        if self.revision_error is not None:
+            raise self.revision_error
+        return self.revision
+
+    async def load_snapshot(self) -> BanCacheSnapshot:
         self.load_calls += 1
+        if self.snapshot_delay:
+            await asyncio.sleep(self.snapshot_delay)
         if self.load_error is not None:
             raise self.load_error
-        return tuple(record for record in self.records if record.is_active)
+        return BanCacheSnapshot(
+            revision=self.revision,
+            records=tuple(record for record in self.records if record.is_active),
+        )
 
     async def add_scopes(
         self,
@@ -102,6 +119,8 @@ class _Repository:
             kind = "updated"
         else:
             kind = "created"
+        if affected:
+            self.revision += 1
         current_records = tuple(
             record
             for record in self.records
@@ -123,6 +142,8 @@ class _Repository:
             and record.is_active
         )
         self.records = [record for record in self.records if record not in removed]
+        if removed:
+            self.revision += 1
         current = tuple(
             record
             for record in self.records
@@ -133,6 +154,8 @@ class _Repository:
     async def delete_expired(self) -> tuple[BanRecord, ...]:
         expired = tuple(record for record in self.records if not record.is_active)
         self.records = [record for record in self.records if record not in expired]
+        if expired:
+            self.revision += 1
         return expired
 
     async def list_statuses(self, **_kwargs: object):
@@ -146,6 +169,44 @@ async def test_cache_is_reused_within_ttl() -> None:
 
     assert await service.is_user_banned("10086", "chat") is True
     assert await service.is_user_banned("10086", "chat") is True
+    assert repository.load_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_ttl_checks_revision_without_reloading_unchanged_snapshot() -> None:
+    repository = _Repository((_record("10086", "chat"),))
+    service = UserBanService(repository, cache_ttl_seconds=0)  # type: ignore[arg-type]
+
+    assert await service.is_user_banned("10086", "chat") is True
+    assert await service.is_user_banned("10086", "chat") is True
+
+    assert repository.load_calls == 1
+    assert repository.revision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_revision_reloads_cross_worker_snapshot() -> None:
+    repository = _Repository((_record("10086", "chat"),))
+    service = UserBanService(repository, cache_ttl_seconds=0)  # type: ignore[arg-type]
+    assert await service.is_user_banned("10086", "chat") is True
+
+    repository.records.append(_record("20000", "command"))
+    repository.revision += 1
+
+    assert await service.is_user_banned("20000", "command") is True
+    assert repository.load_calls == 2
+    assert repository.revision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_initialize_builds_only_one_snapshot() -> None:
+    repository = _Repository((_record("10086", "chat"),))
+    repository.snapshot_delay = 0.01
+    service = UserBanService(repository, cache_ttl_seconds=60)  # type: ignore[arg-type]
+
+    await asyncio.gather(*(service.initialize() for _ in range(20)))
+
+    assert repository.initialize_calls == 1
     assert repository.load_calls == 1
 
 
@@ -247,4 +308,5 @@ async def test_close_clears_cache_and_repository() -> None:
 
     assert repository.closed is True
     assert service._cache == {}
+    assert service._cache_revision is None
     assert service._refreshed_at is None

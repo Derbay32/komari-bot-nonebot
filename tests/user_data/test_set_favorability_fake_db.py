@@ -351,3 +351,66 @@ async def test_set_favorability_first_insertion_with_nonzero_initial() -> None:
     # before 应为 initial_favorability=100
     assert result.before == 100
     assert result.after == 200
+
+
+# ─── delta operation 幂等账本测试 ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_adjust_favorability_claims_and_completes_idempotency_ledger() -> None:
+    """首次 operation 在同一事务内认领账本、调整数值并保存结果。"""
+    db = _build_db(DynamicConfigSchema(initial_favorability=100))
+    conn = _FakeConnection(
+        fetch_rows=[
+            {"operation_id": "reply-1:favorability"},
+            {"favorability": 100},
+            _make_row("u10", 105),
+        ]
+    )
+    _inject_pool(db, conn)
+
+    result = await db.adjust_user_favorability(
+        "u10",
+        5,
+        operation_id="reply-1:favorability",
+    )
+
+    assert result.before == 100
+    assert result.after == 105
+    assert result.delta == 5
+    assert "user_favorability_adjustment_ledger" in conn.queries[0][0]
+    assert "before_value" in conn.queries[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_adjust_favorability_duplicate_returns_stored_result() -> None:
+    """重复 operation 直接返回账本结果，不再次执行 favorability UPDATE。"""
+    timestamp = _make_row("u11", 105)["updated_at"]
+    db = _build_db(DynamicConfigSchema(initial_favorability=100))
+    conn = _FakeConnection(
+        fetch_rows=[
+            None,
+            {
+                "user_id": "u11",
+                "requested_delta": 5,
+                "before_value": 100,
+                "after_value": 105,
+                "result_updated_at": timestamp,
+            },
+        ]
+    )
+    _inject_pool(db, conn)
+
+    result = await db.adjust_user_favorability(
+        "u11",
+        5,
+        operation_id="reply-2:favorability",
+    )
+
+    assert result.before == 100
+    assert result.after == 105
+    assert len(conn.queries) == 2
+    assert all(
+        "UPDATE user_favorability" not in query
+        for query, _args in conn.queries
+    )

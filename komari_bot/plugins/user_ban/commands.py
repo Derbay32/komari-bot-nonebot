@@ -9,6 +9,8 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent  # noqa: TC00
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
+from komari_bot.common.onebot_messages import plain_text_message
+
 from .event_support import is_superuser_id
 from .models import (
     BanRecord,
@@ -157,17 +159,19 @@ async def _handle_status(bot: Bot, user_id_text: str) -> None:
     try:
         status = await get_service().get_status(user_id)
     except BanServiceUnavailableError as error:
-        await ban_matcher.finish(f"❌ {error}")
+        await ban_matcher.finish(plain_text_message(f"❌ {error}"))
 
     if not status.records:
-        await ban_matcher.finish(f"提示：用户 {user_id} 当前未被封禁")
+        await ban_matcher.finish(
+            plain_text_message(f"提示：用户 {user_id} 当前未被封禁")
+        )
 
     lines = [f"🚫 用户 {user_id} 的封禁状态：{_format_active_scopes(status)}"]
     lines.extend(_format_status_record(record) for record in status.records)
     superuser_note = _superuser_note(bot, user_id).lstrip("\n")
     if superuser_note:
         lines.append(superuser_note)
-    await ban_matcher.finish("\n".join(lines))
+    await ban_matcher.finish(plain_text_message("\n".join(lines)))
 
 
 def _parse_list_args(tokens: list[str]) -> tuple[BanScope | None, int] | None:
@@ -203,13 +207,13 @@ async def _handle_list(bot: Bot, tokens: list[str]) -> None:
             offset=(page - 1) * LIST_PAGE_SIZE,
         )
     except BanServiceUnavailableError as error:
-        await ban_matcher.finish(f"❌ {error}")
+        await ban_matcher.finish(plain_text_message(f"❌ {error}"))
 
     if not result.items:
         if result.total:
             total_pages = (result.total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
             await ban_matcher.finish(
-                f"提示：第 {page} 页不存在，当前共 {total_pages} 页"
+                plain_text_message(f"提示：第 {page} 页不存在，当前共 {total_pages} 页")
             )
         await ban_matcher.finish("提示：当前没有符合条件的封禁记录")
 
@@ -222,7 +226,7 @@ async def _handle_list(bot: Bot, tokens: list[str]) -> None:
             _format_list_record(record) for record in status.records
         )
         lines.append(f"{index}. {status.user_id} — {record_text}{note}")
-    await ban_matcher.finish("\n".join(lines))
+    await ban_matcher.finish(plain_text_message("\n".join(lines)))
 
 
 @ban_matcher.handle()
@@ -256,9 +260,9 @@ async def handle_ban(
             reason=reason,
         )
     except ValueError as error:
-        await ban_matcher.finish(f"❌ {error}\n{USAGE}")
+        await ban_matcher.finish(plain_text_message(f"❌ {error}\n{USAGE}"))
     except BanServiceUnavailableError as error:
-        await ban_matcher.finish(f"❌ {error}")
+        await ban_matcher.finish(plain_text_message(f"❌ {error}"))
 
     superuser_bypass = is_superuser_id(bot, user_id)
     notification = await notify_ban_result(
@@ -274,10 +278,12 @@ async def handle_ban(
         case _:
             action = "封禁设置未变化"
     await ban_matcher.finish(
-        f"✅ 用户 {user_id} 的{_scope_label(target_scope)}权限{action}。"
-        f"\n当前状态：{_format_active_scopes(result.status)}"
-        f"{_superuser_note(bot, user_id)}"
-        f"{_notification_suffix(notification, changed=result.changed)}"
+        plain_text_message(
+            f"✅ 用户 {user_id} 的{_scope_label(target_scope)}权限{action}。"
+            f"\n当前状态：{_format_active_scopes(result.status)}"
+            f"{_superuser_note(bot, user_id)}"
+            f"{_notification_suffix(notification, changed=result.changed)}"
+        )
     )
 
 
@@ -306,7 +312,7 @@ async def handle_unban(
             target_scope=target_scope,
         )
     except BanServiceUnavailableError as error:
-        await unban_matcher.finish(f"❌ {error}")
+        await unban_matcher.finish(plain_text_message(f"❌ {error}"))
 
     notification = await notify_unban_result(
         bot,
@@ -315,8 +321,10 @@ async def handle_unban(
     )
     action = "已解封" if result.changed else "原本未封禁"
     await unban_matcher.finish(
-        f"✅ 用户 {user_id} 的{_scope_label(target_scope)}权限{action}。"
-        f"\n当前状态：{_format_active_scopes(result.status)}"
-        f"{_superuser_note(bot, user_id)}"
-        f"{_notification_suffix(notification, changed=result.changed)}"
+        plain_text_message(
+            f"✅ 用户 {user_id} 的{_scope_label(target_scope)}权限{action}。"
+            f"\n当前状态：{_format_active_scopes(result.status)}"
+            f"{_superuser_note(bot, user_id)}"
+            f"{_notification_suffix(notification, changed=result.changed)}"
+        )
     )

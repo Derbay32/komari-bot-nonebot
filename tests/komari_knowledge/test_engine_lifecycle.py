@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +22,7 @@ class _FakeEmbeddingService:
 class _FakePool:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self.rows = rows or []
+        self.version = 0
         self.closed = False
 
     def acquire(self) -> "_FakePool":
@@ -38,35 +38,50 @@ class _FakePool:
         assert "SELECT id, keywords" in query
         return self.rows
 
+    async def fetchval(self, query: str, index_name: str) -> int:
+        assert "komari_search_index_versions" in query
+        assert index_name == "komari_knowledge"
+        return self.version
+
+    def transaction(self, **kwargs: object) -> "_FakePool":
+        assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+        return self
+
     async def close(self) -> None:
         self.closed = True
 
 
 def test_build_keyword_index_rebuild_clears_stale_entries() -> None:
     engine = KnowledgeEngine()
-    engine._pool = _FakePool(
-        rows=[
-            {"id": 2, "keywords": ["Fresh", "Alpha"]},
-            {"id": 3, "keywords": ["Alpha"]},
-        ]
-    )
-    engine._keyword_index = defaultdict(set, {"stale": {1}, "alpha": {99}})
-    engine._index_loaded = True
-
+    pool = _FakePool(rows=[{"id": 1, "keywords": ["Stale", "Alpha"]}])
+    engine._pool = pool
     asyncio.run(engine._build_keyword_index())
 
-    assert "stale" not in engine._keyword_index
-    assert engine._keyword_index["fresh"] == {2}
-    assert engine._keyword_index["alpha"] == {2, 3}
-    assert engine._index_loaded is True
+    pool.rows = [
+        {"id": 2, "keywords": ["Fresh", "Alpha"]},
+        {"id": 3, "keywords": ["Alpha"]},
+    ]
+    pool.version = 1
+    asyncio.run(engine._build_keyword_index())
+
+    entries = engine._keyword_index.entries
+    assert "stale" not in entries
+    assert entries["fresh"] == frozenset({2})
+    assert entries["alpha"] == frozenset({2, 3})
+    assert engine._keyword_index.loaded is True
 
 
 def test_close_cleans_embedding_service_pool_and_global_state() -> None:
     engine = KnowledgeEngine()
-    engine._pool = _FakePool()
+    pool = _FakePool(
+        rows=[
+            {"id": 1, "keywords": ["Alpha"]},
+        ]
+    )
+    engine._pool = pool
+    asyncio.run(engine._build_keyword_index())
     engine._embedding_service = _FakeEmbeddingService()
-    engine._keyword_index = defaultdict(set, {"alpha": {1}})
-    engine._index_loaded = True
+    engine._initialized = True
     original_engine = state.engine
     state.engine = engine
 
@@ -78,8 +93,9 @@ def test_close_cleans_embedding_service_pool_and_global_state() -> None:
 
     assert engine._pool is None
     assert engine._embedding_service is None
-    assert engine._keyword_index == {}
-    assert engine._index_loaded is False
+    assert engine._keyword_index.entries == {}
+    assert engine._keyword_index.loaded is False
+    assert engine._initialized is False
     assert state.engine is None
 
     state.engine = original_engine
@@ -105,6 +121,53 @@ def test_initialize_engine_does_not_keep_failed_instance(monkeypatch: Any) -> No
         assert state.engine is None
     finally:
         state.engine = original_engine
+
+
+def test_initialize_engine_is_single_flight(monkeypatch: Any) -> None:
+    original_engine = state.engine
+    initialize_calls = 0
+
+    async def _record_initialize(self: KnowledgeEngine) -> None:
+        nonlocal initialize_calls
+        del self
+        initialize_calls += 1
+        await asyncio.sleep(0)
+
+    async def _run_concurrently() -> tuple[KnowledgeEngine, KnowledgeEngine]:
+        first, second = await asyncio.gather(
+            engine_module.initialize_engine(),
+            engine_module.initialize_engine(),
+        )
+        return first, second
+
+    monkeypatch.setattr(engine_module.KnowledgeEngine, "initialize", _record_initialize)
+    state.engine = None
+    try:
+        first, second = asyncio.run(_run_concurrently())
+        assert first is second
+        assert initialize_calls == 1
+    finally:
+        state.engine = original_engine
+
+
+def test_engine_instance_initialize_is_single_flight(monkeypatch: Any) -> None:
+    engine = KnowledgeEngine()
+    initialize_calls = 0
+
+    async def _initialize_once() -> None:
+        nonlocal initialize_calls
+        initialize_calls += 1
+        await asyncio.sleep(0)
+        engine._initialized = True
+
+    async def _run_concurrently() -> None:
+        await asyncio.gather(engine.initialize(), engine.initialize())
+
+    monkeypatch.setattr(engine, "_initialize_once", _initialize_once)
+
+    asyncio.run(_run_concurrently())
+
+    assert initialize_calls == 1
 
 
 def test_initialize_bootstraps_schema_before_validation(monkeypatch: Any) -> None:

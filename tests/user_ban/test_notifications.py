@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -17,6 +17,9 @@ from komari_bot.plugins.user_ban.notifications import (
     notify_expired_records,
     notify_unban_result,
 )
+
+if TYPE_CHECKING:
+    from nonebot.adapters.onebot.v11 import Message
 
 
 def _record(scope: str = "chat") -> BanRecord:
@@ -65,10 +68,13 @@ async def test_ban_notification_uses_plain_private_message() -> None:
     assert delivery.sent is True
     assert bot.calls[0]["name"] == "send_private_msg"
     assert bot.calls[0]["user_id"] == 10086
-    message = cast("str", bot.calls[0]["message"])
-    assert "封禁通知" in message
-    assert "刷屏广告" in message
-    assert "期限" in message
+    message = cast("Message", bot.calls[0]["message"])
+    assert len(message) == 1
+    assert message[0].type == "text"
+    text = str(message[0].data["text"])
+    assert "封禁通知" in text
+    assert "刷屏广告" in text
+    assert "期限" in text
 
 
 @pytest.mark.asyncio
@@ -98,9 +104,11 @@ async def test_unban_and_expiry_notifications_preserve_original_reason() -> None
     assert manual.sent is True
     assert natural.sent is True
     assert len(bot.calls) == 2
-    assert "管理员解除" in cast("str", bot.calls[0]["message"])
-    assert "自然到期" in cast("str", bot.calls[1]["message"])
-    assert "SUPERUSER" in cast("str", bot.calls[1]["message"])
+    manual_message = cast("Message", bot.calls[0]["message"])
+    natural_message = cast("Message", bot.calls[1]["message"])
+    assert "管理员解除" in str(manual_message[0].data["text"])
+    assert "自然到期" in str(natural_message[0].data["text"])
+    assert "SUPERUSER" in str(natural_message[0].data["text"])
 
 
 @pytest.mark.asyncio
@@ -123,7 +131,7 @@ async def test_notification_failure_does_not_raise_or_retry() -> None:
 
     assert delivery.attempted is True
     assert delivery.sent is False
-    assert delivery.error == "风控拒绝"
+    assert delivery.error == "平台私信发送失败"
     assert len(bot.calls) == 1
 
 

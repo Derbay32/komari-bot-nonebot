@@ -23,10 +23,12 @@ from .models import (
     HelpSearchResult,
     HelpUpdateRequest,
 )
-from .scanner import scan_and_sync
+from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from komari_bot.common.management_api import ManagementTokenSource
 
 API_PREFIX = "/api/komari-help/v1"
 
@@ -104,6 +106,17 @@ def _resolve_update_params(payload: HelpUpdateRequest) -> dict[str, Any]:
     if not fields_set:
         raise _validation_error("至少提供一个要更新的字段")
 
+    required_fields = {
+        "title": payload.title,
+        "content": payload.content,
+        "keywords": payload.keywords,
+        "category": payload.category,
+    }
+    for field_name, value in required_fields.items():
+        if field_name in fields_set and value is None:
+            message = f"{field_name} 不能为空"
+            raise _validation_error(message)
+
     return {
         "title": payload.title if "title" in fields_set else UNSET,
         "content": payload.content if "content" in fields_set else UNSET,
@@ -116,12 +129,18 @@ def _resolve_update_params(payload: HelpUpdateRequest) -> dict[str, Any]:
 
 def create_help_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     engine_getter: Callable[[], HelpEngineProtocol | None],
 ) -> APIRouter:
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Help 管理接口",
+        required_permission="help:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权修改 Komari Help",
+        required_permission="help:write",
     )
     engine_dependency = _build_engine_dependency(engine_getter)
     router = APIRouter(
@@ -156,7 +175,12 @@ def create_help_router(
             raise _not_found(hid)
         return item
 
-    @router.post("/help", response_model=HelpEntry, status_code=status.HTTP_201_CREATED)
+    @router.post(
+        "/help",
+        response_model=HelpEntry,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def create_help(
         payload: HelpCreateRequest,
         engine: HelpEngineProtocol = Depends(engine_dependency),  # noqa: FAST002
@@ -177,7 +201,11 @@ def create_help_router(
             )
         return item
 
-    @router.patch("/help/{hid}", response_model=HelpEntry)
+    @router.patch(
+        "/help/{hid}",
+        response_model=HelpEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_help(
         hid: int,
         payload: HelpUpdateRequest,
@@ -192,7 +220,10 @@ def create_help_router(
         return item
 
     @router.delete(
-        "/help/{hid}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response
+        "/help/{hid}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_help(
         hid: int,
@@ -210,11 +241,21 @@ def create_help_router(
     ) -> list[HelpSearchResult]:
         return await engine.search(payload.query, limit=payload.limit)
 
-    @router.post("/scan", response_model=HelpScanResponse)
+    @router.post(
+        "/scan",
+        response_model=HelpScanResponse,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def scan_help(
         engine: HelpEngineProtocol = Depends(engine_dependency),  # noqa: FAST002
     ) -> HelpScanResponse:
-        updated_count = await scan_and_sync(cast("Any", engine))
+        try:
+            updated_count = await scan_and_sync(cast("Any", engine))
+        except HelpScanAlreadyRunningError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="另一个进程正在扫描帮助信息",
+            ) from exc
         return HelpScanResponse(updated_count=updated_count)
 
     return router
@@ -223,7 +264,7 @@ def create_help_router(
 def register_help_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     engine_getter: Callable[[], HelpEngineProtocol | None],
 ) -> None:

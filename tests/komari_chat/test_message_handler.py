@@ -84,6 +84,24 @@ def test_resolve_trigger_message_uses_nonebot_to_me(
     assert message_content == "我不吃药！"
 
 
+def test_resolve_trigger_message_detects_reply_to_bot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = _build_handler()
+    _patch_config(monkeypatch)
+    reply = _build_reply(
+        sender_user_id=669293859,
+        message=Message("机器人上一条回复"),
+    )
+
+    at_trigger, message_content = handler._resolve_trigger_message(
+        _FakeEvent("接着说", reply=reply)
+    )
+
+    assert at_trigger is True
+    assert message_content == "接着说"
+
+
 def test_resolve_trigger_message_detects_plain_text_at_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -115,13 +133,14 @@ def test_resolve_trigger_message_keeps_regular_text_unchanged(
 class _FakeRedis:
     def __init__(self, history: list[MessageSchema]) -> None:
         self.history = list(history)
+        self.buffer_calls: list[dict[str, object]] = []
         self.pushed_messages: list[MessageSchema] = []
         self.pushed_global_interactions: list[dict[str, object]] = []
         self.global_interaction_buffer_calls: list[dict[str, object]] = []
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
-        del group_id, limit
-        return list(self.history)
+        self.buffer_calls.append({"group_id": group_id, "limit": limit})
+        return list(self.history[-limit:])
 
     async def push_message(self, group_id: str, message: MessageSchema) -> None:
         del group_id
@@ -278,12 +297,107 @@ def _build_reply(
     )
 
 
+def test_recent_context_uses_newest_contiguous_messages_within_budget() -> None:
+    messages = [
+        MessageSchema(
+            user_id="u1",
+            user_nickname="旧消息",
+            group_id="g1",
+            content="旧内容",
+            timestamp=1,
+            message_id="m1",
+        ),
+        MessageSchema(
+            user_id="u2",
+            user_nickname="超长消息",
+            group_id="g1",
+            content="长" * 1_000,
+            timestamp=2,
+            message_id="m2",
+        ),
+        MessageSchema(
+            user_id="u3",
+            user_nickname="最新消息",
+            group_id="g1",
+            content="最新内容",
+            timestamp=3,
+            message_id="m3",
+        ),
+    ]
+
+    selected = message_handler_module.MessageHandler._select_recent_context(
+        messages,
+        max_messages=10,
+        max_utf8_bytes=128,
+        max_estimated_tokens=128,
+    )
+
+    assert [message.message_id for message in selected] == ["m3"]
+
+
+def test_read_buffers_uses_context_limit_instead_of_summary_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = [
+        MessageSchema(
+            user_id="u1",
+            user_nickname="用户",
+            group_id="g1",
+            content=f"消息 {index}",
+            timestamp=float(index),
+            message_id=f"m{index}",
+        )
+        for index in range(20)
+    ]
+    redis = _FakeRedis(history)
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            context_messages_limit=5,
+            context_max_utf8_bytes=24_000,
+            context_max_estimated_tokens=6_000,
+        ),
+    )
+    current = MessageSchema(
+        user_id="u2",
+        user_nickname="当前用户",
+        group_id="g1",
+        content="当前消息",
+        timestamp=21,
+        message_id="current",
+    )
+
+    recent, _interactions, stored = asyncio.run(
+        handler._read_buffers(
+            group_id="g1",
+            user_id="u2",
+            message=current,
+            store_current=False,
+        )
+    )
+
+    assert redis.buffer_calls == [{"group_id": "g1", "limit": 5}]
+    assert [message.message_id for message in recent] == [
+        "m15",
+        "m16",
+        "m17",
+        "m18",
+        "m19",
+    ]
+    assert stored is False
+
+
 def test_attempt_reply_only_rewrites_current_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     previous_message = MessageSchema(
-        user_id="user-1",
-        user_nickname="阿虚",
+        user_id="user-2",
+        user_nickname="长门",
         group_id="group-1",
         content="前一条过滤后文本",
         timestamp=1.0,
@@ -353,7 +467,7 @@ def test_attempt_reply_only_rewrites_current_message(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     original_require = nonebot.plugin.require
 
@@ -379,10 +493,10 @@ def test_attempt_reply_only_rewrites_current_message(
         )
     )
 
-    assert result[0] == {
-        "reply": "收到啦",
-        "reply_to_message_id": current_message.message_id,
-    }
+    pending_reply = result[0]
+    assert pending_reply is not None
+    assert pending_reply.reply == "收到啦"
+    assert pending_reply.reply_to_message_id == current_message.message_id
     assert handler.query_rewrite.current_query == "当前待回复消息"
     assert redis.global_interaction_buffer_calls == [{"user_id": "user-1", "limit": 10}]
     assert memory.get_user_profile_calls == [{"user_id": "user-1", "group_id": "group-1"}]
@@ -406,10 +520,20 @@ def test_attempt_reply_only_rewrites_current_message(
     assert llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL in generate_with_tools_kwargs["tools"]
     assert generate_with_tools_kwargs["memory_service"] is memory
     assert generate_with_tools_kwargs["group_id"] == "group-1"
+    assert generate_with_tools_kwargs["allowed_profile_user_ids"] == frozenset(
+        {"user-1", "user-2"}
+    )
+    assert generate_with_tools_kwargs["caller_user_id"] == "user-1"
+    assert generate_with_tools_kwargs["caller_group_id"] == "group-1"
+    assert generate_with_tools_kwargs["caller_is_superuser"] is False
     assert generate_with_tools_kwargs["max_tool_rounds"] == 5
     injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
     assert injected_favorability.favorability == 0
     assert generate_with_tools_kwargs["max_favorability_delta"] == 5
+    assert redis.pushed_global_interactions == []
+
+    asyncio.run(handler.commit_delivered_reply(pending_reply))
+
     pushed_record = redis.pushed_global_interactions[0]["record"]
     assert isinstance(pushed_record, dict)
     assert redis.pushed_global_interactions == [
@@ -669,8 +793,11 @@ class _FakeRedisForDebug:
         self.pushed_messages: list[MessageSchema] = []
         self.pushed_global_interactions: list[dict[str, object]] = []
         self.global_interaction_buffer_calls: list[dict[str, object]] = []
-        self.cooldown_calls: list[str] = []
-        self.increment_proactive_calls: list[str] = []
+        self.reserve_proactive_calls: list[dict[str, object]] = []
+        self.confirm_proactive_calls: list[dict[str, object]] = []
+        self.renew_proactive_calls: list[dict[str, object]] = []
+        self.release_proactive_calls: list[dict[str, str]] = []
+        self.reservation_status = "reserved"
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
         del group_id, limit
@@ -693,18 +820,64 @@ class _FakeRedisForDebug:
             {"user_id": user_id, "record": record, "trigger_size": trigger_size}
         )
 
-    async def is_on_cooldown(self, _group_id: str) -> bool:
-        return False
+    async def reserve_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+        *,
+        max_per_hour: int,
+        reservation_ttl_seconds: int,
+    ) -> str:
+        self.reserve_proactive_calls.append(
+            {
+                "group_id": group_id,
+                "reservation_id": reservation_id,
+                "max_per_hour": max_per_hour,
+                "reservation_ttl_seconds": reservation_ttl_seconds,
+            }
+        )
+        return self.reservation_status
 
-    async def get_proactive_count(self, _group_id: str) -> int:
-        return 0
+    async def confirm_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+        *,
+        cooldown_seconds: int,
+    ) -> None:
+        self.confirm_proactive_calls.append(
+            {
+                "group_id": group_id,
+                "reservation_id": reservation_id,
+                "cooldown_seconds": cooldown_seconds,
+            }
+        )
 
-    async def set_cooldown(self, group_id: str, seconds: int) -> None:
-        del seconds
-        self.cooldown_calls.append(group_id)
+    async def renew_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+        *,
+        reservation_ttl_seconds: int,
+    ) -> bool:
+        self.renew_proactive_calls.append(
+            {
+                "group_id": group_id,
+                "reservation_id": reservation_id,
+                "reservation_ttl_seconds": reservation_ttl_seconds,
+            }
+        )
+        return True
 
-    async def increment_proactive_count(self, group_id: str) -> None:
-        self.increment_proactive_calls.append(group_id)
+    async def release_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+    ) -> bool:
+        self.release_proactive_calls.append(
+            {"group_id": group_id, "reservation_id": reservation_id}
+        )
+        return True
 
 
 class _FakeMemoryForDebug:
@@ -773,7 +946,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
 
     # 注入必要的全局配置
@@ -843,8 +1016,10 @@ def test_generate_debug_reply_skips_all_side_effects(
     # 断言零副作用
     assert redis.pushed_messages == []  # 没有 push 当前消息或 AI 回复
     assert redis.pushed_global_interactions == []  # 没有写互动历史
-    assert redis.cooldown_calls == []  # 没有设冷却
-    assert redis.increment_proactive_calls == []  # 没有频控计数
+    assert redis.reserve_proactive_calls == []
+    assert redis.confirm_proactive_calls == []
+    assert redis.renew_proactive_calls == []
+    assert redis.release_proactive_calls == []
     assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
 
 
@@ -864,7 +1039,7 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -944,7 +1119,7 @@ def test_generate_debug_reply_with_images_and_reply_context(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -977,12 +1152,18 @@ def test_generate_debug_reply_with_images_and_reply_context(
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-    async def _download_images(urls: list[str]) -> list[str]:
+    download_batches: list[list[str]] = []
+
+    async def _download_images(
+        urls: list[str],
+        _policy: object,
+    ) -> list[str | None]:
+        download_batches.append(urls)
         return [f"base64:{url}" for url in urls]
 
     monkeypatch.setattr(
         message_handler_module,
-        "download_images_as_base64",
+        "download_images_as_base64_aligned",
         _download_images,
     )
 
@@ -1023,14 +1204,22 @@ def test_generate_debug_reply_with_images_and_reply_context(
     assert result.collector is not None
     assert redis.pushed_messages == []
     assert redis.pushed_global_interactions == []
+    assert download_batches == [
+        ["https://example.com/ref.png", "https://example.com/img.png"]
+    ]
     assert build_prompt_kwargs.get("reply_context") is reply_ctx
-    assert build_prompt_kwargs.get("image_urls") is not None
+    assert build_prompt_kwargs.get("reply_image_urls") == [
+        "base64:https://example.com/ref.png"
+    ]
+    assert build_prompt_kwargs.get("image_urls") == [
+        "base64:https://example.com/img.png"
+    ]
 
 
-def test_normal_attempt_reply_still_commits_side_effects(
+def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证正常 _attempt_reply 路径仍正确提交所有副作用。"""
+    """验证正常回复仅在确认送达后提交副作用。"""
     current_message = MessageSchema(
         user_id="user-1",
         user_nickname="阿虚",
@@ -1052,7 +1241,7 @@ def test_normal_attempt_reply_still_commits_side_effects(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -1109,10 +1298,20 @@ def test_normal_attempt_reply_still_commits_side_effects(
         )
     )
 
-    assert result[0] == {"reply": "正常回复", "reply_to_message_id": "msg-normal-1"}
+    pending_reply = result[0]
+    assert pending_reply is not None
+    assert pending_reply.reply == "正常回复"
+    assert pending_reply.reply_to_message_id == "msg-normal-1"
     assert result[1] is True
 
-    # 验证副作用已提交
+    # 当前用户消息属于输入缓冲，不是回复副作用；其余写入必须等待送达确认
+    assert len(redis.pushed_messages) == 1
+    assert fake_user_data.adjust_calls == []
+    assert redis.pushed_global_interactions == []
+
+    asyncio.run(handler.commit_delivered_reply(pending_reply))
+
+    # 确认送达后提交回复副作用
     assert fake_user_data.adjust_calls == [{"user_id": "user-1", "delta": 1}]
     assert len(redis.pushed_messages) >= 2  # 至少：当前消息 + AI 回复
     assert len(redis.pushed_global_interactions) >= 1
@@ -1121,6 +1320,166 @@ def test_normal_attempt_reply_still_commits_side_effects(
     assert pushed_record["event"] == "正常消息"
     assert pushed_record["result"] == "正常回复"
     assert pushed_record["emotion"] == "平静"
+
+
+def test_proactive_attempt_reserves_then_confirms_after_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主动回复生成前预占，确认送达后才转为正式名额与冷却。"""
+    redis = _FakeRedisForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    commit_calls: list[dict[str, object]] = []
+
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+        return [], [], True
+
+    async def _fake_generate_core(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="主动回复",
+            interaction_history=None,
+            favorability_delta=0,
+            favorability_reason="主动关心",
+        )
+
+    async def _fake_commit_side_effects(**kwargs: object) -> None:
+        commit_calls.append(dict(kwargs))
+
+    monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
+    monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
+    monkeypatch.setattr(handler, "_commit_side_effects", _fake_commit_side_effects)
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=True,
+            proactive_max_per_hour=3,
+            proactive_reservation_ttl_seconds=360,
+            proactive_cooldown=300,
+            bot_nickname="小鞠",
+        ),
+    )
+    message = MessageSchema(
+        user_id="user-proactive",
+        user_nickname="测试用户",
+        group_id="group-proactive",
+        content="看起来值得主动回复",
+        timestamp=1.0,
+        message_id="message-proactive",
+    )
+
+    pending_reply, stored = asyncio.run(
+        handler._attempt_reply(
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=False,
+            reason="score",
+            reply_score=0.95,
+            store_current=True,
+        )
+    )
+
+    assert stored is True
+    assert pending_reply is not None
+    assert pending_reply.proactive_reservation_id == "message-proactive"
+    assert redis.reserve_proactive_calls == [
+        {
+            "group_id": "group-proactive",
+            "reservation_id": "message-proactive",
+            "max_per_hour": 3,
+            "reservation_ttl_seconds": 360,
+        }
+    ]
+    assert redis.confirm_proactive_calls == []
+    assert redis.renew_proactive_calls == [
+        {
+            "group_id": "group-proactive",
+            "reservation_id": "message-proactive",
+            "reservation_ttl_seconds": 360,
+        }
+    ]
+    assert commit_calls == []
+
+    asyncio.run(handler.commit_delivered_reply(pending_reply))
+
+    assert redis.confirm_proactive_calls == [
+        {
+            "group_id": "group-proactive",
+            "reservation_id": "message-proactive",
+            "cooldown_seconds": 300,
+        }
+    ]
+    assert len(commit_calls) == 1
+    assert redis.release_proactive_calls == []
+
+
+def test_proactive_generation_failure_releases_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主动回复生成失败时立即释放名额，不等待预占 TTL。"""
+    redis = _FakeRedisForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+        return [], [], True
+
+    async def _fail_generate_core(**_kwargs: object) -> object:
+        msg = "好感度读取失败"
+        raise message_handler_module._FavorabilityReadError(msg)
+
+    monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
+    monkeypatch.setattr(handler, "_generate_reply_core", _fail_generate_core)
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=True,
+            proactive_max_per_hour=3,
+            proactive_reservation_ttl_seconds=360,
+            bot_nickname="小鞠",
+        ),
+    )
+    message = MessageSchema(
+        user_id="user-proactive",
+        user_nickname="测试用户",
+        group_id="group-proactive",
+        content="生成会失败",
+        timestamp=1.0,
+        message_id="message-failed",
+    )
+
+    result = asyncio.run(
+        handler._attempt_reply(
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=False,
+            reason="score",
+            reply_score=0.95,
+            store_current=True,
+        )
+    )
+
+    assert result == (None, True)
+    assert redis.release_proactive_calls == [
+        {
+            "group_id": "group-proactive",
+            "reservation_id": "message-failed",
+        }
+    ]
+    assert redis.confirm_proactive_calls == []
 
 
 def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(

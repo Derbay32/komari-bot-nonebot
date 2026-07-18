@@ -1,20 +1,26 @@
 """LLM Provider 插件 - 提供统一的 LLM 调用接口（OpenAI 兼容格式）。"""
 
 import asyncio
-import json
 import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any, Literal
 
-from nonebot import logger
+from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
+
+from komari_bot.common.untrusted_context import UntrustedContext
 
 from .api import register_llm_provider_api
 from .base_client import LLMCompletionResultSchema, UnifiedUsageSchema
+from .client_pool import ClientSettings, LLMClientPool
 from .config import Config
 from .config_schema import DynamicConfigSchema
-from .llm_logger import log_llm_call
+from .llm_logger import (
+    build_content_summary,
+    log_llm_call,
+    shutdown_llm_logging,
+)
 from .openai_compatible_api import OpenAICompatibleClient
 from .reply_log_reader import ReplyLogReader
 
@@ -49,6 +55,7 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
+    "UntrustedContext",
     "generate_completion",
     "generate_messages_completion",
     "generate_text",
@@ -67,6 +74,10 @@ config_manager = config_manager_plugin.get_config_manager(
 )
 _reply_log_reader = ReplyLogReader()
 _RATE_LIMIT_WINDOW_SECONDS = 60.0
+_KNOWLEDGE_PLACEHOLDER = "{{DYNAMIC_KNOWLEDGE_BASE}}"
+_KNOWLEDGE_CONTEXT_NOTICE = "相关知识已作为独立的不可信数据块提供。"
+_MAX_KNOWLEDGE_CONTEXTS = 10
+_MAX_KNOWLEDGE_CONTEXT_CHARS = 4_000
 
 
 class _AsyncSlidingWindowRateLimiter:
@@ -165,12 +176,28 @@ def get_reply_log_reader() -> ReplyLogReader:
     return _reply_log_reader
 
 
-def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int]:
+def _estimate_base64_data_url_bytes(image_url: str) -> int:
+    """不解码图片正文，按 base64 长度估算原始字节数。"""
+    header, separator, payload = image_url.partition(",")
+    if not separator or ";base64" not in header.lower():
+        return 0
+
+    compact_payload = "".join(payload.split())
+    padding = len(compact_payload) - len(compact_payload.rstrip("="))
+    return max(len(compact_payload) * 3 // 4 - padding, 0)
+
+
+def _summarize_messages_payload(
+    messages: list[dict[str, Any]],
+) -> dict[str, int | str]:
     """统计 messages 请求中的文本与图片体量。"""
     text_parts = 0
     text_chars = 0
     image_parts = 0
+    image_data_url_parts = 0
+    image_remote_url_parts = 0
     image_url_chars = 0
+    image_bytes = 0
 
     for message in messages:
         content = message.get("content")
@@ -193,24 +220,36 @@ def _summarize_messages_payload(messages: list[dict[str, Any]]) -> dict[str, int
                 image_parts += 1
                 image_data = part.get("image_url")
                 if isinstance(image_data, dict):
-                    image_url_chars += len(str(image_data.get("url", "")))
+                    image_url = str(image_data.get("url", ""))
+                    image_url_chars += len(image_url)
+                    if image_url.startswith("data:"):
+                        image_data_url_parts += 1
+                        image_bytes += _estimate_base64_data_url_bytes(image_url)
+                    elif image_url:
+                        image_remote_url_parts += 1
 
+    content_summary = build_content_summary(messages)
     return {
         "turns": len(messages),
         "text_parts": text_parts,
         "text_chars": text_chars,
         "image_parts": image_parts,
+        "image_data_url_parts": image_data_url_parts,
+        "image_remote_url_parts": image_remote_url_parts,
         "image_url_chars": image_url_chars,
+        "image_bytes": image_bytes,
+        "chars": content_summary["chars"],
+        "sha256": content_summary["sha256"],
     }
 
 
-def _build_log_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """构造写入 JSONL 的剩余调用参数，排除追踪专用字段。"""
-    return {
-        key: value
-        for key, value in kwargs.items()
+def _build_log_parameter_keys(kwargs: dict[str, Any]) -> list[str]:
+    """仅记录非追踪调用参数的键名。"""
+    return sorted(
+        key
+        for key in kwargs
         if key not in {"request_trace_id", "request_phase"}
-    }
+    )
 
 
 def _build_prompt_log_input(
@@ -230,24 +269,28 @@ def _build_prompt_log_input(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
 ) -> dict[str, Any]:
-    """构造 prompt 路径完整 JSONL 请求体。"""
+    """构造 prompt 路径的脱敏日志摘要。"""
     input_data: dict[str, Any] = {
         "trace_id": trace_id,
         "phase": phase,
-        "prompt": prompt,
-        "system_instruction": system_instruction,
+        "prompt_summary": build_content_summary(prompt),
+        "system_instruction_summary": build_content_summary(system_instruction),
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": response_format,
         "enable_knowledge": enable_knowledge,
-        "knowledge_query": knowledge_query,
         "knowledge_limit": knowledge_limit,
-        "kwargs": _build_log_kwargs(kwargs),
+        "parameter_keys": _build_log_parameter_keys(kwargs),
     }
+    if knowledge_query is not None:
+        input_data["knowledge_query_summary"] = build_content_summary(knowledge_query)
+    if response_format is not None:
+        input_data["response_format_summary"] = build_content_summary(response_format)
+        input_data["response_format_keys"] = sorted(response_format)
     if tools is not None:
-        input_data["tools"] = tools
+        input_data["tools_count"] = len(tools)
+        input_data["tools_summary"] = build_content_summary(tools)
     if tool_choice is not None:
-        input_data["tool_choice"] = tool_choice
+        input_data["tool_choice_summary"] = build_content_summary(tool_choice)
     if parallel_tool_calls is not None:
         input_data["parallel_tool_calls"] = parallel_tool_calls
     return input_data
@@ -256,8 +299,7 @@ def _build_prompt_log_input(
 def _build_messages_log_input(
     *,
     trace_id: str,
-    payload_summary: dict[str, int],
-    messages: list[dict],
+    payload_summary: dict[str, int | str],
     temperature: float | None,
     max_tokens: int | None,
     response_format: dict | None,
@@ -266,36 +308,46 @@ def _build_messages_log_input(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
 ) -> dict[str, Any]:
-    """构造 messages 路径完整 JSONL 请求体。"""
+    """构造 messages 路径的脱敏日志摘要。"""
     input_data: dict[str, Any] = {
         "trace_id": trace_id,
+        "phase": str(kwargs.get("request_phase", "")).strip(),
         "payload_summary": payload_summary,
-        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": response_format,
-        "kwargs": _build_log_kwargs(kwargs),
+        "parameter_keys": _build_log_parameter_keys(kwargs),
     }
+    if response_format is not None:
+        input_data["response_format_summary"] = build_content_summary(response_format)
+        input_data["response_format_keys"] = sorted(response_format)
     if tools is not None:
-        input_data["tools"] = tools
+        input_data["tools_count"] = len(tools)
+        input_data["tools_summary"] = build_content_summary(tools)
     if tool_choice is not None:
-        input_data["tool_choice"] = tool_choice
+        input_data["tool_choice_summary"] = build_content_summary(tool_choice)
     if parallel_tool_calls is not None:
         input_data["parallel_tool_calls"] = parallel_tool_calls
     return input_data
 
 
-def _get_client() -> OpenAICompatibleClient:
-    """获取 LLM 客户端实例。"""
-    config = config_manager.get()
-    token = config.api_token
-    if not token:
-        raise ValueError("API Token 未配置，请在配置中设置 api_token")  # noqa: TRY003
+def _get_client_settings() -> ClientSettings:
+    """读取影响 HTTP 连接的动态配置快照。"""
+    return ClientSettings.from_config(config_manager.get())
+
+
+def _create_client(settings: ClientSettings) -> OpenAICompatibleClient:
+    """按配置快照创建候选客户端。"""
     return OpenAICompatibleClient(
-        token,
-        base_url=str(config.api_base),
-        timeout_seconds=float(config.timeout_seconds),
+        settings.api_token,
+        base_url=settings.base_url,
+        timeout_seconds=settings.timeout_seconds,
     )
+
+
+_client_pool = LLMClientPool(
+    settings_getter=_get_client_settings,
+    client_factory=_create_client,
+)
 
 
 def _get_completion_content(result: LLMCompletionResultSchema | str) -> str:
@@ -323,6 +375,77 @@ def _get_completion_usage(
     return None
 
 
+def _get_completion_finish_reason(
+    result: LLMCompletionResultSchema | str,
+) -> str | None:
+    if isinstance(result, LLMCompletionResultSchema):
+        return result.finish_reason
+    return None
+
+
+def _get_tool_calls_count(result: LLMCompletionResultSchema | str) -> int:
+    if isinstance(result, LLMCompletionResultSchema):
+        return len(result.tool_calls)
+    return 0
+
+
+async def _load_knowledge_contexts(
+    *,
+    enabled: bool,
+    query: str,
+    limit: int,
+) -> list[UntrustedContext]:
+    """检索知识并保留来源信息，不拼入 system prompt。"""
+    if not enabled:
+        return []
+
+    try:
+        results = await knowledge_plugin.search_knowledge(query, limit=limit)
+    except Exception as exc:
+        logger.warning(
+            "[LLM Provider] 知识库检索失败: error_type={}",
+            type(exc).__name__,
+        )
+        return []
+
+    contexts: list[UntrustedContext] = []
+    for index, result in enumerate(results[:_MAX_KNOWLEDGE_CONTEXTS], start=1):
+        content = getattr(result, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        contexts.append(
+            UntrustedContext(
+                source_type="knowledge",
+                source_id=(
+                    f"{getattr(result, 'source', 'unknown')}:"
+                    f"{getattr(result, 'id', index)}"
+                ),
+                content=content,
+                trust_level="low",
+                max_chars=_MAX_KNOWLEDGE_CONTEXT_CHARS,
+            )
+        )
+    if contexts:
+        logger.info("[LLM Provider] 已检索到 {} 条相关知识", len(contexts))
+    return contexts
+
+
+def _prepare_untrusted_request_contexts(
+    *,
+    system_instruction: str | None,
+    provided_contexts: list[UntrustedContext] | None,
+    knowledge_contexts: list[UntrustedContext],
+) -> tuple[str, list[UntrustedContext]]:
+    """移除旧知识占位符，并合并调用方与检索上下文。"""
+    contexts = [*(provided_contexts or []), *knowledge_contexts]
+    replacement = _KNOWLEDGE_CONTEXT_NOTICE if knowledge_contexts else ""
+    final_system_instruction = (system_instruction or "").replace(
+        _KNOWLEDGE_PLACEHOLDER,
+        replacement,
+    )
+    return final_system_instruction, contexts
+
+
 async def generate_text(
     prompt: str,
     model: str,
@@ -335,6 +458,7 @@ async def generate_text(
     enable_knowledge: bool = False,
     response_format: dict | None = None,
     record_chat_log: bool = False,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """生成文本（简单 prompt 模式）。
@@ -355,31 +479,23 @@ async def generate_text(
     Returns:
         生成的文本
     """
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
     final_system_instruction = system_instruction or ""
 
     try:
-        # 知识库检索
-        knowledge_context = ""
-        if enable_knowledge:
-            try:
-                query = knowledge_query or prompt
-                results = await knowledge_plugin.search_knowledge(
-                    query, limit=knowledge_limit
-                )
-                if results:
-                    knowledge_context = "\n".join(result.content for result in results)
-                    logger.info(f"[LLM Provider] 已检索到 {len(results)} 条相关知识")
-            except Exception as e:
-                logger.warning(f"[LLM Provider] 知识库检索失败: {e}")
-
-        # 构建系统指令：处理占位符
-        placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
-        final_system_instruction = (system_instruction or "").replace(
-            placeholder, knowledge_context
+        knowledge_contexts = await _load_knowledge_contexts(
+            enabled=enable_knowledge,
+            query=knowledge_query or prompt,
+            limit=knowledge_limit,
+        )
+        final_system_instruction, request_contexts = (
+            _prepare_untrusted_request_contexts(
+                system_instruction=system_instruction,
+                provided_contexts=untrusted_contexts,
+                knowledge_contexts=knowledge_contexts,
+            )
         )
         if request_trace_id:
             logger.info(
@@ -392,16 +508,17 @@ async def generate_text(
             )
 
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text(
-            prompt=prompt,
-            model=model,
-            system_instruction=final_system_instruction,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=final_system_instruction,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                untrusted_contexts=request_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -422,13 +539,14 @@ async def generate_text(
                     kwargs=kwargs,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         logger.error(
-            "[LLM Provider] 文本请求失败: trace_id={} phase={} error={}",
+            "[LLM Provider] 文本请求失败: trace_id={} phase={} error_type={}",
             request_trace_id or "-",
             request_phase or "-",
-            e,
+            type(e).__name__,
         )
         raise
     else:
@@ -454,14 +572,13 @@ async def generate_text(
                     kwargs=kwargs,
                 ),
                 output=content,
-                reasoning_content=reasoning_content,
+                reasoning_chars=len(reasoning_content or ""),
+                finish_reason=_get_completion_finish_reason(result),
+                tool_calls_count=_get_tool_calls_count(result),
                 duration_ms=duration_ms,
                 usage=usage,
             )
         return content
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def generate_completion(
@@ -479,32 +596,27 @@ async def generate_completion(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """生成统一完成结果。"""
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
     final_system_instruction = system_instruction or ""
 
     try:
-        knowledge_context = ""
-        if enable_knowledge:
-            try:
-                query = knowledge_query or prompt
-                results = await knowledge_plugin.search_knowledge(
-                    query, limit=knowledge_limit
-                )
-                if results:
-                    knowledge_context = "\n".join(result.content for result in results)
-                    logger.info(f"[LLM Provider] 已检索到 {len(results)} 条相关知识")
-            except Exception as e:
-                logger.warning(f"[LLM Provider] 知识库检索失败: {e}")
-
-        placeholder = "{{DYNAMIC_KNOWLEDGE_BASE}}"
-        final_system_instruction = (system_instruction or "").replace(
-            placeholder, knowledge_context
+        knowledge_contexts = await _load_knowledge_contexts(
+            enabled=enable_knowledge,
+            query=knowledge_query or prompt,
+            limit=knowledge_limit,
+        )
+        final_system_instruction, request_contexts = (
+            _prepare_untrusted_request_contexts(
+                system_instruction=system_instruction,
+                provided_contexts=untrusted_contexts,
+                knowledge_contexts=knowledge_contexts,
+            )
         )
         if request_trace_id:
             logger.info(
@@ -518,19 +630,20 @@ async def generate_completion(
             )
 
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text(
-            prompt=prompt,
-            model=model,
-            system_instruction=final_system_instruction,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=final_system_instruction,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                untrusted_contexts=request_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -554,6 +667,7 @@ async def generate_completion(
                     parallel_tool_calls=parallel_tool_calls,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         raise
@@ -580,15 +694,14 @@ async def generate_completion(
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
                 ),
-                output=json.dumps(result.model_dump(), ensure_ascii=False),
-                reasoning_content=result.reasoning_content,
+                output=result.content,
+                reasoning_chars=len(result.reasoning_content or ""),
+                finish_reason=result.finish_reason,
+                tool_calls_count=len(result.tool_calls),
                 duration_ms=duration_ms,
                 usage=result.usage,
             )
         return result
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def generate_text_with_messages(
@@ -599,6 +712,7 @@ async def generate_text_with_messages(
     response_format: dict | None = None,
     *,
     record_chat_log: bool = False,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -615,7 +729,6 @@ async def generate_text_with_messages(
     Returns:
         生成的文本
     """
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -634,15 +747,16 @@ async def generate_text_with_messages(
             payload_summary["image_url_chars"],
         )
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text_with_messages(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text_with_messages(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                untrusted_contexts=untrusted_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -652,20 +766,20 @@ async def generate_text_with_messages(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
                     kwargs=kwargs,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         logger.error(
-            "[LLM Provider] Messages 请求失败: trace_id={} model={} error={} payload={}",
+            "[LLM Provider] Messages 请求失败: trace_id={} model={} error_type={} payload={}",
             request_trace_id or "-",
             model,
-            e,
+            type(e).__name__,
             payload_summary,
         )
         raise
@@ -681,21 +795,19 @@ async def generate_text_with_messages(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
                     kwargs=kwargs,
                 ),
                 output=content,
-                reasoning_content=reasoning_content,
+                reasoning_chars=len(reasoning_content or ""),
+                finish_reason=_get_completion_finish_reason(result),
+                tool_calls_count=_get_tool_calls_count(result),
                 duration_ms=duration_ms,
                 usage=usage,
             )
         return content
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def generate_messages_completion(
@@ -709,10 +821,10 @@ async def generate_messages_completion(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
+    untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """使用 messages 生成统一完成结果。"""
-    client: OpenAICompatibleClient | None = None
     start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
@@ -732,18 +844,19 @@ async def generate_messages_completion(
             len(tools or []),
         )
         await _wait_for_llm_rate_limit(request_phase)
-        client = _get_client()
-        result = await client.generate_text_with_messages(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            **kwargs,
-        )
+        async with _client_pool.acquire() as client:
+            result = await client.generate_text_with_messages(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                untrusted_contexts=untrusted_contexts,
+                **kwargs,
+            )
     except Exception as e:
         duration_ms = (time.monotonic() - start_time) * 1000
         if record_chat_log:
@@ -753,7 +866,6 @@ async def generate_messages_completion(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
@@ -763,6 +875,7 @@ async def generate_messages_completion(
                     parallel_tool_calls=parallel_tool_calls,
                 ),
                 error=str(e),
+                error_type=type(e).__name__,
                 duration_ms=duration_ms,
             )
         raise
@@ -776,7 +889,6 @@ async def generate_messages_completion(
                 input_data=_build_messages_log_input(
                     trace_id=request_trace_id,
                     payload_summary=payload_summary,
-                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
@@ -785,15 +897,14 @@ async def generate_messages_completion(
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
                 ),
-                output=json.dumps(result.model_dump(), ensure_ascii=False),
-                reasoning_content=result.reasoning_content,
+                output=result.content,
+                reasoning_chars=len(result.reasoning_content or ""),
+                finish_reason=result.finish_reason,
+                tool_calls_count=len(result.tool_calls),
                 duration_ms=duration_ms,
                 usage=result.usage,
             )
         return result
-    finally:
-        if client is not None:
-            await client.close()
 
 
 async def test_connection() -> bool:
@@ -808,12 +919,19 @@ async def test_connection() -> bool:
         logger.warning("API Token 未配置，跳过连接测试")
         return False
 
-    client = OpenAICompatibleClient(
-        token,
-        base_url=str(config.api_base),
-        timeout_seconds=float(config.timeout_seconds),
-    )
-    try:
-        return await client.test_connection()
-    finally:
-        await client.close()
+    async with _client_pool.acquire() as client:
+        return await client.test_connection(config.model)
+
+
+try:
+    driver = get_driver()
+except ValueError:
+    driver = None
+
+if driver is not None:
+
+    @driver.on_shutdown
+    async def _shutdown_provider_resources() -> None:
+        """在进程退出时排空日志，并关闭复用的 HTTP 连接。"""
+        await shutdown_llm_logging()
+        await _client_pool.close()

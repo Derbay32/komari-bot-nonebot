@@ -8,7 +8,11 @@ from typing import Any
 import pytest
 
 from komari_bot.plugins.user_ban import expiration_worker
-from komari_bot.plugins.user_ban.models import BanRecord, NotificationResult
+from komari_bot.plugins.user_ban.models import (
+    BanRecord,
+    ExpiredBanNotification,
+    NotificationResult,
+)
 
 
 def _record(user_id: str, scope: str) -> BanRecord:
@@ -25,6 +29,23 @@ def _record(user_id: str, scope: str) -> BanRecord:
 
 
 class _Service:
+    def __init__(self) -> None:
+        self.notifications = [
+            ExpiredBanNotification(
+                notification_id="notification-1",
+                user_id="10086",
+                records=(_record("10086", "chat"), _record("10086", "command")),
+                attempt_count=1,
+            ),
+            ExpiredBanNotification(
+                notification_id="notification-2",
+                user_id="10010",
+                records=(_record("10010", "chat"),),
+                attempt_count=1,
+            ),
+        ]
+        self.acknowledged: list[str] = []
+
     async def expire_due_bans(self) -> tuple[BanRecord, ...]:
         return (
             _record("10086", "chat"),
@@ -32,18 +53,38 @@ class _Service:
             _record("10010", "chat"),
         )
 
+    async def claim_expired_notification(
+        self,
+        **_kwargs: object,
+    ) -> ExpiredBanNotification | None:
+        return self.notifications.pop(0) if self.notifications else None
+
+    async def acknowledge_expired_notification(
+        self,
+        *,
+        notification_id: str,
+        owner_token: str,
+    ) -> bool:
+        assert owner_token.startswith("expiration-")
+        self.acknowledged.append(notification_id)
+        return True
+
+    async def retry_expired_notification(self, **_kwargs: object) -> bool:
+        raise AssertionError
+
 
 @pytest.mark.asyncio
 async def test_expiration_sweep_groups_records_by_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
+    service = _Service()
 
     async def notify(*_args: object, **kwargs: Any) -> NotificationResult:
         calls.append(kwargs)
         return NotificationResult(attempted=True, sent=True)
 
-    monkeypatch.setattr(expiration_worker, "get_service", lambda: _Service())
+    monkeypatch.setattr(expiration_worker, "get_service", lambda: service)
     monkeypatch.setattr(expiration_worker, "get_first_available_bot", object)
     monkeypatch.setattr(expiration_worker, "notify_expired_records", notify)
     monkeypatch.setattr(
@@ -60,3 +101,4 @@ async def test_expiration_sweep_groups_records_by_user(
     assert [record.ban_scope for record in first["records"]] == ["chat", "command"]
     assert first["superuser_bypass"] is False
     assert second["superuser_bypass"] is True
+    assert service.acknowledged == ["notification-1", "notification-2"]

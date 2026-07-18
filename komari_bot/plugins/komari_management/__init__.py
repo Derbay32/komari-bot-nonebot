@@ -42,8 +42,9 @@ from komari_bot.plugins.user_data.config_schema import (
     DynamicConfigSchema as UserDataConfigSchema,
 )
 
+from .announcement_repository import close_announcement_dispatch_repository
 from .api_runtime import ManagementApiComponents, register_management_api_for_driver
-from .config_schema import DynamicConfigSchema
+from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
 config_manager_plugin = require("config_manager")
@@ -82,6 +83,7 @@ def _load_management_components() -> ManagementApiComponents:
         help_engine_getter=help_plugin.get_engine,
         register_memory_api=memory_plugin.register_memory_api,
         memory_service_getter=memory_plugin.get_memory_service,
+        memory_redis_getter=memory_plugin.get_redis_manager,
         register_llm_provider_api=llm_provider_plugin.register_llm_provider_api,
         reply_log_reader_getter=llm_provider_plugin.get_reply_log_reader,
         register_user_ban_api=user_ban_plugin.register_user_ban_api,
@@ -202,15 +204,25 @@ def _load_management_components() -> ManagementApiComponents:
 
 driver = get_driver()
 state = PluginState()
+
+
+async def _get_management_credential_source() -> str | list[ManagementCredentialSchema]:
+    """动态返回多凭据配置，未迁移时回退旧单 Token。"""
+    config = await config_manager.get_async()
+    return config.api_credentials or config.api_token
+
+
 state.api_registered = register_management_api_for_driver(
     driver=driver,
     config=config_manager.get(),
     component_loader=_load_management_components,
     logger=logger,
+    api_token_getter=_get_management_credential_source,
 )
 
 
 @driver.on_shutdown
-def _close_prompt_storage() -> None:
-    """关闭已创建的 Prompt 存储。"""
+async def _close_management_resources() -> None:
+    """关闭管理插件持有的 Prompt 与公告账本资源。"""
     close_prompt_storage_if_created()
+    await close_announcement_dispatch_repository()

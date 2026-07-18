@@ -1,4 +1,4 @@
-"""诊断报告格式化与合并转发发送。
+"""诊断报告格式化与私密投递。
 
 安全约束：
 - 绝不输出完整历史、画像、搜索正文、prompt、reasoning content、base64
@@ -6,16 +6,24 @@
 - 零调用聚合全部显示"未报告"，不伪造 0
 - 单节点按行切分并限制体积，每批不超过 50 个节点
 - 合并转发失败时按同章节普通文本逐条发送
+- 完整报告只投递到发起 SUPERUSER 的私聊
+- 显式公开时仅发送二次脱敏的结构化诊断
 """
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 
+from komari_bot.common.onebot_messages import plain_text_message
+
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from komari_bot.plugins.llm_provider.diagnostic import (
         LLMCallTrace,
         LLMDiagnosticCollector,
@@ -24,6 +32,15 @@ if TYPE_CHECKING:
 
 MAX_NODE_TEXT_LENGTH = 3500
 MAX_NODES_PER_BATCH = 50
+_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticDeliveryResult:
+    """完整私聊报告与可选公开脱敏报告的投递结果。"""
+
+    private_delivered: bool
+    public_delivered: bool | None
 
 
 def _fmt_token(val: int | None, *, complete: bool) -> str:
@@ -71,19 +88,26 @@ def _format_call_line(call: LLMCallTrace, index: int) -> str:
     return "\n".join(parts)
 
 
-def _format_tool_line(tool: ToolExecutionTrace) -> str:
+def _format_tool_line(
+    tool: ToolExecutionTrace,
+    *,
+    public_redacted: bool = False,
+) -> str:
     """格式化单次工具执行行。"""
-    safe_arguments = _build_safe_tool_arguments(
-        tool.tool_name,
-        tool.parsed_arguments,
-    )
     lines = [
         f"工具: {tool.tool_name}",
         f"  状态: {tool.status}",
-        f"  参数: {_truncate_dict(safe_arguments, 200)}",
     ]
-    if tool.error_summary:
-        lines.append(f"  错误: {_truncate_text(tool.error_summary, 300)}")
+    if public_redacted:
+        lines.append("  参数与结果: 公开模式已隐藏")
+    else:
+        safe_arguments = _build_safe_tool_arguments(
+            tool.tool_name,
+            tool.parsed_arguments,
+        )
+        lines.append(f"  参数: {_truncate_dict(safe_arguments, 200)}")
+    if tool.error_summary and not public_redacted:
+        lines.append("  错误: 已记录（异常正文已隐藏）")
     if tool.result_summary:
         lines.append("  结果: 已记录（内容已隐藏）")
     return "\n".join(lines)
@@ -93,7 +117,7 @@ def _build_safe_tool_arguments(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    """按工具白名单生成可在群内展示的诊断参数。"""
+    """按工具白名单生成私聊诊断可展示的参数摘要。"""
     safe: dict[str, Any] = {}
     match tool_name:
         case "record_favorability_delta":
@@ -172,6 +196,11 @@ def _truncate_text(content: str, max_chars: int = 500) -> str:
     if len(content) <= max_chars:
         return content
     return content[:max_chars] + "..."
+
+
+def _safe_error_code(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if _ERROR_CODE_PATTERN.fullmatch(candidate) else "internal_error"
 
 
 def _format_phase_subtotal(phase: str, collector: LLMDiagnosticCollector) -> str:
@@ -253,8 +282,9 @@ def _build_chapters(
     *,
     succeeded: bool,
     error: str | None,
-    extra_info: dict[str, Any] | None,
-    final_result_info: dict[str, Any] | None = None,
+    extra_info: Mapping[str, Any] | None,
+    final_result_info: Mapping[str, Any] | None = None,
+    public_redacted: bool = False,
 ) -> list[tuple[str, str]]:
     """构建报告章节列表，每项为 (章节标题, 章节正文)。
 
@@ -270,14 +300,19 @@ def _build_chapters(
         f"类型: {result_type}",
         f"状态: {'成功' if succeeded else '失败'}",
     ]
-    if extra_info:
+    if extra_info and not public_redacted:
         for key, val in extra_info.items():
             safe_val = _truncate_text(str(val), max_chars=300)
             overview_lines.append(f"{key}: {safe_val}")
     chapters.append(("请求总览", "\n".join(overview_lines)))
 
     # 2. 最终结果
-    if succeeded:
+    if public_redacted:
+        final_lines = [
+            f"最终结果: {'已成功完成' if succeeded else '执行失败'}",
+            "输入、输出、用户标识与异常正文已隐藏",
+        ]
+    elif succeeded:
         final_lines = ["最终结果: 已成功完成"]
         if final_result_info:
             for key, val in final_result_info.items():
@@ -293,7 +328,7 @@ def _build_chapters(
     else:
         final_lines = [
             "最终结果: 执行失败",
-            f"错误类型: {_truncate_text(error or '未知', max_chars=300)}",
+            f"错误码: {_safe_error_code(error)}",
         ]
         if final_result_info:
             for key, val in final_result_info.items():
@@ -326,7 +361,9 @@ def _build_chapters(
             grouped.setdefault(t.call_id, []).append(t)
         for call_id, tools in grouped.items():
             tool_lines.append(f"\n调用 {call_id} 的工具:")
-            tool_lines.extend(_format_tool_line(t) for t in tools)
+            tool_lines.extend(
+                _format_tool_line(t, public_redacted=public_redacted) for t in tools
+            )
         chapters.append(("工具摘要", "\n".join(tool_lines)))
     else:
         chapters.append(("工具摘要", "无工具调用记录"))
@@ -346,10 +383,17 @@ def _build_chapters(
 
     # 7. 错误/降级
     if collector.errors:
-        error_lines = [
-            f"阶段: {err['phase']} | 类型: {_truncate_text(err['type'], max_chars=100)} | 消息: {_truncate_text(err['message'], max_chars=300)}"
-            for err in collector.errors
-        ]
+        if public_redacted:
+            error_lines = [
+                f"共 {len(collector.errors)} 个错误或降级事件，详情已隐藏"
+            ]
+        else:
+            error_lines = [
+                f"阶段: {err['phase']} | "
+                f"类型: {_truncate_text(err['type'], max_chars=100)} | "
+                "异常正文: 已隐藏"
+                for err in collector.errors
+            ]
         chapters.append(("错误/降级", "\n".join(error_lines)))
     else:
         chapters.append(("错误/降级", "无"))
@@ -360,27 +404,29 @@ def _build_chapters(
 async def build_and_send_diagnostic_report(
     *,
     bot: Bot,
-    group_id: int,
+    user_id: int,
     collector: LLMDiagnosticCollector,
     result_type: str,
     succeeded: bool,
     error: str | None = None,
-    extra_info: dict[str, Any] | None = None,
-    final_result_info: dict[str, Any] | None = None,
-) -> None:
-    """构建诊断报告并通过合并转发发送；失败时降级为普通文本逐条发送。
+    extra_info: Mapping[str, Any] | None = None,
+    final_result_info: Mapping[str, Any] | None = None,
+    public_group_id: int | None = None,
+) -> DiagnosticDeliveryResult:
+    """私聊完整报告，并可向群内额外投递二次脱敏报告。
 
     Args:
         bot: OneBot Bot 实例
-        group_id: 目标群 ID
+        user_id: 已通过鉴权的 SUPERUSER ID
         collector: 诊断收集器
         result_type: "reply" 或 "summary"
         succeeded: 是否成功
         error: 错误信息（失败时）
-        extra_info: 安全的请求元数据（不放回复正文）
+        extra_info: 私聊报告使用的请求元数据
         final_result_info: 最终结果信息（回复正文、好感度变化等）
+        public_group_id: 显式请求公开脱敏报告时的目标群 ID
     """
-    chapters = _build_chapters(
+    private_chapters = _build_chapters(
         collector,
         result_type,
         succeeded=succeeded,
@@ -388,67 +434,174 @@ async def build_and_send_diagnostic_report(
         extra_info=extra_info,
         final_result_info=final_result_info,
     )
+    private_delivered = await _send_report_nodes(
+        bot,
+        _chapters_to_nodes(private_chapters),
+        forward_api="send_private_forward_msg",
+        text_api="send_private_msg",
+        target_key="user_id",
+        target_id=user_id,
+        channel="private",
+    )
 
-    # 为每个章节构建节点（章节标题作为第一行，正文随后）
+    public_delivered: bool | None = None
+    if public_group_id is not None:
+        public_chapters = _build_chapters(
+            collector,
+            result_type,
+            succeeded=succeeded,
+            error=error,
+            extra_info=extra_info,
+            final_result_info=final_result_info,
+            public_redacted=True,
+        )
+        public_delivered = await _send_report_nodes(
+            bot,
+            _chapters_to_nodes(public_chapters),
+            forward_api="send_group_forward_msg",
+            text_api="send_group_msg",
+            target_key="group_id",
+            target_id=public_group_id,
+            channel="public_redacted",
+        )
+
+    return DiagnosticDeliveryResult(
+        private_delivered=private_delivered,
+        public_delivered=public_delivered,
+    )
+
+
+def _chapters_to_nodes(chapters: list[tuple[str, str]]) -> list[str]:
+    """把报告章节转换为受大小限制的合并转发节点。"""
     nodes: list[str] = []
     for title, body in chapters:
         chapter_text = f"【{title}】\n{body}"
         nodes.extend(_split_into_nodes(chapter_text))
+    return nodes
 
-    # 分批发送合并转发
+
+async def _send_report_nodes(
+    bot: Bot,
+    nodes: list[str],
+    *,
+    forward_api: str,
+    text_api: str,
+    target_key: str,
+    target_id: int,
+    channel: str,
+) -> bool:
+    """发送报告节点；合并转发失败时仅向同一目标降级为普通消息。"""
+    delivered = True
     for batch_idx in range(0, len(nodes), MAX_NODES_PER_BATCH):
         batch = nodes[batch_idx : batch_idx + MAX_NODES_PER_BATCH]
         forward_nodes = [
             MessageSegment.node_custom(
                 user_id=int(bot.self_id),
                 nickname="Komari Debug",
-                content=node_text,
+                content=plain_text_message(node_text),
             )
             for node_text in batch
         ]
 
         try:
             await bot.call_api(
-                "send_group_forward_msg",
-                group_id=group_id,
+                forward_api,
+                **{target_key: target_id},
                 messages=forward_nodes,
             )
             logger.info(
-                "[KomariDebug] 合并转发报告发送成功: group={} batch={}/{} nodes={}",
-                group_id,
+                "[KomariDebug] 诊断报告发送成功: channel={} batch={}/{} nodes={}",
+                channel,
                 batch_idx // MAX_NODES_PER_BATCH + 1,
                 (len(nodes) - 1) // MAX_NODES_PER_BATCH + 1,
                 len(batch),
             )
-        except Exception:
-            logger.exception(
-                "[KomariDebug] 合并转发失败，降级为普通文本发送: group={} batch={}",
-                group_id,
+        except Exception as exc:
+            logger.warning(
+                "[KomariDebug] 合并转发失败，降级为同目标普通消息: "
+                "channel={} batch={} error_type={}",
+                channel,
                 batch_idx // MAX_NODES_PER_BATCH + 1,
+                type(exc).__name__,
             )
-            await _send_text_fallback(bot, group_id, batch)
+            batch_delivered = await _send_text_fallback(
+                bot,
+                batch,
+                text_api=text_api,
+                target_key=target_key,
+                target_id=target_id,
+                channel=channel,
+            )
+            delivered = delivered and batch_delivered
+    return delivered
 
 
 async def _send_text_fallback(
     bot: Bot,
-    group_id: int,
     batch_nodes: list[str],
-) -> None:
-    """合并转发失败时，将同一批次的节点逐条作为普通文本发送。"""
+    *,
+    text_api: str,
+    target_key: str,
+    target_id: int,
+    channel: str,
+) -> bool:
+    """合并转发失败时，将节点逐条发回同一个私聊或群聊目标。"""
+    delivered = True
     for node_text in batch_nodes:
-        try:
-            await send_group_text(bot, group_id, node_text)
-        except Exception:
-            logger.exception("[KomariDebug] 文本降级发送失败")
-
-
-async def send_group_text(bot: Bot, group_id: int, text: str) -> None:
-    """发送普通群消息文本。"""
-    try:
-        await bot.call_api(
-            "send_group_msg",
-            group_id=group_id,
-            message=text,
+        node_delivered = await _send_message(
+            bot,
+            api=text_api,
+            target_key=target_key,
+            target_id=target_id,
+            message=node_text,
+            channel=channel,
         )
-    except Exception:
-        logger.exception("[KomariDebug] send_group_msg 失败")
+        delivered = delivered and node_delivered
+    return delivered
+
+
+async def _send_message(
+    bot: Bot,
+    *,
+    api: str,
+    target_key: str,
+    target_id: int,
+    message: Any,
+    channel: str,
+) -> bool:
+    """向指定目标发送消息，日志不记录目标 ID 或消息正文。"""
+    safe_message = plain_text_message(message) if isinstance(message, str) else message
+    try:
+        await bot.call_api(api, **{target_key: target_id}, message=safe_message)
+    except Exception as exc:
+        logger.warning(
+            "[KomariDebug] 消息投递失败: channel={} error_type={}",
+            channel,
+            type(exc).__name__,
+        )
+        return False
+    return True
+
+
+async def send_private_message(bot: Bot, user_id: int, message: Any) -> bool:
+    """向已鉴权的 SUPERUSER 私聊发送文本或消息段。"""
+    return await _send_message(
+        bot,
+        api="send_private_msg",
+        target_key="user_id",
+        target_id=user_id,
+        message=message,
+        channel="private",
+    )
+
+
+async def send_group_text(bot: Bot, group_id: int, text: str) -> bool:
+    """发送不含诊断正文的群消息文本。"""
+    return await _send_message(
+        bot,
+        api="send_group_msg",
+        target_key="group_id",
+        target_id=group_id,
+        message=plain_text_message(text),
+        channel="group_receipt",
+    )

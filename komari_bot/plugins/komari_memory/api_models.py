@@ -5,7 +5,20 @@ from __future__ import annotations
 from datetime import datetime  # noqa: TC003
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, RootModel, field_validator
+
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    IDENTIFIER_TEXT_BUDGET,
+    KEYWORD_TEXT_BUDGET,
+    TITLE_TEXT_BUDGET,
+    ContentValidationError,
+    normalize_identifiers,
+    normalize_required_text,
+    validate_json_budget,
+)
+
+MAX_PROFILE_TRAIT_COUNT = 100
 
 
 class ConversationEntry(BaseModel):
@@ -32,6 +45,33 @@ class ConversationListResponse(BaseModel):
     offset: int
 
 
+class ConversationDeadLetterEntry(BaseModel):
+    """不含消息正文的对话总结失败快照摘要。"""
+
+    group_id: str
+    snapshot_id: str
+    failure_code: str
+    attempt_count: int
+    failed_at_ms: int
+    message_count: int
+    chunk_state_count: int
+
+
+class ConversationDeadLetterListResponse(BaseModel):
+    """对话总结失败快照列表响应。"""
+
+    items: list[ConversationDeadLetterEntry]
+    limit: int
+
+
+class ConversationDeadLetterRequeueResponse(BaseModel):
+    """失败快照重新入队响应。"""
+
+    group_id: str
+    snapshot_id: str
+    restored_message_count: int
+
+
 class ConversationCreateRequest(BaseModel):
     """创建对话记忆请求。"""
 
@@ -44,18 +84,32 @@ class ConversationCreateRequest(BaseModel):
     end_time: datetime | None = None
     last_accessed: datetime | None = None
 
-    @field_validator("group_id", "summary")
+    @field_validator("group_id")
     @classmethod
-    def strip_required_text(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("字段不能为空")
-        return stripped
+    def normalize_group_id(cls, value: str) -> str:
+        return normalize_required_text(
+            value,
+            label="群组 ID",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_summary(cls, value: str) -> str:
+        return normalize_required_text(
+            value,
+            label="对话摘要",
+            budget=CONTENT_TEXT_BUDGET,
+        )
 
     @field_validator("participants")
     @classmethod
     def normalize_participants(cls, value: list[str]) -> list[str]:
-        return [item.strip() for item in value if item.strip()]
+        return normalize_identifiers(
+            value,
+            label="参与者",
+            require_nonempty=False,
+        )
 
 
 class ConversationUpdateRequest(BaseModel):
@@ -70,15 +124,27 @@ class ConversationUpdateRequest(BaseModel):
     end_time: datetime | None = None
     last_accessed: datetime | None = None
 
-    @field_validator("group_id", "summary")
+    @field_validator("group_id")
     @classmethod
-    def strip_optional_text(cls, value: str | None) -> str | None:
+    def normalize_optional_group_id(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("字段不能为空")
-        return stripped
+        return normalize_required_text(
+            value,
+            label="群组 ID",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_optional_summary(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_required_text(
+            value,
+            label="对话摘要",
+            budget=CONTENT_TEXT_BUDGET,
+        )
 
     @field_validator("participants")
     @classmethod
@@ -88,7 +154,75 @@ class ConversationUpdateRequest(BaseModel):
     ) -> list[str] | None:
         if value is None:
             return None
-        return [item.strip() for item in value if item.strip()]
+        return normalize_identifiers(
+            value,
+            label="参与者",
+            require_nonempty=False,
+        )
+
+
+class UserProfileUpsertRequest(RootModel[dict[str, Any]]):
+    """有结构与内容预算的用户画像写入载荷。"""
+
+    @field_validator("root")
+    @classmethod
+    def normalize_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(value)
+
+        if "user_id" in payload:
+            raw_user_id = payload["user_id"]
+            if not isinstance(raw_user_id, str):
+                message = "用户 ID 必须是字符串"
+                raise ContentValidationError(message)
+            payload["user_id"] = normalize_required_text(
+                raw_user_id,
+                label="用户 ID",
+                budget=IDENTIFIER_TEXT_BUDGET,
+            )
+
+        if "display_name" in payload:
+            raw_display_name = payload["display_name"]
+            if not isinstance(raw_display_name, str):
+                message = "显示名称必须是字符串"
+                raise ContentValidationError(message)
+            payload["display_name"] = normalize_required_text(
+                raw_display_name,
+                label="显示名称",
+                budget=TITLE_TEXT_BUDGET,
+            )
+
+        if "traits" in payload:
+            raw_traits = payload["traits"]
+            if not isinstance(raw_traits, dict):
+                message = "traits 必须是 JSON 对象"
+                raise ContentValidationError(message)
+            if len(raw_traits) > MAX_PROFILE_TRAIT_COUNT:
+                message = (
+                    "画像 trait 数量超过上限"
+                    f"（当前 {len(raw_traits)}，最多 {MAX_PROFILE_TRAIT_COUNT}）"
+                )
+                raise ContentValidationError(message)
+            normalized_traits: dict[str, dict[str, Any]] = {}
+            seen: set[str] = set()
+            for raw_key, raw_trait in raw_traits.items():
+                key = normalize_required_text(
+                    raw_key,
+                    label="画像 trait 名称",
+                    budget=KEYWORD_TEXT_BUDGET,
+                )
+                folded_key = key.casefold()
+                if folded_key in seen:
+                    message = "画像 trait 名称清理后重复"
+                    raise ContentValidationError(message)
+                if not isinstance(raw_trait, dict):
+                    message = "画像 trait 值必须是 JSON 对象"
+                    raise ContentValidationError(message)
+                seen.add(folded_key)
+                normalized_traits[key] = dict(raw_trait)
+            payload["traits"] = normalized_traits
+
+        validate_json_budget(payload, label="用户画像 JSON")
+        return payload
 
 
 class MemoryEntityEntry(BaseModel):
@@ -149,10 +283,11 @@ class InteractionEventUpdateRequest(BaseModel):
 
     @field_validator("event_summary")
     @classmethod
-    def strip_optional_summary(cls, value: str | None) -> str | None:
+    def normalize_optional_summary(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("字段不能为空")
-        return stripped
+        return normalize_required_text(
+            value,
+            label="互动事件摘要",
+            budget=CONTENT_TEXT_BUDGET,
+        )

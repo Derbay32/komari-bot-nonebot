@@ -35,6 +35,8 @@ from nonebot.adapters.onebot.v11 import (
 )
 from nonebot.adapters.onebot.v11.event import Sender
 
+from komari_bot.common.onebot_messages import plain_text_message
+
 if TYPE_CHECKING:
     from nonebug import App
 
@@ -129,10 +131,12 @@ async def test_favor_get_shows_favorability_data(
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
         ctx.should_call_send(
             event,
-            "📊 用户 42 好感度:\n"
-            "  数值: 0\n"
-            "  阶段: 疏离戒备（1/4）\n"
-            "  更新时间: 2026-06-07T00:00:00+00:00",
+            plain_text_message(
+                "📊 用户 42 好感度:\n"
+                "  数值: 0\n"
+                "  阶段: 疏离戒备（1/4）\n"
+                "  更新时间: 2026-06-07T00:00:00+00:00"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -178,8 +182,63 @@ async def test_favor_get_exception_shows_error_message(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_get)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
-        ctx.should_call_send(event, "❌ 查询失败: 数据库连接失败", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 查询失败\n错误码: favor_get_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_group_favor_get_sends_only_receipt_and_hides_error_body(
+    app: App,
+    debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error_canary = "favor-storage-error-canary"
+    private_messages: list[str] = []
+
+    async def _raise_error(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(error_canary)
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        message: object,
+    ) -> bool:
+        private_messages.append(str(message))
+        return True
+
+    monkeypatch.setattr(debug_commands, "get_user_favorability", _raise_error)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="d" * 32),
+    )
+
+    async with app.test_matcher(debug_commands.debug_favor_get) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".debug favor get 42", user_id=SU_ID)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_favor_get)
+        ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
+        ctx.should_call_send(
+            event,
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-favor-get-dddddddddddd\n"
+                "执行状态: 失败\n"
+                "完整结果: 已私聊"
+            ),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+    assert len(private_messages) == 1
+    assert "favor_get_failed" in private_messages[0]
+    assert error_canary not in private_messages[0]
 
 
 # ─── favor set 成功 ───────────────────────────────────────────
@@ -199,11 +258,13 @@ async def test_favor_set_shows_before_after_and_stage(
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_set)
         ctx.should_call_send(
             event,
-            "✅ 用户 42 好感度已设置:\n"
-            "  before: 0\n"
-            "  after:  200\n"
-            "  阶段:    普通熟人（2/4）\n"
-            "  更新时间: 2026-06-07T00:00:00+00:00",
+            plain_text_message(
+                "✅ 用户 42 好感度已设置:\n"
+                "  before: 0\n"
+                "  after:  200\n"
+                "  阶段:    普通熟人（2/4）\n"
+                "  更新时间: 2026-06-07T00:00:00+00:00"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -289,7 +350,11 @@ async def test_favor_set_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_set)
-        ctx.should_call_send(event, "❌ 设置失败: 事务冲突", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 设置失败\n错误码: favor_set_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -330,7 +395,11 @@ async def test_bind_set_success(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
-        ctx.should_call_send(event, "✅ 已为用户 42 设置角色绑定: 泉此方", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("✅ 已为用户 42 设置角色绑定: 泉此方"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -391,7 +460,11 @@ async def test_bind_set_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
-        ctx.should_call_send(event, "❌ 设置绑定失败: 存储失败", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 设置绑定失败\n错误码: bind_set_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -415,7 +488,11 @@ async def test_bind_del_success(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(event, "✅ 已删除用户 42 的角色绑定", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("✅ 已删除用户 42 的角色绑定"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -436,7 +513,11 @@ async def test_bind_del_not_found(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(event, "⚠️ 用户 999 没有角色绑定", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("⚠️ 用户 999 没有角色绑定"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -477,7 +558,11 @@ async def test_bind_del_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(event, "❌ 删除绑定失败: JSON 解析失败", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 删除绑定失败\n错误码: bind_delete_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -503,7 +588,7 @@ async def test_bind_list_with_bindings(
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         expected = "📋 全部角色绑定:\n  10086: 柊镜\n  42: 泉此方"
-        ctx.should_call_send(event, expected, bot=bot)
+        ctx.should_call_send(event, plain_text_message(expected), bot=bot)
         ctx.should_finished()
 
 
@@ -524,7 +609,11 @@ async def test_bind_list_empty(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
-        ctx.should_call_send(event, "📋 当前没有任何角色绑定", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 当前没有任何角色绑定"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -545,7 +634,11 @@ async def test_bind_list_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
-        ctx.should_call_send(event, "❌ 查询绑定列表失败: JSON 文件损坏", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 查询绑定列表失败\n错误码: bind_list_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -563,10 +656,155 @@ async def test_bind_list_rejects_extra_arguments(
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         ctx.should_call_send(
             event,
-            "❌ 参数过多\n用法: .debug bind list",
+            "❌ 参数过多\n用法: .debug bind list [--public]",
             bot=bot,
         )
         ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_group_bind_list_sends_full_details_only_to_superuser_private_chat(
+    app: App,
+    debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bindings = {"42": "binding-canary-konata", "10086": "binding-canary-kagami"}
+    manager_stub = SimpleNamespace(list_bindings=lambda: bindings)
+    private_messages: list[tuple[int, str]] = []
+
+    async def _fake_private_message(
+        _bot: object,
+        user_id: int,
+        message: object,
+    ) -> bool:
+        private_messages.append((user_id, str(message)))
+        return True
+
+    monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="a" * 32),
+    )
+
+    async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".debug bind list", user_id=SU_ID)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
+        ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
+        ctx.should_call_send(
+            event,
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-aaaaaaaaaaaa\n"
+                "执行状态: 成功\n"
+                "完整结果: 已私聊"
+            ),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+    assert private_messages[0][0] == SU_ID
+    assert "binding-canary-konata" in private_messages[0][1]
+    assert "binding-canary-kagami" in private_messages[0][1]
+
+
+@pytest.mark.asyncio
+async def test_group_bind_list_public_mode_shows_only_redacted_count(
+    app: App,
+    debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bindings = {"42": "binding-public-canary"}
+    manager_stub = SimpleNamespace(list_bindings=lambda: bindings)
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        message: object,
+    ) -> bool:
+        assert "binding-public-canary" in str(message)
+        return True
+
+    monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="b" * 32),
+    )
+
+    async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".debug bind list --public", user_id=SU_ID)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
+        ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
+        ctx.should_call_send(
+            event,
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-bbbbbbbbbbbb\n"
+                "执行状态: 成功\n"
+                "完整结果: 已私聊\n"
+                "公开脱敏摘要: 已发送\n"
+                "公开摘要: 共 1 条绑定，明细已隐藏"
+            ),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_group_bind_list_error_reason_is_private(
+    app: App,
+    debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error_canary = "binding-storage-error-canary"
+    manager_stub = SimpleNamespace(
+        list_bindings=lambda: (_ for _ in ()).throw(RuntimeError(error_canary))
+    )
+    private_messages: list[str] = []
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        message: object,
+    ) -> bool:
+        private_messages.append(str(message))
+        return True
+
+    monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="c" * 32),
+    )
+
+    async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".debug bind list", user_id=SU_ID)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
+        ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
+        ctx.should_call_send(
+            event,
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-cccccccccccc\n"
+                "执行状态: 失败\n"
+                "完整结果: 已私聊"
+            ),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+    assert error_canary not in private_messages[0]
+    assert "bind_list_failed" in private_messages[0]
 
 
 # ─── reply 私聊拒绝 ───────────────────────────────────────────
@@ -605,7 +843,7 @@ async def test_reply_empty_text_refused(
         ctx.should_pass_rule(matcher=debug_commands.debug_reply)
         ctx.should_call_send(
             event,
-            "❌ 请提供测试文本\n用法: .debug reply <测试文本>",
+            "❌ 请提供测试文本\n用法: .debug reply [--public] <测试文本>",
             bot=bot,
         )
         ctx.should_finished()
@@ -635,12 +873,12 @@ async def test_reply_success_calls_generate_debug_reply_and_sends_report(
             collector=collector,
         )
 
-    async def _fake_build_report(**kwargs: object) -> None:
+    async def _fake_deliver_report(**kwargs: object) -> None:
         spy.build_report_called = True
         spy.report_kwargs = kwargs
 
     monkeypatch.setattr(debug_commands, "generate_debug_reply", _fake_generate_debug_reply)
-    monkeypatch.setattr(debug_commands, "build_and_send_diagnostic_report", _fake_build_report)
+    monkeypatch.setattr(debug_commands, "_deliver_debug_report", _fake_deliver_report)
 
     async with app.test_matcher(debug_commands.debug_reply) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -654,6 +892,64 @@ async def test_reply_success_calls_generate_debug_reply_and_sends_report(
     assert spy.build_report_called
     assert spy.report_kwargs["result_type"] == "reply"
     assert spy.report_kwargs["succeeded"] is True
+    assert spy.report_kwargs["public_requested"] is False
+
+
+@pytest.mark.asyncio
+async def test_debug_report_group_receipt_never_contains_diagnostic_canaries(
+    debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = debug_commands.LLMDiagnosticCollector(request_id="debug-safe-receipt")
+    event = _build_group_event(".debug reply secret", user_id=SU_ID)
+    captured = SimpleNamespace(report_kwargs=None, receipt=None)
+
+    async def _fake_build_report(**kwargs: object) -> object:
+        captured.report_kwargs = kwargs
+        return debug_commands.DiagnosticDeliveryResult(
+            private_delivered=True,
+            public_delivered=None,
+        )
+
+    async def _fake_group_text(
+        _bot: object,
+        group_id: int,
+        text: str,
+    ) -> bool:
+        assert group_id == event.group_id
+        captured.receipt = text
+        return True
+
+    monkeypatch.setattr(
+        debug_commands,
+        "build_and_send_diagnostic_report",
+        _fake_build_report,
+    )
+    monkeypatch.setattr(debug_commands, "send_group_text", _fake_group_text)
+
+    await debug_commands._deliver_debug_report(
+        bot=cast("Any", SimpleNamespace()),
+        event=event,
+        collector=collector,
+        result_type="reply",
+        succeeded=False,
+        public_requested=False,
+        error="error-receipt-canary",
+        extra_info={"user_id": "user-receipt-canary"},
+        final_result_info={"reply_text": "reply-receipt-canary"},
+    )
+
+    assert captured.report_kwargs["user_id"] == SU_ID
+    assert captured.report_kwargs["public_group_id"] is None
+    assert captured.receipt == (
+        "🔒 调试请求已处理\n"
+        "请求 ID: debug-safe-receipt\n"
+        "执行状态: 失败\n"
+        "完整结果: 已私聊"
+    )
+    assert "error-receipt-canary" not in captured.receipt
+    assert "user-receipt-canary" not in captured.receipt
+    assert "reply-receipt-canary" not in captured.receipt
 
 
 # ─── reply 异常流程 ────────────────────────────────────────────
@@ -672,12 +968,12 @@ async def test_reply_exception_sends_error_report(
         msg = "LLM 服务不可用"
         raise RuntimeError(msg)
 
-    async def _fake_build_report(**kwargs: object) -> None:
+    async def _fake_deliver_report(**kwargs: object) -> None:
         spy.build_report_called = True
         spy.report_kwargs = kwargs
 
     monkeypatch.setattr(debug_commands, "generate_debug_reply", _fake_generate_debug_reply)
-    monkeypatch.setattr(debug_commands, "build_and_send_diagnostic_report", _fake_build_report)
+    monkeypatch.setattr(debug_commands, "_deliver_debug_report", _fake_deliver_report)
 
     async with app.test_matcher(debug_commands.debug_reply) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -689,7 +985,7 @@ async def test_reply_exception_sends_error_report(
 
     assert spy.build_report_called
     assert spy.report_kwargs["succeeded"] is False
-    assert "LLM 服务不可用" in str(spy.report_kwargs["error"])
+    assert spy.report_kwargs["error"] == "debug_reply_failed"
 
 
 # ─── summary 私聊拒绝 ─────────────────────────────────────────
@@ -730,7 +1026,7 @@ async def test_summary_empty_text_refused(
         ctx.should_pass_rule(matcher=debug_commands.debug_summary)
         ctx.should_call_send(
             event,
-            "❌ 请提供总结要求\n用法: .debug summary <总结要求>",
+            "❌ 请提供总结要求\n用法: .debug summary [--public] <总结要求>",
             bot=bot,
         )
         ctx.should_finished()
@@ -753,11 +1049,11 @@ async def test_summary_capability_not_supported(
     # 绕过 _cast_summary_config 类型检查
     monkeypatch.setattr(debug_commands, "_cast_summary_config", lambda c: c)
 
-    # 阻止 build_and_send_diagnostic_report 发出 API 调用
+    # 阻止诊断报告投递发出 API 调用
     async def _noop_report(**kwargs: object) -> None:
         pass
 
-    monkeypatch.setattr(debug_commands, "build_and_send_diagnostic_report", _noop_report)
+    monkeypatch.setattr(debug_commands, "_deliver_debug_report", _noop_report)
 
     async def _fake_execute(**_kwargs: object) -> None:
         raise CapabilityNotSupportedError
@@ -780,19 +1076,16 @@ async def test_summary_success_sends_image_before_report(
 ) -> None:
     """summary 成功时必须先发送图片，再发送诊断报告。"""
     order: list[str] = []
-    event = _build_group_event(".debug summary 总结一下", user_id=SU_ID)
+    event = _build_group_event(".debug summary --public 总结一下", user_id=SU_ID)
 
     class _FakeBot:
         self_id = "669293859"
 
-        async def send(self, _event: object, message: object) -> None:
-            assert "base64://image-data" in str(message)
-            order.append("image")
-
     async def _allow_superuser(_bot: object, _event: object) -> bool:
         return True
 
-    async def _fake_execute(**_kwargs: object) -> SimpleNamespace:
+    async def _fake_execute(**kwargs: object) -> SimpleNamespace:
+        assert kwargs["user_request"] == "总结一下"
         return SimpleNamespace(
             image_base64="image-data",
             filtered_message_count=12,
@@ -800,24 +1093,37 @@ async def test_summary_success_sends_image_before_report(
             time_range="07-11 22:00 - 07-11 23:00",
         )
 
+    async def _fake_private_message(
+        _bot: object,
+        user_id: int,
+        message: object,
+    ) -> bool:
+        assert user_id == SU_ID
+        assert "base64://image-data" in str(message)
+        order.append("image")
+        return True
+
     async def _fake_report(**kwargs: object) -> None:
         assert kwargs["succeeded"] is True
+        assert kwargs["public_requested"] is True
+        assert kwargs["private_artifact_delivered"] is True
         order.append("report")
 
     monkeypatch.setattr(debug_commands, "SUPERUSER", _allow_superuser)
     monkeypatch.setattr(debug_commands._summary_config_mgr, "get", object)
     monkeypatch.setattr(debug_commands, "_cast_summary_config", lambda config: config)
     monkeypatch.setattr(debug_commands, "execute_group_summary", _fake_execute)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
     monkeypatch.setattr(
         debug_commands,
-        "build_and_send_diagnostic_report",
+        "_deliver_debug_report",
         _fake_report,
     )
 
     await debug_commands.handle_debug_summary(
         cast("Any", _FakeBot()),
         event,
-        "总结一下",
+        "--public 总结一下",
     )
 
     assert order == ["image", "report"]
@@ -842,12 +1148,12 @@ async def test_summary_exception_sends_error_report(
         msg = "API 超时"
         raise RuntimeError(msg)
 
-    async def _fake_build_report(**kwargs: object) -> None:
+    async def _fake_deliver_report(**kwargs: object) -> None:
         spy.build_report_called = True
         spy.report_kwargs = kwargs
 
     monkeypatch.setattr(debug_commands, "execute_group_summary", _fake_execute)
-    monkeypatch.setattr(debug_commands, "build_and_send_diagnostic_report", _fake_build_report)
+    monkeypatch.setattr(debug_commands, "_deliver_debug_report", _fake_deliver_report)
 
     async with app.test_matcher(debug_commands.debug_summary) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -859,7 +1165,7 @@ async def test_summary_exception_sends_error_report(
 
     assert spy.build_report_called
     assert spy.report_kwargs["succeeded"] is False
-    assert "API 超时" in str(spy.report_kwargs["error"])
+    assert spy.report_kwargs["error"] == "debug_summary_failed"
 
 
 # ─── 严格多余参数检查 ─────────────────────────────────────────

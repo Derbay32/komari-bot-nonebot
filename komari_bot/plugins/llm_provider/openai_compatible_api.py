@@ -1,11 +1,16 @@
 """OpenAI 兼容 API 客户端。"""
 
 import json
-from typing import Any, Never
+from typing import Any, Never, cast
 
 from nonebot import logger
 from nonebot.plugin import require
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, OpenAIError
+
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    apply_llm_security_boundary,
+)
 
 from .base_client import (
     BaseLLMClient,
@@ -14,7 +19,10 @@ from .base_client import (
     LLMToolCallSchema,
     UnifiedUsageSchema,
 )
-from .config_schema import DynamicConfigSchema
+from .config_schema import (
+    DynamicConfigSchema,
+    get_unsupported_extra_param_keys,
+)
 
 # 依赖 config_manager 插件
 config_manager_plugin = require("config_manager")
@@ -90,6 +98,24 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         suppress_tool_choice = thinking_mode
         return reasoning_effort, thinking_disabled, suppress_tool_choice
+
+    @staticmethod
+    def _build_extra_body(config: object, *, thinking_disabled: bool) -> dict[str, Any]:
+        """构造受白名单约束的 extra_body，避免覆盖正式请求字段。"""
+        extra_body: dict[str, Any] = {}
+        if thinking_disabled:
+            extra_body["thinking"] = {"type": "disabled"}
+
+        extra_params = getattr(config, "extra_params", {})
+        if not isinstance(extra_params, dict):
+            msg = "extra_params 必须是对象"
+            raise TypeError(msg)
+        unsupported = get_unsupported_extra_param_keys(extra_params)
+        if unsupported:
+            msg = f"extra_params 包含不允许的键: {', '.join(unsupported)}"
+            raise ValueError(msg)
+        extra_body.update(extra_params)
+        return extra_body
 
     @classmethod
     def _raise_invalid_response(cls) -> "Never":
@@ -200,13 +226,19 @@ class OpenAICompatibleClient(BaseLLMClient):
     def _build_completion_result(self, response: Any) -> LLMCompletionResultSchema:
         """将 OpenAI 兼容响应转换为统一结果。"""
         if not getattr(response, "choices", None):
-            logger.error(f"OpenAI 兼容 API 响应格式异常: {response}")
+            logger.error(
+                "OpenAI 兼容 API 响应格式异常: response_type={}",
+                type(response).__name__,
+            )
             self._raise_invalid_response()
 
         choice = response.choices[0]
         message = getattr(choice, "message", None)
         if message is None:
-            logger.error(f"OpenAI 兼容 API 响应缺少 message: {response}")
+            logger.error(
+                "OpenAI 兼容 API 响应缺少 message: response_type={}",
+                type(response).__name__,
+            )
             self._raise_invalid_response()
 
         content = getattr(message, "content", None) or ""
@@ -260,6 +292,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """生成文本（支持 JSON 模式）。
@@ -295,10 +328,14 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  tools_count: {len(tools or [])}\n"
                 f"  has_response_format: {response_format is not None}"
             )
-            messages = []
+            messages: list[dict[str, Any]] = []
             if system_instruction:
                 messages.append({"role": "system", "content": system_instruction})
             messages.append({"role": "user", "content": prompt})
+            messages = apply_llm_security_boundary(
+                messages,
+                untrusted_contexts=untrusted_contexts,
+            )
 
             request_data = {
                 "model": model,
@@ -333,16 +370,10 @@ class OpenAICompatibleClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_body: dict[str, Any] = {}
-            if thinking_disabled:
-                extra_body["thinking"] = {"type": "disabled"}
-            extra_params = getattr(config, "extra_params", {})
-            if extra_params:
-                for key, value in extra_params.items():
-                    if key in ("thinking", "enable_thinking") and extra_body:
-                        logger.warning("extra_params 中的 {} 与思考模式控制冲突，已忽略", key)
-                        continue
-                    extra_body[key] = value
+            extra_body = self._build_extra_body(
+                config,
+                thinking_disabled=thinking_disabled,
+            )
             if extra_body:
                 logger.debug("注入 OpenAI 兼容 API extra_body 键名: {}", sorted(extra_body))
                 request_data["extra_body"] = extra_body
@@ -351,14 +382,25 @@ class OpenAICompatibleClient(BaseLLMClient):
         except APITimeoutError:
             logger.error("OpenAI 兼容 API 请求超时")
             raise
-        except APIConnectionError as e:
-            logger.error(f"OpenAI 兼容 API 网络错误: {e}")
+        except APIConnectionError as exc:
+            logger.error(
+                "OpenAI 兼容 API 网络错误: error_type={}",
+                type(exc).__name__,
+            )
             raise
-        except OpenAIError as e:
-            logger.error(f"OpenAI 兼容 API 调用失败: {e}")
+        except OpenAIError as exc:
+            status_code = getattr(exc, "status_code", None)
+            logger.error(
+                "OpenAI 兼容 API 调用失败: error_type={} status_code={}",
+                type(exc).__name__,
+                status_code if isinstance(status_code, int) else "-",
+            )
             raise
-        except Exception as e:
-            logger.error(f"OpenAI 兼容 API 未知错误: {e}")
+        except Exception as exc:
+            logger.error(
+                "OpenAI 兼容 API 未知错误: error_type={}",
+                type(exc).__name__,
+            )
             raise
         else:
             result = self._build_completion_result(response)
@@ -382,6 +424,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 直接生成文本（支持多模态）。
@@ -403,9 +446,13 @@ class OpenAICompatibleClient(BaseLLMClient):
                 self._resolve_thinking_params(model, **kwargs)
             )
 
+            safe_messages = apply_llm_security_boundary(
+                messages,
+                untrusted_contexts=untrusted_contexts,
+            )
             request_data = {
                 "model": model,
-                "messages": messages,
+                "messages": safe_messages,
                 "temperature": temperature
                 if temperature is not None
                 else config.temperature,
@@ -436,16 +483,10 @@ class OpenAICompatibleClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_body: dict[str, Any] = {}
-            if thinking_disabled:
-                extra_body["thinking"] = {"type": "disabled"}
-            extra_params = getattr(config, "extra_params", {})
-            if extra_params:
-                for key, value in extra_params.items():
-                    if key in ("thinking", "enable_thinking") and extra_body:
-                        logger.warning("extra_params 中的 {} 与思考模式控制冲突，已忽略", key)
-                        continue
-                    extra_body[key] = value
+            extra_body = self._build_extra_body(
+                config,
+                thinking_disabled=thinking_disabled,
+            )
             if extra_body:
                 logger.debug("注入 OpenAI 兼容 API extra_body 键名: {}", sorted(extra_body))
                 request_data["extra_body"] = extra_body
@@ -453,7 +494,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             logger.debug(
                 f"OpenAI 兼容 API 请求 (messages):\n"
                 f"  model: {model}\n"
-                f"  messages: {len(messages)} turns\n"
+                f"  messages: {len(safe_messages)} turns\n"
                 f"  temperature: {request_data['temperature']}\n"
                 f"  max_tokens: {request_data['max_tokens']}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
@@ -470,11 +511,19 @@ class OpenAICompatibleClient(BaseLLMClient):
         except APITimeoutError:
             logger.error("OpenAI 兼容 API 请求超时")
             raise
-        except APIConnectionError as e:
-            logger.error(f"OpenAI 兼容 API 网络错误: {e}")
+        except APIConnectionError as exc:
+            logger.error(
+                "OpenAI 兼容 API 网络错误: error_type={}",
+                type(exc).__name__,
+            )
             raise
-        except OpenAIError as e:
-            logger.error(f"OpenAI 兼容 API 调用失败: {e}")
+        except OpenAIError as exc:
+            status_code = getattr(exc, "status_code", None)
+            logger.error(
+                "OpenAI 兼容 API 调用失败: error_type={} status_code={}",
+                type(exc).__name__,
+                status_code if isinstance(status_code, int) else "-",
+            )
             raise
         else:
             result = self._build_completion_result(response)
@@ -487,7 +536,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             )
             return result
 
-    async def test_connection(self) -> bool:
+    async def test_connection(self, model: str | None = None) -> bool:
         """测试 API 连接。
 
         Returns:
@@ -496,13 +545,21 @@ class OpenAICompatibleClient(BaseLLMClient):
         config = config_manager.get()
         try:
             await self.client.chat.completions.create(
-                model=config.model,
-                messages=[{"role": "user", "content": "你好"}],
+                model=model or config.model,
+                messages=cast(
+                    "Any",
+                    apply_llm_security_boundary(
+                        [{"role": "user", "content": "你好"}]
+                    ),
+                ),
                 temperature=0.1,
                 max_tokens=10,
             )
-        except Exception as e:
-            logger.error(f"OpenAI 兼容 API 连接测试失败: {e}")
+        except Exception as exc:
+            logger.error(
+                "OpenAI 兼容 API 连接测试失败: error_type={}",
+                type(exc).__name__,
+            )
             return False
         else:
             return True

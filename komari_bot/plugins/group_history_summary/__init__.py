@@ -4,22 +4,28 @@ from __future__ import annotations
 
 import re
 
-from nonebot import logger, on_regex
+from nonebot import get_driver, logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.exception import FinishedException
+from nonebot.matcher import current_matcher
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.common.onebot_rules import group_message_to_me_rule
 
 from .config_schema import DynamicConfigSchema
 from .execution_service import (
     CapabilityNotSupportedError,
+    HistoryIncompleteError,
     SummaryBusyError,
+    SummaryServiceUnavailableError,
     execute_group_summary,
 )
 from .execution_service import (
     SummaryExecutionResult as SummaryExecutionResult,
 )
+from .group_lock import close_group_summary_lock_manager
+from .history_service import check_group_history_supported
 
 config_manager_plugin = require("config_manager")
 permission_manager_plugin = require("permission_manager")
@@ -48,10 +54,21 @@ summary_matcher = on_regex(
     r".*总结.*",
     rule=group_message_to_me_rule(),
     priority=9,
-    block=True,
+    block=False,
 )
 
 _scene_rerank_service = UnifiedCandidateRerankService()
+try:
+    driver = get_driver()
+except ValueError:
+    driver = None
+
+if driver is not None:
+
+    @driver.on_shutdown
+    async def _close_group_summary_resources() -> None:
+        """关闭群总结分布式锁连接。"""
+        await close_group_summary_lock_manager()
 
 
 def _extract_requested_count(text: str) -> int | None:
@@ -116,18 +133,32 @@ async def _is_summary_request(message_text: str) -> bool:
 
 
 @summary_matcher.handle()
-async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> None:
+async def handle_group_history_summary(
+    bot: Bot,
+    event: GroupMessageEvent,
+) -> None:
     """处理群聊历史总结请求。"""
+    config = config_manager.get()
+    if not config.plugin_enable:
+        return
+
+    can_use, _ = await permission_manager_plugin.check_runtime_permission(
+        bot, event, config
+    )
+    if not can_use:
+        return
+
+    if not await check_group_history_supported(bot):
+        logger.info(
+            "[GroupHistorySummary] 当前 OneBot 实现不支持群历史，放行消息传播"
+        )
+        return
+
     plain_text = event.get_plaintext().strip()
     if not await _is_summary_request(plain_text):
         return
 
-    config = config_manager.get()
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config
-    )
-    if not can_use:
-        await summary_matcher.finish(f"❌ {reason}")
+    current_matcher.get().stop_propagation()
 
     requested_count = _extract_requested_count(plain_text)
     if requested_count is not None and not (
@@ -149,9 +180,14 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
             user_request=plain_text,
             config=config,
             requested_count=requested_count,
+            history_capability_confirmed=True,
         )
     except SummaryBusyError as exc:
-        await summary_matcher.finish(str(exc))
+        await summary_matcher.finish(plain_text_message(exc))
+    except HistoryIncompleteError:
+        await summary_matcher.finish("群历史记录没能完整取回，暂时不能可靠地总结……")
+    except SummaryServiceUnavailableError as exc:
+        await summary_matcher.finish(plain_text_message(exc))
     except CapabilityNotSupportedError:
         return
     except FinishedException:
@@ -161,9 +197,11 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
         return
 
     if not result.image_base64:
-        await summary_matcher.finish(result.summary_text)
+        await summary_matcher.finish(plain_text_message(result.summary_text))
 
-    await bot.send(
-        event,
-        MessageSegment.image(file=f"base64://{result.image_base64}"),
-    )
+    image_pages = getattr(result, "image_pages_base64", ()) or (result.image_base64,)
+    for image_page in image_pages:
+        await bot.send(
+            event,
+            MessageSegment.image(file=f"base64://{image_page}"),
+        )

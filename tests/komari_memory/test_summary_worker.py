@@ -4,11 +4,13 @@ import asyncio
 import importlib.util
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import nonebot.plugin
+import pytest
 
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
@@ -76,24 +78,136 @@ class _FakeRedis:
     def __init__(self, messages: list[MessageSchema]) -> None:
         self._messages = messages
         self.redis = object()
+        self.config = KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            conversation_processing_lease_seconds=120,
+        )
         self.snapshot_calls: list[dict[str, str]] = []
         self.delete_processing_calls: list[dict[str, str]] = []
         self.restore_processing_calls: list[dict[str, str]] = []
+        self.dead_letter_calls: list[dict[str, Any]] = []
         self.update_last_summary_calls: list[str] = []
+        self.chunk_state: dict[str, str] = {}
+        self.current_owner: str | None = None
 
-    async def snapshot_conversation_buffer(self, group_id: str, token: str) -> str | None:
+    async def claim_conversation_buffer(
+        self,
+        group_id: str,
+        owner_token: str,
+        token: str,
+    ) -> SimpleNamespace:
         self.snapshot_calls.append({"group_id": group_id, "token": token})
-        return f"komari_memory:buffer:processing:{group_id}:{token}" if self._messages else None
+        if not self._messages:
+            return SimpleNamespace(status="empty", processing_key=None)
+        self.current_owner = owner_token
+        return SimpleNamespace(
+            status="claimed",
+            processing_key=f"komari_memory:buffer:processing:{group_id}:{token}",
+        )
 
-    async def get_processing_conversation_buffer(self, processing_key: str) -> list[MessageSchema]:
-        del processing_key
+    async def get_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> list[MessageSchema]:
+        del group_id, processing_key
+        assert owner_token == self.current_owner
         return list(self._messages)
 
-    async def delete_processing_conversation_buffer(self, group_id: str, processing_key: str) -> None:
-        self.delete_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
+    async def renew_processing_conversation_lease(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> bool:
+        del group_id, processing_key
+        return owner_token == self.current_owner
 
-    async def restore_processing_conversation_buffer(self, group_id: str, processing_key: str) -> None:
+    async def ack_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> bool:
+        if owner_token != self.current_owner:
+            return False
+        self.delete_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
+        self.current_owner = None
+        self.chunk_state.clear()
+        return True
+
+    async def restore_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> bool:
+        if owner_token != self.current_owner:
+            return False
         self.restore_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
+        self.current_owner = None
+        self.chunk_state.clear()
+        return True
+
+    async def dead_letter_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        *,
+        failure_code: str,
+        attempt_count: int,
+    ) -> bool:
+        if owner_token != self.current_owner:
+            return False
+        self.dead_letter_calls.append(
+            {
+                "group_id": group_id,
+                "processing_key": processing_key,
+                "failure_code": failure_code,
+                "attempt_count": attempt_count,
+            }
+        )
+        self.current_owner = None
+        return True
+
+    async def initialize_conversation_chunk_manifest(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        manifest_json: str,
+    ) -> str:
+        del group_id, processing_key
+        assert owner_token == self.current_owner
+        return self.chunk_state.setdefault("manifest", manifest_json)
+
+    async def get_conversation_chunk_state(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        field: str,
+    ) -> str | None:
+        del group_id, processing_key
+        assert owner_token == self.current_owner
+        return self.chunk_state.get(field)
+
+    async def set_conversation_chunk_state(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        field: str,
+        value: str,
+    ) -> None:
+        del group_id, processing_key
+        assert owner_token == self.current_owner
+        self.chunk_state[field] = value
 
     async def update_last_summary(self, group_id: str) -> None:
         self.update_last_summary_calls.append(group_id)
@@ -133,6 +247,8 @@ class _FakeMemory:
         participants: list[str],
         importance_initial: int = 3,
         dedup_key: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
     ) -> int | None:
         self.store_conversation_calls.append(
             {
@@ -141,6 +257,8 @@ class _FakeMemory:
                 "participants": participants,
                 "importance_initial": importance_initial,
                 "dedup_key": dedup_key,
+                "start_time": start_time,
+                "end_time": end_time,
             }
         )
         if dedup_key in self._duplicate_dedup_keys:
@@ -189,13 +307,14 @@ def _make_message(
     user_nickname: str = "阿明",
     group_id: str = "114514",
     is_bot: bool = False,
+    timestamp: float = 1.0,
 ) -> MessageSchema:
     return MessageSchema(
         user_id=user_id,
         user_nickname=user_nickname,
         group_id=group_id,
         content=content,
-        timestamp=1.0,
+        timestamp=timestamp,
         message_id=f"msg-{user_id}",
         is_bot=is_bot,
     )
@@ -256,6 +375,47 @@ def test_perform_summary_runs_profile_agent_before_storing_memories(monkeypatch:
     assert memory.upsert_interaction_history_calls == []
     assert redis.delete_processing_calls[0]["group_id"] == "114514"
     assert redis.update_last_summary_calls == ["114514"]
+
+
+def test_perform_summary_persists_real_message_time_range(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {"memories": [{"content": "真实时间范围摘要。", "importance": 4}]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+    redis = _FakeRedis(
+        [
+            _make_message(timestamp=1_700_003_600.0),
+            _make_message(user_id="10002", timestamp=1_700_000_000.0),
+        ]
+    )
+    memory = _FakeMemory()
+
+    asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert memory.store_conversation_calls[0]["start_time"] == datetime.fromtimestamp(
+        1_700_000_000.0,
+        UTC,
+    ).replace(tzinfo=None)
+    assert memory.store_conversation_calls[0]["end_time"] == datetime.fromtimestamp(
+        1_700_003_600.0,
+        UTC,
+    ).replace(tzinfo=None)
 
 
 def test_summary_dedup_key_is_stable_for_same_processing_snapshot(monkeypatch: Any) -> None:
@@ -372,6 +532,8 @@ def test_processing_retry_uses_same_dedup_keys_for_partial_success(
             participants: list[str],
             importance_initial: int = 3,
             dedup_key: str | None = None,
+            start_time: datetime | None = None,
+            end_time: datetime | None = None,
         ) -> int | None:
             self.store_conversation_calls.append(
                 {
@@ -380,6 +542,8 @@ def test_processing_retry_uses_same_dedup_keys_for_partial_success(
                     "participants": participants,
                     "importance_initial": importance_initial,
                     "dedup_key": dedup_key,
+                    "start_time": start_time,
+                    "end_time": end_time,
                 }
             )
             if dedup_key in self._seen_dedup_keys:
@@ -396,14 +560,7 @@ def test_processing_retry_uses_same_dedup_keys_for_partial_success(
     redis = _FakeRedis([_make_message()])
     memory = _RetryMemory()
 
-    asyncio.run(
-        module._perform_summary_from_processing(
-            "114514",
-            redis,
-            memory,
-            "processing-key",
-        )
-    )
+    asyncio.run(module.perform_summary("114514", redis, memory))
 
     assert [call["summary"] for call in memory.store_conversation_calls] == [
         "A 已写入。",
@@ -419,12 +576,13 @@ def test_processing_retry_uses_same_dedup_keys_for_partial_success(
     assert memory.store_conversation_calls[1]["dedup_key"] == memory.store_conversation_calls[4][
         "dedup_key"
     ]
-    assert redis.delete_processing_calls == [
-        {"group_id": "114514", "processing_key": "processing-key"}
-    ]
+    assert len(redis.delete_processing_calls) == 1
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
 
 
-def test_perform_summary_continues_profile_agent_when_summary_fails(monkeypatch: Any) -> None:
+def test_perform_summary_dead_letters_snapshot_when_summary_fails(
+    monkeypatch: Any,
+) -> None:
     module = _load_summary_worker_module(monkeypatch)
     monkeypatch.setattr(
         module,
@@ -432,6 +590,12 @@ def test_perform_summary_continues_profile_agent_when_summary_fails(monkeypatch:
         lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
     events: list[str] = []
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    retry_module = sys.modules["komari_bot.plugins.komari_memory.core.retry"]
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _fake_sleep)
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
@@ -449,11 +613,257 @@ def test_perform_summary_continues_profile_agent_when_summary_fails(monkeypatch:
     redis = _FakeRedis([_make_message()])
     memory = _FakeMemory()
 
-    asyncio.run(module.perform_summary("114514", redis, memory))
+    with pytest.raises(RuntimeError, match="总结失败"):
+        asyncio.run(module.perform_summary("114514", redis, memory))
 
-    assert events == ["summary", "profile_agent"]
+    assert events == ["summary", "summary", "summary"]
     assert memory.store_conversation_calls == []
-    assert redis.delete_processing_calls[0]["group_id"] == "114514"
+    assert redis.delete_processing_calls == []
+    assert redis.update_last_summary_calls == []
+    assert redis.restore_processing_calls == []
+    assert len(redis.dead_letter_calls) == 1
+    assert redis.dead_letter_calls[0]["group_id"] == "114514"
+    assert redis.dead_letter_calls[0]["failure_code"] == "RuntimeError"
+    assert redis.dead_letter_calls[0]["attempt_count"] == 3
+
+
+def test_retry_logs_only_error_type(monkeypatch: Any) -> None:
+    _load_summary_worker_module(monkeypatch)
+    retry_module = sys.modules["komari_bot.plugins.komari_memory.core.retry"]
+    logs: list[tuple[object, tuple[object, ...]]] = []
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    async def _always_fail() -> None:
+        raise RuntimeError("绝不能进入日志的用户私密正文")
+
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(
+        retry_module.logger,
+        "warning",
+        lambda message, *args: logs.append((message, args)),
+    )
+    monkeypatch.setattr(
+        retry_module.logger,
+        "error",
+        lambda message, *args: logs.append((message, args)),
+    )
+    retried = retry_module.retry_async(max_attempts=2, base_delay=0)(_always_fail)
+
+    with pytest.raises(RuntimeError, match="用户私密正文"):
+        asyncio.run(retried())
+
+    serialized_logs = repr(logs)
+    assert "RuntimeError" in serialized_logs
+    assert "绝不能进入日志的用户私密正文" not in serialized_logs
+
+
+def test_perform_summary_dead_letters_snapshot_when_summary_has_no_valid_memory(
+    monkeypatch: Any,
+) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+    summary_calls = 0
+    profile_calls = 0
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    retry_module = sys.modules["komari_bot.plugins.komari_memory.core.retry"]
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _fake_sleep)
+
+    async def _fake_summarize_conversation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        nonlocal summary_calls
+        del args, kwargs
+        summary_calls += 1
+        return {"memories": [{"content": "   "}, "无效条目"]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        nonlocal profile_calls
+        del kwargs
+        profile_calls += 1
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis([_make_message()])
+    memory = _FakeMemory()
+
+    with pytest.raises(module.InvalidSummaryResultError):
+        asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert summary_calls == 3
+    assert profile_calls == 0
+    assert memory.store_conversation_calls == []
+    assert redis.delete_processing_calls == []
+    assert redis.update_last_summary_calls == []
+    assert redis.restore_processing_calls == []
+    assert redis.dead_letter_calls[0]["failure_code"] == "InvalidSummaryResultError"
+    assert redis.dead_letter_calls[0]["attempt_count"] == 3
+
+
+def test_perform_summary_dead_letters_snapshot_when_profile_agent_discards(
+    monkeypatch: Any,
+) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+    summary_calls = 0
+    profile_calls = 0
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    retry_module = sys.modules["komari_bot.plugins.komari_memory.core.retry"]
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _fake_sleep)
+
+    async def _fake_summarize_conversation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        nonlocal summary_calls
+        del args, kwargs
+        summary_calls += 1
+        return {"memories": [{"content": "有效摘要", "importance": 3}]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        nonlocal profile_calls
+        del kwargs
+        profile_calls += 1
+        return SimpleNamespace(
+            committed_count=0,
+            staged_count=1,
+            summary="未调用提交工具",
+            status="discarded",
+            changed_user_ids=set(),
+        )
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis([_make_message()])
+    memory = _FakeMemory()
+
+    with pytest.raises(module.IncompleteProfileAgentError, match="discarded"):
+        asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert summary_calls == 1
+    assert profile_calls == 3
+    assert memory.store_conversation_calls == []
+    assert redis.delete_processing_calls == []
+    assert redis.update_last_summary_calls == []
+    assert redis.restore_processing_calls == []
+    assert redis.dead_letter_calls[0]["failure_code"] == "IncompleteProfileAgentError"
+    assert redis.dead_letter_calls[0]["attempt_count"] == 3
+
+
+def test_perform_summary_restores_snapshot_when_cancelled(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+    summary_started = asyncio.Event()
+    never_finished = asyncio.Event()
+
+    async def _fake_summarize_conversation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del args, kwargs
+        summary_started.set()
+        await never_finished.wait()
+        raise AssertionError("取消后不应继续生成总结")
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    redis = _FakeRedis([_make_message()])
+    memory = _FakeMemory()
+
+    async def _run() -> None:
+        task = asyncio.create_task(module.perform_summary("114514", redis, memory))
+        await summary_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+
+    assert redis.dead_letter_calls == []
+    assert len(redis.restore_processing_calls) == 1
+    assert redis.restore_processing_calls[0]["group_id"] == "114514"
+    assert redis.delete_processing_calls == []
+    assert redis.update_last_summary_calls == []
+
+
+def test_perform_summary_does_not_mutate_snapshot_after_lease_loss(
+    monkeypatch: Any,
+) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+
+    async def _fake_summarize_conversation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del args, kwargs
+        return {"memories": [{"content": "有效摘要", "importance": 3}]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
+
+    class _LeaseLostRedis(_FakeRedis):
+        async def renew_processing_conversation_lease(
+            self,
+            group_id: str,
+            processing_key: str,
+            owner_token: str,
+        ) -> bool:
+            del group_id, processing_key, owner_token
+            self.current_owner = None
+            return False
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+    redis = _LeaseLostRedis([_make_message()])
+    memory = _FakeMemory()
+
+    with pytest.raises(module.ConversationLeaseLostError):
+        asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert redis.dead_letter_calls == []
+    assert redis.restore_processing_calls == []
+    assert redis.delete_processing_calls == []
+    assert redis.update_last_summary_calls == []
 
 
 def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
@@ -555,3 +965,151 @@ def test_perform_summary_does_not_write_interaction_history(monkeypatch: Any) ->
 
     assert len(memory.store_conversation_calls) == 1
     assert memory.upsert_interaction_history_calls == []
+
+
+def test_perform_summary_processes_every_chunk_before_ack(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+    production_chunker = module.chunk_messages_for_memory_processing
+
+    def _small_chunker(*args: Any, **kwargs: Any) -> Any:
+        return production_chunker(
+            *args,
+            **kwargs,
+            max_utf8_bytes=460,
+            max_estimated_tokens=154,
+        )
+
+    monkeypatch.setattr(module, "chunk_messages_for_memory_processing", _small_chunker)
+    messages = [
+        _make_message(
+            user_id=f"1000{index}",
+            user_nickname=f"用户{index}",
+            content=(
+                f"第{index}条-" + "内容" * 55 + ("尾部分块金丝雀" if index == 5 else "")
+            ),
+        )
+        for index in range(6)
+    ]
+    summary_inputs: list[str] = []
+    profile_inputs: list[str] = []
+
+    async def _fake_summarize_conversation(
+        chunk_messages: list[MessageSchema],
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del args, kwargs
+        summary_inputs.append("\n".join(message.content for message in chunk_messages))
+        return {
+            "memories": [
+                {"content": f"第{len(summary_inputs)}块的有效摘要", "importance": 3}
+            ]
+        }
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        profile_inputs.append(kwargs["conversation_text"])
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+    redis = _FakeRedis(messages)
+    memory = _FakeMemory()
+
+    asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert len(summary_inputs) > 1
+    assert len(profile_inputs) == len(summary_inputs)
+    assert "尾部分块金丝雀" in summary_inputs[-1]
+    assert "尾部分块金丝雀" in profile_inputs[-1]
+    assert len(memory.store_conversation_calls) == len(summary_inputs)
+    assert len(redis.delete_processing_calls) == 1
+
+
+def test_processing_chunk_ledger_resumes_after_interruption(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(
+            summary_max_buffer_size=100,
+            profile_trait_limit=20,
+        ),
+    )
+    production_chunker = module.chunk_messages_for_memory_processing
+
+    def _small_chunker(*args: Any, **kwargs: Any) -> Any:
+        return production_chunker(
+            *args,
+            **kwargs,
+            max_utf8_bytes=520,
+            max_estimated_tokens=174,
+        )
+
+    monkeypatch.setattr(module, "chunk_messages_for_memory_processing", _small_chunker)
+    messages = [
+        _make_message(user_id="10001", content="第一块" + "甲" * 90),
+        _make_message(user_id="10002", content="第二块" + "乙" * 90),
+    ]
+    summary_calls: list[str] = []
+    profile_calls: list[str] = []
+    second_profile_failed = False
+
+    async def _fake_summarize_conversation(
+        chunk_messages: list[MessageSchema],
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del args, kwargs
+        marker = chunk_messages[0].content[:3]
+        summary_calls.append(marker)
+        return {"memories": [{"content": f"{marker}的有效摘要", "importance": 3}]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        nonlocal second_profile_failed
+        marker = str(kwargs["conversation_text"])
+        profile_calls.append(marker)
+        if "第二块" in marker and not second_profile_failed:
+            second_profile_failed = True
+            raise RuntimeError("模拟第二块处理时进程中断")
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+    redis = _FakeRedis(messages)
+    redis.current_owner = "owner-1"
+    memory = _FakeMemory()
+    run_once = module._perform_summary_from_processing.__wrapped__
+
+    with pytest.raises(RuntimeError, match="进程中断"):
+        asyncio.run(
+            run_once(
+                "114514",
+                redis,
+                memory,
+                "processing-key",
+                "owner-1",
+            )
+        )
+    asyncio.run(
+        run_once(
+            "114514",
+            redis,
+            memory,
+            "processing-key",
+            "owner-1",
+        )
+    )
+
+    assert summary_calls.count("第一块") == 1
+    assert summary_calls.count("第二块") == 1
+    assert sum("第一块" in call for call in profile_calls) == 1
+    assert sum("第二块" in call for call in profile_calls) == 2
+    assert len(memory.store_conversation_calls) == 2

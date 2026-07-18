@@ -13,7 +13,13 @@ from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
+from komari_bot.common.content_budget import estimate_text_tokens
 from komari_bot.common.profile_operations import profile_traits_to_list
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    UntrustedSourceType,
+    render_untrusted_context,
+)
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )
@@ -54,8 +60,27 @@ _INVALID_FAVORABILITY_DELTA_TYPE_ERROR = (
     "record_favorability_delta.delta 必须是整数且不能是 bool"
 )
 _INVALID_FAVORABILITY_REASON_ERROR = "record_favorability_delta.reason 不能为空"
+_MISSING_TOOL_FUNCTION_ERROR = "工具定义缺少 function"
+_DISALLOWED_TOOL_ERROR = "不允许声明工具"
+_INVALID_TOOL_TYPE_ERROR = "工具类型必须为 function"
+_INVALID_TOOL_SCHEMA_ERROR = "工具缺少对象参数 schema"
+_TOOL_SCHEMA_MISMATCH_ERROR = "工具参数 schema 与内置定义不一致"
 _LLM_COMPLETION_CONCURRENCY_LIMIT = 4
 _LLM_COMPLETION_SEMAPHORE = asyncio.Semaphore(_LLM_COMPLETION_CONCURRENCY_LIMIT)
+_MAX_TOOL_ROUNDS = 6
+_MAX_TOOL_CALLS_PER_ROUND = 4
+_MAX_TOTAL_TOOL_CALLS = 12
+_MAX_TOOL_RESULT_CHARS = 8_000
+_MAX_READ_PROFILE_TRAITS = 16
+_MAX_READ_PROFILE_RESULT_CHARS = 4_000
+_MAX_READ_PROFILE_RESULT_TOKENS = 2_048
+_READ_PROFILE_PUBLIC_CATEGORIES = frozenset({"preference", "fact", "general"})
+_READ_PROFILE_SENSITIVE_CATEGORIES = frozenset({"relation"})
+_TOOL_SOURCE_TYPES: dict[str, UntrustedSourceType] = {
+    READ_IMAGE_TOOL_NAME: "vision",
+    SEARCH_WEB_TOOL_NAME: "web",
+    READ_PROFILE_TOOL_NAME: "profile",
+}
 
 READ_IMAGE_TOOL: dict[str, Any] = {
     "type": "function",
@@ -72,10 +97,12 @@ READ_IMAGE_TOOL: dict[str, Any] = {
             "properties": {
                 "image_index": {
                     "type": "integer",
+                    "minimum": 0,
                     "description": "要查看的图片序号（从0开始）。0=第一张图片，1=第二张图片，以此类推。",
                 }
             },
             "required": ["image_index"],
+            "additionalProperties": False,
         },
     },
 }
@@ -94,10 +121,13 @@ TAVILY_SEARCH_TOOL: dict[str, Any] = {
             "properties": {
                 "query": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
                     "description": "搜索查询关键词或问题，需简洁准确",
                 }
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
     },
 }
@@ -116,15 +146,19 @@ READ_PROFILE_TOOL: dict[str, Any] = {
             "properties": {
                 "user_id": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
                     "description": "要查询画像的用户 ID，优先使用 <visible_users> 中的 user_id。",
                 },
                 "keys": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": 64},
+                    "maxItems": 16,
                     "description": "可选，只返回这些画像键。省略时返回该用户全部可展示画像。",
                 },
             },
             "required": ["user_id"],
+            "additionalProperties": False,
         },
     },
 }
@@ -142,6 +176,8 @@ FINAL_RESPONSE_TOOL: dict[str, Any] = {
             "properties": {
                 "content": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2_000,
                     "description": "给用户看的回复正文（即要发送出去的消息内容）",
                 },
                 "interaction_history": {
@@ -154,21 +190,26 @@ FINAL_RESPONSE_TOOL: dict[str, Any] = {
                     "properties": {
                         "event": {
                             "type": "string",
+                            "maxLength": 500,
                             "description": "该用户做了什么（一句话描述）",
                         },
                         "result": {
                             "type": "string",
+                            "maxLength": 500,
                             "description": "你的反应（一句话描述）",
                         },
                         "emotion": {
                             "type": "string",
+                            "maxLength": 100,
                             "description": "你当时的感受（简短情绪词或短语）",
                         },
                     },
                     "required": ["event", "result", "emotion"],
+                    "additionalProperties": False,
                 },
             },
             "required": ["content", "interaction_history"],
+            "additionalProperties": False,
         },
     },
 }
@@ -192,12 +233,23 @@ RECORD_FAVORABILITY_DELTA_TOOL: dict[str, Any] = {
                 },
                 "reason": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
                     "description": "一句话说明本轮变化原因，仅用于日志，不会展示给用户。",
                 },
             },
             "required": ["delta", "reason"],
+            "additionalProperties": False,
         },
     },
+}
+
+_CANONICAL_TOOLS = {
+    READ_IMAGE_TOOL_NAME: READ_IMAGE_TOOL,
+    SEARCH_WEB_TOOL_NAME: TAVILY_SEARCH_TOOL,
+    READ_PROFILE_TOOL_NAME: READ_PROFILE_TOOL,
+    FINAL_RESPONSE_TOOL_NAME: FINAL_RESPONSE_TOOL,
+    RECORD_FAVORABILITY_DELTA_TOOL_NAME: RECORD_FAVORABILITY_DELTA_TOOL,
 }
 
 
@@ -494,22 +546,56 @@ def _format_read_profile_tool_yaml(
     user_id: str,
     profile: dict[str, Any],
     keys: set[str] | None,
+    include_sensitive_traits: bool,
 ) -> str:
-    traits = profile_traits_to_list(profile.get("traits"))
+    all_traits = profile_traits_to_list(profile.get("traits"))
     if keys is not None:
-        traits = [item for item in traits if str(item.get("key", "")) in keys]
+        all_traits = [
+            item for item in all_traits if str(item.get("key", "")) in keys
+        ]
+
+    visible_categories = set(_READ_PROFILE_PUBLIC_CATEGORIES)
+    if include_sensitive_traits:
+        visible_categories.update(_READ_PROFILE_SENSITIVE_CATEGORIES)
+    traits = [
+        item
+        for item in all_traits
+        if str(item.get("category", "general")) in visible_categories
+    ]
+    sensitive_traits_omitted = len(traits) != len(all_traits)
+    traits_truncated = len(traits) > _MAX_READ_PROFILE_TRAITS
+    traits = traits[:_MAX_READ_PROFILE_TRAITS]
 
     lines = [f"user_id: {user_id}"]
-    name = _clean_yaml_text(profile.get("display_name") or profile.get("name") or user_id)
+    name = _clean_yaml_text(
+        profile.get("display_name") or profile.get("name") or user_id
+    )[:128]
     lines.append(f"name: {name}")
     if traits:
         lines.append("traits:")
         for item in traits:
-            key = _clean_yaml_text(item["key"])
+            key = _clean_yaml_text(item["key"])[:64]
             value = _clean_yaml_text(item["value"])
-            lines.append(f"  - {key}: {value}")
+            value_truncated = len(value) > 512
+            if value_truncated:
+                value = f"{value[:511]}…"
+            candidate_lines = [*lines, f"  - {key}: {value}"]
+            candidate_text = "\n".join(candidate_lines)
+            if (
+                len(candidate_text) > _MAX_READ_PROFILE_RESULT_CHARS - 80
+                or estimate_text_tokens(candidate_text)
+                > _MAX_READ_PROFILE_RESULT_TOKENS
+            ):
+                traits_truncated = True
+                break
+            lines = candidate_lines
+            traits_truncated = traits_truncated or value_truncated
     else:
         lines.append("traits: []")
+    if sensitive_traits_omitted:
+        lines.append("sensitive_traits_omitted: true")
+    if traits_truncated:
+        lines.append("traits_truncated: true")
     return "\n".join(lines)
 
 
@@ -519,6 +605,8 @@ async def _build_read_profile_tool_result(
     group_id: str | None,
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
+    allowed_profile_user_ids: frozenset[str],
+    caller_user_id: str | None,
 ) -> str:
     """执行 read_profile 工具并返回 YAML 风格只读画像。"""
     if memory_service is None or group_id is None:
@@ -527,12 +615,19 @@ async def _build_read_profile_tool_result(
     user_id, keys = _parse_read_profile_arguments(parsed_arguments, raw_arguments)
     if user_id is None:
         return "error: user_id 参数缺失或格式错误"
+    if user_id not in allowed_profile_user_ids:
+        return "error: user_id 不在本轮可见用户范围内"
 
     profile = await memory_service.get_user_profile(user_id=user_id, group_id=group_id)
     if profile is None:
         return "not_found: 用户画像不存在"
 
-    return _format_read_profile_tool_yaml(user_id=user_id, profile=profile, keys=keys)
+    return _format_read_profile_tool_yaml(
+        user_id=user_id,
+        profile=profile,
+        keys=keys,
+        include_sensitive_traits=user_id == caller_user_id,
+    )
 
 
 async def _build_image_tool_result(
@@ -570,12 +665,23 @@ async def _build_search_tool_result(
     *,
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
+    request_trace_id: str | None = None,
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
 ) -> str:
     """执行 search_web 工具并返回工具消息内容。"""
     query = _parse_search_query(parsed_arguments, raw_arguments)
     if query is None:
         return "[搜索失败：query 参数缺失或格式错误]"
-    return await komari_search.search_web(query)
+    search_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
+    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
+        search_kwargs.update(
+            caller_user_id=caller_user_id,
+            caller_group_id=caller_group_id,
+            caller_is_superuser=caller_is_superuser,
+        )
+    return await komari_search.search_web(query, **search_kwargs)
 
 
 def _build_tool_call_message(
@@ -645,6 +751,56 @@ def _build_tool_error_result(
             "请修正参数或改用已有上下文继续。"
         ),
     }
+
+
+def _wrap_external_tool_result(
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    content: str,
+) -> str:
+    """把外部工具正文转换为带来源的不可信数据块。"""
+    source_type = _TOOL_SOURCE_TYPES.get(tool_name, "tool_result")
+    return render_untrusted_context(
+        UntrustedContext(
+            source_type=source_type,
+            source_id=f"{tool_name}:{tool_call_id}",
+            content=content,
+        ),
+        max_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+
+def _validate_tool_definitions(
+    tools: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """校验工具白名单和对象参数 schema，并移除重复定义。"""
+    validated: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for tool in tools:
+        if tool.get("type") != "function":
+            raise ValueError(_INVALID_TOOL_TYPE_ERROR)
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise TypeError(_MISSING_TOOL_FUNCTION_ERROR)
+        name = str(function.get("name", "")).strip()
+        canonical_tool = _CANONICAL_TOOLS.get(name)
+        if canonical_tool is None:
+            msg = f"{_DISALLOWED_TOOL_ERROR}: {name or '<empty>'}"
+            raise ValueError(msg)
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict) or parameters.get("type") != "object":
+            msg = f"{_INVALID_TOOL_SCHEMA_ERROR}: {name}"
+            raise ValueError(msg)
+        canonical_parameters = canonical_tool["function"]["parameters"]
+        if parameters != canonical_parameters:
+            msg = f"{_TOOL_SCHEMA_MISMATCH_ERROR}: {name}"
+            raise ValueError(msg)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        validated.append(canonical_tool)
+    return validated
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -785,6 +941,10 @@ async def _execute_business_tool(
     round_num: int,
     memory_service: MemoryService | None,
     group_id: str | None,
+    allowed_profile_user_ids: frozenset[str],
+    caller_user_id: str | None,
+    caller_group_id: str | None,
+    caller_is_superuser: bool,
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -815,11 +975,6 @@ async def _execute_business_tool(
                 parent_call_id=parent_call_id,
                 collector=collector,
             )
-            message = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }
             if content.startswith("[图片读取失败:"):
                 status = "error"
                 error_summary = "图片读取失败"
@@ -829,12 +984,11 @@ async def _execute_business_tool(
             content = await _build_search_tool_result(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
+                request_trace_id=request_trace_id,
+                caller_user_id=caller_user_id,
+                caller_group_id=caller_group_id,
+                caller_is_superuser=caller_is_superuser,
             )
-            message = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }
             if content.startswith("[搜索失败"):
                 status = "error"
                 error_summary = "联网搜索失败"
@@ -846,12 +1000,9 @@ async def _execute_business_tool(
                 group_id=group_id,
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
+                allowed_profile_user_ids=allowed_profile_user_ids,
+                caller_user_id=caller_user_id,
             )
-            message = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }
             if content.startswith("error:"):
                 status = "error"
                 error_summary = "读取用户画像失败"
@@ -875,6 +1026,16 @@ async def _execute_business_tool(
                 error_summary="未知工具",
             )
 
+    message = {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": _wrap_external_tool_result(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            content=content,
+        ),
+    }
+
     return _BusinessToolExecution(
         message=message,
         tool_name=tool_name,
@@ -897,6 +1058,10 @@ async def _execute_tool_loop(
     max_tool_rounds: int,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
+    allowed_profile_user_ids: frozenset[str] = frozenset(),
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
@@ -905,7 +1070,8 @@ async def _execute_tool_loop(
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。"""
     current_messages = list(messages)
-    tool_definitions = list(tools)
+    tool_definitions = _validate_tool_definitions(tools)
+    round_limit = max(1, min(max_tool_rounds, _MAX_TOOL_ROUNDS))
     request_phase_prefix = _build_tool_request_phase_prefix(tool_definitions)
     has_vision_tool = any(
         tool.get("function", {}).get("name") == READ_IMAGE_TOOL_NAME
@@ -923,13 +1089,14 @@ async def _execute_tool_loop(
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
     last_retry_reason: str | None = None
+    total_tool_calls = 0
 
     from komari_bot.plugins.llm_provider.diagnostic import (
         LLMCallTrace,
         ToolExecutionTrace,
     )
 
-    for round_num in range(1, max_tool_rounds + 1):
+    for round_num in range(1, round_limit + 1):
         if has_vision_tool:
             model = vision_model
             temperature = vision_temperature
@@ -1002,6 +1169,45 @@ async def _execute_tool_loop(
                     )
                 )
             continue
+
+        if len(completion.tool_calls) > _MAX_TOOL_CALLS_PER_ROUND:
+            last_retry_reason = (
+                f"{request_phase_prefix} 第 {round_num} 轮工具调用数超过 "
+                f"{_MAX_TOOL_CALLS_PER_ROUND}"
+            )
+            _append_tool_retry_instruction(
+                current_messages,
+                reason=last_retry_reason,
+                expected_action=(
+                    f"每轮调用不超过 {_MAX_TOOL_CALLS_PER_ROUND} 个且只调用必要工具"
+                ),
+            )
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=round_call_id or "",
+                        tool_name="<tool_budget>",
+                        status="error",
+                        error_summary=last_retry_reason,
+                    )
+                )
+            continue
+
+        total_tool_calls += len(completion.tool_calls)
+        if total_tool_calls > _MAX_TOTAL_TOOL_CALLS:
+            last_retry_reason = (
+                f"{request_phase_prefix} 工具调用总数超过 {_MAX_TOTAL_TOOL_CALLS}"
+            )
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=round_call_id or "",
+                        tool_name="<tool_budget>",
+                        status="error",
+                        error_summary=last_retry_reason,
+                    )
+                )
+            break
 
         logger.info(
             "[KomariChat] Tool 调用: trace_id={} round={} tool_calls={}",
@@ -1191,15 +1397,21 @@ async def _execute_tool_loop(
                     round_num=round_num,
                     memory_service=memory_service,
                     group_id=group_id,
+                    allowed_profile_user_ids=allowed_profile_user_ids,
+                    caller_user_id=caller_user_id,
+                    caller_group_id=caller_group_id,
+                    caller_is_superuser=caller_is_superuser,
                     request_trace_id=request_trace_id,
                     parent_call_id=round_call_id,
                     collector=collector,
                 )
             except Exception as exc:  # 向模型回写后继续会话
-                tool_error_results.append(_build_tool_error_result(tool_call, exc))
+                tool_error_results.append(
+                    _build_tool_error_result(tool_call, type(exc).__name__)
+                )
                 last_retry_reason = (
                     f"{request_phase_prefix} 第 {round_num} 轮："
-                    f"工具 {tool_name} 执行失败：{type(exc).__name__}: {exc}"
+                    f"工具 {tool_name} 执行失败：{type(exc).__name__}"
                 )
                 if collector is not None:
                     collector.add_tool(
@@ -1208,7 +1420,7 @@ async def _execute_tool_loop(
                             tool_name=tool_name,
                             parsed_arguments=_build_safe_tool_args(tool_call),
                             status="error",
-                            error_summary=str(exc),
+                            error_summary=type(exc).__name__,
                         )
                     )
                 continue
@@ -1255,7 +1467,7 @@ async def _execute_tool_loop(
                 )
 
     msg = (
-        f"{request_phase_prefix} 达到最大轮数 {max_tool_rounds}，"
+        f"{request_phase_prefix} 达到最大轮数或工具预算上限 {round_limit}，"
         f"模型仍未完成 final_response：{last_retry_reason or '未知原因'}"
     )
     if collector is not None:
@@ -1280,6 +1492,10 @@ async def generate_reply_with_tools(
     max_tool_rounds: int = 3,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
+    allowed_profile_user_ids: frozenset[str] = frozenset(),
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
@@ -1298,7 +1514,8 @@ async def generate_reply_with_tools(
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
 
-    tool_definitions = [*tools, FINAL_RESPONSE_TOOL]
+    tool_definitions = _validate_tool_definitions([*tools, FINAL_RESPONSE_TOOL])
+    round_limit = max(1, min(max_tool_rounds, _MAX_TOOL_ROUNDS))
     tool_names = [
         str(tool["function"]["name"])
         for tool in tool_definitions
@@ -1310,7 +1527,7 @@ async def generate_reply_with_tools(
         request_trace_id or "-",
         tool_names,
         len(base64_images) if base64_images else 0,
-        max_tool_rounds,
+        round_limit,
     )
 
     return await _execute_tool_loop(
@@ -1322,9 +1539,13 @@ async def generate_reply_with_tools(
         vision_model=vision_model,
         vision_temperature=vision_temperature,
         vision_max_tokens=vision_max_tokens,
-        max_tool_rounds=max_tool_rounds,
+        max_tool_rounds=round_limit,
         memory_service=memory_service,
         group_id=group_id,
+        allowed_profile_user_ids=allowed_profile_user_ids,
+        caller_user_id=caller_user_id,
+        caller_group_id=caller_group_id,
+        caller_is_superuser=caller_is_superuser,
         max_favorability_delta=max_favorability_delta,
         vision_thinking_mode=vision_thinking_mode,
         vision_reasoning_effort=vision_reasoning_effort,

@@ -134,13 +134,21 @@ async def add_knowledge(
     keywords: list[str],
     category: KnowledgeCategory = "general",
     notes: str | None = None,
+    *,
+    source_key: str | None = None,
 ) -> int:
     """添加知识到数据库。"""
     engine = get_engine()
     if engine is None:
         raise RuntimeError("常识库引擎未初始化")
 
-    return await engine.add_knowledge(content, keywords, category, notes)
+    return await engine.add_knowledge(
+        content,
+        keywords,
+        category,
+        notes,
+        source_key=source_key,
+    )
 
 
 async def get_knowledge(kid: int) -> KnowledgeEntry | None:

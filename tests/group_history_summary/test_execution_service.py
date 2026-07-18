@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -15,15 +16,57 @@ from komari_bot.plugins.group_history_summary.config_schema import (
 from komari_bot.plugins.group_history_summary.execution_service import (
     CapabilityNotSupportedError,
     SummaryBusyError,
+    SummaryServiceUnavailableError,
     execute_group_summary,
 )
-from komari_bot.plugins.group_history_summary.history_service import HistoryMessage
+from komari_bot.plugins.group_history_summary.history_service import (
+    HistoryFetchMetadata,
+    HistoryMessage,
+)
 from komari_bot.plugins.llm_provider.diagnostic import (
     LLMDiagnosticCollector,
 )
 
 PLANNING_MODEL = "deepseek-chat"
 SUMMARY_MODEL = "deepseek-chat"
+
+
+class _FakeSummaryLease:
+    def __init__(self, manager: _FakeSummaryLockManager, group_id: str) -> None:
+        self._manager = manager
+        self._group_id = group_id
+
+    async def run(self, operation: Any) -> Any:
+        return await operation
+
+    async def close(self) -> None:
+        self._manager.running_groups.discard(self._group_id)
+
+
+class _FakeSummaryLockManager:
+    def __init__(self) -> None:
+        self.running_groups: set[str] = set()
+
+    async def try_acquire(
+        self,
+        *,
+        group_id: str,
+        redis_db: int,
+        ttl_seconds: int,
+    ) -> _FakeSummaryLease | None:
+        assert redis_db >= 0
+        assert ttl_seconds > 0
+        if group_id in self.running_groups:
+            return None
+        self.running_groups.add(group_id)
+        return _FakeSummaryLease(self, group_id)
+
+
+@pytest.fixture(autouse=True)
+def _use_in_memory_group_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    monkeypatch.setattr(exec_module, "_group_lock_manager", _FakeSummaryLockManager())
 
 
 async def _async_return_true(*_args: Any, **_kwargs: Any) -> bool:
@@ -586,6 +629,74 @@ async def test_capability_not_supported_raises(monkeypatch: Any) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_lock_backend_failure_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """分布式锁后端不可用时不得降级为无锁执行。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    class _FailingLockManager:
+        async def try_acquire(self, **_kwargs: object) -> None:
+            raise ConnectionError
+
+    capability_checked = False
+
+    async def _track_capability(_bot: object) -> bool:
+        nonlocal capability_checked
+        capability_checked = True
+        return True
+
+    monkeypatch.setattr(exec_module, "_group_lock_manager", _FailingLockManager())
+    monkeypatch.setattr(exec_module, "check_group_history_supported", _track_capability)
+
+    with pytest.raises(SummaryServiceUnavailableError):
+        await execute_group_summary(
+            bot=cast("Any", SimpleNamespace()),
+            group_id="lock-backend-failure",
+            bot_self_id="999",
+            user_request="总结",
+            config=_build_config(),
+        )
+
+    assert capability_checked is False
+
+
+@pytest.mark.asyncio
+async def test_confirmed_capability_is_not_checked_twice(monkeypatch: Any) -> None:
+    """入口已确认能力时，共享执行服务不再重复调用平台能力接口。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    async def _fail_capability_check(_bot: object) -> bool:
+        raise AssertionError
+
+    async def _empty_plan(*_args: Any, **_kwargs: Any) -> object:
+        return SimpleNamespace(
+            messages=[],
+            tool_result=None,
+            planner_note="",
+            rounds_used=0,
+        )
+
+    monkeypatch.setattr(
+        exec_module,
+        "check_group_history_supported",
+        _fail_capability_check,
+    )
+    monkeypatch.setattr(exec_module, "plan_summary_request", _empty_plan)
+
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="capability-confirmed-group",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+        history_capability_confirmed=True,
+    )
+
+    assert result.filtered_message_count == 0
+
+
 # ======================== 正常 handler 端到端测试 ========================
 
 
@@ -860,3 +971,129 @@ async def test_summary_failure_preserves_plan_trace(
     assert any("plan_round" in c.phase for c in collector.calls)
     assert len(collector.errors) == 1
     assert collector.errors[0]["type"] == "LLMError"
+
+
+@pytest.mark.asyncio
+async def test_image_rendering_runs_outside_event_loop_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PIL 渲染必须在线程中执行，不能阻塞主事件循环。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    messages = [
+        _build_history_message(
+            user_id="1001",
+            nickname="test",
+            content="hello",
+            timestamp=1,
+            message_seq=1,
+        )
+    ]
+
+    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
+        return SimpleNamespace(
+            messages=messages,
+            tool_result=SimpleNamespace(
+                source="recent_group_messages",
+                history_fetch=None,
+            ),
+            planner_note="",
+            rounds_used=1,
+        )
+
+    async def _fake_summarize(*_args: Any, **_kwargs: Any) -> str:
+        return "总结内容"
+
+    render_thread_id = 0
+
+    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal render_thread_id
+        render_thread_id = threading.get_ident()
+        return SimpleNamespace(images_base64=("image-data",), truncated=False)
+
+    monkeypatch.setattr(
+        exec_module, "check_group_history_supported", _async_return_true
+    )
+    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
+    monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
+
+    event_loop_thread_id = threading.get_ident()
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="render-thread-group",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+    )
+
+    assert result.image_base64 == "image-data"
+    assert result.image_pages_base64 == ("image-data",)
+    assert result.image_truncated is False
+    assert render_thread_id != event_loop_thread_id
+
+
+@pytest.mark.asyncio
+async def test_allowed_partial_history_is_explicit_in_result_and_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """达到阈值的部分历史可继续总结，但必须明确展示缺页信息。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    messages = [
+        _build_history_message(
+            user_id="1001",
+            nickname="test",
+            content="hello",
+            timestamp=1,
+            message_seq=1,
+        )
+    ]
+    metadata = HistoryFetchMetadata(
+        status="partial",
+        requested_count=50,
+        retrieved_item_count=40,
+        missing_count=10,
+        completed_batches=2,
+        failed_batch=3,
+        failure_code="history_api_error",
+    )
+
+    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
+        return SimpleNamespace(
+            messages=messages,
+            tool_result=SimpleNamespace(
+                source="recent_group_messages",
+                history_fetch=metadata,
+            ),
+            planner_note="",
+            rounds_used=1,
+        )
+
+    async def _fake_summarize(*_args: Any, **_kwargs: Any) -> str:
+        return "总结内容"
+
+    rendered_lines: list[str] = []
+
+    def _fake_render(**kwargs: Any) -> SimpleNamespace:
+        rendered_lines.extend(kwargs["body_lines"])
+        return SimpleNamespace(images_base64=("image-data",), truncated=False)
+
+    monkeypatch.setattr(
+        exec_module, "check_group_history_supported", _async_return_true
+    )
+    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
+    monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
+
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="partial-history-group",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+    )
+
+    assert result.history_fetch is metadata
+    assert result.summary_text.startswith("⚠ 历史第 3 批读取失败")
+    assert any("约缺 10 条记录" in line for line in rendered_lines)

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any, Protocol
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response
 from starlette import status
 
+from komari_bot.common.content_budget import (
+    IDENTIFIER_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    ContentValidationError,
+    normalize_required_text,
+)
 from komari_bot.common.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
@@ -14,6 +20,9 @@ from komari_bot.common.management_api import (
 
 from .api_models import (
     ConversationCreateRequest,
+    ConversationDeadLetterEntry,
+    ConversationDeadLetterListResponse,
+    ConversationDeadLetterRequeueResponse,
     ConversationEntry,
     ConversationListResponse,
     ConversationUpdateRequest,
@@ -22,10 +31,15 @@ from .api_models import (
     InteractionEventUpdateRequest,
     MemoryEntityEntry,
     MemoryEntityListResponse,
+    UserProfileUpsertRequest,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from komari_bot.common.management_api import ManagementTokenSource
+
+    from .services.conversation_processing import ConversationDeadLetter
 
 API_PREFIX = "/api/komari-memory/v1"
 
@@ -104,13 +118,6 @@ class MemoryServiceProtocol(Protocol):
         group_id: str,
     ) -> dict[str, Any] | None: ...
 
-    async def get_interaction_history_row(
-        self,
-        *,
-        user_id: str,
-        group_id: str,
-    ) -> dict[str, Any] | None: ...
-
     async def upsert_user_profile_row(
         self,
         *,
@@ -120,23 +127,7 @@ class MemoryServiceProtocol(Protocol):
         importance: int = 4,
     ) -> dict[str, Any] | None: ...
 
-    async def upsert_interaction_history_row(
-        self,
-        *,
-        user_id: str,
-        group_id: str,
-        interaction: dict[str, Any],
-        importance: int = 5,
-    ) -> dict[str, Any] | None: ...
-
     async def delete_user_profile(
-        self,
-        *,
-        user_id: str,
-        group_id: str,
-    ) -> bool: ...
-
-    async def delete_interaction_history(
         self,
         *,
         user_id: str,
@@ -160,6 +151,23 @@ class MemoryServiceProtocol(Protocol):
     async def delete_interaction_event_entry(self, event_id: int) -> bool: ...
 
 
+class ConversationDeadLetterManagerProtocol(Protocol):
+    """REST API 需要的最小 Redis dead-letter 协议。"""
+
+    async def list_conversation_dead_letters(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[ConversationDeadLetter]: ...
+
+    async def requeue_conversation_dead_letter(
+        self,
+        *,
+        group_id: str,
+        snapshot_id: str,
+    ) -> int | None: ...
+
+
 def _validation_error(message: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -181,6 +189,13 @@ def _service_unavailable() -> HTTPException:
     )
 
 
+def _dead_letter_service_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Komari Memory Redis dead-letter 服务未初始化",
+    )
+
+
 def _user_id_mismatch_error() -> HTTPException:
     return _validation_error("请求体中的 user_id 与路径参数不一致")
 
@@ -191,10 +206,6 @@ def _conversation_not_found(conversation_id: int) -> HTTPException:
 
 def _user_profile_not_found(group_id: str, user_id: str) -> HTTPException:
     return _not_found(f"未找到 group={group_id} user={user_id} 的用户画像")
-
-
-def _interaction_history_not_found(group_id: str, user_id: str) -> HTTPException:
-    return _not_found(f"未找到 group={group_id} user={user_id} 的互动历史")
 
 
 def _interaction_event_not_found(event_id: int) -> HTTPException:
@@ -211,6 +222,18 @@ def _build_service_dependency(
         return service
 
     return _get_service
+
+
+def _build_dead_letter_dependency(
+    redis_getter: Callable[[], ConversationDeadLetterManagerProtocol | None] | None,
+) -> Callable[[], ConversationDeadLetterManagerProtocol]:
+    def _get_redis_manager() -> ConversationDeadLetterManagerProtocol:
+        redis_manager = redis_getter() if redis_getter is not None else None
+        if redis_manager is None:
+            raise _dead_letter_service_unavailable()
+        return redis_manager
+
+    return _get_redis_manager
 
 
 def _resolve_conversation_patch_params(
@@ -246,6 +269,56 @@ def _ensure_payload_user_id(payload: dict[str, Any], user_id: str) -> None:
         raise _user_id_mismatch_error()
 
 
+def _normalize_identifier(value: str, *, label: str) -> str:
+    try:
+        return normalize_required_text(
+            value,
+            label=label,
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+    except ContentValidationError as exc:
+        raise _validation_error(str(exc)) from exc
+
+
+def _normalize_redis_key_component(value: str, *, label: str) -> str:
+    normalized = _normalize_identifier(value, label=label)
+    if ":" in normalized:
+        message = f"{label} 不能包含冒号"
+        raise _validation_error(message)
+    return normalized
+
+
+def _normalize_optional_identifier(value: str | None, *, label: str) -> str | None:
+    if value is None:
+        return None
+    return _normalize_identifier(value, label=label)
+
+
+def _normalize_optional_query(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return normalize_required_text(
+            value,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
+    except ContentValidationError as exc:
+        raise _validation_error(str(exc)) from exc
+
+
+def _legacy_interaction_history_gone() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "code": "interaction_histories_retired",
+            "message": "旧 group_id/user_id 互动历史接口已退役",
+            "replacement": f"{API_PREFIX}/interactions",
+            "migration": "请先通过 GET /interactions 按 user_id 查询事件 ID，再按事件 ID 读写",
+        },
+    )
+
+
 def _resolve_interaction_event_patch_params(
     payload: InteractionEventUpdateRequest,
 ) -> dict[str, Any]:
@@ -265,20 +338,87 @@ def _resolve_interaction_event_patch_params(
 
 def create_memory_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     service_getter: Callable[[], MemoryServiceProtocol | None],
+    redis_getter: Callable[[], ConversationDeadLetterManagerProtocol | None] | None = None,
 ) -> APIRouter:
     """创建记忆库管理路由。"""
-    auth_dependency = create_bearer_auth_dependency(
+    read_auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Memory 管理接口",
+        required_permission="memory:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="没有修改 Komari Memory 的权限",
+        required_permission="memory:write",
     )
     service_dependency = _build_service_dependency(service_getter)
+    dead_letter_dependency = _build_dead_letter_dependency(redis_getter)
     router = APIRouter(
         prefix=API_PREFIX,
-        dependencies=[Depends(auth_dependency)],
+        dependencies=[Depends(read_auth_dependency)],
         tags=["komari-memory"],
     )
+
+    @router.get(
+        "/conversation-dead-letters",
+        response_model=ConversationDeadLetterListResponse,
+    )
+    async def list_conversation_dead_letters(
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        redis_manager: ConversationDeadLetterManagerProtocol = Depends(  # noqa: FAST002
+            dead_letter_dependency
+        ),
+    ) -> ConversationDeadLetterListResponse:
+        dead_letters = await redis_manager.list_conversation_dead_letters(limit=limit)
+        return ConversationDeadLetterListResponse(
+            items=[
+                ConversationDeadLetterEntry(
+                    group_id=item.group_id,
+                    snapshot_id=item.snapshot_id,
+                    failure_code=item.failure_code,
+                    attempt_count=item.attempt_count,
+                    failed_at_ms=item.failed_at_ms,
+                    message_count=item.message_count,
+                    chunk_state_count=item.chunk_state_count,
+                )
+                for item in dead_letters
+            ],
+            limit=limit,
+        )
+
+    @router.post(
+        "/conversation-dead-letters/{group_id}/{snapshot_id}/requeue",
+        response_model=ConversationDeadLetterRequeueResponse,
+        dependencies=[Depends(write_auth_dependency)],
+    )
+    async def requeue_conversation_dead_letter(
+        group_id: str,
+        snapshot_id: str,
+        redis_manager: ConversationDeadLetterManagerProtocol = Depends(  # noqa: FAST002
+            dead_letter_dependency
+        ),
+    ) -> ConversationDeadLetterRequeueResponse:
+        normalized_group_id = _normalize_redis_key_component(
+            group_id,
+            label="群组 ID",
+        )
+        normalized_snapshot_id = _normalize_redis_key_component(
+            snapshot_id,
+            label="快照 ID",
+        )
+        restored_count = await redis_manager.requeue_conversation_dead_letter(
+            group_id=normalized_group_id,
+            snapshot_id=normalized_snapshot_id,
+        )
+        if restored_count is None:
+            raise _not_found("未找到指定的对话总结失败快照")
+        return ConversationDeadLetterRequeueResponse(
+            group_id=normalized_group_id,
+            snapshot_id=normalized_snapshot_id,
+            restored_message_count=restored_count,
+        )
 
     @router.get("/conversations", response_model=ConversationListResponse)
     async def list_conversations(
@@ -289,12 +429,20 @@ def create_memory_router(
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> ConversationListResponse:
+        normalized_group_id = _normalize_optional_identifier(
+            group_id,
+            label="群组 ID",
+        )
+        normalized_participant = _normalize_optional_identifier(
+            participant,
+            label="参与者 ID",
+        )
         items, total = await service.list_conversations(
             limit=limit,
             offset=offset,
-            group_id=group_id,
-            participant=participant,
-            query=q,
+            group_id=normalized_group_id,
+            participant=normalized_participant,
+            query=_normalize_optional_query(q),
         )
         return ConversationListResponse(
             items=[ConversationEntry.model_validate(item) for item in items],
@@ -317,6 +465,7 @@ def create_memory_router(
         "/conversations",
         response_model=ConversationEntry,
         status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def create_conversation(
         payload: ConversationCreateRequest,
@@ -337,7 +486,11 @@ def create_memory_router(
             raise _validation_error(str(exc)) from exc
         return ConversationEntry.model_validate(item)
 
-    @router.patch("/conversations/{conversation_id}", response_model=ConversationEntry)
+    @router.patch(
+        "/conversations/{conversation_id}",
+        response_model=ConversationEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_conversation(
         conversation_id: int,
         payload: ConversationUpdateRequest,
@@ -358,6 +511,7 @@ def create_memory_router(
         "/conversations/{conversation_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_conversation(
         conversation_id: int,
@@ -380,9 +534,9 @@ def create_memory_router(
         items, total = await service.list_user_profile_rows(
             limit=limit,
             offset=offset,
-            group_id=group_id,
-            user_id=user_id,
-            query=q,
+            group_id=_normalize_optional_identifier(group_id, label="群组 ID"),
+            user_id=_normalize_optional_identifier(user_id, label="用户 ID"),
+            query=_normalize_optional_query(q),
         )
         return MemoryEntityListResponse(
             items=[MemoryEntityEntry.model_validate(item) for item in items],
@@ -400,6 +554,8 @@ def create_memory_router(
         user_id: str,
         service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
     ) -> MemoryEntityEntry:
+        group_id = _normalize_identifier(group_id, label="群组 ID")
+        user_id = _normalize_identifier(user_id, label="用户 ID")
         item = await service.get_user_profile_row(user_id=user_id, group_id=group_id)
         if item is None:
             raise _user_profile_not_found(group_id, user_id)
@@ -408,19 +564,23 @@ def create_memory_router(
     @router.put(
         "/user-profiles/{group_id}/{user_id}",
         response_model=MemoryEntityEntry,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def put_user_profile(
         group_id: str,
         user_id: str,
-        payload: Annotated[dict[str, Any], Body(...)],
+        payload: UserProfileUpsertRequest,
         importance: Annotated[int, Query(ge=1, le=5)] = 4,
         service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
     ) -> MemoryEntityEntry:
-        _ensure_payload_user_id(payload, user_id)
+        group_id = _normalize_identifier(group_id, label="群组 ID")
+        user_id = _normalize_identifier(user_id, label="用户 ID")
+        profile = payload.root
+        _ensure_payload_user_id(profile, user_id)
         item = await service.upsert_user_profile_row(
             user_id=user_id,
             group_id=group_id,
-            profile=payload,
+            profile=profile,
             importance=importance,
         )
         if item is None:
@@ -431,39 +591,23 @@ def create_memory_router(
         "/user-profiles/{group_id}/{user_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_user_profile(
         group_id: str,
         user_id: str,
         service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
     ) -> Response:
+        group_id = _normalize_identifier(group_id, label="群组 ID")
+        user_id = _normalize_identifier(user_id, label="用户 ID")
         deleted = await service.delete_user_profile(user_id=user_id, group_id=group_id)
         if not deleted:
             raise _user_profile_not_found(group_id, user_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    @router.get("/interaction-histories", response_model=MemoryEntityListResponse)
-    async def list_interaction_histories(
-        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
-        group_id: Annotated[str | None, Query(min_length=1)] = None,
-        user_id: Annotated[str | None, Query(min_length=1)] = None,
-        q: Annotated[str | None, Query(min_length=1)] = None,
-        limit: Annotated[int, Query(ge=1, le=100)] = 20,
-        offset: Annotated[int, Query(ge=0)] = 0,
-    ) -> MemoryEntityListResponse:
-        items, total = await service.list_interaction_history_rows(
-            limit=limit,
-            offset=offset,
-            group_id=group_id,
-            user_id=user_id,
-            query=q,
-        )
-        return MemoryEntityListResponse(
-            items=[MemoryEntityEntry.model_validate(item) for item in items],
-            total=total,
-            limit=limit,
-            offset=offset,
-        )
+    @router.get("/interaction-histories", deprecated=True)
+    async def list_interaction_histories() -> None:
+        raise _legacy_interaction_history_gone()
 
     @router.get("/interactions", response_model=InteractionEventListResponse)
     async def list_interactions(
@@ -476,8 +620,8 @@ def create_memory_router(
         items, total = await service.list_interaction_history_rows(
             limit=limit,
             offset=offset,
-            user_id=user_id,
-            query=q,
+            user_id=_normalize_optional_identifier(user_id, label="用户 ID"),
+            query=_normalize_optional_query(q),
         )
         event_items = [item["value"] for item in items]
         return InteractionEventListResponse(
@@ -497,7 +641,11 @@ def create_memory_router(
             raise _interaction_event_not_found(event_id)
         return InteractionEventEntry.model_validate(item)
 
-    @router.patch("/interactions/{event_id}", response_model=InteractionEventEntry)
+    @router.patch(
+        "/interactions/{event_id}",
+        response_model=InteractionEventEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_interaction_event(
         event_id: int,
         payload: InteractionEventUpdateRequest,
@@ -515,6 +663,7 @@ def create_memory_router(
         "/interactions/{event_id}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_interaction_event(
         event_id: int,
@@ -525,62 +674,37 @@ def create_memory_router(
             raise _interaction_event_not_found(event_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    @router.get(
-        "/interaction-histories/{group_id}/{user_id}",
-        response_model=MemoryEntityEntry,
-    )
+    @router.get("/interaction-histories/{group_id}/{user_id}", deprecated=True)
     async def get_interaction_history(
         group_id: str,
         user_id: str,
-        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
-    ) -> MemoryEntityEntry:
-        item = await service.get_interaction_history_row(
-            user_id=user_id,
-            group_id=group_id,
-        )
-        if item is None:
-            raise _interaction_history_not_found(group_id, user_id)
-        return MemoryEntityEntry.model_validate(item)
+    ) -> None:
+        del group_id, user_id
+        raise _legacy_interaction_history_gone()
 
     @router.put(
         "/interaction-histories/{group_id}/{user_id}",
-        response_model=MemoryEntityEntry,
+        deprecated=True,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def put_interaction_history(
         group_id: str,
         user_id: str,
-        payload: Annotated[dict[str, Any], Body(...)],
-        importance: Annotated[int, Query(ge=1, le=5)] = 5,
-        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
-    ) -> MemoryEntityEntry:
-        _ensure_payload_user_id(payload, user_id)
-        item = await service.upsert_interaction_history_row(
-            user_id=user_id,
-            group_id=group_id,
-            interaction=payload,
-            importance=importance,
-        )
-        if item is None:
-            raise _service_unavailable()
-        return MemoryEntityEntry.model_validate(item)
+    ) -> None:
+        del group_id, user_id
+        raise _legacy_interaction_history_gone()
 
     @router.delete(
         "/interaction-histories/{group_id}/{user_id}",
-        status_code=status.HTTP_204_NO_CONTENT,
-        response_class=Response,
+        deprecated=True,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_interaction_history(
         group_id: str,
         user_id: str,
-        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
-    ) -> Response:
-        deleted = await service.delete_interaction_history(
-            user_id=user_id,
-            group_id=group_id,
-        )
-        if not deleted:
-            raise _interaction_history_not_found(group_id, user_id)
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    ) -> None:
+        del group_id, user_id
+        raise _legacy_interaction_history_gone()
 
     return router
 
@@ -588,9 +712,10 @@ def create_memory_router(
 def register_memory_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     service_getter: Callable[[], MemoryServiceProtocol | None],
+    redis_getter: Callable[[], ConversationDeadLetterManagerProtocol | None] | None = None,
 ) -> None:
     """注册记忆库 REST API 与共享 CORS。"""
     if getattr(app.state, "komari_memory_api_registered", False):
@@ -601,6 +726,7 @@ def register_memory_api(
         create_memory_router(
             api_token=api_token,
             service_getter=service_getter,
+            redis_getter=redis_getter,
         )
     )
     app.state.komari_memory_api_registered = True

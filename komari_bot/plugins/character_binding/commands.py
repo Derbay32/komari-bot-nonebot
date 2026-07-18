@@ -10,7 +10,14 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg, Depends
 
-from .manager import CharacterBindingManager, get_manager
+from komari_bot.common.onebot_messages import plain_text_message
+
+from .manager import (
+    BindingPersistenceError,
+    CharacterBindingManager,
+    CharacterNameValidationError,
+    get_manager,
+)
 
 
 @dataclass(slots=True)
@@ -98,7 +105,7 @@ async def handle_bind_help(event: MessageEvent) -> None:
         f"{binding_info}"
     )
 
-    await bind.finish(help_text)
+    await bind.finish(plain_text_message(help_text))
 
 
 # /bind set <角色名>
@@ -114,8 +121,15 @@ async def handle_set(
     if not request.character_name:
         await bind_set.finish("❌ 请提供角色名\n用法: .bind set <角色名>")
 
-    await manager.set_character_name(request.target_user_id, request.character_name)
-    await bind_set.finish(f"✅ 已设置您的角色名为 {request.character_name}")
+    try:
+        await manager.set_character_name(request.target_user_id, request.character_name)
+    except CharacterNameValidationError as exc:
+        await bind_set.finish(plain_text_message(f"❌ {exc}"))
+    except BindingPersistenceError:
+        await bind_set.finish("❌ 角色绑定保存失败，请稍后重试")
+    await bind_set.finish(
+        plain_text_message(f"✅ 已设置您的角色名为 {request.character_name}")
+    )
 
 
 # /bind del
@@ -128,7 +142,10 @@ async def handle_del(
     manager: CharacterBindingManager = Depends(get_manager),
 ) -> None:
     """处理普通用户删除绑定命令。"""
-    success = await manager.remove_character_name(request.target_user_id)
+    try:
+        success = await manager.remove_character_name(request.target_user_id)
+    except BindingPersistenceError:
+        await bind_del.finish("❌ 角色绑定删除失败，请稍后重试")
     if success:
         await bind_del.finish("✅ 已删除您的角色绑定")
     else:
@@ -151,6 +168,8 @@ async def handle_list(
         await bind_list.finish("📋 当前没有任何角色绑定")
 
     if user_id in bindings:
-        await bind_list.finish(f"📋 您的角色绑定: {bindings[user_id]}")
+        await bind_list.finish(
+            plain_text_message(f"📋 您的角色绑定: {bindings[user_id]}")
+        )
 
     await bind_list.finish("❌ 您还没有设置角色绑定")

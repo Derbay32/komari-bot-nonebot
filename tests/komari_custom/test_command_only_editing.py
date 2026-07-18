@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
+from komari_bot.common.content_budget import ContentValidationError
 from komari_bot.plugins.komari_custom.models import SessionData
 from komari_bot.plugins.komari_custom.proposal_repository import ProposalRepository
+from komari_bot.plugins.komari_custom.publication_service import (
+    ProposalPublicationDraft,
+)
 from komari_bot.plugins.komari_custom.session_manager import CustomSessionManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +38,21 @@ class _FakeRedis:
         self.values.pop(key, None)
         return 1 if existed else 0
 
+    async def execute_command(self, command: str, *args: object) -> int:
+        assert command == "EVAL"
+        script, key_count, key, expected, replacement, _ttl, expect_missing = args
+        assert "custom_session_cas_v1" in str(script)
+        assert int(str(key_count)) == 1
+        key_text = str(key)
+        current = self.values.get(key_text)
+        if str(expect_missing) == "1":
+            if current is not None:
+                return 0
+        elif current != str(expected):
+            return 0
+        self.values[key_text] = str(replacement)
+        return 1
+
     async def close(self) -> None:
         return None
 
@@ -39,6 +60,23 @@ class _FakeRedis:
 class _FakeConfigManager:
     def get(self) -> object:
         return SimpleNamespace(redis_db=0)
+
+
+class _BarrierRedis(_FakeRedis):
+    def __init__(self) -> None:
+        super().__init__()
+        self.barrier_enabled = False
+        self._barrier_reads = 0
+        self._barrier = asyncio.Event()
+
+    async def get(self, key: str) -> str | None:
+        captured = self.values.get(key)
+        if self.barrier_enabled and self._barrier_reads < 2:
+            self._barrier_reads += 1
+            if self._barrier_reads == 2:
+                self._barrier.set()
+            await self._barrier.wait()
+        return captured
 
 
 class _FakeProposalConnection:
@@ -92,6 +130,34 @@ async def test_new_with_title_creates_session_title(
     assert saved is not None
     assert saved.title == "标题"
     assert saved.phase == "title"
+    assert saved.version == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_appends_replay_on_latest_session_without_lost_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _BarrierRedis()
+    monkeypatch.setattr(CustomSessionManager, "_redis_client", redis)
+    first = CustomSessionManager(_FakeConfigManager())
+    second = CustomSessionManager(_FakeConfigManager())
+    await first.create_session(100, "200", title="原标题")
+    redis.barrier_enabled = True
+
+    await asyncio.gather(
+        first.append_text(100, "200", "来自 worker A"),
+        second.append_text(100, "200", "来自 worker B"),
+    )
+
+    saved = await first.get_session(100, "200")
+    assert saved is not None
+    assert set(saved.title.splitlines()) == {
+        "原标题",
+        "来自 worker A",
+        "来自 worker B",
+    }
+    assert saved.version == 3
+    assert len(saved.undo_stack) == 2
 
 
 @pytest.mark.asyncio
@@ -151,6 +217,57 @@ async def test_append_rejected_in_review_phase(
 
 
 @pytest.mark.asyncio
+async def test_oversized_append_keeps_saved_draft_unchanged(
+    manager: CustomSessionManager,
+) -> None:
+    await manager.create_session(100, "200", title="原标题")
+
+    with pytest.raises(ContentValidationError, match="提案标题超过"):
+        await manager.append_text(100, "200", "新" * 129)
+
+    saved = await manager.get_session(100, "200")
+    assert saved is not None
+    assert saved.title == "原标题"
+    assert saved.undo_stack == []
+
+
+@pytest.mark.asyncio
+async def test_proposal_content_enforces_estimated_token_budget(
+    manager: CustomSessionManager,
+) -> None:
+    await manager.create_session(100, "200", title="标题")
+    await manager.set_phase(100, "200", "content")
+
+    with pytest.raises(ContentValidationError, match="估算 token 上限"):
+        await manager.append_text(100, "200", "测" * 4_097)
+
+    saved = await manager.get_session(100, "200")
+    assert saved is not None
+    assert saved.content == ""
+
+
+def test_session_model_validates_assignment_and_publication_draft() -> None:
+    with pytest.raises(ValidationError, match="提案标题超过"):
+        SessionData(title="题" * 129)
+
+    session = SessionData(title="标题")
+    with pytest.raises(ValidationError, match="提案正文超过"):
+        session.content = "正" * 8_001
+
+    with pytest.raises(ContentValidationError, match="提案标题超过"):
+        ProposalPublicationDraft(
+            publication_key="key",
+            group_id=100,
+            proposer_id=200,
+            proposer_name="测试用户",
+            title="题" * 129,
+            content="正文",
+            required_votes=3,
+            expire_hours=2,
+        )
+
+
+@pytest.mark.asyncio
 async def test_legacy_prompt_message_ids_are_ignored(
     fake_redis: _FakeRedis,
     manager: CustomSessionManager,
@@ -171,7 +288,7 @@ async def test_legacy_prompt_message_ids_are_ignored(
 def test_no_reply_append_entry_or_prompt_tracking_api() -> None:
     source = CUSTOM_INIT.read_text(encoding="utf-8")
 
-    assert "on_message" not in source
+    assert "on_message(" not in source
     assert "reply_append" not in source
     assert "_is_custom_prompt_reply" not in source
     assert "remember_prompt_message" not in source
@@ -195,6 +312,8 @@ def test_custom_action_fallback_error_message_hides_exception_detail() -> None:
 
     assert 'await custom_action.finish("❌ 处理请求失败，请稍后再试")' in source
     assert 'await custom_action.finish(f"❌ 处理请求失败：{e}")' not in source
+    assert "except ContentValidationError as exc:" in source
+    assert 'await custom_action.finish(plain_text_message(f"❌ {exc}"))' in source
 
 
 @pytest.mark.asyncio
@@ -213,3 +332,37 @@ async def test_find_proposal_by_keyword_escapes_like_wildcards() -> None:
     assert result is None
     assert "title ILIKE $2 ESCAPE '\\'" in query
     assert args == (100, r"%100\%\_x\\tag%")
+
+
+@pytest.mark.asyncio
+async def test_claim_for_approval_is_atomic_and_lease_guarded() -> None:
+    conn = _FakeProposalConnection()
+    repository = ProposalRepository()
+    repository._pool = _FakeProposalPool(conn)  # type: ignore[assignment]
+
+    result = await repository.claim_for_approval(
+        9,
+        "claim-token",
+        lease_seconds=300,
+    )
+
+    assert result is None
+    query, args = conn.fetchrow_calls[0]
+    assert "status = 'approving'" in query
+    assert "vote_count >= required_votes" in query
+    assert "approval_started_at <" in query
+    assert args == (9, "claim-token", 300)
+
+
+@pytest.mark.asyncio
+async def test_publication_message_id_is_saved_in_editing_session(
+    manager: CustomSessionManager,
+) -> None:
+    await manager.create_session(100, "200", title="标题")
+
+    session = await manager.remember_publication_message_id(100, "200", 9988)
+
+    assert session.publication_message_id == 9988
+    saved = await manager.get_session(100, "200")
+    assert saved is not None
+    assert saved.publication_message_id == 9988

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
@@ -46,11 +47,22 @@ class ForgettingTaskManager:
             return
 
         for group_id, processing_key in orphaned_keys:
+            owner_token = f"orphan-recovery-{uuid4().hex}"
             try:
-                await self._redis_manager.restore_processing_conversation_buffer(
+                claim = await self._redis_manager.claim_existing_conversation_processing(
                     group_id,
                     processing_key,
+                    owner_token,
                 )
+                if claim.status != "claimed":
+                    continue
+                restored = await self._redis_manager.restore_processing_conversation_buffer(
+                    group_id,
+                    processing_key,
+                    owner_token,
+                )
+                if not restored:
+                    continue
             except Exception:
                 logger.exception(
                     "[KomariMemory] 恢复孤立对话 processing 快照失败: group={} key={}",
