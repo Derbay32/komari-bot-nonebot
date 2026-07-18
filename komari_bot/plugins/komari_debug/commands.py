@@ -21,6 +21,7 @@ from nonebot.exception import FinishedException
 from nonebot.params import CommandArg, Depends
 from nonebot.permission import SUPERUSER
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.plugins.character_binding import get_binding_manager
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema as SummaryConfigSchema,
@@ -176,6 +177,33 @@ async def _deliver_debug_report(
     return delivery
 
 
+async def _build_basic_command_result(
+    *,
+    bot: Bot,
+    event: MessageEvent,
+    request_id: str,
+    succeeded: bool,
+    private_text: str,
+) -> Message:
+    """基础调试命令在群内只返回回执，业务明细只发给 SUPERUSER 私聊。"""
+    if not isinstance(event, GroupMessageEvent):
+        return plain_text_message(private_text)
+    private_delivered = await send_private_message(
+        bot,
+        int(event.user_id),
+        f"请求 ID: {request_id}\n{private_text}",
+    )
+    return plain_text_message(
+        _build_group_receipt(
+            request_id=request_id,
+            succeeded=succeeded,
+            private_delivered=private_delivered,
+            public_requested=False,
+            public_delivered=None,
+        )
+    )
+
+
 def _gather_image_urls(event: GroupMessageEvent) -> list[str]:
     """从事件消息中提取图片 URL 列表。"""
     try:
@@ -183,8 +211,11 @@ def _gather_image_urls(event: GroupMessageEvent) -> list[str]:
         if msg is None:
             return []
         urls, _count = extract_image_sources(msg)
-    except Exception:
-        logger.debug("[KomariDebug] 提取图片 URL 失败", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "[KomariDebug] 提取图片 URL 失败: error_type={}",
+            type(exc).__name__,
+        )
         return []
     else:
         return urls
@@ -254,8 +285,11 @@ def _build_reply_context_from_event(event: GroupMessageEvent) -> ReplyContext | 
             image_count=image_count,
             has_visible_image=has_visible_image,
         )
-    except Exception:
-        logger.debug("[KomariDebug] 构造引用上下文失败", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "[KomariDebug] 构造引用上下文失败: error_type={}",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -289,17 +323,33 @@ async def handle_favor_get(
     if user_id is None:
         await debug_favor_get.finish("❌ 请提供有效的用户 ID（正整数）\n用法: .debug favor get <用户ID>")
 
+    request_id = f"debug-favor-get-{uuid.uuid4().hex[:12]}"
     try:
         favor = await get_user_favorability(user_id)
-    except Exception as e:
-        logger.exception("[KomariDebug] favor get 失败")
-        await debug_favor_get.finish(f"❌ 查询失败: {e}")
-
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] favor get 失败: request_id={} error_type={}",
+            request_id,
+            type(exc).__name__,
+        )
+        private_text = "❌ 查询失败\n错误码: favor_get_failed"
+        succeeded = False
+    else:
+        private_text = (
+            f"📊 用户 {user_id} 好感度:\n"
+            f"  数值: {favor.favorability}\n"
+            f"  阶段: {favor.stage_name}（{favor.stage_index}/4）\n"
+            f"  更新时间: {favor.updated_at}"
+        )
+        succeeded = True
     await debug_favor_get.finish(
-        f"📊 用户 {user_id} 好感度:\n"
-        f"  数值: {favor.favorability}\n"
-        f"  阶段: {favor.stage_name}（{favor.stage_index}/4）\n"
-        f"  更新时间: {favor.updated_at}"
+        await _build_basic_command_result(
+            bot=bot,
+            event=event,
+            request_id=request_id,
+            succeeded=succeeded,
+            private_text=private_text,
+        )
     )
 
 
@@ -335,18 +385,34 @@ async def handle_favor_set(
             f"❌ 好感度值必须为 {FAVOR_MIN}-{FAVOR_MAX} 的整数\n用法: .debug favor set <用户ID> <0-{FAVOR_MAX}>"
         )
 
+    request_id = f"debug-favor-set-{uuid.uuid4().hex[:12]}"
     try:
         result = await set_user_favorability(user_id, value)
-    except Exception as e:
-        logger.exception("[KomariDebug] favor set 失败")
-        await debug_favor_set.finish(f"❌ 设置失败: {e}")
-
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] favor set 失败: request_id={} error_type={}",
+            request_id,
+            type(exc).__name__,
+        )
+        private_text = "❌ 设置失败\n错误码: favor_set_failed"
+        succeeded = False
+    else:
+        private_text = (
+            f"✅ 用户 {user_id} 好感度已设置:\n"
+            f"  before: {result.before}\n"
+            f"  after:  {result.after}\n"
+            f"  阶段:    {result.stage_name}（{result.stage_index}/4）\n"
+            f"  更新时间: {result.updated_at}"
+        )
+        succeeded = True
     await debug_favor_set.finish(
-        f"✅ 用户 {user_id} 好感度已设置:\n"
-        f"  before: {result.before}\n"
-        f"  after:  {result.after}\n"
-        f"  阶段:    {result.stage_name}（{result.stage_index}/4）\n"
-        f"  更新时间: {result.updated_at}"
+        await _build_basic_command_result(
+            bot=bot,
+            event=event,
+            request_id=request_id,
+            succeeded=succeeded,
+            private_text=private_text,
+        )
     )
 
 
@@ -382,14 +448,30 @@ async def handle_debug_bind_set(
             "❌ 角色名不能为空\n用法: .debug bind set <用户ID> <角色名>"
         )
 
+    request_id = f"debug-bind-set-{uuid.uuid4().hex[:12]}"
     try:
         manager = get_binding_manager()
         await manager.set_character_name(user_id, character_name)
-    except Exception as e:
-        logger.exception("[KomariDebug] bind set 失败")
-        await debug_bind_set.finish(f"❌ 设置绑定失败: {e}")
-
-    await debug_bind_set.finish(f"✅ 已为用户 {user_id} 设置角色绑定: {character_name}")
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] bind set 失败: request_id={} error_type={}",
+            request_id,
+            type(exc).__name__,
+        )
+        private_text = "❌ 设置绑定失败\n错误码: bind_set_failed"
+        succeeded = False
+    else:
+        private_text = f"✅ 已为用户 {user_id} 设置角色绑定: {character_name}"
+        succeeded = True
+    await debug_bind_set.finish(
+        await _build_basic_command_result(
+            bot=bot,
+            event=event,
+            request_id=request_id,
+            succeeded=succeeded,
+            private_text=private_text,
+        )
+    )
 
 
 # ─── .debug bind del ───────────────────────────────────────────
@@ -412,17 +494,34 @@ async def handle_debug_bind_del(
             "❌ 请提供有效的用户 ID（正整数）\n用法: .debug bind del <用户ID>"
         )
 
+    request_id = f"debug-bind-del-{uuid.uuid4().hex[:12]}"
     try:
         manager = get_binding_manager()
         success = await manager.remove_character_name(user_id)
-    except Exception as e:
-        logger.exception("[KomariDebug] bind del 失败")
-        await debug_bind_del.finish(f"❌ 删除绑定失败: {e}")
-
-    if success:
-        await debug_bind_del.finish(f"✅ 已删除用户 {user_id} 的角色绑定")
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] bind del 失败: request_id={} error_type={}",
+            request_id,
+            type(exc).__name__,
+        )
+        private_text = "❌ 删除绑定失败\n错误码: bind_delete_failed"
+        succeeded = False
     else:
-        await debug_bind_del.finish(f"⚠️ 用户 {user_id} 没有角色绑定")
+        private_text = (
+            f"✅ 已删除用户 {user_id} 的角色绑定"
+            if success
+            else f"⚠️ 用户 {user_id} 没有角色绑定"
+        )
+        succeeded = True
+    await debug_bind_del.finish(
+        await _build_basic_command_result(
+            bot=bot,
+            event=event,
+            request_id=request_id,
+            succeeded=succeeded,
+            private_text=private_text,
+        )
+    )
 
 
 # ─── .debug bind list ──────────────────────────────────────────
@@ -452,14 +551,21 @@ async def handle_debug_bind_list(
     try:
         manager = get_binding_manager()
         bindings = manager.list_bindings()
-    except Exception as e:
-        logger.exception("[KomariDebug] bind list 失败")
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] bind list 失败: request_id={} error_type={}",
+            request_id,
+            type(exc).__name__,
+        )
         if not isinstance(event, GroupMessageEvent):
-            await debug_bind_list.finish(f"❌ 查询绑定列表失败: {e}")
+            await debug_bind_list.finish(
+                plain_text_message("❌ 查询绑定列表失败\n错误码: bind_list_failed")
+            )
         private_delivered = await send_private_message(
             bot,
             int(event.user_id),
-            f"❌ 查询绑定列表失败\n请求 ID: {request_id}\n错误: {e}",
+            f"❌ 查询绑定列表失败\n请求 ID: {request_id}\n"
+            "错误码: bind_list_failed",
         )
         receipt = _build_group_receipt(
             request_id=request_id,
@@ -468,7 +574,7 @@ async def handle_debug_bind_list(
             public_requested=public_requested,
             public_delivered=False if public_requested else None,
         )
-        await debug_bind_list.finish(receipt)
+        await debug_bind_list.finish(plain_text_message(receipt))
 
     if bindings:
         lines = ["📋 全部角色绑定:"]
@@ -479,7 +585,7 @@ async def handle_debug_bind_list(
         private_text = "📋 当前没有任何角色绑定"
 
     if not isinstance(event, GroupMessageEvent):
-        await debug_bind_list.finish(private_text)
+        await debug_bind_list.finish(plain_text_message(private_text))
 
     private_delivered = await send_private_message(
         bot,
@@ -495,7 +601,7 @@ async def handle_debug_bind_list(
     )
     if public_requested:
         receipt += f"\n公开摘要: 共 {len(bindings)} 条绑定，明细已隐藏"
-    await debug_bind_list.finish(receipt)
+    await debug_bind_list.finish(plain_text_message(receipt))
 
 
 # ─── .debug reply ──────────────────────────────────────────────
@@ -544,16 +650,21 @@ async def handle_debug_reply(
             bot=bot,
             image_urls=image_urls if image_urls else None,
             reply_context=reply_context,
+            caller_is_superuser=True,
             collector=collector,
         )
     except FinishedException:
         raise
-    except Exception as e:
-        logger.exception("[KomariDebug] debug reply 执行失败")
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] debug reply 执行失败: request_id={} error_type={}",
+            request_trace_id,
+            type(exc).__name__,
+        )
         collector.add_error(
             phase="debug_reply",
-            error_type=type(e).__name__,
-            message=str(e),
+            error_type=type(exc).__name__,
+            message="内部执行失败，异常正文已隐藏",
         )
         await _deliver_debug_report(
             bot=bot,
@@ -562,7 +673,7 @@ async def handle_debug_reply(
             result_type="reply",
             succeeded=False,
             public_requested=public_requested,
-            error=str(e),
+            error="debug_reply_failed",
             extra_info={
                 "user_id": user_id,
                 "content": debug_content[:200],
@@ -640,11 +751,16 @@ async def handle_debug_summary(
     try:
         config = _summary_config_mgr.get()
         summary_config = _cast_summary_config(config)
-    except Exception as e:
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] summary 配置读取失败: request_id={} error_type={}",
+            request_trace_id,
+            type(exc).__name__,
+        )
         collector.add_error(
             phase="debug_summary_config",
-            error_type=type(e).__name__,
-            message=str(e),
+            error_type=type(exc).__name__,
+            message="配置读取失败，异常正文已隐藏",
         )
         await _deliver_debug_report(
             bot=bot,
@@ -653,7 +769,7 @@ async def handle_debug_summary(
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
-            error=str(e),
+            error="debug_summary_config_failed",
             extra_info={"user_id": str(event.user_id)},
         )
         return
@@ -667,11 +783,11 @@ async def handle_debug_summary(
             config=summary_config,
             collector=collector,
         )
-    except SummaryBusyError as e:
+    except SummaryBusyError:
         collector.add_error(
             phase="debug_summary",
             error_type="SummaryBusyError",
-            message=str(e),
+            message="同一群已有总结任务执行中",
         )
         await _deliver_debug_report(
             bot=bot,
@@ -680,7 +796,7 @@ async def handle_debug_summary(
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
-            error=str(e),
+            error="summary_busy",
             extra_info={
                 "user_id": str(event.user_id),
                 "request": summary_request[:200],
@@ -700,7 +816,7 @@ async def handle_debug_summary(
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
-            error="当前 OneBot 实现不支持获取群聊记录",
+            error="capability_not_supported",
             extra_info={
                 "user_id": str(event.user_id),
                 "request": summary_request[:200],
@@ -709,12 +825,16 @@ async def handle_debug_summary(
         return
     except FinishedException:
         raise
-    except Exception as e:
-        logger.exception("[KomariDebug] debug summary 执行失败")
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] debug summary 执行失败: request_id={} error_type={}",
+            request_trace_id,
+            type(exc).__name__,
+        )
         collector.add_error(
             phase="debug_summary",
-            error_type=type(e).__name__,
-            message=str(e),
+            error_type=type(exc).__name__,
+            message="内部执行失败，异常正文已隐藏",
         )
         await _deliver_debug_report(
             bot=bot,
@@ -723,7 +843,7 @@ async def handle_debug_summary(
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
-            error=str(e),
+            error="debug_summary_failed",
             extra_info={
                 "user_id": str(event.user_id),
                 "request": summary_request[:200],
@@ -733,11 +853,16 @@ async def handle_debug_summary(
 
     image_delivered = True
     if result.image_base64:
-        image_delivered = await send_private_message(
-            bot,
-            int(event.user_id),
-            MessageSegment.image(file=f"base64://{result.image_base64}"),
+        image_pages = getattr(result, "image_pages_base64", ()) or (
+            result.image_base64,
         )
+        for image_page in image_pages:
+            page_delivered = await send_private_message(
+                bot,
+                int(event.user_id),
+                MessageSegment.image(file=f"base64://{image_page}"),
+            )
+            image_delivered = image_delivered and page_delivered
         if not image_delivered:
             collector.add_error(
                 phase="debug_summary_image_send",
@@ -751,6 +876,11 @@ async def handle_debug_summary(
         "filtered_message_count": str(result.filtered_message_count),
         "filter_label": result.filter_label,
         "time_range": result.time_range,
+        "image_page_count": str(
+            len(getattr(result, "image_pages_base64", ()))
+            or int(bool(result.image_base64))
+        ),
+        "image_truncated": str(bool(getattr(result, "image_truncated", False))),
     }
     history_fetch = getattr(result, "history_fetch", None)
     if history_fetch is not None:

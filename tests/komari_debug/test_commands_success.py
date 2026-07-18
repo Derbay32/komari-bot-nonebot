@@ -35,6 +35,8 @@ from nonebot.adapters.onebot.v11 import (
 )
 from nonebot.adapters.onebot.v11.event import Sender
 
+from komari_bot.common.onebot_messages import plain_text_message
+
 if TYPE_CHECKING:
     from nonebug import App
 
@@ -129,10 +131,12 @@ async def test_favor_get_shows_favorability_data(
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
         ctx.should_call_send(
             event,
-            "📊 用户 42 好感度:\n"
-            "  数值: 0\n"
-            "  阶段: 疏离戒备（1/4）\n"
-            "  更新时间: 2026-06-07T00:00:00+00:00",
+            plain_text_message(
+                "📊 用户 42 好感度:\n"
+                "  数值: 0\n"
+                "  阶段: 疏离戒备（1/4）\n"
+                "  更新时间: 2026-06-07T00:00:00+00:00"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -178,8 +182,63 @@ async def test_favor_get_exception_shows_error_message(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_get)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
-        ctx.should_call_send(event, "❌ 查询失败: 数据库连接失败", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 查询失败\n错误码: favor_get_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_group_favor_get_sends_only_receipt_and_hides_error_body(
+    app: App,
+    debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error_canary = "favor-storage-error-canary"
+    private_messages: list[str] = []
+
+    async def _raise_error(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(error_canary)
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        message: object,
+    ) -> bool:
+        private_messages.append(str(message))
+        return True
+
+    monkeypatch.setattr(debug_commands, "get_user_favorability", _raise_error)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="d" * 32),
+    )
+
+    async with app.test_matcher(debug_commands.debug_favor_get) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_group_event(".debug favor get 42", user_id=SU_ID)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_favor_get)
+        ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
+        ctx.should_call_send(
+            event,
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-favor-get-dddddddddddd\n"
+                "执行状态: 失败\n"
+                "完整结果: 已私聊"
+            ),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+    assert len(private_messages) == 1
+    assert "favor_get_failed" in private_messages[0]
+    assert error_canary not in private_messages[0]
 
 
 # ─── favor set 成功 ───────────────────────────────────────────
@@ -199,11 +258,13 @@ async def test_favor_set_shows_before_after_and_stage(
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_set)
         ctx.should_call_send(
             event,
-            "✅ 用户 42 好感度已设置:\n"
-            "  before: 0\n"
-            "  after:  200\n"
-            "  阶段:    普通熟人（2/4）\n"
-            "  更新时间: 2026-06-07T00:00:00+00:00",
+            plain_text_message(
+                "✅ 用户 42 好感度已设置:\n"
+                "  before: 0\n"
+                "  after:  200\n"
+                "  阶段:    普通熟人（2/4）\n"
+                "  更新时间: 2026-06-07T00:00:00+00:00"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -289,7 +350,11 @@ async def test_favor_set_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_set)
-        ctx.should_call_send(event, "❌ 设置失败: 事务冲突", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 设置失败\n错误码: favor_set_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -330,7 +395,11 @@ async def test_bind_set_success(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
-        ctx.should_call_send(event, "✅ 已为用户 42 设置角色绑定: 泉此方", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("✅ 已为用户 42 设置角色绑定: 泉此方"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -391,7 +460,11 @@ async def test_bind_set_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
-        ctx.should_call_send(event, "❌ 设置绑定失败: 存储失败", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 设置绑定失败\n错误码: bind_set_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -415,7 +488,11 @@ async def test_bind_del_success(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(event, "✅ 已删除用户 42 的角色绑定", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("✅ 已删除用户 42 的角色绑定"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -436,7 +513,11 @@ async def test_bind_del_not_found(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(event, "⚠️ 用户 999 没有角色绑定", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("⚠️ 用户 999 没有角色绑定"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -477,7 +558,11 @@ async def test_bind_del_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(event, "❌ 删除绑定失败: JSON 解析失败", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 删除绑定失败\n错误码: bind_delete_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -503,7 +588,7 @@ async def test_bind_list_with_bindings(
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         expected = "📋 全部角色绑定:\n  10086: 柊镜\n  42: 泉此方"
-        ctx.should_call_send(event, expected, bot=bot)
+        ctx.should_call_send(event, plain_text_message(expected), bot=bot)
         ctx.should_finished()
 
 
@@ -524,7 +609,11 @@ async def test_bind_list_empty(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
-        ctx.should_call_send(event, "📋 当前没有任何角色绑定", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 当前没有任何角色绑定"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -545,7 +634,11 @@ async def test_bind_list_exception_shows_error(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
-        ctx.should_call_send(event, "❌ 查询绑定列表失败: JSON 文件损坏", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 查询绑定列表失败\n错误码: bind_list_failed"),
+            bot=bot,
+        )
         ctx.should_finished()
 
 
@@ -603,10 +696,12 @@ async def test_group_bind_list_sends_full_details_only_to_superuser_private_chat
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         ctx.should_call_send(
             event,
-            "🔒 调试请求已处理\n"
-            "请求 ID: debug-bind-list-aaaaaaaaaaaa\n"
-            "执行状态: 成功\n"
-            "完整结果: 已私聊",
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-aaaaaaaaaaaa\n"
+                "执行状态: 成功\n"
+                "完整结果: 已私聊"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -649,12 +744,14 @@ async def test_group_bind_list_public_mode_shows_only_redacted_count(
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         ctx.should_call_send(
             event,
-            "🔒 调试请求已处理\n"
-            "请求 ID: debug-bind-list-bbbbbbbbbbbb\n"
-            "执行状态: 成功\n"
-            "完整结果: 已私聊\n"
-            "公开脱敏摘要: 已发送\n"
-            "公开摘要: 共 1 条绑定，明细已隐藏",
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-bbbbbbbbbbbb\n"
+                "执行状态: 成功\n"
+                "完整结果: 已私聊\n"
+                "公开脱敏摘要: 已发送\n"
+                "公开摘要: 共 1 条绑定，明细已隐藏"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -696,15 +793,18 @@ async def test_group_bind_list_error_reason_is_private(
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         ctx.should_call_send(
             event,
-            "🔒 调试请求已处理\n"
-            "请求 ID: debug-bind-list-cccccccccccc\n"
-            "执行状态: 失败\n"
-            "完整结果: 已私聊",
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-cccccccccccc\n"
+                "执行状态: 失败\n"
+                "完整结果: 已私聊"
+            ),
             bot=bot,
         )
         ctx.should_finished()
 
-    assert error_canary in private_messages[0]
+    assert error_canary not in private_messages[0]
+    assert "bind_list_failed" in private_messages[0]
 
 
 # ─── reply 私聊拒绝 ───────────────────────────────────────────
@@ -885,7 +985,7 @@ async def test_reply_exception_sends_error_report(
 
     assert spy.build_report_called
     assert spy.report_kwargs["succeeded"] is False
-    assert "LLM 服务不可用" in str(spy.report_kwargs["error"])
+    assert spy.report_kwargs["error"] == "debug_reply_failed"
 
 
 # ─── summary 私聊拒绝 ─────────────────────────────────────────
@@ -1065,7 +1165,7 @@ async def test_summary_exception_sends_error_report(
 
     assert spy.build_report_called
     assert spy.report_kwargs["succeeded"] is False
-    assert "API 超时" in str(spy.report_kwargs["error"])
+    assert spy.report_kwargs["error"] == "debug_summary_failed"
 
 
 # ─── 严格多余参数检查 ─────────────────────────────────────────

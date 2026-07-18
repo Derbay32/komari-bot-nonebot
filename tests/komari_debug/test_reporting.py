@@ -16,6 +16,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
 from komari_bot.plugins.llm_provider.diagnostic import (
     LLMCallTrace,
@@ -150,10 +151,12 @@ def test_build_chapters_failure_includes_error_chapter(debug_reporting: Any) -> 
     assert "错误/降级" in titles
     error_chapter = chapters[titles.index("错误/降级")][1]
     assert "APITimeoutError" in error_chapter
-    assert "请求超时 30s" in error_chapter
+    assert "请求超时 30s" not in error_chapter
+    assert "异常正文: 已隐藏" in error_chapter
 
     final_chapter = chapters[titles.index("最终结果")][1]
-    assert "LLM API 超时" in final_chapter
+    assert "LLM API 超时" not in final_chapter
+    assert "错误码: internal_error" in final_chapter
     assert "执行失败" in final_chapter
 
 
@@ -444,7 +447,12 @@ async def test_send_private_forward_msg_failure_falls_back_to_private_text(
     text_calls = [c for c in api_calls if c["api"] == "send_private_msg"]
     assert len(text_calls) > 0
     assert all(c["user_id"] == 42 for c in text_calls)
-    assert all(isinstance(c.get("message"), str) for c in text_calls)
+    assert all(
+        isinstance(c.get("message"), Message)
+        and len(c["message"]) == 1
+        and c["message"][0].type == "text"
+        for c in text_calls
+    )
     assert not any(call["api"].startswith("send_group") for call in api_calls)
 
 
@@ -495,7 +503,9 @@ async def test_explicit_public_report_is_redacted_and_private_copy_is_complete(
     private_payload = str(private_calls[0]["messages"])
     public_payload = str(public_calls[0]["messages"])
     assert "input-canary-private-994" in private_payload
-    assert "top-error-canary-992" in private_payload
+    assert "SensitiveFailure" in private_payload
+    assert "error-canary-private-991" not in private_payload
+    assert "top-error-canary-992" not in private_payload
     for canary in [
         "SensitiveFailure",
         "error-canary-private-991",
@@ -533,7 +543,7 @@ async def test_send_group_text_success(debug_reporting: Any) -> None:
     assert len(api_calls) == 1
     assert api_calls[0]["api"] == "send_group_msg"
     assert api_calls[0]["group_id"] == 12345
-    assert api_calls[0]["message"] == "测试文本"
+    assert api_calls[0]["message"] == Message(MessageSegment.text("测试文本"))
 
 
 @pytest.mark.asyncio
@@ -573,7 +583,7 @@ async def test_send_private_message_targets_only_the_superuser(
         {
             "api": "send_private_msg",
             "user_id": 42,
-            "message": "private-canary",
+            "message": Message(MessageSegment.text("private-canary")),
         }
     ]
 

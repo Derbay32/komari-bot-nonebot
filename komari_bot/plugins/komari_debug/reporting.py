@@ -12,11 +12,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
+
+from komari_bot.common.onebot_messages import plain_text_message
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -29,6 +32,7 @@ if TYPE_CHECKING:
 
 MAX_NODE_TEXT_LENGTH = 3500
 MAX_NODES_PER_BATCH = 50
+_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +107,7 @@ def _format_tool_line(
         )
         lines.append(f"  参数: {_truncate_dict(safe_arguments, 200)}")
     if tool.error_summary and not public_redacted:
-        lines.append(f"  错误: {_truncate_text(tool.error_summary, 300)}")
+        lines.append("  错误: 已记录（异常正文已隐藏）")
     if tool.result_summary:
         lines.append("  结果: 已记录（内容已隐藏）")
     return "\n".join(lines)
@@ -192,6 +196,11 @@ def _truncate_text(content: str, max_chars: int = 500) -> str:
     if len(content) <= max_chars:
         return content
     return content[:max_chars] + "..."
+
+
+def _safe_error_code(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if _ERROR_CODE_PATTERN.fullmatch(candidate) else "internal_error"
 
 
 def _format_phase_subtotal(phase: str, collector: LLMDiagnosticCollector) -> str:
@@ -319,7 +328,7 @@ def _build_chapters(
     else:
         final_lines = [
             "最终结果: 执行失败",
-            f"错误类型: {_truncate_text(error or '未知', max_chars=300)}",
+            f"错误码: {_safe_error_code(error)}",
         ]
         if final_result_info:
             for key, val in final_result_info.items():
@@ -380,7 +389,9 @@ def _build_chapters(
             ]
         else:
             error_lines = [
-                f"阶段: {err['phase']} | 类型: {_truncate_text(err['type'], max_chars=100)} | 消息: {_truncate_text(err['message'], max_chars=300)}"
+                f"阶段: {err['phase']} | "
+                f"类型: {_truncate_text(err['type'], max_chars=100)} | "
+                "异常正文: 已隐藏"
                 for err in collector.errors
             ]
         chapters.append(("错误/降级", "\n".join(error_lines)))
@@ -487,7 +498,7 @@ async def _send_report_nodes(
             MessageSegment.node_custom(
                 user_id=int(bot.self_id),
                 nickname="Komari Debug",
-                content=node_text,
+                content=plain_text_message(node_text),
             )
             for node_text in batch
         ]
@@ -559,8 +570,9 @@ async def _send_message(
     channel: str,
 ) -> bool:
     """向指定目标发送消息，日志不记录目标 ID 或消息正文。"""
+    safe_message = plain_text_message(message) if isinstance(message, str) else message
     try:
-        await bot.call_api(api, **{target_key: target_id}, message=message)
+        await bot.call_api(api, **{target_key: target_id}, message=safe_message)
     except Exception as exc:
         logger.warning(
             "[KomariDebug] 消息投递失败: channel={} error_type={}",
@@ -590,6 +602,6 @@ async def send_group_text(bot: Bot, group_id: int, text: str) -> bool:
         api="send_group_msg",
         target_key="group_id",
         target_id=group_id,
-        message=text,
+        message=plain_text_message(text),
         channel="group_receipt",
     )
