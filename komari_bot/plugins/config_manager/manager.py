@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Never
 
 from nonebot import get_plugin_config, logger
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
 _CONFIG_UPDATE_MAX_ATTEMPTS = 3
+_DEFAULT_CONFIG_MAX_STALENESS_SECONDS = 1.0
+_SECURITY_CONFIG_MAX_STALENESS_SECONDS = 0.25
 
 
 class ConfigUpdateConflictError(RuntimeError):
@@ -58,6 +61,13 @@ class ConfigManager:
         self._dynamic_config: BaseModel | None = None
         self._last_loaded_at: datetime | None = None
         self._revision: int | None = None
+        self._last_revision_checked_at = 0.0
+        self._max_staleness_seconds = (
+            _SECURITY_CONFIG_MAX_STALENESS_SECONDS
+            if plugin_name == "komari_management"
+            else _DEFAULT_CONFIG_MAX_STALENESS_SECONDS
+        )
+        self._watcher_registered = False
         self._state_lock = RLock()
         self._sync_lock = RLock()
         self._async_lock = asyncio.Lock()
@@ -82,9 +92,18 @@ class ConfigManager:
 
     def initialize(self) -> BaseModel:
         """从 PostgreSQL 或 .env 初始化配置。"""
+        self._ensure_watcher_registered()
         with self._sync_lock:
             if self._dynamic_config is not None:
                 return self._dynamic_config
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                msg = "事件循环内禁止同步初始化配置，请使用 initialize_async()"
+                raise RuntimeError(msg)
 
             stored = get_config_storage().fetch(self._plugin_name)
             if stored is not None:
@@ -95,9 +114,41 @@ class ConfigManager:
 
             config = self._initialize_from_env()
             self._save_to_pg(config)
-            logger.info(f"[{self._plugin_name}] 已从 .env 初始化配置并写入 PostgreSQL")
+            logger.info(
+                f"[{self._plugin_name}] 已从 .env 尝试初始化配置，"
+                "并采用 PostgreSQL 最终快照"
+            )
             assert self._dynamic_config is not None
             return self._dynamic_config
+
+    def _ensure_watcher_registered(self) -> None:
+        """向存储层注册一次不可变快照订阅。"""
+        with self._state_lock:
+            if self._watcher_registered:
+                return
+            storage = get_config_storage()
+            register = getattr(storage, "register_watcher", None)
+            if callable(register):
+                register(
+                    self._plugin_name,
+                    self._accept_external_snapshot,
+                    max_staleness_seconds=self._max_staleness_seconds,
+                )
+            self._watcher_registered = True
+
+    def _accept_external_snapshot(self, stored: StoredConfig) -> None:
+        """从监听线程原子接纳更高 revision 的配置快照。"""
+        try:
+            self._config_schema(**stored.config_data)
+        except Exception as exc:
+            logger.warning(
+                "[{}] 忽略无法通过 Schema 校验的外部配置快照: revision={}, error={}",
+                self._plugin_name,
+                stored.revision,
+                type(exc).__name__,
+            )
+            return
+        self._cache_stored_config(stored)
 
     def _initialize_from_env(self) -> BaseModel:
         """从 .env 值创建初始配置。"""
@@ -113,10 +164,14 @@ class ConfigManager:
         return data
 
     def _save_to_pg(self, config: BaseModel) -> StoredConfig:
-        """将配置保存到 PostgreSQL。"""
+        """仅在记录缺失时写入初始配置，绝不覆盖并发创建的配置。"""
         data = self._config_to_storage_data(config)
         version = str(data.get("version", "1.0"))
-        stored = get_config_storage().upsert(
+        storage = get_config_storage()
+        insert = getattr(storage, "insert_if_absent", None)
+        if insert is None:
+            insert = storage.upsert
+        stored = insert(
             plugin_name=self._plugin_name,
             schema_name=self._config_schema.__name__,
             config_data=data,
@@ -127,10 +182,14 @@ class ConfigManager:
         return stored
 
     async def _save_to_pg_async(self, config: BaseModel) -> StoredConfig:
-        """异步保存配置，不阻塞调用方事件循环。"""
+        """异步初始化配置，不覆盖并发创建的数据库快照。"""
         data = self._config_to_storage_data(config)
         version = str(data.get("version", "1.0"))
-        stored = await get_config_storage().upsert_async(
+        storage = get_config_storage()
+        insert = getattr(storage, "insert_if_absent_async", None)
+        if insert is None:
+            insert = storage.upsert_async
+        stored = await insert(
             plugin_name=self._plugin_name,
             schema_name=self._config_schema.__name__,
             config_data=data,
@@ -144,6 +203,7 @@ class ConfigManager:
         """用数据库返回值刷新当前进程缓存。"""
         config = self._config_schema(**stored.config_data)
         with self._state_lock:
+            self._last_revision_checked_at = monotonic()
             if (
                 self._revision is not None
                 and stored.revision < self._revision
@@ -348,12 +408,14 @@ class ConfigManager:
 
     def get(self) -> BaseModel:
         """获取当前的动态配置。"""
+        self._ensure_watcher_registered()
         if self._dynamic_config is None:
             return self.initialize()
         return self._dynamic_config
 
     async def initialize_async(self) -> BaseModel:
         """异步从 PostgreSQL 或 .env 初始化配置。"""
+        self._ensure_watcher_registered()
         async with self._async_lock:
             if self._dynamic_config is not None:
                 return self._dynamic_config
@@ -375,10 +437,33 @@ class ConfigManager:
             return self._dynamic_config
 
     async def get_async(self) -> BaseModel:
-        """异步获取当前动态配置，首次加载不会阻塞事件循环。"""
+        """异步获取配置，并按最大陈旧时间向数据库校验 revision。"""
+        self._ensure_watcher_registered()
         if self._dynamic_config is None:
             return await self.initialize_async()
-        return self._dynamic_config
+        with self._state_lock:
+            cache_age = monotonic() - self._last_revision_checked_at
+            cached = self._dynamic_config
+        if cache_age < self._max_staleness_seconds and cached is not None:
+            return cached
+
+        async with self._async_lock:
+            with self._state_lock:
+                cache_age = monotonic() - self._last_revision_checked_at
+                cached = self._dynamic_config
+            if cache_age < self._max_staleness_seconds and cached is not None:
+                return cached
+
+            stored = await get_config_storage().fetch_async(self._plugin_name)
+            if stored is not None:
+                return self._cache_stored_config(stored)
+            with self._state_lock:
+                self._last_revision_checked_at = monotonic()
+                cached = self._dynamic_config
+            if cached is not None:
+                return cached
+            msg = f"[{self._plugin_name}] 配置缓存意外丢失"
+            raise RuntimeError(msg)
 
     def update_field(self, field_name: str, value: Any) -> BaseModel:
         """以字段级 CAS 更新单个配置字段。"""

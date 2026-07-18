@@ -96,3 +96,36 @@ async def test_mutate_field_skips_revision_write_when_value_is_unchanged(
     result = await manager.mutate_field_async("sr_list", lambda value: value)
 
     assert cast("_ListConfig", result).sr_list == ["甲"]
+
+
+@pytest.mark.asyncio
+async def test_get_async_refreshes_snapshot_after_max_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RefreshStorage:
+        def __init__(self) -> None:
+            self.fetch_calls = 0
+
+        def register_watcher(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        async def fetch_async(self, _plugin_name: str) -> StoredConfig:
+            self.fetch_calls += 1
+            return _stored(["甲", "乙"], 2)
+
+    storage = _RefreshStorage()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+    manager = ConfigManager("sr-mutation-test", _ListConfig)
+    manager._cache_stored_config(_stored(["甲"], 1))
+    manager._last_revision_checked_at = 0.0
+
+    result = await manager.get_async()
+
+    assert cast("_ListConfig", result).sr_list == ["甲", "乙"]
+    assert storage.fetch_calls == 1
+
+
+def test_management_config_uses_shorter_refresh_sla() -> None:
+    manager = ConfigManager("komari_management", _ListConfig)
+
+    assert manager._max_staleness_seconds == 0.25

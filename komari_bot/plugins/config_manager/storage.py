@@ -9,20 +9,20 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from dataclasses import dataclass
+from time import monotonic
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
+import asyncpg
 from nonebot import logger
 
 from komari_bot.common.database_config import get_shared_database_config
-from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.postgres import PostgresConfig, create_postgres_pool
 
 T = TypeVar("T")
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Callable, Coroutine
     from datetime import datetime
-
-    import asyncpg
 
 _CONFIG_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS komari_plugin_configs (
@@ -45,7 +45,35 @@ _CONFIG_TABLE_UPDATED_AT_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_komari_plugin_configs_updated_at
     ON komari_plugin_configs (updated_at DESC);
 """
+_CONFIG_NOTIFY_FUNCTION_DDL = """
+CREATE OR REPLACE FUNCTION komari_notify_plugin_config_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('komari_plugin_config_changed', NEW.plugin_name);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"""
+_CONFIG_NOTIFY_TRIGGER_DDL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_komari_plugin_config_changed'
+          AND tgrelid = 'komari_plugin_configs'::regclass
+    ) THEN
+        CREATE TRIGGER trg_komari_plugin_config_changed
+        AFTER INSERT OR UPDATE ON komari_plugin_configs
+        FOR EACH ROW
+        EXECUTE FUNCTION komari_notify_plugin_config_change();
+    END IF;
+END;
+$$;
+"""
 _CONFIG_STORAGE_TIMEOUT_SECONDS = 5.0
+_CONFIG_NOTIFY_CHANNEL = "komari_plugin_config_changed"
+_CONFIG_WATCH_RETRY_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +86,31 @@ class StoredConfig:
     version: str
     revision: int
     updated_at: datetime
+
+
+@dataclass(slots=True)
+class _ConfigWatcher:
+    """一个进程内配置快照订阅。"""
+
+    callback: Callable[[StoredConfig], None]
+    max_staleness_seconds: float
+    last_checked_at: float = 0.0
+
+
+def _stored_config_from_row(row: Any) -> StoredConfig:
+    """把 asyncpg 行转换为不可变配置快照。"""
+    raw_config = row["config_data"]
+    config_data = (
+        json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+    )
+    return StoredConfig(
+        plugin_name=str(row["plugin_name"]),
+        schema_name=str(row["schema_name"]),
+        config_data=dict(config_data),
+        version=str(row["version"]),
+        revision=int(row["revision"]),
+        updated_at=row["updated_at"],
+    )
 
 
 class ConfigStorage:
@@ -82,6 +135,11 @@ class ConfigStorage:
         self._pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
         self._init_lock = threading.RLock()
+        self._watchers: dict[str, list[_ConfigWatcher]] = {}
+        self._watchers_lock = threading.RLock()
+        self._pending_watch_names: set[str] = set()
+        self._watch_event: asyncio.Event | None = None
+        self._watch_task: asyncio.Task[None] | None = None
         self._thread.start()
         if not self._started.wait(timeout=_CONFIG_STORAGE_TIMEOUT_SECONDS):
             self.close()
@@ -157,6 +215,7 @@ class ConfigStorage:
                     await pool.close()
                     raise
                 self._pool = pool
+                self._start_watcher(config)
         assert self._pool is not None
         return self._pool
 
@@ -165,6 +224,177 @@ class ConfigStorage:
             await conn.execute(_CONFIG_TABLE_DDL)
             await conn.execute(_CONFIG_TABLE_REVISION_DDL)
             await conn.execute(_CONFIG_TABLE_UPDATED_AT_INDEX_DDL)
+            await conn.execute(_CONFIG_NOTIFY_FUNCTION_DDL)
+            await conn.execute(_CONFIG_NOTIFY_TRIGGER_DDL)
+
+    def register_watcher(
+        self,
+        plugin_name: str,
+        callback: Callable[[StoredConfig], None],
+        *,
+        max_staleness_seconds: float,
+    ) -> None:
+        """订阅配置变更，并以定期检查弥补丢失的数据库通知。"""
+        watcher = _ConfigWatcher(
+            callback=callback,
+            max_staleness_seconds=max(0.1, float(max_staleness_seconds)),
+        )
+        with self._watchers_lock:
+            self._watchers.setdefault(plugin_name, []).append(watcher)
+            self._pending_watch_names.add(plugin_name)
+        event = self._watch_event
+        if event is not None and self._loop.is_running():
+            with suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(event.set)
+
+    def _start_watcher(self, config: PostgresConfig) -> None:
+        """在存储事件循环中启动唯一的通知监听任务。"""
+        if self._watch_task is not None and not self._watch_task.done():
+            return
+        self._watch_event = asyncio.Event()
+        self._watch_task = asyncio.create_task(
+            self._watch_config_changes(config),
+            name="komari-config-revision-watcher",
+        )
+
+    def _handle_config_notification(
+        self,
+        _connection: asyncpg.Connection,
+        _process_id: int,
+        _channel: str,
+        payload: str,
+    ) -> None:
+        """接收 PostgreSQL 通知，只记录受影响资源，不读取敏感配置。"""
+        if not payload or len(payload) > 128:
+            return
+        with self._watchers_lock:
+            if payload not in self._watchers:
+                return
+            self._pending_watch_names.add(payload)
+        if self._watch_event is not None:
+            self._watch_event.set()
+
+    def _collect_due_watch_names(self) -> set[str]:
+        now = monotonic()
+        with self._watchers_lock:
+            names = set(self._pending_watch_names)
+            self._pending_watch_names.clear()
+            for plugin_name, watchers in self._watchers.items():
+                if any(
+                    now - watcher.last_checked_at
+                    >= watcher.max_staleness_seconds
+                    for watcher in watchers
+                ):
+                    names.add(plugin_name)
+        return names
+
+    def _next_watch_timeout(self) -> float:
+        now = monotonic()
+        with self._watchers_lock:
+            remaining = [
+                watcher.max_staleness_seconds - (now - watcher.last_checked_at)
+                for watchers in self._watchers.values()
+                for watcher in watchers
+            ]
+        if not remaining:
+            return _CONFIG_WATCH_RETRY_SECONDS
+        return max(0.05, min(remaining))
+
+    async def _refresh_watchers(
+        self,
+        conn: asyncpg.Connection,
+        plugin_names: set[str],
+    ) -> None:
+        if not plugin_names:
+            return
+        rows = await conn.fetch(
+            """
+            SELECT
+                plugin_name,
+                schema_name,
+                config_data,
+                version,
+                revision,
+                updated_at
+            FROM komari_plugin_configs
+            WHERE plugin_name = ANY($1::text[])
+            """,
+            sorted(plugin_names),
+        )
+        snapshots = {
+            str(row["plugin_name"]): _stored_config_from_row(row) for row in rows
+        }
+        checked_at = monotonic()
+        with self._watchers_lock:
+            watcher_snapshots = {
+                plugin_name: tuple(self._watchers.get(plugin_name, ()))
+                for plugin_name in plugin_names
+            }
+            for watchers in watcher_snapshots.values():
+                for watcher in watchers:
+                    watcher.last_checked_at = checked_at
+
+        for plugin_name, watchers in watcher_snapshots.items():
+            snapshot = snapshots.get(plugin_name)
+            if snapshot is None:
+                continue
+            for watcher in watchers:
+                try:
+                    watcher.callback(snapshot)
+                except Exception as exc:
+                    logger.warning(
+                        "配置快照订阅回调失败: plugin={}, error={}",
+                        plugin_name,
+                        type(exc).__name__,
+                    )
+
+    async def _watch_config_changes(self, config: PostgresConfig) -> None:
+        """监听数据库通知，并按最大陈旧时间轮询自愈。"""
+        while not self._closing:
+            conn: asyncpg.Connection | None = None
+            try:
+                conn = await asyncpg.connect(
+                    host=config.pg_host,
+                    port=config.pg_port,
+                    database=config.pg_database,
+                    user=config.pg_user,
+                    password=config.pg_password,
+                    command_timeout=30,
+                )
+                assert conn is not None
+                await conn.add_listener(
+                    _CONFIG_NOTIFY_CHANNEL,
+                    self._handle_config_notification,
+                )
+                while not self._closing:
+                    event = self._watch_event
+                    if event is None:
+                        return
+                    event.clear()
+                    names = self._collect_due_watch_names()
+                    await self._refresh_watchers(conn, names)
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            event.wait(),
+                            timeout=self._next_watch_timeout(),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._closing:
+                    logger.warning(
+                        "配置变更监听暂时中断，将自动重试: error={}",
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(_CONFIG_WATCH_RETRY_SECONDS)
+            finally:
+                if conn is not None and not conn.is_closed():
+                    with suppress(Exception):
+                        await conn.remove_listener(
+                            _CONFIG_NOTIFY_CHANNEL,
+                            self._handle_config_notification,
+                        )
+                    await conn.close()
 
     def ensure_schema(self) -> None:
         """确保配置表存在。"""
@@ -198,16 +428,96 @@ class ConfigStorage:
             )
         if row is None:
             return None
-        raw_config = row["config_data"]
-        config_data = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
-        return StoredConfig(
-            plugin_name=str(row["plugin_name"]),
-            schema_name=str(row["schema_name"]),
-            config_data=dict(config_data),
-            version=str(row["version"]),
-            revision=int(row["revision"]),
-            updated_at=row["updated_at"],
+        return _stored_config_from_row(row)
+
+    def insert_if_absent(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+    ) -> StoredConfig:
+        """仅在配置不存在时初始化，否则返回并发写入的现有快照。"""
+        return self._run(
+            self._insert_if_absent(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_data=config_data,
+                version=version,
+            )
         )
+
+    async def insert_if_absent_async(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+    ) -> StoredConfig:
+        """异步执行只插入不覆盖的配置初始化。"""
+        return await self._run_async(
+            self._insert_if_absent(
+                plugin_name=plugin_name,
+                schema_name=schema_name,
+                config_data=config_data,
+                version=version,
+            )
+        )
+
+    async def _insert_if_absent(
+        self,
+        *,
+        plugin_name: str,
+        schema_name: str,
+        config_data: dict[str, Any],
+        version: str,
+    ) -> StoredConfig:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO komari_plugin_configs (
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version
+                )
+                VALUES ($1, $2, $3::jsonb, $4)
+                ON CONFLICT (plugin_name) DO NOTHING
+                RETURNING
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version,
+                    revision,
+                    updated_at
+                """,
+                plugin_name,
+                schema_name,
+                json.dumps(config_data, ensure_ascii=False),
+                version,
+            )
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        plugin_name,
+                        schema_name,
+                        config_data,
+                        version,
+                        revision,
+                        updated_at
+                    FROM komari_plugin_configs
+                    WHERE plugin_name = $1
+                    """,
+                    plugin_name,
+                )
+        if row is None:
+            msg = f"配置初始化后未找到记录: {plugin_name}"
+            raise RuntimeError(msg)
+        return _stored_config_from_row(row)
 
     def upsert(
         self,
@@ -477,6 +787,13 @@ class ConfigStorage:
 
     async def _close_pool(self) -> None:
         """在连接池所属事件循环中关闭并解除引用。"""
+        watch_task = self._watch_task
+        self._watch_task = None
+        if watch_task is not None:
+            watch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await watch_task
+        self._watch_event = None
         pool = self._pool
         self._pool = None
         if pool is not None:

@@ -32,6 +32,8 @@ config = config_manager.reload()
 from nonebot import get_driver
 from nonebot.plugin import PluginMetadata
 
+from komari_bot.common.prompt_storage import close_prompt_storage_if_created
+
 from .manager import ConfigManager, get_config_manager
 from .storage import close_config_storage_if_created
 
@@ -52,5 +54,6 @@ driver = get_driver()
 
 @driver.on_shutdown
 def _close_config_storage() -> None:
-    """关闭已创建的配置存储。"""
+    """关闭已创建的配置与 Prompt 存储。"""
+    close_prompt_storage_if_created()
     close_config_storage_if_created()

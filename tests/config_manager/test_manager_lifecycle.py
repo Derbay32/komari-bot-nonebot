@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from pydantic import BaseModel
@@ -80,6 +80,79 @@ class _ParallelFetchStorage:
             revision=1,
             updated_at=datetime.now().astimezone(),
         )
+
+
+class _InitializationRaceStorage:
+    def __init__(self) -> None:
+        self.callback: object | None = None
+        self.insert_calls = 0
+        self.current = StoredConfig(
+            plugin_name="initialization-race",
+            schema_name="_ConfigSchema",
+            config_data={"value": 99},
+            version="1.0",
+            revision=2,
+            updated_at=datetime.now().astimezone(),
+        )
+
+    def register_watcher(
+        self,
+        _plugin_name: str,
+        callback: object,
+        *,
+        max_staleness_seconds: float,
+    ) -> None:
+        assert max_staleness_seconds == 1.0
+        self.callback = callback
+
+    def fetch(self, _plugin_name: str) -> None:
+        return None
+
+    def insert_if_absent(self, **_kwargs: object) -> StoredConfig:
+        self.insert_calls += 1
+        return self.current
+
+
+def test_concurrent_initialization_never_overwrites_existing_database_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _InitializationRaceStorage()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+    monkeypatch.setattr(
+        ConfigManager,
+        "_get_env_config",
+        lambda _self: _ConfigSchema(value=1),
+    )
+    manager = ConfigManager("initialization-race", _ConfigSchema)
+
+    config = cast("_ConfigSchema", manager.initialize())
+
+    assert config.value == 99
+    assert storage.insert_calls == 1
+
+
+def test_external_revision_notification_atomically_replaces_cached_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _InitializationRaceStorage()
+    monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+    manager = ConfigManager("initialization-race", _ConfigSchema)
+    manager._cache_stored_config(storage.current)
+    manager.get()
+
+    callback = cast("Any", storage.callback)
+    callback(
+        StoredConfig(
+            plugin_name="initialization-race",
+            schema_name="_ConfigSchema",
+            config_data={"value": 100},
+            version="1.0",
+            revision=3,
+            updated_at=datetime.now().astimezone(),
+        )
+    )
+
+    assert cast("_ConfigSchema", manager.get()).value == 100
 
 
 def test_sync_operations_for_different_plugins_do_not_share_a_global_lock(
