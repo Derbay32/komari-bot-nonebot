@@ -61,6 +61,7 @@ class SessionData(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
+    version: int = Field(default=0, ge=0)
     phase: SessionPhase = "title"
     title: str = ""
     content: str = ""

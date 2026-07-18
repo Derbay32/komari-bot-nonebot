@@ -12,9 +12,16 @@ from komari_bot.plugins.komari_custom.proposal_repository import ProposalReposit
 
 
 class _FakeConnection:
-    def __init__(self, *, schema_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        schema_error: Exception | None = None,
+        fetch_results: list[dict[str, object]] | None = None,
+    ) -> None:
         self.schema_error = schema_error
+        self.fetch_results = fetch_results or []
         self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.fetch_calls: list[tuple[str, tuple[object, ...]]] = []
         self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def execute(self, query: str, *args: object) -> str:
@@ -25,6 +32,10 @@ class _FakeConnection:
 
     async def fetchrow(self, query: str, *args: object) -> None:
         self.fetchrow_calls.append((query, args))
+
+    async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
+        self.fetch_calls.append((query, args))
+        return list(self.fetch_results)
 
 
 class _FakeAcquire:
@@ -124,10 +135,10 @@ async def test_claim_publication_uses_idempotency_key_and_lease_guard() -> None:
     query, args = connection.fetchrow_calls[0]
     assert "ON CONFLICT (publication_key) DO UPDATE" in query
     assert "status = 'failed'" in query
-    assert "status = 'publishing'" in query
-    assert "publication_started_at IS NULL" in query
+    assert "IN ('send_rejected', 'send_failed')" in query
+    assert "publication_started_at IS NULL" not in query
     assert args[0:2] == ("stable-key", "claim-token")
-    assert args[-1] == 300
+    assert len(args) == 9
 
 
 @pytest.mark.asyncio
@@ -145,3 +156,24 @@ async def test_complete_publication_requires_current_claim_token() -> None:
     assert "publication_token = $3" in query
     assert "RETURNING *" in query
     assert args == (9, 7788, "claim-token")
+
+
+@pytest.mark.asyncio
+async def test_list_approval_candidates_includes_stale_claims_and_missed_votes() -> None:
+    connection = _FakeConnection(fetch_results=[{"id": 9}, {"id": 11}])
+    repository = ProposalRepository()
+    repository._pool = cast("Any", _FakePool(connection))
+
+    result = await repository.list_approval_candidates(
+        lease_seconds=300,
+        limit=50,
+    )
+
+    assert result == [9, 11]
+    query, args = connection.fetch_calls[0]
+    assert "vote_count >= required_votes" in query
+    assert "status = 'voting'" in query
+    assert "status = 'approving'" in query
+    assert "approval_started_at IS NULL" in query
+    assert "approval_started_at" in query and "INTERVAL '1 second'" in query
+    assert args == (300, 50)

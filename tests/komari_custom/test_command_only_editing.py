@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,21 @@ class _FakeRedis:
         self.values.pop(key, None)
         return 1 if existed else 0
 
+    async def execute_command(self, command: str, *args: object) -> int:
+        assert command == "EVAL"
+        script, key_count, key, expected, replacement, _ttl, expect_missing = args
+        assert "custom_session_cas_v1" in str(script)
+        assert int(str(key_count)) == 1
+        key_text = str(key)
+        current = self.values.get(key_text)
+        if str(expect_missing) == "1":
+            if current is not None:
+                return 0
+        elif current != str(expected):
+            return 0
+        self.values[key_text] = str(replacement)
+        return 1
+
     async def close(self) -> None:
         return None
 
@@ -44,6 +60,23 @@ class _FakeRedis:
 class _FakeConfigManager:
     def get(self) -> object:
         return SimpleNamespace(redis_db=0)
+
+
+class _BarrierRedis(_FakeRedis):
+    def __init__(self) -> None:
+        super().__init__()
+        self.barrier_enabled = False
+        self._barrier_reads = 0
+        self._barrier = asyncio.Event()
+
+    async def get(self, key: str) -> str | None:
+        captured = self.values.get(key)
+        if self.barrier_enabled and self._barrier_reads < 2:
+            self._barrier_reads += 1
+            if self._barrier_reads == 2:
+                self._barrier.set()
+            await self._barrier.wait()
+        return captured
 
 
 class _FakeProposalConnection:
@@ -97,6 +130,34 @@ async def test_new_with_title_creates_session_title(
     assert saved is not None
     assert saved.title == "标题"
     assert saved.phase == "title"
+    assert saved.version == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_appends_replay_on_latest_session_without_lost_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _BarrierRedis()
+    monkeypatch.setattr(CustomSessionManager, "_redis_client", redis)
+    first = CustomSessionManager(_FakeConfigManager())
+    second = CustomSessionManager(_FakeConfigManager())
+    await first.create_session(100, "200", title="原标题")
+    redis.barrier_enabled = True
+
+    await asyncio.gather(
+        first.append_text(100, "200", "来自 worker A"),
+        second.append_text(100, "200", "来自 worker B"),
+    )
+
+    saved = await first.get_session(100, "200")
+    assert saved is not None
+    assert set(saved.title.splitlines()) == {
+        "原标题",
+        "来自 worker A",
+        "来自 worker B",
+    }
+    assert saved.version == 3
+    assert len(saved.undo_stack) == 2
 
 
 @pytest.mark.asyncio
@@ -252,7 +313,7 @@ def test_custom_action_fallback_error_message_hides_exception_detail() -> None:
     assert 'await custom_action.finish("❌ 处理请求失败，请稍后再试")' in source
     assert 'await custom_action.finish(f"❌ 处理请求失败：{e}")' not in source
     assert "except ContentValidationError as exc:" in source
-    assert 'await custom_action.finish(f"❌ {exc}")' in source
+    assert 'await custom_action.finish(plain_text_message(f"❌ {exc}"))' in source
 
 
 @pytest.mark.asyncio

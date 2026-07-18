@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
@@ -112,6 +113,10 @@ class ProposalPublicationInProgressError(ProposalPublicationError):
     """同一编辑会话已有未过租约的发布者。"""
 
 
+class ProposalPublicationReconciliationRequiredError(ProposalPublicationError):
+    """平台投递结果不确定，禁止自动重发并等待人工对账。"""
+
+
 def build_publication_key(group_id: int, user_id: str, created_at: str) -> str:
     """由稳定编辑会话属性生成不暴露用户信息的幂等键。"""
     raw_key = f"{group_id}:{user_id}:{created_at}".encode()
@@ -144,6 +149,7 @@ class ProposalPublicationService:
         remembered_message_id: int | None,
         send_message: Callable[[Proposal], Awaitable[object]],
         remember_message_id: Callable[[int], Awaitable[None]],
+        is_definitive_send_failure: Callable[[Exception], bool] | None = None,
     ) -> Proposal:
         """发布或恢复同一提案，成功时保证记录已进入投票及以后状态。"""
         current = await self._repository.get_by_publication_key(
@@ -160,6 +166,11 @@ class ProposalPublicationService:
             )
             if recovered is not None:
                 return recovered
+
+        if self._requires_reconciliation(current):
+            raise ProposalPublicationReconciliationRequiredError(
+                "publication_reconciliation_required"
+            )
 
         publication_token = uuid4().hex
         claimed = await self._repository.claim_publication(
@@ -181,26 +192,41 @@ class ProposalPublicationService:
             published = self._published_proposal(current)
             if published is not None:
                 return published
+            if self._requires_reconciliation(current):
+                raise ProposalPublicationReconciliationRequiredError(
+                    "publication_reconciliation_required"
+                )
             raise ProposalPublicationInProgressError("publication_in_progress")
 
         try:
             sent = await send_message(claimed)
         except Exception as exc:
+            definitive_failure = False
+            if is_definitive_send_failure is not None:
+                try:
+                    definitive_failure = is_definitive_send_failure(exc)
+                except Exception:
+                    logger.exception(
+                        "[KomariCustom] 平台发送失败分类器异常，按投递结果未知处理"
+                    )
+            error_code = "send_rejected" if definitive_failure else "delivery_unknown"
             await self._repository.mark_publication_failed(
                 claimed.id,
                 publication_token,
-                "send_failed",
+                error_code,
             )
-            raise ProposalPublicationError("send_failed") from exc
+            if definitive_failure:
+                raise ProposalPublicationError(error_code) from exc
+            raise ProposalPublicationReconciliationRequiredError(error_code) from exc
 
         message_id = extract_message_id(sent)
         if message_id is None:
             await self._repository.mark_publication_failed(
                 claimed.id,
                 publication_token,
-                "message_id_missing",
+                "delivery_unknown",
             )
-            raise ProposalPublicationError("message_id_missing")
+            raise ProposalPublicationReconciliationRequiredError("delivery_unknown")
 
         try:
             await remember_message_id(message_id)
@@ -240,3 +266,23 @@ class ProposalPublicationService:
         ):
             return None
         return proposal
+
+    @staticmethod
+    def _requires_reconciliation(proposal: Proposal | None) -> bool:
+        if proposal is None or proposal.vote_message_id is not None:
+            return False
+        if proposal.status == "failed":
+            return proposal.publication_error_code not in {
+                "send_rejected",
+                "send_failed",
+            }
+        if proposal.status != "publishing":
+            return False
+        started_at = proposal.publication_started_at
+        if started_at is None:
+            return True
+        now = datetime.now().astimezone()
+        normalized_started_at = started_at.astimezone()
+        return normalized_started_at <= now - timedelta(
+            seconds=PUBLICATION_LEASE_SECONDS
+        )

@@ -13,6 +13,7 @@ from komari_bot.plugins.komari_custom.publication_service import (
     ProposalPublicationDraft,
     ProposalPublicationError,
     ProposalPublicationInProgressError,
+    ProposalPublicationReconciliationRequiredError,
     ProposalPublicationService,
     build_publication_key,
     extract_message_id,
@@ -66,7 +67,11 @@ class _MemoryPublicationRepository:
                     updated_at=now,
                     expired_at=now + timedelta(hours=expire_hours),
                 )
-            elif self.proposal.status == "failed":
+            elif (
+                self.proposal.status == "failed"
+                and self.proposal.publication_error_code
+                in {"send_rejected", "send_failed"}
+            ):
                 self.proposal = self.proposal.model_copy(
                     update={
                         "status": "publishing",
@@ -168,7 +173,7 @@ async def _ignore_message_id(_message_id: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_failure_marks_failed_and_retry_reuses_same_proposal() -> None:
+async def test_definitive_send_rejection_can_retry_same_proposal() -> None:
     repository = _MemoryPublicationRepository()
     service = ProposalPublicationService(repository)
     send_calls = 0
@@ -191,12 +196,13 @@ async def test_send_failure_marks_failed_and_retry_reuses_same_proposal() -> Non
             remembered_message_id=None,
             send_message=_send,
             remember_message_id=_remember,
+            is_definitive_send_failure=lambda _exc: True,
         )
 
-    assert exc_info.value.error_code == "send_failed"
+    assert exc_info.value.error_code == "send_rejected"
     assert repository.proposal is not None
     assert repository.proposal.status == "failed"
-    assert repository.proposal.publication_error_code == "send_failed"
+    assert repository.proposal.publication_error_code == "send_rejected"
     first_proposal_id = repository.proposal.id
 
     published = await service.publish(
@@ -204,6 +210,7 @@ async def test_send_failure_marks_failed_and_retry_reuses_same_proposal() -> Non
         remembered_message_id=None,
         send_message=_send,
         remember_message_id=_remember,
+        is_definitive_send_failure=lambda _exc: True,
     )
 
     assert published.id == first_proposal_id
@@ -221,7 +228,9 @@ async def test_missing_message_id_marks_publication_failed() -> None:
     async def _send(_proposal: Proposal) -> object:
         return {"status": "ok"}
 
-    with pytest.raises(ProposalPublicationError) as exc_info:
+    with pytest.raises(
+        ProposalPublicationReconciliationRequiredError
+    ) as exc_info:
         await service.publish(
             _draft(),
             remembered_message_id=None,
@@ -229,10 +238,42 @@ async def test_missing_message_id_marks_publication_failed() -> None:
             remember_message_id=_ignore_message_id,
         )
 
-    assert exc_info.value.error_code == "message_id_missing"
+    assert exc_info.value.error_code == "delivery_unknown"
     assert repository.proposal is not None
     assert repository.proposal.status == "failed"
-    assert repository.proposal.publication_error_code == "message_id_missing"
+    assert repository.proposal.publication_error_code == "delivery_unknown"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_send_failure_requires_reconciliation_without_resend() -> None:
+    repository = _MemoryPublicationRepository()
+    service = ProposalPublicationService(repository)
+    send_calls = 0
+
+    async def _send(_proposal: Proposal) -> object:
+        nonlocal send_calls
+        send_calls += 1
+        msg = "模拟网络超时"
+        raise TimeoutError(msg)
+
+    with pytest.raises(ProposalPublicationReconciliationRequiredError):
+        await service.publish(
+            _draft(),
+            remembered_message_id=None,
+            send_message=_send,
+            remember_message_id=_ignore_message_id,
+        )
+    with pytest.raises(ProposalPublicationReconciliationRequiredError):
+        await service.publish(
+            _draft(),
+            remembered_message_id=None,
+            send_message=_send,
+            remember_message_id=_ignore_message_id,
+        )
+
+    assert send_calls == 1
+    assert repository.proposal is not None
+    assert repository.proposal.publication_error_code == "delivery_unknown"
 
 
 @pytest.mark.asyncio

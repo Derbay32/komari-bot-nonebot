@@ -5,10 +5,20 @@ from __future__ import annotations
 from typing import cast
 
 from nonebot import get_driver, logger, on_command
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message  # noqa: TC002
+from nonebot.adapters.onebot.v11 import (
+    ActionFailed,
+    Bot,
+    GroupMessageEvent,
+    Message,
+)
 from nonebot.exception import FinishedException
 from nonebot.params import Command, CommandArg
 from nonebot.plugin import PluginMetadata, require
+
+require("nonebot_plugin_apscheduler")
+
+from apscheduler.jobstores.base import JobLookupError
+from nonebot_plugin_apscheduler import scheduler
 
 from komari_bot.common.content_budget import (
     QUERY_TEXT_BUDGET,
@@ -16,6 +26,7 @@ from komari_bot.common.content_budget import (
     normalize_required_text,
 )
 from komari_bot.common.database_config import get_shared_database_config
+from komari_bot.common.onebot_messages import plain_text_message
 
 from .config_schema import DynamicConfigSchema
 from .models import Proposal, SessionData  # noqa: TC001
@@ -24,6 +35,7 @@ from .publication_service import (
     ProposalPublicationDraft,
     ProposalPublicationError,
     ProposalPublicationInProgressError,
+    ProposalPublicationReconciliationRequiredError,
     ProposalPublicationService,
     build_publication_key,
 )
@@ -32,6 +44,7 @@ from .vote_handler import (
     KnowledgePlugin,
     approve_if_ready,
     fetch_and_update_votes,
+    recover_pending_approvals,
     setup_vote_handler,
 )
 
@@ -70,6 +83,7 @@ setup_vote_handler(
 )
 
 driver = get_driver()
+APPROVAL_RECOVERY_JOB_ID = "komari_custom_approval_recovery"
 
 custom = on_command("custom", priority=10, block=True)
 custom_action = on_command(
@@ -93,6 +107,15 @@ custom_action = on_command(
 @driver.on_startup
 async def on_startup() -> None:
     """启用时预初始化数据库；未启用则保持零影响。"""
+    scheduler.add_job(
+        recover_pending_approvals,
+        "interval",
+        seconds=60,
+        id=APPROVAL_RECOVERY_JOB_ID,
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     config = config_manager.get()
     if not config.plugin_enable:
         logger.info("[KomariCustom] 插件未启用，跳过初始化")
@@ -112,6 +135,10 @@ async def on_startup() -> None:
 @driver.on_shutdown
 async def on_shutdown() -> None:
     """释放数据库与 Redis 资源。"""
+    try:
+        scheduler.remove_job(APPROVAL_RECOVERY_JOB_ID)
+    except JobLookupError:
+        logger.debug("[KomariCustom] 采纳恢复任务不存在，无需注销")
     await repository.close()
     await custom_sessions.close()
 
@@ -127,7 +154,7 @@ async def handle_custom_help(
         bot, event, config_manager.get()
     )
     if not can_use:
-        await custom.finish(f"❌ {reason}")
+        await custom.finish(plain_text_message(f"❌ {reason}"))
     arg_text = args.extract_plain_text().strip()
     if arg_text:
         await custom.finish(
@@ -149,7 +176,7 @@ async def handle_custom_action(
         bot, event, config_manager.get()
     )
     if not can_use:
-        await custom_action.finish(f"❌ {reason}")
+        await custom_action.finish(plain_text_message(f"❌ {reason}"))
 
     try:
         await repository.initialize()
@@ -183,7 +210,7 @@ async def handle_custom_action(
             case _:
                 await custom_action.finish("❌ 未知子命令")
     except ContentValidationError as exc:
-        await custom_action.finish(f"❌ {exc}")
+        await custom_action.finish(plain_text_message(f"❌ {exc}"))
     except Exception as e:
         if not isinstance(e, FinishedException):
             logger.exception("[KomariCustom] 处理 custom 子命令失败")
@@ -201,7 +228,9 @@ async def _handle_new(group_id: int, user_id: str, title: str) -> None:
     active_count = await repository.count_active_by_user(group_id, int(user_id))
     if active_count >= config.max_proposals_per_user:
         await custom_action.finish(
-            f"❌ 你同时进行中的提案已达到上限 {config.max_proposals_per_user} 个"
+            plain_text_message(
+                f"❌ 你同时进行中的提案已达到上限 {config.max_proposals_per_user} 个"
+            )
         )
 
     await custom_sessions.create_session(group_id, user_id, title=title)
@@ -212,7 +241,7 @@ async def _handle_new(group_id: int, user_id: str, title: str) -> None:
         )
     else:
         response = "已开始新的知识库提案，请使用 .custom append <标题> 输入标题。"
-    await custom_action.send(response)
+    await custom_action.send(plain_text_message(response))
     await custom_action.finish()
 
 
@@ -220,7 +249,7 @@ async def _handle_append(group_id: int, user_id: str, text: str) -> None:
     if not text:
         await custom_action.finish("❌ 请输入要追加的文本")
     session = await custom_sessions.append_text(group_id, user_id, text)
-    await custom_action.finish(_format_edit_state(session))
+    await custom_action.finish(plain_text_message(_format_edit_state(session)))
 
 
 async def _handle_replace(group_id: int, user_id: str, text: str) -> None:
@@ -228,19 +257,19 @@ async def _handle_replace(group_id: int, user_id: str, text: str) -> None:
     if not new:
         await custom_action.finish("❌ 请输入替换后的文本")
     session = await custom_sessions.replace_text(group_id, user_id, old, new)
-    await custom_action.finish(_format_edit_state(session))
+    await custom_action.finish(plain_text_message(_format_edit_state(session)))
 
 
 async def _handle_undo(group_id: int, user_id: str) -> None:
     session = await custom_sessions.undo(group_id, user_id)
     if session is None:
         await custom_action.finish("❌ 没有可撤销的编辑操作")
-    await custom_action.finish(_format_edit_state(session))
+    await custom_action.finish(plain_text_message(_format_edit_state(session)))
 
 
 async def _handle_delete(group_id: int, user_id: str, text: str) -> None:
     session = await custom_sessions.delete_text(group_id, user_id, text)
-    await custom_action.finish(_format_edit_state(session))
+    await custom_action.finish(plain_text_message(_format_edit_state(session)))
 
 
 async def _handle_confirm(
@@ -259,14 +288,16 @@ async def _handle_confirm(
                 await custom_action.finish("❌ 标题不能为空，请使用 .custom append <标题> 输入标题")
             session = await custom_sessions.set_phase(group_id, user_id, "content")
             await custom_action.send(
-                f"标题已确认：{session.title}\n请使用 .custom append <正文> 输入提案正文。"
+                plain_text_message(
+                    f"标题已确认：{session.title}\n请使用 .custom append <正文> 输入提案正文。"
+                )
             )
             await custom_action.finish()
         case "content":
             if not session.content:
                 await custom_action.finish("❌ 正文不能为空，请使用 .custom append <正文> 输入内容")
             session = await custom_sessions.set_phase(group_id, user_id, "review")
-            await custom_action.finish(_format_review(session))
+            await custom_action.finish(plain_text_message(_format_review(session)))
         case "review":
             await _commit_proposal(bot, event, group_id, user_id, session)
 
@@ -299,7 +330,7 @@ async def _commit_proposal(
         return await bot.call_api(
             "send_group_msg",
             group_id=group_id,
-            message=_format_vote_message(proposal),
+            message=plain_text_message(_format_vote_message(proposal)),
         )
 
     async def _remember_message_id(message_id: int) -> None:
@@ -315,6 +346,11 @@ async def _commit_proposal(
             remembered_message_id=session.publication_message_id,
             send_message=_send_vote_message,
             remember_message_id=_remember_message_id,
+            is_definitive_send_failure=lambda exc: isinstance(exc, ActionFailed),
+        )
+    except ProposalPublicationReconciliationRequiredError:
+        await custom_action.finish(
+            "⚠️ 平台投递结果无法确认，已停止自动重发；编辑内容和发布记录均已保留，请联系管理员对账"
         )
     except ProposalPublicationInProgressError:
         await custom_action.finish("⏳ 这个提案正在发布中，请稍后再次确认")
@@ -337,7 +373,9 @@ async def _commit_proposal(
         logger.debug("[KomariCustom] 给投票消息添加默认表情失败: {}", e)
     await custom_sessions.delete_session(group_id, user_id)
     await custom_action.finish(
-        f"提案 #{proposal.id} 已发布，达到 {proposal.required_votes} 票后会自动加入知识库。"
+        plain_text_message(
+            f"提案 #{proposal.id} 已发布，达到 {proposal.required_votes} 票后会自动加入知识库。"
+        )
     )
 
 
@@ -356,7 +394,7 @@ async def _handle_list(bot: Bot, group_id: int, text: str) -> None:
         await custom_action.finish("本群暂无有效提案")
     total_pages = max(1, (total + limit - 1) // limit)
     if page > total_pages:
-        await custom_action.finish(f"❌ 只有 {total_pages} 页哦")
+        await custom_action.finish(plain_text_message(f"❌ 只有 {total_pages} 页哦"))
 
     for proposal in proposals:
         if proposal.status in {"voting", "approving"}:
@@ -382,7 +420,7 @@ async def _handle_list(bot: Bot, group_id: int, text: str) -> None:
             f"({proposal.vote_count}/{proposal.required_votes})"
         )
     lines.append("\n输入 .custom show <序号|标题关键词> 查看详情")
-    await custom_action.finish("\n".join(lines))
+    await custom_action.finish(plain_text_message("\n".join(lines)))
 
 
 async def _handle_show(bot: Bot, group_id: int, selector: str) -> None:
@@ -412,14 +450,14 @@ async def _handle_show(bot: Bot, group_id: int, selector: str) -> None:
                 proposal = updated
         await approve_if_ready(bot, proposal.id)
         proposal = await repository.get_by_id(proposal.id, group_id) or proposal
-    await custom_action.finish(_format_proposal_detail(proposal))
+    await custom_action.finish(plain_text_message(_format_proposal_detail(proposal)))
 
 
 async def _handle_status(group_id: int, user_id: str) -> None:
     session = await custom_sessions.get_session(group_id, user_id)
     if session is None:
         await custom_action.finish("当前没有正在编辑的提案")
-    await custom_action.finish(_format_edit_state(session))
+    await custom_action.finish(plain_text_message(_format_edit_state(session)))
 
 
 def _format_edit_state(session: SessionData) -> str:

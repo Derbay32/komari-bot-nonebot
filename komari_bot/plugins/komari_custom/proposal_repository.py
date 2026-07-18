@@ -157,6 +157,7 @@ class ProposalRepository:
         lease_seconds: int,
     ) -> Proposal | None:
         """按幂等键创建或认领待发布提案，并拒绝活跃的并发发布。"""
+        del lease_seconds
         pool = self._require_pool()
         expired_at = datetime.now().astimezone() + timedelta(hours=expire_hours)
         async with pool.acquire() as conn:
@@ -186,14 +187,8 @@ class ProposalRepository:
                     expired_at = EXCLUDED.expired_at,
                     updated_at = NOW()
                 WHERE komari_custom_proposals.status = 'failed'
-                   OR (
-                       komari_custom_proposals.status = 'publishing'
-                       AND (
-                           komari_custom_proposals.publication_started_at IS NULL
-                           OR komari_custom_proposals.publication_started_at
-                               < NOW() - ($10 * INTERVAL '1 second')
-                       )
-                   )
+                  AND komari_custom_proposals.publication_error_code
+                      IN ('send_rejected', 'send_failed')
                 RETURNING *
                 """,
                 publication_key,
@@ -205,7 +200,6 @@ class ProposalRepository:
                 content,
                 required_votes,
                 expired_at,
-                lease_seconds,
             )
         return self._row_to_proposal(row) if row is not None else None
 
@@ -487,6 +481,42 @@ class ProposalRepository:
                 lease_seconds,
             )
         return self._row_to_proposal(row) if row is not None else None
+
+    async def list_approval_candidates(
+        self,
+        *,
+        lease_seconds: int,
+        limit: int,
+    ) -> list[int]:
+        """列出待采纳或认领租约已过期的提案，供周期恢复任务处理。"""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id
+                FROM komari_custom_proposals
+                WHERE vote_count >= required_votes
+                  AND (
+                      (
+                          status = 'voting'
+                          AND (expired_at IS NULL OR expired_at > NOW())
+                      )
+                      OR (
+                          status = 'approving'
+                          AND (
+                              approval_started_at IS NULL
+                              OR approval_started_at
+                                  < NOW() - ($1 * INTERVAL '1 second')
+                          )
+                      )
+                  )
+                ORDER BY updated_at ASC, id ASC
+                LIMIT $2
+                """,
+                lease_seconds,
+                limit,
+            )
+        return [int(row["id"]) for row in rows]
 
     async def release_approval(self, proposal_id: int, approval_token: str) -> None:
         """采纳失败时释放当前认领，让后续通知可以重试。"""

@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
-from nonebot import logger, on_notice
+from nonebot import get_bots, logger, on_notice
 from nonebot.adapters.onebot.v11 import Bot, NoticeEvent  # noqa: TC002
 
+from komari_bot.common.onebot_messages import plain_text_message
+
 from .proposal_repository import ProposalRepository  # noqa: TC001
+
+if TYPE_CHECKING:
+    from .models import Proposal
 
 
 class ConfigManager(Protocol):
@@ -43,6 +48,7 @@ class VoteHandlerState:
 
 state = VoteHandlerState()
 APPROVAL_LEASE_SECONDS = 300
+APPROVAL_RECOVERY_BATCH_SIZE = 50
 
 
 def setup_vote_handler(
@@ -171,10 +177,59 @@ async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
     await bot.call_api(
         "send_group_msg",
         group_id=approved.group_id,
-        message=(
+        message=plain_text_message(
             f"✅ 提案 #{approved.id}《{approved.title}》投票通过！\n"
             f"已加入知识库，知识 ID：{knowledge_id}"
         ),
+    )
+
+
+async def recover_pending_approvals() -> int:
+    """周期接管漏处理的达标提案与租约过期的 ``approving`` 提案。"""
+    if (
+        state.repository is None
+        or state.config_manager is None
+        or state.knowledge_plugin is None
+    ):
+        return 0
+    if not state.config_manager.get().plugin_enable:
+        return 0
+
+    bots = get_bots()
+    if not bots:
+        logger.debug("[KomariCustom] 无在线 Bot，跳过采纳恢复")
+        return 0
+
+    await state.repository.initialize()
+    proposal_ids = await state.repository.list_approval_candidates(
+        lease_seconds=APPROVAL_LEASE_SECONDS,
+        limit=APPROVAL_RECOVERY_BATCH_SIZE,
+    )
+    bot = cast("Bot", min(bots.items(), key=lambda item: str(item[0]))[1])
+    completed = 0
+    for proposal_id in proposal_ids:
+        try:
+            before = await state.repository.get_by_id(proposal_id)
+            await approve_if_ready(bot, proposal_id)
+            after = await state.repository.get_by_id(proposal_id)
+        except Exception:
+            logger.exception(
+                "[KomariCustom] 周期恢复提案采纳失败: proposal_id={}",
+                proposal_id,
+            )
+            continue
+        if _became_approved(before, after):
+            completed += 1
+    return completed
+
+
+def _became_approved(before: Proposal | None, after: Proposal | None) -> bool:
+    """判断本轮是否把未完成提案推进到已采纳。"""
+    return (
+        before is not None
+        and before.status != "approved"
+        and after is not None
+        and after.status == "approved"
     )
 
 

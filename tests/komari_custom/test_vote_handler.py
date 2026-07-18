@@ -14,11 +14,6 @@ from komari_bot.plugins.komari_custom import vote_handler
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, NoticeEvent
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Failing to pass a value to the 'type_params'.*:DeprecationWarning"
-)
-
-
 class _ConfigManager:
     @staticmethod
     def get() -> object:
@@ -259,3 +254,44 @@ async def test_failed_knowledge_write_releases_approval_claim(
 
     repository.release_approval.assert_awaited_once()
     repository.mark_approved.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_periodic_recovery_processes_candidates_and_isolates_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses = {9: "approving", 10: "voting"}
+
+    class _RecoveryRepository:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_approval_candidates(
+            self,
+            *,
+            lease_seconds: int,
+            limit: int,
+        ) -> list[int]:
+            assert lease_seconds == vote_handler.APPROVAL_LEASE_SECONDS
+            assert limit == vote_handler.APPROVAL_RECOVERY_BATCH_SIZE
+            return [9, 10]
+
+        async def get_by_id(self, proposal_id: int) -> object:
+            return SimpleNamespace(status=statuses[proposal_id])
+
+    async def _fake_approve(_bot: object, proposal_id: int) -> None:
+        if proposal_id == 10:
+            raise RuntimeError("单条恢复失败")
+        statuses[proposal_id] = "approved"
+
+    bot = _Bot([])
+    monkeypatch.setattr(vote_handler.state, "repository", _RecoveryRepository())
+    monkeypatch.setattr(vote_handler.state, "config_manager", _ConfigManager())
+    monkeypatch.setattr(vote_handler.state, "knowledge_plugin", object())
+    monkeypatch.setattr(vote_handler, "get_bots", lambda: {bot.self_id: bot})
+    monkeypatch.setattr(vote_handler, "approve_if_ready", _fake_approve)
+
+    completed = await vote_handler.recover_pending_approvals()
+
+    assert completed == 1
+    assert statuses == {9: "approved", 10: "voting"}
