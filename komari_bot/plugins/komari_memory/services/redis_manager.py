@@ -14,6 +14,20 @@ from komari_bot.common.database_config import get_shared_database_config
 
 from ..config_schema import KomariMemoryConfigSchema
 from .config_interface import get_config
+from .conversation_processing import (
+    CONVERSATION_ACK_SCRIPT,
+    CONVERSATION_CHUNK_LEDGER_SCRIPT,
+    CONVERSATION_CLAIM_EXISTING_SCRIPT,
+    CONVERSATION_CLAIM_SCRIPT,
+    CONVERSATION_DEAD_LETTER_REQUEUE_SCRIPT,
+    CONVERSATION_DEAD_LETTER_SCRIPT,
+    CONVERSATION_GET_SCRIPT,
+    CONVERSATION_RENEW_SCRIPT,
+    CONVERSATION_RESTORE_SCRIPT,
+    ConversationDeadLetter,
+    ConversationLeaseLostError,
+    ConversationSnapshotClaim,
+)
 from .redis_keys import RedisKeys
 
 ProactiveReservationStatus = Literal[
@@ -93,6 +107,34 @@ if not current_cooldown or current_cooldown == reservation_id then
 end
 return had_pending
 """
+_PROACTIVE_RENEW_SCRIPT = """
+-- proactive_renew
+local cooldown_key = KEYS[1]
+local slots_key = KEYS[2]
+local reservation_id = ARGV[1]
+local reservation_ttl_ms = tonumber(ARGV[2])
+local slots_ttl_ms = tonumber(ARGV[3])
+local pending_member = "pending:" .. reservation_id
+local confirmed_member = "confirmed:" .. reservation_id
+local redis_time = redis.call("TIME")
+local now_ms = tonumber(redis_time[1]) * 1000
+    + math.floor(tonumber(redis_time[2]) / 1000)
+
+redis.call("ZREMRANGEBYSCORE", slots_key, "-inf", now_ms)
+if redis.call("ZSCORE", slots_key, confirmed_member) then
+    return 2
+end
+if not redis.call("ZSCORE", slots_key, pending_member) then
+    return 0
+end
+
+redis.call("ZADD", slots_key, now_ms + reservation_ttl_ms, pending_member)
+redis.call("PEXPIRE", slots_key, slots_ttl_ms)
+if redis.call("GET", cooldown_key) == reservation_id then
+    redis.call("PEXPIRE", cooldown_key, reservation_ttl_ms)
+end
+return 1
+"""
 _PROACTIVE_RELEASE_SCRIPT = """
 -- proactive_release
 local cooldown_key = KEYS[1]
@@ -115,6 +157,64 @@ local now_ms = tonumber(redis_time[1]) * 1000
 redis.call("ZREMRANGEBYSCORE", slots_key, "-inf", now_ms)
 return redis.call("ZCARD", slots_key)
 """
+_CHAT_COMMIT_MESSAGE_ONCE_SCRIPT = """
+-- chat_commit_message_once_v1
+local dedupe_key = KEYS[1]
+local buffer_key = KEYS[2]
+local session_start_key = KEYS[3]
+local last_message_key = KEYS[4]
+local payload = ARGV[1]
+local timestamp = ARGV[2]
+local dedupe_ttl_seconds = tonumber(ARGV[3])
+
+if redis.call("EXISTS", dedupe_key) == 1 then
+    return 0
+end
+if redis.call("LLEN", buffer_key) == 0 then
+    redis.call("SET", session_start_key, timestamp)
+end
+redis.call("RPUSH", buffer_key, payload)
+redis.call("SET", last_message_key, timestamp)
+redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
+return 1
+"""
+_CHAT_COMMIT_INTERACTION_ONCE_SCRIPT = """
+-- chat_commit_interaction_once_v1
+local dedupe_key = KEYS[1]
+local interaction_key = KEYS[2]
+local pending_key = KEYS[3]
+local payload = ARGV[1]
+local user_id = ARGV[2]
+local trigger_size = tonumber(ARGV[3])
+local dedupe_ttl_seconds = tonumber(ARGV[4])
+
+if redis.call("EXISTS", dedupe_key) == 1 then
+    return 0
+end
+redis.call("RPUSH", interaction_key, payload)
+if redis.call("LLEN", interaction_key) >= trigger_size then
+    redis.call("SADD", pending_key, user_id)
+end
+redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
+return 1
+"""
+_GLOBAL_INTERACTION_PUSH_SCRIPT = """
+-- global_interaction_push_v1
+local interaction_key = KEYS[1]
+local pending_key = KEYS[2]
+local user_id = ARGV[1]
+local trigger_size = tonumber(ARGV[2])
+
+for index = 3, #ARGV do
+    redis.call("RPUSH", interaction_key, ARGV[index])
+end
+local buffer_length = redis.call("LLEN", interaction_key)
+if buffer_length >= trigger_size then
+    redis.call("SADD", pending_key, user_id)
+end
+return buffer_length
+"""
+_CHAT_COMMIT_DEDUPE_TTL_SECONDS = 31 * 24 * 60 * 60
 _INTERACTION_CLAIM_SCRIPT = """
 -- interaction_summary_claim
 local pending_key = KEYS[1]
@@ -148,6 +248,26 @@ for _, user_id in ipairs(candidates) do
     end
 end
 return claimed
+"""
+_INTERACTION_RENEW_SCRIPT = """
+-- interaction_summary_renew
+local leases_key = KEYS[1]
+local owners_key = KEYS[2]
+local user_id = ARGV[1]
+local owner_token = ARGV[2]
+local lease_ms = tonumber(ARGV[3])
+
+if redis.call("HGET", owners_key, user_id) ~= owner_token then
+    return 0
+end
+if not redis.call("ZSCORE", leases_key, user_id) then
+    return 0
+end
+local redis_time = redis.call("TIME")
+local now_ms = tonumber(redis_time[1]) * 1000
+    + math.floor(tonumber(redis_time[2]) / 1000)
+redis.call("ZADD", leases_key, now_ms + lease_ms, user_id)
+return 1
 """
 _INTERACTION_SNAPSHOT_SCRIPT = """
 -- interaction_summary_snapshot
@@ -365,6 +485,38 @@ class RedisManager:
         pipe.set(RedisKeys.last_message(group_id), now)
         await pipe.execute()
 
+    async def push_message_once(
+        self,
+        group_id: str,
+        message: MessageSchema,
+        *,
+        operation_id: str,
+        dedupe_ttl_seconds: int = _CHAT_COMMIT_DEDUPE_TTL_SECONDS,
+    ) -> bool:
+        """按聊天 operation ID 原子写入一次消息缓冲。"""
+        data = {
+            "user_id": message.user_id,
+            "user_nickname": message.user_nickname,
+            "group_id": message.group_id,
+            "content": message.content,
+            "timestamp": message.timestamp,
+            "message_id": message.message_id,
+            "is_bot": message.is_bot,
+        }
+        result = await self.redis.execute_command(
+            "EVAL",
+            _CHAT_COMMIT_MESSAGE_ONCE_SCRIPT,
+            4,
+            RedisKeys.chat_commit_step(operation_id, "ai_history"),
+            RedisKeys.buffer(group_id),
+            RedisKeys.session_start(group_id),
+            RedisKeys.last_message(group_id),
+            json.dumps(data, ensure_ascii=False),
+            message.timestamp,
+            max(1, dedupe_ttl_seconds),
+        )
+        return int(cast("int | str | bytes", result)) == 1
+
     async def get_buffer(
         self,
         group_id: str,
@@ -388,74 +540,79 @@ class RedisManager:
 
         return [self._deserialize_message(item) for item in raw_data]
 
-    async def snapshot_conversation_buffer(
+    async def claim_conversation_buffer(
         self,
         group_id: str,
+        owner_token: str,
         token: str,
-    ) -> str | None:
-        """原子转移群聊消息缓冲到 processing 快照键。"""
+    ) -> ConversationSnapshotClaim:
+        """认领已有快照，或原子转移普通缓冲并建立 owner lease。"""
         source_key = RedisKeys.buffer(group_id)
         processing_key = RedisKeys.buffer_processing(group_id, token)
+        current_key = RedisKeys.buffer_processing_current(group_id)
         lock_key = RedisKeys.buffer_processing_lock(group_id)
         last_message_key = RedisKeys.last_message(group_id)
         session_start_key = RedisKeys.session_start(group_id)
         meta_last_message_key = RedisKeys.buffer_processing_meta_last_message(group_id, token)
         meta_session_start_key = RedisKeys.buffer_processing_meta_session_start(group_id, token)
-        script = """
-        local locked_key = redis.call('GET', KEYS[3])
-        if locked_key and locked_key ~= '' then
-            if redis.call('EXISTS', locked_key) ~= 0 then
-                return locked_key
-            end
-            redis.call('DEL', KEYS[3])
-        end
-        if redis.call('EXISTS', KEYS[1]) == 0 then
-            return nil
-        end
-        if redis.call('LLEN', KEYS[1]) == 0 then
-            redis.call('DEL', KEYS[1])
-            return nil
-        end
-        if redis.call('EXISTS', KEYS[2]) ~= 0 then
-            return redis.error_reply('conversation processing key already exists')
-        end
-        redis.call('RENAME', KEYS[1], KEYS[2])
-        local last_message = redis.call('GET', KEYS[4])
-        if last_message then
-            redis.call('SET', KEYS[6], last_message)
-        end
-        local session_start = redis.call('GET', KEYS[5])
-        if session_start then
-            redis.call('SET', KEYS[7], session_start)
-        end
-        redis.call('DEL', KEYS[4], KEYS[5])
-        redis.call('SET', KEYS[3], KEYS[2])
-        for index = 2, 7 do
-            redis.call('EXPIRE', KEYS[index], tonumber(ARGV[1]))
-        end
-        return KEYS[2]
-        """
         result = await self.redis.execute_command(
             "EVAL",
-            script,
-            7,
+            CONVERSATION_CLAIM_SCRIPT,
+            8,
             source_key,
             processing_key,
+            current_key,
             lock_key,
             last_message_key,
             session_start_key,
             meta_last_message_key,
             meta_session_start_key,
+            owner_token,
+            self.config.conversation_processing_lease_seconds * 1000,
             self.config.conversation_snapshot_ttl_seconds,
         )
-        return self._decode_redis_text(result) if result else None
+        return self._parse_conversation_claim(result)
+
+    async def claim_existing_conversation_processing(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> ConversationSnapshotClaim:
+        """为无有效 owner 的现存快照建立租约，兼容旧格式残留。"""
+        result = await self.redis.execute_command(
+            "EVAL",
+            CONVERSATION_CLAIM_EXISTING_SCRIPT,
+            3,
+            processing_key,
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            owner_token,
+            self.config.conversation_processing_lease_seconds * 1000,
+            self.config.conversation_snapshot_ttl_seconds,
+        )
+        return self._parse_conversation_claim(result)
 
     async def get_processing_conversation_buffer(
         self,
+        group_id: str,
         processing_key: str,
+        owner_token: str,
     ) -> list[MessageSchema]:
-        """读取 processing 快照中的全部群聊消息。"""
-        raw_data = await self.redis.lrange(processing_key, 0, -1)  # type: ignore[arg-type]
+        """仅允许当前 owner 读取 processing 快照中的全部消息。"""
+        result = await self.redis.execute_command(
+            "EVAL",
+            CONVERSATION_GET_SCRIPT,
+            3,
+            processing_key,
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            owner_token,
+        )
+        raw_result = list(cast("list[Any]", result or []))
+        if not raw_result or int(raw_result[0]) != 1:
+            raise ConversationLeaseLostError(processing_key)
+        raw_data = raw_result[1:]
         messages: list[MessageSchema] = []
         for raw_item in raw_data:
             try:
@@ -468,100 +625,299 @@ class RedisManager:
                 )
         return messages
 
-    async def delete_processing_conversation_buffer(
+    async def renew_processing_conversation_lease(
         self,
         group_id: str,
         processing_key: str,
-    ) -> None:
-        """删除对话 processing 快照及其元数据，不影响新普通缓冲。"""
-        token = self._conversation_processing_token(processing_key)
-        lock_key = RedisKeys.buffer_processing_lock(group_id)
-        meta_last_message_key = RedisKeys.buffer_processing_meta_last_message(group_id, token)
-        meta_session_start_key = RedisKeys.buffer_processing_meta_session_start(group_id, token)
-        script = """
-        redis.call('DEL', KEYS[1], KEYS[3], KEYS[4])
-        if redis.call('GET', KEYS[2]) == KEYS[1] then
-            redis.call('DEL', KEYS[2])
-        end
-        return 1
-        """
-        await self.redis.execute_command(
+        owner_token: str,
+    ) -> bool:
+        """仅由当前 owner 续租 processing 快照。"""
+        result = await self.redis.execute_command(
             "EVAL",
-            script,
-            4,
+            CONVERSATION_RENEW_SCRIPT,
+            3,
             processing_key,
-            lock_key,
-            meta_last_message_key,
-            meta_session_start_key,
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            owner_token,
+            self.config.conversation_processing_lease_seconds * 1000,
+            self.config.conversation_snapshot_ttl_seconds,
         )
+        return int(cast("int", result)) == 1
+
+    async def ack_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> bool:
+        """仅由当前 owner 确认并删除 processing 快照。"""
+        token = self._conversation_processing_token(processing_key)
+        result = await self.redis.execute_command(
+            "EVAL",
+            CONVERSATION_ACK_SCRIPT,
+            6,
+            processing_key,
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            RedisKeys.buffer_processing_meta_last_message(group_id, token),
+            RedisKeys.buffer_processing_meta_session_start(group_id, token),
+            RedisKeys.buffer_processing_chunks(group_id, token),
+            owner_token,
+        )
+        return int(cast("int", result)) == 1
 
     async def restore_processing_conversation_buffer(
         self,
         group_id: str,
         processing_key: str,
-    ) -> None:
-        """将对话 processing 快照恢复回普通缓冲，并保持旧记录在新记录之前。"""
+        owner_token: str,
+    ) -> bool:
+        """仅由当前 owner 恢复快照，并保持旧记录在新记录之前。"""
         token = self._conversation_processing_token(processing_key)
-        target_key = RedisKeys.buffer(group_id)
-        lock_key = RedisKeys.buffer_processing_lock(group_id)
-        last_message_key = RedisKeys.last_message(group_id)
-        session_start_key = RedisKeys.session_start(group_id)
-        meta_last_message_key = RedisKeys.buffer_processing_meta_last_message(group_id, token)
-        meta_session_start_key = RedisKeys.buffer_processing_meta_session_start(group_id, token)
-        script = """
-        local old_items = redis.call('LRANGE', KEYS[1], 0, -1)
-        local new_items = redis.call('LRANGE', KEYS[2], 0, -1)
-        redis.call('DEL', KEYS[2])
-        for _, item in ipairs(old_items) do
-            redis.call('RPUSH', KEYS[2], item)
-        end
-        for _, item in ipairs(new_items) do
-            redis.call('RPUSH', KEYS[2], item)
-        end
-        redis.call('DEL', KEYS[1])
-        if redis.call('GET', KEYS[3]) == KEYS[1] then
-            redis.call('DEL', KEYS[3])
-        end
-        local session_start = redis.call('GET', KEYS[7])
-        if session_start then
-            redis.call('SET', KEYS[5], session_start)
-        elseif #old_items > 0 or #new_items > 0 then
-            local first_item = old_items[1] or new_items[1]
-            local timestamp = string.match(first_item, '"timestamp"%s*:%s*([0-9%.]+)')
-            if timestamp then
-                redis.call('SET', KEYS[5], timestamp)
-            end
-        end
-        local last_item = new_items[#new_items] or old_items[#old_items]
-        if last_item then
-            local timestamp = string.match(last_item, '"timestamp"%s*:%s*([0-9%.]+)')
-            if timestamp then
-                redis.call('SET', KEYS[4], timestamp)
-            end
-        else
-            local last_message = redis.call('GET', KEYS[6])
-            if last_message then
-                redis.call('SET', KEYS[4], last_message)
-            end
-        end
-        redis.call('DEL', KEYS[6], KEYS[7])
-        return #old_items
-        """
-        await self.redis.execute_command(
+        result = await self.redis.execute_command(
             "EVAL",
-            script,
-            7,
+            CONVERSATION_RESTORE_SCRIPT,
+            9,
             processing_key,
-            target_key,
-            lock_key,
-            last_message_key,
-            session_start_key,
-            meta_last_message_key,
-            meta_session_start_key,
+            RedisKeys.buffer(group_id),
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            RedisKeys.last_message(group_id),
+            RedisKeys.session_start(group_id),
+            RedisKeys.buffer_processing_meta_last_message(group_id, token),
+            RedisKeys.buffer_processing_meta_session_start(group_id, token),
+            RedisKeys.buffer_processing_chunks(group_id, token),
+            owner_token,
+        )
+        return int(cast("int", result)) >= 0
+
+    async def initialize_conversation_chunk_manifest(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        manifest_json: str,
+    ) -> str:
+        """幂等创建分块清单，已有清单必须由调用方比较一致性。"""
+        return await self._operate_conversation_chunk_ledger(
+            group_id=group_id,
+            processing_key=processing_key,
+            owner_token=owner_token,
+            operation="initialize",
+            field="manifest",
+            value=manifest_json,
         )
 
+    async def get_conversation_chunk_state(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        field: str,
+    ) -> str | None:
+        """读取当前 owner 的单个分块阶段状态。"""
+        value = await self._operate_conversation_chunk_ledger(
+            group_id=group_id,
+            processing_key=processing_key,
+            owner_token=owner_token,
+            operation="get",
+            field=field,
+            value="",
+        )
+        return value or None
+
+    async def set_conversation_chunk_state(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        field: str,
+        value: str,
+    ) -> None:
+        """写入当前 owner 的单个分块阶段状态。"""
+        stored = await self._operate_conversation_chunk_ledger(
+            group_id=group_id,
+            processing_key=processing_key,
+            owner_token=owner_token,
+            operation="set",
+            field=field,
+            value=value,
+        )
+        if stored != value:
+            raise RuntimeError("对话分块阶段状态写入后不一致")
+
+    async def _operate_conversation_chunk_ledger(
+        self,
+        *,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        operation: str,
+        field: str,
+        value: str,
+    ) -> str:
+        token = self._conversation_processing_token(processing_key)
+        result = await self.redis.execute_command(
+            "EVAL",
+            CONVERSATION_CHUNK_LEDGER_SCRIPT,
+            4,
+            processing_key,
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            RedisKeys.buffer_processing_chunks(group_id, token),
+            owner_token,
+            operation,
+            field,
+            value,
+            self.config.conversation_snapshot_ttl_seconds,
+        )
+        raw_result = list(cast("list[Any]", result or []))
+        if not raw_result or int(raw_result[0]) != 1:
+            raise ConversationLeaseLostError(processing_key)
+        return self._decode_redis_text(raw_result[1]) if len(raw_result) > 1 else ""
+
+    async def dead_letter_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+        *,
+        failure_code: str,
+        attempt_count: int,
+    ) -> bool:
+        """把连续失败的 owner 快照持久移入 dead-letter，保留原始消息。"""
+        if self._conversation_processing_group_id(processing_key) != group_id:
+            return False
+        token = self._conversation_processing_token(processing_key)
+        normalized_code = "".join(
+            character if character.isalnum() or character in "._-" else "_"
+            for character in failure_code
+        )[:100]
+        result = await self.redis.execute_command(
+            "EVAL",
+            CONVERSATION_DEAD_LETTER_SCRIPT,
+            8,
+            processing_key,
+            RedisKeys.buffer_processing_current(group_id),
+            RedisKeys.buffer_processing_lock(group_id),
+            RedisKeys.buffer_processing_meta_last_message(group_id, token),
+            RedisKeys.buffer_processing_meta_session_start(group_id, token),
+            RedisKeys.buffer_processing_chunks(group_id, token),
+            RedisKeys.buffer_processing_dead(group_id, token),
+            RedisKeys.BUFFER_PROCESSING_DEAD_INDEX,
+            owner_token,
+            group_id,
+            normalized_code or "UnknownError",
+            max(1, attempt_count),
+        )
+        return int(cast("int | str | bytes", result)) == 1
+
+    async def list_conversation_dead_letters(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[ConversationDeadLetter]:
+        """按失败时间倒序返回不含正文的 dead-letter 摘要。"""
+        if limit <= 0:
+            return []
+        raw_keys = await self.redis.zrevrange(
+            RedisKeys.BUFFER_PROCESSING_DEAD_INDEX,
+            0,
+            min(limit, 1000) - 1,
+        )
+        dead_letters: list[ConversationDeadLetter] = []
+        for raw_key in raw_keys:
+            processing_key = self._decode_redis_text(raw_key)
+            group_id = self._conversation_processing_group_id(processing_key)
+            if group_id is None:
+                continue
+            token = self._conversation_processing_token(processing_key)
+            raw_metadata = await cast(
+                "Any",
+                self.redis.hgetall(
+                    RedisKeys.buffer_processing_dead(group_id, token)
+                ),
+            )
+            metadata = {
+                self._decode_redis_text(key): self._decode_redis_text(value)
+                for key, value in raw_metadata.items()
+            }
+            if (
+                metadata.get("status") != "dead_letter"
+                or metadata.get("processing_key") != processing_key
+                or not await self.redis.exists(processing_key)
+            ):
+                continue
+            try:
+                attempt_count = max(1, int(metadata.get("attempt_count", "1")))
+                failed_at_ms = max(0, int(metadata.get("failed_at_ms", "0")))
+            except ValueError:
+                logger.warning(
+                    "[KomariMemory] 跳过元数据损坏的对话 dead-letter: key={}",
+                    processing_key,
+                )
+                continue
+            message_count = int(
+                cast(
+                    "int | str | bytes",
+                    await self.redis.execute_command("LLEN", processing_key),
+                )
+            )
+            chunk_state_count = int(
+                cast(
+                    "int | str | bytes",
+                    await self.redis.execute_command(
+                        "HLEN",
+                        RedisKeys.buffer_processing_chunks(group_id, token),
+                    ),
+                )
+            )
+            dead_letters.append(
+                ConversationDeadLetter(
+                    group_id=group_id,
+                    snapshot_id=token,
+                    failure_code=metadata.get("failure_code", "UnknownError"),
+                    attempt_count=attempt_count,
+                    failed_at_ms=failed_at_ms,
+                    message_count=max(0, message_count),
+                    chunk_state_count=max(0, chunk_state_count),
+                )
+            )
+        return dead_letters
+
+    async def requeue_conversation_dead_letter(
+        self,
+        *,
+        group_id: str,
+        snapshot_id: str,
+    ) -> int | None:
+        """把指定 dead-letter 原子放回活动缓冲区，旧消息保持在前。"""
+        if not group_id or ":" in group_id or not snapshot_id or ":" in snapshot_id:
+            return None
+        processing_key = RedisKeys.buffer_processing(group_id, snapshot_id)
+        result = await self.redis.execute_command(
+            "EVAL",
+            CONVERSATION_DEAD_LETTER_REQUEUE_SCRIPT,
+            9,
+            processing_key,
+            RedisKeys.buffer(group_id),
+            RedisKeys.last_message(group_id),
+            RedisKeys.session_start(group_id),
+            RedisKeys.buffer_processing_meta_last_message(group_id, snapshot_id),
+            RedisKeys.buffer_processing_meta_session_start(group_id, snapshot_id),
+            RedisKeys.buffer_processing_chunks(group_id, snapshot_id),
+            RedisKeys.buffer_processing_dead(group_id, snapshot_id),
+            RedisKeys.BUFFER_PROCESSING_DEAD_INDEX,
+        )
+        restored_count = int(cast("int | str | bytes", result))
+        return restored_count if restored_count >= 0 else None
+
     async def get_orphaned_conversation_processing_keys(self) -> list[tuple[str, str]]:
-        """扫描无有效处理锁的对话 processing 快照键。"""
+        """扫描没有有效 owner lease 的对话 processing 快照键。"""
         orphaned: list[tuple[str, str]] = []
         async for raw_key in self.redis.scan_iter(match=RedisKeys.BUFFER_PROCESSING_PATTERN):
             processing_key = self._decode_redis_text(raw_key)
@@ -574,10 +930,23 @@ class RedisManager:
                 continue
             if not await self.redis.exists(processing_key):
                 continue
+            token = self._conversation_processing_token(processing_key)
+            if await self.redis.exists(
+                RedisKeys.buffer_processing_dead(group_id, token)
+            ):
+                continue
+            current_key = RedisKeys.buffer_processing_current(group_id)
+            current_value = await self.redis.get(current_key)
+            current_processing = (
+                self._decode_redis_text(current_value) if current_value else ""
+            )
             lock_key = RedisKeys.buffer_processing_lock(group_id)
-            locked_key = await self.redis.get(lock_key)
-            locked_key_text = self._decode_redis_text(locked_key) if locked_key else ""
-            if locked_key_text != processing_key:
+            lease_value = await self.redis.get(lock_key)
+            lease_processing = self._conversation_lease_processing_key(lease_value)
+            if (
+                current_processing != processing_key
+                or lease_processing != processing_key
+            ):
                 orphaned.append((group_id, processing_key))
         return orphaned
 
@@ -775,6 +1144,35 @@ class RedisManager:
             msg = f"Redis 返回未知的主动回复确认状态: {code}"
             raise RuntimeError(msg)
 
+    async def renew_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+        *,
+        reservation_ttl_seconds: int,
+    ) -> bool:
+        """续期生成中的主动回复预占；已确认记录同样视为成功。"""
+        reservation_ttl_ms = max(1, int(reservation_ttl_seconds * 1000))
+        slots_ttl_ms = (
+            max(_PROACTIVE_RATE_WINDOW_MS, reservation_ttl_ms)
+            + _PROACTIVE_SLOTS_TTL_GRACE_MS
+        )
+        result = await self.redis.execute_command(
+            "EVAL",
+            _PROACTIVE_RENEW_SCRIPT,
+            2,
+            RedisKeys.proactive_cooldown(group_id),
+            RedisKeys.proactive_slots(group_id),
+            reservation_id,
+            reservation_ttl_ms,
+            slots_ttl_ms,
+        )
+        code = int(cast("int | str | bytes", result))
+        if code not in {0, 1, 2}:
+            msg = f"Redis 返回未知的主动回复续期状态: {code}"
+            raise RuntimeError(msg)
+        return code in {1, 2}
+
     async def release_proactive_reply(
         self,
         group_id: str,
@@ -829,13 +1227,40 @@ class RedisManager:
 
         key = RedisKeys.global_interaction(user_id)
         payloads = [json.dumps(item, ensure_ascii=False) for item in records]
-        pipe = self.redis.pipeline()
-        pipe.rpush(key, *payloads)
-        pipe.llen(key)
-        results = await pipe.execute()
-        buffer_len = int(results[-1] or 0)
-        if buffer_len >= trigger_size:
-            await self.add_pending_interaction_summary(user_id)
+        await self.redis.execute_command(
+            "EVAL",
+            _GLOBAL_INTERACTION_PUSH_SCRIPT,
+            2,
+            key,
+            RedisKeys.GLOBAL_INTERACTION_PENDING,
+            user_id,
+            max(1, trigger_size),
+            *payloads,
+        )
+
+    async def push_global_interaction_once(
+        self,
+        *,
+        user_id: str,
+        record: dict[str, Any],
+        trigger_size: int,
+        operation_id: str,
+        dedupe_ttl_seconds: int = _CHAT_COMMIT_DEDUPE_TTL_SECONDS,
+    ) -> bool:
+        """按聊天 operation ID 原子写入一次互动事件缓冲。"""
+        result = await self.redis.execute_command(
+            "EVAL",
+            _CHAT_COMMIT_INTERACTION_ONCE_SCRIPT,
+            3,
+            RedisKeys.chat_commit_step(operation_id, "interaction"),
+            RedisKeys.global_interaction(user_id),
+            RedisKeys.GLOBAL_INTERACTION_PENDING,
+            json.dumps(record, ensure_ascii=False),
+            user_id,
+            max(1, trigger_size),
+            max(1, dedupe_ttl_seconds),
+        )
+        return int(cast("int | str | bytes", result)) == 1
 
     async def get_global_interaction_buffer(
         self,
@@ -913,6 +1338,26 @@ class RedisManager:
             _GLOBAL_INTERACTION_SNAPSHOT_TTL_SECONDS,
         )
         return self._decode_redis_text(result) if result else None
+
+    async def renew_interaction_summary_lease(
+        self,
+        *,
+        user_id: str,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> bool:
+        """仅由当前 owner 续期单个互动总结租约。"""
+        result = await self.redis.execute_command(
+            "EVAL",
+            _INTERACTION_RENEW_SCRIPT,
+            2,
+            RedisKeys.GLOBAL_INTERACTION_LEASES,
+            RedisKeys.GLOBAL_INTERACTION_LEASE_OWNERS,
+            user_id,
+            owner_token,
+            max(1, lease_seconds) * 1000,
+        )
+        return int(cast("int | str | bytes", result)) == 1
 
     async def get_processing_global_interactions(
         self,
@@ -1025,7 +1470,9 @@ class RedisManager:
         keys = []
         excluded_prefixes = (
             f"{RedisKeys.PREFIX}:buffer:processing:",
+            f"{RedisKeys.PREFIX}:buffer:processing_current:",
             f"{RedisKeys.PREFIX}:buffer:processing_lock:",
+            f"{RedisKeys.PREFIX}:buffer:processing_chunks:",
             f"{RedisKeys.PREFIX}:buffer:processing_meta:",
         )
         async for key in self.redis.scan_iter(match=pattern):
@@ -1059,6 +1506,40 @@ class RedisManager:
         if isinstance(value, bytes):
             return value.decode()
         return str(value)
+
+    @classmethod
+    def _parse_conversation_claim(cls, value: object) -> ConversationSnapshotClaim:
+        raw = list(cast("list[Any]", value or []))
+        if not raw:
+            return ConversationSnapshotClaim(status="empty")
+        status_code = int(raw[0])
+        processing_key = cls._decode_redis_text(raw[1]) if len(raw) > 1 and raw[1] else None
+        match status_code:
+            case 1:
+                return ConversationSnapshotClaim(
+                    status="claimed",
+                    processing_key=processing_key,
+                )
+            case 2:
+                return ConversationSnapshotClaim(
+                    status="busy",
+                    processing_key=processing_key,
+                )
+            case _:
+                return ConversationSnapshotClaim(status="empty")
+
+    @classmethod
+    def _conversation_lease_processing_key(cls, value: object | None) -> str:
+        if value is None:
+            return ""
+        raw = cls._decode_redis_text(value)
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return raw
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("processing_key", ""))
 
     @staticmethod
     def _conversation_processing_token(processing_key: str) -> str:

@@ -191,6 +191,12 @@ class KomariMemoryConfigSchema(BaseModel):
         le=86400,
         description="对话缓冲 processing 快照 TTL（秒）",
     )
+    conversation_processing_lease_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=900,
+        description="对话总结 processing 所有权租约时长（秒），worker 会周期续租",
+    )
     profile_snapshot_ttl_seconds: int = Field(
         default=1800,
         ge=300,
@@ -248,6 +254,18 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     context_messages_limit: int = Field(
         default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
+    )
+    context_max_utf8_bytes: int = Field(
+        default=24_000,
+        ge=1_024,
+        le=131_072,
+        description="单次聊天近期消息上下文的 UTF-8 字节预算",
+    )
+    context_max_estimated_tokens: int = Field(
+        default=6_000,
+        ge=256,
+        le=32_000,
+        description="单次聊天近期消息上下文的估算 token 预算",
     )
     global_interaction_enabled: bool = Field(
         default=True,
@@ -309,6 +327,44 @@ class KomariMemoryConfigSchema(BaseModel):
         json_schema_extra={"apply_mode": "immediate"},
     )
 
+    # 回复送达后副作用 outbox
+    reply_commit_worker_interval_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=300,
+        description="聊天回复副作用 outbox 的后台扫描间隔（秒）",
+    )
+    reply_commit_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="聊天回复副作用 outbox 单轮最大领取数",
+    )
+    reply_commit_lease_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=900,
+        description="聊天回复副作用 outbox worker 租约时长（秒）",
+    )
+    reply_commit_max_attempts: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="聊天回复副作用 outbox 自动重试上限，耗尽后保留 FAILED 对账记录",
+    )
+    reply_commit_retry_base_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=300,
+        description="聊天回复副作用 outbox 指数退避基准秒数",
+    )
+    reply_commit_tombstone_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="已完成或取消的聊天 operation 防重记录保留天数",
+    )
+
     # 提示词模板配置
     # 机器人昵称
     bot_nickname: str = Field(default="小鞠知花", description="机器人昵称")
@@ -338,6 +394,12 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     forgetting_fuzzify_concurrency: int = Field(
         default=3, ge=1, le=10, description="首次归零模糊化时的 LLM 最大并发数"
+    )
+    forgetting_job_lease_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+        description="每日忘却任务的 PostgreSQL 所有权租约时长（秒）",
     )
 
     # 查询重写配置

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -14,7 +15,10 @@ from nonebot_plugin_apscheduler import scheduler
 
 from ..core.retry import retry_async
 from ..services.config_interface import get_config
-from ..services.interaction_event_summary_service import summarize_interaction_events
+from ..services.interaction_event_summary_service import (
+    MAX_INTERACTION_SUMMARY_RECORDS,
+    summarize_interaction_events,
+)
 
 if TYPE_CHECKING:
     from ..services.memory_service import MemoryService
@@ -22,6 +26,8 @@ if TYPE_CHECKING:
 
 _JOB_ID = "komari_memory_interaction_event_worker"
 _DAILY_JOB_ID = "komari_memory_interaction_event_daily_flush"
+_MAX_USERS_PER_RUN = 100
+_MAX_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 def _record_timestamp(record: dict[str, Any]) -> float:
@@ -82,53 +88,101 @@ async def interaction_event_worker_task(
         return
 
     owner_token = uuid4().hex
-    user_ids = await redis.claim_pending_interaction_summaries(
-        owner_token=owner_token,
-        count=100,
-        lease_seconds=config.global_interaction_processing_lease_seconds,
-    )
-    if not user_ids:
-        return
+    processed_count = 0
+    while processed_count < _MAX_USERS_PER_RUN:
+        user_ids = await redis.claim_pending_interaction_summaries(
+            owner_token=owner_token,
+            count=1,
+            lease_seconds=config.global_interaction_processing_lease_seconds,
+        )
+        if not user_ids:
+            break
+        user_id = user_ids[0]
+        processed_count += 1
+        completed = await _process_claimed_user(
+            redis=redis,
+            memory=memory,
+            user_id=user_id,
+            owner_token=owner_token,
+            lease_seconds=config.global_interaction_processing_lease_seconds,
+        )
+        if not completed:
+            break
 
-    logger.debug("[KomariMemory] 检查 {} 个待总结跨群互动用户", len(user_ids))
-    for user_id in user_ids:
-        token = uuid4().hex
-        processing_key: str | None = None
-        try:
-            processing_key = await redis.snapshot_global_interactions(user_id, token)
-            if processing_key is None:
-                acknowledged = await redis.ack_processing_global_interactions(
+    if processed_count:
+        logger.debug(
+            "[KomariMemory] 本轮处理跨群互动用户: count={}",
+            processed_count,
+        )
+
+
+async def _process_claimed_user(
+    *,
+    redis: RedisManager,
+    memory: MemoryService,
+    user_id: str,
+    owner_token: str,
+    lease_seconds: int,
+) -> bool:
+    """处理单个已认领用户，处理期间持续续租。"""
+    stop_heartbeat = asyncio.Event()
+    lease_lost = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_interaction_lease(
+            redis=redis,
+            user_id=user_id,
+            owner_token=owner_token,
+            lease_seconds=lease_seconds,
+            stop=stop_heartbeat,
+            lease_lost=lease_lost,
+        )
+    )
+    token = uuid4().hex
+    processing_key: str | None = None
+    completed = False
+    try:
+        processing_key = await redis.snapshot_global_interactions(user_id, token)
+        if processing_key is None:
+            if not lease_lost.is_set():
+                completed = await redis.ack_processing_global_interactions(
                     user_id=user_id,
                     owner_token=owner_token,
                     processing_key="",
                 )
-                if not acknowledged:
+                if not completed:
                     logger.warning(
                         "[KomariMemory] 空互动快照确认失败，租约已被接管: user={}",
                         user_id,
                     )
-                continue
+        else:
             await _summarize_processing_key(
                 redis=redis,
                 memory=memory,
                 user_id=user_id,
                 processing_key=processing_key,
             )
-            acknowledged = await redis.ack_processing_global_interactions(
-                user_id=user_id,
-                owner_token=owner_token,
-                processing_key=processing_key,
-            )
-            if not acknowledged:
+            if lease_lost.is_set():
                 logger.warning(
-                    "[KomariMemory] 互动快照确认失败，租约已被接管: user={}",
+                    "[KomariMemory] 互动总结完成前租约已丢失，放弃确认: user={}",
                     user_id,
                 )
-        except Exception:
-            logger.exception(
-                "[KomariMemory] 跨群互动事件总结最终失败，重新入队: user={}",
-                user_id,
-            )
+            else:
+                completed = await redis.ack_processing_global_interactions(
+                    user_id=user_id,
+                    owner_token=owner_token,
+                    processing_key=processing_key,
+                )
+                if not completed:
+                    logger.warning(
+                        "[KomariMemory] 互动快照确认失败，租约已被接管: user={}",
+                        user_id,
+                    )
+    except Exception:
+        logger.exception(
+            "[KomariMemory] 跨群互动事件总结最终失败，重新入队: user={}",
+            user_id,
+        )
+        if not lease_lost.is_set():
             try:
                 requeued = await redis.requeue_processing_global_interactions(
                     user_id=user_id,
@@ -146,6 +200,51 @@ async def interaction_event_worker_task(
                         "[KomariMemory] 互动快照重新入队被拒绝，租约已被接管: user={}",
                         user_id,
                     )
+    finally:
+        stop_heartbeat.set()
+        await heartbeat_task
+    return completed
+
+
+async def _heartbeat_interaction_lease(
+    *,
+    redis: RedisManager,
+    user_id: str,
+    owner_token: str,
+    lease_seconds: int,
+    stop: asyncio.Event,
+    lease_lost: asyncio.Event,
+) -> None:
+    interval = min(
+        max(1.0, lease_seconds / 3),
+        _MAX_HEARTBEAT_INTERVAL_SECONDS,
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            try:
+                renewed = await redis.renew_interaction_summary_lease(
+                    user_id=user_id,
+                    owner_token=owner_token,
+                    lease_seconds=lease_seconds,
+                )
+            except Exception:
+                logger.exception(
+                    "[KomariMemory] 互动总结租约续期失败: user={}",
+                    user_id,
+                )
+                lease_lost.set()
+                return
+            if not renewed:
+                logger.warning(
+                    "[KomariMemory] 互动总结租约续期被拒绝: user={}",
+                    user_id,
+                )
+                lease_lost.set()
+                return
+        else:
+            return
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -161,6 +260,14 @@ async def _summarize_processing_key(
     records = _filter_valid_records(raw_records)
     if not records:
         return
+    if len(records) > MAX_INTERACTION_SUMMARY_RECORDS:
+        omitted_count = len(records) - MAX_INTERACTION_SUMMARY_RECORDS
+        records = records[-MAX_INTERACTION_SUMMARY_RECORDS:]
+        logger.warning(
+            "[KomariMemory] 互动快照超过处理上限，保留最近记录: omitted={} kept={}",
+            omitted_count,
+            len(records),
+        )
 
     dedup_key = _build_snapshot_dedup_key(user_id, records)
     existing_event_id = await memory.get_interaction_event_id_by_dedup_key(dedup_key)

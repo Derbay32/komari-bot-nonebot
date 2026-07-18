@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
@@ -38,6 +38,8 @@ class ConversationRepository:
         participants: list[str],
         importance_initial: int,
         dedup_key: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
     ) -> int | None:
         """插入对话记录。
 
@@ -48,10 +50,20 @@ class ConversationRepository:
             participants: 参与者列表
             importance_initial: 初始重要性评分
             dedup_key: 幂等键，同一 processing 快照重复写入时用于去重
+            start_time: 被总结消息的最早时间；未提供时保留旧版一小时回退语义
+            end_time: 被总结消息的最晚时间；未提供时回退为当前 UTC 时间
 
         Returns:
             创建的对话 ID；幂等冲突时返回 None
         """
+        normalized_end = self._normalize_datetime(end_time) or self._now_naive()
+        normalized_start = self._normalize_datetime(start_time) or (
+            normalized_end - timedelta(hours=1)
+        )
+        if normalized_end < normalized_start:
+            message = "end_time 不能早于 start_time"
+            raise ValueError(message)
+
         async with self.pg_pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
@@ -74,8 +86,8 @@ class ConversationRepository:
                 summary,
                 participants,
                 dedup_key,
-                datetime.now() - timedelta(hours=1),  # noqa: DTZ005
-                datetime.now(),  # noqa: DTZ005
+                normalized_start,
+                normalized_end,
                 importance_initial,
                 importance_initial,
             )
@@ -92,6 +104,18 @@ class ConversationRepository:
                 f"[KomariMemory] 存储对话总结: ID={row['id']}, group={group_id}, importance={importance_initial}"
             )
             return row["id"]
+
+    @staticmethod
+    def _now_naive() -> datetime:
+        """返回与 PostgreSQL ``TIMESTAMP`` 列约定一致的无时区 UTC 时间。"""
+        return datetime.now(UTC).replace(tzinfo=None)
+
+    @staticmethod
+    def _normalize_datetime(value: datetime | None) -> datetime | None:
+        """将有时区时间统一换算为无时区 UTC 时间。"""
+        if value is None or value.tzinfo is None:
+            return value
+        return value.astimezone(UTC).replace(tzinfo=None)
 
     async def list_conversations(
         self,

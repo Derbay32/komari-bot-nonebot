@@ -8,7 +8,7 @@
 - 数据访问：`repositories/`
 - 核心服务：`services/`
 - 后台任务：`handlers/summary_worker.py`、`handlers/forgetting_worker.py`
-- 手工初始化 SQL：`database/init_orm.sql`
+- Schema 唯一真源：`komari_bot/common/vector_storage_schema.py`
 
 运行时已经支持：
 
@@ -16,7 +16,8 @@
 - 启动阶段校验向量列维度
 - 维度不匹配时通过迁移脚本升级
 
-手工 SQL 现在主要用于预建表、手工运维或排障，不再是首装必经步骤。
+历史 `database/init_orm.sql` 已废弃并会直接退出，避免旧表结构被误用。预建表、
+手工运维或排障时，必须通过生成脚本从运行时 DDL 真源生成一次性 SQL。
 
 ## 依赖
 
@@ -53,24 +54,33 @@
 Bot 启动后：
 
 - 会建立 PostgreSQL 连接池
-- 会按当前 embedding 维度自动补齐 `komari_memory_conversations` / `komari_memory_user_profile` / `komari_memory_interaction_history`
-- 会校验 `komari_memory_conversations.embedding` 与 provider 维度一致
+- 会按当前 embedding 维度自动补齐记忆正文表与独立 embedding 表
+- 会校验独立 embedding 表与 provider 维度一致
 - 会初始化 Redis 缓冲区管理
 - 会注册总结任务和忘却任务
 
 ## 手工初始化与迁移
 
-### 手工初始化 SQL
+### 从运行时 DDL 生成运维 SQL
 
-大多数场景不需要手工执行；若需要，可运行：
+大多数场景不需要手工执行。确需预建或排障时，先按当前
+`embedding_provider` 维度生成并审阅一次性 SQL：
 
 ```bash
-psql -h localhost -U your_username -d komari_bot \
-  -v embedding_dimension=512 \
-  -f komari_bot/plugins/komari_memory/database/init_orm.sql
+poetry run python scripts/render_memory_schema.py \
+  --embedding-dimension 512 \
+  --output /tmp/komari-memory-schema.sql
 ```
 
-如果不显式传入 `embedding_dimension`，脚本默认使用当前 provider 默认值 `512`。
+确认 SQL 与备份后再执行；`ON_ERROR_STOP` 禁止部分成功后继续：
+
+```bash
+psql -v ON_ERROR_STOP=1 \
+  -h localhost -U your_username -d komari_bot \
+  -f /tmp/komari-memory-schema.sql
+```
+
+不要执行 `database/init_orm.sql`；它只保留 fail-closed 的迁移提示。
 
 ### 对话向量迁移
 
@@ -129,7 +139,7 @@ psql -h localhost -U your_username -d komari_bot \
 - 达到消息数 / token / 时间阈值后，触发总结任务
 - 总结结果写入 `komari_memory_conversations`
 - 用户画像写入 `komari_memory_user_profile`
-- 互动历史写入 `komari_memory_interaction_history`
+- 跨群互动事件写入 `komari_memory_interaction_history`，向量写入独立 embedding 表
 
 ### 记忆检索
 

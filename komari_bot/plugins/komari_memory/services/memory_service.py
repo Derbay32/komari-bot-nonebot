@@ -52,6 +52,8 @@ class MemoryService:
         participants: list[str],
         importance_initial: int = 3,
         dedup_key: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
     ) -> int | None:
         """存储对话总结（向量检索用 asyncpg）。
 
@@ -61,12 +63,18 @@ class MemoryService:
             participants: 参与者列表
             importance_initial: 初始重要性评分（1-5）
             dedup_key: 幂等键，同一 processing 快照重复写入时用于去重
+            start_time: 被总结消息的最早时间
+            end_time: 被总结消息的最晚时间
 
         Returns:
             创建的对话 ID；幂等冲突时返回 None
         """
         # 业务逻辑：生成向量
         embedding = await self._embedding_plugin.embed(summary)
+        normalized_start, normalized_end = self._resolve_conversation_range(
+            start_time=start_time,
+            end_time=end_time,
+        )
 
         # 数据访问：委托给仓库
         return await self._conversation_repo.insert_conversation(
@@ -76,6 +84,8 @@ class MemoryService:
             participants=participants,
             importance_initial=importance_initial,
             dedup_key=dedup_key,
+            start_time=normalized_start,
+            end_time=normalized_end,
         )
 
     async def search_conversations(

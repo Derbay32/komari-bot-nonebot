@@ -27,8 +27,10 @@ class _FakeRedis:
     def __init__(self, records: list[dict[str, object]]) -> None:
         self.records = records
         self.claim_calls: list[dict[str, object]] = []
+        self.renew_calls: list[dict[str, object]] = []
         self.ack_calls: list[dict[str, str]] = []
         self.requeue_calls: list[dict[str, str]] = []
+        self._claim_available = True
 
     async def claim_pending_interaction_summaries(
         self,
@@ -44,7 +46,27 @@ class _FakeRedis:
                 "lease_seconds": lease_seconds,
             }
         )
-        return ["u1"]
+        if self._claim_available:
+            self._claim_available = False
+            return ["u1"]
+        self._claim_available = True
+        return []
+
+    async def renew_interaction_summary_lease(
+        self,
+        *,
+        user_id: str,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> bool:
+        self.renew_calls.append(
+            {
+                "user_id": user_id,
+                "owner_token": owner_token,
+                "lease_seconds": lease_seconds,
+            }
+        )
+        return True
 
     async def snapshot_global_interactions(self, user_id: str, token: str) -> str:
         return f"processing:{user_id}:{token}"
@@ -138,6 +160,7 @@ def test_duplicate_snapshot_is_stored_only_once(monkeypatch: Any) -> None:
     assert len(redis.ack_calls) == 2
     assert redis.requeue_calls == []
     assert all(call["lease_seconds"] == 120 for call in redis.claim_calls)
+    assert all(call["count"] == 1 for call in redis.claim_calls)
 
 
 def test_worker_requeues_snapshot_after_final_failure(
@@ -170,6 +193,46 @@ def test_snapshot_dedup_key_is_independent_of_dictionary_key_order() -> None:
     assert worker_module._build_snapshot_dedup_key(
         "u1", [first]
     ) != worker_module._build_snapshot_dedup_key("u2", [first])
+
+
+def test_worker_renews_lease_during_slow_summary(monkeypatch: Any) -> None:
+    _patch_config(monkeypatch)
+    monkeypatch.setattr(worker_module, "_MAX_HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    redis = _FakeRedis([_record()])
+    memory = _FakeMemory()
+
+    async def _slow_summary(**_kwargs: Any) -> SimpleNamespace:
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(event_summary="慢速总结", importance=4)
+
+    monkeypatch.setattr(worker_module, "summarize_interaction_events", _slow_summary)
+
+    asyncio.run(worker_module.interaction_event_worker_task(redis, memory))  # type: ignore[arg-type]
+
+    assert redis.renew_calls
+    assert redis.ack_calls
+
+
+def test_worker_caps_snapshot_to_recent_record_window(monkeypatch: Any) -> None:
+    _patch_config(monkeypatch)
+    records = [_record(timestamp=float(index)) for index in range(205)]
+    redis = _FakeRedis(records)
+    memory = _FakeMemory()
+    summarized_timestamps: list[float] = []
+
+    async def _summarize(**kwargs: Any) -> SimpleNamespace:
+        summarized_timestamps.extend(
+            float(record["timestamp"]) for record in kwargs["records"]
+        )
+        return SimpleNamespace(event_summary="有界总结", importance=4)
+
+    monkeypatch.setattr(worker_module, "summarize_interaction_events", _summarize)
+
+    asyncio.run(worker_module.interaction_event_worker_task(redis, memory))  # type: ignore[arg-type]
+
+    assert len(summarized_timestamps) == 200
+    assert summarized_timestamps[0] == 5.0
+    assert memory.insert_calls[0]["source_message_count"] == 200
 
 
 def test_disabled_interaction_worker_is_registered_dormant_for_hot_enable(

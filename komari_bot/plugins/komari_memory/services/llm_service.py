@@ -15,6 +15,7 @@ from komari_bot.common.untrusted_context import (
 
 from ..config_schema import KomariMemoryConfigSchema
 from ..core.retry import retry_async
+from .message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
 from .summary_prompt_template import get_template as get_summary_template
 from .summary_prompt_template import render_template as render_summary_template
 from .token_counter import estimate_text_tokens
@@ -129,14 +130,14 @@ def _build_user_message(
     return "\n\n".join(parts)
 
 
-def _build_summary_messages(
+async def _build_summary_messages(
     *,
     conversation_text: str,
     participants: list[str],
     display_name_map: dict[str, str],
 ) -> list[dict[str, str]]:
     """构建与画像 Agent 共享前缀的三段式总结 messages。"""
-    template = get_summary_template()
+    template = await get_summary_template()
     external_context = _build_user_message(
         conversation_text,
         participants,
@@ -148,6 +149,7 @@ def _build_summary_messages(
                 source_type="conversation_history",
                 source_id="memory-summary-input",
                 content=external_context,
+                max_chars=MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS,
             )
         )
         + "\n\n请生成对话总结。"
@@ -375,7 +377,7 @@ async def summarize_conversation(
     trace_id = f"memsum-{uuid4().hex[:8]}"
     group_id = messages[0].group_id if messages else "-"
     conversation_text = _format_messages_for_summary(messages, config)
-    summary_messages = _build_summary_messages(
+    summary_messages = await _build_summary_messages(
         conversation_text=conversation_text,
         participants=participants,
         display_name_map=display_name_map,

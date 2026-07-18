@@ -14,7 +14,11 @@ class RedisKeys:
     BUFFER_PATTERN = f"{PREFIX}:buffer:*"
     BUFFER_PROCESSING = f"{PREFIX}:buffer:processing:%s:%s"
     BUFFER_PROCESSING_PATTERN = f"{PREFIX}:buffer:processing:*"
+    BUFFER_PROCESSING_CURRENT = f"{PREFIX}:buffer:processing_current:%s"
     BUFFER_PROCESSING_LOCK = f"{PREFIX}:buffer:processing_lock:%s"
+    BUFFER_PROCESSING_CHUNKS = f"{PREFIX}:buffer:processing_chunks:%s:%s"
+    BUFFER_PROCESSING_DEAD = f"{PREFIX}:buffer:processing_dead:%s:%s"
+    BUFFER_PROCESSING_DEAD_INDEX = f"{PREFIX}:buffer:processing_dead_index"
     BUFFER_PROCESSING_META_LAST_MESSAGE = f"{PREFIX}:buffer:processing_meta:%s:%s:last_message"
     BUFFER_PROCESSING_META_SESSION_START = f"{PREFIX}:buffer:processing_meta:%s:%s:session_start"
 
@@ -32,6 +36,9 @@ class RedisKeys:
 
     # 主动回复滑动窗口名额（含生成中的预占与已送达回复）
     PROACTIVE_SLOTS = f"{PREFIX}:proactive:slots:%s"
+
+    # 聊天送达后副作用 Redis 幂等标记
+    CHAT_COMMIT_STEP = f"{PREFIX}:chat_commit:%s:%s"
 
     # 画像 Agent 暂存区
     STAGING_PROFILE = f"{PREFIX}:staging:profile:%s"
@@ -68,6 +75,21 @@ class RedisKeys:
     def buffer_processing_lock(cls, group_id: str) -> str:
         """获取对话缓冲处理锁键。"""
         return cls.BUFFER_PROCESSING_LOCK % group_id
+
+    @classmethod
+    def buffer_processing_current(cls, group_id: str) -> str:
+        """获取当前对话 processing 快照指针键。"""
+        return cls.BUFFER_PROCESSING_CURRENT % group_id
+
+    @classmethod
+    def buffer_processing_chunks(cls, group_id: str, token: str) -> str:
+        """获取对话 processing 分块覆盖账本键。"""
+        return cls.BUFFER_PROCESSING_CHUNKS % (group_id, token)
+
+    @classmethod
+    def buffer_processing_dead(cls, group_id: str, token: str) -> str:
+        """获取对话 processing dead-letter 元数据键。"""
+        return cls.BUFFER_PROCESSING_DEAD % (group_id, token)
 
     @classmethod
     def buffer_processing_meta_last_message(cls, group_id: str, token: str) -> str:
@@ -138,6 +160,11 @@ class RedisKeys:
             Redis 键
         """
         return cls.PROACTIVE_SLOTS % group_id
+
+    @classmethod
+    def chat_commit_step(cls, operation_id: str, step: str) -> str:
+        """获取聊天 outbox 子步骤的 Redis 防重键。"""
+        return cls.CHAT_COMMIT_STEP % (operation_id, step)
 
     @classmethod
     def staging_profile(cls, session_id: str) -> str:

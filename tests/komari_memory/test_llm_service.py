@@ -205,20 +205,25 @@ def test_normalize_summary_result_filters_and_limits_memories() -> None:
 
 
 def test_build_summary_messages_keeps_profile_agent_user_prefix(monkeypatch: Any) -> None:
-    monkeypatch.setattr(
-        llm_service_module,
-        "get_summary_template",
-        lambda: {
+    async def _template() -> dict[str, str]:
+        return {
             "memory_summary_common_system": "共用系统提示",
             "summary_workflow_system": "工作流 {{json_response_example}}",
             "json_response_example": '{"memories": []}',
-        },
+        }
+
+    monkeypatch.setattr(
+        llm_service_module,
+        "get_summary_template",
+        _template,
     )
 
-    messages = llm_service_module._build_summary_messages(
-        conversation_text="[user_id:10001] 阿明: 你好",
-        participants=["10001"],
-        display_name_map={"10001": "阿明"},
+    messages = asyncio.run(
+        llm_service_module._build_summary_messages(
+            conversation_text="[user_id:10001] 阿明: 你好",
+            participants=["10001"],
+            display_name_map={"10001": "阿明"},
+        )
     )
 
     assert messages[0] == {"role": "system", "content": "共用系统提示"}
@@ -229,6 +234,35 @@ def test_build_summary_messages_keeps_profile_agent_user_prefix(monkeypatch: Any
     assert '["10001"]' in messages[1]["content"]
     assert messages[1]["content"].endswith("请生成对话总结。")
     assert messages[2] == {"role": "system", "content": '工作流 {"memories": []}'}
+
+
+def test_build_summary_messages_does_not_truncate_valid_chunk_after_twelve_thousand_chars(
+    monkeypatch: Any,
+) -> None:
+    async def _template() -> dict[str, str]:
+        return {
+            "memory_summary_common_system": "共用系统提示",
+            "summary_workflow_system": "工作流 {{json_response_example}}",
+            "json_response_example": '{"memories": []}',
+        }
+
+    monkeypatch.setattr(
+        llm_service_module,
+        "get_summary_template",
+        _template,
+    )
+    tail_canary = "十二千字符后的尾部金丝雀"
+
+    messages = asyncio.run(
+        llm_service_module._build_summary_messages(
+            conversation_text=f"{'x' * 12_500}{tail_canary}",
+            participants=["10001"],
+            display_name_map={"10001": "阿明"},
+        )
+    )
+
+    assert tail_canary in messages[1]["content"]
+    assert 'truncated="false"' in messages[1]["content"]
 
 
 def test_generate_reply_marks_memory_reply_phase(monkeypatch: Any) -> None:

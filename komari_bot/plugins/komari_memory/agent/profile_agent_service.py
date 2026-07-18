@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from ..config_schema import KomariMemoryConfigSchema
     from ..services.memory_service import MemoryService
 
+from ..services.message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
+
 llm_provider = require("llm_provider")
 _PROFILE_TOOL_RESULT_MAX_CHARS = 12_000
 
@@ -138,7 +140,7 @@ async def _run_profile_agent_locked(
     config: KomariMemoryConfigSchema,
     trace_id: str,
 ) -> ProfileAgentResult:
-    messages = _build_initial_messages(
+    messages = await _build_initial_messages(
         conversation_text=conversation_text,
         participants=participants,
         display_name_map=display_name_map,
@@ -258,7 +260,7 @@ async def _load_profile_snapshot_profiles(
     return profiles
 
 
-def _build_initial_messages(
+async def _build_initial_messages(
     *,
     conversation_text: str,
     participants: list[str],
@@ -266,7 +268,7 @@ def _build_initial_messages(
     bot_user_ids: set[str],
     config: KomariMemoryConfigSchema,
 ) -> list[dict[str, Any]]:
-    template = get_summary_template()
+    template = await get_summary_template()
     workflow = render_summary_template(
         template["profile_agent_workflow_system"],
         bot_user_ids=", ".join(sorted(bot_user_ids)) or "无",
@@ -283,6 +285,7 @@ def _build_initial_messages(
                 source_type="conversation_history",
                 source_id="profile-agent-input",
                 content=external_context,
+                max_chars=MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS,
             )
         )
         + "\n\n请维护用户画像。"
