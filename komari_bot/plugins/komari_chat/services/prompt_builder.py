@@ -255,7 +255,7 @@ async def build_prompt(
     Returns:
         OpenAI 格式消息列表 [{role, content}]，当包含图片时 content 为数组格式
     """
-    template = get_template()
+    template = await get_template()
     messages: list[dict[str, Any]] = []
 
     # ═══════════════════════════════════════

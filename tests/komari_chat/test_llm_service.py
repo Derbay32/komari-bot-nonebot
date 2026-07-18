@@ -281,14 +281,21 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     ]
     searched_queries: list[str] = []
     searched_trace_ids: list[str | None] = []
+    searched_contexts: list[tuple[str | None, str | None, bool]] = []
 
     async def _fake_search_web(
         query: str,
         *,
         request_trace_id: str | None = None,
+        caller_user_id: str | None = None,
+        caller_group_id: str | None = None,
+        caller_is_superuser: bool = False,
     ) -> str:
         searched_queries.append(query)
         searched_trace_ids.append(request_trace_id)
+        searched_contexts.append(
+            (caller_user_id, caller_group_id, caller_is_superuser)
+        )
         return "搜索结果：今天有一条新闻"
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
@@ -304,12 +311,16 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
             messages=[{"role": "user", "content": "查一下今日新闻"}],
             tools=[llm_service_module.TAVILY_SEARCH_TOOL],
             request_trace_id="chat-search-1",
+            caller_user_id="user-1",
+            caller_group_id="group-1",
+            caller_is_superuser=True,
         )
     )
 
     assert result.content == "根据搜索结果回答"
     assert searched_queries == ["今日新闻"]
     assert searched_trace_ids == ["chat-search-1"]
+    assert searched_contexts == [("user-1", "group-1", True)]
     assert fake_provider.completion_calls[0]["tools"] == [
         llm_service_module.TAVILY_SEARCH_TOOL,
         llm_service_module.FINAL_RESPONSE_TOOL,
@@ -329,8 +340,8 @@ def test_generate_reply_with_tools_executes_read_profile_tool(monkeypatch: Any) 
             tool_calls=[
                 _tool_call(
                     "read_profile",
-                    '{"user_id":"user-2"}',
-                    {"user_id": "user-2"},
+                    '{"user_id":"user-2","group_id":"other-group"}',
+                    {"user_id": "user-2", "group_id": "other-group"},
                     call_id="call-profile-1",
                 )
             ],
@@ -382,6 +393,7 @@ def test_generate_reply_with_tools_executes_read_profile_tool(monkeypatch: Any) 
             request_trace_id="chat-profile-1",
             memory_service=_FakeMemory(),
             group_id="group-1",
+            allowed_profile_user_ids=frozenset({"user-2"}),
         )
     )
 
@@ -573,6 +585,7 @@ def test_read_profile_tool_filters_keys(monkeypatch: Any) -> None:
             tools=[llm_service_module.READ_PROFILE_TOOL],
             memory_service=_FakeMemory(),
             group_id="group-1",
+            allowed_profile_user_ids=frozenset({"user-2"}),
         )
     )
 
@@ -626,10 +639,122 @@ def test_read_profile_tool_returns_not_found(monkeypatch: Any) -> None:
             tools=[llm_service_module.READ_PROFILE_TOOL],
             memory_service=_FakeMemory(),
             group_id="group-1",
+            allowed_profile_user_ids=frozenset({"missing"}),
         )
     )
 
     assert "not_found: 用户画像不存在" in fake_provider.completion_calls[1]["messages"][-1]["content"]
+
+
+def test_read_profile_tool_denies_user_outside_visible_scope(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_profile",
+                    '{"user_id":"hidden-user"}',
+                    {"user_id": "hidden-user"},
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "无法读取不可见用户画像",
+                        "interaction_history": {
+                            "event": "尝试读取不可见画像",
+                            "result": "范围校验拒绝",
+                            "emotion": "平静",
+                        },
+                    },
+                )
+            ],
+        ),
+    ]
+
+    class _FailMemory:
+        async def get_user_profile(self, **_kwargs: Any) -> dict[str, Any]:
+            msg = "越权画像不应访问存储层"
+            raise AssertionError(msg)
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "查一下隐藏用户"}],
+            tools=[llm_service_module.READ_PROFILE_TOOL],
+            memory_service=_FailMemory(),
+            group_id="group-1",
+            allowed_profile_user_ids=frozenset({"current-user", "visible-user"}),
+        )
+    )
+
+    assert result.content == "无法读取不可见用户画像"
+    tool_content = fake_provider.completion_calls[1]["messages"][-1]["content"]
+    assert "user_id 不在本轮可见用户范围内" in tool_content
+
+
+def test_read_profile_output_hides_other_users_sensitive_traits() -> None:
+    profile = {
+        "display_name": "长门",
+        "traits": {
+            "喜欢的食物": {"value": "咖喱", "category": "preference"},
+            "与阿虚的关系": {"value": "非常在意", "category": "relation"},
+        },
+    }
+
+    other_user_output = llm_service_module._format_read_profile_tool_yaml(
+        user_id="user-2",
+        profile=profile,
+        keys=None,
+        include_sensitive_traits=False,
+    )
+    owner_output = llm_service_module._format_read_profile_tool_yaml(
+        user_id="user-2",
+        profile=profile,
+        keys=None,
+        include_sensitive_traits=True,
+    )
+
+    assert "喜欢的食物: 咖喱" in other_user_output
+    assert "与阿虚的关系" not in other_user_output
+    assert "sensitive_traits_omitted: true" in other_user_output
+    assert "与阿虚的关系: 非常在意" in owner_output
+
+
+def test_read_profile_output_applies_trait_character_and_token_budgets() -> None:
+    profile = {
+        "display_name": "测试用户",
+        "traits": {
+            f"字段{index}": {
+                "value": "很长的画像内容" * 200,
+                "category": "general",
+            }
+            for index in range(30)
+        },
+    }
+
+    output = llm_service_module._format_read_profile_tool_yaml(
+        user_id="user-2",
+        profile=profile,
+        keys=None,
+        include_sensitive_traits=False,
+    )
+
+    assert len(output) <= llm_service_module._MAX_READ_PROFILE_RESULT_CHARS
+    assert (
+        llm_service_module.estimate_text_tokens(output)
+        <= llm_service_module._MAX_READ_PROFILE_RESULT_TOKENS
+    )
+    assert output.count("  - ") <= llm_service_module._MAX_READ_PROFILE_TRAITS
+    assert "traits_truncated: true" in output
 
 
 def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> None:

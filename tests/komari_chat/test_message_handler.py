@@ -133,13 +133,14 @@ def test_resolve_trigger_message_keeps_regular_text_unchanged(
 class _FakeRedis:
     def __init__(self, history: list[MessageSchema]) -> None:
         self.history = list(history)
+        self.buffer_calls: list[dict[str, object]] = []
         self.pushed_messages: list[MessageSchema] = []
         self.pushed_global_interactions: list[dict[str, object]] = []
         self.global_interaction_buffer_calls: list[dict[str, object]] = []
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
-        del group_id, limit
-        return list(self.history)
+        self.buffer_calls.append({"group_id": group_id, "limit": limit})
+        return list(self.history[-limit:])
 
     async def push_message(self, group_id: str, message: MessageSchema) -> None:
         del group_id
@@ -296,12 +297,107 @@ def _build_reply(
     )
 
 
+def test_recent_context_uses_newest_contiguous_messages_within_budget() -> None:
+    messages = [
+        MessageSchema(
+            user_id="u1",
+            user_nickname="旧消息",
+            group_id="g1",
+            content="旧内容",
+            timestamp=1,
+            message_id="m1",
+        ),
+        MessageSchema(
+            user_id="u2",
+            user_nickname="超长消息",
+            group_id="g1",
+            content="长" * 1_000,
+            timestamp=2,
+            message_id="m2",
+        ),
+        MessageSchema(
+            user_id="u3",
+            user_nickname="最新消息",
+            group_id="g1",
+            content="最新内容",
+            timestamp=3,
+            message_id="m3",
+        ),
+    ]
+
+    selected = message_handler_module.MessageHandler._select_recent_context(
+        messages,
+        max_messages=10,
+        max_utf8_bytes=128,
+        max_estimated_tokens=128,
+    )
+
+    assert [message.message_id for message in selected] == ["m3"]
+
+
+def test_read_buffers_uses_context_limit_instead_of_summary_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = [
+        MessageSchema(
+            user_id="u1",
+            user_nickname="用户",
+            group_id="g1",
+            content=f"消息 {index}",
+            timestamp=float(index),
+            message_id=f"m{index}",
+        )
+        for index in range(20)
+    ]
+    redis = _FakeRedis(history)
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            context_messages_limit=5,
+            context_max_utf8_bytes=24_000,
+            context_max_estimated_tokens=6_000,
+        ),
+    )
+    current = MessageSchema(
+        user_id="u2",
+        user_nickname="当前用户",
+        group_id="g1",
+        content="当前消息",
+        timestamp=21,
+        message_id="current",
+    )
+
+    recent, _interactions, stored = asyncio.run(
+        handler._read_buffers(
+            group_id="g1",
+            user_id="u2",
+            message=current,
+            store_current=False,
+        )
+    )
+
+    assert redis.buffer_calls == [{"group_id": "g1", "limit": 5}]
+    assert [message.message_id for message in recent] == [
+        "m15",
+        "m16",
+        "m17",
+        "m18",
+        "m19",
+    ]
+    assert stored is False
+
+
 def test_attempt_reply_only_rewrites_current_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     previous_message = MessageSchema(
-        user_id="user-1",
-        user_nickname="阿虚",
+        user_id="user-2",
+        user_nickname="长门",
         group_id="group-1",
         content="前一条过滤后文本",
         timestamp=1.0,
@@ -371,7 +467,7 @@ def test_attempt_reply_only_rewrites_current_message(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     original_require = nonebot.plugin.require
 
@@ -424,6 +520,12 @@ def test_attempt_reply_only_rewrites_current_message(
     assert llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL in generate_with_tools_kwargs["tools"]
     assert generate_with_tools_kwargs["memory_service"] is memory
     assert generate_with_tools_kwargs["group_id"] == "group-1"
+    assert generate_with_tools_kwargs["allowed_profile_user_ids"] == frozenset(
+        {"user-1", "user-2"}
+    )
+    assert generate_with_tools_kwargs["caller_user_id"] == "user-1"
+    assert generate_with_tools_kwargs["caller_group_id"] == "group-1"
+    assert generate_with_tools_kwargs["caller_is_superuser"] is False
     assert generate_with_tools_kwargs["max_tool_rounds"] == 5
     injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
     assert injected_favorability.favorability == 0
@@ -693,6 +795,7 @@ class _FakeRedisForDebug:
         self.global_interaction_buffer_calls: list[dict[str, object]] = []
         self.reserve_proactive_calls: list[dict[str, object]] = []
         self.confirm_proactive_calls: list[dict[str, object]] = []
+        self.renew_proactive_calls: list[dict[str, object]] = []
         self.release_proactive_calls: list[dict[str, str]] = []
         self.reservation_status = "reserved"
 
@@ -749,6 +852,22 @@ class _FakeRedisForDebug:
                 "cooldown_seconds": cooldown_seconds,
             }
         )
+
+    async def renew_proactive_reply(
+        self,
+        group_id: str,
+        reservation_id: str,
+        *,
+        reservation_ttl_seconds: int,
+    ) -> bool:
+        self.renew_proactive_calls.append(
+            {
+                "group_id": group_id,
+                "reservation_id": reservation_id,
+                "reservation_ttl_seconds": reservation_ttl_seconds,
+            }
+        )
+        return True
 
     async def release_proactive_reply(
         self,
@@ -827,7 +946,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
 
     # 注入必要的全局配置
@@ -899,6 +1018,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert redis.pushed_global_interactions == []  # 没有写互动历史
     assert redis.reserve_proactive_calls == []
     assert redis.confirm_proactive_calls == []
+    assert redis.renew_proactive_calls == []
     assert redis.release_proactive_calls == []
     assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
 
@@ -919,7 +1039,7 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -999,7 +1119,7 @@ def test_generate_debug_reply_with_images_and_reply_context(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -1121,7 +1241,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda: False),
+        SimpleNamespace(is_search_available=lambda **_kwargs: False),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -1277,6 +1397,13 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
         }
     ]
     assert redis.confirm_proactive_calls == []
+    assert redis.renew_proactive_calls == [
+        {
+            "group_id": "group-proactive",
+            "reservation_id": "message-proactive",
+            "reservation_ttl_seconds": 360,
+        }
+    ]
     assert commit_calls == []
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))

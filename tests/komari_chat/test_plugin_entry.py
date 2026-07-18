@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, Any, cast
 
 import nonebot.plugin
 import pytest
+from nonebot.adapters.onebot.v11 import ActionFailed
 
 if TYPE_CHECKING:
-    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
     from nonebug import App
 
 
@@ -197,7 +198,13 @@ async def test_send_failure_does_not_commit_reply_side_effects(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = SimpleNamespace(send=False, commit=False, discard=False)
+    calls = SimpleNamespace(
+        prepare=False,
+        send=False,
+        commit=False,
+        cancel=False,
+        discard=False,
+    )
     pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
 
     class _Handler:
@@ -210,7 +217,16 @@ async def test_send_failure_does_not_commit_reply_side_effects(
             return pending_reply
 
         @staticmethod
-        async def commit_delivered_reply(_pending_reply: object) -> None:
+        async def prepare_pending_reply(actual_pending_reply: object) -> bool:
+            assert actual_pending_reply is pending_reply
+            calls.prepare = True
+            return True
+
+        @staticmethod
+        async def commit_delivered_reply(
+            _pending_reply: object,
+            **_kwargs: object,
+        ) -> None:
             calls.commit = True
 
         @staticmethod
@@ -218,10 +234,19 @@ async def test_send_failure_does_not_commit_reply_side_effects(
             assert actual_pending_reply is pending_reply
             calls.discard = True
 
+        @staticmethod
+        async def cancel_prepared_reply(actual_pending_reply: object) -> None:
+            assert actual_pending_reply is pending_reply
+            calls.cancel = True
+
     async def _fail_send(_message: object) -> None:
         calls.send = True
-        msg = "模拟发送失败"
-        raise RuntimeError(msg)
+        raise ActionFailed(
+            status="failed",
+            retcode=100,
+            data=None,
+            message="模拟明确发送失败",
+        )
 
     _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
     monkeypatch.setattr(chat_module.matcher, "send", _fail_send)
@@ -231,8 +256,10 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 
+    assert calls.prepare
     assert calls.send
     assert not calls.commit
+    assert calls.cancel
     assert calls.discard
 
 
@@ -242,6 +269,7 @@ async def test_successful_send_commits_reply_side_effects_after_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
+    committed_platform_ids: list[str | None] = []
     pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
 
     class _Handler:
@@ -254,12 +282,24 @@ async def test_successful_send_commits_reply_side_effects_after_delivery(
             return pending_reply
 
         @staticmethod
-        async def commit_delivered_reply(actual_pending_reply: object) -> None:
+        async def prepare_pending_reply(actual_pending_reply: object) -> bool:
+            assert actual_pending_reply is pending_reply
+            order.append("准备")
+            return True
+
+        @staticmethod
+        async def commit_delivered_reply(
+            actual_pending_reply: object,
+            *,
+            platform_message_id: str | None = None,
+        ) -> None:
             assert actual_pending_reply is pending_reply
             order.append("提交")
+            committed_platform_ids.append(platform_message_id)
 
-    async def _send(_message: object) -> None:
+    async def _send(_message: object) -> dict[str, int]:
         order.append("发送")
+        return {"message_id": 7788}
 
     _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
     monkeypatch.setattr(chat_module.matcher, "send", _send)
@@ -269,7 +309,50 @@ async def test_successful_send_commits_reply_side_effects_after_delivery(
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 
-    assert order == ["发送", "提交"]
+    assert order == ["准备", "发送", "提交"]
+    assert committed_platform_ids == ["7788"]
+
+
+@pytest.mark.asyncio
+async def test_llm_cq_literal_is_sent_as_one_plain_text_segment(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cq_literal = "[CQ:reply,id=1][CQ:at,qq=all][CQ:image,file=evil]"
+    pending_reply = SimpleNamespace(reply=cq_literal, reply_to_message_id=None)
+    sent_messages: list[Message] = []
+
+    class _Handler:
+        @staticmethod
+        async def process_message(
+            _bot: object,
+            _event: object,
+            **_kwargs: object,
+        ) -> object:
+            return pending_reply
+
+        @staticmethod
+        async def commit_delivered_reply(
+            _pending_reply: object,
+            **_kwargs: object,
+        ) -> None:
+            return None
+
+    async def _send(message: Message) -> None:
+        sent_messages.append(message)
+
+    _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
+    monkeypatch.setattr(chat_module.matcher, "send", _send)
+
+    await chat_module.handle_group_message(
+        cast("Bot", cast("Any", object())),
+        cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+    )
+
+    assert len(sent_messages) == 1
+    assert len(sent_messages[0]) == 1
+    assert sent_messages[0][0].type == "text"
+    assert sent_messages[0][0].data == {"text": cq_literal}
 
 
 @pytest.mark.asyncio
@@ -290,7 +373,10 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
             return pending_reply
 
         @staticmethod
-        async def commit_delivered_reply(_pending_reply: object) -> None:
+        async def commit_delivered_reply(
+            _pending_reply: object,
+            **_kwargs: object,
+        ) -> None:
             msg = "模拟送达后的提交失败"
             raise RuntimeError(msg)
 
@@ -310,4 +396,53 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
     )
 
     assert calls.send
+    assert not calls.discard
+
+
+@pytest.mark.asyncio
+async def test_unknown_send_result_keeps_prepared_outbox_for_reconciliation(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = SimpleNamespace(cancel=False, discard=False)
+    pending_reply = SimpleNamespace(
+        reply="测试回复",
+        reply_to_message_id=None,
+        operation_id="reply-operation-unknown",
+    )
+
+    class _Handler:
+        @staticmethod
+        async def process_message(
+            _bot: object,
+            _event: object,
+            **_kwargs: object,
+        ) -> object:
+            return pending_reply
+
+        @staticmethod
+        async def prepare_pending_reply(_pending_reply: object) -> bool:
+            return True
+
+        @staticmethod
+        async def cancel_prepared_reply(_pending_reply: object) -> None:
+            calls.cancel = True
+
+        @staticmethod
+        async def discard_pending_reply(_pending_reply: object) -> None:
+            calls.discard = True
+
+    async def _unknown_send(_message: object) -> None:
+        msg = "网络超时，平台是否接收未知"
+        raise TimeoutError(msg)
+
+    _install_allowed_entry_dependencies(chat_module, monkeypatch, _Handler())
+    monkeypatch.setattr(chat_module.matcher, "send", _unknown_send)
+
+    await chat_module.handle_group_message(
+        cast("Bot", cast("Any", object())),
+        cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+    )
+
+    assert not calls.cancel
     assert not calls.discard

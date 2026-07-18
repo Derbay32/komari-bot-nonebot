@@ -1,14 +1,20 @@
 """Komari Chat - 群聊消息处理与 AI 聊天插件。"""
 
-from typing import Any
+import asyncio
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any, cast
 
-from nonebot import logger, on_message
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+from nonebot import get_driver, logger, on_message
+from nonebot.adapters.onebot.v11 import ActionFailed, Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.common.onebot_rules import group_message_rule
 
 from .handlers.message_handler import DebugReplyResult, MessageHandler, PendingReply
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
 
 # 依赖插件
 permission_manager_plugin = require("permission_manager")
@@ -31,6 +37,7 @@ __plugin_meta__ = PluginMetadata(
 matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 
 _handler: MessageHandler | None = None
+_reply_commit_worker_task: asyncio.Task[None] | None = None
 
 
 def _resolve_runtime_components() -> tuple[Any, Any, Any | None, Any] | None:
@@ -72,6 +79,46 @@ def _get_or_build_handler() -> MessageHandler | None:
     return _handler
 
 
+async def _reply_commit_worker() -> None:
+    """周期重试已经确认送达的聊天副作用 outbox。"""
+    while True:
+        try:
+            handler = _get_or_build_handler()
+            if handler is not None:
+                await handler.retry_pending_reply_commits()
+            interval = get_config().reply_commit_worker_interval_seconds
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[KomariChat] 回复 outbox 后台轮询失败")
+            interval = 5
+        await asyncio.sleep(max(1, interval))
+
+
+async def _start_reply_commit_worker() -> None:
+    """启动单进程 outbox 轮询任务。"""
+    global _reply_commit_worker_task  # noqa: PLW0603
+    if _reply_commit_worker_task is None or _reply_commit_worker_task.done():
+        _reply_commit_worker_task = asyncio.create_task(_reply_commit_worker())
+
+
+async def _stop_reply_commit_worker() -> None:
+    """停止 outbox 轮询任务并等待退出。"""
+    global _reply_commit_worker_task  # noqa: PLW0603
+    task = _reply_commit_worker_task
+    _reply_commit_worker_task = None
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+driver = get_driver()
+driver.on_startup(_start_reply_commit_worker)
+driver.on_shutdown(_stop_reply_commit_worker)
+
+
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
     """在触发聊天回复后，对触发消息添加表情反应。"""
     config = get_config()
@@ -88,6 +135,21 @@ async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
         logger.debug("[KomariChat] 表情反应发送失败: {}", e)
 
 
+def _extract_platform_message_id(response: object) -> str | None:
+    """从 OneBot/NoneBot 发送结果中提取可对账的平台消息 ID。"""
+    candidate: object | None = None
+    if isinstance(response, dict):
+        candidate = response.get("message_id")
+        if candidate is None and isinstance(response.get("data"), dict):
+            candidate = response["data"].get("message_id")
+    else:
+        candidate = getattr(response, "message_id", None)
+    if candidate is None:
+        return None
+    value = str(candidate).strip()
+    return value or None
+
+
 async def generate_debug_reply(
     *,
     group_id: str,
@@ -97,6 +159,7 @@ async def generate_debug_reply(
     bot: Bot | None = None,
     image_urls: list[str] | None = None,
     reply_context: Any = None,
+    caller_is_superuser: bool = False,
     collector: Any = None,
 ) -> DebugReplyResult:
     """debug 干跑回复生成：复用 ``_get_or_build_handler()`` 获取 handler，
@@ -135,6 +198,7 @@ async def generate_debug_reply(
         _bot=bot,
         image_urls=image_urls,
         reply_context=reply_context,
+        caller_is_superuser=caller_is_superuser,
         collector=collector,
     )
 
@@ -165,6 +229,9 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
     pending_reply: PendingReply | None = None
     reply_delivered = False
+    reply_prepared = False
+    delivery_outcome = "not_sent"
+    platform_message_id: str | None = None
     try:
         pending_reply = await handler.process_message(
             bot,
@@ -181,25 +248,78 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             await handler.discard_pending_reply(pending_reply)
             return
 
+        prepare_pending = getattr(handler, "prepare_pending_reply", None)
+        if callable(prepare_pending):
+            reply_prepared = bool(
+                await cast(
+                    "Awaitable[object]",
+                    prepare_pending(pending_reply),
+                )
+            )
+            if not reply_prepared:
+                logger.info("[KomariChat] 重复回复 operation 已存在，取消本次发送")
+                await handler.discard_pending_reply(pending_reply)
+                pending_reply = None
+                return
+
         if reply_to_message_id:
             message_array = [
                 {"type": "reply", "data": {"id": reply_to_message_id}},
                 {"type": "text", "data": {"text": reply}},
             ]
             try:
-                await bot.call_api(
+                response = await bot.call_api(
                     "send_group_msg",
                     group_id=int(event.group_id),
                     message=message_array,
                 )
-            except Exception as e:
+            except ActionFailed as e:
                 logger.warning("[KomariChat] 原生回复失败: {}，降级普通发送", e)
-                await matcher.send(reply)
+                try:
+                    response = await matcher.send(plain_text_message(reply))
+                except ActionFailed:
+                    raise
+                except Exception:
+                    delivery_outcome = "unknown"
+                    raise
+            except Exception:
+                delivery_outcome = "unknown"
+                raise
+            platform_message_id = _extract_platform_message_id(response)
         else:
-            await matcher.send(reply)
+            try:
+                response = await matcher.send(plain_text_message(reply))
+            except ActionFailed:
+                raise
+            except Exception:
+                delivery_outcome = "unknown"
+                raise
+            platform_message_id = _extract_platform_message_id(response)
+        delivery_outcome = "delivered"
         reply_delivered = True
-        await handler.commit_delivered_reply(pending_reply)
+        await handler.commit_delivered_reply(
+            pending_reply,
+            platform_message_id=platform_message_id,
+        )
     except Exception:
         if pending_reply is not None and not reply_delivered:
-            await handler.discard_pending_reply(pending_reply)
+            if delivery_outcome == "not_sent":
+                if reply_prepared:
+                    cancel_prepared = getattr(handler, "cancel_prepared_reply", None)
+                    if callable(cancel_prepared):
+                        try:
+                            await cast(
+                                "Awaitable[object]",
+                                cancel_prepared(pending_reply),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[KomariChat] 发送失败后的 outbox 取消失败"
+                            )
+                await handler.discard_pending_reply(pending_reply)
+            else:
+                logger.error(
+                    "[KomariChat] 平台发送结果未知，保留 PREPARED 记录待对账: operation={}",
+                    pending_reply.operation_id,
+                )
         logger.exception("[KomariChat] 消息处理失败")

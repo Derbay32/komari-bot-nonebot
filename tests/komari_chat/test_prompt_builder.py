@@ -22,19 +22,19 @@ async def _empty_search_by_keyword(_uid: str) -> list[object]:
     return []
 
 
+async def _prompt_template() -> dict[str, str]:
+    return {
+        "system_prompt": "system",
+        "memory_ack": "ack",
+        "memory_ack_role": "user",
+        "output_instruction": "output",
+        "cot_prefix": "cot",
+        "cot_prefix_role": "system",
+    }
+
+
 def _patch_dependencies(monkeypatch: Any) -> None:
-    monkeypatch.setattr(
-        prompt_builder_module,
-        "get_template",
-        lambda: {
-            "system_prompt": "system",
-            "memory_ack": "ack",
-            "memory_ack_role": "user",
-            "output_instruction": "output",
-            "cot_prefix": "cot",
-            "cot_prefix_role": "system",
-        },
-    )
+    monkeypatch.setattr(prompt_builder_module, "get_template", _prompt_template)
     monkeypatch.setattr(prompt_builder_module, "get_festival_info", lambda: None)
     monkeypatch.setattr(
         prompt_builder_module,

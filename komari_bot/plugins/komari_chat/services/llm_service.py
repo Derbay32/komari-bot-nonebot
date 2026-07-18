@@ -13,6 +13,7 @@ from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
+from komari_bot.common.content_budget import estimate_text_tokens
 from komari_bot.common.profile_operations import profile_traits_to_list
 from komari_bot.common.untrusted_context import (
     UntrustedContext,
@@ -70,6 +71,11 @@ _MAX_TOOL_ROUNDS = 6
 _MAX_TOOL_CALLS_PER_ROUND = 4
 _MAX_TOTAL_TOOL_CALLS = 12
 _MAX_TOOL_RESULT_CHARS = 8_000
+_MAX_READ_PROFILE_TRAITS = 16
+_MAX_READ_PROFILE_RESULT_CHARS = 4_000
+_MAX_READ_PROFILE_RESULT_TOKENS = 2_048
+_READ_PROFILE_PUBLIC_CATEGORIES = frozenset({"preference", "fact", "general"})
+_READ_PROFILE_SENSITIVE_CATEGORIES = frozenset({"relation"})
 _TOOL_SOURCE_TYPES: dict[str, UntrustedSourceType] = {
     READ_IMAGE_TOOL_NAME: "vision",
     SEARCH_WEB_TOOL_NAME: "web",
@@ -540,22 +546,56 @@ def _format_read_profile_tool_yaml(
     user_id: str,
     profile: dict[str, Any],
     keys: set[str] | None,
+    include_sensitive_traits: bool,
 ) -> str:
-    traits = profile_traits_to_list(profile.get("traits"))
+    all_traits = profile_traits_to_list(profile.get("traits"))
     if keys is not None:
-        traits = [item for item in traits if str(item.get("key", "")) in keys]
+        all_traits = [
+            item for item in all_traits if str(item.get("key", "")) in keys
+        ]
+
+    visible_categories = set(_READ_PROFILE_PUBLIC_CATEGORIES)
+    if include_sensitive_traits:
+        visible_categories.update(_READ_PROFILE_SENSITIVE_CATEGORIES)
+    traits = [
+        item
+        for item in all_traits
+        if str(item.get("category", "general")) in visible_categories
+    ]
+    sensitive_traits_omitted = len(traits) != len(all_traits)
+    traits_truncated = len(traits) > _MAX_READ_PROFILE_TRAITS
+    traits = traits[:_MAX_READ_PROFILE_TRAITS]
 
     lines = [f"user_id: {user_id}"]
-    name = _clean_yaml_text(profile.get("display_name") or profile.get("name") or user_id)
+    name = _clean_yaml_text(
+        profile.get("display_name") or profile.get("name") or user_id
+    )[:128]
     lines.append(f"name: {name}")
     if traits:
         lines.append("traits:")
         for item in traits:
-            key = _clean_yaml_text(item["key"])
+            key = _clean_yaml_text(item["key"])[:64]
             value = _clean_yaml_text(item["value"])
-            lines.append(f"  - {key}: {value}")
+            value_truncated = len(value) > 512
+            if value_truncated:
+                value = f"{value[:511]}…"
+            candidate_lines = [*lines, f"  - {key}: {value}"]
+            candidate_text = "\n".join(candidate_lines)
+            if (
+                len(candidate_text) > _MAX_READ_PROFILE_RESULT_CHARS - 80
+                or estimate_text_tokens(candidate_text)
+                > _MAX_READ_PROFILE_RESULT_TOKENS
+            ):
+                traits_truncated = True
+                break
+            lines = candidate_lines
+            traits_truncated = traits_truncated or value_truncated
     else:
         lines.append("traits: []")
+    if sensitive_traits_omitted:
+        lines.append("sensitive_traits_omitted: true")
+    if traits_truncated:
+        lines.append("traits_truncated: true")
     return "\n".join(lines)
 
 
@@ -565,6 +605,8 @@ async def _build_read_profile_tool_result(
     group_id: str | None,
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
+    allowed_profile_user_ids: frozenset[str],
+    caller_user_id: str | None,
 ) -> str:
     """执行 read_profile 工具并返回 YAML 风格只读画像。"""
     if memory_service is None or group_id is None:
@@ -573,12 +615,19 @@ async def _build_read_profile_tool_result(
     user_id, keys = _parse_read_profile_arguments(parsed_arguments, raw_arguments)
     if user_id is None:
         return "error: user_id 参数缺失或格式错误"
+    if user_id not in allowed_profile_user_ids:
+        return "error: user_id 不在本轮可见用户范围内"
 
     profile = await memory_service.get_user_profile(user_id=user_id, group_id=group_id)
     if profile is None:
         return "not_found: 用户画像不存在"
 
-    return _format_read_profile_tool_yaml(user_id=user_id, profile=profile, keys=keys)
+    return _format_read_profile_tool_yaml(
+        user_id=user_id,
+        profile=profile,
+        keys=keys,
+        include_sensitive_traits=user_id == caller_user_id,
+    )
 
 
 async def _build_image_tool_result(
@@ -617,15 +666,22 @@ async def _build_search_tool_result(
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
     request_trace_id: str | None = None,
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
 ) -> str:
     """执行 search_web 工具并返回工具消息内容。"""
     query = _parse_search_query(parsed_arguments, raw_arguments)
     if query is None:
         return "[搜索失败：query 参数缺失或格式错误]"
-    return await komari_search.search_web(
-        query,
-        request_trace_id=request_trace_id,
-    )
+    search_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
+    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
+        search_kwargs.update(
+            caller_user_id=caller_user_id,
+            caller_group_id=caller_group_id,
+            caller_is_superuser=caller_is_superuser,
+        )
+    return await komari_search.search_web(query, **search_kwargs)
 
 
 def _build_tool_call_message(
@@ -885,6 +941,10 @@ async def _execute_business_tool(
     round_num: int,
     memory_service: MemoryService | None,
     group_id: str | None,
+    allowed_profile_user_ids: frozenset[str],
+    caller_user_id: str | None,
+    caller_group_id: str | None,
+    caller_is_superuser: bool,
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -925,6 +985,9 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
                 request_trace_id=request_trace_id,
+                caller_user_id=caller_user_id,
+                caller_group_id=caller_group_id,
+                caller_is_superuser=caller_is_superuser,
             )
             if content.startswith("[搜索失败"):
                 status = "error"
@@ -937,6 +1000,8 @@ async def _execute_business_tool(
                 group_id=group_id,
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
+                allowed_profile_user_ids=allowed_profile_user_ids,
+                caller_user_id=caller_user_id,
             )
             if content.startswith("error:"):
                 status = "error"
@@ -993,6 +1058,10 @@ async def _execute_tool_loop(
     max_tool_rounds: int,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
+    allowed_profile_user_ids: frozenset[str] = frozenset(),
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
@@ -1328,6 +1397,10 @@ async def _execute_tool_loop(
                     round_num=round_num,
                     memory_service=memory_service,
                     group_id=group_id,
+                    allowed_profile_user_ids=allowed_profile_user_ids,
+                    caller_user_id=caller_user_id,
+                    caller_group_id=caller_group_id,
+                    caller_is_superuser=caller_is_superuser,
                     request_trace_id=request_trace_id,
                     parent_call_id=round_call_id,
                     collector=collector,
@@ -1419,6 +1492,10 @@ async def generate_reply_with_tools(
     max_tool_rounds: int = 3,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
+    allowed_profile_user_ids: frozenset[str] = frozenset(),
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
@@ -1465,6 +1542,10 @@ async def generate_reply_with_tools(
         max_tool_rounds=round_limit,
         memory_service=memory_service,
         group_id=group_id,
+        allowed_profile_user_ids=allowed_profile_user_ids,
+        caller_user_id=caller_user_id,
+        caller_group_id=caller_group_id,
+        caller_is_superuser=caller_is_superuser,
         max_favorability_delta=max_favorability_delta,
         vision_thinking_mode=vision_thinking_mode,
         vision_reasoning_effort=vision_reasoning_effort,
