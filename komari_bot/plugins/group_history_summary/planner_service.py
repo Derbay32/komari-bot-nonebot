@@ -341,8 +341,8 @@ def _serialize_tool_result(result: SummaryToolResult) -> str:
     )
 
 
-def _build_planning_messages(user_request: str) -> list[dict[str, Any]]:
-    template = get_template()
+async def _build_planning_messages(user_request: str) -> list[dict[str, Any]]:
+    template = await get_template()
     return [
         {"role": "system", "content": template["planning_system_prompt"]},
         {"role": "user", "content": user_request},
@@ -547,7 +547,7 @@ async def plan_summary_request(
     history_min_coverage_ratio: float = 0.8,
 ) -> SummaryPlanResult:
     """使用工具调用规划总结所需的历史记录。"""
-    messages = _build_planning_messages(user_request)
+    messages = await _build_planning_messages(user_request)
     tools = build_summary_tools()
     tool_result: SummaryToolResult | None = None
     rounds_used = 0

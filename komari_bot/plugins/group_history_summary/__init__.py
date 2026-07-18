@@ -10,6 +10,7 @@ from nonebot.exception import FinishedException
 from nonebot.matcher import current_matcher
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.common.onebot_rules import group_message_to_me_rule
 
 from .config_schema import DynamicConfigSchema
@@ -182,11 +183,11 @@ async def handle_group_history_summary(
             history_capability_confirmed=True,
         )
     except SummaryBusyError as exc:
-        await summary_matcher.finish(str(exc))
+        await summary_matcher.finish(plain_text_message(exc))
     except HistoryIncompleteError:
         await summary_matcher.finish("群历史记录没能完整取回，暂时不能可靠地总结……")
     except SummaryServiceUnavailableError as exc:
-        await summary_matcher.finish(str(exc))
+        await summary_matcher.finish(plain_text_message(exc))
     except CapabilityNotSupportedError:
         return
     except FinishedException:
@@ -196,9 +197,11 @@ async def handle_group_history_summary(
         return
 
     if not result.image_base64:
-        await summary_matcher.finish(result.summary_text)
+        await summary_matcher.finish(plain_text_message(result.summary_text))
 
-    await bot.send(
-        event,
-        MessageSegment.image(file=f"base64://{result.image_base64}"),
-    )
+    image_pages = getattr(result, "image_pages_base64", ()) or (result.image_base64,)
+    for image_page in image_pages:
+        await bot.send(
+            event,
+            MessageSegment.image(file=f"base64://{image_page}"),
+        )

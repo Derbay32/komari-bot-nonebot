@@ -1006,17 +1006,17 @@ async def test_image_rendering_runs_outside_event_loop_thread(
 
     render_thread_id = 0
 
-    def _fake_render(**_kwargs: Any) -> str:
+    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
         nonlocal render_thread_id
         render_thread_id = threading.get_ident()
-        return "image-data"
+        return SimpleNamespace(images_base64=("image-data",), truncated=False)
 
     monkeypatch.setattr(
         exec_module, "check_group_history_supported", _async_return_true
     )
     monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
     monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
-    monkeypatch.setattr(exec_module, "render_summary_image_base64", _fake_render)
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
 
     event_loop_thread_id = threading.get_ident()
     result = await execute_group_summary(
@@ -1028,6 +1028,8 @@ async def test_image_rendering_runs_outside_event_loop_thread(
     )
 
     assert result.image_base64 == "image-data"
+    assert result.image_pages_base64 == ("image-data",)
+    assert result.image_truncated is False
     assert render_thread_id != event_loop_thread_id
 
 
@@ -1073,16 +1075,16 @@ async def test_allowed_partial_history_is_explicit_in_result_and_image(
 
     rendered_lines: list[str] = []
 
-    def _fake_render(**kwargs: Any) -> str:
+    def _fake_render(**kwargs: Any) -> SimpleNamespace:
         rendered_lines.extend(kwargs["body_lines"])
-        return "image-data"
+        return SimpleNamespace(images_base64=("image-data",), truncated=False)
 
     monkeypatch.setattr(
         exec_module, "check_group_history_supported", _async_return_true
     )
     monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
     monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
-    monkeypatch.setattr(exec_module, "render_summary_image_base64", _fake_render)
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
 
     result = await execute_group_summary(
         bot=cast("Any", SimpleNamespace()),

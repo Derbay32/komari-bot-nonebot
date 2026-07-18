@@ -275,8 +275,9 @@ def test_build_summary_tools_contains_expected_functions() -> None:
     ]
 
 
-def test_planning_rules_use_system_role_and_history_is_untrusted() -> None:
-    planning_messages = _build_planning_messages("总结最近消息")
+@pytest.mark.asyncio
+async def test_planning_rules_use_system_role_and_history_is_untrusted() -> None:
+    planning_messages = await _build_planning_messages("总结最近消息")
     assert planning_messages[0]["role"] == "system"
     assert planning_messages[1] == {"role": "user", "content": "总结最近消息"}
 

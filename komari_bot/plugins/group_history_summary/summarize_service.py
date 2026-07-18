@@ -76,7 +76,7 @@ async def _summarize_history_internal(
     if not history_messages:
         return DEFAULT_SUMMARY_TEXT, None
 
-    template = get_template()
+    template = await get_template()
     transcript = _build_transcript(history_messages)
     transcript_context = render_untrusted_context(
         UntrustedContext(

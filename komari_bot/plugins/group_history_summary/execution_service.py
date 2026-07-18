@@ -15,7 +15,7 @@ from .history_service import (
     HistoryIncompleteError,
     check_group_history_supported,
 )
-from .image_renderer import render_summary_image_base64
+from .image_renderer import render_summary_image_pages_base64
 from .planner_service import SummaryPlanResult, plan_summary_request
 from .summarize_service import summarize_history_messages, summary_text_to_lines
 
@@ -47,6 +47,8 @@ class SummaryExecutionResult:
     filtered_message_count: int
     plan_result: SummaryPlanResult
     image_base64: str
+    image_pages_base64: tuple[str, ...]
+    image_truncated: bool
     filter_label: str
     time_range: str
     history_fetch: HistoryFetchMetadata | None
@@ -156,6 +158,8 @@ async def _execute_group_summary_core(
             filtered_message_count=0,
             plan_result=plan_result,
             image_base64="",
+            image_pages_base64=(),
+            image_truncated=False,
             filter_label="无",
             time_range="无",
             history_fetch=history_fetch,
@@ -186,19 +190,22 @@ async def _execute_group_summary_core(
         filtered_messages[-1].timestamp,
     )
     subtitle = f"{filter_label} {len(filtered_messages)} 条 | {time_range}"
-    image_base64 = await asyncio.to_thread(
-        render_summary_image_base64,
+    image_render = await asyncio.to_thread(
+        render_summary_image_pages_base64,
         title=SUMMARY_TITLE,
         subtitle=subtitle,
         body_lines=body_lines,
         layout_params=config.layout_params.model_dump(),
     )
+    image_pages = image_render.images_base64
 
     return SummaryExecutionResult(
         summary_text=result_summary_text,
         filtered_message_count=len(filtered_messages),
         plan_result=plan_result,
-        image_base64=image_base64,
+        image_base64=image_pages[0] if image_pages else "",
+        image_pages_base64=image_pages,
+        image_truncated=image_render.truncated,
         filter_label=filter_label,
         time_range=time_range,
         history_fetch=history_fetch,
