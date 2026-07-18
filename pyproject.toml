@@ -137,6 +137,9 @@ typeCheckingMode = "standard"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
+filterwarnings = [
+    "error:Failing to pass a value to the 'type_params'.*:DeprecationWarning:nonebot\\.typing",
+]
 
 [tool.poetry]
 package-mode = false
