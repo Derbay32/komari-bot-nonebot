@@ -76,7 +76,7 @@ def _build_app(reader: _FakeReader | None) -> FastAPI:
     api_app = FastAPI()
     register_llm_provider_api(
         api_app,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         allowed_origins=["https://ui.example.com"],
         reader_getter=lambda: reader,
     )
@@ -106,7 +106,7 @@ async def test_llm_provider_routes_require_token_and_handle_cors(app: App) -> No
 @pytest.mark.asyncio
 async def test_llm_provider_routes_support_list_and_detail_filters(app: App) -> None:
     reader = _FakeReader()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(reader))) as ctx:
         client = ctx.get_client()
@@ -159,7 +159,7 @@ async def test_llm_provider_routes_return_503_when_reader_unavailable(app: App) 
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/reply-logs",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 503
@@ -172,7 +172,7 @@ async def test_llm_provider_routes_report_validation_errors(app: App) -> None:
         client = ctx.get_client()
         response = await client.get(
             _with_query(f"{API_PREFIX}/reply-logs", date="bad-date"),
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 422

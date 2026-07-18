@@ -30,6 +30,24 @@ class _FakeManagedClient:
         self.closed = True
 
 
+class _BlockingHealthClient(_FakeManagedClient):
+    def __init__(
+        self,
+        *,
+        healthcheck_started: asyncio.Event,
+        healthcheck_release: asyncio.Event,
+    ) -> None:
+        super().__init__()
+        self._healthcheck_started = healthcheck_started
+        self._healthcheck_release = healthcheck_release
+
+    async def test_connection(self, model: str | None = None) -> bool:
+        self.healthcheck_models.append(model)
+        self._healthcheck_started.set()
+        await self._healthcheck_release.wait()
+        return self.healthy
+
+
 def _settings(token: str, *, model: str = "chat") -> ClientSettings:
     return ClientSettings(
         api_token=token,
@@ -129,6 +147,138 @@ def test_pool_rejects_unhealthy_replacement_without_closing_old_client() -> None
         await pool.close()
 
     asyncio.run(_run())
+
+
+def test_pool_healthcheck_does_not_block_old_lease_release_and_is_single_flight(
+) -> None:
+    state = {"settings": _settings("token-a")}
+    clients: list[_FakeManagedClient] = []
+
+    async def _run() -> None:
+        healthcheck_started = asyncio.Event()
+        healthcheck_release = asyncio.Event()
+
+        def _factory(_value: ClientSettings) -> _FakeManagedClient:
+            if clients:
+                client = _BlockingHealthClient(
+                    healthcheck_started=healthcheck_started,
+                    healthcheck_release=healthcheck_release,
+                )
+            else:
+                client = _FakeManagedClient()
+            clients.append(client)
+            return client
+
+        pool = LLMClientPool(
+            settings_getter=lambda: state["settings"],
+            client_factory=_factory,
+        )
+        old_lease = pool.acquire()
+        old_client = await old_lease.__aenter__()
+        state["settings"] = _settings("token-b", model="model-b")
+
+        async def _use_new_client() -> Any:
+            async with pool.acquire() as client:
+                return client
+
+        requests = [asyncio.create_task(_use_new_client()) for _ in range(5)]
+        await asyncio.wait_for(healthcheck_started.wait(), timeout=1)
+
+        await asyncio.wait_for(
+            old_lease.__aexit__(None, None, None),
+            timeout=0.2,
+        )
+        assert old_client is clients[0]
+        assert clients[0].closed is False
+        assert len(clients) == 2
+        assert all(not request.done() for request in requests)
+
+        healthcheck_release.set()
+        new_clients = await asyncio.gather(*requests)
+        assert all(client is clients[1] for client in new_clients)
+        assert clients[1].healthcheck_models == ["model-b"]
+        assert clients[0].closed is True
+        await pool.close()
+
+    asyncio.run(_run())
+
+    assert clients[1].closed is True
+
+
+def test_pool_close_cancels_inflight_healthcheck_and_closes_candidates() -> None:
+    state = {"settings": _settings("token-a")}
+    clients: list[_FakeManagedClient] = []
+
+    async def _run() -> None:
+        healthcheck_started = asyncio.Event()
+        healthcheck_release = asyncio.Event()
+
+        def _factory(_value: ClientSettings) -> _FakeManagedClient:
+            if clients:
+                client = _BlockingHealthClient(
+                    healthcheck_started=healthcheck_started,
+                    healthcheck_release=healthcheck_release,
+                )
+            else:
+                client = _FakeManagedClient()
+            clients.append(client)
+            return client
+
+        pool = LLMClientPool(
+            settings_getter=lambda: state["settings"],
+            client_factory=_factory,
+        )
+        async with pool.acquire():
+            pass
+        state["settings"] = _settings("token-b")
+
+        async def _request() -> None:
+            async with pool.acquire():
+                pass
+
+        request = asyncio.create_task(_request())
+        await asyncio.wait_for(healthcheck_started.wait(), timeout=1)
+        await asyncio.wait_for(pool.close(), timeout=1)
+
+        with pytest.raises(RuntimeError, match="正在关闭"):
+            await request
+
+    asyncio.run(_run())
+
+    assert len(clients) == 2
+    assert all(client.closed for client in clients)
+
+
+def test_pool_recovers_after_client_factory_failure() -> None:
+    current_settings = _settings("token-a")
+    should_fail = True
+    clients: list[_FakeManagedClient] = []
+
+    def _factory(_value: ClientSettings) -> _FakeManagedClient:
+        nonlocal should_fail
+        if should_fail:
+            should_fail = False
+            raise RuntimeError("构造失败")
+        client = _FakeManagedClient()
+        clients.append(client)
+        return client
+
+    pool = LLMClientPool(
+        settings_getter=lambda: current_settings,
+        client_factory=_factory,
+    )
+
+    async def _run() -> None:
+        with pytest.raises(RuntimeError, match="构造失败"):
+            async with pool.acquire():
+                pass
+        async with pool.acquire() as client:
+            assert client is clients[0]
+        await pool.close()
+
+    asyncio.run(_run())
+
+    assert clients[0].closed is True
 
 
 def test_client_settings_repr_never_exposes_token() -> None:

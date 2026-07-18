@@ -19,7 +19,10 @@ from .base_client import (
     LLMToolCallSchema,
     UnifiedUsageSchema,
 )
-from .config_schema import DynamicConfigSchema
+from .config_schema import (
+    DynamicConfigSchema,
+    get_unsupported_extra_param_keys,
+)
 
 # 依赖 config_manager 插件
 config_manager_plugin = require("config_manager")
@@ -95,6 +98,24 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         suppress_tool_choice = thinking_mode
         return reasoning_effort, thinking_disabled, suppress_tool_choice
+
+    @staticmethod
+    def _build_extra_body(config: object, *, thinking_disabled: bool) -> dict[str, Any]:
+        """构造受白名单约束的 extra_body，避免覆盖正式请求字段。"""
+        extra_body: dict[str, Any] = {}
+        if thinking_disabled:
+            extra_body["thinking"] = {"type": "disabled"}
+
+        extra_params = getattr(config, "extra_params", {})
+        if not isinstance(extra_params, dict):
+            msg = "extra_params 必须是对象"
+            raise TypeError(msg)
+        unsupported = get_unsupported_extra_param_keys(extra_params)
+        if unsupported:
+            msg = f"extra_params 包含不允许的键: {', '.join(unsupported)}"
+            raise ValueError(msg)
+        extra_body.update(extra_params)
+        return extra_body
 
     @classmethod
     def _raise_invalid_response(cls) -> "Never":
@@ -349,16 +370,10 @@ class OpenAICompatibleClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_body: dict[str, Any] = {}
-            if thinking_disabled:
-                extra_body["thinking"] = {"type": "disabled"}
-            extra_params = getattr(config, "extra_params", {})
-            if extra_params:
-                for key, value in extra_params.items():
-                    if key in ("thinking", "enable_thinking") and extra_body:
-                        logger.warning("extra_params 中的 {} 与思考模式控制冲突，已忽略", key)
-                        continue
-                    extra_body[key] = value
+            extra_body = self._build_extra_body(
+                config,
+                thinking_disabled=thinking_disabled,
+            )
             if extra_body:
                 logger.debug("注入 OpenAI 兼容 API extra_body 键名: {}", sorted(extra_body))
                 request_data["extra_body"] = extra_body
@@ -468,16 +483,10 @@ class OpenAICompatibleClient(BaseLLMClient):
             if reasoning_effort is not None:
                 request_data["reasoning_effort"] = reasoning_effort
 
-            extra_body: dict[str, Any] = {}
-            if thinking_disabled:
-                extra_body["thinking"] = {"type": "disabled"}
-            extra_params = getattr(config, "extra_params", {})
-            if extra_params:
-                for key, value in extra_params.items():
-                    if key in ("thinking", "enable_thinking") and extra_body:
-                        logger.warning("extra_params 中的 {} 与思考模式控制冲突，已忽略", key)
-                        continue
-                    extra_body[key] = value
+            extra_body = self._build_extra_body(
+                config,
+                thinking_disabled=thinking_disabled,
+            )
             if extra_body:
                 logger.debug("注入 OpenAI 兼容 API extra_body 键名: {}", sorted(extra_body))
                 request_data["extra_body"] = extra_body

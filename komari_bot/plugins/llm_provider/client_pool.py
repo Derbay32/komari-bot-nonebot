@@ -78,6 +78,9 @@ class LLMClientPool:
         self._lock = asyncio.Lock()
         self._current: _ClientSlot | None = None
         self._retired: list[_ClientSlot] = []
+        self._refresh_tasks: dict[
+            tuple[str, str, float], asyncio.Task[None]
+        ] = {}
         self._shutting_down = False
 
     @asynccontextmanager
@@ -90,50 +93,103 @@ class LLMClientPool:
             await self._release_slot(slot)
 
     async def _acquire_slot(self) -> _ClientSlot:
-        settings = self._settings_getter()
+        while True:
+            settings = self._settings_getter()
+            fingerprint = settings.fingerprint
+
+            async with self._lock:
+                if self._shutting_down:
+                    raise RuntimeError("LLM 客户端连接池正在关闭")  # noqa: TRY003
+
+                if (
+                    self._current is not None
+                    and self._current.fingerprint == fingerprint
+                ):
+                    self._current.active_leases += 1
+                    return self._current
+
+                refresh_task = self._refresh_tasks.get(fingerprint)
+                if refresh_task is None:
+                    validate_candidate = self._current is not None
+                    refresh_task = asyncio.create_task(
+                        self._refresh_client(
+                            settings,
+                            validate_candidate=validate_candidate,
+                        ),
+                        name="llm-provider-client-refresh",
+                    )
+                    self._refresh_tasks[fingerprint] = refresh_task
+
+            try:
+                await asyncio.shield(refresh_task)
+            except BaseException:
+                if self._shutting_down:
+                    raise RuntimeError(  # noqa: TRY003
+                        "LLM 客户端连接池正在关闭"
+                    ) from None
+                latest_fingerprint = self._settings_getter().fingerprint
+                if latest_fingerprint != fingerprint:
+                    continue
+                raise
+
+    async def _refresh_client(
+        self,
+        settings: ClientSettings,
+        *,
+        validate_candidate: bool,
+    ) -> None:
+        """在锁外验证候选连接，并在锁内进行最小化的原子交换。"""
         fingerprint = settings.fingerprint
+        candidate: ManagedLLMClient | None = None
+        published = False
         close_after_swap: _ClientSlot | None = None
 
-        async with self._lock:
-            if self._shutting_down:
-                raise RuntimeError("LLM 客户端连接池正在关闭")  # noqa: TRY003
-
-            if self._current is not None and self._current.fingerprint == fingerprint:
-                self._current.active_leases += 1
-                return self._current
-
+        try:
             candidate = self._client_factory(settings)
-            if self._current is not None:
-                try:
-                    healthy = await candidate.test_connection(
-                        settings.healthcheck_model
-                    )
-                except BaseException:
-                    await self._close_client(candidate)
-                    raise
+            if validate_candidate:
+                healthy = await candidate.test_connection(
+                    settings.healthcheck_model
+                )
                 if not healthy:
-                    await self._close_client(candidate)
                     raise RuntimeError(  # noqa: TRY003
                         "新的 LLM 连接配置健康检查失败，已继续保留旧连接"
                     )
 
+            latest_fingerprint = self._settings_getter().fingerprint
+            if latest_fingerprint != fingerprint:
+                return
+
+            async with self._lock:
+                if self._shutting_down:
+                    raise RuntimeError("LLM 客户端连接池正在关闭")  # noqa: TRY003
+                if (
+                    self._current is not None
+                    and self._current.fingerprint == fingerprint
+                ):
+                    return
+
                 previous = self._current
-                previous.retired = True
-                self._retired.append(previous)
-                if previous.active_leases == 0:
-                    self._retired.remove(previous)
-                    close_after_swap = previous
+                if previous is not None:
+                    previous.retired = True
+                    self._retired.append(previous)
+                    if previous.active_leases == 0:
+                        self._retired.remove(previous)
+                        close_after_swap = previous
 
-            slot = _ClientSlot(
-                client=candidate,
-                fingerprint=fingerprint,
-                active_leases=1,
-            )
-            self._current = slot
-
-        if close_after_swap is not None:
-            await self._close_client(close_after_swap.client)
-        return slot
+                self._current = _ClientSlot(
+                    client=candidate,
+                    fingerprint=fingerprint,
+                )
+                published = True
+        finally:
+            if candidate is not None and not published:
+                await self._close_client(candidate)
+            if close_after_swap is not None:
+                await self._close_client(close_after_swap.client)
+            current_task = asyncio.current_task()
+            async with self._lock:
+                if self._refresh_tasks.get(fingerprint) is current_task:
+                    self._refresh_tasks.pop(fingerprint, None)
 
     async def _release_slot(self, slot: _ClientSlot) -> None:
         should_close = False
@@ -152,6 +208,7 @@ class LLMClientPool:
         to_close: list[_ClientSlot] = []
         async with self._lock:
             self._shutting_down = True
+            refresh_tasks = list(self._refresh_tasks.values())
             slots = [*(self._retired), *([self._current] if self._current else [])]
             self._retired = []
             self._current = None
@@ -161,6 +218,11 @@ class LLMClientPool:
                     to_close.append(slot)
                 else:
                     self._retired.append(slot)
+
+        for task in refresh_tasks:
+            task.cancel()
+        if refresh_tasks:
+            await asyncio.gather(*refresh_tasks, return_exceptions=True)
 
         for slot in to_close:
             await self._close_client(slot.client)
@@ -174,7 +236,3 @@ class LLMClientPool:
                 "[LLM Provider] 关闭旧客户端失败: error_type={}",
                 type(exc).__name__,
             )
-
-    async def generate_text(self, **kwargs: Any) -> Any: ...
-
-    async def generate_text_with_messages(self, **kwargs: Any) -> Any: ...

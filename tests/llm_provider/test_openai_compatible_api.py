@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
+
+import httpx
+import pytest
+from openai import AsyncOpenAI
 
 from komari_bot.common.untrusted_context import (
     LLM_SECURITY_SYSTEM_INSTRUCTION,
@@ -49,6 +54,32 @@ def test_llm_provider_schema_includes_runtime_fields() -> None:
     assert config.extra_params == {}
     assert config.vision_thinking_mode is False
     assert config.vision_reasoning_effort == ""
+    assert "plugin_enable" not in DynamicConfigSchema.model_fields
+    assert "user_whitelist" not in DynamicConfigSchema.model_fields
+    assert "group_whitelist" not in DynamicConfigSchema.model_fields
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api_key",
+        "base_url",
+        "custom_flag",
+        "max_tokens",
+        "messages",
+        "model",
+        "parallel_tool_calls",
+        "reasoning_effort",
+        "response_format",
+        "stream",
+        "thinking",
+        "tool_choice",
+        "tools",
+    ],
+)
+def test_llm_provider_schema_rejects_unsafe_extra_param_keys(key: str) -> None:
+    with pytest.raises(ValueError, match=key):
+        DynamicConfigSchema(extra_params={key: "覆盖值"})
 
 
 def test_openai_compatible_client_session_uses_configured_timeout() -> None:
@@ -413,7 +444,7 @@ def test_generate_text_sends_extra_params_via_extra_body(monkeypatch: Any) -> No
         monkeypatch.setattr(client, "client", fake_client)
         _patch_config_manager(
             monkeypatch,
-            extra_params={"custom_flag": True, "top_p": 0.9},
+            extra_params={"min_p": 0.1, "top_p": 0.9},
         )
 
         result = await client.generate_text(prompt="你好", model="deepseek-chat")
@@ -421,10 +452,105 @@ def test_generate_text_sends_extra_params_via_extra_body(monkeypatch: Any) -> No
         assert result.content == "ok"
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
-        assert request_data["extra_body"] == {"custom_flag": True, "top_p": 0.9}
-        assert "custom_flag" not in request_data
+        assert request_data["extra_body"] == {"min_p": 0.1, "top_p": 0.9}
+        assert "min_p" not in request_data
 
     asyncio.run(_run())
+
+
+def test_generate_text_rejects_unsafe_runtime_extra_params(monkeypatch: Any) -> None:
+    class _FailCompletions:
+        async def create(self, **_kwargs: Any) -> Any:
+            msg = "危险参数应在调用 SDK 前被拒绝"
+            raise AssertionError(msg)
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FailCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    async def _run() -> None:
+        client = OpenAICompatibleClient(
+            "token",
+            base_url="https://example.com/v1",
+            timeout_seconds=300.0,
+        )
+        monkeypatch.setattr(client, "client", _FakeClient())
+        _patch_config_manager(
+            monkeypatch,
+            extra_params={"messages": [{"role": "user", "content": "覆盖"}]},
+        )
+
+        with pytest.raises(ValueError, match="messages"):
+            await client.generate_text(prompt="你好", model="deepseek-chat")
+
+    asyncio.run(_run())
+
+
+def test_allowed_extra_params_cannot_replace_final_wire_messages(
+    monkeypatch: Any,
+) -> None:
+    captured_body: dict[str, Any] = {}
+
+    async def _handle_request(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    async def _run() -> None:
+        transport = httpx.MockTransport(_handle_request)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            sdk_client = AsyncOpenAI(
+                api_key="token",
+                base_url="https://example.com/v1",
+                http_client=http_client,
+            )
+            client = OpenAICompatibleClient(
+                "token",
+                base_url="https://example.com/v1",
+                timeout_seconds=300.0,
+            )
+            await client.client.close()
+            monkeypatch.setattr(client, "client", sdk_client)
+            _patch_config_manager(monkeypatch, extra_params={"top_p": 0.9})
+
+            result = await client.generate_text(
+                prompt="正常请求",
+                model="deepseek-chat",
+            )
+
+            assert result.content == "ok"
+            await sdk_client.close()
+
+    asyncio.run(_run())
+
+    assert captured_body["model"] == "deepseek-chat"
+    assert captured_body["top_p"] == 0.9
+    assert captured_body["messages"][0] == {
+        "role": "system",
+        "content": LLM_SECURITY_SYSTEM_INSTRUCTION,
+    }
+    assert captured_body["messages"][-1] == {
+        "role": "user",
+        "content": "正常请求",
+    }
 
 
 def test_thinking_mode_suppresses_tool_choice(monkeypatch: Any) -> None:
