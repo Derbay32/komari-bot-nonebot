@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, cast
 
 from nonebot import get_bots, logger
 
+from komari_bot.common.management_audit import hash_management_target
+from komari_bot.common.onebot_messages import plain_text_message
+
 from .models import BanMutationResult, BanRecord, NotificationResult
 
 if TYPE_CHECKING:
@@ -84,20 +87,33 @@ async def send_private_notification(
     """尝试发送一次普通文本私信，失败时不抛出异常。"""
     if bot is None:
         error = "Bot 不在线，无法发送私信"
-        logger.warning("[UserBan] 用户 {} 私信通知失败：{}", user_id, error)
+        logger.warning(
+            "[UserBan] 私信通知待重试: target_hash={} error_code=bot_offline",
+            hash_management_target(user_id),
+        )
         return NotificationResult(attempted=False, sent=False, error=error)
 
     try:
         await bot.call_api(
             "send_private_msg",
             user_id=int(user_id),
-            message=message,
+            message=plain_text_message(message),
         )
     except Exception as error:
-        error_text = str(error) or type(error).__name__
-        logger.warning("[UserBan] 用户 {} 私信通知失败：{}", user_id, error_text)
-        return NotificationResult(attempted=True, sent=False, error=error_text)
-    logger.info("[UserBan] 已向用户 {} 发送封禁生命周期私信", user_id)
+        logger.warning(
+            "[UserBan] 私信通知失败: target_hash={} error_type={}",
+            hash_management_target(user_id),
+            type(error).__name__,
+        )
+        return NotificationResult(
+            attempted=True,
+            sent=False,
+            error="平台私信发送失败",
+        )
+    logger.info(
+        "[UserBan] 封禁生命周期私信已发送: target_hash={}",
+        hash_management_target(user_id),
+    )
     return NotificationResult(attempted=True, sent=True)
 
 

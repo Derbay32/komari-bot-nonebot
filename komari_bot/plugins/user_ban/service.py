@@ -13,6 +13,7 @@ from .models import (
     BanRecord,
     BanScope,
     BanTargetScope,
+    ExpiredBanNotification,
     UserBanStatus,
     expand_target_scope,
     normalize_ban_reason,
@@ -235,6 +236,56 @@ class UserBanService:
             if expired:
                 self._mark_snapshot_stale()
             return expired
+
+    async def claim_expired_notification(
+        self,
+        *,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> ExpiredBanNotification | None:
+        """领取一条持久化的自然解封通知。"""
+        try:
+            await self.repository.initialize()
+            return await self.repository.claim_expired_notification(
+                owner_token=owner_token,
+                lease_seconds=lease_seconds,
+            )
+        except Exception as error:
+            raise self._unavailable("领取自然解封通知", error) from error
+
+    async def acknowledge_expired_notification(
+        self,
+        *,
+        notification_id: str,
+        owner_token: str,
+    ) -> bool:
+        """确认自然解封通知已送达。"""
+        try:
+            return await self.repository.acknowledge_expired_notification(
+                notification_id=notification_id,
+                owner_token=owner_token,
+            )
+        except Exception as error:
+            raise self._unavailable("确认自然解封通知", error) from error
+
+    async def retry_expired_notification(
+        self,
+        *,
+        notification_id: str,
+        owner_token: str,
+        error_code: str,
+        retry_delay_seconds: float,
+    ) -> bool:
+        """将发送失败的自然解封通知重新排队。"""
+        try:
+            return await self.repository.retry_expired_notification(
+                notification_id=notification_id,
+                owner_token=owner_token,
+                error_code=error_code,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+        except Exception as error:
+            raise self._unavailable("重排自然解封通知", error) from error
 
     async def list_bans(
         self,

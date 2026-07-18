@@ -22,6 +22,8 @@ from komari_bot.plugins.user_ban.service import BanServiceUnavailableError
 if TYPE_CHECKING:
     from nonebug import App
 
+    from komari_bot.common.management_audit import ManagementAuditEvent
+
 
 def _record(
     user_id: str,
@@ -115,15 +117,31 @@ class _Bot:
         return {"message_id": 1}
 
 
-def _app(service: object) -> FastAPI:
+def _app(
+    service: object,
+    audit_events: list[ManagementAuditEvent] | None = None,
+) -> FastAPI:
+    async def _record_audit(event: ManagementAuditEvent) -> None:
+        if audit_events is not None:
+            audit_events.append(event)
+
     app = FastAPI()
     api.register_user_ban_api(
         app,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         allowed_origins=[],
         service_getter=lambda: cast("Any", service),
+        audit_recorder=_record_audit,
     )
     return app
+
+
+def _write_headers(request_id: str) -> dict[str, str]:
+    return {
+        "Authorization": "Bearer secret-token-00000000",
+        "X-Komari-Change-Reason": "处理违规用户",
+        "X-Request-ID": request_id,
+    }
 
 
 @pytest.mark.asyncio
@@ -131,7 +149,7 @@ async def test_api_requires_token_and_supports_list_and_status(
     app: App,
 ) -> None:
     service = _Service()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _app(service))) as ctx:
         client = ctx.get_client()
@@ -159,14 +177,16 @@ async def test_api_creates_and_deletes_ban_with_notification_result(
 ) -> None:
     service = _Service()
     bot = _Bot()
+    audit_events: list[ManagementAuditEvent] = []
     monkeypatch.setattr(api, "get_first_available_bot", lambda: bot)
-    headers = {"Authorization": "Bearer secret-token"}
 
-    async with app.test_server(asgi=cast("Any", _app(service))) as ctx:
+    async with app.test_server(
+        asgi=cast("Any", _app(service, audit_events))
+    ) as ctx:
         client = ctx.get_client()
         created = await client.post(
             f"{api.API_PREFIX}/bans",
-            headers=headers,
+            headers=_write_headers("user-ban-create"),
             json={
                 "user_id": "10086",
                 "scope": "all",
@@ -176,7 +196,7 @@ async def test_api_creates_and_deletes_ban_with_notification_result(
         )
         deleted = await client.delete(
             f"{api.API_PREFIX}/bans/10086/all",
-            headers=headers,
+            headers=_write_headers("user-ban-delete"),
         )
 
     assert created.status_code == 200
@@ -190,13 +210,27 @@ async def test_api_creates_and_deletes_ban_with_notification_result(
         "error": None,
     }
     ban_call = next(call for call in service.calls if call[0] == "ban")
-    assert ban_call[1]["operator_id"] == "management_api"
+    assert ban_call[1]["operator_id"] == "legacy-api-token"
     assert isinstance(ban_call[1]["expires_at"], datetime)
 
     assert deleted.status_code == 200
     assert deleted.json()["action"] == "removed"
     assert deleted.json()["notification"]["sent"] is True
     assert [name for name, _ in bot.calls] == ["send_private_msg", "send_private_msg"]
+    assert [event.outcome for event in audit_events] == [
+        "started",
+        "succeeded",
+        "started",
+        "succeeded",
+    ]
+    assert {event.operator_id for event in audit_events} == {"legacy-api-token"}
+    assert {event.request_id for event in audit_events} == {
+        "user-ban-create",
+        "user-ban-delete",
+    }
+    serialized_audit = str([event.to_dict() for event in audit_events])
+    assert "10086" not in serialized_audit
+    assert "多次刷屏" not in serialized_audit
 
 
 @pytest.mark.asyncio
@@ -206,18 +240,16 @@ async def test_api_validates_input_and_reports_offline_notification(
 ) -> None:
     service = _Service()
     monkeypatch.setattr(api, "get_first_available_bot", lambda: None)
-    headers = {"Authorization": "Bearer secret-token"}
-
     async with app.test_server(asgi=cast("Any", _app(service))) as ctx:
         client = ctx.get_client()
         invalid = await client.post(
             f"{api.API_PREFIX}/bans",
-            headers=headers,
+            headers=_write_headers("user-ban-invalid"),
             json={"user_id": "010086", "scope": "chat", "duration": "1y"},
         )
         created = await client.post(
             f"{api.API_PREFIX}/bans",
-            headers=headers,
+            headers=_write_headers("user-ban-offline"),
             json={"user_id": "10086", "scope": "chat"},
         )
 
@@ -232,7 +264,7 @@ async def test_api_validates_input_and_reports_offline_notification(
 
 @pytest.mark.asyncio
 async def test_api_maps_storage_failure_to_503(app: App) -> None:
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
     async with app.test_server(asgi=cast("Any", _app(_FailingService()))) as ctx:
         response = await ctx.get_client().get(
             f"{api.API_PREFIX}/bans/10086",
@@ -240,4 +272,4 @@ async def test_api_maps_storage_failure_to_503(app: App) -> None:
         )
 
     assert response.status_code == 503
-    assert "数据库离线" in response.json()["detail"]
+    assert response.json()["detail"] == "用户封禁存储暂不可用"

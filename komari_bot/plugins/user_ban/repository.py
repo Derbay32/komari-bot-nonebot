@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
-from .models import BanMutationKind, BanRecord, BanScope, UserBanStatus
+from .models import (
+    BanMutationKind,
+    BanRecord,
+    BanScope,
+    ExpiredBanNotification,
+    UserBanStatus,
+)
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     import asyncpg
 
 
@@ -86,6 +93,76 @@ class UserBanRepository:
             expires_at=row["expires_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _serialize_records(records: tuple[BanRecord, ...]) -> str:
+        return json.dumps(
+            [
+                {
+                    "user_id": record.user_id,
+                    "ban_scope": record.ban_scope,
+                    "operator_id": record.operator_id,
+                    "reason": record.reason,
+                    "expires_at": (
+                        record.expires_at.isoformat()
+                        if record.expires_at is not None
+                        else None
+                    ),
+                    "created_at": record.created_at.isoformat(),
+                    "updated_at": record.updated_at.isoformat(),
+                }
+                for record in records
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _parse_outbox_datetime(value: object) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(str(value))
+
+    @classmethod
+    def _outbox_row_to_notification(cls, row: Any) -> ExpiredBanNotification:
+        raw_records = row["records"]
+        payload = json.loads(raw_records) if isinstance(raw_records, str) else raw_records
+        if not isinstance(payload, list):
+            message = "自然解封通知 outbox 的 records 结构无效"
+            raise TypeError(message)
+        records: list[BanRecord] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                message = "自然解封通知 outbox 包含无效记录"
+                raise TypeError(message)
+            created_at = cls._parse_outbox_datetime(item.get("created_at"))
+            updated_at = cls._parse_outbox_datetime(item.get("updated_at"))
+            if created_at is None or updated_at is None:
+                message = "自然解封通知 outbox 缺少记录时间"
+                raise ValueError(message)
+            records.append(
+                BanRecord(
+                    user_id=str(item["user_id"]),
+                    ban_scope=cast("BanScope", str(item["ban_scope"])),
+                    operator_id=str(item["operator_id"]),
+                    reason=(
+                        str(item["reason"])
+                        if item.get("reason") is not None
+                        else None
+                    ),
+                    expires_at=cls._parse_outbox_datetime(item.get("expires_at")),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+        return ExpiredBanNotification(
+            notification_id=str(row["notification_id"]),
+            user_id=str(row["user_id"]),
+            records=tuple(records),
+            attempt_count=int(row["attempt_count"]),
         )
 
     @classmethod
@@ -282,7 +359,7 @@ class UserBanRepository:
         return deleted, current
 
     async def delete_expired(self) -> tuple[BanRecord, ...]:
-        """原子删除所有到期记录，并返回被删除的完整记录。"""
+        """原子删除到期记录，并在同一事务写入自然解封通知 outbox。"""
         pool = self._require_pool()
         async with pool.acquire() as conn, conn.transaction():
             rows = await conn.fetch(
@@ -293,11 +370,155 @@ class UserBanRepository:
                 RETURNING {_RECORD_COLUMNS}
                 """
             )
+            records = [self._row_to_record(row) for row in rows]
+            records.sort(key=lambda record: (record.user_id, record.ban_scope))
+            records_by_user: dict[str, list[BanRecord]] = {}
+            for record in records:
+                records_by_user.setdefault(record.user_id, []).append(record)
+            for user_id, user_records in records_by_user.items():
+                await conn.execute(
+                    """
+                    INSERT INTO komari_user_ban_notification_outbox (
+                        notification_id,
+                        user_id,
+                        notification_kind,
+                        records
+                    )
+                    VALUES ($1, $2, 'natural_expiry', $3::jsonb)
+                    """,
+                    uuid4().hex,
+                    user_id,
+                    self._serialize_records(tuple(user_records)),
+                )
             if rows:
                 await self._bump_cache_revision(conn)
-        records = [self._row_to_record(row) for row in rows]
-        records.sort(key=lambda record: (record.user_id, record.ban_scope))
         return tuple(records)
+
+    async def claim_expired_notification(
+        self,
+        *,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> ExpiredBanNotification | None:
+        """使用 SKIP LOCKED 领取一条待发送自然解封通知。"""
+        normalized_owner = owner_token.strip()
+        if not normalized_owner:
+            message = "自然解封通知 owner_token 不能为空"
+            raise ValueError(message)
+        if not 10 <= lease_seconds <= 3600:
+            message = "自然解封通知租约必须在 10 到 3600 秒之间"
+            raise ValueError(message)
+        pool = self._require_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                WITH candidate AS (
+                    SELECT notification_id
+                    FROM komari_user_ban_notification_outbox
+                    WHERE notification_kind = 'natural_expiry'
+                      AND records IS NOT NULL
+                      AND available_at <= CURRENT_TIMESTAMP
+                      AND (
+                          status = 'pending'
+                          OR (
+                              status = 'processing'
+                              AND lease_expires_at <= CURRENT_TIMESTAMP
+                          )
+                      )
+                    ORDER BY available_at, created_at, notification_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE komari_user_ban_notification_outbox AS outbox
+                SET status = 'processing',
+                    owner_token = $1,
+                    lease_expires_at = (
+                        CURRENT_TIMESTAMP
+                        + ($2::double precision * INTERVAL '1 second')
+                    ),
+                    attempt_count = attempt_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM candidate
+                WHERE outbox.notification_id = candidate.notification_id
+                RETURNING outbox.notification_id,
+                          outbox.user_id,
+                          outbox.records,
+                          outbox.attempt_count
+                """,
+                normalized_owner,
+                lease_seconds,
+            )
+        if row is None:
+            return None
+        return self._outbox_row_to_notification(row)
+
+    async def acknowledge_expired_notification(
+        self,
+        *,
+        notification_id: str,
+        owner_token: str,
+    ) -> bool:
+        """确认发送完成，并立即清除包含封禁理由的 outbox payload。"""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            acknowledged = await conn.fetchval(
+                """
+                UPDATE komari_user_ban_notification_outbox
+                SET status = 'sent',
+                    records = NULL,
+                    owner_token = NULL,
+                    lease_expires_at = NULL,
+                    last_error_code = NULL,
+                    sent_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE notification_id = $1
+                  AND status = 'processing'
+                  AND owner_token = $2
+                  AND lease_expires_at > CURRENT_TIMESTAMP
+                RETURNING notification_id
+                """,
+                notification_id,
+                owner_token,
+            )
+        return acknowledged is not None
+
+    async def retry_expired_notification(
+        self,
+        *,
+        notification_id: str,
+        owner_token: str,
+        error_code: str,
+        retry_delay_seconds: float,
+    ) -> bool:
+        """发送失败后按稳定错误码重新排队，保留原 payload。"""
+        if not 0 <= retry_delay_seconds <= 86400:
+            message = "自然解封通知重试延迟必须在 0 到 86400 秒之间"
+            raise ValueError(message)
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            retried = await conn.fetchval(
+                """
+                UPDATE komari_user_ban_notification_outbox
+                SET status = 'pending',
+                    owner_token = NULL,
+                    lease_expires_at = NULL,
+                    available_at = (
+                        CURRENT_TIMESTAMP
+                        + ($4::double precision * INTERVAL '1 second')
+                    ),
+                    last_error_code = $3,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE notification_id = $1
+                  AND status = 'processing'
+                  AND owner_token = $2
+                RETURNING notification_id
+                """,
+                notification_id,
+                owner_token,
+                error_code,
+                retry_delay_seconds,
+            )
+        return retried is not None
 
     async def list_statuses(
         self,
