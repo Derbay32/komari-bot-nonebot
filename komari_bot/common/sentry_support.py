@@ -130,7 +130,13 @@ def sentry_before_send_log(
     """隐藏 Sentry Logs 正文和插值参数。"""
     sanitized = {
         key: log[key]
-        for key in ("severity_number", "severity_text", "timestamp", "trace_id")
+        for key in (
+            "severity_number",
+            "severity_text",
+            "time_unix_nano",
+            "trace_id",
+            "span_id",
+        )
         if key in log and isinstance(log[key], (str, int, float, bool))
     }
     sanitized["body"] = _redacted_text_summary(

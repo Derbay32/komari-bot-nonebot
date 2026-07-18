@@ -107,6 +107,9 @@ def test_sentry_before_send_log_hides_body_and_interpolation_parameters() -> Non
         {
             "severity_text": "WARN",
             "severity_number": 13,
+            "time_unix_nano": 1_721_313_947_123_456_789,
+            "trace_id": "safe-trace-id",
+            "span_id": "safe-span-id",
             "body": "log-body-canary",
             "attributes": {
                 "sentry.message.parameter.0": "log-argument-canary",
@@ -122,6 +125,9 @@ def test_sentry_before_send_log_hides_body_and_interpolation_parameters() -> Non
         "logger.name": "komari.test",
         "code.line.number": 42,
     }
+    assert sanitized["time_unix_nano"] == 1_721_313_947_123_456_789
+    assert sanitized["trace_id"] == "safe-trace-id"
+    assert sanitized["span_id"] == "safe-span-id"
     assert "log-body-canary" not in str(sanitized)
     assert "log-argument-canary" not in str(sanitized)
 
