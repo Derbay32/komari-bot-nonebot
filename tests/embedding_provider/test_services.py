@@ -14,8 +14,11 @@ from komari_bot.plugins.embedding_provider.embedding_service import (
     EmbeddingService,
 )
 from komari_bot.plugins.embedding_provider.request_safety import (
+    RemoteResponseDecodeError,
+    RemoteResponseTooLargeError,
     RemoteServiceRequestError,
     build_request_timeout,
+    read_bounded_json_response,
     request_with_retry,
 )
 from komari_bot.plugins.embedding_provider.rerank_service import (
@@ -32,6 +35,26 @@ class _Session:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _ChunkedContent:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def iter_chunked(self, _size: int) -> Any:
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _Response:
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        content_length: int | None = None,
+    ) -> None:
+        self.content = _ChunkedContent(chunks)
+        self.content_length = content_length
 
 
 class _LogCapture:
@@ -86,6 +109,49 @@ def test_request_timeout_limits_connect_read_and_total() -> None:
     assert timeout.sock_connect == 4.0
     assert timeout.sock_read == 12.0
     assert timeout.total == 20.0
+
+
+@pytest.mark.asyncio
+async def test_bounded_json_reader_accepts_streamed_response() -> None:
+    response = cast(
+        "aiohttp.ClientResponse",
+        _Response([b'{"data":', b"[1,2,3]}"], content_length=16),
+    )
+
+    payload = await read_bounded_json_response(response, max_bytes=32)
+
+    assert payload == {"data": [1, 2, 3]}
+
+
+@pytest.mark.asyncio
+async def test_bounded_json_reader_rejects_declared_and_streamed_oversize() -> None:
+    declared = cast(
+        "aiohttp.ClientResponse",
+        _Response([], content_length=33),
+    )
+    streamed = cast(
+        "aiohttp.ClientResponse",
+        _Response([b"12345678", b"9"], content_length=None),
+    )
+
+    with pytest.raises(RemoteResponseTooLargeError, match="字节上限"):
+        await read_bounded_json_response(declared, max_bytes=32)
+    with pytest.raises(RemoteResponseTooLargeError, match="字节上限"):
+        await read_bounded_json_response(streamed, max_bytes=8)
+
+
+@pytest.mark.asyncio
+async def test_bounded_json_reader_rejects_invalid_json_without_echoing_body() -> None:
+    canary = b"UPSTREAM-RESPONSE-CANARY"
+    response = cast(
+        "aiohttp.ClientResponse",
+        _Response([canary], content_length=len(canary)),
+    )
+
+    with pytest.raises(RemoteResponseDecodeError) as exc_info:
+        await read_bounded_json_response(response, max_bytes=128)
+
+    assert canary.decode() not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -178,6 +244,26 @@ async def test_embedding_retries_transient_timeout(
 
     assert calls == 2
     assert result == [0.1, 0.2, 0.3]
+
+
+@pytest.mark.asyncio
+async def test_embedding_does_not_retry_oversized_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EmbeddingService(_config(request_retry_attempts=3))
+    calls = 0
+
+    async def _post_json(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise RemoteResponseTooLargeError("远程响应超过字节上限")
+
+    _install_post_json(monkeypatch, service, _post_json)
+
+    with pytest.raises(RemoteServiceRequestError):
+        await service.embed("测试输入")
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio

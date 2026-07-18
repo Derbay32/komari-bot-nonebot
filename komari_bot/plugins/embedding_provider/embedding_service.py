@@ -12,6 +12,7 @@ from .request_safety import (
     RequestSafetyConfigProtocol,
     build_request_timeout,
     content_fingerprint,
+    read_bounded_json_response,
     request_with_retry,
 )
 
@@ -69,10 +70,14 @@ class EmbeddingService:
         url: str,
         headers: dict[str, str],
         payload: dict[str, object],
+        max_response_bytes: int,
     ) -> object:
         async with session.post(url, headers=headers, json=payload) as response:
             response.raise_for_status()
-            return await response.json()
+            return await read_bounded_json_response(
+                response,
+                max_bytes=max_response_bytes,
+            )
 
     async def _request_embedding_payload(
         self,
@@ -91,6 +96,7 @@ class EmbeddingService:
                     url=url,
                     headers=headers,
                     payload=payload,
+                    max_response_bytes=self.config.response_max_bytes,
                 )
             except aiohttp.ClientResponseError as error:
                 if fallback_payload is None or error.status not in {400, 422}:
@@ -106,6 +112,7 @@ class EmbeddingService:
                     url=url,
                     headers=headers,
                     payload=fallback_payload,
+                    max_response_bytes=self.config.response_max_bytes,
                 )
 
         return await request_with_retry(

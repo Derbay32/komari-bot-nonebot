@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from typing import TYPE_CHECKING, Protocol
 
 import aiohttp
@@ -23,10 +24,19 @@ class RequestSafetyConfigProtocol(Protocol):
     request_total_timeout_seconds: float
     request_retry_attempts: int
     request_retry_backoff_seconds: float
+    response_max_bytes: int
 
 
 class RemoteServiceRequestError(RuntimeError):
     """不包含 URL、正文或响应内容的稳定远程请求异常。"""
+
+
+class RemoteResponseTooLargeError(RuntimeError):
+    """远程响应声明或实际解压后的正文超过硬上限。"""
+
+
+class RemoteResponseDecodeError(RuntimeError):
+    """远程响应不是合法 JSON。"""
 
 
 def build_request_timeout(config: RequestSafetyConfigProtocol) -> aiohttp.ClientTimeout:
@@ -48,6 +58,30 @@ def content_fingerprint(parts: Iterable[str]) -> str:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()[:16]
+
+
+async def read_bounded_json_response(
+    response: aiohttp.ClientResponse,
+    *,
+    max_bytes: int,
+) -> object:
+    """按解压后的实际字节数流式读取 JSON，避免超大响应占满内存。"""
+    if max_bytes <= 0:
+        raise ValueError("响应字节上限必须为正整数")
+    content_length = response.content_length
+    if content_length is not None and content_length > max_bytes:
+        raise RemoteResponseTooLargeError("远程响应超过字节上限")
+
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(min(65_536, max_bytes + 1)):
+        if len(body) + len(chunk) > max_bytes:
+            raise RemoteResponseTooLargeError("远程响应超过字节上限")
+        body.extend(chunk)
+    try:
+        return json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        message = "远程响应不是合法 JSON"
+        raise RemoteResponseDecodeError(message) from exc
 
 
 def _get_status(error: Exception) -> int | None:
@@ -132,9 +166,12 @@ async def request_with_retry[T](
 
 
 __all__ = [
+    "RemoteResponseDecodeError",
+    "RemoteResponseTooLargeError",
     "RemoteServiceRequestError",
     "RequestSafetyConfigProtocol",
     "build_request_timeout",
     "content_fingerprint",
+    "read_bounded_json_response",
     "request_with_retry",
 ]

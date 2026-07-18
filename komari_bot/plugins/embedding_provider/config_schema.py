@@ -71,6 +71,12 @@ class DynamicConfigSchema(BaseModel):
         le=5.0,
         description="远程请求指数退避基准秒数",
     )
+    response_max_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1024,
+        le=64 * 1024 * 1024,
+        description="Embedding/Rerank 响应解压后的最大字节数",
+    )
     # Rerank 配置
     rerank_enabled: bool = Field(default=False, description="是否启用 rerank")
     rerank_model: str = Field(default="", description="Rerank 模型名称")
