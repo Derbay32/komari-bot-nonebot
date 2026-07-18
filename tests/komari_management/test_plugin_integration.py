@@ -70,6 +70,7 @@ def _build_components() -> ManagementApiComponents:
         help_engine_getter=lambda: None,
         register_memory_api=register_memory_api,
         memory_service_getter=lambda: None,
+        memory_redis_getter=lambda: None,
         register_llm_provider_api=register_llm_provider_api,
         reply_log_reader_getter=lambda: None,
         register_user_ban_api=register_user_ban_api,
@@ -103,7 +104,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         driver=driver,
         config=SimpleNamespace(
             plugin_enable=True,
-            api_token="secret-token",
+            api_token="secret-token-00000000",
             api_allowed_origins=[],
         ),
         component_loader=_build_components,

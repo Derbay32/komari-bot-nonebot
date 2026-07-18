@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.plugins.komari_management.announce_api import (
     API_PREFIX,
     register_announce_api,
+)
+from komari_bot.plugins.komari_management.announcement_repository import (
+    InMemoryAnnouncementDispatchRepository,
 )
 
 if TYPE_CHECKING:
@@ -28,6 +33,9 @@ class _FakeBot:
         groups: list[dict[str, Any]] | None = None,
         fail_group_ids: set[int] | None = None,
         fail_group_list: bool = False,
+        send_exceptions: dict[int, Exception] | None = None,
+        send_started: asyncio.Event | None = None,
+        send_release: asyncio.Event | None = None,
     ) -> None:
         self.groups = groups if groups is not None else [
             {
@@ -42,6 +50,9 @@ class _FakeBot:
         ]
         self.fail_group_ids = fail_group_ids or set()
         self.fail_group_list = fail_group_list
+        self.send_exceptions = send_exceptions or {}
+        self.send_started = send_started
+        self.send_release = send_release
         self.sent_messages: list[dict[str, Any]] = []
 
     async def call_api(self, api: str, **kwargs: Any) -> Any:
@@ -51,6 +62,12 @@ class _FakeBot:
             return self.groups
         if api == "send_group_msg":
             self.sent_messages.append({"api": api, **kwargs})
+            if self.send_started is not None:
+                self.send_started.set()
+            if self.send_release is not None:
+                await self.send_release.wait()
+            if error := self.send_exceptions.get(int(kwargs["group_id"])):
+                raise error
             if kwargs["group_id"] in self.fail_group_ids:
                 raise RuntimeError("发送失败")
             return {"message_id": 1}
@@ -59,11 +76,13 @@ class _FakeBot:
 
 def _build_app(
     *,
-    api_token: ManagementTokenSource = "secret-token",
+    api_token: ManagementTokenSource = "secret-token-00000000",
+    status_page_url: str = "https://status.example.com/komari",
     announce_max_group_count: int = 20,
     announce_send_interval_seconds: float = 0.0,
     announce_request_cooldown_seconds: float = 0.0,
     audit_events: list[ManagementAuditEvent] | None = None,
+    dispatch_repository: InMemoryAnnouncementDispatchRepository | None = None,
 ) -> FastAPI:
     async def _record_audit(event: ManagementAuditEvent) -> None:
         if audit_events is not None:
@@ -74,11 +93,14 @@ def _build_app(
         api_app,
         api_token=api_token,
         allowed_origins=["https://ui.example.com"],
-        status_page_url="https://status.example.com/komari",
+        status_page_url=status_page_url,
         announce_max_group_count=announce_max_group_count,
         announce_send_interval_seconds=announce_send_interval_seconds,
         announce_request_cooldown_seconds=announce_request_cooldown_seconds,
         audit_recorder=_record_audit,
+        dispatch_repository=(
+            dispatch_repository or InMemoryAnnouncementDispatchRepository()
+        ),
     )
     return api_app
 
@@ -89,7 +111,7 @@ def _patch_bots(monkeypatch: MonkeyPatch, bots: dict[str, _FakeBot]) -> None:
 
 def _write_headers(
     request_id: str = "announce-request",
-    token: str = "secret-token",
+    token: str = "secret-token-00000000",
 ) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -110,7 +132,7 @@ async def test_announce_routes_require_token_and_list_groups(
         unauthorized = await client.get(f"{API_PREFIX}/groups")
         listed = await client.get(
             f"{API_PREFIX}/groups",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert unauthorized.status_code == 401
@@ -178,11 +200,11 @@ async def test_announce_routes_support_group_send_and_failure_details(
             "status": "failed",
             "bot_id": "bot",
             "error_code": "send_failed",
-            "error": "平台发送接口调用失败",
+            "error": "所有候选 Bot 的平台发送接口均明确失败",
         },
     ]
     assert len(bot.sent_messages) == 2
-    assert bot.sent_messages[0]["message"] == (
+    assert bot.sent_messages[0]["message"] == plain_text_message(
         "📢 预定维护通知\n\n"
         "【维护标题】\n"
         "数据库维护\n\n"
@@ -202,12 +224,13 @@ async def test_announce_routes_support_group_send_and_failure_details(
         "failed_count": 1,
         "unreachable_count": 0,
         "unavailable_bot_count": 0,
+        "idempotent_replay": False,
     }
     serialized_events = json.dumps(
         [event.to_dict() for event in audit_events],
         ensure_ascii=False,
     )
-    assert "secret-token" not in serialized_events
+    assert "secret-token-00000000" not in serialized_events
     assert "数据库维护" not in serialized_events
     assert "10001" not in serialized_events
 
@@ -217,7 +240,7 @@ async def test_announce_routes_handle_offline_bot(
     app: App, monkeypatch: MonkeyPatch
 ) -> None:
     _patch_bots(monkeypatch, {})
-    read_headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
         client = ctx.get_client()
@@ -357,7 +380,7 @@ async def test_announce_routes_throttle_between_group_sends(
         "status": "failed",
         "bot_id": "bot",
         "error_code": "send_failed",
-        "error": "平台发送接口调用失败",
+        "error": "所有候选 Bot 的平台发送接口均明确失败",
     }
     assert sleep_calls == [2.5, 2.5]
     assert len(bot.sent_messages) == 3
@@ -390,7 +413,7 @@ async def test_announce_routes_use_the_bot_that_can_reach_each_group(
         client = ctx.get_client()
         listed = await client.get(
             f"{API_PREFIX}/groups",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
         sent = await client.post(
             f"{API_PREFIX}/maintenance",
@@ -474,4 +497,281 @@ async def test_announce_routes_enforce_named_credential_permissions(
     assert reader_list.status_code == 200
     assert reader_send.status_code == 403
     assert sender_send.status_code == 200
+    assert len(bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_replay_completed_request_without_resending(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot = _FakeBot(groups=[{"group_id": 10001, "member_count": 1}])
+    _patch_bots(monkeypatch, {"bot": bot})
+    dispatches = InMemoryAnnouncementDispatchRepository()
+    audit_events: list[ManagementAuditEvent] = []
+    payload = {
+        "title": "幂等验证",
+        "content": "同一请求只能发送一次",
+        "scheduled_time": "2026-07-17 03:00",
+        "group_ids": [10001],
+    }
+
+    async with app.test_server(
+        asgi=cast(
+            "Any",
+            _build_app(
+                audit_events=audit_events,
+                dispatch_repository=dispatches,
+            ),
+        )
+    ) as ctx:
+        client = ctx.get_client()
+        first = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-idempotent"),
+            json=payload,
+        )
+        replay = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-idempotent"),
+            json=payload,
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(bot.sent_messages) == 1
+    assert audit_events[-1].metadata == {"idempotent_replay": True}
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_reject_request_id_payload_conflict(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot = _FakeBot(groups=[{"group_id": 10001, "member_count": 1}])
+    _patch_bots(monkeypatch, {"bot": bot})
+    dispatches = InMemoryAnnouncementDispatchRepository()
+    payload = {
+        "title": "原公告",
+        "content": "内容",
+        "scheduled_time": "2026-07-17 03:00",
+        "group_ids": [10001],
+    }
+
+    async with app.test_server(
+        asgi=cast(
+            "Any",
+            _build_app(dispatch_repository=dispatches),
+        )
+    ) as ctx:
+        client = ctx.get_client()
+        first = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-conflict"),
+            json=payload,
+        )
+        conflicting = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-conflict"),
+            json={**payload, "title": "被替换的公告"},
+        )
+
+    assert first.status_code == 200
+    assert conflicting.status_code == 409
+    assert conflicting.json()["detail"] == "同一 request ID 不允许绑定不同公告内容"
+    assert len(bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_fail_over_only_after_definite_failure(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot_a = _FakeBot(
+        groups=[{"group_id": 10001, "member_count": 1}],
+        fail_group_ids={10001},
+    )
+    bot_b = _FakeBot(groups=[{"group_id": 10001, "member_count": 1}])
+    _patch_bots(monkeypatch, {"bot-a": bot_a, "bot-b": bot_b})
+
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        response = await ctx.get_client().post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-failover"),
+            json={
+                "title": "故障转移",
+                "content": "验证候选 Bot",
+                "scheduled_time": "2026-07-17 03:00",
+                "group_ids": [10001],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["bot_id"] == "bot-b"
+    assert len(bot_a.sent_messages) == 1
+    assert len(bot_b.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_do_not_resend_unknown_delivery(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot_a = _FakeBot(
+        groups=[{"group_id": 10001, "member_count": 1}],
+        send_exceptions={10001: TimeoutError("平台可能已经接收")},
+    )
+    bot_b = _FakeBot(groups=[{"group_id": 10001, "member_count": 1}])
+    _patch_bots(monkeypatch, {"bot-a": bot_a, "bot-b": bot_b})
+
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        response = await ctx.get_client().post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-delivery-unknown"),
+            json={
+                "title": "未知送达验证",
+                "content": "不得重复发送",
+                "scheduled_time": "2026-07-17 03:00",
+                "group_ids": [10001],
+            },
+        )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["error_code"] == "delivery_unknown"
+    assert result["bot_id"] == "bot-a"
+    assert len(bot_a.sent_messages) == 1
+    assert bot_b.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_reject_duplicate_and_over_budget_content(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    bot = _FakeBot(groups=[{"group_id": 10001, "member_count": 1}])
+    _patch_bots(monkeypatch, {"bot": bot})
+    base_payload = {
+        "title": "预算验证",
+        "content": "内容",
+        "scheduled_time": "2026-07-17 03:00",
+        "group_ids": [10001],
+    }
+
+    async with app.test_server(
+        asgi=cast(
+            "Any",
+            _build_app(status_page_url="https://status.example/" + "x" * 4096),
+        )
+    ) as ctx:
+        client = ctx.get_client()
+        duplicate = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-duplicate-groups"),
+            json={**base_payload, "group_ids": [10001, 10001]},
+        )
+        title_too_long = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-title-budget"),
+            json={**base_payload, "title": "题" * 129},
+        )
+        message_too_long = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-message-budget"),
+            json=base_payload,
+        )
+
+    assert duplicate.status_code == 422
+    assert title_too_long.status_code == 422
+    assert message_too_long.status_code == 422
+    assert bot.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_coordinate_concurrent_workers(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    send_started = asyncio.Event()
+    send_release = asyncio.Event()
+    bot = _FakeBot(
+        groups=[{"group_id": 10001, "member_count": 1}],
+        send_started=send_started,
+        send_release=send_release,
+    )
+    _patch_bots(monkeypatch, {"bot": bot})
+    dispatches = InMemoryAnnouncementDispatchRepository()
+    payload = {
+        "title": "并发验证",
+        "content": "两个 worker 只能有一个发送者",
+        "scheduled_time": "2026-07-17 03:00",
+        "group_ids": [10001],
+    }
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(dispatch_repository=dispatches))
+    ) as ctx:
+        client = ctx.get_client()
+        first_task = asyncio.create_task(
+            client.post(
+                f"{API_PREFIX}/maintenance",
+                headers=_write_headers("announce-concurrent"),
+                json=payload,
+            )
+        )
+        await asyncio.wait_for(send_started.wait(), timeout=1.0)
+        concurrent = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-concurrent"),
+            json=payload,
+        )
+        send_release.set()
+        first = await first_task
+        replay = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-concurrent"),
+            json=payload,
+        )
+
+    assert first.status_code == 200
+    assert concurrent.status_code == 409
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_announce_routes_release_unstarted_claim_when_bot_is_offline(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    dispatches = InMemoryAnnouncementDispatchRepository()
+    payload = {
+        "title": "离线恢复",
+        "content": "上线后应允许安全重试",
+        "scheduled_time": "2026-07-17 03:00",
+        "group_ids": [10001],
+    }
+    _patch_bots(monkeypatch, {})
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(dispatch_repository=dispatches))
+    ) as ctx:
+        client = ctx.get_client()
+        offline = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-offline-retry"),
+            json=payload,
+        )
+        bot = _FakeBot(groups=[{"group_id": 10001, "member_count": 1}])
+        _patch_bots(monkeypatch, {"bot": bot})
+        retried = await client.post(
+            f"{API_PREFIX}/maintenance",
+            headers=_write_headers("announce-offline-retry"),
+            json=payload,
+        )
+
+    assert offline.status_code == 503
+    assert retried.status_code == 200
     assert len(bot.sent_messages) == 1

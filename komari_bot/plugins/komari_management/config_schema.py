@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from komari_bot.common.management_api import management_token_meets_minimum_strength
+
 DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
 _CREDENTIAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _PERMISSION_PATTERN = re.compile(r"^(?:\*|[a-z][a-z0-9_-]*:(?:\*|[a-z][a-z0-9_-]*))$")
@@ -53,8 +55,8 @@ class ManagementCredentialSchema(BaseModel):
     @classmethod
     def normalize_token(cls, value: str) -> str:
         normalized = value.strip()
-        if len(normalized) < 16:
-            msg = "管理凭据 Token 长度不能少于 16"
+        if not management_token_meets_minimum_strength(normalized):
+            msg = "管理凭据 Token 至少 16 字符，并需要不少于 8 个不同的可打印 ASCII 字符"
             raise ValueError(msg)
         if not _TOKEN_PATTERN.fullmatch(normalized):
             msg = "管理凭据 Token 只能包含不带空格的 ASCII 可打印字符"

@@ -96,6 +96,7 @@ def _build_components() -> ManagementApiComponents:
         help_engine_getter=lambda: None,
         register_memory_api=register_memory_api,
         memory_service_getter=lambda: None,
+        memory_redis_getter=lambda: None,
         register_llm_provider_api=register_llm_provider_api,
         reply_log_reader_getter=lambda: None,
         register_user_ban_api=register_user_ban_api,
@@ -124,7 +125,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     logger = _FakeLogger()
     config = SimpleNamespace(
         plugin_enable=True,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         api_allowed_origins=["https://ui.example.com"],
     )
 
@@ -171,17 +172,18 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "docs=/api/komari-management/docs, "
         "openapi=/api/komari-management/openapi.json"
     )
-    assert logger.warning_messages == []
+    assert len(logger.warning_messages) == 1
+    assert "旧版 api_token 已弃用" in logger.warning_messages[0]
 
 
 @pytest.mark.asyncio
 async def test_registered_api_uses_current_token_after_rotation(app: App) -> None:
     api_app = _build_api_app()
     logger = _FakeLogger()
-    token_state = {"value": "old-token"}
+    token_state = {"value": "old-token-00000000"}
     config = SimpleNamespace(
         plugin_enable=True,
-        api_token="old-token",
+        api_token="old-token-00000000",
         api_allowed_origins=[],
     )
 
@@ -198,17 +200,17 @@ async def test_registered_api_uses_current_token_after_rotation(app: App) -> Non
         client = ctx.get_client()
         before_rotation = await client.get(
             "/api/komari-knowledge/v1/knowledge",
-            headers={"Authorization": "Bearer old-token"},
+            headers={"Authorization": "Bearer old-token-00000000"},
         )
 
-        token_state["value"] = "new-token"
+        token_state["value"] = "new-token-00000000"
         old_token_after_rotation = await client.get(
             "/api/komari-knowledge/v1/knowledge",
-            headers={"Authorization": "Bearer old-token"},
+            headers={"Authorization": "Bearer old-token-00000000"},
         )
         new_token_after_rotation = await client.get(
             "/api/komari-knowledge/v1/knowledge",
-            headers={"Authorization": "Bearer new-token"},
+            headers={"Authorization": "Bearer new-token-00000000"},
         )
 
     assert before_rotation.status_code == 503
@@ -224,7 +226,7 @@ async def test_registered_api_prefers_named_credentials_over_legacy_token(
     logger = _FakeLogger()
     config = SimpleNamespace(
         plugin_enable=True,
-        api_token="legacy-token",
+        api_token="legacy-token-00000000",
         api_credentials=[
             {
                 "credential_id": "knowledge-reader",
@@ -247,7 +249,7 @@ async def test_registered_api_prefers_named_credentials_over_legacy_token(
         client = ctx.get_client()
         legacy = await client.get(
             "/api/komari-knowledge/v1/knowledge",
-            headers={"Authorization": "Bearer legacy-token"},
+            headers={"Authorization": "Bearer legacy-token-00000000"},
         )
         named = await client.get(
             "/api/komari-knowledge/v1/knowledge",
@@ -362,7 +364,7 @@ def test_register_management_api_skips_disabled_config() -> None:
         driver=_FakeDriver("fastapi", _build_api_app()),
         config=SimpleNamespace(
             plugin_enable=False,
-            api_token="secret-token",
+            api_token="secret-token-00000000",
             api_allowed_origins=[],
         ),
         component_loader=_build_components,
@@ -394,11 +396,14 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         driver=_FakeDriver("aiohttp"),
         config=SimpleNamespace(
             plugin_enable=True,
-            api_token="secret-token",
+            api_token="secret-token-00000000",
             api_allowed_origins=[],
         ),
         component_loader=_build_components,
         logger=non_fastapi_logger,
     )
     assert registered_non_fastapi is False
-    assert "当前驱动不是 FastAPI" in non_fastapi_logger.warning_messages[0]
+    assert any(
+        "当前驱动不是 FastAPI" in message
+        for message in non_fastapi_logger.warning_messages
+    )

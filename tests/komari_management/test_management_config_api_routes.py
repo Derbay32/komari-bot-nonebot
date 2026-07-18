@@ -101,7 +101,7 @@ class _ConflictConfigManager(_FakeConfigManager):
 
 def _write_headers(request_id: str) -> dict[str, str]:
     return {
-        "Authorization": "Bearer secret-token",
+        "Authorization": "Bearer secret-token-00000000",
         "X-Komari-Change-Reason": "验证配置变更",
         "X-Request-ID": request_id,
     }
@@ -118,7 +118,7 @@ def _build_app(
     api_app = FastAPI()
     register_config_api(
         api_app,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         allowed_origins=["https://ui.example.com"],
         resources=(
             ManagedConfigResource(
@@ -140,7 +140,7 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
         unauthorized = await client.get(f"{API_PREFIX}/resources")
         listed = await client.get(
             f"{API_PREFIX}/resources",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert unauthorized.status_code == 401
@@ -173,7 +173,7 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
 async def test_config_routes_support_detail_reload_and_field_update(app: App) -> None:
     manager = _FakeConfigManager()
     audit_events: list[ManagementAuditEvent] = []
-    read_headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(
         asgi=cast("Any", _build_app(manager, audit_events))
@@ -257,7 +257,7 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
 @pytest.mark.asyncio
 async def test_config_routes_report_validation_and_not_found(app: App) -> None:
     manager = _FakeConfigManager()
-    read_headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
         client = ctx.get_client()
@@ -304,7 +304,7 @@ async def test_config_write_requires_change_reason(app: App) -> None:
         response = await ctx.get_client().patch(
             f"{API_PREFIX}/resources/komari_management/fields/plugin_enable",
             json={"value": False},
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 400

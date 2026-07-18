@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from komari_bot.common.management_api import (
-        ManagementCredentialSourceValue,
         ManagementTokenSource,
     )
 
@@ -44,6 +43,7 @@ class ManagementApiComponents:
     help_engine_getter: Callable[[], object | None]
     register_memory_api: Callable[..., None]
     memory_service_getter: Callable[[], object | None]
+    memory_redis_getter: Callable[[], object | None]
     register_llm_provider_api: Callable[..., None]
     reply_log_reader_getter: Callable[[], object | None]
     register_user_ban_api: Callable[..., None]
@@ -58,7 +58,7 @@ def register_management_api_for_driver(
     config: object,
     component_loader: Callable[[], ManagementApiComponents],
     logger: Any,
-    api_token_getter: Callable[[], ManagementCredentialSourceValue] | None = None,
+    api_token_getter: ManagementTokenSource | None = None,
 ) -> bool:
     """按驱动与集中配置决定是否挂载统一管理 API。"""
     if not getattr(config, "plugin_enable", False):
@@ -100,6 +100,7 @@ def register_management_api_for_driver(
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
         service_getter=components.memory_service_getter,
+        redis_getter=components.memory_redis_getter,
     )
     components.register_llm_provider_api(
         server_app,

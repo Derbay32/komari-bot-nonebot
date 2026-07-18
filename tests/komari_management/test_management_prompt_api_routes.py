@@ -25,13 +25,15 @@ if TYPE_CHECKING:
 @dataclass
 class _PromptStore:
     values: dict[str, str]
+    revision: int = 1
 
 
-def _write_headers(request_id: str) -> dict[str, str]:
+def _write_headers(request_id: str, revision: int) -> dict[str, str]:
     return {
-        "Authorization": "Bearer secret-token",
+        "Authorization": "Bearer secret-token-00000000",
         "X-Komari-Change-Reason": "验证提示词变更",
         "X-Request-ID": request_id,
+        "If-Match": f'"{revision}"',
     }
 
 
@@ -42,7 +44,7 @@ def _build_app(
 ) -> FastAPI:
     from komari_bot.plugins.komari_management import prompt_api
 
-    def fake_load_prompt_values(resource: ManagedPromptResource) -> PromptValues:
+    async def fake_load_prompt_values(resource: ManagedPromptResource) -> PromptValues:
         values = dict(resource.defaults)
         values.update(store.values)
         stored = StoredPrompt(
@@ -51,13 +53,18 @@ def _build_app(
             prompt_data=dict(store.values),
             version="1.0",
             updated_at=datetime.now(UTC),
+            revision=store.revision,
         )
         return PromptValues(values=values, stored=stored)
 
-    def fake_save_prompt_values(
+    async def fake_replace_prompt_values(
         resource: ManagedPromptResource,
         values: dict[str, object],
-    ) -> StoredPrompt:
+        *,
+        expected_revision: int,
+    ) -> StoredPrompt | None:
+        if expected_revision != store.revision:
+            return None
         unknown_fields = sorted(set(values) - set(resource.defaults))
         if unknown_fields:
             fields = ", ".join(unknown_fields)
@@ -70,16 +77,57 @@ def _build_app(
                 raise ValueError(msg)
             cleaned[key] = value.rstrip("\n")
         store.values = cleaned
+        store.revision += 1
         return StoredPrompt(
             resource_id=resource.resource_id,
             display_name=resource.display_name,
             prompt_data=dict(cleaned),
             version="1.0",
             updated_at=datetime.now(UTC),
+            revision=store.revision,
         )
 
-    monkeypatch.setattr(prompt_api, "load_prompt_values", fake_load_prompt_values)
-    monkeypatch.setattr(prompt_api, "save_prompt_values", fake_save_prompt_values)
+    async def fake_update_prompt_field(
+        resource: ManagedPromptResource,
+        field_name: str,
+        value: object,
+        *,
+        expected_revision: int,
+    ) -> StoredPrompt | None:
+        if expected_revision != store.revision:
+            return None
+        if field_name not in resource.defaults:
+            msg = f"存在未知提示词字段: {field_name}"
+            raise ValueError(msg)
+        if not isinstance(value, str) or not value.strip():
+            msg = f"提示词字段 {field_name} 必须是非空字符串"
+            raise ValueError(msg)
+        store.values[field_name] = value.rstrip("\n")
+        store.revision += 1
+        return StoredPrompt(
+            resource_id=resource.resource_id,
+            display_name=resource.display_name,
+            prompt_data=dict(store.values),
+            version="1.0",
+            updated_at=datetime.now(UTC),
+            revision=store.revision,
+        )
+
+    monkeypatch.setattr(
+        prompt_api,
+        "load_prompt_values_async",
+        fake_load_prompt_values,
+    )
+    monkeypatch.setattr(
+        prompt_api,
+        "replace_prompt_values_async",
+        fake_replace_prompt_values,
+    )
+    monkeypatch.setattr(
+        prompt_api,
+        "update_prompt_field_async",
+        fake_update_prompt_field,
+    )
 
     async def _record_audit(event: ManagementAuditEvent) -> None:
         if audit_events is not None:
@@ -88,7 +136,7 @@ def _build_app(
     api_app = FastAPI()
     register_prompt_api(
         api_app,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         allowed_origins=["https://ui.example.com"],
         resources=(
             ManagedPromptResource(
@@ -117,7 +165,7 @@ async def test_prompt_routes_require_token_and_list_resources(
         unauthorized = await client.get(f"{API_PREFIX}/resources")
         listed = await client.get(
             f"{API_PREFIX}/resources",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert unauthorized.status_code == 401
@@ -133,7 +181,7 @@ async def test_prompt_routes_support_detail_replace_and_field_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _PromptStore(values={"system_prompt": "你好", "memory_ack": "收到"})
-    read_headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
@@ -143,16 +191,17 @@ async def test_prompt_routes_support_detail_replace_and_field_update(
         updated = await client.patch(
             f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
             json={"value": "新的系统提示词"},
-            headers=_write_headers("prompt-field-update"),
+            headers=_write_headers("prompt-field-update", 1),
         )
         replaced = await client.put(
             f"{API_PREFIX}/resources/komari_chat",
             json={"system_prompt": "完整替换", "memory_ack": "也替换"},
-            headers=_write_headers("prompt-replace"),
+            headers=_write_headers("prompt-replace", 2),
         )
 
     assert detail.status_code == 200
     assert detail.json()["values"]["system_prompt"] == "你好"
+    assert detail.json()["revision"] == 1
     assert updated.status_code == 200
     assert updated.json()["values"]["system_prompt"] == "新的系统提示词"
     assert replaced.status_code == 200
@@ -165,7 +214,7 @@ async def test_prompt_routes_report_validation_and_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _PromptStore(values={"system_prompt": "你好", "memory_ack": "收到"})
-    read_headers = {"Authorization": "Bearer secret-token"}
+    read_headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
@@ -176,14 +225,43 @@ async def test_prompt_routes_report_validation_and_not_found(
         missing_field = await client.patch(
             f"{API_PREFIX}/resources/komari_chat/fields/missing_field",
             json={"value": "anything"},
-            headers=_write_headers("prompt-missing-field"),
+            headers=_write_headers("prompt-missing-field", 1),
         )
         invalid_replace = await client.put(
             f"{API_PREFIX}/resources/komari_chat",
             json={"unknown": "anything"},
-            headers=_write_headers("prompt-invalid-replace"),
+            headers=_write_headers("prompt-invalid-replace", 1),
         )
 
     assert missing_resource.status_code == 404
     assert missing_field.status_code == 404
     assert invalid_replace.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_prompt_writes_require_matching_revision(
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _PromptStore(values={"system_prompt": "你好", "memory_ack": "收到"})
+
+    async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
+        client = ctx.get_client()
+        missing_header = await client.patch(
+            f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
+            json={"value": "不会写入"},
+            headers={
+                "Authorization": "Bearer secret-token-00000000",
+                "X-Komari-Change-Reason": "验证缺少修订号",
+            },
+        )
+        stale_revision = await client.patch(
+            f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
+            json={"value": "也不会写入"},
+            headers=_write_headers("prompt-stale-revision", 0),
+        )
+
+    assert missing_header.status_code == 422
+    assert stale_revision.status_code == 409
+    assert store.values["system_prompt"] == "你好"
+    assert store.revision == 1
