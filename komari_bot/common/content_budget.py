@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +58,30 @@ KEYWORDS_TOTAL_TEXT_BUDGET = TextBudget(
     max_estimated_tokens=1_024,
 )
 MAX_KEYWORD_COUNT = 20
+IDENTIFIERS_TOTAL_TEXT_BUDGET = TextBudget(
+    max_characters=4_096,
+    max_utf8_bytes=16_384,
+    max_estimated_tokens=4_096,
+)
+MAX_IDENTIFIER_COUNT = 100
+
+
+@dataclass(frozen=True, slots=True)
+class JsonBudget:
+    """管理入口 JSON 文档允许占用的结构预算。"""
+
+    max_depth: int
+    max_nodes: int
+    max_container_items: int
+    text_budget: TextBudget
+
+
+MANAGEMENT_JSON_BUDGET = JsonBudget(
+    max_depth=8,
+    max_nodes=2_000,
+    max_container_items=100,
+    text_budget=CONTENT_TEXT_BUDGET,
+)
 
 
 class ContentValidationError(ValueError):
@@ -98,6 +125,38 @@ def validate_text_budget(
         )
         raise ContentValidationError(message)
     return value
+
+
+def truncate_text_to_budget(
+    value: str,
+    *,
+    label: str,
+    budget: TextBudget,
+) -> tuple[str, bool]:
+    """显式截断文本到三维预算内，并返回是否发生截断。"""
+    normalized = value.strip()
+    _encode_utf8(normalized, label=label)
+    try:
+        return validate_text_budget(normalized, label=label, budget=budget), False
+    except ContentValidationError:
+        pass
+
+    marker = "…"
+    validate_text_budget(marker, label=label, budget=budget)
+    lower = 0
+    upper = len(normalized)
+    best = marker
+    while lower <= upper:
+        middle = (lower + upper) // 2
+        candidate = f"{normalized[:middle].rstrip()}{marker}"
+        try:
+            validate_text_budget(candidate, label=label, budget=budget)
+        except ContentValidationError:
+            upper = middle - 1
+        else:
+            best = candidate
+            lower = middle + 1
+    return best, True
 
 
 def normalize_required_text(
@@ -165,6 +224,120 @@ def normalize_keywords(
         budget=KEYWORDS_TOTAL_TEXT_BUDGET,
     )
     return normalized
+
+
+def normalize_identifiers(
+    value: list[str],
+    *,
+    label: str,
+    require_nonempty: bool,
+) -> list[str]:
+    """清理、去重并校验一组外部标识符。"""
+    if len(value) > MAX_IDENTIFIER_COUNT:
+        message = (
+            f"{label}数量超过上限（当前 {len(value)}，最多 {MAX_IDENTIFIER_COUNT}）"
+        )
+        raise ContentValidationError(message)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_identifier in value:
+        identifier = normalize_required_text(
+            raw_identifier,
+            label=f"单个{label}",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        normalized.append(identifier)
+
+    if require_nonempty and not normalized:
+        raise ContentValidationError(f"{label}不能为空")
+
+    validate_text_budget(
+        "\n".join(normalized),
+        label=f"{label}总量",
+        budget=IDENTIFIERS_TOTAL_TEXT_BUDGET,
+    )
+    return normalized
+
+
+def validate_json_budget(
+    value: Any,
+    *,
+    label: str,
+    budget: JsonBudget = MANAGEMENT_JSON_BUDGET,
+) -> Any:
+    """校验 JSON 兼容值的深度、节点、容器与序列化文本预算。"""
+    node_count = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    seen_containers: set[int] = set()
+
+    while stack:
+        current, depth = stack.pop()
+        node_count += 1
+        if node_count > budget.max_nodes:
+            message = f"{label}节点数量超过上限（最多 {budget.max_nodes}）"
+            raise ContentValidationError(message)
+        if depth > budget.max_depth:
+            message = f"{label}嵌套深度超过上限（最多 {budget.max_depth} 层）"
+            raise ContentValidationError(message)
+
+        if isinstance(current, dict):
+            container_id = id(current)
+            if container_id in seen_containers:
+                raise ContentValidationError(f"{label}不能包含循环引用")
+            seen_containers.add(container_id)
+            if len(current) > budget.max_container_items:
+                message = (
+                    f"{label}单个对象字段数量超过上限"
+                    f"（最多 {budget.max_container_items}）"
+                )
+                raise ContentValidationError(message)
+            for key, item in current.items():
+                if not isinstance(key, str):
+                    raise ContentValidationError(f"{label}对象键必须是字符串")
+                validate_text_budget(
+                    key,
+                    label=f"{label}对象键",
+                    budget=KEYWORD_TEXT_BUDGET,
+                )
+                stack.append((item, depth + 1))
+            continue
+
+        if isinstance(current, list):
+            container_id = id(current)
+            if container_id in seen_containers:
+                raise ContentValidationError(f"{label}不能包含循环引用")
+            seen_containers.add(container_id)
+            if len(current) > budget.max_container_items:
+                message = (
+                    f"{label}单个数组元素数量超过上限"
+                    f"（最多 {budget.max_container_items}）"
+                )
+                raise ContentValidationError(message)
+            stack.extend((item, depth + 1) for item in current)
+            continue
+
+        if isinstance(current, float) and not math.isfinite(current):
+            raise ContentValidationError(f"{label}不能包含非有限数值")
+        if not isinstance(current, (str, int, float, bool, type(None))):
+            message = f"{label}包含不支持的 JSON 类型"
+            raise ContentValidationError(message)
+
+    try:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        message = f"{label}不是有效 JSON 文档"
+        raise ContentValidationError(message) from exc
+    validate_text_budget(serialized, label=label, budget=budget.text_budget)
+    return value
 
 
 def _encode_utf8(value: str, *, label: str) -> bytes:

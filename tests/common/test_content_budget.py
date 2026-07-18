@@ -5,13 +5,18 @@ from __future__ import annotations
 import pytest
 
 from komari_bot.common.content_budget import (
+    MAX_IDENTIFIER_COUNT,
     MAX_KEYWORD_COUNT,
     ContentValidationError,
+    JsonBudget,
     TextBudget,
     estimate_text_tokens,
+    normalize_identifiers,
     normalize_keywords,
     normalize_optional_text,
     normalize_required_text,
+    truncate_text_to_budget,
+    validate_json_budget,
     validate_text_budget,
 )
 
@@ -49,6 +54,22 @@ def test_text_budget_checks_characters_utf8_bytes_and_tokens() -> None:
         )
 
 
+def test_text_budget_explicit_truncation_obeys_all_dimensions() -> None:
+    value, truncated = truncate_text_to_budget(
+        "测" * 20,
+        label="字段",
+        budget=TextBudget(10, 24, 8),
+    )
+
+    assert truncated is True
+    assert value.endswith("…")
+    assert validate_text_budget(
+        value,
+        label="字段",
+        budget=TextBudget(10, 24, 8),
+    ) == value
+
+
 def test_invalid_unicode_is_rejected_without_echoing_content() -> None:
     with pytest.raises(ContentValidationError, match="无效 Unicode 字符") as exc_info:
         validate_text_budget(
@@ -82,3 +103,53 @@ def test_keyword_budget_normalizes_deduplicates_and_limits_raw_count() -> None:
 def test_token_estimate_is_conservative_for_chinese_and_ascii() -> None:
     assert estimate_text_tokens("测" * 10) == 10
     assert estimate_text_tokens("a" * 12) == 4
+
+
+def test_identifier_list_budget_normalizes_deduplicates_and_limits_count() -> None:
+    assert normalize_identifiers(
+        [" u1 ", "u1", "u2"],
+        label="参与者",
+        require_nonempty=True,
+    ) == ["u1", "u2"]
+
+    with pytest.raises(ContentValidationError, match="参与者数量超过上限"):
+        normalize_identifiers(
+            [str(index) for index in range(MAX_IDENTIFIER_COUNT + 1)],
+            label="参与者",
+            require_nonempty=False,
+        )
+
+
+def test_json_budget_rejects_deep_wide_and_non_finite_documents() -> None:
+    budget = JsonBudget(
+        max_depth=3,
+        max_nodes=10,
+        max_container_items=2,
+        text_budget=TextBudget(100, 300, 100),
+    )
+    assert validate_json_budget(
+        {"traits": {"food": "布丁"}},
+        label="画像",
+        budget=budget,
+    ) == {"traits": {"food": "布丁"}}
+
+    with pytest.raises(ContentValidationError, match="嵌套深度超过上限"):
+        validate_json_budget(
+            {"a": {"b": {"c": "deep"}}},
+            label="画像",
+            budget=budget,
+        )
+
+    with pytest.raises(ContentValidationError, match="字段数量超过上限"):
+        validate_json_budget(
+            {"a": 1, "b": 2, "c": 3},
+            label="画像",
+            budget=budget,
+        )
+
+    with pytest.raises(ContentValidationError, match="非有限数值"):
+        validate_json_budget(
+            {"score": float("nan")},
+            label="画像",
+            budget=budget,
+        )

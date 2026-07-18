@@ -6,6 +6,12 @@ import html
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .content_budget import (
+    TextBudget,
+    estimate_text_tokens,
+    truncate_text_to_budget,
+)
+
 type UntrustedSourceType = Literal[
     "knowledge",
     "web",
@@ -38,7 +44,11 @@ LLM_SECURITY_SYSTEM_INSTRUCTION = (
 
 _DEFAULT_MAX_CONTEXT_CHARS = 12_000
 _MAX_SOURCE_ID_CHARS = 256
+_MAX_CONTEXT_UTF8_BYTES = 36_000
 _INVALID_MAX_CONTEXT_CHARS_ERROR = "max_chars 必须大于 0"
+MAX_UNTRUSTED_CONTEXT_COUNT = 32
+MAX_TOTAL_UNTRUSTED_CONTEXT_UTF8_BYTES = 96 * 1024
+MAX_TOTAL_UNTRUSTED_CONTEXT_ESTIMATED_TOKENS = 32_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,15 +73,37 @@ def render_untrusted_context(
         raise ValueError(_INVALID_MAX_CONTEXT_CHARS_ERROR)
 
     original_chars = len(context.content)
-    truncated = original_chars > max_chars
     content = context.content[:max_chars]
-    if truncated:
-        content = f"{content}…"
 
     source_type = html.escape(context.source_type, quote=True)
-    source_id = html.escape(context.source_id[:_MAX_SOURCE_ID_CHARS], quote=True)
+    escaped_source_id = html.escape(
+        context.source_id[:_MAX_SOURCE_ID_CHARS],
+        quote=True,
+    )
+    source_id, source_id_truncated = truncate_text_to_budget(
+        escaped_source_id,
+        label="不可信上下文来源 ID",
+        budget=TextBudget(
+            max_characters=_MAX_SOURCE_ID_CHARS,
+            max_utf8_bytes=_MAX_SOURCE_ID_CHARS * 3,
+            max_estimated_tokens=_MAX_SOURCE_ID_CHARS,
+        ),
+    )
     trust_level = html.escape(context.trust_level, quote=True)
-    escaped_content = html.escape(content, quote=False)
+    escaped_content, escaped_truncated = truncate_text_to_budget(
+        html.escape(content, quote=False),
+        label="不可信上下文正文",
+        budget=TextBudget(
+            max_characters=max_chars,
+            max_utf8_bytes=min(_MAX_CONTEXT_UTF8_BYTES, max_chars * 3),
+            max_estimated_tokens=max_chars,
+        ),
+    )
+    truncated = (
+        original_chars > max_chars
+        or escaped_truncated
+        or source_id_truncated
+    )
     return (
         f'<untrusted_context source_type="{source_type}" '
         f'source_id="{source_id}" trust_level="{trust_level}" '
@@ -105,12 +137,49 @@ def apply_llm_security_boundary(
         "role": "system",
         "content": LLM_SECURITY_SYSTEM_INSTRUCTION,
     }
+    provided_contexts = untrusted_contexts or []
+    rendered_contexts: list[str] = []
+    total_bytes = 0
+    total_tokens = 0
+    omitted_count = max(0, len(provided_contexts) - MAX_UNTRUSTED_CONTEXT_COUNT)
+    for context in provided_contexts[:MAX_UNTRUSTED_CONTEXT_COUNT]:
+        rendered = render_untrusted_context(context)
+        rendered_bytes = len(rendered.encode("utf-8"))
+        rendered_tokens = estimate_text_tokens(rendered)
+        if (
+            total_bytes + rendered_bytes
+            > MAX_TOTAL_UNTRUSTED_CONTEXT_UTF8_BYTES
+            or total_tokens + rendered_tokens
+            > MAX_TOTAL_UNTRUSTED_CONTEXT_ESTIMATED_TOKENS
+        ):
+            omitted_count += 1
+            continue
+        rendered_contexts.append(rendered)
+        total_bytes += rendered_bytes
+        total_tokens += rendered_tokens
+
+    if omitted_count:
+        omission = render_untrusted_context(
+            UntrustedContext(
+                source_type="tool_result",
+                source_id="provider-context-budget",
+                content=f"已有 {omitted_count} 段不可信上下文因请求总预算被省略",
+                max_chars=128,
+            )
+        )
+        omission_bytes = len(omission.encode("utf-8"))
+        omission_tokens = estimate_text_tokens(omission)
+        if (
+            total_bytes + omission_bytes
+            <= MAX_TOTAL_UNTRUSTED_CONTEXT_UTF8_BYTES
+            and total_tokens + omission_tokens
+            <= MAX_TOTAL_UNTRUSTED_CONTEXT_ESTIMATED_TOKENS
+        ):
+            rendered_contexts.append(omission)
+
     context_messages = [
-        {
-            "role": "user",
-            "content": render_untrusted_context(context),
-        }
-        for context in (untrusted_contexts or [])
+        {"role": "user", "content": rendered}
+        for rendered in rendered_contexts
     ]
     return [
         *system_messages,
