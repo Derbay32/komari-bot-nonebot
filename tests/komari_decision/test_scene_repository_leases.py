@@ -147,6 +147,11 @@ def test_insert_scene_items_ignores_concurrent_duplicate_rows() -> None:
     repository = _repository(connection)
     item = {
         "scene_id": 5,
+        "scene_key": "SCENE_TEST",
+        "scene_type": "general",
+        "content_text": "不可变场景文本",
+        "enabled": True,
+        "order_index": 1,
         "content_hash": "content-hash",
         "embedding": None,
         "embedding_dim": None,
@@ -162,6 +167,16 @@ def test_insert_scene_items_ignores_concurrent_duplicate_rows() -> None:
     assert all(
         "ON CONFLICT (set_id, scene_id) DO NOTHING" in query
         for query, _args in connection.fetchval_calls
+    )
+    assert all(
+        args[2:7] == (
+            "SCENE_TEST",
+            "general",
+            "不可变场景文本",
+            True,
+            1,
+        )
+        for _query, args in connection.fetchval_calls
     )
 
 

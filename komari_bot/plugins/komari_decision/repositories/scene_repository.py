@@ -140,18 +140,40 @@ class SceneRepository:
             return dict(row)
 
     async def delete_scene(self, scene_key: str) -> bool:
-        """删除 scene 内容记录，必需 fixed key 不允许删除。"""
+        """删除未引用 scene；已有历史 set 引用时仅停用当前版本。"""
         if scene_key in {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}:
             msg = f"必需 fixed scene 不允许删除: {scene_key}"
             raise ValueError(msg)
-        async with self.pg_pool.acquire() as conn:
-            result = await conn.execute(
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            referenced = await conn.fetchval(
                 """
-                DELETE FROM komari_decision_scenes
-                WHERE scene_key = $1
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM komari_memory_scene_item item
+                    JOIN komari_decision_scenes scene ON scene.id = item.scene_id
+                    WHERE scene.scene_key = $1
+                )
                 """,
                 scene_key,
             )
+            if referenced:
+                result = await conn.execute(
+                    """
+                    UPDATE komari_decision_scenes
+                    SET enabled = FALSE,
+                        updated_at = NOW()
+                    WHERE scene_key = $1
+                    """,
+                    scene_key,
+                )
+            else:
+                result = await conn.execute(
+                    """
+                    DELETE FROM komari_decision_scenes
+                    WHERE scene_key = $1
+                    """,
+                    scene_key,
+                )
         affected = int(result.split()[-1])
         return affected > 0
 
@@ -244,6 +266,11 @@ class SceneRepository:
                 (
                     set_id,
                     int(scene_id),
+                    str(item["scene_key"]),
+                    str(item["scene_type"]),
+                    str(item["content_text"]),
+                    bool(item.get("enabled", True)),
+                    int(item.get("order_index", 0)),
                     str(item["content_hash"]),
                     item.get("embedding"),
                     item.get("embedding_dim"),
@@ -258,9 +285,11 @@ class SceneRepository:
                 inserted_id = await conn.fetchval(
                     """
                     INSERT INTO komari_memory_scene_item
-                    (set_id, scene_id, content_hash, embedding, embedding_dim,
-                     status, error_message, embedded_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    (set_id, scene_id, scene_key_snapshot, scene_type_snapshot,
+                     content_text_snapshot, enabled_snapshot, order_index_snapshot,
+                     content_hash, embedding, embedding_dim, status, error_message,
+                     embedded_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                     ON CONFLICT (set_id, scene_id) DO NOTHING
                     RETURNING id
                     """,
@@ -434,13 +463,17 @@ class SceneRepository:
     ) -> list[dict[str, Any]]:
         """按 set 获取 scene 条目。"""
         sql = """
-            SELECT i.id, i.set_id, i.scene_id, s.scene_key, s.scene_type,
-                   s.content_text, i.content_hash, s.enabled, s.order_index,
+            SELECT i.id, i.set_id, i.scene_id,
+                   i.scene_key_snapshot AS scene_key,
+                   i.scene_type_snapshot AS scene_type,
+                   i.content_text_snapshot AS content_text,
+                   i.content_hash,
+                   i.enabled_snapshot AS enabled,
+                   i.order_index_snapshot AS order_index,
                    i.embedding, i.embedding_dim, i.status, i.error_message,
                    i.last_error_code, i.attempt_count, i.next_retry_at,
                    i.lease_owner, i.lease_expires_at, i.embedded_at
             FROM komari_memory_scene_item i
-            JOIN komari_decision_scenes s ON s.id = i.scene_id
             WHERE i.set_id = $1
         """
         params: list[Any] = [set_id]
@@ -452,9 +485,9 @@ class SceneRepository:
             idx += 1
 
         if enabled_only:
-            sql += " AND s.enabled = TRUE"
+            sql += " AND i.enabled_snapshot = TRUE"
 
-        sql += " ORDER BY s.order_index ASC, i.id ASC"
+        sql += " ORDER BY i.order_index_snapshot ASC, i.id ASC"
 
         if limit is not None:
             sql += f" LIMIT ${idx}"
@@ -485,12 +518,16 @@ class SceneRepository:
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT i.id, i.set_id, i.scene_id, ds.scene_key, ds.scene_type,
-                       ds.content_text, i.content_hash, ds.enabled, ds.order_index,
+                SELECT i.id, i.set_id, i.scene_id,
+                       i.scene_key_snapshot AS scene_key,
+                       i.scene_type_snapshot AS scene_type,
+                       i.content_text_snapshot AS content_text,
+                       i.content_hash,
+                       i.enabled_snapshot AS enabled,
+                       i.order_index_snapshot AS order_index,
                        i.embedding, i.embedding_dim, i.status, i.error_message, i.embedded_at
                 FROM komari_memory_scene_item i
                 JOIN komari_memory_scene_set s ON s.id = i.set_id
-                JOIN komari_decision_scenes ds ON ds.id = i.scene_id
                 WHERE i.scene_id = $1
                   AND i.content_hash = $2
                   AND i.status = 'READY'
@@ -560,13 +597,12 @@ class SceneRepository:
                 WITH candidates AS (
                     SELECT i.id
                     FROM komari_memory_scene_item i
-                    JOIN komari_decision_scenes s ON s.id = i.scene_id
                     JOIN komari_memory_scene_set scene_set ON scene_set.id = i.set_id
                     WHERE i.set_id = $1
                       AND scene_set.status = 'BUILDING'
                       AND i.status = 'PENDING'
                       AND (i.next_retry_at IS NULL OR i.next_retry_at <= NOW())
-                    ORDER BY s.order_index ASC, i.id ASC
+                    ORDER BY i.order_index_snapshot ASC, i.id ASC
                     FOR UPDATE OF i SKIP LOCKED
                     LIMIT $2
                 ), claimed AS (
@@ -581,16 +617,19 @@ class SceneRepository:
                     RETURNING item.*
                 )
                 SELECT claimed.id, claimed.set_id, claimed.scene_id,
-                       s.scene_key, s.scene_type, s.content_text,
-                       claimed.content_hash, s.enabled, s.order_index,
+                       claimed.scene_key_snapshot AS scene_key,
+                       claimed.scene_type_snapshot AS scene_type,
+                       claimed.content_text_snapshot AS content_text,
+                       claimed.content_hash,
+                       claimed.enabled_snapshot AS enabled,
+                       claimed.order_index_snapshot AS order_index,
                        claimed.embedding, claimed.embedding_dim, claimed.status,
                        claimed.error_message, claimed.last_error_code,
                        claimed.attempt_count, claimed.next_retry_at,
                        claimed.lease_owner, claimed.lease_expires_at,
                        claimed.embedded_at
                 FROM claimed
-                JOIN komari_decision_scenes s ON s.id = claimed.scene_id
-                ORDER BY s.order_index ASC, claimed.id ASC
+                ORDER BY claimed.order_index_snapshot ASC, claimed.id ASC
                 """,
                 set_id,
                 limit,

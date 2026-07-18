@@ -54,7 +54,8 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         IF EXISTS (
             SELECT 1
             FROM information_schema.columns
-            WHERE table_name = 'komari_memory_scene_item'
+            WHERE table_schema = current_schema()
+              AND table_name = 'komari_memory_scene_item'
               AND column_name = 'scene_key'
         ) THEN
             DROP TABLE komari_memory_scene_item CASCADE;
@@ -66,6 +67,11 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         id BIGSERIAL PRIMARY KEY,
         set_id BIGINT NOT NULL REFERENCES komari_memory_scene_set(id) ON DELETE CASCADE,
         scene_id BIGINT NOT NULL REFERENCES komari_decision_scenes(id) ON DELETE CASCADE,
+        scene_key_snapshot TEXT NOT NULL,
+        scene_type_snapshot TEXT NOT NULL,
+        content_text_snapshot TEXT NOT NULL,
+        enabled_snapshot BOOLEAN NOT NULL,
+        order_index_snapshot INT NOT NULL,
         content_hash TEXT NOT NULL,
         embedding REAL[],
         embedding_dim INT,
@@ -81,6 +87,51 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
             CHECK (status IN ('PENDING', 'PROCESSING', 'READY', 'FAILED')),
         UNIQUE (set_id, scene_id)
     )
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS scene_key_snapshot TEXT
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS scene_type_snapshot TEXT
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS content_text_snapshot TEXT
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS enabled_snapshot BOOLEAN
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+    ADD COLUMN IF NOT EXISTS order_index_snapshot INT
+    """,
+    """
+    UPDATE komari_memory_scene_item item
+    SET scene_key_snapshot = scene.scene_key,
+        scene_type_snapshot = scene.scene_type,
+        content_text_snapshot = scene.content_text,
+        enabled_snapshot = scene.enabled,
+        order_index_snapshot = scene.order_index
+    FROM komari_decision_scenes scene
+    WHERE item.scene_id = scene.id
+      AND (
+          item.scene_key_snapshot IS NULL
+          OR item.scene_type_snapshot IS NULL
+          OR item.content_text_snapshot IS NULL
+          OR item.enabled_snapshot IS NULL
+          OR item.order_index_snapshot IS NULL
+      )
+    """,
+    """
+    ALTER TABLE komari_memory_scene_item
+        ALTER COLUMN scene_key_snapshot SET NOT NULL,
+        ALTER COLUMN scene_type_snapshot SET NOT NULL,
+        ALTER COLUMN content_text_snapshot SET NOT NULL,
+        ALTER COLUMN enabled_snapshot SET NOT NULL,
+        ALTER COLUMN order_index_snapshot SET NOT NULL
     """,
     """
     ALTER TABLE komari_memory_scene_item

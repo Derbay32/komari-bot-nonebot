@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal
 from nonebot import logger
 
 from .config_interface import get_config
-from .message_filter import preprocess_message
+from .message_filter import is_command_message, preprocess_message
 from .runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
 from .social_timing_service import SocialTimingService, TimingScoreBreakdown
 from .unified_candidate_rerank import (
@@ -132,7 +132,7 @@ class DecisionEngine:
         config = get_config()
         runtime_state = self._get_runtime_state()
 
-        if at_trigger:
+        if at_trigger and not is_command_message(message_content):
             return DecisionOutcome(
                 memory_action="store",
                 should_reply=True,

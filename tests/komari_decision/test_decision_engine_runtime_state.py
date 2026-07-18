@@ -164,6 +164,38 @@ async def test_explicit_trigger_bypasses_failed_runtime(
 
 
 @pytest.mark.asyncio
+async def test_explicit_trigger_does_not_bypass_command_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filter_calls: list[str] = []
+
+    async def _preprocess_message(**kwargs: object) -> Any:
+        filter_calls.append(str(kwargs["message"]))
+        return SimpleNamespace(should_skip=True, reason="command")
+
+    monkeypatch.setattr(engine_module, "preprocess_message", _preprocess_message)
+    monkeypatch.setattr(
+        engine_module,
+        "get_config",
+        lambda: SimpleNamespace(),
+    )
+    rerank = _RerankService()
+    engine = _build_engine(monkeypatch, DecisionRuntimeState.ready, rerank)
+
+    outcome = await engine.evaluate(
+        message_content=".help",
+        group_id="100",
+        at_trigger=True,
+    )
+
+    assert filter_calls == [".help"]
+    assert rerank.calls == 0
+    assert outcome.memory_action == "drop"
+    assert outcome.should_reply is False
+    assert outcome.filter_reason == "command"
+
+
+@pytest.mark.asyncio
 async def test_transient_snapshot_loss_degrades_without_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
