@@ -21,7 +21,11 @@ class DynamicConfigSchema(BaseModel):
         description="最后更新时间戳",
     )
 
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    plugin_enable: bool = Field(
+        default=False,
+        description="插件启用状态",
+        json_schema_extra={"apply_mode": "restart"},
+    )
 
     user_whitelist: list[str] = Field(
         default_factory=list, description="用户白名单，为空则允许所有用户"

@@ -23,7 +23,7 @@ from .models import (
     HelpSearchResult,
     HelpUpdateRequest,
 )
-from .scanner import scan_and_sync
+from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -249,7 +249,13 @@ def create_help_router(
     async def scan_help(
         engine: HelpEngineProtocol = Depends(engine_dependency),  # noqa: FAST002
     ) -> HelpScanResponse:
-        updated_count = await scan_and_sync(cast("Any", engine))
+        try:
+            updated_count = await scan_and_sync(cast("Any", engine))
+        except HelpScanAlreadyRunningError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="另一个进程正在扫描帮助信息",
+            ) from exc
         return HelpScanResponse(updated_count=updated_count)
 
     return router

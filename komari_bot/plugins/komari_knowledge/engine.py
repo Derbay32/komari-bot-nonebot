@@ -11,6 +11,7 @@ Komari Knowledge 常识库核心引擎。
 """
 
 import asyncio
+import hashlib
 import logging
 import sys
 from collections import defaultdict
@@ -131,6 +132,10 @@ def get_db_config() -> DatabaseConfigSchema:
 
 
 UNSET: Final[object] = object()
+
+
+def _query_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
 class KnowledgeEngine:
@@ -398,12 +403,15 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")  # noqa:TRY003
 
+        config = get_config()
         # 确保 limit 是 int 类型
         if limit is None:
-            limit = get_config().total_limit
+            limit = config.total_limit
 
         # pylance 不知道 config 插件会存取什么东西，写个 assert 告诉它 limit 此时一定是 int
         assert isinstance(limit, int), "limit should be int"
+        if limit <= 0:
+            return []
 
         # 应用查询重写
         original_query = query
@@ -416,7 +424,9 @@ class KnowledgeEngine:
 
         if query != original_query:
             state.logger.info(
-                f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'"
+                "[Komari Knowledge] 查询已重写: "
+                f"original_chars={len(original_query)} rewritten_chars={len(query)} "
+                f"query_hash={_query_fingerprint(query)}"
             )
             if query_vec is not None:
                 state.logger.debug(
@@ -428,7 +438,12 @@ class KnowledgeEngine:
         seen_ids: set[int] = set()
 
         # --- Layer 1: 关键词精确匹配（内存，微秒级） ---
-        keyword_hits = await self._layer1_keyword_search(query, limit)
+        keyword_limit = min(limit, config.layer1_limit)
+        keyword_hits = (
+            await self._layer1_keyword_search(query, keyword_limit)
+            if keyword_limit > 0
+            else []
+        )
         for hit in keyword_hits:
             if hit.id not in seen_ids:
                 results.append(hit)
@@ -436,14 +451,22 @@ class KnowledgeEngine:
 
         # --- Layer 2: 向量语义检索（补漏） ---
         vector_hits: list[SearchResult] = []
-        if len(results) < limit:
+        vector_limit = min(
+            config.layer2_limit,
+            max(0, limit - len(results)),
+        )
+        if vector_limit > 0:
             vector_hits = await self._layer2_vector_search(
-                query, limit - len(results), seen_ids, query_vec=query_vec
+                query,
+                vector_limit,
+                seen_ids,
+                query_vec=query_vec,
             )
             results.extend(vector_hits)
 
         state.logger.debug(
-            f"[Komari Knowledge] 检索 '{query[:20]}...' -> "
+            "[Komari Knowledge] 检索完成: "
+            f"query_hash={_query_fingerprint(query)} "
             f"关键词命中 {len(keyword_hits)} 条，向量补充 {len(vector_hits)} 条"
         )
 

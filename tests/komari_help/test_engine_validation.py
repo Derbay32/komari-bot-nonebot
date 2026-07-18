@@ -12,15 +12,18 @@ from komari_bot.plugins.komari_help.engine import HelpEngine
 
 class _UpdatePool:
     def __init__(self) -> None:
-        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.fetchval_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.active_acquisitions = 0
 
     def acquire(self) -> _UpdatePool:
         return self
 
     async def __aenter__(self) -> Self:
+        self.active_acquisitions += 1
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.active_acquisitions -= 1
         del exc_type, exc, tb
 
     async def fetchrow(self, _query: str, hid: int) -> dict[str, object]:
@@ -32,10 +35,12 @@ class _UpdatePool:
             "category": "other",
             "plugin_name": "demo",
             "notes": None,
+            "row_version": "42",
         }
 
-    async def execute(self, query: str, *args: object) -> None:
-        self.execute_calls.append((query, args))
+    async def fetchval(self, query: str, *args: object) -> int:
+        self.fetchval_calls.append((query, args))
+        return 1
 
 
 @pytest.mark.asyncio
@@ -69,6 +74,7 @@ async def test_update_help_embeds_and_writes_normalized_text() -> None:
     embedding_inputs: list[str] = []
 
     async def _embedding(text: str) -> list[float]:
+        assert pool.active_acquisitions == 0
         embedding_inputs.append(text)
         return [0.1, 0.2]
 
@@ -82,6 +88,7 @@ async def test_update_help_embeds_and_writes_normalized_text() -> None:
 
     assert updated is True
     assert embedding_inputs == ["新标题\n旧内容"]
-    query, args = pool.execute_calls[0]
-    assert "title = $2" in query
-    assert args == (1, "新标题", str([0.1, 0.2]))
+    query, args = pool.fetchval_calls[0]
+    assert "title = $3" in query
+    assert "xmin::text = $2" in query
+    assert args == (1, "42", "新标题", str([0.1, 0.2]))

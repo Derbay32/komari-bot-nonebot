@@ -11,6 +11,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
 
+from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.plugins.komari_help import rendering as rendering_module
 from komari_bot.plugins.komari_help.models import HelpEntry, HelpSearchResult
 
@@ -239,7 +240,11 @@ async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
         ctx.receive_event(bot, event)
         ctx.should_ignore_permission(matcher=matcher)
         ctx.should_pass_rule(matcher=matcher)
-        ctx.should_call_send(event, "❌ 插件当前已禁用", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 插件当前已禁用"),
+            bot=bot,
+        )
         ctx.should_finished()
 
     assert permission_manager.seen_configs == [config]
@@ -309,7 +314,11 @@ async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
         ctx.receive_event(bot, event)
         ctx.should_ignore_permission(matcher=matcher)
         ctx.should_pass_rule(matcher=matcher)
-        ctx.should_call_send(event, "❌ 插件当前已禁用", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("❌ 插件当前已禁用"),
+            bot=bot,
+        )
         ctx.should_finished()
 
     assert permission_manager.seen_configs == [config]

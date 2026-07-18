@@ -143,7 +143,7 @@ def _build_app(engine: _FakeEngine | None) -> FastAPI:
     api_app = FastAPI()
     register_knowledge_api(
         api_app,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         allowed_origins=["https://ui.example.com"],
         engine_getter=lambda: engine,
     )
@@ -183,7 +183,7 @@ async def test_knowledge_routes_return_503_when_engine_unavailable(app: App) -> 
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/knowledge",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 503
@@ -204,15 +204,15 @@ async def test_list_and_get_knowledge_routes_forward_filters(app: App) -> None:
                 limit=5,
                 offset=3,
             ),
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
         detail = await client.get(
             f"{API_PREFIX}/knowledge/1",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
         missing = await client.get(
             f"{API_PREFIX}/knowledge/999",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 200
@@ -227,7 +227,7 @@ async def test_list_and_get_knowledge_routes_forward_filters(app: App) -> None:
 @pytest.mark.asyncio
 async def test_create_update_delete_and_search_routes(app: App) -> None:
     engine = _FakeEngine()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
         client = ctx.get_client()
@@ -277,7 +277,7 @@ async def test_create_update_delete_and_search_routes(app: App) -> None:
 
 @pytest.mark.asyncio
 async def test_update_validation_errors_are_reported(app: App) -> None:
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(_FakeEngine()))) as ctx:
         client = ctx.get_client()
@@ -301,7 +301,7 @@ async def test_update_validation_errors_are_reported(app: App) -> None:
 @pytest.mark.asyncio
 async def test_routes_reject_over_budget_before_engine_call(app: App) -> None:
     engine = _FakeEngine()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
         client = ctx.get_client()

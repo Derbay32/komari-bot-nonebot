@@ -140,7 +140,7 @@ def _build_app(engine: _FakeEngine | None) -> FastAPI:
     api_app = FastAPI()
     register_help_api(
         api_app,
-        api_token="secret-token",
+        api_token="secret-token-00000000",
         allowed_origins=["https://ui.example.com"],
         engine_getter=lambda: engine,
     )
@@ -170,7 +170,7 @@ async def test_help_routes_require_token_and_handle_cors(app: App) -> None:
 @pytest.mark.asyncio
 async def test_help_routes_list_get_create_update_delete_and_search(app: App) -> None:
     engine = _FakeEngine()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
         client = ctx.get_client()
@@ -230,7 +230,7 @@ async def test_help_routes_return_503_when_engine_unavailable(app: App) -> None:
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/help",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 503
@@ -242,7 +242,7 @@ async def test_help_routes_reject_over_budget_and_null_required_fields(
     app: App,
 ) -> None:
     engine = _FakeEngine()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(engine))) as ctx:
         client = ctx.get_client()
