@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import textwrap
 from typing import Any
 
 PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS = 2000
+
+
+def render_schema_statements(statements: tuple[str, ...]) -> str:
+    """把运行时 DDL 规范化为可由 psql 执行的 SQL 文本。"""
+    rendered: list[str] = []
+    for statement in statements:
+        normalized = textwrap.dedent(statement).strip()
+        if not normalized:
+            continue
+        rendered.append(normalized if normalized.endswith(";") else f"{normalized};")
+    return "\n\n".join(rendered) + "\n"
 
 
 def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
@@ -83,6 +95,26 @@ def build_memory_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_conv_dedup_key
         ON komari_memory_conversations (dedup_key)
         WHERE dedup_key IS NOT NULL
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS komari_memory_jobs (
+            job_name TEXT NOT NULL,
+            run_date DATE NOT NULL,
+            owner_token TEXT NOT NULL,
+            lease_until TIMESTAMPTZ NOT NULL,
+            stage TEXT NOT NULL,
+            attempt INT NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+            last_error_code TEXT,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMPTZ,
+            PRIMARY KEY (job_name, run_date)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_komari_memory_jobs_lease
+        ON komari_memory_jobs (job_name, lease_until)
+        WHERE stage <> 'completed'
         """,
         """
         CREATE TABLE IF NOT EXISTS komari_memory_user_profile (
@@ -227,19 +259,22 @@ def _build_legacy_interaction_history_migration_statement() -> str:
         BEGIN
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'komari_memory_interaction_history'
+                WHERE table_schema = current_schema()
+                  AND table_name = 'komari_memory_interaction_history'
                   AND column_name = 'records'
             ) INTO has_old_records;
 
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'komari_memory_interaction_history'
+                WHERE table_schema = current_schema()
+                  AND table_name = 'komari_memory_interaction_history'
                   AND column_name = 'event_summary'
             ) INTO has_new_event_summary;
 
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'komari_memory_interaction_history'
+                WHERE table_schema = current_schema()
+                  AND table_name = 'komari_memory_interaction_history'
                   AND column_name = 'group_id'
             ) INTO has_old_group_id;
 
@@ -435,6 +470,37 @@ def build_help_schema_statements(embedding_dimension: int) -> tuple[str, ...]:
             created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS komari_help_scan_leases (
+            lease_name TEXT PRIMARY KEY,
+            owner_token TEXT NOT NULL,
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        WITH ranked_auto_help AS (
+            SELECT
+                id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY plugin_name
+                    ORDER BY updated_at DESC, id DESC
+                ) AS duplicate_rank
+            FROM komari_help
+            WHERE is_auto_generated = TRUE
+              AND plugin_name IS NOT NULL
+        )
+        DELETE FROM komari_help AS help
+        USING ranked_auto_help AS ranked
+        WHERE help.id = ranked.id
+          AND ranked.duplicate_rank > 1
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_komari_help_auto_plugin
+        ON komari_help(plugin_name)
+        WHERE is_auto_generated = TRUE
+          AND plugin_name IS NOT NULL
         """,
     ]
     embedding_index_statement = build_help_embedding_index_statement(dimension)
