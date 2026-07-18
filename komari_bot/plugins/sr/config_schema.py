@@ -7,6 +7,15 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    KEYWORD_TEXT_BUDGET,
+    normalize_required_text,
+    validate_text_budget,
+)
+
+MAX_SR_LIST_ITEMS = 500
+
 
 class DynamicConfigSchema(BaseModel):
     """SR 插件的配置 Schema。
@@ -39,7 +48,11 @@ class DynamicConfigSchema(BaseModel):
     )
 
     # sr 数据配置
-    sr_list: list[str] = Field(default_factory=list, description="安科神人榜列表")
+    sr_list: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_SR_LIST_ITEMS,
+        description="安科神人榜列表",
+    )
     list_chunk_size: int = Field(
         default=20, ge=5, le=50, description="list 命令每页显示条数"
     )
@@ -67,3 +80,37 @@ class DynamicConfigSchema(BaseModel):
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("sr_list", mode="before")
+    @classmethod
+    def validate_sr_list_count(cls, value: Any) -> Any:
+        """在 Pydantic 内建长度校验前返回中文容量错误。"""
+        if isinstance(value, list) and len(value) > MAX_SR_LIST_ITEMS:
+            msg = f"神人榜最多允许 {MAX_SR_LIST_ITEMS} 项"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("sr_list")
+    @classmethod
+    def validate_sr_list_budget(cls, value: list[str]) -> list[str]:
+        """限制榜单项目数、单项文本和总内容预算。"""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            cleaned = normalize_required_text(
+                item,
+                label="神人榜单项",
+                budget=KEYWORD_TEXT_BUDGET,
+            )
+            identity = cleaned.casefold()
+            if identity in seen:
+                msg = f"神人榜存在重复项目: {cleaned}"
+                raise ValueError(msg)
+            seen.add(identity)
+            normalized.append(cleaned)
+        validate_text_budget(
+            "\n".join(normalized),
+            label="神人榜总内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        return normalized
