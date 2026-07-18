@@ -160,3 +160,4 @@ test_multimodal.py
 logs
 !tools/
 tools/*
+data/character_binding/.bindings.json.lock
