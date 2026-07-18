@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 from typing import TYPE_CHECKING, Any, cast
@@ -108,14 +109,14 @@ async def test_named_credentials_enforce_scope_and_scheduled_revocation(
 
 @pytest.mark.asyncio
 async def test_legacy_and_dynamic_credentials_remain_compatible(app: App) -> None:
-    state: dict[str, object] = {"credentials": "legacy-token"}
+    state: dict[str, object] = {"credentials": "legacy-token-00000000"}
     api_app = _build_auth_app(lambda: state["credentials"])
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
         legacy = await client.get(
             "/read",
-            headers={"Authorization": "Bearer legacy-token"},
+            headers={"Authorization": "Bearer legacy-token-00000000"},
         )
         state["credentials"] = [
             {
@@ -126,7 +127,7 @@ async def test_legacy_and_dynamic_credentials_remain_compatible(app: App) -> Non
         ]
         old_after_rotation = await client.get(
             "/read",
-            headers={"Authorization": "Bearer legacy-token"},
+            headers={"Authorization": "Bearer legacy-token-00000000"},
         )
         rotated = await client.get(
             "/read",
@@ -141,6 +142,73 @@ async def test_legacy_and_dynamic_credentials_remain_compatible(app: App) -> Non
     assert old_after_rotation.status_code == 401
     assert rotated.status_code == 200
     assert rotated.json()["operator_id"] == "rotated-reader"
+
+
+@pytest.mark.asyncio
+async def test_async_credential_source_is_resolved_for_every_request(app: App) -> None:
+    state = {"token": "first-token-00000000"}
+    calls = 0
+
+    async def _credential_source() -> str:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return state["token"]
+
+    async with app.test_server(
+        asgi=cast("Any", _build_auth_app(_credential_source))
+    ) as ctx:
+        client = ctx.get_client()
+        first = await client.get(
+            "/read",
+            headers={"Authorization": "Bearer first-token-00000000"},
+        )
+        state["token"] = "second-token-0000000"
+        old = await client.get(
+            "/read",
+            headers={"Authorization": "Bearer first-token-00000000"},
+        )
+        second = await client.get(
+            "/read",
+            headers={"Authorization": "Bearer second-token-0000000"},
+        )
+
+    assert first.status_code == 200
+    assert old.status_code == 401
+    assert second.status_code == 200
+    assert calls == 3
+
+
+def test_permission_implication_uses_explicit_table_only() -> None:
+    assert ManagementPrincipal(
+        operator_id="config-writer",
+        permissions=frozenset({"config:write"}),
+    ).has_permission("config:read")
+    assert ManagementPrincipal(
+        operator_id="announcement-sender",
+        permissions=frozenset({"announce:send"}),
+    ).has_permission("announce:read")
+    assert not ManagementPrincipal(
+        operator_id="config-deleter",
+        permissions=frozenset({"config:delete"}),
+    ).has_permission("config:read")
+    assert not ManagementPrincipal(
+        operator_id="unknown-writer",
+        permissions=frozenset({"unknown:write"}),
+    ).has_permission("unknown:read")
+
+
+@pytest.mark.asyncio
+async def test_weak_management_token_is_rejected(app: App) -> None:
+    async with app.test_server(
+        asgi=cast("Any", _build_auth_app("short-token"))
+    ) as ctx:
+        response = await ctx.get_client().get(
+            "/read",
+            headers={"Authorization": "Bearer short-token"},
+        )
+
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio

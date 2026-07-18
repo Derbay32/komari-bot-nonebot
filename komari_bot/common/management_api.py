@@ -7,6 +7,7 @@ import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from inspect import isawaitable
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -16,13 +17,30 @@ from starlette import status
 
 type ManagementCredentialSourceValue = str | Sequence[object]
 type ManagementTokenSource = (
-    ManagementCredentialSourceValue | Callable[[], ManagementCredentialSourceValue]
+    ManagementCredentialSourceValue
+    | Callable[
+        [],
+        ManagementCredentialSourceValue | Awaitable[ManagementCredentialSourceValue],
+    ]
 )
 
 _CREDENTIAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _PERMISSION_PATTERN = re.compile(
     r"^(?:\*|[a-z][a-z0-9_-]*:(?:\*|[a-z][a-z0-9_-]*))$"
 )
+_READ_PERMISSION_IMPLICATIONS: Mapping[str, frozenset[str]] = {
+    "announce:read": frozenset({"announce:send"}),
+    "config:read": frozenset({"config:write"}),
+    "help:read": frozenset({"help:write"}),
+    "knowledge:read": frozenset({"knowledge:write"}),
+    "memory:read": frozenset({"memory:write"}),
+    "prompt:read": frozenset({"prompt:write"}),
+    "scene:read": frozenset({"scene:write"}),
+    "user_ban:read": frozenset({"user_ban:write"}),
+}
+LEGACY_TOKEN_REMOVAL_VERSION = "2.0"
+MIN_MANAGEMENT_TOKEN_LENGTH = 16
+MIN_MANAGEMENT_TOKEN_UNIQUE_CHARACTERS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +71,7 @@ class ManagementPrincipal:
     permissions: frozenset[str]
 
     def has_permission(self, required_permission: str) -> bool:
-        """检查精确权限、资源通配符及写权限对读权限的蕴含。"""
+        """检查精确权限、资源通配符及显式声明的权限蕴含。"""
         if "*" in self.permissions or required_permission in self.permissions:
             return True
         resource, separator, action = required_permission.partition(":")
@@ -63,10 +81,12 @@ class ManagementPrincipal:
             return True
         if action != "read":
             return False
-        return any(
-            permission.startswith(f"{resource}:")
-            and permission != f"{resource}:read"
-            for permission in self.permissions
+        return bool(
+            self.permissions
+            & _READ_PERMISSION_IMPLICATIONS.get(
+                required_permission,
+                frozenset(),
+            )
         )
 
 
@@ -83,6 +103,15 @@ def _legacy_credential(token: str) -> ManagementCredential:
         credential_id="legacy-api-token",
         token=token,
         permissions=frozenset({"*"}),
+    )
+
+
+def management_token_meets_minimum_strength(token: str) -> bool:
+    """校验管理 Token 的长度、字符集和最低字符多样性。"""
+    return (
+        MIN_MANAGEMENT_TOKEN_LENGTH <= len(token) <= 512
+        and all(0x21 <= ord(character) <= 0x7E for character in token)
+        and len(set(token)) >= MIN_MANAGEMENT_TOKEN_UNIQUE_CHARACTERS
     )
 
 
@@ -121,7 +150,11 @@ def _normalize_credentials(
     """把旧单 Token 或多凭据配置统一成只读凭据快照。"""
     if isinstance(source, str):
         token = source.strip()
-        return (_legacy_credential(token),) if token else ()
+        return (
+            (_legacy_credential(token),)
+            if management_token_meets_minimum_strength(token)
+            else ()
+        )
     if not isinstance(source, Sequence):
         return ()
 
@@ -132,7 +165,10 @@ def _normalize_credentials(
         permissions = _normalize_permission_set(
             _read_credential_value(raw, "permissions")
         )
-        if not _CREDENTIAL_ID_PATTERN.fullmatch(credential_id) or not token:
+        if (
+            not _CREDENTIAL_ID_PATTERN.fullmatch(credential_id)
+            or not management_token_meets_minimum_strength(token)
+        ):
             continue
         if permissions is None:
             continue
@@ -149,10 +185,12 @@ def _normalize_credentials(
     return tuple(credentials)
 
 
-def _resolve_credential_source(
+async def _resolve_credential_source(
     source: ManagementTokenSource,
 ) -> tuple[ManagementCredential, ...]:
     current_source = source() if callable(source) else source
+    if isawaitable(current_source):
+        current_source = await current_source
     return _normalize_credentials(current_source)
 
 
@@ -183,7 +221,7 @@ def create_bearer_auth_dependency(
                 detail=detail,
             )
         matched_credential: ManagementCredential | None = None
-        for credential in _resolve_credential_source(api_token):
+        for credential in await _resolve_credential_source(api_token):
             token_matches = secrets.compare_digest(
                 token.encode("utf-8"),
                 credential.token.encode("utf-8"),
@@ -268,8 +306,20 @@ def resolve_management_settings(
         credential_source = api_token if isinstance(api_token, str) else ""
 
     if not _normalize_credentials(credential_source):
-        logger.warning(f"{warning_prefix} 未配置有效管理凭据，跳过管理 API 注册")
+        if isinstance(credential_source, str) and credential_source.strip():
+            logger.warning(
+                f"{warning_prefix} 旧版 api_token 不符合最低强度要求，"
+                "管理 API 已拒绝启动；请改用至少 16 字符且字符足够多样的具名凭据"
+            )
+        else:
+            logger.warning(f"{warning_prefix} 未配置有效管理凭据，跳过管理 API 注册")
         return None
+
+    if isinstance(credential_source, str):
+        logger.warning(
+            f"{warning_prefix} 旧版 api_token 已弃用，将在 "
+            f"v{LEGACY_TOKEN_REMOVAL_VERSION} 移除；请迁移到 api_credentials"
+        )
 
     return SharedManagementSettings(
         credential_source=credential_source,
