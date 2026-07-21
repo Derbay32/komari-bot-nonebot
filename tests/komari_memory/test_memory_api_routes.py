@@ -78,24 +78,10 @@ def _interaction_event_entry(*, event_id: int = 1) -> dict[str, object]:
         "last_seen_at": timestamp,
         "importance": 4,
         "importance_initial": 4,
-        "importance_current": 4,
+        "importance_current": 0,
         "last_accessed": timestamp,
         "is_fuzzy": False,
         "created_at": timestamp,
-    }
-
-
-def _interaction_event_entity(*, event_id: int = 1) -> dict[str, object]:
-    event = _interaction_event_entry(event_id=event_id)
-    return {
-        "user_id": event["user_id"],
-        "group_id": "",
-        "key": f"interaction_event:{event_id}",
-        "category": "interaction_event",
-        "importance": event["importance"],
-        "access_count": 0,
-        "last_accessed": event["last_accessed"],
-        "value": event,
     }
 
 
@@ -162,7 +148,7 @@ class _FakeMemoryService:
     ) -> tuple[list[dict[str, object]], int]:
         self.list_history_calls.append(dict(kwargs))
         if kwargs.get("group_id") is None:
-            return [_interaction_event_entity()], len(self.interaction_events)
+            return [_interaction_event_entry()], len(self.interaction_events)
         return [self.interaction_histories[("g1", "u1")]], len(self.interaction_histories)
 
     async def get_user_profile_row(
@@ -678,6 +664,9 @@ async def test_interaction_event_routes_support_event_id_crud(app: App) -> None:
 
     assert listed.status_code == 200
     assert listed.json()["items"][0]["event_summary"].startswith("阿明经常")
+    assert listed.json()["items"][0]["importance"] == 4
+    assert listed.json()["items"][0]["importance_current"] == 0
+    assert listed.json()["items"][0]["last_accessed"] == "2026-04-10T12:00:00Z"
     assert service.list_history_calls[-1] == {
         "limit": 5,
         "offset": 0,

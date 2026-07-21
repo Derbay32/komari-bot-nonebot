@@ -623,9 +623,8 @@ def create_memory_router(
             user_id=_normalize_optional_identifier(user_id, label="用户 ID"),
             query=_normalize_optional_query(q),
         )
-        event_items = [item["value"] for item in items]
         return InteractionEventListResponse(
-            items=[InteractionEventEntry.model_validate(item) for item in event_items],
+            items=[InteractionEventEntry.model_validate(item) for item in items],
             total=total,
             limit=limit,
             offset=offset,

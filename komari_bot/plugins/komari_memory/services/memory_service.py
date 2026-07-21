@@ -414,13 +414,12 @@ class MemoryService:
     ) -> tuple[list[dict[str, Any]], int]:
         """分页获取跨群互动事件行（保留旧方法名给 API 过渡使用）。"""
         del group_id
-        rows, total = await self._get_interaction_event_repo().list_interaction_events(
+        return await self._get_interaction_event_repo().list_interaction_events(
             limit=limit,
             offset=offset,
             user_id=user_id,
             query=query,
         )
-        return [self._interaction_event_to_entity(row) for row in rows], total
 
     async def get_user_profile_row(
         self,
@@ -645,30 +644,3 @@ class MemoryService:
             msg = "跨群互动事件仓库未初始化"
             raise RuntimeError(msg)
         return self._interaction_event_repo
-
-    @staticmethod
-    def _interaction_event_to_entity(row: dict[str, Any]) -> dict[str, Any]:
-        user_id = str(row.get("user_id", "")).strip()
-        return {
-            "user_id": user_id,
-            "group_id": "",
-            "key": f"interaction_event:{row.get('id')}",
-            "category": "interaction_event",
-            "importance": int(row.get("importance", 4) or 4),
-            "access_count": 0,
-            "last_accessed": row.get("last_accessed"),
-            "value": {
-                "version": 1,
-                "id": row.get("id"),
-                "user_id": user_id,
-                "display_name": str(row.get("display_name", "")).strip() or user_id,
-                "event_summary": str(row.get("event_summary", "")).strip(),
-                "source_message_count": int(row.get("source_message_count", 0) or 0),
-                "first_seen_at": row.get("first_seen_at"),
-                "last_seen_at": row.get("last_seen_at"),
-                "importance_initial": int(row.get("importance_initial", 4) or 4),
-                "importance_current": int(row.get("importance_current", 4) or 4),
-                "is_fuzzy": bool(row.get("is_fuzzy", False)),
-                "created_at": row.get("created_at"),
-            },
-        }
