@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
-from komari_bot.plugins.llm_provider.diagnostic import (
+from komari_bot.plugins.agent_run_logger.diagnostic import (
     LLMCallTrace,
     LLMDiagnosticCollector,
     ToolExecutionTrace,

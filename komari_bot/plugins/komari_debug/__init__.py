@@ -11,6 +11,7 @@ require("user_data")
 require("character_binding")
 require("komari_chat")
 require("group_history_summary")
+require("agent_run_logger")
 
 __plugin_meta__ = PluginMetadata(
     name="komari_debug",

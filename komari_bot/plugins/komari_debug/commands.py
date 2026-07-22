@@ -22,6 +22,7 @@ from nonebot.params import CommandArg, Depends
 from nonebot.permission import SUPERUSER
 
 from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.plugins.agent_run_logger import create_collector, finalize_collector
 from komari_bot.plugins.character_binding import get_binding_manager
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema as SummaryConfigSchema,
@@ -36,7 +37,6 @@ from komari_bot.plugins.komari_chat.services.image_downloader import (
     extract_image_sources,
 )
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
-from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 from komari_bot.plugins.user_data import (
     get_user_favorability,
     set_user_favorability,
@@ -51,6 +51,8 @@ from .reporting import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 FAVOR_MIN = 0
 FAVOR_MAX = 400
@@ -639,7 +641,23 @@ async def handle_debug_reply(
     reply_context = _build_reply_context_from_event(event)
 
     request_trace_id = f"debug-reply-{uuid.uuid4().hex[:12]}"
-    collector = LLMDiagnosticCollector(request_id=request_trace_id)
+    collector = create_collector(
+        run_type="chat_reply",
+        task_kind="chat_reply",
+        trace_id=request_trace_id,
+        origin="debug",
+        input_data={
+            "group_id": group_id,
+            "user_id": user_id,
+            "content": debug_content,
+            "image_urls": image_urls,
+            "reply_context": reply_context,
+        },
+        force_collect=True,
+    )
+    if collector is None:
+        msg = "Agent Run debug 收集器创建失败"
+        raise RuntimeError(msg)
 
     try:
         result = await generate_debug_reply(
@@ -656,6 +674,7 @@ async def handle_debug_reply(
     except FinishedException:
         raise
     except Exception as exc:
+        await finalize_collector(collector, status="error", error=exc)
         logger.error(
             "[KomariDebug] debug reply 执行失败: request_id={} error_type={}",
             request_trace_id,
@@ -745,13 +764,28 @@ async def handle_debug_summary(
         )
 
     request_trace_id = f"debug-summary-{uuid.uuid4().hex[:12]}"
-    collector = LLMDiagnosticCollector(request_id=request_trace_id)
+    collector = create_collector(
+        run_type="group_history_summary",
+        task_kind="group_history_summary",
+        trace_id=request_trace_id,
+        origin="debug",
+        input_data={
+            "group_id": str(event.group_id),
+            "summary_request": summary_request,
+            "user_id": str(event.user_id),
+        },
+        force_collect=True,
+    )
+    if collector is None:
+        msg = "Agent Run debug 收集器创建失败"
+        raise RuntimeError(msg)
     group_id = str(event.group_id)
 
     try:
         config = _summary_config_mgr.get()
         summary_config = _cast_summary_config(config)
     except Exception as exc:
+        await finalize_collector(collector, status="error", error=exc)
         logger.error(
             "[KomariDebug] summary 配置读取失败: request_id={} error_type={}",
             request_trace_id,

@@ -449,7 +449,7 @@ def test_plugin_metadata_has_required_plugins() -> None:
 
 def test_report_build_chapters_success(debug_reporting: Any) -> None:
     """验证成功报告包含所有必需章节，且回复正文在最终结果章节不截断。"""
-    from komari_bot.plugins.llm_provider.diagnostic import (
+    from komari_bot.plugins.agent_run_logger.diagnostic import (
         LLMCallTrace,
         LLMDiagnosticCollector,
         ToolExecutionTrace,
@@ -507,7 +507,7 @@ def test_report_build_chapters_success(debug_reporting: Any) -> None:
 
 def test_report_build_chapters_failure(debug_reporting: Any) -> None:
     """验证失败报告包含错误信息章节。"""
-    from komari_bot.plugins.llm_provider.diagnostic import (
+    from komari_bot.plugins.agent_run_logger.diagnostic import (
         LLMCallTrace,
         LLMDiagnosticCollector,
     )
@@ -583,7 +583,7 @@ def test_split_into_nodes_empty(debug_reporting: Any) -> None:
 
 def test_phase_aggregation_with_missing_usage() -> None:
     """usage 为 None 时聚合报告标注为不完整。"""
-    from komari_bot.plugins.llm_provider.diagnostic import (
+    from komari_bot.plugins.agent_run_logger.diagnostic import (
         LLMCallTrace,
         LLMDiagnosticCollector,
     )

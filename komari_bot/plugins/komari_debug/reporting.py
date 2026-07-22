@@ -24,7 +24,7 @@ from komari_bot.common.onebot_messages import plain_text_message
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from komari_bot.plugins.llm_provider.diagnostic import (
+    from komari_bot.plugins.agent_run_logger.diagnostic import (
         LLMCallTrace,
         LLMDiagnosticCollector,
         ToolExecutionTrace,

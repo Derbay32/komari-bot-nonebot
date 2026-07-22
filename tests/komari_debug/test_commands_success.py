@@ -36,6 +36,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.adapters.onebot.v11.event import Sender
 
 from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -900,7 +901,7 @@ async def test_debug_report_group_receipt_never_contains_diagnostic_canaries(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    collector = debug_commands.LLMDiagnosticCollector(request_id="debug-safe-receipt")
+    collector = LLMDiagnosticCollector(request_id="debug-safe-receipt")
     event = _build_group_event(".debug reply secret", user_id=SU_ID)
     captured = SimpleNamespace(report_kwargs=None, receipt=None)
 
