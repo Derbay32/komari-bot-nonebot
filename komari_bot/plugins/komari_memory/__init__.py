@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 # 依赖插件
 apscheduler_plugin = require("nonebot_plugin_apscheduler")
+agent_run_logger_plugin = require("agent_run_logger")
 
 from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema

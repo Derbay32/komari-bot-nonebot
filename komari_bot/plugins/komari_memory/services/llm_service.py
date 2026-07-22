@@ -1,7 +1,10 @@
 """Komari Memory LLM 调用服务，封装 llm_provider 插件。"""
 
+from __future__ import annotations
+
 import json
 import re
+import time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -13,7 +16,6 @@ from komari_bot.common.untrusted_context import (
     render_untrusted_context,
 )
 
-from ..config_schema import KomariMemoryConfigSchema
 from ..core.retry import retry_async
 from .message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
 from .summary_prompt_template import get_template as get_summary_template
@@ -21,6 +23,9 @@ from .summary_prompt_template import render_template as render_summary_template
 from .token_counter import estimate_text_tokens
 
 if TYPE_CHECKING:
+    from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
+    from ..config_schema import KomariMemoryConfigSchema
     from .redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
@@ -205,22 +210,64 @@ async def _request_via_json_mode(
     messages: list[dict[str, str]],
     config: KomariMemoryConfigSchema,
     trace_id: str,
+    collector: AgentRunCollector | None,
 ) -> dict[str, Any]:
     """Layer 1：使用 response_format JSON mode 请求结构化总结。"""
+    request_data = {
+        "messages": messages,
+        "model": config.llm_model_summary,
+        "temperature": config.llm_temperature_summary,
+        "max_tokens": config.llm_max_tokens_summary,
+        "thinking_mode": config.llm_thinking_mode_summary,
+        "reasoning_effort": config.llm_reasoning_effort_summary,
+        "response_format": {"type": "json_object"},
+    }
     try:
-        response = await llm_provider.generate_text_with_messages(
-            messages=messages,
-            model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=config.llm_max_tokens_summary,
-            thinking_mode=config.llm_thinking_mode_summary,
-            reasoning_effort=config.llm_reasoning_effort_summary,
-            response_format={"type": "json_object"},
-            request_trace_id=trace_id,
-            request_phase="summary_json_mode",
-        )
+        if collector is None:
+            response = await llm_provider.generate_text_with_messages(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="summary_json_mode",
+            )
+        else:
+            completion = await llm_provider.generate_messages_completion(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="summary_json_mode",
+            )
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_completion_call,
+            )
+
+            record_completion_call(
+                collector,
+                phase="summary_json_mode",
+                round_index=len(collector.calls),
+                method="generate_messages_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                completion=completion,
+            )
+            response = completion.content
         parsed = json.loads(response)
     except Exception as exc:
+        from komari_bot.plugins.agent_run_logger.diagnostic import record_failed_call
+
+        if not (
+            collector is not None
+            and collector.calls
+            and collector.calls[-1].phase == "summary_json_mode"
+            and collector.calls[-1].status == "success"
+        ):
+            record_failed_call(
+                collector,
+                phase="summary_json_mode",
+                round_index=len(collector.calls) if collector is not None else 0,
+                method="generate_messages_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                error=exc,
+            )
         raise _SummaryFallbackError from exc
 
     if not isinstance(parsed, dict):
@@ -235,6 +282,7 @@ async def _request_via_tool_calling(
     messages: list[dict[str, str]],
     config: KomariMemoryConfigSchema,
     trace_id: str,
+    collector: AgentRunCollector | None,
 ) -> dict[str, Any]:
     """Layer 2：使用强制 tool calling 引导模型输出结构化总结。"""
     messages_with_tool = [
@@ -244,34 +292,108 @@ async def _request_via_tool_calling(
             "content": "请调用 output_summary_result 工具输出最终结果。不要输出任何其他内容。",
         },
     ]
+    request_data = {
+        "messages": messages_with_tool,
+        "model": config.llm_model_summary,
+        "temperature": config.llm_temperature_summary,
+        "max_tokens": config.llm_max_tokens_summary,
+        "tools": [_OUTPUT_SUMMARY_TOOL],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "output_summary_result"},
+        },
+        "parallel_tool_calls": False,
+        "thinking_mode": config.llm_thinking_mode_summary,
+        "reasoning_effort": config.llm_reasoning_effort_summary,
+    }
     try:
         completion = await llm_provider.generate_messages_completion(
-            messages=messages_with_tool,
-            model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=config.llm_max_tokens_summary,
-            tools=[_OUTPUT_SUMMARY_TOOL],
-            tool_choice={
-                "type": "function",
-                "function": {"name": "output_summary_result"},
-            },
-            parallel_tool_calls=False,
-            thinking_mode=config.llm_thinking_mode_summary,
-            reasoning_effort=config.llm_reasoning_effort_summary,
+            **request_data,
             request_trace_id=trace_id,
             request_phase="summary_tool_calling",
         )
     except Exception as exc:
+        from komari_bot.plugins.agent_run_logger.diagnostic import record_failed_call
+
+        record_failed_call(
+            collector,
+            phase="summary_tool_calling",
+            round_index=len(collector.calls) if collector is not None else 0,
+            method="generate_messages_completion",
+            model=config.llm_model_summary,
+            request=request_data,
+            error=exc,
+        )
         raise _SummaryFallbackError from exc
 
+    from komari_bot.plugins.agent_run_logger.diagnostic import (
+        ToolExecutionTrace,
+        record_completion_call,
+    )
+
+    call_id = record_completion_call(
+        collector,
+        phase="summary_tool_calling",
+        round_index=len(collector.calls) if collector is not None else 0,
+        method="generate_messages_completion",
+        model=config.llm_model_summary,
+        request=request_data,
+        completion=completion,
+    )
+
     for tool_call in completion.tool_calls or []:
+        tool_started_at = time.monotonic()
         if tool_call.function.name != "output_summary_result":
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=call_id or "",
+                        tool_name=tool_call.function.name,
+                        parsed_arguments=tool_call.parsed_arguments or {},
+                        status="error",
+                        error=f"未知工具: {tool_call.function.name}",
+                        duration_ms=(time.monotonic() - tool_started_at) * 1000,
+                    )
+                )
             continue
         if not tool_call.parsed_arguments:
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=call_id or "",
+                        tool_name=tool_call.function.name,
+                        status="error",
+                        error="工具参数为空",
+                        duration_ms=(time.monotonic() - tool_started_at) * 1000,
+                    )
+                )
             continue
         result = _normalize_summary_result(tool_call.parsed_arguments)
         if result.get("memories"):
+            if collector is not None:
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=call_id or "",
+                        tool_name=tool_call.function.name,
+                        parsed_arguments=tool_call.parsed_arguments,
+                        status="success",
+                        result=result,
+                        duration_ms=(time.monotonic() - tool_started_at) * 1000,
+                    )
+                )
             return result
+        if collector is not None:
+            collector.add_tool(
+                ToolExecutionTrace(
+                    call_id=call_id or "",
+                    tool_name=tool_call.function.name,
+                    parsed_arguments=tool_call.parsed_arguments,
+                    status="error",
+                    result=result,
+                    error="工具结果不含有效记忆",
+                    duration_ms=(time.monotonic() - tool_started_at) * 1000,
+                )
+            )
     raise _SummaryFallbackError
 
 
@@ -279,18 +401,61 @@ async def _request_via_direct_output(
     messages: list[dict[str, str]],
     config: KomariMemoryConfigSchema,
     trace_id: str,
+    collector: AgentRunCollector | None,
 ) -> dict[str, Any]:
     """Layer 3：直接文本输出，并从 markdown 中提取 JSON。"""
-    response = await llm_provider.generate_text_with_messages(
-        messages=messages,
-        model=config.llm_model_summary,
-        temperature=config.llm_temperature_summary,
-        max_tokens=config.llm_max_tokens_summary,
-        thinking_mode=config.llm_thinking_mode_summary,
-        reasoning_effort=config.llm_reasoning_effort_summary,
-        request_trace_id=trace_id,
-        request_phase="summary_direct_output",
-    )
+    request_data = {
+        "messages": messages,
+        "model": config.llm_model_summary,
+        "temperature": config.llm_temperature_summary,
+        "max_tokens": config.llm_max_tokens_summary,
+        "thinking_mode": config.llm_thinking_mode_summary,
+        "reasoning_effort": config.llm_reasoning_effort_summary,
+    }
+    response = ""
+    completion: Any | None = None
+    try:
+        if collector is None:
+            response = await llm_provider.generate_text_with_messages(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="summary_direct_output",
+            )
+        else:
+            completion = await llm_provider.generate_messages_completion(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="summary_direct_output",
+            )
+    except Exception as exc:
+        from komari_bot.plugins.agent_run_logger.diagnostic import record_failed_call
+
+        record_failed_call(
+            collector,
+            phase="summary_direct_output",
+            round_index=len(collector.calls) if collector is not None else 0,
+            method="generate_messages_completion",
+            model=config.llm_model_summary,
+            request=request_data,
+            error=exc,
+        )
+        raise
+    if collector is not None:
+        assert completion is not None
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            record_completion_call,
+        )
+
+        record_completion_call(
+            collector,
+            phase="summary_direct_output",
+            round_index=len(collector.calls),
+            method="generate_messages_completion",
+            model=config.llm_model_summary,
+            request=request_data,
+            completion=completion,
+        )
+        response = completion.content
     json_text = _extract_json_from_markdown(response)
     parsed = json.loads(json_text)
     if not isinstance(parsed, dict):
@@ -304,6 +469,7 @@ async def _request_structured_summary(
     messages: list[dict[str, str]],
     config: KomariMemoryConfigSchema,
     trace_id: str,
+    collector: AgentRunCollector | None,
 ) -> dict[str, Any]:
     """三层 fallback 的结构化总结输出。"""
     estimated_prompt_tokens = _estimate_messages_tokens(messages)
@@ -320,16 +486,16 @@ async def _request_structured_summary(
         )
 
     try:
-        return await _request_via_json_mode(messages, config, trace_id)
+        return await _request_via_json_mode(messages, config, trace_id, collector)
     except _SummaryFallbackError:
         logger.info("[KomariMemory] Layer 1 (json_mode) 失败，降级到 Layer 2 (tool_calling)")
 
     try:
-        return await _request_via_tool_calling(messages, config, trace_id)
+        return await _request_via_tool_calling(messages, config, trace_id, collector)
     except _SummaryFallbackError:
         logger.info("[KomariMemory] Layer 2 (tool_calling) 失败，降级到 Layer 3 (direct_output)")
 
-    return await _request_via_direct_output(messages, config, trace_id)
+    return await _request_via_direct_output(messages, config, trace_id, collector)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -372,6 +538,7 @@ async def summarize_conversation(
     *,
     participants: list[str],
     display_name_map: dict[str, str],
+    collector: AgentRunCollector | None = None,
 ) -> dict[str, Any]:
     """总结对话为多段独立记忆（oneshot，带三层 fallback + 重试）。"""
     trace_id = f"memsum-{uuid4().hex[:8]}"
@@ -395,4 +562,5 @@ async def summarize_conversation(
         messages=summary_messages,
         config=config,
         trace_id=trace_id,
+        collector=collector,
     )

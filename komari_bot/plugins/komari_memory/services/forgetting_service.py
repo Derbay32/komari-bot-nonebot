@@ -38,10 +38,13 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
     from ..config_schema import KomariMemoryConfigSchema
 
 llm_provider = require("llm_provider")
 embedding_provider = require("embedding_provider")
+agent_run_logger_plugin = require("agent_run_logger")
 
 _CONVERSATION_DECAY_SQL = """
 UPDATE komari_memory_conversations
@@ -663,39 +666,132 @@ class ForgettingService:
 
     async def _fuzzify_conversation(self, conv_id: int, original_summary: str) -> bool:
         """模糊化对话记忆并重置重要性。"""
+        collector = agent_run_logger_plugin.create_collector(
+            run_type="scheduled_summary",
+            task_kind="forgetting_conversation",
+            trace_id=f"memfuzzy-{conv_id}",
+            input_data={
+                "conversation_id": conv_id,
+                "original_summary": original_summary,
+            },
+        )
         try:
-            fuzzy_summary = await self._generate_fuzzy_summary(original_summary, conv_id)
-        except Exception:
+            fuzzy_summary = await self._generate_fuzzy_summary(
+                original_summary,
+                conv_id,
+                collector,
+            )
+        except asyncio.CancelledError as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
+        except Exception as error:
             logger.exception(
                 "[KomariMemory] 模糊化重试失败，删除记忆且不写入占位文本: ID={}",
                 conv_id,
             )
-            return await self._delete_conversation_after_fuzzify_failure(
-                conv_id,
-                original_summary,
+            try:
+                deleted = await self._delete_conversation_after_fuzzify_failure(
+                    conv_id,
+                    original_summary,
+                )
+            except asyncio.CancelledError as cleanup_error:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="cancelled",
+                    error=cleanup_error,
+                    skip_if_no_calls=True,
+                )
+                raise
+            except Exception as cleanup_error:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="error",
+                    error=cleanup_error,
+                    skip_if_no_calls=True,
+                )
+                raise
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                output={"deleted_after_failure": deleted},
+                error=error,
+                skip_if_no_calls=True,
             )
+            return deleted
 
         try:
             embedding = str(await self._embedding_plugin.embed(fuzzy_summary))
-        except Exception:
+        except asyncio.CancelledError as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
+        except Exception as error:
             embedding = None
             logger.exception(
                 "[KomariMemory] 模糊摘要向量化失败，将发布新正文并删除旧向量: ID={}",
                 conv_id,
             )
+            if collector is not None:
+                collector.add_error(
+                    "forgetting_embedding",
+                    type(error).__name__,
+                    str(error),
+                )
 
-        updated = await self._publish_fuzzy_conversation(
-            conv_id=conv_id,
-            original_summary=original_summary,
-            fuzzy_summary=fuzzy_summary,
-            embedding=embedding,
-        )
+        try:
+            updated = await self._publish_fuzzy_conversation(
+                conv_id=conv_id,
+                original_summary=original_summary,
+                fuzzy_summary=fuzzy_summary,
+                embedding=embedding,
+            )
+        except asyncio.CancelledError as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
+        except Exception as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
         if updated:
             logger.debug("[KomariMemory] 模糊化记忆: ID={}", conv_id)
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="success",
+            output={
+                "conversation_id": conv_id,
+                "fuzzy_summary": fuzzy_summary,
+                "embedding_created": embedding is not None,
+                "cas_updated": updated,
+            },
+            skip_if_no_calls=True,
+        )
         return updated
 
     @retry_async(max_attempts=3, base_delay=1.0)
-    async def _generate_fuzzy_summary(self, original: str, conv_id: int) -> str:
+    async def _generate_fuzzy_summary(
+        self,
+        original: str,
+        conv_id: int,
+        collector: AgentRunCollector | None = None,
+    ) -> str:
         """生成模糊化总结，并只保留正文。"""
         config = self.config
         tag = (config.response_tag or "content").strip() or "content"
@@ -712,17 +808,58 @@ class ForgettingService:
             )
         )
 
-        response = await llm_provider.generate_text(
-            prompt=prompt,
-            model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=min(config.llm_max_tokens_summary, 120),
-            thinking_mode=config.llm_thinking_mode_summary,
-            reasoning_effort=config.llm_reasoning_effort_summary,
-            request_trace_id=f"memfuzzy-{conv_id}",
-            request_phase="forgetting_fuzzify",
+        request_data = {
+            "prompt": prompt,
+            "model": config.llm_model_summary,
+            "temperature": config.llm_temperature_summary,
+            "max_tokens": min(config.llm_max_tokens_summary, 120),
+            "thinking_mode": config.llm_thinking_mode_summary,
+            "reasoning_effort": config.llm_reasoning_effort_summary,
+        }
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            record_completion_call,
+            record_failed_call,
         )
-        fuzzy_summary = _extract_tag_content(response, tag)
+
+        try:
+            if collector is None:
+                content = await llm_provider.generate_text(
+                    **request_data,
+                    request_trace_id=f"memfuzzy-{conv_id}",
+                    request_phase="forgetting_fuzzify",
+                )
+                completion = None
+            else:
+                completion = await llm_provider.generate_completion(
+                    **request_data,
+                    request_trace_id=f"memfuzzy-{conv_id}",
+                    request_phase="forgetting_fuzzify",
+                )
+                content = completion.content
+        except Exception as error:
+            record_failed_call(
+                collector,
+                phase="forgetting_fuzzify",
+                round_index=len(collector.calls) if collector is not None else 0,
+                method="generate_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                error=error,
+            )
+            raise
+
+        if completion is not None:
+            assert collector is not None
+            record_completion_call(
+                collector,
+                phase="forgetting_fuzzify",
+                round_index=len(collector.calls),
+                method="generate_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                completion=completion,
+            )
+        fuzzy_summary = _extract_tag_content(content, tag)
         if _is_invalid_fuzzy_summary(fuzzy_summary):
             msg = f"模糊化结果无效: ID={conv_id}"
             raise ValueError(msg)
@@ -809,41 +946,131 @@ class ForgettingService:
 
     async def _fuzzify_interaction_event(self, event_id: int, original_summary: str) -> bool:
         """模糊化跨群互动事件并重置重要性。"""
+        collector = agent_run_logger_plugin.create_collector(
+            run_type="scheduled_summary",
+            task_kind="forgetting_interaction",
+            trace_id=f"memfuzzy-interaction-{event_id}",
+            input_data={
+                "interaction_id": event_id,
+                "original_summary": original_summary,
+            },
+        )
         try:
             fuzzy_summary = await self._generate_fuzzy_interaction_summary(
                 original_summary,
                 event_id,
+                collector,
             )
-        except Exception:
+        except asyncio.CancelledError as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
+        except Exception as error:
             logger.exception(
                 "[KomariMemory] 跨群互动事件模糊化重试失败，删除事件且不写入占位文本: ID={}",
                 event_id,
             )
-            return await self._delete_interaction_after_fuzzify_failure(
-                event_id,
-                original_summary,
+            try:
+                deleted = await self._delete_interaction_after_fuzzify_failure(
+                    event_id,
+                    original_summary,
+                )
+            except asyncio.CancelledError as cleanup_error:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="cancelled",
+                    error=cleanup_error,
+                    skip_if_no_calls=True,
+                )
+                raise
+            except Exception as cleanup_error:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="error",
+                    error=cleanup_error,
+                    skip_if_no_calls=True,
+                )
+                raise
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                output={"deleted_after_failure": deleted},
+                error=error,
+                skip_if_no_calls=True,
             )
+            return deleted
 
         try:
             embedding = str(await self._embedding_plugin.embed(fuzzy_summary))
-        except Exception:
+        except asyncio.CancelledError as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
+        except Exception as error:
             embedding = None
             logger.exception(
                 "[KomariMemory] 互动模糊摘要向量化失败，将发布新正文并删除旧向量: ID={}",
                 event_id,
             )
-        updated = await self._publish_fuzzy_interaction_event(
-            event_id=event_id,
-            original_summary=original_summary,
-            fuzzy_summary=fuzzy_summary,
-            embedding=embedding,
-        )
+            if collector is not None:
+                collector.add_error(
+                    "forgetting_interaction_embedding",
+                    type(error).__name__,
+                    str(error),
+                )
+        try:
+            updated = await self._publish_fuzzy_interaction_event(
+                event_id=event_id,
+                original_summary=original_summary,
+                fuzzy_summary=fuzzy_summary,
+                embedding=embedding,
+            )
+        except asyncio.CancelledError as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
+        except Exception as error:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                error=error,
+                skip_if_no_calls=True,
+            )
+            raise
         if updated:
             logger.debug("[KomariMemory] 模糊化跨群互动事件: ID={}", event_id)
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="success",
+            output={
+                "interaction_id": event_id,
+                "fuzzy_summary": fuzzy_summary,
+                "embedding_created": embedding is not None,
+                "cas_updated": updated,
+            },
+            skip_if_no_calls=True,
+        )
         return updated
 
     @retry_async(max_attempts=3, base_delay=1.0)
-    async def _generate_fuzzy_interaction_summary(self, original: str, event_id: int) -> str:
+    async def _generate_fuzzy_interaction_summary(
+        self,
+        original: str,
+        event_id: int,
+        collector: AgentRunCollector | None = None,
+    ) -> str:
         """生成跨群互动事件模糊化总结。"""
         config = self.config
         tag = (config.response_tag or "content").strip() or "content"
@@ -859,17 +1086,58 @@ class ForgettingService:
                 source_id=f"forgetting-interaction:{event_id}",
             )
         )
-        response = await llm_provider.generate_text(
-            prompt=prompt,
-            model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=min(config.llm_max_tokens_summary, 120),
-            thinking_mode=config.llm_thinking_mode_summary,
-            reasoning_effort=config.llm_reasoning_effort_summary,
-            request_trace_id=f"memfuzzy-interaction-{event_id}",
-            request_phase="forgetting_interaction_fuzzify",
+        request_data = {
+            "prompt": prompt,
+            "model": config.llm_model_summary,
+            "temperature": config.llm_temperature_summary,
+            "max_tokens": min(config.llm_max_tokens_summary, 120),
+            "thinking_mode": config.llm_thinking_mode_summary,
+            "reasoning_effort": config.llm_reasoning_effort_summary,
+        }
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            record_completion_call,
+            record_failed_call,
         )
-        fuzzy_summary = _extract_tag_content(response, tag)
+
+        try:
+            if collector is None:
+                content = await llm_provider.generate_text(
+                    **request_data,
+                    request_trace_id=f"memfuzzy-interaction-{event_id}",
+                    request_phase="forgetting_interaction_fuzzify",
+                )
+                completion = None
+            else:
+                completion = await llm_provider.generate_completion(
+                    **request_data,
+                    request_trace_id=f"memfuzzy-interaction-{event_id}",
+                    request_phase="forgetting_interaction_fuzzify",
+                )
+                content = completion.content
+        except Exception as error:
+            record_failed_call(
+                collector,
+                phase="forgetting_interaction_fuzzify",
+                round_index=len(collector.calls) if collector is not None else 0,
+                method="generate_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                error=error,
+            )
+            raise
+
+        if completion is not None:
+            assert collector is not None
+            record_completion_call(
+                collector,
+                phase="forgetting_interaction_fuzzify",
+                round_index=len(collector.calls),
+                method="generate_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                completion=completion,
+            )
+        fuzzy_summary = _extract_tag_content(content, tag)
         if _is_invalid_fuzzy_summary(fuzzy_summary):
             msg = f"跨群互动事件模糊化结果无效: ID={event_id}"
             raise ValueError(msg)

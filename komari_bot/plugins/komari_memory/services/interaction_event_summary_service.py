@@ -26,6 +26,8 @@ from komari_bot.common.untrusted_context import (
 from ..services.config_interface import get_config
 
 if TYPE_CHECKING:
+    from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
     from ..config_schema import KomariMemoryConfigSchema
 
 llm_provider = require("llm_provider")
@@ -210,31 +212,77 @@ async def _request_summary(
     source_id: str,
     trace_id: str,
     merge: bool,
+    collector: AgentRunCollector | None,
 ) -> InteractionEventSummaryResult:
     context = _build_untrusted_context(payload, source_id=source_id)
-    response = await llm_provider.generate_text(
-        prompt="请根据随附的不可信数据生成所要求的 JSON。",
-        system_instruction=(
+    request_data = {
+        "prompt": "请根据随附的不可信数据生成所要求的 JSON。",
+        "system_instruction": (
             _MERGE_SYSTEM_INSTRUCTION if merge else _SUMMARY_SYSTEM_INSTRUCTION
         ),
-        untrusted_contexts=[context],
-        model=config.llm_model_summary,
-        temperature=config.llm_temperature_summary,
-        max_tokens=min(config.llm_max_tokens_summary, 800),
-        thinking_mode=config.llm_thinking_mode_summary,
-        reasoning_effort=config.llm_reasoning_effort_summary,
-        response_format={"type": "json_object"},
-        request_trace_id=trace_id,
-        request_phase="interaction_event_summary",
-    )
+        "untrusted_contexts": [context],
+        "model": config.llm_model_summary,
+        "temperature": config.llm_temperature_summary,
+        "max_tokens": min(config.llm_max_tokens_summary, 800),
+        "thinking_mode": config.llm_thinking_mode_summary,
+        "reasoning_effort": config.llm_reasoning_effort_summary,
+        "response_format": {"type": "json_object"},
+    }
     try:
-        payload = _extract_json_object(response)
+        if collector is None:
+            content = await llm_provider.generate_text(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="interaction_event_summary",
+            )
+            completion = None
+        else:
+            completion = await llm_provider.generate_completion(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="interaction_event_summary",
+            )
+            content = completion.content
+    except Exception as exc:
+        from komari_bot.plugins.agent_run_logger.diagnostic import record_failed_call
+
+        record_failed_call(
+            collector,
+            phase="interaction_event_summary",
+            round_index=len(collector.calls) if collector is not None else 0,
+            method="generate_completion",
+            model=config.llm_model_summary,
+            request=request_data,
+            error=exc,
+        )
+        raise
+    from komari_bot.plugins.agent_run_logger.diagnostic import record_completion_call
+
+    if completion is not None:
+        assert collector is not None
+        record_completion_call(
+            collector,
+            phase="interaction_event_summary",
+            round_index=len(collector.calls),
+            method="generate_completion",
+            model=config.llm_model_summary,
+            request=request_data,
+            completion=completion,
+        )
+    try:
+        payload = _extract_json_object(content)
         return InteractionEventSummaryResult.model_validate(payload)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
         logger.exception(
             "[KomariMemory] 互动事件总结 JSON 解析失败，使用无原文降级总结: source={}",
             source_id,
         )
+        if collector is not None:
+            collector.add_error(
+                "interaction_event_summary_parse",
+                type(exc).__name__,
+                str(exc),
+            )
         return InteractionEventSummaryResult(
             event_summary=_FALLBACK_SUMMARY,
             importance=4,
@@ -246,6 +294,7 @@ async def summarize_interaction_events(
     user_id: str,
     display_name: str,
     records: list[dict[str, Any]],
+    collector: AgentRunCollector | None = None,
 ) -> InteractionEventSummaryResult:
     """将一批原始互动记录聚合为一条长期互动事件记忆。"""
     config = get_config()
@@ -276,6 +325,7 @@ async def summarize_interaction_events(
                 source_id=f"interaction-records:{user_ref}:{index}",
                 trace_id=f"interaction-event-summary-{user_ref}-{index}",
                 merge=False,
+                collector=collector,
             )
         )
 
@@ -308,6 +358,7 @@ async def summarize_interaction_events(
                         f"interaction-event-merge-{user_ref}-{round_index}-{index}"
                     ),
                     merge=True,
+                    collector=collector,
                 )
             )
         partial_results = next_round

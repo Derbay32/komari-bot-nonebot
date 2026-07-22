@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from apscheduler.jobstores.base import JobLookupError
 from nonebot import logger
+from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
 from ..core.retry import retry_async
@@ -21,6 +22,8 @@ from ..services.interaction_event_summary_service import (
 )
 
 if TYPE_CHECKING:
+    from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
     from ..services.memory_service import MemoryService
     from ..services.redis_manager import RedisManager
 
@@ -28,6 +31,7 @@ _JOB_ID = "komari_memory_interaction_event_worker"
 _DAILY_JOB_ID = "komari_memory_interaction_event_daily_flush"
 _MAX_USERS_PER_RUN = 100
 _MAX_HEARTBEAT_INTERVAL_SECONDS = 30.0
+agent_run_logger_plugin = require("agent_run_logger")
 
 
 def _record_timestamp(record: dict[str, Any]) -> float:
@@ -139,6 +143,7 @@ async def _process_claimed_user(
     )
     token = uuid4().hex
     processing_key: str | None = None
+    collector: AgentRunCollector | None = None
     completed = False
     try:
         processing_key = await redis.snapshot_global_interactions(user_id, token)
@@ -155,11 +160,21 @@ async def _process_claimed_user(
                         user_id,
                     )
         else:
+            collector = agent_run_logger_plugin.create_collector(
+                run_type="scheduled_summary",
+                task_kind="interaction_processing",
+                trace_id=f"interaction-summary-{processing_key}",
+                input_data={
+                    "user_id": user_id,
+                    "processing_key": processing_key,
+                },
+            )
             await _summarize_processing_key(
                 redis=redis,
                 memory=memory,
                 user_id=user_id,
                 processing_key=processing_key,
+                collector=collector,
             )
             if lease_lost.is_set():
                 logger.warning(
@@ -177,7 +192,21 @@ async def _process_claimed_user(
                         "[KomariMemory] 互动快照确认失败，租约已被接管: user={}",
                         user_id,
                     )
-    except Exception:
+    except asyncio.CancelledError as error:
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="cancelled",
+            error=error,
+            skip_if_no_calls=True,
+        )
+        raise
+    except Exception as error:
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="error",
+            error=error,
+            skip_if_no_calls=True,
+        )
         logger.exception(
             "[KomariMemory] 跨群互动事件总结最终失败，重新入队: user={}",
             user_id,
@@ -200,6 +229,25 @@ async def _process_claimed_user(
                         "[KomariMemory] 互动快照重新入队被拒绝，租约已被接管: user={}",
                         user_id,
                     )
+    else:
+        if completed:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="success",
+                output={
+                    "user_id": user_id,
+                    "processing_key": processing_key,
+                    "acknowledged": True,
+                },
+                skip_if_no_calls=True,
+            )
+        else:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                error="互动 processing 快照未确认",
+                skip_if_no_calls=True,
+            )
     finally:
         stop_heartbeat.set()
         await heartbeat_task
@@ -254,12 +302,21 @@ async def _summarize_processing_key(
     memory: MemoryService,
     user_id: str,
     processing_key: str,
+    collector: AgentRunCollector | None,
 ) -> None:
     """处理一个 processing 快照；失败由 retry 装饰器重试。"""
     raw_records = await redis.get_processing_global_interactions(processing_key)
     records = _filter_valid_records(raw_records)
     if not records:
         return
+    if collector is not None:
+        collector.set_input_data(
+            {
+                "user_id": user_id,
+                "processing_key": processing_key,
+                "records": records,
+            }
+        )
     if len(records) > MAX_INTERACTION_SUMMARY_RECORDS:
         omitted_count = len(records) - MAX_INTERACTION_SUMMARY_RECORDS
         records = records[-MAX_INTERACTION_SUMMARY_RECORDS:]
@@ -284,6 +341,7 @@ async def _summarize_processing_key(
         user_id=user_id,
         display_name=display_name,
         records=records,
+        collector=collector,
     )
     first_seen_at = _record_datetime(records[0])
     last_seen_at = _record_datetime(records[-1])

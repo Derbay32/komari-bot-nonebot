@@ -21,6 +21,9 @@ PACKAGE_ROOT = PROJECT_ROOT / "komari_bot/plugins/komari_memory"
 
 
 def _load_summary_worker_module(monkeypatch: Any) -> Any:
+    async def _finalize_collector(*_args: object, **_kwargs: object) -> bool:
+        return True
+
     def _fake_require(name: str) -> object:
         if name == "character_binding":
             return types.SimpleNamespace(
@@ -30,6 +33,11 @@ def _load_summary_worker_module(monkeypatch: Any) -> Any:
             )
         if name == "llm_provider":
             return types.SimpleNamespace(generate_text=lambda **_kwargs: None)
+        if name == "agent_run_logger":
+            return types.SimpleNamespace(
+                create_collector=lambda **_kwargs: None,
+                finalize_collector=_finalize_collector,
+            )
         return object()
 
     monkeypatch.setattr(nonebot.plugin, "require", _fake_require)

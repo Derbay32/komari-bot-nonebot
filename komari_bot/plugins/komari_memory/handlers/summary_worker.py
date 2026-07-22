@@ -30,6 +30,7 @@ from ..services.message_chunking import (
 )
 
 character_binding = require("character_binding")
+agent_run_logger_plugin = require("agent_run_logger")
 
 
 class InvalidSummaryResultError(RuntimeError):
@@ -129,6 +130,8 @@ def _resolve_message_time_range(messages: list[Any]) -> tuple[datetime, datetime
 
 
 if TYPE_CHECKING:
+    from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
     from ..services.memory_service import MemoryService
     from ..services.redis_manager import RedisManager
 
@@ -307,6 +310,12 @@ async def perform_summary(
         )
         return
     processing_key = claim.processing_key
+    collector = agent_run_logger_plugin.create_collector(
+        run_type="scheduled_summary",
+        task_kind="conversation_processing",
+        trace_id=f"conversation-summary-{processing_key}",
+        input_data={"group_id": group_id, "processing_key": processing_key},
+    )
     heartbeat_stop = asyncio.Event()
     lease_lost = asyncio.Event()
     heartbeat_task = asyncio.create_task(
@@ -326,6 +335,7 @@ async def perform_summary(
             memory,
             processing_key,
             owner_token,
+            collector,
         )
     )
     lease_lost_wait = asyncio.create_task(lease_lost.wait())
@@ -354,7 +364,13 @@ async def perform_summary(
             owner_token,
         ):
             _raise_conversation_lease_lost(processing_key)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="cancelled",
+            error=error,
+            skip_if_no_calls=True,
+        )
         await _stop_summary_attempt(
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
@@ -386,6 +402,12 @@ async def perform_summary(
                 )
         raise
     except Exception as error:
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="error",
+            error=error,
+            skip_if_no_calls=True,
+        )
         await _stop_summary_attempt(
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
@@ -435,6 +457,17 @@ async def perform_summary(
                             processing_key,
                         )
         raise
+    else:
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="success",
+            output={
+                "group_id": group_id,
+                "processing_key": processing_key,
+                "acknowledged": True,
+            },
+            skip_if_no_calls=True,
+        )
     finally:
         heartbeat_stop.set()
         lease_lost_wait.cancel()
@@ -495,6 +528,7 @@ async def _perform_summary_from_processing(
     memory: MemoryService,
     processing_key: str,
     owner_token: str,
+    collector: AgentRunCollector | None = None,
 ) -> None:
     """围绕同一个 processing 快照执行可重试的总结流程。"""
     config = get_config()
@@ -507,6 +541,15 @@ async def _perform_summary_from_processing(
     if not messages_buffer:
         logger.warning("[KomariMemory] 群组 {} 消息缓冲为空", group_id)
         return
+
+    if collector is not None:
+        collector.set_input_data(
+            {
+                "group_id": group_id,
+                "processing_key": processing_key,
+                "messages": messages_buffer,
+            }
+        )
 
     await _refresh_character_binding_if_needed(group_id=group_id)
     snapshot_fingerprint = _build_processing_snapshot_fingerprint(group_id, messages_buffer)
@@ -553,6 +596,7 @@ async def _perform_summary_from_processing(
                 config,
                 participants=participants,
                 display_name_map=nickname_map,
+                collector=collector,
             )
             normalized_memories = _normalize_summary_memories(summary_result)
             await redis.set_conversation_chunk_state(
@@ -587,6 +631,7 @@ async def _perform_summary_from_processing(
                 bot_user_ids=bot_user_ids,
                 config=config,
                 trace_id=f"profile-agent-{chunk.chunk_id[:12]}",
+                collector=collector,
             )
             if profile_result.status not in {"committed", "nothing_to_commit"}:
                 raise IncompleteProfileAgentError(profile_result.status)
