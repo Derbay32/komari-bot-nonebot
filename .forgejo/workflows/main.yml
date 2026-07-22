@@ -243,6 +243,7 @@ jobs:
           docker buildx build \
             --push \
             "${TAG_ARGS[@]}" \
+            --build-arg "SENTRY_RELEASE=komari-bot@${IMAGE_TAG}" \
             --label "org.opencontainers.image.source=${FORGEJO_SERVER_URL}/${FORGEJO_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${{ forgejo.sha }}" \
             --label "org.opencontainers.image.version=${IMAGE_TAG}" \

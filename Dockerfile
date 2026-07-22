@@ -20,6 +20,8 @@ RUN poetry check --lock \
 # 第二阶段：运行环境
 FROM python:3.13-slim
 
+ARG SENTRY_RELEASE
+
 WORKDIR /app
 
 # ENV
@@ -27,6 +29,7 @@ ENV TZ=Asia/Shanghai
 ENV PYTHONPATH=/app
 ENV APP_MODULE=_main:app
 ENV MAX_WORKERS=1
+ENV SENTRY_RELEASE="${SENTRY_RELEASE}"
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
