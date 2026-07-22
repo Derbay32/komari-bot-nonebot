@@ -11,18 +11,11 @@ from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.untrusted_context import UntrustedContext
 
-from .api import register_llm_provider_api
-from .base_client import LLMCompletionResultSchema, UnifiedUsageSchema
+from .base_client import LLMCompletionResultSchema
 from .client_pool import ClientSettings, LLMClientPool
 from .config import Config
 from .config_schema import DynamicConfigSchema
-from .llm_logger import (
-    build_content_summary,
-    log_llm_call,
-    shutdown_llm_logging,
-)
 from .openai_compatible_api import OpenAICompatibleClient
-from .reply_log_reader import ReplyLogReader
 
 __plugin_meta__ = PluginMetadata(
     name="llm_provider",
@@ -60,8 +53,6 @@ __all__ = [
     "generate_messages_completion",
     "generate_text",
     "generate_text_with_messages",
-    "get_reply_log_reader",
-    "register_llm_provider_api",
 ]
 
 # 依赖插件
@@ -72,7 +63,6 @@ knowledge_plugin = require("komari_knowledge")
 config_manager = config_manager_plugin.get_config_manager(
     "llm_provider", DynamicConfigSchema
 )
-_reply_log_reader = ReplyLogReader()
 _RATE_LIMIT_WINDOW_SECONDS = 60.0
 _KNOWLEDGE_PLACEHOLDER = "{{DYNAMIC_KNOWLEDGE_BASE}}"
 _KNOWLEDGE_CONTEXT_NOTICE = "相关知识已作为独立的不可信数据块提供。"
@@ -172,10 +162,6 @@ async def _wait_for_llm_rate_limit(request_phase: str) -> None:
         await _chat_rate_limiter.wait()
 
 
-def get_reply_log_reader() -> ReplyLogReader:
-    return _reply_log_reader
-
-
 def _estimate_base64_data_url_bytes(image_url: str) -> int:
     """不解码图片正文，按 base64 长度估算原始字节数。"""
     header, separator, payload = image_url.partition(",")
@@ -228,7 +214,6 @@ def _summarize_messages_payload(
                     elif image_url:
                         image_remote_url_parts += 1
 
-    content_summary = build_content_summary(messages)
     return {
         "turns": len(messages),
         "text_parts": text_parts,
@@ -238,96 +223,7 @@ def _summarize_messages_payload(
         "image_remote_url_parts": image_remote_url_parts,
         "image_url_chars": image_url_chars,
         "image_bytes": image_bytes,
-        "chars": content_summary["chars"],
-        "sha256": content_summary["sha256"],
     }
-
-
-def _build_log_parameter_keys(kwargs: dict[str, Any]) -> list[str]:
-    """仅记录非追踪调用参数的键名。"""
-    return sorted(
-        key
-        for key in kwargs
-        if key not in {"request_trace_id", "request_phase"}
-    )
-
-
-def _build_prompt_log_input(
-    *,
-    trace_id: str,
-    phase: str,
-    prompt: str,
-    system_instruction: str,
-    temperature: float | None,
-    max_tokens: int | None,
-    response_format: dict | None,
-    enable_knowledge: bool,
-    knowledge_query: str | None,
-    knowledge_limit: int,
-    kwargs: dict[str, Any],
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
-    parallel_tool_calls: bool | None = None,
-) -> dict[str, Any]:
-    """构造 prompt 路径的脱敏日志摘要。"""
-    input_data: dict[str, Any] = {
-        "trace_id": trace_id,
-        "phase": phase,
-        "prompt_summary": build_content_summary(prompt),
-        "system_instruction_summary": build_content_summary(system_instruction),
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "enable_knowledge": enable_knowledge,
-        "knowledge_limit": knowledge_limit,
-        "parameter_keys": _build_log_parameter_keys(kwargs),
-    }
-    if knowledge_query is not None:
-        input_data["knowledge_query_summary"] = build_content_summary(knowledge_query)
-    if response_format is not None:
-        input_data["response_format_summary"] = build_content_summary(response_format)
-        input_data["response_format_keys"] = sorted(response_format)
-    if tools is not None:
-        input_data["tools_count"] = len(tools)
-        input_data["tools_summary"] = build_content_summary(tools)
-    if tool_choice is not None:
-        input_data["tool_choice_summary"] = build_content_summary(tool_choice)
-    if parallel_tool_calls is not None:
-        input_data["parallel_tool_calls"] = parallel_tool_calls
-    return input_data
-
-
-def _build_messages_log_input(
-    *,
-    trace_id: str,
-    payload_summary: dict[str, int | str],
-    temperature: float | None,
-    max_tokens: int | None,
-    response_format: dict | None,
-    kwargs: dict[str, Any],
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
-    parallel_tool_calls: bool | None = None,
-) -> dict[str, Any]:
-    """构造 messages 路径的脱敏日志摘要。"""
-    input_data: dict[str, Any] = {
-        "trace_id": trace_id,
-        "phase": str(kwargs.get("request_phase", "")).strip(),
-        "payload_summary": payload_summary,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "parameter_keys": _build_log_parameter_keys(kwargs),
-    }
-    if response_format is not None:
-        input_data["response_format_summary"] = build_content_summary(response_format)
-        input_data["response_format_keys"] = sorted(response_format)
-    if tools is not None:
-        input_data["tools_count"] = len(tools)
-        input_data["tools_summary"] = build_content_summary(tools)
-    if tool_choice is not None:
-        input_data["tool_choice_summary"] = build_content_summary(tool_choice)
-    if parallel_tool_calls is not None:
-        input_data["parallel_tool_calls"] = parallel_tool_calls
-    return input_data
 
 
 def _get_client_settings() -> ClientSettings:
@@ -355,38 +251,6 @@ def _get_completion_content(result: LLMCompletionResultSchema | str) -> str:
     if isinstance(result, str):
         return result
     return result.content
-
-
-def _get_completion_reasoning_content(
-    result: LLMCompletionResultSchema | str,
-) -> str | None:
-    """兼容测试替身与真实客户端的推理内容。"""
-    if isinstance(result, str):
-        return None
-    return result.reasoning_content
-
-
-def _get_completion_usage(
-    result: LLMCompletionResultSchema | str,
-) -> UnifiedUsageSchema | None:
-    """兼容测试替身与真实客户端的用量信息。"""
-    if isinstance(result, LLMCompletionResultSchema):
-        return result.usage
-    return None
-
-
-def _get_completion_finish_reason(
-    result: LLMCompletionResultSchema | str,
-) -> str | None:
-    if isinstance(result, LLMCompletionResultSchema):
-        return result.finish_reason
-    return None
-
-
-def _get_tool_calls_count(result: LLMCompletionResultSchema | str) -> int:
-    if isinstance(result, LLMCompletionResultSchema):
-        return len(result.tool_calls)
-    return 0
 
 
 async def _load_knowledge_contexts(
@@ -457,7 +321,6 @@ async def generate_text(
     *,
     enable_knowledge: bool = False,
     response_format: dict | None = None,
-    record_chat_log: bool = False,
     untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
@@ -473,13 +336,11 @@ async def generate_text(
         knowledge_query: 知识库查询文本
         knowledge_limit: 检索返回的知识数量上限
         response_format: OpenAI 兼容结构化输出参数；非空时下发到底层 LLM API
-        record_chat_log: 是否记录聊天回复日志
         **kwargs: 其他参数
 
     Returns:
         生成的文本
     """
-    start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
     final_system_instruction = system_instruction or ""
@@ -520,28 +381,6 @@ async def generate_text(
                 **kwargs,
             )
     except Exception as e:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_text",
-                model=model,
-                input_data=_build_prompt_log_input(
-                    trace_id=request_trace_id,
-                    phase=request_phase,
-                    prompt=prompt,
-                    system_instruction=final_system_instruction,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    enable_knowledge=enable_knowledge,
-                    knowledge_query=knowledge_query,
-                    knowledge_limit=knowledge_limit,
-                    kwargs=kwargs,
-                ),
-                error=str(e),
-                error_type=type(e).__name__,
-                duration_ms=duration_ms,
-            )
         logger.error(
             "[LLM Provider] 文本请求失败: trace_id={} phase={} error_type={}",
             request_trace_id or "-",
@@ -550,35 +389,7 @@ async def generate_text(
         )
         raise
     else:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        content = _get_completion_content(result)
-        reasoning_content = _get_completion_reasoning_content(result)
-        usage = _get_completion_usage(result)
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_text",
-                model=model,
-                input_data=_build_prompt_log_input(
-                    trace_id=request_trace_id,
-                    phase=request_phase,
-                    prompt=prompt,
-                    system_instruction=final_system_instruction,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    enable_knowledge=enable_knowledge,
-                    knowledge_query=knowledge_query,
-                    knowledge_limit=knowledge_limit,
-                    kwargs=kwargs,
-                ),
-                output=content,
-                reasoning_chars=len(reasoning_content or ""),
-                finish_reason=_get_completion_finish_reason(result),
-                tool_calls_count=_get_tool_calls_count(result),
-                duration_ms=duration_ms,
-                usage=usage,
-            )
-        return content
+        return _get_completion_content(result)
 
 
 async def generate_completion(
@@ -592,7 +403,6 @@ async def generate_completion(
     *,
     enable_knowledge: bool = False,
     response_format: dict | None = None,
-    record_chat_log: bool = False,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
@@ -645,62 +455,16 @@ async def generate_completion(
                 **kwargs,
             )
     except Exception as e:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_completion",
-                model=model,
-                input_data=_build_prompt_log_input(
-                    trace_id=request_trace_id,
-                    phase=request_phase,
-                    prompt=prompt,
-                    system_instruction=final_system_instruction,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    enable_knowledge=enable_knowledge,
-                    knowledge_query=knowledge_query,
-                    knowledge_limit=knowledge_limit,
-                    kwargs=kwargs,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    parallel_tool_calls=parallel_tool_calls,
-                ),
-                error=str(e),
-                error_type=type(e).__name__,
-                duration_ms=duration_ms,
-            )
+        logger.error(
+            "[LLM Provider] Completion 请求失败: trace_id={} phase={} error_type={}",
+            request_trace_id or "-",
+            request_phase or "-",
+            type(e).__name__,
+        )
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
         result.duration_ms = duration_ms
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_completion",
-                model=model,
-                input_data=_build_prompt_log_input(
-                    trace_id=request_trace_id,
-                    phase=request_phase,
-                    prompt=prompt,
-                    system_instruction=final_system_instruction,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    enable_knowledge=enable_knowledge,
-                    knowledge_query=knowledge_query,
-                    knowledge_limit=knowledge_limit,
-                    kwargs=kwargs,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    parallel_tool_calls=parallel_tool_calls,
-                ),
-                output=result.content,
-                reasoning_chars=len(result.reasoning_content or ""),
-                finish_reason=result.finish_reason,
-                tool_calls_count=len(result.tool_calls),
-                duration_ms=duration_ms,
-                usage=result.usage,
-            )
         return result
 
 
@@ -711,7 +475,6 @@ async def generate_text_with_messages(
     max_tokens: int | None = None,
     response_format: dict | None = None,
     *,
-    record_chat_log: bool = False,
     untrusted_contexts: list[UntrustedContext] | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
@@ -723,13 +486,11 @@ async def generate_text_with_messages(
         temperature: 温度参数
         max_tokens: 最大 token 数
         response_format: OpenAI 兼容结构化输出参数；非空时下发到底层 LLM API
-        record_chat_log: 是否记录聊天回复日志
         **kwargs: 其他参数
 
     Returns:
         生成的文本
     """
-    start_time = time.monotonic()
     request_trace_id = str(kwargs.get("request_trace_id", "")).strip()
     request_phase = str(kwargs.get("request_phase", "")).strip()
     payload_summary = _summarize_messages_payload(messages)
@@ -758,23 +519,6 @@ async def generate_text_with_messages(
                 **kwargs,
             )
     except Exception as e:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_text_with_messages",
-                model=model,
-                input_data=_build_messages_log_input(
-                    trace_id=request_trace_id,
-                    payload_summary=payload_summary,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    kwargs=kwargs,
-                ),
-                error=str(e),
-                error_type=type(e).__name__,
-                duration_ms=duration_ms,
-            )
         logger.error(
             "[LLM Provider] Messages 请求失败: trace_id={} model={} error_type={} payload={}",
             request_trace_id or "-",
@@ -784,30 +528,7 @@ async def generate_text_with_messages(
         )
         raise
     else:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        content = _get_completion_content(result)
-        reasoning_content = _get_completion_reasoning_content(result)
-        usage = _get_completion_usage(result)
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_text_with_messages",
-                model=model,
-                input_data=_build_messages_log_input(
-                    trace_id=request_trace_id,
-                    payload_summary=payload_summary,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    kwargs=kwargs,
-                ),
-                output=content,
-                reasoning_chars=len(reasoning_content or ""),
-                finish_reason=_get_completion_finish_reason(result),
-                tool_calls_count=_get_tool_calls_count(result),
-                duration_ms=duration_ms,
-                usage=usage,
-            )
-        return content
+        return _get_completion_content(result)
 
 
 async def generate_messages_completion(
@@ -817,7 +538,6 @@ async def generate_messages_completion(
     max_tokens: int | None = None,
     response_format: dict | None = None,
     *,
-    record_chat_log: bool = False,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
@@ -858,52 +578,16 @@ async def generate_messages_completion(
                 **kwargs,
             )
     except Exception as e:
-        duration_ms = (time.monotonic() - start_time) * 1000
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_messages_completion",
-                model=model,
-                input_data=_build_messages_log_input(
-                    trace_id=request_trace_id,
-                    payload_summary=payload_summary,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    kwargs=kwargs,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    parallel_tool_calls=parallel_tool_calls,
-                ),
-                error=str(e),
-                error_type=type(e).__name__,
-                duration_ms=duration_ms,
-            )
+        logger.error(
+            "[LLM Provider] Completion(messages) 请求失败: trace_id={} phase={} error_type={}",
+            request_trace_id or "-",
+            request_phase or "-",
+            type(e).__name__,
+        )
         raise
     else:
         duration_ms = (time.monotonic() - start_time) * 1000
         result.duration_ms = duration_ms
-        if record_chat_log:
-            await log_llm_call(
-                method="generate_messages_completion",
-                model=model,
-                input_data=_build_messages_log_input(
-                    trace_id=request_trace_id,
-                    payload_summary=payload_summary,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    kwargs=kwargs,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    parallel_tool_calls=parallel_tool_calls,
-                ),
-                output=result.content,
-                reasoning_chars=len(result.reasoning_content or ""),
-                finish_reason=result.finish_reason,
-                tool_calls_count=len(result.tool_calls),
-                duration_ms=duration_ms,
-                usage=result.usage,
-            )
         return result
 
 
@@ -932,6 +616,5 @@ if driver is not None:
 
     @driver.on_shutdown
     async def _shutdown_provider_resources() -> None:
-        """在进程退出时排空日志，并关闭复用的 HTTP 连接。"""
-        await shutdown_llm_logging()
+        """在进程退出时关闭复用的 HTTP 连接。"""
         await _client_pool.close()

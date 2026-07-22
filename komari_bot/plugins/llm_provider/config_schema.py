@@ -2,7 +2,6 @@
 llm provider 配置 Schema 实现。
 """
 
-import re
 from datetime import datetime
 from typing import Any
 
@@ -116,21 +115,6 @@ class DynamicConfigSchema(BaseModel):
         description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
     )
 
-    # LLM 调用日志配置
-    llm_log_retention_days: int = Field(
-        default=30,
-        ge=1,
-        le=90,
-        description="logs/llm_provider/*.jsonl 自动清理的日志保留天数",
-    )
-    llm_log_dir_permission_mode: str = Field(
-        default="0o700",
-        description=(
-            "LLM 日志目录首次创建时应用的八进制权限字符串，"
-            "例如 0o700、0o750；为空字符串时禁用 chmod 权限收敛"
-        ),
-    )
-
     @field_validator("extra_params")
     @classmethod
     def validate_extra_params(cls, v: dict[str, Any]) -> dict[str, Any]:
@@ -138,16 +122,5 @@ class DynamicConfigSchema(BaseModel):
         unsupported = get_unsupported_extra_param_keys(v)
         if unsupported:
             msg = f"extra_params 包含不允许的键: {', '.join(unsupported)}"
-            raise ValueError(msg)
-        return v
-
-    @field_validator("llm_log_dir_permission_mode")
-    @classmethod
-    def validate_log_dir_permission_mode(cls, v: str) -> str:
-        """校验 LLM 日志目录权限模式。"""
-        if v == "":
-            return v
-        if not re.fullmatch(r"0o[0-7]{3,4}", v):
-            msg = "llm_log_dir_permission_mode 必须为空或八进制权限字符串"
             raise ValueError(msg)
         return v

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from komari_bot.plugins.llm_provider.base_client import (
-    UnifiedUsageSchema,
-)
-from komari_bot.plugins.llm_provider.diagnostic import (
+from komari_bot.plugins.agent_run_logger.diagnostic import (
     LLMCallTrace,
     LLMDiagnosticCollector,
     ToolExecutionTrace,
+)
+from komari_bot.plugins.llm_provider.base_client import (
+    UnifiedUsageSchema,
 )
 
 
