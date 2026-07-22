@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from komari_bot.plugins.agent_run_logger.config_schema import (
     AgentRunLoggerConfigSchema,
+    AgentRunLoggerEnvConfigSchema,
 )
 from komari_bot.plugins.agent_run_logger.diagnostic import (
     AgentRunCollector,
@@ -149,6 +150,21 @@ def test_new_config_forbids_old_provider_log_fields() -> None:
     assert schema["additionalProperties"] is False
     with pytest.raises(ValidationError):
         AgentRunLoggerConfigSchema.model_validate({"llm_log_retention_days": 30})
+
+
+def test_env_config_ignores_unrelated_nonebot_global_fields() -> None:
+    config = AgentRunLoggerEnvConfigSchema.model_validate(
+        {
+            "environment": "dev",
+            "pg_host": "127.0.0.1",
+            "redis_port": 6379,
+            "log_enabled": False,
+            "retention_days": 7,
+        }
+    )
+
+    assert config.log_enabled is False
+    assert config.retention_days == 7
 
 
 @pytest.mark.parametrize("retention_days", [0, 91])

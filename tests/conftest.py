@@ -106,8 +106,13 @@ class _DummyConfigManager:
 
 class _DummyConfigManagerPlugin:
     @staticmethod
-    def get_config_manager(name: str, schema: object) -> _DummyConfigManager:
-        del name, schema
+    def get_config_manager(
+        name: str,
+        schema: object,
+        *,
+        env_config_schema: object | None = None,
+    ) -> _DummyConfigManager:
+        del name, schema, env_config_schema
         return _DummyConfigManager()
 
 

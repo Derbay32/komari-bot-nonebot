@@ -53,10 +53,17 @@ class ConfigManager:
     - 支持自定义配置 Schema（任何 BaseModel 子类）
     """
 
-    def __init__(self, plugin_name: str, config_schema: type[BaseModel]) -> None:
+    def __init__(
+        self,
+        plugin_name: str,
+        config_schema: type[BaseModel],
+        *,
+        env_config_schema: type[BaseModel] | None = None,
+    ) -> None:
         """初始化配置管理器。"""
         self._plugin_name = plugin_name
         self._config_schema = config_schema
+        self._env_config_schema = env_config_schema or config_schema
         self._env_config: Any | None = None
         self._dynamic_config: BaseModel | None = None
         self._last_loaded_at: datetime | None = None
@@ -87,7 +94,7 @@ class ConfigManager:
     def _get_env_config(self) -> Any:
         """获取环境配置（延迟加载）。"""
         if self._env_config is None:
-            self._env_config = get_plugin_config(self._config_schema)
+            self._env_config = get_plugin_config(self._env_config_schema)
         return self._env_config
 
     def initialize(self) -> BaseModel:
@@ -660,18 +667,35 @@ async def initialize_registered_config_managers_async() -> None:
 
 
 def get_config_manager(
-    plugin_name: str, config_schema: type[BaseModel]
+    plugin_name: str,
+    config_schema: type[BaseModel],
+    *,
+    env_config_schema: type[BaseModel] | None = None,
 ) -> ConfigManager:
     """从唯一注册表获取配置管理器实例。"""
     with _config_managers_lock:
         manager = _config_managers.get(plugin_name)
         if manager is None:
-            manager = ConfigManager(plugin_name, config_schema)
+            manager = ConfigManager(
+                plugin_name,
+                config_schema,
+                env_config_schema=env_config_schema,
+            )
             _config_managers[plugin_name] = manager
         elif manager._config_schema is not config_schema:
             msg = (
                 f"插件 {plugin_name} 已注册配置 Schema "
                 f"{manager._config_schema.__name__}，不能改用 {config_schema.__name__}"
+            )
+            raise ValueError(msg)
+        elif (
+            env_config_schema is not None
+            and manager._env_config_schema is not env_config_schema
+        ):
+            msg = (
+                f"插件 {plugin_name} 已注册环境配置 Schema "
+                f"{manager._env_config_schema.__name__}，不能改用 "
+                f"{env_config_schema.__name__}"
             )
             raise ValueError(msg)
         return manager

@@ -30,6 +30,10 @@ class _ConflictingConfigSchema(BaseModel):
     enabled: bool = True
 
 
+class _EnvConfigSchema(_ConfigSchema):
+    pass
+
+
 @pytest.fixture(autouse=True)
 def _clear_manager_registry() -> Iterator[None]:
     manager_module._config_managers.clear()
@@ -52,6 +56,29 @@ def test_factory_rejects_two_schemas_for_the_same_storage_resource() -> None:
 
     with pytest.raises(ValueError, match="已注册配置 Schema"):
         get_config_manager("schema-conflict", _ConflictingConfigSchema)
+
+
+def test_manager_uses_dedicated_environment_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_schemas: list[type[BaseModel]] = []
+
+    def _get_plugin_config(schema: type[BaseModel]) -> BaseModel:
+        requested_schemas.append(schema)
+        return schema(value=7)
+
+    monkeypatch.setattr(manager_module, "get_plugin_config", _get_plugin_config)
+    manager = ConfigManager(
+        "dedicated-env-schema",
+        _ConfigSchema,
+        env_config_schema=_EnvConfigSchema,
+    )
+
+    config = manager._get_env_config()
+
+    assert requested_schemas == [_EnvConfigSchema]
+    assert isinstance(config, _EnvConfigSchema)
+    assert config.value == 7
 
 
 def test_factory_creation_is_thread_safe() -> None:

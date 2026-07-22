@@ -15,7 +15,10 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 
 from .api import register_agent_run_log_api
-from .config_schema import AgentRunLoggerConfigSchema
+from .config_schema import (
+    AgentRunLoggerConfigSchema,
+    AgentRunLoggerEnvConfigSchema,
+)
 from .diagnostic import (
     AgentRunCollector,
     AgentRunOrigin,
@@ -60,6 +63,7 @@ config_manager_plugin = require("config_manager")
 config_manager = config_manager_plugin.get_config_manager(
     "agent_run_logger",
     AgentRunLoggerConfigSchema,
+    env_config_schema=AgentRunLoggerEnvConfigSchema,
 )
 driver = get_driver()
 

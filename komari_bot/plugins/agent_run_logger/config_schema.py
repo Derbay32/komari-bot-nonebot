@@ -27,3 +27,12 @@ class AgentRunLoggerConfigSchema(BaseModel):
         le=90,
         description="Agent Run 详细日志按日志日保留的天数",
     )
+
+
+class AgentRunLoggerEnvConfigSchema(AgentRunLoggerConfigSchema):
+    """从 NoneBot 全局环境中提取本插件字段时使用的宽松投影。"""
+
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
