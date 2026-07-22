@@ -69,7 +69,7 @@ komari-bot/
 │   └── *.md                              #   组件文档
 │
 ├── data/ / scripts/ / tools/ / tests/    # 数据 / 脚本 / 工具 / 测试
-└── logs/                                 # 运行时日志（含 LLM 请求 trace）
+└── logs/                                 # 运行时日志（含 Agent Run JSONL）
 ```
 
 ## 插件架构与依赖关系
@@ -85,6 +85,7 @@ komari-bot/
   user_ban ─────────────────── 全局 QQ 用户封禁（chat / command）
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
+  agent_run_logger ─────────── 单任务 Agent Run JSONL + PostgreSQL 轻索引
   komari_search ────────────── Tavily 联网搜索服务
   user_data ────────────────── 当前好感度 PostgreSQL 服务
 
@@ -114,6 +115,7 @@ komari-bot/
          ├─ 调用 komari_decision 判定回复策略
          ├─ 可选调用 komari_search 工具查询实时信息
          ├─ 调用 llm_provider 生成回复
+         ├─ 由 agent_run_logger 汇总一条完整 Agent Run 日志
          └─ 调用 komari_memory 写入新记忆
 
 用户事件 → user_ban（run_preprocessor）
@@ -195,20 +197,26 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - `completion_tokens_details.reasoning_tokens` 映射到 `reasoning_output_tokens`
 - 缺失或异常字段不阻断解析，对应位置保留 `None`
 
-诊断模型（`diagnostic.py`）：
-- `LLMCallTrace`：call ID、父 call ID、阶段、轮次、模型、finish reason、耗时、usage
-- `ToolExecutionTrace`：所属 call ID、工具名、解析参数、状态、错误/结果摘要（不含敏感正文）
-- `LLMDiagnosticCollector`：按请求保存调用与工具记录，按阶段及全链路聚合 token，逐字段标注完整性
-- collector 由 debug 命令创建并显式向下传递；正常业务调用传 `None`
-
 关键规则：
 - `llm_provider` 最底层通过 `apply_llm_security_boundary()` 强制追加不可覆盖的安全 system 边界；知识、网页、群历史、引用、画像、视觉描述和工具结果必须使用 `UntrustedContext` 或统一不可信标签传入，禁止拼进 system prompt
 - 不可信上下文必须保留来源类型、来源 ID、信任级别并限制正文长度；工具调用必须使用白名单、对象参数 schema、轮数与总调用预算
 - `max_tokens` 必须为 **`int`**（不能是 `float`），默认 8192
 - 知识库注入：`enable_knowledge=True` 时自动检索并注入到 system prompt
-- 调用日志：所有请求记录到 `logs/llm_provider/`，JSONL 只写入已报告字段
+- `request_trace_id` / `request_phase` 仅用于限流和普通运行日志；provider 不持久化 Agent Run，也不依赖日志插件
 
-### 2.1 Embedding / Rerank 远程协议
+### 2.1 Agent Run 日志 (`agent_run_logger`)
+
+- 配置资源只有 `log_enabled`（默认 `true`）与 `retention_days`（默认 `1`，范围 `1..90`）；不读取或继承 `llm_provider.llm_log_*` 旧字段。
+- `AgentRunCollector` 由 `komari_chat`、`komari_memory`、`group_history_summary` 和 `komari_debug` 显式下传；一个业务任务无论包含多少 LLM 轮次和工具调用，都只结束和落盘一次。
+- 日志类别固定为 `chat_reply`、`scheduled_summary`、`group_history_summary`；debug 复用对应类别并标记 `origin=debug`。日志关闭时普通任务不采集，debug 仍保留不落盘的内存诊断。
+- JSONL v3 写入 `logs/agent_run_logger/YYYY-MM-DD.jsonl`，目录固定 `0700`、文件固定 `0600`；保存完整输入、输出、prompt/messages、reasoning、工具参数/结果及异常，只移除显式凭据并把图片 URL、base64 与二进制替换为摘要。
+- PostgreSQL `UNLOGGED` 表 `komari_agent_run_log_index` 只保存 run/trace、分类、时间、文件字节定位、模型/方法集合、计数与 usage；禁止加入任何正文、预览、prompt、reasoning、工具正文或错误正文。
+- 写入顺序是跨进程文件锁内追加 JSONL，再 upsert PG。PG 故障不撤销 JSONL；启动及每 5 分钟使用 advisory lock 对账，管理查询在 PG 不可用时降级扫描 JSONL。
+- 每日本地时间 04:00 清理，保留当前日志日及此前 `retention_days - 1` 日；日志关闭不停止清理。启动时同时删除废弃 SQLite 索引文件，并以幂等 JSONB 删除语句物理清除 provider 旧日志配置键。
+- 管理接口为 `/api/agent-run-logs/v1/runs` 与 `/runs/{run_id}`，仍使用 `llm_logs:read`；旧 `/api/llm-provider/v1/reply-logs` URL 只是弃用别名。
+- debug 报告必须继续走独立脱敏投影，绝不能直接复用完整 JSONL 正文。
+
+### 2.2 Embedding / Rerank 远程协议
 
 - HTTP 客户端必须同时配置连接、读取和总超时；只对网络中断、超时、限流及 5xx 做有限重试。
 - Embedding 响应必须与输入数量一致，`index` 唯一且保持输入顺序，向量维度等于配置值，所有元素均为有限数。
@@ -281,7 +289,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 `message_handler.py` 的 `_attempt_reply()` 已拆分为三个边界：
 
 1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
-2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `LLMDiagnosticCollector`
+2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
 3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储与互动历史写入；主动回复冷却/频控不在这里重复记账
 
 主动回复频控契约：
