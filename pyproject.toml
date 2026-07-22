@@ -1,6 +1,6 @@
 [project]
 name = "komari-bot"
-version = "1.3.0b3"
+version = "1.3.0rc1"
 description = "komari-bot"
 readme = "README.md"
 requires-python = ">=3.13, <4.0"
