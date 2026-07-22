@@ -1,6 +1,6 @@
 # Komari Management 前端对接说明
 
-> 最后同步：2026-07-19。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
+> 最后同步：2026-07-22。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
 
 Komari Management 统一把配置、提示词、判定场景、维护公告以及各业务插件的管理 API 挂载到 NoneBot2 的 FastAPI 应用。前端不需要对接独立的管理服务，所有接口共用同一后端 Origin、Bearer 鉴权和 CORS 配置。
 
@@ -194,6 +194,12 @@ X-Request-ID: config-komari-sentry-pii-001
 
 {"value":true}
 ```
+
+`send_default_pii` 默认关闭且重启后生效。开启后，Sentry 会收到用户上下文、
+完整的 Sentry Logs 正文与日志属性，以及日志生成的错误 Issue 中的完整
+`logentry`；这些内容可能包含 QQ 号、昵称、消息片段、URL 或原始异常字符串。
+请求数据、异常正文、breadcrumb、事务/span 和堆栈局部变量仍会脱敏。
+已经发送的历史事件不会补发或恢复。
 
 详情响应中的关键字段：
 

@@ -89,15 +89,20 @@ def sentry_before_send(
     hint: dict[str, Any],
     *,
     allow_user_context: bool = False,
+    allow_log_content: bool = False,
 ) -> dict[str, Any] | None:
-    """在发送前丢弃控制流异常并清除业务内容与用户标识。"""
+    """丢弃控制流异常，并按配置净化错误事件。"""
     exc_info = hint.get("exc_info")
     if isinstance(exc_info, tuple) and len(exc_info) >= 2:
         error = exc_info[1]
         if isinstance(error, BaseException) and should_ignore_sentry_exception(error):
             return None
 
-    _sanitize_event(event, allow_user_context=allow_user_context)
+    _sanitize_event(
+        event,
+        allow_user_context=allow_user_context,
+        preserve_log_content=(allow_log_content and hint.get("log_record") is not None),
+    )
     return event
 
 
@@ -126,8 +131,13 @@ def sentry_before_breadcrumb(
 def sentry_before_send_log(
     log: dict[str, Any],
     _hint: dict[str, Any],
+    *,
+    allow_log_content: bool = False,
 ) -> dict[str, Any]:
-    """隐藏 Sentry Logs 正文和插值参数。"""
+    """按配置保留或隐藏 Sentry Logs 正文和属性。"""
+    if allow_log_content:
+        return log
+
     sanitized = {
         key: log[key]
         for key in (
@@ -244,8 +254,9 @@ def _sanitize_event(
     event: dict[str, Any],
     *,
     allow_user_context: bool,
+    preserve_log_content: bool = False,
 ) -> None:
-    """就地清理错误事件中的日志、请求、用户与局部变量。"""
+    """就地清理错误事件，可为日志型 Issue 保留 logentry。"""
     if "message" in event:
         event["message"] = _redacted_text_summary(
             event.get("message"),
@@ -253,7 +264,7 @@ def _sanitize_event(
         )
 
     logentry = event.get("logentry")
-    if isinstance(logentry, dict):
+    if isinstance(logentry, dict) and not preserve_log_content:
         for key in ("message", "formatted"):
             if key in logentry:
                 logentry[key] = _redacted_text_summary(
@@ -369,13 +380,17 @@ def ensure_sentry_privacy_hooks(
         "before_send": partial(
             sentry_before_send,
             allow_user_context=allow_user_context,
+            allow_log_content=allow_user_context,
         ),
         "before_breadcrumb": sentry_before_breadcrumb,
         "before_send_transaction": partial(
             sentry_before_send_transaction,
             allow_user_context=allow_user_context,
         ),
-        "before_send_log": sentry_before_send_log,
+        "before_send_log": partial(
+            sentry_before_send_log,
+            allow_log_content=allow_user_context,
+        ),
     }
     for option_name, sanitizer in sanitizers.items():
         existing = options.get(option_name)
@@ -493,13 +508,17 @@ def build_sentry_init_options(
         "before_send": partial(
             sentry_before_send,
             allow_user_context=config.send_default_pii,
+            allow_log_content=config.send_default_pii,
         ),
         "before_breadcrumb": sentry_before_breadcrumb,
         "before_send_transaction": partial(
             sentry_before_send_transaction,
             allow_user_context=config.send_default_pii,
         ),
-        "before_send_log": sentry_before_send_log,
+        "before_send_log": partial(
+            sentry_before_send_log,
+            allow_log_content=config.send_default_pii,
+        ),
         "ignore_errors": list(get_ignored_sentry_exceptions()),
         "integrations": [
             logging_integration_factory(

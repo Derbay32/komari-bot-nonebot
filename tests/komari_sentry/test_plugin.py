@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from nonebug import App
 
 
-def _config() -> SimpleNamespace:
+def _config(*, send_default_pii: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         plugin_enable=True,
         dsn="https://public@example.invalid/1",
@@ -24,7 +24,7 @@ def _config() -> SimpleNamespace:
         traces_sample_rate=1.0,
         profiles_sample_rate=0.0,
         attach_stacktrace=True,
-        send_default_pii=False,
+        send_default_pii=send_default_pii,
         max_breadcrumbs=100,
         breadcrumb_level="WARNING",
         sentry_logs_level="WARNING",
@@ -104,6 +104,51 @@ async def test_external_initialized_client_receives_verified_privacy_hooks(
 
 
 @pytest.mark.asyncio
+async def test_external_client_respects_pii_full_log_policy(
+    sentry_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_config_async() -> SimpleNamespace:
+        return _config(send_default_pii=True)
+
+    monkeypatch.setattr(sentry_plugin, "get_config_async", _get_config_async)
+    sdk = _FakeSentrySdk(
+        initialized=True,
+        options={
+            "before_send": None,
+            "before_breadcrumb": None,
+            "before_send_transaction": None,
+            "before_send_log": None,
+        },
+    )
+    monkeypatch.setattr(sentry_plugin, "sentry_sdk", sdk)
+
+    await sentry_plugin.startup()
+
+    log = {
+        "body": "external-full-log-canary",
+        "attributes": {"user_id": "external-user-canary"},
+    }
+    assert sdk.client.options["before_send_log"](log, {}) is log
+
+    issue = {
+        "logentry": {
+            "message": "external-template-canary",
+            "formatted": "external-formatted-canary",
+            "params": ["external-param-canary"],
+        },
+        "request": {"method": "get", "data": "external-request-canary"},
+    }
+    sanitized = sdk.client.options["before_send"](
+        issue,
+        {"log_record": object()},
+    )
+    assert sanitized["logentry"] == issue["logentry"]
+    assert sanitized["request"] == {"method": "GET"}
+    assert "external-request-canary" not in str(sanitized)
+
+
+@pytest.mark.asyncio
 async def test_external_client_without_mutable_options_fails_closed(
     sentry_plugin: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -133,3 +178,27 @@ async def test_plugin_initialized_client_has_transaction_privacy_hook(
     assert len(sdk.init_calls) == 1
     assert callable(sdk.init_calls[0]["before_send_transaction"])
     assert sentry_plugin._initialized_by_plugin is True
+
+
+@pytest.mark.asyncio
+async def test_plugin_initialized_client_enables_full_logs_with_pii(
+    sentry_plugin: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_config_async() -> SimpleNamespace:
+        return _config(send_default_pii=True)
+
+    monkeypatch.setattr(sentry_plugin, "get_config_async", _get_config_async)
+    sdk = _FakeSentrySdk(initialized=False, options={})
+    monkeypatch.setattr(sentry_plugin, "sentry_sdk", sdk)
+
+    await sentry_plugin.startup()
+
+    assert len(sdk.init_calls) == 1
+    log = {
+        "body": "plugin-full-log-canary",
+        "attributes": {"custom": "plugin-attribute-canary"},
+    }
+    before_send_log = sdk.init_calls[0]["before_send_log"]
+    assert callable(before_send_log)
+    assert before_send_log(log, {}) is log

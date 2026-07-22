@@ -132,6 +132,29 @@ def test_sentry_before_send_log_hides_body_and_interpolation_parameters() -> Non
     assert "log-argument-canary" not in str(sanitized)
 
 
+def test_sentry_before_send_log_keeps_full_payload_when_pii_is_enabled() -> None:
+    log = {
+        "severity_text": "WARN",
+        "severity_number": 13,
+        "time_unix_nano": 1_721_313_947_123_456_789,
+        "trace_id": "full-trace-id",
+        "span_id": "full-span-id",
+        "body": "完整日志正文：用户 10001 请求失败",
+        "attributes": {
+            "sentry.message.template": "用户 {} 请求失败",
+            "sentry.message.parameter.0": "10001",
+            "user_id": "10001",
+            "custom_payload": "full-attribute-canary",
+        },
+    }
+
+    result = sentry_before_send_log(log, {}, allow_log_content=True)
+
+    assert result is log
+    assert result["body"] == "完整日志正文：用户 10001 请求失败"
+    assert result["attributes"] == log["attributes"]
+
+
 def test_sentry_before_send_removes_business_content_and_user_context() -> None:
     event = {
         "message": "event-message-canary",
@@ -233,6 +256,117 @@ def test_sentry_before_send_keeps_explicit_user_context_when_pii_is_enabled() ->
     event = {"user": {"id": "explicit-user"}}
 
     assert sentry_before_send(event, {}, allow_user_context=True) == event
+
+
+def test_sentry_before_send_keeps_logentry_for_logging_issue_with_pii() -> None:
+    event = {
+        "logentry": {
+            "message": "用户 {} 请求失败",
+            "formatted": "用户 10001 请求失败",
+            "params": ["10001"],
+        },
+        "exception": {
+            "values": [
+                {
+                    "type": "RuntimeError",
+                    "value": "logging-exception-canary",
+                    "stacktrace": {
+                        "frames": [
+                            {
+                                "function": "process_message",
+                                "vars": {"content": "logging-frame-canary"},
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+        "request": {
+            "method": "post",
+            "url": "https://example.invalid/logging-request-canary",
+            "data": "logging-request-data-canary",
+        },
+        "breadcrumbs": {"values": [{"message": "logging-breadcrumb-canary"}]},
+        "extra": {"payload": "logging-extra-canary"},
+        "user": {"id": "10001"},
+    }
+
+    sanitized = sentry_before_send(
+        event,
+        {"log_record": object()},
+        allow_user_context=True,
+        allow_log_content=True,
+    )
+
+    assert sanitized is not None
+    assert sanitized is event
+    assert sanitized["logentry"] == {
+        "message": "用户 {} 请求失败",
+        "formatted": "用户 10001 请求失败",
+        "params": ["10001"],
+    }
+    assert sanitized["user"] == {"id": "10001"}
+    assert sanitized["request"] == {"method": "POST"}
+    assert "extra" not in sanitized
+    exception = sanitized["exception"]["values"][0]
+    assert exception["value"] == "[异常正文已隐藏，字符数=24]"
+    assert "vars" not in exception["stacktrace"]["frames"][0]
+    assert sanitized["breadcrumbs"]["values"][0]["message"] == (
+        "[breadcrumb 正文已隐藏，字符数=25]"
+    )
+    serialized = str(sanitized)
+    for canary in (
+        "logging-exception-canary",
+        "logging-frame-canary",
+        "logging-request-canary",
+        "logging-request-data-canary",
+        "logging-breadcrumb-canary",
+        "logging-extra-canary",
+    ):
+        assert canary not in serialized
+
+
+def test_sentry_before_send_keeps_non_logging_content_hidden_with_pii() -> None:
+    event = {
+        "message": "capture-message-canary",
+        "logentry": {
+            "message": "non-logging-template-canary",
+            "formatted": "non-logging-formatted-canary",
+            "params": ["non-logging-param-canary"],
+        },
+        "exception": {
+            "values": [
+                {
+                    "type": "RuntimeError",
+                    "value": "non-logging-exception-canary",
+                }
+            ]
+        },
+        "request": {"method": "get", "data": "non-logging-request-canary"},
+        "user": {"id": "explicit-user"},
+    }
+
+    sanitized = sentry_before_send(
+        event,
+        {},
+        allow_user_context=True,
+        allow_log_content=True,
+    )
+
+    assert sanitized is not None
+    assert sanitized is event
+    assert sanitized["user"] == {"id": "explicit-user"}
+    assert sanitized["request"] == {"method": "GET"}
+    serialized = str(sanitized)
+    for canary in (
+        "capture-message-canary",
+        "non-logging-template-canary",
+        "non-logging-formatted-canary",
+        "non-logging-param-canary",
+        "non-logging-exception-canary",
+        "non-logging-request-canary",
+    ):
+        assert canary not in serialized
 
 
 def test_sentry_transaction_hook_hides_transaction_spans_and_request_content() -> None:
@@ -426,13 +560,19 @@ def test_build_sentry_init_options_builds_log_integrations_and_filters() -> None
     before_send = options["before_send"]
     assert isinstance(before_send, partial)
     assert before_send.func is sentry_before_send
-    assert before_send.keywords == {"allow_user_context": False}
+    assert before_send.keywords == {
+        "allow_user_context": False,
+        "allow_log_content": False,
+    }
     assert options["before_breadcrumb"] is sentry_before_breadcrumb
     before_send_transaction = options["before_send_transaction"]
     assert isinstance(before_send_transaction, partial)
     assert before_send_transaction.func is sentry_before_send_transaction
     assert before_send_transaction.keywords == {"allow_user_context": False}
-    assert options["before_send_log"] is sentry_before_send_log
+    before_send_log = options["before_send_log"]
+    assert isinstance(before_send_log, partial)
+    assert before_send_log.func is sentry_before_send_log
+    assert before_send_log.keywords == {"allow_log_content": False}
     assert options["ignore_errors"] == list(get_ignored_sentry_exceptions())
     assert options["integrations"] == [
         {
@@ -449,3 +589,29 @@ def test_build_sentry_init_options_builds_log_integrations_and_filters() -> None
         "fastapi",
         "starlette",
     ]
+
+
+def test_build_sentry_init_options_reuses_pii_for_full_log_content() -> None:
+    config = _DummySentryConfig(send_default_pii=True)
+
+    options = build_sentry_init_options(
+        config=config,
+        dsn="https://example@sentry.invalid/1",
+        resolve_level=lambda level_name, default: getattr(logging, level_name, default),
+        logging_integration_factory=lambda **kwargs: kwargs,
+        loguru_integration_factory=lambda **kwargs: kwargs,
+        asyncio_integration_factory=lambda: "asyncio",
+        fastapi_integration_factory=lambda: "fastapi",
+        starlette_integration_factory=lambda: "starlette",
+        environ={"ENVIRONMENT": "prod"},
+    )
+
+    before_send = options["before_send"]
+    assert isinstance(before_send, partial)
+    assert before_send.keywords == {
+        "allow_user_context": True,
+        "allow_log_content": True,
+    }
+    before_send_log = options["before_send_log"]
+    assert isinstance(before_send_log, partial)
+    assert before_send_log.keywords == {"allow_log_content": True}

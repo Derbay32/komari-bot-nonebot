@@ -67,7 +67,10 @@ class KomariSentryConfigSchema(BaseModel):
     attach_stacktrace: bool = Field(default=True, description="是否附加堆栈")
     send_default_pii: bool = Field(
         default=False,
-        description="是否显式保留 Sentry 用户上下文；日志与请求正文始终脱敏",
+        description=(
+            "是否向 Sentry 发送用户上下文、完整日志正文与日志属性；"
+            "请求、异常、breadcrumb 和事务内容仍会脱敏"
+        ),
     )
     max_breadcrumbs: int = Field(
         default=100,

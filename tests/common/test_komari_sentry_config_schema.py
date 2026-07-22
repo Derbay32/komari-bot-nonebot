@@ -51,3 +51,12 @@ def test_config_schema_default_contains_sentry_logs_level() -> None:
     config = KomariSentryConfigSchema()
 
     assert config.sentry_logs_level == "WARNING"
+
+
+def test_send_default_pii_description_warns_about_full_logs() -> None:
+    properties = KomariSentryConfigSchema.model_json_schema()["properties"]
+    description = properties["send_default_pii"]["description"]
+
+    assert "用户上下文" in description
+    assert "完整日志正文" in description
+    assert "日志属性" in description
