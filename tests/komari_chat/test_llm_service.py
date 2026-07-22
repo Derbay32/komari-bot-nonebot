@@ -98,7 +98,7 @@ def _completion(
     )
 
 
-def test_generate_reply_enables_chat_log_for_messages(monkeypatch: Any) -> None:
+def test_generate_reply_does_not_delegate_logging_to_provider(monkeypatch: Any) -> None:
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         SimpleNamespace(
@@ -135,7 +135,7 @@ def test_generate_reply_enables_chat_log_for_messages(monkeypatch: Any) -> None:
         "result": "陪他说话",
         "emotion": "开心",
     }
-    assert fake_provider.completion_calls[0]["record_chat_log"] is True
+    assert "record_chat_log" not in fake_provider.completion_calls[0]
     assert fake_provider.completion_calls[0]["request_trace_id"] == "chat-2001"
     assert fake_provider.completion_calls[0]["tool_choice"] == "required"
 
@@ -1329,7 +1329,7 @@ def test_execute_tool_loop_records_call_traces_in_collector(monkeypatch: Any) ->
         )
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-tool-loop")
 
@@ -1380,7 +1380,7 @@ def test_execute_tool_loop_records_favorability_pending_in_debug(monkeypatch: An
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-favor-debug")
 
@@ -1399,7 +1399,7 @@ def test_execute_tool_loop_records_favorability_pending_in_debug(monkeypatch: An
     favor_traces = [t for t in collector.tools if t.tool_name == "record_favorability_delta"]
     assert len(favor_traces) == 1
     assert favor_traces[0].status == "success"
-    assert favor_traces[0].parsed_arguments == {"delta": 2}
+    assert favor_traces[0].parsed_arguments == {"delta": 2, "reason": "友好互动"}
     assert "pending" in str(favor_traces[0].result_summary or "")
 
 
@@ -1439,7 +1439,7 @@ def test_read_image_tool_records_error_when_vision_service_fails(
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
     monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-image-tool-failed")
     result = asyncio.run(
@@ -1499,7 +1499,7 @@ def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) ->
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-tool-errors")
 
@@ -1550,7 +1550,7 @@ def test_execute_tool_loop_records_unknown_tool_in_collector(monkeypatch: Any) -
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-unknown-tool")
 
@@ -1591,7 +1591,7 @@ def test_execute_tool_loop_records_no_tool_calls_in_collector(monkeypatch: Any) 
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-no-tool-calls")
 
@@ -1619,7 +1619,7 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
         _completion(),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-max-rounds")
 

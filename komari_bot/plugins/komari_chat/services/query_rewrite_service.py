@@ -7,7 +7,7 @@ from komari_bot.plugins.komari_memory.core.retry import retry_async
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
 if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
@@ -48,30 +48,35 @@ class QueryRewriteService:
         collector: "LLMDiagnosticCollector | None" = None,
     ) -> str:
         """调用 LLM 生成重写后的查询（使用 completion 接口以获取 trace）。"""
+        request_data = {
+            "prompt": rewrite_prompt,
+            "model": model,
+            "temperature": 0.3,
+            "max_tokens": 256,
+            "thinking_mode": thinking_mode,
+            "reasoning_effort": reasoning_effort,
+        }
         result = await llm_provider.generate_completion(
-            prompt=rewrite_prompt,
-            model=model,
-            temperature=0.3,
-            max_tokens=256,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
+            **request_data,
             request_phase="query_rewrite",
             request_trace_id=request_trace_id or "",
         )
 
         if collector is not None:
-            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_completion_call,
+            )
 
-            call_trace = LLMCallTrace(
+            record_completion_call(
+                collector,
                 parent_call_id=parent_call_id,
                 phase="query_rewrite",
                 round_index=0,
+                method="generate_completion",
                 model=model,
-                finish_reason=result.finish_reason,
-                duration_ms=result.duration_ms,
-                usage=result.usage,
+                request=request_data,
+                completion=result,
             )
-            collector.add_call(call_trace)
 
         return result.content
 

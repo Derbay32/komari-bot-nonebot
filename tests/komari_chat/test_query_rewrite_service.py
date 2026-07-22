@@ -131,7 +131,7 @@ def test_rewrite_query_records_trace_in_collector(monkeypatch: Any) -> None:
     _patch_config(monkeypatch)
     fake_provider = _FakeLLMProvider(["重写后的查询"])
     monkeypatch.setattr(query_rewrite_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-qr")
     service = query_rewrite_module.QueryRewriteService()

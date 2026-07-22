@@ -10,7 +10,7 @@ from nonebot.plugin import require
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 config_manager_plugin = require("config_manager")
 llm_provider = require("llm_provider")
@@ -51,6 +51,24 @@ async def _read_single_image(
     if not config.api_token:
         return "[图片读取失败: 未配置 api_token]"
 
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _IMAGE_READ_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_uri},
+                },
+            ],
+        }
+    ]
+    request_data = {
+        "messages": messages,
+        "model": vision_model,
+        "temperature": temperature,
+        "max_tokens": int(max_tokens),
+    }
     try:
         logger.info(
             "[VisionService] 开始读取图片: index={} model={} base64_chars={}",
@@ -60,21 +78,7 @@ async def _read_single_image(
         )
         async with _VISION_READ_SEMAPHORE:
             completion = await llm_provider.generate_messages_completion(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": _IMAGE_READ_PROMPT},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_data_uri},
-                            },
-                        ],
-                    }
-                ],
-                model=vision_model,
-                temperature=temperature,
-                max_tokens=int(max_tokens),
+                **request_data,
                 request_trace_id=request_trace_id or "",
                 request_phase="vision_read_image",
             )
@@ -82,18 +86,20 @@ async def _read_single_image(
         description = content.strip() or "[图片读取失败: 视觉模型返回空内容]"
 
         if collector is not None:
-            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_completion_call,
+            )
 
-            vision_call = LLMCallTrace(
+            record_completion_call(
+                collector,
                 parent_call_id=parent_call_id,
                 phase="vision_read_image",
                 round_index=image_index,
+                method="generate_messages_completion",
                 model=vision_model,
-                finish_reason=completion.finish_reason,
-                duration_ms=completion.duration_ms,
-                usage=completion.usage,
+                request=request_data,
+                completion=completion,
             )
-            collector.add_call(vision_call)
 
         logger.info(
             "[VisionService] 图片读取完成: index={} model={} description_chars={}",
@@ -110,6 +116,20 @@ async def _read_single_image(
             exc_info=True,
         )
         if collector is not None:
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_failed_call,
+            )
+
+            record_failed_call(
+                collector,
+                phase="vision_read_image",
+                round_index=image_index,
+                method="generate_messages_completion",
+                model=vision_model,
+                request=request_data,
+                error=error,
+                parent_call_id=parent_call_id,
+            )
             collector.add_error(
                 phase="vision_read_image",
                 error_type=type(error).__name__,

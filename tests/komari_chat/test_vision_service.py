@@ -111,7 +111,7 @@ async def test_read_images_passes_trace_to_collector(
 ) -> None:
     """视觉调用在传入 collector 时记录 LLMCallTrace。"""
     _patch_vision_dependencies(monkeypatch)
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-vision-trace")
     result = await vision_service_module.read_images(
@@ -135,7 +135,7 @@ async def test_read_images_records_error_in_collector(
     """视觉调用失败时记录错误到 collector。"""
     _patch_vision_dependencies(monkeypatch)
     _FakeLLMProvider.fail_next = True
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-vision-error")
     result = await vision_service_module.read_images(

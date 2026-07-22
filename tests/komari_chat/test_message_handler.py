@@ -12,8 +12,8 @@ import nonebot.plugin
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
+from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
-from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 if TYPE_CHECKING:
     import pytest

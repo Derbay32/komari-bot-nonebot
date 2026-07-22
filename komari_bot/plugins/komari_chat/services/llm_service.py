@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -30,9 +31,9 @@ from .vision_service import read_images
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
@@ -273,11 +274,13 @@ class ReplyResult:
 
 @dataclass(frozen=True)
 class _BusinessToolExecution:
-    """业务工具执行结果及其安全诊断元数据。"""
+    """业务工具执行结果及其完整日志数据。"""
 
     message: dict[str, Any] | None
     tool_name: str
     status: str
+    result: Any = None
+    error: str | None = None
     result_summary: str | None = None
     error_summary: str | None = None
 
@@ -885,8 +888,8 @@ def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
     return "tool"
 
 
-def _build_safe_tool_args(tool_call: Any) -> dict[str, Any]:
-    """从工具调用中提取安全的参数字典（不含敏感内容）。"""
+def _build_tool_log_args(tool_call: Any) -> dict[str, Any]:
+    """提取完整工具参数；持久化边界统一过滤凭据和二进制。"""
     parsed = tool_call.parsed_arguments
     if parsed is None:
         raw = tool_call.raw_arguments or tool_call.function.arguments
@@ -895,39 +898,10 @@ def _build_safe_tool_args(tool_call: Any) -> dict[str, Any]:
             if isinstance(loaded, dict):
                 parsed = loaded
         except (json.JSONDecodeError, TypeError):
-            return {}
+            return {"raw_arguments": str(raw)}
     if not isinstance(parsed, dict):
-        return {}
-
-    tool_name = tool_call.function.name
-    safe: dict[str, Any] = {}
-    match tool_name:
-        case "read_image":
-            image_index = parsed.get("image_index")
-            if isinstance(image_index, int):
-                safe["image_index"] = image_index
-        case "search_web":
-            query = parsed.get("query")
-            if isinstance(query, str):
-                safe["query_chars"] = len(query)
-        case "read_profile":
-            keys = parsed.get("keys")
-            if isinstance(keys, list):
-                safe["requested_key_count"] = len(keys)
-        case "record_favorability_delta":
-            delta = parsed.get("delta")
-            if isinstance(delta, int):
-                safe["delta"] = delta
-        case "final_response":
-            content = parsed.get("content")
-            safe["content_chars"] = len(content) if isinstance(content, str) else 0
-            safe["has_interaction_history"] = isinstance(
-                parsed.get("interaction_history"),
-                dict,
-            )
-        case _:
-            pass
-    return safe
+        return {"raw_arguments": str(parsed)}
+    return dict(parsed)
 
 
 async def _execute_business_tool(
@@ -1023,6 +997,7 @@ async def _execute_business_tool(
                 message=None,
                 tool_name=tool_name,
                 status="error",
+                error="未知工具",
                 error_summary="未知工具",
             )
 
@@ -1040,6 +1015,8 @@ async def _execute_business_tool(
         message=message,
         tool_name=tool_name,
         status=status,
+        result=content,
+        error=error_summary,
         result_summary=result_summary,
         error_summary=error_summary,
     )
@@ -1091,9 +1068,10 @@ async def _execute_tool_loop(
     last_retry_reason: str | None = None
     total_tool_calls = 0
 
-    from komari_bot.plugins.llm_provider.diagnostic import (
-        LLMCallTrace,
+    from komari_bot.plugins.agent_run_logger.diagnostic import (
         ToolExecutionTrace,
+        record_completion_call,
+        record_failed_call,
     )
 
     for round_num in range(1, round_limit + 1):
@@ -1110,37 +1088,48 @@ async def _execute_tool_loop(
             thinking_mode = config.llm_thinking_mode_chat
             reasoning_effort = config.llm_reasoning_effort_chat
 
-        async with _LLM_COMPLETION_SEMAPHORE:
-            completion = await _call_llm_completion(
-                messages=current_messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=int(max_tokens),
-                tools=tool_definitions,
-                tool_choice="required",
-                parallel_tool_calls=False,
-                thinking_mode=thinking_mode,
-                reasoning_effort=reasoning_effort,
-                request_trace_id=request_trace_id,
-                request_phase=f"{request_phase_prefix}_round_{round_num}",
-                record_chat_log=True,
-            )
-
-        # 记录本轮 LLM 调用 trace
-        if collector is not None:
-            call_trace = LLMCallTrace(
-                parent_call_id=parent_call_id,
-                phase=f"{request_phase_prefix}_round_{round_num}",
+        phase = f"{request_phase_prefix}_round_{round_num}"
+        request_data = {
+            "messages": current_messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": int(max_tokens),
+            "tools": tool_definitions,
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+            "thinking_mode": thinking_mode,
+            "reasoning_effort": reasoning_effort,
+        }
+        try:
+            async with _LLM_COMPLETION_SEMAPHORE:
+                completion = await _call_llm_completion(
+                    **request_data,
+                    request_trace_id=request_trace_id,
+                    request_phase=phase,
+                )
+        except Exception as exc:
+            record_failed_call(
+                collector,
+                phase=phase,
                 round_index=round_num - 1,
+                method="generate_messages_completion",
                 model=model,
-                finish_reason=completion.finish_reason,
-                duration_ms=completion.duration_ms,
-                usage=completion.usage,
+                request=request_data,
+                error=exc,
+                parent_call_id=parent_call_id,
             )
-            collector.add_call(call_trace)
-            round_call_id = call_trace.call_id
-        else:
-            round_call_id = None
+            raise
+
+        round_call_id = record_completion_call(
+            collector,
+            phase=phase,
+            round_index=round_num - 1,
+            method="generate_messages_completion",
+            model=model,
+            request=request_data,
+            completion=completion,
+            parent_call_id=parent_call_id,
+        )
 
         if not completion.tool_calls:
             last_retry_reason = (
@@ -1165,6 +1154,8 @@ async def _execute_tool_loop(
                         call_id=round_call_id or "",
                         tool_name="<no_tool_calls>",
                         status="error",
+                        error=last_retry_reason,
+                        duration_ms=0.0,
                         error_summary=last_retry_reason,
                     )
                 )
@@ -1188,6 +1179,8 @@ async def _execute_tool_loop(
                         call_id=round_call_id or "",
                         tool_name="<tool_budget>",
                         status="error",
+                        error=last_retry_reason,
+                        duration_ms=0.0,
                         error_summary=last_retry_reason,
                     )
                 )
@@ -1204,6 +1197,8 @@ async def _execute_tool_loop(
                         call_id=round_call_id or "",
                         tool_name="<tool_budget>",
                         status="error",
+                        error=last_retry_reason,
+                        duration_ms=0.0,
                         error_summary=last_retry_reason,
                     )
                 )
@@ -1221,6 +1216,7 @@ async def _execute_tool_loop(
         saw_unknown_tool = False
 
         for tool_call in completion.tool_calls:
+            tool_started_at = time.monotonic()
             tool_name = tool_call.function.name
 
             if tool_name == FINAL_RESPONSE_TOOL_NAME:
@@ -1245,8 +1241,11 @@ async def _execute_tool_loop(
                             ToolExecutionTrace(
                                 call_id=round_call_id or "",
                                 tool_name=tool_name,
-                                parsed_arguments=_build_safe_tool_args(tool_call),
+                                parsed_arguments=_build_tool_log_args(tool_call),
                                 status="error",
+                                error=err_msg,
+                                duration_ms=(time.monotonic() - tool_started_at)
+                                * 1000,
                                 error_summary=err_msg,
                             )
                         )
@@ -1275,6 +1274,9 @@ async def _execute_tool_loop(
                                 tool_name=tool_name,
                                 parsed_arguments={},
                                 status="error",
+                                error=err_msg,
+                                duration_ms=(time.monotonic() - tool_started_at)
+                                * 1000,
                                 error_summary="缺少 parsed_arguments",
                             )
                         )
@@ -1290,11 +1292,11 @@ async def _execute_tool_loop(
                             ToolExecutionTrace(
                                 call_id=round_call_id or "",
                                 tool_name=tool_name,
-                                parsed_arguments={
-                                    "content_chars": len(result.content),
-                                    "has_interaction_history": True,
-                                },
+                                parsed_arguments=_build_tool_log_args(tool_call),
                                 status="success",
+                                result=result,
+                                duration_ms=(time.monotonic() - tool_started_at)
+                                * 1000,
                                 result_summary=f"content_chars={len(result.content)}",
                             )
                         )
@@ -1312,8 +1314,11 @@ async def _execute_tool_loop(
                             ToolExecutionTrace(
                                 call_id=round_call_id or "",
                                 tool_name=tool_name,
-                                parsed_arguments=_build_safe_tool_args(tool_call),
+                                parsed_arguments=_build_tool_log_args(tool_call),
                                 status="error",
+                                error=str(exc),
+                                duration_ms=(time.monotonic() - tool_started_at)
+                                * 1000,
                                 error_summary=str(exc),
                             )
                         )
@@ -1339,8 +1344,11 @@ async def _execute_tool_loop(
                             ToolExecutionTrace(
                                 call_id=round_call_id or "",
                                 tool_name=tool_name,
-                                parsed_arguments=_build_safe_tool_args(tool_call),
+                                parsed_arguments=_build_tool_log_args(tool_call),
                                 status="error",
+                                error=str(exc),
+                                duration_ms=(time.monotonic() - tool_started_at)
+                                * 1000,
                                 error_summary=str(exc),
                             )
                         )
@@ -1359,8 +1367,10 @@ async def _execute_tool_loop(
                         ToolExecutionTrace(
                             call_id=round_call_id or "",
                             tool_name=tool_name,
-                            parsed_arguments={"delta": delta},
+                            parsed_arguments=_build_tool_log_args(tool_call),
                             status="success",
+                            result=business_tool_results[-1]["content"],
+                            duration_ms=(time.monotonic() - tool_started_at) * 1000,
                             result_summary="pending (debug 路径不会提交)",
                         )
                     )
@@ -1379,8 +1389,10 @@ async def _execute_tool_loop(
                         ToolExecutionTrace(
                             call_id=round_call_id or "",
                             tool_name=tool_name,
-                            parsed_arguments=_build_safe_tool_args(tool_call),
+                            parsed_arguments=_build_tool_log_args(tool_call),
                             status="error",
+                            error=f"未知工具 '{tool_name}'",
+                            duration_ms=(time.monotonic() - tool_started_at) * 1000,
                             error_summary=f"未知工具 '{tool_name}'",
                         )
                     )
@@ -1418,8 +1430,10 @@ async def _execute_tool_loop(
                         ToolExecutionTrace(
                             call_id=round_call_id or "",
                             tool_name=tool_name,
-                            parsed_arguments=_build_safe_tool_args(tool_call),
+                            parsed_arguments=_build_tool_log_args(tool_call),
                             status="error",
+                            error=str(exc),
+                            duration_ms=(time.monotonic() - tool_started_at) * 1000,
                             error_summary=type(exc).__name__,
                         )
                     )
@@ -1431,8 +1445,11 @@ async def _execute_tool_loop(
                         ToolExecutionTrace(
                             call_id=round_call_id or "",
                             tool_name=execution.tool_name,
-                            parsed_arguments=_build_safe_tool_args(tool_call),
+                            parsed_arguments=_build_tool_log_args(tool_call),
                             status=execution.status,
+                            result=execution.result,
+                            error=execution.error,
+                            duration_ms=(time.monotonic() - tool_started_at) * 1000,
                             error_summary=execution.error_summary,
                             result_summary=execution.result_summary,
                         )

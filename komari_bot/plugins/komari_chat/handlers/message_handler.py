@@ -35,7 +35,6 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
     RedisManager,
 )
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
-from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 from ..repositories.reply_commit_repository import (
     PendingReplyCommit,
@@ -61,6 +60,7 @@ from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
 
+agent_run_logger_plugin = require("agent_run_logger")
 user_data_plugin = require("user_data")
 
 config_manager_plugin = require("config_manager")
@@ -73,6 +73,7 @@ llm_provider_config_manager = config_manager_plugin.get_config_manager(
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
         SceneRuntimeService,
     )
@@ -1488,6 +1489,21 @@ class MessageHandler:
 
             # === 纯读取/生成核心 ===
             request_trace_id = f"chat-{message.message_id}"
+            collector = agent_run_logger_plugin.create_collector(
+                run_type="chat_reply",
+                task_kind="chat_reply",
+                trace_id=request_trace_id,
+                input_data={
+                    "message": message,
+                    "recent_messages": recent_messages,
+                    "interaction_records": interaction_records,
+                    "image_urls": image_urls,
+                    "reply_context": reply_context,
+                    "reason": reason,
+                    "reply_score": reply_score,
+                    "force_reply": force_reply,
+                },
+            )
             try:
                 reply_result = await self._generate_reply_core(
                     message=message,
@@ -1501,10 +1517,35 @@ class MessageHandler:
                     _reply_score=reply_score,
                     request_trace_id=request_trace_id,
                     caller_is_superuser=caller_is_superuser,
-                    collector=None,
+                    collector=collector,
                 )
-            except _FavorabilityReadError:
+            except asyncio.CancelledError as exc:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="cancelled",
+                    error=exc,
+                )
+                raise
+            except _FavorabilityReadError as exc:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="error",
+                    error=exc,
+                )
                 return None, stored
+            except Exception as exc:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="error",
+                    error=exc,
+                )
+                raise
+            else:
+                await agent_run_logger_plugin.finalize_collector(
+                    collector,
+                    status="success",
+                    output=reply_result,
+                )
 
             reply = reply_result.content
             if not reply:
@@ -1623,42 +1664,77 @@ class MessageHandler:
             RuntimeError: 底层服务未初始化
         """
         if collector is None:
-            collector = LLMDiagnosticCollector(
-                request_id=f"debug-reply-{uuid.uuid4().hex[:12]}"
+            collector = agent_run_logger_plugin.create_collector(
+                run_type="chat_reply",
+                task_kind="chat_reply",
+                trace_id=f"debug-reply-{uuid.uuid4().hex[:12]}",
+                origin="debug",
+                input_data={
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "user_nickname": user_nickname,
+                    "content": content,
+                    "image_urls": image_urls,
+                    "reply_context": reply_context,
+                },
+                force_collect=True,
             )
+            if collector is None:
+                msg = "Agent Run debug 收集器创建失败"
+                raise RuntimeError(msg)
         request_trace_id = collector.request_id
 
-        reply_context_refetched = False
-        if (
-            _bot is not None
-            and reply_context is not None
-            and self._should_refetch_reply_context(context=reply_context)
-        ):
-            refetched_context = await self._refetch_reply_context_by_message_id(
-                bot=_bot,
-                message_id=reply_context.message_id,
+        try:
+            reply_context_refetched = False
+            if (
+                _bot is not None
+                and reply_context is not None
+                and self._should_refetch_reply_context(context=reply_context)
+            ):
+                refetched_context = await self._refetch_reply_context_by_message_id(
+                    bot=_bot,
+                    message_id=reply_context.message_id,
+                )
+                reply_context_refetched = True
+                if refetched_context is not None:
+                    reply_context = refetched_context
+
+            # 构造测试 MessageSchema
+            message = MessageSchema(
+                user_id=user_id,
+                user_nickname=user_nickname,
+                group_id=group_id,
+                content=content,
+                timestamp=time.time(),
+                message_id=f"debug-{uuid.uuid4().hex[:8]}",
             )
-            reply_context_refetched = True
-            if refetched_context is not None:
-                reply_context = refetched_context
 
-        # 构造测试 MessageSchema
-        message = MessageSchema(
-            user_id=user_id,
-            user_nickname=user_nickname,
-            group_id=group_id,
-            content=content,
-            timestamp=time.time(),
-            message_id=f"debug-{uuid.uuid4().hex[:8]}",
-        )
-
-        # === 读取已有缓冲（不 store_current，不写当前消息） ===
-        recent_messages, interaction_records, _stored = await self._read_buffers(
-            group_id=group_id,
-            user_id=user_id,
-            message=message,
-            store_current=False,
-        )
+            # === 读取已有缓冲（不 store_current，不写当前消息） ===
+            recent_messages, interaction_records, _stored = await self._read_buffers(
+                group_id=group_id,
+                user_id=user_id,
+                message=message,
+                store_current=False,
+            )
+        except asyncio.CancelledError as exc:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            collector.add_error(
+                phase="debug_reply_context",
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                error=exc,
+            )
+            raise
 
         # === 纯读取/生成核心 ===
         try:
@@ -1676,6 +1752,13 @@ class MessageHandler:
                 caller_is_superuser=caller_is_superuser,
                 collector=collector,
             )
+        except asyncio.CancelledError as exc:
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="cancelled",
+                error=exc,
+            )
+            raise
         except Exception as exc:
             if isinstance(exc, FinishedException):
                 raise
@@ -1690,9 +1773,13 @@ class MessageHandler:
                 exc,
                 traceback.format_exc(),
             )
+            await agent_run_logger_plugin.finalize_collector(
+                collector,
+                status="error",
+                error=exc,
+            )
             raise
-
-        return DebugReplyResult(
+        result = DebugReplyResult(
             reply=reply_result.content,
             reply_to_message_id=(
                 reply_context.message_id if reply_context is not None else None
@@ -1702,3 +1789,9 @@ class MessageHandler:
             interaction_history=reply_result.interaction_history,
             collector=collector,
         )
+        await agent_run_logger_plugin.finalize_collector(
+            collector,
+            status="success",
+            output=reply_result,
+        )
+        return result
