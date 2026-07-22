@@ -72,6 +72,7 @@ def _ensure_package_shim(plugin_name: str) -> None:
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
+_ensure_package_shim("agent_run_logger")
 _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
@@ -127,17 +128,63 @@ class _DummyLLMProvider:
             finish_reason="stop",
             duration_ms=100.0,
             usage=None,
+            reasoning_content=None,
         )
 
     @staticmethod
     async def generate_completion(**_kwargs: object) -> object:
         return SimpleNamespace(
             content="重写后查询",
+            tool_calls=[],
             finish_reason="stop",
             duration_ms=50.0,
             usage=None,
+            reasoning_content=None,
         )
 
+
+class _DummyAgentRunLoggerPlugin:
+    @staticmethod
+    def create_collector(**kwargs: object) -> object | None:
+        if (
+            not kwargs.get("force_collect")
+            and kwargs.get("origin", "normal") != "debug"
+        ):
+            return None
+        from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
+        return AgentRunCollector(
+            request_id=cast("str | None", kwargs.get("trace_id")),
+            run_type=cast("Any", kwargs.get("run_type", "chat_reply")),
+            task_kind=str(kwargs.get("task_kind", "test")),
+            origin=cast("Any", kwargs.get("origin", "normal")),
+            input_data=kwargs.get("input_data"),
+            persist=False,
+        )
+
+    @staticmethod
+    async def finalize_collector(
+        collector: object,
+        **kwargs: object,
+    ) -> bool:
+        if collector is None:
+            return False
+        mark_finished = cast("Any", collector).mark_finished
+        return bool(
+            mark_finished(
+                status=kwargs.get("status", "success"),
+                output=kwargs.get("output"),
+                error=kwargs.get("error"),
+            )
+        )
+
+    @staticmethod
+    def get_agent_run_log_reader() -> None:
+        return None
+
+    @staticmethod
+    def register_agent_run_log_api(*_args: object, **_kwargs: object) -> None:
+        return None
 
 class _DummyUserDataPlugin:
     @staticmethod
@@ -298,7 +345,9 @@ class _DummyBindingManager:
 class _DummyChatPlugin:
     @staticmethod
     async def generate_debug_reply(**kwargs: object) -> object:
-        from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            LLMDiagnosticCollector,
+        )
 
         collector = kwargs.get("collector")
         if collector is None:
@@ -355,6 +404,7 @@ class _DummyDecisionPlugin:
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "llm_provider": _DummyLLMProvider(),
+    "agent_run_logger": _DummyAgentRunLoggerPlugin(),
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "permission_manager": _DummyPermissionManagerPlugin(),
@@ -401,4 +451,13 @@ _inject_package_exports(
 _inject_package_exports(
     "komari_chat",
     {"generate_debug_reply": _DummyChatPlugin.generate_debug_reply},
+)
+_inject_package_exports(
+    "agent_run_logger",
+    {
+        "create_collector": _DummyAgentRunLoggerPlugin.create_collector,
+        "finalize_collector": _DummyAgentRunLoggerPlugin.finalize_collector,
+        "get_agent_run_log_reader": _DummyAgentRunLoggerPlugin.get_agent_run_log_reader,
+        "register_agent_run_log_api": _DummyAgentRunLoggerPlugin.register_agent_run_log_api,
+    },
 )
