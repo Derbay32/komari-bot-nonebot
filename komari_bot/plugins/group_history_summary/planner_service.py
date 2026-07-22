@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import uuid
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -28,8 +28,8 @@ if TYPE_CHECKING:
 
     from nonebot.adapters.onebot.v11 import Bot
 
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 llm_provider = require("llm_provider")
 character_binding = require("character_binding")
@@ -592,38 +592,61 @@ async def plan_summary_request(
     for round_index in range(1, planning_round_limit + 1):
         rounds_used = round_index
         trace_phase = f"group_history_summary_plan_round_{round_index - 1}"
-        completion = cast(
-            "LLMCompletionResultSchema",
-            await llm_provider.generate_messages_completion(
-                messages=messages,
-                model=planning_model,
-                temperature=0.1,
-                max_tokens=planning_max_tokens,
-                tools=tools,
-                tool_choice="auto",
-                parallel_tool_calls=False,
-                thinking_mode=planning_thinking_mode,
-                reasoning_effort=planning_reasoning_effort,
-                request_trace_id=request_trace_id,
-                request_phase=trace_phase,
-            ),
-        )
+        request_data = {
+            "messages": messages,
+            "model": planning_model,
+            "temperature": 0.1,
+            "max_tokens": planning_max_tokens,
+            "tools": tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "thinking_mode": planning_thinking_mode,
+            "reasoning_effort": planning_reasoning_effort,
+        }
+        try:
+            completion = cast(
+                "LLMCompletionResultSchema",
+                await llm_provider.generate_messages_completion(
+                    **request_data,
+                    request_trace_id=request_trace_id,
+                    request_phase=trace_phase,
+                ),
+            )
+        except Exception as exc:
+            if collector is not None:
+                from komari_bot.plugins.agent_run_logger.diagnostic import (
+                    record_failed_call,
+                )
 
-        if collector is not None:
-            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
-
-            collector.add_call(
-                LLMCallTrace(
-                    call_id=uuid.uuid4().hex[:12],
-                    parent_call_id=request_trace_id,
+                record_failed_call(
+                    collector,
                     phase=trace_phase,
                     round_index=round_index - 1,
+                    method="generate_messages_completion",
                     model=planning_model,
-                    finish_reason=completion.finish_reason,
-                    duration_ms=completion.duration_ms,
-                    usage=completion.usage,
+                    request=request_data,
+                    error=exc,
+                    parent_call_id=request_trace_id,
                 )
+            raise
+
+        if collector is not None:
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_completion_call,
             )
+
+            round_call_id = record_completion_call(
+                collector,
+                phase=trace_phase,
+                round_index=round_index - 1,
+                method="generate_messages_completion",
+                model=planning_model,
+                request=request_data,
+                completion=completion,
+                parent_call_id=request_trace_id,
+            )
+        else:
+            round_call_id = None
 
         if not completion.tool_calls:
             return SummaryPlanResult(
@@ -660,21 +683,23 @@ async def plan_summary_request(
                     tool_call.function.name,
                 )
                 if collector is not None:
-                    from komari_bot.plugins.llm_provider.diagnostic import (
+                    from komari_bot.plugins.agent_run_logger.diagnostic import (
                         ToolExecutionTrace,
                     )
 
                     collector.add_tool(
                         ToolExecutionTrace(
-                            call_id=collector.calls[-1].call_id,
+                            call_id=round_call_id or "",
                             tool_name=tool_call.function.name,
                             parsed_arguments=tool_call.parsed_arguments or {},
                             status="error",
+                            error=f"未知工具: {tool_call.function.name}",
                             error_summary=f"未知工具: {tool_call.function.name}",
                         )
                     )
                 continue
             arguments = tool_call.parsed_arguments or {}
+            tool_started_at = time.monotonic()
             try:
                 tool_result = await executor(arguments)
                 tool_status = "success"
@@ -683,32 +708,36 @@ async def plan_summary_request(
                 tool_status = "error"
                 tool_error = str(exc)[:200]
                 if collector is not None:
-                    from komari_bot.plugins.llm_provider.diagnostic import (
+                    from komari_bot.plugins.agent_run_logger.diagnostic import (
                         ToolExecutionTrace,
                     )
 
                     collector.add_tool(
                         ToolExecutionTrace(
-                            call_id=collector.calls[-1].call_id,
+                            call_id=round_call_id or "",
                             tool_name=tool_call.function.name,
                             parsed_arguments=arguments,
                             status="error",
+                            error=str(exc),
+                            duration_ms=(time.monotonic() - tool_started_at) * 1000,
                             error_summary=tool_error,
                         )
                     )
                 raise
 
             if collector is not None:
-                from komari_bot.plugins.llm_provider.diagnostic import (
+                from komari_bot.plugins.agent_run_logger.diagnostic import (
                     ToolExecutionTrace,
                 )
 
                 collector.add_tool(
                     ToolExecutionTrace(
-                        call_id=collector.calls[-1].call_id,
+                        call_id=round_call_id or "",
                         tool_name=tool_call.function.name,
                         parsed_arguments=arguments,
                         status=tool_status,
+                        result=tool_result,
+                        duration_ms=(time.monotonic() - tool_started_at) * 1000,
                         error_summary=tool_error,
                         result_summary=json.dumps(
                             {
@@ -754,7 +783,7 @@ async def plan_summary_request(
         arguments={"count": summary_default_count, "include_bot_replies": False},
     )
     if collector is not None:
-        from komari_bot.plugins.llm_provider.diagnostic import ToolExecutionTrace
+        from komari_bot.plugins.agent_run_logger.diagnostic import ToolExecutionTrace
 
         collector.add_tool(
             ToolExecutionTrace(
@@ -765,6 +794,7 @@ async def plan_summary_request(
                     "include_bot_replies": False,
                 },
                 status="success",
+                result=fallback_result,
                 result_summary=json.dumps(
                     {
                         "source": fallback_result.source,

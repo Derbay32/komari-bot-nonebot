@@ -9,6 +9,9 @@ from typing import Any, cast
 
 import pytest
 
+from komari_bot.plugins.agent_run_logger.diagnostic import (
+    LLMDiagnosticCollector,
+)
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema,
     LayoutParamsSchema,
@@ -22,9 +25,6 @@ from komari_bot.plugins.group_history_summary.execution_service import (
 from komari_bot.plugins.group_history_summary.history_service import (
     HistoryFetchMetadata,
     HistoryMessage,
-)
-from komari_bot.plugins.llm_provider.diagnostic import (
-    LLMDiagnosticCollector,
 )
 
 PLANNING_MODEL = "deepseek-chat"
@@ -417,8 +417,8 @@ async def test_empty_history_no_llm_call_traced(monkeypatch: Any) -> None:
 
 def test_phase_aggregation_correctly_groups_by_phase() -> None:
     """验证按阶段聚合的 token 统计正确。"""
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
     from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
-    from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
 
     collector = LLMDiagnosticCollector()
 
@@ -478,7 +478,7 @@ def test_phase_aggregation_correctly_groups_by_phase() -> None:
 
 def test_phase_aggregation_marks_incomplete_when_missing_usage() -> None:
     """验证部分调用缺少 usage 时标注为不完整。"""
-    from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
 
     collector = LLMDiagnosticCollector()
     collector.add_call(
@@ -723,8 +723,8 @@ async def test_normal_handler_returns_image_for_non_empty_history(
     async def _fake_plan(*_args: Any, **kwargs: Any) -> object:
         collector = kwargs.get("collector")
         if collector is not None:
+            from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
             from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
-            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
 
             collector.add_call(
                 LLMCallTrace(
@@ -754,8 +754,8 @@ async def test_normal_handler_returns_image_for_non_empty_history(
     async def _fake_summarize(*_args: Any, **kwargs: Any) -> str:
         collector = kwargs.get("collector")
         if collector is not None:
+            from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
             from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
-            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
 
             collector.add_call(
                 LLMCallTrace(
@@ -921,7 +921,7 @@ async def test_summary_failure_preserves_plan_trace(
     async def _fake_plan(*_args: Any, **kwargs: Any) -> object:
         collector = kwargs.get("collector")
         if collector is not None:
-            from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
+            from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
 
             collector.add_call(
                 LLMCallTrace(

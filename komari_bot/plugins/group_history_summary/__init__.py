@@ -28,6 +28,7 @@ from .group_lock import close_group_summary_lock_manager
 from .history_service import check_group_history_supported
 
 config_manager_plugin = require("config_manager")
+agent_run_logger_plugin = require("agent_run_logger")
 permission_manager_plugin = require("permission_manager")
 character_binding = require("character_binding")
 komari_decision_plugin = require("komari_decision")

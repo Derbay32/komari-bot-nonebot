@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import uuid
 from typing import TYPE_CHECKING
 
 from nonebot.plugin import require
@@ -18,8 +17,8 @@ from .history_service import HistoryMessage, format_message_for_prompt
 from .prompt_template import get_template
 
 if TYPE_CHECKING:
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
-    from komari_bot.plugins.llm_provider.diagnostic import LLMDiagnosticCollector
 
 llm_provider = require("llm_provider")
 
@@ -106,30 +105,47 @@ async def _summarize_history_internal(
         )
 
     if collector is not None:
-        from komari_bot.plugins.llm_provider.diagnostic import LLMCallTrace
-
-        completion = await llm_provider.generate_messages_completion(
-            messages=messages,  # type: ignore[arg-type]
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-            request_trace_id=request_trace_id,
-            request_phase="group_history_summary_final",
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            record_completion_call,
+            record_failed_call,
         )
 
-        collector.add_call(
-            LLMCallTrace(
-                call_id=uuid.uuid4().hex[:12],
-                parent_call_id=request_trace_id,
+        request_data = {
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "thinking_mode": thinking_mode,
+            "reasoning_effort": reasoning_effort,
+        }
+        try:
+            completion = await llm_provider.generate_messages_completion(
+                **request_data,
+                request_trace_id=request_trace_id,
+                request_phase="group_history_summary_final",
+            )
+        except Exception as exc:
+            record_failed_call(
+                collector,
                 phase="group_history_summary_final",
                 round_index=0,
+                method="generate_messages_completion",
                 model=model,
-                finish_reason=completion.finish_reason,
-                duration_ms=completion.duration_ms,
-                usage=completion.usage,
+                request=request_data,
+                error=exc,
+                parent_call_id=request_trace_id,
             )
+            raise
+
+        record_completion_call(
+            collector,
+            parent_call_id=request_trace_id,
+            phase="group_history_summary_final",
+            round_index=0,
+            method="generate_messages_completion",
+            model=model,
+            request=request_data,
+            completion=completion,
         )
 
         summary_text = _extract_tag_content(completion.content, "content")
