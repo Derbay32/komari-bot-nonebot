@@ -8,6 +8,9 @@ from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.prompt_storage import close_prompt_storage_if_created
+from komari_bot.plugins.agent_run_logger.config_schema import (
+    AgentRunLoggerConfigSchema,
+)
 from komari_bot.plugins.embedding_provider.config_schema import (
     DynamicConfigSchema as EmbeddingProviderConfigSchema,
 )
@@ -73,7 +76,7 @@ def _load_management_components() -> ManagementApiComponents:
     knowledge_plugin = require("komari_knowledge")
     help_plugin = require("komari_help")
     memory_plugin = require("komari_memory")
-    llm_provider_plugin = require("llm_provider")
+    agent_run_logger_plugin = require("agent_run_logger")
     user_ban_plugin = require("user_ban")
 
     return ManagementApiComponents(
@@ -84,8 +87,8 @@ def _load_management_components() -> ManagementApiComponents:
         register_memory_api=memory_plugin.register_memory_api,
         memory_service_getter=memory_plugin.get_memory_service,
         memory_redis_getter=memory_plugin.get_redis_manager,
-        register_llm_provider_api=llm_provider_plugin.register_llm_provider_api,
-        reply_log_reader_getter=llm_provider_plugin.get_reply_log_reader,
+        register_agent_run_log_api=agent_run_logger_plugin.register_agent_run_log_api,
+        agent_run_log_reader_getter=agent_run_logger_plugin.get_agent_run_log_reader,
         register_user_ban_api=user_ban_plugin.register_user_ban_api,
         user_ban_service_getter=user_ban_plugin.get_service,
         config_resources=(
@@ -116,6 +119,14 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "komari_help",
                     HelpConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="agent_run_logger",
+                display_name="Agent Run Logger",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "agent_run_logger",
+                    AgentRunLoggerConfigSchema,
                 ),
             ),
             ManagedConfigResource(

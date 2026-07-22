@@ -49,7 +49,7 @@ Authorization: Bearer <management-token>
 | 知识库 | `knowledge:read` | `knowledge:write` |
 | 帮助库 | `help:read` | `help:write` |
 | 记忆库 | `memory:read` | `memory:write` |
-| LLM reply 日志 | `llm_logs:read` | 无写接口 |
+| Agent Run 日志 | `llm_logs:read` | 无写接口 |
 | 用户封禁 | `user_ban:read` | `user_ban:write` |
 
 ### 2.2 审计写请求头
@@ -166,6 +166,7 @@ komari_management
 komari_memory
 komari_knowledge
 komari_help
+agent_run_logger
 llm_provider
 embedding_provider
 group_history_summary
@@ -428,24 +429,29 @@ Base path：`/api/komari-memory/v1`
 
 读操作需要 `memory:read`，写操作和失败快照重新入队需要 `memory:write`。当前这些写接口不要求审计请求头。
 
-## 10. LLM reply 日志页面
+## 10. Agent Run 日志页面
 
-Base path：`/api/llm-provider/v1`
+Base path：`/api/agent-run-logs/v1`
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/reply-logs` | 查询脱敏日志摘要 |
-| `GET` | `/reply-logs/{date}/{line_number}` | 获取一条脱敏详情 |
+| `GET` | `/runs` | 查询 Agent Run 列表；仅当前页从 JSONL 临时生成预览 |
+| `GET` | `/runs/{run_id}` | 获取一条完整 JSONL v3 任务日志 |
 
 列表筛选参数：
 
 - `date=YYYY-MM-DD`，指定后查询单日；
-- `days=1..30`，默认 7；
+- `days=1..90`，默认 7；
+- `run_type`、`task_kind`、`origin=normal|debug`；
 - `trace_id`、`model`、`method`；
-- `status=success|error`；
+- `status=success|error|cancelled`；
 - `limit=1..100`、`offset>=0`。
 
-日志接口只返回脱敏元数据和摘要，不提供完整 Prompt、reasoning 正文、用户正文或输出正文。列表项的稳定定位键是 `date + line_number`。读取器未初始化时返回 `503`。
+详情会返回完整业务输入、输出、prompt/messages、reasoning、工具参数与结果，前端必须把该页面视为最高敏感度运维数据，不得写入浏览器日志、错误上报或公开页面。后端只过滤显式凭据，并把图片 URL、base64、bytes 与渲染图片替换为 MIME/长度/字节数/SHA-256 摘要。debug 私聊诊断仍使用另一套脱敏投影，不等同于此接口。
+
+PostgreSQL 只保存可重建的定位元数据；列表预览来自当前页命中的 JSONL。PG 索引不可用时读取器自动降级扫描保留期文件，读取器整体未初始化时返回 `503`。稳定定位键为 `run_id`。
+
+旧 `/api/llm-provider/v1/reply-logs` 与 `/reply-logs/{date}/{line_number}` 暂时保留为弃用别名，新前端不得继续依赖旧 URL。
 
 ## 11. 前端实现优先级与验收清单
 
@@ -458,7 +464,7 @@ Base path：`/api/llm-provider/v1`
 5. 公告群选择、幂等提交和逐群结果；
 6. 用户封禁；
 7. 知识库、帮助库、记忆库 CRUD；
-8. LLM reply 日志筛选与详情。
+8. Agent Run 日志筛选与完整详情，并为正文区域增加敏感数据提示。
 
 联调验收时至少确认：
 
@@ -478,5 +484,5 @@ Base path：`/api/llm-provider/v1`
 - 动态配置存储于 PostgreSQL `komari_plugin_configs`；
 - Prompt 存储于 PostgreSQL `komari_prompt_configs`，旧 YAML 不是运行时来源；
 - 业务插件自己的管理 API 挂载逻辑已经移除，统一由本插件注册；
-- 知识库、帮助库、记忆库、reply 日志或 Scene 依赖未初始化时，对应接口可能返回 `503`；
+- 知识库、帮助库、记忆库、Agent Run 日志或 Scene 依赖未初始化时，对应接口可能返回 `503`；
 - FastAPI OpenAPI 是字段级类型、格式和长度限制的最终机器可读契约，前端类型应优先从 OpenAPI 生成或定期校对。

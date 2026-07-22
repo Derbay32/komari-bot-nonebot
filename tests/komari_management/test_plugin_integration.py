@@ -10,6 +10,7 @@ import nonebot
 import pytest
 from pydantic import BaseModel
 
+from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
@@ -21,7 +22,6 @@ from komari_bot.plugins.komari_management.managed_resources import (
     ManagedPromptResource,
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
-from komari_bot.plugins.llm_provider.api import register_llm_provider_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
 
 if TYPE_CHECKING:
@@ -71,8 +71,8 @@ def _build_components() -> ManagementApiComponents:
         register_memory_api=register_memory_api,
         memory_service_getter=lambda: None,
         memory_redis_getter=lambda: None,
-        register_llm_provider_api=register_llm_provider_api,
-        reply_log_reader_getter=lambda: None,
+        register_agent_run_log_api=register_agent_run_log_api,
+        agent_run_log_reader_getter=lambda: None,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
         config_resources=(
@@ -126,6 +126,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert "/api/komari-help/v1/help" in schema["paths"]
     assert "/api/komari-memory/v1/conversations" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
+    assert "/api/agent-run-logs/v1/runs" in schema["paths"]
     assert "/api/komari-management-config/v1/resources" in schema["paths"]
     assert "/api/komari-management-prompt/v1/resources" in schema["paths"]
     assert "/api/komari-user-bans/v1/bans" in schema["paths"]
@@ -139,7 +140,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         "komari-knowledge",
         "komari-help",
         "komari-memory",
-        "llm-provider",
+        "agent-run-logs",
         "komari-management-config",
         "komari-management-prompt",
         "komari-user-bans",
