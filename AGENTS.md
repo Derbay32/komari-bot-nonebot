@@ -107,7 +107,7 @@ komari-bot/
   group_history_summary ────── 群聊历史总结
 
 辅助功能层
-  character_binding ────────── .nn 昵称指令（普通用户 self-only；跨用户管理入口已移至 `.debug bind ...`）
+  character_binding ────────── .bind 角色名绑定指令（普通用户 self-only；跨用户管理入口已移至 `.debug bind ...`）
   sr ───────────────────────── 神人榜抽签
   komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_sentry ────────────── Sentry 集成
