@@ -66,6 +66,7 @@ HELP_TEXT = """🔧 Komari Debug 子命令：
 .debug bind list [--public] — 查看全部绑定（明细默认私聊）
 .debug reply [--public] <测试文本> — 群聊干跑回复（完整报告默认私聊）
 .debug summary [--public] <总结要求> — 群聊诊断总结（完整报告默认私聊）
+.debug notify on|off — 切换回复失败 SUPERUSER 通知
 
 --public 只向当前群额外展示二次脱敏摘要。"""
 
@@ -936,4 +937,48 @@ async def handle_debug_summary(
         public_requested=public_requested,
         extra_info=extra_info,
         private_artifact_delivered=image_delivered,
+    )
+
+
+# ─── .debug notify ─────────────────────────────────────────────
+
+debug_notify = on_command(("debug", "notify"), priority=2, block=True)
+
+from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+
+_komari_memory_config_mgr = get_config_manager(
+    "komari_memory",
+    KomariMemoryConfigSchema,
+)
+
+
+@debug_notify.handle()
+async def handle_debug_notify(
+    bot: Bot,
+    event: MessageEvent,
+    arg_text: str = Depends(_get_arg_text),
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await debug_notify.finish("❌ 仅限 SUPERUSER 使用")
+
+    arg = arg_text.strip().lower()
+    if arg not in {"on", "off"}:
+        await debug_notify.finish("❌ 用法: .debug notify on|off")
+
+    enabled = arg == "on"
+    try:
+        updated = await _komari_memory_config_mgr.update_field_async(
+            "error_notify_enabled",
+            enabled,
+        )
+    except Exception as exc:
+        logger.error(
+            "[KomariDebug] notify 切换失败: error_type={}",
+            type(exc).__name__,
+        )
+        await debug_notify.finish("❌ 切换失败\n错误码: notify_toggle_failed")
+
+    current = bool(getattr(updated, "error_notify_enabled", enabled))
+    await debug_notify.finish(
+        f"✅ 回复失败 SUPERUSER 通知已{'开启' if current else '关闭'}"
     )
