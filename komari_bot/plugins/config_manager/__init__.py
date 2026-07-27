@@ -37,6 +37,7 @@ from komari_bot.common.prompt_storage import close_prompt_storage_if_created
 from .manager import (
     ConfigManager,
     get_config_manager,
+    get_registered_config_managers,
     initialize_registered_config_managers_async,
 )
 from .storage import close_config_storage_if_created
@@ -50,6 +51,7 @@ __plugin_meta__ = PluginMetadata(
 __all__ = [
     "ConfigManager",
     "get_config_manager",
+    "get_registered_config_managers",
     "initialize_registered_config_managers_async",
 ]
 

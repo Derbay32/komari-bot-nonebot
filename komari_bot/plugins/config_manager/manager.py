@@ -640,6 +640,12 @@ _config_managers: dict[str, ConfigManager] = {}
 _config_managers_lock = RLock()
 
 
+def get_registered_config_managers() -> dict[str, ConfigManager]:
+    """返回当前已注册配置管理器的浅拷贝快照。"""
+    with _config_managers_lock:
+        return dict(_config_managers)
+
+
 async def initialize_registered_config_managers_async() -> None:
     """在业务插件启动前异步预热全部已注册配置管理器。"""
     initialized_names: set[str] = set()
