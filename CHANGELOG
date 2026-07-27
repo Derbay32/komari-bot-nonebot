@@ -4,6 +4,10 @@
 
 > 当前 `dev` 分支上尚未发版的变更。
 
+---
+
+## [v1.3.0-rc.2] - 2026-07-27
+
 ### 破坏性变更
 
 - search 插件配置项结构大改，需通过 scripts/migrate_search_config_v2.py 脚本进行迁移后部署。
@@ -13,6 +17,7 @@
 - 新增 Exa 搜索 API 接入能力，可通过配置项修改。
 - 新增基于搜索供应商的 WebFetch 网页浏览能力。
 - 新增开发上下文文档 CONTEXT.md。
+- 新增回复出错时向 SUPERUSER 私信简要报错，支持通过 .debug notify on|off 与独立配置项临时开关。
 
 ### 变更
 
@@ -21,6 +26,9 @@
 ### 修复
 
 - 修正了 AGENTS.md 中有关 character_binding 插件的命令错误描述。
+- 修正了确认回复反应在回复完成后才会发送的问题。
+
+详细更新日志: https://codeberg.org/Derbay32/komari-bot-nonebot/compare/v1.3.0-rc.1...v1.3.0-rc.2
 
 ---
 
@@ -462,6 +470,7 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
+| v1.3.0-rc.2 | 2026-07-27 | RC |
 | v1.3.0-rc.1 | 2026-07-22 | RC |
 | v1.3.0-beta.2 | 2026-07-21 | Beta |
 | v1.3.0-beta.1 | 2026-07-18 | Beta |
@@ -492,4 +501,4 @@
 
 ---
 
-*本 CHANGELOG 最后更新于 2026-07-22*
+*本 CHANGELOG 最后更新于 2026-07-27*
