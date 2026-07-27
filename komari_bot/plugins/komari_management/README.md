@@ -196,10 +196,10 @@ X-Request-ID: config-komari-sentry-pii-001
 {"value":true}
 ```
 
-`send_default_pii` 默认关闭且重启后生效。开启后，Sentry 会收到用户上下文、
-完整的 Sentry Logs 正文与日志属性，以及日志生成的错误 Issue 中的完整
-`logentry`；这些内容可能包含 QQ 号、昵称、消息片段、URL 或原始异常字符串。
-请求数据、异常正文、breadcrumb、事务/span 和堆栈局部变量仍会脱敏。
+`send_default_pii` 默认关闭且重启后生效。该开关仅控制是否向 Sentry 上报
+user 上下文（用户标识）；其余诊断数据（异常正文、breadcrumb、Sentry Logs
+正文、事务/span、堆栈局部变量等）默认全量上报，只通过黑名单式脱敏隐藏
+凭据类字段（API Key、Token、密码、连接串、DSN、API 形状 URL 等）。
 已经发送的历史事件不会补发或恢复。
 
 详情响应中的关键字段：

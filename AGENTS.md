@@ -407,7 +407,7 @@ poetry run pytest tests/ -v
 4. **资源清理**：`close()` 方法必须清理所有资源引用（连接池、模型、文件句柄）
 5. **提前返回**：条件检查不通过时添加 `return`，避免继续执行
 6. **Python 3.13 特有**：本项目不兼容 Python 3.12 及以下
-7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤；默认隐藏 breadcrumb、Sentry Logs 和错误事件的正文、插值参数、请求数据与堆栈局部变量。显式启用 `send_default_pii` 后，仅允许 Sentry Logs 和日志型 Issue 保留完整日志正文与属性，同时保留用户上下文；请求、异常、breadcrumb、事务/span 与堆栈局部变量仍必须脱敏
+7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤；脱敏采用黑名单式：诊断数据（异常正文、breadcrumb、Sentry Logs 正文、事务/span、堆栈局部变量、请求数据）默认全量保留，仅通过三层机制（字段名黑名单、值模式正则、已配置秘密精确替换）隐藏凭据类字段。`send_default_pii` 仅控制 user 上下文（用户标识）是否上报
 8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
 9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
@@ -423,4 +423,4 @@ poetry run pytest tests/ -v
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-07-22。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-07-27。发现不一致请以实际代码为准并更新本文档。*
