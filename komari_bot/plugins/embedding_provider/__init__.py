@@ -44,6 +44,12 @@ async def _startup() -> None:
         raise RuntimeError(msg)
     config = await config_manager.get_async()
 
+    # base URL 未标记 secret（管理 API 需明文展示），显式登记为 Sentry 敏感值
+    from komari_bot.common.sentry_support import register_sensitive_value
+
+    register_sensitive_value(config.embedding_api_url)
+    register_sensitive_value(config.rerank_api_url)
+
     state.embedding_service = EmbeddingService(config)
     state.rerank_service = RerankService(config)
 

@@ -1,13 +1,24 @@
-"""Sentry 初始化与事件过滤辅助函数。"""
+"""Sentry 初始化与事件过滤辅助函数。
+
+采用黑名单式脱敏：全量保留诊断数据，仅隐藏凭据类极度敏感字段。
+
+三层凭据识别（纵深防御）：
+1. 字段名黑名单：递归扫描 payload，key 归一化后精确匹配黑名单，命中整值替换。
+2. 值模式正则：仅覆盖确定形状的凭据（sk- key、Bearer token、连接串 userinfo、DSN、API 形状 URL）。
+3. 精确值替换：收集已配置的真实秘密值，在全 payload 字符串内做字面量子串替换。
+"""
 
 from __future__ import annotations
 
 import logging
+import re
+import threading
+import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
 from nonebot.exception import (
     FinishedException,
@@ -16,6 +27,8 @@ from nonebot.exception import (
     StopPropagation,
 )
 
+logger = logging.getLogger(__name__)
+
 _IGNORED_EXCEPTION_TYPES = (
     StopPropagation,
     PausedException,
@@ -23,38 +36,60 @@ _IGNORED_EXCEPTION_TYPES = (
     FinishedException,
 )
 
-_SAFE_TELEMETRY_ATTRIBUTE_KEYS = frozenset(
+_FILTERED = "[Filtered]"
+_MIN_SENSITIVE_VALUE_LENGTH = 8
+
+# 字段名黑名单（归一化形态：小写并去除 - 和 _）
+_SENSITIVE_KEY_NAMES = frozenset(
     {
-        "code.function.name",
-        "code.line.number",
-        "http.method",
-        "http.response.status_code",
-        "logger.name",
-        "method",
-        "sentry.origin",
-        "status_code",
+        "authorization",
+        "proxyauthorization",
+        "xapikey",
+        "apikey",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "clientsecret",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "cookie",
+        "setcookie",
+        "session",
+        "privatekey",
+        "dsn",
     }
 )
-_SAFE_EVENT_TAG_KEYS = frozenset(
-    {"component", "operation", "phase", "plugin", "service", "status"}
+
+# 值模式正则：仅覆盖确定形状，不做通用长 token 猜测
+_VALUE_PATTERNS = (
+    # OpenAI 兼容 key（sk- 开头的长串）
+    re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
+    # Bearer token 头部值
+    re.compile(r"Bearer\s+[A-Za-z0-9_\-\.+/=]{16,}", re.IGNORECASE),
+    # 连接串 userinfo（scheme://user:pass@host，覆盖 postgres/redis 等）
+    re.compile(r"(?<=://)[^\s/?#:@]+:[^\s/?#:@]+(?=@)"),
+    # Sentry DSN 形状（https://<key>@host/...）
+    re.compile(r"https?://[A-Za-z0-9]+@[A-Za-z0-9.\-]+(?::\d+)?/[^\s\"']*"),
+    # API 形状 URL（scheme://host/v数字[字母][/...]，如 /v1、/v1beta）
+    re.compile(
+        r"[a-z][a-z0-9+.\-]*://[A-Za-z0-9.\-]+(?::\d+)?/v\d+[a-z]*(?:/[^\s\"']*)?",
+        re.IGNORECASE,
+    ),
 )
-_SAFE_CONTEXT_FIELDS = {
-    "app": frozenset(
-        {
-            "app_build",
-            "app_identifier",
-            "app_name",
-            "app_start_time",
-            "app_version",
-            "build_type",
-            "in_foreground",
-        }
-    ),
-    "runtime": frozenset({"build", "name", "version"}),
-    "trace": frozenset(
-        {"op", "origin", "parent_span_id", "span_id", "status", "trace_id"}
-    ),
-}
+
+# 精确值替换：进程内累计集合（只增不减，轮换掉的旧 key 继续受保护）
+_registered_sensitive_values: set[str] = set()
+_sensitive_values_lock = threading.RLock()
+_sensitive_value_collector: Callable[[], Iterable[str]] | None = None
+
+# collector 重跑门控：短 TTL 缓存，避免高频钩子反复遍历配置管理器；
+# 以 collector 对象身份为缓存键，collector 更换后立即重跑。
+_COLLECTOR_CACHE_TTL_SECONDS = 30.0
+_cached_collector: object | None = None
+_collector_refresh_at: float = 0.0
 
 
 class SentryConfigProtocol(Protocol):
@@ -84,77 +119,146 @@ def should_ignore_sentry_exception(error: BaseException) -> bool:
     return isinstance(error, get_ignored_sentry_exceptions())
 
 
+def register_sensitive_value(value: str | None) -> None:
+    """登记需要精确替换的敏感值（累计集合，只增不减）。
+
+    小于 8 字符的值不入清单，防止误伤短字符串。
+    """
+    if value is None:
+        return
+    stripped = value.strip()
+    if len(stripped) < _MIN_SENSITIVE_VALUE_LENGTH:
+        return
+    with _sensitive_values_lock:
+        _registered_sensitive_values.add(stripped)
+
+
+def set_sensitive_value_collector(
+    collector: Callable[[], Iterable[str]] | None,
+) -> None:
+    """注入当前配置秘密收集器（由插件层在启动时调用）。
+
+    sentry_support 属 common 层，禁止直接依赖插件层；
+    通过依赖注入由 komari_sentry 插件注册遍历 config_manager 的 collector。
+    """
+    global _sensitive_value_collector  # noqa: PLW0603
+    _sensitive_value_collector = collector
+
+
+def _collect_sensitive_values() -> frozenset[str]:
+    """收集当前配置秘密并与进程内累计集合取并集。
+
+    collector 受短 TTL 缓存门控，高频钩子不会反复遍历配置管理器；
+    累计集合只增不减，缓存窗口内轮换的秘密仍受保护，无正确性损失。
+    收集动作本身异常时降级为仅用累计集合，不阻断事件。
+    """
+    global _cached_collector, _collector_refresh_at  # noqa: PLW0603
+    now = time.monotonic()
+    collector = _sensitive_value_collector
+    if collector is not _cached_collector or now >= _collector_refresh_at:
+        _cached_collector = collector
+        _collector_refresh_at = now + _COLLECTOR_CACHE_TTL_SECONDS
+        collected: set[str] = set()
+        if collector is not None:
+            try:
+                for value in collector():
+                    if isinstance(value, str):
+                        stripped = value.strip()
+                        if len(stripped) >= _MIN_SENSITIVE_VALUE_LENGTH:
+                            collected.add(stripped)
+            except Exception:
+                logger.debug(
+                    "Sentry 敏感值收集器执行失败，降级为累计集合",
+                    exc_info=True,
+                )
+        with _sensitive_values_lock:
+            _registered_sensitive_values.update(collected)
+    with _sensitive_values_lock:
+        return frozenset(_registered_sensitive_values)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """判断字段名是否命中黑名单。
+
+    按点号分段后逐段归一化（小写并去除 - 和 _），
+    覆盖 Sentry 集成常见的点号键约定（如 http.request.header.authorization）。
+    """
+    return any(
+        segment.replace("-", "").replace("_", "") in _SENSITIVE_KEY_NAMES
+        for segment in key.lower().split(".")
+        if segment
+    )
+
+
+def _scrub_string(value: str, secrets: frozenset[str]) -> str:
+    """对字符串先做精确值替换，再做正则形状替换。"""
+    result = value
+    for secret in secrets:
+        if secret in result:
+            result = result.replace(secret, _FILTERED)
+    for pattern in _VALUE_PATTERNS:
+        result = pattern.sub(_FILTERED, result)
+    return result
+
+
+def _scrub_payload(obj: Any, secrets: frozenset[str]) -> Any:
+    """递归净化 payload：字段名黑名单 → 精确值替换 → 正则形状替换。"""
+    if isinstance(obj, dict):
+        scrubbed: dict[Any, Any] = {}
+        for key, value in obj.items():
+            if isinstance(key, str) and _is_sensitive_key(key):
+                scrubbed[key] = _FILTERED
+            else:
+                scrubbed[key] = _scrub_payload(value, secrets)
+        return scrubbed
+    if isinstance(obj, list):
+        return [_scrub_payload(item, secrets) for item in obj]
+    if isinstance(obj, str):
+        return _scrub_string(obj, secrets)
+    return obj
+
+
 def sentry_before_send(
     event: dict[str, Any],
     hint: dict[str, Any],
     *,
     allow_user_context: bool = False,
-    allow_log_content: bool = False,
 ) -> dict[str, Any] | None:
-    """丢弃控制流异常，并按配置净化错误事件。"""
+    """丢弃控制流异常，并按黑名单净化错误事件。"""
     exc_info = hint.get("exc_info")
     if isinstance(exc_info, tuple) and len(exc_info) >= 2:
         error = exc_info[1]
         if isinstance(error, BaseException) and should_ignore_sentry_exception(error):
             return None
 
-    _sanitize_event(
-        event,
-        allow_user_context=allow_user_context,
-        preserve_log_content=(allow_log_content and hint.get("log_record") is not None),
+    if not allow_user_context:
+        event.pop("user", None)
+    return cast(
+        "dict[str, Any]",
+        _scrub_payload(event, _collect_sensitive_values()),
     )
-    return event
 
 
 def sentry_before_breadcrumb(
     breadcrumb: dict[str, Any],
     _hint: dict[str, Any],
 ) -> dict[str, Any]:
-    """隐藏 breadcrumb 正文，仅保留低敏诊断元数据。"""
-    sanitized = {
-        key: breadcrumb[key]
-        for key in ("type", "category", "level", "timestamp")
-        if key in breadcrumb
-    }
-    if "message" in breadcrumb:
-        sanitized["message"] = _redacted_text_summary(
-            breadcrumb.get("message"),
-            label="breadcrumb 正文",
-        )
-
-    safe_data = _safe_telemetry_attributes(breadcrumb.get("data"))
-    if safe_data:
-        sanitized["data"] = safe_data
-    return sanitized
+    """按黑名单净化 breadcrumb，诊断正文无条件保留。"""
+    return cast(
+        "dict[str, Any]",
+        _scrub_payload(breadcrumb, _collect_sensitive_values()),
+    )
 
 
 def sentry_before_send_log(
     log: dict[str, Any],
     _hint: dict[str, Any],
-    *,
-    allow_log_content: bool = False,
 ) -> dict[str, Any]:
-    """按配置保留或隐藏 Sentry Logs 正文和属性。"""
-    if allow_log_content:
-        return log
-
-    sanitized = {
-        key: log[key]
-        for key in (
-            "severity_number",
-            "severity_text",
-            "time_unix_nano",
-            "trace_id",
-            "span_id",
-        )
-        if key in log and isinstance(log[key], (str, int, float, bool))
-    }
-    sanitized["body"] = _redacted_text_summary(
-        log.get("body"),
-        label="日志正文",
+    """按黑名单净化 Sentry Logs，日志正文无条件保留。"""
+    return cast(
+        "dict[str, Any]",
+        _scrub_payload(log, _collect_sensitive_values()),
     )
-    sanitized["attributes"] = _safe_telemetry_attributes(log.get("attributes"))
-    return sanitized
 
 
 def sentry_before_send_transaction(
@@ -163,206 +267,13 @@ def sentry_before_send_transaction(
     *,
     allow_user_context: bool = False,
 ) -> dict[str, Any]:
-    """净化事务、span 与请求上下文，阻止 tracing 绕过错误事件钩子。"""
-    _sanitize_event(event, allow_user_context=allow_user_context)
-
-    if "transaction" in event:
-        event["transaction"] = _redacted_text_summary(
-            event.get("transaction"),
-            label="事务名称",
-        )
-
-    transaction_info = event.get("transaction_info")
-    if isinstance(transaction_info, dict):
-        source = transaction_info.get("source")
-        event["transaction_info"] = (
-            {"source": source}
-            if source in {"component", "custom", "route", "task", "url"}
-            else {}
-        )
-
-    spans = event.get("spans")
-    if isinstance(spans, list):
-        event["spans"] = [
-            _sanitize_transaction_span(span)
-            for span in spans
-            if isinstance(span, dict)
-        ]
-
-    event.pop("measurements", None)
-    return event
-
-
-def _redacted_text_summary(value: object, *, label: str) -> str:
-    """以不可逆长度摘要替代可能包含用户内容的文本。"""
-    if value is None:
-        return f"[{label}已隐藏]"
-    return f"[{label}已隐藏，字符数={len(str(value))}]"
-
-
-def _safe_telemetry_attributes(value: object) -> dict[str, Any]:
-    """只保留不会携带业务正文或用户标识的遥测属性。"""
-    if not isinstance(value, dict):
-        return {}
-    return {
-        str(key): item
-        for key, item in value.items()
-        if str(key) in _SAFE_TELEMETRY_ATTRIBUTE_KEYS
-        and isinstance(item, (str, int, float, bool))
-    }
-
-
-def _sanitize_transaction_span(span: dict[str, Any]) -> dict[str, Any]:
-    """仅保留 span 的低敏标识和状态，并摘要 description。"""
-    sanitized = {
-        key: span[key]
-        for key in (
-            "exclusive_time",
-            "op",
-            "origin",
-            "parent_span_id",
-            "span_id",
-            "start_timestamp",
-            "status",
-            "timestamp",
-            "trace_id",
-        )
-        if key in span and isinstance(span[key], (str, int, float, bool))
-    }
-    if "description" in span:
-        sanitized["description"] = _redacted_text_summary(
-            span.get("description"),
-            label="span 描述",
-        )
-    safe_data = _safe_telemetry_attributes(span.get("data"))
-    if safe_data:
-        sanitized["data"] = safe_data
-    tags = span.get("tags")
-    if isinstance(tags, dict):
-        safe_tags = {
-            str(key): value
-            for key, value in tags.items()
-            if str(key) in _SAFE_EVENT_TAG_KEYS
-            and isinstance(value, (str, int, float, bool))
-        }
-        if safe_tags:
-            sanitized["tags"] = safe_tags
-    return sanitized
-
-
-def _sanitize_event(
-    event: dict[str, Any],
-    *,
-    allow_user_context: bool,
-    preserve_log_content: bool = False,
-) -> None:
-    """就地清理错误事件，可为日志型 Issue 保留 logentry。"""
-    if "message" in event:
-        event["message"] = _redacted_text_summary(
-            event.get("message"),
-            label="事件消息",
-        )
-
-    logentry = event.get("logentry")
-    if isinstance(logentry, dict) and not preserve_log_content:
-        for key in ("message", "formatted"):
-            if key in logentry:
-                logentry[key] = _redacted_text_summary(
-                    logentry.get(key),
-                    label="日志正文",
-                )
-        logentry.pop("params", None)
-
-    _sanitize_exception_values(event.get("exception"))
-    _strip_stack_variables(event.get("threads"))
-    _sanitize_event_breadcrumbs(event.get("breadcrumbs"))
-
-    request = event.get("request")
-    if isinstance(request, dict):
-        method = request.get("method")
-        event["request"] = (
-            {"method": method.upper()}
-            if isinstance(method, str) and method
-            else {}
-        )
-
-    contexts = event.get("contexts")
-    if isinstance(contexts, dict):
-        event["contexts"] = {
-            name: {
-                key: value
-                for key, value in context.items()
-                if key in allowed_fields
-                and isinstance(value, (str, int, float, bool))
-            }
-            for name, context in contexts.items()
-            if (allowed_fields := _SAFE_CONTEXT_FIELDS.get(name)) is not None
-            and isinstance(context, dict)
-        }
-
-    tags = event.get("tags")
-    if isinstance(tags, dict):
-        event["tags"] = {
-            str(key): value
-            for key, value in tags.items()
-            if str(key) in _SAFE_EVENT_TAG_KEYS
-            and isinstance(value, (str, int, float, bool))
-        }
-
-    for key in ("extra", "server_name"):
-        event.pop(key, None)
+    """按黑名单净化事务事件，阻止 tracing 绕过脱敏钩子。"""
     if not allow_user_context:
         event.pop("user", None)
-
-
-def _sanitize_exception_values(exception: object) -> None:
-    """隐藏异常正文，同时保留异常类型和无局部变量的堆栈。"""
-    if not isinstance(exception, dict):
-        return
-    values = exception.get("values")
-    if not isinstance(values, list):
-        return
-    for value in values:
-        if not isinstance(value, dict):
-            continue
-        if "value" in value:
-            value["value"] = _redacted_text_summary(
-                value.get("value"),
-                label="异常正文",
-            )
-        _strip_stack_variables(value.get("stacktrace"))
-
-
-def _strip_stack_variables(stacktrace_container: object) -> None:
-    """移除异常与线程堆栈帧中的局部变量快照。"""
-    if not isinstance(stacktrace_container, dict):
-        return
-
-    frames = stacktrace_container.get("frames")
-    if isinstance(frames, list):
-        for frame in frames:
-            if isinstance(frame, dict):
-                frame.pop("vars", None)
-
-    values = stacktrace_container.get("values")
-    if isinstance(values, list):
-        for value in values:
-            if isinstance(value, dict):
-                _strip_stack_variables(value.get("stacktrace"))
-
-
-def _sanitize_event_breadcrumbs(container: object) -> None:
-    """对事件中已经收集的 breadcrumb 再执行一次净化。"""
-    if not isinstance(container, dict):
-        return
-    values = container.get("values")
-    if not isinstance(values, list):
-        return
-    container["values"] = [
-        sentry_before_breadcrumb(item, {})
-        for item in values
-        if isinstance(item, dict)
-    ]
+    return cast(
+        "dict[str, Any]",
+        _scrub_payload(event, _collect_sensitive_values()),
+    )
 
 
 def ensure_sentry_privacy_hooks(
@@ -380,17 +291,13 @@ def ensure_sentry_privacy_hooks(
         "before_send": partial(
             sentry_before_send,
             allow_user_context=allow_user_context,
-            allow_log_content=allow_user_context,
         ),
         "before_breadcrumb": sentry_before_breadcrumb,
         "before_send_transaction": partial(
             sentry_before_send_transaction,
             allow_user_context=allow_user_context,
         ),
-        "before_send_log": partial(
-            sentry_before_send_log,
-            allow_log_content=allow_user_context,
-        ),
+        "before_send_log": sentry_before_send_log,
     }
     for option_name, sanitizer in sanitizers.items():
         existing = options.get(option_name)
@@ -508,17 +415,13 @@ def build_sentry_init_options(
         "before_send": partial(
             sentry_before_send,
             allow_user_context=config.send_default_pii,
-            allow_log_content=config.send_default_pii,
         ),
         "before_breadcrumb": sentry_before_breadcrumb,
         "before_send_transaction": partial(
             sentry_before_send_transaction,
             allow_user_context=config.send_default_pii,
         ),
-        "before_send_log": partial(
-            sentry_before_send_log,
-            allow_log_content=config.send_default_pii,
-        ),
+        "before_send_log": sentry_before_send_log,
         "ignore_errors": list(get_ignored_sentry_exceptions()),
         "integrations": [
             logging_integration_factory(

@@ -614,6 +614,18 @@ except ValueError:
 
 if driver is not None:
 
+    @driver.on_startup
+    async def _register_sensitive_urls() -> None:
+        """将 API Base URL 登记为 Sentry 敏感值。
+
+        base URL 未标记 secret（管理 API 需明文展示），需显式登记，
+        由精确值替换层在事件脱敏时字面量替换。
+        """
+        from komari_bot.common.sentry_support import register_sensitive_value
+
+        config = await config_manager.get_async()
+        register_sensitive_value(config.api_base)
+
     @driver.on_shutdown
     async def _shutdown_provider_resources() -> None:
         """在进程退出时关闭复用的 HTTP 连接。"""

@@ -68,8 +68,8 @@ class KomariSentryConfigSchema(BaseModel):
     send_default_pii: bool = Field(
         default=False,
         description=(
-            "是否向 Sentry 发送用户上下文、完整日志正文与日志属性；"
-            "请求、异常、breadcrumb 和事务内容仍会脱敏"
+            "是否向 Sentry 上报 user 上下文（用户标识）；"
+            "其余诊断数据默认全量上报并仅脱敏凭据"
         ),
     )
     max_breadcrumbs: int = Field(
