@@ -4,6 +4,24 @@
 
 > 当前 `dev` 分支上尚未发版的变更。
 
+### 破坏性变更
+
+- search 插件配置项结构大改，需通过 scripts/migrate_search_config_v2.py 脚本进行迁移后部署。
+
+### 新增
+
+- 新增 Exa 搜索 API 接入能力，可通过配置项修改。
+- 新增基于搜索供应商的 WebFetch 网页浏览能力。
+- 新增开发上下文文档 CONTEXT.md。
+
+### 变更
+
+- sentry 错误报告更改为仅隐藏敏感字段（如 apikey、数据库账密等）
+
+### 修复
+
+- 修正了 AGENTS.md 中有关 character_binding 插件的命令错误描述。
+
 ---
 
 ## [v1.3.0-rc.1] - 2026-07-22
