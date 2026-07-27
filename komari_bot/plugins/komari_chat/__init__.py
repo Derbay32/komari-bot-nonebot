@@ -11,7 +11,13 @@ from nonebot.plugin import PluginMetadata, require
 from komari_bot.common.onebot_messages import plain_text_message
 from komari_bot.common.onebot_rules import group_message_rule
 
-from .handlers.message_handler import DebugReplyResult, MessageHandler, PendingReply
+from .handlers.message_handler import (
+    DebugReplyResult,
+    MessageHandler,
+    PendingReply,
+    ReplyFailureInfo,
+)
+from .services.error_notify import one_line_summary
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -120,7 +126,7 @@ driver.on_shutdown(_stop_reply_commit_worker)
 
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
-    """在触发聊天回复后，对触发消息添加表情反应。"""
+    """在开始生成回复时，对触发消息添加表情反应（提示“正在生成”）。"""
     config = get_config()
     if not config.face_reaction_enabled or not config.face_reaction_id:
         return
@@ -301,7 +307,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             pending_reply,
             platform_message_id=platform_message_id,
         )
-    except Exception:
+    except Exception as exc:
         if pending_reply is not None and not reply_delivered:
             if delivery_outcome == "not_sent":
                 if reply_prepared:
@@ -323,3 +329,21 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     pending_reply.operation_id,
                 )
         logger.exception("[KomariChat] 消息处理失败")
+        # 失败善后：pending_reply 存在说明表情已在生成前贴出；
+        # 回复未送达时补发群内错误文本，所有未处理异常均通知 SUPERUSER
+        await handler.report_reply_failure(
+            bot=bot,
+            event=event,
+            failure=ReplyFailureInfo(
+                stage="deliver" if pending_reply is not None else "process",
+                error_type=type(exc).__name__,
+                summary=one_line_summary(exc),
+                request_trace_id=(
+                    pending_reply.request_trace_id
+                    if pending_reply is not None
+                    else None
+                ),
+                reaction_sent=pending_reply is not None and not reply_delivered,
+            ),
+            reason=pending_reply.reason if pending_reply is not None else None,
+        )
