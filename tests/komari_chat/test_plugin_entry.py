@@ -23,7 +23,13 @@ def _install_allowed_entry_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     handler: object,
 ) -> None:
-    config = SimpleNamespace(plugin_enable=True, group_whitelist=[])
+    config = SimpleNamespace(
+        plugin_enable=True,
+        group_whitelist=[],
+        error_notify_enabled=False,
+        face_reaction_enabled=False,
+        face_reaction_id="",
+    )
 
     class _PermissionPlugin:
         @staticmethod
@@ -205,7 +211,12 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         cancel=False,
         discard=False,
     )
-    pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
+    pending_reply = SimpleNamespace(
+        reply="测试回复",
+        reply_to_message_id=None,
+        request_trace_id="test-trace-send-fail",
+        reason="at",
+    )
 
     class _Handler:
         @staticmethod
@@ -238,6 +249,12 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         async def cancel_prepared_reply(actual_pending_reply: object) -> None:
             assert actual_pending_reply is pending_reply
             calls.cancel = True
+
+        @staticmethod
+        async def report_reply_failure(
+            **_kwargs: object,
+        ) -> None:
+            return None
 
     async def _fail_send(_message: object) -> None:
         calls.send = True
@@ -361,7 +378,12 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = SimpleNamespace(send=False, discard=False)
-    pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
+    pending_reply = SimpleNamespace(
+        reply="测试回复",
+        reply_to_message_id=None,
+        request_trace_id="test-trace-commit-fail",
+        reason="at",
+    )
 
     class _Handler:
         @staticmethod
@@ -383,6 +405,12 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
         @staticmethod
         async def discard_pending_reply(_pending_reply: object) -> None:
             calls.discard = True
+
+        @staticmethod
+        async def report_reply_failure(
+            **_kwargs: object,
+        ) -> None:
+            return None
 
     async def _send(_message: object) -> None:
         calls.send = True
@@ -409,6 +437,8 @@ async def test_unknown_send_result_keeps_prepared_outbox_for_reconciliation(
         reply="测试回复",
         reply_to_message_id=None,
         operation_id="reply-operation-unknown",
+        request_trace_id="test-trace-unknown",
+        reason="at",
     )
 
     class _Handler:
@@ -431,6 +461,12 @@ async def test_unknown_send_result_keeps_prepared_outbox_for_reconciliation(
         @staticmethod
         async def discard_pending_reply(_pending_reply: object) -> None:
             calls.discard = True
+
+        @staticmethod
+        async def report_reply_failure(
+            **_kwargs: object,
+        ) -> None:
+            return None
 
     async def _unknown_send(_message: object) -> None:
         msg = "网络超时，平台是否接收未知"

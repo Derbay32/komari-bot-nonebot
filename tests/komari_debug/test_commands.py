@@ -414,6 +414,7 @@ def test_sub_matchers_have_higher_priority_than_root(debug_commands: Any) -> Non
         "debug_bind_list",
         "debug_reply",
         "debug_summary",
+        "debug_notify",
     ]:
         matcher = getattr(debug_commands, name, None)
         assert matcher is not None, f"{name} matcher not found"
@@ -430,6 +431,7 @@ def test_sub_matchers_block(debug_commands: Any) -> None:
         "debug_bind_list",
         "debug_reply",
         "debug_summary",
+        "debug_notify",
     ]:
         matcher = getattr(debug_commands, name, None)
         assert matcher is not None
@@ -553,6 +555,7 @@ def test_help_text_uses_debug_prefix(debug_commands: Any) -> None:
     assert ".debug bind list" in debug_commands.HELP_TEXT
     assert ".debug reply" in debug_commands.HELP_TEXT
     assert ".debug summary" in debug_commands.HELP_TEXT
+    assert ".debug notify" in debug_commands.HELP_TEXT
 
 
 def test_split_into_nodes_respects_max_length(debug_reporting: Any) -> None:
@@ -686,3 +689,154 @@ def _make_async_spy(
         return return_value
 
     return spy
+
+
+# ─── .debug notify ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_notify_rejects_non_superuser(
+    debug_commands: Any,
+    app: App,
+) -> None:
+    """非 SUPERUSER 访问 .debug notify 应被拒绝。"""
+    async with app.test_matcher(debug_commands.debug_notify) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".debug notify on", user_id=NON_SU_ID)
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_notify)
+        ctx.should_pass_rule(matcher=debug_commands.debug_notify)
+        ctx.should_call_send(event, REJECT_MSG, bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_notify_invalid_arg_shows_usage(
+    debug_commands: Any,
+    app: App,
+) -> None:
+    """.debug notify 非法参数回复用法。"""
+    async with app.test_matcher(debug_commands.debug_notify) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".debug notify invalid")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_notify)
+        ctx.should_pass_rule(matcher=debug_commands.debug_notify)
+        ctx.should_call_send(event, "❌ 用法: .debug notify on|off", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_notify_empty_arg_shows_usage(
+    debug_commands: Any,
+    app: App,
+) -> None:
+    """.debug notify 无参数回复用法。"""
+    async with app.test_matcher(debug_commands.debug_notify) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".debug notify")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_notify)
+        ctx.should_pass_rule(matcher=debug_commands.debug_notify)
+        ctx.should_call_send(event, "❌ 用法: .debug notify on|off", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_notify_on_success(
+    debug_commands: Any,
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.debug notify on 成功后回复✅提示。"""
+    mock_updated = SimpleNamespace(error_notify_enabled=True)
+    monkeypatch.setattr(
+        debug_commands,
+        "_komari_memory_config_mgr",
+        SimpleNamespace(
+            update_field_async=_make_async_spy(
+                SimpleNamespace(), "_x", return_value=mock_updated
+            ),
+        ),
+    )
+
+    async with app.test_matcher(debug_commands.debug_notify) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".debug notify on")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_notify)
+        ctx.should_pass_rule(matcher=debug_commands.debug_notify)
+        ctx.should_call_send(
+            event, "✅ 回复失败 SUPERUSER 通知已开启", bot=bot
+        )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_notify_off_success(
+    debug_commands: Any,
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.debug notify off 成功后回复✅提示。"""
+    mock_updated = SimpleNamespace(error_notify_enabled=False)
+    monkeypatch.setattr(
+        debug_commands,
+        "_komari_memory_config_mgr",
+        SimpleNamespace(
+            update_field_async=_make_async_spy(
+                SimpleNamespace(), "_x", return_value=mock_updated
+            ),
+        ),
+    )
+
+    async with app.test_matcher(debug_commands.debug_notify) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".debug notify off")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_notify)
+        ctx.should_pass_rule(matcher=debug_commands.debug_notify)
+        ctx.should_call_send(
+            event, "✅ 回复失败 SUPERUSER 通知已关闭", bot=bot
+        )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_notify_toggle_failure(
+    debug_commands: Any,
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.debug notify 切换失败时回复错误提示。"""
+    async def _fail_update_field_async(*_args: object, **_kwargs: object) -> object:
+        msg = "数据库连接断开"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        debug_commands,
+        "_komari_memory_config_mgr",
+        SimpleNamespace(update_field_async=_fail_update_field_async),
+    )
+
+    async with app.test_matcher(debug_commands.debug_notify) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".debug notify on")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=debug_commands.debug_notify)
+        ctx.should_pass_rule(matcher=debug_commands.debug_notify)
+        ctx.should_call_send(
+            event, "❌ 切换失败\n错误码: notify_toggle_failed", bot=bot
+        )
+        ctx.should_finished()
+
+
+# ─── 子命令优先级（notify） ─────────────────────────────────────
+
+
+def test_notify_matcher_has_correct_priority_and_block(
+    debug_commands: Any,
+) -> None:
+    """debug_notify matcher 优先级为 2 且 block=True。"""
+    assert debug_commands.debug_notify.priority == 2
+    assert debug_commands.debug_notify.block is True

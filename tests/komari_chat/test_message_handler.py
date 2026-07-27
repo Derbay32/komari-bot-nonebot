@@ -1385,7 +1385,7 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
         message_id="message-proactive",
     )
 
-    pending_reply, stored = asyncio.run(
+    pending_reply, stored, failure = asyncio.run(
         handler._attempt_reply(
             message=message,
             reply_to_message_id=message.message_id,
@@ -1401,6 +1401,7 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
     )
 
     assert stored is True
+    assert failure is None
     assert pending_reply is not None
     assert pending_reply.proactive_reservation_id == "message-proactive"
     assert redis.reserve_proactive_calls == [
@@ -1487,7 +1488,13 @@ def test_proactive_generation_failure_releases_reservation(
         )
     )
 
-    assert result == (None, True)
+    assert result[0] is None
+    assert result[1] is True
+    failure = result[2]
+    assert failure is not None
+    assert failure.stage == "generate"
+    assert failure.error_type == "_FavorabilityReadError"
+    assert failure.reaction_sent is False
     assert redis.release_proactive_calls == [
         {
             "group_id": "group-proactive",
@@ -1543,7 +1550,13 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
         )
     )
 
-    assert result == (None, True)
+    assert result[0] is None
+    assert result[1] is True
+    failure = result[2]
+    assert failure is not None
+    assert failure.stage == "generate"
+    assert failure.error_type == "_FavorabilityReadError"
+    assert failure.reaction_sent is False
 
 
 def test_generate_debug_reply_refetches_quoted_image_without_url(
@@ -1620,3 +1633,645 @@ def test_generate_debug_reply_refetches_quoted_image_without_url(
     )
     assert captured["reply_context_refetched"] is True
     assert result.reply_to_message_id == "456"
+
+
+# ── 表情反应前置 + 失败分流 测试 ──
+
+
+def test_reaction_scheduled_before_generate_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证表情反应回调在 _generate_reply_core 之前通过 create_task 派发。"""
+    reaction_called = False
+
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler._reaction_tasks = set()
+    handler.query_rewrite = _FakeQueryRewrite()
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            face_reaction_enabled=True,
+            face_reaction_id="76",
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="带表情的回复",
+            interaction_history={"event": "表情测试", "result": "表情回复", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="表情互动",
+        )
+
+    async def _fake_reaction() -> None:
+        nonlocal reaction_called
+        reaction_called = True
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+
+    current_message = MessageSchema(
+        user_id="user-reaction",
+        user_nickname="表情测试用户",
+        group_id="group-reaction",
+        content="表情测试",
+        timestamp=1.0,
+        message_id="msg-reaction",
+    )
+
+    result = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+            on_reply_triggered=_fake_reaction,
+        )
+    )
+
+    pending_reply, _stored, failure = result
+    assert pending_reply is not None
+    assert failure is None
+    # 表情回调在 _schedule_reply_reaction 中被 create_task 派发
+    assert reaction_called is True
+
+
+def test_reaction_not_scheduled_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """face_reaction_enabled=false 时不派发表情，但仍正常生成回复。"""
+    reaction_called = False
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            face_reaction_enabled=False,
+            face_reaction_id="76",
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="无表情回复",
+            interaction_history={"event": "无表情", "result": "无表情回复", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="测试",
+        )
+
+    async def _fake_reaction() -> None:
+        nonlocal reaction_called
+        reaction_called = True
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+
+    current_message = MessageSchema(
+        user_id="user-no-reaction",
+        user_nickname="无表情用户",
+        group_id="group-no-reaction",
+        content="无表情",
+        timestamp=1.0,
+        message_id="msg-no-reaction",
+    )
+
+    result = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+            on_reply_triggered=_fake_reaction,
+        )
+    )
+
+    pending_reply, _stored, failure = result
+    assert pending_reply is not None
+    assert failure is None
+    assert reaction_called is False
+
+
+def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """贴表情后LLM返回空回复→ failure.reaction_sent=True（需发群内错误文本）。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler._reaction_tasks = set()
+    handler.query_rewrite = _FakeQueryRewrite()
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            face_reaction_enabled=True,
+            face_reaction_id="76",
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="",  # 空回复
+            interaction_history={"event": "空回复测试", "result": "", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="测试",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+
+    current_message = MessageSchema(
+        user_id="user-empty",
+        user_nickname="空回复用户",
+        group_id="group-empty",
+        content="空",
+        timestamp=1.0,
+        message_id="msg-empty",
+    )
+
+    async def _dummy_reaction_empty() -> None:
+        pass
+
+    _pending, _stored, failure = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+            on_reply_triggered=_dummy_reaction_empty,
+        )
+    )
+
+    assert failure is not None
+    assert failure.error_type == "EmptyReplyError"
+    assert failure.reaction_sent is True
+
+
+def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """贴表情后好感度delta缺失→ failure.reaction_sent=True。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler._reaction_tasks = set()
+    handler.query_rewrite = _FakeQueryRewrite()
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            face_reaction_enabled=True,
+            face_reaction_id="76",
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="有回复但无delta",
+            interaction_history={"event": "delta测试", "result": "有回复无delta", "emotion": "平静"},
+            favorability_delta=None,  # 缺失
+            favorability_reason=None,
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+
+    current_message = MessageSchema(
+        user_id="user-delta",
+        user_nickname="delta用户",
+        group_id="group-delta",
+        content="delta",
+        timestamp=1.0,
+        message_id="msg-delta",
+    )
+
+    async def _dummy_reaction_delta() -> None:
+        pass
+
+    _pending, _stored, failure = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+            on_reply_triggered=_dummy_reaction_delta,
+        )
+    )
+
+    assert failure is not None
+    assert failure.error_type == "FavorabilityDeltaMissingError"
+    assert failure.reaction_sent is True
+
+
+def test_reserve_failure_returns_failure_with_reaction_sent_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reserve阶段Redis异常→ failure.reaction_sent=False（表情尚未派发，不补发群内错误文本）。"""
+    redis = _FakeRedisForDebug()
+    redis.reservation_status = "error"
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = _FakeMemoryForDebug()
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=True,
+            proactive_max_per_hour=3,
+            proactive_reservation_ttl_seconds=360,
+            bot_nickname="小鞠",
+            face_reaction_enabled=True,
+            face_reaction_id="76",
+            error_notify_enabled=False,
+        ),
+    )
+
+    # 注入 reserve_proactive_reply 使其抛出异常
+    original_reserve = redis.reserve_proactive_reply
+
+    async def _failing_reserve(*_args: object, **_kwargs: object) -> str:
+        del _args, _kwargs
+        msg = "Redis 连接断开"
+        raise RuntimeError(msg)
+
+    redis.reserve_proactive_reply = _failing_reserve  # type: ignore[method-assign]
+
+    reaction_called = False
+
+    async def _fake_reaction() -> None:
+        nonlocal reaction_called
+        reaction_called = True
+
+    current_message = MessageSchema(
+        user_id="user-reserve",
+        user_nickname="reserve用户",
+        group_id="group-reserve",
+        content="reserve",
+        timestamp=1.0,
+        message_id="msg-reserve",
+    )
+
+    _pending, _stored, failure = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=False,
+            reason="score",
+            reply_score=0.95,
+            store_current=True,
+            on_reply_triggered=_fake_reaction,
+        )
+    )
+
+    assert failure is not None
+    assert failure.stage == "reserve"
+    assert failure.error_type == "RuntimeError"
+    assert failure.reaction_sent is False
+    assert reaction_called is False  # 还未到贴表情阶段
+
+    # 恢复原方法以避免影响其他测试
+    redis.reserve_proactive_reply = original_reserve  # type: ignore[method-assign]
+
+
+def test_commit_delivered_reply_does_not_trigger_reaction_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """commit_delivered_reply 不再调用 on_reply_triggered 回调（表情已在生成前贴出）。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="送达测试",
+            interaction_history={"event": "送达", "result": "送达回复", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="测试",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    original_require = nonebot.plugin.require
+
+    def _fake_require(name: str) -> object:
+        if name == "embedding_provider":
+            return _FakeEmbeddingProvider()
+        return original_require(name)
+
+    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+
+    current_message = MessageSchema(
+        user_id="user-commit",
+        user_nickname="commit用户",
+        group_id="group-commit",
+        content="commit测试",
+        timestamp=1.0,
+        message_id="msg-commit",
+    )
+
+    result = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+        )
+    )
+
+    pending_reply = result[0]
+    assert pending_reply is not None
+
+    # 验证 PendingReply 无 on_reply_triggered 字段
+    assert not hasattr(pending_reply, "on_reply_triggered")
+
+    # commit_delivered_reply 应正常执行，不调用已删除的回调
+    asyncio.run(handler.commit_delivered_reply(pending_reply))
+    # 副作用已正常提交（adjust + store_ai_reply + interaction_history）
+    assert len(redis.pushed_messages) >= 1
+
+
+def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """read_buffers阶段异常→ failure.reaction_sent=False。"""
+    redis = _FakeRedisForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = _FakeMemoryForDebug()
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            bot_nickname="小鞠",
+            face_reaction_enabled=True,
+            face_reaction_id="76",
+            error_notify_enabled=False,
+        ),
+    )
+
+    async def _failing_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+        msg = "Redis 读缓冲失败"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(handler, "_read_buffers", _failing_read_buffers)
+
+    current_message = MessageSchema(
+        user_id="user-read",
+        user_nickname="read用户",
+        group_id="group-read",
+        content="read测试",
+        timestamp=1.0,
+        message_id="msg-read",
+    )
+
+    _pending, _stored, failure = asyncio.run(
+        handler._attempt_reply(
+            message=current_message,
+            reply_to_message_id=current_message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+        )
+    )
+
+    assert failure is not None
+    assert failure.stage == "read_buffers"
+    assert failure.reaction_sent is False
