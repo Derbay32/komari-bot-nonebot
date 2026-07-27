@@ -112,7 +112,7 @@ komari-bot/
   komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_sentry ────────────── Sentry 集成
   komari_management ────────── 管理 REST API
-  komari_debug ─────────────── SUPERUSER 调试命令（好感度/绑定/回复干跑/总结诊断）
+  komari_debug ─────────────── SUPERUSER 调试命令（好感度/绑定/回复干跑/总结诊断/失败通知开关）
 ```
 
 ### 数据流路径
@@ -152,6 +152,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
          │         群内默认只发 request ID/状态，`--public` 仅追加二次脱敏摘要
          └─ summary — 调用 group_history_summary.execute_group_summary 共享服务，
                       总结图片与完整诊断报告按顺序私聊 SUPERUSER；群内遵循相同回执/脱敏规则
+         └─ notify — on|off 切换 komari_memory.error_notify_enabled（回复失败 SUPERUSER 通知）
 ```
 
 ## 核心机制详解
@@ -300,6 +301,11 @@ ok, reason = await check_runtime_permission(bot, event, config)
 1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
 2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
 3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储与互动历史写入；主动回复冷却/频控不在这里重复记账
+
+表情反应与失败通知契约：
+- 表情反应在 `_attempt_reply()` 内、调用 `_generate_reply_core()` 之前以 `asyncio.create_task` fire-and-forget 派发（任务引用挂 `self._reaction_tasks` 防 GC），提示“正在生成”；`commit_delivered_reply()` 不再触发表情，送达后不撤下。
+- `_attempt_reply()` 返回 `(PendingReply | None, stored, ReplyFailureInfo | None)`；生成失败（异常、空回复、delta 缺失、预占租约丢失）转为 `ReplyFailureInfo` 而非上抛（CancelledError 除外）；频控冷却/超限/重复等正常控制流返回 `(None, False, None)` 不通知。
+- 失败分流边界是“是否贴过表情”：`report_reply_failure()` 在 `reaction_sent=True` 时以 reply 段引用原消息补发群内固定错误文本，并向 SUPERUSERS 私聊极简诊断卡（trace/群号/触发原因/阶段/异常类型+一行摘要）；Redis key `komari_chat:error_notify:{group_id}:{error_type}` SET NX EX 300 去重，Redis 异常降级照常通知；`error_notify_enabled=false` 仅静默通知，不影响群内错误文本；实现位于 `services/error_notify.py`，善后方法自身绝不抛出。
 
 主动回复频控契约：
 - 非强制回复在生成前调用 Redis Lua 原子预占，同时检查冷却、最近一小时已确认名额与生成中名额；预占 ID 使用平台消息 ID，重复投递不会重复生成。
