@@ -95,7 +95,7 @@ komari-bot/
   embedding_provider ───────── 向量化 + Rerank 服务
   llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
   agent_run_logger ─────────── 单任务 Agent Run JSONL + PostgreSQL 轻索引
-  komari_search ────────────── Tavily 联网搜索服务
+  komari_search ────────────── 联网搜索与网页抓取服务（Tavily / EXA 双提供者）
   user_data ────────────────── 当前好感度 PostgreSQL 服务
 
 核心功能层
@@ -122,7 +122,7 @@ komari-bot/
          ├─ 调用 user_ban 判断是否允许实际聊天回复
          ├─ 调用 komari_memory 获取记忆上下文
          ├─ 调用 komari_decision 判定回复策略
-         ├─ 可选调用 komari_search 工具查询实时信息
+         ├─ 可选调用 komari_search 工具查询实时信息（search_web 搜索 / fetch_page 抓取网页正文）
          ├─ 调用 llm_provider 生成回复
          ├─ 由 agent_run_logger 汇总一条完整 Agent Run 日志
          └─ 调用 komari_memory 写入新记忆
@@ -165,7 +165,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - **线程安全**：唯一工厂注册表仅锁定实例创建；各配置资源使用独立同步/异步锁，互不串行
 - **资源清理**：同步兼容桥的专用事件循环线程在应用关闭时依次关闭连接池、停止循环、join 线程并关闭 loop
 - **管理元数据**：受 `komari_management` 管理的 Schema 必须在 `model_config.json_schema_extra.default_apply_mode` 声明默认 `immediate | rebuild | restart`；例外字段通过 `Field(json_schema_extra={"apply_mode": ...})` 覆盖
-- **秘密字段**：API Token、API Key、密码、凭据和 DSN 必须用 `Field(json_schema_extra={"secret": True})` 显式标记；管理响应中的配置值与可确认生效值均只返回掩码
+- **秘密字段**：API Token、API Key、密码、凭据和 DSN 必须用 `Field(json_schema_extra={"secret": True})` 显式标记；管理响应中的配置值与可确认生效值均只返回掩码（如 `komari_search.search_api_key`）
 - **生效状态**：管理配置详情通过 `field_states` 返回配置来源、生效来源和 `restart_required`；无法观测的启动/服务快照以 `effective_value=null` 表示，禁止宣称已即时生效
 - **使用模式**：
   ```python
@@ -413,6 +413,7 @@ poetry run pytest tests/ -v
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.common.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
+13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
 
 ## 相关文档
 
