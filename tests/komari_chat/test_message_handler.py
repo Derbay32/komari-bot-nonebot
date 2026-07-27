@@ -467,7 +467,10 @@ def test_attempt_reply_only_rewrites_current_message(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda **_kwargs: False),
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
     )
     original_require = nonebot.plugin.require
 
@@ -946,7 +949,10 @@ def test_generate_debug_reply_skips_all_side_effects(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda **_kwargs: False),
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
     )
 
     # 注入必要的全局配置
@@ -1039,7 +1045,10 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda **_kwargs: False),
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -1119,7 +1128,10 @@ def test_generate_debug_reply_with_images_and_reply_context(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda **_kwargs: False),
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
     )
     monkeypatch.setattr(
         message_handler_module,
@@ -1241,7 +1253,10 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
-        SimpleNamespace(is_search_available=lambda **_kwargs: False),
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
     )
     monkeypatch.setattr(
         message_handler_module,

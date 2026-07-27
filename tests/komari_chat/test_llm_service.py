@@ -309,7 +309,7 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "查一下今日新闻"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-search-1",
             caller_user_id="user-1",
             caller_group_id="group-1",
@@ -322,7 +322,7 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     assert searched_trace_ids == ["chat-search-1"]
     assert searched_contexts == [("user-1", "group-1", True)]
     assert fake_provider.completion_calls[0]["tools"] == [
-        llm_service_module.TAVILY_SEARCH_TOOL,
+        llm_service_module.SEARCH_WEB_TOOL,
         llm_service_module.FINAL_RESPONSE_TOOL,
     ]
     search_message = fake_provider.completion_calls[1]["messages"][-1]
@@ -785,7 +785,7 @@ def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> 
             llm_service_module.generate_reply_with_tools(
                 config=_build_config(),
                 messages=[{"role": "user", "content": "查一下"}],
-                tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+                tools=[llm_service_module.SEARCH_WEB_TOOL],
                 request_trace_id="chat-no-final-1",
             )
         )
@@ -831,7 +831,7 @@ def test_generate_reply_with_tools_recovers_when_model_omits_tool_call(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "随便说点"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-omit-1",
         )
     )
@@ -892,7 +892,7 @@ def test_generate_reply_with_tools_retries_invalid_final_response_in_same_sessio
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "再试一次"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-invalid-final-1",
         )
     )
@@ -976,7 +976,7 @@ def test_generate_reply_with_tools_does_not_repeat_successful_search_after_final
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "搜一下新闻"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-no-repeat-search-1",
             max_tool_rounds=3,
         )
@@ -1036,7 +1036,7 @@ def test_generate_reply_with_tools_reports_search_failure_to_model(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "搜一下天气"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-search-failure-1",
         )
     )
@@ -1195,7 +1195,7 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
             messages=[{"role": "user", "content": "看图并查天气"}],
             tools=[
                 llm_service_module.READ_IMAGE_TOOL,
-                llm_service_module.TAVILY_SEARCH_TOOL,
+                llm_service_module.SEARCH_WEB_TOOL,
             ],
             request_trace_id="chat-combined-tools-1",
             base64_images=["base64-image-0"],
@@ -1210,7 +1210,7 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
     assert searched_queries == ["天气"]
     assert fake_provider.completion_calls[0]["tools"] == [
         llm_service_module.READ_IMAGE_TOOL,
-        llm_service_module.TAVILY_SEARCH_TOOL,
+        llm_service_module.SEARCH_WEB_TOOL,
         llm_service_module.FINAL_RESPONSE_TOOL,
     ]
 
@@ -1558,7 +1558,7 @@ def test_execute_tool_loop_records_unknown_tool_in_collector(monkeypatch: Any) -
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "测试未知工具"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             collector=collector,
         )
     )
@@ -1599,7 +1599,7 @@ def test_execute_tool_loop_records_no_tool_calls_in_collector(monkeypatch: Any) 
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "随便说点"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
             collector=collector,
         )
     )
@@ -1628,7 +1628,7 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
             llm_service_module.generate_reply_with_tools(
                 config=_build_config(),
                 messages=[{"role": "user", "content": "查一下"}],
-                tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+                tools=[llm_service_module.SEARCH_WEB_TOOL],
                 max_tool_rounds=2,
                 collector=collector,
             )
@@ -1726,7 +1726,7 @@ def test_search_tool_result_escapes_injection_and_enforces_size_limit(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "查新闻"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
         )
     )
 
@@ -1785,7 +1785,7 @@ def test_tool_loop_rejects_excessive_calls_before_execution(monkeypatch: Any) ->
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "连续搜索"}],
-            tools=[llm_service_module.TAVILY_SEARCH_TOOL],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
         )
     )
 
@@ -1795,3 +1795,333 @@ def test_tool_loop_rejects_excessive_calls_before_execution(monkeypatch: Any) ->
         "工具调用数超过" in str(message.get("content", ""))
         for message in fake_provider.completion_calls[1]["messages"]
     )
+
+
+# ── fetch_page 工具循环测试 ──
+
+
+def test_generate_reply_with_tools_executes_fetch_page_tool_loop(
+    monkeypatch: Any,
+) -> None:
+    """fetch_page 工具成功抓取网页后，模型基于结果生成 final_response。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "fetch_page",
+                    '{"urls":["https://a.example","https://b.example"]}',
+                    {"urls": ["https://a.example", "https://b.example"]},
+                    call_id="call-fetch-1",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "已抓取网页并基于内容回答",
+                        "interaction_history": {
+                            "event": "请求抓取网页",
+                            "result": "抓取后回答",
+                            "emotion": "认真",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+    fetched_urls_list: list[list[str]] = []
+
+    async def _fake_fetch_page(
+        urls: list[str],
+        *,
+        request_trace_id: str | None = None,
+        caller_user_id: str | None = None,
+        caller_group_id: str | None = None,
+        caller_is_superuser: bool = False,
+    ) -> str:
+        del request_trace_id, caller_user_id, caller_group_id, caller_is_superuser
+        fetched_urls_list.append(list(urls))
+        return "[抓取结果] 网页正文内容"
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    monkeypatch.setattr(
+        llm_service_module,
+        "komari_search",
+        SimpleNamespace(fetch_page=_fake_fetch_page),
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "抓取这两个网页"}],
+            tools=[llm_service_module.FETCH_PAGE_TOOL],
+            request_trace_id="chat-fetch-1",
+            caller_user_id="user-1",
+            caller_group_id="group-1",
+            caller_is_superuser=True,
+        )
+    )
+
+    assert result.content == "已抓取网页并基于内容回答"
+    assert fetched_urls_list == [["https://a.example", "https://b.example"]]
+    assert fake_provider.completion_calls[0]["tools"] == [
+        llm_service_module.FETCH_PAGE_TOOL,
+        llm_service_module.FINAL_RESPONSE_TOOL,
+    ]
+    fetch_message = fake_provider.completion_calls[1]["messages"][-1]
+    assert fetch_message["role"] == "tool"
+    assert fetch_message["tool_call_id"] == "call-fetch-1"
+    assert 'source_type="web"' in fetch_message["content"]
+    assert "[抓取结果] 网页正文内容" in fetch_message["content"]
+
+
+def test_generate_reply_with_tools_reports_fetch_page_failure_to_model(
+    monkeypatch: Any,
+) -> None:
+    """fetch_page 返回抓取失败文本时，工具消息包含失败信息，模型继续到 final_response。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "fetch_page",
+                    '{"urls":["https://down.example"]}',
+                    {"urls": ["https://down.example"]},
+                    call_id="call-fetch-fail",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "抓取失败，基于已有信息回答",
+                        "interaction_history": {
+                            "event": "抓取网页失败",
+                            "result": "基于已有信息回答",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+
+    async def _fake_fetch_page(
+        _urls: list[str],
+        *,
+        request_trace_id: str | None = None,
+        caller_user_id: str | None = None,
+        caller_group_id: str | None = None,
+        caller_is_superuser: bool = False,
+    ) -> str:
+        del request_trace_id, caller_user_id, caller_group_id, caller_is_superuser
+        return "[抓取失败：UPSTREAM_ERROR]"
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    monkeypatch.setattr(
+        llm_service_module,
+        "komari_search",
+        SimpleNamespace(fetch_page=_fake_fetch_page),
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "抓取这个网页"}],
+            tools=[llm_service_module.FETCH_PAGE_TOOL],
+            request_trace_id="chat-fetch-failure-1",
+        )
+    )
+
+    assert result.content == "抓取失败，基于已有信息回答"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and "fetch_page" in str(message.get("content", ""))
+        and "[抓取失败：UPSTREAM_ERROR]" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_fetch_page_tool_handles_url_parse_errors(
+    monkeypatch: Any,
+) -> None:
+    """fetch_page 参数 urls 缺失/空数组/全非字符串时，工具消息为抓取失败提示格式。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "fetch_page",
+                    '{"urls":[]}',
+                    {"urls": []},
+                    call_id="call-fetch-empty",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "URL为空已提示",
+                        "interaction_history": {
+                            "event": "空URL抓取",
+                            "result": "提示后回答",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+    fetched_urls_list: list[list[str]] = []
+
+    async def _fake_fetch_page(
+        urls: list[str], **_kwargs: object
+    ) -> str:
+        fetched_urls_list.append(list(urls))
+        return "[抓取结果]"
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+    monkeypatch.setattr(
+        llm_service_module,
+        "komari_search",
+        SimpleNamespace(fetch_page=_fake_fetch_page),
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "抓个空网页"}],
+            tools=[llm_service_module.FETCH_PAGE_TOOL],
+            request_trace_id="chat-fetch-parse-error-1",
+        )
+    )
+
+    assert result.content == "URL为空已提示"
+    assert fetched_urls_list == []
+    tool_message = fake_provider.completion_calls[1]["messages"][-1]
+    assert tool_message["role"] == "tool"
+    assert "[抓取失败：urls 参数缺失或格式错误]" in tool_message["content"]
+
+
+def test_fetch_page_tool_handles_missing_urls_argument(
+    monkeypatch: Any,
+) -> None:
+    """fetch_page 参数完全缺失 urls 字段时，工具消息同样为抓取失败提示。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "fetch_page",
+                    "{}",
+                    {},
+                    call_id="call-fetch-missing",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "缺失URL已提示",
+                        "interaction_history": {
+                            "event": "缺失URL",
+                            "result": "提示后回答",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "抓取一下"}],
+            tools=[llm_service_module.FETCH_PAGE_TOOL],
+            request_trace_id="chat-fetch-missing-urls-1",
+        )
+    )
+
+    assert result.content == "缺失URL已提示"
+    tool_message = fake_provider.completion_calls[1]["messages"][-1]
+    assert "[抓取失败：urls 参数缺失或格式错误]" in tool_message["content"]
+
+
+# ── _build_tool_request_phase_prefix 组合测试 ──
+
+
+def test_build_tool_request_phase_prefix_search_fetch_combination() -> None:
+    """{search_web, fetch_page} 组合 → 'search_fetch_tool'。"""
+    result = llm_service_module._build_tool_request_phase_prefix(
+        [llm_service_module.SEARCH_WEB_TOOL, llm_service_module.FETCH_PAGE_TOOL]
+    )
+    assert result == "search_fetch_tool"
+
+
+def test_build_tool_request_phase_prefix_fetch_only() -> None:
+    """仅 {fetch_page} → 'fetch_tool'。"""
+    result = llm_service_module._build_tool_request_phase_prefix(
+        [llm_service_module.FETCH_PAGE_TOOL]
+    )
+    assert result == "fetch_tool"
+
+
+def test_build_tool_request_phase_prefix_vision_search_fetch() -> None:
+    """{read_image, search_web, fetch_page} 全组合 → 'vision_search_fetch_tool'。"""
+    result = llm_service_module._build_tool_request_phase_prefix(
+        [
+            llm_service_module.READ_IMAGE_TOOL,
+            llm_service_module.SEARCH_WEB_TOOL,
+            llm_service_module.FETCH_PAGE_TOOL,
+        ]
+    )
+    assert result == "vision_search_fetch_tool"
+
+
+def test_build_tool_request_phase_prefix_mixed_tools_falls_back_to_tool() -> None:
+    """混入 profile 等非可组合工具时，回退为 'tool'。"""
+    result = llm_service_module._build_tool_request_phase_prefix(
+        [
+            llm_service_module.READ_PROFILE_TOOL,
+            llm_service_module.SEARCH_WEB_TOOL,
+            llm_service_module.FETCH_PAGE_TOOL,
+        ]
+    )
+    assert result == "tool"
+
+
+def test_build_tool_request_phase_prefix_no_business_tools() -> None:
+    """无业务工具（仅有 final_response / record_favorability_delta）→ 'normal_reply'。"""
+    result = llm_service_module._build_tool_request_phase_prefix(
+        [llm_service_module.FINAL_RESPONSE_TOOL]
+    )
+    assert result == "normal_reply"

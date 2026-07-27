@@ -381,8 +381,16 @@ class _DummySearchPlugin:
         return False
 
     @staticmethod
+    def is_fetch_available(**_kwargs: object) -> bool:
+        return True
+
+    @staticmethod
     async def search_web(_query: str, **_kwargs: object) -> str:
         return "[测试搜索未启用]"
+
+    @staticmethod
+    async def fetch_page(_urls: list[str], **_kwargs: object) -> str:
+        return "[测试抓取结果]"
 
 
 class _DummyEmbeddingPlugin:
