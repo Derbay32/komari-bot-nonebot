@@ -53,10 +53,10 @@ def test_config_schema_default_contains_sentry_logs_level() -> None:
     assert config.sentry_logs_level == "WARNING"
 
 
-def test_send_default_pii_description_warns_about_full_logs() -> None:
+def test_send_default_pii_description_mentions_user_context_and_credential_sanitization() -> None:
+    """send_default_pii 的 description 明确提及 user 上下文和凭据脱敏。"""
     properties = KomariSentryConfigSchema.model_json_schema()["properties"]
     description = properties["send_default_pii"]["description"]
 
-    assert "用户上下文" in description
-    assert "完整日志正文" in description
-    assert "日志属性" in description
+    assert "user 上下文" in description
+    assert "脱敏凭据" in description

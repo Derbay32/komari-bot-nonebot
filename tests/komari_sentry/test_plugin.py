@@ -33,6 +33,18 @@ def _config(*, send_default_pii: bool = False) -> SimpleNamespace:
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_sentry_support_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """每个测试前重置 sentry_support 模块级状态，避免测试间污染。"""
+    import komari_bot.common.sentry_support as ss
+
+    ss._registered_sensitive_values.clear()
+    ss._sensitive_value_collector = None
+    # 还原 set_sensitive_value_collector 的副作用（避免 _collect_sensitive_values
+    # 执行时调用前一次测试注入的 collector）
+    del monkeypatch
+
+
 @pytest.fixture
 def sentry_plugin(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
     del app
@@ -77,6 +89,7 @@ async def test_external_initialized_client_receives_verified_privacy_hooks(
     sentry_plugin: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """外部已初始化 Client：验证隐私钩子安装成功，黑名单脱敏保留诊断但净化凭据。"""
     sdk = _FakeSentrySdk(
         initialized=True,
         options={
@@ -92,22 +105,28 @@ async def test_external_initialized_client_receives_verified_privacy_hooks(
 
     assert sdk.init_calls == []
     transaction_hook = sdk.client.options["before_send_transaction"]
-    sanitized = transaction_hook(
-        {
-            "transaction": "external-transaction-canary",
-            "spans": [{"description": "external-span-canary"}],
+    # 构造包含诊断信息和凭据字段的事务事件
+    event = {
+        "transaction": "external-transaction-canary",
+        "spans": [{"description": "external-span-canary"}],
+        "request": {
+            "headers": {"authorization": "Bearer this-must-be-scrubbed-sentinel"},
         },
-        {},
-    )
-    assert "external-transaction-canary" not in str(sanitized)
-    assert "external-span-canary" not in str(sanitized)
+    }
+    sanitized = transaction_hook(event, {})
+    # 黑名单脱敏：transaction 名和 span description 无条件保留
+    assert "external-transaction-canary" in str(sanitized)
+    assert "external-span-canary" in str(sanitized)
+    # 凭据字段被替换为 [Filtered]
+    assert sanitized["request"]["headers"]["authorization"] == "[Filtered]"
 
 
 @pytest.mark.asyncio
-async def test_external_client_respects_pii_full_log_policy(
+async def test_external_client_preserves_diagnostics_and_scrubs_credentials(
     sentry_plugin: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """外部已初始化 Client（PII 模式）：诊断数据全量保留，凭据字段被净化。"""
     async def _get_config_async() -> SimpleNamespace:
         return _config(send_default_pii=True)
 
@@ -125,12 +144,16 @@ async def test_external_client_respects_pii_full_log_policy(
 
     await sentry_plugin.startup()
 
+    # before_send_log：返回新 dict，内容保留，凭据字段被净化
     log = {
         "body": "external-full-log-canary",
         "attributes": {"user_id": "external-user-canary"},
     }
-    assert sdk.client.options["before_send_log"](log, {}) is log
+    result = sdk.client.options["before_send_log"](log, {})
+    assert result is not log            # 总是返回新 dict 对象
+    assert result == log                 # 内容等价（无敏感字段）
 
+    # before_send：诊断数据全量保留，凭据字段被净化
     issue = {
         "logentry": {
             "message": "external-template-canary",
@@ -138,14 +161,23 @@ async def test_external_client_respects_pii_full_log_policy(
             "params": ["external-param-canary"],
         },
         "request": {"method": "get", "data": "external-request-canary"},
+        "api_key": "sk-proj-this-is-a-long-secret-key-value",
+        "user": {"id": "kept-in-pii-mode"},
     }
     sanitized = sdk.client.options["before_send"](
         issue,
         {"log_record": object()},
     )
+    # logentry 无条件保留
     assert sanitized["logentry"] == issue["logentry"]
-    assert sanitized["request"] == {"method": "GET"}
-    assert "external-request-canary" not in str(sanitized)
+    # request 全量保留（不再只保留 method）
+    assert sanitized["request"] == {"method": "get", "data": "external-request-canary"}
+    # request 中的诊断内容可见
+    assert "external-request-canary" in str(sanitized)
+    # PII 模式下 user 上下文保留
+    assert sanitized.get("user") == {"id": "kept-in-pii-mode"}
+    # 凭据字段名命中黑名单，整值替换为 [Filtered]
+    assert sanitized["api_key"] == "[Filtered]"
 
 
 @pytest.mark.asyncio
@@ -181,10 +213,11 @@ async def test_plugin_initialized_client_has_transaction_privacy_hook(
 
 
 @pytest.mark.asyncio
-async def test_plugin_initialized_client_enables_full_logs_with_pii(
+async def test_plugin_initialized_client_preserves_log_content(
     sentry_plugin: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """插件初始化的 Client（PII 模式）：日志正文保留，凭据字段被净化。"""
     async def _get_config_async() -> SimpleNamespace:
         return _config(send_default_pii=True)
 
@@ -201,4 +234,18 @@ async def test_plugin_initialized_client_enables_full_logs_with_pii(
     }
     before_send_log = sdk.init_calls[0]["before_send_log"]
     assert callable(before_send_log)
-    assert before_send_log(log, {}) is log
+    # 类型收窄：init_calls 的值类型为 object，cast 到 callable
+    before_send_log_fn: Any = before_send_log
+    result = before_send_log_fn(log, {})
+    assert result is not log               # 总是返回新 dict 对象
+    assert result == log                    # 内容等价（无敏感字段）
+
+    # 验证凭据字段仍被净化
+    log_with_cred = {
+        "body": "plugin-cred-log-canary",
+        "attributes": {"custom": "plugin-attribute-canary"},
+        "token": "this-is-a-sensitive-token-value-that-should-be-filtered",
+    }
+    scrubbed = before_send_log_fn(log_with_cred, {})
+    assert scrubbed["token"] == "[Filtered]"
+    assert "plugin-cred-log-canary" in str(scrubbed)
