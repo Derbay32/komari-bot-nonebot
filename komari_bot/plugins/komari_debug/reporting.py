@@ -132,6 +132,10 @@ def _build_safe_tool_arguments(
             query = arguments.get("query")
             if isinstance(query, str):
                 safe["query_chars"] = len(query)
+        case "fetch_page":
+            urls = arguments.get("urls")
+            if isinstance(urls, list):
+                safe["url_count"] = len(urls)
         case "read_profile":
             keys = arguments.get("keys")
             if isinstance(keys, list):

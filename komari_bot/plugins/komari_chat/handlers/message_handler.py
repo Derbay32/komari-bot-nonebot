@@ -47,10 +47,11 @@ from ..services.image_downloader import (
     extract_image_sources,
 )
 from ..services.llm_service import (
+    FETCH_PAGE_TOOL,
     READ_IMAGE_TOOL,
     READ_PROFILE_TOOL,
     RECORD_FAVORABILITY_DELTA_TOOL,
-    TAVILY_SEARCH_TOOL,
+    SEARCH_WEB_TOOL,
     InteractionHistoryRecord,
     ReplyResult,
     generate_reply,
@@ -834,6 +835,13 @@ class MessageHandler:
                 caller_is_superuser=caller_is_superuser,
             )
         )
+        use_fetch_tool = bool(
+            komari_search_plugin.is_fetch_available(
+                caller_user_id=message.user_id,
+                caller_group_id=message.group_id,
+                caller_is_superuser=caller_is_superuser,
+            )
+        )
         allowed_profile_user_ids = {message.user_id}
         allowed_profile_user_ids.update(
             item.user_id
@@ -904,13 +912,16 @@ class MessageHandler:
             interaction_memories=interaction_memories,
             vision_tool_mode=use_vision_tool,
             search_tool_mode=use_search_tool,
+            fetch_tool_mode=use_fetch_tool,
         )
 
         tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
         if use_vision_tool:
             tools.append(READ_IMAGE_TOOL)
         if use_search_tool:
-            tools.append(TAVILY_SEARCH_TOOL)
+            tools.append(SEARCH_WEB_TOOL)
+        if use_fetch_tool:
+            tools.append(FETCH_PAGE_TOOL)
 
         if tools:
             vision_model = ""

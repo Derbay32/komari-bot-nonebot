@@ -41,6 +41,7 @@ komari_search = require("komari_search")
 
 READ_IMAGE_TOOL_NAME = "read_image"
 SEARCH_WEB_TOOL_NAME = "search_web"
+FETCH_PAGE_TOOL_NAME = "fetch_page"
 READ_PROFILE_TOOL_NAME = "read_profile"
 FINAL_RESPONSE_TOOL_NAME = "final_response"
 RECORD_FAVORABILITY_DELTA_TOOL_NAME = "record_favorability_delta"
@@ -80,6 +81,7 @@ _READ_PROFILE_SENSITIVE_CATEGORIES = frozenset({"relation"})
 _TOOL_SOURCE_TYPES: dict[str, UntrustedSourceType] = {
     READ_IMAGE_TOOL_NAME: "vision",
     SEARCH_WEB_TOOL_NAME: "web",
+    FETCH_PAGE_TOOL_NAME: "web",
     READ_PROFILE_TOOL_NAME: "profile",
 }
 
@@ -108,7 +110,7 @@ READ_IMAGE_TOOL: dict[str, Any] = {
     },
 }
 
-TAVILY_SEARCH_TOOL: dict[str, Any] = {
+SEARCH_WEB_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": SEARCH_WEB_TOOL_NAME,
@@ -128,6 +130,32 @@ TAVILY_SEARCH_TOOL: dict[str, Any] = {
                 }
             },
             "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+FETCH_PAGE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": FETCH_PAGE_TOOL_NAME,
+        "description": (
+            "抓取指定网页的正文内容。"
+            "当搜索结果中的摘要不够详细、或用户提供了具体链接需要查看时调用。"
+            "一次调用可传入多个 URL，只传入你确实需要阅读的页面，不要批量抓取所有搜索结果。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string", "format": "uri"},
+                    "minItems": 1,
+                    "maxItems": 5,
+                    "description": "要抓取正文的网页 URL 列表，只传入需要深入阅读的页面",
+                }
+            },
+            "required": ["urls"],
             "additionalProperties": False,
         },
     },
@@ -247,7 +275,8 @@ RECORD_FAVORABILITY_DELTA_TOOL: dict[str, Any] = {
 
 _CANONICAL_TOOLS = {
     READ_IMAGE_TOOL_NAME: READ_IMAGE_TOOL,
-    SEARCH_WEB_TOOL_NAME: TAVILY_SEARCH_TOOL,
+    SEARCH_WEB_TOOL_NAME: SEARCH_WEB_TOOL,
+    FETCH_PAGE_TOOL_NAME: FETCH_PAGE_TOOL,
     READ_PROFILE_TOOL_NAME: READ_PROFILE_TOOL,
     FINAL_RESPONSE_TOOL_NAME: FINAL_RESPONSE_TOOL,
     RECORD_FAVORABILITY_DELTA_TOOL_NAME: RECORD_FAVORABILITY_DELTA_TOOL,
@@ -687,6 +716,53 @@ async def _build_search_tool_result(
     return await komari_search.search_web(query, **search_kwargs)
 
 
+def _parse_fetch_urls(
+    arguments: dict[str, Any] | None,
+    raw_arguments: str,
+) -> list[str] | None:
+    """从工具调用参数中解析网页抓取 URL 列表。"""
+    payload = arguments
+    if payload is None and raw_arguments:
+        try:
+            loaded = json.loads(raw_arguments)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError:
+            return None
+
+    if not payload:
+        return None
+
+    urls_raw = payload.get("urls")
+    if not isinstance(urls_raw, list) or not urls_raw:
+        return None
+    urls = [item.strip() for item in urls_raw if isinstance(item, str) and item.strip()]
+    return urls or None
+
+
+async def _build_fetch_tool_result(
+    *,
+    raw_arguments: str,
+    parsed_arguments: dict[str, Any] | None,
+    request_trace_id: str | None = None,
+    caller_user_id: str | None = None,
+    caller_group_id: str | None = None,
+    caller_is_superuser: bool = False,
+) -> str:
+    """执行 fetch_page 工具并返回工具消息内容。"""
+    urls = _parse_fetch_urls(parsed_arguments, raw_arguments)
+    if urls is None:
+        return "[抓取失败：urls 参数缺失或格式错误]"
+    fetch_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
+    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
+        fetch_kwargs.update(
+            caller_user_id=caller_user_id,
+            caller_group_id=caller_group_id,
+            caller_is_superuser=caller_is_superuser,
+        )
+    return await komari_search.fetch_page(urls, **fetch_kwargs)
+
+
 def _build_tool_call_message(
     tool_calls: list[Any], content: str = ""
 ) -> dict[str, Any]:
@@ -877,15 +953,21 @@ def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
     }
     if not tool_names:
         return "normal_reply"
-    if tool_names == {READ_IMAGE_TOOL_NAME}:
-        return "vision_tool"
-    if tool_names == {SEARCH_WEB_TOOL_NAME}:
-        return "search_tool"
-    if tool_names == {READ_IMAGE_TOOL_NAME, SEARCH_WEB_TOOL_NAME}:
-        return "vision_search_tool"
     if tool_names == {READ_PROFILE_TOOL_NAME}:
         return "profile_tool"
-    return "tool"
+    composable_names = {READ_IMAGE_TOOL_NAME, SEARCH_WEB_TOOL_NAME, FETCH_PAGE_TOOL_NAME}
+    if tool_names & composable_names != tool_names:
+        return "tool"
+    parts: list[str] = []
+    if READ_IMAGE_TOOL_NAME in tool_names:
+        parts.append("vision")
+    if SEARCH_WEB_TOOL_NAME in tool_names:
+        parts.append("search")
+    if FETCH_PAGE_TOOL_NAME in tool_names:
+        parts.append("fetch")
+    if not parts:
+        return "tool"
+    return "_".join([*parts, "tool"])
 
 
 def _build_tool_log_args(tool_call: Any) -> dict[str, Any]:
@@ -966,6 +1048,20 @@ async def _execute_business_tool(
             if content.startswith("[搜索失败"):
                 status = "error"
                 error_summary = "联网搜索失败"
+            else:
+                result_summary = f"result_chars={len(content)}"
+        case "fetch_page":
+            content = await _build_fetch_tool_result(
+                raw_arguments=raw_arguments,
+                parsed_arguments=parsed_arguments,
+                request_trace_id=request_trace_id,
+                caller_user_id=caller_user_id,
+                caller_group_id=caller_group_id,
+                caller_is_superuser=caller_is_superuser,
+            )
+            if content.startswith("[抓取失败"):
+                status = "error"
+                error_summary = "网页抓取失败"
             else:
                 result_summary = f"result_chars={len(content)}"
         case "read_profile":
@@ -1061,6 +1157,7 @@ async def _execute_tool_loop(
     known_business_tool_names: set[str] = {
         READ_IMAGE_TOOL_NAME,
         SEARCH_WEB_TOOL_NAME,
+        FETCH_PAGE_TOOL_NAME,
         READ_PROFILE_TOOL_NAME,
     }
     pending_favorability_delta: int | None = None
