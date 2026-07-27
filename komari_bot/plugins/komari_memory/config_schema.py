@@ -423,6 +423,13 @@ class KomariMemoryConfigSchema(BaseModel):
         description="表情反应的 Face ID（QQ 表情 ID），如 76=赞。仅 face_reaction_enabled=true 时生效",
     )
 
+    # 回复失败通知配置
+    error_notify_enabled: bool = Field(
+        default=True,
+        json_schema_extra={"apply_mode": "immediate"},
+        description="回复生成失败时是否向 SUPERUSER 私聊发送极简诊断通知（群内错误提示不受此开关影响）",
+    )
+
     @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
