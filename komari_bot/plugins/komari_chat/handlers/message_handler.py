@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11.event import Reply
 from nonebot.compat import type_validate_python
+from nonebot.plugin import require
 
 from komari_bot.plugins.komari_decision.services.decision_engine import (
     DecisionEngine,
@@ -21,15 +23,30 @@ from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
     RedisManager,
 )
-from komari_bot.plugins.komari_memory.services.token_counter import (
-    estimate_text_tokens,
-)
+from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..services.image_downloader import download_images_as_base64, extract_image_sources
-from ..services.llm_service import generate_reply
+from ..services.llm_service import (
+    READ_IMAGE_TOOL,
+    READ_PROFILE_TOOL,
+    RECORD_FAVORABILITY_DELTA_TOOL,
+    TAVILY_SEARCH_TOOL,
+    InteractionHistoryRecord,
+    generate_reply,
+    generate_reply_with_tools,
+)
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
+
+user_data_plugin = require("user_data")
+
+config_manager_plugin = require("config_manager")
+komari_search_plugin = require("komari_search")
+llm_provider_config_manager = config_manager_plugin.get_config_manager(
+    "llm_provider",
+    DynamicConfigSchema,
+)
 
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
@@ -46,6 +63,7 @@ ReplyAction = Literal[
     "not_replied",
     "generation_failed",
 ]
+ReplyTriggeredCallback = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -166,9 +184,7 @@ class MessageHandler:
             return None
 
         user_id = (
-            str(reply.sender.user_id)
-            if reply.sender.user_id is not None
-            else None
+            str(reply.sender.user_id) if reply.sender.user_id is not None else None
         )
         user_nickname = (
             str(reply.sender.card or reply.sender.nickname).strip()
@@ -299,6 +315,7 @@ class MessageHandler:
         self,
         bot: Bot,
         event: GroupMessageEvent,
+        on_reply_triggered: ReplyTriggeredCallback | None = None,
     ) -> dict[str, str] | None:
         """处理群聊消息的主流程。"""
         user_id = str(event.user_id)
@@ -384,6 +401,7 @@ class MessageHandler:
             reason=reason,
             reply_score=outcome.reply_score,
             store_current=memory_store,
+            on_reply_triggered=on_reply_triggered,
         )
         if reply is not None:
             reply_action: ReplyAction = (
@@ -419,11 +437,8 @@ class MessageHandler:
         logger.debug("[KomariMemory] 低价值消息已丢弃: {}...", message.content[:30])
 
     async def _handle_normal_message(self, message: MessageSchema) -> None:
-        """处理普通消息（存储缓冲并计数）。"""
+        """处理普通消息（连续追加到当前会话缓冲区）。"""
         await self.redis.push_message(message.group_id, message)
-        await self.redis.increment_message_count(message.group_id)
-        token_count = estimate_text_tokens(message.content)
-        await self.redis.increment_tokens(message.group_id, token_count)
 
     async def _store_ai_reply(
         self,
@@ -447,7 +462,40 @@ class MessageHandler:
         await self.redis.push_message(group_id, bot_message)
         logger.debug("[KomariMemory] AI 回复已存储: {}...", reply_content[:30])
 
-    async def _attempt_reply(
+    async def _write_interaction_history(
+        self,
+        *,
+        message: MessageSchema,
+        new_record: InteractionHistoryRecord,
+        lock_timeout_seconds: int | None,
+    ) -> None:
+        """将本轮互动写入跨群 Redis 原始缓冲。"""
+        del lock_timeout_seconds
+        config = get_config()
+        if not config.global_interaction_enabled:
+            return
+
+        global_record = {
+            "version": 1,
+            "event": str(new_record.get("event", "")).strip(),
+            "result": str(new_record.get("result", "")).strip(),
+            "emotion": str(new_record.get("emotion", "")).strip(),
+            "display_name": self._resolve_display_name(message),
+            "timestamp": time.time(),
+            "message_id": message.message_id,
+        }
+        await self.redis.push_global_interaction(
+            user_id=message.user_id,
+            record=global_record,
+            trigger_size=config.global_interaction_trigger_size,
+        )
+
+    @staticmethod
+    def _resolve_display_name(message: MessageSchema) -> str:
+        """解析写入跨群互动缓冲的用户显示名。"""
+        return str(message.user_nickname or message.user_id).strip() or message.user_id
+
+    async def _attempt_reply(  # noqa: PLR0911
         self,
         *,
         message: MessageSchema,
@@ -460,6 +508,7 @@ class MessageHandler:
         reason: AttemptReplyReason,
         reply_score: float | None,
         store_current: bool,
+        on_reply_triggered: ReplyTriggeredCallback | None = None,
     ) -> tuple[dict[str, str] | None, bool]:
         """尝试生成并返回回复。
 
@@ -482,9 +531,27 @@ class MessageHandler:
                 logger.debug("[KomariMemory] 主动回复频率超限")
                 return None, stored
 
+        if on_reply_triggered is not None:
+            try:
+                await on_reply_triggered()
+            except Exception:
+                logger.debug("[KomariChat] 回复触发表情反应回调失败", exc_info=True)
+
         recent_messages = await self.redis.get_buffer(
-            message.group_id, limit=config.context_messages_limit
+            message.group_id, limit=config.summary_max_buffer_size
         )
+        try:
+            interaction_records = await self.redis.get_global_interaction_buffer(
+                message.user_id,
+                limit=10,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 近期互动原始缓冲读取失败，跳过注入: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+            interaction_records = []
 
         if store_current:
             await self._handle_normal_message(message)
@@ -510,6 +577,33 @@ class MessageHandler:
             limit=config.memory_search_limit,
             query_embedding=query_embedding,
         )
+        try:
+            interaction_memories = await self.memory.search_interaction_events(
+                user_id=message.user_id,
+                query=rewritten_query,
+                limit=config.memory_search_limit,
+                query_embedding=query_embedding,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 长期互动事件记忆检索失败，跳过注入: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+            interaction_memories = []
+
+        try:
+            current_user_profile = await self.memory.get_user_profile(
+                user_id=message.user_id,
+                group_id=message.group_id,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 当前用户画像读取失败，跳过注入: user={}",
+                message.user_id,
+                exc_info=True,
+            )
+            current_user_profile = None
 
         request_trace_id = f"chat-{message.message_id}"
         base64_image_urls: list[str] | None = None
@@ -520,6 +614,11 @@ class MessageHandler:
             reply_image_urls = await download_images_as_base64(
                 list(reply_context.image_sources)
             )
+        all_base64_images = (reply_image_urls or []) + (base64_image_urls or [])
+        use_vision_tool = getattr(config, "vision_tool_enabled", True) and bool(
+            all_base64_images
+        )
+        use_search_tool = bool(komari_search_plugin.is_search_available())
 
         if reply_context_requested:
             logger.info(
@@ -537,7 +636,7 @@ class MessageHandler:
 
         if image_urls or reply_image_urls:
             logger.info(
-                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={}",
+                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} vision_tool_mode={}",
                 request_trace_id,
                 message.group_id,
                 message.message_id,
@@ -549,7 +648,14 @@ class MessageHandler:
                 sum(len(url) for url in (reply_image_urls or []))
                 + sum(len(url) for url in (base64_image_urls or [])),
                 len(memories),
+                use_vision_tool,
             )
+
+        try:
+            favorability = await user_data_plugin.get_user_favorability(message.user_id)
+        except Exception as exc:
+            logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
+            return None, stored
 
         prompt_messages = await build_prompt(
             user_message=message.content,
@@ -565,13 +671,57 @@ class MessageHandler:
             reply_context=reply_context,
             reply_image_urls=reply_image_urls,
             query_embedding=query_embedding,
+            favorability=favorability,
+            current_user_profile=current_user_profile,
+            interaction_records=interaction_records,
+            interaction_memories=interaction_memories,
+            vision_tool_mode=use_vision_tool,
+            search_tool_mode=use_search_tool,
         )
 
-        reply = await generate_reply(
-            config=config,
-            messages=prompt_messages,
-            request_trace_id=request_trace_id,
-        )
+        tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
+        if use_vision_tool:
+            tools.append(READ_IMAGE_TOOL)
+        if use_search_tool:
+            tools.append(TAVILY_SEARCH_TOOL)
+
+        if tools:
+            vision_model = ""
+            vision_temperature = 0.3
+            vision_max_tokens = 1024
+            vision_thinking_mode = False
+            vision_reasoning_effort = ""
+            if use_vision_tool:
+                vision_config = llm_provider_config_manager.get()
+                vision_model = vision_config.vision_model
+                vision_temperature = vision_config.vision_temperature
+                vision_max_tokens = vision_config.vision_max_tokens
+                vision_thinking_mode = vision_config.vision_thinking_mode
+                vision_reasoning_effort = vision_config.vision_reasoning_effort
+
+            reply_result = await generate_reply_with_tools(
+                config=config,
+                messages=prompt_messages,
+                tools=tools,
+                request_trace_id=request_trace_id,
+                base64_images=all_base64_images if use_vision_tool else None,
+                vision_model=vision_model,
+                vision_temperature=vision_temperature,
+                vision_max_tokens=vision_max_tokens,
+                max_tool_rounds=5,
+                memory_service=self.memory,
+                group_id=message.group_id,
+                max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
+                vision_thinking_mode=vision_thinking_mode,
+                vision_reasoning_effort=vision_reasoning_effort,
+            )
+        else:
+            reply_result = await generate_reply(
+                config=config,
+                messages=prompt_messages,
+                request_trace_id=request_trace_id,
+            )
+        reply = reply_result.content
         if reply is None:
             logger.warning(
                 "[KomariMemory] 回复生成失败: group={} reason={} score={}",
@@ -581,11 +731,61 @@ class MessageHandler:
             )
             return None, stored
 
+        if reply_result.favorability_delta is None:
+            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
+            return None, stored
+
+        logger.debug(
+            "[KomariChat] 准备提交好感度变化: group={} user={} delta={} reason={}",
+            message.group_id,
+            message.user_id,
+            reply_result.favorability_delta,
+            reply_result.favorability_reason or "-",
+        )
+        try:
+            adjust_result = await user_data_plugin.adjust_user_favorability(
+                message.user_id,
+                reply_result.favorability_delta,
+            )
+            logger.info(
+                "[KomariChat] 好感度已更新: user={} before={} delta={} after={} reason={}",
+                message.user_id,
+                adjust_result.before,
+                adjust_result.delta,
+                adjust_result.after,
+                reply_result.favorability_reason or "-",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[KomariChat] 好感度提交失败，按生成失败处理: "
+                "group={} user={} delta={} reason={} error_type={} error={}",
+                message.group_id,
+                message.user_id,
+                reply_result.favorability_delta,
+                reply_result.favorability_reason or "-",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            return None, stored
+
         await self._store_ai_reply(
             group_id=message.group_id,
             reply_content=reply,
             bot_nickname=config.bot_nickname,
         )
+        try:
+            await self._write_interaction_history(
+                message=message,
+                new_record=reply_result.interaction_history,
+                lock_timeout_seconds=config.memory_agent_lock_timeout_seconds,
+            )
+        except Exception:
+            logger.debug(
+                "[KomariChat] 互动历史写入失败（非致命）: user={}",
+                message.user_id,
+                exc_info=True,
+            )
         if not force_reply:
             await self.redis.set_cooldown(message.group_id, config.proactive_cooldown)
             await self.redis.increment_proactive_count(message.group_id)

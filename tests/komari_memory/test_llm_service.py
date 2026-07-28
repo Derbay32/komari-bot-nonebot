@@ -1,9 +1,8 @@
-"""KomariMemory 总结分段测试。"""
-
-from __future__ import annotations
+"""KomariMemory 对话总结 LLM 服务测试。"""
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
@@ -13,45 +12,46 @@ from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchem
 
 
 class _FakeLLMProvider:
-    def __init__(self, responses: list[dict[str, Any]]) -> None:
+    def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
-        self.prompts: list[str] = []
+        self.messages_calls: list[dict[str, Any]] = []
+        self.completion_calls: list[dict[str, Any]] = []
+        self.text_calls: list[dict[str, Any]] = []
 
-    async def generate_text(self, **kwargs: Any) -> str:
-        self.prompts.append(str(kwargs["prompt"]))
+    async def generate_text_with_messages(self, **kwargs: Any) -> str:
+        self.messages_calls.append(kwargs)
         if not self._responses:
             raise AssertionError
-        return json.dumps(self._responses.pop(0), ensure_ascii=False)
+        response = self._responses.pop(0)
+        if response == "__raise__":
+            raise RuntimeError("boom")
+        return response
 
-
-class _DynamicChunkFakeLLMProvider:
-    def __init__(self) -> None:
-        self.prompts: list[str] = []
-        self._chunk_index = 0
+    async def generate_messages_completion(self, **kwargs: Any) -> Any:
+        self.completion_calls.append(kwargs)
+        return SimpleNamespace(tool_calls=[])
 
     async def generate_text(self, **kwargs: Any) -> str:
-        prompt = str(kwargs["prompt"])
-        self.prompts.append(prompt)
-        if "按时间顺序排列的分段总结" in prompt:
-            return json.dumps(
-                {
-                    "summary": "最终总结",
-                    "user_profile_operations": [],
-                    "user_interaction_operations": [],
-                    "importance": 5,
-                },
-                ensure_ascii=False,
-            )
+        self.text_calls.append(kwargs)
+        if not self._responses:
+            raise AssertionError
+        return self._responses.pop(0)
 
-        self._chunk_index += 1
-        return json.dumps(
-            {
-                "summary": f"第{self._chunk_index}段总结",
-                "user_profile_operations": [],
-                "user_interaction_operations": [],
-                "importance": 3,
-            },
-            ensure_ascii=False,
+
+class _ToolFakeLLMProvider(_FakeLLMProvider):
+    async def generate_messages_completion(self, **kwargs: Any) -> Any:
+        self.completion_calls.append(kwargs)
+        return SimpleNamespace(
+            tool_calls=[
+                SimpleNamespace(
+                    function=SimpleNamespace(name="output_summary_result"),
+                    parsed_arguments={
+                        "memories": [
+                            {"content": "工具调用生成了一条有效总结记忆", "importance": 4}
+                        ]
+                    },
+                )
+            ]
         )
 
 
@@ -61,7 +61,6 @@ def _make_config(**overrides: Any) -> KomariMemoryConfigSchema:
         "llm_model_summary": "summary-model",
         "llm_temperature_summary": 0.3,
         "llm_max_tokens_summary": 2048,
-        "summary_chunk_token_limit": 3000,
     }
     base.update(overrides)
     return KomariMemoryConfigSchema(**base)
@@ -89,26 +88,24 @@ async def _run_summarize_conversation(
     *,
     messages: list[MessageSchema],
     config: KomariMemoryConfigSchema,
-    existing_profiles: list[dict[str, Any]] | None = None,
-    existing_interactions: list[dict[str, Any]] | None = None,
+    participants: list[str] | None = None,
+    display_name_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return await summarize_conversation(
         messages=messages,
         config=config,
-        existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
+        participants=participants or ["10001"],
+        display_name_map=display_name_map or {"10001": "阿明"},
     )
 
 
-def test_summarize_conversation_single_chunk_uses_one_request(monkeypatch: Any) -> None:
+def test_summarize_conversation_uses_json_mode_messages(monkeypatch: Any) -> None:
     fake_provider = _FakeLLMProvider(
         [
-            {
-                "summary": "一次总结",
-                "user_profile_operations": [],
-                "user_interaction_operations": [],
-                "importance": 4,
-            }
+            json.dumps(
+                {"memories": [{"content": "大家约好周末一起吃拉面。", "importance": 4}]},
+                ensure_ascii=False,
+            )
         ]
     )
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
@@ -116,324 +113,140 @@ def test_summarize_conversation_single_chunk_uses_one_request(monkeypatch: Any) 
     result = asyncio.run(
         _run_summarize_conversation(
             messages=[
-                _make_message(content="今天一起吃拉面吧"),
-                _make_message(
-                    content="好呀，我还想顺便聊聊新番",
-                    user_id="10002",
-                    user_nickname="小绿",
-                ),
+                _make_message(content="周末一起吃拉面吧"),
+                _make_message(content="好呀", user_id="10002", user_nickname="小绿"),
             ],
-            config=_make_config(summary_chunk_token_limit=5000),
+            config=_make_config(),
+            participants=["10001", "10002"],
+            display_name_map={"10001": "阿明", "10002": "小绿"},
         )
     )
 
-    assert result["summary"] == "一次总结"
-    assert len(fake_provider.prompts) == 1
-    assert "按时间顺序排列的分段总结" not in fake_provider.prompts[0]
+    assert result == {"memories": [{"content": "大家约好周末一起吃拉面。", "importance": 4}]}
+    assert len(fake_provider.messages_calls) == 1
+    call = fake_provider.messages_calls[0]
+    assert call["response_format"] == {"type": "json_object"}
+    assert call["request_phase"] == "summary_json_mode"
+    messages = call["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["content"] == (
+        "【群聊记录】\n"
+        "[user_id:10001] 阿明: 周末一起吃拉面吧\n"
+        "[user_id:10002] 小绿: 好呀\n\n"
+        '【参与用户 user_id】\n["10001", "10002"]\n\n'
+        '【昵称映射】\n{"10001": "阿明", "10002": "小绿"}\n\n'
+        "请生成对话总结。"
+    )
+    assert "summary_workflow" not in messages[2]["content"]
 
 
-def test_summarize_conversation_chunks_then_merges(monkeypatch: Any) -> None:
-    fake_provider = _DynamicChunkFakeLLMProvider()
+def test_summarize_conversation_falls_back_to_tool_calling(monkeypatch: Any) -> None:
+    fake_provider = _ToolFakeLLMProvider(["不是 JSON"])
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
 
     result = asyncio.run(
         _run_summarize_conversation(
-            messages=[
-                _make_message(content="甲" * 1400),
-                _make_message(content="乙" * 1400, user_id="10002", user_nickname="小绿"),
-            ],
-            config=_make_config(summary_chunk_token_limit=2200),
-            existing_profiles=[
-                {
-                    "user_id": "10001",
-                    "display_name": "阿明",
-                    "traits": {"喜欢的饮料": {"value": "可乐", "category": "preference"}},
-                }
-            ],
-            existing_interactions=[
-                {
-                    "user_id": "10001",
-                    "display_name": "阿明",
-                    "summary": "喜欢被投喂",
-                    "records": [
-                        {
-                            "event": "递来零食",
-                            "result": "悄悄靠近",
-                            "emotion": "有点开心",
-                        }
-                    ],
-                }
-            ],
+            messages=[_make_message(content="今天讨论了知识库维护方式")],
+            config=_make_config(),
         )
     )
 
-    raw_prompts = [
-        prompt
-        for prompt in fake_provider.prompts
-        if "按时间顺序排列的分段总结" not in prompt
-    ]
-    merge_prompts = [
-        prompt
-        for prompt in fake_provider.prompts
-        if "按时间顺序排列的分段总结" in prompt
-    ]
-
-    assert result["summary"] == "最终总结"
-    assert len(raw_prompts) >= 2
-    assert len(merge_prompts) == 1
-    assert all("【已知用户画像" not in prompt for prompt in raw_prompts)
-    assert "【分段1/" in merge_prompts[0]
+    assert result["memories"][0]["content"] == "工具调用生成了一条有效总结记忆"
+    assert len(fake_provider.messages_calls) == 1
+    assert len(fake_provider.completion_calls) == 1
+    completion_call = fake_provider.completion_calls[0]
+    assert completion_call["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "output_summary_result"},
+    }
+    assert completion_call["parallel_tool_calls"] is False
 
 
-def test_chunk_formatted_messages_splits_oversized_single_message() -> None:
-    chunks, oversized_message_split = llm_service_module._chunk_formatted_messages(
-        messages=[_make_message(content="超长内容" * 900)],
-        config=_make_config(summary_chunk_token_limit=2200),
-    )
-
-    all_lines = [line for chunk in chunks for line in chunk.lines]
-
-    assert oversized_message_split is True
-    assert len(chunks) >= 2
-    assert all(chunk.lines for chunk in chunks)
-    assert any("[分片1]" in line for line in all_lines)
-
-
-def test_existing_context_builder_trims_to_budget() -> None:
-    result = llm_service_module._build_existing_context_with_budget(
-        existing_profiles=[
-            {
-                "user_id": f"{10001 + index}",
-                "display_name": f"阿明{index}",
-                "traits": {
-                    f"特征{i}": {
-                        "value": "很长的描述" * 40,
-                        "category": "general",
-                        "importance": 5,
-                        "updated_at": f"2026-03-21T00:00:{i:02d}+08:00",
-                    }
-                    for i in range(10)
-                },
-            }
-            for index in range(4)
-        ],
-        existing_interactions=[
-            {
-                "user_id": "10001",
-                "display_name": "阿明",
-                "summary": "最近会投喂我",
-                "records": [
-                    {
-                        "event": "递来布丁",
-                        "result": "悄悄靠近",
-                        "emotion": "很开心",
-                    }
-                ],
-            }
-        ],
-        token_budget=2200,
-    )
-
-    assert result.estimated_tokens <= 2200
-    assert result.included_profiles >= 1
-    assert result.truncated is True
-
-
-def test_build_summary_prompt_uses_template_content(monkeypatch: Any) -> None:
-    monkeypatch.setattr(
-        llm_service_module,
-        "get_summary_template",
-        lambda: {
-            "summary_prompt": "前缀\n{{conversation_text}}\n{{existing_context}}\n{{json_response_example}}",
-            "merge_prompt": "不会用到",
-            "existing_context_instruction_block": "不会用到",
-            "existing_profiles_header": "不会用到",
-            "existing_interactions_header": "不会用到",
-            "truncated_context_marker": "不会用到",
-            "json_response_example": '{"ok": true}',
-        },
-    )
-
-    prompt = llm_service_module._build_summary_prompt(
-        "对话正文",
-        existing_context="已有上下文\n",
-    )
-
-    assert prompt == '前缀\n对话正文\n已有上下文\n\n{"ok": true}'
-
-
-def test_build_summary_prompt_uses_operation_contract() -> None:
-    prompt = llm_service_module._build_summary_prompt("对话正文")
-
-    assert "user_profile_operations" in prompt
-    assert "user_interaction_operations" in prompt
-    assert "add / replace / delete" in prompt
-    assert "你输出的是“增量操作”" in prompt
-    assert "`field` 只允许：trait" in prompt
-    assert "绝对不要尝试修改它" in prompt
-    assert "严禁为 `[bot]` 消息" in prompt
-
-
-def test_normalize_profile_operations_drops_display_name_operations() -> None:
-    normalized = llm_service_module._normalize_user_operation_payloads(
-        [
-            {
-                "user_id": "10001",
-                "display_name": "阿明",
-                "operations": [
-                    {"op": "replace", "field": "display_name", "value": "新名字"},
-                    {
-                        "op": "replace",
-                        "field": "trait",
-                        "key": "喜欢的食物",
-                        "value": "拉面",
-                        "category": "preference",
-                        "importance": 4,
-                    },
-                ],
-            }
-        ],
-        operation_type="profile",
-    )
-
-    assert len(normalized) == 1
-    assert normalized[0]["display_name"] == "阿明"
-    assert normalized[0]["operations"] == [
-        {
-            "op": "replace",
-            "field": "trait",
-            "key": "喜欢的食物",
-            "value": "拉面",
-            "category": "preference",
-            "importance": 4,
-        }
-    ]
-
-
-def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> None:
-    monkeypatch.setattr(
-        llm_service_module,
-        "get_summary_template",
-        lambda: {
-            "summary_prompt": "不会用到",
-            "merge_prompt": "不会用到",
-            "existing_context_instruction_block": "自定义指示",
-            "existing_profiles_header": "自定义画像头",
-            "existing_interactions_header": "自定义互动头",
-            "truncated_context_marker": "自定义截断提示",
-            "json_response_example": "不会用到",
-        },
-    )
-
-    result = llm_service_module._build_existing_context_with_budget(
-        existing_profiles=[
-            {
-                "user_id": "10001",
-                "display_name": "阿明",
-                "traits": [{"key": "喜好", "value": "拉面", "category": "preference"}],
-            }
-        ],
-        existing_interactions=[
-            {
-                "user_id": "10001",
-                "display_name": "阿明",
-                "summary": "会被拉面钓走",
-                "records": [
-                    {
-                        "event": "递来拉面",
-                        "result": "马上靠近",
-                        "emotion": "很开心",
-                    }
-                ],
-            }
-        ],
-        token_budget=None,
-    )
-
-    assert "自定义画像头" in result.text
-    assert "自定义互动头" in result.text
-    assert "自定义指示" in result.text
-
-
-def test_summarize_conversation_single_chunk_trims_existing_context_to_fit_limit(
-    monkeypatch: Any,
-) -> None:
+def test_summarize_conversation_falls_back_to_direct_output(monkeypatch: Any) -> None:
     fake_provider = _FakeLLMProvider(
         [
-            {
-                "summary": "一次总结",
-                "user_profile_operations": [],
-                "user_interaction_operations": [],
-                "importance": 4,
-            }
+            "不是 JSON",
+            '```json\n{"memories": [{"content": "直接输出兜底解析成功的总结记忆", "importance": 5}]}\n```',
         ]
     )
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    config = _make_config(summary_chunk_token_limit=4000)
 
-    asyncio.run(
+    result = asyncio.run(
         _run_summarize_conversation(
-            messages=[_make_message(content="今天一起吃拉面吧")],
-            config=config,
-            existing_profiles=[
-                {
-                    "user_id": "10001",
-                    "display_name": "阿明",
-                    "traits": {
-                        f"特征{i}": {
-                            "value": "很长的描述" * 50,
-                            "category": "general",
-                            "importance": 5,
-                            "updated_at": f"2026-03-21T00:00:{i:02d}+08:00",
-                        }
-                        for i in range(12)
-                    },
-                }
-            ],
+            messages=[_make_message(content="群里决定今晚修复总结逻辑")],
+            config=_make_config(),
         )
     )
 
-    assert len(fake_provider.prompts) == 1
-    assert len(fake_provider.prompts[0]) <= config.summary_chunk_token_limit
+    assert result == {
+        "memories": [{"content": "直接输出兜底解析成功的总结记忆", "importance": 5}]
+    }
+    assert [call["request_phase"] for call in fake_provider.messages_calls] == [
+        "summary_json_mode",
+        "summary_direct_output",
+    ]
 
 
-def test_normalize_summary_result_converts_legacy_payload_to_operations() -> None:
+def test_normalize_summary_result_filters_and_limits_memories() -> None:
     normalized = llm_service_module._normalize_summary_result(
         {
-            "summary": "一次总结",
-            "user_profiles": [
-                {
-                    "user_id": "10001",
-                    "display_name": "阿明",
-                    "traits": [
-                        {
-                            "key": "喜欢的食物",
-                            "value": "拉面",
-                            "category": "preference",
-                            "importance": 4,
-                        }
-                    ],
-                }
+            "memories": [
+                {"content": "太短", "importance": 5},
+                {"content": "这是一条有效的总结记忆", "importance": 9},
+                {"content": "这是一条有效的总结记忆", "importance": 1},
+                *[
+                    {"content": f"额外有效总结记忆第{index}条", "importance": "坏值"}
+                    for index in range(10)
+                ],
             ],
-            "user_interactions": [
-                {
-                    "user_id": "10001",
-                    "display_name": "阿明",
-                    "summary": "会被拉面钓走",
-                    "records": [
-                        {
-                            "event": "递来拉面",
-                            "result": "马上靠近",
-                            "emotion": "很开心",
-                        }
-                    ],
-                }
-            ],
-            "importance": 4,
+            "summary": "旧字段应被忽略",
+            "user_interaction_operations": [{"旧字段": "应被忽略"}],
         }
     )
 
-    assert len(normalized["user_profile_operations"][0]["operations"]) == 1
-    assert normalized["user_profile_operations"][0]["operations"][0]["field"] == "trait"
-    assert normalized["user_interaction_operations"][0]["operations"][0]["field"] == "summary"
-    assert normalized["user_interaction_operations"][0]["operations"][1]["field"] == "record"
+    assert len(normalized["memories"]) == 8
+    assert normalized["memories"][0] == {"content": "这是一条有效的总结记忆", "importance": 5}
+    assert all(set(memory) == {"content", "importance"} for memory in normalized["memories"])
+
+
+def test_build_summary_messages_keeps_profile_agent_user_prefix(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        llm_service_module,
+        "get_summary_template",
+        lambda: {
+            "memory_summary_common_system": "共用系统提示",
+            "summary_workflow_system": "工作流 {{json_response_example}}",
+            "json_response_example": '{"memories": []}',
+        },
+    )
+
+    messages = llm_service_module._build_summary_messages(
+        conversation_text="[user_id:10001] 阿明: 你好",
+        participants=["10001"],
+        display_name_map={"10001": "阿明"},
+    )
+
+    assert messages[0] == {"role": "system", "content": "共用系统提示"}
+    assert messages[1]["content"].startswith(
+        "【群聊记录】\n[user_id:10001] 阿明: 你好\n\n"
+        '【参与用户 user_id】\n["10001"]\n\n'
+        '【昵称映射】\n{"10001": "阿明"}'
+    )
+    assert messages[1]["content"].endswith("请生成对话总结。")
+    assert messages[2] == {"role": "system", "content": '工作流 {"memories": []}'}
+
+
+def test_generate_reply_marks_memory_reply_phase(monkeypatch: Any) -> None:
+    fake_provider = _FakeLLMProvider(["<content>记忆回复</content>"])
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    async def _run() -> str:
+        return await llm_service_module.generate_reply(
+            config=_make_config(response_tag="content"),
+            messages=[{"role": "user", "content": "你好"}],
+        )
+
+    result = asyncio.run(_run())
+
+    assert result == "记忆回复"
+    assert fake_provider.messages_calls[0]["request_phase"] == "memory_reply"

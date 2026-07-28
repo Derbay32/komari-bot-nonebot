@@ -24,9 +24,14 @@ from .handlers.forgetting_worker import (
     register_forgetting_task,
     unregister_forgetting_task,
 )
+from .handlers.interaction_event_worker import (
+    register_interaction_event_task,
+    unregister_interaction_event_task,
+)
 from .handlers.summary_worker import register_summary_task, unregister_summary_task
 from .repositories.conversation_repository import ConversationRepository
 from .repositories.entity_repository import EntityRepository
+from .repositories.interaction_event_repository import InteractionEventRepository
 from .services.config_interface import get_config
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
@@ -81,15 +86,22 @@ class PluginManager:
             # 3. 初始化数据访问层
             conversation_repo = ConversationRepository(self.pg_pool)
             entity_repo = EntityRepository(self.pg_pool)
+            interaction_event_repo = InteractionEventRepository(self.pg_pool)
             # 4. 初始化记忆服务
-            self.memory = MemoryService(self.config, conversation_repo, entity_repo)
+            self.memory = MemoryService(
+                self.config,
+                conversation_repo,
+                entity_repo,
+                interaction_event_repo,
+            )
 
             # 5. 注册总结定时任务
             register_summary_task(self.redis, self.memory)
 
             # 6. 初始化忘却服务并注册定时任务
             self.forgetting = ForgettingService(self.config, self.pg_pool)
-            register_forgetting_task(self.forgetting)
+            register_forgetting_task(self.forgetting, self.redis)
+            register_interaction_event_task(self.redis, self.memory)
         except Exception:
             logger.exception("[KomariMemory] 初始化失败")
             try:
@@ -145,7 +157,14 @@ class PluginManager:
 
         await ensure_vector_column_dimension(
             self.pg_pool,
-            table_name="komari_memory_conversations",
+            table_name="komari_memory_conversation_embeddings",
+            column_name="embedding",
+            expected_dimension=expected_dimension,
+            label="KomariMemory",
+        )
+        await ensure_vector_column_dimension(
+            self.pg_pool,
+            table_name="komari_memory_interaction_embeddings",
             column_name="embedding",
             expected_dimension=expected_dimension,
             label="KomariMemory",
@@ -156,6 +175,7 @@ class PluginManager:
         # 取消定时任务
         unregister_summary_task()
         unregister_forgetting_task()
+        unregister_interaction_event_task()
         # 清理记忆服务
         if self.memory:
             await self.memory.cleanup()

@@ -10,6 +10,7 @@ import nonebot
 import pytest
 from pydantic import BaseModel
 
+from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
     ManagementApiComponents,
@@ -44,8 +45,8 @@ class _DummyConfigModel(BaseModel):
 
 class _DummyConfigManager:
     @property
-    def config_file(self) -> Path:
-        return Path("/tmp/komari_management.json")
+    def config_source(self) -> str:
+        return "postgres:komari_plugin_configs/komari_management"
 
     def get(self) -> BaseModel:
         return _DummyConfigModel()
@@ -54,7 +55,7 @@ class _DummyConfigManager:
         del field_name, value
         return self.get()
 
-    def reload_from_json(self) -> BaseModel:
+    def reload(self) -> BaseModel:
         return self.get()
 
 
@@ -62,6 +63,8 @@ def _build_components() -> ManagementApiComponents:
     return ManagementApiComponents(
         register_knowledge_api=register_knowledge_api,
         knowledge_engine_getter=lambda: None,
+        register_help_api=register_help_api,
+        help_engine_getter=lambda: None,
         register_memory_api=register_memory_api,
         memory_service_getter=lambda: None,
         register_llm_provider_api=register_llm_provider_api,
@@ -77,8 +80,8 @@ def _build_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name="Komari Chat Prompt",
-                file_path=Path("config") / "prompts" / "komari_memory.yaml",
                 defaults={"system_prompt": "默认值"},
+                legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
             ),
         ),
     )
@@ -114,6 +117,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
 
     schema = schema_response.json()
     assert "/api/komari-knowledge/v1/knowledge" in schema["paths"]
+    assert "/api/komari-help/v1/help" in schema["paths"]
     assert "/api/komari-memory/v1/conversations" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
     assert "/api/komari-management-config/v1/resources" in schema["paths"]
@@ -126,6 +130,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     }
     assert {
         "komari-knowledge",
+        "komari-help",
         "komari-memory",
         "llm-provider",
         "komari-management-config",

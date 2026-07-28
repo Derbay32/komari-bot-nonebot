@@ -134,6 +134,12 @@ def test_list_logs_supports_filters_and_empty_directory(tmp_path: Path) -> None:
 def test_get_log_returns_detail_and_handles_invalid_date_and_missing_line(
     tmp_path: Path,
 ) -> None:
+    full_input = {
+        "trace_id": "chat-1",
+        "phase": "reply",
+        "prompt": "完整 prompt",
+        "messages": [{"role": "user", "content": "完整消息"}],
+    }
     _write_jsonl(
         tmp_path / "2026-04-10.jsonl",
         [
@@ -142,20 +148,24 @@ def test_get_log_returns_detail_and_handles_invalid_date_and_missing_line(
                     "timestamp": "2026-04-10T11:00:00+00:00",
                     "method": "generate_text_with_messages",
                     "model": "deepseek-chat",
-                    "input": {"trace_id": "chat-1", "phase": "reply"},
+                    "input": full_input,
                     "output": "<content>你好</content>",
+                    "reasoning_content": "完整思考内容",
                 },
                 ensure_ascii=False,
             )
         ],
     )
+    tmp_path.chmod(0o700)
     reader = ReplyLogReader(log_dir=tmp_path)
 
     detail = asyncio.run(reader.get_log(date="2026-04-10", line_number=1))
     missing = asyncio.run(reader.get_log(date="2026-04-10", line_number=99))
 
     assert detail is not None
+    assert detail["input"] == full_input
     assert detail["output"] == "<content>你好</content>"
+    assert detail["reasoning_content"] == "完整思考内容"
     assert missing is None
     with pytest.raises(ValueError):
         asyncio.run(reader.list_logs(date="20260410"))

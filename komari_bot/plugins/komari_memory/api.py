@@ -17,6 +17,9 @@ from .api_models import (
     ConversationEntry,
     ConversationListResponse,
     ConversationUpdateRequest,
+    InteractionEventEntry,
+    InteractionEventListResponse,
+    InteractionEventUpdateRequest,
     MemoryEntityEntry,
     MemoryEntityListResponse,
 )
@@ -140,6 +143,22 @@ class MemoryServiceProtocol(Protocol):
         group_id: str,
     ) -> bool: ...
 
+    async def get_interaction_event_entry(
+        self,
+        event_id: int,
+    ) -> dict[str, Any] | None: ...
+
+    async def update_interaction_event_entry(
+        self,
+        event_id: int,
+        *,
+        event_summary: str | None = None,
+        importance_initial: int | None = None,
+        importance_current: int | None = None,
+    ) -> dict[str, Any] | None: ...
+
+    async def delete_interaction_event_entry(self, event_id: int) -> bool: ...
+
 
 def _validation_error(message: str) -> HTTPException:
     return HTTPException(
@@ -176,6 +195,10 @@ def _user_profile_not_found(group_id: str, user_id: str) -> HTTPException:
 
 def _interaction_history_not_found(group_id: str, user_id: str) -> HTTPException:
     return _not_found(f"未找到 group={group_id} user={user_id} 的互动历史")
+
+
+def _interaction_event_not_found(event_id: int) -> HTTPException:
+    return _not_found(f"未找到 ID={event_id} 的互动事件记忆")
 
 
 def _build_service_dependency(
@@ -221,6 +244,23 @@ def _ensure_payload_user_id(payload: dict[str, Any], user_id: str) -> None:
         return
     if str(payload_user_id) != user_id:
         raise _user_id_mismatch_error()
+
+
+def _resolve_interaction_event_patch_params(
+    payload: InteractionEventUpdateRequest,
+) -> dict[str, Any]:
+    fields_set = payload.model_fields_set
+    if not fields_set:
+        raise _validation_error("至少提供一个要更新的字段")
+    return {
+        "event_summary": payload.event_summary if "event_summary" in fields_set else None,
+        "importance_initial": (
+            payload.importance_initial if "importance_initial" in fields_set else None
+        ),
+        "importance_current": (
+            payload.importance_current if "importance_current" in fields_set else None
+        ),
+    }
 
 
 def create_memory_router(
@@ -424,6 +464,66 @@ def create_memory_router(
             limit=limit,
             offset=offset,
         )
+
+    @router.get("/interactions", response_model=InteractionEventListResponse)
+    async def list_interactions(
+        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
+        user_id: Annotated[str | None, Query(min_length=1)] = None,
+        q: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> InteractionEventListResponse:
+        items, total = await service.list_interaction_history_rows(
+            limit=limit,
+            offset=offset,
+            user_id=user_id,
+            query=q,
+        )
+        event_items = [item["value"] for item in items]
+        return InteractionEventListResponse(
+            items=[InteractionEventEntry.model_validate(item) for item in event_items],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @router.get("/interactions/{event_id}", response_model=InteractionEventEntry)
+    async def get_interaction_event(
+        event_id: int,
+        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
+    ) -> InteractionEventEntry:
+        item = await service.get_interaction_event_entry(event_id)
+        if item is None:
+            raise _interaction_event_not_found(event_id)
+        return InteractionEventEntry.model_validate(item)
+
+    @router.patch("/interactions/{event_id}", response_model=InteractionEventEntry)
+    async def update_interaction_event(
+        event_id: int,
+        payload: InteractionEventUpdateRequest,
+        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
+    ) -> InteractionEventEntry:
+        item = await service.update_interaction_event_entry(
+            event_id,
+            **_resolve_interaction_event_patch_params(payload),
+        )
+        if item is None:
+            raise _interaction_event_not_found(event_id)
+        return InteractionEventEntry.model_validate(item)
+
+    @router.delete(
+        "/interactions/{event_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+    )
+    async def delete_interaction_event(
+        event_id: int,
+        service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
+    ) -> Response:
+        deleted = await service.delete_interaction_event_entry(event_id)
+        if not deleted:
+            raise _interaction_event_not_found(event_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.get(
         "/interaction-histories/{group_id}/{user_id}",

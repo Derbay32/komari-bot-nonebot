@@ -31,9 +31,9 @@ def test_cosine_similarity_invalid_vectors() -> None:
     assert UnifiedCandidateRerankService._cosine_similarity([1.0], [1.0, 2.0]) == 0.0
 
 
-def test_load_template_contains_group_history_summary_scene() -> None:
+def test_yaml_template_runtime_loader_removed() -> None:
     service = UnifiedCandidateRerankService()
-    fixed, scenes = service._load_template(service._resolve_template_path())
 
-    assert "NOISE" in fixed
-    assert any(scene["id"] == "scene_group_history_summary" for scene in scenes)
+    assert not hasattr(service, "_load_template")
+    assert not hasattr(service, "_resolve_template_path")
+    assert not hasattr(service, "_ensure_embeddings")

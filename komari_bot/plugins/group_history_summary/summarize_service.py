@@ -6,6 +6,8 @@ import re
 
 from nonebot.plugin import require
 
+from komari_bot.common.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
+
 from .history_service import HistoryMessage, format_message_for_prompt
 from .prompt_template import get_template
 
@@ -48,6 +50,11 @@ async def summarize_history_messages(
     model: str,
     temperature: float,
     max_tokens: int,
+    *,
+    assistant_prefill_enabled: bool = False,
+    dsv4_roleplay_instruct_mode: str = "auto",
+    thinking_mode: bool = False,
+    reasoning_effort: str = "",
 ) -> str:
     """总结历史消息，返回总结正文。"""
     if not history_messages:
@@ -58,32 +65,46 @@ async def summarize_history_messages(
 
     messages = [
         {
-            "role": "system",
+            "role": "user",
             "content": template["system_prompt"],
+        },
+        {
+            "role": "user",
+            "content": template["output_instruction"],
         },
         {
             "role": "user",
             "content": (f"<history_messages>\n{transcript}\n</history_messages>"),
         },
-        {
-            "role": template.get("memory_ack_role", "assistant"),
-            "content": template["memory_ack"],
-        },
-        {
-            "role": "system",
-            "content": template["output_instruction"],
-        },
-        {
-            "role": template.get("cot_prefix_role", "assistant"),
-            "content": template["cot_prefix"],
-        },
     ]
+    messages = inject_dsv4_instruct_to_first_user_message(
+        messages,
+        model=model,
+        mode=dsv4_roleplay_instruct_mode,
+    )
+
+    if assistant_prefill_enabled:
+        messages.extend(
+            [
+                {
+                    "role": template.get("memory_ack_role", "assistant"),
+                    "content": template["memory_ack"],
+                },
+                {
+                    "role": template.get("cot_prefix_role", "assistant"),
+                    "content": template["cot_prefix"],
+                },
+            ]
+        )
 
     raw_result = await llm_provider.generate_text_with_messages(
         messages=messages,
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        thinking_mode=thinking_mode,
+        reasoning_effort=reasoning_effort,
+        request_phase="group_history_summary",
     )
     summary_text = _extract_tag_content(raw_result, "content")
 

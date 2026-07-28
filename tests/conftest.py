@@ -67,7 +67,9 @@ _ensure_package_shim("llm_provider")
 _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
-_ensure_package_shim("jrhg")
+_ensure_package_shim("user_data")
+_ensure_package_shim("komari_custom")
+_ensure_package_shim("config_manager")
 
 
 class _DummyConfigManager:
@@ -90,11 +92,11 @@ class _DummyConfigManagerPlugin:
 class _DummyLLMProvider:
     @staticmethod
     async def generate_text(**_kwargs: object) -> str:
-        return "对话内容已模糊化处理"
+        return "<content>有效的模糊化测试内容</content>"
 
     @staticmethod
     async def generate_text_with_messages(**_kwargs: object) -> str:
-        return "<content>对话内容已模糊化处理</content>"
+        return "<content>有效的模糊化测试内容</content>"
 
     @staticmethod
     async def generate_messages_completion(**_kwargs: object) -> object:
@@ -103,22 +105,33 @@ class _DummyLLMProvider:
 
 class _DummyUserDataPlugin:
     @staticmethod
-    async def generate_or_update_favorability(_user_id: str) -> object:
+    def get_config() -> object:
         return SimpleNamespace(
-            daily_favor=50,
-            cumulative_favor=50,
-            is_new_day=False,
-            favor_level="中性",
+            max_favorability_delta_per_reply=5,
         )
 
     @staticmethod
-    async def format_favor_response(
-        ai_response: str,
-        user_nickname: str,
-        daily_favor: int,
-    ) -> str:
-        del user_nickname, daily_favor
-        return ai_response
+    async def get_user_favorability(user_id: str) -> object:
+        return SimpleNamespace(
+            user_id=user_id,
+            favorability=0,
+            stage_index=1,
+            stage_name="疏离戒备",
+            stage_prompt="当前关系偏疏离和戒备，回复应克制、保持距离，不主动表现亲昵。",
+            updated_at="2026-06-07T00:00:00+00:00",
+        )
+
+    @staticmethod
+    async def adjust_user_favorability(user_id: str, delta: int) -> object:
+        return SimpleNamespace(
+            user_id=user_id,
+            before=0,
+            delta=delta,
+            after=max(0, min(400, delta)),
+            stage_index=1,
+            stage_name="疏离戒备",
+            updated_at="2026-06-07T00:00:00+00:00",
+        )
 
 
 class _DummyPermissionManagerPlugin:
@@ -165,6 +178,30 @@ class _DummyCharacterBindingPlugin:
         return False
 
 
+class _DummySearchPlugin:
+    @staticmethod
+    def is_search_available() -> bool:
+        return False
+
+    @staticmethod
+    async def search_web(_query: str) -> str:
+        return "[测试搜索未启用]"
+
+
+class _DummyUnifiedCandidateRerankService:
+    async def rank_message(self, *_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            best_scene_id="scene_group_history_summary",
+            best_scene_score=1.0,
+            meaningful_score=1.0,
+            noise_score=0.0,
+        )
+
+
+class _DummyDecisionPlugin:
+    UnifiedCandidateRerankService = _DummyUnifiedCandidateRerankService
+
+
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "llm_provider": _DummyLLMProvider(),
@@ -173,6 +210,8 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
+    "komari_search": _DummySearchPlugin(),
+    "komari_decision": _DummyDecisionPlugin(),
 }
 
 
