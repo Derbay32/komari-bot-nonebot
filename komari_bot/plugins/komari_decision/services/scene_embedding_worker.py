@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -22,6 +23,8 @@ class SceneEmbeddingBatchResult:
     fetched_count: int
     marked_ready: int
     marked_failed: int
+    rescheduled_count: int
+    stale_count: int
     pending_count: int
     set_status: str
     transitioned_ready: bool
@@ -53,52 +56,74 @@ class SceneEmbeddingWorker:
         """惰性获取 embedding_provider，避免模块导入阶段强依赖。"""
         return require("embedding_provider")
 
-    async def fetch_pending_items(
+    async def claim_pending_items(
         self,
         set_id: int,
         *,
+        owner_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        retry_base_seconds: int,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """拉取待处理条目。"""
+        """原子认领待处理条目。"""
         batch_limit = self.batch_size if limit is None else max(1, limit)
-        return await self.repository.fetch_pending_items(set_id, limit=batch_limit)
+        return await self.repository.claim_pending_items(
+            set_id,
+            owner_token=owner_token,
+            limit=batch_limit,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+        )
 
-    async def mark_item_ready(self, item_id: int, embedding: list[float]) -> None:
+    async def mark_item_ready(
+        self,
+        item_id: int,
+        *,
+        owner_token: str,
+        embedding: list[float],
+    ) -> bool:
         """回写 READY 条目。"""
-        await self.repository.mark_item_ready(item_id, embedding, len(embedding))
+        return await self.repository.mark_item_ready(
+            item_id,
+            owner_token,
+            embedding,
+            len(embedding),
+        )
 
-    async def mark_item_failed(self, item_id: int, error_message: str) -> None:
-        """回写 FAILED 条目。"""
-        await self.repository.mark_item_failed(item_id, error_message)
+    async def complete_item_failure(
+        self,
+        item_id: int,
+        *,
+        owner_token: str,
+        error_code: str,
+        error_message: str,
+        max_attempts: int,
+        retry_base_seconds: int,
+    ) -> str:
+        """回写失败结果，由仓库决定退避重试或最终失败。"""
+        return await self.repository.complete_item_failure(
+            item_id,
+            owner_token=owner_token,
+            error_code=error_code,
+            error_message=error_message,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+        )
 
     async def refresh_set_counters(self, set_id: int) -> SceneSetProgress:
         """刷新计数并根据状态收敛 set。"""
-        await self.repository.update_set_counters(set_id)
-        scene_set = await self.repository.get_scene_set(set_id)
-        if scene_set is None:
-            msg = f"scene set 不存在: {set_id}"
-            raise RuntimeError(msg)
+        scene_set = await self.repository.refresh_set_progress(set_id)
 
         total = int(scene_set.get("item_total") or 0)
         ready = int(scene_set.get("item_ready") or 0)
         failed = int(scene_set.get("item_failed") or 0)
         pending = max(total - ready - failed, 0)
         status = str(scene_set.get("status") or "BUILDING")
-
-        transitioned_ready = False
-        transitioned_failed = False
-        if pending == 0 and total > 0:
-            if failed > 0 and status != "FAILED":
-                await self.repository.mark_set_failed(
-                    set_id,
-                    f"scene embedding 存在失败条目: failed={failed}",
-                )
-                status = "FAILED"
-                transitioned_failed = True
-            elif failed == 0 and status != "READY":
-                await self.repository.mark_set_ready(set_id)
-                status = "READY"
-                transitioned_ready = True
+        previous_status = str(scene_set.get("previous_status") or status)
+        transitioned_ready = previous_status != "READY" and status == "READY"
+        transitioned_failed = previous_status != "FAILED" and status == "FAILED"
 
         return SceneSetProgress(
             total=total,
@@ -116,8 +141,17 @@ class SceneEmbeddingWorker:
         *,
         limit: int | None = None,
     ) -> SceneEmbeddingBatchResult:
-        """处理一个批次的 PENDING 条目。"""
-        pending_items = await self.fetch_pending_items(set_id, limit=limit)
+        """认领并处理一个批次的 scene 条目。"""
+        config = get_config()
+        owner_token = uuid4().hex
+        pending_items = await self.claim_pending_items(
+            set_id,
+            owner_token=owner_token,
+            lease_seconds=config.scene_embedding_lease_seconds,
+            max_attempts=config.scene_embedding_max_attempts,
+            retry_base_seconds=config.scene_embedding_retry_base_seconds,
+            limit=limit,
+        )
         if not pending_items:
             progress = await self.refresh_set_counters(set_id)
             return SceneEmbeddingBatchResult(
@@ -125,13 +159,14 @@ class SceneEmbeddingWorker:
                 fetched_count=0,
                 marked_ready=0,
                 marked_failed=0,
+                rescheduled_count=0,
+                stale_count=0,
                 pending_count=progress.pending,
                 set_status=progress.status,
                 transitioned_ready=progress.transitioned_ready,
                 transitioned_failed=progress.transitioned_failed,
             )
 
-        config = get_config()
         instruction = config.embedding_instruction_scene.strip()
         embedding_provider = self._get_embedding_provider()
 
@@ -139,13 +174,41 @@ class SceneEmbeddingWorker:
 
         marked_ready = 0
         marked_failed = 0
+        rescheduled_count = 0
+        stale_count = 0
+
+        async def _record_failure(
+            item_id: int,
+            error_code: str,
+            error_message: str,
+        ) -> None:
+            nonlocal marked_failed, rescheduled_count, stale_count
+            outcome = await self.complete_item_failure(
+                item_id,
+                owner_token=owner_token,
+                error_code=error_code,
+                error_message=error_message[:500],
+                max_attempts=config.scene_embedding_max_attempts,
+                retry_base_seconds=config.scene_embedding_retry_base_seconds,
+            )
+            match outcome:
+                case "failed":
+                    marked_failed += 1
+                case "pending":
+                    rescheduled_count += 1
+                case _:
+                    stale_count += 1
+
         try:
             vectors = await embedding_provider.embed_batch(texts, instruction=instruction)
-        except Exception as e:
-            error_message = f"embedding 批处理异常: {type(e).__name__}: {e}"
+        except Exception as exc:
+            error_message = f"embedding 批处理异常: {type(exc).__name__}"
             for item in pending_items:
-                await self.mark_item_failed(int(item["id"]), error_message[:500])
-                marked_failed += 1
+                await _record_failure(
+                    int(item["id"]),
+                    "embedding_batch_exception",
+                    error_message,
+                )
         else:
             if len(vectors) != len(pending_items):
                 error_message = (
@@ -153,33 +216,51 @@ class SceneEmbeddingWorker:
                     f"expect={len(pending_items)} got={len(vectors)}"
                 )
                 for item in pending_items:
-                    await self.mark_item_failed(int(item["id"]), error_message)
-                    marked_failed += 1
+                    await _record_failure(
+                        int(item["id"]),
+                        "embedding_count_mismatch",
+                        error_message,
+                    )
             else:
                 for item, vector in zip(pending_items, vectors, strict=True):
                     item_id = int(item["id"])
                     try:
                         embedding = [float(v) for v in vector]
                     except Exception:
-                        await self.mark_item_failed(item_id, "embedding 向量格式无效")
-                        marked_failed += 1
+                        await _record_failure(
+                            item_id,
+                            "embedding_vector_invalid",
+                            "embedding 向量格式无效",
+                        )
                         continue
 
                     if not embedding:
-                        await self.mark_item_failed(item_id, "embedding 向量为空")
-                        marked_failed += 1
+                        await _record_failure(
+                            item_id,
+                            "embedding_vector_empty",
+                            "embedding 向量为空",
+                        )
                         continue
 
-                    await self.mark_item_ready(item_id, embedding)
-                    marked_ready += 1
+                    if await self.mark_item_ready(
+                        item_id,
+                        owner_token=owner_token,
+                        embedding=embedding,
+                    ):
+                        marked_ready += 1
+                    else:
+                        stale_count += 1
 
         progress = await self.refresh_set_counters(set_id)
         logger.info(
-            "[KomariDecision] scene embedding 批处理完成: set={} fetched={} ready={} failed={} pending={} status={}",
+            "[KomariDecision] scene embedding 批处理完成: "
+            "set={} fetched={} ready={} failed={} retry={} stale={} pending={} status={}",
             set_id,
             len(pending_items),
             marked_ready,
             marked_failed,
+            rescheduled_count,
+            stale_count,
             progress.pending,
             progress.status,
         )
@@ -188,6 +269,8 @@ class SceneEmbeddingWorker:
             fetched_count=len(pending_items),
             marked_ready=marked_ready,
             marked_failed=marked_failed,
+            rescheduled_count=rescheduled_count,
+            stale_count=stale_count,
             pending_count=progress.pending,
             set_status=progress.status,
             transitioned_ready=progress.transitioned_ready,

@@ -16,16 +16,37 @@ use_errorlog = errorlog_var or None
 cores = multiprocessing.cpu_count()
 workers_per_core_str = os.getenv("WORKERS_PER_CORE", "1")
 workers_per_core = float(workers_per_core_str)
+if workers_per_core <= 0:
+    message = "WORKERS_PER_CORE 必须大于 0"
+    raise ValueError(message)
 default_web_concurrency = workers_per_core * cores
 max_workers_str = os.getenv("MAX_WORKERS")
 use_max_workers = int(max_workers_str) if max_workers_str else None
+if use_max_workers is not None and use_max_workers <= 0:
+    message = "MAX_WORKERS 必须是正整数"
+    raise ValueError(message)
 if web_concurrency_str := os.getenv("WEB_CONCURRENCY", None):
     web_concurrency = int(web_concurrency_str)
-    assert web_concurrency > 0
+    if web_concurrency <= 0:
+        message = "WEB_CONCURRENCY 必须是正整数"
+        raise ValueError(message)
 else:
     web_concurrency = max(int(default_web_concurrency), 2)
-    if use_max_workers:
+    if use_max_workers is not None:
         web_concurrency = min(web_concurrency, use_max_workers)
+
+if use_max_workers is not None and use_max_workers > 1:
+    message = (
+        "当前版本仅支持单 worker：请设置 MAX_WORKERS=1，"
+        "并移除大于 1 的 WEB_CONCURRENCY。"
+    )
+    raise RuntimeError(message)
+if web_concurrency > 1:
+    message = (
+        "当前版本仅支持单 worker：请设置 MAX_WORKERS=1，"
+        "并移除大于 1 的 WEB_CONCURRENCY。"
+    )
+    raise RuntimeError(message)
 
 graceful_timeout_str = os.getenv("GRACEFUL_TIMEOUT", "120")
 timeout_str = os.getenv("TIMEOUT", "120")

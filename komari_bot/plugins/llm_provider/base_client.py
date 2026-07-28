@@ -1,9 +1,35 @@
 """LLM 客户端抽象基类。"""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from komari_bot.common.untrusted_context import UntrustedContext
+
+
+class UnifiedUsageSchema(BaseModel):
+    """统一的 LLM 用量模型。
+
+    所有字段为 int | None，以 None 表示后端未报告该字段，
+    避免用 0 冒充缺失数据。
+    """
+
+    input_tokens: int | None = Field(default=None, description="输入 token 数")
+    cached_input_tokens: int | None = Field(
+        default=None, description="缓存命中的输入 token 数"
+    )
+    cache_miss_input_tokens: int | None = Field(
+        default=None, description="缓存未命中的输入 token 数"
+    )
+    output_tokens: int | None = Field(default=None, description="输出 token 数")
+    reasoning_output_tokens: int | None = Field(
+        default=None, description="推理输出 token 数"
+    )
+    total_tokens: int | None = Field(default=None, description="总 token 数")
 
 
 class LLMToolCallFunctionSchema(BaseModel):
@@ -36,6 +62,8 @@ class LLMCompletionResultSchema(BaseModel):
         default_factory=list, description="工具调用列表"
     )
     finish_reason: str | None = Field(default=None, description="结束原因")
+    usage: UnifiedUsageSchema | None = Field(default=None, description="用量信息")
+    duration_ms: float | None = Field(default=None, description="调用耗时（毫秒）")
 
 
 class BaseLLMClient(ABC):
@@ -54,6 +82,7 @@ class BaseLLMClient(ABC):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """生成文本。
@@ -68,6 +97,7 @@ class BaseLLMClient(ABC):
             tools: 可用工具定义
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
+            untrusted_contexts: 由 provider 作为独立数据块注入的不可信上下文
             **kwargs: 其他 provider 特定参数
 
         Returns:
@@ -86,6 +116,7 @@ class BaseLLMClient(ABC):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        untrusted_contexts: list[UntrustedContext] | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -99,6 +130,7 @@ class BaseLLMClient(ABC):
             tools: 可用工具定义
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
+            untrusted_contexts: 由 provider 作为独立数据块注入的不可信上下文
             **kwargs: 其他参数
 
         Returns:

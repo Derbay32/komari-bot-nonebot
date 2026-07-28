@@ -8,7 +8,7 @@
 - 数据访问：`repositories/`
 - 核心服务：`services/`
 - 后台任务：`handlers/summary_worker.py`、`handlers/forgetting_worker.py`
-- 手工初始化 SQL：`database/init_orm.sql`
+- Schema 唯一真源：`komari_bot/common/vector_storage_schema.py`
 
 运行时已经支持：
 
@@ -16,7 +16,8 @@
 - 启动阶段校验向量列维度
 - 维度不匹配时通过迁移脚本升级
 
-手工 SQL 现在主要用于预建表、手工运维或排障，不再是首装必经步骤。
+历史 `database/init_orm.sql` 已废弃并会直接退出，避免旧表结构被误用。预建表、
+手工运维或排障时，必须通过生成脚本从运行时 DDL 真源生成一次性 SQL。
 
 ## 依赖
 
@@ -53,24 +54,33 @@
 Bot 启动后：
 
 - 会建立 PostgreSQL 连接池
-- 会按当前 embedding 维度自动补齐 `komari_memory_conversations` / `komari_memory_user_profile` / `komari_memory_interaction_history`
-- 会校验 `komari_memory_conversations.embedding` 与 provider 维度一致
+- 会按当前 embedding 维度自动补齐记忆正文表与独立 embedding 表
+- 会校验独立 embedding 表与 provider 维度一致
 - 会初始化 Redis 缓冲区管理
 - 会注册总结任务和忘却任务
 
 ## 手工初始化与迁移
 
-### 手工初始化 SQL
+### 从运行时 DDL 生成运维 SQL
 
-大多数场景不需要手工执行；若需要，可运行：
+大多数场景不需要手工执行。确需预建或排障时，先按当前
+`embedding_provider` 维度生成并审阅一次性 SQL：
 
 ```bash
-psql -h localhost -U your_username -d komari_bot \
-  -v embedding_dimension=512 \
-  -f komari_bot/plugins/komari_memory/database/init_orm.sql
+poetry run python scripts/render_memory_schema.py \
+  --embedding-dimension 512 \
+  --output /tmp/komari-memory-schema.sql
 ```
 
-如果不显式传入 `embedding_dimension`，脚本默认使用当前 provider 默认值 `512`。
+确认 SQL 与备份后再执行；`ON_ERROR_STOP` 禁止部分成功后继续：
+
+```bash
+psql -v ON_ERROR_STOP=1 \
+  -h localhost -U your_username -d komari_bot \
+  -f /tmp/komari-memory-schema.sql
+```
+
+不要执行 `database/init_orm.sql`；它只保留 fail-closed 的迁移提示。
 
 ### 对话向量迁移
 
@@ -129,7 +139,7 @@ psql -h localhost -U your_username -d komari_bot \
 - 达到消息数 / token / 时间阈值后，触发总结任务
 - 总结结果写入 `komari_memory_conversations`
 - 用户画像写入 `komari_memory_user_profile`
-- 互动历史写入 `komari_memory_interaction_history`
+- 跨群互动事件写入 `komari_memory_interaction_history`，向量写入独立 embedding 表
 
 ### 记忆检索
 
@@ -214,12 +224,32 @@ psql -h localhost -U your_username -d komari_bot \
 | --- | --- | --- |
 | `proactive_enabled` | `false` | 是否启用主动回复 |
 | `proactive_score_threshold` | `0.8` | 主动回复阈值 |
-| `proactive_cooldown` | `300` | 主动回复冷却时间 |
-| `proactive_max_per_hour` | `400` | 每小时最大主动回复次数 |
+| `proactive_cooldown` | `300` | 主动回复确认送达后的冷却时间（秒） |
+| `proactive_max_per_hour` | `400` | 最近一小时最大主动回复次数，包含生成中的预占 |
+| `proactive_reservation_ttl_seconds` | `360` | 生成与发送阶段的 Redis 预占有效期（秒） |
 | `reply_threshold` | `0.72` | 回复阈值 |
 | `noise_conf_threshold` | `0.76` | NOISE 置信度阈值 |
 | `noise_margin_threshold` | `0.1` | NOISE 领先阈值 |
 | `call_margin_threshold` | `0.08` | call intent 领先阈值 |
+
+非强制主动回复会在调用 LLM 前通过 Redis Lua 原子检查冷却与最近一小时名额，并用平台消息 ID 建立有 TTL 的预占。生成失败、回复为空或 QQ 发送失败会幂等释放预占；发送成功后将同一预占原子确认为一小时滑动窗口记录，并开始正式冷却。进程中断遗留的生成中预占会在 TTL 到期后由下一次操作清理。
+
+### 视觉图片下载
+
+当前消息和引用消息中的图片共用一组下载预算，引用图片优先进入预算。动态配置更新后立即生效。
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `vision_image_download_max_count` | `4` | 单条消息最多下载的图片总数 |
+| `vision_image_download_max_bytes` | `8388608` | 单张图片响应体上限（字节） |
+| `vision_image_download_total_max_bytes` | `20971520` | 单条消息全部图片响应体累计上限（字节） |
+| `vision_image_download_max_pixels` | `40000000` | 单张静态图或动画全部帧的累计像素上限 |
+| `vision_image_download_concurrency` | `2` | 下载并发上限 |
+| `vision_image_download_connect_timeout_seconds` | `5` | 单次连接超时（秒） |
+| `vision_image_download_read_timeout_seconds` | `30` | 单次响应读取停顿超时（秒） |
+| `vision_image_download_total_timeout_seconds` | `45` | 整批图片下载总时限（秒） |
+
+下载器只允许 HTTP/HTTPS 的 80/443 端口；DNS 地址在实际建连阶段校验，任何内网、回环、链路本地或保留地址都会拒绝。每一跳重定向都会重新经过相同边界。响应头和文件后缀不作为图片类型依据，下载完成后会按真实文件格式、完整解码结果及像素规模验图，只接受 JPEG、PNG、GIF 和 WebP。
 
 ## 对外使用方式
 

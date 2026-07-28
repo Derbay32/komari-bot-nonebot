@@ -1,13 +1,17 @@
 """Komari Memory 配置 Schema。"""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class KomariMemoryConfigSchema(BaseModel):
     """Komari Memory 插件配置。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     # 元数据
     version: str = Field(default="1.0", description="配置架构版本")
@@ -17,7 +21,11 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 插件控制
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    plugin_enable: bool = Field(
+        default=False,
+        description="插件启用状态",
+        json_schema_extra={"apply_mode": "restart"},
+    )
 
     # 白名单配置
     user_whitelist: list[str] = Field(
@@ -29,7 +37,9 @@ class KomariMemoryConfigSchema(BaseModel):
 
     # Redis 配置
     redis_db: int = Field(
-        default=1, description="Redis 数据库编号 (避免与其他插件冲突)"
+        default=1,
+        description="Redis 数据库编号 (避免与其他插件冲突)",
+        json_schema_extra={"apply_mode": "rebuild"},
     )
 
     # LLM 配置 - 对话模型（用于生成回复）
@@ -73,6 +83,62 @@ class KomariMemoryConfigSchema(BaseModel):
     vision_tool_enabled: bool = Field(
         default=True,
         description="是否启用 V4 工具调用读图模式",
+    )
+    vision_image_download_max_count: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="单条消息最多下载的当前消息与引用消息图片总数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=64 * 1024,
+        le=16 * 1024 * 1024,
+        description="单张图片响应体最大字节数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_total_max_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=64 * 1024,
+        le=32 * 1024 * 1024,
+        description="单条消息全部图片响应体累计最大字节数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_pixels: int = Field(
+        default=40_000_000,
+        ge=1_000_000,
+        le=100_000_000,
+        description="单张静态图片或动画全部帧的累计像素上限",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="单条消息图片下载最大并发数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_connect_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=15.0,
+        description="单次图片连接超时秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_read_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=60.0,
+        description="单次图片响应读取停顿超时秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_total_timeout_seconds: float = Field(
+        default=45.0,
+        ge=5.0,
+        le=90.0,
+        description="单条消息全部图片下载总时限秒数",
+        json_schema_extra={"apply_mode": "immediate"},
     )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
@@ -124,6 +190,12 @@ class KomariMemoryConfigSchema(BaseModel):
         ge=300,
         le=86400,
         description="对话缓冲 processing 快照 TTL（秒）",
+    )
+    conversation_processing_lease_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=900,
+        description="对话总结 processing 所有权租约时长（秒），worker 会周期续租",
     )
     profile_snapshot_ttl_seconds: int = Field(
         default=1800,
@@ -183,6 +255,18 @@ class KomariMemoryConfigSchema(BaseModel):
     context_messages_limit: int = Field(
         default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
     )
+    context_max_utf8_bytes: int = Field(
+        default=24_000,
+        ge=1_024,
+        le=131_072,
+        description="单次聊天近期消息上下文的 UTF-8 字节预算",
+    )
+    context_max_estimated_tokens: int = Field(
+        default=6_000,
+        ge=256,
+        le=32_000,
+        description="单次聊天近期消息上下文的估算 token 预算",
+    )
     global_interaction_enabled: bool = Field(
         default=True,
         description="是否启用跨群互动事件缓冲",
@@ -198,18 +282,87 @@ class KomariMemoryConfigSchema(BaseModel):
         ge=1,
         le=10,
         description="互动事件 Worker 轮询间隔（分钟）",
+        json_schema_extra={"apply_mode": "rebuild"},
+    )
+    global_interaction_processing_lease_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=7200,
+        description="互动事件 processing 租约的可见性超时（秒）",
+        json_schema_extra={"apply_mode": "immediate"},
     )
 
     # 主动回复配置
-    proactive_enabled: bool = Field(default=False, description="是否启用主动回复")
+    proactive_enabled: bool = Field(
+        default=False,
+        description="是否启用主动回复",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
     proactive_score_threshold: float = Field(
-        default=0.8, ge=0.0, le=1.0, description="触发主动回复的评分阈值"
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="触发主动回复的评分阈值",
+        json_schema_extra={"apply_mode": "immediate"},
     )
     proactive_cooldown: int = Field(
-        default=300, ge=5, le=3600, description="主动回复冷却时间（秒）"
+        default=300,
+        ge=5,
+        le=3600,
+        description="主动回复送达后的冷却时间（秒）",
+        json_schema_extra={"apply_mode": "immediate"},
     )
     proactive_max_per_hour: int = Field(
-        default=400, ge=1, le=800, description="每小时最大主动回复次数"
+        default=400,
+        ge=1,
+        le=800,
+        description="最近一小时最大主动回复次数（包含生成中的预占）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    proactive_reservation_ttl_seconds: int = Field(
+        default=360,
+        ge=30,
+        le=900,
+        description="主动回复生成与发送阶段的 Redis 预占有效期（秒）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+
+    # 回复送达后副作用 outbox
+    reply_commit_worker_interval_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=300,
+        description="聊天回复副作用 outbox 的后台扫描间隔（秒）",
+    )
+    reply_commit_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="聊天回复副作用 outbox 单轮最大领取数",
+    )
+    reply_commit_lease_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=900,
+        description="聊天回复副作用 outbox worker 租约时长（秒）",
+    )
+    reply_commit_max_attempts: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="聊天回复副作用 outbox 自动重试上限，耗尽后保留 FAILED 对账记录",
+    )
+    reply_commit_retry_base_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=300,
+        description="聊天回复副作用 outbox 指数退避基准秒数",
+    )
+    reply_commit_tombstone_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="已完成或取消的聊天 operation 防重记录保留天数",
     )
 
     # 提示词模板配置
@@ -242,6 +395,12 @@ class KomariMemoryConfigSchema(BaseModel):
     forgetting_fuzzify_concurrency: int = Field(
         default=3, ge=1, le=10, description="首次归零模糊化时的 LLM 最大并发数"
     )
+    forgetting_job_lease_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+        description="每日忘却任务的 PostgreSQL 所有权租约时长（秒）",
+    )
 
     # 查询重写配置
     query_rewrite_history_limit: int = Field(
@@ -262,6 +421,13 @@ class KomariMemoryConfigSchema(BaseModel):
     face_reaction_id: str = Field(
         default="76",
         description="表情反应的 Face ID（QQ 表情 ID），如 76=赞。仅 face_reaction_enabled=true 时生效",
+    )
+
+    # 回复失败通知配置
+    error_notify_enabled: bool = Field(
+        default=True,
+        json_schema_extra={"apply_mode": "immediate"},
+        description="回复生成失败时是否向 SUPERUSER 私聊发送极简诊断通知（群内错误提示不受此开关影响）",
     )
 
     @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
@@ -293,3 +459,16 @@ class KomariMemoryConfigSchema(BaseModel):
         if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
             return "auto"
         return normalized
+
+    @model_validator(mode="after")
+    def validate_vision_image_download_budget(self) -> Self:
+        """确保单图预算和连接阶段能被整批预算完整容纳。"""
+        if self.vision_image_download_total_max_bytes < (
+            self.vision_image_download_max_bytes
+        ):
+            raise ValueError("图片总字节上限不能小于单图字节上限")
+        if self.vision_image_download_total_timeout_seconds < (
+            self.vision_image_download_connect_timeout_seconds
+        ):
+            raise ValueError("图片下载总时限不能小于连接超时")
+        return self

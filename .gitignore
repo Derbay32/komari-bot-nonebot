@@ -31,7 +31,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-poetry.lock
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -161,3 +160,4 @@ test_multimodal.py
 logs
 !tools/
 tools/*
+data/character_binding/.bindings.json.lock

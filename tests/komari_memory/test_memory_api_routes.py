@@ -9,6 +9,9 @@ import pytest
 from fastapi import FastAPI
 
 from komari_bot.plugins.komari_memory.api import API_PREFIX, register_memory_api
+from komari_bot.plugins.komari_memory.services.conversation_processing import (
+    ConversationDeadLetter,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -75,24 +78,10 @@ def _interaction_event_entry(*, event_id: int = 1) -> dict[str, object]:
         "last_seen_at": timestamp,
         "importance": 4,
         "importance_initial": 4,
-        "importance_current": 4,
+        "importance_current": 0,
         "last_accessed": timestamp,
         "is_fuzzy": False,
         "created_at": timestamp,
-    }
-
-
-def _interaction_event_entity(*, event_id: int = 1) -> dict[str, object]:
-    event = _interaction_event_entry(event_id=event_id)
-    return {
-        "user_id": event["user_id"],
-        "group_id": "",
-        "key": f"interaction_event:{event_id}",
-        "category": "interaction_event",
-        "importance": event["importance"],
-        "access_count": 0,
-        "last_accessed": event["last_accessed"],
-        "value": event,
     }
 
 
@@ -159,7 +148,7 @@ class _FakeMemoryService:
     ) -> tuple[list[dict[str, object]], int]:
         self.list_history_calls.append(dict(kwargs))
         if kwargs.get("group_id") is None:
-            return [_interaction_event_entity()], len(self.interaction_events)
+            return [_interaction_event_entry()], len(self.interaction_events)
         return [self.interaction_histories[("g1", "u1")]], len(self.interaction_histories)
 
     async def get_user_profile_row(
@@ -241,13 +230,57 @@ class _FakeMemoryService:
         return self.interaction_events.pop(event_id, None) is not None
 
 
-def _build_app(service: _FakeMemoryService | None) -> FastAPI:
+class _FakeDeadLetterManager:
+    def __init__(self) -> None:
+        self.items = [
+            ConversationDeadLetter(
+                group_id="g1",
+                snapshot_id="snapshot-1",
+                failure_code="RuntimeError",
+                attempt_count=3,
+                failed_at_ms=1_000,
+                message_count=2,
+                chunk_state_count=4,
+            )
+        ]
+        self.list_limits: list[int] = []
+        self.requeue_calls: list[tuple[str, str]] = []
+
+    async def list_conversation_dead_letters(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[ConversationDeadLetter]:
+        self.list_limits.append(limit)
+        return self.items[:limit]
+
+    async def requeue_conversation_dead_letter(
+        self,
+        *,
+        group_id: str,
+        snapshot_id: str,
+    ) -> int | None:
+        self.requeue_calls.append((group_id, snapshot_id))
+        for index, item in enumerate(self.items):
+            if item.group_id == group_id and item.snapshot_id == snapshot_id:
+                self.items.pop(index)
+                return item.message_count
+        return None
+
+
+def _build_app(
+    service: _FakeMemoryService | None,
+    redis_manager: _FakeDeadLetterManager | None = None,
+    *,
+    api_token: Any = "secret-token-00000000",
+) -> FastAPI:
     api_app = FastAPI()
     register_memory_api(
         api_app,
-        api_token="secret-token",
+        api_token=api_token,
         allowed_origins=["https://ui.example.com"],
         service_getter=lambda: service,
+        redis_getter=lambda: redis_manager,
     )
     return api_app
 
@@ -278,7 +311,7 @@ async def test_memory_routes_return_503_when_service_unavailable(app: App) -> No
         client = ctx.get_client()
         response = await client.get(
             f"{API_PREFIX}/conversations",
-            headers={"Authorization": "Bearer secret-token"},
+            headers={"Authorization": "Bearer secret-token-00000000"},
         )
 
     assert response.status_code == 503
@@ -286,9 +319,96 @@ async def test_memory_routes_return_503_when_service_unavailable(app: App) -> No
 
 
 @pytest.mark.asyncio
+async def test_conversation_dead_letter_routes_query_and_requeue_without_body(
+    app: App,
+) -> None:
+    redis_manager = _FakeDeadLetterManager()
+    headers = {"Authorization": "Bearer secret-token-00000000"}
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(_FakeMemoryService(), redis_manager))
+    ) as ctx:
+        client = ctx.get_client()
+        listed = await client.get(
+            _with_query(f"{API_PREFIX}/conversation-dead-letters", limit=5),
+            headers=headers,
+        )
+        requeued = await client.post(
+            f"{API_PREFIX}/conversation-dead-letters/g1/snapshot-1/requeue",
+            headers=headers,
+        )
+        missing = await client.post(
+            f"{API_PREFIX}/conversation-dead-letters/g1/snapshot-1/requeue",
+            headers=headers,
+        )
+
+    assert listed.status_code == 200
+    assert redis_manager.list_limits == [5]
+    assert listed.json() == {
+        "items": [
+            {
+                "group_id": "g1",
+                "snapshot_id": "snapshot-1",
+                "failure_code": "RuntimeError",
+                "attempt_count": 3,
+                "failed_at_ms": 1_000,
+                "message_count": 2,
+                "chunk_state_count": 4,
+            }
+        ],
+        "limit": 5,
+    }
+    assert requeued.status_code == 200
+    assert requeued.json()["restored_message_count"] == 2
+    assert redis_manager.requeue_calls == [
+        ("g1", "snapshot-1"),
+        ("g1", "snapshot-1"),
+    ]
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_conversation_dead_letter_routes_require_redis_and_write_permission(
+    app: App,
+) -> None:
+    credentials = [
+        {
+            "credential_id": "memory-reader",
+            "token": "memory-reader-token-12345",
+            "permissions": ["memory:read"],
+        }
+    ]
+    headers = {"Authorization": "Bearer memory-reader-token-12345"}
+
+    async with app.test_server(
+        asgi=cast(
+            "Any",
+            _build_app(
+                _FakeMemoryService(),
+                None,
+                api_token=credentials,
+            ),
+        )
+    ) as ctx:
+        client = ctx.get_client()
+        unavailable = await client.get(
+            f"{API_PREFIX}/conversation-dead-letters",
+            headers=headers,
+        )
+        forbidden = await client.post(
+            f"{API_PREFIX}/conversation-dead-letters/g1/snapshot-1/requeue",
+            headers=headers,
+        )
+
+    assert unavailable.status_code == 503
+    assert "dead-letter" in unavailable.json()["detail"]
+    assert forbidden.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_conversation_routes_forward_filters_and_support_crud(app: App) -> None:
     service = _FakeMemoryService()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
         client = ctx.get_client()
@@ -349,9 +469,9 @@ async def test_conversation_routes_forward_filters_and_support_crud(app: App) ->
 
 
 @pytest.mark.asyncio
-async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> None:
+async def test_profile_routes_list_get_upsert_delete_and_validate(app: App) -> None:
     service = _FakeMemoryService()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
         client = ctx.get_client()
@@ -365,22 +485,8 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
             ),
             headers=headers,
         )
-        histories = await client.get(
-            _with_query(
-                f"{API_PREFIX}/interaction-histories",
-                group_id="g1",
-                user_id="u1",
-                q="聊天",
-                offset=1,
-            ),
-            headers=headers,
-        )
         profile_detail = await client.get(
             f"{API_PREFIX}/user-profiles/g1/u1",
-            headers=headers,
-        )
-        history_detail = await client.get(
-            f"{API_PREFIX}/interaction-histories/g1/u1",
             headers=headers,
         )
         profile_put = await client.put(
@@ -388,13 +494,8 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
             json={
                 "user_id": "u2",
                 "display_name": "小李",
-                "traits": {"爱好": {"value": "游戏"}},
+                "traits": {" 爱好 ": {"value": "游戏"}},
             },
-            headers=headers,
-        )
-        history_put = await client.put(
-            f"{API_PREFIX}/interaction-histories/g1/u2",
-            json={"user_id": "u2", "summary": "最近常聊游戏", "records": []},
             headers=headers,
         )
         mismatch = await client.put(
@@ -403,7 +504,7 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
             headers=headers,
         )
         bad_body = await client.put(
-            f"{API_PREFIX}/interaction-histories/g1/u3",
+            f"{API_PREFIX}/user-profiles/g1/u3",
             json=["not-an-object"],
             headers=headers,
         )
@@ -411,15 +512,9 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
             f"{API_PREFIX}/user-profiles/g1/u1",
             headers=headers,
         )
-        deleted_history = await client.delete(
-            f"{API_PREFIX}/interaction-histories/g1/u1",
-            headers=headers,
-        )
 
     assert profiles.status_code == 200
     assert profiles.json()["total"] == 1
-    assert histories.status_code == 200
-    assert histories.json()["items"][0]["key"] == "interaction_history"
     assert service.list_profile_calls == [
         {
             "limit": 3,
@@ -429,32 +524,115 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
             "query": "布丁",
         }
     ]
-    assert service.list_history_calls == [
-        {
-            "limit": 20,
-            "offset": 1,
-            "group_id": "g1",
-            "user_id": "u1",
-            "query": "聊天",
-        }
-    ]
     assert profile_detail.status_code == 200
-    assert history_detail.status_code == 200
     assert profile_put.status_code == 200
     assert profile_put.json()["value"]["display_name"] == "小李"
-    assert history_put.status_code == 200
-    assert history_put.json()["value"]["summary"] == "最近常聊游戏"
+    assert profile_put.json()["value"]["traits"] == {"爱好": {"value": "游戏"}}
     assert mismatch.status_code == 422
     assert "user_id" in mismatch.json()["detail"]
     assert bad_body.status_code == 422
     assert deleted_profile.status_code == 204
-    assert deleted_history.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_legacy_interaction_history_routes_return_migration_410(app: App) -> None:
+    service = _FakeMemoryService()
+    headers = {"Authorization": "Bearer secret-token-00000000"}
+
+    async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
+        client = ctx.get_client()
+        responses = [
+            await client.get(f"{API_PREFIX}/interaction-histories", headers=headers),
+            await client.get(
+                f"{API_PREFIX}/interaction-histories/g1/u1",
+                headers=headers,
+            ),
+            await client.put(
+                f"{API_PREFIX}/interaction-histories/g1/u1",
+                json={"user_id": "u1", "records": []},
+                headers=headers,
+            ),
+            await client.delete(
+                f"{API_PREFIX}/interaction-histories/g1/u1",
+                headers=headers,
+            ),
+        ]
+
+    assert {response.status_code for response in responses} == {410}
+    for response in responses:
+        detail = response.json()["detail"]
+        assert detail["code"] == "interaction_histories_retired"
+        assert detail["replacement"] == f"{API_PREFIX}/interactions"
+    assert service.list_history_calls == []
+
+
+@pytest.mark.asyncio
+async def test_memory_api_rejects_oversized_or_deep_management_input(app: App) -> None:
+    service = _FakeMemoryService()
+    headers = {"Authorization": "Bearer secret-token-00000000"}
+    nested: object = "leaf"
+    for _ in range(6):
+        nested = [nested]
+
+    async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
+        client = ctx.get_client()
+        oversized_query = await client.get(
+            _with_query(f"{API_PREFIX}/conversations", q="q" * 513),
+            headers=headers,
+        )
+        oversized_identifier = await client.get(
+            _with_query(f"{API_PREFIX}/user-profiles", group_id="g" * 129),
+            headers=headers,
+        )
+        too_many_participants = await client.post(
+            f"{API_PREFIX}/conversations",
+            json={
+                "group_id": "g1",
+                "summary": "摘要",
+                "participants": [f"u{index}" for index in range(101)],
+            },
+            headers=headers,
+        )
+        too_many_traits = await client.put(
+            f"{API_PREFIX}/user-profiles/g1/u1",
+            json={
+                "traits": {
+                    f"trait-{index}": {"value": "x"} for index in range(101)
+                }
+            },
+            headers=headers,
+        )
+        deep_profile = await client.put(
+            f"{API_PREFIX}/user-profiles/g1/u1",
+            json={"traits": {"deep": {"value": nested}}},
+            headers=headers,
+        )
+        oversized_event_summary = await client.patch(
+            f"{API_PREFIX}/interactions/1",
+            json={"event_summary": "s" * 12_001},
+            headers=headers,
+        )
+
+    assert oversized_query.status_code == 422
+    assert "查询文本" in oversized_query.json()["detail"]
+    assert oversized_identifier.status_code == 422
+    assert "群组 ID" in oversized_identifier.json()["detail"]
+    assert too_many_participants.status_code == 422
+    assert "参与者数量超过上限" in str(too_many_participants.json())
+    assert too_many_traits.status_code == 422
+    assert "trait 数量超过上限" in str(too_many_traits.json())
+    assert deep_profile.status_code == 422
+    assert "嵌套深度超过上限" in str(deep_profile.json())
+    assert oversized_event_summary.status_code == 422
+    assert "对话摘要" not in str(oversized_event_summary.json())
+    assert service.list_conversation_calls == []
+    assert service.list_profile_calls == []
 
 
 @pytest.mark.asyncio
 async def test_interaction_event_routes_support_event_id_crud(app: App) -> None:
     service = _FakeMemoryService()
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
         client = ctx.get_client()
@@ -486,6 +664,9 @@ async def test_interaction_event_routes_support_event_id_crud(app: App) -> None:
 
     assert listed.status_code == 200
     assert listed.json()["items"][0]["event_summary"].startswith("阿明经常")
+    assert listed.json()["items"][0]["importance"] == 4
+    assert listed.json()["items"][0]["importance_current"] == 0
+    assert listed.json()["items"][0]["last_accessed"] == "2026-04-10T12:00:00Z"
     assert service.list_history_calls[-1] == {
         "limit": 5,
         "offset": 0,
@@ -505,7 +686,7 @@ async def test_interaction_event_routes_support_event_id_crud(app: App) -> None:
 
 @pytest.mark.asyncio
 async def test_entity_routes_return_404_for_missing_rows(app: App) -> None:
-    headers = {"Authorization": "Bearer secret-token"}
+    headers = {"Authorization": "Bearer secret-token-00000000"}
 
     async with app.test_server(asgi=cast("Any", _build_app(_FakeMemoryService()))) as ctx:
         client = ctx.get_client()
@@ -513,10 +694,5 @@ async def test_entity_routes_return_404_for_missing_rows(app: App) -> None:
             f"{API_PREFIX}/user-profiles/g1/u9",
             headers=headers,
         )
-        missing_history = await client.delete(
-            f"{API_PREFIX}/interaction-histories/g1/u9",
-            headers=headers,
-        )
 
     assert missing_profile.status_code == 404
-    assert missing_history.status_code == 404

@@ -6,6 +6,9 @@ from nonebot.plugin import require
 from komari_bot.plugins.komari_memory.core.retry import retry_async
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
+if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
 
@@ -33,33 +36,65 @@ class QueryRewriteService:
 用户输入：{current_query}"""
 
     @retry_async(max_attempts=2, base_delay=0.5)
-    async def _generate_rewritten_query(
+    async def _generate_rewritten_completion(
         self,
         *,
         rewrite_prompt: str,
         model: str,
         thinking_mode: bool,
         reasoning_effort: str,
+        request_trace_id: str | None = None,
+        parent_call_id: str | None = None,
+        collector: "LLMDiagnosticCollector | None" = None,
     ) -> str:
-        """调用 LLM 生成重写后的查询。"""
-        return await llm_provider.generate_text(
-            prompt=rewrite_prompt,
-            model=model,
-            temperature=0.3,
-            max_tokens=256,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
+        """调用 LLM 生成重写后的查询（使用 completion 接口以获取 trace）。"""
+        request_data = {
+            "prompt": rewrite_prompt,
+            "model": model,
+            "temperature": 0.3,
+            "max_tokens": 256,
+            "thinking_mode": thinking_mode,
+            "reasoning_effort": reasoning_effort,
+        }
+        result = await llm_provider.generate_completion(
+            **request_data,
             request_phase="query_rewrite",
+            request_trace_id=request_trace_id or "",
         )
+
+        if collector is not None:
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_completion_call,
+            )
+
+            record_completion_call(
+                collector,
+                parent_call_id=parent_call_id,
+                phase="query_rewrite",
+                round_index=0,
+                method="generate_completion",
+                model=model,
+                request=request_data,
+                completion=result,
+            )
+
+        return result.content
 
     async def rewrite_query(
         self,
         current_query: str,
+        *,
+        request_trace_id: str | None = None,
+        parent_call_id: str | None = None,
+        collector: "LLMDiagnosticCollector | None" = None,
     ) -> str:
         """重写查询为语义完整的独立语句。
 
         Args:
             current_query: 当前用户输入
+            request_trace_id: 请求追踪 ID
+            parent_call_id: 父调用 ID
+            collector: 可选的诊断收集器
 
         Returns:
             重写后的查询，失败时返回原始查询
@@ -77,11 +112,14 @@ class QueryRewriteService:
             )
 
             # 调用 LLM 重写（使用总结模型，更快）
-            rewritten = await self._generate_rewritten_query(
+            rewritten = await self._generate_rewritten_completion(
                 rewrite_prompt=rewrite_prompt,
                 model=config.llm_model_summary,
                 thinking_mode=config.llm_thinking_mode_summary,
                 reasoning_effort=config.llm_reasoning_effort_summary,
+                request_trace_id=request_trace_id,
+                parent_call_id=parent_call_id,
+                collector=collector,
             )
         except Exception as e:
             # 降级：返回原始查询
@@ -89,6 +127,12 @@ class QueryRewriteService:
                 f"[QueryRewrite] 重写失败，使用原始查询: {e}",
                 exc_info=True,
             )
+            if collector is not None:
+                collector.add_error(
+                    phase="query_rewrite",
+                    error_type=type(e).__name__,
+                    message=str(e),
+                )
             return current_query
 
         # 清理结果

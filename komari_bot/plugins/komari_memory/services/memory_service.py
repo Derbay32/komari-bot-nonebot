@@ -10,7 +10,6 @@ from nonebot.plugin import require
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..config_schema import KomariMemoryConfigSchema
     from ..repositories.conversation_repository import ConversationRepository
     from ..repositories.entity_repository import (
         EntityRepository,
@@ -26,7 +25,6 @@ class MemoryService:
 
     def __init__(
         self,
-        config: KomariMemoryConfigSchema,
         conversation_repo: ConversationRepository,
         entity_repo: EntityRepository,
         interaction_event_repo: InteractionEventRepository | None = None,
@@ -34,11 +32,9 @@ class MemoryService:
         """初始化记忆服务。
 
         Args:
-            config: 插件配置
             conversation_repo: 对话仓库
             entity_repo: 实体仓库
         """
-        self.config = config
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
         self._interaction_event_repo = interaction_event_repo
@@ -56,6 +52,8 @@ class MemoryService:
         participants: list[str],
         importance_initial: int = 3,
         dedup_key: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
     ) -> int | None:
         """存储对话总结（向量检索用 asyncpg）。
 
@@ -65,12 +63,18 @@ class MemoryService:
             participants: 参与者列表
             importance_initial: 初始重要性评分（1-5）
             dedup_key: 幂等键，同一 processing 快照重复写入时用于去重
+            start_time: 被总结消息的最早时间
+            end_time: 被总结消息的最晚时间
 
         Returns:
             创建的对话 ID；幂等冲突时返回 None
         """
         # 业务逻辑：生成向量
         embedding = await self._embedding_plugin.embed(summary)
+        normalized_start, normalized_end = self._resolve_conversation_range(
+            start_time=start_time,
+            end_time=end_time,
+        )
 
         # 数据访问：委托给仓库
         return await self._conversation_repo.insert_conversation(
@@ -80,6 +84,8 @@ class MemoryService:
             participants=participants,
             importance_initial=importance_initial,
             dedup_key=dedup_key,
+            start_time=normalized_start,
+            end_time=normalized_end,
         )
 
     async def search_conversations(
@@ -327,6 +333,7 @@ class MemoryService:
         source_message_count: int,
         first_seen_at: datetime,
         last_seen_at: datetime,
+        dedup_key: str,
         importance_initial: int = 4,
     ) -> int:
         """生成向量并写入一条跨群互动事件记忆。"""
@@ -340,6 +347,16 @@ class MemoryService:
             first_seen_at=first_seen_at,
             last_seen_at=last_seen_at,
             importance_initial=importance_initial,
+            dedup_key=dedup_key,
+        )
+
+    async def get_interaction_event_id_by_dedup_key(
+        self,
+        dedup_key: str,
+    ) -> int | None:
+        """按来源快照幂等键查询已经写入的事件。"""
+        return await self._get_interaction_event_repo().get_event_id_by_dedup_key(
+            dedup_key
         )
 
     async def search_interaction_events(
@@ -397,13 +414,12 @@ class MemoryService:
     ) -> tuple[list[dict[str, Any]], int]:
         """分页获取跨群互动事件行（保留旧方法名给 API 过渡使用）。"""
         del group_id
-        rows, total = await self._get_interaction_event_repo().list_interaction_events(
+        return await self._get_interaction_event_repo().list_interaction_events(
             limit=limit,
             offset=offset,
             user_id=user_id,
             query=query,
         )
-        return [self._interaction_event_to_entity(row) for row in rows], total
 
     async def get_user_profile_row(
         self,
@@ -628,30 +644,3 @@ class MemoryService:
             msg = "跨群互动事件仓库未初始化"
             raise RuntimeError(msg)
         return self._interaction_event_repo
-
-    @staticmethod
-    def _interaction_event_to_entity(row: dict[str, Any]) -> dict[str, Any]:
-        user_id = str(row.get("user_id", "")).strip()
-        return {
-            "user_id": user_id,
-            "group_id": "",
-            "key": f"interaction_event:{row.get('id')}",
-            "category": "interaction_event",
-            "importance": int(row.get("importance", 4) or 4),
-            "access_count": 0,
-            "last_accessed": row.get("last_accessed"),
-            "value": {
-                "version": 1,
-                "id": row.get("id"),
-                "user_id": user_id,
-                "display_name": str(row.get("display_name", "")).strip() or user_id,
-                "event_summary": str(row.get("event_summary", "")).strip(),
-                "source_message_count": int(row.get("source_message_count", 0) or 0),
-                "first_seen_at": row.get("first_seen_at"),
-                "last_seen_at": row.get("last_seen_at"),
-                "importance_initial": int(row.get("importance_initial", 4) or 4),
-                "importance_current": int(row.get("importance_current", 4) or 4),
-                "is_fuzzy": bool(row.get("is_fuzzy", False)),
-                "created_at": row.get("created_at"),
-            },
-        }

@@ -9,7 +9,11 @@ from nonebot import logger
 from komari_bot.common.database_config import get_shared_database_config
 from komari_bot.common.postgres import create_postgres_pool
 
-from .models import FavorabilityAdjustmentResult, UserFavorability
+from .models import (
+    FavorabilityAdjustmentResult,
+    FavorabilitySetResult,
+    UserFavorability,
+)
 
 if TYPE_CHECKING:
     import asyncpg
@@ -26,10 +30,21 @@ class UserDataDB:
 
     async def initialize(self) -> None:
         """初始化数据库连接和表结构。"""
+        if self._pool is not None:
+            return
+
         db_config = get_shared_database_config()
         logger.debug("[UserDataDB] 开始初始化 PostgreSQL 连接池")
-        self._pool = await create_postgres_pool(db_config)
-        await self._create_tables()
+        pool = await create_postgres_pool(db_config)
+        try:
+            await self._create_tables(pool)
+        except BaseException:
+            try:
+                await pool.close()
+            except Exception:
+                logger.exception("[UserDataDB] 初始化失败后的连接池关闭失败")
+            raise
+        self._pool = pool
         logger.debug("[UserDataDB] PostgreSQL 连接池与表结构初始化完成")
 
     def _require_pool(self) -> "asyncpg.Pool":
@@ -39,10 +54,13 @@ class UserDataDB:
             raise RuntimeError(msg)
         return self._pool
 
-    async def _create_tables(self) -> None:
+    async def _create_tables(self, pool: asyncpg.Pool) -> None:
         """创建数据库表结构。"""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                "komari:user_data:schema:v1",
+            )
             await self._rebuild_legacy_favorability_table(conn)
             await conn.execute(
                 """
@@ -51,6 +69,26 @@ class UserDataDB:
                     favorability INTEGER NOT NULL DEFAULT 0
                         CHECK (favorability >= 0 AND favorability <= 400),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_favorability_adjustment_ledger (
+                    operation_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    requested_delta INTEGER NOT NULL,
+                    before_value INTEGER,
+                    after_value INTEGER,
+                    result_updated_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (
+                        (before_value IS NULL AND after_value IS NULL
+                            AND result_updated_at IS NULL)
+                        OR
+                        (before_value IS NOT NULL AND after_value IS NOT NULL
+                            AND result_updated_at IS NOT NULL)
+                    )
                 )
                 """
             )
@@ -78,9 +116,10 @@ class UserDataDB:
 
     async def close(self) -> None:
         """关闭数据库连接池。"""
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            await pool.close()
 
     async def get_user_favorability(self, user_id: str) -> UserFavorability:
         """获取用户当前好感度，无记录时创建初始值。"""
@@ -88,14 +127,27 @@ class UserDataDB:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO user_favorability (user_id, favorability)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
-                RETURNING user_id, favorability, updated_at
+                WITH inserted AS (
+                    INSERT INTO user_favorability (user_id, favorability)
+                    VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO NOTHING
+                    RETURNING user_id, favorability, updated_at
+                )
+                SELECT user_id, favorability, updated_at
+                FROM inserted
+                UNION ALL
+                SELECT user_id, favorability, updated_at
+                FROM user_favorability
+                WHERE user_id = $1
+                LIMIT 1
                 """,
                 user_id,
                 self.config.initial_favorability,
             )
+
+        if row is None:
+            msg = "好感度读取或初始化后未返回记录"
+            raise RuntimeError(msg)
 
         return UserFavorability.from_score(
             user_id=row["user_id"],
@@ -107,6 +159,8 @@ class UserDataDB:
         self,
         user_id: str,
         delta: int,
+        *,
+        operation_id: str | None = None,
     ) -> FavorabilityAdjustmentResult:
         """原子调整用户当前好感度，并限制在 [0, 400]。"""
         if self._pool is None:
@@ -118,12 +172,58 @@ class UserDataDB:
         pool = self._require_pool()
 
         logger.debug(
-            "[UserDataDB] 开始调整好感度: user={} delta={} initial={}",
+            "[UserDataDB] 开始调整好感度: user={} delta={} initial={} idempotent={}",
             user_id,
             delta,
             self.config.initial_favorability,
+            operation_id is not None,
         )
         async with pool.acquire() as conn, conn.transaction():
+            if operation_id is not None:
+                operation_id = operation_id.strip()
+                if not operation_id:
+                    msg = "operation_id 不能为空"
+                    raise ValueError(msg)
+                claimed = await conn.fetchval(
+                    """
+                    INSERT INTO user_favorability_adjustment_ledger (
+                        operation_id, user_id, requested_delta
+                    )
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (operation_id) DO NOTHING
+                    RETURNING operation_id
+                    """,
+                    operation_id,
+                    user_id,
+                    delta,
+                )
+                if claimed is None:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT user_id, requested_delta, before_value,
+                               after_value, result_updated_at
+                        FROM user_favorability_adjustment_ledger
+                        WHERE operation_id = $1
+                        """,
+                        operation_id,
+                    )
+                    if existing is None or existing["before_value"] is None:
+                        msg = "好感度幂等账本记录不可用"
+                        raise RuntimeError(msg)
+                    if (
+                        str(existing["user_id"]) != user_id
+                        or int(existing["requested_delta"]) != delta
+                    ):
+                        msg = "好感度 operation_id 与既有请求载荷冲突"
+                        raise ValueError(msg)
+                    return FavorabilityAdjustmentResult.from_values(
+                        user_id=str(existing["user_id"]),
+                        before=int(existing["before_value"]),
+                        delta=int(existing["requested_delta"]),
+                        after=int(existing["after_value"]),
+                        updated_at=existing["result_updated_at"].isoformat(),
+                    )
+
             await conn.execute(
                 """
                 INSERT INTO user_favorability (user_id, favorability)
@@ -159,6 +259,25 @@ class UserDataDB:
                 delta,
             )
 
+            if row is not None and operation_id is not None:
+                await conn.execute(
+                    """
+                    UPDATE user_favorability_adjustment_ledger
+                    SET before_value = $2,
+                        after_value = $3,
+                        result_updated_at = $4
+                    WHERE operation_id = $1
+                    """,
+                    operation_id,
+                    int(
+                        before
+                        if before is not None
+                        else self.config.initial_favorability
+                    ),
+                    int(row["favorability"]),
+                    row["updated_at"],
+                )
+
         if row is None:
             logger.error(
                 "[UserDataDB] 好感度 UPDATE 未返回记录: user={} before={} delta={}",
@@ -170,7 +289,9 @@ class UserDataDB:
             raise RuntimeError(msg)
 
         after = int(row["favorability"])
-        before_value = int(before or self.config.initial_favorability)
+        before_value = int(
+            before if before is not None else self.config.initial_favorability
+        )
         logger.debug(
             "[UserDataDB] 好感度调整完成: user={} before={} delta={} after={} updated_at={}",
             row["user_id"],
@@ -186,6 +307,103 @@ class UserDataDB:
             delta=delta,
             after=after,
             updated_at=row["updated_at"].isoformat(),
+        )
+
+    async def cleanup_adjustment_ledger(self, *, retention_days: int) -> int:
+        """清理超过防重窗口的好感度 operation 账本。"""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM user_favorability_adjustment_ledger
+                WHERE created_at < NOW() - ($1 * INTERVAL '1 day')
+                """,
+                max(1, retention_days),
+            )
+        return int(result.split()[-1])
+
+    async def set_user_favorability(
+        self,
+        user_id: str,
+        value: int,
+    ) -> FavorabilitySetResult:
+        """原子设置用户当前好感度为绝对值。
+
+        对新用户以配置中的 initial_favorability 作为 before；
+        已有用户以当前实际值作为 before。通过行锁与 adjust 串行化。
+        """
+        if not 0 <= value <= 400:
+            msg = f"好感度值 {value} 越界，需在 [0, 400] 范围内"
+            raise ValueError(msg)
+
+        pool = self._require_pool()
+
+        logger.debug(
+            "[UserDataDB] 开始设置好感度: user={} value={} initial={}",
+            user_id,
+            value,
+            self.config.initial_favorability,
+        )
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO user_favorability (user_id, favorability)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                user_id,
+                self.config.initial_favorability,
+            )
+            before_row = await conn.fetchrow(
+                """
+                SELECT favorability
+                FROM user_favorability
+                WHERE user_id = $1
+                FOR UPDATE
+                """,
+                user_id,
+            )
+            before = int(before_row["favorability"] if before_row else self.config.initial_favorability)
+            logger.debug(
+                "[UserDataDB] 已锁定好感度行: user={} before={}",
+                user_id,
+                before,
+            )
+            updated = await conn.fetchrow(
+                """
+                UPDATE user_favorability
+                SET favorability = $2,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = $1
+                RETURNING user_id, favorability, updated_at
+                """,
+                user_id,
+                value,
+            )
+
+        if updated is None:
+            logger.error(
+                "[UserDataDB] 好感度 SET 未返回记录: user={} value={}",
+                user_id,
+                value,
+            )
+            msg = "好感度 SET 未返回记录"
+            raise RuntimeError(msg)
+
+        after = int(updated["favorability"])
+        logger.debug(
+            "[UserDataDB] 好感度设置完成: user={} before={} after={} updated_at={}",
+            updated["user_id"],
+            before,
+            after,
+            updated["updated_at"],
+        )
+
+        return FavorabilitySetResult.from_values(
+            user_id=updated["user_id"],
+            before=before,
+            after=after,
+            updated_at=updated["updated_at"].isoformat(),
         )
 
     async def get_user_count(self) -> int:

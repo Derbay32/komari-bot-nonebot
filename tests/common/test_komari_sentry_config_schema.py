@@ -28,7 +28,8 @@ KomariSentryConfigSchema = _load_config_schema_class()
 def test_config_schema_exposes_sentry_logs_level() -> None:
     config = KomariSentryConfigSchema()
 
-    assert config.sentry_logs_level == "INFO"
+    assert config.sentry_logs_level == "WARNING"
+    assert config.breadcrumb_level == "WARNING"
 
 
 def test_config_schema_normalizes_sentry_logs_level() -> None:
@@ -37,13 +38,25 @@ def test_config_schema_normalizes_sentry_logs_level() -> None:
     assert config.sentry_logs_level == "WARNING"
 
 
-def test_config_schema_falls_back_to_info_for_invalid_sentry_logs_level() -> None:
+def test_config_schema_falls_back_to_warning_for_invalid_log_levels() -> None:
     config = KomariSentryConfigSchema(sentry_logs_level="trace")
 
-    assert config.sentry_logs_level == "INFO"
+    assert config.sentry_logs_level == "WARNING"
+
+    breadcrumb_config = KomariSentryConfigSchema(breadcrumb_level="trace")
+    assert breadcrumb_config.breadcrumb_level == "WARNING"
 
 
 def test_config_schema_default_contains_sentry_logs_level() -> None:
     config = KomariSentryConfigSchema()
 
-    assert config.sentry_logs_level == "INFO"
+    assert config.sentry_logs_level == "WARNING"
+
+
+def test_send_default_pii_description_mentions_user_context_and_credential_sanitization() -> None:
+    """send_default_pii 的 description 明确提及 user 上下文和凭据脱敏。"""
+    properties = KomariSentryConfigSchema.model_json_schema()["properties"]
+    description = properties["send_default_pii"]["description"]
+
+    assert "user 上下文" in description
+    assert "脱敏凭据" in description

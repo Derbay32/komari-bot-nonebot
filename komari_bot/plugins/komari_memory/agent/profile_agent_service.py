@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -16,6 +17,10 @@ from komari_bot.common.memory_agent_locks import (
     acquire_memory_agent_lock,
 )
 from komari_bot.common.profile_operations import ProfileOperation
+from komari_bot.common.untrusted_context import (
+    UntrustedContext,
+    render_untrusted_context,
+)
 
 from ..services.redis_keys import RedisKeys
 from ..services.summary_prompt_template import (
@@ -31,10 +36,15 @@ from .tool_definitions import PROFILE_AGENT_TOOLS
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
+    from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
     from ..config_schema import KomariMemoryConfigSchema
     from ..services.memory_service import MemoryService
 
+from ..services.message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
+
 llm_provider = require("llm_provider")
+_PROFILE_TOOL_RESULT_MAX_CHARS = 12_000
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,7 @@ async def run_profile_agent(
     bot_user_ids: set[str],
     config: KomariMemoryConfigSchema,
     trace_id: str,
+    collector: AgentRunCollector | None = None,
 ) -> ProfileAgentResult:
     """运行画像维护 Agent，由 Agent 显式调用提交工具写入暂存区。"""
     session_id = f"{trace_id}:{uuid4().hex[:8]}"
@@ -106,6 +117,7 @@ async def run_profile_agent(
                 bot_user_ids=bot_user_ids,
                 config=config,
                 trace_id=trace_id,
+                collector=collector,
             )
         except Exception:
             if staging is not None:
@@ -132,8 +144,9 @@ async def _run_profile_agent_locked(
     bot_user_ids: set[str],
     config: KomariMemoryConfigSchema,
     trace_id: str,
+    collector: AgentRunCollector | None,
 ) -> ProfileAgentResult:
-    messages = _build_initial_messages(
+    messages = await _build_initial_messages(
         conversation_text=conversation_text,
         participants=participants,
         display_name_map=display_name_map,
@@ -146,19 +159,52 @@ async def _run_profile_agent_locked(
     last_content = ""
 
     for round_index in range(config.memory_agent_max_rounds):
-        completion = await llm_provider.generate_messages_completion(
-            messages=messages,
+        request_data = {
+            "messages": messages,
+            "model": config.llm_model_summary,
+            "temperature": config.llm_temperature_summary,
+            "max_tokens": config.llm_max_tokens_summary,
+            "tools": PROFILE_AGENT_TOOLS,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "thinking_mode": config.llm_thinking_mode_summary,
+            "reasoning_effort": config.llm_reasoning_effort_summary,
+            "request_round_index": round_index + 1,
+        }
+        try:
+            completion = await llm_provider.generate_messages_completion(
+                **request_data,
+                request_trace_id=trace_id,
+                request_phase="profile_agent",
+            )
+        except Exception as exc:
+            from komari_bot.plugins.agent_run_logger.diagnostic import (
+                record_failed_call,
+            )
+
+            record_failed_call(
+                collector,
+                phase="profile_agent",
+                round_index=round_index,
+                method="generate_messages_completion",
+                model=config.llm_model_summary,
+                request=request_data,
+                error=exc,
+            )
+            raise
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            ToolExecutionTrace,
+            record_completion_call,
+        )
+
+        call_id = record_completion_call(
+            collector,
+            phase="profile_agent",
+            round_index=round_index,
+            method="generate_messages_completion",
             model=config.llm_model_summary,
-            temperature=config.llm_temperature_summary,
-            max_tokens=config.llm_max_tokens_summary,
-            tools=PROFILE_AGENT_TOOLS,
-            tool_choice="auto",
-            parallel_tool_calls=False,
-            thinking_mode=config.llm_thinking_mode_summary,
-            reasoning_effort=config.llm_reasoning_effort_summary,
-            request_trace_id=trace_id,
-            request_phase="profile_agent",
-            request_round_index=round_index + 1,
+            request=request_data,
+            completion=completion,
         )
         last_content = str(completion.content or "").strip()
         if not completion.tool_calls:
@@ -176,6 +222,7 @@ async def _run_profile_agent_locked(
 
         messages.append(_build_assistant_tool_call_message(completion))
         for tool_call in completion.tool_calls:
+            tool_started_at = time.monotonic()
             tool_name = tool_call.function.name
             arguments = tool_call.parsed_arguments or {}
             result: dict[str, Any]
@@ -200,9 +247,40 @@ async def _run_profile_agent_locked(
                 case "commit_profile":
                     result = await _execute_commit_profile(staging, config)
                     if result.get("status") in {"committed", "nothing_to_commit"}:
+                        if collector is not None:
+                            collector.add_tool(
+                                ToolExecutionTrace(
+                                    call_id=call_id or "",
+                                    tool_name=tool_name,
+                                    parsed_arguments=arguments,
+                                    status=str(result.get("status", "success")),
+                                    result=result,
+                                    duration_ms=(
+                                        time.monotonic() - tool_started_at
+                                    )
+                                    * 1000,
+                                )
+                            )
                         return _profile_agent_result_from_commit_tool(result, last_content)
                 case _:
                     result = {"status": "error", "message": f"未知工具: {tool_name}"}
+            if collector is not None:
+                tool_status = str(result.get("status", "success"))
+                collector.add_tool(
+                    ToolExecutionTrace(
+                        call_id=call_id or "",
+                        tool_name=tool_name,
+                        parsed_arguments=arguments,
+                        status=tool_status,
+                        result=result,
+                        error=(
+                            str(result.get("message", ""))
+                            if tool_status == "error"
+                            else None
+                        ),
+                        duration_ms=(time.monotonic() - tool_started_at) * 1000,
+                    )
+                )
             messages.append(_build_tool_result_message(tool_call, result))
     else:
         preview = await staging.preview()
@@ -253,7 +331,7 @@ async def _load_profile_snapshot_profiles(
     return profiles
 
 
-def _build_initial_messages(
+async def _build_initial_messages(
     *,
     conversation_text: str,
     participants: list[str],
@@ -261,17 +339,27 @@ def _build_initial_messages(
     bot_user_ids: set[str],
     config: KomariMemoryConfigSchema,
 ) -> list[dict[str, Any]]:
-    template = get_summary_template()
+    template = await get_summary_template()
     workflow = render_summary_template(
         template["profile_agent_workflow_system"],
         bot_user_ids=", ".join(sorted(bot_user_ids)) or "无",
         profile_trait_limit=config.profile_trait_limit,
     )
-    user_content = (
+    external_context = (
         f"【群聊记录】\n{conversation_text}\n\n"
         f"【参与用户 user_id】\n{json.dumps(participants, ensure_ascii=False)}\n\n"
-        f"【昵称映射】\n{json.dumps(display_name_map, ensure_ascii=False)}\n\n"
-        "请维护用户画像。"
+        f"【昵称映射】\n{json.dumps(display_name_map, ensure_ascii=False)}"
+    )
+    user_content = (
+        render_untrusted_context(
+            UntrustedContext(
+                source_type="conversation_history",
+                source_id="profile-agent-input",
+                content=external_context,
+                max_chars=MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS,
+            )
+        )
+        + "\n\n请维护用户画像。"
     )
     return [
         {"role": "system", "content": template["memory_summary_common_system"]},
@@ -424,9 +512,17 @@ def _build_assistant_tool_call_message(completion: Any) -> dict[str, Any]:
 
 
 def _build_tool_result_message(tool_call: Any, result: dict[str, Any]) -> dict[str, Any]:
+    tool_name = tool_call.function.name
     return {
         "role": "tool",
         "tool_call_id": tool_call.id or "",
-        "name": tool_call.function.name,
-        "content": json.dumps(result, ensure_ascii=False),
+        "name": tool_name,
+        "content": render_untrusted_context(
+            UntrustedContext(
+                source_type="profile",
+                source_id=f"profile-agent:{tool_name}:{tool_call.id or 'unknown'}",
+                content=json.dumps(result, ensure_ascii=False),
+            ),
+            max_chars=_PROFILE_TOOL_RESULT_MAX_CHARS,
+        ),
     }

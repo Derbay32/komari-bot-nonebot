@@ -39,12 +39,65 @@ def test_run_timeout_cancels_future_and_raises_runtime_error(
         storage.close()
 
 
+@pytest.mark.asyncio
+async def test_run_async_does_not_block_caller_event_loop(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+
+    async def delayed_result() -> str:
+        await asyncio.sleep(0.1)
+        return "完成"
+
+    try:
+        operation = asyncio.create_task(storage._run_async(delayed_result()))
+        await asyncio.sleep(0)
+
+        assert operation.done() is False
+        assert await operation == "完成"
+    finally:
+        storage.close()
+
+
 class _FakePool:
     def __init__(self) -> None:
         self.closed = False
 
     async def close(self) -> None:
         self.closed = True
+
+
+def test_close_reclaims_pool_thread_and_event_loop(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    pool = _FakePool()
+    storage._pool = pool
+    thread = storage._thread
+    loop = storage._loop
+
+    storage.close()
+    storage.close()
+
+    assert pool.closed is True
+    assert thread.is_alive() is False
+    assert loop.is_closed() is True
+
+
+def test_closed_storage_rejects_new_operations_and_closes_coroutine(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    storage.close()
+
+    async def _completed() -> str:
+        return "不应执行"
+
+    coro = _completed()
+    with pytest.raises(RuntimeError, match="配置存储已关闭"):
+        storage._run(coro)
+
+    assert coro.cr_frame is None
 
 
 def test_get_pool_closes_temporary_pool_when_schema_initialization_fails(

@@ -29,8 +29,98 @@ def test_config_schema_exposes_profile_trait_limit() -> None:
     assert config.profile_trait_limit == 20
 
 
+def test_config_schema_declares_non_immediate_lifecycle_fields() -> None:
+    expected_modes = {
+        "plugin_enable": "restart",
+        "redis_db": "rebuild",
+        "global_interaction_summary_interval_minutes": "rebuild",
+    }
+
+    assert KomariMemoryConfigSchema.model_config.get("json_schema_extra") == {
+        "default_apply_mode": "immediate"
+    }
+    for field_name, expected_mode in expected_modes.items():
+        field_extra = KomariMemoryConfigSchema.model_fields[
+            field_name
+        ].json_schema_extra
+        assert isinstance(field_extra, dict)
+        assert field_extra["apply_mode"] == expected_mode
+
+
 def test_config_schema_rejects_too_small_profile_trait_limit() -> None:
     import pytest
 
     with pytest.raises(ValueError):
         KomariMemoryConfigSchema(profile_trait_limit=0)
+
+
+def test_proactive_reservation_ttl_has_bounded_immediate_config() -> None:
+    config = KomariMemoryConfigSchema()
+    field_extra = KomariMemoryConfigSchema.model_fields[
+        "proactive_reservation_ttl_seconds"
+    ].json_schema_extra
+
+    assert config.proactive_reservation_ttl_seconds == 360
+    assert isinstance(field_extra, dict)
+    assert field_extra["apply_mode"] == "immediate"
+
+    import pytest
+
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=29)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=901)
+
+
+def test_interaction_processing_lease_has_bounded_immediate_config() -> None:
+    import pytest
+
+    config = KomariMemoryConfigSchema()
+    field_extra = KomariMemoryConfigSchema.model_fields[
+        "global_interaction_processing_lease_seconds"
+    ].json_schema_extra
+
+    assert config.global_interaction_processing_lease_seconds == 1800
+    assert isinstance(field_extra, dict)
+    assert field_extra["apply_mode"] == "immediate"
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=59)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=7201)
+
+
+def test_vision_image_download_limits_are_bounded_and_immediate() -> None:
+    config = KomariMemoryConfigSchema()
+    expected_defaults = {
+        "vision_image_download_max_count": 4,
+        "vision_image_download_max_bytes": 8 * 1024 * 1024,
+        "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+        "vision_image_download_max_pixels": 40_000_000,
+        "vision_image_download_concurrency": 2,
+        "vision_image_download_connect_timeout_seconds": 5.0,
+        "vision_image_download_read_timeout_seconds": 30.0,
+        "vision_image_download_total_timeout_seconds": 45.0,
+    }
+
+    for field_name, expected_default in expected_defaults.items():
+        assert getattr(config, field_name) == expected_default
+        field_extra = KomariMemoryConfigSchema.model_fields[
+            field_name
+        ].json_schema_extra
+        assert isinstance(field_extra, dict)
+        assert field_extra["apply_mode"] == "immediate"
+
+
+def test_vision_image_download_rejects_inconsistent_batch_budgets() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="总字节上限"):
+        KomariMemoryConfigSchema(
+            vision_image_download_max_bytes=2 * 1024 * 1024,
+            vision_image_download_total_max_bytes=1024 * 1024,
+        )
+    with pytest.raises(ValueError, match="总时限"):
+        KomariMemoryConfigSchema(
+            vision_image_download_connect_timeout_seconds=10,
+            vision_image_download_total_timeout_seconds=5,
+        )

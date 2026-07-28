@@ -2,11 +2,15 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DynamicConfigSchema(BaseModel):
     """用户数据插件配置（由 config_manager 管理）。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "restart"},
+    )
 
     version: str = Field(default="2.0", description="配置架构版本")
     last_updated: str = Field(
@@ -14,7 +18,11 @@ class DynamicConfigSchema(BaseModel):
         description="最后更新时间戳",
     )
 
-    plugin_enable: bool = Field(default=True, description="插件启用状态")
+    plugin_enable: bool = Field(
+        default=True,
+        description="插件启用状态",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
     initial_favorability: int = Field(
         default=0,
         ge=0,
@@ -26,4 +34,5 @@ class DynamicConfigSchema(BaseModel):
         ge=1,
         le=20,
         description="单次回复允许记录的最大好感度变化绝对值",
+        json_schema_extra={"apply_mode": "immediate"},
     )

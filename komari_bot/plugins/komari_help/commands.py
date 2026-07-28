@@ -5,10 +5,14 @@ from __future__ import annotations
 from collections import defaultdict
 
 from nonebot import logger, on_command
-from nonebot.adapters.onebot.v11 import Message  # noqa: TC002
+from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
+from nonebot.plugin import require
 
+from komari_bot.common.onebot_messages import plain_text_message
+
+from .config_schema import DynamicConfigSchema
 from .engine import get_engine
 from .rendering import (
     LIST_PAGE_SIZE,
@@ -16,16 +20,31 @@ from .rendering import (
     format_results,
     get_search_result_limit,
 )
-from .scanner import scan_and_sync
+from .scanner import HelpScanAlreadyRunningError, scan_and_sync
+
+config_manager_plugin = require("config_manager")
+permission_manager_plugin = require("permission_manager")
+config_manager = config_manager_plugin.get_config_manager(
+    "komari_help",
+    DynamicConfigSchema,
+)
 
 help_cmd = on_command("docs", aliases={"帮助"}, priority=10, block=True)
 help_list_cmd = on_command(("docs", "list"), priority=9, block=True)
 help_refresh_cmd = on_command(
     ("docs", "refresh"),
-    permission=SUPERUSER,
     priority=5,
     block=True,
 )
+
+
+async def _check_runtime_permission(
+    bot: Bot,
+    event: MessageEvent,
+) -> tuple[bool, str]:
+    """读取当前配置并执行统一权限检查。"""
+    config = await config_manager.get_async()
+    return await permission_manager_plugin.check_runtime_permission(bot, event, config)
 
 
 async def _build_overview() -> str:
@@ -49,7 +68,15 @@ async def _build_overview() -> str:
 
 
 @help_cmd.handle()
-async def handle_help(args: Message = CommandArg()) -> None:
+async def handle_help(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    can_use, reason = await _check_runtime_permission(bot, event)
+    if not can_use:
+        await help_cmd.finish(plain_text_message(f"❌ {reason}"))
+
     query = args.extract_plain_text().strip()
     engine = get_engine()
     if engine is None:
@@ -62,11 +89,19 @@ async def handle_help(args: Message = CommandArg()) -> None:
     results = await engine.search(query, limit=get_search_result_limit())
     if not results:
         await help_cmd.finish("没有找到相关的帮助信息呢……")
-    await help_cmd.finish(format_results(results))
+    await help_cmd.finish(plain_text_message(format_results(results)))
 
 
 @help_list_cmd.handle()
-async def handle_help_list(args: Message = CommandArg()) -> None:
+async def handle_help_list(
+    bot: Bot,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+) -> None:
+    can_use, reason = await _check_runtime_permission(bot, event)
+    if not can_use:
+        await help_list_cmd.finish(plain_text_message(f"❌ {reason}"))
+
     engine = get_engine()
     if engine is None:
         await help_list_cmd.finish("帮助引擎尚未初始化，请稍后再试。")
@@ -88,20 +123,34 @@ async def handle_help_list(args: Message = CommandArg()) -> None:
     if not items:
         if total > 0:
             total_pages = (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
-            await help_list_cmd.finish(f"第 {page} 页不存在，当前共 {total_pages} 页。")
+            await help_list_cmd.finish(
+                plain_text_message(f"第 {page} 页不存在，当前共 {total_pages} 页。")
+            )
         await help_list_cmd.finish("当前还没有可用的帮助条目。")
 
-    await help_list_cmd.finish(format_list_page(items, total, page))
+    await help_list_cmd.finish(
+        plain_text_message(format_list_page(items, total, page))
+    )
 
 
 @help_refresh_cmd.handle()
-async def handle_help_refresh() -> None:
+async def handle_help_refresh(bot: Bot, event: MessageEvent) -> None:
+    if not await SUPERUSER(bot, event):
+        await help_refresh_cmd.finish("❌ 仅限 SUPERUSER 使用")
+
+    can_use, reason = await _check_runtime_permission(bot, event)
+    if not can_use:
+        await help_refresh_cmd.finish(plain_text_message(f"❌ {reason}"))
+
     engine = get_engine()
     if engine is None:
         await help_refresh_cmd.finish("帮助引擎尚未初始化，请稍后再试。")
 
-    updated_count = await scan_and_sync(engine)
+    try:
+        updated_count = await scan_and_sync(engine)
+    except HelpScanAlreadyRunningError:
+        await help_refresh_cmd.finish("⏳ 另一个进程正在扫描帮助信息，请稍后再试。")
     logger.info("[Komari Help] 手动刷新完成，更新 %s 条帮助条目", updated_count)
     await help_refresh_cmd.finish(
-        f"✅ 已重新扫描插件帮助信息，本次同步 {updated_count} 条。"
+        plain_text_message(f"✅ 已重新扫描插件帮助信息，本次同步 {updated_count} 条。")
     )

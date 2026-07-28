@@ -6,9 +6,12 @@
 
 from collections.abc import Awaitable, Callable
 from typing import Any
+from warnings import warn
 
-from nonebot.adapters import Bot, MessageTemplate
+from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent
+
+from komari_bot.common.onebot_messages import plain_text_message
 
 from .manager import ConfigType, PermissionManager
 
@@ -25,6 +28,12 @@ class PermissionChecker:
         Args:
             config: 配置对象
         """
+        warn(
+            "PermissionChecker 会捕获静态配置，已弃用；"
+            "请在处理器内调用 check_runtime_permission()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self.permission_manager = PermissionManager(config)
 
@@ -47,7 +56,7 @@ class PermissionChecker:
             can_use, reason = await self.permission_manager.can_use_command(bot, event)
             if not can_use:
                 # 权限检查失败，发送拒绝消息
-                await bot.send(event, MessageTemplate("❌ {}").format(reason))
+                await bot.send(event, plain_text_message(f"❌ {reason}"))
                 return None
 
             # 权限检查通过，执行原函数

@@ -123,8 +123,7 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
     events: list[tuple[str, object]] = []
     fake_pool = _FakePool()
 
-    async def _fake_create_pool(config: object) -> _FakePool:
-        del config
+    async def _fake_create_pool() -> _FakePool:
         events.append(("create_pool", True))
         return fake_pool
 
@@ -154,17 +153,15 @@ def test_initialize_bootstraps_schema_before_registering_tasks(monkeypatch: Any)
         return _FakeRedisManager(config, events)
 
     def _fake_memory_service(
-        config: object,
         conversation_repo: object,
         entity_repo: object,
         interaction_event_repo: object,
     ) -> _FakeMemoryService:
-        del config, conversation_repo, entity_repo, interaction_event_repo
+        del conversation_repo, entity_repo, interaction_event_repo
         events.append(("memory_service", True))
         return _FakeMemoryService(events)
 
-    def _fake_forgetting_service(config: object, pg_pool: object) -> SimpleNamespace:
-        del config
+    def _fake_forgetting_service(pg_pool: object) -> SimpleNamespace:
         events.append(("forgetting_service", pg_pool is fake_pool))
         return SimpleNamespace(pg_pool=pg_pool)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, cast
 
 from apscheduler.jobstores.base import JobLookupError
@@ -41,15 +42,27 @@ class _FakeRedisManager:
     async def get_orphaned_conversation_processing_keys(self) -> list[tuple[str, str]]:
         return list(self.orphaned)
 
+    async def claim_existing_conversation_processing(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> SimpleNamespace:
+        del group_id, processing_key, owner_token
+        return SimpleNamespace(status="claimed")
+
     async def restore_processing_conversation_buffer(
         self,
         group_id: str,
         processing_key: str,
-    ) -> None:
+        owner_token: str,
+    ) -> bool:
+        del owner_token
         self.restore_calls.append((group_id, processing_key))
         if processing_key in self.fail_keys:
             msg = "恢复失败"
             raise RuntimeError(msg)
+        return True
 
 
 def test_unregister_clears_service_when_job_missing(monkeypatch: Any) -> None:

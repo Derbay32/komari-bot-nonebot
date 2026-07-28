@@ -2,17 +2,39 @@
 llm provider 配置 Schema 实现。
 """
 
-import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+ALLOWED_EXTRA_PARAM_KEYS = frozenset(
+    {
+        "logprobs",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+        "seed",
+        "stop",
+        "top_k",
+        "top_logprobs",
+        "top_p",
+    }
+)
+
+
+def get_unsupported_extra_param_keys(extra_params: dict[str, Any]) -> list[str]:
+    """返回不在安全白名单中的额外请求参数键。"""
+    return sorted(set(extra_params) - ALLOWED_EXTRA_PARAM_KEYS)
 
 
 class DynamicConfigSchema(BaseModel):
     """
     llm provider 配置 Schema。
     """
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     # 元数据
     version: str = Field(default="1.0", description="配置架构版本")
@@ -21,19 +43,12 @@ class DynamicConfigSchema(BaseModel):
         description="最后更新时间戳",
     )
 
-    # 插件控制
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
-
-    # 白名单配置
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
-    )
-
     # OpenAI 兼容 API 配置
-    api_token: str = Field(default="", description="OpenAI 兼容 API Token")
+    api_token: str = Field(
+        default="",
+        description="OpenAI 兼容 API Token",
+        json_schema_extra={"secret": True},
+    )
     api_base: str = Field(
         default="https://api.deepseek.com/v1",
         description="OpenAI 兼容 API Base URL",
@@ -68,8 +83,9 @@ class DynamicConfigSchema(BaseModel):
     extra_params: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "OpenAI 兼容 API 请求的额外自定义参数，"
-            "会合并到每次请求体的 extra_body 中。"
+            "OpenAI 兼容 API 请求的额外生成参数，仅接受安全白名单中的键。"
+            "允许：logprobs、min_p、presence_penalty、repetition_penalty、seed、"
+            "stop、top_k、top_logprobs、top_p。"
             "思考模式控制请使用各业务插件的 *_thinking_mode / *_reasoning_effort 字段，"
             "勿在此处配置 thinking/enable_thinking/reasoning_effort。"
         ),
@@ -99,49 +115,12 @@ class DynamicConfigSchema(BaseModel):
         description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
     )
 
-    # LLM 调用日志配置
-    llm_log_retention_days: int = Field(
-        default=30,
-        ge=1,
-        le=90,
-        description="logs/llm_provider/*.jsonl 自动清理的日志保留天数",
-    )
-    llm_log_dir_permission_mode: str = Field(
-        default="0o700",
-        description=(
-            "LLM 日志目录首次创建时应用的八进制权限字符串，"
-            "例如 0o700、0o750；为空字符串时禁用 chmod 权限收敛"
-        ),
-    )
-
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
+    @field_validator("extra_params")
     @classmethod
-    def parse_list_string(cls, v: Any) -> Any:
-        """处理从 .env 格式解析列表。
-
-        Args:
-            v: 输入值，可能是字符串或列表
-
-        Returns:
-            解析后的字符串列表
-        """
-        if isinstance(v, str):
-            import json
-
-            try:
-                parsed = json.loads(v)
-                return [str(item) for item in parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [item.strip() for item in v.split(",") if item.strip()]
-        return v
-
-    @field_validator("llm_log_dir_permission_mode")
-    @classmethod
-    def validate_log_dir_permission_mode(cls, v: str) -> str:
-        """校验 LLM 日志目录权限模式。"""
-        if v == "":
-            return v
-        if not re.fullmatch(r"0o[0-7]{3,4}", v):
-            msg = "llm_log_dir_permission_mode 必须为空或八进制权限字符串"
+    def validate_extra_params(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """拒绝可能覆盖消息、模型、工具或传输控制的额外参数。"""
+        unsupported = get_unsupported_extra_param_keys(v)
+        if unsupported:
+            msg = f"extra_params 包含不允许的键: {', '.join(unsupported)}"
             raise ValueError(msg)
         return v

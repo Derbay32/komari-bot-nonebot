@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from collections import defaultdict
-from typing import Any, Final
+from typing import Any, Final, cast
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    IDENTIFIER_TEXT_BUDGET,
+    KEYWORD_TEXT_BUDGET,
+    NOTES_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    TITLE_TEXT_BUDGET,
+    normalize_keywords,
+    normalize_optional_text,
+    normalize_required_text,
+    validate_text_budget,
+)
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
     get_shared_database_config,
@@ -20,6 +33,7 @@ from komari_bot.common.vector_storage_schema import (
     build_help_embedding_index_statement,
     build_help_schema_statements,
 )
+from komari_bot.common.versioned_keyword_index import VersionedKeywordIndex
 
 from .config_schema import DynamicConfigSchema
 from .models import HelpCategory, HelpEntry, HelpSearchResult
@@ -36,6 +50,18 @@ class PluginState:
 
 
 state = PluginState()
+_engine_initialize_lock: asyncio.Lock | None = None
+_engine_initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_engine_initialize_lock() -> asyncio.Lock:
+    """获取绑定当前事件循环的全局初始化锁。"""
+    global _engine_initialize_lock, _engine_initialize_lock_loop  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    if _engine_initialize_lock is None or _engine_initialize_lock_loop is not loop:
+        _engine_initialize_lock = asyncio.Lock()
+        _engine_initialize_lock_loop = loop
+    return _engine_initialize_lock
 
 if state.nonebot_mode:
     try:
@@ -94,6 +120,10 @@ def get_disabled_auto_help_plugins() -> set[str]:
 
 
 UNSET: Final[object] = object()
+HELP_SCAN_LEASE_NAME: Final[str] = "plugin_metadata"
+HELP_SCAN_LEASE_SECONDS_MIN: Final[int] = 10
+HELP_SCAN_LEASE_SECONDS_MAX: Final[int] = 3600
+HELP_UPDATE_MAX_RETRIES: Final[int] = 5
 
 
 class EmbeddingDimensionMissingError(RuntimeError):
@@ -106,10 +136,27 @@ class HelpEngine:
     def __init__(self) -> None:
         self._pool: Any = None
         self._embedding_service: Any = None
-        self._keyword_index: dict[str, set[int]] = defaultdict(set)
-        self._index_loaded = False
+        self._keyword_index = VersionedKeywordIndex("komari_help")
+        self._initialize_lock: asyncio.Lock | None = None
+        self._initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._initialized = False
 
     async def initialize(self) -> None:
+        """单飞初始化帮助引擎。"""
+        async with self._get_initialize_lock():
+            if self._initialized:
+                return
+            await self._initialize_once()
+
+    def _get_initialize_lock(self) -> asyncio.Lock:
+        """获取绑定当前事件循环的实例初始化锁。"""
+        loop = asyncio.get_running_loop()
+        if self._initialize_lock is None or self._initialize_lock_loop is not loop:
+            self._initialize_lock = asyncio.Lock()
+            self._initialize_lock_loop = loop
+        return self._initialize_lock
+
+    async def _initialize_once(self) -> None:
         state.logger.info("[Komari Help] 正在初始化帮助引擎...")
         get_config()
 
@@ -152,6 +199,7 @@ class HelpEngine:
                 await self._validate_embedding_dimension(expected_dimension)
 
             await self._build_keyword_index()
+            self._initialized = True
             state.logger.info("[Komari Help] 帮助引擎初始化完成")
         except Exception:
             try:
@@ -212,15 +260,134 @@ class HelpEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
-        self._keyword_index.clear()
-        self._index_loaded = False
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, title, plugin_name, keywords
-                FROM komari_help
-                """
+        await self._keyword_index.rebuild(
+            self._pool,
+            self._load_keyword_index_entries,
+        )
+
+    async def rebuild_keyword_index(self) -> None:
+        """公开的索引重建入口，避免扫描器依赖引擎私有实现。"""
+        await self._build_keyword_index()
+
+    @staticmethod
+    def _validate_scan_lease(owner_token: str, lease_seconds: int) -> str:
+        normalized_owner = owner_token.strip()
+        if not normalized_owner:
+            message = "扫描租约 owner_token 不能为空"
+            raise ValueError(message)
+        validate_text_budget(
+            normalized_owner,
+            label="扫描租约 owner_token",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+        if not (
+            HELP_SCAN_LEASE_SECONDS_MIN
+            <= lease_seconds
+            <= HELP_SCAN_LEASE_SECONDS_MAX
+        ):
+            message = (
+                "扫描租约时长必须在 "
+                f"{HELP_SCAN_LEASE_SECONDS_MIN} 到 {HELP_SCAN_LEASE_SECONDS_MAX} 秒之间"
             )
+            raise ValueError(message)
+        return normalized_owner
+
+    async def acquire_scan_lease(
+        self,
+        owner_token: str,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        """跨 worker 原子抢占插件元数据扫描租约。"""
+        if self._pool is None:
+            raise RuntimeError("数据库连接池未初始化")
+        normalized_owner = self._validate_scan_lease(owner_token, lease_seconds)
+        async with self._pool.acquire() as conn:
+            claimed_owner = await conn.fetchval(
+                """
+                INSERT INTO komari_help_scan_leases (
+                    lease_name,
+                    owner_token,
+                    lease_expires_at,
+                    updated_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    CURRENT_TIMESTAMP + ($3::double precision * INTERVAL '1 second'),
+                    CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (lease_name) DO UPDATE
+                SET owner_token = EXCLUDED.owner_token,
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE komari_help_scan_leases.lease_expires_at <= CURRENT_TIMESTAMP
+                   OR komari_help_scan_leases.owner_token = EXCLUDED.owner_token
+                RETURNING owner_token
+                """,
+                HELP_SCAN_LEASE_NAME,
+                normalized_owner,
+                lease_seconds,
+            )
+        return claimed_owner == normalized_owner
+
+    async def renew_scan_lease(
+        self,
+        owner_token: str,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        """仅允许当前且尚未过期的 owner 续租扫描任务。"""
+        if self._pool is None:
+            raise RuntimeError("数据库连接池未初始化")
+        normalized_owner = self._validate_scan_lease(owner_token, lease_seconds)
+        async with self._pool.acquire() as conn:
+            renewed_owner = await conn.fetchval(
+                """
+                UPDATE komari_help_scan_leases
+                SET lease_expires_at = (
+                        CURRENT_TIMESTAMP
+                        + ($3::double precision * INTERVAL '1 second')
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE lease_name = $1
+                  AND owner_token = $2
+                  AND lease_expires_at > CURRENT_TIMESTAMP
+                RETURNING owner_token
+                """,
+                HELP_SCAN_LEASE_NAME,
+                normalized_owner,
+                lease_seconds,
+            )
+        return renewed_owner == normalized_owner
+
+    async def release_scan_lease(self, owner_token: str) -> None:
+        """幂等释放属于当前 owner 的扫描租约。"""
+        if self._pool is None:
+            return
+        normalized_owner = owner_token.strip()
+        if not normalized_owner:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM komari_help_scan_leases
+                WHERE lease_name = $1
+                  AND owner_token = $2
+                """,
+                HELP_SCAN_LEASE_NAME,
+                normalized_owner,
+            )
+
+    async def _load_keyword_index_entries(self, conn: Any) -> dict[str, set[int]]:
+        """从同一数据库快照加载帮助关键词映射。"""
+        rows = await conn.fetch(
+            """
+            SELECT id, title, plugin_name, keywords
+            FROM komari_help
+            """
+        )
+        entries: dict[str, set[int]] = defaultdict(set)
         for row in rows:
             help_id = int(row["id"])
             pieces = [
@@ -230,8 +397,17 @@ class HelpEngine:
             ]
             for piece in pieces:
                 for token in self._tokenize(piece):
-                    self._keyword_index[token].add(help_id)
-        self._index_loaded = True
+                    entries[token].add(help_id)
+        return entries
+
+    async def _ensure_keyword_index_fresh(self) -> None:
+        """按版本戳刷新其他 worker 已修改的索引。"""
+        if self._pool is None:
+            return
+        await self._keyword_index.ensure_fresh(
+            self._pool,
+            self._load_keyword_index_entries,
+        )
 
     async def _get_embedding(self, text: str) -> list[float]:
         if state.nonebot_mode:
@@ -269,6 +445,14 @@ class HelpEngine:
     ) -> list[HelpSearchResult]:
         if not query or not query.strip():
             return []
+        raw_query = query
+        query = normalize_required_text(
+            query,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
+        if query != raw_query:
+            query_vec = None
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
@@ -278,6 +462,11 @@ class HelpEngine:
 
         original_query = query
         query = self._rewrite_query(query)
+        validate_text_budget(
+            query,
+            label="改写后查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
         if query != original_query and query_vec is not None:
             query_vec = None
 
@@ -310,10 +499,19 @@ class HelpEngine:
         return results[:result_limit]
 
     async def search_by_keyword(self, keyword: str) -> list[HelpSearchResult]:
-        if not self._index_loaded:
+        if not keyword.strip():
+            return []
+        keyword = normalize_required_text(
+            keyword,
+            label="关键词查询",
+            budget=KEYWORD_TEXT_BUDGET,
+        )
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded:
             return []
         keyword_lower = keyword.lower().strip()
-        if keyword_lower not in self._keyword_index:
+        entries = self._keyword_index.entries
+        if keyword_lower not in entries:
             return []
         if self._pool is None:
             return []
@@ -326,7 +524,7 @@ class HelpEngine:
                 WHERE id = ANY($1)
                 ORDER BY created_at DESC
                 """,
-                list(self._keyword_index[keyword_lower]),
+                list(entries[keyword_lower]),
             )
         return [
             self._build_search_result(dict(row), similarity=1.0, source="keyword")
@@ -336,13 +534,15 @@ class HelpEngine:
     async def _layer1_keyword_search(
         self, query: str, limit: int
     ) -> list[HelpSearchResult]:
-        if not self._index_loaded or limit <= 0:
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded or limit <= 0:
             return []
         query_tokens = self._tokenize(query)
         matched_ids: set[int] = set()
+        entries = self._keyword_index.entries
         for token in query_tokens:
-            matched_ids.update(self._keyword_index.get(token, set()))
-            for indexed_token, help_ids in self._keyword_index.items():
+            matched_ids.update(entries.get(token, frozenset()))
+            for indexed_token, help_ids in entries.items():
                 if token and token in indexed_token:
                     matched_ids.update(help_ids)
         if not matched_ids or self._pool is None:
@@ -419,6 +619,27 @@ class HelpEngine:
     ) -> int:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
+        title = normalize_required_text(
+            title,
+            label="帮助标题",
+            budget=TITLE_TEXT_BUDGET,
+        )
+        content = normalize_required_text(
+            content,
+            label="帮助内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        keywords = normalize_keywords(keywords, require_nonempty=False)
+        plugin_name = normalize_optional_text(
+            plugin_name,
+            label="插件名",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+        notes = normalize_optional_text(
+            notes,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
         embedding = await self._get_embedding(f"{title}\n{content}")
         async with self._pool.acquire() as conn:
             help_id = await conn.fetchval(
@@ -458,71 +679,121 @@ class HelpEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
+        plugin_name = normalize_required_text(
+            plugin_name,
+            label="插件名",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+        title = normalize_required_text(
+            title,
+            label="帮助标题",
+            budget=TITLE_TEXT_BUDGET,
+        )
+        content = normalize_required_text(
+            content,
+            label="帮助内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        keywords = normalize_keywords(keywords, require_nonempty=False)
+        notes = normalize_optional_text(
+            notes,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
+
         async with self._pool.acquire() as conn:
             existing_row = await conn.fetchrow(
                 """
-                SELECT id, is_auto_generated, title, content, keywords
+                SELECT
+                    id,
+                    is_auto_generated,
+                    category,
+                    title,
+                    content,
+                    keywords,
+                    notes
                 FROM komari_help
                 WHERE plugin_name = $1
-                ORDER BY is_auto_generated DESC, id ASC
+                ORDER BY is_auto_generated ASC, id ASC
                 LIMIT 1
                 """,
                 plugin_name,
             )
 
-            if existing_row is not None and not bool(existing_row["is_auto_generated"]):
+        if existing_row is not None and not bool(existing_row["is_auto_generated"]):
+            return False
+
+        if existing_row is not None:
+            existing_keywords = set(existing_row["keywords"] or [])
+            new_keywords = set(keywords)
+            if (
+                str(existing_row["category"] or "other") == category
+                and str(existing_row["title"] or "") == title
+                and str(existing_row["content"] or "") == content
+                and existing_keywords == new_keywords
+                and existing_row["notes"] == notes
+            ):
                 return False
 
-            if existing_row is not None:
-                existing_keywords = set(existing_row["keywords"] or [])
-                new_keywords = set(keywords)
-                if (
-                    str(existing_row["title"] or "") == title
-                    and str(existing_row["content"] or "") == content
-                    and existing_keywords == new_keywords
-                ):
-                    return False
-
-            embedding = await self._get_embedding(f"{title}\n{content}")
-            if existing_row is None:
-                await conn.execute(
-                    """
-                    INSERT INTO komari_help (
-                        category, plugin_name, keywords, title, content, notes,
-                        is_auto_generated, embedding
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
-                    """,
+        # 外部 embedding 调用不能占用 PostgreSQL 连接；写回由部分唯一索引和
+        # UPSERT 保证多个 worker 即使同时到达也只保留一条自动帮助。
+        embedding = await self._get_embedding(f"{title}\n{content}")
+        async with self._pool.acquire() as conn:
+            changed_id = await conn.fetchval(
+                """
+                INSERT INTO komari_help (
                     category,
                     plugin_name,
                     keywords,
                     title,
                     content,
                     notes,
-                    str(embedding),
+                    is_auto_generated,
+                    embedding
                 )
-            else:
-                await conn.execute(
-                    """
-                    UPDATE komari_help
-                    SET category = $2,
-                        keywords = $3,
-                        title = $4,
-                        content = $5,
-                        notes = $6,
-                        embedding = $7,
-                        is_auto_generated = TRUE,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = $1
-                    """,
-                    int(existing_row["id"]),
-                    category,
-                    keywords,
-                    title,
-                    content,
-                    notes,
-                    str(embedding),
+                SELECT $1, $2, $3, $4, $5, $6, TRUE, $7
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM komari_help
+                    WHERE plugin_name = $2
+                      AND is_auto_generated = FALSE
                 )
+                ON CONFLICT (plugin_name)
+                WHERE is_auto_generated = TRUE
+                  AND plugin_name IS NOT NULL
+                DO UPDATE
+                SET category = EXCLUDED.category,
+                    keywords = EXCLUDED.keywords,
+                    title = EXCLUDED.title,
+                    content = EXCLUDED.content,
+                    notes = EXCLUDED.notes,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE (
+                    komari_help.category,
+                    komari_help.keywords,
+                    komari_help.title,
+                    komari_help.content,
+                    komari_help.notes
+                ) IS DISTINCT FROM (
+                    EXCLUDED.category,
+                    EXCLUDED.keywords,
+                    EXCLUDED.title,
+                    EXCLUDED.content,
+                    EXCLUDED.notes
+                )
+                RETURNING id
+                """,
+                category,
+                plugin_name,
+                keywords,
+                title,
+                content,
+                notes,
+                str(embedding),
+            )
+        if changed_id is None:
+            return False
         if rebuild_index:
             await self._build_keyword_index()
         return True
@@ -562,6 +833,11 @@ class HelpEngine:
         if query is not None:
             keyword = query.strip()
             if keyword:
+                validate_text_budget(
+                    keyword,
+                    label="列表查询文本",
+                    budget=QUERY_TEXT_BUDGET,
+                )
                 pattern = f"%{escape_like_pattern(keyword)}%"
                 conditions.append(
                     f"""
@@ -666,68 +942,137 @@ class HelpEngine:
         ):
             raise ValueError("至少提供一个要更新的字段")
 
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT title, content, keywords, category, plugin_name, notes
-                FROM komari_help
-                WHERE id = $1
-                """,
-                hid,
+        has_title_update = title is not UNSET
+        title_value = ""
+        if has_title_update:
+            assert isinstance(title, str)
+            title_value = normalize_required_text(
+                title,
+                label="帮助标题",
+                budget=TITLE_TEXT_BUDGET,
             )
+
+        has_content_update = content is not UNSET
+        content_value = ""
+        if has_content_update:
+            assert isinstance(content, str)
+            content_value = normalize_required_text(
+                content,
+                label="帮助内容",
+                budget=CONTENT_TEXT_BUDGET,
+            )
+
+        has_keywords_update = keywords is not UNSET
+        keywords_value: list[str] = []
+        if has_keywords_update:
+            assert isinstance(keywords, list)
+            keywords_value = normalize_keywords(keywords, require_nonempty=False)
+
+        has_category_update = category is not UNSET
+        category_value: HelpCategory = "other"
+        if has_category_update:
+            assert isinstance(category, str)
+            category_value = cast("HelpCategory", category)
+
+        has_plugin_name_update = plugin_name is not UNSET
+        plugin_name_value: str | None = None
+        if has_plugin_name_update:
+            assert plugin_name is None or isinstance(plugin_name, str)
+            plugin_name_value = normalize_optional_text(
+                plugin_name,
+                label="插件名",
+                budget=IDENTIFIER_TEXT_BUDGET,
+            )
+
+        has_notes_update = notes is not UNSET
+        notes_value: str | None = None
+        if has_notes_update:
+            assert notes is None or isinstance(notes, str)
+            notes_value = normalize_optional_text(
+                notes,
+                label="备注",
+                budget=NOTES_TEXT_BUDGET,
+            )
+
+        for _attempt in range(HELP_UPDATE_MAX_RETRIES):
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        title,
+                        content,
+                        keywords,
+                        category,
+                        plugin_name,
+                        notes,
+                        xmin::text AS row_version
+                    FROM komari_help
+                    WHERE id = $1
+                    """,
+                    hid,
+                )
             if row is None:
                 return False
 
-            current_title = str(row["title"])
-            current_content = str(row["content"])
-            next_title = title if title is not UNSET else current_title
-            next_content = content if content is not UNSET else current_content
-            assert isinstance(next_title, str)
-            assert isinstance(next_content, str)
-
+            next_title = title_value if has_title_update else str(row["title"])
+            next_content = (
+                content_value if has_content_update else str(row["content"])
+            )
+            row_version = str(row["row_version"])
             updates: list[str] = []
             params: list[object] = []
-            param_idx = 2
+            param_idx = 3
 
-            if title is not UNSET:
+            if has_title_update:
                 updates.append(f"title = ${param_idx}")
-                params.append(next_title)
+                params.append(title_value)
                 param_idx += 1
-            if content is not UNSET:
+            if has_content_update:
                 updates.append(f"content = ${param_idx}")
-                params.append(next_content)
+                params.append(content_value)
                 param_idx += 1
-            if keywords is not UNSET:
+            if has_keywords_update:
                 updates.append(f"keywords = ${param_idx}")
-                params.append(keywords)
+                params.append(keywords_value)
                 param_idx += 1
-            if category is not UNSET:
+            if has_category_update:
                 updates.append(f"category = ${param_idx}")
-                params.append(category)
+                params.append(category_value)
                 param_idx += 1
-            if plugin_name is not UNSET:
+            if has_plugin_name_update:
                 updates.append(f"plugin_name = ${param_idx}")
-                params.append(plugin_name)
+                params.append(plugin_name_value)
                 param_idx += 1
-            if notes is not UNSET:
+            if has_notes_update:
                 updates.append(f"notes = ${param_idx}")
-                params.append(notes)
+                params.append(notes_value)
                 param_idx += 1
 
-            if title is not UNSET or content is not UNSET:
+            if has_title_update or has_content_update:
+                # embedding 属于外部网络调用，必须在释放数据库连接后执行。
                 embedding = await self._get_embedding(f"{next_title}\n{next_content}")
                 updates.append(f"embedding = ${param_idx}")
                 params.append(str(embedding))
-                param_idx += 1
 
             updates.append("updated_at = CURRENT_TIMESTAMP")
-            await conn.execute(
-                f"UPDATE komari_help SET {', '.join(updates)} WHERE id = $1",
-                hid,
-                *params,
-            )
-        await self._build_keyword_index()
-        return True
+            async with self._pool.acquire() as conn:
+                updated_id = await conn.fetchval(
+                    f"""
+                    UPDATE komari_help
+                    SET {", ".join(updates)}
+                    WHERE id = $1
+                      AND xmin::text = $2
+                    RETURNING id
+                    """,
+                    hid,
+                    row_version,
+                    *params,
+                )
+            if updated_id is not None:
+                await self._build_keyword_index()
+                return True
+
+        raise RuntimeError("帮助条目被并发修改次数过多，请稍后重试")
 
     def _build_help_entry(self, payload: dict[str, Any]) -> HelpEntry:
         return HelpEntry(
@@ -780,8 +1125,8 @@ class HelpEngine:
             finally:
                 self._pool = None
 
-        self._keyword_index.clear()
-        self._index_loaded = False
+        await self._keyword_index.reset()
+        self._initialized = False
         if state.engine is self:
             state.engine = None
         if errors:
@@ -795,8 +1140,9 @@ def get_engine() -> HelpEngine | None:
 
 async def initialize_engine() -> HelpEngine:
     """初始化全局引擎实例。"""
-    if state.engine is None:
-        engine = HelpEngine()
-        await engine.initialize()
-        state.engine = engine
+    async with _get_engine_initialize_lock():
+        if state.engine is None:
+            engine = HelpEngine()
+            await engine.initialize()
+            state.engine = engine
     return state.engine

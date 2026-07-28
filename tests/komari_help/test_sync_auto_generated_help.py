@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import cast
+
+import pytest
 
 from komari_bot.plugins.komari_help.engine import HelpEngine
-from komari_bot.plugins.komari_help.scanner import scan_and_sync
-
-if TYPE_CHECKING:
-    import pytest
+from komari_bot.plugins.komari_help.scanner import (
+    HelpScanAlreadyRunningError,
+    scan_and_sync,
+)
 
 
 class _FakeConn:
@@ -19,12 +21,14 @@ class _FakeConn:
         self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
-        assert "SELECT id, is_auto_generated, title, content, keywords" in query
+        assert "is_auto_generated" in query
+        assert "ORDER BY is_auto_generated ASC" in query
         assert args == ("demo_plugin",)
         return self.existing_row
 
-    async def execute(self, query: str, *args: object) -> None:
+    async def fetchval(self, query: str, *args: object) -> int:
         self.execute_calls.append((query, args))
+        return 1
 
 
 class _FakePool:
@@ -65,6 +69,39 @@ class _FakeDeletePool:
         del exc_type, exc, tb
 
 
+class _FakeScanLeaseEngine:
+    index_rebuild_count: int
+    scan_lease_owner: str | None = None
+
+    async def acquire_scan_lease(
+        self,
+        owner_token: str,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        assert owner_token
+        assert lease_seconds > 0
+        self.scan_lease_owner = owner_token
+        return True
+
+    async def renew_scan_lease(
+        self,
+        owner_token: str,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        assert owner_token == self.scan_lease_owner
+        assert lease_seconds > 0
+        return True
+
+    async def release_scan_lease(self, owner_token: str) -> None:
+        assert owner_token == self.scan_lease_owner
+        self.scan_lease_owner = None
+
+    async def rebuild_keyword_index(self) -> None:
+        self.index_rebuild_count += 1
+
+
 def test_sync_auto_generated_help_skips_unchanged_content() -> None:
     engine = HelpEngine()
     conn = _FakeConn(
@@ -74,6 +111,8 @@ def test_sync_auto_generated_help_skips_unchanged_content() -> None:
             "title": "演示插件",
             "content": "/demo help",
             "keywords": ["帮助", "演示"],
+            "category": "feature",
+            "notes": None,
         }
     )
     engine._pool = _FakePool(conn)
@@ -111,6 +150,8 @@ def test_sync_auto_generated_help_updates_changed_content_without_rebuilding_ind
             "title": "旧标题",
             "content": "旧内容",
             "keywords": ["旧关键词"],
+            "category": "feature",
+            "notes": None,
         }
     )
     engine._pool = _FakePool(conn)
@@ -137,10 +178,11 @@ def test_sync_auto_generated_help_updates_changed_content_without_rebuilding_ind
 
     assert changed is True
     update_query, update_args = conn.execute_calls[0]
-    assert "UPDATE komari_help" in update_query
+    assert "INSERT INTO komari_help" in update_query
+    assert "ON CONFLICT (plugin_name)" in update_query
     assert update_args == (
-        1,
         "feature",
+        "demo_plugin",
         ["新关键词"],
         "新标题",
         "新内容",
@@ -171,7 +213,7 @@ def test_scan_and_sync_rebuilds_keyword_index_once(
         ),
     ]
 
-    class _FakeEngine:
+    class _FakeEngine(_FakeScanLeaseEngine):
         def __init__(self) -> None:
             self.sync_calls: list[dict[str, object]] = []
             self.index_rebuild_count = 0
@@ -229,7 +271,7 @@ def test_scan_and_sync_skips_disabled_plugins(
         ),
     ]
 
-    class _FakeEngine:
+    class _FakeEngine(_FakeScanLeaseEngine):
         def __init__(self) -> None:
             self.sync_calls: list[dict[str, object]] = []
             self.index_rebuild_count = 0
@@ -321,7 +363,7 @@ def test_delete_auto_generated_help_by_plugins_only_removes_auto_generated() -> 
 def test_scan_and_sync_rebuilds_index_when_only_disabled_cleanup_happens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class _FakeEngine:
+    class _FakeEngine(_FakeScanLeaseEngine):
         def __init__(self) -> None:
             self.index_rebuild_count = 0
             self.delete_calls: list[tuple[set[str], bool]] = []
@@ -356,3 +398,36 @@ def test_scan_and_sync_rebuilds_index_when_only_disabled_cleanup_happens(
     assert updated_count == 0
     assert engine.delete_calls == [({"demo_plugin"}, False)]
     assert engine.index_rebuild_count == 1
+
+
+def test_scan_and_sync_rejects_second_worker_without_touching_data() -> None:
+    class _BusyEngine(_FakeScanLeaseEngine):
+        index_rebuild_count = 0
+        data_accessed = False
+
+        async def acquire_scan_lease(
+            self,
+            owner_token: str,
+            *,
+            lease_seconds: int,
+        ) -> bool:
+            assert owner_token
+            assert lease_seconds > 0
+            return False
+
+        async def delete_auto_generated_help_by_plugins(
+            self,
+            _plugin_names: set[str],
+            *,
+            rebuild_index: bool = True,
+        ) -> int:
+            del rebuild_index
+            self.data_accessed = True
+            return 0
+
+    engine = _BusyEngine()
+
+    with pytest.raises(HelpScanAlreadyRunningError):
+        asyncio.run(scan_and_sync(cast("HelpEngine", engine)))
+
+    assert engine.data_accessed is False

@@ -44,6 +44,10 @@ class UnifiedRerankResult:
     noise_prior: float
 
 
+class SceneRuntimeUnavailableError(RuntimeError):
+    """scene 运行时快照暂不可用于判定。"""
+
+
 class UnifiedCandidateRerankService:
     """统一候选集组装与单次 rerank。"""
 
@@ -56,9 +60,10 @@ class UnifiedCandidateRerankService:
             return None
         try:
             await self._runtime_service.refresh_if_runtime_updated()
-        except Exception:
+        except Exception as exc:
             logger.exception("[UnifiedRerank] 刷新 scene runtime cache 失败")
-            raise
+            msg = "scene runtime cache 刷新失败"
+            raise SceneRuntimeUnavailableError(msg) from exc
         return self._runtime_service.get_scene_candidates()
 
     @staticmethod
@@ -110,15 +115,15 @@ class UnifiedCandidateRerankService:
             else self.detect_alias(message, config.bot_aliases)
         )
 
+        runtime_snapshot = await self._get_runtime_snapshot()
+        if runtime_snapshot is None:
+            msg = "scene runtime snapshot 不可用，请先初始化/迁移 komari_decision scenes"
+            raise SceneRuntimeUnavailableError(msg)
+
         query_vector = await embedding_provider.embed(
             message,
             instruction=config.embedding_instruction_query,
         )
-
-        runtime_snapshot = await self._get_runtime_snapshot()
-        if runtime_snapshot is None:
-            msg = "scene runtime snapshot 不可用，请先初始化/迁移 komari_decision scenes"
-            raise RuntimeError(msg)
         top_k = max(1, config.scene_top_k)
 
         noise_prior = self._cosine_similarity(

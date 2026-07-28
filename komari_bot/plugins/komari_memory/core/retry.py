@@ -46,13 +46,20 @@ def retry_async(
                     last_error = e
                     if attempt == max_attempts - 1:
                         logger.error(
-                            f"[{func.__name__}] {max_attempts}次尝试全部失败: {last_error}"
+                            "[{}] {}次尝试全部失败: error_type={}",
+                            func.__name__,
+                            max_attempts,
+                            type(last_error).__name__,
                         )
                         raise
 
                     delay = min(base_delay * (2**attempt), max_delay)
                     logger.warning(
-                        f"[{func.__name__}] 第{attempt + 1}次失败，{delay:.1f}秒后重试: {e}"
+                        "[{}] 第{}次失败，{:.1f}秒后重试: error_type={}",
+                        func.__name__,
+                        attempt + 1,
+                        delay,
+                        type(e).__name__,
                     )
                     await asyncio.sleep(delay)
 

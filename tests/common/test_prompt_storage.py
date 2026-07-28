@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -107,6 +108,14 @@ class _ClosablePromptStorage:
         self.closed = True
 
 
+class _FakePool:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def test_merge_prompt_values_only_accepts_known_string_fields() -> None:
     merged = merge_prompt_values(
         {"system_prompt": "默认", "memory_ack": "收到"},
@@ -126,6 +135,8 @@ def test_validate_prompt_values_rejects_unknown_and_blank_fields() -> None:
         validate_prompt_values(defaults, {"unknown": "新值"})
     with pytest.raises(ValueError, match="非空字符串"):
         validate_prompt_values(defaults, {"system_prompt": "   "})
+    with pytest.raises(ValueError, match="字符上限"):
+        validate_prompt_values(defaults, {"system_prompt": "字" * 12_001})
 
 
 def test_load_and_save_prompt_values_use_prompt_storage(
@@ -239,6 +250,10 @@ def test_load_prompt_values_does_not_write_when_fetch_fails(
 def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Storage:
+        def register_invalidator(self, _resource_id: str, _callback: object) -> None:
+            return
+
     calls = 0
 
     def fake_load_prompt_values(_resource: object) -> prompt_storage.PromptValues:
@@ -260,6 +275,7 @@ def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(prompt_storage, "load_prompt_values", fake_load_prompt_values)
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: _Storage())
     loader = PromptTemplateLoader(
         resource_id="test_prompt",
         display_name="测试 Prompt",
@@ -269,6 +285,115 @@ def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
 
     assert loader.get_template() == {"system_prompt": "PG 值"}
     assert loader.get_template() == {"system_prompt": "PG 值"}
+
+
+@pytest.mark.asyncio
+async def test_async_prompt_loader_uses_cache_and_notification_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _InvalidationStorage:
+        def __init__(self) -> None:
+            self.callback: object | None = None
+
+        def register_invalidator(self, _resource_id: str, callback: object) -> None:
+            self.callback = callback
+
+    storage = _InvalidationStorage()
+    calls = 0
+
+    async def fake_load_prompt_values(
+        _resource: object,
+    ) -> prompt_storage.PromptValues:
+        nonlocal calls
+        calls += 1
+        stored = StoredPrompt(
+            resource_id="test_prompt",
+            display_name="测试 Prompt",
+            prompt_data={"system_prompt": f"PG 值 {calls}"},
+            version="1.0",
+            updated_at=datetime.now(UTC),
+            revision=calls,
+        )
+        return prompt_storage.PromptValues(
+            values={"system_prompt": f"PG 值 {calls}"},
+            stored=stored,
+        )
+
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: storage)
+    monkeypatch.setattr(
+        prompt_storage,
+        "load_prompt_values_async",
+        fake_load_prompt_values,
+    )
+    loader = PromptTemplateLoader(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        defaults={"system_prompt": "默认"},
+        log_prefix="[Test]",
+    )
+
+    results = [await loader.get_template_async() for _ in range(100)]
+    assert calls == 1
+    assert all(result == {"system_prompt": "PG 值 1"} for result in results)
+
+    callback = cast("Any", storage.callback)
+    callback()
+    assert await loader.get_template_async() == {"system_prompt": "PG 值 2"}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_async_prompt_loader_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Storage:
+        def register_invalidator(self, _resource_id: str, _callback: object) -> None:
+            return
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_load(_resource: object) -> prompt_storage.PromptValues:
+        started.set()
+        await release.wait()
+        return prompt_storage.PromptValues(values={"system_prompt": "完成"}, stored=None)
+
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: _Storage())
+    monkeypatch.setattr(prompt_storage, "load_prompt_values_async", slow_load)
+    loader = PromptTemplateLoader(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        defaults={"system_prompt": "默认"},
+        log_prefix="[Test]",
+    )
+
+    operation = asyncio.create_task(loader.get_template_async())
+    await started.wait()
+    ticker_ran = False
+
+    async def _tick() -> None:
+        nonlocal ticker_ran
+        await asyncio.sleep(0)
+        ticker_ran = True
+
+    await _tick()
+    assert ticker_ran is True
+    assert operation.done() is False
+    release.set()
+    assert await operation == {"system_prompt": "完成"}
+
+
+@pytest.mark.asyncio
+async def test_sync_prompt_loader_rejects_running_event_loop() -> None:
+    loader = PromptTemplateLoader(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        defaults={"system_prompt": "默认"},
+        log_prefix="[Test]",
+    )
+
+    with pytest.raises(RuntimeError, match="禁止同步读取 Prompt"):
+        loader.get_template()
 
 
 def test_close_prompt_storage_if_created_does_not_create_storage() -> None:
@@ -287,3 +412,18 @@ def test_close_prompt_storage_if_created_closes_and_clears_storage() -> None:
 
     assert storage.closed is True
     assert prompt_storage._StorageState.storage is None
+
+
+def test_prompt_storage_close_reclaims_pool_thread_and_loop() -> None:
+    storage = prompt_storage.PromptStorage()
+    pool = _FakePool()
+    storage._pool = cast("Any", pool)
+    thread = storage._thread
+    loop = storage._loop
+
+    storage.close()
+    storage.close()
+
+    assert pool.closed is True
+    assert thread.is_alive() is False
+    assert loop.is_closed() is True

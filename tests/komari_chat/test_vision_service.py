@@ -22,12 +22,20 @@ class _FakeConfigManager:
         )
 
 
-class _FakeCompletions:
+class _FakeLLMProvider:
+    """伪造 llm_provider，模拟 generate_messages_completion 视觉调用。"""
+
     active: ClassVar[int] = 0
     max_active: ClassVar[int] = 0
     fail_next: ClassVar[bool] = False
 
-    async def create(self, **kwargs: Any) -> SimpleNamespace:
+    @classmethod
+    def reset(cls) -> None:
+        cls.active = 0
+        cls.max_active = 0
+        cls.fail_next = False
+
+    async def generate_messages_completion(self, **kwargs: Any) -> SimpleNamespace:
         self.__class__.active += 1
         self.__class__.max_active = max(
             self.__class__.max_active,
@@ -41,36 +49,19 @@ class _FakeCompletions:
                 raise RuntimeError(msg)
             image_url = kwargs["messages"][0]["content"][1]["image_url"]["url"]
             return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(content=f"图片描述：{image_url}"),
-                    )
-                ],
+                content=f"图片描述：{image_url}",
+                finish_reason="stop",
+                duration_ms=50.0,
+                usage=None,
             )
         finally:
             self.__class__.active -= 1
 
 
-class _FakeChat:
-    def __init__(self) -> None:
-        self.completions = _FakeCompletions()
-
-
-class _FakeAsyncOpenAI:
-    def __init__(self, **_kwargs: Any) -> None:
-        self.chat = _FakeChat()
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-
-
 def _patch_vision_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
-    _FakeCompletions.active = 0
-    _FakeCompletions.max_active = 0
-    _FakeCompletions.fail_next = False
+    _FakeLLMProvider.reset()
     monkeypatch.setattr(vision_service_module, "llm_provider_config_manager", _FakeConfigManager())
-    monkeypatch.setattr(vision_service_module, "AsyncOpenAI", _FakeAsyncOpenAI)
+    monkeypatch.setattr(vision_service_module, "llm_provider", _FakeLLMProvider())
 
 
 @pytest.mark.asyncio
@@ -91,7 +82,7 @@ async def test_read_images_limits_model_call_concurrency(
         "图片描述：image-3",
         "图片描述：image-4",
     ]
-    assert _FakeCompletions.max_active <= 2
+    assert _FakeLLMProvider.max_active <= 2
 
 
 @pytest.mark.asyncio
@@ -104,7 +95,7 @@ async def test_read_images_formats_single_image_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_vision_dependencies(monkeypatch)
-    _FakeCompletions.fail_next = True
+    _FakeLLMProvider.fail_next = True
 
     result = await vision_service_module.read_images(
         ["image-1"],
@@ -112,3 +103,47 @@ async def test_read_images_formats_single_image_failure(
     )
 
     assert result == ["[图片读取失败: 视觉模型故障]"]
+
+
+@pytest.mark.asyncio
+async def test_read_images_passes_trace_to_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """视觉调用在传入 collector 时记录 LLMCallTrace。"""
+    _patch_vision_dependencies(monkeypatch)
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="test-vision-trace")
+    result = await vision_service_module.read_images(
+        ["image-trace"],
+        vision_model="vision-model",
+        request_trace_id="trace-1",
+        parent_call_id="parent-1",
+        collector=collector,
+    )
+
+    assert result == ["图片描述：image-trace"]
+    assert len(collector.calls) == 1
+    assert collector.calls[0].phase == "vision_read_image"
+    assert collector.calls[0].parent_call_id == "parent-1"
+
+
+@pytest.mark.asyncio
+async def test_read_images_records_error_in_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """视觉调用失败时记录错误到 collector。"""
+    _patch_vision_dependencies(monkeypatch)
+    _FakeLLMProvider.fail_next = True
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="test-vision-error")
+    result = await vision_service_module.read_images(
+        ["image-fail"],
+        vision_model="vision-model",
+        collector=collector,
+    )
+
+    assert "图片读取失败" in result[0]
+    assert len(collector.errors) >= 1
+    assert collector.errors[0]["type"] == "RuntimeError"

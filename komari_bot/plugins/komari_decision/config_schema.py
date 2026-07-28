@@ -3,18 +3,27 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class KomariDecisionConfigSchema(BaseModel):
     """Komari Decision 插件配置。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
         default_factory=lambda: datetime.now().astimezone().isoformat(),
         description="最后更新时间戳",
     )
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    plugin_enable: bool = Field(
+        default=False,
+        description=(
+            "是否启用主动回复判定；关闭时聊天仅响应显式 @、文本 @ 别名或回复机器人"
+        ),
+    )
     user_whitelist: list[str] = Field(
         default_factory=list, description="用户白名单，为空则允许所有用户"
     )
@@ -113,10 +122,32 @@ class KomariDecisionConfigSchema(BaseModel):
         description="统一候选集 rerank 的 instruction",
     )
     scene_persist_enabled: bool = Field(
-        default=False, description="是否启用 scene 持久化到 PostgreSQL"
+        default=False,
+        description=(
+            "是否启用 scene PostgreSQL 运行时；关闭时主动回复判定按 disabled 降级，"
+            "显式触发聊天仍可用"
+        ),
     )
     scene_sync_poll_seconds: int = Field(
         default=30, ge=5, le=3600, description="scene runtime 指针轮询间隔（秒）"
+    )
+    scene_embedding_lease_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=1800,
+        description="scene embedding 条目认领租约时长（秒）",
+    )
+    scene_embedding_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="scene embedding 条目进入失败状态前的最大认领次数",
+    )
+    scene_embedding_retry_base_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+        description="scene embedding 失败后的指数退避基础秒数",
     )
     scene_keep_versions: int = Field(
         default=3, ge=1, le=20, description="保留的 READY scene 版本数量"
