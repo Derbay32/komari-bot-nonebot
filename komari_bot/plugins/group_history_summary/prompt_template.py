@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from logging import getLogger
 from pathlib import Path
 from typing import Any
 
 import yaml
-
-logger = getLogger(__name__)
+from nonebot import logger
 
 DEFAULTS: dict[str, str] = {
     "system_prompt": "你是一个专业的群聊总结助手，只基于聊天记录归纳事实。",
@@ -44,7 +42,7 @@ class PromptTemplateLoader:
         except OSError:
             if not self._cache:
                 logger.warning(
-                    "[GroupHistorySummary] 模板文件不存在: %s，使用默认提示词", path
+                    "[GroupHistorySummary] 模板文件不存在: {}，使用默认提示词", path
                 )
                 self._cache = dict(self._defaults)
             return self._cache
@@ -62,7 +60,7 @@ class PromptTemplateLoader:
 
             self._cache = merged
             self._cache_mtime = mtime
-            logger.info("[GroupHistorySummary] 模板已加载/重载: %s", path)
+            logger.info("[GroupHistorySummary] 模板已加载/重载: {}", path)
         except yaml.YAMLError:
             logger.warning("[GroupHistorySummary] 模板 YAML 解析失败，使用缓存/默认值")
             if not self._cache:
@@ -84,4 +82,3 @@ _loader = PromptTemplateLoader(
 def get_template() -> dict[str, str]:
     """兼容入口：获取最新提示词模板。"""
     return _loader.get_template()
-

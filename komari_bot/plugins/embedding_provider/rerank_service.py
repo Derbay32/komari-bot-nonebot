@@ -31,7 +31,11 @@ class RerankService:
         return self._http_session
 
     async def rerank(
-        self, query: str, documents: list[str], top_n: int | None = None
+        self,
+        query: str,
+        documents: list[str],
+        top_n: int | None = None,
+        instruction: str = "",
     ) -> list[RerankResult]:
         """对文档集进行重排。"""
         if not self.enabled:
@@ -60,13 +64,48 @@ class RerankService:
             "documents": documents,
             "top_n": n,
         }
+        if instruction.strip():
+            payload["instruction"] = instruction.strip()
         session = await self._get_http_session()
         logger.info(
             f"[EmbeddingProvider] 正在使用 {self.config.rerank_model} 对 {len(documents)} 个文档进行重排 (Query: '{query}')"
         )
         try:
             async with session.post(url, headers=headers, json=payload) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except aiohttp.ClientResponseError as e:
+                    if (
+                        instruction.strip()
+                        and e.status in {400, 422}
+                        and "instruction" in payload
+                    ):
+                        logger.warning(
+                            "[EmbeddingProvider] Rerank 服务端可能不支持 instruction，降级重试"
+                        )
+                        fallback_payload = {
+                            "model": self.config.rerank_model,
+                            "query": query,
+                            "documents": documents,
+                            "top_n": n,
+                        }
+                        async with session.post(
+                            url, headers=headers, json=fallback_payload
+                        ) as fallback_resp:
+                            fallback_resp.raise_for_status()
+                            fallback_data = await fallback_resp.json()
+                            fallback_results = [
+                                RerankResult(
+                                    index=item.get("index", 0),
+                                    relevance_score=item.get("relevance_score", 0.0),
+                                )
+                                for item in fallback_data.get("results", [])
+                            ]
+                            fallback_results.sort(
+                                key=lambda x: x.relevance_score, reverse=True
+                            )
+                            return fallback_results
+                    raise
                 data = await resp.json()
                 # Jina/Cohere format: {"results": [{"index": 0, "relevance_score": 0.95}, ...]}
                 results = [

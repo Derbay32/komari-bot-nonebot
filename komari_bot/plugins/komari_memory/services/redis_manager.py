@@ -101,7 +101,8 @@ class RedisManager:
 
         pipe = self.redis.pipeline()
         pipe.rpush(key, json.dumps(data))
-        pipe.ltrim(key, 0, self.config.message_buffer_size - 1)
+        # 列表保持“旧 -> 新”顺序，只保留尾部最新 N 条消息。
+        pipe.ltrim(key, -self.config.message_buffer_size, -1)
         await pipe.execute()
 
     async def get_buffer(
@@ -118,23 +119,16 @@ class RedisManager:
         Returns:
             消息列表
         """
+        if limit <= 0:
+            return []
+
         key = RedisKeys.buffer(group_id)
-        raw_data = await self.redis.lrange(key, 0, limit - 1)  # type: ignore[arg-type]
+        # 读取尾部最近 N 条消息，Redis 会保持原有顺序返回。
+        raw_data = await self.redis.lrange(key, -limit, -1)  # type: ignore[arg-type]
 
         messages: list[MessageSchema] = []
         for item in raw_data:
-            data = json.loads(item)
-            messages.append(
-                MessageSchema(
-                    user_id=data["user_id"],
-                    user_nickname=data.get("user_nickname") or data["user_id"],
-                    group_id=data["group_id"],
-                    content=data["content"],
-                    timestamp=data["timestamp"],
-                    message_id=data["message_id"],
-                    is_bot=data.get("is_bot", False),
-                )
-            )
+            messages.append(self._deserialize_message(item))
 
         return messages
 
@@ -163,18 +157,7 @@ class RedisManager:
         # 解析所有消息
         all_messages: list[MessageSchema] = []
         for msg_item in raw_data:
-            msg_data = json.loads(msg_item)
-            all_messages.append(
-                MessageSchema(
-                    user_id=msg_data["user_id"],
-                    user_nickname=msg_data.get("user_nickname") or msg_data["user_id"],
-                    group_id=msg_data["group_id"],
-                    content=msg_data["content"],
-                    timestamp=msg_data["timestamp"],
-                    message_id=msg_data["message_id"],
-                    is_bot=msg_data.get("is_bot", False),
-                )
-            )
+            all_messages.append(self._deserialize_message(msg_item))
 
         # 找到目标消息的索引
         target_index = -1
@@ -413,3 +396,17 @@ class RedisManager:
             )
             keys.append(group_id)
         return keys
+
+    @staticmethod
+    def _deserialize_message(raw_item: str) -> MessageSchema:
+        """将 Redis 中的 JSON 文本解析为消息对象。"""
+        data = json.loads(raw_item)
+        return MessageSchema(
+            user_id=data["user_id"],
+            user_nickname=data.get("user_nickname") or data["user_id"],
+            group_id=data["group_id"],
+            content=data["content"],
+            timestamp=data["timestamp"],
+            message_id=data["message_id"],
+            is_bot=data.get("is_bot", False),
+        )

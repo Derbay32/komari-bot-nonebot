@@ -9,10 +9,9 @@ import asyncio
 import json
 import random
 from datetime import datetime, timedelta
-from logging import getLogger
 from pathlib import Path
 
-logger = getLogger(__name__)
+from nonebot import logger
 
 # 日志目录
 _LOG_DIR = Path("logs") / "llm_provider"
@@ -72,7 +71,7 @@ async def log_llm_call(
             with log_file.open("a", encoding="utf-8") as f:
                 f.write(line)
 
-        logger.debug("[LLM Provider] 日志已记录: method=%s, model=%s", method, model)
+        logger.debug("[LLM Provider] 日志已记录: method={}, model={}", method, model)
 
         # 概率触发清理
         if random.random() < _CLEANUP_PROBABILITY:
@@ -104,6 +103,6 @@ async def cleanup_old_logs(retention_days: int = _RETENTION_DAYS) -> None:
                 removed += 1
 
         if removed > 0:
-            logger.info("[LLM Provider] 已清理 %d 个过期日志文件", removed)
+            logger.info("[LLM Provider] 已清理 {} 个过期日志文件", removed)
     except Exception:
         logger.warning("[LLM Provider] 日志清理失败", exc_info=True)

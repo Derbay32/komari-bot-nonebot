@@ -4,7 +4,16 @@
 -- 1. 确保 PostgreSQL 已安装 pgvector 扩展
 -- 2. 执行以下命令启用扩展：
 --    CREATE EXTENSION IF NOT EXISTS vector;
--- 3. 执行此脚本创建表和索引
+-- 3. 可选：通过 psql 变量覆盖 embedding 维度，例如：
+--    psql -v embedding_dimension=1536 -f komari_bot/plugins/komari_knowledge/init_db.sql
+-- 4. 执行此脚本创建表和索引
+
+\if :{?embedding_dimension}
+\else
+\set embedding_dimension 512
+\endif
+
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ============================================
 -- 1. 创建知识库主表
@@ -25,8 +34,8 @@ CREATE TABLE IF NOT EXISTS komari_knowledge (
     content TEXT NOT NULL,
 
     -- 向量数据：用于 Layer 2 语义检索
-    -- 维度：512 (bge-small-zh-v1.5)
-    embedding VECTOR(512),
+    -- 维度可通过 psql 变量 embedding_dimension 覆盖
+    embedding VECTOR(:embedding_dimension),
 
     -- 元数据
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -41,11 +50,22 @@ CREATE TABLE IF NOT EXISTS komari_knowledge (
 -- ============================================
 
 -- 向量相似度索引（HNSW 算法）
--- 使用余弦相似度（cosine operations）
-CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding
-ON komari_knowledge
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+-- pgvector 当前对 vector 列的 HNSW 索引最多支持 2000 维，超过时跳过索引创建
+SELECT CASE
+    WHEN :embedding_dimension <= 2000 THEN
+        'CREATE INDEX IF NOT EXISTS idx_komari_knowledge_embedding
+         ON komari_knowledge
+         USING hnsw (embedding vector_cosine_ops)
+         WITH (m = 16, ef_construction = 64)'
+    ELSE
+        format(
+            'SELECT %L AS skipped_notice',
+            '[Komari Knowledge] 跳过 idx_komari_knowledge_embedding：embedding_dimension='
+            || (:embedding_dimension)::text
+            || ' 超过 pgvector HNSW 上限 2000'
+        )
+END AS sql_to_execute
+\gexec
 
 -- 关键词倒排索引（GIN）
 -- 加速关键词数组查询
@@ -73,10 +93,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trigger_komari_knowledge_updated_at
-BEFORE UPDATE ON komari_knowledge
-FOR EACH ROW
-EXECUTE FUNCTION update_updated_at_column();
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trigger_komari_knowledge_updated_at'
+          AND tgrelid = 'komari_knowledge'::regclass
+    ) THEN
+        CREATE TRIGGER trigger_komari_knowledge_updated_at
+        BEFORE UPDATE ON komari_knowledge
+        FOR EACH ROW
+        EXECUTE FUNCTION update_updated_at_column();
+    END IF;
+END
+$$;
 
 -- ============================================
 -- 4. 预置示例数据（可选）

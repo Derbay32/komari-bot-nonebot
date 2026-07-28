@@ -26,7 +26,7 @@ class BaseLLMClient(ABC):
             system_instruction: 系统指令
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: Response format dict (e.g. {"type": "json_object"})
+            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
             **kwargs: 其他 provider 特定参数
 
         Returns:
@@ -50,7 +50,7 @@ class BaseLLMClient(ABC):
             model: 模型名称
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: Response format dict
+            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
             **kwargs: 其他参数
 
         Returns:

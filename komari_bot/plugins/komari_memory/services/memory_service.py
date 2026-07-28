@@ -1,12 +1,16 @@
 """Komari Memory 记忆管理服务。"""
 
-from typing import Any
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from nonebot.plugin import require
 
-from ..config_schema import KomariMemoryConfigSchema
-from ..repositories.conversation_repository import ConversationRepository
-from ..repositories.entity_repository import EntityRepository
+if TYPE_CHECKING:
+    from ..config_schema import KomariMemoryConfigSchema
+    from ..repositories.conversation_repository import ConversationRepository
+    from ..repositories.entity_repository import EntityRepository
 
 
 class MemoryService:
@@ -28,7 +32,7 @@ class MemoryService:
         self.config = config
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
-        self._embedding_plugin = require("embedding_provider")
+        self._embedding_plugin: Any = require("embedding_provider")
 
     async def store_conversation(
         self,
@@ -88,7 +92,8 @@ class MemoryService:
         )
 
         # rerank 启用时多取候选
-        fetch_limit = limit * 3 if self._embedding_plugin.is_rerank_enabled() else limit
+        rerank_enabled = self._embedding_plugin.is_rerank_enabled()
+        fetch_limit = limit * 3 if rerank_enabled else limit
 
         # 数据访问：委托给仓库（传递 user_id 用于加权）
         results = await self._conversation_repo.search_by_similarity(
@@ -96,67 +101,80 @@ class MemoryService:
             group_id=group_id,
             user_id=user_id,
             limit=fetch_limit,
+            access_boost=self.config.forgetting_access_boost,
+            touch_results=not rerank_enabled,
         )
 
-        if self._embedding_plugin.is_rerank_enabled() and results:
+        if rerank_enabled and results:
             documents = [r["summary"] for r in results]
             reranked = await self._embedding_plugin.rerank(
                 query, documents, top_n=limit
             )
             results = [results[rr.index] for rr in reranked]
+            await self._conversation_repo.touch_conversations(
+                [int(result["id"]) for result in results],
+                access_boost=self.config.forgetting_access_boost,
+            )
 
         return results[:limit]
 
-    async def upsert_entity(
+    async def upsert_user_profile(
         self,
         user_id: str,
         group_id: str,
-        key: str,
-        value: str,
-        category: str,
-        importance: int = 3,
+        profile: dict[str, Any],
+        importance: int = 4,
     ) -> None:
-        """创建或更新实体（使用 ORM）。
+        """创建或更新用户画像实体。
 
         Args:
             user_id: 用户 ID
             group_id: 群组 ID
-            key: 实体键
-            value: 实体值
-            category: 分类
+            profile: 用户画像 JSON
             importance: 重要性 (1-5)
         """
-        # 数据访问：委托给仓库
-        await self._entity_repo.upsert(
+        profile_with_meta = dict(profile)
+        profile_with_meta.setdefault("version", 1)
+        profile_with_meta.setdefault("user_id", user_id)
+        profile_with_meta.setdefault("updated_at", self._now_iso())
+        profile_with_meta.setdefault("traits", {})
+        await self._entity_repo.upsert_user_profile(
             user_id=user_id,
             group_id=group_id,
-            key=key,
-            value=value,
-            category=category,
+            profile=profile_with_meta,
             importance=importance,
         )
 
-    async def get_entities(
+    async def upsert_interaction_history(
         self,
-        user_id: str | None = None,
-        group_id: str | None = None,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """获取实体列表（已排除 interaction_history 记录）。
-
-        Args:
-            user_id: 过滤用户 ID
-            group_id: 过滤群组 ID
-            limit: 返回数量限制
-
-        Returns:
-            实体列表
-        """
-        # 数据访问：委托给仓库
-        return await self._entity_repo.list(
+        user_id: str,
+        group_id: str,
+        interaction: dict[str, Any],
+        importance: int = 5,
+    ) -> None:
+        """创建或更新互动历史实体。"""
+        interaction_with_meta = dict(interaction)
+        interaction_with_meta.setdefault("version", 1)
+        interaction_with_meta.setdefault("user_id", user_id)
+        interaction_with_meta.setdefault("updated_at", self._now_iso())
+        interaction_with_meta.setdefault("records", [])
+        interaction_with_meta.setdefault("summary", "")
+        await self._entity_repo.upsert_interaction_history(
             user_id=user_id,
             group_id=group_id,
-            limit=limit,
+            interaction=interaction_with_meta,
+            importance=importance,
+        )
+
+    async def get_user_profile(
+        self,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, Any] | None:
+        """获取用户画像 JSON。"""
+        return await self._entity_repo.get_user_profile(
+            user_id=user_id,
+            group_id=group_id,
         )
 
     async def get_interaction_history(
@@ -164,19 +182,58 @@ class MemoryService:
         user_id: str,
         group_id: str,
     ) -> dict[str, Any] | None:
-        """专门获取用户的互动历史实体，不占用常规实体检索名额。
-
-        Args:
-            user_id: 用户 ID
-            group_id: 群组 ID
-
-        Returns:
-            实体字典或 None
-        """
+        """获取用户互动历史 JSON。"""
         return await self._entity_repo.get_interaction_history(
             user_id=user_id,
             group_id=group_id,
         )
 
+    async def ensure_user_memory_rows(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+        display_name: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """确保用户画像与互动历史两行都存在。"""
+        profile = await self.get_user_profile(user_id=user_id, group_id=group_id)
+        if profile is None:
+            profile = {
+                "version": 1,
+                "user_id": user_id,
+                "display_name": display_name,
+                "traits": {},
+                "updated_at": self._now_iso(),
+            }
+            await self.upsert_user_profile(
+                user_id=user_id,
+                group_id=group_id,
+                profile=profile,
+            )
+
+        interaction = await self.get_interaction_history(user_id=user_id, group_id=group_id)
+        if interaction is None:
+            interaction = {
+                "version": 1,
+                "user_id": user_id,
+                "display_name": display_name,
+                "file_type": "用户的近期对鞠行为备忘录",
+                "description": "暂无互动记录",
+                "records": [],
+                "summary": "",
+                "updated_at": self._now_iso(),
+            }
+            await self.upsert_interaction_history(
+                user_id=user_id,
+                group_id=group_id,
+                interaction=interaction,
+            )
+
+        return profile, interaction
+
     async def cleanup(self) -> None:
         """清理资源。"""
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(UTC).isoformat()

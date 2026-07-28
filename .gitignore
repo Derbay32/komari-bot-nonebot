@@ -178,3 +178,4 @@ tools/*
 !tools/migrate_user_data_sqlite_to_pg.py
 config/config_manager/database_config.json
 config/config_manager/user_data_config.json
+config/config_manager/komari_sentry_config.json

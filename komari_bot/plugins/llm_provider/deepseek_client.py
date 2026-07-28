@@ -21,13 +21,15 @@ config_manager = config_manager_plugin.get_config_manager(
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek API 客户端。"""
 
-    def __init__(self, api_token: str) -> None:
+    def __init__(self, api_token: str, timeout_seconds: float = 300.0) -> None:
         """初始化客户端。
 
         Args:
             api_token: DeepSeek API Token
+            timeout_seconds: 请求总超时时间（秒）
         """
         self.api_token = api_token
+        self.timeout_seconds = timeout_seconds
         self.session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -37,9 +39,18 @@ class DeepSeekClient(BaseLLMClient):
                 "Authorization": f"Bearer {self.api_token}",
                 "Content-Type": "application/json",
             }
-            timeout = aiohttp.ClientTimeout(total=30.0)
+            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             self.session = aiohttp.ClientSession(headers=headers, timeout=timeout)
         return self.session
+
+    @staticmethod
+    def _resolve_reasoning_effort(config: DynamicConfigSchema, **kwargs: object) -> str | None:
+        """解析 OpenAI 兼容的 reasoning_effort 请求参数。"""
+        raw_value = kwargs.get("reasoning_effort", config.deepseek_reasoning_effort)
+        if raw_value is None:
+            return None
+        value = str(raw_value).strip()
+        return value or None
 
     async def generate_text(
         self,
@@ -59,7 +70,7 @@ class DeepSeekClient(BaseLLMClient):
             system_instruction: 系统指令
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: Response format dict
+            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
             **kwargs: 其他参数（如 frequency_penalty）
 
         Returns:
@@ -67,16 +78,18 @@ class DeepSeekClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
+            reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
             logger.debug(
                 f"DeepSeek API 请求:\n"
                 f"  model: {model}\n"
                 f"  temperature: {temperature if temperature is not None else config.deepseek_temperature}\n"
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.deepseek_max_tokens}\n"
+                f"  reasoning_effort: {reasoning_effort}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.deepseek_frequency_penalty)}\n"
                 f"  system_instruction: {system_instruction}\n"
-                f"  prompt: {prompt}\n"
-                f"  json_mode: {response_format is not None}"
+                f"  prompt: {prompt}"
             )
+            del response_format
 
             session = await self._get_session()
 
@@ -102,9 +115,8 @@ class DeepSeekClient(BaseLLMClient):
                 "stream": False,
             }
 
-            # 处理 JSON 模式
-            if response_format is not None:
-                request_data["response_format"] = response_format
+            if reasoning_effort is not None:
+                request_data["reasoning_effort"] = reasoning_effort
 
             # 发送 API 请求
             async with session.post(
@@ -156,7 +168,7 @@ class DeepSeekClient(BaseLLMClient):
             model: 模型名称
             temperature: 温度参数
             max_tokens: 最大 token 数
-            response_format: Response format dict
+            response_format: 为兼容旧调用保留；当前不会下发到模型，请通过 prompt 指定输出格式
             **kwargs: 其他参数
 
         Returns:
@@ -164,6 +176,8 @@ class DeepSeekClient(BaseLLMClient):
         """
         config = config_manager.get()
         try:
+            reasoning_effort = self._resolve_reasoning_effort(config, **kwargs)
+            del response_format
             session = await self._get_session()
 
             # 构建请求数据
@@ -182,15 +196,16 @@ class DeepSeekClient(BaseLLMClient):
                 "stream": False,
             }
 
-            if response_format is not None:
-                request_data["response_format"] = response_format
+            if reasoning_effort is not None:
+                request_data["reasoning_effort"] = reasoning_effort
 
             logger.debug(
                 f"DeepSeek API 请求 (messages):\n"
                 f"  model: {model}\n"
                 f"  messages: {len(messages)} turns\n"
                 f"  temperature: {request_data['temperature']}\n"
-                f"  max_tokens: {request_data['max_tokens']}"
+                f"  max_tokens: {request_data['max_tokens']}\n"
+                f"  reasoning_effort: {reasoning_effort}"
             )
 
             # 发送 API 请求

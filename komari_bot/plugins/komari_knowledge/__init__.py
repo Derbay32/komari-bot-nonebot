@@ -118,6 +118,8 @@ async def on_shutdown() -> None:
     # 关闭 WebUI
     if state.streamlit_process:
         try:
+            if state.streamlit_process.returncode is None:
+                state.streamlit_process.terminate()
             try:
                 await asyncio.wait_for(state.streamlit_process.wait(), timeout=5)
                 logger.info("[Komari Knowledge] WebUI 已关闭")
