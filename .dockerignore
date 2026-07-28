@@ -1,0 +1,72 @@
+# 开发工具和配置
+.git
+.gitignore
+.idea
+.vscode
+*.code-workspace
+.env.*
+.env
+.github
+
+# Docker 相关
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 文档
+README.md
+*.md
+docs/
+
+# Python 缓存和虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+
+# 向量模型缓存（重要！）
+.cache/
+
+# 测试和覆盖率
+htmlcov/
+.coverage
+.tox/
+.nox/
+
+# 构建产物
+build/
+dist/
+*.egg
+wheels/
+
+# 日志和临时文件
+*.log
+logs/
+*.pid
+
+# Node modules（如果有前端）
+node_modules/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Linux
+*~
+.Trash-*
+
+# 排除配置、数据
+config/
+data/
+.env.example
+
+# 部署包产物（避免将 app/data/fonts 等运行时文件打入镜像）
+app/
+komari-bot-deploy/
+komari-bot-*.zip

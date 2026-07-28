@@ -1,0 +1,12 @@
+{
+  "embedding_source": "local",
+  "embedding_model": "BAAI/bge-small-zh-v1.5",
+  "embedding_api_url": "",
+  "embedding_api_key": "",
+  "embedding_dimension": 512,
+  "rerank_enabled": false,
+  "rerank_model": "",
+  "rerank_api_url": "",
+  "rerank_api_key": "",
+  "rerank_top_n": 5
+}

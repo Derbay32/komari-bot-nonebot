@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-01-07T23:13:17.148103+08:00",
+  "plugin_enable": true,
+  "user_whitelist": [],
+  "group_whitelist": [],
+  
+  "redis_host": "localhost",
+  "redis_port": 6379,
+  "redis_db": 1,
+  "redis_password": "",
+
+  "bert_service_url": "http://localhost:8000/api/v1/score",
+  "bert_timeout": 2.0,
+
+  "llm_provider": "gemini",
+  "llm_model_chat": "gemini-3-flash-preview",
+  "llm_temperature_chat": 1.0,
+  "llm_max_tokens_chat": 4000,
+
+  "llm_model_summary": "gemini-3-flash-preview",
+  "llm_temperature_summary": 0.3,
+  "llm_max_tokens_summary": 2048,
+
+  "knowledge_enabled": true,
+  "knowledge_limit": 3,
+
+  "summary_message_threshold": 50,
+  "summary_token_threshold": 1000,
+  "summary_time_threshold": 3600,
+  "summary_max_messages": 200,
+  "message_buffer_size": 200,
+  "memory_search_limit": 3,
+  "context_messages_limit": 10,
+
+  "proactive_enabled": false,
+  "proactive_score_threshold": 0.8,
+  "proactive_cooldown": 10,
+  "proactive_max_per_hour": 400,
+
+  "forgetting_enabled": true,
+  "forgetting_importance_threshold": 3,
+  "forgetting_decay_factor": 0.95,
+  "forgetting_access_boost": 1.2,
+  "forgetting_min_age_days": 3,
+
+  "filter_min_length": 3,
+  "filter_history_check_size": 50,
+  "query_rewrite_history_limit": 10
+}
