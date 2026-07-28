@@ -37,7 +37,7 @@ class FilterResult:
         object.__setattr__(self, "reason", reason)
 
 
-def _is_command_message(message: str) -> bool:
+def is_command_message(message: str) -> bool:
     """检查消息是否为命令消息（以 . 或 。开头）。
 
     Args:
@@ -71,7 +71,7 @@ async def preprocess_message(
         过滤结果对象
     """
     # 0. 命令消息过滤（以 . 或 。 开头）
-    if _is_command_message(message):
+    if is_command_message(message):
         logger.debug(f"[KomariMemory] 过滤命令消息: {message[:50]}...")
         return FilterResult(should_skip=True, reason="command")
 

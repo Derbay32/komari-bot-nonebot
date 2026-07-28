@@ -7,31 +7,19 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    IDENTIFIER_TEXT_BUDGET,
+    NOTES_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    TITLE_TEXT_BUDGET,
+    normalize_keywords,
+    normalize_optional_text,
+    normalize_required_text,
+)
+
 HelpCategory = Literal["command", "feature", "faq", "other"]
 HelpSource = Literal["keyword", "vector"]
-
-
-def _normalize_keywords(value: list[str]) -> list[str]:
-    """清理关键词中的空白条目与重复值。"""
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for keyword in value:
-        cleaned = keyword.strip()
-        if not cleaned:
-            continue
-        lowered = cleaned.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        normalized.append(cleaned)
-    return normalized
-
-
-def _normalize_optional_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    return normalized or None
 
 
 class HelpEntry(BaseModel):
@@ -68,23 +56,46 @@ class HelpCreateRequest(BaseModel):
     plugin_name: str | None = None
     notes: str | None = None
 
-    @field_validator("title", "content")
+    @field_validator("title")
     @classmethod
-    def validate_required_text(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("字段不能为空")
-        return normalized
+    def validate_title(cls, value: str) -> str:
+        return normalize_required_text(
+            value,
+            label="帮助标题",
+            budget=TITLE_TEXT_BUDGET,
+        )
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        return normalize_required_text(
+            value,
+            label="帮助内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
 
     @field_validator("keywords")
     @classmethod
     def validate_keywords(cls, value: list[str]) -> list[str]:
-        return _normalize_keywords(value)
+        return normalize_keywords(value, require_nonempty=False)
 
-    @field_validator("plugin_name", "notes")
+    @field_validator("plugin_name")
     @classmethod
-    def normalize_optional_text_fields(cls, value: str | None) -> str | None:
-        return _normalize_optional_text(value)
+    def normalize_plugin_name(cls, value: str | None) -> str | None:
+        return normalize_optional_text(
+            value,
+            label="插件名",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+
+    @field_validator("notes")
+    @classmethod
+    def normalize_notes(cls, value: str | None) -> str | None:
+        return normalize_optional_text(
+            value,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
 
 
 class HelpUpdateRequest(BaseModel):
@@ -97,27 +108,52 @@ class HelpUpdateRequest(BaseModel):
     plugin_name: str | None = None
     notes: str | None = None
 
-    @field_validator("title", "content")
+    @field_validator("title")
     @classmethod
-    def validate_optional_required_text(cls, value: str | None) -> str | None:
+    def validate_optional_title(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("字段不能为空")
-        return normalized
+        return normalize_required_text(
+            value,
+            label="帮助标题",
+            budget=TITLE_TEXT_BUDGET,
+        )
+
+    @field_validator("content")
+    @classmethod
+    def validate_optional_content(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_required_text(
+            value,
+            label="帮助内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
 
     @field_validator("keywords")
     @classmethod
     def validate_optional_keywords(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
-        return _normalize_keywords(value)
+        return normalize_keywords(value, require_nonempty=False)
 
-    @field_validator("plugin_name", "notes")
+    @field_validator("plugin_name")
     @classmethod
-    def normalize_optional_text_fields(cls, value: str | None) -> str | None:
-        return _normalize_optional_text(value)
+    def normalize_optional_plugin_name(cls, value: str | None) -> str | None:
+        return normalize_optional_text(
+            value,
+            label="插件名",
+            budget=IDENTIFIER_TEXT_BUDGET,
+        )
+
+    @field_validator("notes")
+    @classmethod
+    def normalize_optional_notes(cls, value: str | None) -> str | None:
+        return normalize_optional_text(
+            value,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
 
 
 class HelpSearchRequest(BaseModel):
@@ -129,10 +165,11 @@ class HelpSearchRequest(BaseModel):
     @field_validator("query")
     @classmethod
     def validate_query(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("查询文本不能为空")
-        return normalized
+        return normalize_required_text(
+            value,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
 
 
 class HelpSearchResult(BaseModel):

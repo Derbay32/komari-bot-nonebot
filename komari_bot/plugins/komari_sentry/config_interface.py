@@ -17,3 +17,10 @@ def get_config() -> KomariSentryConfigSchema:
     """获取当前配置。"""
     return _config_manager.get()
 
+
+async def get_config_async() -> KomariSentryConfigSchema:
+    """在事件循环内异步获取当前配置。"""
+    return await _config_manager.get_async()
+
+
+__all__ = ["get_config", "get_config_async"]

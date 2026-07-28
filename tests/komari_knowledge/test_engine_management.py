@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from komari_bot.common.content_budget import ContentValidationError
 from komari_bot.plugins.komari_knowledge.engine import KnowledgeEngine
 
 
@@ -67,6 +70,24 @@ class _FakeUpdatePool:
         self.execute_calls.append((query, args))
 
 
+class _FakeAddPool:
+    def __init__(self) -> None:
+        self.fetchval_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def acquire(self) -> "_FakeAddPool":
+        return self
+
+    async def __aenter__(self) -> "_FakeAddPool":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
+    async def fetchval(self, query: str, *args: object) -> int:
+        self.fetchval_calls.append((query, args))
+        return 42
+
+
 def test_list_knowledge_supports_filters_and_pagination() -> None:
     engine = KnowledgeEngine()
     pool = _FakeListPool()
@@ -125,6 +146,13 @@ def test_update_knowledge_allows_clearing_notes_without_touching_embedding() -> 
         raise AssertionError
 
     engine._get_embedding = _unexpected_get_embedding  # type: ignore[method-assign]
+    rebuild_calls = 0
+
+    async def _rebuild_index() -> None:
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+
+    engine._build_keyword_index = _rebuild_index  # type: ignore[method-assign]
 
     updated = asyncio.run(engine.update_knowledge(1, notes=None))
 
@@ -132,3 +160,55 @@ def test_update_knowledge_allows_clearing_notes_without_touching_embedding() -> 
     update_query, update_args = pool.execute_calls[0]
     assert "notes = $2" in update_query
     assert update_args == (1, None)
+    assert rebuild_calls == 1
+
+
+def test_add_knowledge_uses_source_key_for_idempotent_insert() -> None:
+    engine = KnowledgeEngine()
+    pool = _FakeAddPool()
+    engine._pool = pool
+
+    async def _get_embedding(_text: str) -> list[float]:
+        return [0.1, 0.2]
+
+    engine._get_embedding = _get_embedding  # type: ignore[method-assign]
+    rebuild_calls = 0
+
+    async def _rebuild_index() -> None:
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+
+    engine._build_keyword_index = _rebuild_index  # type: ignore[method-assign]
+
+    knowledge_id = asyncio.run(
+        engine.add_knowledge(
+            "提案内容",
+            ["提案"],
+            "custom",
+            source_key="komari_custom:proposal:9",
+        )
+    )
+
+    query, args = pool.fetchval_calls[0]
+    assert knowledge_id == 42
+    assert "ON CONFLICT (source_key) WHERE source_key IS NOT NULL" in query
+    assert args[-1] == "komari_custom:proposal:9"
+    assert rebuild_calls == 1
+
+
+def test_add_knowledge_direct_call_rejects_budget_before_embedding() -> None:
+    engine = KnowledgeEngine()
+    engine._pool = object()
+    embedding_called = False
+
+    async def _unexpected_embedding(_text: str) -> list[float]:
+        nonlocal embedding_called
+        embedding_called = True
+        return []
+
+    engine._get_embedding = _unexpected_embedding  # type: ignore[method-assign]
+
+    with pytest.raises(ContentValidationError, match="估算 token 上限"):
+        asyncio.run(engine.add_knowledge("测" * 6_001, ["测试"]))
+
+    assert embedding_called is False

@@ -1,18 +1,26 @@
-# 第一阶段：生成 bot.py
-FROM python:3.13-slim as requirements_stage
+# 第一阶段：按 poetry.lock 构建运行时虚拟环境
+FROM python:3.13-slim AS dependencies_stage
 
-WORKDIR /wheel
+ARG POETRY_VERSION=2.2.1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV POETRY_NO_INTERACTION=1
 
-RUN python -m pip install --no-cache-dir pipx
+WORKDIR /app
 
-COPY ./pyproject.toml /wheel/
+RUN python -m pip install --no-cache-dir "poetry==${POETRY_VERSION}" \
+    && python -m venv "${VIRTUAL_ENV}"
 
-# 使用 pipx 运行 nb-cli 生成 bot.py
-RUN python -m pipx run --no-cache nb-cli generate -f /tmp/bot.py
+COPY ./pyproject.toml ./poetry.lock /app/
+
+RUN poetry check --lock \
+    && poetry sync --only main --no-root --no-ansi
 
 
 # 第二阶段：运行环境
 FROM python:3.13-slim
+
+ARG SENTRY_RELEASE
 
 WORKDIR /app
 
@@ -21,18 +29,19 @@ ENV TZ=Asia/Shanghai
 ENV PYTHONPATH=/app
 ENV APP_MODULE=_main:app
 ENV MAX_WORKERS=1
+ENV SENTRY_RELEASE="${SENTRY_RELEASE}"
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# 从依赖阶段复制由 lock 文件精确安装的运行时环境
+COPY --from=dependencies_stage /opt/venv /opt/venv
 
 # 复制脚本和配置文件
 COPY ./docker/gunicorn_conf.py ./docker/start.sh /
 RUN chmod +x /start.sh
 
-# 从第一阶段复制生成的 bot.py
-COPY --from=requirements_stage /tmp/bot.py /app/
+COPY ./docker/bot.py /app/
 COPY ./docker/_main.py /app/
-
-# 先复制依赖文件进行安装，利用 Docker 缓存
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # 复制项目所有代码
 COPY . /app/

@@ -39,6 +39,7 @@ from nonebot.plugin import PluginMetadata
 from .checker import PermissionChecker, get_permission_checker
 from .manager import PermissionConfig, PermissionManager, create_whitelist_rule
 from .utils import (
+    check_context_permission,
     check_plugin_status,
     check_runtime_permission,
     format_permission_info,
@@ -55,6 +56,7 @@ __all__ = [
     "PermissionChecker",
     "PermissionConfig",
     "PermissionManager",
+    "check_context_permission",
     "check_plugin_status",
     "check_runtime_permission",
     "create_whitelist_rule",

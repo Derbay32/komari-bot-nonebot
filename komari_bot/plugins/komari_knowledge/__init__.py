@@ -63,7 +63,7 @@ driver = get_driver()
 @driver.on_startup
 async def on_startup() -> None:
     """Bot 启动时初始化常识库引擎。"""
-    config = config_manager.get()
+    config = await config_manager.get_async()
 
     if not config.plugin_enable:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
@@ -134,13 +134,21 @@ async def add_knowledge(
     keywords: list[str],
     category: KnowledgeCategory = "general",
     notes: str | None = None,
+    *,
+    source_key: str | None = None,
 ) -> int:
     """添加知识到数据库。"""
     engine = get_engine()
     if engine is None:
         raise RuntimeError("常识库引擎未初始化")
 
-    return await engine.add_knowledge(content, keywords, category, notes)
+    return await engine.add_knowledge(
+        content,
+        keywords,
+        category,
+        notes,
+        source_key=source_key,
+    )
 
 
 async def get_knowledge(kid: int) -> KnowledgeEntry | None:

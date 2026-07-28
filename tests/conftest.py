@@ -9,12 +9,19 @@ from types import SimpleNamespace
 from typing import Any, Protocol, cast
 
 import nonebot.plugin
-from nonebug import NONEBOT_INIT_KWARGS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from komari_bot.common.nonebot_compat import (
+    install_nonebot_forwardref_compatibility,
+)
+
+install_nonebot_forwardref_compatibility()
+
+from nonebug import NONEBOT_INIT_KWARGS
 
 
 class _PytestConfigWithStash(Protocol):
@@ -28,6 +35,7 @@ def pytest_configure(config: object) -> None:
         "driver": "~fastapi",
         "command_start": ["。", "."],
         "command_sep": [" "],
+        "superusers": {"42", "669293859"},
         "fastapi_docs_url": "/api/komari-management/docs",
         "fastapi_openapi_url": "/api/komari-management/openapi.json",
         "fastapi_redoc_url": None,
@@ -64,12 +72,23 @@ def _ensure_package_shim(plugin_name: str) -> None:
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
+_ensure_package_shim("agent_run_logger")
 _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
 _ensure_package_shim("user_data")
+_ensure_package_shim("user_ban")
 _ensure_package_shim("komari_custom")
 _ensure_package_shim("config_manager")
+
+
+def _inject_package_exports(plugin_name: str, exports: dict[str, object]) -> None:
+    """向已 shim 化的包模块注入导出以供测试使用。"""
+    package_name = f"komari_bot.plugins.{plugin_name}"
+    mod = sys.modules.get(package_name)
+    if mod is not None:
+        for name, val in exports.items():
+            setattr(mod, name, val)
 
 
 class _DummyConfigManager:
@@ -81,11 +100,19 @@ class _DummyConfigManager:
             llm_max_tokens=8192,
         )
 
+    async def get_async(self) -> object:
+        return self.get()
+
 
 class _DummyConfigManagerPlugin:
     @staticmethod
-    def get_config_manager(name: str, schema: object) -> _DummyConfigManager:
-        del name, schema
+    def get_config_manager(
+        name: str,
+        schema: object,
+        *,
+        env_config_schema: object | None = None,
+    ) -> _DummyConfigManager:
+        del name, schema, env_config_schema
         return _DummyConfigManager()
 
 
@@ -100,8 +127,69 @@ class _DummyLLMProvider:
 
     @staticmethod
     async def generate_messages_completion(**_kwargs: object) -> object:
-        return SimpleNamespace(content="规划完成", tool_calls=[], finish_reason="stop")
+        return SimpleNamespace(
+            content="规划完成",
+            tool_calls=[],
+            finish_reason="stop",
+            duration_ms=100.0,
+            usage=None,
+            reasoning_content=None,
+        )
 
+    @staticmethod
+    async def generate_completion(**_kwargs: object) -> object:
+        return SimpleNamespace(
+            content="重写后查询",
+            tool_calls=[],
+            finish_reason="stop",
+            duration_ms=50.0,
+            usage=None,
+            reasoning_content=None,
+        )
+
+
+class _DummyAgentRunLoggerPlugin:
+    @staticmethod
+    def create_collector(**kwargs: object) -> object | None:
+        if (
+            not kwargs.get("force_collect")
+            and kwargs.get("origin", "normal") != "debug"
+        ):
+            return None
+        from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
+
+        return AgentRunCollector(
+            request_id=cast("str | None", kwargs.get("trace_id")),
+            run_type=cast("Any", kwargs.get("run_type", "chat_reply")),
+            task_kind=str(kwargs.get("task_kind", "test")),
+            origin=cast("Any", kwargs.get("origin", "normal")),
+            input_data=kwargs.get("input_data"),
+            persist=False,
+        )
+
+    @staticmethod
+    async def finalize_collector(
+        collector: object,
+        **kwargs: object,
+    ) -> bool:
+        if collector is None:
+            return False
+        mark_finished = cast("Any", collector).mark_finished
+        return bool(
+            mark_finished(
+                status=kwargs.get("status", "success"),
+                output=kwargs.get("output"),
+                error=kwargs.get("error"),
+            )
+        )
+
+    @staticmethod
+    def get_agent_run_log_reader() -> None:
+        return None
+
+    @staticmethod
+    def register_agent_run_log_api(*_args: object, **_kwargs: object) -> None:
+        return None
 
 class _DummyUserDataPlugin:
     @staticmethod
@@ -133,8 +221,43 @@ class _DummyUserDataPlugin:
             updated_at="2026-06-07T00:00:00+00:00",
         )
 
+    @staticmethod
+    async def set_user_favorability(user_id: str, value: int) -> object:
+        return SimpleNamespace(
+            user_id=user_id,
+            before=0,
+            after=value,
+            stage_index=1 if value < 100 else 2,
+            stage_name="疏离戒备" if value < 100 else "普通熟人",
+            updated_at="2026-06-07T00:00:00+00:00",
+        )
+
+    @staticmethod
+    async def get_user_count() -> int:
+        return 0
+
 
 class _DummyPermissionManagerPlugin:
+    @staticmethod
+    def check_context_permission(
+        config: object,
+        *,
+        user_id: str,
+        group_id: str | None,
+        is_superuser: bool = False,
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "plugin_enable", True)):
+            return False, "插件当前已禁用"
+        if is_superuser:
+            return True, ""
+        user_whitelist = getattr(config, "user_whitelist", [])
+        group_whitelist = getattr(config, "group_whitelist", [])
+        if user_whitelist and user_id not in user_whitelist:
+            return False, "用户不在白名单"
+        if group_id is not None and group_whitelist and group_id not in group_whitelist:
+            return False, "群组不在白名单"
+        return True, ""
+
     @staticmethod
     async def check_runtime_permission(
         _bot: object,
@@ -150,6 +273,19 @@ class _DummyPermissionManagerPlugin:
     @staticmethod
     def format_permission_info(_config: object) -> str:
         return "权限正常"
+
+
+class _DummyUserBanPlugin:
+    class BanServiceUnavailableError(RuntimeError):
+        pass
+
+    @staticmethod
+    async def is_event_banned(
+        _bot: object,
+        _event: object,
+        _scope: object,
+    ) -> bool:
+        return False
 
 
 class _DummyMemoryPlugin:
@@ -177,15 +313,91 @@ class _DummyCharacterBindingPlugin:
     def refresh_if_file_updated() -> bool:
         return False
 
+    @staticmethod
+    def get_binding_manager() -> object:
+        return _DummyBindingManager()
+
+
+class _DummyBindingManager:
+    def __init__(self) -> None:
+        self._bindings: dict[str, str] = {}
+
+    def has_binding(self, user_id: str) -> bool:
+        return user_id in self._bindings
+
+    def get_character_name(
+        self, user_id: str, fallback_nickname: str | None = None
+    ) -> str:
+        if user_id in self._bindings:
+            return self._bindings[user_id]
+        if fallback_nickname:
+            return fallback_nickname
+        return user_id
+
+    async def set_character_name(self, user_id: str, character_name: str) -> None:
+        self._bindings[user_id] = character_name
+
+    async def remove_character_name(self, user_id: str) -> bool:
+        if user_id not in self._bindings:
+            return False
+        del self._bindings[user_id]
+        return True
+
+    def list_bindings(self) -> dict[str, str]:
+        return self._bindings.copy()
+
+
+class _DummyChatPlugin:
+    @staticmethod
+    async def generate_debug_reply(**kwargs: object) -> object:
+        from komari_bot.plugins.agent_run_logger.diagnostic import (
+            LLMDiagnosticCollector,
+        )
+
+        collector = kwargs.get("collector")
+        if collector is None:
+            collector = LLMDiagnosticCollector(request_id="test-debug")
+        return SimpleNamespace(
+            reply="测试回复内容",
+            reply_to_message_id=None,
+            favorability_delta=5,
+            favorability_reason="测试好感度变化",
+            interaction_history=None,
+            collector=collector,
+        )
+
+
+class _DummyGroupHistorySummaryPlugin:
+    class SummaryBusyError(Exception):
+        pass
+
+    class CapabilityNotSupportedError(Exception):
+        pass
+
 
 class _DummySearchPlugin:
     @staticmethod
-    def is_search_available() -> bool:
+    def is_search_available(**_kwargs: object) -> bool:
         return False
 
     @staticmethod
-    async def search_web(_query: str) -> str:
+    def is_fetch_available(**_kwargs: object) -> bool:
+        return True
+
+    @staticmethod
+    async def search_web(_query: str, **_kwargs: object) -> str:
         return "[测试搜索未启用]"
+
+    @staticmethod
+    async def fetch_page(_urls: list[str], **_kwargs: object) -> str:
+        return "[测试抓取结果]"
+
+
+class _DummyEmbeddingPlugin:
+    @staticmethod
+    async def embed(_text: str, instruction: str = "") -> list[float]:
+        del instruction
+        return [0.1, 0.2, 0.3]
 
 
 class _DummyUnifiedCandidateRerankService:
@@ -205,13 +417,18 @@ class _DummyDecisionPlugin:
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "llm_provider": _DummyLLMProvider(),
+    "agent_run_logger": _DummyAgentRunLoggerPlugin(),
+    "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "permission_manager": _DummyPermissionManagerPlugin(),
+    "user_ban": _DummyUserBanPlugin(),
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
     "komari_search": _DummySearchPlugin(),
     "komari_decision": _DummyDecisionPlugin(),
+    "komari_chat": _DummyChatPlugin(),
+    "group_history_summary": _DummyGroupHistorySummaryPlugin(),
 }
 
 
@@ -225,3 +442,35 @@ def _fake_require(name: str) -> object:
 
 
 nonebot.plugin.require = _fake_require
+
+
+# 为 komari_debug 测试注入包级导出到 shim
+_inject_package_exports(
+    "config_manager",
+    {"get_config_manager": _DummyConfigManagerPlugin.get_config_manager},
+)
+_inject_package_exports(
+    "character_binding",
+    {"get_binding_manager": _DummyCharacterBindingPlugin.get_binding_manager},
+)
+_inject_package_exports(
+    "user_data",
+    {
+        "get_user_favorability": _DummyUserDataPlugin.get_user_favorability,
+        "set_user_favorability": _DummyUserDataPlugin.set_user_favorability,
+        "get_user_count": _DummyUserDataPlugin.get_user_count,
+    },
+)
+_inject_package_exports(
+    "komari_chat",
+    {"generate_debug_reply": _DummyChatPlugin.generate_debug_reply},
+)
+_inject_package_exports(
+    "agent_run_logger",
+    {
+        "create_collector": _DummyAgentRunLoggerPlugin.create_collector,
+        "finalize_collector": _DummyAgentRunLoggerPlugin.finalize_collector,
+        "get_agent_run_log_reader": _DummyAgentRunLoggerPlugin.get_agent_run_log_reader,
+        "register_agent_run_log_api": _DummyAgentRunLoggerPlugin.register_agent_run_log_api,
+    },
+)

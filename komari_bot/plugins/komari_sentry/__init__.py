@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata
 
-from komari_bot.common.sentry_support import build_sentry_init_options
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
-from .config_interface import get_config
+from komari_bot.common.sentry_support import (
+    build_sentry_init_options,
+    ensure_sentry_privacy_hooks,
+    set_sensitive_value_collector,
+)
+
+from .config_interface import get_config, get_config_async
 from .config_schema import KomariSentryConfigSchema
 
 try:
@@ -56,12 +63,55 @@ def _resolve_dsn(config: KomariSentryConfigSchema) -> str:
     return os.getenv("SENTRY_DSN", "").strip()
 
 
+def _collect_string_values(value: object, values: list[str]) -> None:
+    """递归收集字符串值（覆盖嵌套 list/dict 结构）。"""
+    if isinstance(value, str):
+        values.append(value)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_string_values(item, values)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_string_values(item, values)
+
+
+def _extract_secret_values(config: BaseModel, values: list[str]) -> None:
+    """按 model_fields 的 secret 标记收集字段值。"""
+    for field_name, field_info in config.__class__.model_fields.items():
+        field_extra = field_info.json_schema_extra
+        if not isinstance(field_extra, dict) or field_extra.get("secret") is not True:
+            continue
+        _collect_string_values(getattr(config, field_name, None), values)
+
+
+def _collect_config_secret_values() -> list[str]:
+    """遍历全部已注册配置管理器，收集标记为 secret 的字段值。
+
+    整体 try/except 防御：manager 未初始化、config_manager 不可用等
+    异常均降级为空集，由 sentry_support 的累计集合兜底。
+    """
+    values: list[str] = []
+    try:
+        from komari_bot.plugins.config_manager import get_registered_config_managers
+
+        for manager in get_registered_config_managers().values():
+            try:
+                config = manager.get()
+            except Exception:
+                logger.debug("[KomariSentry] 读取配置快照失败", exc_info=True)
+                continue
+            _extract_secret_values(config, values)
+    except Exception:
+        logger.debug("[KomariSentry] 收集配置秘密值异常", exc_info=True)
+    return values
+
+
 @driver.on_startup
 async def startup() -> None:
     """初始化 Sentry SDK。"""
     global _initialized_by_plugin  # noqa: PLW0603
 
-    config = get_config()
+    config = await get_config_async()
     if not config.plugin_enable:
         logger.info("[KomariSentry] 插件未启用，跳过初始化")
         return
@@ -85,7 +135,21 @@ async def startup() -> None:
         return
 
     if sentry_sdk.is_initialized():
-        logger.info("[KomariSentry] 检测到 Sentry 已初始化，跳过重复初始化")
+        client = sentry_sdk.get_client()
+        try:
+            ensure_sentry_privacy_hooks(
+                client,
+                allow_user_context=config.send_default_pii,
+            )
+        except Exception:
+            logger.critical(
+                "[KomariSentry] 外部 Sentry Client 无法安装或验证隐私钩子，拒绝继续启动"
+            )
+            raise
+        logger.info(
+            "[KomariSentry] 检测到外部 Sentry Client，已合并并验证项目隐私钩子"
+        )
+        set_sensitive_value_collector(_collect_config_secret_values)
         return
 
     init_options = build_sentry_init_options(
@@ -100,7 +164,18 @@ async def startup() -> None:
         environ=os.environ,
     )
     sentry_sdk.init(**init_options)
+    client = sentry_sdk.get_client()
+    try:
+        ensure_sentry_privacy_hooks(
+            client,
+            allow_user_context=config.send_default_pii,
+        )
+    except Exception:
+        client.close(timeout=0)
+        logger.critical("[KomariSentry] 初始化后隐私钩子验证失败，已关闭 Client")
+        raise
     _initialized_by_plugin = True
+    set_sensitive_value_collector(_collect_config_secret_values)
     logger.info(
         "[KomariSentry] 初始化完成 env={} traces={:.3f} profiles={:.3f}",
         init_options["environment"],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 from komari_bot.plugins.komari_memory.repositories.conversation_repository import (
@@ -104,6 +105,8 @@ def test_search_by_similarity_can_skip_touch_results() -> None:
 def test_insert_conversation_passes_dedup_key_and_returns_id() -> None:
     conn = _FakeConnection(fetchrow_results=[{"id": 42}])
     repository = ConversationRepository(_FakePool(conn))  # type: ignore[arg-type]
+    start_time = datetime(2026, 7, 16, 8, 0, tzinfo=UTC)
+    end_time = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
 
     result = asyncio.run(
         repository.insert_conversation(
@@ -113,6 +116,8 @@ def test_insert_conversation_passes_dedup_key_and_returns_id() -> None:
             participants=["u1"],
             importance_initial=4,
             dedup_key="dedup-1",
+            start_time=start_time,
+            end_time=end_time,
         )
     )
 
@@ -121,6 +126,8 @@ def test_insert_conversation_passes_dedup_key_and_returns_id() -> None:
     assert "dedup_key" in query
     assert "ON CONFLICT DO NOTHING" in query
     assert args[3] == "dedup-1"
+    assert args[4] == start_time.replace(tzinfo=None)
+    assert args[5] == end_time.replace(tzinfo=None)
     embedding_query, embedding_args = conn.execute_calls[0]
     assert "komari_memory_conversation_embeddings" in embedding_query
     assert embedding_args[0] == 42

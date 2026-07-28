@@ -29,3 +29,11 @@ def get_config() -> KomariMemoryConfigSchema:
         当前配置对象
     """
     return _config_manager.get()
+
+
+async def get_config_async() -> KomariMemoryConfigSchema:
+    """在事件循环内异步获取当前配置。"""
+    return await _config_manager.get_async()
+
+
+__all__ = ["get_config", "get_config_async"]

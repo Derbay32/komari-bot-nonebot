@@ -26,6 +26,8 @@ from .models import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from komari_bot.common.management_api import ManagementTokenSource
+
 API_PREFIX = "/api/komari-knowledge/v1"
 
 
@@ -136,13 +138,19 @@ def _resolve_update_params(payload: KnowledgeUpdateRequest) -> dict[str, Any]:
 
 def create_knowledge_router(
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     engine_getter: Callable[[], KnowledgeEngineProtocol | None],
 ) -> APIRouter:
     """创建知识库管理路由。"""
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Komari Knowledge 管理接口",
+        required_permission="knowledge:read",
+    )
+    write_auth_dependency = create_bearer_auth_dependency(
+        api_token,
+        detail="未授权修改 Komari Knowledge",
+        required_permission="knowledge:write",
     )
     engine_dependency = _build_engine_dependency(engine_getter)
     router = APIRouter(
@@ -186,6 +194,7 @@ def create_knowledge_router(
         "/knowledge",
         response_model=KnowledgeEntry,
         status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def create_knowledge(
         payload: KnowledgeCreateRequest,
@@ -205,7 +214,11 @@ def create_knowledge_router(
             )
         return item
 
-    @router.patch("/knowledge/{kid}", response_model=KnowledgeEntry)
+    @router.patch(
+        "/knowledge/{kid}",
+        response_model=KnowledgeEntry,
+        dependencies=[Depends(write_auth_dependency)],
+    )
     async def update_knowledge(
         kid: int,
         payload: KnowledgeUpdateRequest,
@@ -223,6 +236,7 @@ def create_knowledge_router(
         "/knowledge/{kid}",
         status_code=status.HTTP_204_NO_CONTENT,
         response_class=Response,
+        dependencies=[Depends(write_auth_dependency)],
     )
     async def delete_knowledge(
         kid: int,
@@ -247,7 +261,7 @@ def create_knowledge_router(
 def register_knowledge_api(
     app: FastAPI,
     *,
-    api_token: str,
+    api_token: ManagementTokenSource,
     allowed_origins: Sequence[str],
     engine_getter: Callable[[], KnowledgeEngineProtocol | None],
 ) -> None:

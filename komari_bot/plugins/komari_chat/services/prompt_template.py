@@ -24,6 +24,6 @@ _loader = PromptTemplateLoader(
 )
 
 
-def get_template() -> dict[str, str]:
-    """获取最新提示词模板。"""
-    return _loader.get_template()
+async def get_template() -> dict[str, str]:
+    """异步获取最新提示词模板。"""
+    return await _loader.get_template_async()

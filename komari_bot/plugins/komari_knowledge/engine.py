@@ -10,11 +10,23 @@ Komari Knowledge 常识库核心引擎。
 2. 独立模式：从 PostgreSQL 读取配置，缺失时使用 schema 默认值
 """
 
+import asyncio
+import hashlib
 import logging
 import sys
 from collections import defaultdict
 from typing import Any, Final
 
+from komari_bot.common.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    KEYWORD_TEXT_BUDGET,
+    NOTES_TEXT_BUDGET,
+    QUERY_TEXT_BUDGET,
+    normalize_keywords,
+    normalize_optional_text,
+    normalize_required_text,
+    validate_text_budget,
+)
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
     get_shared_database_config,
@@ -28,6 +40,7 @@ from komari_bot.common.vector_storage_schema import (
     build_knowledge_embedding_index_statement,
     build_knowledge_schema_statements,
 )
+from komari_bot.common.versioned_keyword_index import VersionedKeywordIndex
 
 from .config_schema import DynamicConfigSchema
 from .models import KnowledgeCategory, KnowledgeEntry, SearchResult
@@ -46,6 +59,18 @@ class PluginState:
 
 # 初始化全局状态单例
 state = PluginState()
+_engine_initialize_lock: asyncio.Lock | None = None
+_engine_initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_engine_initialize_lock() -> asyncio.Lock:
+    """获取绑定当前事件循环的全局初始化锁。"""
+    global _engine_initialize_lock, _engine_initialize_lock_loop  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    if _engine_initialize_lock is None or _engine_initialize_lock_loop is not loop:
+        _engine_initialize_lock = asyncio.Lock()
+        _engine_initialize_lock_loop = loop
+    return _engine_initialize_lock
 
 # 只有在 NoneBot 环境中才尝试加载 config_manager
 if state.nonebot_mode:
@@ -109,6 +134,10 @@ def get_db_config() -> DatabaseConfigSchema:
 UNSET: Final[object] = object()
 
 
+def _query_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
 class KnowledgeEngine:
     """
     常识库核心引擎。
@@ -120,10 +149,27 @@ class KnowledgeEngine:
         """初始化引擎。"""
         self._pool: Any = None
         self._embedding_service: Any = None
-        self._keyword_index: dict[str, set[int]] = defaultdict(set)
-        self._index_loaded = False
+        self._keyword_index = VersionedKeywordIndex("komari_knowledge")
+        self._initialize_lock: asyncio.Lock | None = None
+        self._initialize_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._initialized = False
 
     async def initialize(self) -> None:
+        """单飞初始化引擎。"""
+        async with self._get_initialize_lock():
+            if self._initialized:
+                return
+            await self._initialize_once()
+
+    def _get_initialize_lock(self) -> asyncio.Lock:
+        """获取绑定当前事件循环的实例初始化锁。"""
+        loop = asyncio.get_running_loop()
+        if self._initialize_lock is None or self._initialize_lock_loop is not loop:
+            self._initialize_lock = asyncio.Lock()
+            self._initialize_lock_loop = loop
+        return self._initialize_lock
+
+    async def _initialize_once(self) -> None:
         """初始化引擎（加载模型、建立连接池、构建索引）。"""
         state.logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
 
@@ -174,6 +220,7 @@ class KnowledgeEngine:
 
             # 3. 构建关键词索引（内存预热）
             await self._build_keyword_index()
+            self._initialized = True
             state.logger.info("[Komari Knowledge] 常识库引擎初始化完成")
         except Exception:
             try:
@@ -252,30 +299,43 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
-        state.logger.info("[Komari Knowledge] 正在构建关键词索引...")
-        self._keyword_index.clear()
-        self._index_loaded = False
-
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, keywords
-                FROM komari_knowledge
-                WHERE keywords IS NOT NULL AND array_length(keywords, 1) > 0
-                """
+        rebuilt = await self._keyword_index.rebuild(
+            self._pool,
+            self._load_keyword_index_entries,
+        )
+        if rebuilt:
+            entry_ids = {
+                entry_id
+                for indexed_ids in self._keyword_index.entries.values()
+                for entry_id in indexed_ids
+            }
+            state.logger.info(
+                f"[Komari Knowledge] 关键词索引构建完成，共 {len(entry_ids)} 条知识"
             )
 
-            for row in rows:
-                kid: int = row["id"]
-                keywords: list[str] = row["keywords"]
+    async def _load_keyword_index_entries(self, conn: Any) -> dict[str, set[int]]:
+        """从同一数据库快照加载关键词映射。"""
+        rows = await conn.fetch(
+            """
+            SELECT id, keywords
+            FROM komari_knowledge
+            WHERE keywords IS NOT NULL AND array_length(keywords, 1) > 0
+            """
+        )
+        entries: dict[str, set[int]] = defaultdict(set)
+        for row in rows:
+            kid = int(row["id"])
+            for keyword in list(row["keywords"] or []):
+                entries[str(keyword).lower()].add(kid)
+        return entries
 
-                for kw in keywords:
-                    kw_lower = kw.lower()
-                    self._keyword_index[kw_lower].add(kid)
-
-        self._index_loaded = True
-        state.logger.info(
-            f"[Komari Knowledge] 关键词索引构建完成，共 {len(rows)} 条知识"
+    async def _ensure_keyword_index_fresh(self) -> None:
+        """按版本戳刷新其他 worker 已修改的索引。"""
+        if self._pool is None:
+            return
+        await self._keyword_index.ensure_fresh(
+            self._pool,
+            self._load_keyword_index_entries,
         )
 
     async def _get_embedding(self, text: str) -> list[float]:
@@ -331,24 +391,42 @@ class KnowledgeEngine:
         """
         if not query or not query.strip():
             return []
+        raw_query = query
+        query = normalize_required_text(
+            query,
+            label="查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
+        if query != raw_query:
+            query_vec = None
 
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化，请先调用 initialize()")  # noqa:TRY003
 
+        config = get_config()
         # 确保 limit 是 int 类型
         if limit is None:
-            limit = get_config().total_limit
+            limit = config.total_limit
 
         # pylance 不知道 config 插件会存取什么东西，写个 assert 告诉它 limit 此时一定是 int
         assert isinstance(limit, int), "limit should be int"
+        if limit <= 0:
+            return []
 
         # 应用查询重写
         original_query = query
         query = self._rewrite_query(query)
+        validate_text_budget(
+            query,
+            label="改写后查询文本",
+            budget=QUERY_TEXT_BUDGET,
+        )
 
         if query != original_query:
             state.logger.info(
-                f"[Komari Knowledge] 查询重写: '{original_query}' -> '{query}'"
+                "[Komari Knowledge] 查询已重写: "
+                f"original_chars={len(original_query)} rewritten_chars={len(query)} "
+                f"query_hash={_query_fingerprint(query)}"
             )
             if query_vec is not None:
                 state.logger.debug(
@@ -360,7 +438,12 @@ class KnowledgeEngine:
         seen_ids: set[int] = set()
 
         # --- Layer 1: 关键词精确匹配（内存，微秒级） ---
-        keyword_hits = await self._layer1_keyword_search(query, limit)
+        keyword_limit = min(limit, config.layer1_limit)
+        keyword_hits = (
+            await self._layer1_keyword_search(query, keyword_limit)
+            if keyword_limit > 0
+            else []
+        )
         for hit in keyword_hits:
             if hit.id not in seen_ids:
                 results.append(hit)
@@ -368,14 +451,22 @@ class KnowledgeEngine:
 
         # --- Layer 2: 向量语义检索（补漏） ---
         vector_hits: list[SearchResult] = []
-        if len(results) < limit:
+        vector_limit = min(
+            config.layer2_limit,
+            max(0, limit - len(results)),
+        )
+        if vector_limit > 0:
             vector_hits = await self._layer2_vector_search(
-                query, limit - len(results), seen_ids, query_vec=query_vec
+                query,
+                vector_limit,
+                seen_ids,
+                query_vec=query_vec,
             )
             results.extend(vector_hits)
 
         state.logger.debug(
-            f"[Komari Knowledge] 检索 '{query[:20]}...' -> "
+            "[Komari Knowledge] 检索完成: "
+            f"query_hash={_query_fingerprint(query)} "
             f"关键词命中 {len(keyword_hits)} 条，向量补充 {len(vector_hits)} 条"
         )
 
@@ -390,15 +481,24 @@ class KnowledgeEngine:
         Returns:
             检索结果列表
         """
-        if not self._index_loaded:
+        if not keyword.strip():
+            return []
+        keyword = normalize_required_text(
+            keyword,
+            label="关键词查询",
+            budget=KEYWORD_TEXT_BUDGET,
+        )
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded:
             return []
 
         # 在内存索引中查找
         keyword_lower = keyword.lower()
-        if keyword_lower not in self._keyword_index:
+        entries = self._keyword_index.entries
+        if keyword_lower not in entries:
             return []
 
-        matched_ids = self._keyword_index[keyword_lower]
+        matched_ids = entries[keyword_lower]
 
         # 从数据库获取完整内容
         if self._pool is None:
@@ -440,14 +540,15 @@ class KnowledgeEngine:
         Returns:
             检索结果列表
         """
-        if not self._index_loaded:
+        await self._ensure_keyword_index_fresh()
+        if not self._keyword_index.loaded:
             return []
 
         matched_ids: set[int] = set()
 
         # 检查查询中是否包含已知关键词
         query_lower = query.lower()
-        for kw, kid_set in self._keyword_index.items():
+        for kw, kid_set in self._keyword_index.entries.items():
             if kw in query_lower:
                 matched_ids.update(kid_set)
 
@@ -551,6 +652,8 @@ class KnowledgeEngine:
         keywords: list[str],
         category: KnowledgeCategory = "general",
         notes: str | None = None,
+        *,
+        source_key: str | None = None,
     ) -> int:
         """
         添加知识到数据库。
@@ -560,6 +663,7 @@ class KnowledgeEngine:
             keywords: 关键词列表
             category: 分类
             notes: 备注
+            source_key: 外部来源幂等键
 
         Returns:
             新知识的 ID
@@ -567,14 +671,30 @@ class KnowledgeEngine:
         if self._pool is None:
             raise RuntimeError("数据库连接池未初始化")
 
+        content = normalize_required_text(
+            content,
+            label="知识内容",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+        keywords = normalize_keywords(keywords, require_nonempty=True)
+        notes = normalize_optional_text(
+            notes,
+            label="备注",
+            budget=NOTES_TEXT_BUDGET,
+        )
+
         # 生成向量
         embedding = await self._get_embedding(content)
 
         async with self._pool.acquire() as conn:
             kid = await conn.fetchval(
                 """
-                INSERT INTO komari_knowledge (content, keywords, category, embedding, notes)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO komari_knowledge (
+                    content, keywords, category, embedding, notes, source_key
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (source_key) WHERE source_key IS NOT NULL
+                DO UPDATE SET source_key = EXCLUDED.source_key
                 RETURNING id
                 """,
                 content,
@@ -582,12 +702,10 @@ class KnowledgeEngine:
                 category,
                 str(embedding),
                 notes,
+                source_key,
             )
 
-        # 更新内存索引
-        for kw in keywords:
-            kw_lower = kw.lower()
-            self._keyword_index[kw_lower].add(kid)
+        await self._build_keyword_index()
 
         state.logger.info(f"[Komari Knowledge] 添加知识: ID={kid}, keywords={keywords}")
         return kid
@@ -660,6 +778,11 @@ class KnowledgeEngine:
         if query is not None:
             keyword = query.strip()
             if keyword:
+                validate_text_budget(
+                    keyword,
+                    label="列表查询文本",
+                    budget=QUERY_TEXT_BUDGET,
+                )
                 keyword_pattern = f"%{escape_like_pattern(keyword)}%"
                 conditions.append(
                     f"""
@@ -726,24 +849,17 @@ class KnowledgeEngine:
             raise RuntimeError("数据库连接池未初始化")
 
         async with self._pool.acquire() as conn:
-            # 先获取关键词，用于更新内存索引
             row = await conn.fetchrow(
-                "SELECT keywords FROM komari_knowledge WHERE id = $1", kid
+                "SELECT id FROM komari_knowledge WHERE id = $1", kid
             )
 
             if row is None:
                 return False
 
-            keywords = row["keywords"] or []
-
             # 删除记录
             await conn.execute("DELETE FROM komari_knowledge WHERE id = $1", kid)
 
-        # 更新内存索引
-        for kw in keywords:
-            kw_lower = kw.lower()
-            if kw_lower in self._keyword_index:
-                self._keyword_index[kw_lower].discard(kid)
+        await self._build_keyword_index()
 
         state.logger.info(f"[Komari Knowledge] 删除知识: ID={kid}")
         return True
@@ -794,6 +910,11 @@ class KnowledgeEngine:
             # 内容改变需要重新生成向量
             if content is not UNSET:
                 assert isinstance(content, str), "content 更新值必须是字符串"
+                content = normalize_required_text(
+                    content,
+                    label="知识内容",
+                    budget=CONTENT_TEXT_BUDGET,
+                )
                 embedding = await self._get_embedding(content)
                 updates.append(f"content = ${param_idx}")
                 params.append(content)
@@ -804,6 +925,7 @@ class KnowledgeEngine:
 
             if keywords is not UNSET:
                 assert isinstance(keywords, list), "keywords 更新值必须是字符串列表"
+                keywords = normalize_keywords(keywords, require_nonempty=True)
                 updates.append(f"keywords = ${param_idx}")
                 params.append(keywords)
                 param_idx += 1
@@ -815,6 +937,14 @@ class KnowledgeEngine:
                 param_idx += 1
 
             if notes is not UNSET:
+                assert notes is None or isinstance(notes, str), (
+                    "notes 更新值必须是字符串或 None"
+                )
+                notes = normalize_optional_text(
+                    notes,
+                    label="备注",
+                    budget=NOTES_TEXT_BUDGET,
+                )
                 updates.append(f"notes = ${param_idx}")
                 params.append(notes)
                 param_idx += 1
@@ -826,21 +956,7 @@ class KnowledgeEngine:
             query = f"UPDATE komari_knowledge SET {', '.join(updates)} WHERE id = $1"
             await conn.execute(query, kid, *params)
 
-        # 更新内存关键词索引
-        old_keywords = row["keywords"] or []
-        new_keywords = keywords if keywords is not UNSET else old_keywords
-        assert isinstance(new_keywords, list), "keywords 更新值必须是字符串列表"
-
-        # 移除旧关键词索引
-        for kw in old_keywords:
-            kw_lower = kw.lower()
-            if kw_lower in self._keyword_index:
-                self._keyword_index[kw_lower].discard(kid)
-
-        # 添加新关键词索引
-        for kw in new_keywords:
-            kw_lower = kw.lower()
-            self._keyword_index[kw_lower].add(kid)
+        await self._build_keyword_index()
 
         state.logger.info(f"[Komari Knowledge] 更新知识: ID={kid}")
         return True
@@ -881,8 +997,8 @@ class KnowledgeEngine:
             finally:
                 self._pool = None
 
-        self._keyword_index.clear()
-        self._index_loaded = False
+        await self._keyword_index.reset()
+        self._initialized = False
         if state.engine is self:
             state.engine = None
 
@@ -901,9 +1017,10 @@ async def initialize_engine() -> KnowledgeEngine:
     Returns:
         引擎实例
     """
-    if state.engine is None:
-        engine = KnowledgeEngine()
-        await engine.initialize()
-        state.engine = engine
+    async with _get_engine_initialize_lock():
+        if state.engine is None:
+            engine = KnowledgeEngine()
+            await engine.initialize()
+            state.engine = engine
 
     return state.engine

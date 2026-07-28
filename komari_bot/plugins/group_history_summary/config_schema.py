@@ -1,9 +1,9 @@
 """群聊历史总结插件配置。"""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class LayoutParamsSchema(BaseModel):
@@ -31,9 +31,33 @@ class LayoutParamsSchema(BaseModel):
     char_x_offset: int = Field(default=-10, ge=-5000, le=5000)
     char_y_offset: int = Field(default=0, ge=-5000, le=5000)
 
+    @model_validator(mode="after")
+    def validate_canvas_bounds(self) -> Self:
+        """拒绝会把主要文本或角色图整体放到画布外的组合。"""
+        if self.title_x >= self.canvas_width or self.title_y >= self.canvas_height:
+            msg = "标题起点必须位于画布内"
+            raise ValueError(msg)
+        if self.body_x + self.body_max_width > self.canvas_width:
+            msg = "正文横向区域超出画布"
+            raise ValueError(msg)
+        if self.body_y + self.body_size > self.canvas_height:
+            msg = "正文起点与字号组合超出画布"
+            raise ValueError(msg)
+        if abs(self.char_x_offset) >= self.canvas_width:
+            msg = "角色图横向偏移会使图片完全离开画布"
+            raise ValueError(msg)
+        if abs(self.char_y_offset) >= self.canvas_height:
+            msg = "角色图纵向偏移会使图片完全离开画布"
+            raise ValueError(msg)
+        return self
+
 
 class DynamicConfigSchema(BaseModel):
     """群聊历史总结插件动态配置。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
 
     version: str = Field(default="1.0", description="配置架构版本")
     last_updated: str = Field(
@@ -48,6 +72,26 @@ class DynamicConfigSchema(BaseModel):
     )
     group_whitelist: list[str] = Field(
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
+    )
+
+    redis_db: int = Field(
+        default=0,
+        ge=0,
+        le=15,
+        description="群总结分布式锁使用的 Redis 数据库编号",
+        json_schema_extra={"apply_mode": "restart"},
+    )
+    summary_lock_ttl_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3600,
+        description="群总结分布式锁租约时长（秒），运行中会自动续租",
+    )
+    history_min_coverage_ratio: float = Field(
+        default=0.8,
+        ge=0.1,
+        le=1.0,
+        description="历史分页失败时允许继续总结的最低已覆盖比例",
     )
 
     min_summary_count: int = Field(
@@ -113,6 +157,21 @@ class DynamicConfigSchema(BaseModel):
         default_factory=LayoutParamsSchema,
         description="总结图片布局参数",
     )
+
+    @model_validator(mode="after")
+    def validate_summary_count_bounds(self) -> Self:
+        """校验总结计数与扫描硬上限的组合关系。"""
+        if not (
+            self.min_summary_count
+            <= self.summary_default_count
+            <= self.max_summary_count
+        ):
+            msg = "总结条数必须满足 min_summary_count <= default <= max_summary_count"
+            raise ValueError(msg)
+        if self.summary_tool_scan_limit < self.max_summary_count:
+            msg = "summary_tool_scan_limit 不能小于 max_summary_count"
+            raise ValueError(msg)
+        return self
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")
     @classmethod

@@ -9,7 +9,12 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.plugins.character_binding.manager import (
+    BindingPersistenceError,
+    CharacterBindingManager,
+    CharacterNameValidationError,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -98,20 +103,6 @@ def test_runtime_type_hints_can_resolve_onebot_message_types(
     assert message_hints["args"].__name__ == "Message"
 
 
-def test_parse_superuser_bind_set_request_supports_explicit_target(
-    commands_module: Any,
-) -> None:
-    request = commands_module.parse_superuser_bind_set_request(
-        user_id="42",
-        arg_text="10086 柊镜",
-    )
-
-    assert request.operator_user_id == "42"
-    assert request.target_user_id == "10086"
-    assert request.character_name == "柊镜"
-    assert request.specified_target is True
-
-
 def test_parse_self_bind_set_request_always_targets_self(
     commands_module: Any,
 ) -> None:
@@ -127,70 +118,81 @@ def test_parse_self_bind_set_request_always_targets_self(
 
 
 @pytest.mark.asyncio
-async def test_handle_set_superuser_sets_other_user_binding_with_nonebug(
+async def test_handle_set_reports_validation_failure(
     app: App,
     commands_module: Any,
     manager_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _StubManager()
+
+    async def reject_name(_user_id: str, _character_name: str) -> None:
+        raise CharacterNameValidationError("角色名不能包含换行或控制字符")
+
+    monkeypatch.setattr(manager, "set_character_name", reject_name)
     monkeypatch.setattr(manager_module, "_manager_instance", manager)
 
-    async with app.test_matcher(commands_module.bind_set_superuser) as ctx:
+    async with app.test_matcher(commands_module.bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind set 10086 柊镜")
+        event = _build_private_event(".bind set 角色名")
         ctx.receive_event(bot, event)
-        ctx.should_ignore_permission(matcher=commands_module.bind_set_superuser)
-        ctx.should_pass_rule(matcher=commands_module.bind_set_superuser)
-        ctx.should_call_send(event, "✅ 已为用户 10086 设置角色名为 柊镜", bot=bot)
-        ctx.should_finished()
-
-    assert manager.bindings == {"10086": "柊镜"}
-
-
-@pytest.mark.asyncio
-async def test_handle_del_superuser_removes_other_user_binding_with_nonebug(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager({"10086": "柊镜"})
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
-
-    async with app.test_matcher(commands_module.bind_del_superuser) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind del 10086")
-        ctx.receive_event(bot, event)
-        ctx.should_ignore_permission(matcher=commands_module.bind_del_superuser)
-        ctx.should_pass_rule(matcher=commands_module.bind_del_superuser)
-        ctx.should_call_send(event, "✅ 已删除用户 10086 的角色绑定", bot=bot)
-        ctx.should_finished()
-
-    assert manager.bindings == {}
-
-
-@pytest.mark.asyncio
-async def test_handle_list_superuser_returns_all_bindings_with_nonebug(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager({"42": "泉此方", "10086": "柊镜"})
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
-
-    async with app.test_matcher(commands_module.bind_list_superuser) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind list")
-        ctx.receive_event(bot, event)
-        ctx.should_ignore_permission(matcher=commands_module.bind_list_superuser)
-        ctx.should_pass_rule(matcher=commands_module.bind_list_superuser)
+        ctx.should_pass_permission(matcher=commands_module.bind_set)
+        ctx.should_pass_rule(matcher=commands_module.bind_set)
         ctx.should_call_send(
             event,
-            "📋 所有角色绑定列表：\n  42: 泉此方\n  10086: 柊镜",
+            plain_text_message("❌ 角色名不能包含换行或控制字符"),
             bot=bot,
         )
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_set_reports_persistence_failure(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager()
+
+    async def fail_to_save(_user_id: str, _character_name: str) -> None:
+        raise BindingPersistenceError("角色绑定保存失败")
+
+    monkeypatch.setattr(manager, "set_character_name", fail_to_save)
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_set) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind set 泉此方")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_set)
+        ctx.should_pass_rule(matcher=commands_module.bind_set)
+        ctx.should_call_send(event, "❌ 角色绑定保存失败，请稍后重试", bot=bot)
+        ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_delete_reports_persistence_failure(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager({"42": "泉此方"})
+
+    async def fail_to_delete(_user_id: str) -> bool:
+        raise BindingPersistenceError("角色绑定保存失败")
+
+    monkeypatch.setattr(manager, "remove_character_name", fail_to_delete)
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_del) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind del")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_del)
+        ctx.should_pass_rule(matcher=commands_module.bind_del)
+        ctx.should_call_send(event, "❌ 角色绑定删除失败，请稍后重试", bot=bot)
         ctx.should_finished()
 
 
@@ -210,5 +212,52 @@ async def test_handle_list_only_returns_current_user_binding_with_nonebug(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_list)
         ctx.should_pass_rule(matcher=commands_module.bind_list)
-        ctx.should_call_send(event, "📋 您的角色绑定: 泉此方", bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 您的角色绑定: 泉此方"),
+            bot=bot,
+        )
         ctx.should_finished()
+
+
+@pytest.mark.asyncio
+async def test_handle_list_treats_stored_cq_code_as_plain_text(
+    app: App,
+    commands_module: Any,
+    manager_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _StubManager({"42": "[CQ:at,qq=all]"})
+    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+
+    async with app.test_matcher(commands_module.bind_list) as ctx:
+        bot = _create_onebot_bot(ctx)
+        event = _build_private_event(".bind list")
+        ctx.receive_event(bot, event)
+        ctx.should_pass_permission(matcher=commands_module.bind_list)
+        ctx.should_pass_rule(matcher=commands_module.bind_list)
+        ctx.should_call_send(
+            event,
+            plain_text_message("📋 您的角色绑定: [CQ:at,qq=all]"),
+            bot=bot,
+        )
+        ctx.should_finished()
+
+
+def test_no_superuser_import_in_commands(commands_module: Any) -> None:
+    """验证 commands 模块不再导入 SUPERUSER。"""
+    assert not hasattr(commands_module, "SUPERUSER")
+    assert "SUPERUSER" not in dir(commands_module)
+
+
+def test_no_superuser_matchers_in_commands(commands_module: Any) -> None:
+    """验证 commands 模块不再包含 SUPERUSER matcher。"""
+    assert not hasattr(commands_module, "bind_set_superuser")
+    assert not hasattr(commands_module, "bind_del_superuser")
+    assert not hasattr(commands_module, "bind_list_superuser")
+
+
+def test_no_superuser_parsers_in_commands(commands_module: Any) -> None:
+    """验证 commands 模块不再包含 SUPERUSER 解析器。"""
+    assert not hasattr(commands_module, "parse_superuser_bind_set_request")
+    assert not hasattr(commands_module, "parse_superuser_bind_delete_request")
