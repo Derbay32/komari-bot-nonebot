@@ -7,24 +7,21 @@ Komari Knowledge 常识库核心引擎。
 
 支持两种运行模式：
 1. NoneBot 模式：使用 config_manager 插件加载配置
-2. 独立模式：直接从 JSON 文件加载配置（用于离线脚本或独立调用）
+2. 独立模式：从 PostgreSQL 读取配置，缺失时使用 schema 默认值
 """
 
-import json
 import logging
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Final
 
 from komari_bot.common.database_config import (
     DatabaseConfigSchema,
-    get_effective_database_config,
-    load_database_config_from_file,
-    merge_database_config,
+    get_shared_database_config,
 )
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
 from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.sql_like_utils import escape_like_pattern
 from komari_bot.common.vector_storage_schema import (
     PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
     apply_schema_statements,
@@ -69,19 +66,19 @@ if state.nonebot_mode:
 
 
 def _load_standalone_config() -> DynamicConfigSchema:
-    """独立模式：从 JSON 文件加载配置。"""
-    config_path = Path("config/config_manager/komari_knowledge_config.json")
-    if config_path.exists():
-        try:
-            with Path.open(config_path, encoding="utf-8") as f:
-                data = json.load(f)
-            return DynamicConfigSchema(**data)
-        except (json.JSONDecodeError, TypeError) as e:
-            state.logger.warning(f"配置文件解析失败: {e}，使用默认配置")
-            return DynamicConfigSchema()
-    else:
-        state.logger.warning(f"配置文件不存在: {config_path}，使用默认配置")
+    """独立模式：从 PostgreSQL 读取配置，缺失时使用默认配置。"""
+    try:
+        from komari_bot.plugins.config_manager.storage import get_config_storage
+
+        stored = get_config_storage().fetch("komari_knowledge")
+    except Exception as exc:
+        state.logger.warning(f"[Komari Knowledge] PG 配置读取失败: {exc}，使用默认配置")
         return DynamicConfigSchema()
+    if stored is None:
+        state.logger.warning("[Komari Knowledge] PG 中无配置，使用默认配置")
+        return DynamicConfigSchema()
+    state.logger.info("[Komari Knowledge] 已从 PostgreSQL 加载独立模式配置")
+    return DynamicConfigSchema(**stored.config_data)
 
 
 def get_config() -> DynamicConfigSchema:
@@ -101,23 +98,12 @@ def get_config() -> DynamicConfigSchema:
     return state.standalone_config
 
 
-def get_db_config(config: DynamicConfigSchema) -> DatabaseConfigSchema:
+def get_db_config() -> DatabaseConfigSchema:
     """获取最终生效的数据库配置（兼容两种模式）。"""
     if state.nonebot_mode:
-        return get_effective_database_config(config)
+        return get_shared_database_config()
 
-    shared_config_path = Path("config/config_manager/database_config.json")
-    if shared_config_path.exists():
-        try:
-            shared = load_database_config_from_file(shared_config_path)
-            return merge_database_config(shared, config)
-        except Exception as e:
-            state.logger.warning(
-                "[Komari Knowledge] 共享数据库配置解析失败: %s，回退到本地配置",
-                e,
-            )
-
-    return merge_database_config(DatabaseConfigSchema(), config)
+    return get_shared_database_config()
 
 
 UNSET: Final[object] = object()
@@ -142,7 +128,7 @@ class KnowledgeEngine:
         state.logger.info("[Komari Knowledge] 正在初始化常识库引擎...")
 
         # 获取配置
-        config = get_config()
+        get_config()
 
         try:
             # 1. 加载向量嵌入模型
@@ -157,20 +143,29 @@ class KnowledgeEngine:
                     EmbeddingService,
                 )
 
-                config_path = Path("config/config_manager/embedding_provider_config.json")
-                if config_path.exists():
-                    with Path.open(config_path, encoding="utf-8") as f:
-                        data = json.load(f)
-                    embed_config = EmbedConfigSchema(**data)
-                else:
-                    embed_config = EmbedConfigSchema()
+                try:
+                    from komari_bot.plugins.config_manager.storage import (
+                        get_config_storage,
+                    )
+
+                    stored = get_config_storage().fetch("embedding_provider")
+                except Exception as exc:
+                    state.logger.warning(
+                        f"[Komari Knowledge] embedding PG 配置读取失败: {exc}，使用默认配置"
+                    )
+                    stored = None
+                embed_config = (
+                    EmbedConfigSchema(**stored.config_data)
+                    if stored is not None
+                    else EmbedConfigSchema()
+                )
 
                 self._embedding_service = EmbeddingService(embed_config)
                 state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
 
             # 2. 建立数据库连接池
             if self._pool is None:
-                db_config = get_db_config(config)
+                db_config = get_db_config()
                 self._pool = await create_postgres_pool(db_config, command_timeout=30)
                 state.logger.info("[Komari Knowledge] 数据库连接池已建立")
                 expected_dimension = self._resolve_expected_embedding_dimension()
@@ -663,16 +658,17 @@ class KnowledgeEngine:
         param_idx = 1
 
         if query is not None:
-            keyword_pattern = f"%{query.strip()}%"
-            if keyword_pattern != "%%":
+            keyword = query.strip()
+            if keyword:
+                keyword_pattern = f"%{escape_like_pattern(keyword)}%"
                 conditions.append(
                     f"""
                     (
-                        content ILIKE ${param_idx}
+                        content ILIKE ${param_idx} ESCAPE '\\'
                         OR EXISTS (
                             SELECT 1
                             FROM unnest(COALESCE(keywords, ARRAY[]::text[])) AS keyword
-                            WHERE keyword ILIKE ${param_idx}
+                            WHERE keyword ILIKE ${param_idx} ESCAPE '\\'
                         )
                     )
                     """

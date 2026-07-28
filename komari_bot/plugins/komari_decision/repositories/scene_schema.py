@@ -28,22 +28,56 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     ON komari_memory_scene_set(source_hash)
     """,
     """
-    CREATE TABLE IF NOT EXISTS komari_memory_scene_item (
+    CREATE TABLE IF NOT EXISTS komari_decision_scenes (
         id BIGSERIAL PRIMARY KEY,
-        set_id BIGINT NOT NULL REFERENCES komari_memory_scene_set(id) ON DELETE CASCADE,
-        scene_key TEXT NOT NULL,
+        scene_key TEXT NOT NULL UNIQUE,
         scene_type TEXT NOT NULL CHECK (scene_type IN ('fixed', 'general')),
         content_text TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         enabled BOOLEAN NOT NULL DEFAULT TRUE,
         order_index INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_komari_decision_scenes_type_order
+    ON komari_decision_scenes(scene_type, enabled, order_index)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_komari_decision_scenes_content_hash
+    ON komari_decision_scenes(content_hash)
+    """,
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = 'komari_memory_scene_item'
+              AND column_name = 'scene_key'
+        ) THEN
+            DROP TABLE komari_memory_scene_item CASCADE;
+        END IF;
+    END $$
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS komari_memory_scene_item (
+        id BIGSERIAL PRIMARY KEY,
+        set_id BIGINT NOT NULL REFERENCES komari_memory_scene_set(id) ON DELETE CASCADE,
+        scene_id BIGINT NOT NULL REFERENCES komari_decision_scenes(id) ON DELETE CASCADE,
+        content_hash TEXT NOT NULL,
         embedding REAL[],
         embedding_dim INT,
         status TEXT NOT NULL CHECK (status IN ('PENDING', 'READY', 'FAILED')),
         error_message TEXT,
         embedded_at TIMESTAMPTZ,
-        UNIQUE (set_id, scene_key)
+        UNIQUE (set_id, scene_id)
     )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_scene_id
+    ON komari_memory_scene_item(scene_id)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_set_status
@@ -51,7 +85,7 @@ SCENE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_komari_memory_scene_item_reuse
-    ON komari_memory_scene_item(scene_key, content_hash)
+    ON komari_memory_scene_item(scene_id, content_hash)
     """,
     """
     CREATE TABLE IF NOT EXISTS komari_memory_scene_runtime (

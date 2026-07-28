@@ -2,8 +2,8 @@
 配置管理插件 - 通用配置管理功能。
 
 提供：
-- 从 JSON/.env 分层加载配置
-- 运行时配置更新并持久化
+- 从 PostgreSQL 加载插件动态配置
+- 首次缺失时从 .env 初始化并持久化
 - 线程安全的配置访问
 - 可扩展的配置 Schema
 
@@ -26,16 +26,18 @@ config = config_manager.initialize()
 config_manager.update_field("timeout", 60)
 
 # 重新加载
-config = config_manager.reload_from_json()
+config = config_manager.reload()
 ```
 """
+from nonebot import get_driver
 from nonebot.plugin import PluginMetadata
 
 from .manager import ConfigManager, get_config_manager
+from .storage import close_config_storage_if_created
 
 __plugin_meta__ = PluginMetadata(
     name="config_manager",
-    description="通用配置管理插件，提供 JSON/.env 分层配置加载和运行时更新",
+    description="通用配置管理插件，提供 PostgreSQL 配置存储和运行时更新",
     usage="详见插件文档",
 )
 
@@ -43,3 +45,12 @@ __all__ = [
     "ConfigManager",
     "get_config_manager",
 ]
+
+
+driver = get_driver()
+
+
+@driver.on_shutdown
+def _close_config_storage() -> None:
+    """关闭已创建的配置存储。"""
+    close_config_storage_if_created()

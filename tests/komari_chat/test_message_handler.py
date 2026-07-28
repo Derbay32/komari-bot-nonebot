@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, cast
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
+llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
 
 
 class _FakeEvent:
@@ -113,6 +115,8 @@ class _FakeRedis:
     def __init__(self, history: list[MessageSchema]) -> None:
         self.history = list(history)
         self.pushed_messages: list[MessageSchema] = []
+        self.pushed_global_interactions: list[dict[str, object]] = []
+        self.global_interaction_buffer_calls: list[dict[str, object]] = []
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
         del group_id, limit
@@ -123,18 +127,84 @@ class _FakeRedis:
         self.pushed_messages.append(message)
         self.history.append(message)
 
-    async def increment_message_count(self, group_id: str) -> int:
-        del group_id
-        return 1
+    async def get_global_interaction_buffer(
+        self,
+        user_id: str,
+        limit: int = 10,
+    ) -> list[dict[str, object]]:
+        self.global_interaction_buffer_calls.append({"user_id": user_id, "limit": limit})
+        return [{"event": "旧互动", "result": "旧回应", "emotion": "平静"}]
 
-    async def increment_tokens(self, group_id: str, count: int) -> int:
-        del group_id
-        return count
+    async def push_global_interaction(
+        self,
+        *,
+        user_id: str,
+        record: dict[str, object],
+        trigger_size: int,
+    ) -> None:
+        self.pushed_global_interactions.append(
+            {"user_id": user_id, "record": record, "trigger_size": trigger_size}
+        )
 
 
 class _FakeMemory:
+    def __init__(self) -> None:
+        self.pg_pool = object()
+        self.interaction_history: dict[str, object] | None = None
+        self.upsert_interaction_history_calls: list[dict[str, object]] = []
+        self.search_interaction_event_calls: list[dict[str, object]] = []
+        self.get_user_profile_calls: list[dict[str, object]] = []
+
     async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
         return []
+
+    async def search_interaction_events(
+        self,
+        **kwargs: object,
+    ) -> list[dict[str, object]]:
+        self.search_interaction_event_calls.append(dict(kwargs))
+        return [{"event_summary": "长期互动事件"}]
+
+    async def get_user_profile(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, object]:
+        self.get_user_profile_calls.append({"user_id": user_id, "group_id": group_id})
+        return {
+            "display_name": "阿虚",
+            "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
+        }
+
+    async def get_interaction_history(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> dict[str, object] | None:
+        del user_id, group_id
+        return self.interaction_history
+
+    async def upsert_interaction_history(
+        self,
+        *,
+        user_id: str,
+        group_id: str,
+        interaction: dict[str, object],
+    ) -> None:
+        self.upsert_interaction_history_calls.append(
+            {"user_id": user_id, "group_id": group_id, "interaction": interaction}
+        )
+
+
+@asynccontextmanager
+async def _fake_memory_lock(*_args: object, **kwargs: object):
+    _fake_memory_lock_calls.append(kwargs)
+    yield
+
+
+_fake_memory_lock_calls: list[dict[str, object]] = []
 
 
 class _FakeQueryRewrite:
@@ -216,18 +286,32 @@ def test_attempt_reply_only_rewrites_current_message(
     )
 
     redis = _FakeRedis([previous_message])
+    memory = _FakeMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = _FakeMemory()
+    handler.memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
+    build_prompt_kwargs: dict[str, object] = {}
+    generate_with_tools_kwargs: dict[str, object] = {}
 
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        build_prompt_kwargs.update(_kwargs)
         return []
 
-    async def _fake_generate_reply(**_kwargs: object) -> str:
-        return "收到啦"
+    async def _fake_generate_reply_with_tools(**_kwargs: object) -> object:
+        generate_with_tools_kwargs.update(_kwargs)
+        return llm_service_module.ReplyResult(
+            content="收到啦",
+            interaction_history={
+                "event": "发送当前待回复消息",
+                "result": "回复收到啦",
+                "emotion": "平静",
+            },
+            favorability_delta=1,
+            favorability_reason="正常互动",
+        )
 
     monkeypatch.setattr(
         message_handler_module,
@@ -235,8 +319,12 @@ def test_attempt_reply_only_rewrites_current_message(
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
+            summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
         ),
     )
     monkeypatch.setattr(
@@ -244,7 +332,16 @@ def test_attempt_reply_only_rewrites_current_message(
         "build_prompt",
         _fake_build_prompt,
     )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_reply)
+    monkeypatch.setattr(
+        message_handler_module,
+        "generate_reply_with_tools",
+        _fake_generate_reply_with_tools,
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(is_search_available=lambda: False),
+    )
     original_require = nonebot.plugin.require
 
     def _fake_require(name: str) -> object:
@@ -274,6 +371,96 @@ def test_attempt_reply_only_rewrites_current_message(
         "reply_to_message_id": current_message.message_id,
     }
     assert handler.query_rewrite.current_query == "当前待回复消息"
+    assert redis.global_interaction_buffer_calls == [{"user_id": "user-1", "limit": 10}]
+    assert memory.get_user_profile_calls == [{"user_id": "user-1", "group_id": "group-1"}]
+    assert memory.search_interaction_event_calls == [
+        {
+            "user_id": "user-1",
+            "query": "重写后的查询",
+            "limit": 3,
+            "query_embedding": [0.1, 0.2],
+        }
+    ]
+    assert build_prompt_kwargs["current_user_profile"] == {
+        "display_name": "阿虚",
+        "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
+    }
+    assert build_prompt_kwargs["interaction_records"] == [
+        {"event": "旧互动", "result": "旧回应", "emotion": "平静"}
+    ]
+    assert build_prompt_kwargs["interaction_memories"] == [{"event_summary": "长期互动事件"}]
+    assert llm_service_module.READ_PROFILE_TOOL in generate_with_tools_kwargs["tools"]
+    assert llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL in generate_with_tools_kwargs["tools"]
+    assert generate_with_tools_kwargs["memory_service"] is memory
+    assert generate_with_tools_kwargs["group_id"] == "group-1"
+    assert generate_with_tools_kwargs["max_tool_rounds"] == 5
+    injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
+    assert injected_favorability.favorability == 0
+    assert generate_with_tools_kwargs["max_favorability_delta"] == 5
+    pushed_record = redis.pushed_global_interactions[0]["record"]
+    assert isinstance(pushed_record, dict)
+    assert redis.pushed_global_interactions == [
+        {
+            "user_id": "user-1",
+            "trigger_size": 20,
+            "record": {
+                "version": 1,
+                "event": "发送当前待回复消息",
+                "result": "回复收到啦",
+                "emotion": "平静",
+                "display_name": "阿虚",
+                "message_id": "msg-2",
+                "timestamp": pushed_record["timestamp"],
+            },
+        }
+    ]
+
+
+def test_write_interaction_history_pushes_global_redis_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    redis = _FakeRedis([])
+    handler.redis = redis
+    handler.memory = _FakeMemory()
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_config",
+        lambda: SimpleNamespace(
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+        ),
+    )
+
+    asyncio.run(
+        handler._write_interaction_history(
+            message=MessageSchema(
+                user_id="user-1",
+                user_nickname="阿虚",
+                group_id="group-1",
+                content="当前待回复消息",
+                timestamp=2.0,
+                message_id="msg-2",
+            ),
+            new_record={"event": "新事件", "result": "新反应", "emotion": "新心情"},
+            lock_timeout_seconds=None,
+        )
+    )
+
+    assert len(redis.pushed_global_interactions) == 1
+    pushed = redis.pushed_global_interactions[0]
+    assert pushed["user_id"] == "user-1"
+    assert pushed["trigger_size"] == 20
+    record = pushed["record"]
+    assert isinstance(record, dict)
+    assert record["version"] == 1
+    assert record["event"] == "新事件"
+    assert record["result"] == "新反应"
+    assert record["emotion"] == "新心情"
+    assert record["display_name"] == "阿虚"
+    assert record["message_id"] == "msg-2"
 
 
 def test_resolve_reply_context_builds_user_side_text_context() -> None:

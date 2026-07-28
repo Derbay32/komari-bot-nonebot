@@ -84,7 +84,7 @@ def _is_command_message(text: str) -> bool:
 
     规则：
     1. 匹配“总结过去XX条 / 总结XX条”
-    2. 以 。/.// 开头（如 .jrhg、/bind、。help）
+    2. 以 。/.// 开头（如 .sr、/bind、。help）
     """
     normalized = "".join(text.split())
     if not normalized:
@@ -122,11 +122,32 @@ async def _is_summary_request(message_text: str) -> bool:
         logger.exception("[GroupHistorySummary] scene 判定失败，回退关键词兜底")
         return False
 
-    return (
-        rank_result.best_scene_id == SUMMARY_SCENE_ID
-        and rank_result.best_scene_score >= 0.6
-        and rank_result.meaningful_score >= rank_result.noise_score
+    logger.info(
+        "[SummaryCheck] rerank结果: best_scene={}, score={:.4f}, "
+        "meaningful={:.4f}, noise={:.4f}",
+        rank_result.best_scene_id,
+        rank_result.best_scene_score,
+        rank_result.meaningful_score,
+        rank_result.noise_score,
     )
+
+    is_summary_request = False
+    if rank_result.best_scene_id != SUMMARY_SCENE_ID:
+        logger.info(
+            "[SummaryCheck] 失败: best_scene_id={} (期望={})",
+            rank_result.best_scene_id,
+            SUMMARY_SCENE_ID,
+        )
+    elif rank_result.best_scene_score < 0.6:
+        logger.info(
+            "[SummaryCheck] 失败: best_scene_score={:.4f} < 0.6",
+            rank_result.best_scene_score,
+        )
+    else:
+        logger.info("[SummaryCheck] 全部条件满足，确认为总结请求")
+        is_summary_request = True
+
+    return is_summary_request
 
 
 @summary_matcher.handle()
@@ -183,6 +204,8 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 max_summary_count=config.max_summary_count,
                 summary_tool_scan_limit=config.summary_tool_scan_limit,
                 fetch_batch_size=config.fetch_batch_size,
+                planning_thinking_mode=config.summary_planning_thinking_mode,
+                planning_reasoning_effort=config.summary_planning_reasoning_effort,
             )
 
             filtered_messages = plan_result.messages
@@ -196,6 +219,10 @@ async def handle_group_history_summary(bot: Bot, event: GroupMessageEvent) -> No
                 model=config.summary_model,
                 temperature=config.summary_temperature,
                 max_tokens=config.summary_max_tokens,
+                assistant_prefill_enabled=config.assistant_prefill_enabled,
+                dsv4_roleplay_instruct_mode=config.dsv4_roleplay_instruct_mode,
+                thinking_mode=config.summary_thinking_mode,
+                reasoning_effort=config.summary_reasoning_effort,
             )
 
             body_lines = summary_text_to_lines(summary_text)

@@ -36,6 +36,13 @@ def _patch_config(monkeypatch: Any) -> None:
         social_window_dialogue_seconds=30,
         social_silence_seconds=60,
         social_bot_cooldown_seconds=10,
+        social_timing_mention_bonus=0.2,
+        social_timing_silence_bonus=0.2,
+        social_timing_activity_threshold=5,
+        social_timing_activity_max_penalty=0.5,
+        social_timing_activity_slope_denominator=10,
+        social_timing_dialogue_penalty=0.1,
+        social_timing_cooldown_max_penalty=0.3,
     )
     monkeypatch.setattr(sts, "get_config", lambda: config)
 

@@ -13,15 +13,9 @@
 
 ## 配置
 
-配置文件：`config/config_manager/komari_management_config.json`
+动态配置存储在 PostgreSQL `komari_plugin_configs` 表，首次缺失时从 `.env` / schema 默认值初始化。
 
-```json
-{
-  "plugin_enable": true,
-  "api_token": "请替换为你的管理令牌",
-  "api_allowed_origins": ["http://localhost:3000"]
-}
-```
+管理 API 配置响应使用 `config_source` 标识来源，例如 `postgres:komari_plugin_configs/komari_management`。
 
 ## 说明
 

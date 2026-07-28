@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 
 
@@ -44,11 +43,7 @@ def test_config_schema_falls_back_to_info_for_invalid_sentry_logs_level() -> Non
     assert config.sentry_logs_level == "INFO"
 
 
-def test_example_config_contains_sentry_logs_level() -> None:
-    example_path = (
-        Path(__file__).resolve().parents[2]
-        / "config/config_manager/komari_sentry_config.json.example"
-    )
-    config = json.loads(example_path.read_text(encoding="utf-8"))
+def test_config_schema_default_contains_sentry_logs_level() -> None:
+    config = KomariSentryConfigSchema()
 
-    assert config["sentry_logs_level"] == "INFO"
+    assert config.sentry_logs_level == "INFO"

@@ -6,6 +6,9 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
+from komari_bot.plugins.komari_memory.repositories.entity_repository import (
+    UserProfileBatchUpsertResult,
+)
 from komari_bot.plugins.komari_memory.services import (
     memory_service as memory_service_module,
 )
@@ -14,8 +17,13 @@ from komari_bot.plugins.komari_memory.services.memory_service import MemoryServi
 
 class _FakeConversationRepository:
     def __init__(self) -> None:
+        self.insert_calls: list[dict[str, Any]] = []
         self.search_calls: list[dict[str, Any]] = []
         self.touch_calls: list[dict[str, Any]] = []
+
+    async def insert_conversation(self, **kwargs: Any) -> int | None:
+        self.insert_calls.append(kwargs)
+        return 321
 
     async def search_by_similarity(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.search_calls.append(kwargs)
@@ -56,6 +64,33 @@ class _FakeEmbeddingPlugin:
     ) -> list[SimpleNamespace]:
         del query, documents
         return [SimpleNamespace(index=2), SimpleNamespace(index=0)][:top_n]
+
+
+class _FakeInteractionEventRepository:
+    def __init__(self) -> None:
+        self.search_calls: list[dict[str, Any]] = []
+        self.touch_calls: list[list[int]] = []
+
+    async def search_interaction_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.search_calls.append(dict(kwargs))
+        return [
+            {"id": 201, "event_summary": "喜欢聊游戏", "similarity": 0.9},
+            {"id": 202, "event_summary": "常常吐槽", "similarity": 0.8},
+        ]
+
+    async def touch_interaction_events(self, event_ids: list[int]) -> None:
+        self.touch_calls.append(list(event_ids))
+
+
+class _FakeEntityRepository:
+    def __init__(self) -> None:
+        self.batch_profile_calls: list[list[dict[str, Any]]] = []
+
+    async def batch_upsert_user_profiles(
+        self, payloads: list[dict[str, Any]]
+    ) -> UserProfileBatchUpsertResult:
+        self.batch_profile_calls.append(payloads)
+        return UserProfileBatchUpsertResult()
 
 
 def _make_service(
@@ -99,11 +134,36 @@ def test_search_conversations_touches_results_immediately_without_rerank(
             "group_id": "g1",
             "user_id": "u1",
             "limit": 2,
-            "access_boost": 1.2,
             "touch_results": True,
         }
     ]
     assert repository.touch_calls == []
+
+
+def test_store_conversation_passes_dedup_key(monkeypatch: Any) -> None:
+    service, repository = _make_service(monkeypatch=monkeypatch, rerank_enabled=False)
+
+    result = asyncio.run(
+        service.store_conversation(
+            group_id="g1",
+            summary="大家聊了拉面。",
+            participants=["u1"],
+            importance_initial=4,
+            dedup_key="dedup-1",
+        )
+    )
+
+    assert result == 321
+    assert repository.insert_calls == [
+        {
+            "group_id": "g1",
+            "summary": "大家聊了拉面。",
+            "embedding": "[0.1, 0.2]",
+            "participants": ["u1"],
+            "importance_initial": 4,
+            "dedup_key": "dedup-1",
+        }
+    ]
 
 
 def test_search_conversations_only_touches_reranked_results(monkeypatch: Any) -> None:
@@ -125,13 +185,74 @@ def test_search_conversations_only_touches_reranked_results(monkeypatch: Any) ->
             "group_id": "g1",
             "user_id": "u1",
             "limit": 6,
-            "access_boost": 1.2,
             "touch_results": False,
         }
     ]
     assert repository.touch_calls == [
         {
             "conversation_ids": [103, 101],
-            "access_boost": 1.2,
         }
     ]
+
+
+def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> None:
+    event_repository = _FakeInteractionEventRepository()
+    embedding_plugin = _FakeEmbeddingPlugin(rerank_enabled=False)
+    monkeypatch.setattr(
+        memory_service_module,
+        "require",
+        lambda _name: embedding_plugin,
+    )
+    service = MemoryService(
+        config=cast("Any", SimpleNamespace()),
+        conversation_repo=cast("Any", _FakeConversationRepository()),
+        entity_repo=cast("Any", object()),
+        interaction_event_repo=cast("Any", event_repository),
+    )
+
+    results = asyncio.run(
+        service.search_interaction_events(user_id="u1", query="游戏", limit=2)
+    )
+
+    assert [result["id"] for result in results] == [201, 202]
+    assert event_repository.search_calls == [
+        {"user_id": "u1", "embedding": "[0.1, 0.2]", "limit": 2}
+    ]
+    assert event_repository.touch_calls == [[201, 202]]
+
+
+def test_batch_upsert_user_profiles_adds_default_metadata(monkeypatch: Any) -> None:
+    entity_repository = _FakeEntityRepository()
+    monkeypatch.setattr(
+        memory_service_module,
+        "require",
+        lambda _name: _FakeEmbeddingPlugin(rerank_enabled=False),
+    )
+    service = MemoryService(
+        config=cast("Any", SimpleNamespace()),
+        conversation_repo=cast("Any", _FakeConversationRepository()),
+        entity_repo=cast("Any", entity_repository),
+    )
+
+    asyncio.run(
+        service.batch_upsert_user_profiles(
+            [
+                {
+                    "user_id": "u1",
+                    "group_id": "g1",
+                    "profile": {"display_name": "阿明", "traits": {"爱好": {"value": "游戏"}}},
+                    "importance": 4,
+                }
+            ]
+        )
+    )
+
+    payload = entity_repository.batch_profile_calls[0][0]
+    assert payload["user_id"] == "u1"
+    assert payload["group_id"] == "g1"
+    assert payload["importance"] == 4
+    assert payload["display_name"] == "阿明"
+    assert payload["set_traits"] == {"爱好": {"value": "游戏"}}
+    assert payload["delete_keys"] == []
+    assert payload["updated_at"]
+    assert payload["snapshot_updated_at"] is None

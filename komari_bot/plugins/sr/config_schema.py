@@ -41,11 +41,6 @@ class DynamicConfigSchema(BaseModel):
     )
 
     # Redis 配置
-    redis_host: str = Field(default="localhost", description="Redis 服务器地址")
-    redis_port: int = Field(default=6379, description="Redis 端口")
-    redis_password: str = Field(
-        default="", description="Redis 密码（空字符串表示无密码）"
-    )
     redis_db: int = Field(default=0, description="Redis 数据库编号")
 
     @field_validator("user_whitelist", "group_whitelist", mode="before")

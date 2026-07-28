@@ -1,215 +1,192 @@
-"""Migration script orchestration tests."""
+"""独立迁移脚本测试。"""
 
 from __future__ import annotations
 
 import asyncio
 import importlib.util
 import sys
-import types
 from pathlib import Path
-from typing import Any, ClassVar, cast
-
-import pytest
-
-from komari_bot.common.database_config import DatabaseConfigSchema
-from komari_bot.common.embedding_migration import TableMigrationResult
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/migrate_embeddings.py"
 
 
-def _load_script_module() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "tests.scripts.migrate_embeddings_script",
-        SCRIPT_PATH,
-    )
+def _load_script_module(module_name: str = "tests.scripts.migrate_embeddings_script") -> Any:
+    spec = importlib.util.spec_from_file_location(module_name, SCRIPT_PATH)
     if spec is None or spec.loader is None:
         raise AssertionError
-
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
 class _FakePool:
-    def __init__(self, label: str) -> None:
-        self.label = label
+    def __init__(self, conn: "_FakeConnection") -> None:
+        self.conn = conn
         self.closed = False
+
+    def acquire(self) -> "_FakeAcquire":
+        return _FakeAcquire(self.conn)
 
     async def close(self) -> None:
         self.closed = True
 
 
-class _FakeEmbeddingService:
-    instances: ClassVar[list["_FakeEmbeddingService"]] = []
+class _FakeAcquire:
+    def __init__(self, conn: "_FakeConnection") -> None:
+        self.conn = conn
 
-    def __init__(self, config: object) -> None:
-        self.config = config
-        self.cleaned = False
-        self.__class__.instances.append(self)
+    async def __aenter__(self) -> "_FakeConnection":
+        return self.conn
 
-    async def cleanup(self) -> None:
-        self.cleaned = True
-
-
-def _make_db_config() -> DatabaseConfigSchema:
-    return DatabaseConfigSchema(
-        pg_host="localhost",
-        pg_port=5432,
-        pg_database="komari_bot",
-        pg_user="user",
-        pg_password="pass",
-    )
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
 
 
-def test_main_async_apply_reuses_pool_and_cleans_up_resources(
-    monkeypatch: Any,
-    tmp_path: Path,
-) -> None:
+class _FakeTransaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.fetchval_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchval(self, query: str, *args: object) -> object:
+        self.fetchval_calls.append((query, args))
+        if "to_regclass" in query:
+            return True
+        if "COUNT" in query:
+            return 2
+        return None
+
+    async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
+        self.fetchrow_calls.append((query, args))
+        return {"atttypmod": 512}
+
+    async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
+        self.fetch_calls.append((query, args))
+        return [{"row_id": 1, "text": "文本"}]
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.execute_calls.append((query, args))
+        return "OK"
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+
+def test_expand_memory_targets_contains_two_memory_tables() -> None:
     module = _load_script_module()
-    _FakeEmbeddingService.instances.clear()
-    db_config = _make_db_config()
-    created_pools: list[_FakePool] = []
-    migrate_calls: list[tuple[str, str]] = []
 
-    monkeypatch.setattr(
-        module,
-        "load_embedding_config",
-        lambda _path: types.SimpleNamespace(
-            embedding_model="test-model",
-            embedding_dimension=1536,
-        ),
-    )
-    monkeypatch.setattr(
-        module, "resolve_knowledge_database_config", lambda **_kwargs: db_config
-    )
-    monkeypatch.setattr(
-        module, "resolve_memory_database_config", lambda **_kwargs: db_config
-    )
+    targets = module.expand_targets({"memory"})
 
-    async def _fake_create_pool(
-        config: DatabaseConfigSchema, *, command_timeout: int
-    ) -> _FakePool:
+    assert [target.name for target in targets] == [
+        "memory_conversations",
+        "memory_interactions",
+    ]
+    assert targets[0].embedding_table == "komari_memory_conversation_embeddings"
+    assert targets[1].embedding_table == "komari_memory_interaction_embeddings"
+
+
+def test_main_async_dry_run_reuses_pool_and_reports_memory_targets(monkeypatch: Any) -> None:
+    module = _load_script_module()
+    conn = _FakeConnection()
+    pool = _FakePool(conn)
+
+    async def _fake_create_pool(config: Any, *, command_timeout: int) -> _FakePool:
+        assert config.pg_database == "komari_bot"
         assert command_timeout == 60
-        pool = _FakePool(config.pg_database)
-        created_pools.append(pool)
         return pool
 
-    async def _fake_migrate(
-        pool: _FakePool,
-        *,
-        spec: Any,
-        target_dimension: int,
-        dry_run: bool,
-        embedding_service: object | None,
-    ) -> TableMigrationResult:
-        assert pool is created_pools[0]
-        assert target_dimension == 1536
-        assert dry_run is False
-        assert embedding_service is _FakeEmbeddingService.instances[0]
-        migrate_calls.append((spec.target_name, pool.label))
-        return TableMigrationResult(
-            target_name=spec.target_name,
-            table_name=spec.table_name,
-            dry_run=False,
-            table_exists=True,
-            current_dimension=512,
-            target_dimension=1536,
-            schema_changed=True,
-            row_total=1,
-            updated_rows=1,
-            failed_rows=0,
-        )
-
-    fake_embedding_module = types.ModuleType(
-        "komari_bot.plugins.embedding_provider.embedding_service"
-    )
-    cast("Any", fake_embedding_module).EmbeddingService = _FakeEmbeddingService
-    monkeypatch.setitem(
-        sys.modules,
-        "komari_bot.plugins.embedding_provider.embedding_service",
-        fake_embedding_module,
-    )
     monkeypatch.setattr(module, "create_postgres_pool", _fake_create_pool)
-    monkeypatch.setattr(module, "migrate_table_embeddings", _fake_migrate)
 
     asyncio.run(
         module.main_async(
-            shared_db_config_path=tmp_path / "database.json",
-            knowledge_config_path=tmp_path / "knowledge.json",
-            memory_config_path=tmp_path / "memory.json",
-            embedding_config_path=tmp_path / "embedding.json",
-            targets={"knowledge", "memory"},
-            apply=True,
+            targets={"memory"},
+            apply=False,
+            database_config=module.DatabaseConfig(
+                pg_host="localhost",
+                pg_port=5432,
+                pg_database="komari_bot",
+                pg_user="user",
+                pg_password="pass",
+            ),
+            embedding_config=module.EmbeddingConfig(
+                model="test-model",
+                dimension=1536,
+                api_url="",
+                api_key="",
+            ),
         )
     )
 
-    assert len(created_pools) == 1
-    assert migrate_calls == [("knowledge", "komari_bot"), ("memory", "komari_bot")]
-    assert len(_FakeEmbeddingService.instances) == 1
-    assert _FakeEmbeddingService.instances[0].cleaned is True
-    assert created_pools[0].closed is True
+    assert pool.closed is True
+    assert [call[1][0] for call in conn.fetchval_calls if "to_regclass" in call[0]] == [
+        "komari_memory_conversations",
+        "komari_memory_conversation_embeddings",
+        "komari_memory_interaction_history",
+        "komari_memory_interaction_embeddings",
+    ]
+    assert conn.execute_calls == []
 
 
-def test_main_async_apply_cleans_up_on_migration_failure(
-    monkeypatch: Any,
-    tmp_path: Path,
-) -> None:
+def test_migrate_memory_target_apply_writes_embedding_side_table(monkeypatch: Any) -> None:
     module = _load_script_module()
-    _FakeEmbeddingService.instances.clear()
-    db_config = _make_db_config()
-    created_pools: list[_FakePool] = []
+    conn = _FakeConnection()
+    pool = _FakePool(conn)
 
-    monkeypatch.setattr(
-        module,
-        "load_embedding_config",
-        lambda _path: types.SimpleNamespace(
-            embedding_model="test-model",
-            embedding_dimension=1536,
-        ),
-    )
-    monkeypatch.setattr(
-        module, "resolve_knowledge_database_config", lambda **_kwargs: db_config
-    )
-    monkeypatch.setattr(
-        module, "resolve_memory_database_config", lambda **_kwargs: db_config
-    )
+    async def _fake_request_embedding(text: str, config: Any) -> str:
+        assert text == "文本"
+        assert config.model == "test-model"
+        return "[0.1,0.2]"
 
-    async def _fake_create_pool(
-        config: DatabaseConfigSchema, *, command_timeout: int
-    ) -> _FakePool:
-        assert command_timeout == 60
-        pool = _FakePool(config.pg_database)
-        created_pools.append(pool)
-        return pool
+    monkeypatch.setattr(module, "request_embedding", _fake_request_embedding)
 
-    async def _raise_migrate(*_args: Any, **_kwargs: Any) -> TableMigrationResult:
-        raise RuntimeError("boom")
-
-    fake_embedding_module = types.ModuleType(
-        "komari_bot.plugins.embedding_provider.embedding_service"
-    )
-    cast("Any", fake_embedding_module).EmbeddingService = _FakeEmbeddingService
-    monkeypatch.setitem(
-        sys.modules,
-        "komari_bot.plugins.embedding_provider.embedding_service",
-        fake_embedding_module,
-    )
-    monkeypatch.setattr(module, "create_postgres_pool", _fake_create_pool)
-    monkeypatch.setattr(module, "migrate_table_embeddings", _raise_migrate)
-
-    with pytest.raises(RuntimeError, match="boom"):
-        asyncio.run(
-            module.main_async(
-                shared_db_config_path=tmp_path / "database.json",
-                knowledge_config_path=tmp_path / "knowledge.json",
-                memory_config_path=tmp_path / "memory.json",
-                embedding_config_path=tmp_path / "embedding.json",
-                targets={"knowledge"},
-                apply=True,
-            )
+    result = asyncio.run(
+        module.migrate_target(
+            pool,
+            target=module.CONVERSATION_MEMORY_TARGET,
+            embedding_config=module.EmbeddingConfig(
+                model="test-model",
+                dimension=1536,
+                api_url="http://example.test/embeddings",
+                api_key="key",
+            ),
+            dry_run=False,
         )
+    )
 
-    assert len(_FakeEmbeddingService.instances) == 1
-    assert _FakeEmbeddingService.instances[0].cleaned is True
-    assert created_pools[0].closed is True
+    assert result.updated_rows == 1
+    assert any(
+        "CREATE TABLE IF NOT EXISTS komari_memory_conversation_embeddings" in call[0]
+        for call in conn.execute_calls
+    )
+    assert any(
+        "INSERT INTO komari_memory_conversation_embeddings" in call[0]
+        for call in conn.execute_calls
+    )
+
+
+def test_script_imports_without_komari_bot_package(monkeypatch: Any) -> None:
+    original_modules = dict(sys.modules)
+    for name in list(sys.modules):
+        if name == "komari_bot" or name.startswith("komari_bot."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.syspath_prepend(str(PROJECT_ROOT / "不存在的路径"))
+
+    module = _load_script_module("tests.scripts.migrate_embeddings_script_isolated")
+
+    assert "komari_bot.common" not in sys.modules
+    assert module.expand_targets({"memory"})[0].source_table == "komari_memory_conversations"
+
+    sys.modules.clear()
+    sys.modules.update(original_modules)

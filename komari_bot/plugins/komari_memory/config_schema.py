@@ -27,50 +27,9 @@ class KomariMemoryConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    # PostgreSQL 配置覆盖项（默认读取共享 database_config）
-    pg_host: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的 PostgreSQL 主机地址",
-    )
-    pg_port: int | None = Field(
-        default=None,
-        ge=1,
-        le=65535,
-        description="可选：覆盖共享配置中的 PostgreSQL 端口",
-    )
-    pg_database: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库名称",
-    )
-    pg_user: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库用户名",
-    )
-    pg_password: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库密码",
-    )
-    pg_pool_min_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=10,
-        description="可选：覆盖共享配置中的连接池最小连接数",
-    )
-    pg_pool_max_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=50,
-        description="可选：覆盖共享配置中的连接池最大连接数",
-    )
-
     # Redis 配置
-    redis_host: str = Field(default="localhost", description="Redis 主机地址")
-    redis_port: int = Field(default=6379, description="Redis 端口")
     redis_db: int = Field(
         default=1, description="Redis 数据库编号 (避免与其他插件冲突)"
-    )
-    redis_password: str = Field(
-        default="", description="Redis 密码 (空字符串表示无密码)"
     )
 
     # LLM 配置 - 对话模型（用于生成回复）
@@ -83,16 +42,56 @@ class KomariMemoryConfigSchema(BaseModel):
     llm_max_tokens_chat: int = Field(
         default=4000, ge=20, le=8192, description="对话模型最大 token 数"
     )
+    llm_thinking_mode_chat: bool = Field(
+        default=False,
+        description=(
+            "聊天主模型是否处于思考模式。"
+            "deepseek-v4 系模型默认开启思考，置 False 会注入 thinking:disabled 关闭；"
+            "其他模型置 True 时按 llm_reasoning_effort_chat 开启思考。"
+            "思考模式启用时将跳过 tool_choice 注入。"
+        ),
+    )
+    llm_reasoning_effort_chat: str = Field(
+        default="",
+        description=(
+            "聊天主模型思考强度（仅 thinking_mode=True 且非 deepseek-v4 系时生效）。"
+            "可选：minimal/low/medium/high；为空时不发送 reasoning_effort。"
+        ),
+    )
+    assistant_prefill_enabled: bool = Field(
+        default=False,
+        description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
+    )
+    dsv4_roleplay_instruct_mode: str = Field(
+        default="auto",
+        description=(
+            "DeepSeek V4 角色扮演思考指令注入模式："
+            "disabled=关闭，auto=仅 deepseek-v4 模型注入角色沉浸指令，"
+            "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
+        ),
+    )
+    vision_tool_enabled: bool = Field(
+        default=True,
+        description="是否启用 V4 工具调用读图模式",
+    )
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
     llm_model_summary: str = Field(
-        default="gemini-2.5-flash-lite", description="总结使用模型"
+        default="deepseek-v4-flash", description="总结使用模型"
     )
     llm_temperature_summary: float = Field(
         default=0.3, ge=0.0, le=2.0, description="总结模型温度参数"
     )
     llm_max_tokens_summary: int = Field(
         default=2048, ge=20, le=8192, description="总结模型最大 token 数"
+    )
+    llm_thinking_mode_summary: bool = Field(
+        default=False,
+        description="总结/记忆/画像模型是否处于思考模式。语义同 llm_thinking_mode_chat。",
+    )
+    llm_reasoning_effort_summary: str = Field(
+        default="",
+        description="总结/记忆/画像模型思考强度。语义同 llm_reasoning_effort_chat。",
     )
 
     # 常识库集成配置
@@ -102,29 +101,39 @@ class KomariMemoryConfigSchema(BaseModel):
     )
 
     # 记忆管理配置
-    summary_token_threshold: int = Field(
-        default=1000, ge=100, le=10000, description="触发总结的 Token 阈值"
+    summary_idle_timeout: int = Field(
+        default=1800,
+        ge=300,
+        le=7200,
+        description="群组空闲超时触发总结的时间（秒）。自最后一条消息后超过该时间且消息数达标时才触发",
     )
-    summary_time_threshold: int = Field(
-        default=3600, ge=300, le=86400, description="触发总结的时间阈值（秒）"
-    )
-    message_buffer_size: int = Field(
-        default=200, ge=50, le=1000, description="Redis 消息缓存大小"
-    )
-    summary_message_threshold: int = Field(
-        default=50,
-        ge=10,
+    summary_min_messages: int = Field(
+        default=100,
+        ge=50,
         le=500,
-        description="触发总结的消息数量阈值（优先于 token 阈值）",
+        description="触发总结所需的最小消息条数。不足此数不总结（每日跨天清理除外）",
     )
-    summary_max_messages: int = Field(
-        default=200, ge=50, le=500, description="总结时从缓冲区获取的最大消息数"
+    summary_max_buffer_size: int = Field(
+        default=500,
+        ge=100,
+        le=2000,
+        description="消息缓冲区的最大消息条数安全上限。达到后即使未空闲也会强制触发总结",
     )
-    summary_chunk_token_limit: int = Field(
-        default=3000,
-        ge=200,
-        le=50000,
-        description="总结前原文分段的估算 token 上限（按当前近似口径计算，不用于触发总结）",
+    conversation_snapshot_ttl_seconds: int = Field(
+        default=3600,
+        ge=300,
+        le=86400,
+        description="对话缓冲 processing 快照 TTL（秒）",
+    )
+    profile_snapshot_ttl_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86400,
+        description="画像 Agent 基线快照 TTL（秒）",
+    )
+    profile_snapshot_enable: bool = Field(
+        default=True,
+        description="是否启用画像 Agent 基线快照",
     )
     profile_trait_limit: int = Field(
         default=20,
@@ -132,11 +141,63 @@ class KomariMemoryConfigSchema(BaseModel):
         le=100,
         description="每个用户画像允许保留的长期稳定 traits 最大数量",
     )
+    memory_agent_max_rounds: int = Field(
+        default=12,
+        ge=1,
+        le=50,
+        description="记忆画像 Agent 最大工具调用轮数",
+    )
+    memory_agent_staging_ttl_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=3600,
+        description="记忆画像 Agent Redis 暂存区 TTL（秒）",
+    )
+    memory_agent_max_tool_calls: int = Field(
+        default=24,
+        ge=1,
+        le=200,
+        description="单次记忆画像 Agent 最大工具调用数",
+    )
+    memory_agent_max_read_profiles: int = Field(
+        default=20,
+        ge=0,
+        le=200,
+        description="单次记忆画像 Agent 最大读取用户画像次数",
+    )
+    memory_agent_max_write_operations: int = Field(
+        default=40,
+        ge=0,
+        le=500,
+        description="单次记忆画像 Agent 最大暂存画像操作数",
+    )
+    memory_agent_lock_timeout_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=3600,
+        description="记忆 Agent 生命周期锁等待超时；为空表示一直等待",
+    )
     memory_search_limit: int = Field(
         default=3, ge=1, le=10, description="检索相关记忆的最大数量"
     )
     context_messages_limit: int = Field(
         default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
+    )
+    global_interaction_enabled: bool = Field(
+        default=True,
+        description="是否启用跨群互动事件缓冲",
+    )
+    global_interaction_trigger_size: int = Field(
+        default=20,
+        ge=5,
+        le=200,
+        description="触发事件总结的 Redis 缓冲条数阈值，不是 LIST 最大长度",
+    )
+    global_interaction_summary_interval_minutes: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="互动事件 Worker 轮询间隔（分钟）",
     )
 
     # 主动回复配置
@@ -193,6 +254,16 @@ class KomariMemoryConfigSchema(BaseModel):
         description="机器人别名列表（用于机器人身份识别）",
     )
 
+    # 表情反应配置
+    face_reaction_enabled: bool = Field(
+        default=False,
+        description="是否在触发聊天回复后对用户消息添加表情反应，用于提示正在生成回复",
+    )
+    face_reaction_id: str = Field(
+        default="76",
+        description="表情反应的 Face ID（QQ 表情 ID），如 76=赞。仅 face_reaction_enabled=true 时生效",
+    )
+
     @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
@@ -213,3 +284,12 @@ class KomariMemoryConfigSchema(BaseModel):
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("dsv4_roleplay_instruct_mode", mode="before")
+    @classmethod
+    def normalize_dsv4_roleplay_instruct_mode(cls, value: Any) -> str:
+        """规范化 DeepSeek V4 角色扮演指令注入模式。"""
+        normalized = str(value or "auto").strip().lower()
+        if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
+            return "auto"
+        return normalized

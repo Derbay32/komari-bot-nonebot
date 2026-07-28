@@ -1,0 +1,249 @@
+name: Codeberg 容器注册表发布
+
+on:
+  # 正式版本：在 Forgejo/Codeberg 发布 Release 时触发
+  release:
+    types: [published]
+  # 预发布版本：推送 beta/rc tag 时触发，并自动创建预发布 Release
+  push:
+    tags:
+      - "v*-beta*"
+      - "v*-rc*"
+
+env:
+  DOCKER_IMAGE: codeberg.org/derbay32/komari-bot-nonebot
+  FORGEJO_API_URL: ${{ forgejo.server_url }}/api/v1
+  FORGEJO_REPOSITORY: ${{ forgejo.repository }}
+  FORGEJO_SERVER_URL: ${{ forgejo.server_url }}
+
+jobs:
+  docker:
+    runs-on: dind
+
+    steps:
+      - name: 检出代码
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: 准备发布上下文
+        id: release_context
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${RELEASE_TAG:-}"
+          if [ -z "$TAG_NAME" ]; then
+            TAG_NAME="$REF_NAME"
+          fi
+
+          if [ -z "$TAG_NAME" ]; then
+            echo "无法确定发布标签" >&2
+            exit 1
+          fi
+
+          IMAGE_TAG="${TAG_NAME#v}"
+          SHORT_SHA="${COMMIT_SHA:0:12}"
+
+          {
+            echo "tag_name=$TAG_NAME"
+            echo "image_tag=$IMAGE_TAG"
+            echo "short_sha=$SHORT_SHA"
+          } >> "$FORGEJO_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ forgejo.event.release.tag_name }}
+          REF_NAME: ${{ forgejo.ref_name }}
+          COMMIT_SHA: ${{ forgejo.sha }}
+
+      - name: 检查 Docker-in-Docker 连接
+        run: |
+          set -euo pipefail
+          node --version
+          docker version
+          docker info
+          docker buildx version
+
+      - name: 设置 QEMU
+        run: |
+          set -euo pipefail
+          docker run --privileged --rm tonistiigi/binfmt --install all
+
+      - name: 设置 Docker Buildx
+        run: |
+          set -euo pipefail
+          docker buildx inspect forgejo-builder >/dev/null 2>&1 \
+            || docker buildx create --name forgejo-builder --use
+          docker buildx use forgejo-builder
+          docker buildx inspect --bootstrap
+
+      - name: 登录 Codeberg 容器注册表
+        run: |
+          set -euo pipefail
+          printf '%s' "$CODEBERG_TOKEN" | docker login \
+            --username "$CODEBERG_USERNAME" \
+            --password-stdin codeberg.org
+        env:
+          CODEBERG_USERNAME: ${{ secrets.CODEBERG_USERNAME }}
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+
+      - name: 准备 Forgejo Release
+        id: forgejo_release
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          api_url = os.environ["FORGEJO_API_URL"].rstrip("/")
+          repository = os.environ["FORGEJO_REPOSITORY"]
+          token = os.environ["FORGEJO_TOKEN"]
+          tag_name = os.environ["TAG_NAME"]
+          event_name = os.environ["EVENT_NAME"]
+          output_path = os.environ["FORGEJO_OUTPUT"]
+
+          headers = {
+              "Authorization": f"token {token}",
+              "Content-Type": "application/json",
+          }
+
+          def request(method: str, path: str, payload: dict[str, object] | None = None):
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload, ensure_ascii=False).encode()
+              req = urllib.request.Request(
+                  f"{api_url}{path}",
+                  data=data,
+                  headers=headers,
+                  method=method,
+              )
+              with urllib.request.urlopen(req) as response:
+                  body = response.read()
+              if not body:
+                  return None
+              return json.loads(body.decode())
+
+          def get_release_by_tag():
+              try:
+                  return request("GET", f"/repos/{repository}/releases/tags/{tag_name}")
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      return None
+                  raise
+
+          release = get_release_by_tag()
+          if release is None:
+              release = request(
+                  "POST",
+                  f"/repos/{repository}/releases",
+                  {
+                      "tag_name": tag_name,
+                      "name": f"预发布版本 {tag_name}",
+                      "body": "自动化构建的预发布版本",
+                      "draft": False,
+                      "prerelease": event_name == "push",
+                  },
+              )
+
+          release_id = release["id"]
+          asset_name = f"komari-bot-{tag_name}.zip"
+          for asset in release.get("assets", []):
+              if asset.get("name") == asset_name:
+                  request(
+                      "DELETE",
+                      f"/repos/{repository}/releases/{release_id}/assets/{asset['id']}",
+                  )
+
+          with open(output_path, "a", encoding="utf-8") as output_file:
+              output_file.write(f"release_id={release_id}\n")
+              output_file.write(f"asset_name={asset_name}\n")
+          PY
+        env:
+          EVENT_NAME: ${{ forgejo.event_name }}
+          TAG_NAME: ${{ steps.release_context.outputs.tag_name }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+
+      - name: 打包并上传部署文件
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ steps.release_context.outputs.image_tag }}"
+          ASSET_NAME="${{ steps.forgejo_release.outputs.asset_name }}"
+          RELEASE_ID="${{ steps.forgejo_release.outputs.release_id }}"
+
+          mkdir -p komari-bot-deploy/app
+
+          if [ -d data ]; then
+            cp -r data komari-bot-deploy/app/data
+          else
+            mkdir -p komari-bot-deploy/app/data
+          fi
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          image_tag = os.environ["IMAGE_TAG"]
+          source = Path("docker-compose.yml")
+          target = Path("komari-bot-deploy/docker-compose.yml")
+          content = source.read_text(encoding="utf-8")
+          content = content.replace(
+              "codeberg.org/derbay32/komari-bot-nonebot:latest",
+              f"codeberg.org/derbay32/komari-bot-nonebot:{image_tag}",
+          )
+          target.write_text(content, encoding="utf-8")
+          PY
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import zipfile
+          from pathlib import Path
+
+          asset_name = os.environ["ASSET_NAME"]
+          deploy_dir = Path("komari-bot-deploy")
+          with zipfile.ZipFile(asset_name, "w", zipfile.ZIP_DEFLATED) as archive:
+              for path in deploy_dir.rglob("*"):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(deploy_dir))
+          PY
+
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: token ${FORGEJO_TOKEN}" \
+            --form "attachment=@${ASSET_NAME}" \
+            "${FORGEJO_API_URL}/repos/${FORGEJO_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET_NAME}"
+        env:
+          ASSET_NAME: ${{ steps.forgejo_release.outputs.asset_name }}
+          IMAGE_TAG: ${{ steps.release_context.outputs.image_tag }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+
+      - name: 构建并发布 Docker 镜像
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ steps.release_context.outputs.image_tag }}"
+          SHORT_SHA="${{ steps.release_context.outputs.short_sha }}"
+          EVENT_NAME="${{ forgejo.event_name }}"
+          TAG_ARGS=(
+            --tag "${DOCKER_IMAGE}:${IMAGE_TAG}"
+            --tag "${DOCKER_IMAGE}:sha-${SHORT_SHA}"
+          )
+
+          if [ "$EVENT_NAME" = "release" ]; then
+            MAJOR_MINOR="$(printf '%s' "$IMAGE_TAG" | cut -d. -f1,2)"
+            TAG_ARGS+=(--tag "${DOCKER_IMAGE}:${MAJOR_MINOR}")
+            TAG_ARGS+=(--tag "${DOCKER_IMAGE}:latest")
+          fi
+
+          docker buildx build \
+            --push \
+            "${TAG_ARGS[@]}" \
+            --label "org.opencontainers.image.source=${FORGEJO_SERVER_URL}/${FORGEJO_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${{ forgejo.sha }}" \
+            --label "org.opencontainers.image.version=${IMAGE_TAG}" \
+            .

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated
 
-import yaml
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
 from fastapi import Path as ApiPath
+from nonebot import logger
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
@@ -14,10 +14,10 @@ from komari_bot.common.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
+from komari_bot.common.prompt_storage import load_prompt_values, save_prompt_values
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+    from collections.abc import Mapping, Sequence
 
     from .managed_resources import ManagedPromptResource
 
@@ -29,7 +29,9 @@ class PromptResourceSummary(BaseModel):
 
     resource_id: str
     display_name: str
-    file_path: str
+    config_source: str
+    storage_key: str
+    file_path: str | None = None
     fields: list[str]
 
 
@@ -74,50 +76,34 @@ def _get_resource_map(
     return {resource.resource_id: resource for resource in resources}
 
 
-def _resolve_path(path: Path) -> Path:
-    if path.is_absolute():
-        return path
-    return path.resolve()
-
-
 def _load_prompt_values(resource: ManagedPromptResource) -> dict[str, str]:
-    path = _resolve_path(resource.file_path)
-    values = dict(resource.defaults)
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        return values
-    except yaml.YAMLError as exc:
-        detail = f"提示词文件 YAML 解析失败: {exc}"
-        raise _validation_error(detail) from exc
-    except OSError as exc:
+        return load_prompt_values(resource).values
+    except Exception as exc:
+        logger.exception("读取提示词配置失败: {}", resource.resource_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"读取提示词文件失败: {exc}",
+            detail="读取提示词配置失败",
         ) from exc
-
-    if not isinstance(data, dict):
-        raise _validation_error("提示词文件内容必须是对象")
-    for key in resource.defaults:
-        value = data.get(key)
-        if isinstance(value, str):
-            values[key] = value.rstrip("\n")
-    return values
 
 
 def _save_prompt_values(
-    resource: ManagedPromptResource, values: dict[str, str]
+    resource: ManagedPromptResource, values: Mapping[str, object]
 ) -> None:
-    path = _resolve_path(resource.file_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(
-            values,
-            allow_unicode=True,
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
+    try:
+        save_prompt_values(resource, values)
+    except ValueError as exc:
+        raise _validation_error(str(exc)) from exc
+    except Exception as exc:
+        logger.exception("保存提示词配置失败: {}", resource.resource_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="保存提示词配置失败",
+        ) from exc
+
+
+def _build_config_source(resource: ManagedPromptResource) -> str:
+    return f"postgresql:komari_prompt_configs:{resource.resource_id}"
 
 
 def _build_resource_summary(resource: ManagedPromptResource) -> PromptResourceSummary:
@@ -125,7 +111,9 @@ def _build_resource_summary(resource: ManagedPromptResource) -> PromptResourceSu
     return PromptResourceSummary(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
-        file_path=str(_resolve_path(resource.file_path)),
+        config_source=_build_config_source(resource),
+        storage_key=resource.resource_id,
+        file_path=None,
         fields=sorted(values.keys()),
     )
 
@@ -135,7 +123,9 @@ def _build_resource_detail(resource: ManagedPromptResource) -> PromptResourceDet
     return PromptResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
-        file_path=str(_resolve_path(resource.file_path)),
+        config_source=_build_config_source(resource),
+        storage_key=resource.resource_id,
+        file_path=None,
         fields=sorted(values.keys()),
         values=values,
     )
@@ -184,21 +174,10 @@ def create_prompt_router(
     @router.put("/resources/{resource_id}", response_model=PromptResourceDetail)
     async def replace_prompt_resource(
         resource_id: Annotated[str, ApiPath(min_length=1)],
-        payload: Annotated[dict[str, str], Body()],
+        payload: Annotated[dict[str, object], Body()],
     ) -> PromptResourceDetail:
         resource = _resolve_resource(resource_id, resource_map)
-        unknown_fields = sorted(set(payload) - set(resource.defaults))
-        if unknown_fields:
-            fields = ", ".join(unknown_fields)
-            detail = f"存在未知提示词字段: {fields}"
-            raise _validation_error(detail)
-        values = dict(resource.defaults)
-        for key, value in payload.items():
-            if not isinstance(value, str) or not value.strip():
-                detail = f"提示词字段 {key} 必须是非空字符串"
-                raise _validation_error(detail)
-            values[key] = value.rstrip("\n")
-        _save_prompt_values(resource, values)
+        _save_prompt_values(resource, payload)
         return _build_resource_detail(resource)
 
     @router.patch(
@@ -216,7 +195,7 @@ def create_prompt_router(
             raise _not_found(detail)
         values = _load_prompt_values(resource)
         values[field_name] = payload.value.rstrip("\n")
-        _save_prompt_values(resource, values)
+        _save_prompt_values(resource, dict(values))
         return _build_resource_detail(resource)
 
     return router

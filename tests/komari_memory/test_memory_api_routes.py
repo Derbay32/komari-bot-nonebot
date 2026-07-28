@@ -63,6 +63,39 @@ def _entity_entry(*, key: str, user_id: str = "u1") -> dict[str, object]:
     }
 
 
+def _interaction_event_entry(*, event_id: int = 1) -> dict[str, object]:
+    timestamp = datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
+    return {
+        "id": event_id,
+        "user_id": "u1",
+        "display_name": "阿明",
+        "event_summary": "阿明经常和小鞠聊游戏并喜欢轻松吐槽。",
+        "source_message_count": 20,
+        "first_seen_at": timestamp,
+        "last_seen_at": timestamp,
+        "importance": 4,
+        "importance_initial": 4,
+        "importance_current": 4,
+        "last_accessed": timestamp,
+        "is_fuzzy": False,
+        "created_at": timestamp,
+    }
+
+
+def _interaction_event_entity(*, event_id: int = 1) -> dict[str, object]:
+    event = _interaction_event_entry(event_id=event_id)
+    return {
+        "user_id": event["user_id"],
+        "group_id": "",
+        "key": f"interaction_event:{event_id}",
+        "category": "interaction_event",
+        "importance": event["importance"],
+        "access_count": 0,
+        "last_accessed": event["last_accessed"],
+        "value": event,
+    }
+
+
 class _FakeMemoryService:
     def __init__(self) -> None:
         self.conversations = {
@@ -73,6 +106,7 @@ class _FakeMemoryService:
         self.interaction_histories = {
             ("g1", "u1"): _entity_entry(key="interaction_history")
         }
+        self.interaction_events = {1: _interaction_event_entry()}
         self.list_conversation_calls: list[dict[str, object]] = []
         self.update_conversation_calls: list[tuple[int, dict[str, object]]] = []
         self.list_profile_calls: list[dict[str, object]] = []
@@ -124,9 +158,9 @@ class _FakeMemoryService:
         **kwargs: object,
     ) -> tuple[list[dict[str, object]], int]:
         self.list_history_calls.append(dict(kwargs))
-        return [self.interaction_histories[("g1", "u1")]], len(
-            self.interaction_histories
-        )
+        if kwargs.get("group_id") is None:
+            return [_interaction_event_entity()], len(self.interaction_events)
+        return [self.interaction_histories[("g1", "u1")]], len(self.interaction_histories)
 
     async def get_user_profile_row(
         self,
@@ -183,6 +217,28 @@ class _FakeMemoryService:
 
     async def delete_interaction_history(self, *, user_id: str, group_id: str) -> bool:
         return self.interaction_histories.pop((group_id, user_id), None) is not None
+
+    async def get_interaction_event_entry(
+        self,
+        event_id: int,
+    ) -> dict[str, object] | None:
+        return self.interaction_events.get(event_id)
+
+    async def update_interaction_event_entry(
+        self,
+        event_id: int,
+        **kwargs: object,
+    ) -> dict[str, object] | None:
+        event = self.interaction_events.get(event_id)
+        if event is None:
+            return None
+        updated = dict(event)
+        updated.update({key: value for key, value in kwargs.items() if value is not None})
+        self.interaction_events[event_id] = updated
+        return updated
+
+    async def delete_interaction_event_entry(self, event_id: int) -> bool:
+        return self.interaction_events.pop(event_id, None) is not None
 
 
 def _build_app(service: _FakeMemoryService | None) -> FastAPI:
@@ -393,6 +449,58 @@ async def test_entity_routes_list_get_upsert_delete_and_validate(app: App) -> No
     assert bad_body.status_code == 422
     assert deleted_profile.status_code == 204
     assert deleted_history.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_interaction_event_routes_support_event_id_crud(app: App) -> None:
+    service = _FakeMemoryService()
+    headers = {"Authorization": "Bearer secret-token"}
+
+    async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
+        client = ctx.get_client()
+        listed = await client.get(
+            _with_query(f"{API_PREFIX}/interactions", user_id="u1", q="游戏", limit=5),
+            headers=headers,
+        )
+        detail = await client.get(f"{API_PREFIX}/interactions/1", headers=headers)
+        updated = await client.patch(
+            f"{API_PREFIX}/interactions/1",
+            json={"event_summary": "阿明喜欢和小鞠聊游戏。", "importance_current": 5},
+            headers=headers,
+        )
+        missing_update = await client.patch(
+            f"{API_PREFIX}/interactions/999",
+            json={"event_summary": "不存在"},
+            headers=headers,
+        )
+        empty_patch = await client.patch(
+            f"{API_PREFIX}/interactions/1",
+            json={},
+            headers=headers,
+        )
+        deleted = await client.delete(f"{API_PREFIX}/interactions/1", headers=headers)
+        missing_delete = await client.delete(
+            f"{API_PREFIX}/interactions/1",
+            headers=headers,
+        )
+
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["event_summary"].startswith("阿明经常")
+    assert service.list_history_calls[-1] == {
+        "limit": 5,
+        "offset": 0,
+        "user_id": "u1",
+        "query": "游戏",
+    }
+    assert detail.status_code == 200
+    assert detail.json()["id"] == 1
+    assert updated.status_code == 200
+    assert updated.json()["importance_current"] == 5
+    assert updated.json()["event_summary"] == "阿明喜欢和小鞠聊游戏。"
+    assert missing_update.status_code == 404
+    assert empty_patch.status_code == 422
+    assert deleted.status_code == 204
+    assert missing_delete.status_code == 404
 
 
 @pytest.mark.asyncio
