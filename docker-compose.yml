@@ -1,6 +1,6 @@
 services:
   nonebot:
-    image: codeberg.org/derbay32/komari-bot-nonebot:latest
+    image: ghcr.io/derbay32/komari-bot-nonebot:latest
     ports:
       - 8502:8502
     volumes:

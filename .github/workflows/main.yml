@@ -1,0 +1,156 @@
+name: 构建并发布容器镜像
+
+on:
+  # 正式版本：在 GitHub 发布 Release 时触发
+  release:
+    types: [published]
+  # 预发布版本：推送 beta/rc 标签时触发，并自动创建预发布 Release
+  push:
+    tags:
+      - "v*-beta*"
+      - "v*-rc*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  DOCKER_IMAGE: ghcr.io/derbay32/komari-bot-nonebot
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 准备发布上下文
+        id: release_context
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${RELEASE_TAG:-}"
+          if [ -z "$TAG_NAME" ]; then
+            TAG_NAME="$REF_NAME"
+          fi
+
+          if [ -z "$TAG_NAME" ]; then
+            echo "无法确定发布标签" >&2
+            exit 1
+          fi
+
+          IMAGE_TAG="${TAG_NAME#v}"
+          SHORT_SHA="${COMMIT_SHA:0:12}"
+          TAGS=(
+            "${DOCKER_IMAGE}:${IMAGE_TAG}"
+            "${DOCKER_IMAGE}:sha-${SHORT_SHA}"
+          )
+
+          if [ "$EVENT_NAME" = "release" ] && [ "$IS_PRERELEASE" != "true" ]; then
+            MAJOR_MINOR="$(printf '%s' "$IMAGE_TAG" | cut -d. -f1,2)"
+            TAGS+=("${DOCKER_IMAGE}:${MAJOR_MINOR}")
+            TAGS+=("${DOCKER_IMAGE}:latest")
+          fi
+
+          {
+            echo "tag_name=$TAG_NAME"
+            echo "image_tag=$IMAGE_TAG"
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GitHub 容器镜像仓库
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并发布 Docker 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.release_context.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release_context.outputs.image_tag }}
+          build-args: |
+            SENTRY_RELEASE=komari-bot@${{ steps.release_context.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 创建预发布 Release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release_context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          gh release create "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --title "预发布版本 $TAG_NAME" \
+            --notes "自动化构建的预发布版本"
+
+      - name: 打包并上传部署文件
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ steps.release_context.outputs.image_tag }}
+          TAG_NAME: ${{ steps.release_context.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          ASSET_NAME="komari-bot-${TAG_NAME}.zip"
+          mkdir -p komari-bot-deploy/app
+
+          if [ -d data ]; then
+            cp -r data komari-bot-deploy/app/data
+          else
+            mkdir -p komari-bot-deploy/app/data
+          fi
+
+          sed \
+            "s|${DOCKER_IMAGE}:latest|${DOCKER_IMAGE}:${IMAGE_TAG}|g" \
+            docker-compose.yml \
+            > komari-bot-deploy/docker-compose.yml
+
+          ASSET_NAME="$ASSET_NAME" python3 - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import zipfile
+          from pathlib import Path
+
+          asset_name = os.environ["ASSET_NAME"]
+          deploy_dir = Path("komari-bot-deploy")
+          with zipfile.ZipFile(asset_name, "w", zipfile.ZIP_DEFLATED) as archive:
+              for path in deploy_dir.rglob("*"):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(deploy_dir))
+          PY
+
+          gh release upload "$TAG_NAME" "$ASSET_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
