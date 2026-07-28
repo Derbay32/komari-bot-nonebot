@@ -1,4 +1,4 @@
-"""Komari Management 配置文件 REST API。"""
+"""Komari Management 配置 REST API。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from .managed_resources import ManagedConfigResource
 
 API_PREFIX = "/api/komari-management-config/v1"
+_SENSITIVE_FIELD_KEYWORDS = ("password", "token", "secret", "key", "credential")
+_MASKED_CONFIG_VALUE = "******"
 
 
 class ConfigResourceSummary(BaseModel):
@@ -26,8 +28,9 @@ class ConfigResourceSummary(BaseModel):
 
     resource_id: str
     display_name: str
-    config_file: str
+    config_source: str
     fields: list[str]
+    field_descriptions: dict[str, str]
 
 
 class ConfigResourceDetail(ConfigResourceSummary):
@@ -75,14 +78,34 @@ def _get_fields(config: BaseModel) -> list[str]:
     return sorted(config.model_dump().keys())
 
 
+def _get_field_descriptions(config: BaseModel) -> dict[str, str]:
+    return {
+        field_name: (field_info.description or "")
+        for field_name, field_info in sorted(config.__class__.model_fields.items())
+    }
+
+
+def _is_sensitive_field(field_name: str) -> bool:
+    lower_name = field_name.lower()
+    return any(keyword in lower_name for keyword in _SENSITIVE_FIELD_KEYWORDS)
+
+
+def _mask_config_values(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field_name: _MASKED_CONFIG_VALUE if _is_sensitive_field(field_name) else value
+        for field_name, value in values.items()
+    }
+
+
 def _build_resource_summary(resource: ManagedConfigResource) -> ConfigResourceSummary:
     manager = resource.manager_getter()
     config = manager.get()
     return ConfigResourceSummary(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
-        config_file=str(manager.config_file),
+        config_source=manager.config_source,
         fields=_get_fields(config),
+        field_descriptions=_get_field_descriptions(config),
     )
 
 
@@ -92,9 +115,10 @@ def _build_resource_detail(resource: ManagedConfigResource) -> ConfigResourceDet
     return ConfigResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
-        config_file=str(manager.config_file),
+        config_source=manager.config_source,
         fields=_get_fields(config),
-        values=config.model_dump(),
+        field_descriptions=_get_field_descriptions(config),
+        values=_mask_config_values(config.model_dump()),
     )
 
 
@@ -143,7 +167,7 @@ def create_config_router(
         resource_id: Annotated[str, Path(min_length=1)],
     ) -> ConfigResourceDetail:
         resource = _resolve_resource(resource_id, resource_map)
-        resource.manager_getter().reload_from_json()
+        resource.manager_getter().reload()
         return _build_resource_detail(resource)
 
     @router.patch(
@@ -173,7 +197,7 @@ def register_config_api(
     allowed_origins: Sequence[str],
     resources: Sequence[ManagedConfigResource],
 ) -> None:
-    """注册配置文件管理 API。"""
+    """注册配置管理 API。"""
     if getattr(app.state, "komari_management_config_api_registered", False):
         return
 

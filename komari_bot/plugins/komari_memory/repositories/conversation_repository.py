@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
+from komari_bot.common.sql_like_utils import escape_like_pattern
+
 if TYPE_CHECKING:
     import asyncpg
+
+
+def _build_content_hash(content: str) -> str:
+    """生成稳定的文本内容哈希。"""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 class ConversationRepository:
@@ -29,7 +37,8 @@ class ConversationRepository:
         embedding: str,
         participants: list[str],
         importance_initial: int,
-    ) -> int:
+        dedup_key: str | None = None,
+    ) -> int | None:
         """插入对话记录。
 
         Args:
@@ -38,27 +47,46 @@ class ConversationRepository:
             embedding: 向量嵌入（字符串格式）
             participants: 参与者列表
             importance_initial: 初始重要性评分
+            dedup_key: 幂等键，同一 processing 快照重复写入时用于去重
 
         Returns:
-            创建的对话 ID
+            创建的对话 ID；幂等冲突时返回 None
         """
-        async with self.pg_pool.acquire() as conn:
+        async with self.pg_pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
                 INSERT INTO komari_memory_conversations
-                (group_id, summary, embedding, participants, start_time, end_time, importance_initial, importance_current)
+                (
+                    group_id,
+                    summary,
+                    participants,
+                    dedup_key,
+                    start_time,
+                    end_time,
+                    importance_initial,
+                    importance_current
+                )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
                 group_id,
                 summary,
-                embedding,
                 participants,
+                dedup_key,
                 datetime.now() - timedelta(hours=1),  # noqa: DTZ005
                 datetime.now(),  # noqa: DTZ005
                 importance_initial,
                 importance_initial,
             )
+
+            if row is None:
+                logger.info(
+                    f"[KomariMemory] 跳过重复对话总结: group={group_id}, dedup_key={dedup_key}"
+                )
+                return None
+
+            await self._upsert_embedding(conn, int(row["id"]), summary, embedding)
 
             logger.info(
                 f"[KomariMemory] 存储对话总结: ID={row['id']}, group={group_id}, importance={importance_initial}"
@@ -85,8 +113,8 @@ class ConversationRepository:
             filters.append(f"${len(params) + 1} = ANY(participants)")
             params.append(participant)
         if query:
-            filters.append(f"summary ILIKE ${len(params) + 1}")
-            params.append(f"%{query}%")
+            filters.append(f"summary ILIKE ${len(params) + 1} ESCAPE '\\'")
+            params.append(f"%{escape_like_pattern(query)}%")
 
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 
@@ -162,14 +190,13 @@ class ConversationRepository:
         last_accessed: datetime | None = None,
     ) -> dict[str, Any]:
         """创建可管理的对话记忆记录。"""
-        async with self.pg_pool.acquire() as conn:
+        async with self.pg_pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
                 INSERT INTO komari_memory_conversations
                 (
                     group_id,
                     summary,
-                    embedding,
                     participants,
                     start_time,
                     end_time,
@@ -177,7 +204,7 @@ class ConversationRepository:
                     importance_current,
                     last_accessed
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, $6))
+                VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, $5))
                 RETURNING
                     id,
                     group_id,
@@ -192,7 +219,6 @@ class ConversationRepository:
                 """,
                 group_id,
                 summary,
-                embedding,
                 participants,
                 start_time,
                 end_time,
@@ -200,6 +226,8 @@ class ConversationRepository:
                 importance_current,
                 last_accessed,
             )
+            if row is not None:
+                await self._upsert_embedding(conn, int(row["id"]), summary, embedding)
 
         if row is None:
             msg = "创建对话记忆失败"
@@ -232,7 +260,6 @@ class ConversationRepository:
 
         _append_update("group_id", group_id)
         _append_update("summary", summary)
-        _append_update("embedding", embedding)
         _append_update("participants", participants)
         _append_update("start_time", start_time)
         _append_update("end_time", end_time)
@@ -240,29 +267,58 @@ class ConversationRepository:
         _append_update("importance_current", importance_current)
         _append_update("last_accessed", last_accessed)
 
-        if not updates:
+        if not updates and embedding is None:
             return await self.get_conversation(conversation_id)
 
-        async with self.pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                UPDATE komari_memory_conversations
-                SET {", ".join(updates)}
-                WHERE id = $1
-                RETURNING
-                    id,
-                    group_id,
-                    summary,
-                    participants,
-                    start_time,
-                    end_time,
-                    importance_initial,
-                    importance_current,
-                    last_accessed,
-                    created_at
-                """,
-                *params,
-            )
+        async with self.pg_pool.acquire() as conn, conn.transaction():
+            if updates:
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE komari_memory_conversations
+                    SET {", ".join(updates)}
+                    WHERE id = $1
+                    RETURNING
+                        id,
+                        group_id,
+                        summary,
+                        participants,
+                        start_time,
+                        end_time,
+                        importance_initial,
+                        importance_current,
+                        last_accessed,
+                        created_at
+                    """,
+                    *params,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        id,
+                        group_id,
+                        summary,
+                        participants,
+                        start_time,
+                        end_time,
+                        importance_initial,
+                        importance_current,
+                        last_accessed,
+                        created_at
+                    FROM komari_memory_conversations
+                    WHERE id = $1
+                    """,
+                    conversation_id,
+                )
+
+            if row is not None and embedding is not None:
+                embedding_summary = summary if summary is not None else str(row["summary"])
+                await self._upsert_embedding(
+                    conn,
+                    conversation_id,
+                    embedding_summary,
+                    embedding,
+                )
 
         return dict(row) if row is not None else None
 
@@ -305,16 +361,17 @@ class ConversationRepository:
                 rows = await conn.fetch(
                     """
                     SELECT
-                        id, summary, participants,
-                        1 - (embedding <=> $1::vector) as similarity
-                    FROM komari_memory_conversations
-                    WHERE group_id = $2
+                        c.id, c.summary, c.participants,
+                        1 - (e.embedding <=> $1::vector) as similarity
+                    FROM komari_memory_conversations c
+                    JOIN komari_memory_conversation_embeddings e ON e.conversation_id = c.id
+                    WHERE c.group_id = $2
                     ORDER BY
                         CASE
-                            WHEN $4 = ANY(participants) THEN
-                                (embedding <=> $1::vector) / 1.2
+                            WHEN $4 = ANY(c.participants) THEN
+                                (e.embedding <=> $1::vector) / 1.2
                             ELSE
-                                embedding <=> $1::vector
+                                e.embedding <=> $1::vector
                         END
                     LIMIT $3
                     """,
@@ -327,11 +384,12 @@ class ConversationRepository:
                 # 原有逻辑：无用户加权
                 rows = await conn.fetch(
                     """
-                    SELECT id, summary, participants,
-                           1 - (embedding <=> $1::vector) as similarity
-                    FROM komari_memory_conversations
-                    WHERE group_id = $2
-                    ORDER BY embedding <=> $1::vector
+                    SELECT c.id, c.summary, c.participants,
+                           1 - (e.embedding <=> $1::vector) as similarity
+                    FROM komari_memory_conversations c
+                    JOIN komari_memory_conversation_embeddings e ON e.conversation_id = c.id
+                    WHERE c.group_id = $2
+                    ORDER BY e.embedding <=> $1::vector
                     LIMIT $3
                     """,
                     embedding,
@@ -369,3 +427,26 @@ class ConversationRepository:
             )
 
         logger.debug("[KomariMemory] 更新 {} 条记忆的访问状态", len(conversation_ids))
+
+    async def _upsert_embedding(
+        self,
+        conn: Any,
+        conversation_id: int,
+        summary: str,
+        embedding: str,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO komari_memory_conversation_embeddings
+                (conversation_id, content_hash, embedding, embedding_dim)
+            VALUES ($1, $2, $3, vector_dims($3::vector))
+            ON CONFLICT (conversation_id) DO UPDATE SET
+                content_hash = EXCLUDED.content_hash,
+                embedding = EXCLUDED.embedding,
+                embedding_dim = EXCLUDED.embedding_dim,
+                embedded_at = CURRENT_TIMESTAMP
+            """,
+            conversation_id,
+            _build_content_hash(summary),
+            embedding,
+        )

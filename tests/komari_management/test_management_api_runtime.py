@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
     ManagementApiComponents,
@@ -62,8 +63,8 @@ class _FakeConfigSchema(BaseModel):
 
 class _FakeConfigManager:
     @property
-    def config_file(self) -> Path:
-        return Path("/tmp/komari_management.json")
+    def config_source(self) -> str:
+        return "postgres:komari_plugin_configs/komari_management"
 
     def get(self) -> BaseModel:
         return _FakeConfigSchema()
@@ -72,7 +73,7 @@ class _FakeConfigManager:
         del field_name, value
         return self.get()
 
-    def reload_from_json(self) -> BaseModel:
+    def reload(self) -> BaseModel:
         return self.get()
 
 
@@ -88,6 +89,8 @@ def _build_components() -> ManagementApiComponents:
     return ManagementApiComponents(
         register_knowledge_api=register_knowledge_api,
         knowledge_engine_getter=lambda: None,
+        register_help_api=register_help_api,
+        help_engine_getter=lambda: None,
         register_memory_api=register_memory_api,
         memory_service_getter=lambda: None,
         register_llm_provider_api=register_llm_provider_api,
@@ -103,8 +106,8 @@ def _build_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name="Komari Chat Prompt",
-                file_path=Path("config") / "prompts" / "komari_memory.yaml",
                 defaults={"system_prompt": "默认值"},
+                legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
             ),
         ),
     )
@@ -130,10 +133,14 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     route_paths = {getattr(route, "path", "") for route in api_app.routes}
     assert registered is True
     assert "/api/komari-knowledge/v1/knowledge" in route_paths
+    assert "/api/komari-help/v1/help" in route_paths
     assert "/api/komari-memory/v1/conversations" in route_paths
     assert "/api/llm-provider/v1/reply-logs" in route_paths
     assert "/api/komari-management-config/v1/resources" in route_paths
     assert "/api/komari-management-prompt/v1/resources" in route_paths
+    assert "/api/komari-announce/v1/groups" in route_paths
+    assert "/api/komari-announce/v1/maintenance" in route_paths
+    assert "/api/komari-decision-scenes/v1/scenes" in route_paths
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
@@ -144,10 +151,14 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert schema_response.status_code == 200
     schema = schema_response.json()
     assert "/api/komari-knowledge/v1/knowledge" in schema["paths"]
+    assert "/api/komari-help/v1/help" in schema["paths"]
     assert "/api/komari-memory/v1/conversations" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
     assert "/api/komari-management-config/v1/resources" in schema["paths"]
     assert "/api/komari-management-prompt/v1/resources" in schema["paths"]
+    assert "/api/komari-announce/v1/groups" in schema["paths"]
+    assert "/api/komari-announce/v1/maintenance" in schema["paths"]
+    assert "/api/komari-decision-scenes/v1/scenes" in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(
         item.get("type") == "http" and item.get("scheme") == "bearer"
@@ -155,8 +166,9 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     )
     assert logger.info_messages[-2] == (
         "[Komari Management] 管理 API 已注册: "
-        "/api/komari-knowledge/v1, /api/komari-memory/v1, /api/llm-provider/v1, "
-        "/api/komari-management-config/v1, /api/komari-management-prompt/v1"
+        "/api/komari-knowledge/v1, /api/komari-help/v1, /api/komari-memory/v1, /api/llm-provider/v1, "
+        "/api/komari-management-config/v1, /api/komari-management-prompt/v1, /api/komari-announce/v1, "
+        "/api/komari-decision-scenes/v1"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "

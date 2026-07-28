@@ -2,6 +2,7 @@
 llm provider 配置 Schema 实现。
 """
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -31,40 +32,85 @@ class DynamicConfigSchema(BaseModel):
         default_factory=list, description="群聊白名单，为空则允许所有群聊"
     )
 
-    # DeepSeek 配置
-    deepseek_api_token: str = Field(default="", description="DeepSeek API Token")
-    deepseek_api_base: str = Field(
+    # OpenAI 兼容 API 配置
+    api_token: str = Field(default="", description="OpenAI 兼容 API Token")
+    api_base: str = Field(
         default="https://api.deepseek.com/v1",
-        description="DeepSeek OpenAI 兼容 API Base URL",
+        description="OpenAI 兼容 API Base URL",
     )
-    deepseek_model: str = Field(
-        default="deepseek-chat", description="DeepSeek 使用模型"
+    model: str = Field(
+        default="deepseek-chat", description="OpenAI 兼容 API 使用模型"
     )
-    deepseek_temperature: float = Field(
-        default=1.0, ge=0.0, le=2.0, description="DeepSeek 调用温度参数"
+    temperature: float = Field(
+        default=1.0, ge=0.0, le=2.0, description="OpenAI 兼容 API 调用温度参数"
     )
-    deepseek_max_tokens: int = Field(
-        default=8192, ge=20, le=8192, description="DeepSeek 最大token数量"
+    max_tokens: int = Field(
+        default=8192, ge=20, le=8192, description="OpenAI 兼容 API 最大 token 数量"
     )
-    deepseek_timeout_seconds: float = Field(
-        default=300.0, gt=0.0, description="DeepSeek 请求总超时时间（秒）"
+    timeout_seconds: float = Field(
+        default=300.0, gt=0.0, description="OpenAI 兼容 API 请求总超时时间（秒）"
     )
-    deepseek_reasoning_effort: str = Field(
-        default="",
-        description=(
-            "DeepSeek OpenAI 兼容请求的 reasoning_effort。"
-            "可选：none/minimal/low/medium/high/xhigh；为空时不发送"
-        ),
+    summary_task_rpm_limit: int = Field(
+        default=20,
+        ge=1,
+        le=600,
+        description="总结任务 LLM 请求每分钟上限",
     )
-    deepseek_frequency_penalty: float = Field(
-        default=0.0, description="DeepSeek 重复内容惩罚"
+    chat_rpm_limit: int = Field(
+        default=60,
+        ge=1,
+        le=600,
+        description="聊天 LLM 请求每分钟上限",
     )
-    deepseek_extra_params: dict[str, Any] = Field(
+    frequency_penalty: float = Field(
+        default=0.0, description="OpenAI 兼容 API 重复内容惩罚"
+    )
+    extra_params: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "DeepSeek API 请求的额外自定义参数，"
-            "会合并到每次请求体中。支持简单值和嵌套结构。"
-            '例如：{"enable_thinking": false} 或 {"thinking": {"type": "disabled"}}'
+            "OpenAI 兼容 API 请求的额外自定义参数，"
+            "会合并到每次请求体的 extra_body 中。"
+            "思考模式控制请使用各业务插件的 *_thinking_mode / *_reasoning_effort 字段，"
+            "勿在此处配置 thinking/enable_thinking/reasoning_effort。"
+        ),
+    )
+    vision_model: str = Field(
+        default="gemini-2.0-flash-exp",
+        description="多模态视觉模型名",
+    )
+    vision_temperature: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=2.0,
+        description="视觉模型温度",
+    )
+    vision_max_tokens: int = Field(
+        default=1024,
+        ge=20,
+        le=8192,
+        description="视觉模型最大 token 数",
+    )
+    vision_thinking_mode: bool = Field(
+        default=False,
+        description="视觉模型是否处于思考模式（仅在聊天循环 has_vision_tool=True 切到 vision_model 时生效）。",
+    )
+    vision_reasoning_effort: str = Field(
+        default="",
+        description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
+    )
+
+    # LLM 调用日志配置
+    llm_log_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=90,
+        description="logs/llm_provider/*.jsonl 自动清理的日志保留天数",
+    )
+    llm_log_dir_permission_mode: str = Field(
+        default="0o700",
+        description=(
+            "LLM 日志目录首次创建时应用的八进制权限字符串，"
+            "例如 0o700、0o750；为空字符串时禁用 chmod 权限收敛"
         ),
     )
 
@@ -87,4 +133,15 @@ class DynamicConfigSchema(BaseModel):
                 return [str(item) for item in parsed]
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("llm_log_dir_permission_mode")
+    @classmethod
+    def validate_log_dir_permission_mode(cls, v: str) -> str:
+        """校验 LLM 日志目录权限模式。"""
+        if v == "":
+            return v
+        if not re.fullmatch(r"0o[0-7]{3,4}", v):
+            msg = "llm_log_dir_permission_mode 必须为空或八进制权限字符串"
+            raise ValueError(msg)
         return v

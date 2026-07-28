@@ -111,3 +111,48 @@ class MemoryEntityListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class InteractionEventEntry(BaseModel):
+    """跨群互动事件记忆条目。"""
+
+    id: int
+    user_id: str
+    display_name: str
+    event_summary: str
+    source_message_count: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+    importance: int
+    importance_initial: int
+    importance_current: int
+    last_accessed: datetime | None = None
+    is_fuzzy: bool = False
+    created_at: datetime | None = None
+
+
+class InteractionEventListResponse(BaseModel):
+    """跨群互动事件记忆列表响应。"""
+
+    items: list[InteractionEventEntry]
+    total: int
+    limit: int
+    offset: int
+
+
+class InteractionEventUpdateRequest(BaseModel):
+    """更新跨群互动事件请求。"""
+
+    event_summary: str | None = Field(default=None, min_length=1)
+    importance_initial: int | None = Field(default=None, ge=1, le=5)
+    importance_current: int | None = Field(default=None, ge=0, le=5)
+
+    @field_validator("event_summary")
+    @classmethod
+    def strip_optional_summary(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("字段不能为空")
+        return stripped

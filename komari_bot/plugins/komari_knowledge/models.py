@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-KnowledgeCategory = Literal["general", "character", "setting", "plot", "other"]
+KnowledgeCategory = Literal["general", "character", "setting", "plot", "other", "custom"]
 KnowledgeSource = Literal["keyword", "vector"]
 
 

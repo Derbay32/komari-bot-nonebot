@@ -28,7 +28,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from komari_bot.common.database_config import load_database_config_from_file
+from komari_bot.common.database_config import (
+    load_database_config_from_env,
+    load_database_config_from_file,
+)
 from komari_bot.common.postgres import create_postgres_pool
 from komari_bot.common.profile_compaction import normalize_profile_for_storage
 
@@ -348,13 +351,17 @@ async def _apply_plan(conn: Any, plan: MergePlan) -> None:
 async def run(
     *,
     apply: bool,
-    database_config_path: Path,
+    database_config_path: Path | None,
     bindings_path: Path,
     group_id: str | None = None,
     user_id: str | None = None,
 ) -> dict[str, int]:
     bindings = _load_bindings(bindings_path)
-    database_config = load_database_config_from_file(database_config_path)
+    database_config = (
+        load_database_config_from_file(database_config_path)
+        if database_config_path is not None
+        else load_database_config_from_env()
+    )
     pool = await create_postgres_pool(database_config, command_timeout=60)
 
     try:
@@ -406,8 +413,8 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--database-config-path",
         type=Path,
-        default=Path("config/config_manager/database_config.json"),
-        help="共享数据库配置文件路径",
+        default=None,
+        help="显式旧版共享数据库 JSON 配置文件路径；默认从 dotenv / 环境变量读取",
     )
     parser.add_argument(
         "--bindings-path",

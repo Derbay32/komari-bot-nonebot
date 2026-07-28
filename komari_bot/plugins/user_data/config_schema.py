@@ -8,48 +8,22 @@ from pydantic import BaseModel, Field
 class DynamicConfigSchema(BaseModel):
     """用户数据插件配置（由 config_manager 管理）。"""
 
-    version: str = Field(default="1.0", description="配置架构版本")
+    version: str = Field(default="2.0", description="配置架构版本")
     last_updated: str = Field(
         default_factory=lambda: datetime.now().astimezone().isoformat(),
         description="最后更新时间戳",
     )
 
     plugin_enable: bool = Field(default=True, description="插件启用状态")
-
-    # PostgreSQL 配置覆盖项（默认读取共享 database_config）
-    pg_host: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的 PostgreSQL 主机地址",
+    initial_favorability: int = Field(
+        default=0,
+        ge=0,
+        le=400,
+        description="新用户初始当前好感度",
     )
-    pg_port: int | None = Field(
-        default=None,
+    max_favorability_delta_per_reply: int = Field(
+        default=5,
         ge=1,
-        le=65535,
-        description="可选：覆盖共享配置中的 PostgreSQL 端口",
+        le=20,
+        description="单次回复允许记录的最大好感度变化绝对值",
     )
-    pg_database: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库名称",
-    )
-    pg_user: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库用户名",
-    )
-    pg_password: str | None = Field(
-        default=None,
-        description="可选：覆盖共享配置中的数据库密码",
-    )
-    pg_pool_min_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=10,
-        description="可选：覆盖共享配置中的连接池最小连接数",
-    )
-    pg_pool_max_size: int | None = Field(
-        default=None,
-        ge=1,
-        le=50,
-        description="可选：覆盖共享配置中的连接池最大连接数",
-    )
-
-    data_retention_days: int = Field(default=30, ge=1, le=3650, description="数据保留天数")

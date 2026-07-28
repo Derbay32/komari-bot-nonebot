@@ -94,6 +94,28 @@ def test_list_knowledge_supports_filters_and_pagination() -> None:
     assert data_args == ("%布丁%", "character", 10, 5)
 
 
+def test_list_knowledge_escapes_like_wildcards() -> None:
+    engine = KnowledgeEngine()
+    pool = _FakeListPool()
+    engine._pool = pool
+
+    asyncio.run(
+        engine.list_knowledge(
+            limit=10,
+            offset=0,
+            query=r"100%_x\tag",
+        )
+    )
+
+    count_query, count_args = pool.fetchval_calls[0]
+    _data_query, data_args = pool.fetch_calls[0]
+
+    assert "content ILIKE $1 ESCAPE '\\'" in count_query
+    assert "keyword ILIKE $1 ESCAPE '\\'" in count_query
+    assert count_args == (r"%100\%\_x\\tag%",)
+    assert data_args == (r"%100\%\_x\\tag%", 10, 0)
+
+
 def test_update_knowledge_allows_clearing_notes_without_touching_embedding() -> None:
     engine = KnowledgeEngine()
     pool = _FakeUpdatePool()

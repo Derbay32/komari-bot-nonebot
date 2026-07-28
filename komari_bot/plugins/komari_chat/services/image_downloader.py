@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import re
+import socket
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from nonebot import logger
@@ -26,8 +29,9 @@ _READ_CHUNK_SIZE = 64 * 1024
 _DOWNLOAD_RETRY_ATTEMPTS = 3
 _DOWNLOAD_RETRY_BASE_DELAY = 0.2
 _DOWNLOAD_RETRY_MAX_DELAY = 1.0
+_MAX_REDIRECTS = 3
 _RETRYABLE_STATUS_CODES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
-_DIRECT_IMAGE_SOURCE_RE = re.compile(r"^(?:https?://|data:)", re.IGNORECASE)
+_DIRECT_IMAGE_SOURCE_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
 @runtime_checkable
@@ -63,6 +67,78 @@ def _normalize_image_source(value: object) -> str | None:
     if not text or not _DIRECT_IMAGE_SOURCE_RE.match(text):
         return None
     return text
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+async def _resolve_host_ips(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    addr_infos = await asyncio.to_thread(
+        socket.getaddrinfo,
+        hostname,
+        None,
+        type=socket.SOCK_STREAM,
+    )
+    resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    seen: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for addr_info in addr_infos:
+        raw_ip = addr_info[4][0]
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        if ip not in seen:
+            seen.add(ip)
+            resolved_ips.append(ip)
+    return resolved_ips
+
+
+async def _validate_download_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        _port = parsed.port
+    except ValueError as exc:
+        logger.warning("[ImageDownloader] 图片 URL 解析失败: {}, url={}", exc, url[:100])
+        return False
+
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        logger.warning("[ImageDownloader] 拒绝不支持的图片 URL: url={}", url[:100])
+        return False
+
+    try:
+        resolved_ips = await _resolve_host_ips(parsed.hostname)
+    except OSError as exc:
+        logger.warning(
+            "[ImageDownloader] 图片 URL 主机解析失败: {}, url={}",
+            exc,
+            url[:100],
+        )
+        return False
+
+    if not resolved_ips:
+        logger.warning("[ImageDownloader] 图片 URL 未解析到 IP: url={}", url[:100])
+        return False
+
+    blocked_ips = [ip for ip in resolved_ips if _is_blocked_ip(ip)]
+    if blocked_ips:
+        logger.warning(
+            "[ImageDownloader] 拒绝下载内网或保留地址图片: ips={} url={}",
+            ",".join(str(ip) for ip in blocked_ips),
+            url[:100],
+        )
+        return False
+
+    return True
 
 
 def extract_image_sources(message: Iterable[object]) -> tuple[list[str], int]:
@@ -161,33 +237,49 @@ async def _handle_download_response(
     resp: aiohttp.ClientResponse,
     url: str,
     attempt: int,
-) -> tuple[str | None, str | None, bool]:
-    """处理单次下载响应，返回重试原因、数据 URI 和是否应终止。"""
+) -> tuple[str | None, str | None, bool, str | None]:
+    """处理单次下载响应，返回重试原因、数据 URI、是否终止和重定向地址。"""
     if resp.status != 200:
-        if resp.status in _RETRYABLE_STATUS_CODES and attempt < _DOWNLOAD_RETRY_ATTEMPTS:
-            return f"HTTP {resp.status}", None, False
-
-        logger.warning(
-            "[ImageDownloader] 下载失败: HTTP {}, url={}",
-            resp.status,
-            url[:100],
-        )
-        return None, None, True
+        return _handle_non_success_response(resp, url, attempt)
 
     data = await _read_image_bytes(resp, url)
     if data is None:
-        return None, None, True
+        return None, None, True, None
 
     if not data:
         if attempt < _DOWNLOAD_RETRY_ATTEMPTS:
-            return "empty body", None, False
+            return "empty body", None, False, None
 
         logger.warning("[ImageDownloader] 图片内容为空: url={}", url[:100])
-        return None, None, True
+        return None, None, True, None
 
     mime_type = _guess_mime_type(resp.content_type, url)
     b64 = base64.b64encode(data).decode("ascii")
-    return None, f"data:{mime_type};base64,{b64}", False
+    return None, f"data:{mime_type};base64,{b64}", False, None
+
+
+def _handle_non_success_response(
+    resp: aiohttp.ClientResponse,
+    url: str,
+    attempt: int,
+) -> tuple[str | None, str | None, bool, str | None]:
+    if 300 <= resp.status < 400:
+        location = resp.headers.get("Location")
+        if not location:
+            logger.warning("[ImageDownloader] 重定向缺少 Location: url={}", url[:100])
+            return None, None, True, None
+        redirect_url = urljoin(str(resp.url), location)
+        return None, None, False, redirect_url
+
+    if resp.status in _RETRYABLE_STATUS_CODES and attempt < _DOWNLOAD_RETRY_ATTEMPTS:
+        return f"HTTP {resp.status}", None, False, None
+
+    logger.warning(
+        "[ImageDownloader] 下载失败: HTTP {}, url={}",
+        resp.status,
+        url[:100],
+    )
+    return None, None, True, None
 
 
 async def _download_single_image(
@@ -203,29 +295,38 @@ async def _download_single_image(
     Returns:
         base64 data URI 字符串，失败时返回 None
     """
-    for attempt in range(1, _DOWNLOAD_RETRY_ATTEMPTS + 1):
+    current_url = url
+    redirects = 0
+    attempt = 1
+    while attempt <= _DOWNLOAD_RETRY_ATTEMPTS:
         retry_reason: str | None = None
         data_uri: str | None = None
         should_abort = False
+        redirect_url: str | None = None
+
+        if not await _validate_download_url(current_url):
+            return None
 
         try:
-            async with session.get(url) as resp:
-                retry_reason, data_uri, should_abort = await _handle_download_response(
-                    resp,
-                    url,
-                    attempt,
+            async with session.get(current_url, allow_redirects=False) as resp:
+                retry_reason, data_uri, should_abort, redirect_url = (
+                    await _handle_download_response(
+                        resp,
+                        current_url,
+                        attempt,
+                    )
                 )
 
         except (TimeoutError, aiohttp.ClientError) as e:
             if attempt < _DOWNLOAD_RETRY_ATTEMPTS:
                 retry_reason = str(e)
             else:
-                logger.warning("[ImageDownloader] 下载失败: {}, url={}", e, url[:100])
+                logger.warning("[ImageDownloader] 下载失败: {}, url={}", e, current_url[:100])
                 should_abort = True
         except Exception:
             logger.warning(
                 "[ImageDownloader] 下载未知错误: url={}",
-                url[:100],
+                current_url[:100],
                 exc_info=True,
             )
             should_abort = True
@@ -236,6 +337,19 @@ async def _download_single_image(
         if should_abort:
             break
 
+        if redirect_url is not None:
+            redirects += 1
+            if redirects > _MAX_REDIRECTS:
+                logger.warning(
+                    "[ImageDownloader] 图片重定向次数超过上限: url={}",
+                    current_url[:100],
+                )
+                break
+            if not await _validate_download_url(redirect_url):
+                break
+            current_url = redirect_url
+            continue
+
         if retry_reason is None:
             break
 
@@ -245,9 +359,10 @@ async def _download_single_image(
             f"{delay:.1f}",
             attempt,
             retry_reason,
-            url[:100],
+            current_url[:100],
         )
         await asyncio.sleep(delay)
+        attempt += 1
 
     return None
 

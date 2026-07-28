@@ -5,18 +5,20 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from komari_bot.common.database_config import get_shared_database_config
+
 # Redis 客户端单例
 _redis_client: aioredis.Redis | None = None
 
 
 def get_redis_config(config_manager: Any) -> Any:
-    """从 config_manager 获取配置（包含 Redis 连接信息）。
+    """从 config_manager 获取插件 Redis 配置。
 
     Args:
         config_manager: 配置管理器实例
 
     Returns:
-        配置对象，包含 Redis 连接信息
+        配置对象，包含插件级 Redis 配置
     """
     return config_manager.get()
 
@@ -33,10 +35,16 @@ async def get_redis_client(config_manager: Any) -> aioredis.Redis:
     global _redis_client  # noqa: PLW0603
     if _redis_client is None:
         config = get_redis_config(config_manager)
+        db_config = get_shared_database_config()
 
         # 构建连接 URL
-        password_part = f":{config.redis_password}@" if config.redis_password else ""
-        redis_url = f"redis://{password_part}{config.redis_host}:{config.redis_port}/{config.redis_db}"
+        password_part = (
+            f":{db_config.redis_password}@" if db_config.redis_password else ""
+        )
+        redis_url = (
+            f"redis://{password_part}{db_config.redis_host}:"
+            f"{db_config.redis_port}/{config.redis_db}"
+        )
 
         _redis_client = await aioredis.from_url(
             redis_url, decode_responses=True, encoding="utf-8"

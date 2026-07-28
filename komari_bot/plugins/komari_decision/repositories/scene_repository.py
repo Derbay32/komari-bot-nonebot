@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
@@ -37,6 +39,127 @@ class SceneRepository:
 
             self._schema_ready = True
             logger.info("[KomariDecision] scene 持久化表结构检查完成")
+
+    @staticmethod
+    def compute_text_hash(text: str) -> str:
+        """计算 scene 内容哈希。"""
+        return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def compute_scene_source_hash(scenes: list[dict[str, Any]]) -> str:
+        """基于启用 scene 内容计算规范化来源哈希。"""
+        payload = {
+            "scenes": [
+                {
+                    "scene_key": str(scene["scene_key"]),
+                    "scene_type": str(scene["scene_type"]),
+                    "content_hash": str(scene["content_hash"]),
+                    "enabled": bool(scene.get("enabled", True)),
+                    "order_index": int(scene.get("order_index", 0)),
+                }
+                for scene in scenes
+            ]
+        }
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    async def list_scenes(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """列出 scene 内容表记录。"""
+        sql = """
+            SELECT id, scene_key, scene_type, content_text, content_hash,
+                   enabled, order_index, created_at, updated_at
+            FROM komari_decision_scenes
+        """
+        if enabled_only:
+            sql += " WHERE enabled = TRUE"
+        sql += " ORDER BY order_index ASC, id ASC"
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch(sql)
+            return [dict(row) for row in rows]
+
+    async def get_scene_by_key(self, scene_key: str) -> dict[str, Any] | None:
+        """按 scene_key 获取 scene 内容记录。"""
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, scene_key, scene_type, content_text, content_hash,
+                       enabled, order_index, created_at, updated_at
+                FROM komari_decision_scenes
+                WHERE scene_key = $1
+                """,
+                scene_key,
+            )
+            return dict(row) if row else None
+
+    async def upsert_scene(
+        self,
+        *,
+        scene_key: str,
+        scene_type: str,
+        content_text: str,
+        enabled: bool = True,
+        order_index: int = 0,
+    ) -> dict[str, Any]:
+        """新增或更新 scene 内容记录。"""
+        scene_key = scene_key.strip()
+        scene_type = scene_type.strip()
+        content_text = content_text.strip()
+        if not scene_key:
+            msg = "scene_key 不能为空"
+            raise ValueError(msg)
+        if scene_type not in {"fixed", "general"}:
+            msg = "scene_type 只能是 fixed 或 general"
+            raise ValueError(msg)
+        if not content_text:
+            msg = "content_text 不能为空"
+            raise ValueError(msg)
+        content_hash = self.compute_text_hash(content_text)
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO komari_decision_scenes
+                (scene_key, scene_type, content_text, content_hash, enabled, order_index)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (scene_key) DO UPDATE
+                SET scene_type = EXCLUDED.scene_type,
+                    content_text = EXCLUDED.content_text,
+                    content_hash = EXCLUDED.content_hash,
+                    enabled = EXCLUDED.enabled,
+                    order_index = EXCLUDED.order_index,
+                    updated_at = NOW()
+                RETURNING id, scene_key, scene_type, content_text, content_hash,
+                          enabled, order_index, created_at, updated_at
+                """,
+                scene_key,
+                scene_type,
+                content_text,
+                content_hash,
+                enabled,
+                order_index,
+            )
+            return dict(row)
+
+    async def delete_scene(self, scene_key: str) -> bool:
+        """删除 scene 内容记录，必需 fixed key 不允许删除。"""
+        if scene_key in {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}:
+            msg = f"必需 fixed scene 不允许删除: {scene_key}"
+            raise ValueError(msg)
+        async with self.pg_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM komari_decision_scenes
+                WHERE scene_key = $1
+                """,
+                scene_key,
+            )
+        affected = int(result.split()[-1])
+        return affected > 0
+
+    async def has_any_scene(self) -> bool:
+        """检查 scene 内容表是否已有记录。"""
+        async with self.pg_pool.acquire() as conn:
+            value = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM komari_decision_scenes)")
+            return bool(value)
 
     async def create_scene_set(
         self,
@@ -79,30 +202,34 @@ class SceneRepository:
         if not items:
             return 0
 
-        values: list[tuple[Any, ...]] = [
-            (
-                set_id,
-                str(item["scene_key"]),
-                str(item["scene_type"]),
-                str(item["content_text"]),
-                str(item["content_hash"]),
-                bool(item.get("enabled", True)),
-                int(item.get("order_index", 0)),
-                item.get("embedding"),
-                item.get("embedding_dim"),
-                str(item.get("status", "PENDING")),
-                item.get("error_message"),
-                item.get("embedded_at"),
+        values: list[tuple[Any, ...]] = []
+        for item in items:
+            scene_id = item.get("scene_id")
+            if scene_id is None:
+                scene = await self.get_scene_by_key(str(item["scene_key"]))
+                if scene is None:
+                    msg = f"scene 内容记录不存在: {item['scene_key']}"
+                    raise ValueError(msg)
+                scene_id = scene["id"]
+            values.append(
+                (
+                    set_id,
+                    int(scene_id),
+                    str(item["content_hash"]),
+                    item.get("embedding"),
+                    item.get("embedding_dim"),
+                    str(item.get("status", "PENDING")),
+                    item.get("error_message"),
+                    item.get("embedded_at"),
+                )
             )
-            for item in items
-        ]
         async with self.pg_pool.acquire() as conn:
             await conn.executemany(
                 """
                 INSERT INTO komari_memory_scene_item
-                (set_id, scene_key, scene_type, content_text, content_hash, enabled,
-                 order_index, embedding, embedding_dim, status, error_message, embedded_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                (set_id, scene_id, content_hash, embedding, embedding_dim,
+                 status, error_message, embedded_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 values,
             )
@@ -288,24 +415,25 @@ class SceneRepository:
     ) -> list[dict[str, Any]]:
         """按 set 获取 scene 条目。"""
         sql = """
-            SELECT id, set_id, scene_key, scene_type, content_text, content_hash,
-                   enabled, order_index, embedding, embedding_dim,
-                   status, error_message, embedded_at
-            FROM komari_memory_scene_item
-            WHERE set_id = $1
+            SELECT i.id, i.set_id, i.scene_id, s.scene_key, s.scene_type,
+                   s.content_text, i.content_hash, s.enabled, s.order_index,
+                   i.embedding, i.embedding_dim, i.status, i.error_message, i.embedded_at
+            FROM komari_memory_scene_item i
+            JOIN komari_decision_scenes s ON s.id = i.scene_id
+            WHERE i.set_id = $1
         """
         params: list[Any] = [set_id]
         idx = 2
 
         if status is not None:
-            sql += f" AND status = ${idx}"
+            sql += f" AND i.status = ${idx}"
             params.append(status)
             idx += 1
 
         if enabled_only:
-            sql += " AND enabled = TRUE"
+            sql += " AND s.enabled = TRUE"
 
-        sql += " ORDER BY order_index ASC, id ASC"
+        sql += " ORDER BY s.order_index ASC, i.id ASC"
 
         if limit is not None:
             sql += f" LIMIT ${idx}"
@@ -317,21 +445,32 @@ class SceneRepository:
 
     async def find_reusable_ready_item(
         self,
-        scene_key: str,
+        *,
+        scene_id: int | None = None,
         content_hash: str,
         embedding_model: str,
         embedding_instruction_hash: str,
+        scene_key: str | None = None,
     ) -> dict[str, Any] | None:
         """查找可复用 embedding 的 READY 条目。"""
+        if scene_id is None:
+            if scene_key is None:
+                msg = "scene_id 或 scene_key 必须提供一个"
+                raise ValueError(msg)
+            scene = await self.get_scene_by_key(scene_key)
+            if scene is None:
+                return None
+            scene_id = int(scene["id"])
         async with self.pg_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT i.id, i.set_id, i.scene_key, i.scene_type, i.content_text,
-                       i.content_hash, i.enabled, i.order_index, i.embedding,
-                       i.embedding_dim, i.status, i.error_message, i.embedded_at
+                SELECT i.id, i.set_id, i.scene_id, ds.scene_key, ds.scene_type,
+                       ds.content_text, i.content_hash, ds.enabled, ds.order_index,
+                       i.embedding, i.embedding_dim, i.status, i.error_message, i.embedded_at
                 FROM komari_memory_scene_item i
                 JOIN komari_memory_scene_set s ON s.id = i.set_id
-                WHERE i.scene_key = $1
+                JOIN komari_decision_scenes ds ON ds.id = i.scene_id
+                WHERE i.scene_id = $1
                   AND i.content_hash = $2
                   AND i.status = 'READY'
                   AND i.embedding IS NOT NULL
@@ -341,7 +480,7 @@ class SceneRepository:
                 ORDER BY COALESCE(s.ready_at, s.created_at) DESC, s.id DESC
                 LIMIT 1
                 """,
-                scene_key,
+                scene_id,
                 content_hash,
                 embedding_model,
                 embedding_instruction_hash,
@@ -361,13 +500,14 @@ class SceneRepository:
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, set_id, scene_key, scene_type, content_text, content_hash,
-                       enabled, order_index, embedding, embedding_dim,
-                       status, error_message, embedded_at
-                FROM komari_memory_scene_item
-                WHERE set_id = $1
-                  AND status = 'PENDING'
-                ORDER BY order_index ASC, id ASC
+                SELECT i.id, i.set_id, i.scene_id, s.scene_key, s.scene_type,
+                       s.content_text, i.content_hash, s.enabled, s.order_index,
+                       i.embedding, i.embedding_dim, i.status, i.error_message, i.embedded_at
+                FROM komari_memory_scene_item i
+                JOIN komari_decision_scenes s ON s.id = i.scene_id
+                WHERE i.set_id = $1
+                  AND i.status = 'PENDING'
+                ORDER BY s.order_index ASC, i.id ASC
                 LIMIT $2
                 """,
                 set_id,

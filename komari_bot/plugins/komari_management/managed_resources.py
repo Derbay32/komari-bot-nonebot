@@ -16,13 +16,13 @@ class ConfigManagerProtocol(Protocol):
     """管理接口所需的最小配置管理器协议。"""
 
     @property
-    def config_file(self) -> Path: ...
+    def config_source(self) -> str: ...
 
     def get(self) -> BaseModel: ...
 
     def update_field(self, field_name: str, value: Any) -> BaseModel: ...
 
-    def reload_from_json(self) -> BaseModel: ...
+    def reload(self) -> BaseModel: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,5 +40,5 @@ class ManagedPromptResource:
 
     resource_id: str
     display_name: str
-    file_path: Path
     defaults: dict[str, str]
+    legacy_file_path: Path | None = None

@@ -49,10 +49,14 @@ class _FakeResponse:
         content_type: str,
         body: bytes,
         chunks: list[bytes] | None = None,
+        headers: dict[str, str] | None = None,
+        url: str = "https://93.184.216.34/a.png",
     ) -> None:
         self.status = status
         self.content_length = content_length
         self.content_type = content_type
+        self.headers = headers or {}
+        self.url = url
         self._body = body
         self.content = _FakeContent(chunks or [body])
         self.read_calls = 0
@@ -93,7 +97,7 @@ class _FakeSession:
         self._responses = list(responses)
         self.calls = 0
 
-    def get(self, _url: str) -> _FakeRequestContext:
+    def get(self, _url: str, **_kwargs: object) -> _FakeRequestContext:
         item = self._responses[self.calls]
         self.calls += 1
         if isinstance(item, Exception):
@@ -111,7 +115,7 @@ def test_download_single_image_reads_known_length_response_to_eof() -> None:
     )
     session = _FakeSession([response])
 
-    result = _download_with_fake_session(session, "https://example.com/a.png")
+    result = _download_with_fake_session(session, "https://93.184.216.34/a.png")
 
     assert result == _encode_data_uri(body, "image/png")
     assert response.read_calls == 1
@@ -127,7 +131,7 @@ def test_download_single_image_reads_chunked_response_until_eof() -> None:
     )
     session = _FakeSession([response])
 
-    result = _download_with_fake_session(session, "https://example.com/a.jpg")
+    result = _download_with_fake_session(session, "https://93.184.216.34/a.jpg")
 
     assert result == _encode_data_uri(b"abcdef", "image/jpeg")
     assert response.read_calls == 0
@@ -146,7 +150,7 @@ def test_download_single_image_rejects_oversized_chunked_response(
     )
     session = _FakeSession([response])
 
-    result = _download_with_fake_session(session, "https://example.com/a.png")
+    result = _download_with_fake_session(session, "https://93.184.216.34/a.png")
 
     assert result is None
 
@@ -172,7 +176,76 @@ def test_download_single_image_retries_temporary_http_failure(
     )
     session = _FakeSession([first, second])
 
-    result = _download_with_fake_session(session, "https://example.com/a.png")
+    result = _download_with_fake_session(session, "https://93.184.216.34/a.png")
 
     assert result == _encode_data_uri(b"done", "image/png")
     assert session.calls == 2
+
+
+def test_normalize_image_source_rejects_data_uri() -> None:
+    assert image_downloader._normalize_image_source("data:image/png;base64,AAAA") is None
+    assert (
+        image_downloader._normalize_image_source("https://93.184.216.34/a.png")
+        == "https://93.184.216.34/a.png"
+    )
+
+
+def test_validate_download_url_rejects_blocked_networks() -> None:
+    blocked_urls = [
+        "http://127.0.0.1/a.jpg",
+        "http://localhost/a.jpg",
+        "http://10.0.0.1/a.jpg",
+        "http://172.16.0.1/a.jpg",
+        "http://192.168.1.1/a.jpg",
+        "http://169.254.169.254/latest/meta-data/",
+    ]
+
+    async def _validate_all() -> list[bool]:
+        return [
+            await image_downloader._validate_download_url(url) for url in blocked_urls
+        ]
+
+    assert asyncio.run(_validate_all()) == [False] * len(blocked_urls)
+
+
+def test_validate_download_url_allows_public_ip() -> None:
+    assert asyncio.run(
+        image_downloader._validate_download_url("https://93.184.216.34/a.png")
+    )
+
+
+def test_download_single_image_rejects_redirect_to_blocked_network() -> None:
+    redirect = _FakeResponse(
+        status=302,
+        content_length=0,
+        content_type="text/plain",
+        body=b"",
+        headers={"Location": "http://127.0.0.1/a.png"},
+        url="https://93.184.216.34/a.png",
+    )
+    session = _FakeSession([redirect])
+
+    result = _download_with_fake_session(session, "https://93.184.216.34/a.png")
+
+    assert result is None
+    assert session.calls == 1
+
+
+def test_download_single_image_rejects_too_many_redirects() -> None:
+    responses: list[_FakeResponse | Exception] = [
+        _FakeResponse(
+            status=302,
+            content_length=0,
+            content_type="text/plain",
+            body=b"",
+            headers={"Location": f"https://93.184.216.34/{index}.png"},
+            url=f"https://93.184.216.34/{index - 1}.png",
+        )
+        for index in range(1, 5)
+    ]
+    session = _FakeSession(responses)
+
+    result = _download_with_fake_session(session, "https://93.184.216.34/0.png")
+
+    assert result is None
+    assert session.calls == 4

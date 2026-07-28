@@ -1,24 +1,17 @@
 """Komari Memory LLM 调用服务，封装 llm_provider 插件。"""
 
-from __future__ import annotations
-
 import json
 import re
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from nonebot import logger
 from nonebot.plugin import require
 
-from ..config_schema import KomariMemoryConfigSchema  # noqa: TC001
+from ..config_schema import KomariMemoryConfigSchema
 from ..core.retry import retry_async
-from .summary_prompt_template import (
-    get_template as get_summary_template,
-)
-from .summary_prompt_template import (
-    render_template as render_summary_template,
-)
+from .summary_prompt_template import get_template as get_summary_template
+from .summary_prompt_template import render_template as render_summary_template
 from .token_counter import estimate_text_tokens
 
 if TYPE_CHECKING:
@@ -27,23 +20,49 @@ if TYPE_CHECKING:
 # 依赖 llm_provider 插件
 llm_provider = require("llm_provider")
 
-_MESSAGE_SPLIT_MARKER = "[分片0000] "
-_MAX_EXISTING_TRAITS_PER_USER = 5
-_MAX_EXISTING_INTERACTION_RECORDS_PER_USER = 3
+_MAX_SUMMARY_MEMORIES = 8
+_SUMMARY_TOKEN_WARNING_THRESHOLD = 32000
+
+_OUTPUT_SUMMARY_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "output_summary_result",
+        "description": (
+            "输出最终的对话总结结果。将群聊记录按话题或时间段拆分为多段独立记忆，"
+            "每段记忆包含简短总结和重要性评分。请在完成所有分析后调用此工具。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "description": "对话记忆数组，每条记忆独立存储",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "该段对话的简短总结",
+                            },
+                            "importance": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 5,
+                                "description": "该段对话的重要性评分 1-5",
+                            },
+                        },
+                        "required": ["content", "importance"],
+                    },
+                },
+            },
+            "required": ["memories"],
+        },
+    },
+}
 
 
-@dataclass(frozen=True)
-class _ConversationChunk:
-    lines: list[str]
-    estimated_tokens: int
-
-
-@dataclass(frozen=True)
-class _ExistingContextBuildResult:
-    text: str
-    estimated_tokens: int
-    included_profiles: int
-    truncated: bool
+class _SummaryFallbackError(Exception):
+    """内部异常：标记当前总结输出 layer 失败，触发下一层 fallback。"""
 
 
 def _extract_json_from_markdown(text: str) -> str:
@@ -78,664 +97,180 @@ def _extract_tag_content(text: str, tag: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
 
-def _build_existing_context(
-    existing_profiles: list[dict] | None = None,
-    existing_interactions: list[dict] | None = None,
-) -> _ExistingContextBuildResult:
-    return _build_existing_context_with_budget(
-        existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
-        token_budget=None,
-    )
-
-
-def _compact_profile_line(profile: dict[str, Any]) -> str | None:
-    """压缩单个用户画像，避免把历史冗余字段整包塞进 prompt。"""
-    user_id = str(profile.get("user_id", "")).strip()
-    if not user_id:
-        return None
-
-    display_name = str(profile.get("display_name", "")).strip()
-    traits_raw = profile.get("traits")
-    compact_traits: list[dict[str, Any]] = []
-    if isinstance(traits_raw, dict):
-        sortable_traits: list[tuple[str, dict[str, Any]]] = []
-        for key, raw in traits_raw.items():
-            if isinstance(raw, dict):
-                sortable_traits.append((str(key), raw))
-        sortable_traits.sort(
-            key=lambda item: (
-                str(item[1].get("updated_at", "")),
-                int(item[1].get("importance", 0) or 0),
-            ),
-            reverse=True,
-        )
-        for key, raw in sortable_traits[:_MAX_EXISTING_TRAITS_PER_USER]:
-            value = str(raw.get("value", "")).strip()
-            if not value:
-                continue
-            compact_traits.append(
-                {
-                    "key": key,
-                    "value": value,
-                    "category": str(raw.get("category", "general")).strip()
-                    or "general",
-                    "importance": int(raw.get("importance", 3) or 3),
-                }
-            )
-    elif isinstance(traits_raw, list):
-        for raw in traits_raw[:_MAX_EXISTING_TRAITS_PER_USER]:
-            if not isinstance(raw, dict):
-                continue
-            key = str(raw.get("key", "")).strip()
-            value = str(raw.get("value", "")).strip()
-            if not key or not value:
-                continue
-            compact_traits.append(
-                {
-                    "key": key,
-                    "value": value,
-                    "category": str(raw.get("category", "general")).strip()
-                    or "general",
-                    "importance": int(raw.get("importance", 3) or 3),
-                }
-            )
-
-    return (
-        f"- [user_id:{user_id}] display_name={display_name} "
-        f"traits={json.dumps(compact_traits, ensure_ascii=False)}"
-    )
-
-
-def _compact_interaction_line(interaction: dict[str, Any]) -> str | None:
-    """压缩单个用户互动历史，便于模型输出增量操作。"""
-    user_id = str(interaction.get("user_id", "")).strip()
-    if not user_id:
-        return None
-
-    display_name = str(interaction.get("display_name", "")).strip()
-    file_type = str(interaction.get("file_type", "")).strip()
-    description = str(interaction.get("description", "")).strip()
-    summary = str(interaction.get("summary", "")).strip()
-
-    compact_records: list[dict[str, str]] = []
-    records_raw = interaction.get("records")
-    if isinstance(records_raw, list):
-        for raw in records_raw[-_MAX_EXISTING_INTERACTION_RECORDS_PER_USER:]:
-            if not isinstance(raw, dict):
-                continue
-            compact_record = {
-                "event": str(raw.get("event", "")).strip(),
-                "result": str(raw.get("result", "")).strip(),
-                "emotion": str(raw.get("emotion", "")).strip(),
-            }
-            if not any(compact_record.values()):
-                continue
-            compact_records.append(compact_record)
-
-    if not any([display_name, file_type, description, summary, compact_records]):
-        return None
-
-    return (
-        f"- [user_id:{user_id}] display_name={display_name} "
-        f"file_type={json.dumps(file_type, ensure_ascii=False)} "
-        f"description={json.dumps(description, ensure_ascii=False)} "
-        f"summary={json.dumps(summary, ensure_ascii=False)} "
-        f"recent_records={json.dumps(compact_records, ensure_ascii=False)}"
-    )
-
-
-def _build_existing_context_with_budget(
-    *,
-    existing_profiles: list[dict] | None = None,
-    existing_interactions: list[dict] | None = None,
-    token_budget: int | None,
-) -> _ExistingContextBuildResult:
-    """构建可控大小的已有画像提示。"""
-    template = get_summary_template()
-    instruction_block = f"{template['existing_context_instruction_block']}\n\n"
-    instruction_tokens = estimate_text_tokens(instruction_block)
-    if token_budget is not None and token_budget <= instruction_tokens:
-        return _ExistingContextBuildResult(
-            text="",
-            estimated_tokens=0,
-            included_profiles=0,
-            truncated=bool(existing_profiles),
-        )
-
-    data_budget = None
-    if token_budget is not None:
-        data_budget = max(0, token_budget - instruction_tokens)
-
-    blocks: list[str] = []
-    included_profiles = 0
-    truncated = False
-
-    def _current_tokens() -> int:
-        return estimate_text_tokens("".join(blocks))
-
-    def _append_block(block: str) -> bool:
-        if data_budget is None:
-            blocks.append(block)
-            return True
-        candidate = "".join(blocks) + block
-        if estimate_text_tokens(candidate) > data_budget:
-            return False
-        blocks.append(block)
-        return True
-
-    profile_lines = [
-        line
-        for profile in (existing_profiles or [])
-        if (line := _compact_profile_line(profile)) is not None
-    ]
-    if profile_lines:
-        profile_header = template["existing_profiles_header"]
-        header_added = False
-        for line in profile_lines:
-            block = f"{profile_header}\n{line}\n" if not header_added else f"{line}\n"
-            if _append_block(block):
-                header_added = True
-                included_profiles += 1
-            else:
-                truncated = True
-                break
-        if header_added:
-            _append_block("\n")
-
-    interaction_lines = [
-        line
-        for interaction in (existing_interactions or [])
-        if (line := _compact_interaction_line(interaction)) is not None
-    ]
-    if interaction_lines:
-        interaction_header = template.get(
-            "existing_interactions_header",
-            "【已知互动历史（数据库中已有记录）】\n以下是目前已存储的用户互动备忘录：",
-        )
-        header_added = False
-        for line in interaction_lines:
-            block = (
-                f"{interaction_header}\n{line}\n" if not header_added else f"{line}\n"
-            )
-            if _append_block(block):
-                header_added = True
-            else:
-                truncated = True
-                break
-        if header_added:
-            _append_block("\n")
-
-    if truncated:
-        _append_block(f"{template['truncated_context_marker']}\n\n")
-
-    data_text = "".join(blocks)
-    if not data_text:
-        return _ExistingContextBuildResult(
-            text="",
-            estimated_tokens=0,
-            included_profiles=0,
-            truncated=truncated,
-        )
-
-    full_text = data_text + instruction_block
-    return _ExistingContextBuildResult(
-        text=full_text,
-        estimated_tokens=estimate_text_tokens(full_text),
-        included_profiles=included_profiles,
-        truncated=truncated,
-    )
-
-
-def _build_summary_prompt(
-    conversation_text: str,
-    *,
-    existing_context: str = "",
-) -> str:
-    """构建原始对话总结提示词。"""
-    template = get_summary_template()
-    return render_summary_template(
-        template["summary_prompt"],
-        conversation_text=conversation_text,
-        existing_context=existing_context,
-        json_response_example=template["json_response_example"],
-    )
-
-
-def _build_merge_prompt(
-    chunk_summaries_text: str,
-    *,
-    existing_context: str = "",
-) -> str:
-    """构建分段总结后的二次汇总提示词。"""
-    template = get_summary_template()
-    return render_summary_template(
-        template["merge_prompt"],
-        chunk_summaries_text=chunk_summaries_text,
-        existing_context=existing_context,
-        json_response_example=template["json_response_example"],
-    )
-
-
-def _format_message_prefix(
-    message: MessageSchema,
+def _format_messages_for_summary(
+    messages: list["MessageSchema"],
     config: KomariMemoryConfigSchema,
 ) -> str:
-    if message.is_bot:
-        return f"[bot] {config.bot_nickname}: "
-    return f"[user_id:{message.user_id}] {message.user_nickname}: "
-
-
-def _format_message_line(
-    message: MessageSchema,
-    config: KomariMemoryConfigSchema,
-) -> str:
-    return f"{_format_message_prefix(message, config)}{message.content}"
-
-
-def _estimate_payload_limit(config: KomariMemoryConfigSchema) -> int:
-    """估算单个原文分段可承载的消息正文大小。"""
-    prompt_base_tokens = estimate_text_tokens(_build_summary_prompt(""))
-    return max(1, config.summary_chunk_token_limit - prompt_base_tokens)
-
-
-def _split_oversized_message(
-    *,
-    prefix: str,
-    content: str,
-    payload_limit: int,
-) -> list[str]:
-    """把单条超长消息拆成多个分片，避免单条消息打爆输入上限。"""
-    max_content_tokens = max(
-        1,
-        payload_limit
-        - estimate_text_tokens(prefix)
-        - estimate_text_tokens(_MESSAGE_SPLIT_MARKER),
-    )
-
-    parts: list[str] = []
-    cursor = 0
-    part_index = 1
-    while cursor < len(content):
-        piece = content[cursor : cursor + max_content_tokens]
-        line = f"{prefix}[分片{part_index}] {piece}"
-        while piece and estimate_text_tokens(line) > payload_limit:
-            piece = piece[:-1]
-            line = f"{prefix}[分片{part_index}] {piece}"
-
-        if not piece:
-            piece = content[cursor : cursor + 1]
-            line = f"{prefix}[分片{part_index}] {piece}"
-
-        parts.append(line)
-        cursor += len(piece)
-        part_index += 1
-
-    return parts
-
-
-def _chunk_formatted_messages(
-    messages: list[MessageSchema],
-    config: KomariMemoryConfigSchema,
-) -> tuple[list[_ConversationChunk], bool]:
-    """按当前近似 token 口径把原始消息切成多个分段。"""
-    payload_limit = _estimate_payload_limit(config)
-    prepared_lines: list[str] = []
-    oversized_message_split = False
-
+    """将消息缓冲格式化为总结/画像 Agent 共用的群聊记录文本。"""
+    lines: list[str] = []
     for message in messages:
-        formatted_line = _format_message_line(message, config)
-        if estimate_text_tokens(formatted_line) <= payload_limit:
-            prepared_lines.append(formatted_line)
-            continue
+        if message.is_bot:
+            lines.append(f"[bot] {config.bot_nickname}: {message.content}")
+        else:
+            lines.append(f"[user_id:{message.user_id}] {message.user_nickname}: {message.content}")
+    return "\n".join(lines)
 
-        oversized_message_split = True
-        prepared_lines.extend(
-            _split_oversized_message(
-                prefix=_format_message_prefix(message, config),
-                content=message.content,
-                payload_limit=payload_limit,
-            )
-        )
 
-    chunks: list[_ConversationChunk] = []
-    current_lines: list[str] = []
-    current_tokens = 0
-    for line in prepared_lines:
-        line_tokens = estimate_text_tokens(line)
-        separator_tokens = 1 if current_lines else 0
-        if (
-            current_lines
-            and current_tokens + separator_tokens + line_tokens > payload_limit
-        ):
-            chunks.append(
-                _ConversationChunk(
-                    lines=list(current_lines),
-                    estimated_tokens=current_tokens,
-                )
-            )
-            current_lines = [line]
-            current_tokens = line_tokens
-            continue
+def _build_user_message(
+    conversation_text: str,
+    participants: list[str],
+    display_name_map: dict[str, str],
+) -> str:
+    """构建与画像 Agent 前缀一致的 user 消息前三段。"""
+    parts: list[str] = []
+    parts.append(f"【群聊记录】\n{conversation_text}")
+    parts.append(f"【参与用户 user_id】\n{json.dumps(participants, ensure_ascii=False)}")
+    parts.append(f"【昵称映射】\n{json.dumps(display_name_map, ensure_ascii=False)}")
+    return "\n\n".join(parts)
 
-        if current_lines:
-            current_tokens += 1
-        current_lines.append(line)
-        current_tokens += line_tokens
 
-    if current_lines:
-        chunks.append(
-            _ConversationChunk(
-                lines=list(current_lines),
-                estimated_tokens=current_tokens,
-            )
-        )
+def _build_summary_messages(
+    *,
+    conversation_text: str,
+    participants: list[str],
+    display_name_map: dict[str, str],
+) -> list[dict[str, str]]:
+    """构建与画像 Agent 共享前缀的三段式总结 messages。"""
+    template = get_summary_template()
+    user_content = _build_user_message(conversation_text, participants, display_name_map)
+    user_content += "\n\n请生成对话总结。"
+    workflow = render_summary_template(
+        template["summary_workflow_system"],
+        json_response_example=template["json_response_example"],
+    )
+    return [
+        {"role": "system", "content": template["memory_summary_common_system"]},
+        {"role": "user", "content": user_content},
+        {"role": "system", "content": workflow},
+    ]
 
-    return chunks, oversized_message_split
+
+def _estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+    """轻量估算 messages 文本 token，用于日志观测。"""
+    return sum(estimate_text_tokens(str(message.get("content", ""))) for message in messages)
 
 
 def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
-    """规范化总结结果结构。"""
-    normalized_result = dict(result)
-    normalized_result["summary"] = str(normalized_result.get("summary", "")).strip()
+    """规范化总结结果，确保 memories 数组格式正确。"""
+    memories_raw = result.get("memories")
+    if not isinstance(memories_raw, list):
+        memories_raw = []
 
-    profile_operation_payloads = normalized_result.get("user_profile_operations")
-    if not isinstance(profile_operation_payloads, list):
-        legacy_profiles = normalized_result.get("user_profiles")
-        if isinstance(legacy_profiles, list):
-            profile_operation_payloads = _convert_legacy_profiles_to_operations(
-                legacy_profiles
-            )
-        else:
-            profile_operation_payloads = []
-    normalized_result["user_profile_operations"] = _normalize_user_operation_payloads(
-        profile_operation_payloads,
-        operation_type="profile",
-    )
-
-    interaction_operation_payloads = normalized_result.get(
-        "user_interaction_operations"
-    )
-    if not isinstance(interaction_operation_payloads, list):
-        legacy_interactions = normalized_result.get("user_interactions")
-        if isinstance(legacy_interactions, list):
-            interaction_operation_payloads = _convert_legacy_interactions_to_operations(
-                legacy_interactions
-            )
-        else:
-            interaction_operation_payloads = []
-    normalized_result["user_interaction_operations"] = (
-        _normalize_user_operation_payloads(
-            interaction_operation_payloads,
-            operation_type="interaction",
-        )
-    )
-
-    try:
-        importance = int(normalized_result.get("importance", 3))
-        normalized_result["importance"] = max(1, min(5, importance))
-    except (TypeError, ValueError):
-        normalized_result["importance"] = 3
-
-    return normalized_result
-
-
-def _normalize_user_operation_payloads(
-    payloads: list[Any],
-    *,
-    operation_type: str,
-) -> list[dict[str, Any]]:
-    normalized_payloads: list[dict[str, Any]] = []
-    for payload in payloads:
-        if not isinstance(payload, dict):
+    normalized_memories: list[dict[str, Any]] = []
+    seen_contents: set[str] = set()
+    for memory in memories_raw:
+        if not isinstance(memory, dict):
             continue
-        user_id = str(payload.get("user_id", "")).strip()
-        if not user_id:
+        content = str(memory.get("content", "")).strip()
+        if len(content) < 8 or content in seen_contents:
             continue
-        operations_raw = payload.get("operations")
-        if not isinstance(operations_raw, list):
-            continue
-        normalized_operations: list[dict[str, Any]] = []
-        for operation in operations_raw:
-            if not isinstance(operation, dict):
-                continue
-            normalized_operation = (
-                _normalize_profile_operation(operation)
-                if operation_type == "profile"
-                else _normalize_interaction_operation(operation)
-            )
-            if normalized_operation is not None:
-                normalized_operations.append(normalized_operation)
-
-        if not normalized_operations:
-            continue
-        normalized_payloads.append(
+        try:
+            importance = int(memory.get("importance", 3))
+        except (TypeError, ValueError):
+            importance = 3
+        seen_contents.add(content)
+        normalized_memories.append(
             {
-                "user_id": user_id,
-                "display_name": str(payload.get("display_name", "")).strip(),
-                "operations": normalized_operations,
+                "content": content,
+                "importance": max(1, min(5, importance)),
             }
         )
-    return normalized_payloads
+        if len(normalized_memories) >= _MAX_SUMMARY_MEMORIES:
+            break
+
+    return {"memories": normalized_memories}
 
 
-def _normalize_profile_operation(operation: dict[str, Any]) -> dict[str, Any] | None:
-    op = str(operation.get("op", "")).strip().lower()
-    field = str(operation.get("field", operation.get("target", ""))).strip()
-    if op not in {"add", "replace", "delete"}:
-        return None
-    if field != "trait":
-        return None
-
-    normalized: dict[str, Any] = {
-        "op": op,
-        "field": field,
-    }
-    key = str(operation.get("key", "")).strip()
-    if not key:
-        return None
-    normalized["key"] = key
-    if op == "delete":
-        return normalized
-
-    value = str(operation.get("value", "")).strip()
-    if not value:
-        return None
-    category = str(operation.get("category", "general")).strip() or "general"
-    if category not in {"preference", "fact", "relation", "general"}:
-        category = "general"
-    try:
-        importance = int(operation.get("importance", 3))
-    except (TypeError, ValueError):
-        importance = 3
-
-    normalized["value"] = value
-    normalized["category"] = category
-    normalized["importance"] = max(1, min(5, importance))
-    return normalized
-
-
-def _normalize_interaction_operation(
-    operation: dict[str, Any],
-) -> dict[str, Any] | None:
-    op = str(operation.get("op", "")).strip().lower()
-    field = str(operation.get("field", operation.get("target", ""))).strip()
-    allowed_ops = {"add", "replace", "delete"}
-    allowed_fields = {"file_type", "description", "summary", "record"}
-    if op not in allowed_ops or field not in allowed_fields:
-        return None
-
-    normalized: dict[str, Any] = {
-        "op": op,
-        "field": field,
-    }
-    value: str | dict[str, str] | None = None
-    if field == "record":
-        if op == "replace":
-            return None
-        value = _normalize_record_value(operation.get("value"))
-    elif op != "delete":
-        text = str(operation.get("value", "")).strip()
-        value = text or None
-
-    if op != "delete" and value is None:
-        return None
-    if value is not None:
-        normalized["value"] = value
-    return normalized
-
-
-def _normalize_record_value(value: Any) -> dict[str, str] | None:
-    if not isinstance(value, dict):
-        return None
-    normalized = {
-        "event": str(value.get("event", "")).strip(),
-        "result": str(value.get("result", "")).strip(),
-        "emotion": str(value.get("emotion", "")).strip(),
-    }
-    if not any(normalized.values()):
-        return None
-    return normalized
-
-
-def _convert_legacy_profiles_to_operations(
-    profiles: list[Any],
-) -> list[dict[str, Any]]:
-    converted: list[dict[str, Any]] = []
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        user_id = str(profile.get("user_id", "")).strip()
-        if not user_id:
-            continue
-        operations: list[dict[str, Any]] = []
-        display_name = str(profile.get("display_name", "")).strip()
-        traits = profile.get("traits")
-        if isinstance(traits, list):
-            for trait in traits:
-                if not isinstance(trait, dict):
-                    continue
-                key = str(trait.get("key", "")).strip()
-                value = str(trait.get("value", "")).strip()
-                if not key or not value:
-                    continue
-                category = str(trait.get("category", "general")).strip() or "general"
-                if category not in {"preference", "fact", "relation", "general"}:
-                    category = "general"
-                try:
-                    importance = int(trait.get("importance", 3))
-                except (TypeError, ValueError):
-                    importance = 3
-                operations.append(
-                    {
-                        "op": "replace",
-                        "field": "trait",
-                        "key": key,
-                        "value": value,
-                        "category": category,
-                        "importance": max(1, min(5, importance)),
-                    }
-                )
-
-        if operations:
-            converted.append(
-                {
-                    "user_id": user_id,
-                    "display_name": display_name,
-                    "operations": operations,
-                }
-            )
-    return converted
-
-
-def _convert_legacy_interactions_to_operations(
-    interactions: list[Any],
-) -> list[dict[str, Any]]:
-    converted: list[dict[str, Any]] = []
-    for interaction in interactions:
-        if not isinstance(interaction, dict):
-            continue
-        user_id = str(interaction.get("user_id", "")).strip()
-        if not user_id:
-            continue
-        operations: list[dict[str, Any]] = []
-        for field in ("file_type", "description", "summary"):
-            value = str(interaction.get(field, "")).strip()
-            if value:
-                operations.append(
-                    {
-                        "op": "replace",
-                        "field": field,
-                        "value": value,
-                    }
-                )
-
-        records = interaction.get("records")
-        if isinstance(records, list):
-            for record in records[-6:]:
-                normalized_record = _normalize_record_value(record)
-                if normalized_record is None:
-                    continue
-                operations.append(
-                    {
-                        "op": "add",
-                        "field": "record",
-                        "value": normalized_record,
-                    }
-                )
-
-        if operations:
-            converted.append(
-                {
-                    "user_id": user_id,
-                    "display_name": str(interaction.get("display_name", "")).strip(),
-                    "operations": operations,
-                }
-            )
-    return converted
-
-
-async def _request_structured_summary(
-    *,
-    prompt: str,
+async def _request_via_json_mode(
+    messages: list[dict[str, str]],
     config: KomariMemoryConfigSchema,
     trace_id: str,
-    stage: str,
-    chunk_index: int | None = None,
-    chunk_total: int | None = None,
-    estimated_input_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """调用总结模型并解析结构化 JSON。"""
-    estimated_prompt_tokens = estimate_text_tokens(prompt)
-    logger.info(
-        "[KomariMemory] 总结请求追踪: trace_id={} stage={} chunk={}/{} estimated_input_tokens={} estimated_prompt_tokens={}",
-        trace_id,
-        stage,
-        chunk_index if chunk_index is not None else "-",
-        chunk_total if chunk_total is not None else "-",
-        estimated_input_tokens if estimated_input_tokens is not None else "-",
-        estimated_prompt_tokens,
-    )
-    if estimated_prompt_tokens > config.summary_chunk_token_limit:
-        logger.warning(
-            "[KomariMemory] 总结请求估算 token 超过分段上限: trace_id={} stage={} estimated={} limit={}",
-            trace_id,
-            stage,
-            estimated_prompt_tokens,
-            config.summary_chunk_token_limit,
+    """Layer 1：使用 response_format JSON mode 请求结构化总结。"""
+    try:
+        response = await llm_provider.generate_text_with_messages(
+            messages=messages,
+            model=config.llm_model_summary,
+            temperature=config.llm_temperature_summary,
+            max_tokens=config.llm_max_tokens_summary,
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
+            response_format={"type": "json_object"},
+            request_trace_id=trace_id,
+            request_phase="summary_json_mode",
         )
+        parsed = json.loads(response)
+    except Exception as exc:
+        raise _SummaryFallbackError from exc
 
-    response = await llm_provider.generate_text(
-        prompt=prompt,
+    if not isinstance(parsed, dict):
+        raise _SummaryFallbackError
+    result = _normalize_summary_result(parsed)
+    if not result.get("memories"):
+        raise _SummaryFallbackError
+    return result
+
+
+async def _request_via_tool_calling(
+    messages: list[dict[str, str]],
+    config: KomariMemoryConfigSchema,
+    trace_id: str,
+) -> dict[str, Any]:
+    """Layer 2：使用强制 tool calling 引导模型输出结构化总结。"""
+    messages_with_tool = [
+        *messages,
+        {
+            "role": "system",
+            "content": "请调用 output_summary_result 工具输出最终结果。不要输出任何其他内容。",
+        },
+    ]
+    try:
+        completion = await llm_provider.generate_messages_completion(
+            messages=messages_with_tool,
+            model=config.llm_model_summary,
+            temperature=config.llm_temperature_summary,
+            max_tokens=config.llm_max_tokens_summary,
+            tools=[_OUTPUT_SUMMARY_TOOL],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "output_summary_result"},
+            },
+            parallel_tool_calls=False,
+            thinking_mode=config.llm_thinking_mode_summary,
+            reasoning_effort=config.llm_reasoning_effort_summary,
+            request_trace_id=trace_id,
+            request_phase="summary_tool_calling",
+        )
+    except Exception as exc:
+        raise _SummaryFallbackError from exc
+
+    for tool_call in completion.tool_calls or []:
+        if tool_call.function.name != "output_summary_result":
+            continue
+        if not tool_call.parsed_arguments:
+            continue
+        result = _normalize_summary_result(tool_call.parsed_arguments)
+        if result.get("memories"):
+            return result
+    raise _SummaryFallbackError
+
+
+async def _request_via_direct_output(
+    messages: list[dict[str, str]],
+    config: KomariMemoryConfigSchema,
+    trace_id: str,
+) -> dict[str, Any]:
+    """Layer 3：直接文本输出，并从 markdown 中提取 JSON。"""
+    response = await llm_provider.generate_text_with_messages(
+        messages=messages,
         model=config.llm_model_summary,
         temperature=config.llm_temperature_summary,
         max_tokens=config.llm_max_tokens_summary,
+        thinking_mode=config.llm_thinking_mode_summary,
+        reasoning_effort=config.llm_reasoning_effort_summary,
         request_trace_id=trace_id,
-        request_phase=stage,
-        request_chunk_index=chunk_index,
-        request_chunk_total=chunk_total,
+        request_phase="summary_direct_output",
     )
-
     json_text = _extract_json_from_markdown(response)
     parsed = json.loads(json_text)
     if not isinstance(parsed, dict):
@@ -744,23 +279,37 @@ async def _request_structured_summary(
     return _normalize_summary_result(parsed)
 
 
-def _serialize_chunk_results_for_merge(
-    chunk_results: list[dict[str, Any]],
-    chunk_tokens: list[int],
-) -> str:
-    """将分段总结结果序列化为二次汇总输入。"""
-    blocks = []
-    total = len(chunk_results)
-    for index, (result, estimated_tokens) in enumerate(
-        zip(chunk_results, chunk_tokens, strict=True),
-        start=1,
-    ):
-        blocks.append(
-            f"【分段{index}/{total}】\n"
-            f"estimated_input_tokens={estimated_tokens}\n"
-            f"{json.dumps(result, ensure_ascii=False)}"
+async def _request_structured_summary(
+    *,
+    messages: list[dict[str, str]],
+    config: KomariMemoryConfigSchema,
+    trace_id: str,
+) -> dict[str, Any]:
+    """三层 fallback 的结构化总结输出。"""
+    estimated_prompt_tokens = _estimate_messages_tokens(messages)
+    logger.info(
+        "[KomariMemory] 总结请求追踪: trace_id={} estimated_tokens={}",
+        trace_id,
+        estimated_prompt_tokens,
+    )
+    if estimated_prompt_tokens > _SUMMARY_TOKEN_WARNING_THRESHOLD:
+        logger.warning(
+            "[KomariMemory] 总结输入 token 估算过高: trace_id={} estimated_tokens={}",
+            trace_id,
+            estimated_prompt_tokens,
         )
-    return "\n\n".join(blocks)
+
+    try:
+        return await _request_via_json_mode(messages, config, trace_id)
+    except _SummaryFallbackError:
+        logger.info("[KomariMemory] Layer 1 (json_mode) 失败，降级到 Layer 2 (tool_calling)")
+
+    try:
+        return await _request_via_tool_calling(messages, config, trace_id)
+    except _SummaryFallbackError:
+        logger.info("[KomariMemory] Layer 2 (tool_calling) 失败，降级到 Layer 3 (direct_output)")
+
+    return await _request_via_direct_output(messages, config, trace_id)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -777,6 +326,9 @@ async def generate_reply(
             model=config.llm_model_chat,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            thinking_mode=config.llm_thinking_mode_chat,
+            reasoning_effort=config.llm_reasoning_effort_chat,
+            request_phase="memory_reply",
         )
     else:
         raw_response = await llm_provider.generate_text(
@@ -785,6 +337,9 @@ async def generate_reply(
             system_instruction=system_prompt,
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
+            thinking_mode=config.llm_thinking_mode_chat,
+            reasoning_effort=config.llm_reasoning_effort_chat,
+            request_phase="memory_reply",
         )
 
     return _extract_tag_content(raw_response, config.response_tag)
@@ -792,111 +347,32 @@ async def generate_reply(
 
 @retry_async(max_attempts=3, base_delay=1.0)
 async def summarize_conversation(
-    messages: list[MessageSchema],
+    messages: list["MessageSchema"],
     config: KomariMemoryConfigSchema,
-    existing_profiles: list[dict] | None = None,
-    existing_interactions: list[dict] | None = None,
-) -> dict:
-    """总结对话，提取用户画像，并评估重要性（带重试机制）。"""
+    *,
+    participants: list[str],
+    display_name_map: dict[str, str],
+) -> dict[str, Any]:
+    """总结对话为多段独立记忆（oneshot，带三层 fallback + 重试）。"""
     trace_id = f"memsum-{uuid4().hex[:8]}"
     group_id = messages[0].group_id if messages else "-"
-    chunks, oversized_message_split = _chunk_formatted_messages(messages, config)
+    conversation_text = _format_messages_for_summary(messages, config)
+    summary_messages = _build_summary_messages(
+        conversation_text=conversation_text,
+        participants=participants,
+        display_name_map=display_name_map,
+    )
     logger.info(
-        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={}",
+        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={}",
         trace_id,
         group_id,
         len(messages),
-        config.summary_chunk_token_limit,
-        len(existing_profiles or []),
     )
-    if not chunks:
-        return _normalize_summary_result({})
+    if not messages:
+        return {"memories": []}
 
-    if len(chunks) == 1:
-        single_message_text = "\n".join(chunks[0].lines)
-        single_base_prompt = _build_summary_prompt(single_message_text)
-        single_context_budget = max(
-            0,
-            config.summary_chunk_token_limit - estimate_text_tokens(single_base_prompt),
-        )
-        existing_context_result = _build_existing_context_with_budget(
-            existing_profiles=existing_profiles,
-            existing_interactions=existing_interactions,
-            token_budget=single_context_budget,
-        )
-        single_prompt = _build_summary_prompt(
-            single_message_text,
-            existing_context=existing_context_result.text,
-        )
-        logger.debug(
-            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={} context_tokens={} included_profiles={} context_truncated={}",
-            trace_id,
-            chunks[0].estimated_tokens,
-            existing_context_result.estimated_tokens,
-            existing_context_result.included_profiles,
-            existing_context_result.truncated,
-        )
-        return await _request_structured_summary(
-            prompt=single_prompt,
-            config=config,
-            trace_id=trace_id,
-            stage="single",
-            chunk_index=1,
-            chunk_total=1,
-            estimated_input_tokens=chunks[0].estimated_tokens,
-        )
-
-    chunk_tokens = [chunk.estimated_tokens for chunk in chunks]
-    logger.info(
-        "[KomariMemory] 总结输入触发分段: trace_id={} chunks={} estimated_input_tokens={} oversized_message_split={}",
-        trace_id,
-        len(chunks),
-        chunk_tokens,
-        oversized_message_split,
-    )
-
-    chunk_results: list[dict[str, Any]] = []
-    for index, chunk in enumerate(chunks, start=1):
-        chunk_prompt = _build_summary_prompt("\n".join(chunk.lines))
-        chunk_results.append(
-            await _request_structured_summary(
-                prompt=chunk_prompt,
-                config=config,
-                trace_id=trace_id,
-                stage="chunk",
-                chunk_index=index,
-                chunk_total=len(chunks),
-                estimated_input_tokens=chunk.estimated_tokens,
-            )
-        )
-
-    merge_source = _serialize_chunk_results_for_merge(chunk_results, chunk_tokens)
-    merge_base_prompt = _build_merge_prompt(merge_source)
-    merge_context_budget = max(
-        0,
-        config.summary_chunk_token_limit - estimate_text_tokens(merge_base_prompt),
-    )
-    existing_context_result = _build_existing_context_with_budget(
-        existing_profiles=existing_profiles,
-        existing_interactions=existing_interactions,
-        token_budget=merge_context_budget,
-    )
-    merge_prompt = _build_merge_prompt(
-        merge_source,
-        existing_context=existing_context_result.text,
-    )
-    logger.info(
-        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={} context_tokens={} included_profiles={} context_truncated={}",
-        trace_id,
-        len(chunk_results),
-        existing_context_result.estimated_tokens,
-        existing_context_result.included_profiles,
-        existing_context_result.truncated,
-    )
     return await _request_structured_summary(
-        prompt=merge_prompt,
+        messages=summary_messages,
         config=config,
         trace_id=trace_id,
-        stage="merge",
-        estimated_input_tokens=estimate_text_tokens(merge_source),
     )

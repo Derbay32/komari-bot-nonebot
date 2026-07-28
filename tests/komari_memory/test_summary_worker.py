@@ -1,53 +1,29 @@
-"""KomariMemory 总结 worker 画像压缩测试。"""
-
-from __future__ import annotations
+"""KomariMemory 总结 worker 编排测试。"""
 
 import asyncio
 import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import nonebot.plugin
 
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.services.profile_compaction import (
-    count_profile_traits,
-)
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = (
-    PROJECT_ROOT / "komari_bot/plugins/komari_memory/handlers/summary_worker.py"
-)
+MODULE_PATH = PROJECT_ROOT / "komari_bot/plugins/komari_memory/handlers/summary_worker.py"
 PACKAGE_ROOT = PROJECT_ROOT / "komari_bot/plugins/komari_memory"
-
-
-def _make_profile(trait_count: int) -> dict[str, Any]:
-    return {
-        "version": 1,
-        "user_id": "10001",
-        "display_name": "阿明",
-        "traits": {
-            f"特征{i:02d}": {
-                "value": f"长期描述{i}",
-                "category": "general",
-                "importance": 4,
-                "updated_at": f"2026-03-21T00:00:{i % 60:02d}+08:00",
-            }
-            for i in range(trait_count)
-        },
-    }
 
 
 def _load_summary_worker_module(monkeypatch: Any) -> Any:
     def _fake_require(name: str) -> object:
         if name == "character_binding":
             return types.SimpleNamespace(
-                get_character_name=lambda user_id, fallback_nickname="": (
-                    fallback_nickname or user_id
-                ),
+                get_character_name=lambda user_id, fallback_nickname="": fallback_nickname
+                or user_id,
                 refresh_if_file_updated=lambda: False,
             )
         if name == "llm_provider":
@@ -62,12 +38,8 @@ def _load_summary_worker_module(monkeypatch: Any) -> Any:
     handlers_package.__path__ = [str(PACKAGE_ROOT / "handlers")]  # type: ignore[attr-defined]
 
     original_memory_package = sys.modules.get("komari_bot.plugins.komari_memory")
-    original_handlers_package = sys.modules.get(
-        "komari_bot.plugins.komari_memory.handlers"
-    )
-    original_module = sys.modules.get(
-        "komari_bot.plugins.komari_memory.handlers.summary_worker"
-    )
+    original_handlers_package = sys.modules.get("komari_bot.plugins.komari_memory.handlers")
+    original_module = sys.modules.get("komari_bot.plugins.komari_memory.handlers.summary_worker")
 
     sys.modules["komari_bot.plugins.komari_memory"] = memory_package
     sys.modules["komari_bot.plugins.komari_memory.handlers"] = handlers_package
@@ -85,19 +57,12 @@ def _load_summary_worker_module(monkeypatch: Any) -> Any:
         return module
     finally:
         if original_module is not None:
-            sys.modules["komari_bot.plugins.komari_memory.handlers.summary_worker"] = (
-                original_module
-            )
+            sys.modules["komari_bot.plugins.komari_memory.handlers.summary_worker"] = original_module
         else:
-            sys.modules.pop(
-                "komari_bot.plugins.komari_memory.handlers.summary_worker",
-                None,
-            )
+            sys.modules.pop("komari_bot.plugins.komari_memory.handlers.summary_worker", None)
 
         if original_handlers_package is not None:
-            sys.modules["komari_bot.plugins.komari_memory.handlers"] = (
-                original_handlers_package
-            )
+            sys.modules["komari_bot.plugins.komari_memory.handlers"] = original_handlers_package
         else:
             sys.modules.pop("komari_bot.plugins.komari_memory.handlers", None)
 
@@ -110,23 +75,25 @@ def _load_summary_worker_module(monkeypatch: Any) -> Any:
 class _FakeRedis:
     def __init__(self, messages: list[MessageSchema]) -> None:
         self._messages = messages
-        self.reset_message_count_calls: list[str] = []
-        self.reset_tokens_calls: list[str] = []
-        self.delete_buffer_calls: list[str] = []
+        self.redis = object()
+        self.snapshot_calls: list[dict[str, str]] = []
+        self.delete_processing_calls: list[dict[str, str]] = []
+        self.restore_processing_calls: list[dict[str, str]] = []
         self.update_last_summary_calls: list[str] = []
 
-    async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
-        del group_id, limit
+    async def snapshot_conversation_buffer(self, group_id: str, token: str) -> str | None:
+        self.snapshot_calls.append({"group_id": group_id, "token": token})
+        return f"komari_memory:buffer:processing:{group_id}:{token}" if self._messages else None
+
+    async def get_processing_conversation_buffer(self, processing_key: str) -> list[MessageSchema]:
+        del processing_key
         return list(self._messages)
 
-    async def reset_message_count(self, group_id: str) -> None:
-        self.reset_message_count_calls.append(group_id)
+    async def delete_processing_conversation_buffer(self, group_id: str, processing_key: str) -> None:
+        self.delete_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
 
-    async def reset_tokens(self, group_id: str) -> None:
-        self.reset_tokens_calls.append(group_id)
-
-    async def delete_buffer(self, group_id: str) -> None:
-        self.delete_buffer_calls.append(group_id)
+    async def restore_processing_conversation_buffer(self, group_id: str, processing_key: str) -> None:
+        self.restore_processing_calls.append({"group_id": group_id, "processing_key": processing_key})
 
     async def update_last_summary(self, group_id: str) -> None:
         self.update_last_summary_calls.append(group_id)
@@ -138,9 +105,11 @@ class _FakeMemory:
         *,
         profiles: dict[tuple[str, str], dict[str, Any]] | None = None,
         interactions: dict[tuple[str, str], dict[str, Any]] | None = None,
+        duplicate_dedup_keys: set[str] | None = None,
     ) -> None:
         self._profiles = profiles or {}
         self._interactions = interactions or {}
+        self._duplicate_dedup_keys = duplicate_dedup_keys or set()
         self.store_conversation_calls: list[dict[str, Any]] = []
         self.upsert_user_profile_calls: list[dict[str, Any]] = []
         self.upsert_interaction_history_calls: list[dict[str, Any]] = []
@@ -163,16 +132,20 @@ class _FakeMemory:
         summary: str,
         participants: list[str],
         importance_initial: int = 3,
-    ) -> int:
+        dedup_key: str | None = None,
+    ) -> int | None:
         self.store_conversation_calls.append(
             {
                 "group_id": group_id,
                 "summary": summary,
                 "participants": participants,
                 "importance_initial": importance_initial,
+                "dedup_key": dedup_key,
             }
         )
-        return 99
+        if dedup_key in self._duplicate_dedup_keys:
+            return None
+        return len(self.store_conversation_calls)
 
     async def upsert_user_profile(
         self,
@@ -228,358 +201,269 @@ def _make_message(
     )
 
 
-def test_enforce_profile_trait_limit_uses_compacted_profile(monkeypatch: Any) -> None:
-    module = _load_summary_worker_module(monkeypatch)
-
-    async def _fake_compact_profile_with_llm(**kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return _make_profile(20)
-
-    monkeypatch.setattr(module, "compact_profile_with_llm", _fake_compact_profile_with_llm)
-
-    result = asyncio.run(
-        module._enforce_profile_trait_limit(
-            group_id="114514",
-            user_id="10001",
-            base_profile=_make_profile(6),
-            merged_profile=_make_profile(26),
-            config=KomariMemoryConfigSchema(profile_trait_limit=20),
-        )
+def _profile_agent_result(*, changed_user_ids: set[str] | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        committed_count=len(changed_user_ids or set()),
+        staged_count=len(changed_user_ids or set()),
+        summary="画像 Agent 完成",
+        status="committed",
+        changed_user_ids=changed_user_ids or set(),
     )
 
-    assert count_profile_traits(result) == 20
 
-
-def test_enforce_profile_trait_limit_falls_back_to_base_profile(
-    monkeypatch: Any,
-) -> None:
-    module = _load_summary_worker_module(monkeypatch)
-
-    async def _boom(**kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        raise RuntimeError("boom")
-
-    base_profile = _make_profile(4)
-    monkeypatch.setattr(module, "compact_profile_with_llm", _boom)
-
-    result = asyncio.run(
-        module._enforce_profile_trait_limit(
-            group_id="114514",
-            user_id="10001",
-            base_profile=base_profile,
-            merged_profile=_make_profile(25),
-            config=KomariMemoryConfigSchema(profile_trait_limit=20),
-        )
-    )
-
-    assert result == base_profile
-
-
-def test_perform_summary_appends_interaction_records_and_preserves_metadata(
-    monkeypatch: Any,
-) -> None:
+def test_perform_summary_runs_profile_agent_before_storing_memories(monkeypatch: Any) -> None:
     module = _load_summary_worker_module(monkeypatch)
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
+    events: list[str] = []
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        del args, kwargs
+        del args
+        events.append("summary")
+        assert kwargs["participants"] == ["10001"]
+        assert kwargs["display_name_map"] == {"10001": "阿明"}
         return {
-            "summary": "新的群聊总结",
-            "user_profile_operations": [],
-            "user_interaction_operations": [
-                {
-                    "user_id": "10001",
-                    "display_name": "阿明",
-                    "operations": [
-                        {"op": "replace", "field": "summary", "value": "新的整体评价"},
-                        {
-                            "op": "add",
-                            "field": "record",
-                            "value": {
-                                "event": "新事件1",
-                                "result": "新反应1",
-                                "emotion": "新情绪1",
-                            },
-                        },
-                        {
-                            "op": "add",
-                            "field": "record",
-                            "value": {
-                                "event": "新事件2",
-                                "result": "新反应2",
-                                "emotion": "新情绪2",
-                            },
-                        },
-                        {
-                            "op": "add",
-                            "field": "record",
-                            "value": {
-                                "event": "新事件3",
-                                "result": "新反应3",
-                                "emotion": "新情绪3",
-                            },
-                        },
-                        {
-                            "op": "add",
-                            "field": "record",
-                            "value": {
-                                "event": "新事件4",
-                                "result": "新反应4",
-                                "emotion": "新情绪4",
-                            },
-                        },
-                    ],
-                }
-            ],
-            "importance": 4,
+            "memories": [
+                {"content": "大家讨论了周末吃拉面。", "importance": 4},
+                {"content": "阿明提到最近在追新番。", "importance": 3},
+            ]
         }
 
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        events.append("profile_agent")
+        return _profile_agent_result()
+
     monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
 
     redis = _FakeRedis([_make_message()])
-    memory = _FakeMemory(
-        interactions={
-            (
-                "114514",
-                "10001",
-            ): {
-                "version": 1,
-                "user_id": "10001",
-                "display_name": "阿明",
-                "file_type": "旧文件类型",
-                "description": "旧描述",
-                "records": [
-                    {"event": "旧事件1", "result": "旧反应1", "emotion": "旧情绪1"},
-                    {"event": "旧事件2", "result": "旧反应2", "emotion": "旧情绪2"},
-                    {"event": "旧事件3", "result": "旧反应3", "emotion": "旧情绪3"},
-                    {"event": "旧事件4", "result": "旧反应4", "emotion": "旧情绪4"},
-                ],
-                "summary": "旧评价",
-            }
-        }
-    )
-
-    asyncio.run(module.perform_summary("114514", redis, memory))
-
-    interaction = memory.upsert_interaction_history_calls[0]["interaction"]
-    assert interaction["file_type"] == "旧文件类型"
-    assert interaction["description"] == "旧描述"
-    assert interaction["summary"] == "新的整体评价"
-    assert interaction["records"] == [
-        {"event": "旧事件3", "result": "旧反应3", "emotion": "旧情绪3"},
-        {"event": "旧事件4", "result": "旧反应4", "emotion": "旧情绪4"},
-        {"event": "新事件1", "result": "新反应1", "emotion": "新情绪1"},
-        {"event": "新事件2", "result": "新反应2", "emotion": "新情绪2"},
-        {"event": "新事件3", "result": "新反应3", "emotion": "新情绪3"},
-        {"event": "新事件4", "result": "新反应4", "emotion": "新情绪4"},
-    ]
-
-
-def test_perform_summary_keeps_existing_interaction_when_model_returns_no_update(
-    monkeypatch: Any,
-) -> None:
-    module = _load_summary_worker_module(monkeypatch)
-    monkeypatch.setattr(
-        module,
-        "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
-    )
-
-    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        del args, kwargs
-        return {
-            "summary": "新的群聊总结",
-            "user_profile_operations": [],
-            "user_interaction_operations": [],
-            "importance": 4,
-        }
-
-    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
-
-    existing_interaction = {
-        "version": 1,
-        "user_id": "10001",
-        "display_name": "阿明",
-        "file_type": "旧文件类型",
-        "description": "旧描述",
-        "records": [{"event": "旧事件", "result": "旧反应", "emotion": "旧情绪"}],
-        "summary": "旧评价",
-    }
-    redis = _FakeRedis([_make_message()])
-    memory = _FakeMemory(interactions={("114514", "10001"): existing_interaction})
-
-    asyncio.run(module.perform_summary("114514", redis, memory))
-
-    interaction = memory.upsert_interaction_history_calls[0]["interaction"]
-    assert interaction["file_type"] == "旧文件类型"
-    assert interaction["description"] == "旧描述"
-    assert interaction["summary"] == "旧评价"
-    assert interaction["records"] == existing_interaction["records"]
-
-
-def test_perform_summary_remaps_hallucinated_uid_by_display_name_and_drops_unknown_uid(
-    monkeypatch: Any,
-) -> None:
-    module = _load_summary_worker_module(monkeypatch)
-    monkeypatch.setattr(
-        module,
-        "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
-    )
-
-    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        del args, kwargs
-        return {
-            "summary": "新的群聊总结",
-            "user_profile_operations": [
-                {
-                    "user_id": "99999",
-                    "display_name": "阿明",
-                    "operations": [
-                        {
-                            "op": "replace",
-                            "field": "trait",
-                            "key": "喜欢的食物",
-                            "value": "布丁",
-                            "category": "preference",
-                            "importance": 4,
-                        }
-                    ],
-                },
-                {
-                    "user_id": "88888",
-                    "display_name": "路人甲",
-                    "operations": [
-                        {
-                            "op": "replace",
-                            "field": "trait",
-                            "key": "无效画像",
-                            "value": "不该入库",
-                            "category": "general",
-                            "importance": 1,
-                        }
-                    ],
-                },
-            ],
-            "user_interaction_operations": [
-                {
-                    "user_id": "99999",
-                    "display_name": "阿明",
-                    "operations": [
-                        {
-                            "op": "add",
-                            "field": "record",
-                            "value": {
-                                "event": "递上布丁",
-                                "result": "立刻靠近",
-                                "emotion": "开心",
-                            },
-                        },
-                        {
-                            "op": "replace",
-                            "field": "summary",
-                            "value": "会被布丁钓走",
-                        },
-                    ],
-                },
-                {
-                    "user_id": "77777",
-                    "display_name": "路人乙",
-                    "operations": [
-                        {
-                            "op": "add",
-                            "field": "record",
-                            "value": {
-                                "event": "无效事件",
-                                "result": "无效反应",
-                                "emotion": "无效情绪",
-                            },
-                        }
-                    ],
-                },
-            ],
-            "importance": 4,
-        }
-
-    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
-
-    redis = _FakeRedis([_make_message(user_id="10001", user_nickname="阿明")])
     memory = _FakeMemory()
 
     asyncio.run(module.perform_summary("114514", redis, memory))
 
-    assert [call["user_id"] for call in memory.upsert_user_profile_calls] == ["10001"]
-    assert [call["user_id"] for call in memory.upsert_interaction_history_calls] == [
-        "10001"
+    assert events == ["summary", "profile_agent"]
+    assert [call["summary"] for call in memory.store_conversation_calls] == [
+        "大家讨论了周末吃拉面。",
+        "阿明提到最近在追新番。",
     ]
-    profile = memory.upsert_user_profile_calls[0]["profile"]
-    assert profile["traits"]["喜欢的食物"]["value"] == "布丁"
-    interaction = memory.upsert_interaction_history_calls[0]["interaction"]
-    assert interaction["summary"] == "会被布丁钓走"
-    assert interaction["records"] == [
-        {"event": "递上布丁", "result": "立刻靠近", "emotion": "开心"}
-    ]
+    assert [call["importance_initial"] for call in memory.store_conversation_calls] == [4, 3]
+    assert all(call["dedup_key"] for call in memory.store_conversation_calls)
+    assert len({call["dedup_key"] for call in memory.store_conversation_calls}) == 2
+    assert memory.upsert_interaction_history_calls == []
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
+    assert redis.update_last_summary_calls == ["114514"]
 
 
-def test_apply_profile_operations_supports_add_replace_delete(monkeypatch: Any) -> None:
+def test_summary_dedup_key_is_stable_for_same_processing_snapshot(monkeypatch: Any) -> None:
     module = _load_summary_worker_module(monkeypatch)
+    messages = [_make_message(), _make_message(content="晚上看新番", user_id="10002")]
 
-    result = module._apply_profile_operations(
-        {
-            "version": 1,
-            "user_id": "10001",
-            "display_name": "旧名字",
-            "traits": {
-                "旧特征": {
-                    "value": "会过时",
-                    "category": "general",
-                    "importance": 2,
-                    "updated_at": "2026-04-01T00:00:00+08:00",
-                },
-                "保留特征": {
-                    "value": "旧值",
-                    "category": "general",
-                    "importance": 3,
-                    "updated_at": "2026-04-01T00:00:00+08:00",
-                },
-            },
-        },
-        user_id="10001",
-        display_name="阿明",
-        operations=[
-            {"op": "add", "field": "trait", "key": "新增特征", "value": "新值"},
-            {
-                "op": "replace",
-                "field": "trait",
-                "key": "保留特征",
-                "value": "改成新值",
-                "category": "fact",
-                "importance": 5,
-            },
-            {"op": "delete", "field": "trait", "key": "旧特征"},
-            {"op": "replace", "field": "display_name", "value": "新名字"},
-        ],
+    first_fingerprint = module._build_processing_snapshot_fingerprint("114514", messages)
+    second_fingerprint = module._build_processing_snapshot_fingerprint("114514", list(messages))
+
+    assert first_fingerprint == second_fingerprint
+    assert len(first_fingerprint) == 64
+    assert module._build_summary_dedup_key(
+        "114514",
+        first_fingerprint,
+        0,
+    ) == module._build_summary_dedup_key(
+        "114514",
+        second_fingerprint,
+        0,
+    )
+    assert module._build_summary_dedup_key(
+        "114514",
+        first_fingerprint,
+        0,
+    ) != module._build_summary_dedup_key(
+        "114514",
+        first_fingerprint,
+        1,
     )
 
-    assert result["display_name"] == "阿明"
-    assert "旧特征" not in result["traits"]
-    assert result["traits"]["新增特征"]["value"] == "新值"
-    assert result["traits"]["保留特征"]["value"] == "改成新值"
-    assert result["traits"]["保留特征"]["category"] == "fact"
+
+def test_perform_summary_skips_duplicate_conversation_ids(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
+    )
+    messages = [_make_message()]
+    snapshot_fingerprint = module._build_processing_snapshot_fingerprint("114514", messages)
+    duplicate_key = module._build_summary_dedup_key("114514", snapshot_fingerprint, 0)
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "memories": [
+                {"content": "第一条在之前尝试中已经落库。", "importance": 4},
+                {"content": "第二条本次继续落库。", "importance": 3},
+            ]
+        }
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis(messages)
+    memory = _FakeMemory(duplicate_dedup_keys={duplicate_key})
+
+    asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert [call["summary"] for call in memory.store_conversation_calls] == [
+        "第一条在之前尝试中已经落库。",
+        "第二条本次继续落库。",
+    ]
+    assert memory.store_conversation_calls[0]["dedup_key"] == duplicate_key
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
+    assert redis.update_last_summary_calls == ["114514"]
 
 
-def test_perform_summary_refreshes_binding_before_prompt_and_syncs_context_names(
+def test_processing_retry_uses_same_dedup_keys_for_partial_success(
     monkeypatch: Any,
 ) -> None:
     module = _load_summary_worker_module(monkeypatch)
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(summary_max_messages=50, profile_trait_limit=20),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
+    )
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    retry_module = sys.modules["komari_bot.plugins.komari_memory.core.retry"]
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _fake_sleep)
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "memories": [
+                {"content": "A 已写入。", "importance": 4},
+                {"content": "B 已写入。", "importance": 4},
+                {"content": "C 首次失败后重试写入。", "importance": 4},
+            ]
+        }
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
+
+    class _RetryMemory(_FakeMemory):
+        def __init__(self) -> None:
+            super().__init__()
+            self._seen_dedup_keys: set[str] = set()
+            self._failed_once = False
+
+        async def store_conversation(
+            self,
+            *,
+            group_id: str,
+            summary: str,
+            participants: list[str],
+            importance_initial: int = 3,
+            dedup_key: str | None = None,
+        ) -> int | None:
+            self.store_conversation_calls.append(
+                {
+                    "group_id": group_id,
+                    "summary": summary,
+                    "participants": participants,
+                    "importance_initial": importance_initial,
+                    "dedup_key": dedup_key,
+                }
+            )
+            if dedup_key in self._seen_dedup_keys:
+                return None
+            self._seen_dedup_keys.add(str(dedup_key))
+            if summary == "C 首次失败后重试写入。" and not self._failed_once:
+                self._failed_once = True
+                raise RuntimeError("模拟部分写入后的失败")
+            return len(self._seen_dedup_keys)
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis([_make_message()])
+    memory = _RetryMemory()
+
+    asyncio.run(
+        module._perform_summary_from_processing(
+            "114514",
+            redis,
+            memory,
+            "processing-key",
+        )
+    )
+
+    assert [call["summary"] for call in memory.store_conversation_calls] == [
+        "A 已写入。",
+        "B 已写入。",
+        "C 首次失败后重试写入。",
+        "A 已写入。",
+        "B 已写入。",
+        "C 首次失败后重试写入。",
+    ]
+    assert memory.store_conversation_calls[0]["dedup_key"] == memory.store_conversation_calls[3][
+        "dedup_key"
+    ]
+    assert memory.store_conversation_calls[1]["dedup_key"] == memory.store_conversation_calls[4][
+        "dedup_key"
+    ]
+    assert redis.delete_processing_calls == [
+        {"group_id": "114514", "processing_key": "processing-key"}
+    ]
+
+
+def test_perform_summary_continues_profile_agent_when_summary_fails(monkeypatch: Any) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
+    )
+    events: list[str] = []
+
+    async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        events.append("summary")
+        raise RuntimeError("总结失败")
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        events.append("profile_agent")
+        return _profile_agent_result()
+
+    monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
+
+    redis = _FakeRedis([_make_message()])
+    memory = _FakeMemory()
+
+    asyncio.run(module.perform_summary("114514", redis, memory))
+
+    assert events == ["summary", "profile_agent"]
+    assert memory.store_conversation_calls == []
+    assert redis.delete_processing_calls[0]["group_id"] == "114514"
+
+
+def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
+    monkeypatch: Any,
+) -> None:
+    module = _load_summary_worker_module(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "get_config",
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
 
     class _FakeBinding:
@@ -590,35 +474,28 @@ def test_perform_summary_refreshes_binding_before_prompt_and_syncs_context_names
             self.refresh_calls += 1
             return True
 
-        def get_character_name(
-            self,
-            user_id: str,
-            fallback_nickname: str = "",
-        ) -> str:
+        def get_character_name(self, user_id: str, fallback_nickname: str = "") -> str:
             if user_id == "10001":
                 return "绑定新名"
             return fallback_nickname or user_id
 
     fake_binding = _FakeBinding()
     monkeypatch.setattr(module, "character_binding", fake_binding)
-
     observed: dict[str, Any] = {}
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args
-        observed["profile_display_name"] = kwargs["existing_profiles"][0]["display_name"]
-        observed["interaction_display_name"] = kwargs["existing_interactions"][0][
-            "display_name"
-        ]
-        observed["refresh_calls_before_prompt"] = fake_binding.refresh_calls
-        return {
-            "summary": "新的群聊总结",
-            "user_profile_operations": [],
-            "user_interaction_operations": [],
-            "importance": 4,
-        }
+        observed["summary_refresh_calls"] = fake_binding.refresh_calls
+        observed["summary_display_name_map"] = kwargs["display_name_map"]
+        return {"memories": [{"content": "绑定刷新后生成总结。", "importance": 3}]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        observed["profile_conversation_text"] = kwargs["conversation_text"]
+        observed["profile_display_name_map"] = kwargs["display_name_map"]
+        return _profile_agent_result(changed_user_ids={"10001"})
 
     monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
 
     redis = _FakeRedis([_make_message(user_id="10001", user_nickname="旧昵称")])
     memory = _FakeMemory(
@@ -629,103 +506,52 @@ def test_perform_summary_refreshes_binding_before_prompt_and_syncs_context_names
                 "display_name": "旧画像名",
                 "traits": {},
             }
-        },
-        interactions={
-            ("114514", "10001"): {
-                "version": 1,
-                "user_id": "10001",
-                "display_name": "旧互动名",
-                "file_type": "用户的近期对鞠行为备忘录",
-                "description": "",
-                "records": [],
-                "summary": "",
-            }
-        },
+        }
     )
 
     asyncio.run(module.perform_summary("114514", redis, memory))
 
-    assert observed["refresh_calls_before_prompt"] == 1
-    assert observed["profile_display_name"] == "绑定新名"
-    assert observed["interaction_display_name"] == "绑定新名"
-    assert memory.upsert_user_profile_calls[0]["profile"]["display_name"] == "绑定新名"
-    assert (
-        memory.upsert_interaction_history_calls[0]["interaction"]["display_name"]
-        == "绑定新名"
-    )
+    assert observed["summary_refresh_calls"] == 1
+    assert observed["summary_display_name_map"] == {"10001": "旧昵称"}
+    assert observed["profile_display_name_map"] == {"10001": "旧昵称"}
+    assert "[user_id:10001] 旧昵称: 今天一起吃拉面吧" in observed[
+        "profile_conversation_text"
+    ]
+    assert memory.store_conversation_calls[0]["summary"] == "绑定刷新后生成总结。"
 
 
-def test_perform_summary_skips_bot_entries_from_model_output(
-    monkeypatch: Any,
-) -> None:
+def test_perform_summary_does_not_write_interaction_history(monkeypatch: Any) -> None:
     module = _load_summary_worker_module(monkeypatch)
     monkeypatch.setattr(
         module,
         "get_config",
-        lambda: KomariMemoryConfigSchema(
-            summary_max_messages=50,
-            profile_trait_limit=20,
-            bot_nickname="小鞠知花",
-            bot_aliases=["小鞠", "小鞠知花", "komari"],
-        ),
+        lambda: KomariMemoryConfigSchema(summary_max_buffer_size=100, profile_trait_limit=20),
     )
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
-        return {
-            "summary": "新的群聊总结",
-            "user_profile_operations": [
-                {
-                    "user_id": "669293859",
-                    "display_name": "小鞠知花",
-                    "operations": [
-                        {
-                            "op": "replace",
-                            "field": "trait",
-                            "key": "机器人画像",
-                            "value": "不该写入",
-                            "category": "general",
-                            "importance": 1,
-                        }
-                    ],
-                }
-            ],
-            "user_interaction_operations": [
-                {
-                    "user_id": "bot",
-                    "display_name": "小鞠知花",
-                    "operations": [
-                        {
-                            "op": "replace",
-                            "field": "summary",
-                            "value": "不该写入",
-                        }
-                    ],
-                }
-            ],
-            "importance": 4,
-        }
+        return {"memories": [{"content": "只写入对话记忆，不处理互动历史。", "importance": 4}]}
+
+    async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return _profile_agent_result()
 
     monkeypatch.setattr(module, "summarize_conversation", _fake_summarize_conversation)
+    monkeypatch.setattr(module, "run_profile_agent", _fake_run_profile_agent)
 
-    redis = _FakeRedis(
-        [
-            _make_message(user_id="10001", user_nickname="阿明"),
-            _make_message(
-                user_id="669293859",
-                user_nickname="小鞠知花",
-                content="bot 回复",
-                is_bot=True,
-            ),
-        ]
+    redis = _FakeRedis([_make_message()])
+    memory = _FakeMemory(
+        interactions={
+            ("114514", "10001"): {
+                "version": 1,
+                "user_id": "10001",
+                "display_name": "阿明",
+                "records": [{"event": "旧事件", "result": "旧反应", "emotion": "旧情绪"}],
+            }
+        }
     )
-    memory = _FakeMemory()
 
     asyncio.run(module.perform_summary("114514", redis, memory))
 
-    assert [call["user_id"] for call in memory.upsert_user_profile_calls] == ["10001"]
-    assert [call["user_id"] for call in memory.upsert_interaction_history_calls] == [
-        "10001"
-    ]
-    assert memory.upsert_user_profile_calls[0]["profile"]["traits"] == {}
-    assert memory.upsert_interaction_history_calls[0]["interaction"]["summary"] == ""
+    assert len(memory.store_conversation_calls) == 1
+    assert memory.upsert_interaction_history_calls == []

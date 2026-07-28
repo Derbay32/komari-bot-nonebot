@@ -161,4 +161,3 @@ test_multimodal.py
 logs
 !tools/
 tools/*
-!tools/migrate_user_data_sqlite_to_pg.py

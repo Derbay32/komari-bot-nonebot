@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -10,7 +11,11 @@ from nonebot import logger
 from nonebot.plugin import require
 
 from .config_interface import get_config
-from .scene_template_loader import SceneTemplateLoader
+from .scene_template_loader import (
+    PostgresSceneTemplateLoader,
+    SceneTemplateLoaderProtocol,
+    SceneTemplatePayload,
+)
 
 if TYPE_CHECKING:
     from ..repositories.scene_repository import SceneRepository
@@ -34,10 +39,10 @@ class SceneSyncService:
     def __init__(
         self,
         repository: SceneRepository,
-        loader: SceneTemplateLoader | None = None,
-    ) -> None:
+        loader: SceneTemplateLoaderProtocol | None = None,
+        ) -> None:
         self.repository = repository
-        self.loader = loader or SceneTemplateLoader()
+        self.loader = loader or PostgresSceneTemplateLoader(repository)
 
     @staticmethod
     def _instruction_hash(instruction: str) -> str:
@@ -65,7 +70,11 @@ class SceneSyncService:
     async def build_scene_set(self) -> SceneSyncResult:
         """构建新的 scene set（含 embedding 复用）。"""
         config = get_config()
-        template = self.loader.load_scene_template()
+        raw_template = self.loader.load_scene_template()
+        template = await raw_template if inspect.isawaitable(raw_template) else raw_template
+        if not isinstance(template, SceneTemplatePayload):
+            msg = "scene loader 返回类型无效"
+            raise TypeError(msg)
 
         embedding_model = self._resolve_embedding_model()
         instruction_hash = self._instruction_hash(config.embedding_instruction_scene)
@@ -130,15 +139,24 @@ class SceneSyncService:
         pending_count = 0
 
         for item in template.items:
-            reusable = await self.repository.find_reusable_ready_item(
-                scene_key=item.scene_key,
-                content_hash=item.content_hash,
-                embedding_model=embedding_model,
-                embedding_instruction_hash=instruction_hash,
-            )
+            if item.scene_id is None:
+                reusable = await self.repository.find_reusable_ready_item(
+                    scene_key=item.scene_key,
+                    content_hash=item.content_hash,
+                    embedding_model=embedding_model,
+                    embedding_instruction_hash=instruction_hash,
+                )
+            else:
+                reusable = await self.repository.find_reusable_ready_item(
+                    scene_id=item.scene_id,
+                    content_hash=item.content_hash,
+                    embedding_model=embedding_model,
+                    embedding_instruction_hash=instruction_hash,
+                )
 
             payload = {
                 "scene_key": item.scene_key,
+                "scene_id": item.scene_id,
                 "scene_type": item.scene_type,
                 "content_text": item.content_text,
                 "content_hash": item.content_hash,

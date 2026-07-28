@@ -270,15 +270,8 @@ def _serialize_tool_result(result: SummaryToolResult) -> str:
 
 def _build_planning_messages(user_request: str) -> list[dict[str, Any]]:
     template = get_template()
-    planning_instruction = (
-        "你现在负责先规划该取哪些聊天记录。"
-        "不要直接写总结正文。"
-        "优先调用工具获取真实消息，再基于工具结果决定是否继续取数。"
-        "如果已经拿到足够消息，就用一句简短中文说明规划完成。"
-    )
     return [
-        {"role": "system", "content": template["system_prompt"]},
-        {"role": "system", "content": planning_instruction},
+        {"role": "user", "content": template["planning_system_prompt"]},
         {"role": "user", "content": user_request},
     ]
 
@@ -444,6 +437,8 @@ async def plan_summary_request(
     max_summary_count: int,
     summary_tool_scan_limit: int,
     fetch_batch_size: int,
+    planning_thinking_mode: bool = False,
+    planning_reasoning_effort: str = "",
 ) -> SummaryPlanResult:
     """使用工具调用规划总结所需的历史记录。"""
     messages = _build_planning_messages(user_request)
@@ -497,6 +492,8 @@ async def plan_summary_request(
                 tools=tools,
                 tool_choice="auto",
                 parallel_tool_calls=False,
+                thinking_mode=planning_thinking_mode,
+                reasoning_effort=planning_reasoning_effort,
             ),
         )
 
@@ -523,6 +520,8 @@ async def plan_summary_request(
                 for tool_call in completion.tool_calls
             ],
         }
+        if completion.reasoning_content:
+            assistant_message["reasoning_content"] = completion.reasoning_content
         messages.append(assistant_message)
 
         for tool_call in completion.tool_calls[:1]:
