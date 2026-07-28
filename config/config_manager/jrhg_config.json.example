@@ -3,7 +3,10 @@
   "last_updated": "2025-12-24T01:49:16.236075",
   "plugin_enable": true,
   "user_whitelist": [],
-  "group_whitelist": []
+  "group_whitelist": [],
+  "llm_model": "deepseek-chat",
+  "llm_temperature": 1.0,
+  "llm_max_tokens": 8192
 }
 
 /*

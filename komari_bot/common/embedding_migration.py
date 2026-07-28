@@ -42,7 +42,6 @@ class EmbeddingServiceProtocol(Protocol):
 class EmbeddingMigrationConfig:
     """Minimal embedding config needed by the migration tool."""
 
-    embedding_source: str = "local"
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     embedding_api_url: str = ""
     embedding_api_key: str = ""
@@ -117,7 +116,6 @@ def load_embedding_config(config_path: Path) -> EmbeddingMigrationConfig:
     """Load embedding provider config from JSON, or return defaults."""
     data = _load_optional_json(config_path)
     return EmbeddingMigrationConfig(
-        embedding_source=str(data.get("embedding_source", "local")),
         embedding_model=str(data.get("embedding_model", "BAAI/bge-small-zh-v1.5")),
         embedding_api_url=str(data.get("embedding_api_url", "")),
         embedding_api_key=str(data.get("embedding_api_key", "")),

@@ -15,6 +15,7 @@ from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
 )
 
 from .prompt_template import get_template
+from .reply_context import ReplyContext  # noqa: TC001
 
 if TYPE_CHECKING:
     from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
@@ -102,6 +103,8 @@ async def build_prompt(
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
     image_urls: list[str] | None = None,
+    reply_context: ReplyContext | None = None,
+    reply_image_urls: list[str] | None = None,
     query_embedding: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """构建 5 段式 OpenAI 格式消息数组。
@@ -124,6 +127,8 @@ async def build_prompt(
         memory_service: 记忆服务（用于检索用户实体，可选）
         group_id: 群组 ID（用于检索用户实体，可选）
         image_urls: 用户消息中的图片 URL 列表（可选）
+        reply_context: 当前消息引用的上下文（可选）
+        reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
         query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
 
     Returns:
@@ -199,6 +204,12 @@ async def build_prompt(
                 all_user_ids.add(msg.user_id)
     if current_user_id:
         all_user_ids.add(current_user_id)
+    if (
+        reply_context is not None
+        and reply_context.source_side == "user"
+        and reply_context.user_id
+    ):
+        all_user_ids.add(reply_context.user_id)
 
     # 用户常识检索（基于对话中的用户 UID）
     if all_user_ids:
@@ -317,6 +328,24 @@ async def build_prompt(
             block_text = "\n".join(current_block)
             messages.append({"role": current_side, "content": block_text})
 
+    if reply_context is not None and reply_context.source_side == "assistant":
+        assistant_reply_parts: list[str] = []
+        if reply_context.text:
+            assistant_reply_parts.append(reply_context.text)
+        if reply_context.image_count > 0:
+            if reply_image_urls:
+                assistant_reply_parts.append(
+                    f"（你上一条还发了 {reply_context.image_count} 张图片，下面附上用户正在回复的引用图片。）"
+                )
+            else:
+                assistant_reply_parts.append(
+                    f"（你上一条发了 {reply_context.image_count} 张图片，但当前引用图不可直接查看。）"
+                )
+        if assistant_reply_parts:
+            messages.append(
+                {"role": "assistant", "content": "\n".join(assistant_reply_parts)}
+            )
+
     # 当前用户消息（使用 <user_input> 标签防止提示词注入）
     current_character_name = (
         character_binding.get_character_name(
@@ -330,24 +359,79 @@ async def build_prompt(
         f"- {current_character_name}: <user_input>{user_message}</user_input>"
     )
 
-    # 如果包含图片，构建 OpenAI Vision 格式的 content 数组
-    if image_urls:
-        content_parts: list[dict[str, Any]] = [{"type": "text", "text": current_text}]
+    reply_intro_lines: list[str] = []
+    if reply_context is not None:
+        if reply_context.source_side == "user":
+            reply_name = (
+                character_binding.get_character_name(
+                    user_id=reply_context.user_id,
+                    fallback_nickname=reply_context.user_nickname or "被回复用户",
+                )
+                if reply_context.user_id
+                else (reply_context.user_nickname or "被回复用户")
+            )
+            if reply_context.text:
+                reply_intro_lines.append(
+                    f"- {reply_name}（被回复）: {reply_context.text}"
+                )
+            if reply_context.image_count > 0:
+                if reply_image_urls:
+                    reply_intro_lines.append(
+                        f"- {reply_name}（被回复）发送了 {reply_context.image_count} 张图片。"
+                    )
+                else:
+                    reply_intro_lines.append(
+                        f"- {reply_name}（被回复）发送了 {reply_context.image_count} 张图片，但当前不可直接查看。"
+                    )
+        elif reply_context.image_count > 0:
+            if reply_image_urls:
+                reply_intro_lines.append(
+                    f"（以下是你上一条被引用的 {reply_context.image_count} 张图片）"
+                )
+            else:
+                reply_intro_lines.append(
+                    f"（你上一条被引用的是 {reply_context.image_count} 张图片，但当前不可直接查看）"
+                )
+
+    reply_intro_text = "\n".join(reply_intro_lines)
+    has_multimodal_content = bool(reply_image_urls or image_urls)
+    if has_multimodal_content:
+        content_parts: list[dict[str, Any]] = []
+        if reply_intro_text:
+            content_parts.append({"type": "text", "text": reply_intro_text})
         content_parts.extend(
             {
                 "type": "image_url",
                 "image_url": {"url": url},
             }
-            for url in image_urls
+            for url in (reply_image_urls or [])
+        )
+        content_parts.append({"type": "text", "text": current_text})
+        content_parts.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": url},
+            }
+            for url in (image_urls or [])
         )
         messages.append({"role": "user", "content": content_parts})
     else:
-        messages.append({"role": "user", "content": current_text})
+        text_content = (
+            "\n".join([reply_intro_text, current_text])
+            if reply_intro_text
+            else current_text
+        )
+        messages.append({"role": "user", "content": text_content})
 
     # ═══════════════════════════════════════
     # ③ assistant — 伪造记忆确认
     # ═══════════════════════════════════════
-    messages.append({"role": "assistant", "content": template["memory_ack"]})
+    messages.append(
+        {
+            "role": template.get("memory_ack_role", "assistant"),
+            "content": template["memory_ack"],
+        }
+    )
 
     # ═══════════════════════════════════════
     # ④ system — 输出格式指令
@@ -357,6 +441,11 @@ async def build_prompt(
     # ═══════════════════════════════════════
     # ⑤ assistant — CoT 思维链前缀
     # ═══════════════════════════════════════
-    messages.append({"role": "assistant", "content": template["cot_prefix"]})
+    messages.append(
+        {
+            "role": template.get("cot_prefix_role", "assistant"),
+            "content": template["cot_prefix"],
+        }
+    )
 
     return messages

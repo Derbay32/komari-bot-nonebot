@@ -44,23 +44,18 @@ def _make_profile_row(
     return module.ProfileRow(
         user_id=user_id,
         group_id="821560570",
-        value=json.dumps(
-            {
-                "version": 1,
-                "user_id": user_id,
-                "display_name": f"用户{user_id}",
-                "traits": {
-                    f"特征{i:02d}": {
-                        "value": f"长期描述{i}",
-                        "category": "general",
-                        "importance": 4,
-                        "updated_at": f"2026-03-21T00:00:{i % 60:02d}+08:00",
-                    }
-                    for i in range(trait_count)
-                },
-            },
-            ensure_ascii=False,
-        ),
+        version=1,
+        display_name=f"用户{user_id}",
+        traits={
+            f"特征{i:02d}": {
+                "value": f"长期描述{i}",
+                "category": "general",
+                "importance": 4,
+                "updated_at": f"2026-03-21T00:00:{i % 60:02d}+08:00",
+            }
+            for i in range(trait_count)
+        },
+        updated_at="2026-04-10T12:00:00+00:00",
         importance=4,
     )
 

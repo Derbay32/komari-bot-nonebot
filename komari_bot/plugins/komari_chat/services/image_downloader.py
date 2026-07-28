@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import aiohttp
 from nonebot import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # 限制：单张图片最大 10 MB
 _MAX_IMAGE_SIZE = 10 * 1024 * 1024
@@ -22,6 +27,66 @@ _DOWNLOAD_RETRY_ATTEMPTS = 3
 _DOWNLOAD_RETRY_BASE_DELAY = 0.2
 _DOWNLOAD_RETRY_MAX_DELAY = 1.0
 _RETRYABLE_STATUS_CODES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
+_DIRECT_IMAGE_SOURCE_RE = re.compile(r"^(?:https?://|data:)", re.IGNORECASE)
+
+
+@runtime_checkable
+class _SegmentWithData(Protocol):
+    data: object
+
+
+@runtime_checkable
+class _SegmentWithType(Protocol):
+    type: object
+
+
+def _extract_segment_data(segment: object) -> dict[str, Any]:
+    if isinstance(segment, _SegmentWithData) and isinstance(segment.data, dict):
+        return segment.data
+    if isinstance(segment, dict):
+        data = segment.get("data")
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _extract_segment_type(segment: object) -> str:
+    if isinstance(segment, _SegmentWithType):
+        return str(segment.type)
+    if isinstance(segment, dict):
+        return str(segment.get("type", ""))
+    return ""
+
+
+def _normalize_image_source(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text or not _DIRECT_IMAGE_SOURCE_RE.match(text):
+        return None
+    return text
+
+
+def extract_image_sources(message: Iterable[object]) -> tuple[list[str], int]:
+    """从消息段中提取图片来源。
+
+    Returns:
+        (可直接下载/查看的图片来源列表, 图片段总数)
+    """
+    sources: list[str] = []
+    image_count = 0
+
+    for segment in message:
+        if _extract_segment_type(segment) != "image":
+            continue
+
+        image_count += 1
+        data = _extract_segment_data(segment)
+        for key in ("url", "file"):
+            source = _normalize_image_source(data.get(key))
+            if source is not None:
+                sources.append(source)
+                break
+
+    return sources, image_count
 
 
 def _guess_mime_type(content_type: str | None, url: str) -> str:

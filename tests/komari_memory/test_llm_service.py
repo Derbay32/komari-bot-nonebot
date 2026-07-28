@@ -36,8 +36,8 @@ class _DynamicChunkFakeLLMProvider:
             return json.dumps(
                 {
                     "summary": "最终总结",
-                    "user_profiles": [],
-                    "user_interactions": [],
+                    "user_profile_operations": [],
+                    "user_interaction_operations": [],
                     "importance": 5,
                 },
                 ensure_ascii=False,
@@ -47,8 +47,8 @@ class _DynamicChunkFakeLLMProvider:
         return json.dumps(
             {
                 "summary": f"第{self._chunk_index}段总结",
-                "user_profiles": [],
-                "user_interactions": [],
+                "user_profile_operations": [],
+                "user_interaction_operations": [],
                 "importance": 3,
             },
             ensure_ascii=False,
@@ -105,8 +105,8 @@ def test_summarize_conversation_single_chunk_uses_one_request(monkeypatch: Any) 
         [
             {
                 "summary": "一次总结",
-                "user_profiles": [],
-                "user_interactions": [],
+                "user_profile_operations": [],
+                "user_interaction_operations": [],
                 "importance": 4,
             }
         ]
@@ -117,7 +117,11 @@ def test_summarize_conversation_single_chunk_uses_one_request(monkeypatch: Any) 
         _run_summarize_conversation(
             messages=[
                 _make_message(content="今天一起吃拉面吧"),
-                _make_message(content="好呀，我还想顺便聊聊新番", user_id="10002", user_nickname="小绿"),
+                _make_message(
+                    content="好呀，我还想顺便聊聊新番",
+                    user_id="10002",
+                    user_nickname="小绿",
+                ),
             ],
             config=_make_config(summary_chunk_token_limit=5000),
         )
@@ -149,10 +153,15 @@ def test_summarize_conversation_chunks_then_merges(monkeypatch: Any) -> None:
             existing_interactions=[
                 {
                     "user_id": "10001",
-                    "file_type": "用户的近期对鞠行为备忘录",
-                    "description": "旧记录",
-                    "records": [{"event": "投喂", "result": "开心", "emotion": "期待"}],
-                    "summary": "旧总结",
+                    "display_name": "阿明",
+                    "summary": "喜欢被投喂",
+                    "records": [
+                        {
+                            "event": "递来零食",
+                            "result": "悄悄靠近",
+                            "emotion": "有点开心",
+                        }
+                    ],
                 }
             ],
         )
@@ -173,7 +182,6 @@ def test_summarize_conversation_chunks_then_merges(monkeypatch: Any) -> None:
     assert len(raw_prompts) >= 2
     assert len(merge_prompts) == 1
     assert all("【已知用户画像" not in prompt for prompt in raw_prompts)
-    assert "【已知用户画像" in merge_prompts[0]
     assert "【分段1/" in merge_prompts[0]
 
 
@@ -195,8 +203,8 @@ def test_existing_context_builder_trims_to_budget() -> None:
     result = llm_service_module._build_existing_context_with_budget(
         existing_profiles=[
             {
-                "user_id": "10001",
-                "display_name": "阿明",
+                "user_id": f"{10001 + index}",
+                "display_name": f"阿明{index}",
                 "traits": {
                     f"特征{i}": {
                         "value": "很长的描述" * 40,
@@ -207,26 +215,27 @@ def test_existing_context_builder_trims_to_budget() -> None:
                     for i in range(10)
                 },
             }
+            for index in range(4)
         ],
         existing_interactions=[
             {
                 "user_id": "10001",
-                "summary": "很长的互动总结" * 40,
+                "display_name": "阿明",
+                "summary": "最近会投喂我",
                 "records": [
                     {
-                        "event": "事件" * 20,
-                        "result": "结果" * 20,
-                        "emotion": "情绪" * 20,
+                        "event": "递来布丁",
+                        "result": "悄悄靠近",
+                        "emotion": "很开心",
                     }
-                    for _ in range(6)
                 ],
             }
         ],
-        token_budget=1200,
+        token_budget=2200,
     )
 
-    assert result.estimated_tokens <= 1200
-    assert result.included_profiles + result.included_interactions >= 1
+    assert result.estimated_tokens <= 2200
+    assert result.included_profiles >= 1
     assert result.truncated is True
 
 
@@ -251,6 +260,54 @@ def test_build_summary_prompt_uses_template_content(monkeypatch: Any) -> None:
     )
 
     assert prompt == '前缀\n对话正文\n已有上下文\n\n{"ok": true}'
+
+
+def test_build_summary_prompt_uses_operation_contract() -> None:
+    prompt = llm_service_module._build_summary_prompt("对话正文")
+
+    assert "user_profile_operations" in prompt
+    assert "user_interaction_operations" in prompt
+    assert "add / replace / delete" in prompt
+    assert "你输出的是“增量操作”" in prompt
+    assert "`field` 只允许：trait" in prompt
+    assert "绝对不要尝试修改它" in prompt
+    assert "严禁为 `[bot]` 消息" in prompt
+
+
+def test_normalize_profile_operations_drops_display_name_operations() -> None:
+    normalized = llm_service_module._normalize_user_operation_payloads(
+        [
+            {
+                "user_id": "10001",
+                "display_name": "阿明",
+                "operations": [
+                    {"op": "replace", "field": "display_name", "value": "新名字"},
+                    {
+                        "op": "replace",
+                        "field": "trait",
+                        "key": "喜欢的食物",
+                        "value": "拉面",
+                        "category": "preference",
+                        "importance": 4,
+                    },
+                ],
+            }
+        ],
+        operation_type="profile",
+    )
+
+    assert len(normalized) == 1
+    assert normalized[0]["display_name"] == "阿明"
+    assert normalized[0]["operations"] == [
+        {
+            "op": "replace",
+            "field": "trait",
+            "key": "喜欢的食物",
+            "value": "拉面",
+            "category": "preference",
+            "importance": 4,
+        }
+    ]
 
 
 def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> None:
@@ -279,8 +336,15 @@ def test_existing_context_builder_uses_template_sections(monkeypatch: Any) -> No
         existing_interactions=[
             {
                 "user_id": "10001",
-                "summary": "最近常聊吃饭",
-                "records": [{"event": "约饭", "result": "答应", "emotion": "开心"}],
+                "display_name": "阿明",
+                "summary": "会被拉面钓走",
+                "records": [
+                    {
+                        "event": "递来拉面",
+                        "result": "马上靠近",
+                        "emotion": "很开心",
+                    }
+                ],
             }
         ],
         token_budget=None,
@@ -298,8 +362,8 @@ def test_summarize_conversation_single_chunk_trims_existing_context_to_fit_limit
         [
             {
                 "summary": "一次总结",
-                "user_profiles": [],
-                "user_interactions": [],
+                "user_profile_operations": [],
+                "user_interaction_operations": [],
                 "importance": 4,
             }
         ]
@@ -326,22 +390,50 @@ def test_summarize_conversation_single_chunk_trims_existing_context_to_fit_limit
                     },
                 }
             ],
-            existing_interactions=[
-                {
-                    "user_id": "10001",
-                    "summary": "很长的互动总结" * 60,
-                    "records": [
-                        {
-                            "event": "事件" * 20,
-                            "result": "结果" * 20,
-                            "emotion": "情绪" * 20,
-                        }
-                        for _ in range(8)
-                    ],
-                }
-            ],
         )
     )
 
     assert len(fake_provider.prompts) == 1
     assert len(fake_provider.prompts[0]) <= config.summary_chunk_token_limit
+
+
+def test_normalize_summary_result_converts_legacy_payload_to_operations() -> None:
+    normalized = llm_service_module._normalize_summary_result(
+        {
+            "summary": "一次总结",
+            "user_profiles": [
+                {
+                    "user_id": "10001",
+                    "display_name": "阿明",
+                    "traits": [
+                        {
+                            "key": "喜欢的食物",
+                            "value": "拉面",
+                            "category": "preference",
+                            "importance": 4,
+                        }
+                    ],
+                }
+            ],
+            "user_interactions": [
+                {
+                    "user_id": "10001",
+                    "display_name": "阿明",
+                    "summary": "会被拉面钓走",
+                    "records": [
+                        {
+                            "event": "递来拉面",
+                            "result": "马上靠近",
+                            "emotion": "很开心",
+                        }
+                    ],
+                }
+            ],
+            "importance": 4,
+        }
+    )
+
+    assert len(normalized["user_profile_operations"][0]["operations"]) == 1
+    assert normalized["user_profile_operations"][0]["operations"][0]["field"] == "trait"
+    assert normalized["user_interaction_operations"][0]["operations"][0]["field"] == "summary"
+    assert normalized["user_interaction_operations"][0]["operations"][1]["field"] == "record"

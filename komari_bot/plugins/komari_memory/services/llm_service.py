@@ -29,7 +29,7 @@ llm_provider = require("llm_provider")
 
 _MESSAGE_SPLIT_MARKER = "[分片0000] "
 _MAX_EXISTING_TRAITS_PER_USER = 5
-_MAX_EXISTING_INTERACTION_RECORDS = 2
+_MAX_EXISTING_INTERACTION_RECORDS_PER_USER = 3
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,6 @@ class _ExistingContextBuildResult:
     text: str
     estimated_tokens: int
     included_profiles: int
-    included_interactions: int
     truncated: bool
 
 
@@ -149,28 +148,39 @@ def _compact_profile_line(profile: dict[str, Any]) -> str | None:
 
 
 def _compact_interaction_line(interaction: dict[str, Any]) -> str | None:
-    """压缩单个互动历史，保留近期摘要与最近几条 records。"""
+    """压缩单个用户互动历史，便于模型输出增量操作。"""
     user_id = str(interaction.get("user_id", "")).strip()
     if not user_id:
         return None
 
-    records_raw = interaction.get("records")
-    compact_records: list[dict[str, str]] = []
-    if isinstance(records_raw, list):
-        for record in records_raw[-_MAX_EXISTING_INTERACTION_RECORDS:]:
-            if not isinstance(record, dict):
-                continue
-            compact_records.append(
-                {
-                    "event": str(record.get("event", "")).strip(),
-                    "result": str(record.get("result", "")).strip(),
-                    "emotion": str(record.get("emotion", "")).strip(),
-                }
-            )
+    display_name = str(interaction.get("display_name", "")).strip()
+    file_type = str(interaction.get("file_type", "")).strip()
+    description = str(interaction.get("description", "")).strip()
+    summary = str(interaction.get("summary", "")).strip()
 
-    compact_summary = str(interaction.get("summary", "")).strip()
+    compact_records: list[dict[str, str]] = []
+    records_raw = interaction.get("records")
+    if isinstance(records_raw, list):
+        for raw in records_raw[-_MAX_EXISTING_INTERACTION_RECORDS_PER_USER:]:
+            if not isinstance(raw, dict):
+                continue
+            compact_record = {
+                "event": str(raw.get("event", "")).strip(),
+                "result": str(raw.get("result", "")).strip(),
+                "emotion": str(raw.get("emotion", "")).strip(),
+            }
+            if not any(compact_record.values()):
+                continue
+            compact_records.append(compact_record)
+
+    if not any([display_name, file_type, description, summary, compact_records]):
+        return None
+
     return (
-        f"- [user_id:{user_id}] interaction_summary={compact_summary} "
+        f"- [user_id:{user_id}] display_name={display_name} "
+        f"file_type={json.dumps(file_type, ensure_ascii=False)} "
+        f"description={json.dumps(description, ensure_ascii=False)} "
+        f"summary={json.dumps(summary, ensure_ascii=False)} "
         f"recent_records={json.dumps(compact_records, ensure_ascii=False)}"
     )
 
@@ -181,7 +191,7 @@ def _build_existing_context_with_budget(
     existing_interactions: list[dict] | None = None,
     token_budget: int | None,
 ) -> _ExistingContextBuildResult:
-    """构建可控大小的已有画像与互动历史提示。"""
+    """构建可控大小的已有画像提示。"""
     template = get_summary_template()
     instruction_block = f"{template['existing_context_instruction_block']}\n\n"
     instruction_tokens = estimate_text_tokens(instruction_block)
@@ -190,8 +200,7 @@ def _build_existing_context_with_budget(
             text="",
             estimated_tokens=0,
             included_profiles=0,
-            included_interactions=0,
-            truncated=bool(existing_profiles or existing_interactions),
+            truncated=bool(existing_profiles),
         )
 
     data_budget = None
@@ -200,7 +209,6 @@ def _build_existing_context_with_budget(
 
     blocks: list[str] = []
     included_profiles = 0
-    included_interactions = 0
     truncated = False
 
     def _current_tokens() -> int:
@@ -241,7 +249,10 @@ def _build_existing_context_with_budget(
         if (line := _compact_interaction_line(interaction)) is not None
     ]
     if interaction_lines:
-        interaction_header = template["existing_interactions_header"]
+        interaction_header = template.get(
+            "existing_interactions_header",
+            "【已知互动历史（数据库中已有记录）】\n以下是目前已存储的用户互动备忘录：",
+        )
         header_added = False
         for line in interaction_lines:
             block = (
@@ -249,7 +260,6 @@ def _build_existing_context_with_budget(
             )
             if _append_block(block):
                 header_added = True
-                included_interactions += 1
             else:
                 truncated = True
                 break
@@ -265,7 +275,6 @@ def _build_existing_context_with_budget(
             text="",
             estimated_tokens=0,
             included_profiles=0,
-            included_interactions=0,
             truncated=truncated,
         )
 
@@ -274,7 +283,6 @@ def _build_existing_context_with_budget(
         text=full_text,
         estimated_tokens=estimate_text_tokens(full_text),
         included_profiles=included_profiles,
-        included_interactions=included_interactions,
         truncated=truncated,
     )
 
@@ -431,17 +439,178 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized_result = dict(result)
     normalized_result["summary"] = str(normalized_result.get("summary", "")).strip()
 
-    if not isinstance(normalized_result.get("user_profiles"), list):
-        normalized_result["user_profiles"] = []
-    normalized_profiles: list[dict[str, Any]] = []
-    for profile in normalized_result["user_profiles"]:
+    profile_operation_payloads = normalized_result.get("user_profile_operations")
+    if not isinstance(profile_operation_payloads, list):
+        legacy_profiles = normalized_result.get("user_profiles")
+        if isinstance(legacy_profiles, list):
+            profile_operation_payloads = _convert_legacy_profiles_to_operations(
+                legacy_profiles
+            )
+        else:
+            profile_operation_payloads = []
+    normalized_result["user_profile_operations"] = _normalize_user_operation_payloads(
+        profile_operation_payloads,
+        operation_type="profile",
+    )
+
+    interaction_operation_payloads = normalized_result.get(
+        "user_interaction_operations"
+    )
+    if not isinstance(interaction_operation_payloads, list):
+        legacy_interactions = normalized_result.get("user_interactions")
+        if isinstance(legacy_interactions, list):
+            interaction_operation_payloads = _convert_legacy_interactions_to_operations(
+                legacy_interactions
+            )
+        else:
+            interaction_operation_payloads = []
+    normalized_result["user_interaction_operations"] = (
+        _normalize_user_operation_payloads(
+            interaction_operation_payloads,
+            operation_type="interaction",
+        )
+    )
+
+    try:
+        importance = int(normalized_result.get("importance", 3))
+        normalized_result["importance"] = max(1, min(5, importance))
+    except (TypeError, ValueError):
+        normalized_result["importance"] = 3
+
+    return normalized_result
+
+
+def _normalize_user_operation_payloads(
+    payloads: list[Any],
+    *,
+    operation_type: str,
+) -> list[dict[str, Any]]:
+    normalized_payloads: list[dict[str, Any]] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        user_id = str(payload.get("user_id", "")).strip()
+        if not user_id:
+            continue
+        operations_raw = payload.get("operations")
+        if not isinstance(operations_raw, list):
+            continue
+        normalized_operations: list[dict[str, Any]] = []
+        for operation in operations_raw:
+            if not isinstance(operation, dict):
+                continue
+            normalized_operation = (
+                _normalize_profile_operation(operation)
+                if operation_type == "profile"
+                else _normalize_interaction_operation(operation)
+            )
+            if normalized_operation is not None:
+                normalized_operations.append(normalized_operation)
+
+        if not normalized_operations:
+            continue
+        normalized_payloads.append(
+            {
+                "user_id": user_id,
+                "display_name": str(payload.get("display_name", "")).strip(),
+                "operations": normalized_operations,
+            }
+        )
+    return normalized_payloads
+
+
+def _normalize_profile_operation(operation: dict[str, Any]) -> dict[str, Any] | None:
+    op = str(operation.get("op", "")).strip().lower()
+    field = str(operation.get("field", operation.get("target", ""))).strip()
+    if op not in {"add", "replace", "delete"}:
+        return None
+    if field != "trait":
+        return None
+
+    normalized: dict[str, Any] = {
+        "op": op,
+        "field": field,
+    }
+    key = str(operation.get("key", "")).strip()
+    if not key:
+        return None
+    normalized["key"] = key
+    if op == "delete":
+        return normalized
+
+    value = str(operation.get("value", "")).strip()
+    if not value:
+        return None
+    category = str(operation.get("category", "general")).strip() or "general"
+    if category not in {"preference", "fact", "relation", "general"}:
+        category = "general"
+    try:
+        importance = int(operation.get("importance", 3))
+    except (TypeError, ValueError):
+        importance = 3
+
+    normalized["value"] = value
+    normalized["category"] = category
+    normalized["importance"] = max(1, min(5, importance))
+    return normalized
+
+
+def _normalize_interaction_operation(
+    operation: dict[str, Any],
+) -> dict[str, Any] | None:
+    op = str(operation.get("op", "")).strip().lower()
+    field = str(operation.get("field", operation.get("target", ""))).strip()
+    allowed_ops = {"add", "replace", "delete"}
+    allowed_fields = {"file_type", "description", "summary", "record"}
+    if op not in allowed_ops or field not in allowed_fields:
+        return None
+
+    normalized: dict[str, Any] = {
+        "op": op,
+        "field": field,
+    }
+    value: str | dict[str, str] | None = None
+    if field == "record":
+        if op == "replace":
+            return None
+        value = _normalize_record_value(operation.get("value"))
+    elif op != "delete":
+        text = str(operation.get("value", "")).strip()
+        value = text or None
+
+    if op != "delete" and value is None:
+        return None
+    if value is not None:
+        normalized["value"] = value
+    return normalized
+
+
+def _normalize_record_value(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized = {
+        "event": str(value.get("event", "")).strip(),
+        "result": str(value.get("result", "")).strip(),
+        "emotion": str(value.get("emotion", "")).strip(),
+    }
+    if not any(normalized.values()):
+        return None
+    return normalized
+
+
+def _convert_legacy_profiles_to_operations(
+    profiles: list[Any],
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for profile in profiles:
         if not isinstance(profile, dict):
             continue
         user_id = str(profile.get("user_id", "")).strip()
         if not user_id:
             continue
+        operations: list[dict[str, Any]] = []
+        display_name = str(profile.get("display_name", "")).strip()
         traits = profile.get("traits")
-        normalized_traits: list[dict[str, Any]] = []
         if isinstance(traits, list):
             for trait in traits:
                 if not isinstance(trait, dict):
@@ -457,8 +626,10 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
                     importance = int(trait.get("importance", 3))
                 except (TypeError, ValueError):
                     importance = 3
-                normalized_traits.append(
+                operations.append(
                     {
+                        "op": "replace",
+                        "field": "trait",
                         "key": key,
                         "value": value,
                         "category": category,
@@ -466,46 +637,62 @@ def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
 
-        normalized_profiles.append(
-            {
-                "user_id": user_id,
-                "display_name": str(profile.get("display_name", "")).strip(),
-                "traits": normalized_traits,
-            }
-        )
-    normalized_result["user_profiles"] = normalized_profiles
+        if operations:
+            converted.append(
+                {
+                    "user_id": user_id,
+                    "display_name": display_name,
+                    "operations": operations,
+                }
+            )
+    return converted
 
-    if not isinstance(normalized_result.get("user_interactions"), list):
-        normalized_result["user_interactions"] = []
-    normalized_interactions: list[dict[str, Any]] = []
-    for interaction in normalized_result["user_interactions"]:
+
+def _convert_legacy_interactions_to_operations(
+    interactions: list[Any],
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for interaction in interactions:
         if not isinstance(interaction, dict):
             continue
         user_id = str(interaction.get("user_id", "")).strip()
         if not user_id:
             continue
+        operations: list[dict[str, Any]] = []
+        for field in ("file_type", "description", "summary"):
+            value = str(interaction.get(field, "")).strip()
+            if value:
+                operations.append(
+                    {
+                        "op": "replace",
+                        "field": field,
+                        "value": value,
+                    }
+                )
+
         records = interaction.get("records")
-        normalized_records = records if isinstance(records, list) else []
-        if len(normalized_records) > 6:
-            normalized_records = normalized_records[-6:]
-        normalized_interactions.append(
-            {
-                "user_id": user_id,
-                "file_type": str(interaction.get("file_type", "")).strip(),
-                "description": str(interaction.get("description", "")).strip(),
-                "records": normalized_records,
-                "summary": str(interaction.get("summary", "")).strip(),
-            }
-        )
-    normalized_result["user_interactions"] = normalized_interactions
+        if isinstance(records, list):
+            for record in records[-6:]:
+                normalized_record = _normalize_record_value(record)
+                if normalized_record is None:
+                    continue
+                operations.append(
+                    {
+                        "op": "add",
+                        "field": "record",
+                        "value": normalized_record,
+                    }
+                )
 
-    try:
-        importance = int(normalized_result.get("importance", 3))
-        normalized_result["importance"] = max(1, min(5, importance))
-    except (TypeError, ValueError):
-        normalized_result["importance"] = 3
-
-    return normalized_result
+        if operations:
+            converted.append(
+                {
+                    "user_id": user_id,
+                    "display_name": str(interaction.get("display_name", "")).strip(),
+                    "operations": operations,
+                }
+            )
+    return converted
 
 
 async def _request_structured_summary(
@@ -615,13 +802,12 @@ async def summarize_conversation(
     group_id = messages[0].group_id if messages else "-"
     chunks, oversized_message_split = _chunk_formatted_messages(messages, config)
     logger.info(
-        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={} existing_interactions={}",
+        "[KomariMemory] 总结追踪开始: trace_id={} group={} messages={} chunk_limit={} existing_profiles={}",
         trace_id,
         group_id,
         len(messages),
         config.summary_chunk_token_limit,
         len(existing_profiles or []),
-        len(existing_interactions or []),
     )
     if not chunks:
         return _normalize_summary_result({})
@@ -643,12 +829,11 @@ async def summarize_conversation(
             existing_context=existing_context_result.text,
         )
         logger.debug(
-            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={} context_tokens={} included_profiles={} included_interactions={} context_truncated={}",
+            "[KomariMemory] 总结输入未触发分段: trace_id={} estimated_input_tokens={} context_tokens={} included_profiles={} context_truncated={}",
             trace_id,
             chunks[0].estimated_tokens,
             existing_context_result.estimated_tokens,
             existing_context_result.included_profiles,
-            existing_context_result.included_interactions,
             existing_context_result.truncated,
         )
         return await _request_structured_summary(
@@ -701,12 +886,11 @@ async def summarize_conversation(
         existing_context=existing_context_result.text,
     )
     logger.info(
-        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={} context_tokens={} included_profiles={} included_interactions={} context_truncated={}",
+        "[KomariMemory] 开始执行总结二次汇总: trace_id={} chunk_summaries={} context_tokens={} included_profiles={} context_truncated={}",
         trace_id,
         len(chunk_results),
         existing_context_result.estimated_tokens,
         existing_context_result.included_profiles,
-        existing_context_result.included_interactions,
         existing_context_result.truncated,
     )
     return await _request_structured_summary(

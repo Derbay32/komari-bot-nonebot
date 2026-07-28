@@ -48,8 +48,7 @@ async def main_async(
     embed_config = load_embedding_config(embedding_config_path)
     target_dimension = int(embed_config.embedding_dimension)
     logger.info(
-        "当前 Embedding Provider: source=%s model=%s dimension=%s",
-        embed_config.embedding_source,
+        "当前 Embedding Provider: model=%s dimension=%s",
         embed_config.embedding_model,
         target_dimension,
     )
@@ -82,8 +81,11 @@ async def main_async(
 
         embedding_service = EmbeddingService(embed_config)
     try:
+
         async def get_pool(config_key: str) -> Any:
-            config = knowledge_db_config if config_key == "knowledge" else memory_db_config
+            config = (
+                knowledge_db_config if config_key == "knowledge" else memory_db_config
+            )
             pool_key = get_pool_key(config)
             if pool_key not in pools:
                 logger.info(

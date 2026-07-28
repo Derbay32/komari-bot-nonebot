@@ -12,15 +12,12 @@ from .handlers.message_handler import MessageHandler
 
 # 依赖插件
 permission_manager_plugin = require("permission_manager")
-require("komari_memory")
-require("komari_decision")
+memory_plugin = require("komari_memory")
+decision_plugin = require("komari_decision")
 
-from komari_bot.plugins.komari_decision import (
-    get_plugin_manager as get_decision_plugin_manager,
-)
-from komari_bot.plugins.komari_memory import (
-    get_plugin_manager as get_memory_plugin_manager,
-)
+get_memory_plugin_manager = memory_plugin.get_plugin_manager
+get_decision_plugin_manager = decision_plugin.get_plugin_manager
+
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
 __plugin_meta__ = PluginMetadata(
@@ -34,8 +31,7 @@ matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 _handler: MessageHandler | None = None
 
 
-def _resolve_runtime_components(
-) -> tuple[Any, Any, Any | None] | None:
+def _resolve_runtime_components() -> tuple[Any, Any, Any | None] | None:
     memory_manager = get_memory_plugin_manager()
     if (
         memory_manager is None
@@ -56,11 +52,7 @@ def _get_or_build_handler() -> MessageHandler | None:
         return None
     redis, memory, scene_runtime = components
 
-    if (
-        _handler is None
-        or _handler.redis is not redis
-        or _handler.memory is not memory
-    ):
+    if _handler is None or _handler.redis is not redis or _handler.memory is not memory:
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
@@ -92,7 +84,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
-        result = await handler.process_message(event)
+        result = await handler.process_message(bot, event)
         if not result:
             return
 

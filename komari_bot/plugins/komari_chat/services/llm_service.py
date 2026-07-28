@@ -183,6 +183,7 @@ async def generate_reply(
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
             request_trace_id=request_trace_id,
+            record_chat_log=True,
         )
     else:
         # 兼容旧格式
@@ -193,6 +194,7 @@ async def generate_reply(
             temperature=config.llm_temperature_chat,
             max_tokens=config.llm_max_tokens_chat,
             request_trace_id=request_trace_id,
+            record_chat_log=True,
         )
 
     # 提取 XML 标签内容

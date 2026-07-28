@@ -78,7 +78,7 @@ class SceneSyncService:
             and latest_ready.get("embedding_instruction_hash") == instruction_hash
         ):
             existing_set_id = int(latest_ready["id"])
-            logger.info(
+            logger.debug(
                 "[KomariDecision] Scene 模板未变化，复用现有 set: id={}",
                 existing_set_id,
             )
@@ -103,7 +103,7 @@ class SceneSyncService:
             ready = int(latest_building.get("item_ready") or 0)
             failed = int(latest_building.get("item_failed") or 0)
             pending = max(total - ready - failed, 0)
-            logger.info(
+            logger.debug(
                 "[KomariDecision] 复用构建中的 scene set: id={} pending={}",
                 existing_set_id,
                 pending,

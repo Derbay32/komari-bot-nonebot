@@ -59,7 +59,7 @@
 Bot 启动后：
 
 - 会建立 PostgreSQL 连接池
-- 会按当前 embedding 维度自动补齐 `komari_memory_conversations` / `komari_memory_entity`
+- 会按当前 embedding 维度自动补齐 `komari_memory_conversations` / `komari_memory_user_profile` / `komari_memory_interaction_history`
 - 会校验 `komari_memory_conversations.embedding` 与 provider 维度一致
 - 会初始化 Redis 缓冲区管理
 - 会注册总结任务和忘却任务
@@ -90,6 +90,20 @@ poetry run python scripts/migrate_embeddings.py --target memory
 
 ```bash
 poetry run python scripts/migrate_embeddings.py --apply --target memory
+```
+
+### 单表实体拆表迁移
+
+如果你的库里仍然只有旧的 `komari_memory_entity`，先做 dry-run：
+
+```bash
+poetry run python scripts/split_komari_memory_entity_tables.py
+```
+
+确认后执行真实迁移：
+
+```bash
+poetry run python scripts/split_komari_memory_entity_tables.py --apply
 ```
 
 ### `komari_memory_entity` 旧结构迁移
@@ -140,7 +154,8 @@ psql -h localhost -U your_username -d komari_bot \
 - 群聊消息先进入 Redis 缓冲
 - 达到消息数 / token / 时间阈值后，触发总结任务
 - 总结结果写入 `komari_memory_conversations`
-- 用户画像和互动历史写入 `komari_memory_entity`
+- 用户画像写入 `komari_memory_user_profile`
+- 互动历史写入 `komari_memory_interaction_history`
 
 ### 记忆检索
 
@@ -152,10 +167,12 @@ psql -h localhost -U your_username -d komari_bot \
 
 忘却任务每天凌晨 4 点运行，核心规则：
 
-- `forgetting_decay_factor`：每日按比例衰减 `importance_current`
-- `forgetting_access_boost`：记忆被命中时提升 `importance_current`
+- `importance_current` 使用整数模型，每天执行 `-1`，最低降到 `0`
+- 记忆被命中后，`importance_current` 直接恢复为 `importance_initial`
+- `importance_initial <= forgetting_importance_threshold` 的低价值记忆，归零后会直接删除
+- `importance_initial > forgetting_importance_threshold` 的高价值记忆，第一次归零会交给 LLM 模糊化并重置重要性，下一次归零再删除
+- `forgetting_fuzzify_concurrency`：首次归零模糊化时的并发上限
 - `forgetting_min_age_days`：未达到最小保留天数的记忆不会被删除或模糊化
-- 低价值记忆删除，高价值记忆先模糊化，再进入下一轮删除
 
 ### scene 持久化依赖
 
@@ -212,10 +229,11 @@ psql -h localhost -U your_username -d komari_bot \
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `forgetting_enabled` | `true` | 是否启用忘却 |
-| `forgetting_importance_threshold` | `3` | 低价值记忆阈值 |
-| `forgetting_decay_factor` | `0.95` | 每日衰减系数 |
-| `forgetting_access_boost` | `1.2` | 命中时的访问回升系数 |
+| `forgetting_importance_threshold` | `3` | 低价值记忆直接删除阈值，高于该值的记忆首次归零会先模糊化 |
+| `forgetting_decay_factor` | `0.95` | 兼容旧配置，当前整数忘却模型未使用 |
+| `forgetting_access_boost` | `1.2` | 兼容旧配置，当前整数忘却模型未使用 |
 | `forgetting_min_age_days` | `3` | 最小保留天数 |
+| `forgetting_fuzzify_concurrency` | `3` | 首次归零模糊化时的 LLM 最大并发数 |
 
 ### 主动回复与判定
 

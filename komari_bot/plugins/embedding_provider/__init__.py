@@ -2,7 +2,7 @@
 Komari Bot Embedding Provider。
 
 提供统一的向量嵌入服务和重排服务。
-支持本地 fastembed 以及在线 API 兼容格式。
+支持在线 API 兼容格式。
 """
 
 from typing import Any
@@ -47,7 +47,7 @@ async def _startup() -> None:
     state.embedding_service = EmbeddingService(config)
     state.rerank_service = RerankService(config)
 
-    logger.info(f"[EmbeddingProvider] 插件启动完成 (模式: {config.embedding_source})")
+    logger.info("[EmbeddingProvider] 插件启动完成")
 
 
 async def _shutdown() -> None:

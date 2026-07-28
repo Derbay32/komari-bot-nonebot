@@ -51,8 +51,14 @@ def get_character_name(
     return get_manager().get_character_name(user_id, fallback_nickname)
 
 
+async def refresh_if_file_updated() -> bool:
+    """当绑定文件更新时重新加载绑定。"""
+    return await get_manager().refresh_if_file_updated()
+
+
 __all__ = [
     "CharacterBindingManager",
     "get_binding_manager",
     "get_character_name",
+    "refresh_if_file_updated",
 ]

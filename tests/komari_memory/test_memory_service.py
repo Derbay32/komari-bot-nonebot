@@ -28,13 +28,10 @@ class _FakeConversationRepository:
     async def touch_conversations(
         self,
         conversation_ids: list[int],
-        *,
-        access_boost: float = 1.0,
     ) -> None:
         self.touch_calls.append(
             {
                 "conversation_ids": list(conversation_ids),
-                "access_boost": access_boost,
             }
         )
 

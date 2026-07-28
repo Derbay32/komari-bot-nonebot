@@ -76,15 +76,20 @@ def test_main_async_apply_reuses_pool_and_cleans_up_resources(
         module,
         "load_embedding_config",
         lambda _path: types.SimpleNamespace(
-            embedding_source="local",
             embedding_model="test-model",
             embedding_dimension=1536,
         ),
     )
-    monkeypatch.setattr(module, "resolve_knowledge_database_config", lambda **_kwargs: db_config)
-    monkeypatch.setattr(module, "resolve_memory_database_config", lambda **_kwargs: db_config)
+    monkeypatch.setattr(
+        module, "resolve_knowledge_database_config", lambda **_kwargs: db_config
+    )
+    monkeypatch.setattr(
+        module, "resolve_memory_database_config", lambda **_kwargs: db_config
+    )
 
-    async def _fake_create_pool(config: DatabaseConfigSchema, *, command_timeout: int) -> _FakePool:
+    async def _fake_create_pool(
+        config: DatabaseConfigSchema, *, command_timeout: int
+    ) -> _FakePool:
         assert command_timeout == 60
         pool = _FakePool(config.pg_database)
         created_pools.append(pool)
@@ -159,15 +164,20 @@ def test_main_async_apply_cleans_up_on_migration_failure(
         module,
         "load_embedding_config",
         lambda _path: types.SimpleNamespace(
-            embedding_source="local",
             embedding_model="test-model",
             embedding_dimension=1536,
         ),
     )
-    monkeypatch.setattr(module, "resolve_knowledge_database_config", lambda **_kwargs: db_config)
-    monkeypatch.setattr(module, "resolve_memory_database_config", lambda **_kwargs: db_config)
+    monkeypatch.setattr(
+        module, "resolve_knowledge_database_config", lambda **_kwargs: db_config
+    )
+    monkeypatch.setattr(
+        module, "resolve_memory_database_config", lambda **_kwargs: db_config
+    )
 
-    async def _fake_create_pool(config: DatabaseConfigSchema, *, command_timeout: int) -> _FakePool:
+    async def _fake_create_pool(
+        config: DatabaseConfigSchema, *, command_timeout: int
+    ) -> _FakePool:
         assert command_timeout == 60
         pool = _FakePool(config.pg_database)
         created_pools.append(pool)

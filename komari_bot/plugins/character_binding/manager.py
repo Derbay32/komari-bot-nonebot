@@ -33,6 +33,7 @@ class CharacterBindingManager:
         self.binding_file = Path("data/character_binding/bindings.json")
         self.binding_file.parent.mkdir(parents=True, exist_ok=True)
         self._bindings: dict[str, str] = {}
+        self._binding_mtime_ns: int | None = None
         self._lock = asyncio.Lock()
         self._load_bindings()
 
@@ -42,19 +43,29 @@ class CharacterBindingManager:
             try:
                 with Path.open(self.binding_file, encoding="utf-8") as f:
                     self._bindings = json.load(f)
+                self._binding_mtime_ns = self._get_binding_mtime_ns()
                 logger.info(f"[CharacterBinding] 加载角色绑定: {len(self._bindings)} 条")
             except (OSError, json.JSONDecodeError):
                 logger.warning("[CharacterBinding] 绑定文件加载失败", exc_info=True)
                 self._bindings = {}
+                self._binding_mtime_ns = None
         else:
             self._bindings = {}
             # 初始化时同步写入空文件
             try:
                 with Path.open(self.binding_file, "w", encoding="utf-8") as f:
                     json.dump({}, f, ensure_ascii=False, indent=2)
+                self._binding_mtime_ns = self._get_binding_mtime_ns()
                 logger.info("[CharacterBinding] 初始化角色绑定文件")
             except OSError:
                 logger.exception("[CharacterBinding] 初始化绑定文件失败")
+                self._binding_mtime_ns = None
+
+    def _get_binding_mtime_ns(self) -> int | None:
+        try:
+            return self.binding_file.stat().st_mtime_ns
+        except OSError:
+            return None
 
     async def _save_bindings(self) -> None:
         """保存绑定数据到文件。"""
@@ -137,3 +148,17 @@ class CharacterBindingManager:
             是否存在绑定
         """
         return user_id in self._bindings
+
+    async def refresh_if_file_updated(self) -> bool:
+        """当绑定文件更新时重新加载绑定。"""
+        current_mtime_ns = self._get_binding_mtime_ns()
+        if current_mtime_ns == self._binding_mtime_ns:
+            return False
+
+        async with self._lock:
+            latest_mtime_ns = self._get_binding_mtime_ns()
+            if latest_mtime_ns == self._binding_mtime_ns:
+                return False
+
+            self._load_bindings()
+            return True

@@ -1,6 +1,5 @@
 {
-  "embedding_source": "local",
-  "embedding_model": "BAAI/bge-small-zh-v1.5",
+  "embedding_model": "Qwen/Qwen3-Embedding-8B",
   "embedding_api_url": "",
   "embedding_api_key": "",
   "embedding_dimension": 512,

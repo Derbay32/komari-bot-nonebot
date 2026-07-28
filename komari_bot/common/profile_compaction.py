@@ -11,9 +11,10 @@ from typing import Any, Protocol
 from .token_counter import estimate_text_tokens
 
 _ALLOWED_CATEGORIES = {"preference", "fact", "relation", "general"}
-_PROFILE_COMPACTION_JSON_EXAMPLE = (
-    '{"user_id": "12345", "display_name": "阿明", "traits": '
-    '[{"key": "长期兴趣", "value": "偏爱策略和养成类游戏", "category": "preference", "importance": 5}]}'
+_COMPACTION_OPERATIONS_JSON_EXAMPLE = (
+    '{"operations": [{"op": "replace", "field": "trait", "key": "长期兴趣", '
+    '"value": "偏爱策略和养成类游戏", "category": "preference", "importance": 5}, '
+    '{"op": "delete", "field": "trait", "key": "短期状态"}]}'
 )
 _MAX_COMPACTION_PASSES = 6
 _DEFAULT_LOGGER = logging.getLogger("komari_memory.profile_compaction")
@@ -179,9 +180,7 @@ def normalize_profile_for_storage(
     trait_limit: int | None = None,
 ) -> dict[str, Any]:
     user_id = str(profile.get("user_id", "")).strip() or fallback_user_id
-    display_name = (
-        str(profile.get("display_name", "")).strip() or fallback_display_name
-    )
+    display_name = str(profile.get("display_name", "")).strip() or fallback_display_name
     traits = profile_traits_to_list(profile)
     if trait_limit is not None:
         traits = traits[: max(0, trait_limit)]
@@ -235,66 +234,59 @@ def summarize_profile_compaction_diff(
     }
 
 
-def _build_prompt_profile_payload(
-    *,
-    user_id: str,
-    display_name: str,
+def _build_prompt_traits_payload(
     traits: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "user_id": user_id,
-        "display_name": display_name,
-        "traits": [
-            {
-                "key": trait["key"],
-                "value": trait["value"],
-                "category": trait["category"],
-                "importance": trait["importance"],
-            }
-            for trait in traits
-        ],
-    }
+) -> list[dict[str, Any]]:
+    """为压缩提示词构建 traits 列表（去除 updated_at 等内部字段）。"""
+    return [
+        {
+            "key": trait["key"],
+            "value": trait["value"],
+            "category": trait["category"],
+            "importance": trait["importance"],
+        }
+        for trait in traits
+    ]
 
 
 def _build_profile_compaction_prompt(
     *,
-    user_id: str,
-    display_name: str,
     traits: list[dict[str, Any]],
     trait_limit: int,
 ) -> str:
-    payload = _build_prompt_profile_payload(
-        user_id=user_id,
-        display_name=display_name,
-        traits=traits,
-    )
-    return f"""请把下面这份用户画像压缩成最多 {trait_limit} 条长期稳定 traits，输出必须使用简体中文。
+    traits_payload = _build_prompt_traits_payload(traits)
+    return f"""请将以下用户画像 traits 压缩为最多 {trait_limit} 条长期稳定项，输出增量操作指令。输出必须使用简体中文。
 
 压缩规则：
 - 只保留身份、长期偏好、稳定习惯、关系认知、长期事实这类可复用的长期信息
 - 删除短期状态、一次性事件、瞬时情绪、临时计划、当天小事
 - 合并语义相近或重复的 traits，改写成更稳定、不易过时的表达
-- trait 的 key 要简短、稳定、可长期复用，不要使用“当前状态”“最近想法”这种时效性强的键名
+- trait 的 key 要简短、稳定、可长期复用，不要使用"当前状态""最近想法"这种时效性强的键名
 - 不要编造新信息，不要输出解释，不要输出 Markdown
 
-当前画像 JSON：
-{json.dumps(payload, ensure_ascii=False)}
+操作约束：
+- op 只允许：add / replace / delete
+- field 只允许：trait
+- 当 op 为 add 或 replace 时，必须提供 key / value / category / importance
+- 当 op 为 delete 时，只需提供 key
+- 你输出的是"增量操作"，不是最终完整画像；禁止把完整 traits 全量重写出来
+- 未在操作中提及的 trait 将原样保留
+- 严禁输出 user_id、display_name 等由程序维护的字段
+
+当前 traits JSON：
+{json.dumps(traits_payload, ensure_ascii=False)}
 
 请严格返回以下 JSON 格式：
-{_PROFILE_COMPACTION_JSON_EXAMPLE}"""
+{_COMPACTION_OPERATIONS_JSON_EXAMPLE}"""
 
 
 def _estimate_prompt_tokens(
     *,
-    user_id: str,
-    display_name: str,
     traits: list[dict[str, Any]],
     trait_limit: int,
 ) -> int:
     return estimate_text_tokens(
         _build_profile_compaction_prompt(
-            user_id=user_id,
-            display_name=display_name,
             traits=traits,
             trait_limit=trait_limit,
         )
@@ -303,8 +295,6 @@ def _estimate_prompt_tokens(
 
 def _chunk_traits_for_prompt(
     *,
-    user_id: str,
-    display_name: str,
     traits: list[dict[str, Any]],
     trait_limit: int,
     token_limit: int,
@@ -315,8 +305,6 @@ def _chunk_traits_for_prompt(
     for trait in traits:
         candidate = [*current_chunk, trait]
         estimated_tokens = _estimate_prompt_tokens(
-            user_id=user_id,
-            display_name=display_name,
             traits=candidate,
             trait_limit=trait_limit,
         )
@@ -332,10 +320,110 @@ def _chunk_traits_for_prompt(
     return chunks
 
 
+def _parse_compaction_operations(parsed: Any) -> list[dict[str, Any]]:
+    """从 LLM 返回的 JSON 中解析增量操作列表。
+
+    Args:
+        parsed: LLM 返回的 JSON 解析结果
+
+    Returns:
+        有效的增量操作列表
+
+    Raises:
+        TypeError: 当返回的 JSON 格式不符合预期时
+    """
+    if not isinstance(parsed, dict):
+        msg = "画像压缩返回的 JSON 不是对象"
+        raise TypeError(msg)
+    operations = parsed.get("operations")
+    if not isinstance(operations, list):
+        msg = "画像压缩返回的 JSON 缺少 operations 数组"
+        raise TypeError(msg)
+    valid_ops: list[dict[str, Any]] = []
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        op_type = str(op.get("op", "")).strip()
+        field = str(op.get("field", "")).strip()
+        if op_type not in {"add", "replace", "delete"} or field != "trait":
+            continue
+        key = str(op.get("key", "")).strip()
+        if not key:
+            continue
+        valid_ops.append(op)
+    return valid_ops
+
+
+def _apply_compaction_operations(
+    current_traits: list[dict[str, Any]],
+    operations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """将增量操作应用到当前 traits，返回处理后的 traits 列表。
+
+    Args:
+        current_traits: 当前的 traits 列表
+        operations: LLM 输出的增量操作列表
+
+    Returns:
+        应用操作后的 traits 列表
+    """
+    traits_by_key: dict[str, dict[str, Any]] = {
+        trait["key"]: dict(trait) for trait in current_traits
+    }
+    now_iso = _now_iso()
+    for operation in operations:
+        op_type = str(operation.get("op", "")).strip()
+        key = str(operation.get("key", "")).strip()
+        if not key:
+            continue
+        if op_type == "delete":
+            traits_by_key.pop(key, None)
+        elif op_type in {"add", "replace"}:
+            value = str(operation.get("value", "")).strip()
+            if not value:
+                continue
+            if op_type == "add" and key in traits_by_key:
+                continue
+            traits_by_key[key] = {
+                "key": key,
+                "value": value,
+                "category": _normalize_category(operation.get("category", "general")),
+                "importance": _clamp_importance(operation.get("importance", 3)),
+                "updated_at": now_iso,
+            }
+    return list(traits_by_key.values())
+
+
+def _build_compacted_profile(
+    *,
+    original_profile: dict[str, Any],
+    reduced_traits: list[dict[str, Any]],
+    trait_limit: int,
+) -> dict[str, Any]:
+    """根据原始画像和压缩后的 traits 构建最终画像。
+
+    user_id 和 display_name 始终取自原始画像，确保程序维护字段不被篡改。
+
+    Args:
+        original_profile: 压缩前的原始画像
+        reduced_traits: 压缩后的 traits 列表
+        trait_limit: traits 上限
+
+    Returns:
+        完整的压缩后画像
+    """
+    user_id = str(original_profile.get("user_id", "")).strip()
+    display_name = str(original_profile.get("display_name", "")).strip()
+    return normalize_profile_for_storage(
+        {"traits": reduced_traits},
+        fallback_user_id=user_id,
+        fallback_display_name=display_name,
+        trait_limit=trait_limit,
+    )
+
+
 async def _request_profile_compaction(
     *,
-    user_id: str,
-    display_name: str,
     traits: list[dict[str, Any]],
     config: ProfileCompactionConfig,
     llm_generate_text: GenerateTextCallable,
@@ -346,10 +434,25 @@ async def _request_profile_compaction(
     log: LoggerLike,
     chunk_index: int | None = None,
     chunk_total: int | None = None,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
+    """请求 LLM 对 traits 进行压缩，返回增量操作应用后的 traits 列表。
+
+    Args:
+        traits: 待压缩的 traits 列表
+        config: 压缩配置
+        llm_generate_text: LLM 调用函数
+        trace_id: 追踪 ID
+        source: 调用来源
+        stage: 压缩阶段（single / final / chunk）
+        pass_index: 当前轮次
+        log: 日志记录器
+        chunk_index: 分批索引（分批时使用）
+        chunk_total: 分批总数（分批时使用）
+
+    Returns:
+        压缩后的 traits 列表
+    """
     prompt = _build_profile_compaction_prompt(
-        user_id=user_id,
-        display_name=display_name,
         traits=traits,
         trait_limit=config.profile_trait_limit,
     )
@@ -370,15 +473,8 @@ async def _request_profile_compaction(
         request_phase=f"profile_compaction_{stage}",
     )
     parsed = json.loads(_extract_json_from_markdown(response))
-    if not isinstance(parsed, dict):
-        msg = "画像压缩返回的 JSON 不是对象"
-        raise TypeError(msg)
-    return normalize_profile_for_storage(
-        parsed,
-        fallback_user_id=user_id,
-        fallback_display_name=display_name,
-        trait_limit=config.profile_trait_limit,
-    )
+    operations = _parse_compaction_operations(parsed)
+    return _apply_compaction_operations(traits, operations)
 
 
 async def compact_profile_with_llm(
@@ -390,6 +486,25 @@ async def compact_profile_with_llm(
     source: str,
     log: LoggerLike | None = None,
 ) -> dict[str, Any]:
+    """对超出上限的用户画像执行 LLM 压缩。
+
+    压缩流程：提取当前 traits → LLM 输出增量操作（add/replace/delete） →
+    程序侧应用操作 → 构建最终画像。user_id 和 display_name 始终由程序维护。
+
+    Args:
+        profile: 待压缩的原始画像
+        config: 压缩配置
+        llm_generate_text: LLM 调用函数
+        trace_id: 追踪 ID
+        source: 调用来源
+        log: 日志记录器
+
+    Returns:
+        压缩后的完整画像
+
+    Raises:
+        RuntimeError: 当压缩无法收敛时
+    """
     resolved_logger = _resolve_logger(log)
     normalized_profile = normalize_profile_for_storage(
         profile,
@@ -416,15 +531,11 @@ async def compact_profile_with_llm(
 
     for pass_index in range(1, _MAX_COMPACTION_PASSES + 1):
         estimated_prompt_tokens = _estimate_prompt_tokens(
-            user_id=user_id,
-            display_name=display_name,
             traits=current_traits,
             trait_limit=config.profile_trait_limit,
         )
         if estimated_prompt_tokens <= config.summary_chunk_token_limit:
-            compacted_profile = await _request_profile_compaction(
-                user_id=user_id,
-                display_name=display_name,
+            reduced_traits = await _request_profile_compaction(
                 traits=current_traits,
                 config=config,
                 llm_generate_text=llm_generate_text,
@@ -434,7 +545,14 @@ async def compact_profile_with_llm(
                 pass_index=pass_index,
                 log=resolved_logger,
             )
-            diff = summarize_profile_compaction_diff(normalized_profile, compacted_profile)
+            compacted_profile = _build_compacted_profile(
+                original_profile=normalized_profile,
+                reduced_traits=reduced_traits,
+                trait_limit=config.profile_trait_limit,
+            )
+            diff = summarize_profile_compaction_diff(
+                normalized_profile, compacted_profile
+            )
             resolved_logger.info(
                 f"[KomariMemory] 画像压缩完成: trace_id={trace_id} source={source} user={user_id or '-'} "
                 f"before_traits={diff['before_traits']} after_traits={diff['after_traits']} "
@@ -443,8 +561,6 @@ async def compact_profile_with_llm(
             return compacted_profile
 
         trait_chunks = _chunk_traits_for_prompt(
-            user_id=user_id,
-            display_name=display_name,
             traits=current_traits,
             trait_limit=config.profile_trait_limit,
             token_limit=config.summary_chunk_token_limit,
@@ -457,9 +573,7 @@ async def compact_profile_with_llm(
 
         reduced_traits: list[dict[str, Any]] = []
         for chunk_index, chunk_traits in enumerate(trait_chunks, start=1):
-            chunk_profile = await _request_profile_compaction(
-                user_id=user_id,
-                display_name=display_name,
+            chunk_reduced = await _request_profile_compaction(
                 traits=chunk_traits,
                 config=config,
                 llm_generate_text=llm_generate_text,
@@ -471,7 +585,7 @@ async def compact_profile_with_llm(
                 chunk_total=len(trait_chunks),
                 log=resolved_logger,
             )
-            reduced_traits.extend(profile_traits_to_list(chunk_profile))
+            reduced_traits.extend(chunk_reduced)
 
         reduced_traits = _dedupe_traits(reduced_traits)
         resolved_logger.info(

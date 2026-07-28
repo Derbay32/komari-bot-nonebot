@@ -11,11 +11,13 @@ from nonebot import logger
 DEFAULTS: dict[str, str] = {
     "system_prompt": "你是一个专业的群聊总结助手，只基于聊天记录归纳事实。",
     "memory_ack": "已收到聊天记录，我先梳理重点。",
+    "memory_ack_role": "assistant",
     "output_instruction": (
         "请仅输出总结正文，使用 <content></content> 包裹。"
         "正文控制在 120-220 字，尽量清晰、紧凑、客观。"
     ),
     "cot_prefix": "<think>\n我先按时间梳理讨论脉络，再输出总结。\n",
+    "cot_prefix_role": "assistant",
 }
 
 

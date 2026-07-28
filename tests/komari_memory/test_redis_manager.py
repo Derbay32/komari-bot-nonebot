@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
-from komari_bot.plugins.komari_memory.services import redis_manager as redis_manager_module
+from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+from komari_bot.plugins.komari_memory.services import (
+    redis_manager as redis_manager_module,
+)
 from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
     RedisManager,
@@ -83,14 +85,19 @@ def _build_message(index: int) -> MessageSchema:
 
 
 def _build_manager(monkeypatch: Any, *, buffer_size: int = 3) -> RedisManager:
+    config = KomariMemoryConfigSchema.model_construct(message_buffer_size=buffer_size)
     monkeypatch.setattr(
         redis_manager_module,
         "get_config",
-        lambda: SimpleNamespace(message_buffer_size=buffer_size),
+        lambda: config,
     )
-    manager = RedisManager(SimpleNamespace())
-    manager._redis = _FakeRedis()
+    manager = RedisManager(config)
+    manager._redis = cast("Any", _FakeRedis())
     return manager
+
+
+def _get_fake_redis(manager: RedisManager) -> _FakeRedis:
+    return cast("_FakeRedis", manager._redis)
 
 
 def test_push_message_keeps_latest_messages(monkeypatch: Any) -> None:
@@ -109,7 +116,7 @@ def test_push_message_keeps_latest_messages(monkeypatch: Any) -> None:
 def test_get_buffer_returns_latest_window_in_time_order(monkeypatch: Any) -> None:
     manager = _build_manager(monkeypatch, buffer_size=5)
     key = redis_manager_module.RedisKeys.buffer("group-1")
-    manager.redis.data[key] = [
+    _get_fake_redis(manager).data[key] = [
         json.dumps(_build_message(index).__dict__, ensure_ascii=False)
         for index in range(1, 6)
     ]
