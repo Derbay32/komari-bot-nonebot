@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     from komari_bot.common.management_api import ManagementTokenSource
     from komari_bot.common.management_audit import ManagementAuditEvent
 
+_DEFAULT_CREDENTIALS = (
+    {
+        "credential_id": "announce-operator",
+        "token": "secret-token-00000000",
+        "permissions": ["*"],
+    },
+)
+
 
 class _FakeBot:
     def __init__(
@@ -76,7 +84,7 @@ class _FakeBot:
 
 def _build_app(
     *,
-    api_token: ManagementTokenSource = "secret-token-00000000",
+    api_token: ManagementTokenSource = _DEFAULT_CREDENTIALS,
     status_page_url: str = "https://status.example.com/komari",
     announce_max_group_count: int = 20,
     announce_send_interval_seconds: float = 0.0,
@@ -217,7 +225,7 @@ async def test_announce_routes_support_group_send_and_failure_details(
         "   https://status.example.com/komari"
     )
     assert [event.outcome for event in audit_events] == ["started", "succeeded"]
-    assert {event.operator_id for event in audit_events} == {"legacy-api-token"}
+    assert {event.operator_id for event in audit_events} == {"announce-operator"}
     assert audit_events[-1].metadata == {
         "target_count": 2,
         "success_count": 1,

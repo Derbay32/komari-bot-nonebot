@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from komari_bot.common.management_api import ManagementTokenSource
 
-API_PREFIX = "/api/komari-help/v1"
+API_PREFIX = "/api/v2/komari-help"
 
 
 class HelpEngineProtocol(Protocol):

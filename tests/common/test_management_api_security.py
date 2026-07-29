@@ -108,15 +108,23 @@ async def test_named_credentials_enforce_scope_and_scheduled_revocation(
 
 
 @pytest.mark.asyncio
-async def test_legacy_and_dynamic_credentials_remain_compatible(app: App) -> None:
-    state: dict[str, object] = {"credentials": "legacy-token-00000000"}
+async def test_dynamic_credentials_are_resolved_for_every_request(app: App) -> None:
+    state: dict[str, object] = {
+        "credentials": [
+            {
+                "credential_id": "initial-reader",
+                "token": "initial-token-000000",
+                "permissions": ["config:read"],
+            }
+        ]
+    }
     api_app = _build_auth_app(lambda: state["credentials"])
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
-        legacy = await client.get(
+        initial = await client.get(
             "/read",
-            headers={"Authorization": "Bearer legacy-token-00000000"},
+            headers={"Authorization": "Bearer initial-token-000000"},
         )
         state["credentials"] = [
             {
@@ -127,18 +135,15 @@ async def test_legacy_and_dynamic_credentials_remain_compatible(app: App) -> Non
         ]
         old_after_rotation = await client.get(
             "/read",
-            headers={"Authorization": "Bearer legacy-token-00000000"},
+            headers={"Authorization": "Bearer initial-token-000000"},
         )
         rotated = await client.get(
             "/read",
             headers={"Authorization": "Bearer rotated-token-000000"},
         )
 
-    assert legacy.status_code == 200
-    assert legacy.json() == {
-        "operator_id": "legacy-api-token",
-        "permissions": ["*"],
-    }
+    assert initial.status_code == 200
+    assert initial.json()["operator_id"] == "initial-reader"
     assert old_after_rotation.status_code == 401
     assert rotated.status_code == 200
     assert rotated.json()["operator_id"] == "rotated-reader"
@@ -149,11 +154,17 @@ async def test_async_credential_source_is_resolved_for_every_request(app: App) -
     state = {"token": "first-token-00000000"}
     calls = 0
 
-    async def _credential_source() -> str:
+    async def _credential_source() -> list[dict[str, object]]:
         nonlocal calls
         calls += 1
         await asyncio.sleep(0)
-        return state["token"]
+        return [
+            {
+                "credential_id": "async-reader",
+                "token": state["token"],
+                "permissions": ["config:read"],
+            }
+        ]
 
     async with app.test_server(
         asgi=cast("Any", _build_auth_app(_credential_source))
@@ -201,7 +212,18 @@ def test_permission_implication_uses_explicit_table_only() -> None:
 @pytest.mark.asyncio
 async def test_weak_management_token_is_rejected(app: App) -> None:
     async with app.test_server(
-        asgi=cast("Any", _build_auth_app("short-token"))
+        asgi=cast(
+            "Any",
+            _build_auth_app(
+                [
+                    {
+                        "credential_id": "weak-reader",
+                        "token": "short-token",
+                        "permissions": ["config:read"],
+                    }
+                ]
+            ),
+        )
     ) as ctx:
         response = await ctx.get_client().get(
             "/read",
@@ -227,7 +249,7 @@ async def test_jsonl_audit_records_results_without_sensitive_payloads(
         reason="轮换配置",
         action="config.update_field",
         resource="komari_management",
-        field_name="api_token",
+        field_name="api_credentials",
         target_hash=hash_management_target("super-secret-token-canary"),
         recorder=recorder,
     ) as audit:
@@ -240,7 +262,7 @@ async def test_jsonl_audit_records_results_without_sensitive_payloads(
             reason="验证失败审计",
             action="config.update_field",
             resource="komari_management",
-            field_name="api_token",
+            field_name="api_credentials",
             target_hash=hash_management_target("super-secret-token-canary"),
             recorder=recorder,
         ):

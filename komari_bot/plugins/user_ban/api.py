@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from komari_bot.common.management_api import ManagementTokenSource
     from komari_bot.common.management_audit import ManagementAuditRecorder
 
-API_PREFIX = "/api/komari-user-bans/v1"
+API_PREFIX = "/api/v2/komari-user-bans"
 MANAGEMENT_API_OPERATOR_ID = "management_api"
 
 

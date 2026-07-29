@@ -36,8 +36,8 @@ def pytest_configure(config: object) -> None:
         "command_start": ["。", "."],
         "command_sep": [" "],
         "superusers": {"42", "669293859"},
-        "fastapi_docs_url": "/api/komari-management/docs",
-        "fastapi_openapi_url": "/api/komari-management/openapi.json",
+        "fastapi_docs_url": "/api/docs",
+        "fastapi_openapi_url": "/api/openapi.json",
         "fastapi_redoc_url": None,
         "fastapi_include_adapter_schema": False,
     }

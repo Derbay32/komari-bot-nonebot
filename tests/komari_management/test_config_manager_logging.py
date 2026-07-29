@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class _ConfigSchema(BaseModel):
-    api_token: str = "old-token"
+    private_value: str = "old-value"
     public_name: str = "old-name"
 
 
@@ -35,7 +35,7 @@ class _FakeStorage:
         conflict_data: dict[str, Any] | None = None,
     ) -> None:
         self.config_data: dict[str, Any] = config_data or {
-            "api_token": "old-token",
+            "private_value": "old-value",
             "public_name": "old-name",
         }
         self.fail_upsert = fail_upsert
@@ -312,15 +312,15 @@ def test_update_field_log_does_not_include_new_value(
     monkeypatch.setattr(manager_module, "logger", fake_logger)
 
     manager = ConfigManager("test_safe_logging", _ConfigSchema)
-    manager.update_field("api_token", "new-sensitive-token")
+    manager.update_field("private_value", "new-sensitive-value")
     manager.update_field("public_name", "new-public-name")
 
     update_logs = [msg for msg in fake_logger.info_messages if "配置已更新" in msg]
     assert update_logs == [
-        "[test_safe_logging] 配置已更新: api_token",
+        "[test_safe_logging] 配置已更新: private_value",
         "[test_safe_logging] 配置已更新: public_name",
     ]
-    assert all("new-sensitive-token" not in msg for msg in update_logs)
+    assert all("new-sensitive-value" not in msg for msg in update_logs)
     assert all("new-public-name" not in msg for msg in update_logs)
 
 
@@ -337,11 +337,11 @@ async def test_async_field_updates_from_two_workers_preserve_each_other(
     second_manager = ConfigManager("test_multi_worker", _ConfigSchema)
     await second_manager.initialize_async()
 
-    await first_manager.update_field_async("api_token", "new-token")
+    await first_manager.update_field_async("private_value", "new-value")
     await second_manager.update_field_async("public_name", "new-name")
 
     assert fake_storage.config_data == {
-        "api_token": "new-token",
+        "private_value": "new-value",
         "public_name": "new-name",
     }
 
@@ -356,13 +356,13 @@ async def test_async_field_update_reloads_and_retries_after_revision_conflict(
     manager = ConfigManager("test_revision_retry", _ConfigSchema)
     updated = cast(
         "_ConfigSchema",
-        await manager.update_field_async("api_token", "new-token"),
+        await manager.update_field_async("private_value", "new-value"),
     )
 
     assert fake_storage.conflict_injected is True
-    assert updated.api_token == "new-token"
+    assert updated.private_value == "new-value"
     assert updated.public_name == "并发更新值"
     assert fake_storage.config_data == {
-        "api_token": "new-token",
+        "private_value": "new-value",
         "public_name": "并发更新值",
     }

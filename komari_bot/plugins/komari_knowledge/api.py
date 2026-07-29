@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from komari_bot.common.management_api import ManagementTokenSource
 
-API_PREFIX = "/api/komari-knowledge/v1"
+API_PREFIX = "/api/v2/komari-knowledge"
 
 
 class KnowledgeEngineProtocol(Protocol):

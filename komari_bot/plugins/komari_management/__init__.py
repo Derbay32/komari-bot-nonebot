@@ -49,6 +49,7 @@ from .announcement_repository import close_announcement_dispatch_repository
 from .api_runtime import ManagementApiComponents, register_management_api_for_driver
 from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
+from .startup_cleanup import cleanup_management_v1_config
 
 config_manager_plugin = require("config_manager")
 config_manager = config_manager_plugin.get_config_manager(
@@ -77,6 +78,7 @@ def _load_management_components() -> ManagementApiComponents:
     help_plugin = require("komari_help")
     memory_plugin = require("komari_memory")
     agent_run_logger_plugin = require("agent_run_logger")
+    search_plugin = require("komari_search")
     user_ban_plugin = require("user_ban")
 
     return ManagementApiComponents(
@@ -89,6 +91,7 @@ def _load_management_components() -> ManagementApiComponents:
         memory_redis_getter=memory_plugin.get_redis_manager,
         register_agent_run_log_api=agent_run_logger_plugin.register_agent_run_log_api,
         agent_run_log_reader_getter=agent_run_logger_plugin.get_agent_run_log_reader,
+        register_search_api=search_plugin.register_search_api,
         register_user_ban_api=user_ban_plugin.register_user_ban_api,
         user_ban_service_getter=user_ban_plugin.get_service,
         config_resources=(
@@ -217,10 +220,10 @@ driver = get_driver()
 state = PluginState()
 
 
-async def _get_management_credential_source() -> str | list[ManagementCredentialSchema]:
-    """动态返回多凭据配置，未迁移时回退旧单 Token。"""
+async def _get_management_credential_source() -> list[ManagementCredentialSchema]:
+    """动态返回具名管理凭据配置。"""
     config = await config_manager.get_async()
-    return config.api_credentials or config.api_token
+    return config.api_credentials
 
 
 state.api_registered = register_management_api_for_driver(
@@ -230,6 +233,12 @@ state.api_registered = register_management_api_for_driver(
     logger=logger,
     api_token_getter=_get_management_credential_source,
 )
+
+
+@driver.on_startup
+async def _cleanup_management_v1_config() -> None:
+    """清理 v1 管理配置残留并提示旧权限名。"""
+    await cleanup_management_v1_config(logger=logger)
 
 
 @driver.on_shutdown

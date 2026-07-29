@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
     from .managed_resources import ManagedPromptResource
 
-API_PREFIX = "/api/komari-management-prompt/v1"
+API_PREFIX = "/api/v2/komari-management-prompt"
 _WEAK_ETAG_ERROR = "If-Match 必须使用强 ETag"
 _INVALID_ETAG_ERROR = "If-Match 必须是非负整数 revision"
 

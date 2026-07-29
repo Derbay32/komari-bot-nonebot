@@ -22,6 +22,7 @@ from komari_bot.plugins.komari_management.managed_resources import (
     ManagedPromptResource,
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
+from komari_bot.plugins.komari_search.api import register_search_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
 
 if TYPE_CHECKING:
@@ -82,10 +83,24 @@ class _FakeConfigManager:
 
 def _build_api_app() -> FastAPI:
     return FastAPI(
-        docs_url="/api/komari-management/docs",
-        openapi_url="/api/komari-management/openapi.json",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
         redoc_url=None,
     )
+
+
+def _credentials(
+    token: str = "secret-token-00000000",
+    *,
+    permissions: list[str] | None = None,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "credential_id": "test-operator",
+            "token": token,
+            "permissions": permissions or ["*"],
+        }
+    ]
 
 
 def _build_components() -> ManagementApiComponents:
@@ -99,6 +114,7 @@ def _build_components() -> ManagementApiComponents:
         memory_redis_getter=lambda: None,
         register_agent_run_log_api=register_agent_run_log_api,
         agent_run_log_reader_getter=lambda: None,
+        register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
         config_resources=(
@@ -125,7 +141,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     logger = _FakeLogger()
     config = SimpleNamespace(
         plugin_enable=True,
-        api_token="secret-token-00000000",
+        api_credentials=_credentials(),
         api_allowed_origins=["https://ui.example.com"],
     )
 
@@ -140,23 +156,24 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
 
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
-        docs = await client.get("/api/komari-management/docs")
-        schema_response = await client.get("/api/komari-management/openapi.json")
+        docs = await client.get("/api/docs")
+        schema_response = await client.get("/api/openapi.json")
 
     assert docs.status_code == 200
     assert schema_response.status_code == 200
     schema = schema_response.json()
-    assert "/api/komari-knowledge/v1/knowledge" in schema["paths"]
-    assert "/api/komari-help/v1/help" in schema["paths"]
-    assert "/api/komari-memory/v1/conversations" in schema["paths"]
-    assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
-    assert "/api/agent-run-logs/v1/runs" in schema["paths"]
-    assert "/api/komari-management-config/v1/resources" in schema["paths"]
-    assert "/api/komari-management-prompt/v1/resources" in schema["paths"]
-    assert "/api/komari-announce/v1/groups" in schema["paths"]
-    assert "/api/komari-announce/v1/maintenance" in schema["paths"]
-    assert "/api/komari-decision-scenes/v1/scenes" in schema["paths"]
-    assert "/api/komari-user-bans/v1/bans" in schema["paths"]
+    assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
+    assert "/api/v2/komari-help/help" in schema["paths"]
+    assert "/api/v2/komari-memory/conversations" in schema["paths"]
+    assert "/api/v2/agent-run-logs/runs" in schema["paths"]
+    assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
+    assert "/api/v2/komari-management-config/resources" in schema["paths"]
+    assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
+    assert "/api/v2/komari-announce/groups" in schema["paths"]
+    assert "/api/v2/komari-announce/maintenance" in schema["paths"]
+    assert "/api/v2/komari-decision-scenes/scenes" in schema["paths"]
+    assert "/api/v2/komari-user-bans/bans" in schema["paths"]
+    assert "/api/llm-provider/v1/reply-logs" not in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(
         item.get("type") == "http" and item.get("scheme") == "bearer"
@@ -164,28 +181,28 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     )
     assert logger.info_messages[-2] == (
         "[Komari Management] 管理 API 已注册: "
-        "/api/komari-knowledge/v1, /api/komari-help/v1, /api/komari-memory/v1, "
-        "/api/agent-run-logs/v1, /api/llm-provider/v1, "
-        "/api/komari-management-config/v1, /api/komari-management-prompt/v1, /api/komari-announce/v1, "
-        "/api/komari-decision-scenes/v1, /api/komari-user-bans/v1"
+        "/api/v2/komari-knowledge, /api/v2/komari-help, /api/v2/komari-memory, "
+        "/api/v2/agent-run-logs, /api/v2/komari-search, "
+        "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
+        "/api/v2/komari-announce, /api/v2/komari-decision-scenes, "
+        "/api/v2/komari-user-bans"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "
-        "docs=/api/komari-management/docs, "
-        "openapi=/api/komari-management/openapi.json"
+        "docs=/api/docs, "
+        "openapi=/api/openapi.json"
     )
-    assert len(logger.warning_messages) == 1
-    assert "旧版 api_token 已弃用" in logger.warning_messages[0]
+    assert logger.warning_messages == []
 
 
 @pytest.mark.asyncio
 async def test_registered_api_uses_current_token_after_rotation(app: App) -> None:
     api_app = _build_api_app()
     logger = _FakeLogger()
-    token_state = {"value": "old-token-00000000"}
+    token_state = {"value": _credentials("old-token-00000000")}
     config = SimpleNamespace(
         plugin_enable=True,
-        api_token="old-token-00000000",
+        api_credentials=token_state["value"],
         api_allowed_origins=[],
     )
 
@@ -201,65 +218,23 @@ async def test_registered_api_uses_current_token_after_rotation(app: App) -> Non
     async with app.test_server(asgi=cast("Any", api_app)) as ctx:
         client = ctx.get_client()
         before_rotation = await client.get(
-            "/api/komari-knowledge/v1/knowledge",
+            "/api/v2/komari-knowledge/knowledge",
             headers={"Authorization": "Bearer old-token-00000000"},
         )
 
-        token_state["value"] = "new-token-00000000"
+        token_state["value"] = _credentials("new-token-00000000")
         old_token_after_rotation = await client.get(
-            "/api/komari-knowledge/v1/knowledge",
+            "/api/v2/komari-knowledge/knowledge",
             headers={"Authorization": "Bearer old-token-00000000"},
         )
         new_token_after_rotation = await client.get(
-            "/api/komari-knowledge/v1/knowledge",
+            "/api/v2/komari-knowledge/knowledge",
             headers={"Authorization": "Bearer new-token-00000000"},
         )
 
     assert before_rotation.status_code == 503
     assert old_token_after_rotation.status_code == 401
     assert new_token_after_rotation.status_code == 503
-
-
-@pytest.mark.asyncio
-async def test_registered_api_prefers_named_credentials_over_legacy_token(
-    app: App,
-) -> None:
-    api_app = _build_api_app()
-    logger = _FakeLogger()
-    config = SimpleNamespace(
-        plugin_enable=True,
-        api_token="legacy-token-00000000",
-        api_credentials=[
-            {
-                "credential_id": "knowledge-reader",
-                "token": "knowledge-token-00000",
-                "permissions": ["knowledge:read"],
-            }
-        ],
-        api_allowed_origins=[],
-    )
-
-    registered = register_management_api_for_driver(
-        driver=_FakeDriver("fastapi", api_app),
-        config=config,
-        component_loader=_build_components,
-        logger=logger,
-    )
-
-    assert registered is True
-    async with app.test_server(asgi=cast("Any", api_app)) as ctx:
-        client = ctx.get_client()
-        legacy = await client.get(
-            "/api/komari-knowledge/v1/knowledge",
-            headers={"Authorization": "Bearer legacy-token-00000000"},
-        )
-        named = await client.get(
-            "/api/komari-knowledge/v1/knowledge",
-            headers={"Authorization": "Bearer knowledge-token-00000"},
-        )
-
-    assert legacy.status_code == 401
-    assert named.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -270,7 +245,6 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
     logger = _FakeLogger()
     config = SimpleNamespace(
         plugin_enable=True,
-        api_token="",
         api_credentials=[
             {
                 "credential_id": "dashboard-reader",
@@ -279,7 +253,8 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                     "knowledge:read",
                     "help:read",
                     "memory:read",
-                    "llm_logs:read",
+                    "agent_run_logs:read",
+                    "search:read",
                     "config:read",
                     "prompt:read",
                     "announce:read",
@@ -306,17 +281,17 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
         client = ctx.get_client()
         responses = [
             await client.post(
-                "/api/komari-knowledge/v1/knowledge",
+                "/api/v2/komari-knowledge/knowledge",
                 headers=headers,
                 json={"content": "测试", "keywords": ["测试"]},
             ),
             await client.post(
-                "/api/komari-help/v1/help",
+                "/api/v2/komari-help/help",
                 headers=headers,
                 json={"title": "测试", "content": "测试"},
             ),
             await client.post(
-                "/api/komari-memory/v1/conversations",
+                "/api/v2/komari-memory/conversations",
                 headers=headers,
                 json={
                     "group_id": "1",
@@ -325,17 +300,17 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 },
             ),
             await client.patch(
-                "/api/komari-management-config/v1/resources/komari_management/fields/plugin_enable",
+                "/api/v2/komari-management-config/resources/komari_management/fields/plugin_enable",
                 headers=headers,
                 json={"value": False},
             ),
             await client.patch(
-                "/api/komari-management-prompt/v1/resources/komari_chat/fields/system_prompt",
+                "/api/v2/komari-management-prompt/resources/komari_chat/fields/system_prompt",
                 headers=headers,
                 json={"value": "测试"},
             ),
             await client.post(
-                "/api/komari-announce/v1/maintenance",
+                "/api/v2/komari-announce/maintenance",
                 headers=headers,
                 json={
                     "title": "测试",
@@ -345,12 +320,12 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 },
             ),
             await client.put(
-                "/api/komari-decision-scenes/v1/scenes/TEST",
+                "/api/v2/komari-decision-scenes/scenes/TEST",
                 headers=headers,
                 json={"scene_type": "general", "content_text": "测试"},
             ),
             await client.post(
-                "/api/komari-user-bans/v1/bans",
+                "/api/v2/komari-user-bans/bans",
                 headers=headers,
                 json={"user_id": "10086", "scope": "chat"},
             ),
@@ -366,7 +341,7 @@ def test_register_management_api_skips_disabled_config() -> None:
         driver=_FakeDriver("fastapi", _build_api_app()),
         config=SimpleNamespace(
             plugin_enable=False,
-            api_token="secret-token-00000000",
+            api_credentials=_credentials(),
             api_allowed_origins=[],
         ),
         component_loader=_build_components,
@@ -384,7 +359,7 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         driver=_FakeDriver("fastapi", _build_api_app()),
         config=SimpleNamespace(
             plugin_enable=True,
-            api_token="",
+            api_credentials=[],
             api_allowed_origins=[],
         ),
         component_loader=_build_components,
@@ -398,7 +373,7 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         driver=_FakeDriver("aiohttp"),
         config=SimpleNamespace(
             plugin_enable=True,
-            api_token="secret-token-00000000",
+            api_credentials=_credentials(),
             api_allowed_origins=[],
         ),
         component_loader=_build_components,

@@ -13,16 +13,16 @@ from .config_schema import DEFAULT_ANNOUNCE_STATUS_PAGE_URL
 from .prompt_api import register_prompt_api
 from .scene_api import register_scene_api
 
-KNOWLEDGE_API_PREFIX = "/api/komari-knowledge/v1"
-HELP_API_PREFIX = "/api/komari-help/v1"
-MEMORY_API_PREFIX = "/api/komari-memory/v1"
-AGENT_RUN_LOG_API_PREFIX = "/api/agent-run-logs/v1"
-LEGACY_LLM_LOG_API_PREFIX = "/api/llm-provider/v1"
-ANNOUNCE_API_PREFIX = "/api/komari-announce/v1"
-MANAGEMENT_CONFIG_API_PREFIX = "/api/komari-management-config/v1"
-MANAGEMENT_PROMPT_API_PREFIX = "/api/komari-management-prompt/v1"
-DECISION_SCENE_API_PREFIX = "/api/komari-decision-scenes/v1"
-USER_BAN_API_PREFIX = "/api/komari-user-bans/v1"
+KNOWLEDGE_API_PREFIX = "/api/v2/komari-knowledge"
+HELP_API_PREFIX = "/api/v2/komari-help"
+MEMORY_API_PREFIX = "/api/v2/komari-memory"
+AGENT_RUN_LOG_API_PREFIX = "/api/v2/agent-run-logs"
+SEARCH_API_PREFIX = "/api/v2/komari-search"
+ANNOUNCE_API_PREFIX = "/api/v2/komari-announce"
+MANAGEMENT_CONFIG_API_PREFIX = "/api/v2/komari-management-config"
+MANAGEMENT_PROMPT_API_PREFIX = "/api/v2/komari-management-prompt"
+DECISION_SCENE_API_PREFIX = "/api/v2/komari-decision-scenes"
+USER_BAN_API_PREFIX = "/api/v2/komari-user-bans"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,6 +47,7 @@ class ManagementApiComponents:
     memory_redis_getter: Callable[[], object | None]
     register_agent_run_log_api: Callable[..., None]
     agent_run_log_reader_getter: Callable[[], object | None]
+    register_search_api: Callable[..., None]
     register_user_ban_api: Callable[..., None]
     user_ban_service_getter: Callable[[], object]
     config_resources: tuple[ManagedConfigResource, ...]
@@ -109,6 +110,11 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         reader_getter=components.agent_run_log_reader_getter,
     )
+    components.register_search_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+    )
     components.register_user_ban_api(
         server_app,
         api_token=token_source,
@@ -158,7 +164,7 @@ def register_management_api_for_driver(
     logger.info(
         "[Komari Management] 管理 API 已注册: "
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, {MEMORY_API_PREFIX}, "
-        f"{AGENT_RUN_LOG_API_PREFIX}, {LEGACY_LLM_LOG_API_PREFIX}, "
+        f"{AGENT_RUN_LOG_API_PREFIX}, {SEARCH_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
         f"{DECISION_SCENE_API_PREFIX}, {USER_BAN_API_PREFIX}"
     )

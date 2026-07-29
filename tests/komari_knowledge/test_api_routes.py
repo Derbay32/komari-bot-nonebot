@@ -143,7 +143,13 @@ def _build_app(engine: _FakeEngine | None) -> FastAPI:
     api_app = FastAPI()
     register_knowledge_api(
         api_app,
-        api_token="secret-token-00000000",
+        api_token=[
+            {
+                "credential_id": "knowledge-operator",
+                "token": "secret-token-00000000",
+                "permissions": ["*"],
+            }
+        ],
         allowed_origins=["https://ui.example.com"],
         engine_getter=lambda: engine,
     )

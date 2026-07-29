@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from komari_bot.common.management_api import ManagementTokenSource
     from komari_bot.common.management_audit import ManagementAuditRecorder
 
-API_PREFIX = "/api/komari-announce/v1"
+API_PREFIX = "/api/v2/komari-announce"
 ANNOUNCE_CONTENT_BUDGET = TextBudget(3000, 9000, 3000)
 ANNOUNCE_TIME_BUDGET = TextBudget(128, 512, 128)
 ANNOUNCE_MESSAGE_BUDGET = TextBudget(4096, 12_288, 4096)

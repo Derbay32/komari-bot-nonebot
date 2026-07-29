@@ -30,9 +30,9 @@ class _ConfigSchema(BaseModel):
     )
 
     plugin_enable: bool = Field(default=True, description="插件启用状态")
-    api_token: str = Field(
-        default="secret",
-        description="管理接口令牌",
+    api_credentials: list[dict[str, object]] = Field(
+        default_factory=lambda: [{"credential_id": "管理后台"}],
+        description="具名管理凭据列表",
         json_schema_extra={"secret": True},
     )
     embedding_api_key: str = Field(
@@ -118,7 +118,13 @@ def _build_app(
     api_app = FastAPI()
     register_config_api(
         api_app,
-        api_token="secret-token-00000000",
+        api_token=[
+            {
+                "credential_id": "config-api-operator",
+                "token": "secret-token-00000000",
+                "permissions": ["*"],
+            }
+        ],
         allowed_origins=["https://ui.example.com"],
         resources=(
             ManagedConfigResource(
@@ -151,7 +157,7 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     assert payload["items"][0]["config_source"] == manager.config_source
     assert payload["items"][0]["field_descriptions"] == {
         "api_allowed_origins": "管理接口 CORS Origin",
-        "api_token": "管理接口令牌",
+        "api_credentials": "具名管理凭据列表",
         "db_password": "数据库密码",
         "dsn": "Sentry DSN",
         "embedding_api_key": "嵌入 API 密钥",
@@ -183,9 +189,9 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
             f"{API_PREFIX}/resources/komari_management", headers=read_headers
         )
         updated = await client.patch(
-            f"{API_PREFIX}/resources/komari_management/fields/api_token",
-            json={"value": "changed-token"},
-            headers=_write_headers("config-token-update"),
+            f"{API_PREFIX}/resources/komari_management/fields/api_credentials",
+            json={"value": [{"credential_id": "updated-operator"}]},
+            headers=_write_headers("config-credentials-update"),
         )
         restart_updated = await client.patch(
             f"{API_PREFIX}/resources/komari_management/fields/api_allowed_origins",
@@ -198,7 +204,7 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
         )
 
     assert detail.status_code == 200
-    assert detail.json()["values"]["api_token"] == "******"
+    assert detail.json()["values"]["api_credentials"] == "******"
     assert detail.json()["values"]["embedding_api_key"] == "******"
     assert detail.json()["values"]["db_password"] == "******"
     assert detail.json()["values"]["dsn"] == "******"
@@ -206,11 +212,17 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
     assert detail.json()["values"]["plugin_enable"] is True
     assert detail.json()["values"]["last_updated"] == "2026-04-14T00:00:00+08:00"
     assert detail.json()["config_source"] == manager.config_source
-    assert detail.json()["field_descriptions"]["api_token"] == "管理接口令牌"
+    assert (
+        detail.json()["field_descriptions"]["api_credentials"]
+        == "具名管理凭据列表"
+    )
     assert updated.status_code == 200
-    assert updated.json()["values"]["api_token"] == "******"
-    assert updated.json()["field_descriptions"]["api_token"] == "管理接口令牌"
-    assert updated.json()["field_states"]["api_token"] == {
+    assert updated.json()["values"]["api_credentials"] == "******"
+    assert (
+        updated.json()["field_descriptions"]["api_credentials"]
+        == "具名管理凭据列表"
+    )
+    assert updated.json()["field_states"]["api_credentials"] == {
         "secret": True,
         "apply_mode": "immediate",
         "configured_value": "******",
@@ -230,7 +242,7 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
         "restart_required": True,
     }
     assert reloaded.status_code == 200
-    assert reloaded.json()["values"]["api_token"] == "******"
+    assert reloaded.json()["values"]["api_credentials"] == "******"
     assert reloaded.json()["field_descriptions"]["plugin_enable"] == "插件启用状态"
     assert manager.reload_count == 1
     assert [event.outcome for event in audit_events] == [
@@ -241,17 +253,21 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
         "started",
         "succeeded",
     ]
-    token_events = [
-        event for event in audit_events if event.request_id == "config-token-update"
+    credential_events = [
+        event
+        for event in audit_events
+        if event.request_id == "config-credentials-update"
     ]
-    assert {event.operator_id for event in token_events} == {"legacy-api-token"}
-    assert {event.resource for event in token_events} == {"komari_management"}
-    assert {event.field_name for event in token_events} == {"api_token"}
+    assert {event.operator_id for event in credential_events} == {
+        "config-api-operator"
+    }
+    assert {event.resource for event in credential_events} == {"komari_management"}
+    assert {event.field_name for event in credential_events} == {"api_credentials"}
     serialized_events = json.dumps(
         [event.to_dict() for event in audit_events],
         ensure_ascii=False,
     )
-    assert "changed-token" not in serialized_events
+    assert "updated-operator" not in serialized_events
 
 
 @pytest.mark.asyncio

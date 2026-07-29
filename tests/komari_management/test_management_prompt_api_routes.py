@@ -136,7 +136,13 @@ def _build_app(
     api_app = FastAPI()
     register_prompt_api(
         api_app,
-        api_token="secret-token-00000000",
+        api_token=[
+            {
+                "credential_id": "prompt-api-operator",
+                "token": "secret-token-00000000",
+                "permissions": ["*"],
+            }
+        ],
         allowed_origins=["https://ui.example.com"],
         resources=(
             ManagedPromptResource(

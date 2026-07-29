@@ -128,7 +128,13 @@ def _app(
     app = FastAPI()
     api.register_user_ban_api(
         app,
-        api_token="secret-token-00000000",
+        api_token=[
+            {
+                "credential_id": "user-ban-operator",
+                "token": "secret-token-00000000",
+                "permissions": ["*"],
+            }
+        ],
         allowed_origins=[],
         service_getter=lambda: cast("Any", service),
         audit_recorder=_record_audit,
@@ -210,7 +216,7 @@ async def test_api_creates_and_deletes_ban_with_notification_result(
         "error": None,
     }
     ban_call = next(call for call in service.calls if call[0] == "ban")
-    assert ban_call[1]["operator_id"] == "legacy-api-token"
+    assert ban_call[1]["operator_id"] == "user-ban-operator"
     assert isinstance(ban_call[1]["expires_at"], datetime)
 
     assert deleted.status_code == 200
@@ -223,7 +229,7 @@ async def test_api_creates_and_deletes_ban_with_notification_result(
         "started",
         "succeeded",
     ]
-    assert {event.operator_id for event in audit_events} == {"legacy-api-token"}
+    assert {event.operator_id for event in audit_events} == {"user-ban-operator"}
     assert {event.request_id for event in audit_events} == {
         "user-ban-create",
         "user-ban-delete",

@@ -18,8 +18,7 @@ if TYPE_CHECKING:
 
     from komari_bot.common.management_api import ManagementTokenSource
 
-API_PREFIX = "/api/agent-run-logs/v1"
-LEGACY_API_PREFIX = "/api/llm-provider/v1"
+API_PREFIX = "/api/v2/agent-run-logs"
 
 
 class AgentRunLogReaderProtocol(Protocol):
@@ -40,13 +39,6 @@ class AgentRunLogReaderProtocol(Protocol):
     ) -> tuple[list[dict[str, Any]], int]: ...
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None: ...
-
-    async def get_legacy_line(
-        self,
-        *,
-        log_date: str,
-        line_number: int,
-    ) -> dict[str, Any] | None: ...
 
 
 class AgentRunListItem(BaseModel):
@@ -113,10 +105,6 @@ def _run_not_found(run_id: str) -> HTTPException:
     return _not_found(f"未找到 Agent Run 日志: {run_id}")
 
 
-def _legacy_line_not_found(log_date: str, line_number: int) -> HTTPException:
-    return _not_found(f"未找到 {log_date} 第 {line_number} 行日志")
-
-
 def _reader_dependency(
     reader_getter: Callable[[], AgentRunLogReaderProtocol | None],
 ) -> Callable[[], AgentRunLogReaderProtocol]:
@@ -140,7 +128,7 @@ def create_agent_run_log_router(
     auth_dependency = create_bearer_auth_dependency(
         api_token,
         detail="未授权访问 Agent Run 日志接口",
-        required_permission="llm_logs:read",
+        required_permission="agent_run_logs:read",
     )
     get_reader = _reader_dependency(reader_getter)
     router = APIRouter(
@@ -209,77 +197,6 @@ def create_agent_run_log_router(
     return router
 
 
-def create_legacy_log_router(
-    *,
-    api_token: ManagementTokenSource,
-    reader_getter: Callable[[], AgentRunLogReaderProtocol | None],
-) -> APIRouter:
-    """旧 llm-provider URL 的弃用别名，不恢复 provider 日志职责。"""
-    auth_dependency = create_bearer_auth_dependency(
-        api_token,
-        detail="未授权访问 Agent Run 日志接口",
-        required_permission="llm_logs:read",
-    )
-    get_reader = _reader_dependency(reader_getter)
-    router = APIRouter(
-        prefix=LEGACY_API_PREFIX,
-        dependencies=[Depends(auth_dependency)],
-        tags=["agent-run-logs-deprecated"],
-        deprecated=True,
-    )
-
-    @router.get("/reply-logs", response_model=AgentRunListResponse)
-    async def list_legacy_logs(
-        reader: AgentRunLogReaderProtocol = Depends(get_reader),  # noqa: FAST002
-        log_date: Annotated[
-            str | None,
-            Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
-        ] = None,
-        days: Annotated[int, Query(ge=1, le=90)] = 7,
-        trace_id: Annotated[str | None, Query(min_length=1)] = None,
-        model: Annotated[str | None, Query(min_length=1)] = None,
-        method: Annotated[str | None, Query(min_length=1)] = None,
-        run_status: Annotated[
-            Literal["success", "error", "cancelled"] | None,
-            Query(alias="status"),
-        ] = None,
-        limit: Annotated[int, Query(ge=1, le=100)] = 20,
-        offset: Annotated[int, Query(ge=0)] = 0,
-    ) -> AgentRunListResponse:
-        items, total = await reader.list_runs(
-            log_date=log_date,
-            days=days,
-            trace_id=trace_id,
-            status=run_status,
-            model=model,
-            method=method,
-            limit=limit,
-            offset=offset,
-        )
-        return AgentRunListResponse(
-            items=[AgentRunListItem.model_validate(item) for item in items],
-            total=total,
-            limit=limit,
-            offset=offset,
-        )
-
-    @router.get("/reply-logs/{log_date}/{line_number}", response_model=AgentRunDetail)
-    async def get_legacy_log(
-        log_date: Annotated[str, Path(pattern=r"^\d{4}-\d{2}-\d{2}$")],
-        line_number: Annotated[int, Path(ge=1)],
-        reader: AgentRunLogReaderProtocol = Depends(get_reader),  # noqa: FAST002
-    ) -> AgentRunDetail:
-        item = await reader.get_legacy_line(
-            log_date=log_date,
-            line_number=line_number,
-        )
-        if item is None:
-            raise _legacy_line_not_found(log_date, line_number)
-        return AgentRunDetail.model_validate(item)
-
-    return router
-
-
 def register_agent_run_log_api(
     app: FastAPI,
     *,
@@ -296,22 +213,14 @@ def register_agent_run_log_api(
             reader_getter=reader_getter,
         )
     )
-    app.include_router(
-        create_legacy_log_router(
-            api_token=api_token,
-            reader_getter=reader_getter,
-        )
-    )
     app.state.komari_agent_run_log_api_registered = True
 
 
 __all__ = [
     "API_PREFIX",
-    "LEGACY_API_PREFIX",
     "AgentRunDetail",
     "AgentRunListItem",
     "AgentRunListResponse",
     "create_agent_run_log_router",
-    "create_legacy_log_router",
     "register_agent_run_log_api",
 ]

@@ -1,4 +1,4 @@
-"""Agent Run 日志管理 API 与旧 URL 别名测试。"""
+"""Agent Run 日志管理 API 测试。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from fastapi import FastAPI
 
 from komari_bot.plugins.agent_run_logger.api import (
     API_PREFIX,
-    LEGACY_API_PREFIX,
     register_agent_run_log_api,
 )
 
@@ -73,22 +72,17 @@ class _FakeReader:
             "usage": {"total_tokens": 20},
         }
 
-    async def get_legacy_line(
-        self,
-        *,
-        log_date: str,
-        line_number: int,
-    ) -> dict[str, Any] | None:
-        if line_number == 99:
-            return None
-        return await self.get_run(f"legacy-{log_date}-{line_number}")
-
-
 def _build_app(reader: _FakeReader | None) -> FastAPI:
     api_app = FastAPI()
     register_agent_run_log_api(
         api_app,
-        api_token="secret-token-00000000",
+        api_token=[
+            {
+                "credential_id": "agent-run-reader",
+                "token": "secret-token-00000000",
+                "permissions": ["agent_run_logs:read"],
+            }
+        ],
         allowed_origins=["https://ui.example.com"],
         reader_getter=lambda: reader,
     )
@@ -154,26 +148,6 @@ async def test_canonical_routes_forward_combined_filters_and_return_full_detail(
         "完整思考"
     )
     assert missing.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_legacy_urls_are_deprecated_aliases(app: App) -> None:
-    reader = _FakeReader()
-    headers = {"Authorization": "Bearer secret-token-00000000"}
-    async with app.test_server(asgi=cast("Any", _build_app(reader))) as ctx:
-        client = ctx.get_client()
-        listed = await client.get(f"{LEGACY_API_PREFIX}/reply-logs", headers=headers)
-        detail = await client.get(
-            f"{LEGACY_API_PREFIX}/reply-logs/2026-07-22/1",
-            headers=headers,
-        )
-        schema = (await client.get("/openapi.json")).json()
-
-    assert listed.status_code == 200
-    assert detail.status_code == 200
-    assert schema["paths"][f"{LEGACY_API_PREFIX}/reply-logs"]["get"][
-        "deprecated"
-    ] is True
 
 
 @pytest.mark.asyncio

@@ -62,7 +62,6 @@ def test_managed_config_schemas_declare_default_apply_mode(
 @pytest.mark.parametrize(
     ("plugin_name", "class_name", "field_name"),
     [
-        ("komari_management", "DynamicConfigSchema", "api_token"),
         ("komari_management", "DynamicConfigSchema", "api_credentials"),
         ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
@@ -103,7 +102,7 @@ def test_management_config_schema_defaults_are_safe() -> None:
     )
 
     assert config.plugin_enable is False
-    assert config.api_token == ""
+    assert config.version == "2.0"
     assert config.api_credentials == []
     assert config.api_allowed_origins == []
     assert isinstance(config.announce_status_page_url, str)
@@ -120,7 +119,6 @@ def test_management_config_schema_rejects_blank_status_page_url() -> None:
 
 def test_management_config_schema_normalizes_named_credentials() -> None:
     config = DynamicConfigSchema(
-        api_token="legacy-token",
         api_credentials=cast(
             "Any",
             [

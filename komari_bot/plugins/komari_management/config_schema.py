@@ -97,22 +97,17 @@ class DynamicConfigSchema(BaseModel):
         json_schema_extra={"default_apply_mode": "restart"},
     )
 
-    version: str = Field(default="1.0", description="配置架构版本")
+    version: str = Field(default="2.0", description="配置架构版本")
     last_updated: str = Field(
         default_factory=lambda: datetime.now().astimezone().isoformat(),
         description="最后更新时间戳",
     )
 
     plugin_enable: bool = Field(default=False, description="是否启用统一管理 API 插件")
-    api_token: str = Field(
-        default="",
-        description="旧版单一管理 API Bearer Token；api_credentials 非空时不再接受",
-        json_schema_extra={"secret": True, "apply_mode": "immediate"},
-    )
     api_credentials: list[ManagementCredentialSchema] = Field(
         default_factory=list,
         max_length=32,
-        description="具名管理凭据；非空时完全替代旧版 api_token",
+        description="具名管理凭据列表",
         json_schema_extra={"secret": True, "apply_mode": "immediate"},
     )
     api_allowed_origins: list[str] = Field(

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from .managed_resources import ManagedConfigResource
 
-API_PREFIX = "/api/komari-management-config/v1"
+API_PREFIX = "/api/v2/komari-management-config"
 _MASKED_CONFIG_VALUE = "******"
 
 ConfigApplyMode = Literal["immediate", "rebuild", "restart"]

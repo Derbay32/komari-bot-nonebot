@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
     from .services.conversation_processing import ConversationDeadLetter
 
-API_PREFIX = "/api/komari-memory/v1"
+API_PREFIX = "/api/v2/komari-memory"
 
 
 class MemoryServiceProtocol(Protocol):
@@ -305,18 +305,6 @@ def _normalize_optional_query(value: str | None) -> str | None:
         )
     except ContentValidationError as exc:
         raise _validation_error(str(exc)) from exc
-
-
-def _legacy_interaction_history_gone() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail={
-            "code": "interaction_histories_retired",
-            "message": "旧 group_id/user_id 互动历史接口已退役",
-            "replacement": f"{API_PREFIX}/interactions",
-            "migration": "请先通过 GET /interactions 按 user_id 查询事件 ID，再按事件 ID 读写",
-        },
-    )
 
 
 def _resolve_interaction_event_patch_params(
@@ -605,10 +593,6 @@ def create_memory_router(
             raise _user_profile_not_found(group_id, user_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    @router.get("/interaction-histories", deprecated=True)
-    async def list_interaction_histories() -> None:
-        raise _legacy_interaction_history_gone()
-
     @router.get("/interactions", response_model=InteractionEventListResponse)
     async def list_interactions(
         service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
@@ -672,38 +656,6 @@ def create_memory_router(
         if not deleted:
             raise _interaction_event_not_found(event_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    @router.get("/interaction-histories/{group_id}/{user_id}", deprecated=True)
-    async def get_interaction_history(
-        group_id: str,
-        user_id: str,
-    ) -> None:
-        del group_id, user_id
-        raise _legacy_interaction_history_gone()
-
-    @router.put(
-        "/interaction-histories/{group_id}/{user_id}",
-        deprecated=True,
-        dependencies=[Depends(write_auth_dependency)],
-    )
-    async def put_interaction_history(
-        group_id: str,
-        user_id: str,
-    ) -> None:
-        del group_id, user_id
-        raise _legacy_interaction_history_gone()
-
-    @router.delete(
-        "/interaction-histories/{group_id}/{user_id}",
-        deprecated=True,
-        dependencies=[Depends(write_auth_dependency)],
-    )
-    async def delete_interaction_history(
-        group_id: str,
-        user_id: str,
-    ) -> None:
-        del group_id, user_id
-        raise _legacy_interaction_history_gone()
 
     return router
 

@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from komari_bot.common.management_api import ManagementTokenSource
     from komari_bot.common.management_audit import ManagementAuditRecorder
 
-API_PREFIX = "/api/komari-decision-scenes/v1"
+API_PREFIX = "/api/v2/komari-decision-scenes"
 _REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
 _fallback_repository: SceneRepository | None = None
 _fallback_repository_lock = asyncio.Lock()

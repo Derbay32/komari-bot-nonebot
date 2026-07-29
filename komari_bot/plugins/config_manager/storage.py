@@ -409,6 +409,52 @@ class ConfigStorage:
         """按插件名异步读取配置。"""
         return await self._run_async(self._fetch(plugin_name))
 
+    async def delete_field_if_present_async(
+        self,
+        *,
+        plugin_name: str,
+        field_name: str,
+    ) -> StoredConfig | None:
+        """仅当顶层字段存在时原子删除，并返回更新后的配置快照。"""
+        return await self._run_async(
+            self._delete_field_if_present(
+                plugin_name=plugin_name,
+                field_name=field_name,
+            )
+        )
+
+    async def _delete_field_if_present(
+        self,
+        *,
+        plugin_name: str,
+        field_name: str,
+    ) -> StoredConfig | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE komari_plugin_configs
+                SET
+                    config_data = config_data - $2::text,
+                    revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE plugin_name = $1
+                  AND config_data ? $2::text
+                RETURNING
+                    plugin_name,
+                    schema_name,
+                    config_data,
+                    version,
+                    revision,
+                    updated_at
+                """,
+                plugin_name,
+                field_name,
+            )
+        if row is None:
+            return None
+        return _stored_config_from_row(row)
+
     async def _fetch(self, plugin_name: str) -> StoredConfig | None:
         pool = await self._get_pool()
         async with pool.acquire() as conn:

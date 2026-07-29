@@ -16,6 +16,14 @@ from komari_bot.plugins.komari_memory.services.conversation_processing import (
 if TYPE_CHECKING:
     from nonebug import App
 
+_DEFAULT_CREDENTIALS = (
+    {
+        "credential_id": "memory-operator",
+        "token": "secret-token-00000000",
+        "permissions": ["*"],
+    },
+)
+
 
 def _with_query(path: str, **params: object) -> str:
     query = "&".join(
@@ -272,7 +280,7 @@ def _build_app(
     service: _FakeMemoryService | None,
     redis_manager: _FakeDeadLetterManager | None = None,
     *,
-    api_token: Any = "secret-token-00000000",
+    api_token: Any = _DEFAULT_CREDENTIALS,
 ) -> FastAPI:
     api_app = FastAPI()
     register_memory_api(
@@ -532,38 +540,6 @@ async def test_profile_routes_list_get_upsert_delete_and_validate(app: App) -> N
     assert "user_id" in mismatch.json()["detail"]
     assert bad_body.status_code == 422
     assert deleted_profile.status_code == 204
-
-
-@pytest.mark.asyncio
-async def test_legacy_interaction_history_routes_return_migration_410(app: App) -> None:
-    service = _FakeMemoryService()
-    headers = {"Authorization": "Bearer secret-token-00000000"}
-
-    async with app.test_server(asgi=cast("Any", _build_app(service))) as ctx:
-        client = ctx.get_client()
-        responses = [
-            await client.get(f"{API_PREFIX}/interaction-histories", headers=headers),
-            await client.get(
-                f"{API_PREFIX}/interaction-histories/g1/u1",
-                headers=headers,
-            ),
-            await client.put(
-                f"{API_PREFIX}/interaction-histories/g1/u1",
-                json={"user_id": "u1", "records": []},
-                headers=headers,
-            ),
-            await client.delete(
-                f"{API_PREFIX}/interaction-histories/g1/u1",
-                headers=headers,
-            ),
-        ]
-
-    assert {response.status_code for response in responses} == {410}
-    for response in responses:
-        detail = response.json()["detail"]
-        assert detail["code"] == "interaction_histories_retired"
-        assert detail["replacement"] == f"{API_PREFIX}/interactions"
-    assert service.list_history_calls == []
 
 
 @pytest.mark.asyncio

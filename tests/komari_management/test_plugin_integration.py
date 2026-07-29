@@ -22,6 +22,7 @@ from komari_bot.plugins.komari_management.managed_resources import (
     ManagedPromptResource,
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
+from komari_bot.plugins.komari_search.api import register_search_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
 
 if TYPE_CHECKING:
@@ -73,6 +74,7 @@ def _build_components() -> ManagementApiComponents:
         memory_redis_getter=lambda: None,
         register_agent_run_log_api=register_agent_run_log_api,
         agent_run_log_reader_getter=lambda: None,
+        register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
         config_resources=(
@@ -104,7 +106,13 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         driver=driver,
         config=SimpleNamespace(
             plugin_enable=True,
-            api_token="secret-token-00000000",
+            api_credentials=[
+                {
+                    "credential_id": "test-operator",
+                    "token": "secret-token-00000000",
+                    "permissions": ["*"],
+                }
+            ],
             api_allowed_origins=[],
         ),
         component_loader=_build_components,
@@ -115,21 +123,22 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
 
     async with app.test_server() as ctx:
         client = ctx.get_client()
-        docs = await client.get("/api/komari-management/docs")
-        schema_response = await client.get("/api/komari-management/openapi.json")
+        docs = await client.get("/api/docs")
+        schema_response = await client.get("/api/openapi.json")
 
     assert docs.status_code == 200
     assert schema_response.status_code == 200
 
     schema = schema_response.json()
-    assert "/api/komari-knowledge/v1/knowledge" in schema["paths"]
-    assert "/api/komari-help/v1/help" in schema["paths"]
-    assert "/api/komari-memory/v1/conversations" in schema["paths"]
-    assert "/api/llm-provider/v1/reply-logs" in schema["paths"]
-    assert "/api/agent-run-logs/v1/runs" in schema["paths"]
-    assert "/api/komari-management-config/v1/resources" in schema["paths"]
-    assert "/api/komari-management-prompt/v1/resources" in schema["paths"]
-    assert "/api/komari-user-bans/v1/bans" in schema["paths"]
+    assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
+    assert "/api/v2/komari-help/help" in schema["paths"]
+    assert "/api/v2/komari-memory/conversations" in schema["paths"]
+    assert "/api/v2/agent-run-logs/runs" in schema["paths"]
+    assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
+    assert "/api/v2/komari-management-config/resources" in schema["paths"]
+    assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
+    assert "/api/v2/komari-user-bans/bans" in schema["paths"]
+    assert "/api/llm-provider/v1/reply-logs" not in schema["paths"]
     tag_names = {
         tag
         for operations in schema["paths"].values()
@@ -141,6 +150,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         "komari-help",
         "komari-memory",
         "agent-run-logs",
+        "komari-search",
         "komari-management-config",
         "komari-management-prompt",
         "komari-user-bans",

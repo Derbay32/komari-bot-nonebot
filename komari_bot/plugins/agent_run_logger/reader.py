@@ -197,31 +197,6 @@ class AgentRunLogReader:
             fallback,
         )
 
-    async def get_legacy_line(
-        self,
-        *,
-        log_date: str,
-        line_number: int,
-    ) -> dict[str, Any] | None:
-        """旧 URL 的日期/物理行号兼容定位。"""
-        parsed = self._parse_date(log_date)
-        entries = await asyncio.to_thread(
-            scan_log_files_sync,
-            self._log_dir,
-            retained_from=parsed,
-        )
-        dated = sorted(
-            (entry for entry in entries if entry.log_date == parsed),
-            key=lambda item: item.byte_offset,
-        )
-        if line_number > len(dated):
-            return None
-        return await asyncio.to_thread(
-            read_indexed_record_sync,
-            self._log_dir,
-            dated[line_number - 1],
-        )
-
     @staticmethod
     def _build_list_item(
         entry: AgentRunIndexEntry,
