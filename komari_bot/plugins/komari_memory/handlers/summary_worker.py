@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import math
 from datetime import UTC, datetime
@@ -177,23 +176,6 @@ def _build_summary_dedup_key(
     memory_index = str(index) if chunk_index == 0 else f"{chunk_index}:{index}"
     raw = f"summary:{group_id}:{snapshot_fingerprint}:{memory_index}"
     return sha256(raw.encode("utf-8")).hexdigest()
-
-
-async def _refresh_character_binding_if_needed(*, group_id: str) -> bool:
-    refresh_func = getattr(character_binding, "refresh_if_file_updated", None)
-    if not callable(refresh_func):
-        return False
-
-    try:
-        result = refresh_func()
-        changed = await result if inspect.isawaitable(result) else result
-    except Exception:
-        logger.exception("[KomariMemory] binding 热刷新失败: group={}", group_id)
-        return False
-
-    if bool(changed):
-        logger.info("[KomariMemory] 检测到 binding 更新，已在总结前刷新: group={}", group_id)
-    return bool(changed)
 
 
 def _collect_bot_user_ids(
@@ -551,7 +533,6 @@ async def _perform_summary_from_processing(
             }
         )
 
-    await _refresh_character_binding_if_needed(group_id=group_id)
     snapshot_fingerprint = _build_processing_snapshot_fingerprint(group_id, messages_buffer)
     chunks = chunk_messages_for_memory_processing(
         messages_buffer,

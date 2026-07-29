@@ -3,8 +3,6 @@
 from nonebot import get_driver
 from nonebot.plugin import PluginMetadata
 
-# 导入命令模块以注册命令处理器（必须在 manager 之后导入以避免循环导入）
-from . import commands  # noqa: F401
 from .manager import CharacterBindingManager, get_manager
 
 __plugin_meta__ = PluginMetadata(
@@ -18,14 +16,15 @@ __plugin_meta__ = PluginMetadata(
 )
 
 
-driver = get_driver()
-
-
-@driver.on_startup
 async def init_plugin() -> None:
     """插件启动时初始化管理器。"""
-    # 触发单例初始化，确保启动时加载数据并输出日志
-    get_manager()
+    await get_manager().initialize()
+
+
+async def close_plugin() -> None:
+    """插件关闭时释放数据库连接池租约。"""
+    manager = get_manager()
+    await manager.close()
 
 
 def get_binding_manager() -> CharacterBindingManager:
@@ -53,14 +52,20 @@ def get_character_name(
     return get_manager().get_character_name(user_id, fallback_nickname)
 
 
-async def refresh_if_file_updated() -> bool:
-    """当绑定文件更新时重新加载绑定。"""
-    return await get_manager().refresh_if_file_updated()
-
-
 __all__ = [
     "CharacterBindingManager",
     "get_binding_manager",
     "get_character_name",
-    "refresh_if_file_updated",
 ]
+
+try:
+    driver = get_driver()
+except ValueError:
+    driver = None
+
+if driver is not None:
+    # 导入命令模块以注册命令处理器（必须在 manager 之后导入以避免循环导入）
+    from . import commands  # noqa: F401
+
+    driver.on_startup(init_plugin)
+    driver.on_shutdown(close_plugin)

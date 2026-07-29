@@ -130,7 +130,7 @@ async def test_handle_set_reports_validation_failure(
         raise CharacterNameValidationError("角色名不能包含换行或控制字符")
 
     monkeypatch.setattr(manager, "set_character_name", reject_name)
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+    monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -159,7 +159,7 @@ async def test_handle_set_reports_persistence_failure(
         raise BindingPersistenceError("角色绑定保存失败")
 
     monkeypatch.setattr(manager, "set_character_name", fail_to_save)
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+    monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -184,7 +184,7 @@ async def test_handle_delete_reports_persistence_failure(
         raise BindingPersistenceError("角色绑定保存失败")
 
     monkeypatch.setattr(manager, "remove_character_name", fail_to_delete)
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+    monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_del) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -204,7 +204,7 @@ async def test_handle_list_only_returns_current_user_binding_with_nonebug(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _StubManager({"42": "泉此方", "10086": "柊镜"})
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+    monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
@@ -228,7 +228,7 @@ async def test_handle_list_treats_stored_cq_code_as_plain_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _StubManager({"42": "[CQ:at,qq=all]"})
-    monkeypatch.setattr(manager_module, "_manager_instance", manager)
+    monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_list) as ctx:
         bot = _create_onebot_bot(ctx)

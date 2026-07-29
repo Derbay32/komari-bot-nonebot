@@ -1,175 +1,236 @@
-"""角色绑定管理器的原子持久化与输入约束测试。"""
+"""角色名绑定 PostgreSQL 存储与内存快照测试。"""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-from typing import TYPE_CHECKING
 
 import pytest
 
+from komari_bot.plugins.character_binding import database as database_module
 from komari_bot.plugins.character_binding import manager as manager_module
 from komari_bot.plugins.character_binding.manager import (
-    DEFAULT_BINDING_FILE,
     MAX_CHARACTER_NAME_LENGTH,
     BindingPersistenceError,
     CharacterBindingManager,
     CharacterNameValidationError,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
+
+class _FakeTransaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
 
 
-@pytest.fixture
-def binding_file(tmp_path: Path) -> Path:
-    return tmp_path / "character_binding" / "bindings.json"
+class _FakeConnection:
+    def __init__(
+        self,
+        *,
+        rows: list[dict[str, str]] | None = None,
+        delete_results: list[str] | None = None,
+    ) -> None:
+        self.rows = list(rows or [])
+        self.delete_results = list(delete_results or [])
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.fail_writes = False
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def fetchval(self, query: str, *args: object) -> None:
+        self.calls.append((query, args))
+
+    async def fetch(
+        self,
+        query: str,
+        *args: object,
+    ) -> list[dict[str, str]]:
+        self.calls.append((query, args))
+        return list(self.rows)
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.calls.append((query, args))
+        if self.fail_writes and (
+            "INSERT INTO komari_character_bindings" in query
+            or "DELETE FROM komari_character_bindings" in query
+        ):
+            msg = "模拟数据库写入失败"
+            raise RuntimeError(msg)
+        if "DELETE FROM komari_character_bindings" in query:
+            return self.delete_results.pop(0) if self.delete_results else "DELETE 0"
+        return "OK"
 
 
-def test_default_binding_path_is_independent_of_working_directory(
-    tmp_path: Path,
+class _FakeAcquire:
+    def __init__(self, connection: _FakeConnection) -> None:
+        self.connection = connection
+
+    async def __aenter__(self) -> _FakeConnection:
+        return self.connection
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _FakePool:
+    def __init__(self, connection: _FakeConnection) -> None:
+        self.connection = connection
+        self.closed = False
+
+    def acquire(self) -> _FakeAcquire:
+        return _FakeAcquire(self.connection)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _install_fake_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: _FakeConnection,
+) -> _FakePool:
+    pool = _FakePool(connection)
+
+    async def _create_pool(_config: object) -> _FakePool:
+        return pool
+
+    monkeypatch.setattr(database_module, "create_postgres_pool", _create_pool)
+    monkeypatch.setattr(
+        database_module,
+        "get_shared_database_config",
+        lambda: object(),
+    )
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_initialize_creates_table_and_loads_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    temporary_default = tmp_path / "app-data" / "character_binding" / "bindings.json"
-    monkeypatch.setattr(manager_module, "DEFAULT_BINDING_FILE", temporary_default)
-    monkeypatch.chdir(tmp_path)
-
+    connection = _FakeConnection(
+        rows=[
+            {"user_id": "42", "character_name": "泉此方"},
+            {"user_id": "10086", "character_name": "柊镜"},
+        ]
+    )
+    pool = _install_fake_pool(monkeypatch, connection)
     manager = CharacterBindingManager()
 
-    assert DEFAULT_BINDING_FILE.is_absolute()
-    assert manager.binding_file == temporary_default
-    assert manager.binding_file.is_absolute()
+    await asyncio.gather(*(manager.initialize() for _ in range(10)))
+
+    assert manager.list_bindings() == {"42": "泉此方", "10086": "柊镜"}
+    assert (
+        sum(
+            "CREATE TABLE IF NOT EXISTS komari_character_bindings" in query
+            for query, _args in connection.calls
+        )
+        == 1
+    )
+    assert any("pg_advisory_xact_lock" in query for query, _args in connection.calls)
+
+    await manager.close()
+    assert pool.closed is True
 
 
 @pytest.mark.asyncio
-async def test_set_uses_fsync_and_atomic_replace(
-    binding_file: Path,
+async def test_upsert_updates_snapshot_after_database_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = CharacterBindingManager(binding_file)
-    real_fsync = os.fsync
-    real_replace = os.replace
-    fsync_calls = 0
-    replace_calls: list[tuple[Path, Path]] = []
-
-    def tracked_fsync(file_descriptor: int) -> None:
-        nonlocal fsync_calls
-        fsync_calls += 1
-        real_fsync(file_descriptor)
-
-    def tracked_replace(source: Path, target: Path) -> None:
-        replace_calls.append((source, target))
-        real_replace(source, target)
-
-    monkeypatch.setattr(manager_module.os, "fsync", tracked_fsync)
-    monkeypatch.setattr(manager_module.os, "replace", tracked_replace)
+    connection = _FakeConnection()
+    _install_fake_pool(monkeypatch, connection)
+    manager = CharacterBindingManager()
+    await manager.initialize()
 
     await manager.set_character_name("42", "泉此方")
 
-    assert fsync_calls == 1
-    assert len(replace_calls) == 1
-    assert replace_calls[0][1] == binding_file
-    assert json.loads(binding_file.read_text(encoding="utf-8")) == {"42": "泉此方"}
-    assert list(binding_file.parent.glob(".bindings.json.*.tmp")) == []
+    assert manager.list_bindings() == {"42": "泉此方"}
+    assert any(
+        "ON CONFLICT (user_id) DO UPDATE" in query and args == ("42", "泉此方")
+        for query, args in connection.calls
+    )
 
 
 @pytest.mark.asyncio
-async def test_set_failure_keeps_memory_and_file_unchanged(
-    binding_file: Path,
+async def test_delete_result_controls_snapshot_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = CharacterBindingManager(binding_file)
-    await manager.set_character_name("42", "泉此方")
-    original_content = binding_file.read_text(encoding="utf-8")
+    connection = _FakeConnection(
+        rows=[{"user_id": "42", "character_name": "泉此方"}],
+        delete_results=["DELETE 0", "DELETE 1"],
+    )
+    _install_fake_pool(monkeypatch, connection)
+    manager = CharacterBindingManager()
+    await manager.initialize()
 
-    def fail_replace(_source: Path, _target: Path) -> None:
-        raise OSError("模拟原子替换失败")
+    assert await manager.remove_character_name("404") is False
+    assert manager.list_bindings() == {"42": "泉此方"}
 
-    monkeypatch.setattr(manager_module.os, "replace", fail_replace)
+    assert await manager.remove_character_name("42") is True
+    assert manager.list_bindings() == {}
+
+
+@pytest.mark.asyncio
+async def test_database_failure_raises_and_keeps_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection(
+        rows=[{"user_id": "42", "character_name": "泉此方"}],
+    )
+    _install_fake_pool(monkeypatch, connection)
+    manager = CharacterBindingManager()
+    await manager.initialize()
+    connection.fail_writes = True
 
     with pytest.raises(BindingPersistenceError, match="角色绑定保存失败"):
         await manager.set_character_name("10086", "柊镜")
-
-    assert manager.list_bindings() == {"42": "泉此方"}
-    assert binding_file.read_text(encoding="utf-8") == original_content
-    assert list(binding_file.parent.glob(".bindings.json.*.tmp")) == []
-
-
-@pytest.mark.asyncio
-async def test_remove_failure_keeps_existing_binding(
-    binding_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = CharacterBindingManager(binding_file)
-    await manager.set_character_name("42", "泉此方")
-
-    def fail_replace(_source: Path, _target: Path) -> None:
-        raise OSError("模拟原子替换失败")
-
-    monkeypatch.setattr(manager_module.os, "replace", fail_replace)
-
     with pytest.raises(BindingPersistenceError, match="角色绑定保存失败"):
         await manager.remove_character_name("42")
 
-    assert manager.get_character_name("42") == "泉此方"
-    assert json.loads(binding_file.read_text(encoding="utf-8")) == {"42": "泉此方"}
+    assert manager.list_bindings() == {"42": "泉此方"}
 
 
 @pytest.mark.asyncio
-async def test_concurrent_updates_are_serialized(binding_file: Path) -> None:
-    manager = CharacterBindingManager(binding_file)
-
-    await asyncio.gather(
-        manager.set_character_name("42", "泉此方"),
-        manager.set_character_name("10086", "柊镜"),
-    )
-
-    assert manager.list_bindings() == {"42": "泉此方", "10086": "柊镜"}
-    assert json.loads(binding_file.read_text(encoding="utf-8")) == {
-        "42": "泉此方",
-        "10086": "柊镜",
-    }
-
-
-@pytest.mark.asyncio
-async def test_two_managers_reload_under_file_lock_without_lost_update(
-    binding_file: Path,
+async def test_postgres_unavailable_degrades_to_empty_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
-    second = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
+    async def _fail_create_pool(_config: object) -> None:
+        msg = "模拟 PostgreSQL 不可用"
+        raise RuntimeError(msg)
 
-    await asyncio.gather(
-        first.set_character_name("42", "泉此方"),
-        second.set_character_name("10086", "柊镜"),
+    monkeypatch.setattr(database_module, "create_postgres_pool", _fail_create_pool)
+    monkeypatch.setattr(
+        database_module,
+        "get_shared_database_config",
+        lambda: object(),
     )
+    manager = CharacterBindingManager()
 
-    expected = {"42": "泉此方", "10086": "柊镜"}
-    assert json.loads(binding_file.read_text(encoding="utf-8")) == expected
-    assert first.list_bindings() == expected
-    assert second.list_bindings() == expected
+    await manager.initialize()
+
+    assert manager.list_bindings() == {}
+    assert manager.get_character_name("42", "昵称") == "昵称"
+    with pytest.raises(BindingPersistenceError, match="角色绑定保存失败"):
+        await manager.set_character_name("42", "泉此方")
 
 
-@pytest.mark.asyncio
-async def test_regular_reads_refresh_external_updates_with_bounded_interval(
-    binding_file: Path,
-) -> None:
-    writer = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
-    reader = CharacterBindingManager(binding_file, refresh_interval_seconds=0)
+def test_character_name_fallback_chain() -> None:
+    manager = CharacterBindingManager()
+    manager._bindings = {"42": "泉此方"}
 
-    await writer.set_character_name("42", "泉此方")
-
-    assert reader.get_character_name("42") == "泉此方"
-    assert reader.has_binding("42") is True
+    assert manager.get_character_name("42", "昵称") == "泉此方"
+    assert manager.get_character_name("10086", "柊镜") == "柊镜"
+    assert manager.get_character_name("114514") == "114514"
+    assert manager.has_binding("42") is True
+    assert manager.has_binding("10086") is False
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("character_name", ["角色\n名", "角色\t名", "角色\u2028名"])
 async def test_rejects_line_breaks_and_control_characters(
-    binding_file: Path,
     character_name: str,
 ) -> None:
-    manager = CharacterBindingManager(binding_file)
+    manager = CharacterBindingManager()
 
     with pytest.raises(CharacterNameValidationError, match="换行或控制字符"):
         await manager.set_character_name("42", character_name)
@@ -178,10 +239,30 @@ async def test_rejects_line_breaks_and_control_characters(
 
 
 @pytest.mark.asyncio
-async def test_rejects_name_over_unicode_length_limit(binding_file: Path) -> None:
-    manager = CharacterBindingManager(binding_file)
+async def test_rejects_name_over_unicode_length_limit() -> None:
+    manager = CharacterBindingManager()
 
     with pytest.raises(CharacterNameValidationError, match="不能超过"):
-        await manager.set_character_name("42", "鞠" * (MAX_CHARACTER_NAME_LENGTH + 1))
+        await manager.set_character_name(
+            "42",
+            "鞠" * (MAX_CHARACTER_NAME_LENGTH + 1),
+        )
 
     assert manager.list_bindings() == {}
+
+
+@pytest.mark.asyncio
+async def test_close_clears_singleton_before_closing_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection()
+    pool = _install_fake_pool(monkeypatch, connection)
+    manager_module.state.manager = None
+    manager = manager_module.get_manager()
+    await manager.initialize()
+
+    await manager.close()
+
+    assert manager_module.state.manager is None
+    assert manager.list_bindings() == {}
+    assert pool.closed is True

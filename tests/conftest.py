@@ -310,10 +310,6 @@ class _DummyCharacterBindingPlugin:
         return fallback_nickname or user_id
 
     @staticmethod
-    def refresh_if_file_updated() -> bool:
-        return False
-
-    @staticmethod
     def get_binding_manager() -> object:
         return _DummyBindingManager()
 

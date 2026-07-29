@@ -29,7 +29,6 @@ def _load_summary_worker_module(monkeypatch: Any) -> Any:
             return types.SimpleNamespace(
                 get_character_name=lambda user_id, fallback_nickname="": fallback_nickname
                 or user_id,
-                refresh_if_file_updated=lambda: False,
             )
         if name == "llm_provider":
             return types.SimpleNamespace(generate_text=lambda **_kwargs: None)
@@ -874,7 +873,7 @@ def test_perform_summary_does_not_mutate_snapshot_after_lease_loss(
     assert redis.update_last_summary_calls == []
 
 
-def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
+def test_perform_summary_uses_current_binding_snapshot(
     monkeypatch: Any,
 ) -> None:
     module = _load_summary_worker_module(monkeypatch)
@@ -885,13 +884,6 @@ def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
     )
 
     class _FakeBinding:
-        def __init__(self) -> None:
-            self.refresh_calls = 0
-
-        async def refresh_if_file_updated(self) -> bool:
-            self.refresh_calls += 1
-            return True
-
         def get_character_name(self, user_id: str, fallback_nickname: str = "") -> str:
             if user_id == "10001":
                 return "绑定新名"
@@ -903,9 +895,8 @@ def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args
-        observed["summary_refresh_calls"] = fake_binding.refresh_calls
         observed["summary_display_name_map"] = kwargs["display_name_map"]
-        return {"memories": [{"content": "绑定刷新后生成总结。", "importance": 3}]}
+        return {"memories": [{"content": "按当前绑定生成总结。", "importance": 3}]}
 
     async def _fake_run_profile_agent(**kwargs: Any) -> SimpleNamespace:
         observed["profile_conversation_text"] = kwargs["conversation_text"]
@@ -929,13 +920,12 @@ def test_perform_summary_refreshes_binding_before_summary_and_profile_agent(
 
     asyncio.run(module.perform_summary("114514", redis, memory))
 
-    assert observed["summary_refresh_calls"] == 1
     assert observed["summary_display_name_map"] == {"10001": "旧昵称"}
     assert observed["profile_display_name_map"] == {"10001": "旧昵称"}
     assert "[user_id:10001] 旧昵称: 今天一起吃拉面吧" in observed[
         "profile_conversation_text"
     ]
-    assert memory.store_conversation_calls[0]["summary"] == "绑定刷新后生成总结。"
+    assert memory.store_conversation_calls[0]["summary"] == "按当前绑定生成总结。"
 
 
 def test_perform_summary_does_not_write_interaction_history(monkeypatch: Any) -> None:
