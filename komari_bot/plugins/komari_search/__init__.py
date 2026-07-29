@@ -17,6 +17,7 @@ from komari_bot.common.content_budget import (
     normalize_required_text,
 )
 
+from .api import register_search_api
 from .config import Config
 from .config_schema import DynamicConfigSchema
 from .formatter import format_fetch_response, format_search_response
@@ -39,6 +40,7 @@ __all__ = [
     "fetch_page",
     "is_fetch_available",
     "is_search_available",
+    "register_search_api",
     "search_web",
     "shutdown_search_resources",
 ]
