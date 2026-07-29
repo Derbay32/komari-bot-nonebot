@@ -141,7 +141,9 @@ dmypy.json
 .pytype/
 
 # programming tools
-/docs
+/docs/*
+!/docs/adr/
+!/docs/adr/**
 /.ruff_cache
 /.kilo
 
