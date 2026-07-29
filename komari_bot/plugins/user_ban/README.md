@@ -41,6 +41,6 @@ NapCat 虽支持 `markdown` 消息段，但官方说明发送端只能用于双�
 
 ## 管理 API
 
-统一管理 API 启用后会挂载 `/api/komari-user-bans/v1`，复用 `komari_management` 的 Bearer Token 与 CORS 配置。接口定义、请求示例和响应字段见 [`API.md`](./API.md)。
+统一管理 API 启用后会挂载 `/api/v2/komari-user-bans`，复用 `komari_management` 的具名 Bearer 凭据与 CORS 配置。接口定义、请求示例和响应字段见 [`API.md`](./API.md)。
 
 被封用户触发受限功能时不会收到提示。SUPERUSER 始终绕过封禁，但仍可保存对应 QQ 的封禁记录并接收生命周期私信。

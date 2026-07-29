@@ -8,15 +8,6 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 
 **核心能力**：AI 聊天（LLM 驱动）、四层记忆系统、RAG 知识库、智能帮助、群聊总结、角色绑定、好感度系统、主动回复判定。
 
-## ⚠️ 下个版本特别声明：Komari Management v2.0
-
-下一个发布版本必须将 **Komari Management 管理 API 升级至 v2.0**，并将其作为明确的破坏性升级处理：
-
-- 删除旧版管理 API 及全部兼容入口，不继续保留 v1 路由、弃用别名或旧行为回退；
-- 删除旧版单 Token 配置 `api_token` 及其读取、回退、警告、测试和文档，只允许通过 `api_credentials` 配置具名凭据；
-- 同步升级路由版本、请求/响应 Schema、鉴权机制、前端调用、测试与组件文档，并提供必要的迁移说明；
-- 后续处理相关任务时不得为了兼容旧调用而重新引入旧版 API；除非 Master 明确修改本声明。
-
 ## 技术栈速览
 
 | 层次 | 技术 | 说明 |
@@ -184,6 +175,14 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - **管理 API**：`komari_management` Prompt API 的 GET / PUT / PATCH 均读写 `komari_prompt_configs`，响应中 `config_source` 形如 `postgresql:komari_prompt_configs:<resource_id>`，`file_path` 仅保留为 `null` 兼容字段。
 - **旧 YAML**：`config/prompts/*.yaml` 不再作为运行时来源；如需保留旧值，显式执行 `scripts/migrate_prompt_config_to_pg.py` 导入。`komari_decision` 的 `komari_memory_scenes.yaml` 已迁移到 PostgreSQL `komari_decision_scenes` 表，运行时默认使用 `PostgresSceneTemplateLoader`；YAML loader 仅供迁移脚本和测试使用。
 
+### 1.2 Komari Management v2
+
+- 管理路由统一使用 `/api/v2/<plugin>` 前缀，旧版路由、弃用别名和退役 stub 均不注册。
+- 鉴权只接受 `api_credentials` 具名凭据；启动时会物理删除 PostgreSQL 中残留的旧单 Token 配置键。
+- Agent Run 日志权限为 `agent_run_logs:read`；搜索提供者描述端点使用 `search:read`。
+- Swagger 与 OpenAPI 入口分别为 `/api/docs` 和 `/api/openapi.json`。
+- `GET /api/v2/komari-search/provider-descriptors` 从 `komari_search` 配置 Schema 动态生成通用字段与 Tavily/EXA 专用字段描述。
+
 ### 2. LLM 网关 (`llm_provider`)
 
 导出的核心函数（位于 `__init__.py`）：
@@ -223,7 +222,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - PostgreSQL `UNLOGGED` 表 `komari_agent_run_log_index` 只保存 run/trace、分类、时间、文件字节定位、模型/方法集合、计数与 usage；禁止加入任何正文、预览、prompt、reasoning、工具正文或错误正文。
 - 写入顺序是跨进程文件锁内追加 JSONL，再 upsert PG。PG 故障不撤销 JSONL；启动及每 5 分钟使用 advisory lock 对账，管理查询在 PG 不可用时降级扫描 JSONL。
 - 每日本地时间 04:00 清理，保留当前日志日及此前 `retention_days - 1` 日；日志关闭不停止清理。启动时同时删除废弃 SQLite 索引文件，并以幂等 JSONB 删除语句物理清除 provider 旧日志配置键。
-- 管理接口为 `/api/agent-run-logs/v1/runs` 与 `/runs/{run_id}`，仍使用 `llm_logs:read`；旧 `/api/llm-provider/v1/reply-logs` URL 只是弃用别名。
+- 管理接口为 `/api/v2/agent-run-logs/runs` 与 `/runs/{run_id}`，使用 `agent_run_logs:read`。
 - debug 报告必须继续走独立脱敏投影，绝不能直接复用完整 JSONL 正文。
 
 ### 2.2 Embedding / Rerank 远程协议
@@ -252,7 +251,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **自然解封**：APScheduler 每 30 秒原子删除到期记录并按用户合并发送一次普通文本私信；发送失败不回滚且不重试
 - **command 拦截**：全局 `run_preprocessor` 检查除 `komari_chat` 外的用户 matcher，封禁时静默清空 `remain_handlers`，保留 matcher 原有 `block`
 - **chat 拦截**：聊天消息仍参与判定和记忆；只有实际准备回复时通过 `reply_allowed=False` 压制生成及全部回复副作用
-- **管理入口**：SUPERUSER 命令支持永久或 `m/h/d/w` 临时封禁和理由；统一管理 API 通过 `/api/komari-user-bans/v1` 提供查询、封禁与解封
+- **管理入口**：SUPERUSER 命令支持永久或 `m/h/d/w` 临时封禁和理由；统一管理 API 通过 `/api/v2/komari-user-bans` 提供查询、封禁与解封
 - **SUPERUSER**：管理命令仅限 SUPERUSER，且 SUPERUSER 运行时始终绕过封禁；管理操作和生命周期变化会尝试发送一次私信
 
 ### 3.2 用户数据 (`user_data`)

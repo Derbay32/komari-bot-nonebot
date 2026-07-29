@@ -1,21 +1,23 @@
 # Komari Management 前端对接说明
 
-> 最后同步：2026-07-22。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
+> 最后同步：2026-07-29。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
 
 Komari Management 统一把配置、提示词、判定场景、维护公告以及各业务插件的管理 API 挂载到 NoneBot2 的 FastAPI 应用。前端不需要对接独立的管理服务，所有接口共用同一后端 Origin、Bearer 鉴权和 CORS 配置。
 
 ## 1. 联调入口
 
-- Swagger UI：由 `FASTAPI_DOCS_URL` 配置，项目建议值为 `/api/komari-management/docs`
-- OpenAPI JSON：由 `FASTAPI_OPENAPI_URL` 配置，项目建议值为 `/api/komari-management/openapi.json`
+- Swagger UI：由 `FASTAPI_DOCS_URL` 配置，项目建议值为 `/api/docs`
+- OpenAPI JSON：由 `FASTAPI_OPENAPI_URL` 配置，项目建议值为 `/api/openapi.json`
 - API Base URL：使用机器人后端的 HTTP Origin，例如 `https://bot.example.com`
+
+当前接口版本为 v2.0，所有业务路由统一使用 `/api/v2/<plugin>`。这是破坏性升级，旧版路由与兼容入口均不再注册，请一次性更新前端 Base URL 和 Agent Run 日志权限名。
 
 Swagger/OpenAPI 文档本身可以公开访问，但下列业务接口全部需要 Bearer Token。
 
 后端只在以下条件都满足时注册管理 API：
 
 1. `komari_management.plugin_enable=true`；
-2. 至少存在一条有效的 `api_credentials`，或仍在使用符合强度要求的旧版 `api_token`；
+2. 至少存在一条有效的 `api_credentials`；
 3. NoneBot2 使用 FastAPI Driver；
 4. 前端 Origin 已加入 `api_allowed_origins`，跨域访问时需要完整匹配协议、主机和端口。
 
@@ -40,6 +42,23 @@ Authorization: Bearer <management-token>
 
 具名凭据支持精确权限、资源通配符（例如 `config:*`）和全局通配符 `*`。写权限自动包含同资源的读权限；`announce:send` 自动包含 `announce:read`。
 
+推荐先配置一个供管理后台使用的全权限凭据：
+
+```json
+{
+  "api_credentials": [
+    {
+      "credential_id": "management-dashboard",
+      "token": "replace-with-a-strong-random-token",
+      "permissions": ["*"],
+      "revoked_at": null
+    }
+  ]
+}
+```
+
+Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 个不同字符。升级前仍使用旧单 Token 字段的部署必须先迁移；新版本不会读取该字段，启动时会删除数据库中的残留键并记录警告。
+
 | 功能 | 读权限 | 写权限 |
 | --- | --- | --- |
 | 动态配置 | `config:read` | `config:write` |
@@ -49,7 +68,8 @@ Authorization: Bearer <management-token>
 | 知识库 | `knowledge:read` | `knowledge:write` |
 | 帮助库 | `help:read` | `help:write` |
 | 记忆库 | `memory:read` | `memory:write` |
-| Agent Run 日志 | `llm_logs:read` | 无写接口 |
+| Agent Run 日志 | `agent_run_logs:read` | 无写接口 |
+| 搜索提供者描述 | `search:read` | 无写接口 |
 | 用户封禁 | `user_ban:read` | `user_ban:write` |
 
 ### 2.2 审计写请求头
@@ -143,14 +163,13 @@ type ApiError = {
 | `403` | 展示权限不足，不要按登录失效处理 |
 | `404` | 刷新列表，目标可能已不存在 |
 | `409` | 处理并发更新、幂等冲突或正在执行状态 |
-| `410` | 当前接口已退役，切换到响应给出的替代接口 |
 | `422` | 展示字段校验信息 |
 | `429` | 按 `remaining_seconds` 禁用提交按钮 |
 | `503` | 服务依赖未就绪，可保留页面并允许稍后重试 |
 
 ## 3. 动态配置页面
 
-Base path：`/api/komari-management-config/v1`
+Base path：`/api/v2/komari-management-config`
 
 | 方法 | 路径 | 权限 | 用途 |
 | --- | --- | --- | --- |
@@ -187,7 +206,7 @@ user_data
 例如更新 `komari_sentry.send_default_pii`：
 
 ```http
-PATCH /api/komari-management-config/v1/resources/komari_sentry/fields/send_default_pii
+PATCH /api/v2/komari-management-config/resources/komari_sentry/fields/send_default_pii
 Authorization: Bearer <management-token>
 Content-Type: application/json
 X-Komari-Change-Reason: update-sentry-pii-setting
@@ -234,7 +253,7 @@ type ConfigFieldState = ConfigFieldMetadata & {
 
 ## 4. Prompt 编辑页面
 
-Base path：`/api/komari-management-prompt/v1`
+Base path：`/api/v2/komari-management-prompt`
 
 | 方法 | 路径 | 权限 | 用途 |
 | --- | --- | --- | --- |
@@ -286,7 +305,7 @@ If-Match: "7"
 
 ## 5. Komari Decision Scene 页面
 
-Base path：`/api/komari-decision-scenes/v1`
+Base path：`/api/v2/komari-decision-scenes`
 
 | 方法 | 路径 | 权限 | 用途 |
 | --- | --- | --- | --- |
@@ -313,7 +332,7 @@ Base path：`/api/komari-decision-scenes/v1`
 
 ## 6. 维护公告页面
 
-Base path：`/api/komari-announce/v1`
+Base path：`/api/v2/komari-announce`
 
 | 方法 | 路径 | 权限 | 用途 |
 | --- | --- | --- | --- |
@@ -344,7 +363,7 @@ Base path：`/api/komari-announce/v1`
 
 ## 7. 用户封禁页面
 
-Base path：`/api/komari-user-bans/v1`
+Base path：`/api/v2/komari-user-bans`
 
 | 方法 | 路径 | 权限 | 用途 |
 | --- | --- | --- | --- |
@@ -375,7 +394,7 @@ Base path：`/api/komari-user-bans/v1`
 
 ### 8.1 知识库
 
-Base path：`/api/komari-knowledge/v1`
+Base path：`/api/v2/komari-knowledge`
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -390,7 +409,7 @@ Base path：`/api/komari-knowledge/v1`
 
 ### 8.2 帮助库
 
-Base path：`/api/komari-help/v1`
+Base path：`/api/v2/komari-help`
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -408,7 +427,7 @@ Base path：`/api/komari-help/v1`
 
 ## 9. 记忆库页面
 
-Base path：`/api/komari-memory/v1`
+Base path：`/api/v2/komari-memory`
 
 | 数据区 | 端点 |
 | --- | --- |
@@ -425,13 +444,11 @@ Base path：`/api/komari-memory/v1`
 
 用户画像 PUT 的正文是画像 JSON 本身，不要额外包 `value` 或 `profile`；重要度通过查询参数 `importance=1..5` 传递。路径中的 `user_id` 与正文中的 `user_id` 如果同时存在必须一致。
 
-旧 `/interaction-histories` 系列接口已退役并固定返回 `410`。新前端必须使用 `/interactions`，先按 `user_id` 查询事件 ID，再按事件 ID 读写。
-
 读操作需要 `memory:read`，写操作和失败快照重新入队需要 `memory:write`。当前这些写接口不要求审计请求头。
 
 ## 10. Agent Run 日志页面
 
-Base path：`/api/agent-run-logs/v1`
+Base path：`/api/v2/agent-run-logs`
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -451,7 +468,17 @@ Base path：`/api/agent-run-logs/v1`
 
 PostgreSQL 只保存可重建的定位元数据；列表预览来自当前页命中的 JSONL。PG 索引不可用时读取器自动降级扫描保留期文件，读取器整体未初始化时返回 `503`。稳定定位键为 `run_id`。
 
-旧 `/api/llm-provider/v1/reply-logs` 与 `/reply-logs/{date}/{line_number}` 暂时保留为弃用别名，新前端不得继续依赖旧 URL。
+## 10.5 Komari Search 提供者描述
+
+Base path：`/api/v2/komari-search`
+
+| 方法 | 路径 | 权限 | 用途 |
+| --- | --- | --- | --- |
+| `GET` | `/provider-descriptors` | `search:read` | 获取搜索提供者及其动态配置字段描述 |
+
+响应中的 `current_provider` 是默认搜索提供者，`available_providers` 是可选提供者 ID。`common_fields` 包含通用搜索、抓取和熔断配置；`providers` 按 `tavily`、`exa` 分组返回专用字段。
+
+每个字段包含 `field_name`、`field_type`、`description`、`default` 和 `secret`。这些数据由 `komari_search` 的 Pydantic Schema 动态生成，前端不得硬编码字段清单；`secret=true` 的字段输入和日志处理应遵循动态配置页面的秘密值规则。
 
 ## 11. 前端实现优先级与验收清单
 
@@ -464,7 +491,8 @@ PostgreSQL 只保存可重建的定位元数据；列表预览来自当前页命
 5. 公告群选择、幂等提交和逐群结果；
 6. 用户封禁；
 7. 知识库、帮助库、记忆库 CRUD；
-8. Agent Run 日志筛选与完整详情，并为正文区域增加敏感数据提示。
+8. 搜索提供者动态表单；
+9. Agent Run 日志筛选与完整详情，并为正文区域增加敏感数据提示。
 
 联调验收时至少确认：
 
@@ -476,7 +504,6 @@ PostgreSQL 只保存可重建的定位元数据；列表预览来自当前页命
 - 秘密字段掩码不会被回写；
 - `restart_required=true` 会明确提示重启；
 - 公告重试不会生成新的 request ID，也不会因 HTTP `200` 忽略单群失败；
-- 页面不会使用已退役的 `/interaction-histories` 接口；
 - 前端生产 Origin 已加入 CORS 白名单。
 
 ## 12. 后端运行说明

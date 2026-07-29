@@ -31,9 +31,9 @@
 
 本插件是受权限保护的完整调试日志，不做普通正文脱敏。用户消息、历史、画像、网页结果、prompt、回复、reasoning 与工具文本按原文保存；仅过滤 API key、Authorization、Cookie、密码等显式凭据，并摘要化图片 URL、data URL、base64 和二进制。
 
-管理 API 使用 `llm_logs:read`：
+管理 API 使用 `agent_run_logs:read`：
 
-- `GET /api/agent-run-logs/v1/runs`
-- `GET /api/agent-run-logs/v1/runs/{run_id}`
+- `GET /api/v2/agent-run-logs/runs`
+- `GET /api/v2/agent-run-logs/runs/{run_id}`
 
 `.debug` 报告继续使用独立的二次脱敏格式，禁止把完整日志对象交给消息投递代码。

@@ -8,16 +8,16 @@
 
 ## 鉴权与前缀
 
-启用 `komari_management` 后，接口挂载在 `/api/komari-user-bans/v1`，并复用统一管理 API 的 Bearer Token：
+启用 `komari_management` 后，接口挂载在 `/api/v2/komari-user-bans`，并复用统一管理 API 的具名 Bearer 凭据：
 
 ```http
-Authorization: Bearer <api_token>
+Authorization: Bearer <management-token>
 ```
 
 ## 查询封禁列表
 
 ```http
-GET /api/komari-user-bans/v1/bans?scope=all&page=1&page_size=20
+GET /api/v2/komari-user-bans/bans?scope=all&page=1&page_size=20
 ```
 
 `scope` 支持 `chat`、`command`、`all`；`page_size` 范围为 1 至 100。响应只包含当前有效记录。
@@ -25,7 +25,7 @@ GET /api/komari-user-bans/v1/bans?scope=all&page=1&page_size=20
 ## 查询单个用户
 
 ```http
-GET /api/komari-user-bans/v1/bans/10086
+GET /api/v2/komari-user-bans/bans/10086
 ```
 
 响应包含 `active_scopes`、各作用域记录和 `superuser_bypass`。QQ 号必须是不带前导零的正整数字符串。
@@ -33,7 +33,7 @@ GET /api/komari-user-bans/v1/bans/10086
 ## 新增或覆盖封禁
 
 ```http
-POST /api/komari-user-bans/v1/bans
+POST /api/v2/komari-user-bans/bans
 Content-Type: application/json
 
 {
@@ -49,7 +49,7 @@ Content-Type: application/json
 ## 手动解封
 
 ```http
-DELETE /api/komari-user-bans/v1/bans/10086/all
+DELETE /api/v2/komari-user-bans/bans/10086/all
 ```
 
 末尾作用域支持 `chat`、`command`、`all`。不存在有效记录时返回幂等成功，`changed` 为 `false`。
