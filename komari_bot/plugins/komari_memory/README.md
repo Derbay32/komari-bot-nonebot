@@ -110,20 +110,6 @@ poetry run python scripts/split_komari_memory_entity_tables.py
 poetry run python scripts/split_komari_memory_entity_tables.py --apply
 ```
 
-### `komari_memory_entity` 旧结构迁移
-
-如果你的 `komari_memory_entity` 还是旧版多行 key/value 结构，先做 dry-run：
-
-```bash
-poetry run python scripts/migrate_komari_memory_entity_to_json.py
-```
-
-确认后执行真实迁移：
-
-```bash
-poetry run python scripts/migrate_komari_memory_entity_to_json.py --apply
-```
-
 如果只想手工应用约束：
 
 ```bash
