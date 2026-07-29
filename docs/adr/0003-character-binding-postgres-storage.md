@@ -4,6 +4,6 @@
 
 ## Consequences
 
-- 文件锁、fsync、原子替换、stat 签名刷新与 `refresh_if_file_updated` 导出全部移除；新增一次性迁移脚本 `scripts/migrate_character_binding_to_pg.py`。
+- 文件锁、fsync、原子替换、stat 签名刷新与公开的文件刷新导出全部移除；新增一次性迁移脚本 `scripts/migrate_character_binding_to_pg.py`。
 - PG 启动不可用时以空快照降级（角色名回退昵称/QQ 号），写入报错，延续原文件损坏时的故障语义。
 - **失效条件**：未来若放开多 worker 部署，本决策的前提即告失效，必须重新引入跨进程刷新机制（revision 轮询或 LISTEN/NOTIFY），否则其他 worker 的快照将永久过期。

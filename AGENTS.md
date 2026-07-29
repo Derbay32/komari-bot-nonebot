@@ -98,7 +98,7 @@ komari-bot/
   group_history_summary ────── 群聊历史总结
 
 辅助功能层
-  character_binding ────────── .bind 角色名绑定指令（普通用户 self-only；跨用户管理入口已移至 `.debug bind ...`）
+  character_binding ────────── PostgreSQL 角色名绑定 + 进程内快照（普通用户 self-only；跨用户管理入口已移至 `.debug bind ...`）
   sr ───────────────────────── 神人榜抽签
   komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_sentry ────────────── Sentry 集成
@@ -260,6 +260,14 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **动态禁用**：每次数据库入口（包括已有缓存）都实时检查 `plugin_enable`；禁用时抛出 `UserDataDisabledError`，禁止通过懒加载绕过开关
 - **原子初始化**：PostgreSQL 连接池仅在表结构创建成功后发布；建表失败必须立即关闭局部连接池并保持实例未初始化
 - **并发清理**：关闭流程与懒初始化共用初始化锁，先清空全局引用再关闭连接池，避免继续分发正在关闭的实例
+
+### 3.3 角色名绑定 (`character_binding`)
+
+- **持久化**：PostgreSQL 表 `komari_character_bindings`，以 `user_id` 为主键；运行时不再读写 JSON 绑定文件
+- **同步读取**：`get_character_name()`、`list_bindings()`、`has_binding()` 只读取进程内不可变快照；写库成功后用新字典原子替换快照
+- **一致性边界**：部署层强制单 worker，因此不轮询数据库也不使用 LISTEN/NOTIFY；直接改库需重启后生效，未来放开多 worker 时必须重新设计跨进程刷新
+- **故障降级**：启动时 PostgreSQL 不可用则保留空快照，角色名回退昵称或 QQ 号；写入失败统一抛出 `BindingPersistenceError`
+- **显式迁移**：升级部署前先执行 `poetry run python scripts/migrate_character_binding_to_pg.py`，把旧 `data/character_binding/bindings.json` 内容 upsert 到 PostgreSQL
 
 ### 4. 四层记忆系统 (`komari_memory`)
 
