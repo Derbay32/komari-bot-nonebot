@@ -767,7 +767,13 @@ class _FakeRedis:
 
     async def scan_iter(self, *, match: str):
         prefix = match.removesuffix("*")
-        for key in sorted(self.data):
+        all_keys: set[str] = set()
+        all_keys.update(self.data.keys())
+        all_keys.update(self.values.keys())
+        all_keys.update(self.sets.keys())
+        all_keys.update(self.zsets.keys())
+        all_keys.update(self.hashes.keys())
+        for key in sorted(all_keys):
             if key.startswith(prefix):
                 yield key
 
@@ -1716,3 +1722,38 @@ def test_get_orphaned_conversation_processing_keys_filters_active_locks(
     orphaned = asyncio.run(manager.get_orphaned_conversation_processing_keys())
 
     assert orphaned == [("g2", no_lock_key), ("g3", stale_lock_key)]
+
+
+def test_get_active_groups_excludes_processing_and_dead_letter_keys(
+    monkeypatch: Any,
+) -> None:
+    """get_active_groups() 应排除 processing 系列键和 dead-letter 索引键。
+
+    回归覆盖：此前 BUFFER_PROCESSING_DEAD_INDEX（ZSET）未被排除，
+    被误认为群组 ID ``processing_dead_index``，下游 LLEN 触发 WRONGTYPE。
+    """
+    manager = _build_manager(monkeypatch)
+    fake_redis = _get_fake_redis(manager)
+
+    # 真实群组缓冲键
+    fake_redis.data[RedisKeys.buffer("10001")] = ["m1"]
+    fake_redis.data[RedisKeys.buffer("10002")] = ["m1"]
+
+    # 本次事故元凶 — ZSET 键，位于 zsets 存储
+    fake_redis.zsets[RedisKeys.BUFFER_PROCESSING_DEAD_INDEX] = {}
+
+    # 各 processing 前缀覆盖
+    fake_redis.data[RedisKeys.buffer_processing("10001", "token")] = []  # processing:
+    fake_redis.values[RedisKeys.buffer_processing_current("10001")] = ""  # processing_current:
+    fake_redis.values[RedisKeys.buffer_processing_lock("10001")] = ""  # processing_lock:
+    fake_redis.hashes[RedisKeys.buffer_processing_chunks("10001", "token")] = {}  # processing_chunks:
+    fake_redis.values[
+        RedisKeys.buffer_processing_meta_last_message("10001", "token")
+    ] = ""  # processing_meta:
+    fake_redis.hashes[
+        RedisKeys.buffer_processing_dead("10001", "deadtoken")
+    ] = {}  # processing_dead:
+
+    result = asyncio.run(manager.get_active_groups())
+
+    assert set(result) == {"10001", "10002"}
