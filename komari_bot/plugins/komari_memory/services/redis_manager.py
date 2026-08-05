@@ -1468,15 +1468,19 @@ class RedisManager:
         """
         pattern = RedisKeys.BUFFER_PATTERN
         keys = []
+        excluded_keys = {RedisKeys.BUFFER_PROCESSING_DEAD_INDEX}
         excluded_prefixes = (
             f"{RedisKeys.PREFIX}:buffer:processing:",
             f"{RedisKeys.PREFIX}:buffer:processing_current:",
             f"{RedisKeys.PREFIX}:buffer:processing_lock:",
             f"{RedisKeys.PREFIX}:buffer:processing_chunks:",
             f"{RedisKeys.PREFIX}:buffer:processing_meta:",
+            f"{RedisKeys.PREFIX}:buffer:processing_dead:",
         )
         async for key in self.redis.scan_iter(match=pattern):
             key_text = self._decode_redis_text(key)
+            if key_text in excluded_keys:
+                continue
             if any(key_text.startswith(prefix) for prefix in excluded_prefixes):
                 continue
             prefix = f"{RedisKeys.PREFIX}:buffer:"
