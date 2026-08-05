@@ -5,6 +5,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from komari_bot.common.llm_protocol import RequestApi
+
 
 class LayoutParamsSchema(BaseModel):
     """图片布局参数。"""
@@ -113,6 +115,20 @@ class DynamicConfigSchema(BaseModel):
     summary_planning_round_limit: int = Field(
         default=3, ge=1, le=6, description="总结规划工具循环上限"
     )
+    summary_planning_request_api: RequestApi = Field(
+        default="chat_completions",
+        description=(
+            "总结规划阶段请求 API：chat_completions=OpenAI Chat Completions，"
+            "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
+        ),
+    )
+    summary_planning_stream_enabled: bool = Field(
+        default=False,
+        description=(
+            "总结规划阶段是否启用流式传输（仅在网关内部聚合，业务插件无感知）。"
+            "修改后从下一个业务任务开始生效。"
+        ),
+    )
     summary_planning_thinking_mode: bool = Field(
         default=False,
         description="群聊总结规划阶段模型是否处于思考模式。语义同 komari_memory.llm_thinking_mode_chat。",
@@ -131,6 +147,14 @@ class DynamicConfigSchema(BaseModel):
     )
     summary_max_tokens: int = Field(
         default=1200, ge=128, le=8192, description="总结最大 tokens"
+    )
+    summary_request_api: RequestApi = Field(
+        default="chat_completions",
+        description="总结执行阶段请求 API。语义同 summary_planning_request_api。",
+    )
+    summary_stream_enabled: bool = Field(
+        default=False,
+        description="总结执行阶段是否启用流式传输。语义同 summary_planning_stream_enabled。",
     )
     summary_thinking_mode: bool = Field(
         default=False,

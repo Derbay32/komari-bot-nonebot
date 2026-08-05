@@ -164,6 +164,8 @@ async def _run_profile_agent_locked(
             "model": config.llm_model_summary,
             "temperature": config.llm_temperature_summary,
             "max_tokens": config.llm_max_tokens_summary,
+            "request_api": config.llm_request_api_summary,
+            "stream_enabled": config.llm_stream_enabled_summary,
             "tools": PROFILE_AGENT_TOOLS,
             "tool_choice": "auto",
             "parallel_tool_calls": False,
@@ -493,22 +495,15 @@ def _parse_operations(raw: Any) -> list[ProfileOperation]:
 
 
 def _build_assistant_tool_call_message(completion: Any) -> dict[str, Any]:
-    tool_calls = [
-        {
-            "id": tool_call.id or f"call_{uuid4().hex[:8]}",
-            "type": "function",
-            "function": {
-                "name": tool_call.function.name,
-                "arguments": tool_call.raw_arguments or tool_call.function.arguments,
-            },
-        }
-        for tool_call in completion.tool_calls
-    ]
-    return {
-        "role": "assistant",
-        "content": completion.content or "",
-        "tool_calls": tool_calls,
-    }
+    """委托 llm_provider 统一助手消息构造函数。
+
+    统一构造函数把 completion 转为工具循环内部 assistant 消息，并把
+    continuation 附着为 `_llm_continuation` 内部元数据；tool_call id
+    回退策略统一为函数名（与原 uuid 回退的差异为可接受的统一化）。
+    """
+    from komari_bot.plugins.llm_provider.base_client import build_assistant_message
+
+    return build_assistant_message(completion)
 
 
 def _build_tool_result_message(tool_call: Any, result: dict[str, Any]) -> dict[str, Any]:

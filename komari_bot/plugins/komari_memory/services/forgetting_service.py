@@ -813,6 +813,11 @@ class ForgettingService:
             "model": config.llm_model_summary,
             "temperature": config.llm_temperature_summary,
             "max_tokens": min(config.llm_max_tokens_summary, 120),
+            # 测试替身快照可能缺失新槽位字段，回退到与 Schema 默认值一致的显式值
+            "request_api": getattr(
+                config, "llm_request_api_summary", "chat_completions"
+            ),
+            "stream_enabled": getattr(config, "llm_stream_enabled_summary", False),
             "thinking_mode": config.llm_thinking_mode_summary,
             "reasoning_effort": config.llm_reasoning_effort_summary,
         }
@@ -1091,6 +1096,11 @@ class ForgettingService:
             "model": config.llm_model_summary,
             "temperature": config.llm_temperature_summary,
             "max_tokens": min(config.llm_max_tokens_summary, 120),
+            # 测试替身快照可能缺失新槽位字段，回退到与 Schema 默认值一致的显式值
+            "request_api": getattr(
+                config, "llm_request_api_summary", "chat_completions"
+            ),
+            "stream_enabled": getattr(config, "llm_stream_enabled_summary", False),
             "thinking_mode": config.llm_thinking_mode_summary,
             "reasoning_effort": config.llm_reasoning_effort_summary,
         }

@@ -40,3 +40,33 @@ def test_layout_rejects_text_regions_outside_canvas() -> None:
             body_y=290,
             body_size=30,
         )
+
+
+def test_config_schema_request_protocol_defaults() -> None:
+    config = DynamicConfigSchema()
+
+    assert config.summary_planning_request_api == "chat_completions"
+    assert config.summary_planning_stream_enabled is False
+    assert config.summary_request_api == "chat_completions"
+    assert config.summary_stream_enabled is False
+
+
+def test_config_schema_accepts_responses_request_api() -> None:
+    config = DynamicConfigSchema(
+        summary_planning_request_api="responses",
+        summary_planning_stream_enabled=True,
+        summary_request_api="responses",
+        summary_stream_enabled=True,
+    )
+
+    assert config.summary_planning_request_api == "responses"
+    assert config.summary_planning_stream_enabled is True
+    assert config.summary_request_api == "responses"
+    assert config.summary_stream_enabled is True
+
+
+def test_config_schema_rejects_invalid_request_api() -> None:
+    with pytest.raises(ValidationError):
+        DynamicConfigSchema(summary_planning_request_api="websocket")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        DynamicConfigSchema(summary_request_api="websocket")  # type: ignore[arg-type]

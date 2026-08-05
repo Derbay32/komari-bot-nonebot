@@ -34,6 +34,8 @@ class LLMCallTrace(BaseModel):
     finish_reason: str | None = None
     duration_ms: float | None = None
     usage: Any | None = None
+    request_api: str | None = None
+    stream_enabled: bool | None = None
 
 
 class ToolExecutionTrace(BaseModel):
@@ -257,6 +259,7 @@ LLMDiagnosticCollector = AgentRunCollector
 def completion_response_payload(completion: object) -> dict[str, Any]:
     """从 provider completion 结果提取完整、可序列化响应。"""
     tool_calls = getattr(completion, "tool_calls", []) or []
+    continuation = getattr(completion, "continuation", None)
     return {
         "content": getattr(completion, "content", ""),
         "reasoning_content": getattr(completion, "reasoning_content", None),
@@ -270,6 +273,12 @@ def completion_response_payload(completion: object) -> dict[str, Any]:
         ],
         "finish_reason": getattr(completion, "finish_reason", None),
         "usage": sanitize_log_value(getattr(completion, "usage", None)),
+        "continuation": (
+            continuation.model_dump(mode="json")
+            if continuation is not None
+            and callable(getattr(continuation, "model_dump", None))
+            else sanitize_log_value(continuation)
+        ),
     }
 
 
@@ -300,9 +309,19 @@ def record_completion_call(
         finish_reason=getattr(completion, "finish_reason", None),
         duration_ms=getattr(completion, "duration_ms", None),
         usage=getattr(completion, "usage", None),
+        request_api=_request_mode_value(request, "request_api"),
+        stream_enabled=_request_mode_value(request, "stream_enabled"),
     )
     collector.add_call(trace)
     return trace.call_id
+
+
+def _request_mode_value(request: dict[str, Any], key: str) -> Any:
+    """从请求数据提取协议标记，缺失时保持 None（不伪造生效值）。"""
+    value = request.get(key)
+    if key == "request_api":
+        return value if isinstance(value, str) else None
+    return value if isinstance(value, bool) else None
 
 
 def record_failed_call(
@@ -329,5 +348,7 @@ def record_failed_call(
             status="error",
             request=request,
             error={"type": type(error).__name__, "message": str(error)},
+            request_api=_request_mode_value(request, "request_api"),
+            stream_enabled=_request_mode_value(request, "stream_enabled"),
         )
     )

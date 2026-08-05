@@ -139,6 +139,8 @@ async def _execute_group_summary_core(
         fetch_batch_size=config.fetch_batch_size,
         planning_thinking_mode=config.summary_planning_thinking_mode,
         planning_reasoning_effort=config.summary_planning_reasoning_effort,
+        planning_request_api=config.summary_planning_request_api,
+        planning_stream_enabled=config.summary_planning_stream_enabled,
         request_trace_id=request_trace_id,
         collector=collector,
         history_min_coverage_ratio=config.history_min_coverage_ratio,
@@ -176,6 +178,8 @@ async def _execute_group_summary_core(
         dsv4_roleplay_instruct_mode=config.dsv4_roleplay_instruct_mode,
         thinking_mode=config.summary_thinking_mode,
         reasoning_effort=config.summary_reasoning_effort,
+        request_api=config.summary_request_api,
+        stream_enabled=config.summary_stream_enabled,
         request_trace_id=request_trace_id,
         collector=collector,
     )

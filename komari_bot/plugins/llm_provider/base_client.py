@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
+    from komari_bot.common.llm_protocol import RequestApi
     from komari_bot.common.untrusted_context import UntrustedContext
 
 
@@ -51,6 +52,64 @@ class LLMToolCallSchema(BaseModel):
     )
 
 
+class LLMProviderContinuationSchema(BaseModel):
+    """Responses 协议的不透明续接项。
+
+    只在当前业务任务的多轮工具循环内存活：不写入业务数据库、
+    不跨 QQ 消息复用、不属于持久协议。Chat 路径不产生此对象。
+    """
+
+    api: Literal["responses"] = Field(description="协议鉴别（Chat 无此对象）")
+    output_items: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "序列化的 Responses output items（message / function_call / "
+            "reasoning，含加密推理内容，原样回传）"
+        ),
+    )
+
+
+CONTINUATION_METADATA_KEY = "_llm_continuation"
+"""assistant 消息上附着 continuation 的内部元数据键。
+
+Chat 请求构建器会剥离全部 `_` 前缀内部键（永不发往 Chat 端点）；
+Responses 请求构建器校验协议后原样展开 output items。
+"""
+
+
+def build_assistant_message(
+    completion: LLMCompletionResultSchema,
+) -> dict[str, Any]:
+    """统一助手消息构造函数。
+
+    把统一完成结果转为工具循环内部 messages 条目：包含 assistant 文本与
+    tool_calls（Chat 格式）；completion 的 continuation（如有）附着为内部
+    元数据，Chat 构建器剥离、Responses 构建器原样展开。
+    无工具但需重试的 assistant 输出同样经此构造函数附着 continuation。
+    """
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": completion.content,
+    }
+    if completion.tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": tool_call.id or tool_call.function.name,
+                "type": tool_call.type,
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.raw_arguments
+                    or tool_call.function.arguments,
+                },
+            }
+            for tool_call in completion.tool_calls
+        ]
+    continuation = getattr(completion, "continuation", None)
+    if continuation is not None:
+        message[CONTINUATION_METADATA_KEY] = continuation.model_dump()
+    return message
+
+
 class LLMCompletionResultSchema(BaseModel):
     """统一的 LLM 完成结果。"""
 
@@ -64,6 +123,10 @@ class LLMCompletionResultSchema(BaseModel):
     finish_reason: str | None = Field(default=None, description="结束原因")
     usage: UnifiedUsageSchema | None = Field(default=None, description="用量信息")
     duration_ms: float | None = Field(default=None, description="调用耗时（毫秒）")
+    continuation: LLMProviderContinuationSchema | None = Field(
+        default=None,
+        description="Responses 协议续接项；Chat Completions 路径恒为 None",
+    )
 
 
 class BaseLLMClient(ABC):
@@ -83,6 +146,8 @@ class BaseLLMClient(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
         untrusted_contexts: list[UntrustedContext] | None = None,
+        request_api: RequestApi | None = None,
+        stream_enabled: bool | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """生成文本。
@@ -98,6 +163,8 @@ class BaseLLMClient(ABC):
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
             untrusted_contexts: 由 provider 作为独立数据块注入的不可信上下文
+            request_api: 请求 API（None 时解析默认槽位配置）
+            stream_enabled: 是否启用流式传输（None 时解析默认槽位配置）
             **kwargs: 其他 provider 特定参数
 
         Returns:
@@ -117,6 +184,8 @@ class BaseLLMClient(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
         untrusted_contexts: list[UntrustedContext] | None = None,
+        request_api: RequestApi | None = None,
+        stream_enabled: bool | None = None,
         **kwargs,  # noqa: ANN003
     ) -> LLMCompletionResultSchema:
         """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -131,6 +200,8 @@ class BaseLLMClient(ABC):
             tool_choice: 工具选择策略
             parallel_tool_calls: 是否允许并行工具调用
             untrusted_contexts: 由 provider 作为独立数据块注入的不可信上下文
+            request_api: 请求 API（None 时解析默认槽位配置）
+            stream_enabled: 是否启用流式传输（None 时解析默认槽位配置）
             **kwargs: 其他参数
 
         Returns:
