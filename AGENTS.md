@@ -432,7 +432,7 @@ poetry run pytest tests/ -v
 
 ### Issue tracker
 
-Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）。See `docs/agents/issue-tracker.md`.
+Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）；`/to-tickets` 拆出的实施 ticket 以 GitHub Projects 草稿项管理，不进 issue 库。See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
