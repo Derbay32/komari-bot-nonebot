@@ -428,13 +428,28 @@ poetry run pytest tests/ -v
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.common.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
 13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
 
+## Agent skills
+
+### Issue tracker
+
+Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）。See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+使用默认五个规范标签：needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix。See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/domain.md`.
+
 ## 相关文档
 
 | 文档 | 位置 | 用途 |
 |------|------|------|
 | 任务交接记录 | `docs/handoff.md` | 历史任务详情、决策记录、注意事项 |
 | 组件文档 | `docs/*.md` | 各插件的详细设计文档 |
+| Agent skill 配置 | `docs/agents/*.md` | issue tracker / triage 标签 / 领域文档约定 |
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-07-27。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-08-05。发现不一致请以实际代码为准并更新本文档。*
