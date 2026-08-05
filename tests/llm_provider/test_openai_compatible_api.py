@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 
 from komari_bot.common.untrusted_context import (
     LLM_SECURITY_SYSTEM_INSTRUCTION,
@@ -80,6 +81,36 @@ def test_llm_provider_schema_includes_runtime_fields() -> None:
 def test_llm_provider_schema_rejects_unsafe_extra_param_keys(key: str) -> None:
     with pytest.raises(ValueError, match=key):
         DynamicConfigSchema(extra_params={key: "覆盖值"})
+
+
+def test_llm_provider_schema_request_protocol_defaults() -> None:
+    config = DynamicConfigSchema()
+
+    assert config.request_api == "chat_completions"
+    assert config.stream_enabled is False
+    assert config.vision_request_api == "chat_completions"
+    assert config.vision_stream_enabled is False
+
+
+def test_llm_provider_schema_accepts_responses_request_api() -> None:
+    config = DynamicConfigSchema(
+        request_api="responses",
+        stream_enabled=True,
+        vision_request_api="responses",
+        vision_stream_enabled=True,
+    )
+
+    assert config.request_api == "responses"
+    assert config.stream_enabled is True
+    assert config.vision_request_api == "responses"
+    assert config.vision_stream_enabled is True
+
+
+@pytest.mark.parametrize("field", ["request_api", "vision_request_api"])
+def test_llm_provider_schema_rejects_invalid_request_api(field: str) -> None:
+    kwargs: dict[str, Any] = {field: "websocket"}
+    with pytest.raises(ValidationError):
+        DynamicConfigSchema(**kwargs)
 
 
 def test_openai_compatible_client_session_uses_configured_timeout() -> None:

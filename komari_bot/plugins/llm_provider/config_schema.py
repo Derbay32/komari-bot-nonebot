@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from komari_bot.common.llm_protocol import RequestApi
+
 ALLOWED_EXTRA_PARAM_KEYS = frozenset(
     {
         "logprobs",
@@ -56,6 +58,20 @@ class DynamicConfigSchema(BaseModel):
     model: str = Field(
         default="deepseek-chat", description="OpenAI 兼容 API 使用模型"
     )
+    request_api: RequestApi = Field(
+        default="chat_completions",
+        description=(
+            "默认槽位请求 API：chat_completions=OpenAI Chat Completions，"
+            "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
+        ),
+    )
+    stream_enabled: bool = Field(
+        default=False,
+        description=(
+            "默认槽位是否启用流式传输（仅在网关内部聚合，业务插件无感知）。"
+            "修改后从下一个业务任务开始生效。"
+        ),
+    )
     temperature: float = Field(
         default=1.0, ge=0.0, le=2.0, description="OpenAI 兼容 API 调用温度参数"
     )
@@ -93,6 +109,14 @@ class DynamicConfigSchema(BaseModel):
     vision_model: str = Field(
         default="gemini-2.0-flash-exp",
         description="多模态视觉模型名",
+    )
+    vision_request_api: RequestApi = Field(
+        default="chat_completions",
+        description="视觉槽位请求 API。语义同 request_api。",
+    )
+    vision_stream_enabled: bool = Field(
+        default=False,
+        description="视觉槽位是否启用流式传输。语义同 stream_enabled。",
     )
     vision_temperature: float = Field(
         default=0.3,

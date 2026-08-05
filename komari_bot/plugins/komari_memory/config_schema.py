@@ -5,6 +5,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from komari_bot.common.llm_protocol import RequestApi
+
 
 class KomariMemoryConfigSchema(BaseModel):
     """Komari Memory 插件配置。"""
@@ -51,6 +53,20 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     llm_max_tokens_chat: int = Field(
         default=4000, ge=20, le=8192, description="对话模型最大 token 数"
+    )
+    llm_request_api_chat: RequestApi = Field(
+        default="chat_completions",
+        description=(
+            "对话模型请求 API：chat_completions=OpenAI Chat Completions，"
+            "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
+        ),
+    )
+    llm_stream_enabled_chat: bool = Field(
+        default=False,
+        description=(
+            "对话模型是否启用流式传输（仅在网关内部聚合，业务插件无感知）。"
+            "修改后从下一个业务任务开始生效。"
+        ),
     )
     llm_thinking_mode_chat: bool = Field(
         default=False,
@@ -150,6 +166,14 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     llm_max_tokens_summary: int = Field(
         default=2048, ge=20, le=8192, description="总结模型最大 token 数"
+    )
+    llm_request_api_summary: RequestApi = Field(
+        default="chat_completions",
+        description="总结/记忆/画像模型请求 API。语义同 llm_request_api_chat。",
+    )
+    llm_stream_enabled_summary: bool = Field(
+        default=False,
+        description="总结/记忆/画像模型是否启用流式传输。语义同 llm_stream_enabled_chat。",
     )
     llm_thinking_mode_summary: bool = Field(
         default=False,
