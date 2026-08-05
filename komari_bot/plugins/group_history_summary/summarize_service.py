@@ -17,6 +17,7 @@ from .history_service import HistoryMessage, format_message_for_prompt
 from .prompt_template import get_template
 
 if TYPE_CHECKING:
+    from komari_bot.common.llm_protocol import RequestApi
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
 
@@ -64,6 +65,8 @@ async def _summarize_history_internal(
     dsv4_roleplay_instruct_mode: str = "auto",
     thinking_mode: bool = False,
     reasoning_effort: str = "",
+    request_api: "RequestApi" = "chat_completions",
+    stream_enabled: bool = False,
     request_trace_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
 ) -> tuple[str, "LLMCompletionResultSchema | None"]:
@@ -117,6 +120,8 @@ async def _summarize_history_internal(
             "max_tokens": max_tokens,
             "thinking_mode": thinking_mode,
             "reasoning_effort": reasoning_effort,
+            "request_api": request_api,
+            "stream_enabled": stream_enabled,
         }
         try:
             completion = await llm_provider.generate_messages_completion(
@@ -161,6 +166,8 @@ async def _summarize_history_internal(
         max_tokens=max_tokens,
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
+        request_api=request_api,
+        stream_enabled=stream_enabled,
         request_phase="group_history_summary",
     )
     summary_text = _extract_tag_content(raw_result, "content")
@@ -181,6 +188,8 @@ async def summarize_history_messages(
     dsv4_roleplay_instruct_mode: str = "auto",
     thinking_mode: bool = False,
     reasoning_effort: str = "",
+    request_api: "RequestApi" = "chat_completions",
+    stream_enabled: bool = False,
     request_trace_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
 ) -> str:
@@ -194,6 +203,8 @@ async def summarize_history_messages(
         dsv4_roleplay_instruct_mode=dsv4_roleplay_instruct_mode,
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
+        request_api=request_api,
+        stream_enabled=stream_enabled,
         request_trace_id=request_trace_id,
         collector=collector,
     )

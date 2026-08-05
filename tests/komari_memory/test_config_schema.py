@@ -124,3 +124,36 @@ def test_vision_image_download_rejects_inconsistent_batch_budgets() -> None:
             vision_image_download_connect_timeout_seconds=10,
             vision_image_download_total_timeout_seconds=5,
         )
+
+
+def test_config_schema_request_protocol_defaults() -> None:
+    config = KomariMemoryConfigSchema()
+
+    assert config.llm_request_api_chat == "chat_completions"
+    assert config.llm_stream_enabled_chat is False
+    assert config.llm_request_api_summary == "chat_completions"
+    assert config.llm_stream_enabled_summary is False
+
+
+def test_config_schema_accepts_responses_request_api() -> None:
+    config = KomariMemoryConfigSchema(
+        llm_request_api_chat="responses",
+        llm_stream_enabled_chat=True,
+        llm_request_api_summary="responses",
+        llm_stream_enabled_summary=True,
+    )
+
+    assert config.llm_request_api_chat == "responses"
+    assert config.llm_stream_enabled_chat is True
+    assert config.llm_request_api_summary == "responses"
+    assert config.llm_stream_enabled_summary is True
+
+
+def test_config_schema_rejects_invalid_request_api() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        KomariMemoryConfigSchema(llm_request_api_chat="websocket")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        KomariMemoryConfigSchema(llm_request_api_summary="websocket")  # type: ignore[arg-type]

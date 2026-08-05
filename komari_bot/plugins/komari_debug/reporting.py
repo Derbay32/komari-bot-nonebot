@@ -71,6 +71,11 @@ def _format_call_line(call: LLMCallTrace, index: int) -> str:
         f"  finish: {call.finish_reason or '未知'}",
         f"  耗时: {_fmt_ms(call.duration_ms)}",
     ]
+    if call.request_api is not None:
+        stream_text = (
+            "开" if call.stream_enabled else "关"
+        ) if call.stream_enabled is not None else "未报告"
+        parts.append(f"  协议: {call.request_api} / 流式: {stream_text}")
     if call.parent_call_id:
         parts.append(f"  父调用: {call.parent_call_id}")
     if call.usage:

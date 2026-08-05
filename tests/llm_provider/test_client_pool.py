@@ -285,3 +285,26 @@ def test_client_settings_repr_never_exposes_token() -> None:
     settings = _settings("super-secret-token")
 
     assert "super-secret-token" not in repr(settings)
+
+
+def test_request_mode_change_does_not_alter_client_fingerprint() -> None:
+    """请求 API / 流式开关不属于连接身份：指纹保持 token、base URL、timeout 三元组。"""
+    from types import SimpleNamespace
+
+    base: dict[str, Any] = {
+        "api_token": "token-a",
+        "api_base": "https://llm.example.com/v1",
+        "timeout_seconds": 30.0,
+        "model": "chat",
+    }
+    chat_config = SimpleNamespace(
+        **base, request_api="chat_completions", stream_enabled=False
+    )
+    responses_config = SimpleNamespace(
+        **base, request_api="responses", stream_enabled=True
+    )
+
+    chat_settings = ClientSettings.from_config(chat_config)  # type: ignore[arg-type]
+    responses_settings = ClientSettings.from_config(responses_config)  # type: ignore[arg-type]
+
+    assert chat_settings.fingerprint == responses_settings.fingerprint

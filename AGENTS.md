@@ -195,6 +195,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 `LLMCompletionResultSchema` 新增字段：
 - `usage: UnifiedUsageSchema | None` — 后端实际返回的 token 用量
 - `duration_ms: float | None` — 网关测得的调用耗时（毫秒）
+- `continuation: LLMProviderContinuationSchema | None` — Responses 协议的不透明续接项（见下）
 
 `UnifiedUsageSchema` 字段（全部 `int | None`，`None` 表示后端未报告）：
 - `input_tokens`、`cached_input_tokens`、`cache_miss_input_tokens`
@@ -205,6 +206,25 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - DeepSeek `prompt_cache_hit_tokens` 优先于 OpenAI `prompt_tokens_details.cached_tokens`
 - `completion_tokens_details.reasoning_tokens` 映射到 `reasoning_output_tokens`
 - 缺失或异常字段不阻断解析，对应位置保留 `None`
+
+双请求 API 与流式（issue #23）：
+- 四个 `generate_*` 公共入口与底层抽象接口均接受显式关键字参数 `request_api: RequestApi | None` 与 `stream_enabled: bool | None`；`RequestApi = Literal["chat_completions", "responses"]` 定义在 `komari_bot/common/llm_protocol.py`（避免业务插件 import 网关触发 require 副作用）
+- 调用方传 `None` 时按网关默认槽位配置解析；业务插件必须按自己的槽位显式透传（见下「槽位配置」），禁止依赖默认解析
+- 流式只在网关内部聚合，业务侧永远拿到完整 `LLMCompletionResultSchema`；Chat 流式强制 `stream_options.include_usage=true` 并按工具 index 聚合增量 tool_calls；断流/取消丢弃部分结果并明确失败
+- Responses 协议翻译：安全边界合并入 `instructions`；tools 扁平化（strict 默认 false）；`store=false` 无状态；终态归一化（completed/incomplete/failed/refusal）；无映射参数（frequency_penalty、不兼容 extra_params 键）静默忽略
+- 明确失败、禁止静默降级或能力自动探测；连接指纹保持 token/base_url/timeout 三元组不变
+
+续接项（continuation）传递机制：
+- `LLMProviderContinuationSchema`（`api="responses"` + 序列化 `output_items`，含加密推理项）只在当前业务任务的多轮工具循环内存活：不写入业务数据库、不跨 QQ 消息复用
+- assistant 消息统一经 `build_assistant_message(completion)` 构造；continuation 以内部元数据键 `_llm_continuation`（`CONTINUATION_METADATA_KEY`）附着在消息上
+- Chat 请求构建器剥离全部 `_` 前缀内部键（永不发往 Chat 端点）；Responses 构建器校验 `api=="responses"` 后原样展开 output items
+- 无工具但需重试的 assistant 输出同样经统一构造函数附着 continuation
+
+槽位配置（issue #23 新增，全部默认 `chat_completions` + 非流式，零行为变化）：
+- `llm_provider`：默认槽位 `request_api` / `stream_enabled`、`vision_request_api` / `vision_stream_enabled`
+- `komari_memory`：`llm_request_api_chat` / `llm_stream_enabled_chat`、`llm_request_api_summary` / `llm_stream_enabled_summary`
+- `group_history_summary`：`summary_planning_request_api` / `summary_planning_stream_enabled`、`summary_request_api` / `summary_stream_enabled`
+- 任务内配置冻结：同一业务任务（如 komari_chat 工具循环）在任务开始时读取一次协议/流式配置，任务执行期间的配置变更不影响进行中的任务；运维按槽位逐位灰度
 
 关键规则：
 - `llm_provider` 最底层通过 `apply_llm_security_boundary()` 强制追加不可覆盖的安全 system 边界；知识、网页、群历史、引用、画像、视觉描述和工具结果必须使用 `UntrustedContext` 或统一不可信标签传入，禁止拼进 system prompt
@@ -219,7 +239,8 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - `AgentRunCollector` 由 `komari_chat`、`komari_memory`、`group_history_summary` 和 `komari_debug` 显式下传；一个业务任务无论包含多少 LLM 轮次和工具调用，都只结束和落盘一次。
 - 日志类别固定为 `chat_reply`、`scheduled_summary`、`group_history_summary`；debug 复用对应类别并标记 `origin=debug`。日志关闭时普通任务不采集，debug 仍保留不落盘的内存诊断。
 - JSONL v3 写入 `logs/agent_run_logger/YYYY-MM-DD.jsonl`，目录固定 `0700`、文件固定 `0600`；保存完整输入、输出、prompt/messages、reasoning、工具参数/结果及异常，只移除显式凭据并把图片 URL、base64 与二进制替换为摘要。
-- PostgreSQL `UNLOGGED` 表 `komari_agent_run_log_index` 只保存 run/trace、分类、时间、文件字节定位、模型/方法集合、计数与 usage；禁止加入任何正文、预览、prompt、reasoning、工具正文或错误正文。
+- 每次 LLM 调用（`LLMCallTrace`）额外记录最终生效的 `request_api` / `stream_enabled`（取自请求 kwargs，缺失保持 `null` 不伪造）；响应载荷完整保留 `continuation`（含加密推理项），与正文走同一脱敏管线。
+- PostgreSQL `UNLOGGED` 表 `komari_agent_run_log_index` 只保存 run/trace、分类、时间、文件字节定位、模型/方法集合、计数与 usage；禁止加入任何正文、预览、prompt、reasoning、工具正文或错误正文；协议标记只存在于 JSONL，不为它扩展索引结构。
 - 写入顺序是跨进程文件锁内追加 JSONL，再 upsert PG。PG 故障不撤销 JSONL；启动及每 5 分钟使用 advisory lock 对账，管理查询在 PG 不可用时降级扫描 JSONL。
 - 每日本地时间 04:00 清理，保留当前日志日及此前 `retention_days - 1` 日；日志关闭不停止清理。启动时同时删除废弃 SQLite 索引文件，并以幂等 JSONB 删除语句物理清除 provider 旧日志配置键。
 - 管理接口为 `/api/v2/agent-run-logs/runs` 与 `/runs/{run_id}`，使用 `agent_run_logs:read`。
@@ -432,7 +453,7 @@ poetry run pytest tests/ -v
 
 ### Issue tracker
 
-Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）。See `docs/agents/issue-tracker.md`.
+Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）；`/to-tickets` 拆出的实施 ticket 以 GitHub Projects 草稿项管理，不进 issue 库。See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

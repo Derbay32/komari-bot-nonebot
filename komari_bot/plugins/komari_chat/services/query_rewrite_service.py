@@ -43,6 +43,8 @@ class QueryRewriteService:
         model: str,
         thinking_mode: bool,
         reasoning_effort: str,
+        request_api: str = "chat_completions",
+        stream_enabled: bool = False,
         request_trace_id: str | None = None,
         parent_call_id: str | None = None,
         collector: "LLMDiagnosticCollector | None" = None,
@@ -55,6 +57,8 @@ class QueryRewriteService:
             "max_tokens": 256,
             "thinking_mode": thinking_mode,
             "reasoning_effort": reasoning_effort,
+            "request_api": request_api,
+            "stream_enabled": stream_enabled,
         }
         result = await llm_provider.generate_completion(
             **request_data,
@@ -117,6 +121,10 @@ class QueryRewriteService:
                 model=config.llm_model_summary,
                 thinking_mode=config.llm_thinking_mode_summary,
                 reasoning_effort=config.llm_reasoning_effort_summary,
+                request_api=getattr(
+                    config, "llm_request_api_summary", "chat_completions"
+                ),
+                stream_enabled=getattr(config, "llm_stream_enabled_summary", False),
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,

@@ -42,6 +42,8 @@ async def _read_single_image(
     vision_model: str,
     temperature: float,
     max_tokens: int,
+    request_api: str = "chat_completions",
+    stream_enabled: bool = False,
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -68,6 +70,8 @@ async def _read_single_image(
         "model": vision_model,
         "temperature": temperature,
         "max_tokens": int(max_tokens),
+        "request_api": request_api,
+        "stream_enabled": stream_enabled,
     }
     try:
         logger.info(
@@ -146,6 +150,8 @@ async def read_images(
     temperature: float = 0.3,
     max_tokens: int = 1024,
     *,
+    request_api: str = "chat_completions",
+    stream_enabled: bool = False,
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -162,6 +168,8 @@ async def read_images(
                 vision_model=vision_model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                request_api=request_api,
+                stream_enabled=stream_enabled,
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,

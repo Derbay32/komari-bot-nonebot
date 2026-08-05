@@ -224,6 +224,8 @@ async def _request_summary(
         "model": config.llm_model_summary,
         "temperature": config.llm_temperature_summary,
         "max_tokens": min(config.llm_max_tokens_summary, 800),
+        "request_api": config.llm_request_api_summary,
+        "stream_enabled": config.llm_stream_enabled_summary,
         "thinking_mode": config.llm_thinking_mode_summary,
         "reasoning_effort": config.llm_reasoning_effort_summary,
         "response_format": {"type": "json_object"},
