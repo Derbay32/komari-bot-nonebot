@@ -9,9 +9,14 @@ from typing import Any, Literal
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.common.llm_protocol import DEFAULT_REQUEST_API, RequestApi
 from komari_bot.common.untrusted_context import UntrustedContext
 
-from .base_client import LLMCompletionResultSchema
+from .base_client import (
+    LLMCompletionResultSchema,
+    LLMProviderContinuationSchema,
+    build_assistant_message,
+)
 from .client_pool import ClientSettings, LLMClientPool
 from .config import Config
 from .config_schema import DynamicConfigSchema
@@ -48,7 +53,9 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
+    "LLMProviderContinuationSchema",
     "UntrustedContext",
+    "build_assistant_message",
     "generate_completion",
     "generate_messages_completion",
     "generate_text",
@@ -231,6 +238,28 @@ def _get_client_settings() -> ClientSettings:
     return ClientSettings.from_config(config_manager.get())
 
 
+def _resolve_request_mode(
+    request_api: RequestApi | None,
+    *,
+    stream_enabled: bool | None,
+) -> tuple[RequestApi, bool]:
+    """解析请求模式：None 分量回退到默认槽位的一次配置快照。"""
+    if request_api is not None and stream_enabled is not None:
+        return request_api, stream_enabled
+    config = config_manager.get()
+    resolved_api: RequestApi = (
+        request_api
+        if request_api is not None
+        else getattr(config, "request_api", DEFAULT_REQUEST_API)
+    )
+    resolved_stream = (
+        bool(stream_enabled)
+        if stream_enabled is not None
+        else bool(getattr(config, "stream_enabled", False))
+    )
+    return resolved_api, resolved_stream
+
+
 def _create_client(settings: ClientSettings) -> OpenAICompatibleClient:
     """按配置快照创建候选客户端。"""
     return OpenAICompatibleClient(
@@ -322,6 +351,8 @@ async def generate_text(
     enable_knowledge: bool = False,
     response_format: dict | None = None,
     untrusted_contexts: list[UntrustedContext] | None = None,
+    request_api: RequestApi | None = None,
+    stream_enabled: bool | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """生成文本（简单 prompt 模式）。
@@ -336,6 +367,8 @@ async def generate_text(
         knowledge_query: 知识库查询文本
         knowledge_limit: 检索返回的知识数量上限
         response_format: OpenAI 兼容结构化输出参数；非空时下发到底层 LLM API
+        request_api: 请求 API（None 时解析默认槽位配置）
+        stream_enabled: 是否启用流式传输（None 时解析默认槽位配置）
         **kwargs: 其他参数
 
     Returns:
@@ -346,6 +379,9 @@ async def generate_text(
     final_system_instruction = system_instruction or ""
 
     try:
+        resolved_api, resolved_stream = _resolve_request_mode(
+            request_api, stream_enabled=stream_enabled
+        )
         knowledge_contexts = await _load_knowledge_contexts(
             enabled=enable_knowledge,
             query=knowledge_query or prompt,
@@ -378,6 +414,8 @@ async def generate_text(
                 max_tokens=max_tokens,
                 response_format=response_format,
                 untrusted_contexts=request_contexts,
+                request_api=resolved_api,
+                stream_enabled=resolved_stream,
                 **kwargs,
             )
     except Exception as e:
@@ -407,6 +445,8 @@ async def generate_completion(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
     untrusted_contexts: list[UntrustedContext] | None = None,
+    request_api: RequestApi | None = None,
+    stream_enabled: bool | None = None,
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """生成统一完成结果。"""
@@ -416,6 +456,9 @@ async def generate_completion(
     final_system_instruction = system_instruction or ""
 
     try:
+        resolved_api, resolved_stream = _resolve_request_mode(
+            request_api, stream_enabled=stream_enabled
+        )
         knowledge_contexts = await _load_knowledge_contexts(
             enabled=enable_knowledge,
             query=knowledge_query or prompt,
@@ -452,6 +495,8 @@ async def generate_completion(
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 untrusted_contexts=request_contexts,
+                request_api=resolved_api,
+                stream_enabled=resolved_stream,
                 **kwargs,
             )
     except Exception as e:
@@ -476,6 +521,8 @@ async def generate_text_with_messages(
     response_format: dict | None = None,
     *,
     untrusted_contexts: list[UntrustedContext] | None = None,
+    request_api: RequestApi | None = None,
+    stream_enabled: bool | None = None,
     **kwargs,  # noqa: ANN003
 ) -> str:
     """使用 OpenAI 格式 messages 生成文本（支持多模态）。
@@ -486,6 +533,8 @@ async def generate_text_with_messages(
         temperature: 温度参数
         max_tokens: 最大 token 数
         response_format: OpenAI 兼容结构化输出参数；非空时下发到底层 LLM API
+        request_api: 请求 API（None 时解析默认槽位配置）
+        stream_enabled: 是否启用流式传输（None 时解析默认槽位配置）
         **kwargs: 其他参数
 
     Returns:
@@ -496,6 +545,9 @@ async def generate_text_with_messages(
     payload_summary = _summarize_messages_payload(messages)
 
     try:
+        resolved_api, resolved_stream = _resolve_request_mode(
+            request_api, stream_enabled=stream_enabled
+        )
         logger.info(
             "[LLM Provider] Messages 请求追踪: trace_id={} phase={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={}",
             request_trace_id or "-",
@@ -516,6 +568,8 @@ async def generate_text_with_messages(
                 max_tokens=max_tokens,
                 response_format=response_format,
                 untrusted_contexts=untrusted_contexts,
+                request_api=resolved_api,
+                stream_enabled=resolved_stream,
                 **kwargs,
             )
     except Exception as e:
@@ -542,6 +596,8 @@ async def generate_messages_completion(
     tool_choice: str | dict[str, Any] | None = None,
     parallel_tool_calls: bool | None = None,
     untrusted_contexts: list[UntrustedContext] | None = None,
+    request_api: RequestApi | None = None,
+    stream_enabled: bool | None = None,
     **kwargs,  # noqa: ANN003
 ) -> LLMCompletionResultSchema:
     """使用 messages 生成统一完成结果。"""
@@ -551,6 +607,9 @@ async def generate_messages_completion(
     payload_summary = _summarize_messages_payload(messages)
 
     try:
+        resolved_api, resolved_stream = _resolve_request_mode(
+            request_api, stream_enabled=stream_enabled
+        )
         logger.info(
             "[LLM Provider] Completion(messages) 请求追踪: trace_id={} phase={} model={} turns={} text_parts={} text_chars={} image_parts={} image_url_chars={} tools={}",
             request_trace_id or "-",
@@ -575,6 +634,8 @@ async def generate_messages_completion(
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 untrusted_contexts=untrusted_contexts,
+                request_api=resolved_api,
+                stream_enabled=resolved_stream,
                 **kwargs,
             )
     except Exception as e:
