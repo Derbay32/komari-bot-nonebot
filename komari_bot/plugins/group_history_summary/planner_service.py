@@ -28,8 +28,11 @@ if TYPE_CHECKING:
 
     from nonebot.adapters.onebot.v11 import Bot
 
+    from komari_bot.common.llm_protocol import RequestApi
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
+
+from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 llm_provider = require("llm_provider")
 character_binding = require("character_binding")
@@ -542,6 +545,8 @@ async def plan_summary_request(
     fetch_batch_size: int,
     planning_thinking_mode: bool = False,
     planning_reasoning_effort: str = "",
+    planning_request_api: "RequestApi" = "chat_completions",
+    planning_stream_enabled: bool = False,
     request_trace_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
     history_min_coverage_ratio: float = 0.8,
@@ -602,6 +607,8 @@ async def plan_summary_request(
             "parallel_tool_calls": False,
             "thinking_mode": planning_thinking_mode,
             "reasoning_effort": planning_reasoning_effort,
+            "request_api": planning_request_api,
+            "stream_enabled": planning_stream_enabled,
         }
         try:
             completion = cast(
@@ -656,21 +663,7 @@ async def plan_summary_request(
                 rounds_used=rounds_used,
             )
 
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": completion.content,
-            "tool_calls": [
-                {
-                    "id": tool_call.id,
-                    "type": tool_call.type,
-                    "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.raw_arguments,
-                    },
-                }
-                for tool_call in completion.tool_calls
-            ],
-        }
+        assistant_message = build_assistant_message(completion)
         if completion.reasoning_content:
             assistant_message["reasoning_content"] = completion.reasoning_content
         messages.append(assistant_message)

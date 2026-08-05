@@ -25,6 +25,7 @@ from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )
 from komari_bot.plugins.komari_memory.core.retry import retry_async
+from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .vision_service import read_images
 
@@ -670,6 +671,8 @@ async def _build_image_tool_result(
     vision_model: str,
     vision_temperature: float,
     vision_max_tokens: int,
+    vision_request_api: str = "chat_completions",
+    vision_stream_enabled: bool = False,
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -686,6 +689,8 @@ async def _build_image_tool_result(
         vision_model=vision_model,
         temperature=vision_temperature,
         max_tokens=vision_max_tokens,
+        request_api=vision_request_api,
+        stream_enabled=vision_stream_enabled,
         request_trace_id=request_trace_id if collector is not None else None,
         parent_call_id=parent_call_id if collector is not None else None,
         collector=collector,
@@ -761,28 +766,6 @@ async def _build_fetch_tool_result(
             caller_is_superuser=caller_is_superuser,
         )
     return await komari_search.fetch_page(urls, **fetch_kwargs)
-
-
-def _build_tool_call_message(
-    tool_calls: list[Any], content: str = ""
-) -> dict[str, Any]:
-    """构造可回填给 OpenAI messages 的 assistant tool_calls 消息。"""
-    return {
-        "role": "assistant",
-        "content": content,
-        "tool_calls": [
-            {
-                "id": tool_call.id or tool_call.function.name,
-                "type": tool_call.type,
-                "function": {
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.raw_arguments
-                    or tool_call.function.arguments,
-                },
-            }
-            for tool_call in tool_calls
-        ],
-    }
 
 
 def _append_tool_retry_instruction(
@@ -1001,6 +984,8 @@ async def _execute_business_tool(
     caller_user_id: str | None,
     caller_group_id: str | None,
     caller_is_superuser: bool,
+    vision_request_api: str = "chat_completions",
+    vision_stream_enabled: bool = False,
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -1027,6 +1012,8 @@ async def _execute_business_tool(
                 vision_model=vision_model,
                 vision_temperature=vision_temperature,
                 vision_max_tokens=vision_max_tokens,
+                vision_request_api=vision_request_api,
+                vision_stream_enabled=vision_stream_enabled,
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,
@@ -1138,6 +1125,8 @@ async def _execute_tool_loop(
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
+    vision_request_api: str = "chat_completions",
+    vision_stream_enabled: bool = False,
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
 ) -> ReplyResult:
@@ -1146,6 +1135,9 @@ async def _execute_tool_loop(
     tool_definitions = _validate_tool_definitions(tools)
     round_limit = max(1, min(max_tool_rounds, _MAX_TOOL_ROUNDS))
     request_phase_prefix = _build_tool_request_phase_prefix(tool_definitions)
+    # 任务内冻结：整个工具循环使用任务开始时的协议/流式配置
+    chat_request_api = getattr(config, "llm_request_api_chat", "chat_completions")
+    chat_stream_enabled = getattr(config, "llm_stream_enabled_chat", False)
     has_vision_tool = any(
         tool.get("function", {}).get("name") == READ_IMAGE_TOOL_NAME
         for tool in tool_definitions
@@ -1178,12 +1170,16 @@ async def _execute_tool_loop(
             max_tokens = vision_max_tokens
             thinking_mode = vision_thinking_mode
             reasoning_effort = vision_reasoning_effort
+            request_api = vision_request_api
+            stream_enabled = vision_stream_enabled
         else:
             model = config.llm_model_chat
             temperature = config.llm_temperature_chat
             max_tokens = config.llm_max_tokens_chat
             thinking_mode = config.llm_thinking_mode_chat
             reasoning_effort = config.llm_reasoning_effort_chat
+            request_api = chat_request_api
+            stream_enabled = chat_stream_enabled
 
         phase = f"{request_phase_prefix}_round_{round_num}"
         request_data = {
@@ -1196,6 +1192,8 @@ async def _execute_tool_loop(
             "parallel_tool_calls": False,
             "thinking_mode": thinking_mode,
             "reasoning_effort": reasoning_effort,
+            "request_api": request_api,
+            "stream_enabled": stream_enabled,
         }
         try:
             async with _LLM_COMPLETION_SEMAPHORE:
@@ -1233,10 +1231,9 @@ async def _execute_tool_loop(
                 f"{request_phase_prefix} 第 {round_num} 轮：模型未调用任何工具，"
                 "但 tool_choice='required' 要求至少调用一个工具"
             )
-            if completion.content:
-                current_messages.append(
-                    {"role": "assistant", "content": completion.content}
-                )
+            # 空内容但带 continuation 时也必须回填，确保 Responses 推理项不丢轮次
+            if completion.content or getattr(completion, "continuation", None) is not None:
+                current_messages.append(build_assistant_message(completion))
             _append_tool_retry_instruction(
                 current_messages,
                 reason=last_retry_reason,
@@ -1510,6 +1507,8 @@ async def _execute_tool_loop(
                     caller_user_id=caller_user_id,
                     caller_group_id=caller_group_id,
                     caller_is_superuser=caller_is_superuser,
+                    vision_request_api=vision_request_api,
+                    vision_stream_enabled=vision_stream_enabled,
                     request_trace_id=request_trace_id,
                     parent_call_id=round_call_id,
                     collector=collector,
@@ -1558,9 +1557,7 @@ async def _execute_tool_loop(
             or saw_unknown_tool
         )
         if has_messages_to_send:
-            current_messages.append(
-                _build_tool_call_message(completion.tool_calls, completion.content or "")
-            )
+            current_messages.append(build_assistant_message(completion))
             current_messages.extend(business_tool_results)
             current_messages.extend(tool_error_results)
             if saw_unknown_tool and not tool_error_results:
@@ -1613,6 +1610,8 @@ async def generate_reply_with_tools(
     max_favorability_delta: int = 5,
     vision_thinking_mode: bool = False,
     vision_reasoning_effort: str = "",
+    vision_request_api: str = "chat_completions",
+    vision_stream_enabled: bool = False,
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
 ) -> ReplyResult:
@@ -1663,6 +1662,8 @@ async def generate_reply_with_tools(
         max_favorability_delta=max_favorability_delta,
         vision_thinking_mode=vision_thinking_mode,
         vision_reasoning_effort=vision_reasoning_effort,
+        vision_request_api=vision_request_api,
+        vision_stream_enabled=vision_stream_enabled,
         collector=collector,
         parent_call_id=parent_call_id,
     )
@@ -1779,6 +1780,8 @@ async def summarize_conversation(
         max_tokens=config.llm_max_tokens_summary,
         thinking_mode=config.llm_thinking_mode_summary,
         reasoning_effort=config.llm_reasoning_effort_summary,
+        request_api=getattr(config, "llm_request_api_summary", "chat_completions"),
+        stream_enabled=getattr(config, "llm_stream_enabled_summary", False),
         request_phase="chat_memory_summary",
     )
 
