@@ -853,7 +853,7 @@ def test_initialize_uses_structured_redis_connection_parameters(
 
     monkeypatch.setattr(
         redis_manager_module,
-        "get_shared_database_config",
+        "get_shared_redis_config",
         lambda: SimpleNamespace(
             redis_host="redis.internal",
             redis_port=6380,
@@ -900,7 +900,7 @@ def test_initialize_closes_redis_client_when_ping_fails(monkeypatch: Any) -> Non
     connection = _Connection()
     monkeypatch.setattr(
         redis_manager_module,
-        "get_shared_database_config",
+        "get_shared_redis_config",
         lambda: SimpleNamespace(
             redis_host="redis.internal",
             redis_port=6380,

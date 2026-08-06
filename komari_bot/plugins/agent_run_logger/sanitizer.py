@@ -28,7 +28,6 @@ _SECRET_KEYS = frozenset(
         "clientsecret",
         "dsn",
         "password",
-        "pg_password",
         "redis_password",
         "access_token",
         "refresh_token",

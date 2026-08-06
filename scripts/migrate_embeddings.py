@@ -1,7 +1,8 @@
 """独立向量嵌入迁移工具。
 
 默认 dry-run；实际写入必须显式传入 ``--apply``。本脚本刻意不导入 ``komari_bot`` 包，
-用于在运行时插件不可加载时仍能重建知识库与记忆向量。
+用于在运行时插件不可加载时仍能重建知识库与记忆向量。v2.0.0 起连接串统一读取
+nonebot-plugin-orm 权威的 ``SQLALCHEMY_DATABASE_URL``（``--dsn`` 可显式覆盖）。
 """
 
 from __future__ import annotations
@@ -26,15 +27,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-
-
-@dataclass(frozen=True)
-class DatabaseConfig:
-    pg_host: str
-    pg_port: int
-    pg_database: str
-    pg_user: str
-    pg_password: str
 
 
 @dataclass(frozen=True)
@@ -164,36 +156,15 @@ def parse_args() -> argparse.Namespace:
         parents=[env_parser],
     )
     parser.add_argument(
+        "--dsn",
+        default=os.environ.get("SQLALCHEMY_DATABASE_URL", ""),
+        help="SQLAlchemy 数据库连接串；缺省读取 SQLALCHEMY_DATABASE_URL 环境变量",
+    )
+    parser.add_argument(
         "--database-config-path",
         type=Path,
         default=None,
         help="兼容旧参数；本脚本不读取项目配置文件",
-    )
-    parser.add_argument(
-        "--pg-host",
-        default=_env_value("PG_HOST", "POSTGRES_HOST", "PGHOST", default="localhost"),
-    )
-    parser.add_argument(
-        "--pg-port",
-        type=int,
-        default=_env_int("PG_PORT", "POSTGRES_PORT", "PGPORT", default=5432),
-    )
-    parser.add_argument(
-        "--pg-database",
-        default=_env_value(
-            "PG_DATABASE",
-            "PG_DB",
-            "POSTGRES_DB",
-            "PGDATABASE",
-            default="komari_bot",
-        ),
-    )
-    parser.add_argument(
-        "--pg-user", default=_env_value("PG_USER", "POSTGRES_USER", "PGUSER")
-    )
-    parser.add_argument(
-        "--pg-password",
-        default=_env_value("PG_PASSWORD", "POSTGRES_PASSWORD", "PGPASSWORD"),
     )
     parser.add_argument(
         "--embedding-model",
@@ -219,17 +190,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_database_config(args: argparse.Namespace) -> DatabaseConfig:
-    if not args.pg_user or not args.pg_password:
-        msg = "数据库配置缺少 pg_user 或 pg_password"
+def resolve_dsn(args: argparse.Namespace) -> str:
+    """返回数据库连接串（nonebot-plugin-orm 权威的 SQLALCHEMY_DATABASE_URL）。"""
+    dsn = args.dsn or os.environ.get("SQLALCHEMY_DATABASE_URL", "")
+    if not dsn:
+        msg = (
+            "未配置 SQLALCHEMY_DATABASE_URL，"
+            "请通过 --dsn 或环境变量设置 nonebot-plugin-orm 的连接串"
+        )
         raise RuntimeError(msg)
-    return DatabaseConfig(
-        pg_host=args.pg_host,
-        pg_port=args.pg_port,
-        pg_database=args.pg_database,
-        pg_user=args.pg_user,
-        pg_password=args.pg_password,
-    )
+    return dsn
 
 
 def build_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
@@ -256,31 +226,18 @@ def expand_targets(targets: set[str]) -> tuple[MigrationTarget, ...]:
     return tuple(expanded)
 
 
-async def create_postgres_pool(
-    config: DatabaseConfig, *, command_timeout: int = 60
-) -> asyncpg.Pool:
-    return await asyncpg.create_pool(
-        host=config.pg_host,
-        port=config.pg_port,
-        database=config.pg_database,
-        user=config.pg_user,
-        password=config.pg_password,
-        command_timeout=command_timeout,
-    )
-
-
 async def main_async(
     *,
     shared_db_config_path: Path | None = None,
     targets: set[str] | None = None,
     apply: bool,
-    database_config: DatabaseConfig | None = None,
+    dsn: str | None = None,
     embedding_config: EmbeddingConfig | None = None,
 ) -> None:
     del shared_db_config_path
-    if database_config is None or embedding_config is None:
+    if dsn is None or embedding_config is None:
         args = parse_args()
-        database_config = database_config or build_database_config(args)
+        dsn = dsn or resolve_dsn(args)
         embedding_config = embedding_config or build_embedding_config(args)
         targets = targets or set(args.targets or {"all"})
 
@@ -289,7 +246,7 @@ async def main_async(
         embedding_config.model,
         embedding_config.dimension,
     )
-    pool = await create_postgres_pool(database_config, command_timeout=60)
+    pool = await asyncpg.create_pool(dsn=dsn, command_timeout=60)
     try:
         results = [
             await migrate_target(
@@ -545,7 +502,7 @@ def main() -> None:
         main_async(
             targets=set(args.targets or {"all"}),
             apply=args.apply,
-            database_config=build_database_config(args),
+            dsn=resolve_dsn(args),
             embedding_config=build_embedding_config(args),
         )
     )

@@ -17,11 +17,17 @@ from komari_bot.plugins.embedding_provider.config_schema import (
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema as GroupHistorySummaryConfigSchema,
 )
-from komari_bot.plugins.group_history_summary.prompt_template import (
+from komari_bot.plugins.group_history_summary.prompt_schema import (
     DEFAULTS as GROUP_HISTORY_PROMPT_DEFAULTS,
 )
-from komari_bot.plugins.komari_chat.services.prompt_template import (
-    _DEFAULTS as KOMARI_CHAT_PROMPT_DEFAULTS,
+from komari_bot.plugins.group_history_summary.prompt_schema import (
+    DISPLAY_NAME as GROUP_HISTORY_PROMPT_DISPLAY_NAME,
+)
+from komari_bot.plugins.komari_chat.prompt_schema import (
+    DEFAULTS as KOMARI_CHAT_PROMPT_DEFAULTS,
+)
+from komari_bot.plugins.komari_chat.prompt_schema import (
+    DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
 )
 from komari_bot.plugins.komari_decision.config_schema import KomariDecisionConfigSchema
 from komari_bot.plugins.komari_help.config_schema import (
@@ -31,8 +37,11 @@ from komari_bot.plugins.komari_knowledge.config_schema import (
     DynamicConfigSchema as KnowledgeConfigSchema,
 )
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.services.summary_prompt_template import (
+from komari_bot.plugins.komari_memory.prompt_schema import (
     DEFAULTS as KOMARI_MEMORY_SUMMARY_PROMPT_DEFAULTS,
+)
+from komari_bot.plugins.komari_memory.prompt_schema import (
+    DISPLAY_NAME as KOMARI_MEMORY_SUMMARY_PROMPT_DISPLAY_NAME,
 )
 from komari_bot.plugins.komari_sentry.config_schema import KomariSentryConfigSchema
 from komari_bot.plugins.llm_provider.config_schema import (
@@ -192,13 +201,13 @@ def _load_management_components() -> ManagementApiComponents:
         prompt_resources=(
             ManagedPromptResource(
                 resource_id="komari_chat",
-                display_name="Komari Chat Prompt",
+                display_name=KOMARI_CHAT_PROMPT_DISPLAY_NAME,
                 defaults=KOMARI_CHAT_PROMPT_DEFAULTS,
                 legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
             ),
             ManagedPromptResource(
                 resource_id="komari_memory_summary",
-                display_name="Komari Memory Summary Prompt",
+                display_name=KOMARI_MEMORY_SUMMARY_PROMPT_DISPLAY_NAME,
                 defaults=KOMARI_MEMORY_SUMMARY_PROMPT_DEFAULTS,
                 legacy_file_path=Path("config")
                 / "prompts"
@@ -206,7 +215,7 @@ def _load_management_components() -> ManagementApiComponents:
             ),
             ManagedPromptResource(
                 resource_id="group_history_summary",
-                display_name="Group History Summary Prompt",
+                display_name=GROUP_HISTORY_PROMPT_DISPLAY_NAME,
                 defaults=GROUP_HISTORY_PROMPT_DEFAULTS,
                 legacy_file_path=Path("config")
                 / "prompts"

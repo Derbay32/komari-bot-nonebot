@@ -6,10 +6,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from komari_bot.plugins.komari_search import api as search_api
-from komari_bot.plugins.komari_search.config_schema import DynamicConfigSchema
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -70,7 +69,15 @@ async def test_provider_descriptors_reflect_new_schema_fields(
     app: App,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    class _ExtendedSearchConfig(DynamicConfigSchema):
+    # SQLModel 表模型不支持再子类化（sa_type 元数据丢失、字段类属性是
+    # 映射列描述符），改用独立 Pydantic 替身模拟“Schema 新增字段”的形态；
+    # 断言目标不变：描述符端点必须从当前 Schema 动态反射而非硬编码。
+    class _ExtendedSearchConfig(BaseModel):
+        search_provider: str = "tavily"
+        tavily_search_depth: str = "basic"
+        tavily_include_answer: bool = True
+        exa_search_type: str = "auto"
+        exa_fetch_format: str = "text"
         tavily_result_mode: str = Field(
             default="compact",
             description="Tavily 结果展示模式",

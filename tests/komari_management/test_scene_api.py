@@ -15,15 +15,7 @@ class _FakeSceneRepository:
 
     def __init__(self, pg_pool: object) -> None:
         self.pg_pool = pg_pool
-        self.schema_ready = False
-        self.schema_body_count = 0
         _FakeSceneRepository.instances.append(self)
-
-    async def ensure_schema(self) -> None:
-        if self.schema_ready:
-            return
-        self.schema_body_count += 1
-        self.schema_ready = True
 
 
 @pytest.mark.asyncio
@@ -55,7 +47,6 @@ async def test_prepare_repository_reuses_fallback_repository(monkeypatch: pytest
     assert first is second
     assert len(_FakeSceneRepository.instances) == 1
     assert _FakeSceneRepository.instances[0].pg_pool is pg_pool
-    assert _FakeSceneRepository.instances[0].schema_body_count == 1
 
 
 @pytest.mark.asyncio
@@ -76,4 +67,3 @@ async def test_prepare_repository_prefers_decision_repository(monkeypatch: pytes
     repository = await scene_api._prepare_repository()
 
     assert repository is decision_repository
-    assert decision_repository.schema_body_count == 1

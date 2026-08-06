@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, Never
 if TYPE_CHECKING:
     from datetime import date
 
-    import asyncpg
+    from komari_bot.common.orm_connection import SharedEngineConnectionPool
 
 type ForgettingJobStage = Literal[
     "claimed",
@@ -77,7 +77,7 @@ def _normalize_stage(value: object) -> ForgettingJobStage:
 class ForgettingJobRepository:
     """使用数据库行锁保证同一天只由一个 worker 推进阶段。"""
 
-    def __init__(self, pg_pool: asyncpg.Pool) -> None:
+    def __init__(self, pg_pool: SharedEngineConnectionPool) -> None:
         self._pg_pool = pg_pool
 
     async def claim(

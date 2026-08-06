@@ -102,9 +102,7 @@ class _ParallelFetchStorage:
         self.barrier.wait(timeout=2)
         return StoredConfig(
             plugin_name=plugin_name,
-            schema_name="_ConfigSchema",
             config_data={"value": 1},
-            version="1.0",
             revision=1,
             updated_at=datetime.now().astimezone(),
         )
@@ -116,9 +114,7 @@ class _InitializationRaceStorage:
         self.insert_calls = 0
         self.current = StoredConfig(
             plugin_name="initialization-race",
-            schema_name="_ConfigSchema",
             config_data={"value": 99},
-            version="1.0",
             revision=2,
             updated_at=datetime.now().astimezone(),
         )
@@ -159,9 +155,7 @@ class _AsyncStartupStorage:
         value = 1 if plugin_name == "startup-first" else 2
         return StoredConfig(
             plugin_name=plugin_name,
-            schema_name="_ConfigSchema",
             config_data={"value": value},
-            version="1.0",
             revision=1,
             updated_at=datetime.now().astimezone(),
         )
@@ -198,9 +192,7 @@ def test_external_revision_notification_atomically_replaces_cached_snapshot(
     callback(
         StoredConfig(
             plugin_name="initialization-race",
-            schema_name="_ConfigSchema",
             config_data={"value": 100},
-            version="1.0",
             revision=3,
             updated_at=datetime.now().astimezone(),
         )

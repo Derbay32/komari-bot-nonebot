@@ -13,7 +13,7 @@ from komari_bot.common.content_budget import (
     TITLE_TEXT_BUDGET,
     normalize_required_text,
 )
-from komari_bot.common.database_config import get_shared_database_config
+from komari_bot.common.redis_config import get_shared_redis_config
 
 from .models import SessionData, UndoRecord
 
@@ -69,7 +69,7 @@ class CustomSessionManager:
             async with self._get_client_lock():
                 if self.__class__._redis_client is None:
                     config = await self.config_manager.get_async()
-                    db_config = get_shared_database_config()
+                    db_config = get_shared_redis_config()
                     self.__class__._redis_client = aioredis.Redis(
                         host=db_config.redis_host,
                         port=db_config.redis_port,

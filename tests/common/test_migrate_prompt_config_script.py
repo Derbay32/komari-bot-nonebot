@@ -95,7 +95,7 @@ def test_migrate_prompts_imports_only_supported_string_fields(
     monkeypatch.setattr(module.asyncpg, "connect", _fake_connect)
     dotenv_path = tmp_path / ".env"
     dotenv_path.write_text(
-        "PG_HOST=localhost\nPG_PORT=5432\nPG_DATABASE=komari_bot\nPG_USER=user\nPG_PASSWORD=pass\n",
+        "SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/komari_bot\n",
         encoding="utf-8",
     )
 

@@ -102,24 +102,18 @@ def test_main_async_dry_run_reuses_pool_and_reports_memory_targets(monkeypatch: 
     conn = _FakeConnection()
     pool = _FakePool(conn)
 
-    async def _fake_create_pool(config: Any, *, command_timeout: int) -> _FakePool:
-        assert config.pg_database == "komari_bot"
+    async def _fake_create_pool(dsn: str, *, command_timeout: int) -> _FakePool:
+        assert dsn == "postgresql+asyncpg://user:pass@localhost:5432/komari_bot"
         assert command_timeout == 60
         return pool
 
-    monkeypatch.setattr(module, "create_postgres_pool", _fake_create_pool)
+    monkeypatch.setattr(module.asyncpg, "create_pool", _fake_create_pool)
 
     asyncio.run(
         module.main_async(
             targets={"memory"},
             apply=False,
-            database_config=module.DatabaseConfig(
-                pg_host="localhost",
-                pg_port=5432,
-                pg_database="komari_bot",
-                pg_user="user",
-                pg_password="pass",
-            ),
+            dsn="postgresql+asyncpg://user:pass@localhost:5432/komari_bot",
             embedding_config=module.EmbeddingConfig(
                 model="test-model",
                 dimension=1536,

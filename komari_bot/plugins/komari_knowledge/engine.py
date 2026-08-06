@@ -27,19 +27,9 @@ from komari_bot.common.content_budget import (
     normalize_required_text,
     validate_text_budget,
 )
-from komari_bot.common.database_config import (
-    DatabaseConfigSchema,
-    get_shared_database_config,
-)
+from komari_bot.common.orm_connection import get_shared_orm_connection_pool
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
-from komari_bot.common.postgres import create_postgres_pool
 from komari_bot.common.sql_like_utils import escape_like_pattern
-from komari_bot.common.vector_storage_schema import (
-    PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS,
-    apply_schema_statements,
-    build_knowledge_embedding_index_statement,
-    build_knowledge_schema_statements,
-)
 from komari_bot.common.versioned_keyword_index import VersionedKeywordIndex
 
 from .config_schema import DynamicConfigSchema
@@ -123,14 +113,6 @@ def get_config() -> DynamicConfigSchema:
     return state.standalone_config
 
 
-def get_db_config() -> DatabaseConfigSchema:
-    """获取最终生效的数据库配置（兼容两种模式）。"""
-    if state.nonebot_mode:
-        return get_shared_database_config()
-
-    return get_shared_database_config()
-
-
 UNSET: Final[object] = object()
 
 
@@ -209,13 +191,11 @@ class KnowledgeEngine:
                 self._embedding_service = EmbeddingService(embed_config)
                 state.logger.info("[Komari Knowledge] 独立嵌入服务初始化完成")
 
-            # 2. 建立数据库连接池
+            # 2. 建立数据库连接（共享引擎，表结构由 Alembic 迁移统一管理）
             if self._pool is None:
-                db_config = get_db_config()
-                self._pool = await create_postgres_pool(db_config, command_timeout=30)
-                state.logger.info("[Komari Knowledge] 数据库连接池已建立")
+                self._pool = get_shared_orm_connection_pool()
+                state.logger.info("[Komari Knowledge] 已接入共享数据库引擎")
                 expected_dimension = self._resolve_expected_embedding_dimension()
-                await self._ensure_storage_schema(expected_dimension)
                 await self._validate_embedding_dimension(expected_dimension)
 
             # 3. 构建关键词索引（内存预热）
@@ -249,30 +229,6 @@ class KnowledgeEngine:
         elif getattr(self, "_embedding_service", None) is not None:
             expected_dimension = int(self._embedding_service.config.embedding_dimension)
         return expected_dimension
-
-    async def _ensure_storage_schema(self, expected_dimension: int | None) -> None:
-        """按当前 embedding 维度补齐常识库基础表结构。"""
-        if self._pool is None:
-            msg = "数据库连接池未初始化"
-            raise RuntimeError(msg)
-        if expected_dimension is None:
-            msg = "无法确定 embedding 维度，不能初始化 knowledge schema"
-            raise RuntimeError(msg)
-
-        await apply_schema_statements(
-            self._pool,
-            statements=build_knowledge_schema_statements(expected_dimension),
-        )
-        if build_knowledge_embedding_index_statement(expected_dimension) is None:
-            state.logger.warning(
-                "[Komari Knowledge] embedding 维度 "
-                f"{expected_dimension} 超过 pgvector HNSW 上限 "
-                f"{PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS}，"
-                "已跳过 idx_komari_knowledge_embedding，语义检索将退化为顺序扫描。"
-            )
-        state.logger.info(
-            f"[Komari Knowledge] PostgreSQL schema 检查完成 (embedding={expected_dimension})"
-        )
 
     async def _validate_embedding_dimension(
         self,

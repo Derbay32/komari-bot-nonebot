@@ -1,4 +1,9 @@
-"""Komari Management v1 配置残留清理。"""
+"""Komari Management v1 权限名提示。
+
+旧版单 Token / ``llm_logs:read`` 权限只存在于遗留 ``komari_plugin_configs``
+JSONB 表中；强类型配置表不含这些列，运行时不再做旧 KV 清理，这里只保留
+对仍在用旧权限名的凭据提示。
+"""
 
 from __future__ import annotations
 
@@ -11,16 +16,9 @@ if TYPE_CHECKING:
 
 
 class ManagementConfigCleanupStorageProtocol(Protocol):
-    """启动清理所需的最小配置存储接口。"""
+    """启动检查所需的最小配置存储接口。"""
 
     async def fetch_async(self, plugin_name: str) -> StoredConfig | None: ...
-
-    async def delete_field_if_present_async(
-        self,
-        *,
-        plugin_name: str,
-        field_name: str,
-    ) -> StoredConfig | None: ...
 
 
 def _contains_legacy_agent_run_permission(config_data: Mapping[str, Any]) -> bool:
@@ -41,22 +39,11 @@ async def cleanup_management_v1_config(
     logger: Any,
     storage: ManagementConfigCleanupStorageProtocol | None = None,
 ) -> None:
-    """删除旧 Token 键，并提示仍使用旧权限名的凭据。"""
+    """提示仍使用旧权限名的管理凭据。"""
     config_storage = storage if storage is not None else get_config_storage()
     stored = await config_storage.fetch_async("komari_management")
     if stored is None:
         return
-
-    cleaned = await config_storage.delete_field_if_present_async(
-        plugin_name="komari_management",
-        field_name="api_token",
-    )
-    if cleaned is not None:
-        logger.warning(
-            "[Komari Management] 已删除废弃的 api_token 配置键，"
-            "请使用 api_credentials 配置管理凭据"
-        )
-        stored = cleaned
 
     if _contains_legacy_agent_run_permission(stored.config_data):
         logger.warning(

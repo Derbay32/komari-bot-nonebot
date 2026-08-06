@@ -2,26 +2,23 @@
 Komari Bot Embedding Provider 配置 Schema。
 """
 
-from datetime import datetime
+from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """
     Embedding Provider 配置 Schema。
     """
 
-    model_config = ConfigDict(
+    plugin_name: ClassVar[str] = "embedding_provider"
+    __tablename__ = "komari_embedding_provider_config"
+
+    model_config = typed_model_config(
         json_schema_extra={"default_apply_mode": "restart"},
     )
 
-    # 元数据
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
-    )
     # 嵌入配置
     embedding_model: str = Field(
         default="BAAI/bge-small-zh-v1.5", description="模型名称"

@@ -156,7 +156,7 @@ def test_env_config_ignores_unrelated_nonebot_global_fields() -> None:
     config = AgentRunLoggerEnvConfigSchema.model_validate(
         {
             "environment": "dev",
-            "pg_host": "127.0.0.1",
+            "sentry_org": "derbay",
             "redis_port": 6379,
             "log_enabled": False,
             "retention_days": 7,

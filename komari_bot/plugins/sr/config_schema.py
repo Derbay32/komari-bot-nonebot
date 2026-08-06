@@ -2,10 +2,10 @@
 配置 sr 插件的 Schema 实现。
 """
 
-from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import field_validator
+from sqlalchemy.dialects.postgresql import JSONB
 
 from komari_bot.common.content_budget import (
     CONTENT_TEXT_BUDGET,
@@ -13,26 +13,22 @@ from komari_bot.common.content_budget import (
     normalize_required_text,
     validate_text_budget,
 )
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 MAX_SR_LIST_ITEMS = 500
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """SR 插件的配置 Schema。
 
     此模型表示可在运行时修改并在机器人重启后持久化的配置。
     """
 
-    model_config = ConfigDict(
+    plugin_name: ClassVar[str] = "sr"
+    __tablename__ = "komari_sr_config"
+
+    model_config = typed_model_config(
         json_schema_extra={"default_apply_mode": "immediate"},
-    )
-
-    # 元数据
-    version: str = Field(default="1.0", description="配置架构版本")
-
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
     )
 
     # 插件控制
@@ -40,17 +36,18 @@ class DynamicConfigSchema(BaseModel):
 
     # 白名单配置
     user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
     )
 
     group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
     )
 
     # sr 数据配置
     sr_list: list[str] = Field(
         default_factory=list,
         max_length=MAX_SR_LIST_ITEMS,
+        sa_type=JSONB,
         description="安科神人榜列表",
     )
     list_chunk_size: int = Field(

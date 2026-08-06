@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from komari_bot.common.orm_connection import SharedEngineConnectionPool
     from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
 
     from ..config_schema import KomariMemoryConfigSchema
@@ -192,7 +193,7 @@ class ForgettingService:
 
     def __init__(
         self,
-        pg_pool: asyncpg.Pool,
+        pg_pool: SharedEngineConnectionPool,
         *,
         config_provider: Callable[[], KomariMemoryConfigSchema] = get_config,
         job_repository: ForgettingJobRepository | None = None,

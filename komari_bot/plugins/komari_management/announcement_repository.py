@@ -1,4 +1,17 @@
-"""维护公告请求的跨 worker 幂等与冷却账本。"""
+"""维护公告请求的跨 worker 幂等与冷却账本（SQLModel + nonebot-plugin-orm AsyncSession）。
+
+连接池与 engine 生命周期由 nonebot-plugin-orm 托管（本模块不再依赖
+``komari_bot.common.postgres`` 自研池）；表结构由 Alembic 迁移统一管理，
+启动期与懒路径均无任何 DDL。
+
+跨 worker 串行化依赖 PostgreSQL 事务级咨询锁 ``pg_advisory_xact_lock``：
+同一 request_id 的并发抢占在锁内先到先得，冷却与幂等判定共享同一事务快照。
+间隔运算使用 ``CAST(:param AS INTERVAL)``（``_interval`` 辅助）。
+
+SQLModel 字段在 Pyright 下被推断为 Python 值类型而非列表达式，因此列访问
+统一走 ``模型.__table__.c``（与 user_ban / komari_decision 仓储同一约定）。
+JSONB 列写 SQL NULL 必须使用 ``sqlalchemy.null()``。
+"""
 
 from __future__ import annotations
 
@@ -6,13 +19,25 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-from komari_bot.common.database_config import get_shared_database_config
-from komari_bot.common.postgres import create_postgres_pool
+from sqlalchemy import (
+    Double,
+    Interval,
+    delete,
+    func,
+    select,
+    text,
+    update,
+)
+from sqlalchemy import cast as sqlalchemy_cast
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+
+from .orm_models import AnnouncementDispatchRow
 
 if TYPE_CHECKING:
-    import asyncpg
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 type DispatchClaimState = Literal[
     "claimed",
@@ -23,24 +48,22 @@ type DispatchClaimState = Literal[
     "reconciliation_required",
 ]
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS komari_announcement_dispatches (
-    request_id TEXT PRIMARY KEY,
-    payload_hash TEXT NOT NULL,
-    status TEXT NOT NULL
-        CHECK (status IN ('processing', 'completed', 'reconciliation_required')),
-    owner_token TEXT,
-    lease_expires_at TIMESTAMPTZ,
-    response_payload JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_komari_announcement_dispatches_created_at
-ON komari_announcement_dispatches (created_at DESC);
-"""
+# 表结构由 Alembic 迁移统一管理，运行时不执行 DDL。
 _ADVISORY_LOCK_ID = 6_126_613_117_029_977_126
+
+_D = AnnouncementDispatchRow.__table__
+
+
+def _interval(seconds: float) -> Any:
+    """把秒数构造成 ``CAST(%s AS INTERVAL)`` 表达式（PG 侧原生 interval）。"""
+    return sqlalchemy_cast(timedelta(seconds=seconds), Interval)
+
+
+def _open_session() -> "AsyncSession":
+    """打开绑定 nonebot-plugin-orm 共享引擎的会话。"""
+    from nonebot_plugin_orm import get_session
+
+    return get_session(expire_on_commit=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,39 +79,30 @@ class AnnouncementDispatchRepository:
     """PostgreSQL 公告幂等账本。"""
 
     def __init__(self) -> None:
-        self._pool: asyncpg.Pool | None = None
         self._initialize_lock = asyncio.Lock()
+        self._ready = False
 
     async def initialize(self) -> None:
-        if self._pool is not None:
-            return
+        """单飞确认 ORM 存储可连接；表结构由 Alembic 迁移统一管理。"""
         async with self._initialize_lock:
-            if self._pool is not None:
+            if self._ready:
                 return
-            pool = await create_postgres_pool(
-                get_shared_database_config(),
-                command_timeout=30,
-            )
+            session = _open_session()
             try:
-                async with pool.acquire() as connection:
-                    await connection.execute(_SCHEMA_SQL)
-            except Exception:
-                await pool.close()
-                raise
-            self._pool = pool
+                await session.execute(select(1))
+            finally:
+                await session.close()
+            self._ready = True
 
     async def close(self) -> None:
+        """重置就绪状态；engine 生命周期由 nonebot-plugin-orm 托管。"""
         async with self._initialize_lock:
-            pool = self._pool
-            self._pool = None
-            if pool is not None:
-                await pool.close()
+            self._ready = False
 
-    def _require_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
+    def _require_ready(self) -> None:
+        if not self._ready:
             message = "公告幂等账本尚未初始化"
             raise RuntimeError(message)
-        return self._pool
 
     @staticmethod
     def _decode_response(value: object) -> dict[str, Any] | None:
@@ -108,106 +122,109 @@ class AnnouncementDispatchRepository:
     ) -> DispatchClaim:
         """原子校验 request ID、全局冷却并抢占新公告请求。"""
         await self.initialize()
-        pool = self._require_pool()
-        async with pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                "SELECT pg_advisory_xact_lock($1)",
-                _ADVISORY_LOCK_ID,
-            )
-            await connection.execute(
-                """
-                DELETE FROM komari_announcement_dispatches
-                WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '30 days'
-                """
-            )
-            existing = await connection.fetchrow(
-                """
-                SELECT payload_hash,
-                       status,
-                       response_payload,
-                       lease_expires_at
-                FROM komari_announcement_dispatches
-                WHERE request_id = $1
-                FOR UPDATE
-                """,
-                request_id,
-            )
-            if existing is not None:
-                if str(existing["payload_hash"]) != payload_hash:
-                    return DispatchClaim(state="payload_conflict")
-                status = str(existing["status"])
-                if status == "completed":
-                    response = self._decode_response(existing["response_payload"])
-                    if response is None:
-                        return DispatchClaim(state="reconciliation_required")
-                    return DispatchClaim(state="replay", response_payload=response)
-                if status == "reconciliation_required":
+        session = _open_session()
+        try:
+            async with session.begin():
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                    {"lock_id": _ADVISORY_LOCK_ID},
+                )
+                await session.execute(
+                    delete(_D).where(
+                        _D.c.created_at
+                        < func.now() - _interval(30 * 24 * 3600)
+                    )
+                )
+                existing = (
+                    await session.execute(
+                        select(
+                            _D.c.payload_hash,
+                            _D.c.status,
+                            _D.c.response_payload,
+                            _D.c.lease_expires_at,
+                        )
+                        .where(_D.c.request_id == request_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if existing is not None:
+                    if str(existing.payload_hash) != payload_hash:
+                        return DispatchClaim(state="payload_conflict")
+                    status = str(existing.status)
+                    if status == "completed":
+                        response = self._decode_response(
+                            existing.response_payload
+                        )
+                        if response is None:
+                            return DispatchClaim(
+                                state="reconciliation_required"
+                            )
+                        return DispatchClaim(
+                            state="replay", response_payload=response
+                        )
+                    if status == "reconciliation_required":
+                        return DispatchClaim(
+                            state="reconciliation_required"
+                        )
+
+                    expired = (
+                        await session.execute(
+                            select(_D.c.lease_expires_at <= func.now()).where(
+                                _D.c.request_id == request_id
+                            )
+                        )
+                    ).scalar_one()
+                    if not bool(expired):
+                        return DispatchClaim(state="in_progress")
+                    await session.execute(
+                        update(_D)
+                        .where(_D.c.request_id == request_id)
+                        .values(
+                            status="reconciliation_required",
+                            owner_token=None,
+                            lease_expires_at=None,
+                            updated_at=func.now(),
+                        )
+                    )
                     return DispatchClaim(state="reconciliation_required")
 
-                expired = await connection.fetchval(
-                    "SELECT $1::timestamptz <= CURRENT_TIMESTAMP",
-                    existing["lease_expires_at"],
-                )
-                if not bool(expired):
-                    return DispatchClaim(state="in_progress")
-                await connection.execute(
-                    """
-                    UPDATE komari_announcement_dispatches
-                    SET status = 'reconciliation_required',
-                        owner_token = NULL,
-                        lease_expires_at = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE request_id = $1
-                    """,
-                    request_id,
-                )
-                return DispatchClaim(state="reconciliation_required")
+                if cooldown_seconds > 0:
+                    remaining = (
+                        await session.execute(
+                            select(
+                                func.greatest(
+                                    sqlalchemy_cast(
+                                        float(cooldown_seconds), Double
+                                    )
+                                    - func.extract(
+                                        "epoch",
+                                        func.now() - _D.c.created_at,
+                                    ),
+                                    0,
+                                )
+                            )
+                            .order_by(_D.c.created_at.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    if remaining is not None and float(remaining) > 0:
+                        return DispatchClaim(
+                            state="cooldown",
+                            remaining_seconds=float(remaining),
+                        )
 
-            if cooldown_seconds > 0:
-                remaining = await connection.fetchval(
-                    """
-                    SELECT GREATEST(
-                        $1::double precision
-                        - EXTRACT(
-                            EPOCH FROM (CURRENT_TIMESTAMP - created_at)
-                        ),
-                        0
+                await session.execute(
+                    postgres_insert(_D)
+                    .values(
+                        request_id=request_id,
+                        payload_hash=payload_hash,
+                        status="processing",
+                        owner_token=owner_token,
+                        lease_expires_at=func.now() + _interval(lease_seconds),
                     )
-                    FROM komari_announcement_dispatches
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    cooldown_seconds,
                 )
-                if remaining is not None and float(remaining) > 0:
-                    return DispatchClaim(
-                        state="cooldown",
-                        remaining_seconds=float(remaining),
-                    )
-
-            await connection.execute(
-                """
-                INSERT INTO komari_announcement_dispatches (
-                    request_id,
-                    payload_hash,
-                    status,
-                    owner_token,
-                    lease_expires_at
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    'processing',
-                    $3,
-                    CURRENT_TIMESTAMP
-                    + ($4::double precision * INTERVAL '1 second')
-                )
-                """,
-                request_id,
-                payload_hash,
-                owner_token,
-                lease_seconds,
-            )
+        finally:
+            await session.close()
         return DispatchClaim(state="claimed")
 
     async def complete(
@@ -218,31 +235,32 @@ class AnnouncementDispatchRepository:
         response_payload: dict[str, Any],
     ) -> bool:
         """仅由当前 owner 持久化最终响应并完成请求。"""
-        pool = self._require_pool()
-        async with pool.acquire() as connection:
-            completed = await connection.fetchval(
-                """
-                UPDATE komari_announcement_dispatches
-                SET status = 'completed',
-                    response_payload = $3::jsonb,
-                    owner_token = NULL,
-                    lease_expires_at = NULL,
-                    completed_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE request_id = $1
-                  AND status = 'processing'
-                  AND owner_token = $2
-                  AND lease_expires_at > CURRENT_TIMESTAMP
-                RETURNING request_id
-                """,
-                request_id,
-                owner_token,
-                json.dumps(
-                    response_payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            )
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                completed = (
+                    await session.execute(
+                        update(_D)
+                        .where(
+                            _D.c.request_id == request_id,
+                            _D.c.status == "processing",
+                            _D.c.owner_token == owner_token,
+                            _D.c.lease_expires_at > func.now(),
+                        )
+                        .values(
+                            status="completed",
+                            response_payload=response_payload,
+                            owner_token=None,
+                            lease_expires_at=None,
+                            completed_at=func.now(),
+                            updated_at=func.now(),
+                        )
+                        .returning(_D.c.request_id)
+                    )
+                ).scalar_one_or_none()
+        finally:
+            await session.close()
         return completed is not None
 
     async def mark_reconciliation_required(
@@ -252,22 +270,26 @@ class AnnouncementDispatchRepository:
         owner_token: str,
     ) -> None:
         """异常退出时阻止该 request ID 被自动重发。"""
-        pool = self._require_pool()
-        async with pool.acquire() as connection:
-            await connection.execute(
-                """
-                UPDATE komari_announcement_dispatches
-                SET status = 'reconciliation_required',
-                    owner_token = NULL,
-                    lease_expires_at = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE request_id = $1
-                  AND status = 'processing'
-                  AND owner_token = $2
-                """,
-                request_id,
-                owner_token,
-            )
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                await session.execute(
+                    update(_D)
+                    .where(
+                        _D.c.request_id == request_id,
+                        _D.c.status == "processing",
+                        _D.c.owner_token == owner_token,
+                    )
+                    .values(
+                        status="reconciliation_required",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        updated_at=func.now(),
+                    )
+                )
+        finally:
+            await session.close()
 
     async def cancel_unstarted(
         self,
@@ -276,19 +298,23 @@ class AnnouncementDispatchRepository:
         owner_token: str,
     ) -> bool:
         """在确认尚未调用平台发送接口时删除当前抢占。"""
-        pool = self._require_pool()
-        async with pool.acquire() as connection:
-            deleted = await connection.fetchval(
-                """
-                DELETE FROM komari_announcement_dispatches
-                WHERE request_id = $1
-                  AND status = 'processing'
-                  AND owner_token = $2
-                RETURNING request_id
-                """,
-                request_id,
-                owner_token,
-            )
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                deleted = (
+                    await session.execute(
+                        delete(_D)
+                        .where(
+                            _D.c.request_id == request_id,
+                            _D.c.status == "processing",
+                            _D.c.owner_token == owner_token,
+                        )
+                        .returning(_D.c.request_id)
+                    )
+                ).scalar_one_or_none()
+        finally:
+            await session.close()
         return deleted is not None
 
 

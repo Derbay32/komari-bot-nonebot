@@ -7,8 +7,9 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/migrate_character_binding_to_pg.py"
@@ -59,27 +60,25 @@ def test_migration_upserts_valid_entries_and_skips_invalid_ones(
         encoding="utf-8",
     )
     connection = _FakeConnection()
+    connect_kwargs: dict[str, object] = {}
 
-    async def _fake_connect(**_kwargs: object) -> _FakeConnection:
+    async def _fake_connect(**kwargs: object) -> _FakeConnection:
+        connect_kwargs.update(kwargs)
         return connection
 
-    monkeypatch.setattr(module.asyncpg, "connect", _fake_connect)
-    monkeypatch.setattr(
-        module,
-        "load_database_config_from_env",
-        lambda: SimpleNamespace(
-            pg_host="localhost",
-            pg_port=5432,
-            pg_database="komari_bot",
-            pg_user="user",
-            pg_password="password",
-        ),
+    monkeypatch.setenv(
+        "SQLALCHEMY_DATABASE_URL",
+        "postgresql+asyncpg://user:pass@localhost:5432/komari_bot",
     )
+    monkeypatch.setattr(module.asyncpg, "connect", _fake_connect)
 
     stats = asyncio.run(module.migrate_bindings(bindings_path=bindings_path))
 
     assert stats == {"written": 1, "skipped": 2}
     assert connection.closed is True
+    assert connect_kwargs["dsn"] == (
+        "postgresql+asyncpg://user:pass@localhost:5432/komari_bot"
+    )
     assert any(
         "CREATE TABLE IF NOT EXISTS komari_character_bindings" in query
         for query, _args in connection.execute_calls
@@ -87,44 +86,14 @@ def test_migration_upserts_valid_entries_and_skips_invalid_ones(
     assert ("42", "泉此方") in [args for _query, args in connection.execute_calls]
 
 
-def test_migration_uses_explicit_database_config(
+def test_migration_raises_when_dsn_unconfigured(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
     module = _load_script_module()
     bindings_path = tmp_path / "bindings.json"
     bindings_path.write_text('{"42": "泉此方"}', encoding="utf-8")
-    config_path = tmp_path / "database.json"
-    config_path.write_text("{}", encoding="utf-8")
-    connection = _FakeConnection()
-    explicit_config = SimpleNamespace(
-        pg_host="db",
-        pg_port=5432,
-        pg_database="komari",
-        pg_user="user",
-        pg_password="password",
-    )
+    monkeypatch.delenv("SQLALCHEMY_DATABASE_URL", raising=False)
 
-    async def _fake_connect(**_kwargs: object) -> _FakeConnection:
-        return connection
-
-    monkeypatch.setattr(module.asyncpg, "connect", _fake_connect)
-    monkeypatch.setattr(
-        module,
-        "load_database_config_from_file",
-        lambda path: explicit_config if path == config_path else None,
-    )
-    monkeypatch.setattr(
-        module,
-        "load_database_config_from_env",
-        lambda: (_ for _ in ()).throw(AssertionError),
-    )
-
-    stats = asyncio.run(
-        module.migrate_bindings(
-            bindings_path=bindings_path,
-            database_config_path=config_path,
-        )
-    )
-
-    assert stats == {"written": 1, "skipped": 0}
+    with pytest.raises(RuntimeError, match="SQLALCHEMY_DATABASE_URL"):
+        asyncio.run(module.migrate_bindings(bindings_path=bindings_path))

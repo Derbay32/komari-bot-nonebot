@@ -1,11 +1,13 @@
 """群聊历史总结插件配置。"""
 
-from datetime import datetime
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import Column, String
+from sqlalchemy.dialects.postgresql import JSONB
 
 from komari_bot.common.llm_protocol import RequestApi
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 
 class LayoutParamsSchema(BaseModel):
@@ -54,26 +56,23 @@ class LayoutParamsSchema(BaseModel):
         return self
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """群聊历史总结插件动态配置。"""
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "immediate"},
-    )
+    plugin_name: ClassVar[str] = "group_history_summary"
+    __tablename__ = "komari_group_history_summary_config"
 
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "immediate"},
     )
 
     plugin_enable: bool = Field(default=True, description="插件启用状态")
 
     user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
     )
     group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
     )
 
     redis_db: int = Field(
@@ -117,6 +116,9 @@ class DynamicConfigSchema(BaseModel):
     )
     summary_planning_request_api: RequestApi = Field(
         default="chat_completions",
+        sa_column=Column(
+            String(32), nullable=False, default="chat_completions"
+        ),
         description=(
             "总结规划阶段请求 API：chat_completions=OpenAI Chat Completions，"
             "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
@@ -150,6 +152,9 @@ class DynamicConfigSchema(BaseModel):
     )
     summary_request_api: RequestApi = Field(
         default="chat_completions",
+        sa_column=Column(
+            String(32), nullable=False, default="chat_completions"
+        ),
         description="总结执行阶段请求 API。语义同 summary_planning_request_api。",
     )
     summary_stream_enabled: bool = Field(
@@ -179,6 +184,7 @@ class DynamicConfigSchema(BaseModel):
 
     layout_params: LayoutParamsSchema = Field(
         default_factory=LayoutParamsSchema,
+        sa_type=JSONB,
         description="总结图片布局参数",
     )
 

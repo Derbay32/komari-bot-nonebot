@@ -440,12 +440,10 @@ class AgentRunLogStorage:
                 self.log_dir,
                 retained_from=retained_from,
             )
-        await repository.cleanup_legacy_provider_config()
         return await repository.reconcile(entries, retained_from=retained_from)
 
     async def maintain(self) -> None:
         await repository.initialize()
-        await repository.cleanup_legacy_provider_config()
         await self.cleanup()
         await self.reconcile()
 

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -246,33 +247,23 @@ def load_dotenv_values(path: Path) -> dict[str, str]:
     return values
 
 
-def _dotenv_int(values: dict[str, str], key: str, default: int) -> int:
-    raw_value = values.get(key)
-    if raw_value is None or not raw_value.strip():
-        return default
-    return int(raw_value)
+def load_postgres_config(dotenv_path: Path) -> str:
+    """读取 nonebot-plugin-orm 权威数据库连接串（SQLALCHEMY_DATABASE_URL）。
 
-
-@dataclass(frozen=True, slots=True)
-class PostgresConfig:
-    """迁移脚本独立使用的 PostgreSQL 配置。"""
-
-    host: str
-    port: int
-    database: str
-    user: str
-    password: str
-
-
-def load_postgres_config(dotenv_path: Path) -> PostgresConfig:
+    优先使用真实环境变量（与 nonebot 的 settings 合并结果一致）；缺失时
+    从 dotenv 文件补充，且不覆盖已存在的环境变量。
+    """
     values = load_dotenv_values(dotenv_path)
-    return PostgresConfig(
-        host=values.get("PG_HOST") or "localhost",
-        port=_dotenv_int(values, "PG_PORT", 5432),
-        database=values.get("PG_DATABASE") or "komari_bot",
-        user=values.get("PG_USER") or "",
-        password=values.get("PG_PASSWORD") or "",
+    dsn = os.environ.get("SQLALCHEMY_DATABASE_URL") or values.get(
+        "SQLALCHEMY_DATABASE_URL"
     )
+    if not dsn:
+        msg = (
+            "未配置 SQLALCHEMY_DATABASE_URL，"
+            "请通过环境变量或 dotenv 设置 nonebot-plugin-orm 的连接串"
+        )
+        raise RuntimeError(msg)
+    return str(dsn)
 
 
 def validate_prompt_values(
@@ -374,17 +365,8 @@ async def migrate_prompts(
     stats = {"success": 0, "skipped": 0, "failed": 0}
     conn: asyncpg.Connection | None = None
     if not dry_run:
-        config = load_postgres_config(dotenv_path)
-        conn = cast(
-            "asyncpg.Connection",
-            await asyncpg.connect(
-                host=config.host,
-                port=config.port,
-                database=config.database,
-                user=config.user,
-                password=config.password,
-            ),
-        )
+        dsn = load_postgres_config(dotenv_path)
+        conn = cast("asyncpg.Connection", await asyncpg.connect(dsn=dsn))
         await _ensure_prompt_schema(conn)
 
     try:

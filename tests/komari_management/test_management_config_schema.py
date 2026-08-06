@@ -2,33 +2,24 @@
 
 from __future__ import annotations
 
-import importlib.util
-from functools import cache
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from komari_bot.common.typed_config import ensure_typed_config_model
 from komari_bot.plugins.komari_management.config_schema import DynamicConfigSchema
 
 
-@cache
 def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
-    module_path = (
-        Path(__file__).resolve().parents[2]
-        / "komari_bot"
-        / "plugins"
-        / plugin_name
-        / "config_schema.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        f"managed_{plugin_name}_config_schema",
-        module_path,
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return cast("type[Any]", getattr(module, class_name))
+    """通过生产安全加载器取得配置表模型。
+
+    与 Alembic env / 配置存储使用同一入口：按源文件加载 config_schema，
+    不执行业务插件 ``__init__``，且同一模块不会重复注册。
+    """
+    model = ensure_typed_config_model(plugin_name)
+    assert model is not None
+    assert model.__name__ == class_name
+    return cast("type[Any]", model)
 
 
 @pytest.mark.parametrize(
@@ -102,7 +93,6 @@ def test_management_config_schema_defaults_are_safe() -> None:
     )
 
     assert config.plugin_enable is False
-    assert config.version == "2.0"
     assert config.api_credentials == []
     assert config.api_allowed_origins == []
     assert isinstance(config.announce_status_page_url, str)

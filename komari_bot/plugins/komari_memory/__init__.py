@@ -6,10 +6,6 @@ from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
-from komari_bot.common.vector_storage_schema import (
-    apply_schema_statements,
-    build_memory_schema_statements,
-)
 
 if TYPE_CHECKING:
     from .config_schema import KomariMemoryConfigSchema
@@ -78,7 +74,6 @@ class PluginManager:
             logger.info("[KomariMemory] PostgreSQL 连接池已建立")
 
             expected_dimension = self._resolve_expected_embedding_dimension()
-            await self._ensure_storage_schema(expected_dimension)
             await self._validate_embedding_dimension(expected_dimension)
 
             # 2. 初始化 Redis 管理器
@@ -127,24 +122,6 @@ class PluginManager:
                 msg = f"embedding_provider 返回了无效维度类型: {type(raw_dimension)!r}"
                 raise TypeError(msg)
         return expected_dimension
-
-    async def _ensure_storage_schema(self, expected_dimension: int | None) -> None:
-        """按当前 embedding 维度补齐 PostgreSQL 基础表结构。"""
-        if self.pg_pool is None:
-            msg = "PostgreSQL 连接池未初始化"
-            raise RuntimeError(msg)
-        if expected_dimension is None:
-            msg = "无法确定 embedding 维度，不能初始化 memory schema"
-            raise RuntimeError(msg)
-
-        await apply_schema_statements(
-            self.pg_pool,
-            statements=build_memory_schema_statements(expected_dimension),
-        )
-        logger.info(
-            "[KomariMemory] PostgreSQL schema 检查完成 (embedding={})",
-            expected_dimension,
-        )
 
     async def _validate_embedding_dimension(
         self,

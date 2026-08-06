@@ -15,60 +15,6 @@ from komari_bot.plugins.komari_help.scanner import (
 )
 
 
-class _FakeConn:
-    def __init__(self, existing_row: dict[str, object] | None) -> None:
-        self.existing_row = existing_row
-        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
-
-    async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
-        assert "is_auto_generated" in query
-        assert "ORDER BY is_auto_generated ASC" in query
-        assert args == ("demo_plugin",)
-        return self.existing_row
-
-    async def fetchval(self, query: str, *args: object) -> int:
-        self.execute_calls.append((query, args))
-        return 1
-
-
-class _FakePool:
-    def __init__(self, conn: _FakeConn) -> None:
-        self.conn = conn
-
-    def acquire(self) -> "_FakePool":
-        return self
-
-    async def __aenter__(self) -> _FakeConn:
-        return self.conn
-
-    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
-        del exc_type, exc, tb
-
-
-class _FakeDeleteConn:
-    def __init__(self, result: str) -> None:
-        self.result = result
-        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
-
-    async def execute(self, query: str, *args: object) -> str:
-        self.execute_calls.append((query, args))
-        return self.result
-
-
-class _FakeDeletePool:
-    def __init__(self, conn: _FakeDeleteConn) -> None:
-        self.conn = conn
-
-    def acquire(self) -> "_FakeDeletePool":
-        return self
-
-    async def __aenter__(self) -> _FakeDeleteConn:
-        return self.conn
-
-    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
-        del exc_type, exc, tb
-
-
 class _FakeScanLeaseEngine:
     index_rebuild_count: int
     scan_lease_owner: str | None = None
@@ -100,95 +46,6 @@ class _FakeScanLeaseEngine:
 
     async def rebuild_keyword_index(self) -> None:
         self.index_rebuild_count += 1
-
-
-def test_sync_auto_generated_help_skips_unchanged_content() -> None:
-    engine = HelpEngine()
-    conn = _FakeConn(
-        {
-            "id": 1,
-            "is_auto_generated": True,
-            "title": "演示插件",
-            "content": "/demo help",
-            "keywords": ["帮助", "演示"],
-            "category": "feature",
-            "notes": None,
-        }
-    )
-    engine._pool = _FakePool(conn)
-
-    async def _unexpected_get_embedding(_text: str) -> list[float]:
-        raise AssertionError
-
-    async def _unexpected_build_keyword_index() -> None:
-        raise AssertionError
-
-    engine._get_embedding = _unexpected_get_embedding  # type: ignore[method-assign]
-    engine._build_keyword_index = _unexpected_build_keyword_index  # type: ignore[method-assign]
-
-    changed = asyncio.run(
-        engine.sync_auto_generated_help(
-            plugin_name="demo_plugin",
-            title="演示插件",
-            content="/demo help",
-            keywords=["演示", "帮助"],
-        )
-    )
-
-    assert changed is False
-    assert conn.execute_calls == []
-
-
-def test_sync_auto_generated_help_updates_changed_content_without_rebuilding_index() -> (
-    None
-):
-    engine = HelpEngine()
-    conn = _FakeConn(
-        {
-            "id": 1,
-            "is_auto_generated": True,
-            "title": "旧标题",
-            "content": "旧内容",
-            "keywords": ["旧关键词"],
-            "category": "feature",
-            "notes": None,
-        }
-    )
-    engine._pool = _FakePool(conn)
-
-    async def _fake_get_embedding(text: str) -> list[float]:
-        assert text == "新标题\n新内容"
-        return [0.1, 0.2]
-
-    async def _unexpected_build_keyword_index() -> None:
-        raise AssertionError
-
-    engine._get_embedding = _fake_get_embedding  # type: ignore[method-assign]
-    engine._build_keyword_index = _unexpected_build_keyword_index  # type: ignore[method-assign]
-
-    changed = asyncio.run(
-        engine.sync_auto_generated_help(
-            plugin_name="demo_plugin",
-            title="新标题",
-            content="新内容",
-            keywords=["新关键词"],
-            rebuild_index=False,
-        )
-    )
-
-    assert changed is True
-    update_query, update_args = conn.execute_calls[0]
-    assert "INSERT INTO komari_help" in update_query
-    assert "ON CONFLICT (plugin_name)" in update_query
-    assert update_args == (
-        "feature",
-        "demo_plugin",
-        ["新关键词"],
-        "新标题",
-        "新内容",
-        None,
-        str([0.1, 0.2]),
-    )
 
 
 def test_scan_and_sync_rebuilds_keyword_index_once(
@@ -331,33 +188,6 @@ def test_sync_auto_generated_help_returns_false_for_disabled_plugin(
     )
 
     assert changed is False
-
-
-def test_delete_auto_generated_help_by_plugins_only_removes_auto_generated() -> None:
-    engine = HelpEngine()
-    conn = _FakeDeleteConn("DELETE 2")
-    engine._pool = _FakeDeletePool(conn)
-
-    rebuilt = 0
-
-    async def _fake_build_keyword_index() -> None:
-        nonlocal rebuilt
-        rebuilt += 1
-
-    engine._build_keyword_index = _fake_build_keyword_index  # type: ignore[method-assign]
-
-    deleted_count = asyncio.run(
-        engine.delete_auto_generated_help_by_plugins(
-            {"demo_plugin", "other_plugin"},
-        )
-    )
-
-    assert deleted_count == 2
-    delete_query, delete_args = conn.execute_calls[0]
-    assert "DELETE FROM komari_help" in delete_query
-    assert "is_auto_generated = TRUE" in delete_query
-    assert delete_args == (["demo_plugin", "other_plugin"],)
-    assert rebuilt == 1
 
 
 def test_scan_and_sync_rebuilds_index_when_only_disabled_cleanup_happens(

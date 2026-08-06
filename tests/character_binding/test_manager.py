@@ -1,4 +1,10 @@
-"""角色名绑定 PostgreSQL 存储与内存快照测试。"""
+"""角色名绑定 ORM 存储与内存快照测试。
+
+使用实现了 ``CharacterBindingDB`` 公共接口（initialize/load_all/upsert/
+delete/close + 未初始化拒绝语义）的内存替身替换真实数据库，验证管理器的
+快照发布、写入失败包装与降级契约；SQL 级行为由真实库集成测试
+（``test_database_integration.py``）覆盖。
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,6 @@ import asyncio
 
 import pytest
 
-from komari_bot.plugins.character_binding import database as database_module
 from komari_bot.plugins.character_binding import manager as manager_module
 from komari_bot.plugins.character_binding.manager import (
     MAX_CHARACTER_NAME_LENGTH,
@@ -16,150 +21,127 @@ from komari_bot.plugins.character_binding.manager import (
 )
 
 
-class _FakeTransaction:
-    async def __aenter__(self) -> None:
-        return None
+class _FakeCharacterBindingDB:
+    """CharacterBindingDB 内存替身：忠实建模 ready 状态与失败开关。
 
-    async def __aexit__(self, *_args: object) -> None:
-        return None
+    - 未初始化（含初始化失败）时读写抛出 RuntimeError，与真实 ORM 仓储
+      的 ``_require_ready`` 语义一致；
+    - ``calls`` 记录全部公共方法调用，供断言调用参数与零 DDL 契约。
+    """
 
-
-class _FakeConnection:
-    def __init__(
-        self,
-        *,
-        rows: list[dict[str, str]] | None = None,
-        delete_results: list[str] | None = None,
-    ) -> None:
-        self.rows = list(rows or [])
-        self.delete_results = list(delete_results or [])
+    def __init__(self, rows: dict[str, str] | None = None) -> None:
+        self.bindings = dict(rows or {})
         self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.fail_initialize = False
         self.fail_writes = False
+        self.initialize_calls = 0
+        self.closed = False
+        self._ready = False
 
-    def transaction(self) -> _FakeTransaction:
-        return _FakeTransaction()
+    async def initialize(self) -> None:
+        self.initialize_calls += 1
+        self.calls.append(("initialize", ()))
+        if self.fail_initialize:
+            self._ready = False
+            msg = "模拟 PostgreSQL 不可用"
+            raise RuntimeError(msg)
+        self._ready = True
 
-    async def fetchval(self, query: str, *args: object) -> None:
-        self.calls.append((query, args))
+    def _require_ready(self) -> None:
+        if not self._ready:
+            msg = "character_binding 数据库尚未初始化"
+            raise RuntimeError(msg)
 
-    async def fetch(
-        self,
-        query: str,
-        *args: object,
-    ) -> list[dict[str, str]]:
-        self.calls.append((query, args))
-        return list(self.rows)
+    async def load_all(self) -> dict[str, str]:
+        self._require_ready()
+        self.calls.append(("load_all", ()))
+        return dict(self.bindings)
 
-    async def execute(self, query: str, *args: object) -> str:
-        self.calls.append((query, args))
-        if self.fail_writes and (
-            "INSERT INTO komari_character_bindings" in query
-            or "DELETE FROM komari_character_bindings" in query
-        ):
+    async def upsert(self, user_id: str, character_name: str) -> None:
+        self._require_ready()
+        self.calls.append(("upsert", (user_id, character_name)))
+        if self.fail_writes:
             msg = "模拟数据库写入失败"
             raise RuntimeError(msg)
-        if "DELETE FROM komari_character_bindings" in query:
-            return self.delete_results.pop(0) if self.delete_results else "DELETE 0"
-        return "OK"
+        self.bindings[user_id] = character_name
 
-
-class _FakeAcquire:
-    def __init__(self, connection: _FakeConnection) -> None:
-        self.connection = connection
-
-    async def __aenter__(self) -> _FakeConnection:
-        return self.connection
-
-    async def __aexit__(self, *_args: object) -> None:
-        return None
-
-
-class _FakePool:
-    def __init__(self, connection: _FakeConnection) -> None:
-        self.connection = connection
-        self.closed = False
-
-    def acquire(self) -> _FakeAcquire:
-        return _FakeAcquire(self.connection)
+    async def delete(self, user_id: str) -> bool:
+        self._require_ready()
+        self.calls.append(("delete", (user_id,)))
+        if self.fail_writes:
+            msg = "模拟数据库写入失败"
+            raise RuntimeError(msg)
+        return self.bindings.pop(user_id, None) is not None
 
     async def close(self) -> None:
         self.closed = True
+        self.calls.append(("close", ()))
 
 
-def _install_fake_pool(
+def _install_fake_database(
     monkeypatch: pytest.MonkeyPatch,
-    connection: _FakeConnection,
-) -> _FakePool:
-    pool = _FakePool(connection)
+    database: _FakeCharacterBindingDB,
+) -> _FakeCharacterBindingDB:
+    def _create_database() -> _FakeCharacterBindingDB:
+        return database
 
-    async def _create_pool(_config: object) -> _FakePool:
-        return pool
-
-    monkeypatch.setattr(database_module, "create_postgres_pool", _create_pool)
-    monkeypatch.setattr(
-        database_module,
-        "get_shared_database_config",
-        lambda: object(),
-    )
-    return pool
+    monkeypatch.setattr(manager_module, "CharacterBindingDB", _create_database)
+    return database
 
 
 @pytest.mark.asyncio
-async def test_initialize_creates_table_and_loads_snapshot(
+async def test_initialize_creates_only_connectivity_check_and_loads_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = _FakeConnection(
-        rows=[
-            {"user_id": "42", "character_name": "泉此方"},
-            {"user_id": "10086", "character_name": "柊镜"},
-        ]
+    database = _install_fake_database(
+        monkeypatch,
+        _FakeCharacterBindingDB(
+            rows={"42": "泉此方", "10086": "柊镜"},
+        ),
     )
-    pool = _install_fake_pool(monkeypatch, connection)
     manager = CharacterBindingManager()
 
     await asyncio.gather(*(manager.initialize() for _ in range(10)))
 
     assert manager.list_bindings() == {"42": "泉此方", "10086": "柊镜"}
-    assert (
-        sum(
-            "CREATE TABLE IF NOT EXISTS komari_character_bindings" in query
-            for query, _args in connection.calls
-        )
-        == 1
+    assert database.initialize_calls == 1
+    ddl_keywords = (
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "ALTER TABLE",
+        "pg_advisory_xact_lock",
     )
-    assert any("pg_advisory_xact_lock" in query for query, _args in connection.calls)
+    assert all(
+        not any(keyword in repr(call) for keyword in ddl_keywords)
+        for call in database.calls
+    )
 
     await manager.close()
-    assert pool.closed is True
+    assert database.closed is True
 
 
 @pytest.mark.asyncio
 async def test_upsert_updates_snapshot_after_database_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = _FakeConnection()
-    _install_fake_pool(monkeypatch, connection)
+    database = _install_fake_database(monkeypatch, _FakeCharacterBindingDB())
     manager = CharacterBindingManager()
     await manager.initialize()
 
     await manager.set_character_name("42", "泉此方")
 
     assert manager.list_bindings() == {"42": "泉此方"}
-    assert any(
-        "ON CONFLICT (user_id) DO UPDATE" in query and args == ("42", "泉此方")
-        for query, args in connection.calls
-    )
+    assert ("upsert", ("42", "泉此方")) in database.calls
 
 
 @pytest.mark.asyncio
 async def test_delete_result_controls_snapshot_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = _FakeConnection(
-        rows=[{"user_id": "42", "character_name": "泉此方"}],
-        delete_results=["DELETE 0", "DELETE 1"],
+    _database = _install_fake_database(
+        monkeypatch,
+        _FakeCharacterBindingDB(rows={"42": "泉此方"}),
     )
-    _install_fake_pool(monkeypatch, connection)
     manager = CharacterBindingManager()
     await manager.initialize()
 
@@ -174,13 +156,13 @@ async def test_delete_result_controls_snapshot_update(
 async def test_database_failure_raises_and_keeps_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = _FakeConnection(
-        rows=[{"user_id": "42", "character_name": "泉此方"}],
+    database = _install_fake_database(
+        monkeypatch,
+        _FakeCharacterBindingDB(rows={"42": "泉此方"}),
     )
-    _install_fake_pool(monkeypatch, connection)
     manager = CharacterBindingManager()
     await manager.initialize()
-    connection.fail_writes = True
+    database.fail_writes = True
 
     with pytest.raises(BindingPersistenceError, match="角色绑定保存失败"):
         await manager.set_character_name("10086", "柊镜")
@@ -194,16 +176,8 @@ async def test_database_failure_raises_and_keeps_snapshot(
 async def test_postgres_unavailable_degrades_to_empty_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _fail_create_pool(_config: object) -> None:
-        msg = "模拟 PostgreSQL 不可用"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(database_module, "create_postgres_pool", _fail_create_pool)
-    monkeypatch.setattr(
-        database_module,
-        "get_shared_database_config",
-        lambda: object(),
-    )
+    database = _install_fake_database(monkeypatch, _FakeCharacterBindingDB())
+    database.fail_initialize = True
     manager = CharacterBindingManager()
 
     await manager.initialize()
@@ -252,11 +226,10 @@ async def test_rejects_name_over_unicode_length_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_clears_singleton_before_closing_pool(
+async def test_close_clears_singleton_before_closing_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = _FakeConnection()
-    pool = _install_fake_pool(monkeypatch, connection)
+    database = _install_fake_database(monkeypatch, _FakeCharacterBindingDB())
     manager_module.state.manager = None
     manager = manager_module.get_manager()
     await manager.initialize()
@@ -265,4 +238,4 @@ async def test_close_clears_singleton_before_closing_pool(
 
     assert manager_module.state.manager is None
     assert manager.list_bindings() == {}
-    assert pool.closed is True
+    assert database.closed is True

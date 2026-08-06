@@ -19,6 +19,9 @@ dependencies = [
     "openai (>=2.31.0,<3.0.0)",
     "tavily-python (>=0.7.24,<0.8.0)",
     "exa-py (>=2.16.0,<3.0.0)",
+    # v2.0.0 数据库基础设施：engine/会话生命周期与 Alembic 迁移由该插件托管
+    "nonebot-plugin-orm[asyncpg] (>=0.8.3,<0.9.0)",
+    "sqlmodel (>=0.0.39,<0.1.0)",
 ]
 
 [tool.nonebot]
@@ -34,6 +37,7 @@ nonebot-adapter-onebot = [
 [tool.nonebot.plugins]
 "@local" = []
 nonebot-plugin-apscheduler = ["nonebot_plugin_apscheduler"]
+nonebot-plugin-orm = ["nonebot_plugin_orm"]
 
 [tool.ruff]
 line-length = 88
@@ -128,6 +132,10 @@ allowed-confusables = [
 
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true
+
+[tool.ruff.lint.per-file-ignores]
+# 该测试是 ticket03 的不可变 seam 测试，保持其原始断言写法。
+"tests/config_manager/test_typed_models.py" = ["SIM300"]
 
 [tool.pyright]
 # For Pylance/Pyright configurations, see https://microsoft.github.io/pyright/#/configuration.

@@ -29,10 +29,17 @@ config_manager.update_field("timeout", 60)
 config = config_manager.reload()
 ```
 """
-from nonebot import get_driver
-from nonebot.plugin import PluginMetadata
+import asyncio
 
-from komari_bot.common.prompt_storage import close_prompt_storage_if_created
+from nonebot import get_driver
+from nonebot.plugin import PluginMetadata, require
+
+from komari_bot.common.prompt_storage import (
+    close_prompt_storage_if_created,
+    get_prompt_storage,
+)
+
+require("nonebot_plugin_orm")
 
 from .manager import (
     ConfigManager,
@@ -40,7 +47,7 @@ from .manager import (
     get_registered_config_managers,
     initialize_registered_config_managers_async,
 )
-from .storage import close_config_storage_if_created
+from .storage import close_config_storage_if_created, get_config_storage
 
 __plugin_meta__ = PluginMetadata(
     name="config_manager",
@@ -60,13 +67,25 @@ driver = get_driver()
 
 
 @driver.on_startup
+async def _bind_config_storage_app_loop() -> None:
+    """把应用事件循环交给配置存储，启动 revision 轮询任务。"""
+    get_config_storage().bind_app_loop(asyncio.get_running_loop())
+
+
+@driver.on_startup
+async def _bind_prompt_storage_app_loop() -> None:
+    """把应用事件循环交给 Prompt 存储，供同步桥跨线程提交使用。"""
+    get_prompt_storage().bind_app_loop(asyncio.get_running_loop())
+
+
+@driver.on_startup
 async def _initialize_registered_configs() -> None:
     """先于依赖本插件的业务启动钩子异步预热配置。"""
     await initialize_registered_config_managers_async()
 
 
 @driver.on_shutdown
-def _close_config_storage() -> None:
-    """关闭已创建的配置与 Prompt 存储。"""
+async def _close_config_storage() -> None:
+    """等待配置存储轮询任务退出，并关闭 Prompt 存储。"""
     close_prompt_storage_if_created()
-    close_config_storage_if_created()
+    await close_config_storage_if_created()

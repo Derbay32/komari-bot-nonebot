@@ -1,85 +1,59 @@
-"""Prompt 专用 PostgreSQL 存储与运行时加载辅助。"""
+"""PostgreSQL 强类型 Prompt 存储与运行时加载辅助。
+
+每个 Prompt 资源对应一张 ``TypedPromptModel`` 单行表（主键 ``id=1``、
+CAS 修订号 ``revision``、写入时间 ``updated_at``），由 Alembic 迁移统一
+建表。本模块通过 nonebot-plugin-orm 的 ``get_session`` 在调用方/应用事件
+循环上执行 SQLAlchemy AsyncSession 操作：
+
+- 异步入口（``*_async``）直接在调用方事件循环执行；
+- 同步入口在应用事件循环绑定后通过 ``run_coroutine_threadsafe`` 提交，
+  绑定前（如独立脚本）使用一次性事件循环与一次性引擎，用完即释放连接；
+  禁止在事件循环内阻塞等待自身；
+- 跨进程 Prompt 变更传播不再使用 asyncpg LISTEN/NOTIFY：
+  ``PromptTemplateLoader`` 缓存本身有 1 秒陈限上限，传播延迟 ≤1 秒级；
+  本进程写入通过 ``register_invalidator`` 回调立即失效本地缓存。
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
-from concurrent.futures import Future
+from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from time import monotonic
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
+from typing import Any, ClassVar, Protocol, TypeVar
 
-import asyncpg
 from nonebot import logger
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from komari_bot.common.content_budget import (
     CONTENT_TEXT_BUDGET,
     validate_text_budget,
 )
-from komari_bot.common.database_config import get_shared_database_config
-from komari_bot.common.postgres import PostgresConfig, create_postgres_pool
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Mapping
-    from datetime import datetime
+from komari_bot.common.orm_config import get_orm_database_url
+from komari_bot.common.typed_config import (
+    TypedConfigModel,
+    ensure_typed_prompt_model,
+)
 
 T = TypeVar("T")
 
 _PROMPT_STORAGE_TIMEOUT_SECONDS = 5.0
-
-_PROMPT_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS komari_prompt_configs (
-    resource_id VARCHAR(128) PRIMARY KEY,
-    display_name VARCHAR(128) NOT NULL,
-    prompt_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    version VARCHAR(32) NOT NULL DEFAULT '1.0',
-    revision BIGINT NOT NULL DEFAULT 1,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-"""
-
-_PROMPT_REVISION_DDL = """
-ALTER TABLE komari_prompt_configs
-    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
-"""
-
-_PROMPT_UPDATED_AT_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_komari_prompt_configs_updated_at
-    ON komari_prompt_configs (updated_at DESC);
-"""
-_PROMPT_NOTIFY_FUNCTION_DDL = """
-CREATE OR REPLACE FUNCTION komari_notify_prompt_config_change()
-RETURNS TRIGGER AS $$
-BEGIN
-    PERFORM pg_notify('komari_prompt_config_changed', NEW.resource_id);
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-"""
-_PROMPT_NOTIFY_TRIGGER_DDL = """
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_trigger
-        WHERE tgname = 'trg_komari_prompt_config_changed'
-          AND tgrelid = 'komari_prompt_configs'::regclass
-    ) THEN
-        CREATE TRIGGER trg_komari_prompt_config_changed
-        AFTER INSERT OR UPDATE ON komari_prompt_configs
-        FOR EACH ROW
-        EXECUTE FUNCTION komari_notify_prompt_config_change();
-    END IF;
-END;
-$$;
-"""
-_PROMPT_NOTIFY_CHANNEL = "komari_prompt_config_changed"
-_PROMPT_NOTIFY_RETRY_SECONDS = 1.0
 _PROMPT_CACHE_MAX_STALENESS_SECONDS = 1.0
+
+_INTERNAL_STORAGE_FIELDS = frozenset({"id", "revision", "updated_at"})
+"""继承自 TypedConfigModel 的存储专用字段，不属于 Prompt 正文。"""
+
+_PromptOperation = Callable[[AsyncSession], Coroutine[Any, Any, T]]
 
 
 class PromptResourceProtocol(Protocol):
@@ -97,14 +71,15 @@ class PromptResourceProtocol(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class StoredPrompt:
-    """已存储的 prompt 配置。"""
+    """已存储的 Prompt 快照（不含存储专用字段）。
+
+    结构（Schema）版本的权威来源是 Alembic 迁移链，快照不再携带 version。
+    """
 
     resource_id: str
-    display_name: str
-    prompt_data: dict[str, Any]
-    version: str
+    prompt_data: dict[str, str]
+    revision: int
     updated_at: datetime
-    revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,641 +90,478 @@ class PromptValues:
     stored: StoredPrompt | None
 
 
+def _utcnow() -> datetime:
+    """返回带时区的当前时间。"""
+    return datetime.now(UTC)
+
+
+def _public_field_names(model_cls: type[TypedConfigModel]) -> set[str]:
+    """返回 Prompt 表的正文字段名集合（不含存储专用字段）。"""
+    return set(model_cls.model_fields) - _INTERNAL_STORAGE_FIELDS
+
+
+def _stored_prompt_from_entity(
+    resource_id: str, entity: TypedConfigModel
+) -> StoredPrompt:
+    """把单行表实体转换为不可变 Prompt 快照。"""
+    data = entity.model_dump()
+    return StoredPrompt(
+        resource_id=resource_id,
+        prompt_data={name: str(value) for name, value in data.items()},
+        revision=int(entity.revision),
+        updated_at=entity.updated_at,
+    )
+
+
+def _validated_write_values(
+    model_cls: type[TypedConfigModel],
+    prompt_data: Mapping[str, str],
+) -> dict[str, str]:
+    """校验写入载荷与表正文字段一一对应，返回按列名排序的写入值。"""
+    allowed = _public_field_names(model_cls)
+    unknown_fields = sorted(set(prompt_data) - allowed)
+    if unknown_fields:
+        msg = f"存在未知提示词字段: {', '.join(unknown_fields)}"
+        raise ValueError(msg)
+    missing_fields = sorted(allowed - set(prompt_data))
+    if missing_fields:
+        msg = f"提示词写入缺少字段: {', '.join(missing_fields)}"
+        raise ValueError(msg)
+    return {name: prompt_data[name] for name in sorted(allowed)}
+
+
 class PromptStorage:
-    """PostgreSQL Prompt 存储，提供同步兼容桥与非阻塞异步接口。"""
+    """PostgreSQL 强类型 Prompt 存储门面。"""
 
     def __init__(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        self._started = threading.Event()
-        self._stopped = threading.Event()
-        self._lifecycle_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._closing = False
         self._closed = False
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="komari-prompt-storage",
-            daemon=True,
-        )
-        self._pool: asyncpg.Pool | None = None
-        self._pool_lock = asyncio.Lock()
-        self._init_lock = threading.RLock()
+        self._app_loop: asyncio.AbstractEventLoop | None = None
         self._invalidators: dict[str, list[Callable[[], None]]] = {}
         self._invalidators_lock = threading.RLock()
-        self._listener_task: asyncio.Task[None] | None = None
-        self._listener_stop_event: asyncio.Event | None = None
-        self._listener_ready_event: asyncio.Event | None = None
-        self._thread.start()
-        if not self._started.wait(timeout=_PROMPT_STORAGE_TIMEOUT_SECONDS):
-            self.close()
-            msg = "Prompt 存储后台线程启动超时"
-            raise RuntimeError(msg)
 
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._started.set()
+    # ------------------------------ 生命周期 ------------------------------
+
+    def bind_app_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """绑定应用事件循环，供同步桥跨线程提交使用。"""
+        with self._state_lock:
+            if self._closing:
+                return
+            self._app_loop = loop
+
+    def close(self) -> None:
+        """关闭存储并拒绝后续操作。
+
+        存储不再持有连接池或后台任务，同步桥的会话/引擎均为一次性资源，
+        关闭只需标记状态。
+        """
+        with self._state_lock:
+            self._closing = True
+            self._closed = True
+            self._app_loop = None
+
+    @property
+    def closed(self) -> bool:
+        """是否已关闭。"""
+        return self._closed
+
+    # ------------------------------ 会话桥接 ------------------------------
+
+    @staticmethod
+    def _open_app_session() -> AsyncSession:
+        from nonebot_plugin_orm import get_session
+
+        return get_session(expire_on_commit=False)
+
+    async def _run_on_app_session(self, operation: _PromptOperation[T]) -> T:
+        session = self._open_app_session()
         try:
-            self._loop.run_forever()
+            return await operation(session)
+        except BaseException:
+            with suppress(Exception):
+                await session.rollback()
+            raise
         finally:
-            pending = asyncio.all_tasks(self._loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                self._loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
-            asyncio.set_event_loop(None)
-            self._loop.close()
-            with self._lifecycle_lock:
-                self._closed = True
-            self._stopped.set()
+            await session.close()
 
-    def _submit(self, coro: Coroutine[Any, Any, T]) -> Future[T]:
-        with self._lifecycle_lock:
-            if self._closing or self._closed or self._loop.is_closed():
-                coro.close()
-                msg = "Prompt 存储已关闭"
-                raise RuntimeError(msg)
-            try:
-                return asyncio.run_coroutine_threadsafe(coro, self._loop)
-            except RuntimeError:
-                coro.close()
-                raise
+    async def _run_on_private_engine(self, operation: _PromptOperation[T]) -> T:
+        """在一次性事件循环上用一次性引擎执行单步操作。
 
-    def _run(self, coro: Coroutine[Any, Any, T]) -> T:
+        URL 统一读取 nonebot-plugin-orm 权威的 ``SQLALCHEMY_DATABASE_URL``，
+        不再消费已退役的 PG 连接配置。
+        """
+        engine = create_async_engine(get_orm_database_url())
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        session = factory()
+        try:
+            return await operation(session)
+        except BaseException:
+            with suppress(Exception):
+                await session.rollback()
+            raise
+        finally:
+            await session.close()
+            await engine.dispose()
+
+    def _run_sync(self, operation: _PromptOperation[T]) -> T:
+        """同步入口：线程上桥接异步实现，事件循环内禁用。"""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             pass
         else:
-            coro.close()
-            msg = "事件循环内禁止同步访问 Prompt 存储，请使用异步接口"
+            msg = (
+                "事件循环内禁止阻塞等待 Prompt 存储，请改用对应的 _async 方法"
+            )
             raise RuntimeError(msg)
 
-        future = self._submit(coro)
-        try:
-            return future.result(timeout=_PROMPT_STORAGE_TIMEOUT_SECONDS)
-        except FutureTimeoutError as exc:
-            future.cancel()
-            msg = "Prompt 存储操作超时"
-            raise RuntimeError(msg) from exc
-
-    async def _run_async(self, coro: Coroutine[Any, Any, T]) -> T:
-        future = self._submit(coro)
-        try:
-            return await asyncio.wait_for(
-                asyncio.wrap_future(future),
-                timeout=_PROMPT_STORAGE_TIMEOUT_SECONDS,
+        app_loop = self._app_loop
+        if app_loop is not None and app_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._run_on_app_session(operation), app_loop
             )
-        except TimeoutError as exc:
-            future.cancel()
-            msg = "Prompt 存储操作超时"
-            raise RuntimeError(msg) from exc
+            try:
+                return future.result(timeout=_PROMPT_STORAGE_TIMEOUT_SECONDS)
+            except FutureTimeoutError as exc:
+                future.cancel()
+                msg = "Prompt 存储操作超时"
+                raise RuntimeError(msg) from exc
+        return asyncio.run(self._run_on_private_engine(operation))
 
-    async def _get_pool(self) -> asyncpg.Pool:
-        if self._pool is not None:
-            return self._pool
-        async with self._pool_lock:
-            if self._pool is None:
-                config = get_shared_database_config()
-                pool = await create_postgres_pool(config)
-                try:
-                    await self._ensure_schema(pool)
-                except Exception:
-                    await pool.close()
-                    raise
-                self._pool = pool
-                self._start_listener(config)
-        assert self._pool is not None
-        return self._pool
+    def _require_open(self) -> None:
+        with self._state_lock:
+            if self._closing or self._closed:
+                msg = "Prompt 存储已关闭"
+                raise RuntimeError(msg)
 
-    async def _ensure_schema(self, pool: asyncpg.Pool) -> None:
-        async with pool.acquire() as conn:
-            await conn.execute(_PROMPT_TABLE_DDL)
-            await conn.execute(_PROMPT_REVISION_DDL)
-            await conn.execute(_PROMPT_UPDATED_AT_INDEX_DDL)
-            await conn.execute(_PROMPT_NOTIFY_FUNCTION_DDL)
-            await conn.execute(_PROMPT_NOTIFY_TRIGGER_DDL)
+    def _resolve_model(self, resource_id: str) -> type[TypedConfigModel]:
+        model_cls = ensure_typed_prompt_model(resource_id)
+        if model_cls is None:
+            msg = f"Prompt 资源 {resource_id} 未注册强类型 Prompt 表"
+            raise RuntimeError(msg)
+        return model_cls
+
+    # ------------------------------ 本地失效 ------------------------------
 
     def register_invalidator(
         self,
         resource_id: str,
         callback: Callable[[], None],
     ) -> None:
-        """注册当前进程 Prompt 缓存失效回调。"""
+        """注册当前进程 Prompt 缓存失效回调。
+
+        移除 LISTEN/NOTIFY 后仅承担本地失效：本存储实例每次写入成功后
+        立即触发对应资源的回调；跨进程变更由加载器缓存 1 秒陈限覆盖。
+        """
         with self._invalidators_lock:
             callbacks = self._invalidators.setdefault(resource_id, [])
             if callback not in callbacks:
                 callbacks.append(callback)
 
-    def _start_listener(self, config: PostgresConfig) -> None:
-        if self._listener_task is not None and not self._listener_task.done():
-            return
-        self._listener_stop_event = asyncio.Event()
-        self._listener_ready_event = asyncio.Event()
-        self._listener_task = asyncio.create_task(
-            self._listen_for_invalidations(config),
-            name="komari-prompt-revision-listener",
-        )
-
-    def _handle_prompt_notification(
-        self,
-        _connection: asyncpg.Connection,
-        _process_id: int,
-        _channel: str,
-        payload: str,
-    ) -> None:
-        if not payload or len(payload) > 128:
-            return
+    def _notify_invalidators(self, resource_id: str) -> None:
         with self._invalidators_lock:
-            callbacks = tuple(self._invalidators.get(payload, ()))
+            callbacks = tuple(self._invalidators.get(resource_id, ()))
         for callback in callbacks:
             try:
                 callback()
             except Exception as exc:
                 logger.warning(
                     "Prompt 缓存失效回调失败: resource_id={}, error={}",
-                    payload,
+                    resource_id,
                     type(exc).__name__,
                 )
 
-    async def _listen_for_invalidations(self, config: PostgresConfig) -> None:
-        while not self._closing:
-            conn: asyncpg.Connection | None = None
-            try:
-                conn = await asyncpg.connect(
-                    host=config.pg_host,
-                    port=config.pg_port,
-                    database=config.pg_database,
-                    user=config.pg_user,
-                    password=config.pg_password,
-                    command_timeout=30,
+    # ------------------------------ 存储操作 ------------------------------
+
+    def _fetch_op(
+        self, resource_id: str
+    ) -> _PromptOperation[StoredPrompt | None]:
+        async def operation(session: AsyncSession) -> StoredPrompt | None:
+            model_cls = self._resolve_model(resource_id)
+            entity = await session.get(model_cls, 1)
+            if entity is None:
+                return None
+            return _stored_prompt_from_entity(resource_id, entity)
+
+        return operation
+
+    def _upsert_op(
+        self,
+        *,
+        resource_id: str,
+        prompt_data: dict[str, str],
+    ) -> _PromptOperation[StoredPrompt]:
+        async def operation(session: AsyncSession) -> StoredPrompt:
+            model_cls = self._resolve_model(resource_id)
+            table = model_cls.__table__
+            values = _validated_write_values(model_cls, prompt_data)
+            statement = (
+                postgres_insert(model_cls)
+                .values(id=1, revision=1, updated_at=_utcnow(), **values)
+                .on_conflict_do_update(
+                    index_elements=["id"],
+                    set_={
+                        **values,
+                        "revision": table.c.revision + 1,
+                        "updated_at": _utcnow(),
+                    },
                 )
-                assert conn is not None
-                await conn.add_listener(
-                    _PROMPT_NOTIFY_CHANNEL,
-                    self._handle_prompt_notification,
+                .returning(model_cls)
+            )
+            result = await session.execute(statement)
+            entity = result.scalars().first()
+            if entity is None:
+                msg = f"Prompt 写入后未返回记录: {resource_id}"
+                raise RuntimeError(msg)
+            stored = _stored_prompt_from_entity(resource_id, entity)
+            await session.commit()
+            return stored
+
+        return operation
+
+    def _update_if_unchanged_op(
+        self,
+        *,
+        resource_id: str,
+        prompt_data: dict[str, str],
+        expected_updated_at: datetime,
+    ) -> _PromptOperation[StoredPrompt | None]:
+        async def operation(session: AsyncSession) -> StoredPrompt | None:
+            model_cls = self._resolve_model(resource_id)
+            table = model_cls.__table__
+            values = _validated_write_values(model_cls, prompt_data)
+            statement = (
+                update(model_cls)
+                .where(
+                    table.c.id == 1,
+                    table.c.updated_at == expected_updated_at,
                 )
-                ready_event = self._listener_ready_event
-                if ready_event is not None:
-                    ready_event.set()
-                stop_event = self._listener_stop_event
-                if stop_event is None:
-                    return
-                await stop_event.wait()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not self._closing:
-                    logger.warning(
-                        "Prompt 变更监听暂时中断，将自动重试: error={}",
-                        type(exc).__name__,
+                .values(
+                    revision=table.c.revision + 1,
+                    updated_at=_utcnow(),
+                    **values,
+                )
+                .returning(model_cls)
+            )
+            result = await session.execute(statement)
+            entity = result.scalars().first()
+            if entity is None:
+                await session.commit()
+                return None
+            stored = _stored_prompt_from_entity(resource_id, entity)
+            await session.commit()
+            return stored
+
+        return operation
+
+    def _replace_if_revision_op(
+        self,
+        *,
+        resource_id: str,
+        prompt_data: dict[str, str],
+        expected_revision: int,
+    ) -> _PromptOperation[StoredPrompt | None]:
+        async def operation(session: AsyncSession) -> StoredPrompt | None:
+            model_cls = self._resolve_model(resource_id)
+            table = model_cls.__table__
+            values = _validated_write_values(model_cls, prompt_data)
+            if expected_revision == 0:
+                statement = (
+                    postgres_insert(model_cls)
+                    .values(id=1, revision=1, updated_at=_utcnow(), **values)
+                    .on_conflict_do_nothing(index_elements=["id"])
+                    .returning(model_cls)
+                )
+            else:
+                statement = (
+                    update(model_cls)
+                    .where(
+                        table.c.id == 1,
+                        table.c.revision == expected_revision,
                     )
-                    await asyncio.sleep(_PROMPT_NOTIFY_RETRY_SECONDS)
-            finally:
-                if self._listener_ready_event is not None:
-                    self._listener_ready_event.clear()
-                if conn is not None and not conn.is_closed():
-                    with suppress(Exception):
-                        await conn.remove_listener(
-                            _PROMPT_NOTIFY_CHANNEL,
-                            self._handle_prompt_notification,
-                        )
-                    await conn.close()
+                    .values(
+                        revision=table.c.revision + 1,
+                        updated_at=_utcnow(),
+                        **values,
+                    )
+                    .returning(model_cls)
+                )
+            result = await session.execute(statement)
+            entity = result.scalars().first()
+            if entity is None:
+                await session.commit()
+                return None
+            stored = _stored_prompt_from_entity(resource_id, entity)
+            await session.commit()
+            return stored
 
-    async def wait_for_listener_ready(self, *, timeout_seconds: float = 5.0) -> bool:
-        """等待跨 worker 失效监听真正订阅完成。"""
+        return operation
 
-        async def _wait() -> bool:
-            event = self._listener_ready_event
-            if event is None:
-                return False
-            try:
-                await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
-            except TimeoutError:
-                return False
-            return True
+    def _update_field_if_revision_op(
+        self,
+        *,
+        resource_id: str,
+        field_name: str,
+        value: str,
+        expected_revision: int,
+    ) -> _PromptOperation[StoredPrompt | None]:
+        async def operation(session: AsyncSession) -> StoredPrompt | None:
+            model_cls = self._resolve_model(resource_id)
+            if field_name not in _public_field_names(model_cls):
+                msg = f"存在未知提示词字段: {field_name}"
+                raise ValueError(msg)
+            table = model_cls.__table__
+            statement = (
+                update(model_cls)
+                .where(
+                    table.c.id == 1,
+                    table.c.revision == expected_revision,
+                )
+                .values(
+                    revision=table.c.revision + 1,
+                    updated_at=_utcnow(),
+                    **{field_name: value},
+                )
+                .returning(model_cls)
+            )
+            result = await session.execute(statement)
+            entity = result.scalars().first()
+            if entity is None:
+                await session.commit()
+                return None
+            stored = _stored_prompt_from_entity(resource_id, entity)
+            await session.commit()
+            return stored
 
-        return await self._run_async(_wait())
+        return operation
 
-    def ensure_schema(self) -> None:
-        """确保 prompt 配置表存在。"""
-        with self._init_lock:
-            self._run(self._get_pool())
+    # ------------------------------ 公共 API ------------------------------
 
     def fetch(self, resource_id: str) -> StoredPrompt | None:
         """按资源 ID 读取 prompt 配置。"""
-        return self._run(self._fetch(resource_id))
+        self._require_open()
+        return self._run_sync(self._fetch_op(resource_id))
 
     async def fetch_async(self, resource_id: str) -> StoredPrompt | None:
         """异步读取 Prompt 配置，不阻塞调用方事件循环。"""
-        return await self._run_async(self._fetch(resource_id))
-
-    async def _fetch(self, resource_id: str) -> StoredPrompt | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    resource_id,
-                    display_name,
-                    prompt_data,
-                    version,
-                    updated_at,
-                    revision
-                FROM komari_prompt_configs
-                WHERE resource_id = $1
-                """,
-                resource_id,
-            )
-        if row is None:
-            return None
-        return _stored_prompt_from_row(row)
+        self._require_open()
+        return await self._run_on_app_session(self._fetch_op(resource_id))
 
     def upsert(
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str = "1.0",
     ) -> StoredPrompt:
         """写入或更新 prompt 配置。"""
-        return self._run(
-            self._upsert(
-                resource_id=resource_id,
-                display_name=display_name,
-                prompt_data=prompt_data,
-                version=version,
-            )
+        self._require_open()
+        stored = self._run_sync(
+            self._upsert_op(resource_id=resource_id, prompt_data=prompt_data)
         )
+        self._notify_invalidators(resource_id)
+        return stored
 
     async def upsert_async(
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str = "1.0",
     ) -> StoredPrompt:
         """异步完整写入 Prompt 配置。"""
-        return await self._run_async(
-            self._upsert(
-                resource_id=resource_id,
-                display_name=display_name,
-                prompt_data=prompt_data,
-                version=version,
-            )
+        self._require_open()
+        stored = await self._run_on_app_session(
+            self._upsert_op(resource_id=resource_id, prompt_data=prompt_data)
         )
-
-    async def _upsert(
-        self,
-        *,
-        resource_id: str,
-        display_name: str,
-        prompt_data: dict[str, str],
-        version: str,
-    ) -> StoredPrompt:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO komari_prompt_configs (
-                    resource_id,
-                    display_name,
-                    prompt_data,
-                    version
-                )
-                VALUES ($1, $2, $3::jsonb, $4)
-                ON CONFLICT (resource_id) DO UPDATE SET
-                    display_name = EXCLUDED.display_name,
-                    prompt_data = EXCLUDED.prompt_data,
-                    version = EXCLUDED.version,
-                    revision = komari_prompt_configs.revision + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING
-                    resource_id,
-                    display_name,
-                    prompt_data,
-                    version,
-                    updated_at,
-                    revision
-                """,
-                resource_id,
-                display_name,
-                json.dumps(prompt_data, ensure_ascii=False),
-                version,
-            )
-        if row is None:
-            msg = f"Prompt 写入后未返回记录: {resource_id}"
-            raise RuntimeError(msg)
-        return _stored_prompt_from_row(row)
+        self._notify_invalidators(resource_id)
+        return stored
 
     def update_if_unchanged(
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str,
         expected_updated_at: datetime,
     ) -> StoredPrompt | None:
         """仅在记录未被其他写入修改时更新 prompt 配置。"""
-        return self._run(
-            self._update_if_unchanged(
+        self._require_open()
+        stored = self._run_sync(
+            self._update_if_unchanged_op(
                 resource_id=resource_id,
-                display_name=display_name,
                 prompt_data=prompt_data,
-                version=version,
                 expected_updated_at=expected_updated_at,
             )
         )
+        if stored is not None:
+            self._notify_invalidators(resource_id)
+        return stored
 
     async def update_if_unchanged_async(
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str,
         expected_updated_at: datetime,
     ) -> StoredPrompt | None:
         """记录未变化时异步更新完整 Prompt。"""
-        return await self._run_async(
-            self._update_if_unchanged(
+        self._require_open()
+        stored = await self._run_on_app_session(
+            self._update_if_unchanged_op(
                 resource_id=resource_id,
-                display_name=display_name,
                 prompt_data=prompt_data,
-                version=version,
                 expected_updated_at=expected_updated_at,
             )
         )
-
-    async def _update_if_unchanged(
-        self,
-        *,
-        resource_id: str,
-        display_name: str,
-        prompt_data: dict[str, str],
-        version: str,
-        expected_updated_at: datetime,
-    ) -> StoredPrompt | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                UPDATE komari_prompt_configs
-                SET
-                    display_name = $2,
-                    prompt_data = $3::jsonb,
-                    version = $4,
-                    revision = revision + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE resource_id = $1
-                  AND updated_at = $5
-                RETURNING
-                    resource_id,
-                    display_name,
-                    prompt_data,
-                    version,
-                    updated_at,
-                    revision
-                """,
-                resource_id,
-                display_name,
-                json.dumps(prompt_data, ensure_ascii=False),
-                version,
-                expected_updated_at,
-            )
-        if row is None:
-            return None
-        return _stored_prompt_from_row(row)
+        if stored is not None:
+            self._notify_invalidators(resource_id)
+        return stored
 
     async def replace_if_revision_async(
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str,
         expected_revision: int,
     ) -> StoredPrompt | None:
         """仅在 revision 匹配时替换完整 Prompt；0 表示仅允许首次创建。"""
-        return await self._run_async(
-            self._replace_if_revision(
+        self._require_open()
+        stored = await self._run_on_app_session(
+            self._replace_if_revision_op(
                 resource_id=resource_id,
-                display_name=display_name,
                 prompt_data=prompt_data,
-                version=version,
                 expected_revision=expected_revision,
             )
         )
-
-    async def _replace_if_revision(
-        self,
-        *,
-        resource_id: str,
-        display_name: str,
-        prompt_data: dict[str, str],
-        version: str,
-        expected_revision: int,
-    ) -> StoredPrompt | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            if expected_revision == 0:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO komari_prompt_configs (
-                        resource_id,
-                        display_name,
-                        prompt_data,
-                        version
-                    )
-                    VALUES ($1, $2, $3::jsonb, $4)
-                    ON CONFLICT (resource_id) DO NOTHING
-                    RETURNING
-                        resource_id,
-                        display_name,
-                        prompt_data,
-                        version,
-                        updated_at,
-                        revision
-                    """,
-                    resource_id,
-                    display_name,
-                    json.dumps(prompt_data, ensure_ascii=False),
-                    version,
-                )
-            else:
-                row = await conn.fetchrow(
-                    """
-                    UPDATE komari_prompt_configs
-                    SET
-                        display_name = $2,
-                        prompt_data = $3::jsonb,
-                        version = $4,
-                        revision = revision + 1,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE resource_id = $1
-                      AND revision = $5
-                    RETURNING
-                        resource_id,
-                        display_name,
-                        prompt_data,
-                        version,
-                        updated_at,
-                        revision
-                    """,
-                    resource_id,
-                    display_name,
-                    json.dumps(prompt_data, ensure_ascii=False),
-                    version,
-                    expected_revision,
-                )
-        if row is None:
-            return None
-        return _stored_prompt_from_row(row)
+        if stored is not None:
+            self._notify_invalidators(resource_id)
+        return stored
 
     async def update_field_if_revision_async(
         self,
         *,
         resource_id: str,
-        display_name: str,
         field_name: str,
         value: str,
-        version: str,
         expected_revision: int,
     ) -> StoredPrompt | None:
-        """按 revision 原子更新一个 JSONB 顶层字段。"""
-        return await self._run_async(
-            self._update_field_if_revision(
+        """按 revision 原子更新一个 Prompt 正文字段。"""
+        self._require_open()
+        stored = await self._run_on_app_session(
+            self._update_field_if_revision_op(
                 resource_id=resource_id,
-                display_name=display_name,
                 field_name=field_name,
                 value=value,
-                version=version,
                 expected_revision=expected_revision,
             )
         )
-
-    async def _update_field_if_revision(
-        self,
-        *,
-        resource_id: str,
-        display_name: str,
-        field_name: str,
-        value: str,
-        version: str,
-        expected_revision: int,
-    ) -> StoredPrompt | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                UPDATE komari_prompt_configs
-                SET
-                    display_name = $2,
-                    prompt_data = prompt_data || $3::jsonb,
-                    version = $4,
-                    revision = revision + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE resource_id = $1
-                  AND revision = $5
-                RETURNING
-                    resource_id,
-                    display_name,
-                    prompt_data,
-                    version,
-                    updated_at,
-                    revision
-                """,
-                resource_id,
-                display_name,
-                json.dumps({field_name: value}, ensure_ascii=False),
-                version,
-                expected_revision,
-            )
-        if row is None:
-            return None
-        return _stored_prompt_from_row(row)
-
-    async def _close_pool(self) -> None:
-        if self._listener_stop_event is not None:
-            self._listener_stop_event.set()
-        listener_task = self._listener_task
-        self._listener_task = None
-        if listener_task is not None:
-            listener_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await listener_task
-        self._listener_stop_event = None
-        self._listener_ready_event = None
-        pool = self._pool
-        self._pool = None
-        if pool is not None:
-            await pool.close()
-
-    def close(self) -> None:
-        """关闭连接池，停止并回收后台线程及事件循环。"""
-        with self._lifecycle_lock:
-            if self._closed:
-                return
-            if self._closing:
-                wait_for_other_close = True
-            else:
-                self._closing = True
-                wait_for_other_close = False
-
-        shutdown_timeout = _PROMPT_STORAGE_TIMEOUT_SECONDS + 1.0
-        if wait_for_other_close:
-            self._stopped.wait(timeout=shutdown_timeout)
-            return
-
-        try:
-            if not self._loop.is_closed():
-                future = asyncio.run_coroutine_threadsafe(
-                    self._close_pool(),
-                    self._loop,
-                )
-                try:
-                    future.result(timeout=_PROMPT_STORAGE_TIMEOUT_SECONDS)
-                except FutureTimeoutError as exc:
-                    future.cancel()
-                    logger.warning(
-                        "Prompt 存储关闭连接池超时: {}", type(exc).__name__
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Prompt 存储关闭连接池失败: {}", type(exc).__name__
-                    )
-        except Exception as exc:
-            logger.warning("Prompt 存储提交关闭任务失败: {}", type(exc).__name__)
-        finally:
-            if not self._loop.is_closed():
-                with suppress(RuntimeError):
-                    self._loop.call_soon_threadsafe(self._loop.stop)
-            if threading.current_thread() is not self._thread:
-                self._thread.join(timeout=shutdown_timeout)
-                if self._thread.is_alive():
-                    logger.error("Prompt 存储后台线程未在超时内停止")
+        if stored is not None:
+            self._notify_invalidators(resource_id)
+        return stored
 
 
 class _StorageState:
     storage: ClassVar[PromptStorage | None] = None
     lock: ClassVar[threading.RLock] = threading.RLock()
-
-
-def _stored_prompt_from_row(row: Any) -> StoredPrompt:
-    raw_data = row["prompt_data"]
-    prompt_data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-    return StoredPrompt(
-        resource_id=str(row["resource_id"]),
-        display_name=str(row["display_name"]),
-        prompt_data=dict(prompt_data),
-        version=str(row["version"]),
-        updated_at=row["updated_at"],
-        revision=int(row["revision"]),
-    )
 
 
 def get_prompt_storage() -> PromptStorage:
@@ -836,9 +648,7 @@ def load_prompt_values(resource: PromptResourceProtocol) -> PromptValues:
                 prompt_data.update(validate_prompt_values(resource.defaults, values))
                 synced = storage.update_if_unchanged(
                     resource_id=resource.resource_id,
-                    display_name=resource.display_name,
                     prompt_data=prompt_data,
-                    version=stored.version,
                     expected_updated_at=stored.updated_at,
                 )
                 if synced is None:
@@ -906,9 +716,7 @@ async def load_prompt_values_async(
         prompt_data.update(validate_prompt_values(resource.defaults, values))
         synced = await storage.update_if_unchanged_async(
             resource_id=resource.resource_id,
-            display_name=resource.display_name,
             prompt_data=prompt_data,
-            version=stored.version,
             expected_updated_at=stored.updated_at,
         )
         if synced is None:
@@ -954,7 +762,6 @@ def save_prompt_values(
     cleaned = validate_prompt_values(resource.defaults, values)
     return get_prompt_storage().upsert(
         resource_id=resource.resource_id,
-        display_name=resource.display_name,
         prompt_data=cleaned,
     )
 
@@ -967,7 +774,6 @@ async def save_prompt_values_async(
     cleaned = validate_prompt_values(resource.defaults, values)
     return await get_prompt_storage().upsert_async(
         resource_id=resource.resource_id,
-        display_name=resource.display_name,
         prompt_data=cleaned,
     )
 
@@ -982,9 +788,7 @@ async def replace_prompt_values_async(
     cleaned = validate_prompt_values(resource.defaults, values)
     return await get_prompt_storage().replace_if_revision_async(
         resource_id=resource.resource_id,
-        display_name=resource.display_name,
         prompt_data=cleaned,
-        version="1.0",
         expected_revision=expected_revision,
     )
 
@@ -1004,17 +808,13 @@ async def update_prompt_field_async(
     if expected_revision == 0:
         return await get_prompt_storage().replace_if_revision_async(
             resource_id=resource.resource_id,
-            display_name=resource.display_name,
             prompt_data=cleaned,
-            version="1.0",
             expected_revision=0,
         )
     return await get_prompt_storage().update_field_if_revision_async(
         resource_id=resource.resource_id,
-        display_name=resource.display_name,
         field_name=field_name,
         value=cleaned[field_name],
-        version="1.0",
         expected_revision=expected_revision,
     )
 

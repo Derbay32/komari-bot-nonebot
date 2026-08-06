@@ -1,23 +1,23 @@
 """Komari Decision 配置 Schema。"""
 
-from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import field_validator
+from sqlalchemy.dialects.postgresql import JSONB
+
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 
-class KomariDecisionConfigSchema(BaseModel):
+class KomariDecisionConfigSchema(TypedConfigModel, table=True):
     """Komari Decision 插件配置。"""
 
-    model_config = ConfigDict(
+    plugin_name: ClassVar[str] = "komari_decision"
+    __tablename__ = "komari_decision_config"
+
+    model_config = typed_model_config(
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
-    )
     plugin_enable: bool = Field(
         default=False,
         description=(
@@ -25,10 +25,10 @@ class KomariDecisionConfigSchema(BaseModel):
         ),
     )
     user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
     )
     group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
     )
     filter_min_length: int = Field(
         default=3, ge=1, le=20, description="最短消息长度阈值（字符数）"
@@ -41,6 +41,7 @@ class KomariDecisionConfigSchema(BaseModel):
     )
     bot_aliases: list[str] = Field(
         default_factory=lambda: ["小鞠", "小鞠知花", "komari"],
+        sa_type=JSONB,
         description="机器人别名列表（用于 alias 命中与 call-intent 判定）",
     )
     scene_top_k: int = Field(

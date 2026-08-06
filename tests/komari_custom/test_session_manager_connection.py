@@ -36,7 +36,7 @@ def test_session_manager_uses_structured_password_and_single_initialization(
     monkeypatch.setattr(CustomSessionManager, "_redis_client_lock_loop", None)
     monkeypatch.setattr(
         session_manager_module,
-        "get_shared_database_config",
+        "get_shared_redis_config",
         lambda: SimpleNamespace(
             redis_host="redis.internal",
             redis_port=6380,

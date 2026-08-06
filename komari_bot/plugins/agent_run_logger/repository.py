@@ -1,4 +1,9 @@
-"""Agent Run 日志的 PostgreSQL 轻量索引。"""
+"""Agent Run 日志的 PostgreSQL 轻量索引。
+
+连接来源为 nonebot-plugin-orm 共享引擎（配置统一从 ``SQLALCHEMY_DATABASE_URL``
+读取），不再创建自研 asyncpg 池；表结构由 Alembic 迁移管理，文件锁 → JSONL →
+PG upsert 顺序、PG 故障不撤销 JSONL、5 分钟 advisory lock 对账等行为契约不变。
+"""
 
 from __future__ import annotations
 
@@ -8,8 +13,10 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
-from komari_bot.common.database_config import get_shared_database_config
-from komari_bot.common.postgres import create_postgres_pool
+from komari_bot.common.orm_connection import (
+    SharedEngineConnectionPool,
+    get_shared_orm_connection_pool,
+)
 
 if TYPE_CHECKING:
     from datetime import date, datetime
@@ -17,72 +24,6 @@ if TYPE_CHECKING:
     import asyncpg
 
 _RECONCILE_LOCK_KEY = 4_861_576_143_022_611_907
-
-_SCHEMA_STATEMENTS = (
-    """
-    CREATE UNLOGGED TABLE IF NOT EXISTS komari_agent_run_log_index (
-        run_id TEXT PRIMARY KEY,
-        trace_id TEXT NOT NULL,
-        run_type TEXT NOT NULL,
-        task_kind TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        status TEXT NOT NULL,
-        started_at TIMESTAMPTZ NOT NULL,
-        finished_at TIMESTAMPTZ NOT NULL,
-        log_date DATE NOT NULL,
-        file_name TEXT NOT NULL,
-        byte_offset BIGINT NOT NULL CHECK (byte_offset >= 0),
-        byte_length BIGINT NOT NULL CHECK (byte_length > 0),
-        models TEXT[] NOT NULL DEFAULT '{}',
-        methods TEXT[] NOT NULL DEFAULT '{}',
-        round_count INTEGER NOT NULL DEFAULT 0,
-        tool_count INTEGER NOT NULL DEFAULT 0,
-        input_tokens BIGINT NOT NULL DEFAULT 0,
-        cached_input_tokens BIGINT NOT NULL DEFAULT 0,
-        cache_miss_input_tokens BIGINT NOT NULL DEFAULT 0,
-        output_tokens BIGINT NOT NULL DEFAULT 0,
-        reasoning_output_tokens BIGINT NOT NULL DEFAULT 0,
-        total_tokens BIGINT NOT NULL DEFAULT 0,
-        usage_complete BOOLEAN NOT NULL DEFAULT FALSE
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_started_at
-    ON komari_agent_run_log_index (started_at DESC, run_id DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_date
-    ON komari_agent_run_log_index (log_date DESC, started_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_trace_id
-    ON komari_agent_run_log_index (trace_id)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_run_type
-    ON komari_agent_run_log_index (run_type, started_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_task_kind
-    ON komari_agent_run_log_index (task_kind, started_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_status
-    ON komari_agent_run_log_index (status, started_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_origin
-    ON komari_agent_run_log_index (origin, started_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_models
-    ON komari_agent_run_log_index USING GIN (models)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_agent_run_log_methods
-    ON komari_agent_run_log_index USING GIN (methods)
-    """,
-)
 
 _UPSERT_SQL = """
 INSERT INTO komari_agent_run_log_index (
@@ -218,32 +159,21 @@ class AgentRunIndexRepository:
     """管理不含任何日志正文的 PostgreSQL 索引。"""
 
     def __init__(self) -> None:
-        self._pool: asyncpg.Pool | None = None
+        self._pool: SharedEngineConnectionPool | None = None
         self._init_lock = asyncio.Lock()
         self._available = False
-        self._legacy_config_cleaned = False
 
     @property
     def available(self) -> bool:
         return self._available and self._pool is not None
 
-    @property
-    def legacy_config_cleaned(self) -> bool:
-        return self._legacy_config_cleaned
-
     async def initialize(self) -> bool:
-        """尝试建池与建表；失败仅使查询降级，不影响 JSONL。"""
+        """探测共享引擎可达性；失败仅使查询降级，不影响 JSONL。"""
         async with self._init_lock:
             try:
                 if self._pool is None:
-                    self._pool = await create_postgres_pool(
-                        get_shared_database_config(),
-                        command_timeout=30,
-                    )
-                async with self._pool.acquire() as connection:
-                    for statement in _SCHEMA_STATEMENTS:
-                        await connection.execute(statement)
-                self._available = True
+                    self._pool = get_shared_orm_connection_pool()
+                self._available = await self._pool.probe()
             except Exception:
                 self._available = False
                 logger.opt(exception=True).warning(
@@ -251,10 +181,9 @@ class AgentRunIndexRepository:
                 )
                 return False
 
-        await self.cleanup_legacy_provider_config()
         return True
 
-    async def _require_pool(self) -> asyncpg.Pool:
+    async def _require_pool(self) -> SharedEngineConnectionPool:
         if not self.available and not await self.initialize():
             raise IndexUnavailableError
         if self._pool is None:
@@ -263,39 +192,6 @@ class AgentRunIndexRepository:
 
     def _mark_failed(self) -> None:
         self._available = False
-
-    async def cleanup_legacy_provider_config(self) -> bool:
-        """原子删除 llm_provider 已废弃日志字段，并保证重复执行幂等。"""
-        if self._legacy_config_cleaned:
-            return True
-        try:
-            pool = await self._require_pool()
-            async with pool.acquire() as connection:
-                await connection.execute(
-                    """
-                    UPDATE komari_plugin_configs
-                    SET config_data = config_data - ARRAY[
-                            'llm_log_retention_days',
-                            'llm_log_dir_permission_mode'
-                        ]::text[],
-                        revision = revision + 1,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE plugin_name = 'llm_provider'
-                      AND config_data ?| ARRAY[
-                            'llm_log_retention_days',
-                            'llm_log_dir_permission_mode'
-                        ]::text[]
-                    """
-                )
-            self._legacy_config_cleaned = True
-        except Exception:
-            self._legacy_config_cleaned = False
-            logger.opt(exception=True).warning(
-                "[AgentRunLogger] 清理 llm_provider 废弃日志配置失败，将稍后重试"
-            )
-            return False
-        else:
-            return True
 
     async def upsert_many(self, entries: list[AgentRunIndexEntry]) -> bool:
         if not entries:
@@ -441,10 +337,11 @@ class AgentRunIndexRepository:
             pool = await self._require_pool()
             async with pool.acquire() as connection:
                 total = int(
-                    await connection.fetchval(
+                    (await connection.fetchval(
                         f"SELECT COUNT(*) FROM komari_agent_run_log_index{where}",
                         *values,
-                    )
+                    ))
+                    or 0
                 )
                 limit_index = len(values) + 1
                 offset_index = len(values) + 2
@@ -472,6 +369,7 @@ class AgentRunIndexRepository:
             self._pool = None
             self._available = False
             if pool is not None:
+                # 共享引擎由 nonebot-plugin-orm 托管，close 仅为释放本仓库引用
                 await pool.close()
 
 

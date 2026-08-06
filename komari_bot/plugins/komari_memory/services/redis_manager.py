@@ -10,7 +10,7 @@ from typing import Any, Literal, cast
 import redis.asyncio as aioredis
 from nonebot import logger
 
-from komari_bot.common.database_config import get_shared_database_config
+from komari_bot.common.redis_config import get_shared_redis_config
 
 from ..config_schema import KomariMemoryConfigSchema
 from .config_interface import get_config
@@ -422,7 +422,7 @@ class RedisManager:
 
     async def initialize(self) -> None:
         """初始化 Redis 连接。"""
-        db_config = get_shared_database_config()
+        db_config = get_shared_redis_config()
         client = aioredis.Redis(
             host=db_config.redis_host,
             port=db_config.redis_port,

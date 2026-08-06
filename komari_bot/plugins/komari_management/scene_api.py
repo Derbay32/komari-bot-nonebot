@@ -159,7 +159,6 @@ async def _get_repository() -> SceneRepository:
 async def _prepare_repository() -> SceneRepository:
     try:
         repository = await _get_repository()
-        await repository.ensure_schema()
     except Exception as exc:
         logger.exception("[Komari Management] 获取 scene repository 失败")
         raise HTTPException(

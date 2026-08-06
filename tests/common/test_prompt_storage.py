@@ -11,6 +11,7 @@ import pytest
 
 from komari_bot.common import prompt_storage
 from komari_bot.common.prompt_storage import (
+    PromptStorage,
     PromptTemplateLoader,
     StoredPrompt,
     load_prompt_values,
@@ -57,12 +58,9 @@ class _FakePromptStorage:
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str = "1.0",
     ) -> StoredPrompt:
         assert resource_id == "test_prompt"
-        assert display_name == "测试 Prompt"
         self.upsert_calls += 1
         if self.fail_upsert:
             msg = "写入失败"
@@ -71,9 +69,8 @@ class _FakePromptStorage:
         self.saved_payloads.append(prompt_data)
         self.stored = StoredPrompt(
             resource_id=resource_id,
-            display_name=display_name,
             prompt_data=dict(prompt_data),
-            version=version,
+            revision=1,
             updated_at=datetime.now(UTC),
         )
         return self.stored
@@ -82,9 +79,7 @@ class _FakePromptStorage:
         self,
         *,
         resource_id: str,
-        display_name: str,
         prompt_data: dict[str, str],
-        version: str,
         expected_updated_at: datetime,
     ) -> StoredPrompt | None:
         assert self.stored is not None
@@ -94,9 +89,7 @@ class _FakePromptStorage:
             return None
         return self.upsert(
             resource_id=resource_id,
-            display_name=display_name,
             prompt_data=prompt_data,
-            version=version,
         )
 
 
@@ -108,12 +101,19 @@ class _ClosablePromptStorage:
         self.closed = True
 
 
-class _FakePool:
-    def __init__(self) -> None:
-        self.closed = False
+def test_stored_prompt_has_no_version_field() -> None:
+    """StoredPrompt 不再携带 version：Schema 版本唯一权威是 Alembic。"""
+    stored = StoredPrompt(
+        resource_id="test_prompt",
+        prompt_data={},
+        revision=1,
+        updated_at=datetime.now(UTC),
+    )
 
-    async def close(self) -> None:
-        self.closed = True
+    with pytest.raises(AttributeError):
+        # 刻意动态访问：断言该属性在运行时不存在，静态检查无法表达
+        getattr(stored, "version")  # noqa: B009
+    assert "version" not in stored.__dataclass_fields__
 
 
 def test_merge_prompt_values_only_accepts_known_string_fields() -> None:
@@ -145,9 +145,8 @@ def test_load_and_save_prompt_values_use_prompt_storage(
     resource = _Resource()
     stored = StoredPrompt(
         resource_id="test_prompt",
-        display_name="测试 Prompt",
         prompt_data={"system_prompt": "PG 值"},
-        version="1.0",
+        revision=1,
         updated_at=datetime.now(UTC),
     )
     fake_storage = _FakePromptStorage(stored)
@@ -167,9 +166,8 @@ def test_load_prompt_values_syncs_added_and_removed_keys(
     resource = _Resource()
     stored = StoredPrompt(
         resource_id="test_prompt",
-        display_name="测试 Prompt",
         prompt_data={"system_prompt": "PG 值\n", "legacy": "旧字段"},
-        version="1.0",
+        revision=1,
         updated_at=datetime.now(UTC),
     )
     fake_storage = _FakePromptStorage(stored)
@@ -190,9 +188,8 @@ def test_load_prompt_values_returns_merged_values_when_sync_fails(
     resource = _Resource()
     stored = StoredPrompt(
         resource_id="test_prompt",
-        display_name="测试 Prompt",
         prompt_data={"legacy": "旧字段"},
-        version="1.0",
+        revision=1,
         updated_at=datetime.now(UTC),
     )
     fake_storage = _FakePromptStorage(stored, fail_upsert=True)
@@ -212,16 +209,14 @@ def test_load_prompt_values_refetches_when_sync_conflicts(
     resource = _Resource()
     stored = StoredPrompt(
         resource_id="test_prompt",
-        display_name="测试 Prompt",
         prompt_data={"legacy": "旧字段"},
-        version="1.0",
+        revision=1,
         updated_at=datetime.now(UTC),
     )
     latest = StoredPrompt(
         resource_id="test_prompt",
-        display_name="测试 Prompt",
         prompt_data={"system_prompt": "管理员新值", "memory_ack": "收到"},
-        version="1.0",
+        revision=2,
         updated_at=datetime.now(UTC),
     )
     fake_storage = _FakePromptStorage(stored, conflict_stored=latest)
@@ -262,9 +257,8 @@ def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
         if calls == 1:
             stored = StoredPrompt(
                 resource_id="test_prompt",
-                display_name="测试 Prompt",
                 prompt_data={"system_prompt": "PG 值"},
-                version="1.0",
+                revision=1,
                 updated_at=datetime.now(UTC),
             )
             return prompt_storage.PromptValues(
@@ -308,11 +302,9 @@ async def test_async_prompt_loader_uses_cache_and_notification_invalidation(
         calls += 1
         stored = StoredPrompt(
             resource_id="test_prompt",
-            display_name="测试 Prompt",
             prompt_data={"system_prompt": f"PG 值 {calls}"},
-            version="1.0",
-            updated_at=datetime.now(UTC),
             revision=calls,
+            updated_at=datetime.now(UTC),
         )
         return prompt_storage.PromptValues(
             values={"system_prompt": f"PG 值 {calls}"},
@@ -396,6 +388,69 @@ async def test_sync_prompt_loader_rejects_running_event_loop() -> None:
         loader.get_template()
 
 
+def test_prompt_loader_refetches_after_staleness_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缓存 1 秒陈限：界内命中缓存，超界重新读取并接受新值。"""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(prompt_storage, "monotonic", lambda: clock["now"])
+
+    class _Storage:
+        def register_invalidator(self, _resource_id: str, _callback: object) -> None:
+            return
+
+    calls = 0
+    load_results = [{"system_prompt": "第一版"}, {"system_prompt": "第二版"}]
+
+    def fake_load_prompt_values(_resource: object) -> prompt_storage.PromptValues:
+        nonlocal calls
+        values = load_results[min(calls, len(load_results) - 1)]
+        calls += 1
+        return prompt_storage.PromptValues(
+            values=dict(values),
+            stored=None,
+        )
+
+    monkeypatch.setattr(prompt_storage, "load_prompt_values", fake_load_prompt_values)
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: _Storage())
+    loader = PromptTemplateLoader(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        defaults={"system_prompt": "默认"},
+        log_prefix="[Test]",
+    )
+
+    assert loader.get_template() == {"system_prompt": "第一版"}
+    assert calls == 1
+    assert loader.get_template() == {"system_prompt": "第一版"}
+    assert calls == 1
+
+    clock["now"] += 2.0
+    assert loader.get_template() == {"system_prompt": "第二版"}
+    assert calls == 2
+
+
+def test_sync_operations_inside_event_loop_raise() -> None:
+    storage = PromptStorage()
+
+    async def _caller() -> None:
+        with pytest.raises(RuntimeError, match="请改用对应的 _async"):
+            storage.fetch("komari_chat")
+
+    try:
+        asyncio.run(_caller())
+    finally:
+        storage.close()
+
+
+def test_closed_storage_rejects_new_operations() -> None:
+    storage = PromptStorage()
+    storage.close()
+
+    with pytest.raises(RuntimeError, match="Prompt 存储已关闭"):
+        storage.fetch("komari_chat")
+
+
 def test_close_prompt_storage_if_created_does_not_create_storage() -> None:
     prompt_storage._StorageState.storage = None
 
@@ -414,16 +469,43 @@ def test_close_prompt_storage_if_created_closes_and_clears_storage() -> None:
     assert prompt_storage._StorageState.storage is None
 
 
-def test_prompt_storage_close_reclaims_pool_thread_and_loop() -> None:
-    storage = prompt_storage.PromptStorage()
-    pool = _FakePool()
-    storage._pool = cast("Any", pool)
-    thread = storage._thread
-    loop = storage._loop
+def test_private_engine_uses_orm_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_urls: list[str] = []
 
-    storage.close()
-    storage.close()
+    class _FakeEngine:
+        def __init__(self, url: str) -> None:
+            created_urls.append(url)
+            self.sync_engine = object()
 
-    assert pool.closed is True
-    assert thread.is_alive() is False
-    assert loop.is_closed() is True
+        async def dispose(self) -> None:
+            return None
+
+    async def _simple_op(session: object) -> str:
+        del session
+        return "ok"
+
+    monkeypatch.setattr(
+        prompt_storage,
+        "create_async_engine",
+        lambda url: _FakeEngine(url),
+    )
+    monkeypatch.setattr(
+        prompt_storage,
+        "get_orm_database_url",
+        lambda: "postgresql+asyncpg://u:p@h:5432/db",
+    )
+
+    storage = PromptStorage()
+    try:
+        result = asyncio.run(storage._run_on_private_engine(_simple_op))
+        assert result == "ok"
+        assert created_urls == ["postgresql+asyncpg://u:p@h:5432/db"]
+    finally:
+        storage.close()
+
+
+def test_prompt_storage_no_longer_builds_url_from_postgres_config() -> None:
+    assert not hasattr(prompt_storage, "_build_database_url")
+    assert not hasattr(prompt_storage, "get_shared_database_config")

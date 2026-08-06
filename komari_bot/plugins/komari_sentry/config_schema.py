@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import field_validator
+
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
@@ -17,17 +19,14 @@ def _normalize_log_level(value: object, default: str) -> str:
     return text
 
 
-class KomariSentryConfigSchema(BaseModel):
+class KomariSentryConfigSchema(TypedConfigModel, table=True):
     """Komari Sentry 动态配置。"""
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "restart"},
-    )
+    plugin_name: ClassVar[str] = "komari_sentry"
+    __tablename__ = "komari_sentry_config"
 
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "restart"},
     )
 
     plugin_enable: bool = Field(default=False, description="是否启用 Sentry 插件")

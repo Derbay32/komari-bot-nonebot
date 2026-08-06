@@ -4,27 +4,24 @@
 
 ## 功能特性
 
-- **PostgreSQL 持久化**：配置存储在 `komari_plugin_configs` 表。
+- **PostgreSQL 持久化**：每个配置资源一张强类型单行表 `komari_<插件>_config`（SQLModel，主键 `id=1`、CAS 修订号 `revision`、写入时间 `updated_at`），表结构由 Alembic 迁移链管理（`migrations/versions/0002` 建 14 张表），运行时无 DDL。
 - **dotenv 初始化**：PG 中缺少配置时，从 NoneBot 已加载的 `.env` / schema 默认值初始化。
-- **运行时更新**：`update_field()` 会校验字段并写回 PostgreSQL。
+- **运行时更新**：`update_field()` 会校验字段并写回 PostgreSQL（revision CAS，冲突重载重试）。
+- **跨进程刷新**：应用事件循环上轮询各表 `revision`（亚秒级）检测外部变更；已移除 asyncpg LISTEN/NOTIFY。
 - **资源级并发**：工厂注册表只锁定实例创建，各插件管理器使用独立操作锁。
-- **完整生命周期**：同步兼容桥使用专用事件循环线程，应用关闭时会回收连接池、线程和事件循环。
-- **通用设计**：接受任何 Pydantic `BaseModel` 子类作为配置 Schema。
+- **完整生命周期**：同步兼容桥使用专用事件循环线程，应用关闭时会回收一次性引擎连接、线程和事件循环；共享引擎归 nonebot-plugin-orm 托管，不 dispose。
+- **通用设计**：接受任何 SQLModel/Pydantic Schema（`TypedConfigModel` 基类见 `komari_bot/common/typed_config.py`）。
 
 ## 配置表
 
-```sql
-CREATE TABLE IF NOT EXISTS komari_plugin_configs (
-    plugin_name VARCHAR(128) PRIMARY KEY,
-    schema_name VARCHAR(128) NOT NULL,
-    config_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    version VARCHAR(32) NOT NULL DEFAULT '1.0',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
+配置存储源是各插件 `config_schema.py` 中的 SQLModel 强类型表（如 `komari_memory_config` / `komari_knowledge_config`），由 Alembic 迁移 0002 建表：
 
-`database` 连接配置不写入该表；PG / Redis 引导配置来自 `.env`、`.env.dev`、`.env.prod` 或进程环境变量。
+- 单行使用，主键 `id` 恒为 1；
+- `revision` 为跨进程 CAS 修订号，写操作原子自增；
+- `updated_at` 为最后写入时间（带时区），由存储层显式赋值；
+- 列表/字典/嵌套配置使用 JSONB 列。
+
+旧版 JSONB KV 表 `komari_plugin_configs` 在 v2.0.0 保留（仅存量数据，不再读写），`DROP` 由后续版本的 autogenerate revision 执行。数据库连接不进入配置表：连接唯一权威是 nonebot-plugin-orm 的 `SQLALCHEMY_DATABASE_URL`，Redis 引导配置来自 `.env` / 进程环境变量（`komari_bot/common/redis_config.py`）。
 
 ## 使用方法
 
@@ -87,7 +84,7 @@ await config_manager.mutate_field_async("items", append_unique)
 
 ### `config_source`
 
-返回配置来源描述，例如：`postgres:komari_plugin_configs/komari_memory`。
+返回配置来源描述，例如：`postgresql:komari_memory_config`。
 
 ## 旧 JSON 迁移
 
@@ -97,4 +94,4 @@ await config_manager.mutate_field_async("items", append_unique)
 poetry run python scripts/migrate_json_config_to_pg.py --config-dir config/config_manager
 ```
 
-脚本会跳过 `database_config.json`，且不会删除本地旧 JSON 文件。
+脚本会把 JSON 内容写入 legacy JSONB 表 `komari_plugin_configs`（v2.0.0 起仅作为存量中转，新表数据由 `scripts/migrate_legacy_config_to_typed_tables.py` 统一搬运），不会删除本地旧 JSON 文件。

@@ -19,3 +19,30 @@ v2.0.0 起，数据库连接池、engine/session 生命周期与 Schema 迁移�
 - 日常工作流变为：改 SQLModel 类 → autogenerate revision → 发版 → 容器启动自动迁移，全程零人工干预数据库。
 - `pg_pool_process_budget` 等自研连接预算防护随单 engine 架构自然消解，池语义改由 SQLAlchemy 池参数表达。
 - SQLModel 引入 Pydantic v2 兼容窗口的版本锁定约束，依赖升级时需留意。
+
+## 落地状态（2026-08-07，v2.0.0）
+
+**状态：已完成**（Project spec #26 tickets 01–12 全部关闭）。
+
+| Ticket | 内容 | 状态 |
+|--------|------|------|
+| 01 | 基线迁移 0001（全量表结构）与迁移引导 `orm_bootstrap` | 已完成 |
+| 02 | `SQLALCHEMY_DATABASE_URL` 连接解析（`orm_config.py`）与旧 `PG_*` 配置下线 | 已完成 |
+| 03 | 动态配置强类型表（迁移 0002，14 张 `komari_<插件>_config`）+ `typed_config.py` | 已完成 |
+| 04 | 配置存储 CAS/revision 轮询刷新与跨进程一致性 | 已完成 |
+| 05 | Prompt 强类型表（迁移 0003，3 张 `komari_prompt_*`）+ `prompt_storage.py` 重写 | 已完成 |
+| 06 | 业务关系表 ORM 化（user_ban/character_binding/user_data/komari_custom/komari_management/komari_decision 的 `orm_models.py`） | 已完成 |
+| 07 | 存量 legacy 表（`komari_plugin_configs` / `komari_prompt_configs`）保留与运行时清理策略 | 已完成 |
+| 08 | 部署链路：`docker/prestart.sh` 自动 `upgrade head` + CI `migration-check.yml` | 已完成 |
+| 09 | 离线迁移脚本体系（`migrate_legacy_config_to_typed_tables.py` 等 9 个脚本） | 已完成 |
+| 10 | raw SQL 插件连接切换（memory/knowledge/help/agent_run_logger → `orm_connection.py` 共享引擎适配） | 已完成 |
+| 11 | 环境变量与文档收尾（删除 `PG_*`、清理失效配置行） | 已完成 |
+| 12 | 文档与 v2.0.0 发布说明（AGENTS.md / 插件 README / CHANGELOG） | 已完成 |
+
+### 最终落地与决策原文的差异
+
+- 基线 0001 实际建 **26 张表**（含保留的 `komari_plugin_configs` / `komari_prompt_configs` 两张 legacy 配置表，运行时不读写）；加上 0002 的 14 张配置表与 0003 的 3 张 Prompt 表，版本链共 43 张表。
+- 跨进程配置变更通知最终采用「应用事件循环亚秒级轮询 `revision`」而非 asyncpg LISTEN/NOTIFY（0002 迁移注释同步说明）；Prompt 变更传播依赖 `PromptTemplateLoader` 1 秒陈限上限 + 本进程写入即时失效回调。
+- `komari_memory/database/init_orm.sql` 与 `komari_knowledge/init_db.sql` 保留为 fail-closed 提示/运维参考文件，不再作为运行时 DDL 来源；手工建表只能使用 `scripts/render_memory_schema.py` 离线渲染。
+- 旧脚本 `split_komari_memory_entity_tables.py`、`extract_komari_memory_profile_columns.py`、`drop_legacy_user_attributes_table.py` 已删除（其目标结构已由基线 0001 一次性覆盖）。
+- 管理 API 配置来源描述为 `postgresql:<强类型表名>`（如 `postgresql:komari_prompt_komari_chat:komari_chat`），不再使用 `komari_plugin_configs` / `komari_prompt_configs`。

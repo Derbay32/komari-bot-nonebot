@@ -1,15 +1,18 @@
-"""Dynamic PostgreSQL schema bootstrap helpers for embedding-backed plugins."""
+"""embedding 插件的 PostgreSQL schema 语句离线构建器。
+
+运行时不执行任何 DDL；数据库结构由 Alembic 迁移（migrations/）统一管理。
+本模块仅供离线工具（如 scripts/render_memory_schema.py）渲染/对照 SQL 使用。
+"""
 
 from __future__ import annotations
 
 import textwrap
-from typing import Any
 
 PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS = 2000
 
 
 def render_schema_statements(statements: tuple[str, ...]) -> str:
-    """把运行时 DDL 规范化为可由 psql 执行的 SQL 文本。"""
+    """把 schema 语句规范化为可由 psql 执行的离线 SQL 文本。"""
     rendered: list[str] = []
     for statement in statements:
         normalized = textwrap.dedent(statement).strip()
@@ -624,17 +627,6 @@ def _build_search_index_version_statements(
         EXECUTE FUNCTION bump_komari_search_index_version('{index_name}')
         """,
     )
-
-
-async def apply_schema_statements(
-    pg_pool: Any,
-    *,
-    statements: tuple[str, ...],
-) -> None:
-    """Execute schema bootstrap statements sequentially."""
-    async with pg_pool.acquire() as conn:
-        for statement in statements:
-            await conn.execute(statement)
 
 
 def _normalize_dimension(embedding_dimension: int) -> int:

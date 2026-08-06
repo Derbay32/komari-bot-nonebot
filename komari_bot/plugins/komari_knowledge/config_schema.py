@@ -3,26 +3,24 @@
 用于管理 PostgreSQL 数据库连接和检索参数配置。
 """
 
-from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import field_validator
+from sqlalchemy.dialects.postgresql import JSONB
+
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """
     Komari Knowledge 配置 Schema。
     """
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "immediate"},
-    )
+    plugin_name: ClassVar[str] = "komari_knowledge"
+    __tablename__ = "komari_knowledge_config"
 
-    # 元数据
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "immediate"},
     )
 
     # 插件控制
@@ -30,10 +28,10 @@ class DynamicConfigSchema(BaseModel):
 
     # 白名单配置
     user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
     )
     group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
     )
 
     similarity_threshold: float = Field(
@@ -46,6 +44,7 @@ class DynamicConfigSchema(BaseModel):
     # 检索配置
     query_rewrite_rules: dict[str, str] = Field(
         default={"你": "小鞠", "您的": "小鞠的"},
+        sa_type=JSONB,
         description="查询重写规则，key 为待替换词，value 为替换词",
     )
     layer1_limit: int = Field(

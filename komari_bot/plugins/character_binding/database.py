@@ -1,125 +1,125 @@
-"""角色名绑定 PostgreSQL 访问层。"""
+"""角色名绑定 PostgreSQL 访问层（SQLModel + nonebot-plugin-orm AsyncSession）。
+
+连接池与 engine 生命周期由 nonebot-plugin-orm 托管（本模块不再依赖
+``komari_bot.common.postgres`` 自研池）；表结构由 Alembic 迁移统一管理，
+启动期与懒路径均无任何 DDL。同表只保留本仓储一套访问路径。
+
+SQLModel 字段在 Pyright 下被推断为 Python 值类型而非列表达式，因此
+列访问统一走 ``模型.__table__.c``（与 user_ban 仓储同一约定）。
+"""
 
 from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING
 
-from nonebot import logger
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
-from komari_bot.common.database_config import get_shared_database_config
-from komari_bot.common.postgres import create_postgres_pool
+from .orm_models import CharacterBindingRow
 
 if TYPE_CHECKING:
-    import asyncpg
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+_BINDINGS = CharacterBindingRow.__table__
 
 
-_SCHEMA_LOCK_KEY = "komari:character_binding:schema:v1"
+def _open_session() -> "AsyncSession":
+    """打开绑定 nonebot-plugin-orm 共享引擎的会话。"""
+    from nonebot_plugin_orm import get_session
+
+    return get_session(expire_on_commit=False)
 
 
 class CharacterBindingDB:
     """角色名绑定数据库操作类。"""
 
     def __init__(self) -> None:
-        self._pool: asyncpg.Pool | None = None
         self._initialize_lock = asyncio.Lock()
+        self._ready = False
 
     async def initialize(self) -> None:
-        """初始化共享连接池租约与表结构。"""
-        if self._pool is not None:
-            return
+        """单飞确认 ORM 存储可连接；表结构由 Alembic 迁移统一管理。
 
+        PostgreSQL 不可用时抛出异常，由管理器降级为空快照。
+        """
         async with self._initialize_lock:
-            if self._pool is not None:
+            if self._ready:
                 return
-
-            pool = await create_postgres_pool(get_shared_database_config())
+            session = _open_session()
             try:
-                await self._create_table(pool)
-            except BaseException:
-                try:
-                    await pool.close()
-                except Exception:
-                    logger.exception(
-                        "[CharacterBindingDB] 初始化失败后的连接池关闭失败"
-                    )
-                raise
-            self._pool = pool
+                await session.execute(select(1))
+            finally:
+                await session.close()
+            self._ready = True
 
-    @staticmethod
-    async def _create_table(pool: asyncpg.Pool) -> None:
-        """在事务级 advisory lock 下幂等创建绑定表。"""
-        async with pool.acquire() as conn, conn.transaction():
-            await conn.fetchval(
-                "SELECT pg_advisory_xact_lock(hashtext($1))",
-                _SCHEMA_LOCK_KEY,
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS komari_character_bindings (
-                    user_id TEXT PRIMARY KEY,
-                    character_name TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-
-    def _require_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
+    def _require_ready(self) -> None:
+        """未初始化时拒绝读写，保持原“尚未初始化”错误语义。"""
+        if not self._ready:
             msg = "character_binding 数据库尚未初始化"
             raise RuntimeError(msg)
-        return self._pool
 
     async def load_all(self) -> dict[str, str]:
-        """读取全部角色名绑定。"""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT user_id, character_name
-                FROM komari_character_bindings
-                ORDER BY user_id
-                """
+        """读取全部角色名绑定（按 user_id 升序）。"""
+        self._require_ready()
+        session = _open_session()
+        try:
+            rows = (
+                (
+                    await session.execute(
+                        select(CharacterBindingRow).order_by(_BINDINGS.c.user_id)
+                    )
+                )
+                .scalars()
+                .all()
             )
-        return {str(row["user_id"]): str(row["character_name"]) for row in rows}
+        finally:
+            await session.close()
+        return {row.user_id: row.character_name for row in rows}
 
     async def upsert(self, user_id: str, character_name: str) -> None:
-        """新增或更新角色名绑定。"""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO komari_character_bindings (user_id, character_name)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE
-                SET character_name = EXCLUDED.character_name,
-                    updated_at = now()
-                """,
-                user_id,
-                character_name,
-            )
+        """新增或更新角色名绑定，冲突时覆盖名称并刷新 updated_at。"""
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                statement = postgres_insert(CharacterBindingRow).values(
+                    user_id=user_id, character_name=character_name
+                )
+                excluded = statement.excluded
+                await session.execute(
+                    statement.on_conflict_do_update(
+                        index_elements=["user_id"],
+                        set_={
+                            "character_name": excluded.character_name,
+                            "updated_at": func.now(),
+                        },
+                    )
+                )
+        finally:
+            await session.close()
 
     async def delete(self, user_id: str) -> bool:
         """删除角色名绑定，并返回记录是否存在。"""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                DELETE FROM komari_character_bindings
-                WHERE user_id = $1
-                """,
-                user_id,
-            )
-        return result == "DELETE 1"
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                deleted = (
+                    await session.execute(
+                        delete(CharacterBindingRow)
+                        .where(_BINDINGS.c.user_id == user_id)
+                        .returning(_BINDINGS.c.user_id)
+                    )
+                ).scalar_one_or_none()
+        finally:
+            await session.close()
+        return deleted is not None
 
     async def close(self) -> None:
-        """释放当前实例持有的共享连接池租约。"""
+        """重置就绪状态；engine 生命周期由 nonebot-plugin-orm 托管。"""
         async with self._initialize_lock:
-            pool = self._pool
-            self._pool = None
-            if pool is not None:
-                await pool.close()
+            self._ready = False
 
 
 __all__ = ["CharacterBindingDB"]

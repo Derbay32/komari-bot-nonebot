@@ -1,8 +1,10 @@
-"""聊天回复送达后副作用的 PostgreSQL outbox。"""
+"""聊天回复送达后副作用的 PostgreSQL outbox。
+
+表结构由 Alembic 迁移统一管理，运行时不执行 DDL。
+"""
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -24,64 +26,6 @@ _STEP_COLUMNS: dict[ReplyCommitStep, str] = {
     "ai_history_stored": "ai_history_stored_at",
     "interaction_stored": "interaction_stored_at",
 }
-
-_SCHEMA_STATEMENTS: tuple[str, ...] = (
-    """
-    CREATE TABLE IF NOT EXISTS komari_chat_reply_commit_outbox (
-        operation_id TEXT PRIMARY KEY,
-        payload_hash TEXT NOT NULL,
-        request_trace_id TEXT NOT NULL,
-        source_message_id TEXT NOT NULL,
-        platform_message_id TEXT,
-        group_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        user_nickname TEXT,
-        bot_nickname TEXT,
-        reply_content TEXT,
-        reply_timestamp DOUBLE PRECISION NOT NULL,
-        favorability_delta INT NOT NULL,
-        favorability_reason TEXT,
-        interaction_history JSONB,
-        proactive_reservation_id TEXT,
-        proactive_cooldown_seconds INT NOT NULL CHECK (
-            proactive_cooldown_seconds >= 0
-        ),
-        global_interaction_enabled BOOLEAN NOT NULL,
-        global_interaction_trigger_size INT NOT NULL CHECK (
-            global_interaction_trigger_size > 0
-        ),
-        status TEXT NOT NULL CHECK (
-            status IN (
-                'PREPARED', 'DELIVERED', 'PROCESSING',
-                'COMPLETED', 'CANCELLED', 'FAILED'
-            )
-        ),
-        proactive_confirmed_at TIMESTAMPTZ,
-        favorability_applied_at TIMESTAMPTZ,
-        ai_history_stored_at TIMESTAMPTZ,
-        interaction_stored_at TIMESTAMPTZ,
-        attempt_count INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-        next_retry_at TIMESTAMPTZ,
-        lease_owner TEXT,
-        lease_expires_at TIMESTAMPTZ,
-        last_error_code TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        delivered_at TIMESTAMPTZ,
-        completed_at TIMESTAMPTZ,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_komari_chat_reply_commit_claim
-    ON komari_chat_reply_commit_outbox(
-        status, next_retry_at, lease_expires_at, created_at
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_komari_chat_reply_commit_cleanup
-    ON komari_chat_reply_commit_outbox(status, completed_at)
-    """,
-)
 
 
 @dataclass(frozen=True)
@@ -139,24 +83,9 @@ class ReplyCommitRepository:
 
     def __init__(self, pg_pool: asyncpg.Pool) -> None:
         self.pg_pool = pg_pool
-        self._schema_ready = False
-        self._schema_lock = asyncio.Lock()
-
-    async def ensure_schema(self) -> None:
-        """单飞创建 outbox 表结构。"""
-        if self._schema_ready:
-            return
-        async with self._schema_lock:
-            if self._schema_ready:
-                return
-            async with self.pg_pool.acquire() as connection:
-                for statement in _SCHEMA_STATEMENTS:
-                    await connection.execute(statement)
-            self._schema_ready = True
 
     async def has_active_operation(self, operation_id: str) -> bool:
         """判断同一平台事件是否已有不可重发的意图或 tombstone。"""
-        await self.ensure_schema()
         async with self.pg_pool.acquire() as connection:
             exists = await connection.fetchval(
                 """
@@ -173,7 +102,6 @@ class ReplyCommitRepository:
 
     async def prepare(self, payload: PendingReplyCommit) -> bool:
         """插入发送意图；活动 operation 已存在时返回 False。"""
-        await self.ensure_schema()
         payload_hash = payload.payload_hash()
         async with self.pg_pool.acquire() as connection:
             row = await connection.fetchrow(
@@ -248,7 +176,6 @@ class ReplyCommitRepository:
 
     async def cancel_prepared(self, operation_id: str) -> bool:
         """发送失败时只取消尚未确认送达的意图并清除正文。"""
-        await self.ensure_schema()
         async with self.pg_pool.acquire() as connection:
             cancelled = await connection.fetchval(
                 """
@@ -277,7 +204,6 @@ class ReplyCommitRepository:
         platform_message_id: str | None = None,
     ) -> bool:
         """把 PREPARED 意图原子转换为可领取的 DELIVERED 任务。"""
-        await self.ensure_schema()
         async with self.pg_pool.acquire() as connection:
             delivered = await connection.fetchval(
                 """
@@ -329,7 +255,6 @@ class ReplyCommitRepository:
         lease_seconds: int,
     ) -> dict[str, Any] | None:
         """领取单个已送达任务，并回收其过期租约。"""
-        await self.ensure_schema()
         async with self.pg_pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
@@ -369,7 +294,6 @@ class ReplyCommitRepository:
         """以 SKIP LOCKED 批量领取到期任务。"""
         if limit <= 0:
             return []
-        await self.ensure_schema()
         async with self.pg_pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
                 """
@@ -537,7 +461,6 @@ class ReplyCommitRepository:
 
     async def cleanup_tombstones(self, *, retention_days: int) -> int:
         """清理过期的 COMPLETED/CANCELLED 防重记录。"""
-        await self.ensure_schema()
         async with self.pg_pool.acquire() as connection:
             result = await connection.execute(
                 """

@@ -30,6 +30,7 @@ from komari_bot.common.prompt_storage import (
     replace_prompt_values_async,
     update_prompt_field_async,
 )
+from komari_bot.common.typed_config import ensure_typed_prompt_model
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -177,7 +178,12 @@ async def _update_prompt_field(
 
 
 def _build_config_source(resource: ManagedPromptResource) -> str:
-    return f"postgresql:komari_prompt_configs:{resource.resource_id}"
+    """Prompt 资源的存储来源标识，表名取自强类型 Prompt 表。"""
+    model_cls = ensure_typed_prompt_model(resource.resource_id)
+    if model_cls is None:
+        msg = f"Prompt 资源 {resource.resource_id} 未注册强类型 Prompt 表"
+        raise RuntimeError(msg)
+    return f"postgresql:{model_cls.__tablename__}:{resource.resource_id}"
 
 
 def _build_resource_summary(resource: ManagedPromptResource) -> PromptResourceSummary:

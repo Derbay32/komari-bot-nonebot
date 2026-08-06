@@ -9,7 +9,7 @@ from __future__ import annotations
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.database_config import get_shared_database_config
+from komari_bot.common.orm_config import is_orm_database_url_configured
 
 from .api import register_knowledge_api
 from .config_schema import DynamicConfigSchema
@@ -69,11 +69,10 @@ async def on_startup() -> None:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
         return
 
-    db_config = get_shared_database_config()
-    if not db_config.pg_user or not db_config.pg_password:
+    if not is_orm_database_url_configured():
         logger.warning(
-            "[Komari Knowledge] 数据库用户名或密码未配置，跳过初始化。"
-            "请在 database_config 中设置 pg_user 和 pg_password"
+            "[Komari Knowledge] 未配置 SQLALCHEMY_DATABASE_URL，跳过初始化。"
+            "请通过环境变量或 dotenv 设置 nonebot-plugin-orm 的连接串"
         )
         return
 

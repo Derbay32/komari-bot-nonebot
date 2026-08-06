@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from sqlalchemy.dialects.postgresql import JSONB
 
 from komari_bot.common.management_api import management_token_meets_minimum_strength
+from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
 _CREDENTIAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -90,28 +92,27 @@ class ManagementCredentialSchema(BaseModel):
         return value.astimezone(UTC)
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """Komari Management 配置模型。"""
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "restart"},
-    )
+    plugin_name: ClassVar[str] = "komari_management"
+    __tablename__ = "komari_management_config"
 
-    version: str = Field(default="2.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "restart"},
     )
 
     plugin_enable: bool = Field(default=False, description="是否启用统一管理 API 插件")
     api_credentials: list[ManagementCredentialSchema] = Field(
         default_factory=list,
         max_length=32,
+        sa_type=JSONB,
         description="具名管理凭据列表",
         json_schema_extra={"secret": True, "apply_mode": "immediate"},
     )
     api_allowed_origins: list[str] = Field(
         default_factory=list,
+        sa_type=JSONB,
         description="允许访问管理 API 的前端 Origin 白名单",
     )
     announce_status_page_url: str = Field(
