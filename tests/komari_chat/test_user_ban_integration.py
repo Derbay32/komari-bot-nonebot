@@ -10,11 +10,8 @@ import pytest
 from nonebot.adapters.onebot.v11 import Message
 from nonebot.adapters.onebot.v11.event import Sender
 
+from komari_bot.decision import DecisionOutcome, DecisionRuntimeStatus
 from komari_bot.plugins.komari_chat.handlers.message_handler import MessageHandler
-from komari_bot.plugins.komari_decision.services.decision_engine import DecisionOutcome
-from komari_bot.plugins.komari_decision.services.runtime_state import (
-    DecisionRuntimeStatus,
-)
 
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"

@@ -26,12 +26,11 @@ if TYPE_CHECKING:
 permission_manager_plugin = require("permission_manager")
 user_ban_plugin = require("user_ban")
 memory_plugin = require("komari_memory")
-decision_plugin = require("komari_decision")
+require("komari_decision")
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
-get_decision_plugin_manager = decision_plugin.get_plugin_manager
-get_decision_runtime_state = getattr(decision_plugin, "get_runtime_state", None)
 
+from komari_bot.plugins.komari_decision import get_decision_engine
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
 __plugin_meta__ = PluginMetadata(
@@ -46,7 +45,7 @@ _handler: MessageHandler | None = None
 _reply_commit_worker_task: asyncio.Task[None] | None = None
 
 
-def _resolve_runtime_components() -> tuple[Any, Any, Any | None, Any] | None:
+def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
     memory_manager = get_memory_plugin_manager()
     if (
         memory_manager is None
@@ -54,12 +53,10 @@ def _resolve_runtime_components() -> tuple[Any, Any, Any | None, Any] | None:
         or memory_manager.memory is None
     ):
         return None
-    decision_manager = get_decision_plugin_manager()
-    scene_runtime = None if decision_manager is None else decision_manager.scene_runtime
-    state_provider = (
-        get_decision_runtime_state if callable(get_decision_runtime_state) else None
-    )
-    return memory_manager.redis, memory_manager.memory, scene_runtime, state_provider
+    decision_engine = get_decision_engine()
+    if decision_engine is None:
+        return None
+    return memory_manager.redis, memory_manager.memory, decision_engine
 
 
 def _get_or_build_handler() -> MessageHandler | None:
@@ -68,19 +65,13 @@ def _get_or_build_handler() -> MessageHandler | None:
     components = _resolve_runtime_components()
     if components is None:
         return None
-    redis, memory, scene_runtime, state_provider = components
+    redis, memory, decision_engine = components
 
-    if (
-        _handler is None
-        or _handler.redis is not redis
-        or _handler.memory is not memory
-        or _handler.scene_runtime is not scene_runtime
-    ):
+    if _handler is None or _handler.decision_engine is not decision_engine:
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
-            scene_runtime=scene_runtime,
-            decision_runtime_state_provider=state_provider,
+            decision_engine=decision_engine,
         )
     return _handler
 
