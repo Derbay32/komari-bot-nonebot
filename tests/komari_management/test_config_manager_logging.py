@@ -31,14 +31,14 @@ class _FakeStorage:
         self,
         config_data: dict[str, Any] | None = None,
         *,
-        fail_upsert: bool = False,
+        fail_update: bool = False,
         conflict_data: dict[str, Any] | None = None,
     ) -> None:
         self.config_data: dict[str, Any] = config_data or {
             "private_value": "old-value",
             "public_name": "old-name",
         }
-        self.fail_upsert = fail_upsert
+        self.fail_update = fail_update
         self.conflict_data = conflict_data
         self.revision = 1
         self.saved_payloads: list[dict[str, Any]] = []
@@ -46,9 +46,7 @@ class _FakeStorage:
     def fetch(self, plugin_name: str) -> StoredConfig:
         return StoredConfig(
             plugin_name=plugin_name,
-            schema_name="TestSchema",
-            config_data=self.config_data,
-            version="1.0",
+            config_data=dict(self.config_data),
             revision=self.revision,
             updated_at=datetime.now().astimezone(),
         )
@@ -56,78 +54,59 @@ class _FakeStorage:
     async def fetch_async(self, plugin_name: str) -> StoredConfig:
         return self.fetch(plugin_name)
 
-    def upsert(
+    def register_watcher(
         self,
+        _plugin_name: str,
+        _callback: object,
         *,
-        plugin_name: str,
-        schema_name: str,
-        config_data: dict[str, Any],
-        version: str,
-    ) -> StoredConfig:
-        if self.fail_upsert:
-            msg = "写入失败"
-            raise RuntimeError(msg)
-        self.config_data = config_data
-        self.revision += 1
-        self.saved_payloads.append(config_data)
-        return StoredConfig(
-            plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_data=config_data,
-            version=version,
-            revision=self.revision,
-            updated_at=datetime.now().astimezone(),
-        )
+        _max_staleness_seconds: float = 1.0,
+        **_kwargs: Any,
+    ) -> None:
+        return None
 
-    async def upsert_async(
-        self,
-        *,
-        plugin_name: str,
-        schema_name: str,
-        config_data: dict[str, Any],
-        version: str,
+    def insert_if_absent(
+        self, *, plugin_name: str, config: BaseModel
     ) -> StoredConfig:
-        return self.upsert(
-            plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_data=config_data,
-            version=version,
-        )
+        if not self.config_data:
+            self.config_data = config.model_dump(mode="json")
+            self.saved_payloads.append(dict(self.config_data))
+        return self.fetch(plugin_name)
+
+    async def insert_if_absent_async(
+        self, *, plugin_name: str, config: BaseModel
+    ) -> StoredConfig:
+        return self.insert_if_absent(plugin_name=plugin_name, config=config)
 
     def update_if_unchanged(
         self,
         *,
         plugin_name: str,
-        schema_name: str,
-        config_data: dict[str, Any],
-        version: str,
+        config: BaseModel,
         expected_updated_at: datetime,
     ) -> StoredConfig | None:
         del expected_updated_at
+        if self.fail_update:
+            msg = "写入失败"
+            raise RuntimeError(msg)
         if self.conflict_data is not None:
-            self.config_data = self.conflict_data
+            self.config_data = dict(self.conflict_data)
+            self.revision += 1
             return None
-        return self.upsert(
-            plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_data=config_data,
-            version=version,
-        )
+        self.config_data = config.model_dump(mode="json")
+        self.revision += 1
+        self.saved_payloads.append(dict(self.config_data))
+        return self.fetch(plugin_name)
 
     async def update_if_unchanged_async(
         self,
         *,
         plugin_name: str,
-        schema_name: str,
-        config_data: dict[str, Any],
-        version: str,
+        config: BaseModel,
         expected_updated_at: datetime,
     ) -> StoredConfig | None:
         return self.update_if_unchanged(
             plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_data=config_data,
-            version=version,
+            config=config,
             expected_updated_at=expected_updated_at,
         )
 
@@ -135,35 +114,33 @@ class _FakeStorage:
         self,
         *,
         plugin_name: str,
-        schema_name: str,
-        config_patch: dict[str, Any],
-        version: str,
+        config: BaseModel,
+        field_names: set[str],
         expected_revision: int,
     ) -> StoredConfig | None:
         if expected_revision != self.revision:
             return None
-        updated_data = {**self.config_data, **config_patch}
-        return self.upsert(
-            plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_data=updated_data,
-            version=version,
-        )
+        new_dump = config.model_dump(mode="json")
+        self.config_data = {
+            **self.config_data,
+            **{key: new_dump[key] for key in field_names},
+        }
+        self.revision += 1
+        self.saved_payloads.append(dict(self.config_data))
+        return self.fetch(plugin_name)
 
     async def update_fields_if_revision_async(
         self,
         *,
         plugin_name: str,
-        schema_name: str,
-        config_patch: dict[str, Any],
-        version: str,
+        config: BaseModel,
+        field_names: set[str],
         expected_revision: int,
     ) -> StoredConfig | None:
         return self.update_fields_if_revision(
             plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_patch=config_patch,
-            version=version,
+            config=config,
+            field_names=field_names,
             expected_revision=expected_revision,
         )
 
@@ -195,9 +172,8 @@ class _SingleConflictStorage(_FakeStorage):
         self,
         *,
         plugin_name: str,
-        schema_name: str,
-        config_patch: dict[str, Any],
-        version: str,
+        config: BaseModel,
+        field_names: set[str],
         expected_revision: int,
     ) -> StoredConfig | None:
         if not self.conflict_injected:
@@ -207,9 +183,8 @@ class _SingleConflictStorage(_FakeStorage):
             return None
         return super().update_fields_if_revision(
             plugin_name=plugin_name,
-            schema_name=schema_name,
-            config_patch=config_patch,
-            version=version,
+            config=config,
+            field_names=field_names,
             expected_revision=expected_revision,
         )
 
@@ -241,11 +216,10 @@ def test_initialize_syncs_added_removed_and_converted_fields(
     assert config.retry_count == 7
     assert config.public_name == "默认名称"
     assert fake_storage.saved_payloads == [
-        {"retry_count": 7, "legacy_field": "旧字段", "public_name": "默认名称"}
+        {"retry_count": 7, "public_name": "默认名称"}
     ]
     assert fake_storage.config_data == {
         "retry_count": 7,
-        "legacy_field": "旧字段",
         "public_name": "默认名称",
     }
     assert any("sync_result=success" in msg for msg in fake_logger.info_messages)
@@ -262,14 +236,14 @@ def test_reload_syncs_stored_config(
 
     assert config.retry_count == 3
     assert fake_storage.saved_payloads == [
-        {"legacy_field": "旧字段", "retry_count": 3, "public_name": "默认名称"}
+        {"retry_count": 3, "public_name": "默认名称"}
     ]
 
 
 def test_sync_failure_keeps_memory_config_and_warns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_storage = _FakeStorage({"legacy_field": "旧字段"}, fail_upsert=True)
+    fake_storage = _FakeStorage({"legacy_field": "旧字段"}, fail_update=True)
     fake_logger = _FakeLogger()
     monkeypatch.setattr(manager_module, "get_config_storage", lambda: fake_storage)
     monkeypatch.setattr(manager_module, "logger", fake_logger)

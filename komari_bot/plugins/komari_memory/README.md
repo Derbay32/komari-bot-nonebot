@@ -8,20 +8,20 @@
 - 数据访问：`repositories/`
 - 核心服务：`services/`
 - 后台任务：`handlers/summary_worker.py`、`handlers/forgetting_worker.py`
-- Schema 唯一真源：`komari_bot/common/vector_storage_schema.py`
+- Schema 唯一权威：`migrations/` Alembic 版本链（`0001_baseline_full_schema.py`）；`komari_bot/db/vector_storage_schema.py` 仅用于离线渲染对照 SQL
 
-运行时已经支持：
+运行时特性：
 
-- 按当前 `embedding_provider` 维度自动补齐基础表结构
-- 启动阶段校验向量列维度
-- 维度不匹配时通过迁移脚本升级
+- 连接统一经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层（nonebot-plugin-orm 托管，保留 asyncpg 风格 `$n` SQL）
+- 表结构与 HNSW 索引由 Alembic 迁移统一管理，运行时无任何 DDL
+- 启动阶段校验向量列维度；维度不匹配时通过迁移脚本升级
 
-历史 `database/init_orm.sql` 已废弃并会直接退出，避免旧表结构被误用。预建表、
-手工运维或排障时，必须通过生成脚本从运行时 DDL 真源生成一次性 SQL。
+历史 `database/init_orm.sql` 已废弃并会直接退出，避免旧表结构被误用。手工预建、
+运维或排障时，通过 `scripts/render_memory_schema.py` 从迁移结构生成一次性 SQL。
 
 ## 依赖
 
-- PostgreSQL 12+，并安装 `pgvector`
+- PostgreSQL 12+，并安装 `pgvector`；连接由 nonebot-plugin-orm（`SQLALCHEMY_DATABASE_URL`）统一托管
 - Redis 5+
 - `embedding_provider`
 - `llm_provider`
@@ -32,9 +32,9 @@
 
 ### 1. 配置数据库与 Redis
 
-共享数据库与 Redis 引导配置从 `.env` / `.env.dev` / `.env.prod` 或进程环境变量读取。
+数据库连接唯一权威是 `SQLALCHEMY_DATABASE_URL`（`.env` / `.env.dev` / `.env.prod` 或进程环境变量，旧 `PG_*` 配置已下线）；Redis 引导配置为 `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`（见 `komari_bot/config/redis_config.py`）。
 
-插件动态配置存储在 PostgreSQL `komari_plugin_configs` 表，首次缺失时由 schema 默认值或 dotenv 初始化。
+插件动态配置存储在强类型单行表 `komari_memory_config`，首次缺失时由 schema 默认值或 dotenv 初始化。
 
 最小示例：
 
@@ -42,8 +42,6 @@
 {
   "plugin_enable": true,
   "group_whitelist": ["123456789"],
-  "pg_user": "your_username",
-  "pg_password": "your_password",
   "redis_host": "localhost",
   "redis_port": 6379
 }
@@ -53,8 +51,8 @@
 
 Bot 启动后：
 
-- 会建立 PostgreSQL 连接池
-- 会按当前 embedding 维度自动补齐记忆正文表与独立 embedding 表
+- 会初始化共享引擎连接租约（nonebot-plugin-orm）
+- 表结构由 Alembic 迁移统一管理，无需运行时补齐
 - 会校验独立 embedding 表与 provider 维度一致
 - 会初始化 Redis 缓冲区管理
 - 会注册总结任务和忘却任务
@@ -96,26 +94,11 @@ poetry run python scripts/migrate_embeddings.py --target memory
 poetry run python scripts/migrate_embeddings.py --apply --target memory
 ```
 
-### 单表实体拆表迁移
+### 单表实体拆表
 
-如果你的库里仍然只有旧的 `komari_memory_entity`，先做 dry-run：
-
-```bash
-poetry run python scripts/split_komari_memory_entity_tables.py
-```
-
-确认后执行真实迁移：
-
-```bash
-poetry run python scripts/split_komari_memory_entity_tables.py --apply
-```
-
-如果只想手工应用约束：
-
-```bash
-psql -h localhost -U your_username -d komari_bot \
-  -f komari_bot/plugins/komari_memory/database/entity_unification_constraints.sql
-```
+记忆四层与独立 embedding 表的最终结构已由 Alembic 基线 `0001` 一次性建立；
+v1.x 时代的手工拆表脚本（`split_komari_memory_entity_tables.py` 等）已随
+v2.0.0 删除，不再需要单独执行。
 
 ## 核心能力
 
@@ -146,7 +129,11 @@ psql -h localhost -U your_username -d komari_bot \
 
 ### scene 持久化依赖
 
-`scene` 运行时已迁到 `komari_decision`，但 PostgreSQL 连接池和共享配置仍由 `komari_memory` 提供依赖。
+`scene` 运行时位于 `komari_decision`，其四张表（`komari_decision_scenes` /
+`komari_memory_scene_set` / `komari_memory_scene_item` /
+`komari_memory_scene_runtime`）为 SQLModel ORM 模型，经
+nonebot-plugin-orm `get_session` 访问；embedding 生成仍依赖
+`komari_memory` 提供的服务。
 
 相关配置：
 
@@ -171,7 +158,6 @@ psql -h localhost -U your_username -d komari_bot \
 | `plugin_enable` | `false` | 插件总开关 |
 | `user_whitelist` | `[]` | 用户白名单 |
 | `group_whitelist` | `[]` | 群白名单 |
-| `pg_host` / `pg_port` / `pg_database` / `pg_user` / `pg_password` | `None` | 可选：覆盖共享数据库配置 |
 | `redis_host` | `localhost` | Redis 主机 |
 | `redis_port` | `6379` | Redis 端口 |
 | `redis_db` | `1` | Redis DB |
@@ -248,10 +234,10 @@ psql -h localhost -U your_username -d komari_bot \
 拿到 `PluginManager`，再访问：
 
 - `manager.memory`
-- `manager.pg_pool`
+- `manager.pg_pool`（`SharedEngineConnectionPool`：nonebot-plugin-orm 共享引擎的 asyncpg 兼容连接租约，`acquire()` 借出底层连接）
 - `manager.redis`
 
-`komari_decision` 的 scene 子系统就是这样复用 `komari_memory` 的 PostgreSQL 连接池。
+`komari_decision` 的 scene 子系统通过 `get_session()` 访问自己的 ORM 表，不共用记忆插件的连接池。
 
 ## 排障
 
@@ -261,7 +247,7 @@ psql -h localhost -U your_username -d komari_bot \
 
 - `plugin_enable` 是否为 `true`
 - `group_whitelist` 是否配置了目标群
-- 共享数据库配置或本地 `pg_user` / `pg_password` 是否完整
+- `SQLALCHEMY_DATABASE_URL` 是否已正确配置（旧 `pg_user` / `pg_password` 已随 v2.0.0 下线）
 
 ### 向量维度不匹配
 

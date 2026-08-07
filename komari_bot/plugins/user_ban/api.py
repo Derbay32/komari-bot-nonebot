@@ -9,12 +9,12 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Quer
 from nonebot import logger
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
-from komari_bot.common.management_audit import (
+from komari_bot.management.management_audit import (
     hash_management_target,
     management_audit_span,
     record_management_audit_event,
@@ -45,8 +45,8 @@ from .service import BanServiceUnavailableError, UserBanService, get_service
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditRecorder
 
 API_PREFIX = "/api/v2/komari-user-bans"
 MANAGEMENT_API_OPERATOR_ID = "management_api"

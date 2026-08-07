@@ -22,7 +22,7 @@ from komari_bot.plugins.user_ban.service import BanServiceUnavailableError
 if TYPE_CHECKING:
     from nonebug import App
 
-    from komari_bot.common.management_audit import ManagementAuditEvent
+    from komari_bot.management.management_audit import ManagementAuditEvent
 
 
 def _record(

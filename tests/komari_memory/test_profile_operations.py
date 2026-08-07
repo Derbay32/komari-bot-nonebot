@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from komari_bot.common.profile_operations import (
+from komari_bot.memory.profile_operations import (
     ProfileDiffItem,
     ProfileOperation,
     build_profile_traits_patch,

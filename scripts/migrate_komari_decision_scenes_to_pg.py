@@ -124,19 +124,6 @@ _SCENE_SCHEMA_STATEMENTS = (
 
 
 @dataclass(frozen=True)
-class DatabaseConfig:
-    """PostgreSQL 连接配置。"""
-
-    pg_host: str = "localhost"
-    pg_port: int = 5432
-    pg_database: str = "komari_bot"
-    pg_user: str = ""
-    pg_password: str = ""
-    pg_pool_min_size: int = 2
-    pg_pool_max_size: int = 5
-
-
-@dataclass(frozen=True)
 class SceneTemplateItem:
     """标准化后的 scene 条目。"""
 
@@ -216,47 +203,21 @@ def _load_dotenv_file(env_path: Path) -> None:
             os.environ[key] = value
 
 
-def _get_env(key: str, default: str) -> str:
-    """读取环境变量，兼容项目配置里的大小写键名。"""
-    return os.getenv(key) or os.getenv(key.lower()) or default
+def _resolve_dsn() -> str:
+    """读取 nonebot-plugin-orm 权威数据库连接串（SQLALCHEMY_DATABASE_URL）。"""
+    dsn = os.getenv("SQLALCHEMY_DATABASE_URL")
+    if not dsn:
+        msg = (
+            "未配置 SQLALCHEMY_DATABASE_URL，"
+            "请通过环境变量或 dotenv 设置 nonebot-plugin-orm 的连接串"
+        )
+        raise RuntimeError(msg)
+    return dsn
 
 
-def _get_env_int(key: str, default: int) -> int:
-    raw = os.getenv(key) or os.getenv(key.lower())
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError as e:
-        msg = f"环境变量 {key} 必须是整数: {raw}"
-        raise ValueError(msg) from e
-
-
-def _load_database_config_from_env() -> DatabaseConfig:
-    """从 dotenv 已注入的环境变量读取 PostgreSQL 配置。"""
-    return DatabaseConfig(
-        pg_host=_get_env("PG_HOST", "localhost"),
-        pg_port=_get_env_int("PG_PORT", 5432),
-        pg_database=_get_env("PG_DATABASE", "komari_bot"),
-        pg_user=_get_env("PG_USER", ""),
-        pg_password=_get_env("PG_PASSWORD", ""),
-        pg_pool_min_size=_get_env_int("PG_POOL_MIN_SIZE", 2),
-        pg_pool_max_size=_get_env_int("PG_POOL_MAX_SIZE", 5),
-    )
-
-
-async def _create_postgres_pool(config: DatabaseConfig) -> asyncpg.Pool:
-    """创建 PostgreSQL 连接池。"""
-    return await asyncpg.create_pool(
-        host=config.pg_host,
-        port=config.pg_port,
-        database=config.pg_database,
-        user=config.pg_user,
-        password=config.pg_password,
-        min_size=config.pg_pool_min_size,
-        max_size=config.pg_pool_max_size,
-        command_timeout=60,
-    )
+async def _create_pool_from_dsn(dsn: str) -> asyncpg.Pool:
+    """创建脚本专用 PostgreSQL 连接池。"""
+    return await asyncpg.create_pool(dsn=dsn, command_timeout=60)
 
 
 def _compute_text_hash(text: str) -> str:
@@ -491,7 +452,7 @@ async def _run() -> None:
     payload = _load_scene_template(args.source_path)
     _validate_items(payload.items)
 
-    pool = await _create_postgres_pool(_load_database_config_from_env())
+    pool = await _create_pool_from_dsn(_resolve_dsn())
     try:
         existing_rows = await _list_scenes(pool)
         stats = _build_stats(payload.items, existing_rows, payload.source_hash)

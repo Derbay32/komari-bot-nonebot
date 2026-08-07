@@ -10,7 +10,7 @@ from typing import Any
 from nonebot import logger
 from PIL import Image, ImageDraw, ImageFont
 
-from komari_bot.common.project_paths import DATA_DIR
+from komari_bot.core.project_paths import DATA_DIR
 
 FontLike = ImageFont.FreeTypeFont | ImageFont.ImageFont
 

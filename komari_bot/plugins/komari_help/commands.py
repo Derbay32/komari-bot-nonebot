@@ -10,7 +10,7 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import require
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .config_schema import DynamicConfigSchema
 from .engine import get_engine

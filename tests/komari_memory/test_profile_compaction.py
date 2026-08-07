@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from komari_bot.common import profile_compaction as profile_compaction_module
+from komari_bot.memory import profile_compaction as profile_compaction_module
 
 
 def _make_profile(trait_count: int, *, uniform: bool = False) -> dict[str, Any]:

@@ -11,7 +11,7 @@ from typing import Any
 
 import nonebot.plugin
 
-from komari_bot.common.profile_operations import (
+from komari_bot.memory.profile_operations import (
     CommitResult,
     PreviewResult,
     ProfileDiffItem,

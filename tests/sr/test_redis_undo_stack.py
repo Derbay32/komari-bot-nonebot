@@ -137,7 +137,7 @@ async def test_redis_client_uses_structured_connection_arguments_and_single_init
     monkeypatch.setattr(redis_module.aioredis, "Redis", _create_redis)
     monkeypatch.setattr(
         redis_module,
-        "get_shared_database_config",
+        "get_shared_redis_config",
         lambda: SimpleNamespace(
             redis_host="redis.internal",
             redis_port=6380,

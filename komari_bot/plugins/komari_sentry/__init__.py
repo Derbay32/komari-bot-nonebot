@@ -12,7 +12,7 @@ from nonebot.plugin import PluginMetadata
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
-from komari_bot.common.sentry_support import (
+from komari_bot.core.sentry_support import (
     build_sentry_init_options,
     ensure_sentry_privacy_hooks,
     set_sensitive_value_collector,

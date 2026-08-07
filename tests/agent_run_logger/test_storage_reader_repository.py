@@ -6,19 +6,15 @@ import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import pytest
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 from komari_bot.plugins.agent_run_logger import reader as reader_module
 from komari_bot.plugins.agent_run_logger import storage as storage_module
 from komari_bot.plugins.agent_run_logger.reader import AgentRunLogReader
 from komari_bot.plugins.agent_run_logger.repository import (
-    _SCHEMA_STATEMENTS,
-    AgentRunIndexRepository,
     IndexUnavailableError,
 )
 from komari_bot.plugins.agent_run_logger.storage import (
@@ -119,9 +115,6 @@ class _FailingThenReconcilingRepository:
     async def initialize(self) -> bool:
         return True
 
-    async def cleanup_legacy_provider_config(self) -> bool:
-        return True
-
     async def upsert_many(self, _entries: object) -> bool:
         self.upsert_calls += 1
         return False
@@ -218,138 +211,17 @@ def test_cleanup_retains_current_log_day_and_removes_legacy_sqlite(
     assert _remove_legacy_sqlite_sync() == 3
 
 
-class _ConfigConnection:
-    def __init__(self) -> None:
-        self.queries: list[str] = []
-
-    async def execute(self, query: str, *_args: object) -> str:
-        self.queries.append(query)
-        return "UPDATE 1"
-
-
-class _Acquire:
-    def __init__(self, connection: _ConfigConnection) -> None:
-        self.connection = connection
-
-    async def __aenter__(self) -> _ConfigConnection:
-        return self.connection
-
-    async def __aexit__(self, *_args: object) -> None:
-        return None
-
-
-class _ConfigPool:
-    def __init__(self, connection: _ConfigConnection) -> None:
-        self.connection = connection
-
-    def acquire(self) -> _Acquire:
-        return _Acquire(self.connection)
-
-
-class _Transaction:
-    async def __aenter__(self) -> None:
-        return None
-
-    async def __aexit__(self, *_args: object) -> None:
-        return None
-
-
-class _ReconcileConnection(_ConfigConnection):
-    def __init__(self, *, lock_acquired: bool) -> None:
-        super().__init__()
-        self.lock_acquired = lock_acquired
-        self.fetchval_calls: list[tuple[str, tuple[object, ...]]] = []
-        self.executemany_calls: list[tuple[str, list[tuple[object, ...]]]] = []
-        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
-
-    def transaction(self) -> _Transaction:
-        return _Transaction()
-
-    async def fetchval(self, query: str, *args: object) -> bool:
-        self.fetchval_calls.append((query, args))
-        return self.lock_acquired
-
-    async def executemany(
-        self,
-        query: str,
-        values: list[tuple[object, ...]],
-    ) -> None:
-        self.executemany_calls.append((query, values))
-
-    async def execute(self, query: str, *args: object) -> str:
-        self.execute_calls.append((query, args))
-        return "DELETE 0"
-
-
-@pytest.mark.asyncio
-async def test_legacy_provider_config_cleanup_is_physical_atomic_and_idempotent() -> None:
-    connection = _ConfigConnection()
-    repository = AgentRunIndexRepository()
-    repository._pool = _ConfigPool(connection)  # type: ignore[assignment]
-    repository._available = True
-
-    assert await repository.cleanup_legacy_provider_config()
-    assert await repository.cleanup_legacy_provider_config()
-    assert len(connection.queries) == 1
-    query = connection.queries[0]
-    assert "config_data = config_data - ARRAY" in query
-    assert "llm_log_retention_days" in query
-    assert "llm_log_dir_permission_mode" in query
-    assert "revision = revision + 1" in query
-    assert "config_data ?| ARRAY" in query
-
-
-@pytest.mark.asyncio
-async def test_reconcile_uses_advisory_lock_and_repairs_missing_and_stale_rows(
-    tmp_path: Path,
-) -> None:
-    [entry] = _append_batch_sync(tmp_path, [_record("run-live")])
-    connection = _ReconcileConnection(lock_acquired=True)
-    repository = AgentRunIndexRepository()
-    repository._pool = _ConfigPool(connection)  # type: ignore[assignment]
-    repository._available = True
-
-    assert await repository.reconcile(
-        [entry],
-        retained_from=date(2026, 7, 22),
-    )
-    assert "pg_try_advisory_xact_lock" in connection.fetchval_calls[0][0]
-    assert len(connection.executemany_calls) == 1
-    assert connection.executemany_calls[0][1][0][0] == "run-live"
-    assert len(connection.execute_calls) == 2
-    assert connection.execute_calls[0][1] == (
-        date(2026, 7, 22),
-        ["run-live"],
-    )
-    assert "not (run_id = any" in connection.execute_calls[0][0].lower()
-    assert "log_date <" in connection.execute_calls[1][0].lower()
-
-
-@pytest.mark.asyncio
-async def test_reconcile_skips_when_another_worker_holds_advisory_lock(
-    tmp_path: Path,
-) -> None:
-    [entry] = _append_batch_sync(tmp_path, [_record("run-other-worker")])
-    connection = _ReconcileConnection(lock_acquired=False)
-    repository = AgentRunIndexRepository()
-    repository._pool = _ConfigPool(connection)  # type: ignore[assignment]
-    repository._available = True
-
-    assert not await repository.reconcile(
-        [entry],
-        retained_from=date(2026, 7, 22),
-    )
-    assert not connection.executemany_calls
-    assert not connection.execute_calls
-
-
 def test_pg_schema_contains_only_rebuildable_metadata() -> None:
-    ddl = "\n".join(_SCHEMA_STATEMENTS).lower()
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "migrations/versions/0001_baseline_full_schema.py"
+    )
+    ddl = migration_path.read_text(encoding="utf-8").lower()
+    assert "komari_agent_run_log_index" in ddl
     assert "create unlogged table" in ddl
     assert "byte_offset" in ddl
     assert "byte_length" in ddl
-    assert "using gin (models)" in ddl
-    assert "using gin (methods)" in ddl
+    assert "models" in ddl and "methods" in ddl
     for forbidden in (
         "input_preview",
         "output_preview",

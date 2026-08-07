@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from komari_bot.common.llm_protocol import RequestApi
-    from komari_bot.common.untrusted_context import UntrustedContext
+    from komari_bot.llm.llm_protocol import RequestApi
+    from komari_bot.llm.untrusted_context import UntrustedContext
 
 
 class UnifiedUsageSchema(BaseModel):

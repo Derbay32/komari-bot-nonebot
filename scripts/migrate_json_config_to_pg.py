@@ -19,8 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from komari_bot.common.database_config import load_database_config_from_env
-from komari_bot.common.postgres import create_postgres_pool
+import asyncpg
 
 logger = logging.getLogger("migrate_json_config_to_pg")
 logging.basicConfig(
@@ -162,11 +161,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_dsn() -> str:
+    """读取 nonebot-plugin-orm 权威数据库连接串（SQLALCHEMY_DATABASE_URL）。"""
+    dsn = os.environ.get("SQLALCHEMY_DATABASE_URL", "")
+    if not dsn:
+        msg = (
+            "未配置 SQLALCHEMY_DATABASE_URL，"
+            "请通过环境变量设置 nonebot-plugin-orm 的连接串"
+        )
+        raise RuntimeError(msg)
+    return dsn
+
+
 async def main_async() -> None:
     args = parse_args()
     _load_dotenv_file(args.env_file)
-    config = load_database_config_from_env()
-    pool = await create_postgres_pool(config)
+    pool = await asyncpg.create_pool(dsn=_resolve_dsn(), command_timeout=30)
     try:
         stats = await migrate_config_dir(args.config_dir, pool)
         logger.info(

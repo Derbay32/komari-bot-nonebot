@@ -1,89 +1,119 @@
-"""可选的真实 PostgreSQL 每日忘却账本集成测试。"""
+"""可选的真实 PostgreSQL 每日忘却账本集成测试。
+
+任务表由 Alembic 迁移管理；测试使用远期唯一 run_date 并清理任务行，
+仅保留 stage_effects 夹具表用于验证阶段事务性。仓库连接来源为插件公开的
+``create_pool()``（nonebot-plugin-orm 共享引擎租约）。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import suppress
 from datetime import date
-from uuid import uuid4
+from urllib.parse import urlparse
 
 import asyncpg
 import pytest
 
 from komari_bot.plugins.komari_memory.repositories.forgetting_job_repository import (
+    FORGETTING_JOB_NAME,
     ForgettingJobLeaseLostError,
     ForgettingJobRepository,
 )
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
 
+_RUN_DATE = date(9999, 12, 31)
+
+
+def _asyncpg_url() -> str:
+    return POSTGRES_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+
+def _configured_database_url() -> str:
+    from nonebot import get_driver
+
+    return str(getattr(get_driver().config, "sqlalchemy_database_url", "") or "")
+
+
+def _same_database(left: str, right: str) -> bool:
+    left_parsed = urlparse(left)
+    right_parsed = urlparse(right)
+    return (
+        left_parsed.hostname == right_parsed.hostname
+        and (left_parsed.port or 5432) == (right_parsed.port or 5432)
+        and left_parsed.path == right_parsed.path
+    )
+
+
+async def _reset_shared_orm_engine() -> None:
+    from nonebot import require
+
+    require("nonebot_plugin_orm")
+    import nonebot_plugin_orm as orm_module
+
+    engines = getattr(orm_module, "_engines", None)
+    if not engines:
+        return
+    for engine in list(engines.values()):
+        with suppress(Exception):
+            await engine.dispose()
+
 
 @pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
 def test_real_postgres_daily_job_owner_and_transactional_stage() -> None:
     async def _run() -> None:
-        schema = f"komari_forgetting_test_{uuid4().hex}"
-        admin = await asyncpg.connect(POSTGRES_URL)
-        await admin.execute(f'CREATE SCHEMA "{schema}"')
+        if not _same_database(POSTGRES_URL, _configured_database_url()):
+            pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
+        await _reset_shared_orm_engine()
+        from komari_bot.plugins.komari_memory.database.connection import create_pool
+
+        admin = await asyncpg.connect(_asyncpg_url())
+        await admin.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stage_effects (
+                counter INT NOT NULL
+            )
+            """
+        )
+        await admin.execute("DELETE FROM stage_effects")
+        await admin.execute("INSERT INTO stage_effects (counter) VALUES (0)")
+        first_pool = await create_pool()
+        second_pool = await create_pool()
         try:
-            await admin.execute(
-                f"""
-                CREATE TABLE "{schema}".komari_memory_jobs (
-                    job_name TEXT NOT NULL,
-                    run_date DATE NOT NULL,
-                    owner_token TEXT NOT NULL,
-                    lease_until TIMESTAMPTZ NOT NULL,
-                    stage TEXT NOT NULL,
-                    attempt INT NOT NULL DEFAULT 0,
-                    last_error_code TEXT,
-                    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMPTZ,
-                    PRIMARY KEY (job_name, run_date)
-                );
-                CREATE TABLE "{schema}".stage_effects (
-                    counter INT NOT NULL
-                );
-                INSERT INTO "{schema}".stage_effects (counter) VALUES (0)
-                """
-            )
-            settings = {"search_path": schema}
-            first_pool = await asyncpg.create_pool(
-                POSTGRES_URL,
-                min_size=1,
-                max_size=1,
-                server_settings=settings,
-            )
-            second_pool = await asyncpg.create_pool(
-                POSTGRES_URL,
-                min_size=1,
-                max_size=1,
-                server_settings=settings,
-            )
-            if first_pool is None or second_pool is None:
-                raise AssertionError
-            first = ForgettingJobRepository(first_pool)
-            second = ForgettingJobRepository(second_pool)
-            run_date = date(2026, 7, 17)
+            async with admin.transaction():
+                await admin.execute(
+                    "DELETE FROM komari_memory_jobs WHERE job_name = $1 AND run_date = $2",
+                    FORGETTING_JOB_NAME,
+                    _RUN_DATE,
+                )
+
+            first = ForgettingJobRepository(first_pool)  # type: ignore[arg-type]
+            second = ForgettingJobRepository(second_pool)  # type: ignore[arg-type]
             try:
                 first_claim = await first.claim(
-                    run_date=run_date,
+                    run_date=_RUN_DATE,
                     owner_token="owner-1",
                     lease_seconds=60,
                 )
                 busy_claim = await second.claim(
-                    run_date=run_date,
+                    run_date=_RUN_DATE,
                     owner_token="owner-2",
                     lease_seconds=60,
                 )
-                async with first_pool.acquire() as conn:
-                    await conn.execute(
+                async with admin.transaction():
+                    await admin.execute(
                         """
                         UPDATE komari_memory_jobs
                         SET lease_until = NOW() - INTERVAL '1 second'
-                        """
+                        WHERE job_name = $1 AND run_date = $2
+                        """,
+                        FORGETTING_JOB_NAME,
+                        _RUN_DATE,
                     )
                 takeover = await second.claim(
-                    run_date=run_date,
+                    run_date=_RUN_DATE,
                     owner_token="owner-2",
                     lease_seconds=60,
                 )
@@ -93,7 +123,7 @@ def test_real_postgres_daily_job_owner_and_transactional_stage() -> None:
                 assert takeover.status == "claimed"
                 with pytest.raises(ForgettingJobLeaseLostError):
                     await first.advance_stage(
-                        run_date=run_date,
+                        run_date=_RUN_DATE,
                         owner_token="owner-1",
                         lease_seconds=60,
                         expected_stage="claimed",
@@ -101,7 +131,7 @@ def test_real_postgres_daily_job_owner_and_transactional_stage() -> None:
                     )
 
                 await second.run_transactional_stage(
-                    run_date=run_date,
+                    run_date=_RUN_DATE,
                     owner_token="owner-2",
                     lease_seconds=60,
                     expected_stage="claimed",
@@ -109,27 +139,36 @@ def test_real_postgres_daily_job_owner_and_transactional_stage() -> None:
                     actions=(("UPDATE stage_effects SET counter = counter + 1", ()),),
                 )
                 await second.advance_stage(
-                    run_date=run_date,
+                    run_date=_RUN_DATE,
                     owner_token="owner-2",
                     lease_seconds=60,
                     expected_stage="conversation_decay_done",
                     next_stage="completed",
                 )
                 completed = await first.claim(
-                    run_date=run_date,
+                    run_date=_RUN_DATE,
                     owner_token="owner-3",
                     lease_seconds=60,
                 )
-                async with first_pool.acquire() as conn:
-                    counter = await conn.fetchval("SELECT counter FROM stage_effects")
+                counter = await admin.fetchval("SELECT counter FROM stage_effects")
 
                 assert completed.status == "completed"
                 assert counter == 1
             finally:
-                await first_pool.close()
-                await second_pool.close()
+                async with admin.transaction():
+                    await admin.execute(
+                        """
+                        DELETE FROM komari_memory_jobs
+                        WHERE job_name = $1 AND run_date = $2
+                        """,
+                        FORGETTING_JOB_NAME,
+                        _RUN_DATE,
+                    )
         finally:
-            await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+            await first_pool.close()  # type: ignore[attr-defined]
+            await second_pool.close()  # type: ignore[attr-defined]
+            await admin.execute("DROP TABLE IF EXISTS stage_effects")
             await admin.close()
+            await _reset_shared_orm_engine()
 
     asyncio.run(_run())

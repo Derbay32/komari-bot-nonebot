@@ -1,4 +1,7 @@
-"""可选的聊天副作用 outbox PostgreSQL 集成测试。"""
+"""可选的聊天副作用 outbox PostgreSQL 集成测试。
+
+依赖已执行 alembic upgrade head 的迁移管理 schema；测试使用唯一 operation_id 并清理行。
+"""
 
 from __future__ import annotations
 
@@ -14,6 +17,11 @@ from komari_bot.plugins.komari_chat.repositories.reply_commit_repository import 
 )
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
+
+
+def _asyncpg_url() -> str:
+    """剥离 ``+asyncpg`` scheme，得到 asyncpg 直连可解析的 URL。"""
+    return POSTGRES_URL.replace("postgresql+asyncpg://", "postgresql://")
 
 
 def _payload(operation_id: str) -> PendingReplyCommit:
@@ -44,19 +52,13 @@ def _payload(operation_id: str) -> PendingReplyCommit:
 @pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
 @pytest.mark.asyncio
 async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
-    schema_name = f"reply_commit_{uuid4().hex}"
-    admin = await asyncpg.connect(POSTGRES_URL)
-    pool: asyncpg.Pool | None = None
+    run_id = uuid4().hex
+    operation_id = f"operation-1-{run_id}"
+    cancelled_operation_id = f"operation-2-{run_id}"
+    pool = await asyncpg.create_pool(_asyncpg_url(), min_size=1, max_size=2)
     try:
-        await admin.execute(f"CREATE SCHEMA {schema_name}")
-        pool = await asyncpg.create_pool(
-            POSTGRES_URL,
-            min_size=1,
-            max_size=2,
-            server_settings={"search_path": schema_name},
-        )
         repository = ReplyCommitRepository(pool)
-        payload = _payload("operation-1")
+        payload = _payload(operation_id)
 
         assert await repository.prepare(payload) is True
         assert await repository.prepare(payload) is False
@@ -116,7 +118,7 @@ async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
         assert completed["proactive_reservation_id"] is None
         assert completed["completed_at"] is not None
 
-        cancelled_payload = _payload("operation-2")
+        cancelled_payload = _payload(cancelled_operation_id)
         assert await repository.prepare(cancelled_payload) is True
         assert await repository.cancel_prepared(cancelled_payload.operation_id) is True
         assert (
@@ -125,7 +127,12 @@ async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
         )
         assert await repository.prepare(cancelled_payload) is True
     finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
-        await admin.close()
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                DELETE FROM komari_chat_reply_commit_outbox
+                WHERE operation_id = ANY($1::text[])
+                """,
+                [operation_id, cancelled_operation_id],
+            )
+        await pool.close()

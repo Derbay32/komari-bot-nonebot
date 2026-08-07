@@ -11,13 +11,13 @@
 - REST API：`komari_bot/plugins/komari_knowledge/api.py`
 - 路由挂载：`komari_bot/plugins/komari_management/api_runtime.py`
 - 数据模型：`komari_bot/plugins/komari_knowledge/models.py`
-- 手工初始化 SQL：`komari_bot/plugins/komari_knowledge/init_db.sql`
+- 手工参考 SQL：`komari_bot/plugins/komari_knowledge/init_db.sql`（仅运维参考，不作为运行时 DDL 来源）
 
-运行时会自动补齐基础表结构并校验向量维度。手工 SQL 只在预建表、运维或排障时需要。
+表结构与向量列 DDL 由 Alembic 迁移链统一管理（`migrations/versions/0001_baseline_full_schema.py`），运行时不再执行任何建表语句；启动时只校验向量维度。
 
 ## 依赖
 
-- PostgreSQL 12+，并安装 `pgvector`
+- PostgreSQL 12+，并安装 `pgvector`；连接由 nonebot-plugin-orm（`SQLALCHEMY_DATABASE_URL`）统一托管
 - `embedding_provider` 插件
 - `config_manager` 插件
 - `nonebot2[fastapi]`
@@ -26,9 +26,9 @@
 
 ### 1. 配置数据库
 
-共享数据库配置从 `.env` / `.env.dev` / `.env.prod` 或进程环境变量读取。
+数据库连接唯一权威是 `SQLALCHEMY_DATABASE_URL`（`.env` / `.env.dev` / `.env.prod` 或进程环境变量，旧 `PG_*` 配置已下线）。
 
-`komari_knowledge` 的动态配置存储在 PostgreSQL `komari_plugin_configs` 表。
+`komari_knowledge` 的动态配置存储在强类型单行表 `komari_knowledge_config`（由 `config_manager` 管理）。
 
 最小可用示例：
 
@@ -40,7 +40,7 @@
 
 ### 2. 配置 embedding_provider
 
-向量维度来自 `embedding_provider` 的 PostgreSQL 动态配置。
+向量维度来自 `embedding_provider` 的动态配置（强类型表 `komari_embedding_provider_config`）。
 
 默认配置对应 512 维向量；如果切换模型或 API 端点，请保持知识库和记忆库使用同一 provider 配置。
 
@@ -49,7 +49,7 @@
 Bot 启动后：
 
 - 会初始化 `KnowledgeEngine`
-- 会按当前 embedding 维度自动补齐 `komari_knowledge` 表结构
+- 表结构由 Alembic 迁移统一管理，无需运行时补齐
 - 会校验 `komari_knowledge.embedding` 与当前 provider 维度是否一致
 - `komari_management` 启用且具名凭据有效时，会统一挂载管理 REST API
 
@@ -57,7 +57,7 @@ Bot 启动后：
 
 ### 手工初始化 SQL
 
-大多数场景不需要手工执行；若需要，可运行：
+Schema 唯一权威是 `migrations/` Alembic 版本链，正常运行不需要手工建表；`init_db.sql` 仅保留为运维参考。确需预建或排障时，可运行：
 
 ```bash
 psql -h localhost -U your_username -d komari_bot \
@@ -234,7 +234,6 @@ for item in results:
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `plugin_enable` | `false` | 插件总开关 |
-| `pg_host` / `pg_port` / `pg_database` / `pg_user` / `pg_password` | `None` | 可选：覆盖共享数据库配置 |
 | `similarity_threshold` | `0.65` | 向量检索最低相似度阈值 |
 | `query_rewrite_rules` | `{"你": "小鞠", "您的": "小鞠的"}` | 查询重写规则 |
 | `layer1_limit` | `3` | Layer 1 关键词匹配返回上限 |
@@ -262,14 +261,14 @@ for item in results:
 - `komari_management.api_credentials` 是否至少包含一条有效凭据
 - `.env` / `env.example` 中的驱动是否仍为 `DRIVER=~fastapi`
 
-### 数据库密码未配置
+### 数据库连接未配置
 
-现象：启动日志提示数据库用户名或密码未配置，插件跳过初始化。
+现象：启动日志提示未配置 `SQLALCHEMY_DATABASE_URL`，插件跳过初始化。
 
 处理：检查：
 
-- `.env` / `.env.prod` 中的 `PG_USER`、`PG_PASSWORD` 等字段
-- PostgreSQL `komari_plugin_configs` 中的 `komari_knowledge` 配置
+- `.env` / `.env.prod` 是否设置了 `SQLALCHEMY_DATABASE_URL`（旧 `PG_USER`、`PG_PASSWORD` 等字段已随 v2.0.0 下线）
+- `komari_knowledge_config` 表中是否已有可用的 `komari_knowledge` 配置
 
 ### 向量维度不匹配
 

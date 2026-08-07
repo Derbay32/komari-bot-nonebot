@@ -9,7 +9,7 @@ from uuid import uuid4
 from nonebot import get_bots, logger, on_notice
 from nonebot.adapters.onebot.v11 import Bot, NoticeEvent  # noqa: TC002
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .proposal_repository import ProposalRepository  # noqa: TC001
 

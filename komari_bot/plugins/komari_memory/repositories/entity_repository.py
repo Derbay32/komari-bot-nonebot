@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 from nonebot import logger
 
-from komari_bot.common.sql_like_utils import escape_like_pattern
+from komari_bot.db.sql_like_utils import escape_like_pattern
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import asyncpg
+    from komari_bot.db.orm_connection import SharedEngineConnectionPool
 
 _PROFILE_KEY = "user_profile"
 _PROFILE_CATEGORY = "profile_json"
@@ -107,7 +107,7 @@ class UserProfileBatchUpsertError(RuntimeError):
 class EntityRepository:
     """画像与互动历史数据访问仓库。"""
 
-    def __init__(self, pg_pool: asyncpg.Pool) -> None:
+    def __init__(self, pg_pool: SharedEngineConnectionPool) -> None:
         self.pg_pool = pg_pool
 
     async def upsert_user_profile(

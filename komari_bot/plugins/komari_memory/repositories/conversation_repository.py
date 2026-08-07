@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
-from komari_bot.common.sql_like_utils import escape_like_pattern
+from komari_bot.db.sql_like_utils import escape_like_pattern
 
 if TYPE_CHECKING:
-    import asyncpg
+    from komari_bot.db.orm_connection import SharedEngineConnectionPool
 
 
 def _build_content_hash(content: str) -> str:
@@ -22,7 +22,7 @@ def _build_content_hash(content: str) -> str:
 class ConversationRepository:
     """对话数据访问仓库。"""
 
-    def __init__(self, pg_pool: asyncpg.Pool) -> None:
+    def __init__(self, pg_pool: SharedEngineConnectionPool) -> None:
         """初始化仓库。
 
         Args:

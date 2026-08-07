@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
 from threading import RLock
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Never
@@ -20,6 +19,7 @@ from .storage import StoredConfig, get_config_storage
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     from pydantic import BaseModel
 
@@ -84,7 +84,11 @@ class ConfigManager:
     @property
     def config_source(self) -> str:
         """获取配置来源描述。"""
-        return f"postgres:komari_plugin_configs/{self._plugin_name}"
+        table = getattr(self._config_schema, "__table__", None)
+        table_name = getattr(table, "name", None)
+        if isinstance(table_name, str) and table_name:
+            return f"postgresql:{table_name}"
+        return f"postgresql:{self._plugin_name}"
 
     @property
     def config_file(self) -> str:
@@ -163,26 +167,12 @@ class ConfigManager:
         env_dict = env.model_dump() if hasattr(env, "model_dump") else dict(env)
         return self._config_schema(**env_dict)
 
-    def _config_to_storage_data(self, config: BaseModel) -> dict[str, Any]:
-        """转换为可写入 JSONB 的配置字典。"""
-        data = config.model_dump(mode="json")
-        if "last_updated" in self._config_schema.model_fields:
-            data["last_updated"] = datetime.now().astimezone().isoformat()
-        return data
-
     def _save_to_pg(self, config: BaseModel) -> StoredConfig:
         """仅在记录缺失时写入初始配置，绝不覆盖并发创建的配置。"""
-        data = self._config_to_storage_data(config)
-        version = str(data.get("version", "1.0"))
         storage = get_config_storage()
-        insert = getattr(storage, "insert_if_absent", None)
-        if insert is None:
-            insert = storage.upsert
-        stored = insert(
+        stored = storage.insert_if_absent(
             plugin_name=self._plugin_name,
-            schema_name=self._config_schema.__name__,
-            config_data=data,
-            version=version,
+            config=config,
         )
         self._cache_stored_config(stored)
         logger.debug(f"[{self._plugin_name}] 配置已保存到 PostgreSQL")
@@ -190,17 +180,10 @@ class ConfigManager:
 
     async def _save_to_pg_async(self, config: BaseModel) -> StoredConfig:
         """异步初始化配置，不覆盖并发创建的数据库快照。"""
-        data = self._config_to_storage_data(config)
-        version = str(data.get("version", "1.0"))
         storage = get_config_storage()
-        insert = getattr(storage, "insert_if_absent_async", None)
-        if insert is None:
-            insert = storage.upsert_async
-        stored = await insert(
+        stored = await storage.insert_if_absent_async(
             plugin_name=self._plugin_name,
-            schema_name=self._config_schema.__name__,
-            config_data=data,
-            version=version,
+            config=config,
         )
         self._cache_stored_config(stored)
         logger.debug(f"[{self._plugin_name}] 配置已异步保存到 PostgreSQL")
@@ -273,9 +256,7 @@ class ConfigManager:
             storage = get_config_storage()
             synced = storage.update_if_unchanged(
                 plugin_name=self._plugin_name,
-                schema_name=self._config_schema.__name__,
-                config_data=normalized_data,
-                version=stored.version,
+                config=self._config_schema(**normalized_data),
                 expected_updated_at=stored.updated_at,
             )
             if synced is None:
@@ -339,9 +320,7 @@ class ConfigManager:
             storage = get_config_storage()
             synced = await storage.update_if_unchanged_async(
                 plugin_name=self._plugin_name,
-                schema_name=self._config_schema.__name__,
-                config_data=normalized_data,
-                version=stored.version,
+                config=self._config_schema(**normalized_data),
                 expected_updated_at=stored.updated_at,
             )
             if synced is None:
@@ -378,33 +357,21 @@ class ConfigManager:
         )
         return self._config_schema(**synced.config_data), synced
 
-    def _build_field_patch(
+    def _build_field_update(
         self,
         *,
         stored: StoredConfig,
         field_name: str,
         value: Any,
-    ) -> tuple[dict[str, Any], str]:
-        """根据数据库最新快照校验字段，并生成顶层 JSONB 补丁。"""
-        current_dict = self._config_schema(**stored.config_data).model_dump(mode="json")
-        if field_name not in current_dict:
+    ) -> tuple[BaseModel, set[str]]:
+        """根据数据库最新快照校验字段，并生成校验后的完整配置实例。"""
+        if field_name not in self._config_schema.model_fields:
             raise ValueError(f"未知的配置字段: {field_name}")  # noqa: TRY003
 
+        current_dict = self._config_schema(**stored.config_data).model_dump()
         current_dict[field_name] = value
-        patch_fields = {field_name}
-        if "last_updated" in current_dict:
-            current_dict["last_updated"] = datetime.now().astimezone().isoformat()
-            patch_fields.add("last_updated")
-
         new_config = self._config_schema(**current_dict)
-        normalized_data = new_config.model_dump(mode="json")
-        config_patch = {
-            name: normalized_data[name]
-            for name in patch_fields
-            if name in normalized_data
-        }
-        version = str(normalized_data.get("version", stored.version))
-        return config_patch, version
+        return new_config, {field_name}
 
     def _raise_update_conflict(self, field_name: str) -> Never:
         logger.error(
@@ -482,16 +449,15 @@ class ConfigManager:
                     initial = self._dynamic_config or self._initialize_from_env()
                     stored = self._save_to_pg(initial)
 
-                config_patch, version = self._build_field_patch(
+                new_config, field_names = self._build_field_update(
                     stored=stored,
                     field_name=field_name,
                     value=value,
                 )
                 updated = storage.update_fields_if_revision(
                     plugin_name=self._plugin_name,
-                    schema_name=self._config_schema.__name__,
-                    config_patch=config_patch,
-                    version=version,
+                    config=new_config,
+                    field_names=field_names,
                     expected_revision=stored.revision,
                 )
                 if updated is not None:
@@ -516,16 +482,15 @@ class ConfigManager:
                     initial = self._dynamic_config or self._initialize_from_env()
                     stored = await self._save_to_pg_async(initial)
 
-                config_patch, version = self._build_field_patch(
+                new_config, field_names = self._build_field_update(
                     stored=stored,
                     field_name=field_name,
                     value=value,
                 )
                 updated = await storage.update_fields_if_revision_async(
                     plugin_name=self._plugin_name,
-                    schema_name=self._config_schema.__name__,
-                    config_patch=config_patch,
-                    version=version,
+                    config=new_config,
+                    field_names=field_names,
                     expected_revision=stored.revision,
                 )
                 if updated is not None:
@@ -566,12 +531,12 @@ class ConfigManager:
                     raise ValueError(msg)
 
                 mutated_value = mutator(deepcopy(current_data[field_name]))
-                config_patch, version = self._build_field_patch(
+                new_config, field_names = self._build_field_update(
                     stored=stored,
                     field_name=field_name,
                     value=mutated_value,
                 )
-                if config_patch[field_name] == current_data[field_name]:
+                if new_config.model_dump(mode="json")[field_name] == current_data[field_name]:
                     logger.debug(
                         f"[{self._plugin_name}] 配置字段变换无变化: {field_name}"
                     )
@@ -579,9 +544,8 @@ class ConfigManager:
 
                 updated = await storage.update_fields_if_revision_async(
                     plugin_name=self._plugin_name,
-                    schema_name=self._config_schema.__name__,
-                    config_patch=config_patch,
-                    version=version,
+                    config=new_config,
+                    field_names=field_names,
                     expected_revision=stored.revision,
                 )
                 if updated is not None:

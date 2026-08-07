@@ -15,26 +15,26 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11.exception import NetworkError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     TITLE_TEXT_BUDGET,
     ContentValidationError,
     TextBudget,
     normalize_required_text,
     validate_text_budget,
 )
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
-from komari_bot.common.management_audit import (
+from komari_bot.management.management_audit import (
     hash_management_target,
     management_audit_span,
     record_management_audit_event,
     require_management_change_reason,
     resolve_management_request_id,
 )
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .announcement_repository import (
     DispatchClaim,
@@ -44,8 +44,8 @@ from .announcement_repository import (
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditRecorder
 
 API_PREFIX = "/api/v2/komari-announce"
 ANNOUNCE_CONTENT_BUDGET = TextBudget(3000, 9000, 3000)

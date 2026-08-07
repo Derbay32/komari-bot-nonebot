@@ -27,6 +27,7 @@ class UserDataDisabledError(RuntimeError):
 class UserDataStoppingError(RuntimeError):
     """user_data 正在或已经关闭，不允许重新建立连接池。"""
 
+
 __plugin_meta__ = PluginMetadata(
     name="user_data",
     description="当前好感度数据服务插件",
@@ -35,7 +36,9 @@ __plugin_meta__ = PluginMetadata(
 )
 
 config_manager_plugin = require("config_manager")
-config_manager = config_manager_plugin.get_config_manager("user_data", DynamicConfigSchema)
+config_manager = config_manager_plugin.get_config_manager(
+    "user_data", DynamicConfigSchema
+)
 
 _db: UserDataDB | None = None
 _db_init_lock: asyncio.Lock | None = None

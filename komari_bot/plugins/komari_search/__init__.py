@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     QUERY_TEXT_BUDGET,
     ContentValidationError,
     normalize_required_text,

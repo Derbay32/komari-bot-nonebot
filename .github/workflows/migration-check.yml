@@ -1,0 +1,59 @@
+name: 迁移链同步卫士
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  migration-sync-guard:
+    name: Alembic autogenerate 空 diff 校验
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # 使用带 pgvector 的镜像，后续票的向量表基线迁移可直接复用本工作流
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: komari_bot
+          POSTGRES_PASSWORD: komari_bot_ci
+          POSTGRES_DB: komari_bot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U komari_bot -d komari_bot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://komari_bot:komari_bot_ci@localhost:5432/komari_bot
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 安装 Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: 安装 Poetry
+        run: python -m pip install --no-cache-dir "poetry==2.2.1"
+
+      - name: 校验 lock 与 pyproject 一致
+        run: poetry check --lock
+
+      - name: 同步运行时依赖
+        run: poetry sync --only main --no-root --no-ansi
+
+      # 先把版本链应用到最新，保证 check 的比对基线是 upgrade head 之后的数据库
+      - name: 应用迁移 upgrade head
+        run: poetry run python -m komari_bot.db.orm_bootstrap upgrade head
+
+      # autogenerate 空 diff 卫士：模型与版本链漂移（忘记生成迁移）即失败
+      - name: autogenerate 空 diff 校验
+        run: poetry run python -m komari_bot.db.orm_bootstrap check

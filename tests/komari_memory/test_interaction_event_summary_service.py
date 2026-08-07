@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
-from komari_bot.common.untrusted_context import render_untrusted_context
+from komari_bot.llm.untrusted_context import render_untrusted_context
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import (
     interaction_event_summary_service as summary_module,

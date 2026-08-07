@@ -10,13 +10,13 @@ from nonebot import logger
 from nonebot.plugin import require
 from zhdate import ZhDate
 
-from komari_bot.common.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
-from komari_bot.common.profile_operations import profile_traits_to_list
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
+from komari_bot.llm.untrusted_context import (
     LLM_SECURITY_SYSTEM_INSTRUCTION,
     UntrustedContext,
     render_untrusted_context,
 )
+from komari_bot.memory.profile_operations import profile_traits_to_list
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )

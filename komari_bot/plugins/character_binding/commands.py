@@ -10,7 +10,7 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg, Depends
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .manager import (
     BindingPersistenceError,

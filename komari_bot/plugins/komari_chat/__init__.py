@@ -8,8 +8,8 @@ from nonebot import get_driver, logger, on_message
 from nonebot.adapters.onebot.v11 import ActionFailed, Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.onebot_messages import plain_text_message
-from komari_bot.common.onebot_rules import group_message_rule
+from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_rules import group_message_rule
 
 from .handlers.message_handler import (
     DebugReplyResult,

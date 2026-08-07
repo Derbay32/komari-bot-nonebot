@@ -1,25 +1,23 @@
 """Komari Memory 配置 Schema。"""
 
-from datetime import datetime
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import field_validator, model_validator
+from sqlalchemy import Column, String
+from sqlalchemy.dialects.postgresql import JSONB
 
-from komari_bot.common.llm_protocol import RequestApi
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.llm.llm_protocol import RequestApi
 
 
-class KomariMemoryConfigSchema(BaseModel):
+class KomariMemoryConfigSchema(TypedConfigModel, table=True):
     """Komari Memory 插件配置。"""
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "immediate"},
-    )
+    plugin_name: ClassVar[str] = "komari_memory"
+    __tablename__ = "komari_memory_config"
 
-    # 元数据
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "immediate"},
     )
 
     # 插件控制
@@ -31,10 +29,10 @@ class KomariMemoryConfigSchema(BaseModel):
 
     # 白名单配置
     user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
     )
     group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
     )
 
     # Redis 配置
@@ -56,6 +54,7 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     llm_request_api_chat: RequestApi = Field(
         default="chat_completions",
+        sa_column=Column(String(32), nullable=False, default="chat_completions"),
         description=(
             "对话模型请求 API：chat_completions=OpenAI Chat Completions，"
             "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
@@ -169,6 +168,7 @@ class KomariMemoryConfigSchema(BaseModel):
     )
     llm_request_api_summary: RequestApi = Field(
         default="chat_completions",
+        sa_column=Column(String(32), nullable=False, default="chat_completions"),
         description="总结/记忆/画像模型请求 API。语义同 llm_request_api_chat。",
     )
     llm_stream_enabled_summary: bool = Field(
@@ -434,6 +434,7 @@ class KomariMemoryConfigSchema(BaseModel):
     # 机器人身份配置
     bot_aliases: list[str] = Field(
         default_factory=lambda: ["小鞠", "小鞠知花", "komari"],
+        sa_type=JSONB,
         description="机器人别名列表（用于机器人身份识别）",
     )
 

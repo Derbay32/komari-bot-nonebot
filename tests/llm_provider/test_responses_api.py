@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.untrusted_context import (
     LLM_SECURITY_SYSTEM_INSTRUCTION,
     UntrustedContext,
 )

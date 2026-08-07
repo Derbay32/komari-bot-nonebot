@@ -15,143 +15,232 @@ def storage_module() -> Any:
     return import_module("komari_bot.plugins.config_manager.storage")
 
 
-async def _never_finishes(cancelled: threading.Event) -> None:
+class _LoopThread:
+    """后台承载事件循环的线程，模拟应用事件循环。"""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=2)
+        self.loop.close()
+
+
+def test_sync_operations_inside_event_loop_raise(storage_module: Any) -> None:
+    storage = storage_module.ConfigStorage()
+
+    async def _caller() -> None:
+        with pytest.raises(RuntimeError, match="请改用对应的 _async"):
+            storage.fetch("user_data")
+
     try:
-        await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        cancelled.set()
-        raise
+        asyncio.run(_caller())
+    finally:
+        storage.close()
 
 
-def test_run_timeout_cancels_future_and_raises_runtime_error(
+def test_sync_bridge_timeout_cancels_in_flight_operation(
     storage_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(storage_module, "_CONFIG_STORAGE_TIMEOUT_SECONDS", 0.01)
     storage = storage_module.ConfigStorage()
+    runner = _LoopThread()
     cancelled = threading.Event()
+
+    async def _never_finishes(_session: object) -> str:
+        try:
+            await asyncio.sleep(60)
+            msg = "不应完成"
+            raise AssertionError(msg)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def _fake_run_on_app_session(_operation: Any) -> Any:
+        return await _never_finishes(None)
+
+    monkeypatch.setattr(
+        storage, "_run_on_app_session", _fake_run_on_app_session
+    )
+    storage.bind_app_loop(runner.loop)
 
     try:
         with pytest.raises(RuntimeError, match="配置存储操作超时"):
-            storage._run(_never_finishes(cancelled))
+            storage.fetch("user_data")
         assert cancelled.wait(timeout=1.0) is True
     finally:
+        asyncio.run_coroutine_threadsafe(
+            storage.close_async(), runner.loop
+        ).result(timeout=2)
+        runner.stop()
         storage.close()
 
 
-@pytest.mark.asyncio
-async def test_run_async_does_not_block_caller_event_loop(
-    storage_module: Any,
-) -> None:
-    storage = storage_module.ConfigStorage()
-
-    async def delayed_result() -> str:
-        await asyncio.sleep(0.1)
-        return "完成"
-
-    try:
-        operation = asyncio.create_task(storage._run_async(delayed_result()))
-        await asyncio.sleep(0)
-
-        assert operation.done() is False
-        assert await operation == "完成"
-    finally:
-        storage.close()
-
-
-class _FakePool:
-    def __init__(self) -> None:
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-def test_close_reclaims_pool_thread_and_event_loop(
-    storage_module: Any,
-) -> None:
-    storage = storage_module.ConfigStorage()
-    pool = _FakePool()
-    storage._pool = pool
-    thread = storage._thread
-    loop = storage._loop
-
-    storage.close()
-    storage.close()
-
-    assert pool.closed is True
-    assert thread.is_alive() is False
-    assert loop.is_closed() is True
-
-
-def test_closed_storage_rejects_new_operations_and_closes_coroutine(
-    storage_module: Any,
-) -> None:
-    storage = storage_module.ConfigStorage()
-    storage.close()
-
-    async def _completed() -> str:
-        return "不应执行"
-
-    coro = _completed()
-    with pytest.raises(RuntimeError, match="配置存储已关闭"):
-        storage._run(coro)
-
-    assert coro.cr_frame is None
-
-
-def test_get_pool_closes_temporary_pool_when_schema_initialization_fails(
+def test_sync_bridge_uses_private_engine_before_app_loop_bind(
     storage_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = storage_module.ConfigStorage()
-    pool = _FakePool()
+    calls: list[str] = []
 
-    async def fake_create_postgres_pool(_config: object) -> _FakePool:
-        return pool
+    async def _fake_private_engine(_operation: Any) -> str:
+        calls.append("private")
+        return "ok"
 
-    async def fail_ensure_schema(_pool: _FakePool) -> None:
-        msg = "建表失败"
-        raise RuntimeError(msg)
+    async def _fake_app_session(_operation: Any) -> str:
+        calls.append("app")
+        return "ok"
 
-    monkeypatch.setattr(storage_module, "create_postgres_pool", fake_create_postgres_pool)
-    monkeypatch.setattr(storage, "_ensure_schema", fail_ensure_schema)
+    monkeypatch.setattr(storage, "_run_on_private_engine", _fake_private_engine)
+    monkeypatch.setattr(storage, "_run_on_app_session", _fake_app_session)
 
     try:
-        with pytest.raises(RuntimeError, match="建表失败"):
-            storage._run(storage._get_pool())
-
-        assert pool.closed is True
-        assert storage._pool is None
+        assert storage.fetch("user_data") == "ok"
+        assert calls == ["private"]
     finally:
         storage.close()
 
 
-class _FakeStorage:
-    def __init__(self) -> None:
-        self.closed = False
+def test_sync_bridge_uses_app_session_after_bind(
+    storage_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    runner = _LoopThread()
+    calls: list[str] = []
 
-    def close(self) -> None:
-        self.closed = True
+    async def _fake_private_engine(_operation: Any) -> str:
+        calls.append("private")
+        return "ok"
+
+    async def _fake_app_session(_operation: Any) -> str:
+        calls.append("app")
+        return "ok"
+
+    monkeypatch.setattr(storage, "_run_on_private_engine", _fake_private_engine)
+    monkeypatch.setattr(storage, "_run_on_app_session", _fake_app_session)
+    storage.bind_app_loop(runner.loop)
+
+    try:
+        assert storage.fetch("user_data") == "ok"
+        assert calls == ["app"]
+    finally:
+        asyncio.run_coroutine_threadsafe(
+            storage.close_async(), runner.loop
+        ).result(timeout=2)
+        runner.stop()
+        storage.close()
 
 
-def test_close_config_storage_if_created_does_not_create_storage(
+def test_closed_storage_rejects_new_operations(storage_module: Any) -> None:
+    storage = storage_module.ConfigStorage()
+    storage.close()
+
+    with pytest.raises(RuntimeError, match="配置存储已关闭"):
+        storage.fetch("user_data")
+
+
+@pytest.mark.asyncio
+async def test_close_async_cancels_and_awaits_watcher_task(
+    storage_module: Any,
+) -> None:
+    storage = storage_module.ConfigStorage()
+    cancelled = threading.Event()
+
+    async def _never_finishes() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    storage._watch_config_changes = _never_finishes  # type: ignore[method-assign]
+    storage.bind_app_loop(asyncio.get_running_loop())
+    assert storage._watch_task is not None
+    await asyncio.sleep(0)
+
+    await storage.close_async()
+
+    assert cancelled.wait(timeout=1.0) is True
+    assert storage.closed is True
+    with pytest.raises(RuntimeError, match="配置存储已关闭"):
+        await storage.fetch_async("user_data")
+
+
+@pytest.mark.asyncio
+async def test_close_config_storage_if_created_does_not_create_storage(
     storage_module: Any,
 ) -> None:
     storage_module._StorageState.storage = None
 
-    storage_module.close_config_storage_if_created()
+    await storage_module.close_config_storage_if_created()
 
     assert storage_module._StorageState.storage is None
 
 
-def test_close_config_storage_if_created_closes_and_clears_storage(
+@pytest.mark.asyncio
+async def test_close_config_storage_if_created_closes_and_clears_storage(
     storage_module: Any,
 ) -> None:
-    storage = _FakeStorage()
-    storage_module._StorageState.storage = storage
+    class _FakeStorage:
+        closed = False
 
-    storage_module.close_config_storage_if_created()
+        async def close_async(self) -> None:
+            self.closed = True
 
-    assert storage.closed is True
+    fake = _FakeStorage()
+    storage_module._StorageState.storage = fake
+
+    await storage_module.close_config_storage_if_created()
+
+    assert fake.closed is True
     assert storage_module._StorageState.storage is None
+
+
+def test_private_engine_uses_orm_database_url(
+    storage_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_urls: list[str] = []
+
+    class _FakeEngine:
+        def __init__(self, url: str) -> None:
+            created_urls.append(url)
+            self.sync_engine = object()
+
+        async def dispose(self) -> None:
+            return None
+
+    async def _simple_op(session: object) -> str:
+        del session
+        return "ok"
+
+    monkeypatch.setattr(
+        storage_module,
+        "create_async_engine",
+        lambda url: _FakeEngine(url),
+    )
+    monkeypatch.setattr(
+        storage_module,
+        "get_orm_database_url",
+        lambda: "postgresql+asyncpg://u:p@h:5432/db",
+    )
+
+    storage = storage_module.ConfigStorage()
+    try:
+        result = asyncio.run(storage._run_on_private_engine(_simple_op))
+        assert result == "ok"
+        assert created_urls == ["postgresql+asyncpg://u:p@h:5432/db"]
+    finally:
+        storage.close()
+
+
+def test_config_storage_no_longer_builds_url_from_postgres_config(
+    storage_module: Any,
+) -> None:
+    assert not hasattr(storage_module, "_build_database_url")
+    assert not hasattr(storage_module, "get_shared_database_config")

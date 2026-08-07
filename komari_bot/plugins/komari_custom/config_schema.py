@@ -3,26 +3,26 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import field_validator
+from sqlalchemy.dialects.postgresql import JSONB
+
+from komari_bot.config.typed_config import Field, TypedConfigModel
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """群成员知识库提案插件的运行时配置。"""
 
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
-    )
+    plugin_name: ClassVar[str] = "komari_custom"
+    __tablename__ = "komari_custom_config"
+
     plugin_enable: bool = Field(default=False, description="插件启用状态")
     user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
+        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
     )
     group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
+        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
     )
 
     required_votes: int = Field(default=5, ge=2, le=50, description="提案通过所需票数")

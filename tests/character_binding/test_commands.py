@@ -9,7 +9,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.plugins.character_binding.manager import (
     BindingPersistenceError,
     CharacterBindingManager,

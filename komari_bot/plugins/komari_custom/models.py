@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     PROPOSAL_CONTENT_TEXT_BUDGET,
     TITLE_TEXT_BUDGET,
     normalize_required_text,

@@ -1,29 +1,33 @@
 """Komari Search 动态配置 Schema（v2.0：双提供者 + 网页抓取）。"""
 
-from datetime import datetime
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import field_validator
+from sqlalchemy import Column, String
+from sqlalchemy.dialects.postgresql import JSONB
+
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """Komari Search 插件配置。"""
 
-    model_config = ConfigDict(json_schema_extra={"default_apply_mode": "immediate"})
+    plugin_name: ClassVar[str] = "komari_search"
+    __tablename__ = "komari_search_config"
 
-    # --- 通用 ---
-    version: str = Field(default="2.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
-    )
+    model_config = typed_model_config(json_schema_extra={"default_apply_mode": "immediate"})
 
     plugin_enable: bool = Field(default=False, description="插件启用状态")
-    user_whitelist: list[str] = Field(default_factory=list, description="用户白名单")
-    group_whitelist: list[str] = Field(default_factory=list, description="群聊白名单")
+    user_whitelist: list[str] = Field(
+        default_factory=list, description="用户白名单", sa_type=JSONB
+    )
+    group_whitelist: list[str] = Field(
+        default_factory=list, description="群聊白名单", sa_type=JSONB
+    )
 
     search_provider: Literal["tavily", "exa"] = Field(
         default="tavily",
+        sa_column=Column(String(16), nullable=False, default="tavily"),
         description="联网搜索提供者：tavily / exa",
     )
     search_api_key: str = Field(
@@ -72,6 +76,7 @@ class DynamicConfigSchema(BaseModel):
     # --- Tavily 专用 ---
     tavily_search_depth: Literal["basic", "advanced"] = Field(
         default="basic",
+        sa_column=Column(String(16), nullable=False, default="basic"),
         description="Tavily 搜索深度：basic（快速）/ advanced（深入）",
     )
     tavily_include_answer: bool = Field(
@@ -82,10 +87,12 @@ class DynamicConfigSchema(BaseModel):
     # --- EXA 专用 ---
     exa_search_type: Literal["neural", "keyword", "auto"] = Field(
         default="auto",
+        sa_column=Column(String(16), nullable=False, default="auto"),
         description="EXA 搜索类型：neural / keyword / auto",
     )
     exa_fetch_format: Literal["text", "highlights", "summary"] = Field(
         default="text",
+        sa_column=Column(String(16), nullable=False, default="text"),
         description="EXA 抓取正文格式：text / highlights / summary",
     )
 

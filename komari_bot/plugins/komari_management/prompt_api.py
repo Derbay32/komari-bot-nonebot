@@ -10,19 +10,7 @@ from nonebot import logger
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
-from komari_bot.common.management_api import (
-    ManagementPrincipal,
-    create_bearer_auth_dependency,
-    ensure_management_cors,
-)
-from komari_bot.common.management_audit import (
-    hash_management_target,
-    management_audit_span,
-    record_management_audit_event,
-    require_management_change_reason,
-    resolve_management_request_id,
-)
-from komari_bot.common.prompt_storage import (
+from komari_bot.config.prompt_storage import (
     PromptValues,
     StoredPrompt,
     load_prompt_values_async,
@@ -30,12 +18,25 @@ from komari_bot.common.prompt_storage import (
     replace_prompt_values_async,
     update_prompt_field_async,
 )
+from komari_bot.config.typed_config import ensure_typed_prompt_model
+from komari_bot.management.management_api import (
+    ManagementPrincipal,
+    create_bearer_auth_dependency,
+    ensure_management_cors,
+)
+from komari_bot.management.management_audit import (
+    hash_management_target,
+    management_audit_span,
+    record_management_audit_event,
+    require_management_change_reason,
+    resolve_management_request_id,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditRecorder
 
     from .managed_resources import ManagedPromptResource
 
@@ -177,7 +178,12 @@ async def _update_prompt_field(
 
 
 def _build_config_source(resource: ManagedPromptResource) -> str:
-    return f"postgresql:komari_prompt_configs:{resource.resource_id}"
+    """Prompt 资源的存储来源标识，表名取自强类型 Prompt 表。"""
+    model_cls = ensure_typed_prompt_model(resource.resource_id)
+    if model_cls is None:
+        msg = f"Prompt 资源 {resource.resource_id} 未注册强类型 Prompt 表"
+        raise RuntimeError(msg)
+    return f"postgresql:{model_cls.__tablename__}:{resource.resource_id}"
 
 
 def _build_resource_summary(resource: ManagedPromptResource) -> PromptResourceSummary:

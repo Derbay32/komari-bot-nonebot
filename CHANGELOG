@@ -2,15 +2,48 @@
 
 ## [Unreleased]
 
-> 当前 `dev` 分支上尚未发版的变更。
+> dev 分支上的未发版变更。
 
 ### 破坏性变更
 
-- 管理 API 全面更新至 V2，与旧版本 V1 不再兼容，需将管理后台升级至 v2.0.0 以适配新端点。
+- 数据库连接唯一权威改为 nonebot-plugin-orm，需手动迁移后进行升级。
+
+### 运维注意
+
+升级操作顺序（关键）：
+
+1. **备份数据库**（pg_dump 全量备份，迁移脚本只 upsert 不删数据，但备份是唯一保险）；
+2. 仅当库中 `komari_plugin_configs` 仍是 v1 键名结构（古老部署）时，按需执行 `poetry run python scripts/migrate_search_config_v2.py` 整理 search 配置键名；
+3. 补齐旧 JSONB 表与旧文件数据（按当前版本选择性执行，全部幂等可重跑）：
+   - `scripts/migrate_json_config_to_pg.py` —— 旧 `config/config_manager/*_config.json` → `komari_plugin_configs`
+   - `scripts/migrate_prompt_config_to_pg.py` —— 旧 `config/prompts/*.yaml` → `komari_prompt_configs`
+   - `scripts/migrate_character_binding_to_pg.py` —— 旧 `data/character_binding/bindings.json` → `komari_character_bindings`
+   - `scripts/migrate_komari_decision_scenes_to_pg.py` —— 旧 YAML 场景 → `komari_decision_scenes`
+4. **既有部署（库中已有 v1 表、无 `alembic_version`）必须先离线标记基线**，否则 prestart 的 `upgrade head` 会对既有表重复 `CREATE TABLE` 直接失败：
+   `poetry run python -m komari_bot.common.orm_bootstrap stamp 0001`
+   `stamp` 只写版本号不执行 DDL；随后执行 `upgrade head` 应用 0002/0003，并执行 `check` 验证零 diff——`check` 同时校验既有业务表结构与 ORM 模型精确一致，发现漂移必须先按原版本升级流程修复再继续。全新部署（空库）跳过 `stamp`，`upgrade head` 会从 0001 全量建表；
+5. 部署 v2.0.0 镜像：容器 prestart 自动执行 `upgrade head`（上一步已执行则为 no-op），失败 fail fast；
+6. 执行存量搬运主力脚本并核对 stdout 决算报告：
+   `poetry run python scripts/migrate_legacy_config_to_typed_tables.py`（`--dsn` 或 `SQLALCHEMY_DATABASE_URL` 指定连接，幂等可重跑）；
+7. 启动应用；`.env` / docker-compose 数据库配置只需 `SQLALCHEMY_DATABASE_URL`。
+
+- 全新部署注意：0001 基线建表时从环境变量 `EMBEDDING_DIMENSION`（默认 512）读取向量列维度，必须与运行时 `embedding_dimension` 配置一致（不匹配时记忆/知识插件初始化会 fail fast）；既有部署走 `stamp` 不执行 DDL，不受影响。
+- 开发流程新增迁移守门：改过任何 SQLModel（`config_schema.py` / `prompt_schema.py` / `orm_models.py`）后必须 `python -m komari_bot.common.orm_bootstrap revision --autogenerate` 生成迁移，并跑 `check` 零 diff；CI `migration-check.yml` 同样执行 `upgrade head` + `check`。
+- 集成测试新增 `KOMARI_TEST_POSTGRES_URL` 门控的真实库模式。运行时必须同时提供两个变量且指向同一数据库（`SQLALCHEMY_DATABASE_URL` 是 NoneBot 驱动配置的来源，守卫会拒绝不一致的组合并 skip）：
+  `SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test poetry run pytest tests/`
 
 ### 新增
 
 - 新增 search 管理 API 端点，支持向前端提供搜索能力支持商描述。
+- 新增 OpenAI Response API 与流式传输支持，可在配置项中配置 (#23)。
+
+### 变更
+
+- 迁移数据库连接至 `nonebot-plugin-orm`
+
+### 修复
+
+- 修正 AGENTS.md / 插件 README 中关于连接池、配置表与已删脚本的过时描述，使其与实际代码一致。
 
 ---
 
@@ -591,4 +624,4 @@
 
 ---
 
-*本 CHANGELOG 最后更新于 2026-08-05*
+*本 CHANGELOG 最后更新于 2026-08-07*

@@ -20,13 +20,13 @@ require("nonebot_plugin_apscheduler")
 from apscheduler.jobstores.base import JobLookupError
 from nonebot_plugin_apscheduler import scheduler
 
-from komari_bot.common.content_budget import (
+from komari_bot.db.orm_config import is_orm_database_url_configured
+from komari_bot.llm.content_budget import (
     QUERY_TEXT_BUDGET,
     ContentValidationError,
     normalize_required_text,
 )
-from komari_bot.common.database_config import get_shared_database_config
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .config_schema import DynamicConfigSchema
 from .models import Proposal, SessionData  # noqa: TC001
@@ -120,9 +120,11 @@ async def on_startup() -> None:
     if not config.plugin_enable:
         logger.info("[KomariCustom] 插件未启用，跳过初始化")
         return
-    db_config = get_shared_database_config()
-    if not db_config.pg_user or not db_config.pg_password:
-        logger.warning("[KomariCustom] PostgreSQL 未配置，跳过初始化")
+    if not is_orm_database_url_configured():
+        logger.warning(
+            "[KomariCustom] 未配置 SQLALCHEMY_DATABASE_URL，跳过初始化。"
+            "请通过环境变量或 dotenv 设置 nonebot-plugin-orm 的连接串"
+        )
         return
     try:
         await repository.initialize()

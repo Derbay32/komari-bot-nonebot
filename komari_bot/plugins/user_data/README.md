@@ -6,7 +6,7 @@
 
 - 当前好感度：每个用户一个 `0-400` 的当前值，默认初始值为 `0`。
 - 四阶段判定：`0-99`、`100-199`、`200-299`、`300-400`。
-- PostgreSQL 持久化：使用共享 PostgreSQL 连接池，无 SQLite 运行时依赖。
+- PostgreSQL 持久化：SQLModel ORM 表（`orm_models.py`），连接与引擎生命周期由 nonebot-plugin-orm 托管，无 SQLite 运行时依赖。
 - 原子调整：好感度增减在 SQL 事务中完成，并 clamp 到 `[0, 400]`。
 
 ## 配置说明
@@ -72,7 +72,17 @@ class FavorabilityAdjustmentResult:
 | favorability | INTEGER | 当前好感度，范围 `[0, 400]` |
 | updated_at | TIMESTAMPTZ | 最后更新时间 |
 
-启动建表时如果检测到旧版 `last_updated`、`daily_favor` 或 `cumulative_favor` 列，会直接删除旧 `user_favorability` 表并重建；旧好感度历史不会迁移。
+### user_favorability_adjustment_ledger
+
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| operation_id | TEXT | 主键，幂等操作 ID |
+| user_id | TEXT | 用户 ID |
+| requested_delta | INTEGER | 请求的好感度增量 |
+| before_value / after_value | INTEGER | 调整前后值（回填） |
+| result_updated_at / created_at | TIMESTAMPTZ | 结果回填时间 / 创建时间 |
+
+两张表的 DDL 由 Alembic 基线 `0001` 统一管理，运行时不建表、不删表；旧版 SQLite 时代的 `last_updated`、`daily_favor`、`cumulative_favor` 列不存在于当前结构，历史好感度不迁移。
 
 ## 聊天集成
 

@@ -1,6 +1,6 @@
 # Komari Management 前端对接说明
 
-> 最后同步：2026-07-29。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
+> 最后同步：2026-08-07。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
 
 Komari Management 统一把配置、提示词、判定场景、维护公告以及各业务插件的管理 API 挂载到 NoneBot2 的 FastAPI 应用。前端不需要对接独立的管理服务，所有接口共用同一后端 Origin、Bearer 鉴权和 CORS 配置。
 
@@ -57,7 +57,7 @@ Authorization: Bearer <management-token>
 }
 ```
 
-Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 个不同字符。升级前仍使用旧单 Token 字段的部署必须先迁移；新版本不会读取该字段，启动时会删除数据库中的残留键并记录警告。
+Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 个不同字符。升级前仍使用旧单 Token 字段的部署必须先迁移；新版本不会读取该字段，启动时若在遗留配置中发现旧权限名（如 `llm_logs:read`）会记录警告提示改为 `agent_run_logs:read`。
 
 | 功能 | 读权限 | 写权限 |
 | --- | --- | --- |
@@ -508,8 +508,8 @@ Base path：`/api/v2/komari-search`
 
 ## 12. 后端运行说明
 
-- 动态配置存储于 PostgreSQL `komari_plugin_configs`；
-- Prompt 存储于 PostgreSQL `komari_prompt_configs`，旧 YAML 不是运行时来源；
+- 动态配置存储于 PostgreSQL 强类型单行表 `komari_<插件>_config`（14 张，迁移 0002 建表），旧 JSONB KV 表 `komari_plugin_configs` 仅保留存量数据、运行时不读写；
+- Prompt 存储于 3 张强类型单行表（`komari_prompt_komari_chat` / `komari_prompt_memory_summary` / `komari_prompt_group_history_summary`，迁移 0003 建表），旧 YAML 不是运行时来源；
 - 业务插件自己的管理 API 挂载逻辑已经移除，统一由本插件注册；
 - 知识库、帮助库、记忆库、Agent Run 日志或 Scene 依赖未初始化时，对应接口可能返回 `503`；
 - FastAPI OpenAPI 是字段级类型、格式和长度限制的最终机器可读契约，前端类型应优先从 OpenAPI 生成或定期校对。

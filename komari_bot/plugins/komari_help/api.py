@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Protocol, cast
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response
 from starlette import status
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
@@ -28,7 +28,7 @@ from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.management.management_api import ManagementTokenSource
 
 API_PREFIX = "/api/v2/komari-help"
 

@@ -9,8 +9,8 @@ from typing import Any, Literal
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.llm_protocol import DEFAULT_REQUEST_API, RequestApi
-from komari_bot.common.untrusted_context import UntrustedContext
+from komari_bot.llm.llm_protocol import DEFAULT_REQUEST_API, RequestApi
+from komari_bot.llm.untrusted_context import UntrustedContext
 
 from .base_client import (
     LLMCompletionResultSchema,
@@ -682,7 +682,7 @@ if driver is not None:
         base URL 未标记 secret（管理 API 需明文展示），需显式登记，
         由精确值替换层在事件脱敏时字面量替换。
         """
-        from komari_bot.common.sentry_support import register_sensitive_value
+        from komari_bot.core.sentry_support import register_sensitive_value
 
         config = await config_manager.get_async()
         register_sensitive_value(config.api_base)

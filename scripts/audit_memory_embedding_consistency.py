@@ -1,4 +1,7 @@
-"""只读检查 Komari Memory 正文、content_hash 与向量维度的一致性。"""
+"""只读检查 Komari Memory 正文、content_hash 与向量维度的一致性。
+
+v2.0.0 起连接串统一读取 nonebot-plugin-orm 权威的 ``SQLALCHEMY_DATABASE_URL``。
+"""
 
 from __future__ import annotations
 
@@ -6,16 +9,14 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from komari_bot.common.database_config import load_database_config_from_env
-from komari_bot.common.postgres import create_postgres_pool
+import asyncpg
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterable, Iterable
-
-    import asyncpg
 
 
 @dataclass(slots=True)
@@ -121,10 +122,21 @@ async def _audit_table(
         return await _audit_cursor(cursor, sample_limit=sample_limit)
 
 
+def _resolve_dsn() -> str:
+    """读取 nonebot-plugin-orm 权威数据库连接串（SQLALCHEMY_DATABASE_URL）。"""
+    dsn = os.environ.get("SQLALCHEMY_DATABASE_URL", "")
+    if not dsn:
+        msg = (
+            "未配置 SQLALCHEMY_DATABASE_URL，"
+            "请通过环境变量设置 nonebot-plugin-orm 的连接串"
+        )
+        raise RuntimeError(msg)
+    return dsn
+
+
 async def run(*, sample_limit: int) -> dict[str, object]:
     """执行只读核对并返回可序列化报告。"""
-    database_config = load_database_config_from_env()
-    pool = await create_postgres_pool(database_config, command_timeout=60)
+    pool = await asyncpg.create_pool(dsn=_resolve_dsn(), command_timeout=60)
     try:
         conversations = await _audit_table(
             pool,

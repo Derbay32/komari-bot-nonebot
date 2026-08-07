@@ -8,12 +8,12 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
-from komari_bot.common.management_audit import (
+from komari_bot.management.management_audit import (
     hash_management_target,
     management_audit_span,
     record_management_audit_event,
@@ -25,8 +25,8 @@ from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditRecorder
 
     from .managed_resources import ManagedConfigResource
 
@@ -124,9 +124,11 @@ def _get_fields(config: BaseModel) -> list[str]:
 
 
 def _get_field_descriptions(config: BaseModel) -> dict[str, str]:
+    public_fields = set(config.model_dump())
     return {
         field_name: (field_info.description or "")
         for field_name, field_info in sorted(config.__class__.model_fields.items())
+        if field_name in public_fields
     }
 
 
@@ -152,8 +154,11 @@ def _get_default_apply_mode(config: BaseModel) -> ConfigApplyMode:
 
 def _get_field_metadata(config: BaseModel) -> dict[str, ConfigFieldMetadata]:
     default_apply_mode = _get_default_apply_mode(config)
+    public_fields = set(config.model_dump())
     metadata: dict[str, ConfigFieldMetadata] = {}
     for field_name, field_info in config.__class__.model_fields.items():
+        if field_name not in public_fields:
+            continue
         field_extra = field_info.json_schema_extra
         extra = field_extra if isinstance(field_extra, dict) else {}
         metadata[field_name] = ConfigFieldMetadata(

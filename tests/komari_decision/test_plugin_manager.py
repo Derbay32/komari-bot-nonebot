@@ -19,9 +19,6 @@ class _FakeSceneRepository:
     def __init__(self, pg_pool: object) -> None:
         self.pg_pool = pg_pool
 
-    async def ensure_schema(self) -> None:
-        return None
-
     async def has_any_scene(self) -> bool:
         return True
 

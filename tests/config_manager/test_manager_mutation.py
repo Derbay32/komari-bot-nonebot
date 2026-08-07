@@ -14,21 +14,13 @@ from komari_bot.plugins.config_manager.storage import StoredConfig
 
 
 class _ListConfig(BaseModel):
-    version: str = "1.0"
-    last_updated: str = "2026-07-16T00:00:00+08:00"
     sr_list: list[str] = Field(default_factory=list)
 
 
 def _stored(items: list[str], revision: int) -> StoredConfig:
     return StoredConfig(
         plugin_name="sr-mutation-test",
-        schema_name="_ListConfig",
-        config_data={
-            "version": "1.0",
-            "last_updated": "2026-07-16T00:00:00+08:00",
-            "sr_list": items,
-        },
-        version="1.0",
+        config_data={"sr_list": items},
         revision=revision,
         updated_at=datetime.now().astimezone() + timedelta(seconds=revision),
     )
@@ -38,6 +30,7 @@ class _ConflictOnceStorage:
     def __init__(self) -> None:
         self.fetch_results = [_stored(["甲"], 1), _stored(["甲", "乙"], 2)]
         self.update_patches: list[dict[str, Any]] = []
+        self.update_field_names: list[set[str]] = []
 
     async def fetch_async(self, _plugin_name: str) -> StoredConfig:
         return self.fetch_results.pop(0)
@@ -46,8 +39,10 @@ class _ConflictOnceStorage:
         self,
         **kwargs: Any,
     ) -> StoredConfig | None:
-        patch = dict(kwargs["config_patch"])
+        config = cast("_ListConfig", kwargs["config"])
+        patch = {"sr_list": list(config.sr_list)}
         self.update_patches.append(patch)
+        self.update_field_names.append(set(kwargs["field_names"]))
         if len(self.update_patches) == 1:
             return None
         return _stored(list(patch["sr_list"]), 3)
@@ -72,6 +67,7 @@ async def test_mutate_field_reapplies_transform_to_latest_value_after_conflict(
     assert observed_values == [["甲"], ["甲", "乙"]]
     assert storage.update_patches[0]["sr_list"] == ["甲", "丙"]
     assert storage.update_patches[1]["sr_list"] == ["甲", "乙", "丙"]
+    assert storage.update_field_names == [{"sr_list"}, {"sr_list"}]
     assert cast("_ListConfig", result).sr_list == ["甲", "乙", "丙"]
 
 

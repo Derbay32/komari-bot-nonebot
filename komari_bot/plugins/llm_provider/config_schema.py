@@ -2,12 +2,14 @@
 llm provider 配置 Schema 实现。
 """
 
-from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import field_validator
+from sqlalchemy import Column, String
+from sqlalchemy.dialects.postgresql import JSONB
 
-from komari_bot.common.llm_protocol import RequestApi
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.llm.llm_protocol import RequestApi
 
 ALLOWED_EXTRA_PARAM_KEYS = frozenset(
     {
@@ -29,20 +31,16 @@ def get_unsupported_extra_param_keys(extra_params: dict[str, Any]) -> list[str]:
     return sorted(set(extra_params) - ALLOWED_EXTRA_PARAM_KEYS)
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """
     llm provider 配置 Schema。
     """
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "immediate"},
-    )
+    plugin_name: ClassVar[str] = "llm_provider"
+    __tablename__ = "komari_llm_provider_config"
 
-    # 元数据
-    version: str = Field(default="1.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "immediate"},
     )
 
     # OpenAI 兼容 API 配置
@@ -60,6 +58,7 @@ class DynamicConfigSchema(BaseModel):
     )
     request_api: RequestApi = Field(
         default="chat_completions",
+        sa_column=Column(String(32), nullable=False, default="chat_completions"),
         description=(
             "默认槽位请求 API：chat_completions=OpenAI Chat Completions，"
             "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
@@ -98,6 +97,7 @@ class DynamicConfigSchema(BaseModel):
     )
     extra_params: dict[str, Any] = Field(
         default_factory=dict,
+        sa_type=JSONB,
         description=(
             "OpenAI 兼容 API 请求的额外生成参数，仅接受安全白名单中的键。"
             "允许：logprobs、min_p、presence_penalty、repetition_penalty、seed、"
@@ -112,6 +112,7 @@ class DynamicConfigSchema(BaseModel):
     )
     vision_request_api: RequestApi = Field(
         default="chat_completions",
+        sa_column=Column(String(32), nullable=False, default="chat_completions"),
         description="视觉槽位请求 API。语义同 request_api。",
     )
     vision_stream_enabled: bool = Field(

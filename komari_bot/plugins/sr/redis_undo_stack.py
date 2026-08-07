@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import redis.asyncio as aioredis
 
-from komari_bot.common.database_config import get_shared_database_config
+from komari_bot.config.redis_config import get_shared_redis_config
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -98,7 +98,7 @@ async def get_redis_client(config_manager: Any) -> aioredis.Redis:
     async with _get_redis_client_lock():
         if _redis_client is None:
             config = await get_redis_config(config_manager)
-            db_config = get_shared_database_config()
+            db_config = get_shared_redis_config()
             _redis_client = aioredis.Redis(
                 host=db_config.redis_host,
                 port=db_config.redis_port,

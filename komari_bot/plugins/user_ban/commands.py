@@ -9,7 +9,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent  # noqa: TC00
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .event_support import is_superuser_id
 from .models import (

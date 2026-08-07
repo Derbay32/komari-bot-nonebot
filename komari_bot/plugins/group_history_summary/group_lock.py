@@ -11,7 +11,7 @@ from uuid import uuid4
 import redis.asyncio as aioredis
 from nonebot import logger
 
-from komari_bot.common.database_config import get_shared_database_config
+from komari_bot.config.redis_config import get_shared_redis_config
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -161,7 +161,7 @@ class GroupSummaryLockManager:
 
         async with self._get_client_lock():
             if self._redis is None:
-                database_config = get_shared_database_config()
+                database_config = get_shared_redis_config()
                 client = aioredis.Redis(
                     host=database_config.redis_host,
                     port=database_config.redis_port,

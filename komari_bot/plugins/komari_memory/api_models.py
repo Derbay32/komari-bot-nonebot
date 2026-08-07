@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, RootModel, field_validator
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     CONTENT_TEXT_BUDGET,
     IDENTIFIER_TEXT_BUDGET,
     KEYWORD_TEXT_BUDGET,

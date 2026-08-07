@@ -1,21 +1,18 @@
 """用户数据插件动态配置 Schema。"""
 
-from datetime import datetime
+from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
 
-class DynamicConfigSchema(BaseModel):
+class DynamicConfigSchema(TypedConfigModel, table=True):
     """用户数据插件配置（由 config_manager 管理）。"""
 
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "restart"},
-    )
+    plugin_name: ClassVar[str] = "user_data"
+    __tablename__ = "komari_user_data_config"
 
-    version: str = Field(default="2.0", description="配置架构版本")
-    last_updated: str = Field(
-        default_factory=lambda: datetime.now().astimezone().isoformat(),
-        description="最后更新时间戳",
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "restart"},
     )
 
     plugin_enable: bool = Field(

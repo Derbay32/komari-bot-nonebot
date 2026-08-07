@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.common.prompt_storage import PromptValues, StoredPrompt
+from komari_bot.config.prompt_storage import PromptValues, StoredPrompt
 from komari_bot.plugins.komari_management.managed_resources import ManagedPromptResource
 from komari_bot.plugins.komari_management.prompt_api import (
     API_PREFIX,
@@ -19,7 +19,7 @@ from komari_bot.plugins.komari_management.prompt_api import (
 if TYPE_CHECKING:
     from nonebug import App
 
-    from komari_bot.common.management_audit import ManagementAuditEvent
+    from komari_bot.management.management_audit import ManagementAuditEvent
 
 
 @dataclass
@@ -49,11 +49,9 @@ def _build_app(
         values.update(store.values)
         stored = StoredPrompt(
             resource_id=resource.resource_id,
-            display_name=resource.display_name,
             prompt_data=dict(store.values),
-            version="1.0",
-            updated_at=datetime.now(UTC),
             revision=store.revision,
+            updated_at=datetime.now(UTC),
         )
         return PromptValues(values=values, stored=stored)
 
@@ -80,11 +78,9 @@ def _build_app(
         store.revision += 1
         return StoredPrompt(
             resource_id=resource.resource_id,
-            display_name=resource.display_name,
             prompt_data=dict(cleaned),
-            version="1.0",
-            updated_at=datetime.now(UTC),
             revision=store.revision,
+            updated_at=datetime.now(UTC),
         )
 
     async def fake_update_prompt_field(
@@ -106,11 +102,9 @@ def _build_app(
         store.revision += 1
         return StoredPrompt(
             resource_id=resource.resource_id,
-            display_name=resource.display_name,
             prompt_data=dict(store.values),
-            version="1.0",
-            updated_at=datetime.now(UTC),
             revision=store.revision,
+            updated_at=datetime.now(UTC),
         )
 
     monkeypatch.setattr(
@@ -179,6 +173,10 @@ async def test_prompt_routes_require_token_and_list_resources(
     assert listed.json()["items"][0]["resource_id"] == "komari_chat"
     assert listed.json()["items"][0]["file_path"] is None
     assert listed.json()["items"][0]["storage_key"] == "komari_chat"
+    assert (
+        listed.json()["items"][0]["config_source"]
+        == "postgresql:komari_prompt_komari_chat:komari_chat"
+    )
 
 
 @pytest.mark.asyncio
@@ -208,6 +206,10 @@ async def test_prompt_routes_support_detail_replace_and_field_update(
     assert detail.status_code == 200
     assert detail.json()["values"]["system_prompt"] == "你好"
     assert detail.json()["revision"] == 1
+    assert (
+        detail.json()["config_source"]
+        == "postgresql:komari_prompt_komari_chat:komari_chat"
+    )
     assert updated.status_code == 200
     assert updated.json()["values"]["system_prompt"] == "新的系统提示词"
     assert replaced.status_code == 200

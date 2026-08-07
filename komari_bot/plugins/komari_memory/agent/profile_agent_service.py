@@ -12,15 +12,15 @@ from uuid import uuid4
 from nonebot import logger
 from nonebot.plugin import require
 
-from komari_bot.common.memory_agent_locks import (
+from komari_bot.db.memory_agent_locks import (
     MemoryAgentLockScope,
     acquire_memory_agent_lock,
 )
-from komari_bot.common.profile_operations import ProfileOperation
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
+from komari_bot.memory.profile_operations import ProfileOperation
 
 from ..services.redis_keys import RedisKeys
 from ..services.summary_prompt_template import (

@@ -12,12 +12,12 @@ from nonebot.plugin import get_plugin, require
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
-from komari_bot.common.management_audit import (
+from komari_bot.management.management_audit import (
     hash_management_target,
     management_audit_span,
     record_management_audit_event,
@@ -31,8 +31,8 @@ from komari_bot.plugins.komari_decision.repositories.scene_repository import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditRecorder
 
 API_PREFIX = "/api/v2/komari-decision-scenes"
 _REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
@@ -159,7 +159,6 @@ async def _get_repository() -> SceneRepository:
 async def _prepare_repository() -> SceneRepository:
     try:
         repository = await _get_repository()
-        await repository.ensure_schema()
     except Exception as exc:
         logger.exception("[Komari Management] 获取 scene repository 失败")
         raise HTTPException(

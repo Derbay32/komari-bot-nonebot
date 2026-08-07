@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI
 from pydantic import BaseModel
 from pydantic_core import PydanticUndefined
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
@@ -20,7 +20,7 @@ from .config_schema import DynamicConfigSchema
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.management.management_api import ManagementTokenSource
 
 API_PREFIX = "/api/v2/komari-search"
 _PROVIDER_PREFIXES = {
@@ -28,8 +28,11 @@ _PROVIDER_PREFIXES = {
     "exa": "exa_",
 }
 _METADATA_FIELDS = {
-    "version",
-    "last_updated",
+    # 强类型表存储专用字段（单行主键 / CAS 修订号 / 写入时间）不进入
+    # 管理描述符；白名单与插件开关同样不属于搜索字段描述面。
+    "id",
+    "revision",
+    "updated_at",
     "plugin_enable",
     "user_whitelist",
     "group_whitelist",

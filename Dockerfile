@@ -38,7 +38,9 @@ COPY --from=dependencies_stage /opt/venv /opt/venv
 
 # 复制脚本和配置文件
 COPY ./docker/gunicorn_conf.py ./docker/start.sh /
-RUN chmod +x /start.sh
+# prestart 在应用启动前执行 Alembic 迁移（由 start.sh 源入执行）
+COPY ./docker/prestart.sh /app/prestart.sh
+RUN chmod +x /start.sh /app/prestart.sh
 
 COPY ./docker/bot.py /app/
 COPY ./docker/_main.py /app/

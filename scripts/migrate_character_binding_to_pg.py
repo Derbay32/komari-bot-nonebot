@@ -1,4 +1,8 @@
-"""将旧版角色名绑定 JSON 显式导入 PostgreSQL。"""
+"""将旧版角色名绑定 JSON 显式导入 PostgreSQL。
+
+v2.0.0 起连接串统一读取 nonebot-plugin-orm 权威的 ``SQLALCHEMY_DATABASE_URL``
+（``postgresql://`` 与 ``postgresql+asyncpg://`` 均可）。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,11 +21,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from komari_bot.common.database_config import (
-    DatabaseConfigSchema,
-    load_database_config_from_env,
-    load_database_config_from_file,
-)
 from komari_bot.plugins.character_binding.manager import (
     CharacterNameValidationError,
     validate_character_name,
@@ -77,19 +77,25 @@ def _validate_binding(
     return raw_user_id, validate_character_name(raw_character_name)
 
 
+def _resolve_dsn() -> str:
+    """读取 nonebot-plugin-orm 权威数据库连接串（SQLALCHEMY_DATABASE_URL）。"""
+    dsn = os.environ.get("SQLALCHEMY_DATABASE_URL", "")
+    if not dsn:
+        msg = (
+            "未配置 SQLALCHEMY_DATABASE_URL，"
+            "请通过环境变量设置 nonebot-plugin-orm 的连接串"
+        )
+        raise RuntimeError(msg)
+    return dsn
+
+
 async def migrate_bindings(
     *,
     bindings_path: Path = DEFAULT_BINDINGS_PATH,
-    database_config_path: Path | None = None,
 ) -> dict[str, int]:
     """把文件中的有效绑定 upsert 到 PostgreSQL。"""
     raw_bindings = _load_bindings(bindings_path)
-    config = (
-        load_database_config_from_file(database_config_path)
-        if database_config_path is not None
-        else load_database_config_from_env()
-    )
-    connection = await _connect(config)
+    connection = await asyncpg.connect(dsn=_resolve_dsn(), command_timeout=30)
     written = 0
     skipped = 0
     try:
@@ -128,18 +134,6 @@ async def migrate_bindings(
     return stats
 
 
-async def _connect(config: DatabaseConfigSchema) -> asyncpg.Connection:
-    """建立脚本专用 asyncpg 直连。"""
-    return await asyncpg.connect(
-        host=config.pg_host,
-        port=config.pg_port,
-        database=config.pg_database,
-        user=config.pg_user,
-        password=config.pg_password,
-        command_timeout=30,
-    )
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="将 data/character_binding/bindings.json 导入 PostgreSQL",
@@ -150,12 +144,6 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_BINDINGS_PATH,
         help="旧版 bindings.json 路径",
     )
-    parser.add_argument(
-        "--database-config",
-        type=Path,
-        default=None,
-        help="可选的旧版数据库 JSON 配置；默认读取 PG_* 环境变量",
-    )
     return parser.parse_args()
 
 
@@ -164,7 +152,6 @@ def main() -> None:
     asyncio.run(
         migrate_bindings(
             bindings_path=args.bindings_path,
-            database_config_path=args.database_config,
         )
     )
 

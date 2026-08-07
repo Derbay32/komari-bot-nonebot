@@ -4,7 +4,7 @@
 
 ## 依赖与调用方
 
-- 直接依赖：`config_manager`、`nonebot_plugin_apscheduler`、项目共享 PostgreSQL 配置。
+- 直接依赖：`config_manager`、`nonebot_plugin_apscheduler`；PostgreSQL 索引经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层访问（`UNLOGGED` 表 DDL 由 Alembic 基线管理）。
 - 调用方：`komari_chat`、`komari_memory`、`group_history_summary`、`komari_debug`。
 - 管理挂载：`komari_management` 从本插件获取 API 注册函数和 reader。
 - 禁止反向依赖：`llm_provider` 不得 import 本插件，也不得自行写持久 LLM 日志。
@@ -25,7 +25,7 @@
 - 查询索引：PostgreSQL `UNLOGGED komari_agent_run_log_index`，只含定位与聚合元数据，可从 JSONL 完整重建。
 - 顺序：文件锁内追加并获得 byte offset/length，释放锁，再写 PG；索引失败不回滚 JSONL。
 - 维护：启动及每 5 分钟对账；每日本地时间 04:00 清理。默认只保留当前日志日。
-- 配置：`log_enabled=true`、`retention_days=1`。旧 `llm_provider.llm_log_*` 字段不兼容、不迁移，启动后从 PG 配置 JSONB 中物理删除。
+- 配置：`log_enabled=true`、`retention_days=1`。旧 `llm_provider.llm_log_*` 字段不兼容、不迁移（agent_run_logger 不执行 legacy 配置键清理）。
 
 ## 内容边界
 

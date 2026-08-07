@@ -13,13 +13,13 @@ from uuid import uuid4
 from nonebot import logger
 from nonebot.plugin import require
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     ContentValidationError,
     TextBudget,
     truncate_text_to_budget,
     validate_text_budget,
 )
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from komari_bot.db.orm_connection import SharedEngineConnectionPool
     from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
 
     from ..config_schema import KomariMemoryConfigSchema
@@ -192,7 +193,7 @@ class ForgettingService:
 
     def __init__(
         self,
-        pg_pool: asyncpg.Pool,
+        pg_pool: SharedEngineConnectionPool,
         *,
         config_provider: Callable[[], KomariMemoryConfigSchema] = get_config,
         job_repository: ForgettingJobRepository | None = None,

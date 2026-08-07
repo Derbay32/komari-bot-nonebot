@@ -11,7 +11,7 @@ from uuid import uuid4
 from nonebot import logger
 from nonebot.plugin import require
 
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
