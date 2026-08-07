@@ -515,7 +515,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ### Issue tracker
 
-Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）；`/to-tickets` 拆出的实施 ticket 以 GitHub Projects 草稿项管理，不进 issue 库。See `docs/agents/issue-tracker.md`.
+Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）；`/to-tickets` 拆出的实施 ticket 以父 spec issue 的 sub-issue 管理（原生父子关系 + blocked-by 依赖）。See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

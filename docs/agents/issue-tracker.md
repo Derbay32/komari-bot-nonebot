@@ -31,26 +31,25 @@ GitHub shares one number space across issues and PRs, so a bare `#42` may be eit
 按产出类型分流：
 
 - **PRD / spec / 缺陷报告 / 需求** → 创建 GitHub issue。
-- **实施 ticket（`/to-tickets` 的产出）** → 发布为 GitHub Projects **草稿项（draft items）**，不进 issue 库。见下一节。
+- **实施 ticket（`/to-tickets` 的产出）** → 创建为父 spec issue 的 **sub-issue**（GitHub 原生父子关系）。见下一节。
 
-## Ticket 管理：GitHub Projects 草稿项
+## Ticket 管理：sub-issue
 
-`/to-tickets` 拆出的实施 ticket 一律以 draft items 管理，避免污染 issue 库。
+`/to-tickets` 拆出的实施 ticket 一律作为父 spec issue 的 sub-issue 管理，父子关系与 blocking 边都使用 GitHub 原生能力，UI 直接可见。
 
-- **载体**：每个 feature/spec 一个 GitHub Project，标题与 spec 同名（如 `LLM 双请求 API 与流式传输 tickets`），创建后 `gh project link <number> --owner Derbay32 --repo komari-bot-nonebot` 关联仓库。
-- **权限**：`gh` token 需具备 `read:project,project` scope；缺失时让操作者执行 `gh auth refresh -s read:project,project`。
-- **创建草稿项**：按依赖顺序（blockers 先行）逐个执行
-  `gh project item-create <project-number> --owner Derbay32 --title "<NN> — <标题>" --body "<正文>"`。
+- **创建 ticket**：按依赖顺序（blockers 先行）逐个执行
+  `gh issue create --title "<NN> — <标题>" --body "<正文>" --label ready-for-agent`。
   标题带两位序号前缀保持顺序可见；正文沿用 to-tickets 模板（Parent / What to build / Acceptance criteria / Blocked by），简体中文。
-- **Blocking 边**：draft items 无原生依赖关系，以正文 `## Blocked by` 一节的文字声明为准（列序号 + 标题）；frontier = 所有 blocker 均已完成的 ticket。
-- **状态推进**：用 Project 的 Status 字段流转；完成一张就把对应草稿项标记为 Done。
-- **升级正式 issue**：仅当某张 ticket 需要被外部协作、挂 PR 或进入 triage 流程时，才在 Project 面板将其 "Convert to issue"；转换后按 issue 惯例补 `ready-for-agent` 标签与原生 blocked-by 依赖。默认不转换。
+- **挂载为 sub-issue**：`gh api --method POST repos/<owner>/<repo>/issues/<parent-number>/sub_issues -F sub_issue_id=<child-db-id>`，其中 `<child-db-id>` 是子 issue 的数字 **database id**（`gh api repos/<owner>/<repo>/issues/<n> --jq .id`，不是 `#number` 或 `node_id`）。
+- **Blocking 边**：GitHub 原生 issue 依赖——`gh api --method POST repos/<owner>/<repo>/issues/<child-number>/dependencies/blocked_by -F issue_id=<blocker-db-id>`（同为 database id）。正文 `## Blocked by` 一节的文字声明（序号 + 标题）保留为兜底与速读。frontier = 所有 blocker 均已关闭的 ticket。
+- **列出子 ticket**：`gh api repos/<owner>/<repo>/issues/<parent-number>/sub_issues`。
+- **状态推进**：完成一张 ticket 即 `gh issue close <n> --comment "<完成说明>"`；父 spec issue 在全部子 ticket 完成后才由人决定是否关闭。
 - **父 spec issue**：发布 ticket 时绝不关闭或修改父 issue。
 
 ## When a skill says "fetch the relevant ticket"
 
 - 工单编号（`#<n>`）→ `gh issue view <n> --comments`。
-- 实施 ticket → `gh project item-list <project-number> --owner Derbay32 --format json` 找到对应草稿项，再 `gh project item-view` 或面板查看正文。
+- 实施 ticket → 同为 issue，直接 `gh issue view <n> --comments`；父 spec issue 的全部子 ticket 用 `gh api repos/<owner>/<repo>/issues/<n>/sub_issues` 列出。
 
 ## Wayfinding operations
 
