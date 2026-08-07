@@ -43,9 +43,17 @@ if TYPE_CHECKING:
 
     from ..config_schema import KomariMemoryConfigSchema
 
-llm_provider = require("llm_provider")
-embedding_provider = require("embedding_provider")
-agent_run_logger_plugin = require("agent_run_logger")
+require("llm_provider")
+require("embedding_provider")
+require("agent_run_logger")
+
+from komari_bot.plugins import (
+    agent_run_logger as agent_run_logger_plugin,
+)
+from komari_bot.plugins import (
+    embedding_provider,
+    llm_provider,
+)
 
 _CONVERSATION_DECAY_SQL = """
 UPDATE komari_memory_conversations

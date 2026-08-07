@@ -58,7 +58,9 @@ if state.nonebot_mode:
         from nonebot import logger as nb_logger
         from nonebot.plugin import require
 
-        config_manager_plugin = require("config_manager")
+        require("config_manager")
+        from komari_bot.plugins import config_manager as config_manager_plugin
+
         config_manager = config_manager_plugin.get_config_manager(
             "komari_help", DynamicConfigSchema
         )
@@ -89,7 +91,7 @@ def get_config() -> DynamicConfigSchema:
         assert config_manager is not None, (
             "config_manager 应该在 NoneBot 模式下已初始化"
         )
-        return config_manager.get()
+        return cast("DynamicConfigSchema", config_manager.get())
     if state.standalone_config is None:
         state.standalone_config = _load_standalone_config()
     return state.standalone_config
@@ -189,9 +191,8 @@ class HelpEngine:
     def _resolve_expected_embedding_dimension(self) -> int | None:
         expected_dimension: int | None = None
         if state.nonebot_mode:
-            from nonebot.plugin import require
+            from komari_bot.plugins import embedding_provider
 
-            embedding_provider = require("embedding_provider")
             get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
             if callable(get_dimension):
                 raw_dimension = get_dimension()
@@ -374,9 +375,8 @@ class HelpEngine:
 
     async def _get_embedding(self, text: str) -> list[float]:
         if state.nonebot_mode:
-            from nonebot.plugin import require
+            from komari_bot.plugins import embedding_provider
 
-            embedding_provider = require("embedding_provider")
             return await embedding_provider.embed(text)
         if self._embedding_service is None:
             raise RuntimeError("独立嵌入服务未初始化")

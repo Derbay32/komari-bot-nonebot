@@ -31,7 +31,9 @@ _JOB_ID = "komari_memory_interaction_event_worker"
 _DAILY_JOB_ID = "komari_memory_interaction_event_daily_flush"
 _MAX_USERS_PER_RUN = 100
 _MAX_HEARTBEAT_INTERVAL_SECONDS = 30.0
-agent_run_logger_plugin = require("agent_run_logger")
+require("agent_run_logger")
+
+from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
 
 
 def _record_timestamp(record: dict[str, Any]) -> float:

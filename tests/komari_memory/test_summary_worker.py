@@ -890,7 +890,7 @@ def test_perform_summary_uses_current_binding_snapshot(
             return fallback_nickname or user_id
 
     fake_binding = _FakeBinding()
-    monkeypatch.setattr(module, "character_binding", fake_binding)
+    monkeypatch.setattr(module, "character_binding", fake_binding, raising=False)
     observed: dict[str, Any] = {}
 
     async def _fake_summarize_conversation(*args: Any, **kwargs: Any) -> dict[str, Any]:

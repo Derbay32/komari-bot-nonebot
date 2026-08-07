@@ -6,11 +6,9 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import komari_bot.plugins as plugins_package
 from komari_bot.plugins.komari_memory.repositories.entity_repository import (
     UserProfileBatchUpsertResult,
-)
-from komari_bot.plugins.komari_memory.services import (
-    memory_service as memory_service_module,
 )
 from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
 
@@ -165,7 +163,9 @@ def _make_service(
     entity_repo = _FakeEntityRepository()
     interaction_event_repo = _FakeInteractionEventRepository()
     embedding_plugin = _FakeEmbeddingPlugin()
-    monkeypatch.setattr(memory_service_module, "require", lambda _name: embedding_plugin)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_plugin, raising=False
+    )
     service = MemoryService(
         conversation_repo=cast("Any", conversation_repo),
         entity_repo=cast("Any", entity_repo),

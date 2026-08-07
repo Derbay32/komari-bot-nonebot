@@ -6,6 +6,8 @@ Komari Knowledge 常识库插件。
 
 from __future__ import annotations
 
+from typing import cast
+
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
@@ -22,8 +24,10 @@ from .engine import (
 from .models import KnowledgeCategory, KnowledgeEntry, KnowledgeListResponse
 
 # 依赖其他插件
-config_manager_plugin = require("config_manager")
+require("config_manager")
 require("embedding_provider")
+
+from komari_bot.plugins import config_manager as config_manager_plugin
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
@@ -63,7 +67,7 @@ driver = get_driver()
 @driver.on_startup
 async def on_startup() -> None:
     """Bot 启动时初始化常识库引擎。"""
-    config = await config_manager.get_async()
+    config = cast("DynamicConfigSchema", await config_manager.get_async())
 
     if not config.plugin_enable:
         logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
@@ -107,7 +111,7 @@ async def search_knowledge(
         logger.warning("[Komari Knowledge] 引擎未初始化")
         return []
 
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     if not config.plugin_enable:
         return []
 
@@ -121,7 +125,7 @@ async def search_by_keyword(keyword: str) -> list[SearchResult]:
         logger.warning("[Komari Knowledge] 引擎未初始化")
         return []
 
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     if not config.plugin_enable:
         return []
 

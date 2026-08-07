@@ -13,6 +13,7 @@ import os
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -269,7 +270,7 @@ async def test_fuzzify_conversation_writes_summary_and_replaces_vector(
         assert int(vector_row["embedding_dim"]) == EMBEDDING_DIMENSION
 
     # LLM 输出必须只保留 <content> 标签内正文
-    llm = forgetting_service_module.llm_provider
+    llm: Any = forgetting_service_module.llm_provider
     assert "标签外不要输出任何解释" in str(llm.calls[0]["prompt"])
     assert 'source_type="memory"' in str(llm.calls[0]["prompt"])
 

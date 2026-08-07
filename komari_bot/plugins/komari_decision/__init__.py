@@ -58,7 +58,8 @@ def _get_ready_memory_pool(memory_plugin: object) -> Pool:
     return memory_pool
 
 
-# 先加载 memory
+# 先加载 embedding 与 memory
+require("embedding_provider")
 require("komari_memory")
 
 __plugin_meta__ = PluginMetadata(
@@ -151,7 +152,8 @@ class PluginManager:
 
             unregister_task = unregister_scene_sync_task
             runtime_require("nonebot_plugin_apscheduler")
-            memory_plugin = require("komari_memory")
+            from komari_bot.plugins import komari_memory as memory_plugin
+
             memory_pool = _get_ready_memory_pool(memory_plugin)
 
             scene_repository = SceneRepository(memory_pool)

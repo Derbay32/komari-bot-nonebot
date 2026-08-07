@@ -28,8 +28,10 @@ from ..services.message_chunking import (
     format_message_line,
 )
 
-character_binding = require("character_binding")
-agent_run_logger_plugin = require("agent_run_logger")
+require("character_binding")
+require("agent_run_logger")
+
+from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
 
 
 class InvalidSummaryResultError(RuntimeError):

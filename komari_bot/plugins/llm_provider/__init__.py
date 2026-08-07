@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
@@ -63,8 +63,11 @@ __all__ = [
 ]
 
 # 依赖插件
-config_manager_plugin = require("config_manager")
-knowledge_plugin = require("komari_knowledge")
+require("config_manager")
+require("komari_knowledge")
+
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import komari_knowledge as knowledge_plugin
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
@@ -235,7 +238,9 @@ def _summarize_messages_payload(
 
 def _get_client_settings() -> ClientSettings:
     """读取影响 HTTP 连接的动态配置快照。"""
-    return ClientSettings.from_config(config_manager.get())
+    return ClientSettings.from_config(
+        cast("DynamicConfigSchema", config_manager.get())
+    )
 
 
 def _resolve_request_mode(
@@ -658,7 +663,7 @@ async def test_connection() -> bool:
     Returns:
         连接是否成功
     """
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     token = config.api_token
     if not token:
         logger.warning("API Token 未配置，跳过连接测试")
@@ -684,7 +689,7 @@ if driver is not None:
         """
         from komari_bot.core.sentry_support import register_sensitive_value
 
-        config = await config_manager.get_async()
+        config = cast("DynamicConfigSchema", await config_manager.get_async())
         register_sensitive_value(config.api_base)
 
     @driver.on_shutdown

@@ -1,4 +1,5 @@
 from random import randint
+from typing import cast
 
 from nonebot import get_driver, get_plugin_config, logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
@@ -40,11 +41,15 @@ __plugin_meta__ = PluginMetadata(
 config = get_plugin_config(Config)
 
 # 依赖配置管理插件
-config_manager_plugin = require("config_manager")
+require("config_manager")
 # 依赖权限管理插件
-permission_manager_plugin = require("permission_manager")
+require("permission_manager")
 # 依赖用户名绑定插件
-character_binding = require("character_binding")
+require("character_binding")
+
+from komari_bot.plugins import character_binding
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import permission_manager as permission_manager_plugin
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("sr", DynamicConfigSchema)
@@ -135,7 +140,7 @@ async def sr_switch(
         await sr_manage.finish("❌ 仅限 SUPERUSER 使用")
 
     _, action = cmd
-    config = await config_manager.get_async()
+    config = cast("DynamicConfigSchema", await config_manager.get_async())
 
     match action:
         case "status":
@@ -190,7 +195,7 @@ async def sr_function(
         custom_message = args.extract_plain_text().strip() if args else None
 
         # 获取神人榜与其长度
-        config = await config_manager.get_async()
+        config = cast("DynamicConfigSchema", await config_manager.get_async())
         sr_list = config.sr_list
         sr_num = len(sr_list)
         if not sr_list:
@@ -245,7 +250,7 @@ async def sr_usrcustom(
         match action:
             case "list":
                 # 获取神人榜
-                config = await config_manager.get_async()
+                config = cast("DynamicConfigSchema", await config_manager.get_async())
                 sr_list = config.sr_list
 
                 if not sr_list:

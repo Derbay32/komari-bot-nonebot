@@ -447,7 +447,10 @@ _inject_package_exports(
 )
 _inject_package_exports(
     "character_binding",
-    {"get_binding_manager": _DummyCharacterBindingPlugin.get_binding_manager},
+    {
+        "get_binding_manager": _DummyCharacterBindingPlugin.get_binding_manager,
+        "get_character_name": _DummyCharacterBindingPlugin.get_character_name,
+    },
 )
 _inject_package_exports(
     "user_data",
@@ -455,6 +458,27 @@ _inject_package_exports(
         "get_user_favorability": _DummyUserDataPlugin.get_user_favorability,
         "set_user_favorability": _DummyUserDataPlugin.set_user_favorability,
         "get_user_count": _DummyUserDataPlugin.get_user_count,
+        "get_config": _DummyUserDataPlugin.get_config,
+        "adjust_user_favorability": _DummyUserDataPlugin.adjust_user_favorability,
+    },
+)
+# 业务插件改为普通 import 后，保持 require 桩语义注入 shim 导出
+_inject_package_exports(
+    "komari_memory",
+    {"get_plugin_manager": _DummyMemoryPlugin.get_plugin_manager},
+)
+_inject_package_exports(
+    "agent_run_logger",
+    {
+        "create_collector": _DummyAgentRunLoggerPlugin.create_collector,
+        "finalize_collector": _DummyAgentRunLoggerPlugin.finalize_collector,
+    },
+)
+_inject_package_exports(
+    "komari_knowledge",
+    {
+        "search_knowledge": _DummyKnowledgePlugin.search_knowledge,
+        "search_by_keyword": _DummyKnowledgePlugin.search_by_keyword,
     },
 )
 _inject_package_exports(
@@ -468,5 +492,14 @@ _inject_package_exports(
         "finalize_collector": _DummyAgentRunLoggerPlugin.finalize_collector,
         "get_agent_run_log_reader": _DummyAgentRunLoggerPlugin.get_agent_run_log_reader,
         "register_agent_run_log_api": _DummyAgentRunLoggerPlugin.register_agent_run_log_api,
+    },
+)
+_inject_package_exports(
+    "llm_provider",
+    {
+        "generate_text": _DummyLLMProvider.generate_text,
+        "generate_text_with_messages": _DummyLLMProvider.generate_text_with_messages,
+        "generate_messages_completion": _DummyLLMProvider.generate_messages_completion,
+        "generate_completion": _DummyLLMProvider.generate_completion,
     },
 )

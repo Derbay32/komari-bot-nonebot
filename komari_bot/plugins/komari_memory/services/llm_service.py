@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from nonebot import logger
@@ -29,7 +29,9 @@ if TYPE_CHECKING:
     from .redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
-llm_provider = require("llm_provider")
+require("llm_provider")
+
+from komari_bot.plugins import llm_provider
 
 _MAX_SUMMARY_MEMORIES = 8
 _SUMMARY_TOKEN_WARNING_THRESHOLD = 32000
@@ -529,7 +531,7 @@ async def generate_reply(
             prompt=user_message,
             model=config.llm_model_chat,
             system_instruction=system_prompt,
-            temperature=config.llm_temperature_chat,
+            temperature=cast("int | None", config.llm_temperature_chat),
             max_tokens=config.llm_max_tokens_chat,
             request_api=config.llm_request_api_chat,
             stream_enabled=config.llm_stream_enabled_chat,

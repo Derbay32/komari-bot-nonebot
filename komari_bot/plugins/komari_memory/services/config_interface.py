@@ -8,10 +8,14 @@
     config = get_config()
 """
 
+from typing import cast
+
 from nonebot.plugin import require
 
 # 导入 config_manager 插件
-config_manager_plugin = require("config_manager")
+require("config_manager")
+
+from komari_bot.plugins import config_manager as config_manager_plugin
 
 # 导入配置 Schema
 from ..config_schema import KomariMemoryConfigSchema
@@ -28,12 +32,12 @@ def get_config() -> KomariMemoryConfigSchema:
     Returns:
         当前配置对象
     """
-    return _config_manager.get()
+    return cast("KomariMemoryConfigSchema", _config_manager.get())
 
 
 async def get_config_async() -> KomariMemoryConfigSchema:
     """在事件循环内异步获取当前配置。"""
-    return await _config_manager.get_async()
+    return cast("KomariMemoryConfigSchema", await _config_manager.get_async())
 
 
 __all__ = ["get_config", "get_config_async"]

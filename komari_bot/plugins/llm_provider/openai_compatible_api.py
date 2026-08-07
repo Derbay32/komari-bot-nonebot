@@ -29,7 +29,8 @@ from .config_schema import (
 )
 
 # 依赖 config_manager 插件
-config_manager_plugin = require("config_manager")
+require("config_manager")
+from komari_bot.plugins import config_manager as config_manager_plugin
 
 # 获取配置管理器
 config_manager = config_manager_plugin.get_config_manager(
@@ -1074,7 +1075,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         Returns:
             生成的文本
         """
-        config = config_manager.get()
+        config = cast("DynamicConfigSchema", config_manager.get())
         try:
             reasoning_effort, thinking_disabled, suppress_tool_choice = (
                 self._resolve_thinking_params(model, **kwargs)
@@ -1190,7 +1191,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         Returns:
             生成的文本
         """
-        config = config_manager.get()
+        config = cast("DynamicConfigSchema", config_manager.get())
         try:
             reasoning_effort, thinking_disabled, suppress_tool_choice = (
                 self._resolve_thinking_params(model, **kwargs)
@@ -1273,7 +1274,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         Returns:
             连接是否成功
         """
-        config = config_manager.get()
+        config = cast("DynamicConfigSchema", config_manager.get())
         resolved_api, resolved_stream = self._resolve_request_mode(
             config, None, stream_enabled=None
         )

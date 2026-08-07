@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
-from nonebot.plugin import require
 
 from .config_interface import get_config
 from .scene_template_loader import (
@@ -51,7 +50,9 @@ class SceneSyncService:
     @staticmethod
     def _get_embedding_provider() -> Any:
         """惰性获取 embedding_provider，避免模块导入阶段强依赖。"""
-        return require("embedding_provider")
+        from komari_bot.plugins import embedding_provider
+
+        return embedding_provider
 
     @classmethod
     def _resolve_embedding_model(cls) -> str:

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from typing import cast
 from urllib.parse import urlparse
 
 from nonebot import get_driver, logger
@@ -45,8 +46,12 @@ __all__ = [
     "shutdown_search_resources",
 ]
 
-config_manager_plugin = require("config_manager")
-permission_manager_plugin = require("permission_manager")
+require("config_manager")
+require("permission_manager")
+
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import permission_manager as permission_manager_plugin
+
 config_manager = config_manager_plugin.get_config_manager(
     "komari_search",
     DynamicConfigSchema,
@@ -169,7 +174,7 @@ _fetch_circuit_breaker = _CircuitBreaker()
 
 def _get_config() -> DynamicConfigSchema:
     """读取动态配置，并用 .env 中的搜索 Key 作为未持久化时的兜底。"""
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     if config.search_api_key.strip():
         return config
 

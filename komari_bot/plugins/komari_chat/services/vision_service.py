@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -12,8 +13,12 @@ from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
-config_manager_plugin = require("config_manager")
-llm_provider = require("llm_provider")
+require("config_manager")
+require("llm_provider")
+
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import llm_provider
+
 llm_provider_config_manager = config_manager_plugin.get_config_manager(
     "llm_provider",
     DynamicConfigSchema,
@@ -49,7 +54,7 @@ async def _read_single_image(
     collector: "LLMDiagnosticCollector | None" = None,
 ) -> str:
     """调用视觉模型读取单张图片。"""
-    config = llm_provider_config_manager.get()
+    config = cast("DynamicConfigSchema", llm_provider_config_manager.get())
     if not config.api_token:
         return "[图片读取失败: 未配置 api_token]"
 

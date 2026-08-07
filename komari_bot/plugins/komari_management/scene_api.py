@@ -284,7 +284,9 @@ def create_scene_router(
             resource="komari_decision_scene_set",
             recorder=recorder,
         ) as audit:
-            decision_plugin = require("komari_decision")
+            require("komari_decision")
+            from komari_bot.plugins import komari_decision as decision_plugin
+
             manager_getter = getattr(decision_plugin, "get_plugin_manager", None)
             manager = manager_getter() if callable(manager_getter) else None
             scene_sync = (

@@ -5,8 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from nonebot.plugin import require
-
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -38,7 +36,12 @@ class MemoryService:
         self._conversation_repo = conversation_repo
         self._entity_repo = entity_repo
         self._interaction_event_repo = interaction_event_repo
-        self._embedding_plugin: Any = require("embedding_provider")
+
+        # 惰性 import，避免模块导入阶段强依赖（komari_memory 包内由
+        # forgetting_service 的模块级 require("embedding_provider") 声明加载顺序）
+        from komari_bot.plugins import embedding_provider
+
+        self._embedding_plugin: Any = embedding_provider
 
     @property
     def pg_pool(self) -> Any:

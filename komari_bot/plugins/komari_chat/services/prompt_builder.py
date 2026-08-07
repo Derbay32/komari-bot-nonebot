@@ -29,10 +29,12 @@ if TYPE_CHECKING:
     from komari_bot.plugins.user_data.models import UserFavorability
 
 # 获取常识库插件
-komari_knowledge = require("komari_knowledge")
+require("komari_knowledge")
 
 # 获取角色绑定插件
-character_binding = require("character_binding")
+require("character_binding")
+
+from komari_bot.plugins import character_binding, komari_knowledge
 
 
 def _clean_yaml_text(value: object) -> str:

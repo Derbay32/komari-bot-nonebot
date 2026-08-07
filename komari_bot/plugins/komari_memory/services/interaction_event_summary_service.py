@@ -30,7 +30,9 @@ if TYPE_CHECKING:
 
     from ..config_schema import KomariMemoryConfigSchema
 
-llm_provider = require("llm_provider")
+require("llm_provider")
+
+from komari_bot.plugins import llm_provider
 
 MAX_INTERACTION_SUMMARY_RECORDS = 200
 INTERACTION_RECORDS_PER_CHUNK = 40

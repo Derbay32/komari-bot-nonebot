@@ -67,10 +67,15 @@ __plugin_meta__ = PluginMetadata(
     config=DynamicConfigSchema,
 )
 
-config_manager_plugin = require("config_manager")
-permission_manager_plugin = require("permission_manager")
-knowledge_plugin = require("komari_knowledge")
-character_binding = require("character_binding")
+require("config_manager")
+require("permission_manager")
+require("komari_knowledge")
+require("character_binding")
+
+from komari_bot.plugins import character_binding
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import komari_knowledge as knowledge_plugin
+from komari_bot.plugins import permission_manager as permission_manager_plugin
 
 config_manager = config_manager_plugin.get_config_manager(
     "komari_custom", DynamicConfigSchema
@@ -116,7 +121,7 @@ async def on_startup() -> None:
         max_instances=1,
         coalesce=True,
     )
-    config = await config_manager.get_async()
+    config = cast("DynamicConfigSchema", await config_manager.get_async())
     if not config.plugin_enable:
         logger.info("[KomariCustom] 插件未启用，跳过初始化")
         return
@@ -226,7 +231,7 @@ async def _handle_new(group_id: int, user_id: str, title: str) -> None:
             "❌ 你已经有正在编辑的提案啦，先 confirm/cancel 处理掉吧"
         )
 
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     active_count = await repository.count_active_by_user(group_id, int(user_id))
     if active_count >= config.max_proposals_per_user:
         await custom_action.finish(
@@ -311,7 +316,7 @@ async def _commit_proposal(
     user_id: str,
     session: SessionData,
 ) -> None:
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     proposer_name = _resolve_proposer_name(event)
     draft = ProposalPublicationDraft(
         publication_key=build_publication_key(
@@ -382,7 +387,7 @@ async def _commit_proposal(
 
 
 async def _handle_list(bot: Bot, group_id: int, text: str) -> None:
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     page = int(text) if text.isdigit() else 1
     if page < 1:
         await custom_action.finish("❌ 页码必须大于 0")
@@ -433,7 +438,7 @@ async def _handle_show(bot: Bot, group_id: int, selector: str) -> None:
         label="提案查询文本",
         budget=QUERY_TEXT_BUDGET,
     )
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     proposal = await repository.find_in_group_by_index_or_keyword(
         group_id=group_id,
         selector=selector,

@@ -63,11 +63,17 @@ from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
 
-agent_run_logger_plugin = require("agent_run_logger")
-user_data_plugin = require("user_data")
+require("agent_run_logger")
+require("user_data")
 
-config_manager_plugin = require("config_manager")
-komari_search_plugin = require("komari_search")
+require("config_manager")
+require("komari_search")
+
+from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import komari_search as komari_search_plugin
+from komari_bot.plugins import user_data as user_data_plugin
+
 llm_provider_config_manager = config_manager_plugin.get_config_manager(
     "llm_provider",
     DynamicConfigSchema,
@@ -831,9 +837,8 @@ class MessageHandler:
         )
 
         try:
-            from nonebot.plugin import require
+            from komari_bot.plugins import embedding_provider
 
-            embedding_provider = require("embedding_provider")
             query_embedding = await embedding_provider.embed(rewritten_query)
         except Exception as e:
             logger.warning("[KomariMemory] 预生成查询特征向量失败: {}", e)
@@ -1004,7 +1009,9 @@ class MessageHandler:
             vision_request_api = "chat_completions"
             vision_stream_enabled = False
             if use_vision_tool:
-                vision_config = llm_provider_config_manager.get()
+                vision_config = cast(
+                    "DynamicConfigSchema", llm_provider_config_manager.get()
+                )
                 vision_model = vision_config.vision_model
                 vision_temperature = vision_config.vision_temperature
                 vision_max_tokens = vision_config.vision_max_tokens
