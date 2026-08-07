@@ -80,6 +80,7 @@ def chat_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
                 / "komari_decision"
             )
         ]
+        decision_package.get_decision_engine = lambda: None  # type: ignore[attr-defined]
         sys.modules[decision_package_name] = decision_package
 
     module_name = "komari_bot.plugins.komari_chat._entry_under_test"
@@ -154,14 +155,14 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
     assert calls.process
 
 
-def test_handler_rebuilds_when_decision_runtime_changes(
+def test_handler_rebuilds_when_decision_engine_changes(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = object()
     memory = object()
-    runtime_ref = SimpleNamespace(value=object())
-    built_runtimes: list[object | None] = []
+    engine_ref = SimpleNamespace(value=object())
+    built_engines: list[object] = []
 
     class _Handler:
         def __init__(
@@ -169,14 +170,12 @@ def test_handler_rebuilds_when_decision_runtime_changes(
             *,
             redis: object,
             memory: object,
-            scene_runtime: object | None,
-            decision_runtime_state_provider: object,
+            decision_engine: object,
         ) -> None:
-            del decision_runtime_state_provider
             self.redis = redis
             self.memory = memory
-            self.scene_runtime = scene_runtime
-            built_runtimes.append(scene_runtime)
+            self.decision_engine = decision_engine
+            built_engines.append(decision_engine)
 
     monkeypatch.setattr(
         chat_module,
@@ -185,18 +184,18 @@ def test_handler_rebuilds_when_decision_runtime_changes(
     )
     monkeypatch.setattr(
         chat_module,
-        "get_decision_plugin_manager",
-        lambda: SimpleNamespace(scene_runtime=runtime_ref.value),
+        "get_decision_engine",
+        lambda: engine_ref.value,
     )
     monkeypatch.setattr(chat_module, "MessageHandler", _Handler)
     monkeypatch.setattr(chat_module, "_handler", None)
 
     first = chat_module._get_or_build_handler()
-    runtime_ref.value = object()
+    engine_ref.value = object()
     second = chat_module._get_or_build_handler()
 
     assert first is not second
-    assert built_runtimes == [first.scene_runtime, second.scene_runtime]
+    assert built_engines == [first.decision_engine, second.decision_engine]
 
 
 @pytest.mark.asyncio
