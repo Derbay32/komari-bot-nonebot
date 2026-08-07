@@ -16,6 +16,7 @@ EXPECTED_PLUGIN_ALL = {
     "PluginManager",
     "UnifiedCandidateRerankService",
     "UnifiedRerankResult",
+    "get_decision_engine",
     "get_plugin_manager",
     "get_runtime_state",
     "get_scene_admin_service",
