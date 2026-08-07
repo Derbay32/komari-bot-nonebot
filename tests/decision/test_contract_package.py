@@ -75,6 +75,12 @@ def _collect_import_modules(path: Path) -> set[str]:
     return modules
 
 
+def _is_frozen_dataclass(cls: type) -> bool:
+    """读取 dataclass 的 frozen 配置（pyright 未实现该运行时属性，走 getattr）。"""
+    params = getattr(cls, "__dataclass_params__", None)
+    return bool(getattr(params, "frozen", False))
+
+
 def test_package_reexports_all_contract_symbols() -> None:
     missing = EXPECTED_EXPORTS.difference(dir(contracts))
     assert not missing, f"共享包缺少导出符号: {sorted(missing)}"
@@ -112,7 +118,7 @@ def test_runtime_state_behaviour_matches_legacy() -> None:
     status = contracts.DecisionRuntimeStatus
 
     assert dataclasses.is_dataclass(state_cls)
-    assert state_cls.__dataclass_params__.frozen is True
+    assert _is_frozen_dataclass(state_cls) is True
     assert [field.name for field in dataclasses.fields(state_cls)] == [
         "status",
         "reason",
@@ -156,7 +162,7 @@ def test_literal_aliases_match_legacy() -> None:
 def test_decision_outcome_fields_match_legacy() -> None:
     outcome = contracts.DecisionOutcome
     assert dataclasses.is_dataclass(outcome)
-    assert outcome.__dataclass_params__.frozen is True
+    assert _is_frozen_dataclass(outcome) is True
     assert [field.name for field in dataclasses.fields(outcome)] == [
         "memory_action",
         "should_reply",
@@ -185,7 +191,7 @@ def test_decision_outcome_fields_match_legacy() -> None:
 def test_candidate_schema_fields_match_legacy() -> None:
     schema = contracts.CandidateSchema
     assert dataclasses.is_dataclass(schema)
-    assert schema.__dataclass_params__.frozen is True
+    assert _is_frozen_dataclass(schema) is True
     fields = {field.name: field for field in dataclasses.fields(schema)}
     assert list(fields) == [
         "key",
@@ -201,7 +207,7 @@ def test_candidate_schema_fields_match_legacy() -> None:
 def test_unified_rerank_result_fields_match_legacy() -> None:
     result = contracts.UnifiedRerankResult
     assert dataclasses.is_dataclass(result)
-    assert result.__dataclass_params__.frozen is True
+    assert _is_frozen_dataclass(result) is True
     assert [field.name for field in dataclasses.fields(result)] == [
         "alias_hit",
         "candidates",
@@ -224,7 +230,7 @@ def test_scene_runtime_unavailable_error_is_runtime_error() -> None:
 def test_timing_score_breakdown_fields_match_legacy() -> None:
     breakdown = contracts.TimingScoreBreakdown
     assert dataclasses.is_dataclass(breakdown)
-    assert breakdown.__dataclass_params__.frozen is True
+    assert _is_frozen_dataclass(breakdown) is True
     assert [field.name for field in dataclasses.fields(breakdown)] == [
         "timing_score",
         "mention_bonus",
@@ -242,7 +248,7 @@ def test_timing_score_breakdown_fields_match_legacy() -> None:
 def test_filter_result_is_frozen_and_keyword_only() -> None:
     result_cls = contracts.FilterResult
     assert dataclasses.is_dataclass(result_cls)
-    assert result_cls.__dataclass_params__.frozen is True
+    assert _is_frozen_dataclass(result_cls) is True
     assert [field.name for field in dataclasses.fields(result_cls)] == [
         "should_skip",
         "reason",
@@ -253,7 +259,7 @@ def test_filter_result_is_frozen_and_keyword_only() -> None:
     assert result.reason == "short"
 
     with pytest.raises(TypeError):
-        result_cls(True, "short")  # type: ignore[call-arg]
+        result_cls(True, "short")  # type: ignore[call-arg]  # noqa: FBT003 故意位置调用验证关键字-only
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.should_skip = False  # type: ignore[misc]
