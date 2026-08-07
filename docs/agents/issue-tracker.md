@@ -10,7 +10,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
-- **语言约定**：本仓库 issue 的标题与正文统一使用简体中文撰写。
+- **Language convention**: issue titles and bodies in this repo are written in Simplified Chinese.
 
 Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
 
@@ -28,28 +28,28 @@ GitHub shares one number space across issues and PRs, so a bare `#42` may be eit
 
 ## When a skill says "publish to the issue tracker"
 
-按产出类型分流：
+Route by artifact type:
 
-- **PRD / spec / 缺陷报告 / 需求** → 创建 GitHub issue。
-- **实施 ticket（`/to-tickets` 的产出）** → 创建为父 spec issue 的 **sub-issue**（GitHub 原生父子关系）。见下一节。
+- **PRD / spec / bug report / feature request** → create a GitHub issue.
+- **Implementation ticket (output of `/to-tickets`)** → create as a **sub-issue** of the parent spec issue (GitHub's native parent-child relation). See the next section.
 
-## Ticket 管理：sub-issue
+## Ticket management: sub-issues
 
-`/to-tickets` 拆出的实施 ticket 一律作为父 spec issue 的 sub-issue 管理，父子关系与 blocking 边都使用 GitHub 原生能力，UI 直接可见。
+Implementation tickets produced by `/to-tickets` are always managed as sub-issues of the parent spec issue; both the parent-child relation and blocking edges use GitHub's native capabilities, visible directly in the UI.
 
-- **创建 ticket**：按依赖顺序（blockers 先行）逐个执行
-  `gh issue create --title "<NN> — <标题>" --body "<正文>" --label ready-for-agent`。
-  标题带两位序号前缀保持顺序可见；正文沿用 to-tickets 模板（Parent / What to build / Acceptance criteria / Blocked by），简体中文。
-- **挂载为 sub-issue**：`gh api --method POST repos/<owner>/<repo>/issues/<parent-number>/sub_issues -F sub_issue_id=<child-db-id>`，其中 `<child-db-id>` 是子 issue 的数字 **database id**（`gh api repos/<owner>/<repo>/issues/<n> --jq .id`，不是 `#number` 或 `node_id`）。
-- **Blocking 边**：GitHub 原生 issue 依赖——`gh api --method POST repos/<owner>/<repo>/issues/<child-number>/dependencies/blocked_by -F issue_id=<blocker-db-id>`（同为 database id）。正文 `## Blocked by` 一节的文字声明（序号 + 标题）保留为兜底与速读。frontier = 所有 blocker 均已关闭的 ticket。
-- **列出子 ticket**：`gh api repos/<owner>/<repo>/issues/<parent-number>/sub_issues`。
-- **状态推进**：完成一张 ticket 即 `gh issue close <n> --comment "<完成说明>"`；父 spec issue 在全部子 ticket 完成后才由人决定是否关闭。
-- **父 spec issue**：发布 ticket 时绝不关闭或修改父 issue。
+- **Create a ticket**: one at a time, in dependency order (blockers first):
+  `gh issue create --title "<NN> — <title>" --body "<body>" --label ready-for-agent`.
+  The two-digit sequence prefix in the title keeps ordering visible; the body follows the to-tickets template (Parent / What to build / Acceptance criteria / Blocked by), in Simplified Chinese.
+- **Attach as sub-issue**: `gh api --method POST repos/<owner>/<repo>/issues/<parent-number>/sub_issues -F sub_issue_id=<child-db-id>`, where `<child-db-id>` is the child issue's numeric **database id** (`gh api repos/<owner>/<repo>/issues/<n> --jq .id`, _not_ the `#number` or `node_id`).
+- **Blocking edge**: GitHub's native issue dependencies — `gh api --method POST repos/<owner>/<repo>/issues/<child-number>/dependencies/blocked_by -F issue_id=<blocker-db-id>` (also a database id). The textual declaration in the body's `## Blocked by` section (sequence number + title) is kept as a fallback and for quick reading. frontier = tickets whose blockers are all closed.
+- **List child tickets**: `gh api repos/<owner>/<repo>/issues/<parent-number>/sub_issues`.
+- **Status progression**: finishing a ticket means `gh issue close <n> --comment "<completion note>"`; the parent spec issue is closed by a human only after all child tickets complete.
+- **Parent spec issue**: never close or modify the parent issue when publishing tickets.
 
 ## When a skill says "fetch the relevant ticket"
 
-- 工单编号（`#<n>`）→ `gh issue view <n> --comments`。
-- 实施 ticket → 同为 issue，直接 `gh issue view <n> --comments`；父 spec issue 的全部子 ticket 用 `gh api repos/<owner>/<repo>/issues/<n>/sub_issues` 列出。
+- A ticket number (`#<n>`) → `gh issue view <n> --comments`.
+- Implementation tickets are issues too — same `gh issue view <n> --comments`; list all child tickets of a parent spec issue with `gh api repos/<owner>/<repo>/issues/<n>/sub_issues`.
 
 ## Wayfinding operations
 
