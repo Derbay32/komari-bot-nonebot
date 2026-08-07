@@ -76,7 +76,6 @@ __all__ = [
     "UnifiedRerankResult",
     "get_decision_engine",
     "get_plugin_manager",
-    "get_runtime_state",
     "get_scene_admin_service",
 ]
 
@@ -242,7 +241,7 @@ def get_plugin_manager() -> PluginManager | None:
     return _plugin_manager
 
 
-def get_runtime_state() -> DecisionRuntimeState:
+def _get_runtime_state() -> DecisionRuntimeState:
     """获取判定运行时三态快照。"""
     manager = get_plugin_manager()
     if manager is not None:
@@ -315,7 +314,7 @@ def get_decision_engine() -> DecisionEngine | None:
     engine = DecisionEngine(
         redis,
         scene_runtime,
-        runtime_state_provider=get_runtime_state,
+        runtime_state_provider=_get_runtime_state,
     )
     _cached_decision_engine = engine
     _cached_engine_redis = redis

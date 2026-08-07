@@ -98,6 +98,8 @@ komari-bot/
 
 插件的 `require()` 声明就是硬依赖，修改前必须理解依赖链。
 
+跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
+
 ```
 基础服务层（被依赖，不应依赖业务插件）
   config_manager ───────────── 动态配置存储（PostgreSQL 强类型表 + .env 初始化）
