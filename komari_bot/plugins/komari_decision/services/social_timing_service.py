@@ -3,29 +3,14 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from komari_bot.decision.social_timing_service import TimingScoreBreakdown
 
 from .config_interface import get_config
 
 if TYPE_CHECKING:
     from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
-
-
-@dataclass(frozen=True)
-class TimingScoreBreakdown:
-    """时机评分分解结果。"""
-
-    timing_score: float
-    mention_bonus: float
-    silence_bonus: float
-    activity_penalty: float
-    dialogue_penalty: float
-    cooldown_penalty: float
-    activity_count: int
-    unique_users: int
-    silence_gap_seconds: float
-    bot_gap_seconds: float | None
 
 
 class SocialTimingService:

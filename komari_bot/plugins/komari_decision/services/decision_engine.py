@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from nonebot import logger
 
-from .config_interface import get_config
-from .message_filter import is_command_message, preprocess_message
-from .runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
-from .social_timing_service import SocialTimingService, TimingScoreBreakdown
-from .unified_candidate_rerank import (
+from komari_bot.decision.decision_engine import (
+    CallIntent,
+    DecisionOutcome,
+    MemoryAction,
+)
+from komari_bot.decision.runtime_state import (
+    DecisionRuntimeState,
+)
+from komari_bot.decision.unified_candidate_rerank import (
     SceneRuntimeUnavailableError,
-    UnifiedCandidateRerankService,
     UnifiedRerankResult,
 )
+
+from .config_interface import get_config
+from .message_filter import is_command_message, preprocess_message
+from .social_timing_service import SocialTimingService
+from .unified_candidate_rerank import UnifiedCandidateRerankService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -24,37 +31,6 @@ if TYPE_CHECKING:
         SceneRuntimeService,
     )
     from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
-
-CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
-MemoryAction = Literal["store", "drop"]
-ReplyReason = Literal["at", "direct_call", "score", "none"]
-
-
-@dataclass(frozen=True)
-class DecisionOutcome:
-    """判定输出。"""
-
-    memory_action: MemoryAction
-    should_reply: bool
-    force_reply: bool
-    reply_reason: ReplyReason
-    forced_reply_reason: Literal["at", "direct_call", "none"]
-    reply_score: float | None
-    alias_hit: bool | None
-    call_intent: CallIntent
-    call_margin: float | None
-    best_scene_id: str | None
-    scene_score: float | None
-    timing_score: float | None
-    noise_score: float | None
-    meaningful_score: float | None
-    call_direct_score: float | None
-    call_mention_score: float | None
-    filter_reason: Literal["short", "history_repeat", "none", "command"] | None
-    rank_result: UnifiedRerankResult | None
-    timing_breakdown: TimingScoreBreakdown | None
-    runtime_status: DecisionRuntimeStatus
-    runtime_reason: str
 
 
 class DecisionEngine:
