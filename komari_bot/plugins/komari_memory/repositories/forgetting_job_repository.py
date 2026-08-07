@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, Never
 if TYPE_CHECKING:
     from datetime import date
 
-    from komari_bot.common.orm_connection import SharedEngineConnectionPool
+    from komari_bot.db.orm_connection import SharedEngineConnectionPool
 
 type ForgettingJobStage = Literal[
     "claimed",

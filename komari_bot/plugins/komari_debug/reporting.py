@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

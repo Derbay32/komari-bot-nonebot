@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from komari_bot.common.content_budget import estimate_text_tokens
+from komari_bot.llm.content_budget import estimate_text_tokens
 from komari_bot.plugins.komari_memory.services.message_chunking import (
     MessageChunkBudgetError,
     build_chunk_manifest,

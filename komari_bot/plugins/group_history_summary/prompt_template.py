@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from komari_bot.common.prompt_storage import PromptTemplateLoader
+from komari_bot.config.prompt_storage import PromptTemplateLoader
 from komari_bot.plugins.group_history_summary.prompt_schema import (
     DEFAULTS,
     DISPLAY_NAME,

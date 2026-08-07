@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Annotated, Any, Protocol
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response
 from starlette import status
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     IDENTIFIER_TEXT_BUDGET,
     QUERY_TEXT_BUDGET,
     ContentValidationError,
     normalize_required_text,
 )
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
@@ -37,7 +37,7 @@ from .api_models import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.management.management_api import ManagementTokenSource
 
     from .services.conversation_processing import ConversationDeadLetter
 

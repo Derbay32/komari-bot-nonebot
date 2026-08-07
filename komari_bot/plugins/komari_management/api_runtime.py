@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from komari_bot.common.management_api import resolve_management_settings
+from komari_bot.management.management_api import resolve_management_settings
 
 from .announce_api import register_announce_api
 from .config_api import register_config_api
@@ -27,7 +27,7 @@ USER_BAN_API_PREFIX = "/api/v2/komari-user-bans"
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from komari_bot.common.management_api import (
+    from komari_bot.management.management_api import (
         ManagementTokenSource,
     )
 

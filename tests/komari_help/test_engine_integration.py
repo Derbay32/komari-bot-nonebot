@@ -129,7 +129,7 @@ async def data_engine() -> "AsyncIterator[HelpEngine]":
     await _reset_shared_orm_engine()
     if not _same_database(POSTGRES_URL, _configured_database_url()):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
-    from komari_bot.common.orm_connection import get_shared_orm_connection_pool
+    from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     engine = HelpEngine()
     engine._pool = get_shared_orm_connection_pool()
@@ -419,7 +419,7 @@ async def test_close_resets_engine_and_keeps_shared_engine_usable(
     assert engine._initialized is False
     assert engine._keyword_index.loaded is False
 
-    from komari_bot.common.orm_connection import get_shared_orm_connection_pool
+    from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     pool = get_shared_orm_connection_pool()
     async with pool.acquire() as conn:  # type: ignore[attr-defined]

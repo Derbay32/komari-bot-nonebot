@@ -42,19 +42,38 @@ komari-bot/
 │       └── 0003_typed_prompt_tables.py   #   3 张强类型 Prompt 表
 │
 ├── komari_bot/                           # ★ 核心代码
-│   ├── common/                           # 共享工具层（无 NoneBot 依赖）
+│   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
+│   │   ├── nonebot_compat.py             #   NoneBot ForwardRef 兼容补丁（显式安装点）
+│   │   ├── project_paths.py              #   项目路径常量（DATA_DIR 等）
+│   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
+│   ├── db/                               # PostgreSQL 边界共享件（经 nonebot-plugin-orm 托管连接）
 │   │   ├── orm_bootstrap.py              #   迁移命令引导（upgrade head / check / revision）
 │   │   ├── orm_config.py                 #   SQLALCHEMY_DATABASE_URL 解析
 │   │   ├── orm_connection.py             #   共享引擎的 asyncpg 兼容 raw 连接适配
-│   │   ├── typed_config.py               #   强类型配置/Prompt 表基类、注册表、安全加载器
-│   │   ├── redis_config.py               #   Redis 共享配置 Schema
-│   │   ├── vector_storage_schema.py      #   pgvector DDL 离线渲染（运行时不执行 DDL）
 │   │   ├── pgvector_schema.py            #   向量列维度校验等辅助
-│   │   ├── management_api.py             #   Bearer Token 鉴权 + CORS
+│   │   ├── vector_storage_schema.py      #   pgvector DDL 离线渲染（运行时不执行 DDL）
+│   │   ├── sql_like_utils.py             #   LIKE 模式转义等 SQL 工具
+│   │   ├── memory_agent_locks.py         #   记忆 Agent 并发锁
+│   │   └── versioned_keyword_index.py    #   版本化关键词索引
+│   ├── llm/                              # LLM 协议与安全上下文共享件（无 NoneBot 依赖）
+│   │   ├── llm_protocol.py               #   RequestApi 等协议类型（避免业务插件 import 网关）
+│   │   ├── untrusted_context.py          #   不可信上下文包装与渲染
+│   │   ├── content_budget.py             #   内容预算校验（字符/字节/估算 token）
+│   │   ├── token_counter.py              #   估算 token 计数
+│   │   └── dsv4_instruct.py              #   DSV4 指令注入
+│   ├── config/                           # 强类型配置与 Prompt 存储共享件（加载器依赖 NoneBot 运行时）
+│   │   ├── typed_config.py               #   强类型配置/Prompt 表基类、注册表、安全加载器
 │   │   ├── prompt_storage.py             #   Prompt 强类型表与运行时加载
+│   │   └── redis_config.py               #   Redis 共享配置 Schema
+│   ├── management/                       # 管理 API 与审计共享件（依赖 FastAPI）
+│   │   ├── management_api.py             #   Bearer Token 鉴权 + CORS
+│   │   └── management_audit.py           #   管理操作审计
+│   ├── memory/                           # 记忆画像共享件（无 NoneBot 依赖）
 │   │   ├── profile_compaction.py         #   用户画像 LLM 压缩
-│   │   ├── onebot_rules.py               #   group_message_rule() 等
-│   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
+│   │   └── profile_operations.py         #   画像 trait 操作
+│   ├── onebot/                           # OneBot 消息与规则共享件（依赖 OneBot V11 适配器）
+│   │   ├── onebot_messages.py            #   消息工具（plain_text_message 等）
+│   │   └── onebot_rules.py               #   group_message_rule() 等
 │   └── plugins/                          # NoneBot 插件模块
 │       ├── <插件>/config_schema.py       #   动态配置强类型表（SQLModel，14 个资源）
 │       ├── <插件>/prompt_schema.py       #   Prompt 强类型表（SQLModel，3 个资源）
@@ -152,7 +171,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 ### 1. 配置管理 (`config_manager`)
 
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（14 张，迁移 0002 建表）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
-- **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `common/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
+- **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：`komari_plugin_configs` 在 v2.0.0 保留（仅承载存量数据，运行时不读写），`DROP` 由后续版本的 autogenerate revision 执行
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
 - **初始化**：PG 中缺失配置时，从 `.env` 环境变量 / Pydantic 默认值生成并写入 PG
@@ -174,7 +193,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 ### 1.1 Prompt 配置 (`komari_prompt_*`)
 
-- **存储源**：`komari_chat`、`komari_memory_summary`、`group_history_summary` 三组字符串 prompt 各对应一张强类型单行表（`komari_prompt_komari_chat` / `komari_prompt_memory_summary` / `komari_prompt_group_history_summary`，迁移 0003 建表），运行时经 `common/prompt_storage.py` 读取；表结构真源是各插件 `prompt_schema.py` 的 `TypedPromptModel` 元数据
+- **存储源**：`komari_chat`、`komari_memory_summary`、`group_history_summary` 三组字符串 prompt 各对应一张强类型单行表（`komari_prompt_komari_chat` / `komari_prompt_memory_summary` / `komari_prompt_group_history_summary`，迁移 0003 建表），运行时经 `config/prompt_storage.py` 读取；表结构真源是各插件 `prompt_schema.py` 的 `TypedPromptModel` 元数据
 - **默认值回退**：PG 无记录或读取失败时使用代码内 defaults；读取失败优先回退当前进程缓存，避免聊天主流程中断
 - **跨进程刷新**：无 LISTEN/NOTIFY；`PromptTemplateLoader` 缓存自带 1 秒陈限上限，本进程写入经 `register_invalidator` 回调立即失效本地缓存，传播延迟 ≤1 秒级
 - **管理 API**：`komari_management` Prompt API 的 GET / PUT / PATCH 均读写强类型表（`If-Match` revision 强 ETag），响应中 `config_source` 形如 `postgresql:komari_prompt_komari_chat:komari_chat`，`file_path` 仅保留为 `null` 兼容字段
@@ -213,7 +232,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - 缺失或异常字段不阻断解析，对应位置保留 `None`
 
 双请求 API 与流式（issue #23）：
-- 四个 `generate_*` 公共入口与底层抽象接口均接受显式关键字参数 `request_api: RequestApi | None` 与 `stream_enabled: bool | None`；`RequestApi = Literal["chat_completions", "responses"]` 定义在 `komari_bot/common/llm_protocol.py`（避免业务插件 import 网关触发 require 副作用）
+- 四个 `generate_*` 公共入口与底层抽象接口均接受显式关键字参数 `request_api: RequestApi | None` 与 `stream_enabled: bool | None`；`RequestApi = Literal["chat_completions", "responses"]` 定义在 `komari_bot/llm/llm_protocol.py`（避免业务插件 import 网关触发 require 副作用）
 - 调用方传 `None` 时按网关默认槽位配置解析；业务插件必须按自己的槽位显式透传（见下「槽位配置」），禁止依赖默认解析
 - 流式只在网关内部聚合，业务侧永远拿到完整 `LLMCompletionResultSchema`；Chat 流式强制 `stream_options.include_usage=true` 并按工具 index 聚合增量 tool_calls；断流/取消丢弃部分结果并明确失败
 - Responses 协议翻译：安全边界合并入 `instructions`；tools 扁平化（strict 默认 false）；`store=false` 无状态；终态归一化（completed/incomplete/failed/refusal）；无映射参数（frequency_penalty、不兼容 extra_params 键）静默忽略
@@ -305,7 +324,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 | 4. 实体知识 | PG | 通过 EntityRepository | 关键词 + 向量检索 |
 
 关键类：`PluginManager` → `MemoryService` → `ConversationRepository` / `EntityRepository` + `ForgettingService`
-注意：四层表（含独立 embedding 表、记忆 job 表）与 HNSW 索引的 DDL 由 Alembic 基线 0001 统一管理，运行时不建表；`EntityRepository` 操作的是记忆层自身的画像/互动表，与 `komari_knowledge` 的知识表相互独立。连接统一经 `komari_bot/common/orm_connection.py` 共享引擎 raw 适配层（asyncpg 兼容，`$n` 占位符 SQL 原样保留）。
+注意：四层表（含独立 embedding 表、记忆 job 表）与 HNSW 索引的 DDL 由 Alembic 基线 0001 统一管理，运行时不建表；`EntityRepository` 操作的是记忆层自身的画像/互动表，与 `komari_knowledge` 的知识表相互独立。连接统一经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层（asyncpg 兼容，`$n` 占位符 SQL 原样保留）。
 
 ### 4.1 知识与帮助关键词索引
 
@@ -418,7 +437,7 @@ async with get_session(expire_on_commit=False) as session:
 
 # 特殊 DDL 表（向量/HNSW/UNLOGGED/advisory lock）保留 raw SQL：
 # 共享引擎的 asyncpg 兼容适配层，SQL 的 $n 占位符逐字保留
-from komari_bot.common.orm_connection import get_shared_orm_connection_pool
+from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 pg_pool = get_shared_orm_connection_pool()
 async with pg_pool.acquire() as conn:
     rows = await conn.fetch("SELECT * FROM ... WHERE col = $1", param)
@@ -426,9 +445,9 @@ async with pg_pool.acquire() as conn:
         ...
 
 # pgvector 维度校验辅助
-from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
+from komari_bot.db.pgvector_schema import ensure_vector_column_dimension
 
-# Redis（使用 redis.asyncio，禁止用 aioredis；配置见 common/redis_config.py）
+# Redis（使用 redis.asyncio，禁止用 aioredis；配置见 config/redis_config.py）
 import redis.asyncio as aioredis
 redis_client = aioredis.Redis(host=..., port=..., db=..., password=...)
 ```
@@ -437,11 +456,11 @@ Alembic 迁移工作流（Schema 变更唯一入口）：
 
 ```bash
 # 应用迁移 / 校验迁移链与模型零漂移
-poetry run python -m komari_bot.common.orm_bootstrap upgrade head
-poetry run python -m komari_bot.common.orm_bootstrap check
+poetry run python -m komari_bot.db.orm_bootstrap upgrade head
+poetry run python -m komari_bot.db.orm_bootstrap check
 
 # 生成新 revision（改完 SQLModel 后必须 autogenerate 并审阅生成的迁移）
-poetry run python -m komari_bot.common.orm_bootstrap revision --autogenerate -m "描述"
+poetry run python -m komari_bot.db.orm_bootstrap revision --autogenerate -m "描述"
 ```
 
 规则：
@@ -467,8 +486,8 @@ poetry run ruff check .
 poetry run pytest tests/ -v
 
 # 迁移验证（改过任何 SQLModel 后必须执行）
-poetry run python -m komari_bot.common.orm_bootstrap upgrade head
-poetry run python -m komari_bot.common.orm_bootstrap check   # 必须零 diff
+poetry run python -m komari_bot.db.orm_bootstrap upgrade head
+poetry run python -m komari_bot.db.orm_bootstrap check   # 必须零 diff
 
 # 真实库集成测试（KOMARI_TEST_POSTGRES_URL 门控；两变量必须同库，否则守卫 skip）
 SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
@@ -489,7 +508,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
-12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.common.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
+12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.llm.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
 13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
 
 ## Agent skills

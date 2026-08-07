@@ -14,13 +14,13 @@ from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
-from komari_bot.common.content_budget import estimate_text_tokens
-from komari_bot.common.profile_operations import profile_traits_to_list
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.content_budget import estimate_text_tokens
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     UntrustedSourceType,
     render_untrusted_context,
 )
+from komari_bot.memory.profile_operations import profile_traits_to_list
 from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
     KomariMemoryConfigSchema,
 )

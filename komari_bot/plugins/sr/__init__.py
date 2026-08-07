@@ -7,7 +7,7 @@ from nonebot.params import Command, CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .commands import AddCommand, DeleteCommand
 from .config import Config

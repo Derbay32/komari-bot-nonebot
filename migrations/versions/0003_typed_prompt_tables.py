@@ -5,7 +5,7 @@
 创建时间: 2026-08-06 17:30:00
 
 本 revision 为 3 个 Prompt 资源建立强类型存储（结构真源为
-``komari_bot/common/typed_config.TypedPromptModel`` 与各插件
+``komari_bot/config/typed_config.TypedPromptModel`` 与各插件
 ``prompt_schema`` 的 SQLModel 元数据）：
 
 - ``komari_chat`` → ``komari_prompt_komari_chat``

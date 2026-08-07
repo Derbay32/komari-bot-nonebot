@@ -2,7 +2,7 @@
 
 本模块是**无副作用**的纯模型模块：只导入 SQLModel/SQLAlchemy，不导入
 NoneBot 与任何业务插件，因此 Alembic 迁移环境可以直接以源文件方式加载
-（见 ``komari_bot/common/typed_config.load_all_plugin_orm_models``），
+（见 ``komari_bot/config/typed_config.load_all_plugin_orm_models``），
 模型注册进 ``SQLModel.metadata`` 供 autogenerate/check 使用。
 
 列定义与 ``migrations/versions/0001_baseline_full_schema.py`` 中

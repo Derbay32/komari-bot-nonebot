@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from nonebot import logger
 from nonebot.plugin import require
 
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from nonebot.adapters.onebot.v11 import Bot
 
-    from komari_bot.common.llm_protocol import RequestApi
+    from komari_bot.llm.llm_protocol import RequestApi
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
 

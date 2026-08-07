@@ -21,7 +21,7 @@ from nonebot.exception import FinishedException
 from nonebot.params import CommandArg, Depends
 from nonebot.permission import SUPERUSER
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.plugins.agent_run_logger import create_collector, finalize_collector
 from komari_bot.plugins.character_binding import get_binding_manager
 from komari_bot.plugins.group_history_summary.config_schema import (

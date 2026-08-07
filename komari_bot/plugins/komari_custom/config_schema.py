@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 from pydantic import field_validator
 from sqlalchemy.dialects.postgresql import JSONB
 
-from komari_bot.common.typed_config import Field, TypedConfigModel
+from komari_bot.config.typed_config import Field, TypedConfigModel
 
 
 class DynamicConfigSchema(TypedConfigModel, table=True):

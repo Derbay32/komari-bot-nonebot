@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from nonebot import logger
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     PROPOSAL_CONTENT_TEXT_BUDGET,
     TITLE_TEXT_BUDGET,
     normalize_required_text,

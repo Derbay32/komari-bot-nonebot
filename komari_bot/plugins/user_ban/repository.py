@@ -1,7 +1,7 @@
 """用户封禁 PostgreSQL 访问层（SQLModel + nonebot-plugin-orm AsyncSession）。
 
 连接池与 engine 生命周期由 nonebot-plugin-orm 托管（本模块不再依赖
-``komari_bot.common.postgres`` 自研池）；表结构由 Alembic 迁移统一管理，
+自研 asyncpg 池）；表结构由 Alembic 迁移统一管理，
 启动期与懒路径均无任何 DDL。
 
 REPEATABLE READ 只读快照通过 ``session.execute(..., execution_options=...)``

@@ -9,8 +9,8 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from sqlalchemy.dialects.postgresql import JSONB
 
-from komari_bot.common.management_api import management_token_meets_minimum_strength
-from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.management.management_api import management_token_meets_minimum_strength
 
 DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
 _CREDENTIAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")

@@ -21,7 +21,7 @@ from komari_bot.plugins.komari_management.managed_resources import (
 if TYPE_CHECKING:
     from nonebug import App
 
-    from komari_bot.common.management_audit import ManagementAuditEvent
+    from komari_bot.management.management_audit import ManagementAuditEvent
 
 
 class _ConfigSchema(BaseModel):

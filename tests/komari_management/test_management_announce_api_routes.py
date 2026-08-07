@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.plugins.komari_management.announce_api import (
     API_PREFIX,
     register_announce_api,
@@ -22,8 +22,8 @@ if TYPE_CHECKING:
     from nonebug import App
     from pytest import MonkeyPatch
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditEvent
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditEvent
 
 _DEFAULT_CREDENTIALS = (
     {

@@ -16,7 +16,7 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
-from komari_bot.common.pgvector_schema import get_vector_column_dimension
+from komari_bot.db.pgvector_schema import get_vector_column_dimension
 from komari_bot.plugins.komari_help.engine import HelpEngine
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
@@ -62,7 +62,7 @@ async def test_help_scan_lease_and_auto_sync_are_multi_worker_safe() -> None:
     if not _same_database(POSTGRES_URL, _configured_database_url()):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
     await _reset_shared_orm_engine()
-    from komari_bot.common.orm_connection import get_shared_orm_connection_pool
+    from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     run_id = uuid4().hex
     plugin_name = f"demo_plugin_{run_id}"

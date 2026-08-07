@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.common.prompt_storage import PromptValues, StoredPrompt
+from komari_bot.config.prompt_storage import PromptValues, StoredPrompt
 from komari_bot.plugins.komari_management.managed_resources import ManagedPromptResource
 from komari_bot.plugins.komari_management.prompt_api import (
     API_PREFIX,
@@ -19,7 +19,7 @@ from komari_bot.plugins.komari_management.prompt_api import (
 if TYPE_CHECKING:
     from nonebug import App
 
-    from komari_bot.common.management_audit import ManagementAuditEvent
+    from komari_bot.management.management_audit import ManagementAuditEvent
 
 
 @dataclass

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import redis.asyncio as aioredis
 
-from komari_bot.common.redis_config import get_shared_redis_config
+from komari_bot.config.redis_config import get_shared_redis_config
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable

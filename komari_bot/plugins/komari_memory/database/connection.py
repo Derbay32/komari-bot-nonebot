@@ -6,7 +6,7 @@
 （向量检索 / 数组绑定 / 事务边界）逐字不变。
 """
 
-from komari_bot.common.orm_connection import (
+from komari_bot.db.orm_connection import (
     SharedEngineConnectionPool,
     get_shared_orm_connection_pool,
 )

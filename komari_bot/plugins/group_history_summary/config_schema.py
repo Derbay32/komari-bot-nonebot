@@ -6,8 +6,8 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import Column, String
 from sqlalchemy.dialects.postgresql import JSONB
 
-from komari_bot.common.llm_protocol import RequestApi
-from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.llm.llm_protocol import RequestApi
 
 
 class LayoutParamsSchema(BaseModel):

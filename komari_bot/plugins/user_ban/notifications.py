@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, cast
 
 from nonebot import get_bots, logger
 
-from komari_bot.common.management_audit import hash_management_target
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.management.management_audit import hash_management_target
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .models import BanMutationResult, BanRecord, NotificationResult
 

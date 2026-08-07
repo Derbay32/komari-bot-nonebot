@@ -10,7 +10,7 @@
 - **跨进程刷新**：应用事件循环上轮询各表 `revision`（亚秒级）检测外部变更；已移除 asyncpg LISTEN/NOTIFY。
 - **资源级并发**：工厂注册表只锁定实例创建，各插件管理器使用独立操作锁。
 - **完整生命周期**：同步兼容桥使用专用事件循环线程，应用关闭时会回收一次性引擎连接、线程和事件循环；共享引擎归 nonebot-plugin-orm 托管，不 dispose。
-- **通用设计**：接受任何 SQLModel/Pydantic Schema（`TypedConfigModel` 基类见 `komari_bot/common/typed_config.py`）。
+- **通用设计**：接受任何 SQLModel/Pydantic Schema（`TypedConfigModel` 基类见 `komari_bot/config/typed_config.py`）。
 
 ## 配置表
 
@@ -21,7 +21,7 @@
 - `updated_at` 为最后写入时间（带时区），由存储层显式赋值；
 - 列表/字典/嵌套配置使用 JSONB 列。
 
-旧版 JSONB KV 表 `komari_plugin_configs` 在 v2.0.0 保留（仅存量数据，不再读写），`DROP` 由后续版本的 autogenerate revision 执行。数据库连接不进入配置表：连接唯一权威是 nonebot-plugin-orm 的 `SQLALCHEMY_DATABASE_URL`，Redis 引导配置来自 `.env` / 进程环境变量（`komari_bot/common/redis_config.py`）。
+旧版 JSONB KV 表 `komari_plugin_configs` 在 v2.0.0 保留（仅存量数据，不再读写），`DROP` 由后续版本的 autogenerate revision 执行。数据库连接不进入配置表：连接唯一权威是 nonebot-plugin-orm 的 `SQLALCHEMY_DATABASE_URL`，Redis 引导配置来自 `.env` / 进程环境变量（`komari_bot/config/redis_config.py`）。
 
 ## 使用方法
 

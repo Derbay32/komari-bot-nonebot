@@ -1,7 +1,7 @@
 """维护公告请求的跨 worker 幂等与冷却账本（SQLModel + nonebot-plugin-orm AsyncSession）。
 
 连接池与 engine 生命周期由 nonebot-plugin-orm 托管（本模块不再依赖
-``komari_bot.common.postgres`` 自研池）；表结构由 Alembic 迁移统一管理，
+自研 asyncpg 池）；表结构由 Alembic 迁移统一管理，
 启动期与懒路径均无任何 DDL。
 
 跨 worker 串行化依赖 PostgreSQL 事务级咨询锁 ``pg_advisory_xact_lock``：

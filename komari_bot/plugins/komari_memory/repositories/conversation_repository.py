@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
-from komari_bot.common.sql_like_utils import escape_like_pattern
+from komari_bot.db.sql_like_utils import escape_like_pattern
 
 if TYPE_CHECKING:
-    from komari_bot.common.orm_connection import SharedEngineConnectionPool
+    from komari_bot.db.orm_connection import SharedEngineConnectionPool
 
 
 def _build_content_hash(content: str) -> str:

@@ -34,7 +34,7 @@ import asyncio
 from nonebot import get_driver
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.prompt_storage import (
+from komari_bot.config.prompt_storage import (
     close_prompt_storage_if_created,
     get_prompt_storage,
 )

@@ -7,14 +7,14 @@
 本 revision 是版本链的唯一基线，结构真源为当前运行时代码：
 
 - ``komari_bot/plugins/config_manager/storage.py``
-- ``komari_bot/common/prompt_storage.py``
+- ``komari_bot/config/prompt_storage.py``
 - ``komari_bot/plugins/user_ban/init_db.sql``
 - ``komari_bot/plugins/character_binding/database.py``
 - ``komari_bot/plugins/user_data/database.py``
 - ``komari_bot/plugins/komari_custom/init_db.sql``
 - ``komari_bot/plugins/komari_management/announcement_repository.py``
 - ``komari_bot/plugins/komari_decision/repositories/scene_schema.py``
-- ``komari_bot/common/vector_storage_schema.py``
+- ``komari_bot/db/vector_storage_schema.py``
 - ``komari_bot/plugins/komari_chat/repositories/reply_commit_repository.py``
 - ``komari_bot/plugins/agent_run_logger/repository.py``
 
@@ -44,7 +44,7 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 #: pgvector HNSW 索引支持的最大维度，与运行时
-#: ``komari_bot.common.vector_storage_schema.PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS``
+#: ``komari_bot.db.vector_storage_schema.PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS``
 #: 保持一致。
 _PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS = 2000
 

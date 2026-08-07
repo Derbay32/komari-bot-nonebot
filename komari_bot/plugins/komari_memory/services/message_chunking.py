@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
-from komari_bot.common.content_budget import estimate_text_tokens
+from komari_bot.llm.content_budget import estimate_text_tokens
 
 if TYPE_CHECKING:
     from .redis_manager import MessageSchema

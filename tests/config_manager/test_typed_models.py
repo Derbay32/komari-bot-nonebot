@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import SQLModel
 
 if TYPE_CHECKING:
-    from komari_bot.common.typed_config import TypedConfigModel
+    from komari_bot.config.typed_config import TypedConfigModel
 
 CONFIG_SCHEMA_MODULES = (
     "komari_bot.plugins.agent_run_logger.config_schema",

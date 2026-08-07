@@ -6,7 +6,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
-from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
 
 class AgentRunLoggerConfigSchema(TypedConfigModel, table=True):

@@ -4,7 +4,7 @@ Komari Bot Embedding Provider 配置 Schema。
 
 from typing import ClassVar
 
-from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
 
 class DynamicConfigSchema(TypedConfigModel, table=True):

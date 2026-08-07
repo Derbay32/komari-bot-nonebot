@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 
 from nonebot.plugin import require
 
-from komari_bot.common.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.dsv4_instruct import inject_dsv4_instruct_to_first_user_message
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
@@ -17,7 +17,7 @@ from .history_service import HistoryMessage, format_message_for_prompt
 from .prompt_template import get_template
 
 if TYPE_CHECKING:
-    from komari_bot.common.llm_protocol import RequestApi
+    from komari_bot.llm.llm_protocol import RequestApi
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
 

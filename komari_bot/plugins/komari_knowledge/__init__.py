@@ -9,7 +9,7 @@ from __future__ import annotations
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.orm_config import is_orm_database_url_configured
+from komari_bot.db.orm_config import is_orm_database_url_configured
 
 from .api import register_knowledge_api
 from .config_schema import DynamicConfigSchema

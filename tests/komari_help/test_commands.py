@@ -11,7 +11,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.plugins.komari_help import rendering as rendering_module
 from komari_bot.plugins.komari_help.models import HelpEntry, HelpSearchResult
 

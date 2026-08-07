@@ -6,7 +6,7 @@ from typing import ClassVar
 
 from pydantic import field_validator
 
-from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
+from komari_bot.db.pgvector_schema import ensure_vector_column_dimension
 
 if TYPE_CHECKING:
     from .config_schema import KomariMemoryConfigSchema

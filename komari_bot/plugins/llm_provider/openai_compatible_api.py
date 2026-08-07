@@ -8,8 +8,8 @@ from nonebot import logger
 from nonebot.plugin import require
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, OpenAIError
 
-from komari_bot.common.llm_protocol import DEFAULT_REQUEST_API, RequestApi
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.llm_protocol import DEFAULT_REQUEST_API, RequestApi
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     apply_llm_security_boundary,
 )

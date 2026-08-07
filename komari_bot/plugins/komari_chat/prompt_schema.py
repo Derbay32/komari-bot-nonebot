@@ -12,7 +12,7 @@ from typing import ClassVar
 
 from sqlalchemy import Text
 
-from komari_bot.common.typed_config import Field, TypedPromptModel
+from komari_bot.config.typed_config import Field, TypedPromptModel
 
 RESOURCE_ID = "komari_chat"
 DISPLAY_NAME = "Komari Chat Prompt"

@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 from nonebot import logger
 
-from komari_bot.common.sql_like_utils import escape_like_pattern
+from komari_bot.db.sql_like_utils import escape_like_pattern
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.orm_connection import SharedEngineConnectionPool
+    from komari_bot.db.orm_connection import SharedEngineConnectionPool
 
 _PROFILE_KEY = "user_profile"
 _PROFILE_CATEGORY = "profile_json"

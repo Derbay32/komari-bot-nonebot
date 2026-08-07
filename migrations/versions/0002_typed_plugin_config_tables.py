@@ -5,7 +5,7 @@
 创建时间: 2026-08-06 07:20:00
 
 本 revision 为 14 个动态配置资源建立强类型存储（结构真源为
-``komari_bot/common/typed_config.TypedConfigModel`` 与各插件
+``komari_bot/config/typed_config.TypedConfigModel`` 与各插件
 ``config_schema`` 的 SQLModel 元数据）：
 
 - 每张表单行使用，主键 ``id`` 恒为 1；

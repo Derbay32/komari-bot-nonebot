@@ -17,7 +17,11 @@ import sys
 from collections import defaultdict
 from typing import Any, Final
 
-from komari_bot.common.content_budget import (
+from komari_bot.db.orm_connection import get_shared_orm_connection_pool
+from komari_bot.db.pgvector_schema import ensure_vector_column_dimension
+from komari_bot.db.sql_like_utils import escape_like_pattern
+from komari_bot.db.versioned_keyword_index import VersionedKeywordIndex
+from komari_bot.llm.content_budget import (
     CONTENT_TEXT_BUDGET,
     KEYWORD_TEXT_BUDGET,
     NOTES_TEXT_BUDGET,
@@ -27,10 +31,6 @@ from komari_bot.common.content_budget import (
     normalize_required_text,
     validate_text_budget,
 )
-from komari_bot.common.orm_connection import get_shared_orm_connection_pool
-from komari_bot.common.pgvector_schema import ensure_vector_column_dimension
-from komari_bot.common.sql_like_utils import escape_like_pattern
-from komari_bot.common.versioned_keyword_index import VersionedKeywordIndex
 
 from .config_schema import DynamicConfigSchema
 from .models import KnowledgeCategory, KnowledgeEntry, SearchResult

@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 
-from komari_bot.common.typed_config import ensure_typed_config_model
+from komari_bot.config.typed_config import ensure_typed_config_model
 from komari_bot.plugins.komari_management.config_schema import DynamicConfigSchema
 
 

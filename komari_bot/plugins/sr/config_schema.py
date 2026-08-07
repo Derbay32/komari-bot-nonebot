@@ -7,13 +7,13 @@ from typing import Any, ClassVar
 from pydantic import field_validator
 from sqlalchemy.dialects.postgresql import JSONB
 
-from komari_bot.common.content_budget import (
+from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.llm.content_budget import (
     CONTENT_TEXT_BUDGET,
     KEYWORD_TEXT_BUDGET,
     normalize_required_text,
     validate_text_budget,
 )
-from komari_bot.common.typed_config import Field, TypedConfigModel, typed_model_config
 
 MAX_SR_LIST_ITEMS = 500
 

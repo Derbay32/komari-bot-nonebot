@@ -4,7 +4,7 @@
 
 ## 依赖与调用方
 
-- 直接依赖：`config_manager`、`nonebot_plugin_apscheduler`；PostgreSQL 索引经 `komari_bot/common/orm_connection.py` 共享引擎 raw 适配层访问（`UNLOGGED` 表 DDL 由 Alembic 基线管理）。
+- 直接依赖：`config_manager`、`nonebot_plugin_apscheduler`；PostgreSQL 索引经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层访问（`UNLOGGED` 表 DDL 由 Alembic 基线管理）。
 - 调用方：`komari_chat`、`komari_memory`、`group_history_summary`、`komari_debug`。
 - 管理挂载：`komari_management` 从本插件获取 API 注册函数和 reader。
 - 禁止反向依赖：`llm_provider` 不得 import 本插件，也不得自行写持久 LLM 日志。

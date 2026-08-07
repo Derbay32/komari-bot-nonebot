@@ -1,7 +1,7 @@
 """User data PostgreSQL access layer（SQLModel + nonebot-plugin-orm AsyncSession）。
 
 连接池与 engine 生命周期由 nonebot-plugin-orm 托管（本模块不再依赖
-``komari_bot.common.postgres`` 自研池）；表结构由 Alembic 迁移统一管理，
+自研 asyncpg 池）；表结构由 Alembic 迁移统一管理，
 启动期与懒路径均无任何 DDL。同表只保留本仓储一套访问路径。
 
 SQLModel 字段在 Pyright 下被推断为 Python 值类型而非列表达式，因此

@@ -8,11 +8,11 @@
 - 数据访问：`repositories/`
 - 核心服务：`services/`
 - 后台任务：`handlers/summary_worker.py`、`handlers/forgetting_worker.py`
-- Schema 唯一权威：`migrations/` Alembic 版本链（`0001_baseline_full_schema.py`）；`komari_bot/common/vector_storage_schema.py` 仅用于离线渲染对照 SQL
+- Schema 唯一权威：`migrations/` Alembic 版本链（`0001_baseline_full_schema.py`）；`komari_bot/db/vector_storage_schema.py` 仅用于离线渲染对照 SQL
 
 运行时特性：
 
-- 连接统一经 `komari_bot/common/orm_connection.py` 共享引擎 raw 适配层（nonebot-plugin-orm 托管，保留 asyncpg 风格 `$n` SQL）
+- 连接统一经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层（nonebot-plugin-orm 托管，保留 asyncpg 风格 `$n` SQL）
 - 表结构与 HNSW 索引由 Alembic 迁移统一管理，运行时无任何 DDL
 - 启动阶段校验向量列维度；维度不匹配时通过迁移脚本升级
 
@@ -32,7 +32,7 @@
 
 ### 1. 配置数据库与 Redis
 
-数据库连接唯一权威是 `SQLALCHEMY_DATABASE_URL`（`.env` / `.env.dev` / `.env.prod` 或进程环境变量，旧 `PG_*` 配置已下线）；Redis 引导配置为 `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`（见 `komari_bot/common/redis_config.py`）。
+数据库连接唯一权威是 `SQLALCHEMY_DATABASE_URL`（`.env` / `.env.dev` / `.env.prod` 或进程环境变量，旧 `PG_*` 配置已下线）；Redis 引导配置为 `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`（见 `komari_bot/config/redis_config.py`）。
 
 插件动态配置存储在强类型单行表 `komari_memory_config`，首次缺失时由 schema 默认值或 dotenv 初始化。
 

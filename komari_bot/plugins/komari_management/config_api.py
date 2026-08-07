@@ -8,12 +8,12 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
-from komari_bot.common.management_audit import (
+from komari_bot.management.management_audit import (
     hash_management_target,
     management_audit_span,
     record_management_audit_event,
@@ -25,8 +25,8 @@ from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
-    from komari_bot.common.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_api import ManagementTokenSource
+    from komari_bot.management.management_audit import ManagementAuditRecorder
 
     from .managed_resources import ManagedConfigResource
 

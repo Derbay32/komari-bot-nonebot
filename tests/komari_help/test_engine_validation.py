@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from komari_bot.common.content_budget import ContentValidationError
+from komari_bot.llm.content_budget import ContentValidationError
 from komari_bot.plugins.komari_help.engine import HelpEngine
 
 

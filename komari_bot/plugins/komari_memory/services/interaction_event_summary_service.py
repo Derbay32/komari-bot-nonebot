@@ -11,14 +11,14 @@ from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
-from komari_bot.common.content_budget import (
+from komari_bot.llm.content_budget import (
     ContentValidationError,
     TextBudget,
     normalize_required_text,
     truncate_text_to_budget,
     validate_text_budget,
 )
-from komari_bot.common.untrusted_context import (
+from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )

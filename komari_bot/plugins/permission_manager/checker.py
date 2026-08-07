@@ -11,7 +11,7 @@ from warnings import warn
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import MessageEvent as Obv11MessageEvent
 
-from komari_bot.common.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .manager import ConfigType, PermissionManager
 

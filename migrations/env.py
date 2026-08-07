@@ -8,7 +8,7 @@ from nonebot_plugin_orm import AlembicConfig, plugin_config
 from sqlalchemy.util import await_only
 from sqlmodel import SQLModel
 
-from komari_bot.common.typed_config import (
+from komari_bot.config.typed_config import (
     load_all_plugin_orm_models,
     load_all_typed_config_models,
 )

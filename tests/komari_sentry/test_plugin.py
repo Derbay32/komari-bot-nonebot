@@ -36,7 +36,7 @@ def _config(*, send_default_pii: bool = False) -> SimpleNamespace:
 @pytest.fixture(autouse=True)
 def _reset_sentry_support_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """每个测试前重置 sentry_support 模块级状态，避免测试间污染。"""
-    import komari_bot.common.sentry_support as ss
+    import komari_bot.core.sentry_support as ss
 
     ss._registered_sensitive_values.clear()
     ss._sensitive_value_collector = None

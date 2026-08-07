@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from komari_bot.common.vector_storage_schema import (
+from komari_bot.db.vector_storage_schema import (
     build_memory_schema_statements,
     render_schema_statements,
 )
 
 _GENERATED_HEADER = """-- 本文件由 scripts/render_memory_schema.py 生成，请勿手工维护。
--- 唯一 Schema 真源：komari_bot/common/vector_storage_schema.py
+-- 唯一 Schema 真源：komari_bot/db/vector_storage_schema.py
 -- 执行前请备份数据库，并使用 psql -v ON_ERROR_STOP=1。
 
 """

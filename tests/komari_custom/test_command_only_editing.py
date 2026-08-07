@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from komari_bot.common.content_budget import ContentValidationError
+from komari_bot.llm.content_budget import ContentValidationError
 from komari_bot.plugins.komari_custom.models import SessionData
 from komari_bot.plugins.komari_custom.publication_service import (
     ProposalPublicationDraft,

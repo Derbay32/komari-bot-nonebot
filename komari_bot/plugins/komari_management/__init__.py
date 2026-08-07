@@ -7,7 +7,7 @@ from pathlib import Path
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.prompt_storage import close_prompt_storage_if_created
+from komari_bot.config.prompt_storage import close_prompt_storage_if_created
 from komari_bot.plugins.agent_run_logger.config_schema import (
     AgentRunLoggerConfigSchema,
 )

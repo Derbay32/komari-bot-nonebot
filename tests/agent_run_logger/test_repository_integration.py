@@ -396,7 +396,7 @@ async def test_close_releases_reference_without_disposing_shared_engine(
     await repo.close()
     assert repo.available is False
     # 共享引擎仍可继续服务其他调用方
-    from komari_bot.common.orm_connection import get_shared_orm_connection_pool
+    from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     pool = get_shared_orm_connection_pool()
     async with pool.acquire() as conn:  # type: ignore[attr-defined]

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from komari_bot.common.profile_operations import (
+from komari_bot.memory.profile_operations import (
     CommitResult,
     PreviewResult,
     ProfileConflict,

@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from komari_bot.common.profile_operations import ProfileOperation
+from komari_bot.memory.profile_operations import ProfileOperation
 from komari_bot.plugins.komari_memory.agent.redis_staging import ProfileStaging
 from komari_bot.plugins.komari_memory.repositories.entity_repository import (
     UserProfileBatchUpsertError,

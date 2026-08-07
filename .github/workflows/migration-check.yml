@@ -52,8 +52,8 @@ jobs:
 
       # 先把版本链应用到最新，保证 check 的比对基线是 upgrade head 之后的数据库
       - name: 应用迁移 upgrade head
-        run: poetry run python -m komari_bot.common.orm_bootstrap upgrade head
+        run: poetry run python -m komari_bot.db.orm_bootstrap upgrade head
 
       # autogenerate 空 diff 卫士：模型与版本链漂移（忘记生成迁移）即失败
       - name: autogenerate 空 diff 校验
-        run: poetry run python -m komari_bot.common.orm_bootstrap check
+        run: poetry run python -m komari_bot.db.orm_bootstrap check

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 
-from komari_bot.common.orm_connection import (
+from komari_bot.db.orm_connection import (
     SharedEngineConnectionPool,
     get_shared_orm_connection_pool,
 )

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI
 from pydantic import BaseModel
 from pydantic_core import PydanticUndefined
 
-from komari_bot.common.management_api import (
+from komari_bot.management.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
 )
@@ -20,7 +20,7 @@ from .config_schema import DynamicConfigSchema
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.common.management_api import ManagementTokenSource
+    from komari_bot.management.management_api import ManagementTokenSource
 
 API_PREFIX = "/api/v2/komari-search"
 _PROVIDER_PREFIXES = {

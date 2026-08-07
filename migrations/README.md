@@ -7,7 +7,7 @@
 配置 `SQLALCHEMY_DATABASE_URL` 与实际使用的 `EMBEDDING_DIMENSION` 后执行：
 
 ```bash
-poetry run python -m komari_bot.common.orm_bootstrap upgrade head
+poetry run python -m komari_bot.db.orm_bootstrap upgrade head
 ```
 
 容器会在 Gunicorn 启动前自动执行同一命令；迁移失败时容器拒绝启动。
@@ -17,8 +17,8 @@ poetry run python -m komari_bot.common.orm_bootstrap upgrade head
 `0001` 是现有 v2.0.0 前数据库结构的完整基线。已有数据库已经包含这些对象，不得直接执行 `0001` 的建表操作；完成备份并确认当前结构来自迁移前版本后，将数据库标记到基线：
 
 ```bash
-poetry run python -m komari_bot.common.orm_bootstrap stamp 0001
-poetry run python -m komari_bot.common.orm_bootstrap upgrade head
+poetry run python -m komari_bot.db.orm_bootstrap stamp 0001
+poetry run python -m komari_bot.db.orm_bootstrap upgrade head
 ```
 
 `stamp` 只写入 Alembic 版本号，不执行 DDL，也不会校正结构差异。结构不符合基线的数据库必须先按原版本升级流程修复，再执行 `stamp`。
@@ -26,7 +26,7 @@ poetry run python -m komari_bot.common.orm_bootstrap upgrade head
 ## 开发校验
 
 ```bash
-poetry run python -m komari_bot.common.orm_bootstrap check
+poetry run python -m komari_bot.db.orm_bootstrap check
 ```
 
 该命令用于检查 SQLAlchemy/SQLModel 元数据与版本链是否同步。特殊 raw SQL 对象由手写 revision 管理。

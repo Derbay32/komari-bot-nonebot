@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import redis.asyncio as aioredis
 
-from komari_bot.common.content_budget import (
+from komari_bot.config.redis_config import get_shared_redis_config
+from komari_bot.llm.content_budget import (
     PROPOSAL_CONTENT_TEXT_BUDGET,
     TITLE_TEXT_BUDGET,
     normalize_required_text,
 )
-from komari_bot.common.redis_config import get_shared_redis_config
 
 from .models import SessionData, UndoRecord
 

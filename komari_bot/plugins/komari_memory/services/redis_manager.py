@@ -10,7 +10,7 @@ from typing import Any, Literal, cast
 import redis.asyncio as aioredis
 from nonebot import logger
 
-from komari_bot.common.redis_config import get_shared_redis_config
+from komari_bot.config.redis_config import get_shared_redis_config
 
 from ..config_schema import KomariMemoryConfigSchema
 from .config_interface import get_config

@@ -20,13 +20,13 @@ require("nonebot_plugin_apscheduler")
 from apscheduler.jobstores.base import JobLookupError
 from nonebot_plugin_apscheduler import scheduler
 
-from komari_bot.common.content_budget import (
+from komari_bot.db.orm_config import is_orm_database_url_configured
+from komari_bot.llm.content_budget import (
     QUERY_TEXT_BUDGET,
     ContentValidationError,
     normalize_required_text,
 )
-from komari_bot.common.onebot_messages import plain_text_message
-from komari_bot.common.orm_config import is_orm_database_url_configured
+from komari_bot.onebot.onebot_messages import plain_text_message
 
 from .config_schema import DynamicConfigSchema
 from .models import Proposal, SessionData  # noqa: TC001

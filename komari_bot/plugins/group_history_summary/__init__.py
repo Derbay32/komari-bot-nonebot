@@ -10,8 +10,8 @@ from nonebot.exception import FinishedException
 from nonebot.matcher import current_matcher
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.common.onebot_messages import plain_text_message
-from komari_bot.common.onebot_rules import group_message_to_me_rule
+from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.onebot.onebot_rules import group_message_to_me_rule
 
 from .config_schema import DynamicConfigSchema
 from .execution_service import (

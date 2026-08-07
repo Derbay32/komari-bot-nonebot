@@ -35,11 +35,11 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.types import JSON as SQLAlchemyJSON  # noqa: N811
 
-from komari_bot.common.orm_config import get_orm_database_url
-from komari_bot.common.typed_config import (
+from komari_bot.config.typed_config import (
     TypedConfigModel,
     ensure_typed_config_model,
 )
+from komari_bot.db.orm_config import get_orm_database_url
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
