@@ -1,17 +1,12 @@
 # CHANGELOG
 
-## [v2.0.0] - 2026-08-07
+## [Unreleased]
 
-> v2.0.0 是数据库层与配置存储的架构级升级（详见 `docs/adr/0004`）：连接/会话生命周期与 Schema 迁移全部移交 nonebot-plugin-orm（SQLAlchemy 2.x + Alembic），动态配置与 Prompt 改为强类型表。升级前请务必阅读下方「升级操作顺序」。
+> dev 分支上的未发版变更。
 
 ### 破坏性变更
 
-- 数据库连接唯一权威改为 nonebot-plugin-orm 的 `SQLALCHEMY_DATABASE_URL`；自研连接池模块 `komari_bot/common/postgres.py` 与 `database_config.py` 删除，`PG_*` 环境变量（`PG_HOST` / `PG_PORT` / `PG_DATABASE` / `PG_USER` / `PG_PASSWORD` / `PG_POOL_*`）全部下线，配置仅需 `SQLALCHEMY_DATABASE_URL`。
-- 动态配置存储迁移：旧 JSONB KV 表 `komari_plugin_configs` / `komari_prompt_configs` 冻结（保留存量数据，运行时不读写），改为 14 张 `komari_<插件>_config` + 3 张 `komari_prompt_*` SQLModel 强类型单行表（主键 `id=1`、revision CAS、updated_at）；旧表 `DROP` 由后续版本执行。
-- 跨进程配置变更通知从 asyncpg LISTEN/NOTIFY 改为应用事件循环亚秒级轮询各表 `revision`；`PromptTemplateLoader` 以 1 秒陈限 + 本进程写入即时失效传播变更。
-- 三个历史迁移脚本删除：`split_komari_memory_entity_tables.py`、`extract_komari_memory_profile_columns.py`、`drop_legacy_user_attributes_table.py`（其目标结构已由基线 0001 一次性覆盖）。
-- 管理 API 全面更新至 V2，与旧版本 V1 不再兼容，需将管理后台升级至 v2.0.0 以适配新端点（旧版路由与退役 stub 均不再注册）。
-- 运行时禁止任何 `CREATE TABLE` / `ALTER` DDL；`komari_memory/database/init_orm.sql` 保持 fail-closed，`komari_knowledge/init_db.sql` 仅作运维参考。
+- 数据库连接唯一权威改为 nonebot-plugin-orm，需手动迁移后进行升级。
 
 ### 运维注意
 
@@ -39,19 +34,12 @@
 
 ### 新增
 
-- Alembic 迁移版本链 `migrations/`（0001 全量基线 26 张既有表、0002 14 张强类型配置表、0003 3 张 Prompt 表）与迁移引导 `komari_bot/common/orm_bootstrap.py`（`upgrade head` / `check` / `revision --autogenerate`）。
-- 强类型配置/Prompt 表体系：`komari_bot/common/typed_config.py`（`TypedConfigModel` / `TypedPromptModel`、进程内注册表、按源文件安全加载）与 `prompt_storage.py` 重写（1 秒陈限缓存、无 NOTIFY）。
-- 连接与配置解析：`orm_config.py`（`SQLALCHEMY_DATABASE_URL` 权威解析）、`orm_connection.py`（共享引擎 asyncpg 兼容 raw 连接适配，保留 `$n` 占位符 SQL）、`redis_config.py`（Redis 共享配置 Schema）。
-- 业务关系表 ORM 化：user_ban / character_binding / user_data / komari_custom / komari_management / komari_decision 各新增 `orm_models.py`（SQLModel，经 `get_session` 访问）。
-- 离线迁移脚本体系：`migrate_legacy_config_to_typed_tables.py`（v2.0.0 存量搬运主力，含决算报告）等 9 个脚本，连接统一走 `--dsn` 或 `SQLALCHEMY_DATABASE_URL`。
-- 新增 search 管理 API 端点，支持向前端提供搜索能力支持商描述（`/api/v2/komari-search/provider-descriptors`）。
+- 新增 search 管理 API 端点，支持向前端提供搜索能力支持商描述。
 - 新增 OpenAI Response API 与流式传输支持，可在配置项中配置 (#23)。
 
 ### 变更
 
-- 容器 `docker/prestart.sh` 在启动 Gunicorn 前自动执行 `upgrade head`，迁移失败容器拒绝启动。
-- `komari_management` 启动检查只对遗留 `komari_plugin_configs` 中仍使用旧单 Token / `llm_logs:read` 权限名的凭据记录警告（不再物理删除）。
-- 文档全面刷新：AGENTS.md（配置管理、Prompt 配置、数据库操作模式、开发流程）、插件 README、`docs/adr/0004` 补落地状态。
+- 迁移数据库连接至 `nonebot-plugin-orm`
 
 ### 修复
 
@@ -603,7 +591,6 @@
 | 版本 | 日期 | 类型 |
 |------|------|------|
 | Unreleased | - | dev 分支 |
-| v2.0.0 | 2026-08-07 | **Stable** |
 | v1.3.1 | 2026-08-05 | **Stable** |
 | v1.3.0 | 2026-07-29 | **Stable** |
 | v1.3.0-rc.2 | 2026-07-27 | RC |
