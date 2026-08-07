@@ -267,14 +267,15 @@ def test_scene_api_module_has_no_repository_fallback() -> None:
 def test_management_package_has_no_decision_internal_imports() -> None:
     """管理插件全包不得 import 判定插件内部子模块（配置 Schema 豁免）。"""
     package_dir = Path(scene_api.__file__).resolve().parent
-    offenders: list[str] = []
-    for module_file in sorted(package_dir.rglob("*.py")):
-        source = module_file.read_text(encoding="utf-8")
-        for forbidden in (
-            "komari_decision.repositories",
-            "komari_decision.services",
-            "komari_decision.handlers",
-        ):
-            if forbidden in source:
-                offenders.append(f"{module_file.name}: {forbidden}")
+    forbidden_prefixes = (
+        "komari_decision.repositories",
+        "komari_decision.services",
+        "komari_decision.handlers",
+    )
+    offenders = [
+        f"{module_file.name}: {forbidden}"
+        for module_file in sorted(package_dir.rglob("*.py"))
+        for forbidden in forbidden_prefixes
+        if forbidden in module_file.read_text(encoding="utf-8")
+    ]
     assert not offenders, f"管理插件存在判定插件深 import: {offenders}"
