@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING, Protocol, cast
 
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
-from .services.config_interface import get_config, get_config_async
-from .services.runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
-from .services.unified_candidate_rerank import (
+from komari_bot.decision import (
     CandidateSchema,
-    UnifiedCandidateRerankService,
+    DecisionRuntimeState,
+    DecisionRuntimeStatus,
     UnifiedRerankResult,
 )
+
+from .services.config_interface import get_config, get_config_async
+from .services.decision_engine import DecisionEngine
+from .services.unified_candidate_rerank import UnifiedCandidateRerankService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from asyncpg import Pool
+
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
     from .repositories.scene_repository import SceneRepository
     from .services.scene_admin_service import SceneAdminService
@@ -31,6 +37,7 @@ class MemoryPluginManagerProtocol(Protocol):
     """Komari Memory 插件管理器协议。"""
 
     pg_pool: Pool | None
+    redis: RedisManager | None
 
 
 def _get_ready_memory_pool(memory_plugin: object) -> Pool:
@@ -67,8 +74,8 @@ __all__ = [
     "PluginManager",
     "UnifiedCandidateRerankService",
     "UnifiedRerankResult",
+    "get_decision_engine",
     "get_plugin_manager",
-    "get_runtime_state",
     "get_scene_admin_service",
 ]
 
@@ -234,7 +241,7 @@ def get_plugin_manager() -> PluginManager | None:
     return _plugin_manager
 
 
-def get_runtime_state() -> DecisionRuntimeState:
+def _get_runtime_state() -> DecisionRuntimeState:
     """获取判定运行时三态快照。"""
     manager = get_plugin_manager()
     if manager is not None:
@@ -254,6 +261,76 @@ def get_scene_admin_service() -> SceneAdminService | None:
     if manager is None:
         return None
     return manager.scene_admin
+
+
+_cached_decision_engine: DecisionEngine | None = None
+_cached_engine_redis: RedisManager | None = None
+_cached_engine_scene_runtime: SceneRuntimeService | None = None
+
+
+def _get_ready_memory_redis() -> RedisManager | None:
+    """逐调用惰性解析 Memory 插件管理器，返回已就绪的 Redis 客户端。"""
+    memory_plugin = sys.modules.get("komari_bot.plugins.komari_memory")
+    if memory_plugin is None:
+        return None
+    get_memory_plugin_manager = getattr(memory_plugin, "get_plugin_manager", None)
+    if not callable(get_memory_plugin_manager):
+        return None
+    memory_manager = cast(
+        "MemoryPluginManagerProtocol | None",
+        get_memory_plugin_manager(),
+    )
+    if memory_manager is None:
+        return None
+    return memory_manager.redis
+
+
+def get_decision_engine() -> DecisionEngine | None:
+    """获取惰性构建并缓存的决策引擎；Redis 未就绪时返回 None。
+
+    Redis 短暂未就绪只让当次调用返回 None，不清缓存；
+    同身份恢复后仍返回原缓存引擎（与聊天插件懒构建语义一致）。
+    """
+    global _cached_decision_engine  # noqa: PLW0603
+    global _cached_engine_redis  # noqa: PLW0603
+    global _cached_engine_scene_runtime  # noqa: PLW0603
+
+    redis = _get_ready_memory_redis()
+    if redis is None:
+        return None
+
+    decision_manager = get_plugin_manager()
+    scene_runtime = (
+        None if decision_manager is None else decision_manager.scene_runtime
+    )
+
+    if (
+        _cached_decision_engine is not None
+        and _cached_engine_redis is redis
+        and _cached_engine_scene_runtime is scene_runtime
+    ):
+        return _cached_decision_engine
+
+    engine = DecisionEngine(
+        redis,
+        scene_runtime,
+        runtime_state_provider=_get_runtime_state,
+    )
+    _cached_decision_engine = engine
+    _cached_engine_redis = redis
+    _cached_engine_scene_runtime = scene_runtime
+    return engine
+
+
+def _clear_decision_engine_cache() -> None:
+    """清空决策引擎缓存（进程关闭语义）。"""
+    global _cached_decision_engine  # noqa: PLW0603
+    global _cached_engine_redis  # noqa: PLW0603
+    global _cached_engine_scene_runtime  # noqa: PLW0603
+
+    _cached_decision_engine = None
+    _cached_engine_redis = None
+    _cached_engine_scene_runtime = None
 
 
 try:
@@ -282,3 +359,4 @@ if driver is not None:
         if manager:
             await manager.shutdown()
         _plugin_manager = None
+        _clear_decision_engine_cache()

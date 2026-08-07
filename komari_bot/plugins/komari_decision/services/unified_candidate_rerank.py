@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
+
+from komari_bot.decision.unified_candidate_rerank import (
+    CandidateSchema,
+    SceneRuntimeUnavailableError,
+    UnifiedRerankResult,
+)
 
 from .config_interface import get_config
 
@@ -14,38 +19,6 @@ if TYPE_CHECKING:
         SceneRuntimeService,
         SceneRuntimeSnapshot,
     )
-
-
-@dataclass(frozen=True)
-class CandidateSchema:
-    """统一候选条目。"""
-
-    key: str
-    text: str
-    kind: Literal["fixed", "call", "scene"]
-    scene_id: str | None = None
-    embedding_similarity: float | None = None
-
-
-@dataclass(frozen=True)
-class UnifiedRerankResult:
-    """单次 rerank 聚合结果。"""
-
-    alias_hit: bool
-    candidates: list[CandidateSchema]
-    score_map: dict[str, float]
-    meaningful_score: float
-    noise_score: float
-    call_direct_score: float | None
-    call_mention_score: float | None
-    best_scene_id: str | None
-    best_scene_score: float
-    meaningful_prior: float
-    noise_prior: float
-
-
-class SceneRuntimeUnavailableError(RuntimeError):
-    """scene 运行时快照暂不可用于判定。"""
 
 
 class UnifiedCandidateRerankService:

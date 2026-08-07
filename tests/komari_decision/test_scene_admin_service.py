@@ -6,6 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from komari_bot.plugins.komari_decision.services.scene_admin_service import (
     SceneAdminService,
 )
@@ -21,6 +23,15 @@ class FakeSceneRepository:
         ]
         self.deleted_ids: list[int] = []
         self.reopened_failed_sets: list[int] = []
+        self.scene_rows: list[dict[str, Any]] = [
+            {"scene_key": "NOISE", "enabled": True},
+            {"scene_key": "MEANINGFUL", "enabled": False},
+        ]
+        self.list_scenes_calls: list[bool] = []
+        self.get_scene_by_key_calls: list[str] = []
+        self.upsert_scene_calls: list[dict[str, Any]] = []
+        self.list_scenes_error: Exception | None = None
+        self.upsert_scene_error: Exception | None = None
 
     async def list_ready_sets(self, *, limit: int | None = None) -> list[dict[str, int]]:
         if limit is None:
@@ -39,6 +50,40 @@ class FakeSceneRepository:
     async def reopen_failed_set(self, set_id: int) -> int:
         self.reopened_failed_sets.append(set_id)
         return 2
+
+    async def list_scenes(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        if self.list_scenes_error is not None:
+            raise self.list_scenes_error
+        self.list_scenes_calls.append(enabled_only)
+        return [dict(row) for row in self.scene_rows]
+
+    async def get_scene_by_key(self, scene_key: str) -> dict[str, Any] | None:
+        self.get_scene_by_key_calls.append(scene_key)
+        for row in self.scene_rows:
+            if row["scene_key"] == scene_key:
+                return dict(row)
+        return None
+
+    async def upsert_scene(
+        self,
+        *,
+        scene_key: str,
+        scene_type: str,
+        content_text: str,
+        enabled: bool = True,
+        order_index: int = 0,
+    ) -> dict[str, Any]:
+        if self.upsert_scene_error is not None:
+            raise self.upsert_scene_error
+        call = {
+            "scene_key": scene_key,
+            "scene_type": scene_type,
+            "content_text": content_text,
+            "enabled": enabled,
+            "order_index": order_index,
+        }
+        self.upsert_scene_calls.append(call)
+        return dict(call)
 
 
 class FakeSceneRuntimeService:
@@ -183,3 +228,77 @@ def test_prune_old_sets_deletes_ready_sets_outside_keep_window(
     assert result.kept_set_ids == [5, 4, 2]
     assert result.deleted_set_ids == [3, 1]
     assert repository.deleted_ids == [3, 1]
+
+
+def _build_service(repository: FakeSceneRepository) -> SceneAdminService:
+    return SceneAdminService(
+        repository=cast("Any", repository),
+        runtime_service=cast("Any", FakeSceneRuntimeService()),
+        embedding_worker=cast("Any", FakeSceneEmbeddingWorker([])),
+    )
+
+
+def test_list_scenes_delegates_with_enabled_only_flag() -> None:
+    repository = FakeSceneRepository()
+    service = _build_service(repository)
+
+    rows = asyncio.run(service.list_scenes(enabled_only=True))
+    assert rows == repository.scene_rows
+    assert repository.list_scenes_calls == [True]
+
+    rows = asyncio.run(service.list_scenes())
+    assert rows == repository.scene_rows
+    assert repository.list_scenes_calls == [True, False]
+
+
+def test_get_scene_by_key_delegates_and_returns_none_when_missing() -> None:
+    repository = FakeSceneRepository()
+    service = _build_service(repository)
+
+    row = asyncio.run(service.get_scene_by_key("NOISE"))
+    assert row == {"scene_key": "NOISE", "enabled": True}
+
+    missing = asyncio.run(service.get_scene_by_key("NOT_EXIST"))
+    assert missing is None
+    assert repository.get_scene_by_key_calls == ["NOISE", "NOT_EXIST"]
+
+
+def test_upsert_scene_delegates_keyword_arguments() -> None:
+    repository = FakeSceneRepository()
+    service = _build_service(repository)
+
+    row = asyncio.run(
+        service.upsert_scene(
+            scene_key="GREETING",
+            scene_type="general",
+            content_text="打招呼",
+            enabled=False,
+            order_index=7,
+        )
+    )
+    assert row == {
+        "scene_key": "GREETING",
+        "scene_type": "general",
+        "content_text": "打招呼",
+        "enabled": False,
+        "order_index": 7,
+    }
+    assert repository.upsert_scene_calls == [row]
+
+
+def test_passthrough_methods_propagate_repository_errors() -> None:
+    repository = FakeSceneRepository()
+    repository.list_scenes_error = RuntimeError("list 失败")
+    repository.upsert_scene_error = ValueError("scene_key 不能为空")
+    service = _build_service(repository)
+
+    with pytest.raises(RuntimeError, match="list 失败"):
+        asyncio.run(service.list_scenes())
+    with pytest.raises(ValueError, match="scene_key 不能为空"):
+        asyncio.run(
+            service.upsert_scene(
+                scene_key="",
+                scene_type="general",
+                content_text="x",
+            )
+        )

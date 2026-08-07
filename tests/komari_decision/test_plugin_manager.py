@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import sys
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import nonebot.plugin
 
 import komari_bot.plugins.komari_decision as decision_plugin
+from komari_bot.plugins.komari_decision.services.decision_engine import (
+    DecisionEngine,
+)
 from komari_bot.plugins.komari_decision.services.runtime_state import (
     DecisionRuntimeStatus,
 )
@@ -295,3 +298,113 @@ def test_runtime_state_tracks_ready_and_transient_snapshot(
     snapshot.value = None
 
     assert manager.runtime_state.status is DecisionRuntimeStatus.FAILED
+
+
+def _patch_memory_plugin_manager(
+    monkeypatch: Any,
+    memory_manager: object,
+) -> None:
+    """替换 komari_memory 模块的插件管理器出口（惰性解析，逐调用生效）。"""
+    memory_module = sys.modules["komari_bot.plugins.komari_memory"]
+    monkeypatch.setattr(
+        memory_module,
+        "get_plugin_manager",
+        lambda: memory_manager,
+        raising=False,
+    )
+
+
+def _patch_decision_manager(
+    monkeypatch: Any,
+    manager: object,
+) -> None:
+    monkeypatch.setattr(decision_plugin, "get_plugin_manager", lambda: manager)
+
+
+def test_get_decision_engine_returns_none_when_memory_manager_missing(
+    monkeypatch: Any,
+) -> None:
+    _patch_memory_plugin_manager(monkeypatch, None)
+    _patch_decision_manager(monkeypatch, None)
+
+    assert decision_plugin.get_decision_engine() is None
+
+
+def test_get_decision_engine_returns_none_when_redis_not_ready(
+    monkeypatch: Any,
+) -> None:
+    _patch_memory_plugin_manager(monkeypatch, SimpleNamespace(redis=None))
+    _patch_decision_manager(monkeypatch, None)
+
+    assert decision_plugin.get_decision_engine() is None
+
+
+def test_get_decision_engine_builds_and_caches_engine(
+    monkeypatch: Any,
+) -> None:
+    redis = object()
+    _patch_memory_plugin_manager(monkeypatch, SimpleNamespace(redis=redis))
+    _patch_decision_manager(monkeypatch, None)
+
+    engine = decision_plugin.get_decision_engine()
+    assert isinstance(engine, DecisionEngine)
+    assert decision_plugin.get_decision_engine() is engine
+
+
+def test_get_decision_engine_rebuilds_on_redis_identity_change(
+    monkeypatch: Any,
+) -> None:
+    holder = SimpleNamespace(redis=object())
+    _patch_memory_plugin_manager(monkeypatch, holder)
+    _patch_decision_manager(monkeypatch, None)
+
+    first = decision_plugin.get_decision_engine()
+    holder.redis = object()
+    second = decision_plugin.get_decision_engine()
+
+    assert isinstance(first, DecisionEngine)
+    assert isinstance(second, DecisionEngine)
+    assert second is not first
+
+
+def test_get_decision_engine_rebuilds_on_scene_runtime_identity_change(
+    monkeypatch: Any,
+) -> None:
+    _patch_memory_plugin_manager(monkeypatch, SimpleNamespace(redis=object()))
+    manager = decision_plugin.PluginManager()
+    manager.scene_runtime = cast("Any", object())
+    _patch_decision_manager(monkeypatch, manager)
+
+    first = decision_plugin.get_decision_engine()
+    manager.scene_runtime = cast("Any", object())
+    second = decision_plugin.get_decision_engine()
+
+    assert isinstance(first, DecisionEngine)
+    assert isinstance(second, DecisionEngine)
+    assert second is not first
+
+
+def test_get_decision_engine_keeps_cache_across_redis_gap(
+    monkeypatch: Any,
+) -> None:
+    """Redis 短暂未就绪不清缓存，同身份恢复后仍返回原引擎（与聊天懒构建等价）。"""
+    holder = SimpleNamespace(redis=object())
+    _patch_memory_plugin_manager(monkeypatch, holder)
+    _patch_decision_manager(monkeypatch, None)
+
+    engine = decision_plugin.get_decision_engine()
+    assert isinstance(engine, DecisionEngine)
+
+    holder.redis = None
+    assert decision_plugin.get_decision_engine() is None
+
+    holder.redis = engine_redis = object()
+    rebuilt = decision_plugin.get_decision_engine()
+    assert isinstance(rebuilt, DecisionEngine)
+    assert rebuilt is not engine
+
+    holder.redis = None
+    assert decision_plugin.get_decision_engine() is None
+
+    holder.redis = engine_redis
+    assert decision_plugin.get_decision_engine() is rebuilt

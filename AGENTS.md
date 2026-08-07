@@ -98,6 +98,8 @@ komari-bot/
 
 插件的 `require()` 声明就是硬依赖，修改前必须理解依赖链。
 
+跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
+
 ```
 基础服务层（被依赖，不应依赖业务插件）
   config_manager ───────────── 动态配置存储（PostgreSQL 强类型表 + .env 初始化）
@@ -344,7 +346,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 存储：场景四表（`komari_decision_scenes` / `komari_memory_scene_set` / `komari_memory_scene_item` / `komari_memory_scene_runtime`）为 SQLModel ORM 模型（`orm_models.py`），经 nonebot-plugin-orm `get_session` 访问，DDL 由 Alembic 基线 0001 管理；embedding 生成经 `embedding_provider` 远程接口。
 
 运行时契约：
-- `get_runtime_state()` 明确返回 `ready` / `disabled` / `failed`，禁止再用 `None` 混合表达状态。
+- 运行时状态模型 `DecisionRuntimeState`（共享包 `komari_bot.decision`，经顶层 `get_decision_engine()` 发放的引擎内部消费）明确返回 `ready` / `disabled` / `failed`，禁止再用 `None` 混合表达状态。
 - `disabled` 或 `failed` 时，显式 @、文本 @ 别名和回复机器人仍由 `komari_chat` 直通；普通非 @ 消息仅保留必要缓冲，不执行 embedding/rerank，也不主动回复。
 - `plugin_enable=true` 但初始化异常或 scene snapshot 缺失必须报告 `failed`；只有 snapshot 可用时才记录 `ready`。
 
@@ -515,7 +517,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ### Issue tracker
 
-Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）；`/to-tickets` 拆出的实施 ticket 以 GitHub Projects 草稿项管理，不进 issue 库。See `docs/agents/issue-tracker.md`.
+Issue 与 PRD 跟踪在 GitHub Issues（Derbay32/komari-bot-nonebot，经 `gh` CLI 操作）；`/to-tickets` 拆出的实施 ticket 以父 spec issue 的 sub-issue 管理（原生父子关系 + blocked-by 依赖）。See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .config_interface import get_config
 
@@ -141,4 +141,30 @@ class SceneAdminService:
             deleted_set_ids=deleted_set_ids,
             kept_set_ids=kept_set_ids,
             active_set_id=active_set_id,
+        )
+
+    async def list_scenes(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """列出 scene 内容表记录，直通 SceneRepository.list_scenes。"""
+        return await self._repository.list_scenes(enabled_only=enabled_only)
+
+    async def get_scene_by_key(self, scene_key: str) -> dict[str, Any] | None:
+        """按 scene_key 获取 scene 内容记录，直通 SceneRepository.get_scene_by_key。"""
+        return await self._repository.get_scene_by_key(scene_key)
+
+    async def upsert_scene(
+        self,
+        *,
+        scene_key: str,
+        scene_type: str,
+        content_text: str,
+        enabled: bool = True,
+        order_index: int = 0,
+    ) -> dict[str, Any]:
+        """新增或更新 scene 内容记录，直通 SceneRepository.upsert_scene。"""
+        return await self._repository.upsert_scene(
+            scene_key=scene_key,
+            scene_type=scene_type,
+            content_text=content_text,
+            enabled=enabled,
+            order_index=order_index,
         )

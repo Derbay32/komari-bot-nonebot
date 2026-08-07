@@ -21,12 +21,9 @@ from nonebot.exception import FinishedException
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import require
 
-from komari_bot.plugins.komari_decision.services.decision_engine import (
-    DecisionEngine,
+from komari_bot.decision import (
+    DecisionEngineProtocol,
     DecisionOutcome,
-)
-from komari_bot.plugins.komari_decision.services.runtime_state import (
-    DecisionRuntimeState,
     DecisionRuntimeStatus,
 )
 from komari_bot.plugins.komari_memory.services.config_interface import get_config
@@ -80,9 +77,6 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
-        SceneRuntimeService,
-    )
     from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
 
 AttemptReplyReason = Literal["at", "direct_call", "score"]
@@ -167,24 +161,17 @@ class MessageHandler:
         self,
         redis: RedisManager,
         memory: MemoryService,
-        scene_runtime: SceneRuntimeService | None = None,
-        decision_runtime_state_provider: Callable[[], DecisionRuntimeState]
-        | None = None,
+        decision_engine: DecisionEngineProtocol,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
-        self.scene_runtime = scene_runtime
         self.reply_commit_repository = ReplyCommitRepository(memory.pg_pool)
         self._reply_commit_owner = f"chat-{uuid.uuid4().hex}"
         self._last_reply_commit_cleanup = 0.0
         self.query_rewrite = QueryRewriteService()
         self._reaction_tasks: set[asyncio.Task[None]] = set()
-        self.decision_engine = DecisionEngine(
-            redis,
-            scene_runtime,
-            runtime_state_provider=decision_runtime_state_provider,
-        )
+        self.decision_engine = decision_engine
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。"""
