@@ -12,6 +12,7 @@ from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_to_me_rule
+from komari_bot.plugins.komari_decision import UnifiedCandidateRerankService
 
 from .config_schema import DynamicConfigSchema
 from .execution_service import (
@@ -31,9 +32,7 @@ config_manager_plugin = require("config_manager")
 agent_run_logger_plugin = require("agent_run_logger")
 permission_manager_plugin = require("permission_manager")
 character_binding = require("character_binding")
-komari_decision_plugin = require("komari_decision")
-
-UnifiedCandidateRerankService = komari_decision_plugin.UnifiedCandidateRerankService
+require("komari_decision")
 
 config_manager = config_manager_plugin.get_config_manager(
     "group_history_summary", DynamicConfigSchema

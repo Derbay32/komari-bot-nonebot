@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
 from fastapi import Path as ApiPath
 from nonebot import logger
-from nonebot.plugin import get_plugin, require
+from nonebot.plugin import require
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
@@ -24,9 +23,7 @@ from komari_bot.management.management_audit import (
     require_management_change_reason,
     resolve_management_request_id,
 )
-from komari_bot.plugins.komari_decision.repositories.scene_repository import (
-    SceneRepository,
-)
+from komari_bot.plugins.komari_decision import get_scene_admin_service
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -36,8 +33,6 @@ if TYPE_CHECKING:
 
 API_PREFIX = "/api/v2/komari-decision-scenes"
 _REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
-_fallback_repository: SceneRepository | None = None
-_fallback_repository_lock = asyncio.Lock()
 
 
 class SceneSummary(BaseModel):
@@ -125,48 +120,16 @@ def _serialize_detail(row: dict[str, Any]) -> SceneDetail:
     )
 
 
-async def _get_repository() -> SceneRepository:
-    global _fallback_repository  # noqa: PLW0603
-
-    decision_plugin = get_plugin("komari_decision")
-    if decision_plugin is not None:
-        manager_getter = getattr(decision_plugin.module, "get_plugin_manager", None)
-        if callable(manager_getter):
-            manager = manager_getter()
-            repository = getattr(manager, "scene_repository", None) if manager is not None else None
-            if repository is not None:
-                return cast("SceneRepository", repository)
-
-    async with _fallback_repository_lock:
-        if _fallback_repository is not None:
-            return _fallback_repository
-
-        memory_plugin = require("komari_memory")
-        memory_manager_getter = getattr(memory_plugin, "get_plugin_manager", None)
-        if not callable(memory_manager_getter):
-            msg = "KomariMemory 未导出 get_plugin_manager"
-            raise TypeError(msg)
-        memory_manager = memory_manager_getter()
-        pg_pool = getattr(memory_manager, "pg_pool", None) if memory_manager is not None else None
-        if pg_pool is None:
-            msg = "KomariMemory PostgreSQL 连接池未就绪"
-            raise RuntimeError(msg)
-
-        _fallback_repository = SceneRepository(pg_pool)
-        return _fallback_repository
-
-
-async def _prepare_repository() -> SceneRepository:
-    try:
-        repository = await _get_repository()
-    except Exception as exc:
-        logger.exception("[Komari Management] 获取 scene repository 失败")
+def _prepare_admin_service() -> Any:
+    """获取 scene 运维服务；判定插件未就绪时统一报服务未就绪。"""
+    service = get_scene_admin_service()
+    if service is None:
+        logger.error("[Komari Management] scene 服务未就绪；请确认 komari_decision 已就绪")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="scene repository 不可用",
-        ) from exc
-    else:
-        return repository
+            detail="scene 服务未就绪；请确认 komari_decision 已就绪",
+        )
+    return service
 
 
 def _validate_required_fixed_update(scene_key: str, scene_type: str, *, enabled: bool) -> None:
@@ -205,15 +168,15 @@ def create_scene_router(
 
     @router.get("/scenes", response_model=SceneListResponse)
     async def list_scenes() -> SceneListResponse:
-        repository = await _prepare_repository()
-        rows = await repository.list_scenes(enabled_only=False)
+        service = _prepare_admin_service()
+        rows = await service.list_scenes(enabled_only=False)
         items = [_serialize_summary(row) for row in rows]
         return SceneListResponse(items=items, total=len(items))
 
     @router.get("/scenes/{scene_key}", response_model=SceneDetail)
     async def get_scene(scene_key: Annotated[str, ApiPath(min_length=1)]) -> SceneDetail:
-        repository = await _prepare_repository()
-        row = await repository.get_scene_by_key(scene_key)
+        service = _prepare_admin_service()
+        row = await service.get_scene_by_key(scene_key)
         if row is None:
             detail = f"scene 不存在: {scene_key}"
             raise _not_found(detail)
@@ -242,9 +205,9 @@ def create_scene_router(
                 payload.scene_type,
                 enabled=payload.enabled,
             )
-            repository = await _prepare_repository()
+            service = _prepare_admin_service()
             try:
-                row = await repository.upsert_scene(
+                row = await service.upsert_scene(
                     scene_key=scene_key,
                     scene_type=payload.scene_type,
                     content_text=payload.content_text,
@@ -273,8 +236,8 @@ def create_scene_router(
             target_hash=hash_management_target(scene_key),
             recorder=recorder,
         ):
-            repository = await _prepare_repository()
-            current = await repository.get_scene_by_key(scene_key)
+            service = _prepare_admin_service()
+            current = await service.get_scene_by_key(scene_key)
             if current is None:
                 detail = f"scene 不存在: {scene_key}"
                 raise _not_found(detail)
@@ -296,7 +259,7 @@ def create_scene_router(
             )
             _validate_required_fixed_update(scene_key, scene_type, enabled=enabled)
             try:
-                row = await repository.upsert_scene(
+                row = await service.upsert_scene(
                     scene_key=scene_key,
                     scene_type=scene_type,
                     content_text=content_text,
