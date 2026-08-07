@@ -346,7 +346,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 存储：场景四表（`komari_decision_scenes` / `komari_memory_scene_set` / `komari_memory_scene_item` / `komari_memory_scene_runtime`）为 SQLModel ORM 模型（`orm_models.py`），经 nonebot-plugin-orm `get_session` 访问，DDL 由 Alembic 基线 0001 管理；embedding 生成经 `embedding_provider` 远程接口。
 
 运行时契约：
-- `get_runtime_state()` 明确返回 `ready` / `disabled` / `failed`，禁止再用 `None` 混合表达状态。
+- 运行时状态模型 `DecisionRuntimeState`（共享包 `komari_bot.decision`，经顶层 `get_decision_engine()` 发放的引擎内部消费）明确返回 `ready` / `disabled` / `failed`，禁止再用 `None` 混合表达状态。
 - `disabled` 或 `failed` 时，显式 @、文本 @ 别名和回复机器人仍由 `komari_chat` 直通；普通非 @ 消息仅保留必要缓冲，不执行 embedding/rerank，也不主动回复。
 - `plugin_enable=true` 但初始化异常或 scene snapshot 缺失必须报告 `failed`；只有 snapshot 可用时才记录 `ready`。
 
