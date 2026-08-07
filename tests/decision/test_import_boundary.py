@@ -25,15 +25,14 @@ RETIRED_SYMBOL = "get_runtime_state"
 
 
 def _iter_plugin_sources() -> list[tuple[str, Path]]:
-    sources: list[tuple[str, Path]] = []
-    for plugin_dir in sorted(PLUGINS_DIR.iterdir()):
-        if not plugin_dir.is_dir() or plugin_dir.name == "komari_decision":
-            continue
-        if not (plugin_dir / "__init__.py").exists():
-            continue
-        for module_file in sorted(plugin_dir.rglob("*.py")):
-            sources.append((plugin_dir.name, module_file))
-    return sources
+    return [
+        (plugin_dir.name, module_file)
+        for plugin_dir in sorted(PLUGINS_DIR.iterdir())
+        if plugin_dir.is_dir()
+        and plugin_dir.name != "komari_decision"
+        and (plugin_dir / "__init__.py").exists()
+        for module_file in sorted(plugin_dir.rglob("*.py"))
+    ]
 
 
 def test_no_plugin_imports_decision_internal_submodules() -> None:
