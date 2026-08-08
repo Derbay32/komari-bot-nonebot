@@ -146,6 +146,8 @@ dmypy.json
 !/docs/adr/**
 !/docs/agents/
 !/docs/agents/**
+!/docs/research/
+!/docs/research/**
 /.ruff_cache
 /.kilo
 
