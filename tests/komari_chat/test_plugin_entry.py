@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -14,6 +16,8 @@ import pytest
 from nonebot.adapters.onebot.v11 import ActionFailed
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
     from nonebug import App
 
@@ -481,3 +485,243 @@ async def test_unknown_send_result_keeps_prepared_outbox_for_reconciliation(
 
     assert not calls.cancel
     assert not calls.discard
+
+
+class _FakeAsyncio:
+    """受控的 asyncio 命名空间：记录 create_task、门控 sleep。
+
+    monkeypatch 到 ``chat_module.asyncio`` 只替换被测模块的引用，
+    不触碰全局 asyncio 模块，避免干扰 pytest-asyncio 的事件循环。
+    每次 sleep 挂起在一个独立 Event 上，由测试逐个放行或直接取消任务。
+    """
+
+    CancelledError = asyncio.CancelledError
+
+    def __init__(self) -> None:
+        self.sleep_calls: list[float] = []
+        self.created_tasks: list[asyncio.Task[None]] = []
+        self._sleep_gates: list[asyncio.Event] = []
+
+    async def sleep(self, seconds: float) -> None:
+        """记录请求的等待间隔并挂起，直到测试放行或任务被取消。"""
+        self.sleep_calls.append(seconds)
+        gate = asyncio.Event()
+        self._sleep_gates.append(gate)
+        await gate.wait()
+
+    def release_next_sleep(self) -> None:
+        """放行当前挂起的那一拍 sleep（worker 串行，同一时刻至多一拍）。"""
+        self._sleep_gates[-1].set()
+
+    def create_task(self, coro: Any) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro)
+        self.created_tasks.append(task)
+        return task
+
+
+async def _wait_for(
+    predicate: Callable[[], bool],
+    max_wait: float = 5.0,
+) -> None:
+    """轮询等待条件成立，避免依赖真实 wall-clock 长等待。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_wait
+    while not predicate():
+        if loop.time() > deadline:
+            msg = "等待 worker 节拍超时"
+            raise AssertionError(msg)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_startup_hook_starts_worker_and_shutdown_cancels_it(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """startup 钩子启动 outbox 轮询任务，shutdown 钩子取消并等待其终结。"""
+    # 模块加载时两个生命周期钩子已注册到 driver（nonebot lifespan 内部存储）
+    lifespan = chat_module.driver._lifespan
+    assert chat_module._start_reply_commit_worker in lifespan._startup_funcs
+    assert chat_module._stop_reply_commit_worker in lifespan._shutdown_funcs
+
+    fake_asyncio = _FakeAsyncio()
+    monkeypatch.setattr(chat_module, "asyncio", fake_asyncio)
+    retry_calls: list[int] = []
+
+    class _Handler:
+        @staticmethod
+        async def retry_pending_reply_commits() -> int:
+            retry_calls.append(1)
+            return 0
+
+    monkeypatch.setattr(
+        chat_module,
+        "get_config",
+        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+    )
+    monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
+
+    await chat_module._start_reply_commit_worker()
+    task = chat_module._reply_commit_worker_task
+    assert task is not None
+    assert task is fake_asyncio.created_tasks[-1]
+    assert not task.done()
+
+    # 重复 start 幂等：任务已在运行时不重复创建
+    await chat_module._start_reply_commit_worker()
+    assert len(fake_asyncio.created_tasks) == 1
+
+    # 第一拍：构建 handler、执行 retry，随后按配置间隔睡眠
+    await _wait_for(lambda: len(fake_asyncio.sleep_calls) == 1)
+    assert retry_calls == [1]
+    assert fake_asyncio.sleep_calls == [30]
+
+    # shutdown：取消任务并等待退出，全局引用清空
+    await chat_module._stop_reply_commit_worker()
+    assert chat_module._reply_commit_worker_task is None
+    assert task.cancelled()
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_worker_interval_shrinks_to_five_seconds_after_polling_exception(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一轮轮询抛出普通异常后，下一拍等待间隔收缩到 5 秒并记录错误日志。"""
+    fake_asyncio = _FakeAsyncio()
+    monkeypatch.setattr(chat_module, "asyncio", fake_asyncio)
+    monkeypatch.setattr(
+        chat_module,
+        "get_config",
+        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+    )
+    errors_logged: list[int] = []
+
+    def _record_exception(*_args: object, **_kwargs: object) -> None:
+        errors_logged.append(1)
+
+    monkeypatch.setattr(
+        chat_module,
+        "logger",
+        SimpleNamespace(exception=_record_exception),
+    )
+
+    attempts = {"count": 0}
+
+    class _Handler:
+        @staticmethod
+        async def retry_pending_reply_commits() -> int:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                msg = "模拟 outbox 轮询失败"
+                raise RuntimeError(msg)
+            return 0
+
+    monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
+
+    await chat_module._start_reply_commit_worker()
+    task = chat_module._reply_commit_worker_task
+    assert task is not None
+
+    # 第一拍抛出普通异常：间隔收缩到 5 秒，并记录一条错误日志
+    await _wait_for(lambda: len(fake_asyncio.sleep_calls) == 1)
+    assert fake_asyncio.sleep_calls == [5]
+    assert errors_logged == [1]
+
+    # 放行后第二拍恢复正常：按配置读取的间隔继续轮询
+    fake_asyncio.release_next_sleep()
+    await _wait_for(lambda: len(fake_asyncio.sleep_calls) == 2)
+    assert fake_asyncio.sleep_calls[1] == 30
+
+    await chat_module._stop_reply_commit_worker()
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_worker_cancel_exits_cleanly_without_extra_side_effects(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """外部取消任务：CancelledError 不被吞掉，任务以 cancelled 结束且无多余轮询。"""
+    fake_asyncio = _FakeAsyncio()
+    monkeypatch.setattr(chat_module, "asyncio", fake_asyncio)
+    monkeypatch.setattr(
+        chat_module,
+        "get_config",
+        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+    )
+    retry_calls: list[int] = []
+
+    class _Handler:
+        @staticmethod
+        async def retry_pending_reply_commits() -> int:
+            retry_calls.append(1)
+            return 0
+
+    monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
+
+    await chat_module._start_reply_commit_worker()
+    task = chat_module._reply_commit_worker_task
+    assert task is not None
+    await _wait_for(lambda: len(fake_asyncio.sleep_calls) == 1)
+    assert len(retry_calls) == 1
+
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+    # 干净退出：任务以 cancelled 状态终结，且不再产生 retry / sleep 副作用
+    assert task.cancelled()
+    assert retry_calls == [1]
+    assert fake_asyncio.sleep_calls == [30]
+
+    # 收尾：shutdown 语义对已终结任务幂等，全局引用清空
+    await chat_module._stop_reply_commit_worker()
+    assert chat_module._reply_commit_worker_task is None
+
+
+@pytest.mark.asyncio
+async def test_worker_rethrows_cancelled_error_from_handler(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handler 内部冒出的 CancelledError 被原样重抛：不降级、不继续循环、无错误日志。"""
+    fake_asyncio = _FakeAsyncio()
+    monkeypatch.setattr(chat_module, "asyncio", fake_asyncio)
+    monkeypatch.setattr(
+        chat_module,
+        "get_config",
+        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+    )
+    errors_logged: list[int] = []
+
+    def _record_exception(*_args: object, **_kwargs: object) -> None:
+        errors_logged.append(1)
+
+    monkeypatch.setattr(
+        chat_module,
+        "logger",
+        SimpleNamespace(exception=_record_exception),
+    )
+    retry_calls: list[int] = []
+
+    class _Handler:
+        @staticmethod
+        async def retry_pending_reply_commits() -> int:
+            retry_calls.append(1)
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
+
+    await chat_module._start_reply_commit_worker()
+    task = chat_module._reply_commit_worker_task
+    assert task is not None
+    with suppress(asyncio.CancelledError):
+        await task
+
+    # CancelledError 未被吞掉：任务以 cancelled 终结，未降级为 5 秒、未继续轮询
+    assert task.cancelled()
+    assert retry_calls == [1]
+    assert fake_asyncio.sleep_calls == []
+    assert errors_logged == []
