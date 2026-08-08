@@ -26,7 +26,6 @@ from komari_bot.decision import (
     DecisionOutcome,
     DecisionRuntimeStatus,
 )
-from komari_bot.plugins.komari_memory.services.config_interface import get_config
 from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
     RedisManager,
@@ -38,6 +37,7 @@ from ..repositories.reply_commit_repository import (
     ReplyCommitRepository,
     ReplyCommitStep,
 )
+from ..services.config_interface import get_config, get_memory_config
 from ..services.error_notify import (
     notify_superusers_reply_failure,
     one_line_summary,
@@ -226,7 +226,7 @@ class MessageHandler:
         if self._is_at_trigger(event) or self._is_reply_to_bot(event):
             return True, message_content
 
-        config = get_config()
+        config = get_memory_config()
         stripped_content = self._strip_text_at_alias_prefix(
             message_content,
             [config.bot_nickname, *config.bot_aliases],
@@ -617,7 +617,7 @@ class MessageHandler:
 
         表情发送失败维持静默 DEBUG 日志语义，不阻塞生成。
         """
-        config = get_config()
+        config = get_memory_config()
         if (
             callback is None
             or not config.face_reaction_enabled
@@ -696,7 +696,7 @@ class MessageHandler:
     ) -> None:
         """将本轮互动写入跨群 Redis 原始缓冲。"""
         del lock_timeout_seconds
-        config = get_config()
+        config = get_memory_config()
         if not config.global_interaction_enabled:
             return
 
@@ -766,7 +766,7 @@ class MessageHandler:
         Returns:
             (recent_messages, interaction_records, stored)
         """
-        config = get_config()
+        config = get_memory_config()
         stored = False
 
         context_messages_limit = int(getattr(config, "context_messages_limit", 10))
@@ -821,7 +821,7 @@ class MessageHandler:
 
         不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
         """
-        config = get_config()
+        config = get_memory_config()
 
         # 查询重写（带 trace）
         if collector is not None:
@@ -1107,7 +1107,7 @@ class MessageHandler:
             await self._write_interaction_history(
                 message=message,
                 new_record=reply_result.interaction_history,
-                lock_timeout_seconds=get_config().memory_agent_lock_timeout_seconds,
+                lock_timeout_seconds=get_memory_config().memory_agent_lock_timeout_seconds,
             )
         except Exception:
             logger.debug(
@@ -1123,6 +1123,7 @@ class MessageHandler:
             msg = "favorability_delta missing"
             raise ValueError(msg)
         config = get_config()
+        memory_config = get_memory_config()
         payload = PendingReplyCommit(
             operation_id=pending_reply.operation_id,
             request_trace_id=pending_reply.request_trace_id,
@@ -1142,8 +1143,8 @@ class MessageHandler:
             },
             proactive_reservation_id=pending_reply.proactive_reservation_id,
             proactive_cooldown_seconds=config.proactive_cooldown,
-            global_interaction_enabled=config.global_interaction_enabled,
-            global_interaction_trigger_size=config.global_interaction_trigger_size,
+            global_interaction_enabled=memory_config.global_interaction_enabled,
+            global_interaction_trigger_size=memory_config.global_interaction_trigger_size,
         )
         return await self.reply_commit_repository.prepare(payload)
 
@@ -1526,6 +1527,7 @@ class MessageHandler:
             频控冷却/超限/重复等正常控制流返回 (None, False, None)。
         """
         config = get_config()
+        memory_config = get_memory_config()
         reservation_id: str | None = None
         reservation_transferred = False
         reservation_heartbeat: asyncio.Task[None] | None = None
@@ -1734,7 +1736,7 @@ class MessageHandler:
                 message=message,
                 reply_result=reply_result,
                 force_reply=force_reply,
-                bot_nickname=config.bot_nickname,
+                bot_nickname=memory_config.bot_nickname,
                 reason=reason,
                 reply_score=reply_score,
                 operation_id=self._reply_operation_id(message),

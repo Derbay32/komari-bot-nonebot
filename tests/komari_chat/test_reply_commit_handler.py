@@ -324,6 +324,7 @@ async def test_delivered_reply_commits_all_idempotent_steps(
     handler, repository, redis = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "get_memory_config", _config)
     monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
     pending = _pending_reply(handler_module, "reply-operation-1")
 
@@ -345,6 +346,7 @@ async def test_partial_commit_retries_without_reapplying_completed_step(
     handler, repository, redis = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "get_memory_config", _config)
     monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
     pending = _pending_reply(handler_module, "reply-operation-2")
     redis.fail_ai_once = True
@@ -414,6 +416,7 @@ async def test_process_claimed_reply_commit_raises_when_lease_lost_before_comple
     handler, repository, _redis = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "get_memory_config", _config)
     monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
     repository.renew_lease_result = False
     repository.yield_once_on_step = "interaction_stored"
@@ -454,6 +457,7 @@ async def test_retry_pending_reply_commits_triggers_hourly_cleanup(
     handler, repository, _redis = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "get_memory_config", _config)
     monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
     handler._last_reply_commit_cleanup = time.monotonic() - 7200
     pending = _pending_reply(handler_module, "reply-operation-7")
@@ -480,6 +484,7 @@ async def test_retry_pending_reply_commits_skips_cleanup_within_hour(
     handler, repository, _redis = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "get_memory_config", _config)
     monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
     handler._last_reply_commit_cleanup = time.monotonic()
 
@@ -498,6 +503,7 @@ async def test_finish_claimed_reply_commit_marks_failure_on_step_error(
     handler, repository, _redis = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "get_memory_config", _config)
     monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
     pending = _pending_reply(handler_module, "reply-operation-4")
     assert await handler.prepare_pending_reply(pending) is True

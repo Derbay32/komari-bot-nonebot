@@ -3,8 +3,9 @@
 from nonebot import get_driver, logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
-from komari_bot.plugins.komari_memory.services.config_interface import get_config
 from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
+
+from .config_interface import get_memory_config
 
 GROUP_ERROR_TEXT = "啊、啊呜……对不起，脑袋里刚才突然乱成一团了……"
 
@@ -88,7 +89,7 @@ async def notify_superusers_reply_failure(
     不含消息正文、prompt 或回复正文。同群 + 同异常类型 5 分钟 Redis 冷却去重；
     `error_notify_enabled=false` 时整体静默跳过。
     """
-    config = get_config()
+    config = get_memory_config()
     if not config.error_notify_enabled:
         return
 

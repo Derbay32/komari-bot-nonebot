@@ -4,7 +4,8 @@ from nonebot import logger
 from nonebot.plugin import require
 
 from komari_bot.plugins.komari_memory.core.retry import retry_async
-from komari_bot.plugins.komari_memory.services.config_interface import get_config
+
+from .config_interface import get_memory_config
 
 if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
@@ -109,7 +110,7 @@ class QueryRewriteService:
             return current_query
 
         # 获取最新配置
-        config = get_config()
+        config = get_memory_config()
 
         try:
             # 构建重写 Prompt

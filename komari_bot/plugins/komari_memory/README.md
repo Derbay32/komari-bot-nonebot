@@ -192,13 +192,13 @@ nonebot-plugin-orm `get_session` 访问；embedding 生成仍依赖
 
 ### 主动回复与判定
 
+> 主动回复频控（`proactive_*`）与回复送达副作用 outbox（`reply_commit_*`）
+> 的 10 个字段自 KOMARIBOT-7 起归 `komari_chat` 自有配置表
+> `komari_chat_config` 所有，不再由本插件配置承载；死字段
+> `proactive_score_threshold` 已随迁出删除。
+
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `proactive_enabled` | `false` | 是否启用主动回复 |
-| `proactive_score_threshold` | `0.8` | 主动回复阈值 |
-| `proactive_cooldown` | `300` | 主动回复确认送达后的冷却时间（秒） |
-| `proactive_max_per_hour` | `400` | 最近一小时最大主动回复次数，包含生成中的预占 |
-| `proactive_reservation_ttl_seconds` | `360` | 生成与发送阶段的 Redis 预占有效期（秒） |
 | `reply_threshold` | `0.72` | 回复阈值 |
 | `noise_conf_threshold` | `0.76` | NOISE 置信度阈值 |
 | `noise_margin_threshold` | `0.1` | NOISE 领先阈值 |

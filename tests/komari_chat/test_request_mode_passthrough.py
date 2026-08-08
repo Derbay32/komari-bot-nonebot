@@ -409,7 +409,7 @@ def test_query_rewrite_passes_summary_slot_mode(monkeypatch: Any) -> None:
     monkeypatch.setattr(query_rewrite_module, "llm_provider", _Provider())
     monkeypatch.setattr(
         query_rewrite_module,
-        "get_config",
+        "get_memory_config",
         lambda: SimpleNamespace(
             llm_model_summary="summary-model",
             llm_thinking_mode_summary=False,
