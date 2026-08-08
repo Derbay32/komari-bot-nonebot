@@ -1427,13 +1427,13 @@ class MessageHandler:
             if isinstance(reserve_result, str):
                 match reserve_result:
                     case "cooldown":
-                        logger.debug("[KomariMemory] 主动回复冷却或生成预占中")
+                        logger.debug("[KomariChat] 主动回复冷却或生成预占中")
                         return None, False, None
                     case "rate_limited":
-                        logger.debug("[KomariMemory] 主动回复频率超限")
+                        logger.debug("[KomariChat] 主动回复频率超限")
                         return None, False, None
                     case "duplicate":
-                        logger.debug("[KomariMemory] 主动回复消息已预占或已送达")
+                        logger.debug("[KomariChat] 主动回复消息已预占或已送达")
                         return None, False, None
                     case _:
                         return None, False, ReplyFailureInfo(
