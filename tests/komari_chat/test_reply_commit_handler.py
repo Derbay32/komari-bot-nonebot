@@ -350,7 +350,7 @@ async def test_partial_commit_retries_without_reapplying_completed_step(
     handler_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handler, repository, redis, reservation_svc = _handler(handler_module)
+    handler, repository, redis, _reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
