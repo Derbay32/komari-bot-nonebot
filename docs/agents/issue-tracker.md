@@ -1,63 +1,94 @@
-# Issue tracker: GitHub
+# Issue tracker: Plane
 
-Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
+Issues、PRD、spec 与 wayfinder 寻路图全部存放在 **Plane 官方云**项目 **KOMARIBOT**（"komari bot"）。所有操作经 Kilo 已配置的 **Plane MCP 服务器**（`plane_*` 工具族）完成——**不要**用 `gh` / `glab` CLI 操作 ticket；`gh` 仅用于 GitHub PR 与仓库操作。
 
-## Conventions
+## 坐标
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Comment on an issue**: `gh issue comment <number> --body "..."`
-- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
-- **Language convention**: issue titles and bodies in this repo are written in Simplified Chinese.
+| 项 | 值 |
+|---|---|
+| 实例 | Plane 官方云（app.plane.so） |
+| Workspace ID | `23ddd34b-c5d6-4a0e-90b9-c9586be8dc97` |
+| 项目名 | komari bot |
+| 项目 identifier | `KOMARIBOT` |
+| 项目 ID（project_id，所有 MCP 调用必填） | `c3c4a0f3-6bc2-4a09-b80d-bda803342f7a` |
 
-Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
+Work item 的人读标识是 `KOMARIBOT-<sequence_id>`（如 KOMARIBOT-3）；MCP 调用一律用 UUID。叙述与引用时用**名字**，identifier 随行。
+
+## 常用操作（MCP 工具对照）
+
+- **创建**：`plane_create_work_item`（project_id + name；正文用 `description_html`，或 `description_stripped` 纯文本便捷入口）
+- **读取**：`plane_retrieve_work_item`（按 UUID）或 `plane_retrieve_work_item_by_identifier`（按 `KOMARIBOT-N`）；评论用 `plane_list_work_item_comments`
+- **列表/筛选**：`plane_list_work_items`（project_id + PQL）；PQL 中 state/label/assignee 等 UUID 字段必须用 UUID——先查下面的参照表，或直接 `plane_list_labels` / `plane_list_states`
+- **评论**：`plane_create_work_item_comment`（`comment_html`）
+- **打/摘标签**：`plane_manage_work_item_label`（add_label_id / remove_label_id）
+- **改状态**：`plane_update_work_item`（state=<状态 UUID>）——Plane 没有 "close" 动作，关闭 = 状态置 Done 或 Cancelled
+- **认领**：`plane_update_work_item`（assignees=[<用户 UUID>]）或 `plane_manage_work_item_assignee`；当前用户 UUID 用 `plane_get_me`
+- **父子关系**：创建时传 `parent=<父 work item UUID>`，或 `plane_update_work_item`（parent=...）
+
+**语言约定**：work item 标题与正文使用简体中文。
+
+## 状态参照表
+
+| 状态 | UUID | group | 用途 |
+|---|---|---|---|
+| Backlog | `67f8ee2e-4e8f-43fb-803d-144e3c0be5eb` | backlog | 默认，未评估 |
+| Todo | `6636aa7e-5dd4-4cc3-8c3b-e0f7619cf021` | unstarted | 已评估待做 |
+| In Progress | `6df18c81-e009-4018-9f17-20b2765e01ba` | started | 进行中（认领后置此） |
+| Done | `c467719b-4c84-4de3-9604-e55a99862e35` | completed | 完成（= 关闭） |
+| Cancelled | `0e52dead-fa92-4861-a59a-97ac8e9bac58` | cancelled | 取消（= wontfix/误报关闭） |
+
+## 标签参照表
+
+Triage 五标签（词汇见 `docs/agents/triage-labels.md`）：
+
+| 标签 | UUID |
+|---|---|
+| `needs-triage` | `40bfe7ac-d279-4543-9d8e-157fae44955a` |
+| `needs-info` | `a09c39f8-7902-4880-be8b-2bd7d6b0e751` |
+| `ready-for-agent` | `c6e76b86-8b4f-4684-97b8-878a1ac05056` |
+| `ready-for-human` | `7dd9db41-5c0e-4505-a649-b7287f487c27` |
+| `wontfix` | `12a6964c-f279-476e-ba10-f92758514348` |
+
+Wayfinder 五标签：
+
+| 标签 | UUID |
+|---|---|
+| `wayfinder:map` | `ceacbfdf-ba88-407b-bb85-f9b801b8fd47` |
+| `wayfinder:research` | `2da6f427-b6c7-424a-ad2d-ff060033ddef` |
+| `wayfinder:grilling` | `670044a8-6c48-42ab-9ed3-71ef5bf2b150` |
+| `wayfinder:prototype` | `29a424fa-56e8-4028-ab05-18852b040633` |
+| `wayfinder:task` | `5758ced2-be65-4234-81b9-673089868e4d` |
+
+新标签用 `plane_create_label`（project_id + name + color），创建后把 UUID 补进本表。
 
 ## Pull requests as a triage surface
 
-**PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
+**PRs as a request surface: no.** PR 留在 GitHub（`gh pr`），不进 Plane triage 队列。GitHub 外部 issue 若出现，人工搬运进 Plane。
 
-When set to `yes`, PRs run through the same labels and states as issues, using the `gh pr` equivalents:
+## 当 skill 说「publish to the issue tracker」
 
-- **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>` for the diff.
-- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments` then keep only `authorAssociation` of `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, or `NONE` (drop `OWNER`/`MEMBER`/`COLLABORATOR`).
-- **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label`/`--remove-label`, `gh pr close`.
+按产物类型路由：
 
-GitHub shares one number space across issues and PRs, so a bare `#42` may be either — resolve with `gh pr view 42` and fall back to `gh issue view 42`.
+- **PRD / spec / bug report / feature request** → `plane_create_work_item`（标题简体中文，正文 description_html）。
+- **实施 ticket（/to-tickets 产物）** → 父 spec work item 的 **sub-issue**：创建时传 `parent=<父 UUID>`，标题带两位序号前缀（`01 — <标题>`）保持排序可见，正文按 to-tickets 模板（Parent / What to build / Acceptance criteria / Blocked by），打 `ready-for-agent` 标签，状态 Todo。
+- **完成 ticket** → `plane_create_work_item_comment` 记完成说明 + 状态置 Done；父 spec 由人类在全部子 ticket 完成后关闭，agent 不动父项。
 
-## When a skill says "publish to the issue tracker"
+## 当 skill 说「fetch the relevant ticket」
 
-Route by artifact type:
-
-- **PRD / spec / bug report / feature request** → create a GitHub issue.
-- **Implementation ticket (output of `/to-tickets`)** → create as a **sub-issue** of the parent spec issue (GitHub's native parent-child relation). See the next section.
-
-## Ticket management: sub-issues
-
-Implementation tickets produced by `/to-tickets` are always managed as sub-issues of the parent spec issue; both the parent-child relation and blocking edges use GitHub's native capabilities, visible directly in the UI.
-
-- **Create a ticket**: one at a time, in dependency order (blockers first):
-  `gh issue create --title "<NN> — <title>" --body "<body>" --label ready-for-agent`.
-  The two-digit sequence prefix in the title keeps ordering visible; the body follows the to-tickets template (Parent / What to build / Acceptance criteria / Blocked by), in Simplified Chinese.
-- **Attach as sub-issue**: `gh api --method POST repos/<owner>/<repo>/issues/<parent-number>/sub_issues -F sub_issue_id=<child-db-id>`, where `<child-db-id>` is the child issue's numeric **database id** (`gh api repos/<owner>/<repo>/issues/<n> --jq .id`, _not_ the `#number` or `node_id`).
-- **Blocking edge**: GitHub's native issue dependencies — `gh api --method POST repos/<owner>/<repo>/issues/<child-number>/dependencies/blocked_by -F issue_id=<blocker-db-id>` (also a database id). The textual declaration in the body's `## Blocked by` section (sequence number + title) is kept as a fallback and for quick reading. frontier = tickets whose blockers are all closed.
-- **List child tickets**: `gh api repos/<owner>/<repo>/issues/<parent-number>/sub_issues`.
-- **Status progression**: finishing a ticket means `gh issue close <n> --comment "<completion note>"`; the parent spec issue is closed by a human only after all child tickets complete.
-- **Parent spec issue**: never close or modify the parent issue when publishing tickets.
-
-## When a skill says "fetch the relevant ticket"
-
-- A ticket number (`#<n>`) → `gh issue view <n> --comments`.
-- Implementation tickets are issues too — same `gh issue view <n> --comments`; list all child tickets of a parent spec issue with `gh api repos/<owner>/<repo>/issues/<n>/sub_issues`.
+- `KOMARIBOT-<n>` → `plane_retrieve_work_item_by_identifier`；UUID → `plane_retrieve_work_item`。
+- 列出某 spec 的全部子 ticket：`plane_list_work_items` + PQL（parent 字段为父 UUID）。
 
 ## Wayfinding operations
 
-Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
+供 `/wayfinder` 使用。**map** 是单个带 `wayfinder:map` 标签的 work item，ticket 是它的 sub-issue。
 
-- **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body. `gh issue create --label wayfinder:map`.
-- **Child ticket**: an issue linked to the map as a GitHub sub-issue (`gh api` on the sub-issues endpoint). Where sub-issues aren't enabled, add the child to a task list in the map body and put `Part of #<map>` at the top of the child body. Labels: `wayfinder:<type>` (`research`/`prototype`/`grilling`/`task`). Once claimed, the ticket is assigned to the driving dev.
-- **Blocking**: GitHub's **native issue dependencies** — the canonical, UI-visible representation. Add an edge with `gh api --method POST repos/<owner>/<repo>/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`, where `<blocker-db-id>` is the blocker's numeric **database id** (`gh api repos/<owner>/<repo>/issues/<n> --jq .id`, _not_ the `#number` or `node_id`). GitHub reports `issue_dependencies_summary.blocked_by` (open blockers only — the live gate). Where dependencies aren't available, fall back to a `Blocked by: #<n>, #<n>` line at the top of the child body. A ticket is unblocked when every blocker is closed.
-- **Frontier query**: list the map's open children (`gh issue list --state open`, scoped to the map's sub-issues / task list), drop any with an open blocker (`issue_dependencies_summary.blocked_by > 0`, or an open issue in the `Blocked by` line) or an assignee; first in map order wins.
-- **Claim**: `gh issue edit <n> --add-assignee @me` — the session's first write.
-- **Resolve**: `gh issue comment <n> --body "<answer>"`, then `gh issue close <n>`, then append a context pointer (gist + link) to the map's Decisions-so-far.
+- **Map**：`plane_create_work_item` + `wayfinder:map` 标签，正文含 Destination / Notes / Decisions so far / Not yet specified / Out of scope 五节。
+- **Child ticket**：`plane_create_work_item`（`parent=<map UUID>`，`## Question` 正文），打 `wayfinder:<type>` 标签（research / prototype / grilling / task），状态 Todo。
+- **Blocking**：⚠️ Plane 原生 relation（blocked_by）在当前工作区**不可用**（`plane_list_work_item_relation_definitions` 返回 HTTP 402，付费功能）——一律使用**正文声明 fallback**：ticket 正文顶部写 `Blocked by: KOMARIBOT-N, KOMARIBOT-M`。ticket unblocked 当且仅当声明的每个 blocker 状态为 Done/Cancelled。
+- **Frontier 查询**：`plane_list_work_items` 取 map 的子项，保留状态不在 completed/cancelled、无 assignee、且正文 `Blocked by` 中无未关闭项的 ticket；map 顺序第一个优先。
+- **Claim**：`plane_manage_work_item_assignee`（add_user_id=<driver UUID>）+ 状态置 In Progress——会话的第一次写操作。
+- **Resolve**：`plane_create_work_item_comment` 记答案 → 状态置 Done → 把 gist + 链接追加到 map 的 Decisions-so-far（`plane_update_work_item` 改 description_html）。
+
+## GitHub 封存说明
+
+2026-08-08 前的 spec/ticket 历史留在 GitHub Issues（Derbay32/komari-bot-nonebot）原地封存，不删不改；已迁移的条目在两侧互留指针（`external_source=github` + `external_id=<原 issue 号>` 也已记录在 Plane work item 上）。新工作一律从 Plane 开始。
