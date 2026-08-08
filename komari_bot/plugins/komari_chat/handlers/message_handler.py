@@ -143,6 +143,7 @@ class PendingReply:
     reply_timestamp: float
     proactive_reservation_id: str | None = None
     proactive_reservation: Reservation | None = None
+    reaction_sent: bool = False
     decision_payload: dict[str, object] | None = None
 
 
@@ -767,8 +768,6 @@ class MessageHandler:
         reply_context: ReplyContext | None,
         reply_context_requested: bool,
         reply_context_refetched: bool,
-        _reason: AttemptReplyReason,
-        _reply_score: float | None,
         request_trace_id: str,
         caller_is_superuser: bool = False,
         collector: LLMDiagnosticCollector | None = None,
@@ -1501,8 +1500,6 @@ class MessageHandler:
                     reply_context=reply_context,
                     reply_context_requested=reply_context_requested,
                     reply_context_refetched=reply_context_refetched,
-                    _reason=reason,
-                    _reply_score=reply_score,
                     request_trace_id=request_trace_id,
                     caller_is_superuser=caller_is_superuser,
                     collector=collector,
@@ -1607,6 +1604,7 @@ class MessageHandler:
                 reply_timestamp=time.time(),
                 proactive_reservation_id=reservation_id,
                 proactive_reservation=reservation,
+                reaction_sent=reaction_sent,
             )
             reservation_transferred = True
             return pending_reply, stored, None
@@ -1751,8 +1749,6 @@ class MessageHandler:
                 reply_context=reply_context,
                 reply_context_requested=reply_context is not None,
                 reply_context_refetched=reply_context_refetched,
-                _reason="direct_call",
-                _reply_score=None,
                 request_trace_id=request_trace_id,
                 caller_is_superuser=caller_is_superuser,
                 collector=collector,
