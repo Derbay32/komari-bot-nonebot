@@ -17,6 +17,7 @@ from .handlers.message_handler import (
     PendingReply,
     ReplyFailureInfo,
 )
+from .repositories import ReplyCommitRepository
 from .services.error_notify import one_line_summary
 
 if TYPE_CHECKING:
@@ -79,6 +80,7 @@ def _get_or_build_handler() -> MessageHandler | None:
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
+            reply_commit_repository=ReplyCommitRepository(memory.pg_pool),
             decision_engine=decision_engine,
         )
     return _handler

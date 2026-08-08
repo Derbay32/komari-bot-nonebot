@@ -358,7 +358,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
 2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
-3. **`_commit_side_effects()`** — 提交好感度 adjust、AI 消息存储与互动历史写入；主动回复冷却/频控不在这里重复记账
+3. **送达后副作用唯一路径 = outbox** — `commit_delivered_reply()` 只做 `mark_delivered()` 登记 → `claim_operation()` 领取（失败/None 由后台 worker 轮询）→ 四步幂等提交（proactive confirm / 好感度 adjust / AI 历史存储 / 互动历史写入）→ `complete()`；`_attempt_reply()` 自身不提交任何聊天副作用
 
 表情反应与失败通知契约：
 - 表情反应在 `_attempt_reply()` 内、调用 `_generate_reply_core()` 之前以 `asyncio.create_task` fire-and-forget 派发（任务引用挂 `self._reaction_tasks` 防 GC），提示“正在生成”；`commit_delivered_reply()` 不再触发表情，送达后不撤下。

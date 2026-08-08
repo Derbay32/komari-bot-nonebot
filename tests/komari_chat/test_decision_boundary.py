@@ -49,14 +49,19 @@ def test_chat_package_has_no_decision_internal_imports() -> None:
     assert not offenders, f"聊天插件存在判定插件深 import: {offenders}"
 
 
-def test_message_handler_constructor_accepts_engine_only() -> None:
+def test_message_handler_constructor_requires_repository_and_engine() -> None:
+    """构造契约：outbox 仓库为必填硬依赖（KOMARIBOT-10），引擎注入保持。"""
     signature = inspect.signature(MessageHandler.__init__)
     assert list(signature.parameters) == [
         "self",
         "redis",
         "memory",
+        "reply_commit_repository",
         "decision_engine",
     ]
+    repository_param = signature.parameters["reply_commit_repository"]
+    assert repository_param.default is inspect.Parameter.empty
+    assert "ReplyCommitRepository" in str(repository_param.annotation)
     annotation = signature.parameters["decision_engine"].annotation
     assert "DecisionEngineProtocol" in str(annotation)
 
@@ -127,22 +132,31 @@ def test_handler_built_with_engine_and_rebuilt_on_identity_change(
             *,
             redis: object,
             memory: object,
+            reply_commit_repository: object,
             decision_engine: object,
         ) -> None:
             self.redis = redis
             self.memory = memory
+            self.reply_commit_repository = reply_commit_repository
             self.decision_engine = decision_engine
             built_engines.append(decision_engine)
 
     monkeypatch.setattr(
         chat_entry_module,
         "get_memory_plugin_manager",
-        lambda: SimpleNamespace(redis=object(), memory=object()),
+        lambda: SimpleNamespace(
+            redis=object(), memory=SimpleNamespace(pg_pool=object())
+        ),
     )
     monkeypatch.setattr(
         chat_entry_module,
         "get_decision_engine",
         lambda: engine_ref.value,
+    )
+    monkeypatch.setattr(
+        chat_entry_module,
+        "ReplyCommitRepository",
+        lambda pg_pool: SimpleNamespace(pg_pool=pg_pool),
     )
     monkeypatch.setattr(chat_entry_module, "MessageHandler", _Handler)
     monkeypatch.setattr(chat_entry_module, "_handler", None)
