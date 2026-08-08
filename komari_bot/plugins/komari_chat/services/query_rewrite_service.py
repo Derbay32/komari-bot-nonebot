@@ -3,7 +3,7 @@
 from nonebot import logger
 from nonebot.plugin import require
 
-from komari_bot.plugins.komari_memory.core.retry import retry_async
+from komari_bot.plugins.komari_memory import retry_async
 
 from .config_interface import get_memory_config
 

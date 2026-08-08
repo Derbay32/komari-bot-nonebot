@@ -21,10 +21,7 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 from komari_bot.memory.profile_operations import profile_traits_to_list
-from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
-    KomariMemoryConfigSchema,
-)
-from komari_bot.plugins.komari_memory.core.retry import retry_async
+from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_async
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .vision_service import read_images
@@ -33,8 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
-    from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+    from komari_bot.plugins.komari_memory import MemoryService, MessageSchema
 
 # 依赖 llm_provider 插件
 require("llm_provider")

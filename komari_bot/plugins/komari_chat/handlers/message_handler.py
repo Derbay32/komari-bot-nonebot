@@ -26,10 +26,7 @@ from komari_bot.decision import (
     DecisionOutcome,
     DecisionRuntimeStatus,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
-)
+from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..repositories.reply_commit_repository import (
@@ -87,7 +84,7 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
+    from komari_bot.plugins.komari_memory import MemoryService
 
 AttemptReplyReason = Literal["at", "direct_call", "score"]
 ReplyAction = Literal[

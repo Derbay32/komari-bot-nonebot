@@ -19,9 +19,10 @@ from komari_bot.plugins import config_manager as config_manager_plugin
 
 # 导入配置 Schema（绝对导入：config_schema 是 SQLModel 表模型，必须始终
 # 以唯一真实模块名加载一次；相对导入在测试把插件入口加载为别名模块时
-# 会导致同表重复注册）
+# 会导致同表重复注册。komari_memory 的 Schema 经其顶层暴露面导入，
+# 避免深 import 内部子模块）
 from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema
 
 # 获取配置管理器（插件级单例；komari_memory 资源与 komari_memory 自身
 # 接口共用同一工厂注册表，不产生第二份缓存）

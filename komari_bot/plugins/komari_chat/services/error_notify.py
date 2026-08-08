@@ -3,7 +3,7 @@
 from nonebot import get_driver, logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
-from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
+from komari_bot.plugins.komari_memory import RedisManager
 
 from .config_interface import get_memory_config
 
