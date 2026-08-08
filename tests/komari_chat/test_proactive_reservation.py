@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 from importlib import import_module
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pytest
+if TYPE_CHECKING:
+    import pytest
 
 proactive_reservation_module = import_module(
     "komari_bot.plugins.komari_chat.services.proactive_reservation"
@@ -250,11 +251,12 @@ def test_release_restores_capacity_and_clears_cooldown(
     reservation = asyncio.run(service.reserve("group-1", "message-1"))
     assert isinstance(reservation, Reservation)
     released = asyncio.run(reservation.release())
-    second = asyncio.run(service.reserve("group-1", "message-2"))
 
     assert released is True
     assert fake.zsets[_slots_key("group-1")] == {}
     assert _cooldown_key("group-1") not in fake.values
+
+    second = asyncio.run(service.reserve("group-1", "message-2"))
     assert isinstance(second, Reservation)
 
 
