@@ -586,6 +586,146 @@ def test_message_handler_has_no_direct_side_effect_path() -> None:
     )
 
 
+def test_generate_reply_core_has_no_dead_reason_params() -> None:
+    """KOMARIBOT-11 守卫：_reason/_reply_score 死参数已删除。"""
+    signature = inspect.signature(
+        message_handler_module.MessageHandler._generate_reply_core
+    )
+    assert "_reason" not in signature.parameters, "_reason 死参数应已删除"
+    assert "_reply_score" not in signature.parameters, "_reply_score 死参数应已删除"
+
+
+def _wire_reaction_sent_case(
+    monkeypatch: "pytest.MonkeyPatch",
+    *,
+    face_reaction_enabled: bool,
+) -> tuple[message_handler_module.MessageHandler, MessageSchema]:
+    """reaction_sent 字段双分支公共布线（KOMARIBOT-11）。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler._reaction_tasks = set()
+    handler.query_rewrite = _FakeQueryRewrite()
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="生成成功",
+            interaction_history={"event": "测试", "result": "生成成功", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="测试",
+        )
+
+    _patch_both_configs(
+        monkeypatch,
+        lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            face_reaction_enabled=face_reaction_enabled,
+            face_reaction_id="76",
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
+    monkeypatch.setattr(
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    )
+
+    message = MessageSchema(
+        user_id="user-1",
+        user_nickname="测试用户",
+        group_id="group-1",
+        content="待回复",
+        timestamp=1.0,
+        message_id="msg-1",
+    )
+    return handler, message
+
+
+def _run_reaction_sent_attempt(
+    handler: message_handler_module.MessageHandler, message: MessageSchema
+) -> Any:
+    async def _dummy_reaction() -> None:
+        return None
+
+    return asyncio.run(
+        handler._attempt_reply(
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+            on_reply_triggered=_dummy_reaction,
+        )
+    )
+
+
+def test_pending_reply_reaction_sent_true_when_reaction_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ KOMARIBOT-11：表情真实派发时 PendingReply.reaction_sent=True。"""
+    handler, message = _wire_reaction_sent_case(
+        monkeypatch, face_reaction_enabled=True
+    )
+    pending_reply, stored, failure = _run_reaction_sent_attempt(handler, message)
+    assert failure is None
+    assert stored is True
+    assert pending_reply is not None
+    assert pending_reply.reaction_sent is True
+
+
+def test_pending_reply_reaction_sent_false_when_reaction_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ KOMARIBOT-11：face_reaction_enabled=False 边界下 reaction_sent=False。"""
+    handler, message = _wire_reaction_sent_case(
+        monkeypatch, face_reaction_enabled=False
+    )
+    pending_reply, stored, failure = _run_reaction_sent_attempt(handler, message)
+    assert failure is None
+    assert stored is True
+    assert pending_reply is not None
+    assert pending_reply.reaction_sent is False
+
+
 def test_resolve_reply_context_builds_user_side_text_context() -> None:
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
@@ -2211,6 +2351,8 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
 
     # 验证 PendingReply 无 on_reply_triggered 字段
     assert not hasattr(pending_reply, "on_reply_triggered")
+    # KOMARIBOT-11：无表情回调时 reaction_sent 为真实派发结果 False
+    assert pending_reply.reaction_sent is False
 
     # commit_delivered_reply 应正常执行，不调用已删除的回调
     asyncio.run(handler.commit_delivered_reply(pending_reply))
