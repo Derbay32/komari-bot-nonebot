@@ -172,12 +172,13 @@ class MessageHandler:
         self,
         redis: RedisManager,
         memory: MemoryService,
+        reply_commit_repository: ReplyCommitRepository,
         decision_engine: DecisionEngineProtocol,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
-        self.reply_commit_repository = ReplyCommitRepository(memory.pg_pool)
+        self.reply_commit_repository = reply_commit_repository
         self._reply_commit_owner = f"chat-{uuid.uuid4().hex}"
         self._last_reply_commit_cleanup = 0.0
         self.query_rewrite = QueryRewriteService()
@@ -543,10 +544,7 @@ class MessageHandler:
             return None
 
         operation_id = self._reply_operation_id(message)
-        repository = getattr(self, "reply_commit_repository", None)
-        if repository is not None and await repository.has_active_operation(
-            operation_id
-        ):
+        if await self.reply_commit_repository.has_active_operation(operation_id):
             logger.info(
                 "[KomariChat] 重复平台事件已有回复 operation，跳过生成: group={} message={}",
                 group_id,
@@ -672,54 +670,6 @@ class MessageHandler:
             )
         except Exception:
             logger.exception("[KomariChat] 回复失败善后上报异常")
-
-    async def _store_ai_reply(
-        self,
-        group_id: str,
-        reply_content: str,
-        bot_nickname: str,
-    ) -> None:
-        """存储 AI 回复到缓冲区。"""
-        bot_message = MessageSchema(
-            user_id="bot",
-            user_nickname=bot_nickname,
-            group_id=group_id,
-            content=reply_content,
-            timestamp=time.time(),
-            message_id=f"bot_{uuid.uuid4().hex[:16]}",
-            is_bot=True,
-        )
-
-        await self.redis.push_message(group_id, bot_message)
-        logger.debug("[KomariMemory] AI 回复已存储: {}...", reply_content[:30])
-
-    async def _write_interaction_history(
-        self,
-        *,
-        message: MessageSchema,
-        new_record: InteractionHistoryRecord,
-        lock_timeout_seconds: int | None,
-    ) -> None:
-        """将本轮互动写入跨群 Redis 原始缓冲。"""
-        del lock_timeout_seconds
-        config = get_memory_config()
-        if not config.global_interaction_enabled:
-            return
-
-        global_record = {
-            "version": 1,
-            "event": str(new_record.get("event", "")).strip(),
-            "result": str(new_record.get("result", "")).strip(),
-            "emotion": str(new_record.get("emotion", "")).strip(),
-            "display_name": self._resolve_display_name(message),
-            "timestamp": time.time(),
-            "message_id": message.message_id,
-        }
-        await self.redis.push_global_interaction(
-            user_id=message.user_id,
-            record=global_record,
-            trigger_size=config.global_interaction_trigger_size,
-        )
 
     @staticmethod
     def _resolve_display_name(message: MessageSchema) -> str:
@@ -1070,58 +1020,6 @@ class MessageHandler:
         )
         return reply_result
 
-    async def _commit_side_effects(
-        self,
-        *,
-        message: MessageSchema,
-        reply_result: ReplyResult,
-        group_id: str,
-        bot_nickname: str,
-    ) -> None:
-        """提交正常聊天副作用：好感度、AI 回复存储与互动历史写入。"""
-        if reply_result.favorability_delta is None:
-            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
-            msg = "favorability_delta missing"
-            raise ValueError(msg)
-
-        logger.debug(
-            "[KomariChat] 准备提交好感度变化: group={} user={} delta={} reason={}",
-            group_id,
-            message.user_id,
-            reply_result.favorability_delta,
-            reply_result.favorability_reason or "-",
-        )
-        adjust_result = await user_data_plugin.adjust_user_favorability(
-            message.user_id,
-            reply_result.favorability_delta,
-        )
-        logger.info(
-            "[KomariChat] 好感度已更新: user={} before={} delta={} after={} reason={}",
-            message.user_id,
-            adjust_result.before,
-            adjust_result.delta,
-            adjust_result.after,
-            reply_result.favorability_reason or "-",
-        )
-
-        await self._store_ai_reply(
-            group_id=group_id,
-            reply_content=reply_result.content,
-            bot_nickname=bot_nickname,
-        )
-        try:
-            await self._write_interaction_history(
-                message=message,
-                new_record=reply_result.interaction_history,
-                lock_timeout_seconds=get_memory_config().memory_agent_lock_timeout_seconds,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 互动历史写入失败（非致命）: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-
     async def prepare_pending_reply(self, pending_reply: PendingReply) -> bool:
         """发送前持久化回复意图；重复 operation 返回 False。"""
         favorability_delta = pending_reply.reply_result.favorability_delta
@@ -1422,63 +1320,36 @@ class MessageHandler:
         *,
         platform_message_id: str | None = None,
     ) -> None:
-        """在回复确认送达后提交决策日志及聊天副作用。"""
-        repository = getattr(self, "reply_commit_repository", None)
-        if repository is not None:
-            delivered = await repository.mark_delivered(
-                pending_reply.operation_id,
-                platform_message_id=platform_message_id,
-            )
-            if not delivered:
-                msg = "回复已发送，但 outbox 无法标记为 DELIVERED"
-                raise RuntimeError(msg)
+        """在回复确认送达后登记 outbox 并尝试立即领取提交。
 
-            if pending_reply.decision_payload is not None:
-                self._log_decision(pending_reply.decision_payload)
-
-            record = await repository.claim_operation(
-                pending_reply.operation_id,
-                owner_token=self._reply_commit_owner,
-                lease_seconds=get_config().reply_commit_lease_seconds,
-            )
-            if record is not None:
-                await self._finish_claimed_reply_commit(
-                    record,
-                    owner_token=self._reply_commit_owner,
-                )
-            logger.info(
-                "[KomariMemory] 回复已送达并进入持久副作用提交: group={} operation={}",
-                pending_reply.message.group_id,
-                pending_reply.operation_id,
-            )
-            return
-
-        reservation_id = pending_reply.proactive_reservation_id
-        if reservation_id is not None:
-            await self.proactive_reservation.confirm(
-                pending_reply.message.group_id,
-                reservation_id,
-                cooldown_seconds=get_config().proactive_cooldown,
-            )
+        送达后副作用唯一路径是 outbox：mark_delivered 登记 → claim_operation
+        领取 → 四步幂等提交 → complete；claim 返回 None 时由后台 worker 领取。
+        """
+        delivered = await self.reply_commit_repository.mark_delivered(
+            pending_reply.operation_id,
+            platform_message_id=platform_message_id,
+        )
+        if not delivered:
+            msg = "回复已发送，但 outbox 无法标记为 DELIVERED"
+            raise RuntimeError(msg)
 
         if pending_reply.decision_payload is not None:
             self._log_decision(pending_reply.decision_payload)
 
-        await self._commit_side_effects(
-            message=pending_reply.message,
-            reply_result=pending_reply.reply_result,
-            group_id=pending_reply.message.group_id,
-            bot_nickname=pending_reply.bot_nickname,
+        record = await self.reply_commit_repository.claim_operation(
+            pending_reply.operation_id,
+            owner_token=self._reply_commit_owner,
+            lease_seconds=get_config().reply_commit_lease_seconds,
         )
+        if record is not None:
+            await self._finish_claimed_reply_commit(
+                record,
+                owner_token=self._reply_commit_owner,
+            )
         logger.info(
-            "[KomariMemory] 回复已送达并提交副作用: group={} reason={} score={}",
+            "[KomariMemory] 回复已送达并进入持久副作用提交: group={} operation={}",
             pending_reply.message.group_id,
-            pending_reply.reason,
-            (
-                f"{pending_reply.reply_score:.3f}"
-                if pending_reply.reply_score is not None
-                else "-"
-            ),
+            pending_reply.operation_id,
         )
 
     async def _release_proactive_reservation(

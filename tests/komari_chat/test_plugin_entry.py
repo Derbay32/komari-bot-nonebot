@@ -166,7 +166,7 @@ def test_handler_rebuilds_when_decision_engine_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = object()
-    memory = object()
+    memory = SimpleNamespace(pg_pool=object())
     engine_ref = SimpleNamespace(value=object())
     built_engines: list[object] = []
 
@@ -176,10 +176,12 @@ def test_handler_rebuilds_when_decision_engine_changes(
             *,
             redis: object,
             memory: object,
+            reply_commit_repository: object,
             decision_engine: object,
         ) -> None:
             self.redis = redis
             self.memory = memory
+            self.reply_commit_repository = reply_commit_repository
             self.decision_engine = decision_engine
             built_engines.append(decision_engine)
 
@@ -192,6 +194,11 @@ def test_handler_rebuilds_when_decision_engine_changes(
         chat_module,
         "get_decision_engine",
         lambda: engine_ref.value,
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "ReplyCommitRepository",
+        lambda pg_pool: SimpleNamespace(pg_pool=pg_pool),
     )
     monkeypatch.setattr(chat_module, "MessageHandler", _Handler)
     monkeypatch.setattr(chat_module, "_handler", None)
