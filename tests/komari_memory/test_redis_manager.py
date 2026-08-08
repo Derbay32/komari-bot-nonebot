@@ -139,11 +139,6 @@ class _FakeRedis:
         script, key_count, *rest = args
         script_text = str(script)
         evaluators: tuple[tuple[str, Callable[[list[object]], object]], ...] = (
-            ("proactive_reserve", self._eval_proactive_reserve),
-            ("proactive_confirm", self._eval_proactive_confirm),
-            ("proactive_renew", self._eval_proactive_renew),
-            ("proactive_release", self._eval_proactive_release),
-            ("proactive_count", self._eval_proactive_count),
             ("chat_commit_message_once_v1", self._eval_chat_commit_message_once),
             (
                 "chat_commit_interaction_once_v1",
@@ -190,80 +185,6 @@ class _FakeRedis:
         if "RENAME" in script_text:
             return self._eval_snapshot(key1, key2)
         return self._eval_restore(key1, key2)
-
-    def _prune_proactive_slots(self, slots_key: str, now_ms: float) -> None:
-        slots = self.zsets.setdefault(slots_key, {})
-        expired = [member for member, score in slots.items() if score <= now_ms]
-        for member in expired:
-            slots.pop(member, None)
-
-    def _eval_proactive_reserve(self, rest: list[object]) -> int:
-        cooldown_key, slots_key = map(str, rest[:2])
-        reservation_id = str(rest[2])
-        max_slots = int(str(rest[3]))
-        reservation_ttl_ms = float(str(rest[4]))
-        now_ms = self.now_ms
-        pending_until_ms = now_ms + reservation_ttl_ms
-        self._prune_proactive_slots(slots_key, now_ms)
-        slots = self.zsets[slots_key]
-        if (
-            f"pending:{reservation_id}" in slots
-            or f"confirmed:{reservation_id}" in slots
-        ):
-            return 3
-        if cooldown_key in self.values:
-            return 1
-        if len(slots) >= max_slots:
-            return 2
-        slots[f"pending:{reservation_id}"] = pending_until_ms
-        self.values[cooldown_key] = reservation_id
-        return 0
-
-    def _eval_proactive_confirm(self, rest: list[object]) -> int:
-        cooldown_key, slots_key = map(str, rest[:2])
-        reservation_id = str(rest[2])
-        rate_window_ms = float(str(rest[5]))
-        now_ms = self.now_ms
-        confirmed_until_ms = now_ms + rate_window_ms
-        self._prune_proactive_slots(slots_key, now_ms)
-        slots = self.zsets[slots_key]
-        confirmed_member = f"confirmed:{reservation_id}"
-        if confirmed_member in slots:
-            return 2
-        had_pending = int(slots.pop(f"pending:{reservation_id}", None) is not None)
-        slots[confirmed_member] = confirmed_until_ms
-        current_cooldown = self.values.get(cooldown_key)
-        if current_cooldown is None or current_cooldown == reservation_id:
-            self.values[cooldown_key] = confirmed_member
-        return had_pending
-
-    def _eval_proactive_release(self, rest: list[object]) -> int:
-        cooldown_key, slots_key = map(str, rest[:2])
-        reservation_id = str(rest[2])
-        slots = self.zsets.setdefault(slots_key, {})
-        removed = int(slots.pop(f"pending:{reservation_id}", None) is not None)
-        if self.values.get(cooldown_key) == reservation_id:
-            self.values.pop(cooldown_key, None)
-        return removed
-
-    def _eval_proactive_renew(self, rest: list[object]) -> int:
-        _cooldown_key, slots_key = map(str, rest[:2])
-        reservation_id = str(rest[2])
-        reservation_ttl_ms = float(str(rest[3]))
-        self._prune_proactive_slots(slots_key, self.now_ms)
-        slots = self.zsets.setdefault(slots_key, {})
-        if f"confirmed:{reservation_id}" in slots:
-            return 2
-        pending_member = f"pending:{reservation_id}"
-        if pending_member not in slots:
-            return 0
-        slots[pending_member] = self.now_ms + reservation_ttl_ms
-        return 1
-
-    def _eval_proactive_count(self, rest: list[object]) -> int:
-        slots_key = str(rest[0])
-        self._prune_proactive_slots(slots_key, self.now_ms)
-        return len(self.zsets[slots_key])
 
     def _eval_chat_commit_message_once(self, rest: list[object]) -> int:
         dedupe_key, buffer_key, session_key, last_key = map(str, rest[:4])
@@ -921,149 +842,30 @@ def test_initialize_closes_redis_client_when_ping_fails(monkeypatch: Any) -> Non
     assert manager._redis is None
 
 
-def test_proactive_reservation_is_atomic_for_concurrent_requests(
-    monkeypatch: Any,
-) -> None:
-    manager = _build_manager(monkeypatch)
-
-    async def _reserve_pair() -> list[str]:
-        return list(
-            await asyncio.gather(
-                manager.reserve_proactive_reply(
-                    "group-1",
-                    "message-1",
-                    max_per_hour=10,
-                    reservation_ttl_seconds=360,
-                ),
-                manager.reserve_proactive_reply(
-                    "group-1",
-                    "message-2",
-                    max_per_hour=10,
-                    reservation_ttl_seconds=360,
-                ),
-            )
+def test_redis_manager_no_longer_hosts_proactive_reservation() -> None:
+    """预占生命周期职责已迁出 RedisManager/RedisKeys（KOMARIBOT-9，守卫防回归）。"""
+    removed_manager_methods = (
+        "reserve_proactive_reply",
+        "confirm_proactive_reply",
+        "renew_proactive_reply",
+        "release_proactive_reply",
+        "get_proactive_count",
+    )
+    for method_name in removed_manager_methods:
+        assert not hasattr(RedisManager, method_name), (
+            f"RedisManager 不应再暴露 {method_name}"
         )
 
-    statuses = asyncio.run(_reserve_pair())
-
-    assert statuses.count("reserved") == 1
-    assert statuses.count("cooldown") == 1
-    assert asyncio.run(manager.get_proactive_count("group-1")) == 1
-
-
-def test_proactive_reservation_release_restores_capacity(monkeypatch: Any) -> None:
-    manager = _build_manager(monkeypatch)
-
-    first = asyncio.run(
-        manager.reserve_proactive_reply(
-            "group-1",
-            "message-1",
-            max_per_hour=1,
-            reservation_ttl_seconds=360,
+    removed_key_members = (
+        "PROACTIVE_COOLDOWN",
+        "PROACTIVE_SLOTS",
+        "proactive_cooldown",
+        "proactive_slots",
+    )
+    for member_name in removed_key_members:
+        assert not hasattr(RedisKeys, member_name), (
+            f"RedisKeys 不应再保留 {member_name}"
         )
-    )
-    released = asyncio.run(
-        manager.release_proactive_reply("group-1", "message-1")
-    )
-    second = asyncio.run(
-        manager.reserve_proactive_reply(
-            "group-1",
-            "message-2",
-            max_per_hour=1,
-            reservation_ttl_seconds=360,
-        )
-    )
-
-    assert first == "reserved"
-    assert released is True
-    assert second == "reserved"
-    assert asyncio.run(manager.get_proactive_count("group-1")) == 1
-
-
-def test_confirmed_proactive_reservation_is_idempotent_and_rate_limited(
-    monkeypatch: Any,
-) -> None:
-    manager = _build_manager(monkeypatch)
-    fake_redis = _get_fake_redis(manager)
-
-    assert (
-        asyncio.run(
-            manager.reserve_proactive_reply(
-                "group-1",
-                "message-1",
-                max_per_hour=1,
-                reservation_ttl_seconds=360,
-            )
-        )
-        == "reserved"
-    )
-    asyncio.run(
-        manager.confirm_proactive_reply(
-            "group-1",
-            "message-1",
-            cooldown_seconds=300,
-        )
-    )
-    asyncio.run(
-        manager.confirm_proactive_reply(
-            "group-1",
-            "message-1",
-            cooldown_seconds=300,
-        )
-    )
-    assert asyncio.run(manager.release_proactive_reply("group-1", "message-1")) is False
-
-    fake_redis.values.pop(RedisKeys.proactive_cooldown("group-1"), None)
-    second = asyncio.run(
-        manager.reserve_proactive_reply(
-            "group-1",
-            "message-2",
-            max_per_hour=1,
-            reservation_ttl_seconds=360,
-        )
-    )
-
-    assert second == "rate_limited"
-    assert asyncio.run(manager.get_proactive_count("group-1")) == 1
-
-
-def test_proactive_reservation_heartbeat_extends_pending_lease(
-    monkeypatch: Any,
-) -> None:
-    manager = _build_manager(monkeypatch)
-    fake_redis = _get_fake_redis(manager)
-
-    assert (
-        asyncio.run(
-            manager.reserve_proactive_reply(
-                "group-1",
-                "message-1",
-                max_per_hour=1,
-                reservation_ttl_seconds=30,
-            )
-        )
-        == "reserved"
-    )
-    original_expiry = fake_redis.zsets[RedisKeys.proactive_slots("group-1")][
-        "pending:message-1"
-    ]
-    fake_redis.now_ms += 10_000
-
-    renewed = asyncio.run(
-        manager.renew_proactive_reply(
-            "group-1",
-            "message-1",
-            reservation_ttl_seconds=30,
-        )
-    )
-
-    assert renewed is True
-    assert (
-        fake_redis.zsets[RedisKeys.proactive_slots("group-1")][
-            "pending:message-1"
-        ]
-        > original_expiry
-    )
 
 
 def test_chat_commit_redis_steps_are_idempotent(monkeypatch: Any) -> None:
@@ -1117,39 +919,6 @@ def test_chat_commit_redis_steps_are_idempotent(monkeypatch: Any) -> None:
     assert len(asyncio.run(manager.get_global_interaction_buffer("user-1"))) == 1
     fake_redis = _get_fake_redis(manager)
     assert "user-1" in fake_redis.sets[RedisKeys.GLOBAL_INTERACTION_PENDING]
-
-
-def test_expired_proactive_reservation_is_pruned(monkeypatch: Any) -> None:
-    manager = _build_manager(monkeypatch)
-    fake_redis = _get_fake_redis(manager)
-    fake_redis.now_ms = 100_000.0
-
-    assert (
-        asyncio.run(
-            manager.reserve_proactive_reply(
-                "group-1",
-                "message-1",
-                max_per_hour=1,
-                reservation_ttl_seconds=30,
-            )
-        )
-        == "reserved"
-    )
-    fake_redis.values.pop(RedisKeys.proactive_cooldown("group-1"), None)
-    fake_redis.now_ms = 131_000.0
-
-    assert (
-        asyncio.run(
-            manager.reserve_proactive_reply(
-                "group-1",
-                "message-2",
-                max_per_hour=1,
-                reservation_ttl_seconds=30,
-            )
-        )
-        == "reserved"
-    )
-    assert asyncio.run(manager.get_proactive_count("group-1")) == 1
 
 
 def test_push_message_appends_messages_without_trimming(monkeypatch: Any) -> None:

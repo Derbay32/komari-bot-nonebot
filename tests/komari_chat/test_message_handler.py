@@ -808,11 +808,6 @@ class _FakeRedisForDebug:
         self.pushed_messages: list[MessageSchema] = []
         self.pushed_global_interactions: list[dict[str, object]] = []
         self.global_interaction_buffer_calls: list[dict[str, object]] = []
-        self.reserve_proactive_calls: list[dict[str, object]] = []
-        self.confirm_proactive_calls: list[dict[str, object]] = []
-        self.renew_proactive_calls: list[dict[str, object]] = []
-        self.release_proactive_calls: list[dict[str, str]] = []
-        self.reservation_status = "reserved"
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
         del group_id, limit
@@ -835,64 +830,64 @@ class _FakeRedisForDebug:
             {"user_id": user_id, "record": record, "trigger_size": trigger_size}
         )
 
-    async def reserve_proactive_reply(
+
+class _FakeReservation:
+    """fake module 的预占句柄：续租/释放调用记录回所属服务（KOMARIBOT-9）。"""
+
+    def __init__(
         self,
+        service: "_FakeProactiveReservation",
         group_id: str,
         reservation_id: str,
-        *,
-        max_per_hour: int,
-        reservation_ttl_seconds: int,
-    ) -> str:
-        self.reserve_proactive_calls.append(
-            {
-                "group_id": group_id,
-                "reservation_id": reservation_id,
-                "max_per_hour": max_per_hour,
-                "reservation_ttl_seconds": reservation_ttl_seconds,
-            }
+    ) -> None:
+        self._service = service
+        self.group_id = group_id
+        self.reservation_id = reservation_id
+
+    async def renew(self) -> bool:
+        self._service.renew_calls.append(
+            {"group_id": self.group_id, "reservation_id": self.reservation_id}
         )
+        return self._service.renew_result
+
+    async def release(self) -> bool:
+        self._service.release_calls.append(
+            {"group_id": self.group_id, "reservation_id": self.reservation_id}
+        )
+        return True
+
+
+class _FakeProactiveReservation:
+    """fake proactive_reservation module：记录四动词调用，断言编排分支。"""
+
+    def __init__(self) -> None:
+        self.reserve_calls: list[dict[str, str]] = []
+        self.confirm_calls: list[dict[str, object]] = []
+        self.renew_calls: list[dict[str, str]] = []
+        self.release_calls: list[dict[str, str]] = []
+        self.reservation_status = "reserved"
+        self.renew_result = True
+
+    async def reserve(
+        self, group_id: str, reservation_id: str
+    ) -> _FakeReservation | str:
+        self.reserve_calls.append(
+            {"group_id": group_id, "reservation_id": reservation_id}
+        )
+        if self.reservation_status == "reserved":
+            return _FakeReservation(self, group_id, reservation_id)
         return self.reservation_status
 
-    async def confirm_proactive_reply(
-        self,
-        group_id: str,
-        reservation_id: str,
-        *,
-        cooldown_seconds: int,
+    async def confirm(
+        self, group_id: str, reservation_id: str, *, cooldown_seconds: int
     ) -> None:
-        self.confirm_proactive_calls.append(
+        self.confirm_calls.append(
             {
                 "group_id": group_id,
                 "reservation_id": reservation_id,
                 "cooldown_seconds": cooldown_seconds,
             }
         )
-
-    async def renew_proactive_reply(
-        self,
-        group_id: str,
-        reservation_id: str,
-        *,
-        reservation_ttl_seconds: int,
-    ) -> bool:
-        self.renew_proactive_calls.append(
-            {
-                "group_id": group_id,
-                "reservation_id": reservation_id,
-                "reservation_ttl_seconds": reservation_ttl_seconds,
-            }
-        )
-        return True
-
-    async def release_proactive_reply(
-        self,
-        group_id: str,
-        reservation_id: str,
-    ) -> bool:
-        self.release_proactive_calls.append(
-            {"group_id": group_id, "reservation_id": reservation_id}
-        )
-        return True
 
 
 class _FakeMemoryForDebug:
@@ -951,11 +946,13 @@ def test_generate_debug_reply_skips_all_side_effects(
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
     fake_user_data = _FakeUserDataForDebug()
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    handler.proactive_reservation = reservation_svc
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1032,10 +1029,11 @@ def test_generate_debug_reply_skips_all_side_effects(
     # 断言零副作用
     assert redis.pushed_messages == []  # 没有 push 当前消息或 AI 回复
     assert redis.pushed_global_interactions == []  # 没有写互动历史
-    assert redis.reserve_proactive_calls == []
-    assert redis.confirm_proactive_calls == []
-    assert redis.renew_proactive_calls == []
-    assert redis.release_proactive_calls == []
+    # debug 路径完全不触达预占 module（冷却/频控零副作用）
+    assert reservation_svc.reserve_calls == []
+    assert reservation_svc.confirm_calls == []
+    assert reservation_svc.renew_calls == []
+    assert reservation_svc.release_calls == []
     assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
 
 
@@ -1346,10 +1344,12 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
 ) -> None:
     """主动回复生成前预占，确认送达后才转为正式名额与冷却。"""
     redis = _FakeRedisForDebug()
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
+    handler.proactive_reservation = reservation_svc
     commit_calls: list[dict[str, object]] = []
 
     async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
@@ -1407,27 +1407,19 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
     assert failure is None
     assert pending_reply is not None
     assert pending_reply.proactive_reservation_id == "message-proactive"
-    assert redis.reserve_proactive_calls == [
-        {
-            "group_id": "group-proactive",
-            "reservation_id": "message-proactive",
-            "max_per_hour": 3,
-            "reservation_ttl_seconds": 360,
-        }
+    # 编排分支：reserve 一次、生成完成最终续租一次，送达前不 confirm 不 release
+    assert reservation_svc.reserve_calls == [
+        {"group_id": "group-proactive", "reservation_id": "message-proactive"}
     ]
-    assert redis.confirm_proactive_calls == []
-    assert redis.renew_proactive_calls == [
-        {
-            "group_id": "group-proactive",
-            "reservation_id": "message-proactive",
-            "reservation_ttl_seconds": 360,
-        }
+    assert reservation_svc.confirm_calls == []
+    assert reservation_svc.renew_calls == [
+        {"group_id": "group-proactive", "reservation_id": "message-proactive"}
     ]
     assert commit_calls == []
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    assert redis.confirm_proactive_calls == [
+    assert reservation_svc.confirm_calls == [
         {
             "group_id": "group-proactive",
             "reservation_id": "message-proactive",
@@ -1435,7 +1427,7 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
         }
     ]
     assert len(commit_calls) == 1
-    assert redis.release_proactive_calls == []
+    assert reservation_svc.release_calls == []
 
 
 def test_proactive_generation_failure_releases_reservation(
@@ -1443,10 +1435,12 @@ def test_proactive_generation_failure_releases_reservation(
 ) -> None:
     """主动回复生成失败时立即释放名额，不等待预占 TTL。"""
     redis = _FakeRedisForDebug()
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
+    handler.proactive_reservation = reservation_svc
 
     async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
         return [], [], True
@@ -1497,13 +1491,10 @@ def test_proactive_generation_failure_releases_reservation(
     assert failure.stage == "generate"
     assert failure.error_type == "_FavorabilityReadError"
     assert failure.reaction_sent is False
-    assert redis.release_proactive_calls == [
-        {
-            "group_id": "group-proactive",
-            "reservation_id": "message-failed",
-        }
+    assert reservation_svc.release_calls == [
+        {"group_id": "group-proactive", "reservation_id": "message-failed"}
     ]
-    assert redis.confirm_proactive_calls == []
+    assert reservation_svc.confirm_calls == []
 
 
 def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
@@ -2040,12 +2031,13 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
 ) -> None:
     """reserve阶段Redis异常→ failure.reaction_sent=False（表情尚未派发，不补发群内错误文本）。"""
     redis = _FakeRedisForDebug()
-    redis.reservation_status = "error"
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = _FakeMemoryForDebug()
+    handler.proactive_reservation = reservation_svc
 
     _patch_both_configs(
         monkeypatch,
@@ -2060,15 +2052,13 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
         ),
     )
 
-    # 注入 reserve_proactive_reply 使其抛出异常
-    original_reserve = redis.reserve_proactive_reply
-
+    # 注入 reserve 使其抛出异常
     async def _failing_reserve(*_args: object, **_kwargs: object) -> str:
         del _args, _kwargs
         msg = "Redis 连接断开"
         raise RuntimeError(msg)
 
-    redis.reserve_proactive_reply = _failing_reserve  # type: ignore[method-assign]
+    reservation_svc.reserve = _failing_reserve  # type: ignore[method-assign]
 
     reaction_called = False
 
@@ -2106,9 +2096,6 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
     assert failure.error_type == "RuntimeError"
     assert failure.reaction_sent is False
     assert reaction_called is False  # 还未到贴表情阶段
-
-    # 恢复原方法以避免影响其他测试
-    redis.reserve_proactive_reply = original_reserve  # type: ignore[method-assign]
 
 
 def test_commit_delivered_reply_does_not_trigger_reaction_callback(

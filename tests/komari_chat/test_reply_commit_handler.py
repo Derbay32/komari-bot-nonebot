@@ -164,20 +164,9 @@ class _FakeReplyCommitRepository:
 
 class _FakeRedis:
     def __init__(self) -> None:
-        self.confirmed: set[str] = set()
         self.ai_operations: set[str] = set()
         self.interaction_operations: set[str] = set()
         self.fail_ai_once = False
-
-    async def confirm_proactive_reply(
-        self,
-        _group_id: str,
-        reservation_id: str,
-        *,
-        cooldown_seconds: int,
-    ) -> None:
-        del cooldown_seconds
-        self.confirmed.add(reservation_id)
 
     async def push_message_once(
         self,
@@ -211,12 +200,28 @@ class _FakeRedis:
         return inserted
 
 
+class _FakeProactiveReservation:
+    """fake proactive_reservation module：只记录 confirm 调用（KOMARIBOT-9）。"""
+
+    def __init__(self) -> None:
+        self.confirmed: set[str] = set()
+
+    async def confirm(
+        self,
+        _group_id: str,
+        reservation_id: str,
+        *,
+        cooldown_seconds: int,
+    ) -> None:
+        del cooldown_seconds
+        self.confirmed.add(reservation_id)
+
+
 class _FakeUserData:
     def __init__(self) -> None:
         self.operations: set[str] = set()
         self.application_count = 0
         self.cleanup_favorability_calls = 0
-
     async def adjust_user_favorability(
         self,
         _user_id: str,
@@ -284,15 +289,17 @@ def _pending_reply(module: Any, operation_id: str) -> Any:
     )
 
 
-def _handler(module: Any) -> tuple[Any, _FakeReplyCommitRepository, _FakeRedis]:
+def _handler(module: Any) -> tuple[Any, _FakeReplyCommitRepository, _FakeRedis, _FakeProactiveReservation]:
     handler = module.MessageHandler.__new__(module.MessageHandler)
     repository = _FakeReplyCommitRepository()
     redis = _FakeRedis()
+    reservation_svc = _FakeProactiveReservation()
     handler.reply_commit_repository = repository
     handler.redis = redis
+    handler.proactive_reservation = reservation_svc
     handler._reply_commit_owner = "worker-1"
     handler._last_reply_commit_cleanup = 0.0
-    return handler, repository, redis
+    return handler, repository, redis, reservation_svc
 
 
 async def _heartbeat_lost_on_renew_failure(
@@ -321,7 +328,7 @@ async def test_delivered_reply_commits_all_idempotent_steps(
     handler_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handler, repository, redis = _handler(handler_module)
+    handler, repository, redis, reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
@@ -332,7 +339,7 @@ async def test_delivered_reply_commits_all_idempotent_steps(
     await handler.commit_delivered_reply(pending)
 
     assert repository.records[pending.operation_id]["status"] == "COMPLETED"
-    assert redis.confirmed == {"reservation-1"}
+    assert reservation_svc.confirmed == {"reservation-1"}
     assert redis.ai_operations == {pending.operation_id}
     assert redis.interaction_operations == {pending.operation_id}
     assert user_data.application_count == 1
@@ -343,7 +350,7 @@ async def test_partial_commit_retries_without_reapplying_completed_step(
     handler_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handler, repository, redis = _handler(handler_module)
+    handler, repository, redis, _reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
@@ -371,7 +378,7 @@ async def test_mark_reply_commit_step_raises_when_mark_step_returns_false(
     handler_module: Any,
 ) -> None:
     """mark_step 返回 False 时 _mark_reply_commit_step 抛错，且不落记录。"""
-    handler, repository, _redis = _handler(handler_module)
+    handler, repository, _redis, _reservation_svc = _handler(handler_module)
     repository.mark_step_result = False
     lost = asyncio.Event()
 
@@ -392,7 +399,7 @@ async def test_mark_reply_commit_step_raises_when_lease_lost_already_set(
     handler_module: Any,
 ) -> None:
     """租约事件已置位时 _mark_reply_commit_step 直接抛错，不触碰 repository。"""
-    handler, repository, _redis = _handler(handler_module)
+    handler, repository, _redis, _reservation_svc = _handler(handler_module)
     lost = asyncio.Event()
     lost.set()
 
@@ -413,7 +420,7 @@ async def test_process_claimed_reply_commit_raises_when_lease_lost_before_comple
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """续租失败置位 lost 后，全部子步骤完成时在 complete 前抛错。"""
-    handler, repository, _redis = _handler(handler_module)
+    handler, repository, _redis, _reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
@@ -454,7 +461,7 @@ async def test_retry_pending_reply_commits_triggers_hourly_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """距上次清理超过一小时时，retry 触发 tombstone 与好感度台账清理。"""
-    handler, repository, _redis = _handler(handler_module)
+    handler, repository, _redis, _reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
@@ -481,7 +488,7 @@ async def test_retry_pending_reply_commits_skips_cleanup_within_hour(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """一小时内已清理过时，retry 不再触发 cleanup。"""
-    handler, repository, _redis = _handler(handler_module)
+    handler, repository, _redis, _reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
@@ -500,7 +507,7 @@ async def test_finish_claimed_reply_commit_marks_failure_on_step_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """子步骤确认失败时 _finish_claimed_reply_commit 记失败并退回 DELIVERED。"""
-    handler, repository, _redis = _handler(handler_module)
+    handler, repository, _redis, _reservation_svc = _handler(handler_module)
     user_data = _FakeUserData()
     monkeypatch.setattr(handler_module, "get_config", _config)
     monkeypatch.setattr(handler_module, "get_memory_config", _config)
