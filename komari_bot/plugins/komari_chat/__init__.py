@@ -330,7 +330,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     pending_reply.operation_id,
                 )
         logger.exception("[KomariChat] 消息处理失败")
-        # 失败善后：pending_reply 存在说明表情已在生成前贴出；
+        # 失败善后：reaction_sent 以 PendingReply 字段为真源（生成前是否贴出表情）；
         # 回复未送达时补发群内错误文本，所有未处理异常均通知 SUPERUSER
         await handler.report_reply_failure(
             bot=bot,
@@ -344,7 +344,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     if pending_reply is not None
                     else None
                 ),
-                reaction_sent=pending_reply is not None and not reply_delivered,
+                reaction_sent=(
+                    pending_reply.reaction_sent
+                    if pending_reply is not None
+                    else False
+                ),
             ),
             reason=pending_reply.reason if pending_reply is not None else None,
         )

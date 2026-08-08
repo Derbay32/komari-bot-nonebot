@@ -599,7 +599,7 @@ def _wire_reaction_sent_case(
     monkeypatch: "pytest.MonkeyPatch",
     *,
     face_reaction_enabled: bool,
-) -> tuple[message_handler_module.MessageHandler, MessageSchema]:
+) -> tuple[Any, MessageSchema]:
     """reaction_sent 字段双分支公共布线（KOMARIBOT-11）。"""
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
@@ -675,9 +675,7 @@ def _wire_reaction_sent_case(
     return handler, message
 
 
-def _run_reaction_sent_attempt(
-    handler: message_handler_module.MessageHandler, message: MessageSchema
-) -> Any:
+def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
     async def _dummy_reaction() -> None:
         return None
 
