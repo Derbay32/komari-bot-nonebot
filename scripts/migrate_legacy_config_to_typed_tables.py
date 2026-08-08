@@ -1,6 +1,6 @@
 """旧版 JSONB 配置离线迁移到强类型配置表（ticket 05 / ADR-0004）。
 
-把 legacy 通用 JSONB KV 表 ``komari_plugin_configs``（14 个配置资源）
+把 legacy 通用 JSONB KV 表 ``komari_plugin_configs``（15 个配置资源）
 与 ``komari_prompt_configs``（3 个 prompt 资源）的值一次性搬运到 v2.0.0
 引入的强类型单行表（``komari_<插件>_config`` / ``komari_prompt_<资源>``，
 主键 ``id=1``，内部列 ``revision`` / ``updated_at``）。
@@ -362,17 +362,6 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "global_interaction_trigger_size",
             "global_interaction_summary_interval_minutes",
             "global_interaction_processing_lease_seconds",
-            "proactive_enabled",
-            "proactive_score_threshold",
-            "proactive_cooldown",
-            "proactive_max_per_hour",
-            "proactive_reservation_ttl_seconds",
-            "reply_commit_worker_interval_seconds",
-            "reply_commit_batch_size",
-            "reply_commit_lease_seconds",
-            "reply_commit_max_attempts",
-            "reply_commit_retry_base_seconds",
-            "reply_commit_tombstone_retention_days",
             "bot_nickname",
             "response_tag",
             "forgetting_enabled",
@@ -394,6 +383,30 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "group_whitelist": [],
             "bot_aliases": [],
         },
+    ),
+    # KOMARIBOT-7：komari_chat 拥有自有配置表后，legacy komari_memory 行里的
+    # 主动回复频控 / outbox 字段改投 komari_chat_config（同一 legacy 行，
+    # key_value 与 komari_memory 一致；proactive_score_threshold 死字段不迁移，
+    # 由 komari_memory 资源的 unknown 键丢弃逻辑一并清理）。
+    ResourceSpec(
+        legacy_table="komari_plugin_configs",
+        legacy_key_column="plugin_name",
+        legacy_data_column="config_data",
+        key_value="komari_memory",
+        target_table="komari_chat_config",
+        columns=(
+            "proactive_enabled",
+            "proactive_cooldown",
+            "proactive_max_per_hour",
+            "proactive_reservation_ttl_seconds",
+            "reply_commit_worker_interval_seconds",
+            "reply_commit_batch_size",
+            "reply_commit_lease_seconds",
+            "reply_commit_max_attempts",
+            "reply_commit_retry_base_seconds",
+            "reply_commit_tombstone_retention_days",
+        ),
+        deprecated_keys=_DEPRECATED_PLUGIN_KEYS,
     ),
     ResourceSpec(
         legacy_table="komari_plugin_configs",

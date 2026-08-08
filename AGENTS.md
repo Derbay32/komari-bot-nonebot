@@ -38,8 +38,9 @@ komari-bot/
 │   ├── env.py                            #   合并 SQLModel.metadata + include_object 守卫
 │   └── versions/
 │       ├── 0001_baseline_full_schema.py  #   全量基线（26 张既有表，含保留的 2 张 legacy 配置表）
-│       ├── 0002_typed_plugin_config_tables.py  # 14 张强类型配置表
-│       └── 0003_typed_prompt_tables.py   #   3 张强类型 Prompt 表
+│       ├── 0002_typed_plugin_config_tables.py  # 14 张强类型配置表（0004 补充 komari_chat）
+│       ├── 0003_typed_prompt_tables.py   #   3 张强类型 Prompt 表
+│       └── 0004_komari_chat_config.py    #   komari_chat 配置表（承接 memory 迁出字段）
 │
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
@@ -75,7 +76,7 @@ komari-bot/
 │   │   ├── onebot_messages.py            #   消息工具（plain_text_message 等）
 │   │   └── onebot_rules.py               #   group_message_rule() 等
 │   └── plugins/                          # NoneBot 插件模块
-│       ├── <插件>/config_schema.py       #   动态配置强类型表（SQLModel，14 个资源）
+│       ├── <插件>/config_schema.py       #   动态配置强类型表（SQLModel，15 个资源）
 │       ├── <插件>/prompt_schema.py       #   Prompt 强类型表（SQLModel，3 个资源）
 │       └── <插件>/orm_models.py          #   业务关系表 ORM 模型（user_ban/character_binding/
 │                                          #   user_data/komari_custom/komari_management/komari_decision）
@@ -172,7 +173,8 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 ### 1. 配置管理 (`config_manager`)
 
-- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（14 张，迁移 0002 建表）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
+- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（15 张，迁移 0002 建表、0004 为 komari_chat 补充）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
+- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：`komari_plugin_configs` 在 v2.0.0 保留（仅承载存量数据，运行时不读写），`DROP` 由后续版本的 autogenerate revision 执行
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
