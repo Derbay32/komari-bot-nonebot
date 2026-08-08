@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     from .config_schema import KomariMemoryConfigSchema
 
 # 依赖插件
-apscheduler_plugin = require("nonebot_plugin_apscheduler")
-agent_run_logger_plugin = require("agent_run_logger")
+require("nonebot_plugin_apscheduler")
+require("agent_run_logger")
 
 from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema
@@ -109,7 +109,8 @@ class PluginManager:
 
     def _resolve_expected_embedding_dimension(self) -> int | None:
         """解析当前 embedding_provider 的目标维度。"""
-        embedding_provider = require("embedding_provider")
+        from komari_bot.plugins import embedding_provider
+
         get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
         expected_dimension: int | None = None
         if callable(get_dimension):

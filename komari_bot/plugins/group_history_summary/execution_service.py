@@ -59,7 +59,8 @@ SUMMARY_TITLE = "小鞠的总结时间到！"
 EMPTY_HISTORY_TEXT = "可用的文本记录太少，没法总结……"
 
 _group_lock_manager = group_summary_lock_manager
-agent_run_logger_plugin = require("agent_run_logger")
+require("agent_run_logger")
+from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
 
 
 def _format_time_range(start_ts: int, end_ts: int) -> str:

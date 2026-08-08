@@ -42,9 +42,9 @@ class UnifiedCandidateRerankService:
     @staticmethod
     def _get_embedding_provider() -> Any:
         """惰性获取 embedding_provider，避免模块导入阶段强依赖。"""
-        from nonebot.plugin import require
+        from komari_bot.plugins import embedding_provider
 
-        return require("embedding_provider")
+        return embedding_provider
 
     @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:

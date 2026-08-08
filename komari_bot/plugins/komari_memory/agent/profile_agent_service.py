@@ -43,7 +43,10 @@ if TYPE_CHECKING:
 
 from ..services.message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
 
-llm_provider = require("llm_provider")
+require("llm_provider")
+
+from komari_bot.plugins import llm_provider
+
 _PROFILE_TOOL_RESULT_MAX_CHARS = 12_000
 
 

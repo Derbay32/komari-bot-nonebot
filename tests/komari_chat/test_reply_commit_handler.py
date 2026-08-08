@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from functools import partial
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -17,6 +20,13 @@ if TYPE_CHECKING:
 class _FakeReplyCommitRepository:
     def __init__(self) -> None:
         self.records: dict[str, dict[str, Any]] = {}
+        # 可翻转的失败行为：续租/子步骤确认失败、指定子步骤执行时让出事件循环
+        self.renew_lease_result = True
+        self.mark_step_result = True
+        self.yield_once_on_step: str | None = None
+        self.mark_step_calls = 0
+        self.cleanup_calls = 0
+        self.failure_log: list[dict[str, str]] = []
 
     async def prepare(self, payload: Any) -> bool:
         if payload.operation_id in self.records:
@@ -90,7 +100,7 @@ class _FakeReplyCommitRepository:
         return claimed
 
     async def renew_lease(self, *_args: object, **_kwargs: object) -> bool:
-        return True
+        return self.renew_lease_result
 
     async def mark_step(
         self,
@@ -100,6 +110,12 @@ class _FakeReplyCommitRepository:
         step: str,
     ) -> bool:
         del owner_token
+        self.mark_step_calls += 1
+        if not self.mark_step_result:
+            return False
+        if self.yield_once_on_step is not None and step == self.yield_once_on_step:
+            # 让出事件循环，使心跳任务有机会置位 lost 事件
+            await asyncio.sleep(0)
         columns = {
             "proactive_confirmed": "proactive_confirmed_at",
             "favorability_applied": "favorability_applied_at",
@@ -127,13 +143,22 @@ class _FakeReplyCommitRepository:
     async def mark_failure(
         self,
         operation_id: str,
-        **_kwargs: object,
+        *,
+        owner_token: str,
+        error_code: str,
+        max_attempts: int,
+        retry_base_seconds: int,
     ) -> str:
+        del owner_token, max_attempts, retry_base_seconds
+        self.failure_log.append(
+            {"operation_id": operation_id, "error_code": error_code}
+        )
         self.records[operation_id]["status"] = "DELIVERED"
         return "DELIVERED"
 
     async def cleanup_tombstones(self, *, retention_days: int) -> int:
         del retention_days
+        self.cleanup_calls += 1
         return 0
 
 
@@ -190,6 +215,7 @@ class _FakeUserData:
     def __init__(self) -> None:
         self.operations: set[str] = set()
         self.application_count = 0
+        self.cleanup_favorability_calls = 0
 
     async def adjust_user_favorability(
         self,
@@ -205,6 +231,7 @@ class _FakeUserData:
 
     async def cleanup_favorability_operations(self, *, retention_days: int) -> int:
         del retention_days
+        self.cleanup_favorability_calls += 1
         return 0
 
 
@@ -268,6 +295,27 @@ def _handler(module: Any) -> tuple[Any, _FakeReplyCommitRepository, _FakeRedis]:
     return handler, repository, redis
 
 
+async def _heartbeat_lost_on_renew_failure(
+    repository: _FakeReplyCommitRepository,
+    operation_id: str,
+    *,
+    owner_token: str,
+    lease_seconds: int,
+    lost: asyncio.Event,
+) -> None:
+    """替身心跳：续租一次，失败（renew_lease 返回 False）即置位 lost。
+
+    生产心跳以固定间隔轮询续租；测试中用单次续租替代，避免真实等待。
+    """
+    renewed = await repository.renew_lease(
+        operation_id,
+        owner_token=owner_token,
+        lease_seconds=lease_seconds,
+    )
+    if not renewed:
+        lost.set()
+
+
 @pytest.mark.asyncio
 async def test_delivered_reply_commits_all_idempotent_steps(
     handler_module: Any,
@@ -314,3 +362,164 @@ async def test_partial_commit_retries_without_reapplying_completed_step(
     assert record["status"] == "COMPLETED"
     assert user_data.application_count == 1
     assert redis.ai_operations == {pending.operation_id}
+
+
+@pytest.mark.asyncio
+async def test_mark_reply_commit_step_raises_when_mark_step_returns_false(
+    handler_module: Any,
+) -> None:
+    """mark_step 返回 False 时 _mark_reply_commit_step 抛错，且不落记录。"""
+    handler, repository, _redis = _handler(handler_module)
+    repository.mark_step_result = False
+    lost = asyncio.Event()
+
+    with pytest.raises(RuntimeError, match="子步骤确认失败"):
+        await handler._mark_reply_commit_step(
+            "op-1",
+            owner_token="worker-1",
+            step="favorability_applied",
+            lease_lost=lost,
+        )
+
+    assert repository.mark_step_calls == 1
+    assert "op-1" not in repository.records
+
+
+@pytest.mark.asyncio
+async def test_mark_reply_commit_step_raises_when_lease_lost_already_set(
+    handler_module: Any,
+) -> None:
+    """租约事件已置位时 _mark_reply_commit_step 直接抛错，不触碰 repository。"""
+    handler, repository, _redis = _handler(handler_module)
+    lost = asyncio.Event()
+    lost.set()
+
+    with pytest.raises(RuntimeError, match="租约已丢失"):
+        await handler._mark_reply_commit_step(
+            "op-1",
+            owner_token="worker-1",
+            step="proactive_confirmed",
+            lease_lost=lost,
+        )
+
+    assert repository.mark_step_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_process_claimed_reply_commit_raises_when_lease_lost_before_complete(
+    handler_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """续租失败置位 lost 后，全部子步骤完成时在 complete 前抛错。"""
+    handler, repository, _redis = _handler(handler_module)
+    user_data = _FakeUserData()
+    monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
+    repository.renew_lease_result = False
+    repository.yield_once_on_step = "interaction_stored"
+    monkeypatch.setattr(
+        handler,
+        "_reply_commit_heartbeat",
+        partial(_heartbeat_lost_on_renew_failure, repository),
+    )
+    pending = _pending_reply(handler_module, "reply-operation-3")
+
+    assert await handler.prepare_pending_reply(pending) is True
+    await repository.mark_delivered(
+        pending.operation_id,
+        platform_message_id="platform-1",
+    )
+    record = await repository.claim_operation(
+        pending.operation_id,
+        owner_token="worker-1",
+        lease_seconds=60,
+    )
+    assert record is not None
+
+    with pytest.raises(RuntimeError, match="完成前租约已丢失"):
+        await handler._process_claimed_reply_commit(record, owner_token="worker-1")
+
+    # complete 未被调用：record 保持 PROCESSING，四个子步骤均已落列
+    record_state = repository.records[pending.operation_id]
+    assert record_state["status"] == "PROCESSING"
+    assert record_state["interaction_stored_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_retry_pending_reply_commits_triggers_hourly_cleanup(
+    handler_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """距上次清理超过一小时时，retry 触发 tombstone 与好感度台账清理。"""
+    handler, repository, _redis = _handler(handler_module)
+    user_data = _FakeUserData()
+    monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
+    handler._last_reply_commit_cleanup = time.monotonic() - 7200
+    pending = _pending_reply(handler_module, "reply-operation-7")
+
+    assert await handler.prepare_pending_reply(pending) is True
+    await repository.mark_delivered(
+        pending.operation_id,
+        platform_message_id="platform-1",
+    )
+
+    assert await handler.retry_pending_reply_commits() == 1
+
+    assert repository.cleanup_calls == 1
+    assert user_data.cleanup_favorability_calls == 1
+    assert repository.records[pending.operation_id]["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_retry_pending_reply_commits_skips_cleanup_within_hour(
+    handler_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一小时内已清理过时，retry 不再触发 cleanup。"""
+    handler, repository, _redis = _handler(handler_module)
+    user_data = _FakeUserData()
+    monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
+    handler._last_reply_commit_cleanup = time.monotonic()
+
+    assert await handler.retry_pending_reply_commits() == 0
+
+    assert repository.cleanup_calls == 0
+    assert user_data.cleanup_favorability_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_claimed_reply_commit_marks_failure_on_step_error(
+    handler_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """子步骤确认失败时 _finish_claimed_reply_commit 记失败并退回 DELIVERED。"""
+    handler, repository, _redis = _handler(handler_module)
+    user_data = _FakeUserData()
+    monkeypatch.setattr(handler_module, "get_config", _config)
+    monkeypatch.setattr(handler_module, "user_data_plugin", user_data)
+    pending = _pending_reply(handler_module, "reply-operation-4")
+    assert await handler.prepare_pending_reply(pending) is True
+    await repository.mark_delivered(
+        pending.operation_id,
+        platform_message_id="platform-1",
+    )
+    record = await repository.claim_operation(
+        pending.operation_id,
+        owner_token="worker-1",
+        lease_seconds=60,
+    )
+    assert record is not None
+    repository.mark_step_result = False
+
+    assert (
+        await handler._finish_claimed_reply_commit(record, owner_token="worker-1")
+        is False
+    )
+
+    assert repository.failure_log[-1] == {
+        "operation_id": pending.operation_id,
+        "error_code": "RuntimeError",
+    }
+    assert repository.records[pending.operation_id]["status"] == "DELIVERED"

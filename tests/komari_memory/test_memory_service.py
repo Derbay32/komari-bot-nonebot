@@ -7,11 +7,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
+import komari_bot.plugins as plugins_package
 from komari_bot.plugins.komari_memory.repositories.entity_repository import (
     UserProfileBatchUpsertResult,
-)
-from komari_bot.plugins.komari_memory.services import (
-    memory_service as memory_service_module,
 )
 from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
 
@@ -102,9 +100,10 @@ def _make_service(
     repository = _FakeConversationRepository()
     embedding_plugin = _FakeEmbeddingPlugin(rerank_enabled=rerank_enabled)
     monkeypatch.setattr(
-        memory_service_module,
-        "require",
-        lambda _name: embedding_plugin,
+        plugins_package,
+        "embedding_provider",
+        embedding_plugin,
+        raising=False,
     )
     service = MemoryService(
         conversation_repo=cast("Any", repository),
@@ -205,9 +204,10 @@ def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> 
     event_repository = _FakeInteractionEventRepository()
     embedding_plugin = _FakeEmbeddingPlugin(rerank_enabled=False)
     monkeypatch.setattr(
-        memory_service_module,
-        "require",
-        lambda _name: embedding_plugin,
+        plugins_package,
+        "embedding_provider",
+        embedding_plugin,
+        raising=False,
     )
     service = MemoryService(
         conversation_repo=cast("Any", _FakeConversationRepository()),
@@ -229,9 +229,10 @@ def test_search_interaction_events_touches_returned_events(monkeypatch: Any) -> 
 def test_batch_upsert_user_profiles_adds_default_metadata(monkeypatch: Any) -> None:
     entity_repository = _FakeEntityRepository()
     monkeypatch.setattr(
-        memory_service_module,
-        "require",
-        lambda _name: _FakeEmbeddingPlugin(rerank_enabled=False),
+        plugins_package,
+        "embedding_provider",
+        _FakeEmbeddingPlugin(rerank_enabled=False),
+        raising=False,
     )
     service = MemoryService(
         conversation_repo=cast("Any", _FakeConversationRepository()),

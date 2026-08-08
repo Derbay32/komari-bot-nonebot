@@ -21,7 +21,8 @@ except ValueError:
     driver = None
     config_manager: Any | None = None
 else:
-    config_manager_plugin = require("config_manager")
+    require("config_manager")
+    from komari_bot.plugins import config_manager as config_manager_plugin
     config_manager = config_manager_plugin.get_config_manager(
         "embedding_provider", DynamicConfigSchema
     )

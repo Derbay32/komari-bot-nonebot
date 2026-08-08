@@ -8,7 +8,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -37,8 +37,10 @@ if TYPE_CHECKING:
     from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
-llm_provider = require("llm_provider")
-komari_search = require("komari_search")
+require("llm_provider")
+require("komari_search")
+
+from komari_bot.plugins import komari_search, llm_provider
 
 READ_IMAGE_TOOL_NAME = "read_image"
 SEARCH_WEB_TOOL_NAME = "search_web"
@@ -1776,7 +1778,7 @@ async def summarize_conversation(
     response = await llm_provider.generate_text(
         prompt=prompt_with_format,
         model=config.llm_model_summary,
-        temperature=config.llm_temperature_summary,
+        temperature=cast("int | None", config.llm_temperature_summary),
         max_tokens=config.llm_max_tokens_summary,
         thinking_mode=config.llm_thinking_mode_summary,
         reasoning_effort=config.llm_reasoning_effort_summary,

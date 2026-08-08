@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import cast
 
 from nonebot import get_driver, logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
@@ -28,10 +29,14 @@ from .execution_service import (
 from .group_lock import close_group_summary_lock_manager
 from .history_service import check_group_history_supported
 
-config_manager_plugin = require("config_manager")
-agent_run_logger_plugin = require("agent_run_logger")
-permission_manager_plugin = require("permission_manager")
-character_binding = require("character_binding")
+require("config_manager")
+from komari_bot.plugins import config_manager as config_manager_plugin
+
+require("agent_run_logger")
+require("permission_manager")
+from komari_bot.plugins import permission_manager as permission_manager_plugin
+
+require("character_binding")
 require("komari_decision")
 
 config_manager = config_manager_plugin.get_config_manager(
@@ -138,7 +143,7 @@ async def handle_group_history_summary(
     event: GroupMessageEvent,
 ) -> None:
     """处理群聊历史总结请求。"""
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     if not config.plugin_enable:
         return
 

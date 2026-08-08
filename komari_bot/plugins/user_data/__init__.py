@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
@@ -35,7 +35,9 @@ __plugin_meta__ = PluginMetadata(
     config=DynamicConfigSchema,
 )
 
-config_manager_plugin = require("config_manager")
+require("config_manager")
+from komari_bot.plugins import config_manager as config_manager_plugin
+
 config_manager = config_manager_plugin.get_config_manager(
     "user_data", DynamicConfigSchema
 )
@@ -64,12 +66,12 @@ def _get_db_init_lock() -> asyncio.Lock:
 
 def get_config() -> DynamicConfigSchema:
     """获取 user_data 动态配置。"""
-    return config_manager.get()
+    return cast("DynamicConfigSchema", config_manager.get())
 
 
 async def _get_config_async() -> DynamicConfigSchema:
     """在事件循环内异步获取 user_data 动态配置。"""
-    return await config_manager.get_async()
+    return cast("DynamicConfigSchema", await config_manager.get_async())
 
 
 async def get_db() -> UserDataDB:

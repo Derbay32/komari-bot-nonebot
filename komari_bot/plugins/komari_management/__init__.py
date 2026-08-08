@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
@@ -60,7 +61,9 @@ from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
 from .startup_cleanup import cleanup_management_v1_config
 
-config_manager_plugin = require("config_manager")
+require("config_manager")
+from komari_bot.plugins import config_manager as config_manager_plugin
+
 config_manager = config_manager_plugin.get_config_manager(
     "komari_management",
     DynamicConfigSchema,
@@ -83,12 +86,18 @@ class PluginState:
 
 def _load_management_components() -> ManagementApiComponents:
     """加载统一管理 API 所需的业务插件组件。"""
-    knowledge_plugin = require("komari_knowledge")
-    help_plugin = require("komari_help")
-    memory_plugin = require("komari_memory")
-    agent_run_logger_plugin = require("agent_run_logger")
-    search_plugin = require("komari_search")
-    user_ban_plugin = require("user_ban")
+    require("komari_knowledge")
+    from komari_bot.plugins import komari_knowledge as knowledge_plugin
+    require("komari_help")
+    from komari_bot.plugins import komari_help as help_plugin
+    require("komari_memory")
+    from komari_bot.plugins import komari_memory as memory_plugin
+    require("agent_run_logger")
+    from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
+    require("komari_search")
+    from komari_bot.plugins import komari_search as search_plugin
+    require("user_ban")
+    from komari_bot.plugins import user_ban as user_ban_plugin
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
@@ -231,7 +240,7 @@ state = PluginState()
 
 async def _get_management_credential_source() -> list[ManagementCredentialSchema]:
     """动态返回具名管理凭据配置。"""
-    config = await config_manager.get_async()
+    config = cast("DynamicConfigSchema", await config_manager.get_async())
     return config.api_credentials
 
 

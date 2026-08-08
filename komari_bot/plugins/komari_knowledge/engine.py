@@ -15,7 +15,7 @@ import hashlib
 import logging
 import sys
 from collections import defaultdict
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 from komari_bot.db.pgvector_schema import ensure_vector_column_dimension
@@ -68,7 +68,9 @@ if state.nonebot_mode:
         from nonebot import logger as nb_logger
         from nonebot.plugin import require
 
-        config_manager_plugin = require("config_manager")
+        require("config_manager")
+        from komari_bot.plugins import config_manager as config_manager_plugin
+
         config_manager = config_manager_plugin.get_config_manager(
             "komari_knowledge", DynamicConfigSchema
         )
@@ -107,7 +109,7 @@ def get_config() -> DynamicConfigSchema:
         assert config_manager is not None, (
             "config_manager 应该在 NoneBot 模式下已初始化"
         )
-        return config_manager.get()
+        return cast("DynamicConfigSchema", config_manager.get())
     if state.standalone_config is None:
         state.standalone_config = _load_standalone_config()
     return state.standalone_config
@@ -213,9 +215,8 @@ class KnowledgeEngine:
         """解析当前 embedding 配置的目标维度。"""
         expected_dimension: int | None = None
         if state.nonebot_mode:
-            from nonebot.plugin import require
+            from komari_bot.plugins import embedding_provider
 
-            embedding_provider = require("embedding_provider")
             get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
             if callable(get_dimension):
                 raw_dimension = get_dimension()
@@ -304,9 +305,8 @@ class KnowledgeEngine:
             向量数组
         """
         if state.nonebot_mode:
-            from nonebot.plugin import require
+            from komari_bot.plugins import embedding_provider
 
-            embedding_provider = require("embedding_provider")
             return await embedding_provider.embed(text)
         if getattr(self, "_embedding_service", None) is None:
             raise RuntimeError("独立嵌入服务未初始化")

@@ -10,7 +10,9 @@ if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 # 依赖 llm_provider 插件
-llm_provider = require("llm_provider")
+require("llm_provider")
+
+from komari_bot.plugins import llm_provider
 
 
 class QueryRewriteService:

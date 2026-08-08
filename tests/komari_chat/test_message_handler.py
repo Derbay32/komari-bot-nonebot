@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import types
 from contextlib import asynccontextmanager
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-import nonebot.plugin
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
+import komari_bot.plugins as plugins_package
 from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
@@ -472,14 +474,13 @@ def test_attempt_reply_only_rewrites_current_message(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     result = asyncio.run(
         handler._attempt_reply(
@@ -986,14 +987,13 @@ def test_generate_debug_reply_skips_all_side_effects(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     result = asyncio.run(
         handler.generate_debug_reply(
@@ -1085,14 +1085,13 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_with_tools)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     supplied_collector = LLMDiagnosticCollector(request_id="debug-reply-supplied")
     result = asyncio.run(
@@ -1179,14 +1178,13 @@ def test_generate_debug_reply_with_images_and_reply_context(
         _download_images,
     )
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 
@@ -1289,14 +1287,13 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     result = asyncio.run(
         handler._attempt_reply(
@@ -1700,14 +1697,13 @@ def test_reaction_scheduled_before_generate_core(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
@@ -1803,14 +1799,13 @@ def test_reaction_not_scheduled_when_disabled(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
@@ -1900,14 +1895,13 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
@@ -1999,14 +1993,13 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
@@ -2173,14 +2166,13 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
     monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    original_require = nonebot.plugin.require
-
-    def _fake_require(name: str) -> object:
-        if name == "embedding_provider":
-            return _FakeEmbeddingProvider()
-        return original_require(name)
-
-    monkeypatch.setattr(nonebot.plugin, "require", _fake_require)
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
 
     current_message = MessageSchema(
         user_id="user-commit",

@@ -23,10 +23,15 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
 # 依赖插件
-permission_manager_plugin = require("permission_manager")
-user_ban_plugin = require("user_ban")
-memory_plugin = require("komari_memory")
+require("embedding_provider")
+require("permission_manager")
+require("user_ban")
+require("komari_memory")
 require("komari_decision")
+
+from komari_bot.plugins import komari_memory as memory_plugin
+from komari_bot.plugins import permission_manager as permission_manager_plugin
+from komari_bot.plugins import user_ban as user_ban_plugin
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
 

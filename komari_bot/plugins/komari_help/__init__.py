@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from typing import cast
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
@@ -15,7 +16,9 @@ from .engine import UNSET, HelpEngine, get_engine, initialize_engine
 from .models import HelpCategory, HelpEntry, HelpListResponse, HelpSearchResult
 from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 
-config_manager_plugin = require("config_manager")
+require("config_manager")
+from komari_bot.plugins import config_manager as config_manager_plugin
+
 try:
     require("embedding_provider")
 except RuntimeError as exc:
@@ -61,7 +64,7 @@ if driver is not None:
 
     @driver.on_startup
     async def on_startup() -> None:
-        config = await config_manager.get_async()
+        config = cast("DynamicConfigSchema", await config_manager.get_async())
         if not config.plugin_enable:
             logger.info("[Komari Help] 插件未启用，跳过初始化")
             return
@@ -107,7 +110,7 @@ async def search_help(
     if engine is None:
         logger.warning("[Komari Help] 引擎未初始化")
         return []
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     if not config.plugin_enable:
         return []
     return await engine.search(query, limit, query_vec=query_embedding)
@@ -118,7 +121,7 @@ async def search_by_keyword(keyword: str) -> list[HelpSearchResult]:
     if engine is None:
         logger.warning("[Komari Help] 引擎未初始化")
         return []
-    config = config_manager.get()
+    config = cast("DynamicConfigSchema", config_manager.get())
     if not config.plugin_enable:
         return []
     return await engine.search_by_keyword(keyword)

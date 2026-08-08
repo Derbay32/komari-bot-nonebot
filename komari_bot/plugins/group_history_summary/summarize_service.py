@@ -21,7 +21,8 @@ if TYPE_CHECKING:
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
 
-llm_provider = require("llm_provider")
+require("llm_provider")
+from komari_bot.plugins import llm_provider
 
 DEFAULT_SUMMARY_TEXT = "本次聊天记录信息较少，暂无可提炼的有效总结。"
 

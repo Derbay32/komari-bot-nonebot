@@ -34,8 +34,11 @@ if TYPE_CHECKING:
 
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
-llm_provider = require("llm_provider")
-character_binding = require("character_binding")
+require("llm_provider")
+from komari_bot.plugins import llm_provider
+
+require("character_binding")
+from komari_bot.plugins import character_binding
 
 RECENT_SOURCE = "recent_group_messages"
 USER_SOURCE = "messages_by_user"

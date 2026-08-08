@@ -22,8 +22,12 @@ from .rendering import (
 )
 from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 
-config_manager_plugin = require("config_manager")
-permission_manager_plugin = require("permission_manager")
+require("config_manager")
+require("permission_manager")
+
+from komari_bot.plugins import config_manager as config_manager_plugin
+from komari_bot.plugins import permission_manager as permission_manager_plugin
+
 config_manager = config_manager_plugin.get_config_manager(
     "komari_help",
     DynamicConfigSchema,
