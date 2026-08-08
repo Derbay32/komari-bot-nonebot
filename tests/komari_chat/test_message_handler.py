@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import types
 from contextlib import asynccontextmanager
@@ -429,11 +430,13 @@ def test_attempt_reply_only_rewrites_current_message(
 
     redis = _FakeRedis([previous_message])
     memory = _FakeMemory()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     build_prompt_kwargs: dict[str, object] = {}
     generate_with_tools_kwargs: dict[str, object] = {}
@@ -462,6 +465,7 @@ def test_attempt_reply_only_rewrites_current_message(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -550,69 +554,36 @@ def test_attempt_reply_only_rewrites_current_message(
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    pushed_record = redis.pushed_global_interactions[0]["record"]
-    assert isinstance(pushed_record, dict)
-    assert redis.pushed_global_interactions == [
+    # KOMARIBOT-10：送达后副作用只剩 outbox 一条路径；claim 返回 None
+    # 表示由后台 worker 稍后领取提交，这里只断言送达登记进入 outbox
+    assert repository.mark_delivered_calls == [
         {
-            "user_id": "user-1",
-            "trigger_size": 20,
-            "record": {
-                "version": 1,
-                "event": "发送当前待回复消息",
-                "result": "回复收到啦",
-                "emotion": "平静",
-                "display_name": "阿虚",
-                "message_id": "msg-2",
-                "timestamp": pushed_record["timestamp"],
-            },
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
         }
     ]
+    assert repository.claim_operation_calls == [pending_reply.operation_id]
+    assert redis.pushed_global_interactions == []
 
 
-def test_write_interaction_history_pushes_global_redis_buffer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    handler = message_handler_module.MessageHandler.__new__(
-        message_handler_module.MessageHandler
+def test_message_handler_has_no_direct_side_effect_path() -> None:
+    """直连副作用路径已删除，repository 为构造必填硬依赖（KOMARIBOT-10 守卫）。"""
+    removed_methods = (
+        "_commit_side_effects",
+        "_store_ai_reply",
+        "_write_interaction_history",
     )
-    redis = _FakeRedis([])
-    handler.redis = redis
-    handler.memory = _FakeMemory()
-    _patch_both_configs(
-        monkeypatch,
-        lambda: SimpleNamespace(
-            global_interaction_enabled=True,
-            global_interaction_trigger_size=20,
-        ),
-    )
-
-    asyncio.run(
-        handler._write_interaction_history(
-            message=MessageSchema(
-                user_id="user-1",
-                user_nickname="阿虚",
-                group_id="group-1",
-                content="当前待回复消息",
-                timestamp=2.0,
-                message_id="msg-2",
-            ),
-            new_record={"event": "新事件", "result": "新反应", "emotion": "新心情"},
-            lock_timeout_seconds=None,
+    for method_name in removed_methods:
+        assert not hasattr(message_handler_module.MessageHandler, method_name), (
+            f"MessageHandler 不应再保留直连副作用方法 {method_name}"
         )
-    )
 
-    assert len(redis.pushed_global_interactions) == 1
-    pushed = redis.pushed_global_interactions[0]
-    assert pushed["user_id"] == "user-1"
-    assert pushed["trigger_size"] == 20
-    record = pushed["record"]
-    assert isinstance(record, dict)
-    assert record["version"] == 1
-    assert record["event"] == "新事件"
-    assert record["result"] == "新反应"
-    assert record["emotion"] == "新心情"
-    assert record["display_name"] == "阿虚"
-    assert record["message_id"] == "msg-2"
+    signature = inspect.signature(message_handler_module.MessageHandler.__init__)
+    param = signature.parameters.get("reply_commit_repository")
+    assert param is not None, "MessageHandler.__init__ 缺少 reply_commit_repository 参数"
+    assert param.default is inspect.Parameter.empty, (
+        "reply_commit_repository 必须是构造必填参数"
+    )
 
 
 def test_resolve_reply_context_builds_user_side_text_context() -> None:
@@ -888,6 +859,46 @@ class _FakeProactiveReservation:
                 "cooldown_seconds": cooldown_seconds,
             }
         )
+
+
+class _FakeReplyCommitRepository:
+    """fake outbox 仓库：记录 mark_delivered/claim_operation，claim 默认返回 None。
+
+    KOMARIBOT-10：commit_delivered_reply 只剩 outbox 一条路径；claim 返回
+    None 表示副作用由后台 worker 稍后领取提交，测试只断言送达登记。
+    """
+
+    def __init__(self) -> None:
+        self.mark_delivered_calls: list[dict[str, object]] = []
+        self.claim_operation_calls: list[str] = []
+        self.claim_result: dict[str, Any] | None = None
+
+    async def has_active_operation(self, operation_id: str) -> bool:
+        del operation_id
+        return False
+
+    async def mark_delivered(
+        self, operation_id: str, *, platform_message_id: str | None = None
+    ) -> bool:
+        self.mark_delivered_calls.append(
+            {"operation_id": operation_id, "platform_message_id": platform_message_id}
+        )
+        return True
+
+    async def claim_operation(
+        self, operation_id: str, *, owner_token: str, lease_seconds: int
+    ) -> dict[str, Any] | None:
+        del owner_token, lease_seconds
+        self.claim_operation_calls.append(operation_id)
+        return self.claim_result
+
+
+def _wire_reply_commit_repository(
+    handler: object, repository: _FakeReplyCommitRepository
+) -> None:
+    """为 __new__ 构建的 handler 补上 outbox 硬依赖与 owner（KOMARIBOT-10）。"""
+    handler.reply_commit_repository = repository  # type: ignore[attr-defined]
+    handler._reply_commit_owner = "test-owner"  # type: ignore[attr-defined]
 
 
 class _FakeMemoryForDebug:
@@ -1247,11 +1258,13 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
     fake_user_data = _FakeUserDataForDebug()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1269,6 +1282,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -1328,29 +1342,37 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    # 确认送达后提交回复副作用
-    assert fake_user_data.adjust_calls == [{"user_id": "user-1", "delta": 1}]
-    assert len(redis.pushed_messages) >= 2  # 至少：当前消息 + AI 回复
-    assert len(redis.pushed_global_interactions) >= 1
-    pushed_record = redis.pushed_global_interactions[0]["record"]
-    assert isinstance(pushed_record, dict)
-    assert pushed_record["event"] == "正常消息"
-    assert pushed_record["result"] == "正常回复"
-    assert pushed_record["emotion"] == "平静"
+    # KOMARIBOT-10：送达后副作用只剩 outbox 一条路径；claim 返回 None 表示
+    # 副作用由后台 worker 稍后领取提交，此处只断言送达登记，副作用断言由
+    # test_reply_commit_handler.py 的 outbox 编排测试继承
+    assert repository.mark_delivered_calls == [
+        {
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
+        }
+    ]
+    assert repository.claim_operation_calls == [pending_reply.operation_id]
+    assert fake_user_data.adjust_calls == []
+    assert redis.pushed_global_interactions == []
 
 
-def test_proactive_attempt_reserves_then_confirms_after_delivery(
+def test_proactive_attempt_reserves_then_enters_outbox_after_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """主动回复生成前预占，确认送达后才转为正式名额与冷却。"""
+    """主动回复生成前预占；送达确认后进入 outbox，confirm 由 outbox 步骤 1 驱动。
+
+    KOMARIBOT-10：直连 confirm 路径已删除；confirm-after-delivery 语义由
+    test_reply_commit_handler.py 的 outbox 编排测试继承。
+    """
     redis = _FakeRedisForDebug()
     reservation_svc = _FakeProactiveReservation()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.proactive_reservation = reservation_svc
-    commit_calls: list[dict[str, object]] = []
+    _wire_reply_commit_repository(handler, repository)
 
     async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
         return [], [], True
@@ -1363,12 +1385,8 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
             favorability_reason="主动关心",
         )
 
-    async def _fake_commit_side_effects(**kwargs: object) -> None:
-        commit_calls.append(dict(kwargs))
-
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
-    monkeypatch.setattr(handler, "_commit_side_effects", _fake_commit_side_effects)
     _patch_both_configs(
         monkeypatch,
         lambda: SimpleNamespace(
@@ -1376,6 +1394,7 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
             proactive_max_per_hour=3,
             proactive_reservation_ttl_seconds=360,
             proactive_cooldown=300,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
         ),
     )
@@ -1415,18 +1434,19 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
     assert reservation_svc.renew_calls == [
         {"group_id": "group-proactive", "reservation_id": "message-proactive"}
     ]
-    assert commit_calls == []
+    assert repository.mark_delivered_calls == []
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    assert reservation_svc.confirm_calls == [
+    # 送达登记进入 outbox；confirm 不在此处内联，由 outbox 步骤 1 驱动
+    assert repository.mark_delivered_calls == [
         {
-            "group_id": "group-proactive",
-            "reservation_id": "message-proactive",
-            "cooldown_seconds": 300,
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
         }
     ]
-    assert len(commit_calls) == 1
+    assert repository.claim_operation_calls == [pending_reply.operation_id]
+    assert reservation_svc.confirm_calls == []
     assert reservation_svc.release_calls == []
 
 
@@ -2104,11 +2124,13 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
     """commit_delivered_reply 不再调用 on_reply_triggered 回调（表情已在生成前贴出）。"""
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
     monkeypatch.setattr(
@@ -2127,6 +2149,7 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -2191,8 +2214,13 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
 
     # commit_delivered_reply 应正常执行，不调用已删除的回调
     asyncio.run(handler.commit_delivered_reply(pending_reply))
-    # 副作用已正常提交（adjust + store_ai_reply + interaction_history）
-    assert len(redis.pushed_messages) >= 1
+    # KOMARIBOT-10：送达登记进入 outbox（副作用由 worker 领取提交）
+    assert repository.mark_delivered_calls == [
+        {
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
+        }
+    ]
 
 
 def test_read_buffers_failure_returns_failure_with_reaction_sent_false(

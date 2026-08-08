@@ -201,20 +201,25 @@ class _FakeRedis:
 
 
 class _FakeProactiveReservation:
-    """fake proactive_reservation module：只记录 confirm 调用（KOMARIBOT-9）。"""
+    """fake proactive_reservation module：记录 confirm 调用（KOMARIBOT-9/10）。"""
 
     def __init__(self) -> None:
-        self.confirmed: set[str] = set()
+        self.confirm_calls: list[dict[str, object]] = []
 
     async def confirm(
         self,
-        _group_id: str,
+        group_id: str,
         reservation_id: str,
         *,
         cooldown_seconds: int,
     ) -> None:
-        del cooldown_seconds
-        self.confirmed.add(reservation_id)
+        self.confirm_calls.append(
+            {
+                "group_id": group_id,
+                "reservation_id": reservation_id,
+                "cooldown_seconds": cooldown_seconds,
+            }
+        )
 
 
 class _FakeUserData:
@@ -339,7 +344,13 @@ async def test_delivered_reply_commits_all_idempotent_steps(
     await handler.commit_delivered_reply(pending)
 
     assert repository.records[pending.operation_id]["status"] == "COMPLETED"
-    assert reservation_svc.confirmed == {"reservation-1"}
+    assert reservation_svc.confirm_calls == [
+        {
+            "group_id": "group-1",
+            "reservation_id": "reservation-1",
+            "cooldown_seconds": 300,
+        }
+    ]
     assert redis.ai_operations == {pending.operation_id}
     assert redis.interaction_operations == {pending.operation_id}
     assert user_data.application_count == 1
