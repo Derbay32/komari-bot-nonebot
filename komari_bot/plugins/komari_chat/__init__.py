@@ -35,8 +35,11 @@ from komari_bot.plugins import user_ban as user_ban_plugin
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
 
+from komari_bot.plugins.komari_chat.services.config_interface import (
+    get_config,
+    get_memory_config,
+)
 from komari_bot.plugins.komari_decision import get_decision_engine
-from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠聊天",
@@ -123,7 +126,7 @@ driver.on_shutdown(_stop_reply_commit_worker)
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
     """在开始生成回复时，对触发消息添加表情反应（提示“正在生成”）。"""
-    config = get_config()
+    config = get_memory_config()
     if not config.face_reaction_enabled or not config.face_reaction_id:
         return
 
@@ -208,7 +211,7 @@ async def generate_debug_reply(
 @matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     """处理群聊消息。"""
-    config = get_config()
+    config = get_memory_config()
     if not config.plugin_enable:
         return
 

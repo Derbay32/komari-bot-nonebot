@@ -18,12 +18,27 @@ from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollecto
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pytest
 
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+
+
+def _patch_both_configs(
+    monkeypatch: "pytest.MonkeyPatch",
+    stub: "Callable[[], object]",
+) -> None:
+    """KOMARIBOT-7：迁出字段走 get_config、memory 字段走 get_memory_config。
+
+    两个名字都 patch 为同一鸭子类型桩：被测路径只会从各自名字读取
+    其字段，桩内同时持有迁出字段与 memory 字段时两处都能命中。
+    """
+    monkeypatch.setattr(message_handler_module, "get_config", stub)
+    monkeypatch.setattr(message_handler_module, "get_memory_config", stub)
 
 
 class _FakeEvent:
@@ -62,9 +77,8 @@ def _patch_config(
     *,
     bot_nickname: str = "小鞠知花",
 ) -> None:
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             bot_nickname=bot_nickname,
             bot_aliases=["小鞠", "小鞠知花", "komari"],
@@ -356,9 +370,8 @@ def test_read_buffers_uses_context_limit_instead_of_summary_limit(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             context_messages_limit=5,
             context_max_utf8_bytes=24_000,
@@ -442,9 +455,8 @@ def test_attempt_reply_only_rewrites_current_message(
             favorability_reason="正常互动",
         )
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -566,9 +578,8 @@ def test_write_interaction_history_pushes_global_redis_buffer(
     redis = _FakeRedis([])
     handler.redis = redis
     handler.memory = _FakeMemory()
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
@@ -957,9 +968,8 @@ def test_generate_debug_reply_skips_all_side_effects(
     )
 
     # 注入必要的全局配置
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             summary_max_buffer_size=500,
             memory_search_limit=3,
@@ -1050,9 +1060,8 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             summary_max_buffer_size=500,
             memory_search_limit=3,
@@ -1132,9 +1141,8 @@ def test_generate_debug_reply_with_images_and_reply_context(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             summary_max_buffer_size=500,
             memory_search_limit=3,
@@ -1256,9 +1264,8 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1362,9 +1369,8 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
     monkeypatch.setattr(handler, "_commit_side_effects", _fake_commit_side_effects)
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=True,
             proactive_max_per_hour=3,
@@ -1451,9 +1457,8 @@ def test_proactive_generation_failure_releases_reservation(
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fail_generate_core)
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=True,
             proactive_max_per_hour=3,
@@ -1518,9 +1523,8 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(bot_nickname="小鞠"),
     )
 
@@ -1651,9 +1655,8 @@ def test_reaction_scheduled_before_generate_core(
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1753,9 +1756,8 @@ def test_reaction_not_scheduled_when_disabled(
     handler.memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1853,9 +1855,8 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1951,9 +1952,8 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -2047,9 +2047,8 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
     handler.redis = redis
     handler.memory = _FakeMemoryForDebug()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=True,
             proactive_max_per_hour=3,
@@ -2134,9 +2133,8 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
         ),
     )
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -2221,9 +2219,8 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
     handler.redis = redis
     handler.memory = _FakeMemoryForDebug()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,

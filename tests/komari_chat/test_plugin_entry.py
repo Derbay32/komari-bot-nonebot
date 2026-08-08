@@ -57,6 +57,7 @@ def _install_allowed_entry_dependencies(
             return False
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
+    monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: handler)
     monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
@@ -146,6 +147,7 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
             calls.process = True
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
+    monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
     monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())

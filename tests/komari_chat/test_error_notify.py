@@ -118,7 +118,9 @@ async def test_notify_skipped_when_error_notify_disabled(
     """error_notify_enabled=False 时通知整体静默，不发私聊。"""
     config_stub = SimpleNamespace(error_notify_enabled=False)
     redis = _FakeRedisManager(_FakeRedis())
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
 
     bot = _FakeBot()
     await error_notify_module.notify_superusers_reply_failure(
@@ -140,7 +142,9 @@ async def test_notify_sends_private_message_to_superusers(
     """正常通知路径：向所有SUPERUSER发送私聊并包含诊断信息。"""
     config_stub = SimpleNamespace(error_notify_enabled=True)
     redis = _FakeRedisManager(_FakeRedis())
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
 
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"10001", "10002"})
@@ -180,7 +184,9 @@ async def test_notify_skips_non_numeric_superuser(
     """非数字 SUPERUSER 条目被跳过，不影响其他条目。"""
     config_stub = SimpleNamespace(error_notify_enabled=True)
     redis = _FakeRedisManager(_FakeRedis())
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
 
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"invalid", "10003", ""})
@@ -229,7 +235,9 @@ async def test_notify_cooldown_blocks_duplicate_within_5_minutes(
     redis.set = _set  # type: ignore[method-assign]
     redis_manager = _FakeRedisManager(redis)
 
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"10001"})
     )
@@ -269,7 +277,9 @@ async def test_notify_cooldown_does_not_block_different_error_type(
     config_stub = SimpleNamespace(error_notify_enabled=True)
     redis = _FakeRedis(nx_returns=True)
     redis_manager = _FakeRedisManager(redis)
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"10001"})
     )
@@ -307,7 +317,9 @@ async def test_notify_cooldown_does_not_block_different_group(
     config_stub = SimpleNamespace(error_notify_enabled=True)
     redis = _FakeRedis(nx_returns=True)
     redis_manager = _FakeRedisManager(redis)
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"10001"})
     )
@@ -345,7 +357,9 @@ async def test_notify_cooldown_redis_error_falls_through(
     config_stub = SimpleNamespace(error_notify_enabled=True)
     redis = _FakeRedis(nx_raises=RuntimeError("Redis 不可用"))
     redis_manager = _FakeRedisManager(redis)
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"10001"})
     )
@@ -371,7 +385,9 @@ async def test_notify_with_none_redis_still_sends(
 ) -> None:
     """redis=None 时跳过冷却检查，照常通知。"""
     config_stub = SimpleNamespace(error_notify_enabled=True)
-    monkeypatch.setattr(error_notify_module, "get_config", lambda: config_stub)
+    monkeypatch.setattr(
+        error_notify_module, "get_memory_config", lambda: config_stub
+    )
     driver_stub = SimpleNamespace(
         config=SimpleNamespace(superusers={"10001"})
     )
