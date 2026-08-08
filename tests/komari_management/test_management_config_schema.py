@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -28,6 +29,7 @@ def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
         ("komari_management", "DynamicConfigSchema", "restart"),
         ("embedding_provider", "DynamicConfigSchema", "restart"),
         ("komari_memory", "KomariMemoryConfigSchema", "immediate"),
+        ("komari_chat", "KomariChatConfigSchema", "immediate"),
         ("komari_sentry", "KomariSentryConfigSchema", "restart"),
         ("user_data", "DynamicConfigSchema", "restart"),
         ("group_history_summary", "DynamicConfigSchema", "immediate"),
@@ -70,6 +72,27 @@ def test_managed_secret_fields_use_explicit_schema_metadata(
 
     assert isinstance(field_extra, dict)
     assert field_extra["secret"] is True
+
+
+def test_management_registers_komari_chat_config_resource() -> None:
+    """komari_chat 配置资源注册进管理面 config_resources（KOMARIBOT-7）。
+
+    与既有 prompt 资源（ManagedPromptResource，独立注册表）区分：
+    本断言只检查 config_resources 元组段。
+    """
+    init_path = (
+        Path(__file__).resolve().parents[2]
+        / "komari_bot"
+        / "plugins"
+        / "komari_management"
+        / "__init__.py"
+    )
+    source = init_path.read_text(encoding="utf-8")
+
+    config_block = source.split("config_resources=(", 1)[1].split(
+        "prompt_resources", 1
+    )[0]
+    assert '"komari_chat"' in config_block
 
 
 def test_management_config_schema_parses_origin_list_string() -> None:
