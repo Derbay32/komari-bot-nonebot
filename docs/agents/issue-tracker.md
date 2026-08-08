@@ -84,7 +84,7 @@ Wayfinder 五标签：
 
 - **Map**：`plane_create_work_item` + `wayfinder:map` 标签，正文含 Destination / Notes / Decisions so far / Not yet specified / Out of scope 五节。
 - **Child ticket**：`plane_create_work_item`（`parent=<map UUID>`，`## Question` 正文），打 `wayfinder:<type>` 标签（research / prototype / grilling / task），状态 Todo。
-- **Blocking**：⚠️ Plane 原生 relation（blocked_by）在当前工作区**不可用**（`plane_list_work_item_relation_definitions` 返回 HTTP 402，付费功能）——一律使用**正文声明 fallback**：ticket 正文顶部写 `Blocked by: KOMARIBOT-N, KOMARIBOT-M`。ticket unblocked 当且仅当声明的每个 blocker 状态为 Done/Cancelled。
+- **Blocking**：Plane 原生**内置依赖**（`plane_create_work_item_relation`，`relation_type="blocking"`，A 调用时 `work_item_id=A`、`work_item_ids=[B]` 表示 A blocks B）——canonical 且 UI 可见。ticket 正文顶部仍保留 `Blocked by: KOMARIBOT-N` 文本行作为速读与 fallback。ticket unblocked 当且仅当每个 blocker 状态为 Done/Cancelled（`plane_list_work_item_relations` 读取）。注意：`plane_list_work_item_relation_definitions` 在当前工作区返回 HTTP 402——只有**自定义关系定义**是付费功能，内置 blocking/blocked_by/start/finish 依赖可用，不要用 402 误判。
 - **Frontier 查询**：`plane_list_work_items` 取 map 的子项，保留状态不在 completed/cancelled、无 assignee、且正文 `Blocked by` 中无未关闭项的 ticket；map 顺序第一个优先。
 - **Claim**：`plane_manage_work_item_assignee`（add_user_id=<driver UUID>）+ 状态置 In Progress——会话的第一次写操作。
 - **Resolve**：`plane_create_work_item_comment` 记答案 → 状态置 Done → 把 gist + 链接追加到 map 的 Decisions-so-far（`plane_update_work_item` 改 description_html）。

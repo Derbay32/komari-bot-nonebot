@@ -517,7 +517,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ### Issue tracker
 
-Issue 与 PRD 跟踪在 Plane 官方云项目 **KOMARIBOT**（经 Plane MCP 工具操作，**不用** `gh` CLI 管 ticket）；`/to-tickets` 拆出的实施 ticket 以父 spec work item 的 sub-issue 管理（`parent` 父子关系 + 正文 `Blocked by` 声明——Plane 原生 blocking relation 当前工作区不可用）。See `docs/agents/issue-tracker.md`.
+Issue 与 PRD 跟踪在 Plane 官方云项目 **KOMARIBOT**（经 Plane MCP 工具操作，**不用** `gh` CLI 管 ticket）；`/to-tickets` 拆出的实施 ticket 以父 spec work item 的 sub-issue 管理（`parent` 父子关系 + 原生内置 blocking 依赖，正文 `Blocked by` 声明作速读 fallback；自定义关系定义是付费功能，不可用）。See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
