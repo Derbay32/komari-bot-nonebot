@@ -7,7 +7,14 @@ from typing import Any, cast
 
 import pytest
 
-from komari_bot.config.typed_config import ensure_typed_config_model
+from komari_bot.config.typed_config import (
+    Field as ConfigField,
+)
+from komari_bot.config.typed_config import (
+    TypedConfigModel,
+    ensure_typed_config_model,
+    typed_model_config,
+)
 from komari_bot.plugins.komari_management.config_schema import DynamicConfigSchema
 
 
@@ -128,6 +135,63 @@ def test_management_config_schema_defaults_are_safe() -> None:
 def test_management_config_schema_rejects_blank_status_page_url() -> None:
     with pytest.raises(ValueError, match="announce_status_page_url 不能为空"):
         DynamicConfigSchema(announce_status_page_url="   ")
+
+
+def test_typed_config_schema_rejects_duplicate_section_ids() -> None:
+    with pytest.raises(ValueError, match=r"分区 ID.*重复"):
+
+        class _DuplicateSectionSchema(TypedConfigModel):
+            model_config = typed_model_config(
+                json_schema_extra={
+                    "sections": [
+                        {
+                            "section_id": "runtime",
+                            "display_name": "运行控制",
+                            "order": 10,
+                        },
+                        {
+                            "section_id": "runtime",
+                            "display_name": "重复分区",
+                            "order": 20,
+                        },
+                    ]
+                }
+            )
+
+            enabled: bool = ConfigField(default=True)
+
+
+def test_typed_config_schema_rejects_unknown_field_section_reference() -> None:
+    with pytest.raises(ValueError, match="字段 enabled 引用了未声明分区 missing"):
+
+        class _UnknownSectionSchema(TypedConfigModel):
+            model_config = typed_model_config(
+                json_schema_extra={
+                    "sections": [
+                        {
+                            "section_id": "runtime",
+                            "display_name": "运行控制",
+                            "order": 10,
+                        }
+                    ]
+                }
+            )
+
+            enabled: bool = ConfigField(
+                default=True,
+                json_schema_extra={"section_id": "missing"},
+            )
+
+
+def test_typed_config_schema_rejects_invalid_sections_shape() -> None:
+    with pytest.raises(TypeError, match="sections 必须是列表"):
+
+        class _InvalidSectionsShapeSchema(TypedConfigModel):
+            model_config = typed_model_config(
+                json_schema_extra={"sections": {"runtime": "运行控制"}}
+            )
+
+            enabled: bool = ConfigField(default=True)
 
 
 def test_management_config_schema_normalizes_named_credentials() -> None:

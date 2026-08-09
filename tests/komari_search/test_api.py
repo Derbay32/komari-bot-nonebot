@@ -47,6 +47,37 @@ async def test_provider_descriptors_group_schema_fields_and_protect_secrets(
 
     assert response.status_code == 200
     payload = response.json()
+    assert set(payload) == {
+        "current_provider",
+        "available_providers",
+        "common_fields",
+        "providers",
+    }
+    assert all(
+        set(field) == {
+            "field_name",
+            "field_type",
+            "description",
+            "default",
+            "secret",
+        }
+        for field in payload["common_fields"]
+    )
+    assert all(
+        set(provider) == {"provider_id", "fields"}
+        for provider in payload["providers"]
+    )
+    assert all(
+        set(field) == {
+            "field_name",
+            "field_type",
+            "description",
+            "default",
+            "secret",
+        }
+        for provider in payload["providers"]
+        for field in provider["fields"]
+    )
     assert payload["current_provider"] == "tavily"
     assert payload["available_providers"] == ["tavily", "exa"]
     common = {item["field_name"]: item for item in payload["common_fields"]}
@@ -62,6 +93,32 @@ async def test_provider_descriptors_group_schema_fields_and_protect_secrets(
         "tavily_include_answer",
     }
     assert providers["exa"] == {"exa_search_type", "exa_fetch_format"}
+
+
+@pytest.mark.asyncio
+async def test_provider_descriptors_openapi_excludes_visual_sections(app: App) -> None:
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        response = await ctx.get_client().get("/openapi.json")
+
+    assert response.status_code == 200
+    schemas = response.json()["components"]["schemas"]
+    assert set(schemas["ProviderDescriptorsResponse"]["properties"]) == {
+        "current_provider",
+        "available_providers",
+        "common_fields",
+        "providers",
+    }
+    assert set(schemas["ProviderDescriptor"]["properties"]) == {
+        "provider_id",
+        "fields",
+    }
+    assert set(schemas["ProviderFieldDescriptor"]["properties"]) == {
+        "field_name",
+        "field_type",
+        "description",
+        "default",
+        "secret",
+    }
 
 
 @pytest.mark.asyncio
