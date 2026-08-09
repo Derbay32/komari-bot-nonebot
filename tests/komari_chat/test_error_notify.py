@@ -222,6 +222,34 @@ async def test_notification_switch_is_read_at_each_failure(
 
 
 @pytest.mark.asyncio
+async def test_config_read_failure_only_mutes_private_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """运行时配置读取失败时仍保留群回执，并静默私聊诊断。"""
+
+    def _raise_config_error() -> None:
+        msg = "模拟运行时配置读取失败"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_memory_config",
+        _raise_config_error,
+    )
+    bot = _FakeBot()
+
+    await _build_handler().report_reply_failure(
+        bot=bot,
+        event=_FakeEvent(),
+        failure=_failure(),
+        reason="at",
+    )
+
+    _assert_group_reply(bot)
+    assert bot.send_private_msg_calls == []
+
+
+@pytest.mark.asyncio
 async def test_shared_cooldown_deduplicates_same_reason_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

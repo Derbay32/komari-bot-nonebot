@@ -18,7 +18,6 @@ from .handlers.message_handler import (
     ReplyFailureInfo,
 )
 from .repositories import ReplyCommitRepository
-from .services.error_notify import one_line_summary
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -338,7 +337,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             failure=ReplyFailureInfo(
                 stage="deliver" if pending_reply is not None else "process",
                 error_type=type(exc).__name__,
-                summary=one_line_summary(exc),
+                summary=str(exc),
                 request_trace_id=(
                     pending_reply.request_trace_id
                     if pending_reply is not None
