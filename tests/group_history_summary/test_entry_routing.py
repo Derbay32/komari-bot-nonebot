@@ -153,8 +153,8 @@ def _install_failure_notifier(
     notifier = _FailureNotifier()
     monkeypatch.setattr(
         summary_module,
-        "GroupTaskFailureNotifier",
-        lambda: notifier,
+        "_classification_failure_notifier",
+        notifier,
         raising=False,
     )
     return notifier
