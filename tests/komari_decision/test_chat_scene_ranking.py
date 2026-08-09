@@ -1,4 +1,4 @@
-"""聊天用途迁入深场景重排 module 的验收测试（KOMARIBOT-26）。"""
+"""聊天用途迁入深场景重排 module 的验收测试（KOMARIBOT-26 / KOMARIBOT-27）。"""
 
 from __future__ import annotations
 
@@ -8,10 +8,17 @@ from typing import Any, cast
 
 import pytest
 
-from komari_bot.decision import SceneRuntimeUnavailableError
+from komari_bot import decision as decision_contracts
+from komari_bot.plugins.komari_decision import __all__ as decision_plugin_all
+from komari_bot.plugins.komari_decision.services import (
+    __all__ as decision_services_all,
+)
 from komari_bot.plugins.komari_decision.services import (
     decision_engine,
     scene_classification,
+)
+from komari_bot.plugins.komari_decision.services.scene_classification import (
+    ChatSceneUnavailableError,
 )
 from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
     SceneRuntimeGeneralCandidate,
@@ -217,7 +224,7 @@ async def test_chat_operation_keeps_runtime_unavailable_error_contract(
 ) -> None:
     _install_dependencies(monkeypatch, _Provider())
 
-    with pytest.raises(SceneRuntimeUnavailableError):
+    with pytest.raises(ChatSceneUnavailableError):
         await cast("Any", scene_classification).rank_chat_message(
             "普通聊天",
             scene_runtime=runtime,  # type: ignore[arg-type]
@@ -229,3 +236,28 @@ def test_chat_operation_type_annotations_do_not_need_public_purpose() -> None:
         cast("Any", scene_classification).rank_chat_message
     )
     assert "purpose" not in hints
+
+
+def test_chat_only_types_stay_inside_deep_implementation() -> None:
+    """聊天专用候选/结果/异常只存在于深 implementation，不泄漏到任何公开面。
+
+    KOMARIBOT-27 起聊天宽重排契约退役：共享包、插件顶层与 services 包均
+    不得再导出聊天专用类型（旧名与新名都不允许）。
+    """
+    chat_only_types = {
+        "ChatCandidate",
+        "ChatRerankResult",
+        "ChatSceneUnavailableError",
+    }
+    public_all_lists = (
+        decision_contracts.__all__,
+        decision_plugin_all,
+        decision_services_all,
+        scene_classification.__all__,
+    )
+    for exported in public_all_lists:
+        assert chat_only_types.isdisjoint(exported)
+    assert not any(
+        hasattr(decision_contracts, name) for name in chat_only_types
+    )
+    assert "rank_chat_message" not in scene_classification.__all__

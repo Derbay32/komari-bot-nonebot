@@ -341,9 +341,10 @@ ok, reason = await check_runtime_permission(bot, event, config)
 核心服务：
 - `SceneRuntimeService` — 场景生命周期管理
 - `SceneAdminService` — 场景运维（CRUD）
-- `UnifiedCandidateRerankService` — 候选回复重排序
 - `SocialTimingService` — 社交时机判定（主动回复冷却、频控）
 - `MessageFilter` — 消息过滤
+
+聊天候选重排与群总结场景归类收敛到深场景归类 module（`services/scene_classification.py`）内部：聊天专用 operation `rank_chat_message` 及其候选/结果/异常类型不对外导出，不加入插件顶层、services `__all__` 与共享包 `komari_bot.decision`（KOMARIBOT-27 已物理删除旧宽重排服务与跨插件宽契约）。
 
 存储：场景四表（`komari_decision_scenes` / `komari_memory_scene_set` / `komari_memory_scene_item` / `komari_memory_scene_runtime`）为 SQLModel ORM 模型（`orm_models.py`），经 nonebot-plugin-orm `get_session` 访问，DDL 由 Alembic 基线 0001 管理；embedding 生成经 `embedding_provider` 远程接口。
 

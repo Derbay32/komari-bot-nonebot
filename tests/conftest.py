@@ -396,18 +396,8 @@ class _DummyEmbeddingPlugin:
         return [0.1, 0.2, 0.3]
 
 
-class _DummyUnifiedCandidateRerankService:
-    async def rank_message(self, *_args: object, **_kwargs: object) -> object:
-        return SimpleNamespace(
-            best_scene_id="scene_group_history_summary",
-            best_scene_score=1.0,
-            meaningful_score=1.0,
-            noise_score=0.0,
-        )
-
-
 class _DummyDecisionPlugin:
-    UnifiedCandidateRerankService = _DummyUnifiedCandidateRerankService
+    pass
 
 
 _REQUIRE_REGISTRY: dict[str, object] = {

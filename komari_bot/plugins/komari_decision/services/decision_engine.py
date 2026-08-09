@@ -14,14 +14,14 @@ from komari_bot.decision.decision_engine import (
 from komari_bot.decision.runtime_state import (
     DecisionRuntimeState,
 )
-from komari_bot.decision.unified_candidate_rerank import (
-    SceneRuntimeUnavailableError,
-    UnifiedRerankResult,
-)
 
 from .config_interface import get_config
 from .message_filter import is_command_message, preprocess_message
-from .scene_classification import rank_chat_message
+from .scene_classification import (
+    ChatRerankResult,
+    ChatSceneUnavailableError,
+    rank_chat_message,
+)
 from .social_timing_service import SocialTimingService
 
 if TYPE_CHECKING:
@@ -90,7 +90,6 @@ class DecisionEngine:
             call_direct_score=None,
             call_mention_score=None,
             filter_reason=None,
-            rank_result=None,
             timing_breakdown=None,
             runtime_status=runtime_state.status,
             runtime_reason=runtime_state.reason,
@@ -126,7 +125,6 @@ class DecisionEngine:
                 call_direct_score=None,
                 call_mention_score=None,
                 filter_reason=None,
-                rank_result=None,
                 timing_breakdown=None,
                 runtime_status=runtime_state.status,
                 runtime_reason=runtime_state.reason,
@@ -157,7 +155,6 @@ class DecisionEngine:
                 call_direct_score=None,
                 call_mention_score=None,
                 filter_reason=filter_result.reason,
-                rank_result=None,
                 timing_breakdown=None,
                 runtime_status=runtime_state.status,
                 runtime_reason=runtime_state.reason,
@@ -176,7 +173,7 @@ class DecisionEngine:
                 message_content,
                 scene_runtime=self._scene_runtime,
             )
-        except SceneRuntimeUnavailableError as exc:
+        except ChatSceneUnavailableError as exc:
             unavailable_state = DecisionRuntimeState.failed(str(exc))
             logger.warning(
                 "[KomariDecision] scene runtime 暂不可用，跳过主动回复判定: {}",
@@ -219,7 +216,6 @@ class DecisionEngine:
                 call_direct_score=rank_result.call_direct_score,
                 call_mention_score=rank_result.call_mention_score,
                 filter_reason=None,
-                rank_result=rank_result,
                 timing_breakdown=timing_result,
                 runtime_status=runtime_state.status,
                 runtime_reason=runtime_state.reason,
@@ -244,7 +240,6 @@ class DecisionEngine:
             call_direct_score=rank_result.call_direct_score,
             call_mention_score=rank_result.call_mention_score,
             filter_reason=None,
-            rank_result=rank_result,
             timing_breakdown=timing_result,
             runtime_status=runtime_state.status,
             runtime_reason=runtime_state.reason,
@@ -264,7 +259,7 @@ class DecisionEngine:
 
     @staticmethod
     def _resolve_call_intent(
-        rank_result: UnifiedRerankResult,
+        rank_result: ChatRerankResult,
     ) -> tuple[CallIntent, float]:
         config = get_config()
 
@@ -284,7 +279,7 @@ class DecisionEngine:
         return "ambiguous", call_margin
 
     @staticmethod
-    def _should_drop_memory(rank_result: UnifiedRerankResult) -> bool:
+    def _should_drop_memory(rank_result: ChatRerankResult) -> bool:
         config = get_config()
         noise_delta = rank_result.noise_score - rank_result.meaningful_score
         return (
