@@ -32,9 +32,13 @@ class SummaryRequestUnavailableReason(StrEnum):
     EMBEDDING_UNAVAILABLE = "embedding_unavailable"
     CONFIGURATION_INCOMPLETE = "configuration_incomplete"
     # 仅表达「配置与提供者均启用 rerank 时的预期调用故障」
-    # （远程服务/响应校验/传输超时/未初始化）；提供者明确关闭时走真实余弦模式；
-    # KOMARIBOT-24 再接失败预算与 fallback。
+    # （远程服务/响应校验/传输超时/未初始化）；提供者明确关闭时走真实余弦模式。
     RERANK_UNAVAILABLE = "rerank_unavailable"
+    # KOMARIBOT-24：rerank 供应方可降级失败累计达到阈值，需要升级诊断的窄标记；
+    # 达到阈值后计数保留，后续失败仍返回本原因码。
+    RERANK_FAILURE_BUDGET_EXHAUSTED = "rerank_failure_budget_exhausted"
+    # KOMARIBOT-24：rerank 已失败但失败预算存储（Redis）不可用，禁止走 fallback。
+    FAILURE_BUDGET_UNAVAILABLE = "failure_budget_unavailable"
 
 
 @dataclass(frozen=True, slots=True)

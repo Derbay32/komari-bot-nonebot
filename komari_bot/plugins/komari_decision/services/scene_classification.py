@@ -1,10 +1,16 @@
-"""群总结请求场景归类实现（KOMARIBOT-23）。
+"""群总结请求场景归类实现（KOMARIBOT-23 / KOMARIBOT-24）。
 
 深场景归类 module：统一拥有场景 runtime 刷新、embedding 召回、评分与用途策略，
 对外只暴露「命中 / 未命中 / 不可用（带稳定原因码）」的窄 operation。
 
 调用方不能传入 runtime、候选 flags、场景键、阈值或指令；目标场景键
 ``_SUMMARY_SCENE_KEY`` 只存在于本 implementation 内部。
+
+rerank 供应方可降级失败（网络/超时/HTTP 408/429/5xx/响应格式错误）进入
+固定窗口失败预算（KOMARIBOT-24）：达到阈值返回
+RERANK_FAILURE_BUDGET_EXHAUSTED；未达阈值且配置开启 fallback 时用已有
+query embedding 与真实余弦归类；401/403、其他 4xx（含 425）、缺少 URL 等
+本地配置非法立即返回 RERANK_UNAVAILABLE，不消耗预算。
 
 本模块不创建 request trace / Agent Run，也不迁移既有聊天 DecisionEngine
 与 UnifiedCandidateRerankService（分别由 KOMARIBOT-26 / KOMARIBOT-27 处理）。
@@ -14,6 +20,8 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING, Any
+
+from nonebot import logger
 
 from komari_bot.decision import (
     DecisionRuntimeState,
@@ -25,8 +33,15 @@ from komari_bot.plugins.embedding_provider import (
     EmbeddingResponseValidationError,
     RemoteResponseDecodeError,
     RemoteResponseTooLargeError,
+    RemoteServiceFailureKind,
     RemoteServiceRequestError,
+    RerankConfigurationError,
     RerankResponseValidationError,
+)
+
+from .summary_rerank_failure_budget import (
+    RerankFailureBudgetUnavailableError,
+    SummaryRerankFailureBudget,
 )
 
 if TYPE_CHECKING:
@@ -50,12 +65,13 @@ _EMBEDDING_EXPECTED_ERRORS = (
     TimeoutError,
 )
 
-# 已声明的 rerank 预期故障：远程请求/响应异常、传输超时
+# 已声明的 rerank 预期故障：远程请求/响应异常、传输超时、本地配置非法
 _RERANK_EXPECTED_ERRORS = (
     RemoteServiceRequestError,
     RemoteResponseTooLargeError,
     RemoteResponseDecodeError,
     RerankResponseValidationError,
+    RerankConfigurationError,
     TimeoutError,
 )
 
@@ -75,6 +91,24 @@ def _get_embedding_provider() -> Any:
     return embedding_provider
 
 
+def _get_rerank_failure_budget() -> Any:
+    """惰性获取群总结 rerank 失败预算存储。
+
+    经 komari_memory 顶层 ``get_redis_manager()`` 获取 ``RedisManager.redis``；
+    Redis 未就绪时构造不可用 store（记录失败时抛预算不可用）。
+    """
+    from komari_bot.plugins import komari_memory
+
+    redis_client: Any | None = None
+    try:
+        redis_manager = komari_memory.get_redis_manager()
+        if redis_manager is not None:
+            redis_client = redis_manager.redis
+    except Exception:
+        redis_client = None
+    return SummaryRerankFailureBudget(redis_client)
+
+
 def _is_embedding_expected_error(exc: BaseException) -> bool:
     """判断是否为已声明的 embedding 预期故障（未初始化/传输超时/远程服务/响应校验）。"""
     if isinstance(exc, _EMBEDDING_EXPECTED_ERRORS):
@@ -83,10 +117,41 @@ def _is_embedding_expected_error(exc: BaseException) -> bool:
 
 
 def _is_rerank_expected_error(exc: BaseException) -> bool:
-    """判断是否为已声明的 rerank 预期故障（未初始化/传输超时/远程服务/响应校验）。"""
+    """判断是否为已声明的 rerank 预期故障（未初始化/传输超时/远程服务/响应校验/配置）。"""
     if isinstance(exc, _RERANK_EXPECTED_ERRORS):
         return True
     return isinstance(exc, RuntimeError) and "尚未初始化" in str(exc)
+
+
+def _is_rerank_failure_budgetable(exc: BaseException) -> bool:
+    """判断供应方失败是否可计入失败预算。
+
+    只有网络中断、超时、HTTP 408/429/5xx 与供应方响应格式错误可降级；
+    401/403、其他 4xx（含 425）、缺少 URL/本地配置非法与未分类异常
+    一律不消耗预算。
+    """
+    if isinstance(
+        exc,
+        (
+            RerankResponseValidationError,
+            RemoteResponseDecodeError,
+            RemoteResponseTooLargeError,
+            TimeoutError,
+        ),
+    ):
+        return True
+    if not isinstance(exc, RemoteServiceRequestError):
+        return False
+    if exc.failure_kind is RemoteServiceFailureKind.HTTP_STATUS:
+        status = exc.status
+        return status in (408, 429) or (
+            status is not None and 500 <= status <= 599
+        )
+    return exc.failure_kind in (
+        RemoteServiceFailureKind.NETWORK,
+        RemoteServiceFailureKind.TIMEOUT,
+        RemoteServiceFailureKind.RESPONSE_INVALID,
+    )
 
 
 def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
@@ -159,13 +224,16 @@ async def _resolve_summary_snapshot(
 async def _classify_with_rerank(
     *,
     message_text: str,
+    query_vector: list[float],
     config: KomariDecisionConfigSchema,
     provider: Any,
     top_scenes: list[SceneRuntimeGeneralCandidate],
 ) -> SummaryRequestClassificationResult:
     """使用总结专用 rerank 指令对 top-k 场景精排归类。
 
-    调用方已确认配置与提供者均允许 rerank；此处只处理提供者传输失败。
+    调用方已确认配置与提供者均允许 rerank；此处处理提供者失败：
+    可降级失败进入固定窗口失败预算（达阈值升级，未达阈值按配置 fallback），
+    本地配置非法/鉴权类 4xx 立即返回 RERANK_UNAVAILABLE 且不消耗预算。
     """
     try:
         rerank_results = await provider.rerank(
@@ -175,12 +243,27 @@ async def _classify_with_rerank(
             instruction=config.summary_rerank_instruction,
         )
     except Exception as exc:
-        # 仅白名单稳定类型（远程服务/响应校验/传输超时/未初始化）映射为不可用，
-        # 未声明的程序错误（如 RuntimeError/TypeError）继续传播；
-        # 本票不做失败预算与 fallback（KOMARIBOT-24）
-        if _is_rerank_expected_error(exc):
+        # 仅白名单稳定类型（远程服务/响应校验/传输超时/未初始化/配置非法）继续处理，
+        # 未声明的程序错误（如 RuntimeError/TypeError/AssertionError）与取消继续传播
+        if not _is_rerank_expected_error(exc):
+            raise
+        if not _is_rerank_failure_budgetable(exc):
+            # 401/403、其他 4xx（含 425）、缺少 URL/本地配置非法：
+            # 供应方未进入降级窗口，不消耗预算
+            logger.warning(
+                "[KomariDecision] 群总结 rerank 非降级失败: error_type={}",
+                type(exc).__name__,
+            )
             return _unavailable(SummaryRequestUnavailableReason.RERANK_UNAVAILABLE)
-        raise
+        return await _resolve_budgeted_rerank_failure(
+            config=config,
+            provider=provider,
+            query_vector=query_vector,
+            top_scenes=top_scenes,
+        )
+
+    # rerank 成功：best-effort 清零失败预算，清零失败不影响成功结果
+    await _best_effort_clear_rerank_budget(provider)
 
     score_by_index: dict[int, float] = {}
     for result in rerank_results:
@@ -199,6 +282,63 @@ async def _classify_with_rerank(
     ):
         return SummaryRequestClassificationResult.matched()
     return SummaryRequestClassificationResult.not_matched()
+
+
+async def _resolve_budgeted_rerank_failure(
+    *,
+    config: KomariDecisionConfigSchema,
+    provider: Any,
+    query_vector: list[float],
+    top_scenes: list[SceneRuntimeGeneralCandidate],
+) -> SummaryRequestClassificationResult:
+    """已声明的可降级 rerank 失败：记录预算，达阈值升级，未达阈值才考虑 fallback。
+
+    预算 key 按提供方安全指纹全局隔离；Redis/预算存储不可用时返回
+    FAILURE_BUDGET_UNAVAILABLE 并禁止 fallback。
+    """
+    budget = _get_rerank_failure_budget()
+    try:
+        count = await budget.record_failure(
+            provider.get_rerank_provider_fingerprint(),
+            int(config.summary_rerank_failure_window_seconds),
+        )
+    except RerankFailureBudgetUnavailableError:
+        logger.warning(
+            "[KomariDecision] 群总结 rerank 失败预算不可用，禁止 fallback"
+        )
+        return _unavailable(SummaryRequestUnavailableReason.FAILURE_BUDGET_UNAVAILABLE)
+
+    logger.warning(
+        "[KomariDecision] 群总结 rerank 供应方降级失败: count={} threshold={}",
+        count,
+        config.summary_rerank_failure_threshold,
+    )
+    if count >= config.summary_rerank_failure_threshold:
+        # 达到阈值后不删除计数，后续失败仍升级
+        return _unavailable(
+            SummaryRequestUnavailableReason.RERANK_FAILURE_BUDGET_EXHAUSTED
+        )
+    if not config.summary_rerank_fallback_enabled:
+        return _unavailable(SummaryRequestUnavailableReason.RERANK_UNAVAILABLE)
+    if config.summary_similarity_threshold is None:
+        return _unavailable(SummaryRequestUnavailableReason.CONFIGURATION_INCOMPLETE)
+    # fallback：使用本次已有 query embedding 与真实余弦继续归类
+    return _classify_with_cosine(
+        query_vector=query_vector,
+        similarity_threshold=config.summary_similarity_threshold,
+        top_scenes=top_scenes,
+    )
+
+
+async def _best_effort_clear_rerank_budget(provider: Any) -> None:
+    """rerank 成功后清零失败预算；清零失败不得改变成功结果。"""
+    try:
+        budget = _get_rerank_failure_budget()
+        await budget.clear(provider.get_rerank_provider_fingerprint())
+    except Exception:
+        logger.warning(
+            "[KomariDecision] 群总结 rerank 失败预算清零失败，忽略"
+        )
 
 
 def _classify_with_cosine(
@@ -256,6 +396,7 @@ async def _classify_embedded(
     if rerank_mode:
         return await _classify_with_rerank(
             message_text=message_text,
+            query_vector=query_vector,
             config=config,
             provider=provider,
             top_scenes=top_scenes,
