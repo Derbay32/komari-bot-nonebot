@@ -86,7 +86,7 @@ komari-bot/
 │   ├── config/                           #   旧版配置归档（迁移输入源）
 │   ├── local/                            #   本地工具脚本
 │   ├── reviews/                          #   代码审查记录
-│   ├── handoff.md                        #   任务交接记录
+│   ├── handoff/                          #   任务交接记录
 │   └── *.md                              #   组件文档
 │
 ├── data/ / scripts/ / tools/ / tests/    # 数据 / 脚本 / 工具 / 测试
@@ -533,7 +533,7 @@ Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/
 
 | 文档 | 位置 | 用途 |
 |------|------|------|
-| 任务交接记录 | `docs/handoff.md` | 历史任务详情、决策记录、注意事项 |
+| 任务交接记录 | `docs/handoff/` | 历史任务详情、跨会话交接文档 |
 | 架构决策记录 | `docs/adr/`（0001–0004） | 搜索抽象、管理 API v2、绑定迁移、ORM/强类型配置迁移 |
 | 组件文档 | `docs/*.md` | 各插件的详细设计文档 |
 | 迁移说明 | `migrations/README.md` | Alembic 工作流与存量配置搬运 |
