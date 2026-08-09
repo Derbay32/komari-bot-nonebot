@@ -13,6 +13,7 @@ from komari_bot.config.typed_config import (
 )
 from komari_bot.config.typed_config import (
     TypedConfigModel,
+    ensure_typed_config_model,
     typed_model_config,
 )
 from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
@@ -385,6 +386,53 @@ async def test_config_routes_keep_legacy_resources_unsectioned(app: App) -> None
     assert detail.status_code == 200
     assert detail.json()["sections"] == []
     assert detail.json()["field_metadata"]["plugin_enable"]["section_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_config_routes_expose_komari_decision_sections(app: App) -> None:
+    """真实判定配置的分区与字段归属进入资源摘要和详情。"""
+    schema = ensure_typed_config_model("komari_decision")
+    assert schema is not None
+    manager = _StaticConfigManager(schema())
+
+    async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
+        client = ctx.get_client()
+        headers = {"Authorization": "Bearer secret-token-00000000"}
+        listed = await client.get(f"{API_PREFIX}/resources", headers=headers)
+        detail = await client.get(
+            f"{API_PREFIX}/resources/komari_management",
+            headers=headers,
+        )
+
+    expected_sections = [
+        {"section_id": "chat_scene", "display_name": "聊天场景", "order": 10},
+        {
+            "section_id": "summary_classification",
+            "display_name": "群总结归类",
+            "order": 20,
+        },
+    ]
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["sections"] == expected_sections
+    assert detail.status_code == 200
+    assert detail.json()["sections"] == expected_sections
+    assert detail.json()["field_metadata"]["scene_top_k"]["section_id"] == (
+        "chat_scene"
+    )
+    assert detail.json()["field_metadata"]["summary_rerank_threshold"] == {
+        "secret": False,
+        "apply_mode": "immediate",
+        "section_id": "summary_classification",
+    }
+    assert detail.json()["field_states"]["summary_similarity_threshold"] == {
+        "secret": False,
+        "apply_mode": "immediate",
+        "configured_value": None,
+        "effective_value": None,
+        "source": manager.config_source,
+        "effective_source": "dynamic_config",
+        "restart_required": False,
+    }
 
 
 @pytest.mark.asyncio
