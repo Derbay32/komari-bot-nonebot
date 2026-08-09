@@ -12,6 +12,7 @@ from komari_bot.decision import (
     CandidateSchema,
     DecisionRuntimeState,
     DecisionRuntimeStatus,
+    SummaryRequestClassificationResult,
     UnifiedRerankResult,
 )
 
@@ -75,6 +76,7 @@ __all__ = [
     "PluginManager",
     "UnifiedCandidateRerankService",
     "UnifiedRerankResult",
+    "classify_summary_request",
     "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
@@ -263,6 +265,34 @@ def get_scene_admin_service() -> SceneAdminService | None:
     if manager is None:
         return None
     return manager.scene_admin
+
+
+async def classify_summary_request(
+    message_text: str,
+) -> SummaryRequestClassificationResult:
+    """群总结请求场景归类窄 operation（KOMARIBOT-23）。
+
+    每次调用动态解析当前 PluginManager 与 scene runtime，并在开始时只读取一次
+    配置冻结本次用途；调用方只能得到命中 / 未命中 / 不可用（带稳定原因码）。
+    """
+    from .services.scene_classification import (
+        classify_summary_request as _classify_summary_request,
+    )
+
+    config = get_config()
+    manager = get_plugin_manager()
+    if manager is None:
+        runtime_state = DecisionRuntimeState.failed("插件管理器尚未初始化")
+        scene_runtime = None
+    else:
+        runtime_state = manager.runtime_state
+        scene_runtime = manager.scene_runtime
+    return await _classify_summary_request(
+        message_text=message_text,
+        config=config,
+        runtime_state=runtime_state,
+        scene_runtime=scene_runtime,
+    )
 
 
 _cached_decision_engine: DecisionEngine | None = None
