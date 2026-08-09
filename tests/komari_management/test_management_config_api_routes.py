@@ -7,62 +7,101 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, Field
 
+from komari_bot.config.typed_config import (
+    Field as ConfigField,
+)
+from komari_bot.config.typed_config import (
+    TypedConfigModel,
+    typed_model_config,
+)
 from komari_bot.plugins.config_manager.manager import ConfigUpdateConflictError
 from komari_bot.plugins.komari_management.config_api import (
     API_PREFIX,
     register_config_api,
 )
-from komari_bot.plugins.komari_management.managed_resources import (
-    ManagedConfigResource,
-)
+from komari_bot.plugins.komari_management.managed_resources import ManagedConfigResource
 
 if TYPE_CHECKING:
     from nonebug import App
+    from pydantic import BaseModel
 
     from komari_bot.management.management_audit import ManagementAuditEvent
-
-
-class _ConfigSchema(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={"default_apply_mode": "immediate"},
+    from komari_bot.plugins.komari_management.managed_resources import (
+        ConfigManagerProtocol,
     )
 
-    plugin_enable: bool = Field(default=True, description="插件启用状态")
-    api_credentials: list[dict[str, object]] = Field(
+
+class _ConfigSchema(TypedConfigModel):
+    model_config = typed_model_config(
+        json_schema_extra={
+            "default_apply_mode": "immediate",
+            "sections": [
+                {
+                    "section_id": "runtime",
+                    "display_name": "运行控制",
+                    "order": 20,
+                },
+                {
+                    "section_id": "access",
+                    "display_name": "访问凭据",
+                    "order": 10,
+                },
+                {
+                    "section_id": "advanced",
+                    "display_name": "高级设置",
+                    "order": 10,
+                },
+            ],
+        },
+    )
+
+    plugin_enable: bool = ConfigField(
+        default=True,
+        description="插件启用状态",
+        json_schema_extra={"section_id": "runtime"},
+    )
+    api_credentials: list[dict[str, object]] = ConfigField(
         default_factory=lambda: [{"credential_id": "管理后台"}],
         description="具名管理凭据列表",
-        json_schema_extra={"secret": True},
+        json_schema_extra={"secret": True, "section_id": "access"},
     )
-    embedding_api_key: str = Field(
+    embedding_api_key: str = ConfigField(
         default="embedding-secret",
         description="嵌入 API 密钥",
-        json_schema_extra={"secret": True},
+        json_schema_extra={"secret": True, "section_id": "access"},
     )
-    db_password: str = Field(
+    db_password: str = ConfigField(
         default="database-secret",
         description="数据库密码",
-        json_schema_extra={"secret": True},
+        json_schema_extra={"secret": True, "section_id": "access"},
     )
-    dsn: str = Field(
+    dsn: str = ConfigField(
         default="https://sentry-canary@example.invalid/1",
         description="Sentry DSN",
-        json_schema_extra={"secret": True},
+        json_schema_extra={"secret": True, "section_id": "access"},
     )
-    monkey_mode: str = Field(
+    monkey_mode: str = ConfigField(
         default="visible",
         description="名称含 key 但不是秘密的普通字段",
     )
-    api_allowed_origins: list[str] = Field(
+    api_allowed_origins: list[str] = ConfigField(
         default_factory=lambda: ["https://old.example.com"],
         description="管理接口 CORS Origin",
-        json_schema_extra={"apply_mode": "restart"},
+        json_schema_extra={"apply_mode": "restart", "section_id": "runtime"},
     )
-    last_updated: str = Field(
+    last_updated: str = ConfigField(
         default="2026-04-14T00:00:00+08:00",
         description="最后更新时间",
     )
+
+
+class _LegacyConfigSchema(TypedConfigModel):
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "immediate"},
+    )
+
+    plugin_enable: bool = ConfigField(default=True, description="插件启用状态")
 
 
 class _FakeConfigManager:
@@ -99,6 +138,22 @@ class _ConflictConfigManager(_FakeConfigManager):
         raise ConfigUpdateConflictError(msg)
 
 
+class _StaticConfigManager:
+    def __init__(self, config: BaseModel) -> None:
+        self.config = config
+        self.config_source = "postgresql:test_config:static"
+
+    async def get_async(self) -> BaseModel:
+        return self.config
+
+    async def update_field_async(self, field_name: str, value: object) -> BaseModel:
+        del field_name, value
+        return self.config
+
+    async def reload_async(self) -> BaseModel:
+        return self.config
+
+
 def _write_headers(request_id: str) -> dict[str, str]:
     return {
         "Authorization": "Bearer secret-token-00000000",
@@ -108,7 +163,7 @@ def _write_headers(request_id: str) -> dict[str, str]:
 
 
 def _build_app(
-    manager: _FakeConfigManager,
+    manager: ConfigManagerProtocol,
     audit_events: list[ManagementAuditEvent] | None = None,
 ) -> FastAPI:
     async def _record_audit(event: ManagementAuditEvent) -> None:
@@ -155,6 +210,23 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     assert payload["total"] == 1
     assert payload["items"][0]["resource_id"] == "komari_management"
     assert payload["items"][0]["config_source"] == manager.config_source
+    assert payload["items"][0]["sections"] == [
+        {
+            "section_id": "access",
+            "display_name": "访问凭据",
+            "order": 10,
+        },
+        {
+            "section_id": "advanced",
+            "display_name": "高级设置",
+            "order": 10,
+        },
+        {
+            "section_id": "runtime",
+            "display_name": "运行控制",
+            "order": 20,
+        },
+    ]
     assert payload["items"][0]["field_descriptions"] == {
         "api_allowed_origins": "管理接口 CORS Origin",
         "api_credentials": "具名管理凭据列表",
@@ -168,11 +240,14 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
     assert payload["items"][0]["field_metadata"]["dsn"] == {
         "secret": True,
         "apply_mode": "immediate",
+        "section_id": "access",
     }
     assert payload["items"][0]["field_metadata"]["api_allowed_origins"] == {
         "secret": False,
         "apply_mode": "restart",
+        "section_id": "runtime",
     }
+    assert payload["items"][0]["field_metadata"]["monkey_mode"]["section_id"] is None
 
 
 @pytest.mark.asyncio
@@ -204,6 +279,23 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
         )
 
     assert detail.status_code == 200
+    assert detail.json()["sections"] == [
+        {
+            "section_id": "access",
+            "display_name": "访问凭据",
+            "order": 10,
+        },
+        {
+            "section_id": "advanced",
+            "display_name": "高级设置",
+            "order": 10,
+        },
+        {
+            "section_id": "runtime",
+            "display_name": "运行控制",
+            "order": 20,
+        },
+    ]
     assert detail.json()["values"]["api_credentials"] == "******"
     assert detail.json()["values"]["embedding_api_key"] == "******"
     assert detail.json()["values"]["db_password"] == "******"
@@ -268,6 +360,51 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
         ensure_ascii=False,
     )
     assert "updated-operator" not in serialized_events
+
+
+@pytest.mark.asyncio
+async def test_config_routes_keep_legacy_resources_unsectioned(app: App) -> None:
+    manager = _StaticConfigManager(_LegacyConfigSchema())
+
+    async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
+        client = ctx.get_client()
+        headers = {"Authorization": "Bearer secret-token-00000000"}
+        listed = await client.get(f"{API_PREFIX}/resources", headers=headers)
+        detail = await client.get(
+            f"{API_PREFIX}/resources/komari_management",
+            headers=headers,
+        )
+
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["sections"] == []
+    assert listed.json()["items"][0]["field_metadata"]["plugin_enable"] == {
+        "secret": False,
+        "apply_mode": "immediate",
+        "section_id": None,
+    }
+    assert detail.status_code == 200
+    assert detail.json()["sections"] == []
+    assert detail.json()["field_metadata"]["plugin_enable"]["section_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_config_openapi_models_section_contract(app: App) -> None:
+    manager = _FakeConfigManager()
+
+    async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
+        response = await ctx.get_client().get("/openapi.json")
+
+    assert response.status_code == 200
+    schemas = response.json()["components"]["schemas"]
+    summary_properties = schemas["ConfigResourceSummary"]["properties"]
+    section_ref = summary_properties["sections"]["items"]["$ref"]
+    section_schema_name = section_ref.rsplit("/", 1)[1]
+    assert set(schemas[section_schema_name]["properties"]) == {
+        "section_id",
+        "display_name",
+        "order",
+    }
+    assert "section_id" in schemas["ConfigFieldMetadata"]["properties"]
 
 
 @pytest.mark.asyncio
