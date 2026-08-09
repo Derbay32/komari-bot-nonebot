@@ -214,6 +214,17 @@ def test_summary_classification_contract_is_narrow_and_nonebot_free() -> None:
     for forbidden in ("scene_id", "score", "threshold", "exception", "message"):
         assert not hasattr(result, forbidden)
 
+    with pytest.raises(ValueError, match="不可用结果必须携带原因码"):
+        SummaryRequestClassificationResult(
+            status=SummaryRequestClassificationStatus.UNAVAILABLE,
+            reason=None,
+        )
+    with pytest.raises(ValueError, match="命中或未命中结果不能携带原因码"):
+        SummaryRequestClassificationResult(
+            status=SummaryRequestClassificationStatus.MATCHED,
+            reason=SummaryRequestUnavailableReason.RUNTIME_UNAVAILABLE,
+        )
+
 
 def test_summary_classification_operation_has_one_narrow_argument() -> None:
     """调用方不能传 runtime、场景键、阈值、候选 flags 或 trace。"""
