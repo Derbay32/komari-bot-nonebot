@@ -11,9 +11,15 @@ from nonebot.exception import FinishedException
 from nonebot.matcher import current_matcher
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.decision import (
+    SummaryRequestClassificationResult,
+    SummaryRequestClassificationStatus,
+    SummaryRequestUnavailableReason,
+)
+from komari_bot.onebot import GroupTaskFailureNotification, GroupTaskFailureNotifier
 from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_to_me_rule
-from komari_bot.plugins.komari_decision import UnifiedCandidateRerankService
+from komari_bot.plugins.komari_decision import classify_summary_request
 
 from .config_schema import DynamicConfigSchema
 from .execution_service import (
@@ -49,11 +55,19 @@ __plugin_meta__ = PluginMetadata(
     usage="@机器人 总结过去50条",
 )
 
-SUMMARY_TRIGGER_PATTERN = r"(?=.*总结)(?=.*\d).+"
 SUMMARY_COUNT_PATTERN = r"总结[^\d]{0,20}(\d{1,4})"
 FALLBACK_COUNT_PATTERN = r"(\d{1,4})"
 OUT_OF_RANGE_MESSAGE = "我、我只能看10-200条……"
-SUMMARY_SCENE_ID = "scene_group_history_summary"
+# 场景归类阶段失败时发送的固定群提示；不得携带异常、场景键、分数、阈值或配置。
+CLASSIFICATION_FAILURE_MESSAGE = "群聊总结暂时不可用，稍后再试试吧……"
+
+# 静默私聊通知的安全原因码：仍发送固定群提示，但不向 SUPERUSER 发送诊断。
+_SILENT_NOTIFY_REASONS: frozenset[SummaryRequestUnavailableReason] = frozenset(
+    {
+        SummaryRequestUnavailableReason.DECISION_DISABLED,
+        SummaryRequestUnavailableReason.RERANK_UNAVAILABLE,
+    }
+)
 
 summary_matcher = on_regex(
     r".*总结.*",
@@ -62,7 +76,6 @@ summary_matcher = on_regex(
     block=False,
 )
 
-_scene_rerank_service = UnifiedCandidateRerankService()
 try:
     driver = get_driver()
 except ValueError:
@@ -93,48 +106,86 @@ def _extract_requested_count(text: str) -> int | None:
         return None
 
 
-async def _is_summary_request(message_text: str) -> bool:
-    """结合兜底规则与统一 scene 识别判断是否为总结请求。"""
-    normalized = " ".join(message_text.split())
-    if "总结" not in normalized:
-        return False
-    if re.search(SUMMARY_TRIGGER_PATTERN, normalized):
-        return True
-
-    try:
-        rank_result = await _scene_rerank_service.rank_message(
-            normalized, alias_hit=True
-        )
-    except Exception:
-        logger.exception("[GroupHistorySummary] scene 判定失败，回退关键词兜底")
-        return False
-
-    logger.info(
-        "[SummaryCheck] rerank结果: best_scene={}, score={:.4f}, "
-        "meaningful={:.4f}, noise={:.4f}",
-        rank_result.best_scene_id,
-        rank_result.best_scene_score,
-        rank_result.meaningful_score,
-        rank_result.noise_score,
+def _classification_notification(
+    *,
+    group_id: int,
+    message_id: int,
+    reason_code: str,
+    notify_superusers: bool,
+) -> GroupTaskFailureNotification:
+    """构造场景归类阶段失败通知（固定任务类型、阶段与群提示）。"""
+    return GroupTaskFailureNotification(
+        group_id=group_id,
+        message_id=message_id,
+        group_text=CLASSIFICATION_FAILURE_MESSAGE,
+        task_kind="group_history_summary",
+        stage="scene_classification",
+        reason_code=reason_code,
+        notify_superusers=notify_superusers,
+        request_trace_id=None,
+        summary=None,
     )
 
-    is_summary_request = False
-    if rank_result.best_scene_id != SUMMARY_SCENE_ID:
-        logger.info(
-            "[SummaryCheck] 失败: best_scene_id={} (期望={})",
-            rank_result.best_scene_id,
-            SUMMARY_SCENE_ID,
-        )
-    elif rank_result.best_scene_score < 0.6:
-        logger.info(
-            "[SummaryCheck] 失败: best_scene_score={:.4f} < 0.6",
-            rank_result.best_scene_score,
-        )
-    else:
-        logger.info("[SummaryCheck] 全部条件满足，确认为总结请求")
-        is_summary_request = True
 
-    return is_summary_request
+async def _notify_classification_failure(
+    bot: Bot,
+    event: GroupMessageEvent,
+    *,
+    reason_code: str,
+    notify_superusers: bool,
+) -> None:
+    """投递场景归类失败通知；群内 reply 段由通知边界自身负责。"""
+    await GroupTaskFailureNotifier().notify(
+        bot=bot,
+        notification=_classification_notification(
+            group_id=int(event.group_id),
+            message_id=int(event.message_id),
+            reason_code=reason_code,
+            notify_superusers=notify_superusers,
+        ),
+    )
+
+
+async def _classify_and_route(
+    bot: Bot,
+    event: GroupMessageEvent,
+    plain_text: str,
+) -> bool:
+    """调用判定插件顶层归类 operation 并完成失败路由。
+
+    返回 True 表示命中总结请求，调用方应继续执行总结；
+    未命中、不可用或未预期异常均在此完成停止传播与通知后返回 False。
+    """
+    try:
+        classification: SummaryRequestClassificationResult = (
+            await classify_summary_request(plain_text)
+        )
+    except Exception:
+        logger.exception("[GroupHistorySummary] 场景归类发生未预期异常，停止传播")
+        current_matcher.get().stop_propagation()
+        await _notify_classification_failure(
+            bot,
+            event,
+            reason_code="unexpected_error",
+            notify_superusers=True,
+        )
+        return False
+
+    if classification.status is SummaryRequestClassificationStatus.NOT_MATCHED:
+        return False
+
+    if classification.status is SummaryRequestClassificationStatus.UNAVAILABLE:
+        reason = cast("SummaryRequestUnavailableReason", classification.reason)
+        current_matcher.get().stop_propagation()
+        await _notify_classification_failure(
+            bot,
+            event,
+            reason_code=reason.value,
+            notify_superusers=reason not in _SILENT_NOTIFY_REASONS,
+        )
+        return False
+
+    return True
 
 
 @summary_matcher.handle()
@@ -160,7 +211,7 @@ async def handle_group_history_summary(
         return
 
     plain_text = event.get_plaintext().strip()
-    if not await _is_summary_request(plain_text):
+    if not await _classify_and_route(bot, event, plain_text):
         return
 
     current_matcher.get().stop_propagation()
