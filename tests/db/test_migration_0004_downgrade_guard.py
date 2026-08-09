@@ -93,14 +93,20 @@ def _parse_dsn(url: str) -> dict[str, object]:
     }
 
 
-def _run_bootstrap(tmp_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """以隔离环境执行 orm_bootstrap 迁移命令（不读取项目 .env）。"""
+def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
+    """在仓库根目录执行 orm_bootstrap 迁移命令。
+
+    子进程 cwd 必须是仓库根：nonebot-plugin-orm 按 cwd 相对的
+    ``migrations/`` 定位版本链，nonebot 配置（含 ``.env`` 覆盖层）
+    也在该目录加载。``SQLALCHEMY_DATABASE_URL`` 经环境变量显式覆盖，
+    优先级高于 dotenv 文件。
+    """
     env = os.environ.copy()
     env["SQLALCHEMY_DATABASE_URL"] = POSTGRES_URL
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     return subprocess.run(
         [sys.executable, "-m", "komari_bot.db.orm_bootstrap", *args],
-        cwd=tmp_dir,
+        cwd=PROJECT_ROOT,
         env=env,
         capture_output=True,
         text=True,
@@ -127,9 +133,7 @@ def _expected_schema_defaults() -> dict[str, object]:
 @pytest.mark.skipif(
     not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试"
 )
-async def test_downgrade_empty_row_and_populated_row_scenarios(
-    tmp_path: Path,
-) -> None:
+async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
     """空行与有行两种场景的 downgrade 行为验证。
 
     1. 空行：upgrade head 后 komari_chat_config 尚未初始化（无行），
@@ -140,20 +144,21 @@ async def test_downgrade_empty_row_and_populated_row_scenarios(
     if not _same_database(POSTGRES_URL, _configured_database_url()):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
 
-    result = _run_bootstrap(tmp_path, "upgrade", "head")
+    result = _run_bootstrap("upgrade", "head")
     assert result.returncode == 0, result.stderr
 
     conn = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
     original_chat_row: asyncpg.Record | None = None
+    created_memory_row = False
     try:
         original_chat_row = await conn.fetchrow(
             "SELECT * FROM komari_chat_config WHERE id = 1"
         )
-        await _ensure_memory_config_row(conn)
+        created_memory_row = await _ensure_memory_config_row(conn)
 
         # === 场景一：komari_chat_config 无行 ===
         await conn.execute("DELETE FROM komari_chat_config WHERE id = 1")
-        result = _run_bootstrap(tmp_path, "downgrade", "-1")
+        result = _run_bootstrap("downgrade", "0003")
         assert result.returncode == 0, (
             f"空行场景 downgrade 失败: {result.stderr}"
         )
@@ -164,7 +169,7 @@ async def test_downgrade_empty_row_and_populated_row_scenarios(
         assert not chat_table_exists, "downgrade 后 komari_chat_config 应已删除"
 
         memory_columns = await _memory_config_columns(conn)
-        assert set(_DROPPED_COLUMNS) <= memory_columns, "11 列结构未复原"
+        assert set(_DROPPED_COLUMNS) <= set(memory_columns), "11 列结构未复原"
 
         memory_row = await conn.fetchrow(
             "SELECT * FROM komari_memory_config WHERE id = 1"
@@ -178,20 +183,20 @@ async def test_downgrade_empty_row_and_populated_row_scenarios(
             )
 
         # === 场景二：komari_chat_config 有行，活字段原样回填 ===
-        result = _run_bootstrap(tmp_path, "upgrade", "head")
+        result = _run_bootstrap("upgrade", "head")
         assert result.returncode == 0, result.stderr
 
         distinctive = dict(_expected_schema_defaults())
         distinctive.pop("proactive_score_threshold")
         distinctive["proactive_cooldown"] = 123
         distinctive["reply_commit_batch_size"] = 7
-        set_clause = ", ".join(f"{column} = ${index}" for index, column in enumerate(distinctive, start=2))
+        set_clause = ", ".join(f"{column} = ${index}" for index, column in enumerate(distinctive, start=1))
         await conn.execute(
             f"UPDATE komari_chat_config SET {set_clause} WHERE id = 1",
             *distinctive.values(),
         )
 
-        result = _run_bootstrap(tmp_path, "downgrade", "-1")
+        result = _run_bootstrap("downgrade", "0003")
         assert result.returncode == 0, (
             f"有行场景 downgrade 失败: {result.stderr}"
         )
@@ -209,32 +214,40 @@ async def test_downgrade_empty_row_and_populated_row_scenarios(
             assert memory_row[column] == expected, column
 
         memory_columns = await _memory_config_columns(conn)
-        assert set(_DROPPED_COLUMNS) <= memory_columns, "有行场景 11 列结构未复原"
+        assert set(_DROPPED_COLUMNS) <= set(memory_columns), "有行场景 11 列结构未复原"
     finally:
         # === 恢复：迁移回到 head，数据还原为测试前快照 ===
-        result = _run_bootstrap(tmp_path, "upgrade", "head")
+        result = _run_bootstrap("upgrade", "head")
         assert result.returncode == 0, result.stderr
         if original_chat_row is not None:
             chat_columns = [
                 column for column in dict(original_chat_row) if column != "updated_at"
             ]
             set_clause = ", ".join(
-                f"{column} = ${index}" for index, column in enumerate(chat_columns, start=2)
+                f"{column} = ${index}" for index, column in enumerate(chat_columns, start=1)
             )
             await conn.execute(
                 f"UPDATE komari_chat_config SET {set_clause} WHERE id = 1",
                 *[original_chat_row[column] for column in chat_columns],
             )
+        else:
+            await conn.execute("DELETE FROM komari_chat_config WHERE id = 1")
+        if created_memory_row:
+            await conn.execute("DELETE FROM komari_memory_config WHERE id = 1")
         await conn.close()
 
 
-async def _ensure_memory_config_row(conn: asyncpg.Connection) -> None:
-    """确保 komari_memory_config 单行存在（无行时按 schema 默认插入）。"""
+async def _ensure_memory_config_row(conn: asyncpg.Connection) -> bool:
+    """确保 komari_memory_config 单行存在（无行时按 schema 默认插入）。
+
+    Returns:
+        是否由本函数新建了该行（供 finally 决定是否删除以恢复原状）。
+    """
     exists = await conn.fetchval(
         "SELECT EXISTS (SELECT 1 FROM komari_memory_config WHERE id = 1)"
     )
     if exists:
-        return
+        return False
 
     from komari_bot.plugins.komari_memory.config_schema import (
         KomariMemoryConfigSchema,
@@ -259,6 +272,7 @@ async def _ensure_memory_config_row(conn: asyncpg.Connection) -> None:
         datetime.now(UTC),
         *[getattr(defaults, column) for column in value_columns],
     )
+    return True
 
 
 async def _memory_config_columns(conn: asyncpg.Connection) -> list[str]:
