@@ -17,6 +17,13 @@
 3. ``komari_memory_config`` 仅 DROP 这 11 列，表本身保留（其余字段仍归
    komari_memory 所有），不得删表。
 
+``downgrade`` 反向执行：重建 ``komari_memory_config`` 的 11 列（ADD
+COLUMN 携带与 schema 一致的临时默认值）→ 从 ``komari_chat_config``
+单行回填活字段值 → 移除临时默认值 → DROP ``komari_chat_config``。
+回填 UPDATE 带 EXISTS 守卫：``komari_chat_config`` 单行未初始化时跳过
+回填，保留 ADD COLUMN 附带的临时默认值（与 schema 默认一致），避免
+NOT NULL 列被赋 NULL。
+
 迁移后运行时行为零变化：字段默认值、范围校验与 apply_mode 元数据原样
 保留（见 ``komari_chat/config_schema.py``）。
 
@@ -152,12 +159,13 @@ def downgrade(name: str = "") -> None:
             f"{_COLUMN_TYPES[column]} DEFAULT {_COLUMN_DEFAULTS[column]} NOT NULL"
         )
 
-    # 从 komari_chat_config 回填活字段值
+    # 从 komari_chat_config 回填活字段值（EXISTS 守卫：单行未初始化时
+    # 跳过回填，保留 ADD COLUMN 附带的临时默认值，避免 NOT NULL 列赋 NULL）
     columns = ", ".join(_MIGRATED_COLUMNS)
     op.execute(
         f"UPDATE komari_memory_config SET ({columns}) = "
         f"(SELECT {columns} FROM komari_chat_config WHERE id = 1) "
-        "WHERE id = 1"
+        "WHERE id = 1 AND EXISTS (SELECT 1 FROM komari_chat_config WHERE id = 1)"
     )
 
     for column in _DROPPED_COLUMNS:
