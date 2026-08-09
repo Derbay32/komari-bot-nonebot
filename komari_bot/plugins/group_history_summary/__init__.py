@@ -151,10 +151,12 @@ async def _classify_and_route(
     event: GroupMessageEvent,
     plain_text: str,
 ) -> bool:
-    """调用判定插件顶层归类 operation 并完成失败路由。
+    """调用判定插件顶层归类 operation 并按窄结果路由。
 
-    返回 True 表示命中总结请求，调用方应继续执行总结；
-    未命中、不可用或未预期异常均在此完成停止传播与通知后返回 False。
+    返回 True 表示命中（MATCHED）总结请求，调用方应继续执行总结；
+    未命中（NOT_MATCHED）放行：不停止传播、不通知、不执行总结；
+    不可用（UNAVAILABLE）记录日志、停止传播并发送固定群提示，按安全原因码
+    决定是否私聊 SUPERUSER；未预期异常记录异常、停止传播并通知 SUPERUSER。
     """
     try:
         classification: SummaryRequestClassificationResult = (
@@ -176,6 +178,18 @@ async def _classify_and_route(
 
     if classification.status is SummaryRequestClassificationStatus.UNAVAILABLE:
         reason = cast("SummaryRequestUnavailableReason", classification.reason)
+        if reason is SummaryRequestUnavailableReason.DECISION_DISABLED:
+            logger.info(
+                "[GroupHistorySummary] 场景归类不可用: reason={}",
+                reason.value,
+            )
+        else:
+            # RERANK_UNAVAILABLE 等未达失败预算的预期故障只记 warning，
+            # 日志仅含稳定原因码，不携带异常、场景键、分数、阈值或配置。
+            logger.warning(
+                "[GroupHistorySummary] 场景归类不可用: reason={}",
+                reason.value,
+            )
         current_matcher.get().stop_propagation()
         await _notify_classification_failure(
             bot,
