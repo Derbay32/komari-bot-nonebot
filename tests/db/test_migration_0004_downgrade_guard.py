@@ -17,6 +17,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import asyncpg
@@ -82,7 +83,7 @@ def _same_database(left: str, right: str) -> bool:
     )
 
 
-def _parse_dsn(url: str) -> dict[str, object]:
+def _parse_dsn(url: str) -> dict[str, Any]:
     parsed = urlparse(url.replace("postgresql+asyncpg://", "postgresql://"))
     return {
         "host": parsed.hostname,
