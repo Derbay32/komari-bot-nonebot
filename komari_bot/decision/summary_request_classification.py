@@ -31,8 +31,9 @@ class SummaryRequestUnavailableReason(StrEnum):
     SCENE_DATA_UNAVAILABLE = "scene_data_unavailable"
     EMBEDDING_UNAVAILABLE = "embedding_unavailable"
     CONFIGURATION_INCOMPLETE = "configuration_incomplete"
-    # 预留给 KOMARIBOT-24 的 rerank 供应方不可用/失败升级路径；
-    # 本票在 rerank 供应方关闭或调用失败时直接使用，不做失败预算与 fallback。
+    # 仅表达「配置与提供者均启用 rerank 时的预期调用故障」
+    # （远程服务/响应校验/传输超时/未初始化）；提供者明确关闭时走真实余弦模式；
+    # KOMARIBOT-24 再接失败预算与 fallback。
     RERANK_UNAVAILABLE = "rerank_unavailable"
 
 
@@ -40,11 +41,22 @@ class SummaryRequestUnavailableReason(StrEnum):
 class SummaryRequestClassificationResult:
     """群总结请求场景归类结果。
 
-    仅暴露三态状态与不可用原因码；matched/not_matched 时 reason 恒为 None。
+    仅暴露三态状态与不可用原因码；强制状态/原因不变量：
+    UNAVAILABLE 必须携带 reason，MATCHED/NOT_MATCHED 不得携带 reason。
     """
 
     status: SummaryRequestClassificationStatus
     reason: SummaryRequestUnavailableReason | None
+
+    def __post_init__(self) -> None:
+        """校验状态/原因不变量，非法组合抛 ValueError。"""
+        if self.status is SummaryRequestClassificationStatus.UNAVAILABLE:
+            if self.reason is None:
+                msg = "不可用结果必须携带原因码"
+                raise ValueError(msg)
+        elif self.reason is not None:
+            msg = "命中或未命中结果不能携带原因码"
+            raise ValueError(msg)
 
     @classmethod
     def matched(cls) -> "SummaryRequestClassificationResult":
