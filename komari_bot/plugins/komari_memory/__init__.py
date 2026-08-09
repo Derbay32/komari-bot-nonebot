@@ -16,6 +16,7 @@ require("agent_run_logger")
 
 from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema
+from .core.retry import retry_async
 from .database.connection import create_pool
 from .handlers.forgetting_worker import (
     register_forgetting_task,
@@ -32,7 +33,7 @@ from .repositories.interaction_event_repository import InteractionEventRepositor
 from .services.config_interface import get_config_async
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
-from .services.redis_manager import RedisManager
+from .services.redis_manager import MessageSchema, RedisManager
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠记忆",
@@ -41,11 +42,16 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
+    "KomariMemoryConfigSchema",
+    "MemoryService",
+    "MessageSchema",
     "PluginManager",
+    "RedisManager",
     "get_memory_service",
     "get_plugin_manager",
     "get_redis_manager",
     "register_memory_api",
+    "retry_async",
 ]
 
 

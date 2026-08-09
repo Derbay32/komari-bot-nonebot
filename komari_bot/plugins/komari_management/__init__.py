@@ -24,6 +24,7 @@ from komari_bot.plugins.group_history_summary.prompt_schema import (
 from komari_bot.plugins.group_history_summary.prompt_schema import (
     DISPLAY_NAME as GROUP_HISTORY_PROMPT_DISPLAY_NAME,
 )
+from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
 from komari_bot.plugins.komari_chat.prompt_schema import (
     DEFAULTS as KOMARI_CHAT_PROMPT_DEFAULTS,
 )
@@ -124,6 +125,14 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "komari_memory",
                     KomariMemoryConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="komari_chat",
+                display_name="Komari Chat",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_chat",
+                    KomariChatConfigSchema,
                 ),
             ),
             ManagedConfigResource(

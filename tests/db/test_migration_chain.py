@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -148,6 +149,50 @@ def test_typed_prompt_tables_revision_exists() -> None:
     # 旧版 JSONB KV 表保留给离线迁移脚本（ticket 05），本 revision 不得删表
     assert "DROP TABLE IF EXISTS komari_prompt_configs" not in revision_sql
     assert "DROP TABLE komari_prompt_configs" not in revision_sql
+
+
+def test_komari_chat_config_revision_exists() -> None:
+    """komari_chat 配置表由独立 revision 引入（KOMARIBOT-7）。
+
+    同一 revision 内完成：建 komari_chat_config → 从 komari_memory_config
+    单行搬运活字段 → DROP 旧表 11 列（10 活字段 + 死字段
+    proactive_score_threshold）；komari_memory_config 表本身保留。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    chat_revision = next(
+        (rev for rev in revisions if "komari_chat_config" in Path(rev.path).name),
+        None,
+    )
+    assert chat_revision is not None
+    assert chat_revision.down_revision == "0003"
+    revision_sql = Path(chat_revision.path).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE komari_chat_config" in revision_sql
+    # 数据搬运在迁移内完成，不留运行时搬运逻辑
+    assert "INSERT INTO komari_chat_config" in revision_sql
+    assert "FROM komari_memory_config" in revision_sql
+
+    dropped_columns = (
+        "proactive_enabled",
+        "proactive_score_threshold",
+        "proactive_cooldown",
+        "proactive_max_per_hour",
+        "proactive_reservation_ttl_seconds",
+        "reply_commit_worker_interval_seconds",
+        "reply_commit_batch_size",
+        "reply_commit_lease_seconds",
+        "reply_commit_max_attempts",
+        "reply_commit_retry_base_seconds",
+        "reply_commit_tombstone_retention_days",
+    )
+    for column in dropped_columns:
+        assert re.search(
+            rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql
+        ), column
+
+    # 旧表保留（其余字段仍归 komari_memory 所有），只删列不删表
+    assert "DROP TABLE komari_memory_config" not in revision_sql
 
 
 def test_migration_cli_can_inspect_chain_without_loading_application(

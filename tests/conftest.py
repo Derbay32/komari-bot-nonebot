@@ -463,9 +463,27 @@ _inject_package_exports(
     },
 )
 # 业务插件改为普通 import 后，保持 require 桩语义注入 shim 导出
+# KOMARIBOT-12：komari_memory 顶层暴露面符号（ADR-0006 边界）同步注入
+# shim；符号取真实实现（shim 下子模块仍按真实路径加载），保证
+# komari_chat 经顶层包导入后测试中的构造与调用语义不变
+from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+from komari_bot.plugins.komari_memory.core.retry import retry_async
+from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
+from komari_bot.plugins.komari_memory.services.redis_manager import (
+    MessageSchema,
+    RedisManager,
+)
+
 _inject_package_exports(
     "komari_memory",
-    {"get_plugin_manager": _DummyMemoryPlugin.get_plugin_manager},
+    {
+        "get_plugin_manager": _DummyMemoryPlugin.get_plugin_manager,
+        "KomariMemoryConfigSchema": KomariMemoryConfigSchema,
+        "MemoryService": MemoryService,
+        "MessageSchema": MessageSchema,
+        "RedisManager": RedisManager,
+        "retry_async": retry_async,
+    },
 )
 _inject_package_exports(
     "agent_run_logger",

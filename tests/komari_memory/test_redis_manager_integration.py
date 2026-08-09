@@ -227,21 +227,6 @@ def test_real_redis_chat_commit_steps_are_idempotent(monkeypatch: Any) -> None:
         manager = RedisManager(config)
         manager._redis = cast("Any", client)
         try:
-            assert (
-                await manager.reserve_proactive_reply(
-                    "g1",
-                    "reservation-1",
-                    max_per_hour=1,
-                    reservation_ttl_seconds=30,
-                )
-                == "reserved"
-            )
-            assert await manager.renew_proactive_reply(
-                "g1",
-                "reservation-1",
-                reservation_ttl_seconds=30,
-            )
-
             message = MessageSchema(
                 user_id="bot",
                 user_nickname="小鞠",

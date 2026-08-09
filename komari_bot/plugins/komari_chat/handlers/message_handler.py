@@ -26,11 +26,7 @@ from komari_bot.decision import (
     DecisionOutcome,
     DecisionRuntimeStatus,
 )
-from komari_bot.plugins.komari_memory.services.config_interface import get_config
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
-)
+from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..repositories.reply_commit_repository import (
@@ -38,6 +34,7 @@ from ..repositories.reply_commit_repository import (
     ReplyCommitRepository,
     ReplyCommitStep,
 )
+from ..services.config_interface import get_config, get_memory_config
 from ..services.error_notify import (
     notify_superusers_reply_failure,
     one_line_summary,
@@ -58,6 +55,10 @@ from ..services.llm_service import (
     ReplyResult,
     generate_reply,
     generate_reply_with_tools,
+)
+from ..services.proactive_reservation import (
+    ProactiveReservationService,
+    Reservation,
 )
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
@@ -83,7 +84,7 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
+    from komari_bot.plugins.komari_memory import MemoryService
 
 AttemptReplyReason = Literal["at", "direct_call", "score"]
 ReplyAction = Literal[
@@ -138,6 +139,8 @@ class PendingReply:
     request_trace_id: str
     reply_timestamp: float
     proactive_reservation_id: str | None = None
+    proactive_reservation: Reservation | None = None
+    reaction_sent: bool = False
     decision_payload: dict[str, object] | None = None
 
 
@@ -167,17 +170,19 @@ class MessageHandler:
         self,
         redis: RedisManager,
         memory: MemoryService,
+        reply_commit_repository: ReplyCommitRepository,
         decision_engine: DecisionEngineProtocol,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
-        self.reply_commit_repository = ReplyCommitRepository(memory.pg_pool)
+        self.reply_commit_repository = reply_commit_repository
         self._reply_commit_owner = f"chat-{uuid.uuid4().hex}"
         self._last_reply_commit_cleanup = 0.0
         self.query_rewrite = QueryRewriteService()
         self._reaction_tasks: set[asyncio.Task[None]] = set()
         self.decision_engine = decision_engine
+        self.proactive_reservation = ProactiveReservationService(redis.redis)
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。"""
@@ -226,7 +231,7 @@ class MessageHandler:
         if self._is_at_trigger(event) or self._is_reply_to_bot(event):
             return True, message_content
 
-        config = get_config()
+        config = get_memory_config()
         stripped_content = self._strip_text_at_alias_prefix(
             message_content,
             [config.bot_nickname, *config.bot_aliases],
@@ -537,10 +542,7 @@ class MessageHandler:
             return None
 
         operation_id = self._reply_operation_id(message)
-        repository = getattr(self, "reply_commit_repository", None)
-        if repository is not None and await repository.has_active_operation(
-            operation_id
-        ):
+        if await self.reply_commit_repository.has_active_operation(operation_id):
             logger.info(
                 "[KomariChat] 重复平台事件已有回复 operation，跳过生成: group={} message={}",
                 group_id,
@@ -617,7 +619,7 @@ class MessageHandler:
 
         表情发送失败维持静默 DEBUG 日志语义，不阻塞生成。
         """
-        config = get_config()
+        config = get_memory_config()
         if (
             callback is None
             or not config.face_reaction_enabled
@@ -666,54 +668,6 @@ class MessageHandler:
             )
         except Exception:
             logger.exception("[KomariChat] 回复失败善后上报异常")
-
-    async def _store_ai_reply(
-        self,
-        group_id: str,
-        reply_content: str,
-        bot_nickname: str,
-    ) -> None:
-        """存储 AI 回复到缓冲区。"""
-        bot_message = MessageSchema(
-            user_id="bot",
-            user_nickname=bot_nickname,
-            group_id=group_id,
-            content=reply_content,
-            timestamp=time.time(),
-            message_id=f"bot_{uuid.uuid4().hex[:16]}",
-            is_bot=True,
-        )
-
-        await self.redis.push_message(group_id, bot_message)
-        logger.debug("[KomariMemory] AI 回复已存储: {}...", reply_content[:30])
-
-    async def _write_interaction_history(
-        self,
-        *,
-        message: MessageSchema,
-        new_record: InteractionHistoryRecord,
-        lock_timeout_seconds: int | None,
-    ) -> None:
-        """将本轮互动写入跨群 Redis 原始缓冲。"""
-        del lock_timeout_seconds
-        config = get_config()
-        if not config.global_interaction_enabled:
-            return
-
-        global_record = {
-            "version": 1,
-            "event": str(new_record.get("event", "")).strip(),
-            "result": str(new_record.get("result", "")).strip(),
-            "emotion": str(new_record.get("emotion", "")).strip(),
-            "display_name": self._resolve_display_name(message),
-            "timestamp": time.time(),
-            "message_id": message.message_id,
-        }
-        await self.redis.push_global_interaction(
-            user_id=message.user_id,
-            record=global_record,
-            trigger_size=config.global_interaction_trigger_size,
-        )
 
     @staticmethod
     def _resolve_display_name(message: MessageSchema) -> str:
@@ -766,7 +720,7 @@ class MessageHandler:
         Returns:
             (recent_messages, interaction_records, stored)
         """
-        config = get_config()
+        config = get_memory_config()
         stored = False
 
         context_messages_limit = int(getattr(config, "context_messages_limit", 10))
@@ -811,8 +765,6 @@ class MessageHandler:
         reply_context: ReplyContext | None,
         reply_context_requested: bool,
         reply_context_refetched: bool,
-        _reason: AttemptReplyReason,
-        _reply_score: float | None,
         request_trace_id: str,
         caller_is_superuser: bool = False,
         collector: LLMDiagnosticCollector | None = None,
@@ -821,7 +773,7 @@ class MessageHandler:
 
         不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
         """
-        config = get_config()
+        config = get_memory_config()
 
         # 查询重写（带 trace）
         if collector is not None:
@@ -1064,58 +1016,6 @@ class MessageHandler:
         )
         return reply_result
 
-    async def _commit_side_effects(
-        self,
-        *,
-        message: MessageSchema,
-        reply_result: ReplyResult,
-        group_id: str,
-        bot_nickname: str,
-    ) -> None:
-        """提交正常聊天副作用：好感度、AI 回复存储与互动历史写入。"""
-        if reply_result.favorability_delta is None:
-            logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
-            msg = "favorability_delta missing"
-            raise ValueError(msg)
-
-        logger.debug(
-            "[KomariChat] 准备提交好感度变化: group={} user={} delta={} reason={}",
-            group_id,
-            message.user_id,
-            reply_result.favorability_delta,
-            reply_result.favorability_reason or "-",
-        )
-        adjust_result = await user_data_plugin.adjust_user_favorability(
-            message.user_id,
-            reply_result.favorability_delta,
-        )
-        logger.info(
-            "[KomariChat] 好感度已更新: user={} before={} delta={} after={} reason={}",
-            message.user_id,
-            adjust_result.before,
-            adjust_result.delta,
-            adjust_result.after,
-            reply_result.favorability_reason or "-",
-        )
-
-        await self._store_ai_reply(
-            group_id=group_id,
-            reply_content=reply_result.content,
-            bot_nickname=bot_nickname,
-        )
-        try:
-            await self._write_interaction_history(
-                message=message,
-                new_record=reply_result.interaction_history,
-                lock_timeout_seconds=get_config().memory_agent_lock_timeout_seconds,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 互动历史写入失败（非致命）: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-
     async def prepare_pending_reply(self, pending_reply: PendingReply) -> bool:
         """发送前持久化回复意图；重复 operation 返回 False。"""
         favorability_delta = pending_reply.reply_result.favorability_delta
@@ -1123,6 +1023,7 @@ class MessageHandler:
             msg = "favorability_delta missing"
             raise ValueError(msg)
         config = get_config()
+        memory_config = get_memory_config()
         payload = PendingReplyCommit(
             operation_id=pending_reply.operation_id,
             request_trace_id=pending_reply.request_trace_id,
@@ -1142,8 +1043,8 @@ class MessageHandler:
             },
             proactive_reservation_id=pending_reply.proactive_reservation_id,
             proactive_cooldown_seconds=config.proactive_cooldown,
-            global_interaction_enabled=config.global_interaction_enabled,
-            global_interaction_trigger_size=config.global_interaction_trigger_size,
+            global_interaction_enabled=memory_config.global_interaction_enabled,
+            global_interaction_trigger_size=memory_config.global_interaction_trigger_size,
         )
         return await self.reply_commit_repository.prepare(payload)
 
@@ -1244,7 +1145,7 @@ class MessageHandler:
             if record.get("proactive_confirmed_at") is None:
                 reservation_id = record.get("proactive_reservation_id")
                 if reservation_id is not None:
-                    await self.redis.confirm_proactive_reply(
+                    await self.proactive_reservation.confirm(
                         str(record["group_id"]),
                         str(reservation_id),
                         cooldown_seconds=int(record["proactive_cooldown_seconds"]),
@@ -1415,92 +1316,57 @@ class MessageHandler:
         *,
         platform_message_id: str | None = None,
     ) -> None:
-        """在回复确认送达后提交决策日志及聊天副作用。"""
-        repository = getattr(self, "reply_commit_repository", None)
-        if repository is not None:
-            delivered = await repository.mark_delivered(
-                pending_reply.operation_id,
-                platform_message_id=platform_message_id,
-            )
-            if not delivered:
-                msg = "回复已发送，但 outbox 无法标记为 DELIVERED"
-                raise RuntimeError(msg)
+        """在回复确认送达后登记 outbox 并尝试立即领取提交。
 
-            if pending_reply.decision_payload is not None:
-                self._log_decision(pending_reply.decision_payload)
-
-            record = await repository.claim_operation(
-                pending_reply.operation_id,
-                owner_token=self._reply_commit_owner,
-                lease_seconds=get_config().reply_commit_lease_seconds,
-            )
-            if record is not None:
-                await self._finish_claimed_reply_commit(
-                    record,
-                    owner_token=self._reply_commit_owner,
-                )
-            logger.info(
-                "[KomariMemory] 回复已送达并进入持久副作用提交: group={} operation={}",
-                pending_reply.message.group_id,
-                pending_reply.operation_id,
-            )
-            return
-
-        reservation_id = pending_reply.proactive_reservation_id
-        if reservation_id is not None:
-            await self.redis.confirm_proactive_reply(
-                pending_reply.message.group_id,
-                reservation_id,
-                cooldown_seconds=get_config().proactive_cooldown,
-            )
+        送达后副作用唯一路径是 outbox：mark_delivered 登记 → claim_operation
+        领取 → 四步幂等提交 → complete；claim 返回 None 时由后台 worker 领取。
+        """
+        delivered = await self.reply_commit_repository.mark_delivered(
+            pending_reply.operation_id,
+            platform_message_id=platform_message_id,
+        )
+        if not delivered:
+            msg = "回复已发送，但 outbox 无法标记为 DELIVERED"
+            raise RuntimeError(msg)
 
         if pending_reply.decision_payload is not None:
             self._log_decision(pending_reply.decision_payload)
 
-        await self._commit_side_effects(
-            message=pending_reply.message,
-            reply_result=pending_reply.reply_result,
-            group_id=pending_reply.message.group_id,
-            bot_nickname=pending_reply.bot_nickname,
+        record = await self.reply_commit_repository.claim_operation(
+            pending_reply.operation_id,
+            owner_token=self._reply_commit_owner,
+            lease_seconds=get_config().reply_commit_lease_seconds,
         )
+        if record is not None:
+            await self._finish_claimed_reply_commit(
+                record,
+                owner_token=self._reply_commit_owner,
+            )
         logger.info(
-            "[KomariMemory] 回复已送达并提交副作用: group={} reason={} score={}",
+            "[KomariMemory] 回复已送达并进入持久副作用提交: group={} operation={}",
             pending_reply.message.group_id,
-            pending_reply.reason,
-            (
-                f"{pending_reply.reply_score:.3f}"
-                if pending_reply.reply_score is not None
-                else "-"
-            ),
+            pending_reply.operation_id,
         )
 
     async def _release_proactive_reservation(
         self,
-        *,
-        group_id: str,
-        reservation_id: str,
+        reservation: Reservation,
     ) -> None:
         """尽力释放主动回复预占，失败时由 TTL 兜底。"""
         try:
-            await self.redis.release_proactive_reply(
-                group_id,
-                reservation_id,
-            )
+            await reservation.release()
         except Exception:
             logger.exception(
-                "[KomariMemory] 主动回复预占释放失败，将等待 TTL 回收: group={}",
-                group_id,
+                "[KomariChat] 主动回复预占释放失败，将等待 TTL 回收: group={}",
+                reservation.group_id,
             )
 
     async def discard_pending_reply(self, pending_reply: PendingReply) -> None:
         """发送失败时释放尚未确认的主动回复预占。"""
-        reservation_id = pending_reply.proactive_reservation_id
-        if reservation_id is None:
+        reservation = pending_reply.proactive_reservation
+        if reservation is None:
             return
-        await self._release_proactive_reservation(
-            group_id=pending_reply.message.group_id,
-            reservation_id=reservation_id,
-        )
+        await self._release_proactive_reservation(reservation)
 
     async def _attempt_reply(  # noqa: PLR0911
         self,
@@ -1526,7 +1392,9 @@ class MessageHandler:
             频控冷却/超限/重复等正常控制流返回 (None, False, None)。
         """
         config = get_config()
+        memory_config = get_memory_config()
         reservation_id: str | None = None
+        reservation: Reservation | None = None
         reservation_transferred = False
         reservation_heartbeat: asyncio.Task[None] | None = None
         reservation_lost = asyncio.Event()
@@ -1539,11 +1407,9 @@ class MessageHandler:
 
             reservation_id = str(message.message_id)
             try:
-                reservation_status = await self.redis.reserve_proactive_reply(
+                reserve_result = await self.proactive_reservation.reserve(
                     message.group_id,
                     reservation_id,
-                    max_per_hour=config.proactive_max_per_hour,
-                    reservation_ttl_seconds=config.proactive_reservation_ttl_seconds,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1555,31 +1421,30 @@ class MessageHandler:
                     request_trace_id=request_trace_id,
                     reaction_sent=False,
                 )
-            match reservation_status:
-                case "reserved":
-                    pass
-                case "cooldown":
-                    logger.debug("[KomariMemory] 主动回复冷却或生成预占中")
-                    return None, False, None
-                case "rate_limited":
-                    logger.debug("[KomariMemory] 主动回复频率超限")
-                    return None, False, None
-                case "duplicate":
-                    logger.debug("[KomariMemory] 主动回复消息已预占或已送达")
-                    return None, False, None
-                case _:
-                    return None, False, ReplyFailureInfo(
-                        stage="reserve",
-                        error_type="UnknownReservationStatusError",
-                        summary=f"未知的主动回复预占状态: {reservation_status}",
-                        request_trace_id=request_trace_id,
-                        reaction_sent=False,
-                    )
+            if isinstance(reserve_result, str):
+                match reserve_result:
+                    case "cooldown":
+                        logger.debug("[KomariChat] 主动回复冷却或生成预占中")
+                        return None, False, None
+                    case "rate_limited":
+                        logger.debug("[KomariChat] 主动回复频率超限")
+                        return None, False, None
+                    case "duplicate":
+                        logger.debug("[KomariChat] 主动回复消息已预占或已送达")
+                        return None, False, None
+                    case _:
+                        return None, False, ReplyFailureInfo(
+                            stage="reserve",
+                            error_type="UnknownReservationStatusError",
+                            summary=f"未知的主动回复预占状态: {reserve_result}",
+                            request_trace_id=request_trace_id,
+                            reaction_sent=False,
+                        )
+            else:
+                reservation = reserve_result
             reservation_heartbeat = asyncio.create_task(
                 self._proactive_reservation_heartbeat(
-                    group_id=message.group_id,
-                    reservation_id=reservation_id,
-                    reservation_ttl_seconds=config.proactive_reservation_ttl_seconds,
+                    reservation=reservation,
                     lost=reservation_lost,
                 )
             )
@@ -1632,8 +1497,6 @@ class MessageHandler:
                     reply_context=reply_context,
                     reply_context_requested=reply_context_requested,
                     reply_context_refetched=reply_context_refetched,
-                    _reason=reason,
-                    _reply_score=reply_score,
                     request_trace_id=request_trace_id,
                     caller_is_superuser=caller_is_superuser,
                     collector=collector,
@@ -1704,12 +1567,8 @@ class MessageHandler:
                     reaction_sent=reaction_sent,
                 )
 
-            if reservation_id is not None:
-                renewed = await self.redis.renew_proactive_reply(
-                    message.group_id,
-                    reservation_id,
-                    reservation_ttl_seconds=config.proactive_reservation_ttl_seconds,
-                )
+            if reservation is not None:
+                renewed = await reservation.renew()
                 if reservation_lost.is_set() or not renewed:
                     logger.warning(
                         "[KomariChat] 主动回复生成完成时预占租约已丢失，取消发送"
@@ -1734,42 +1593,35 @@ class MessageHandler:
                 message=message,
                 reply_result=reply_result,
                 force_reply=force_reply,
-                bot_nickname=config.bot_nickname,
+                bot_nickname=memory_config.bot_nickname,
                 reason=reason,
                 reply_score=reply_score,
                 operation_id=self._reply_operation_id(message),
                 request_trace_id=request_trace_id,
                 reply_timestamp=time.time(),
                 proactive_reservation_id=reservation_id,
+                proactive_reservation=reservation,
+                reaction_sent=reaction_sent,
             )
             reservation_transferred = True
             return pending_reply, stored, None
         finally:
             await self._stop_background_task(reservation_heartbeat)
-            if reservation_id is not None and not reservation_transferred:
-                await self._release_proactive_reservation(
-                    group_id=message.group_id,
-                    reservation_id=reservation_id,
-                )
+            if reservation is not None and not reservation_transferred:
+                await self._release_proactive_reservation(reservation)
 
     async def _proactive_reservation_heartbeat(
         self,
         *,
-        group_id: str,
-        reservation_id: str,
-        reservation_ttl_seconds: int,
+        reservation: Reservation,
         lost: asyncio.Event,
     ) -> None:
         """LLM 生成期间周期续期主动回复预占。"""
-        interval = max(1.0, reservation_ttl_seconds / 3)
+        interval = max(1.0, reservation.reservation_ttl_seconds / 3)
         while True:
             await asyncio.sleep(interval)
             try:
-                renewed = await self.redis.renew_proactive_reply(
-                    group_id,
-                    reservation_id,
-                    reservation_ttl_seconds=reservation_ttl_seconds,
-                )
+                renewed = await reservation.renew()
             except Exception:
                 logger.exception("[KomariChat] 主动回复预占续期失败")
                 lost.set()
@@ -1894,8 +1746,6 @@ class MessageHandler:
                 reply_context=reply_context,
                 reply_context_requested=reply_context is not None,
                 reply_context_refetched=reply_context_refetched,
-                _reason="direct_call",
-                _reply_score=None,
                 request_trace_id=request_trace_id,
                 caller_is_superuser=caller_is_superuser,
                 collector=collector,

@@ -31,12 +31,6 @@ class RedisKeys:
     # 当前会话开始时间
     SESSION_START = f"{PREFIX}:session_start:%s"
 
-    # 主动回复冷却
-    PROACTIVE_COOLDOWN = f"{PREFIX}:proactive:cd:%s"
-
-    # 主动回复滑动窗口名额（含生成中的预占与已送达回复）
-    PROACTIVE_SLOTS = f"{PREFIX}:proactive:slots:%s"
-
     # 聊天送达后副作用 Redis 幂等标记
     CHAT_COMMIT_STEP = f"{PREFIX}:chat_commit:%s:%s"
 
@@ -136,30 +130,6 @@ class RedisKeys:
             Redis 键
         """
         return cls.SESSION_START % group_id
-
-    @classmethod
-    def proactive_cooldown(cls, group_id: str) -> str:
-        """获取主动回复冷却键。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            Redis 键
-        """
-        return cls.PROACTIVE_COOLDOWN % group_id
-
-    @classmethod
-    def proactive_slots(cls, group_id: str) -> str:
-        """获取主动回复滑动窗口名额键。
-
-        Args:
-            group_id: 群组 ID
-
-        Returns:
-            Redis 键
-        """
-        return cls.PROACTIVE_SLOTS % group_id
 
     @classmethod
     def chat_commit_step(cls, operation_id: str, step: str) -> str:

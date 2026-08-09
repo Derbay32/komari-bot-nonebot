@@ -41,7 +41,7 @@ async def _no_sleep(_delay: float) -> None:
 def _patch_config(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         query_rewrite_module,
-        "get_config",
+        "get_memory_config",
         lambda: SimpleNamespace(
             llm_model_summary="summary-model",
             llm_thinking_mode_summary=False,

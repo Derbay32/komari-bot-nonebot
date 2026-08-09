@@ -57,6 +57,7 @@ def _install_allowed_entry_dependencies(
             return False
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
+    monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: handler)
     monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
@@ -146,6 +147,7 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
             calls.process = True
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
+    monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
     monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
@@ -164,7 +166,7 @@ def test_handler_rebuilds_when_decision_engine_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = object()
-    memory = object()
+    memory = SimpleNamespace(pg_pool=object())
     engine_ref = SimpleNamespace(value=object())
     built_engines: list[object] = []
 
@@ -174,10 +176,12 @@ def test_handler_rebuilds_when_decision_engine_changes(
             *,
             redis: object,
             memory: object,
+            reply_commit_repository: object,
             decision_engine: object,
         ) -> None:
             self.redis = redis
             self.memory = memory
+            self.reply_commit_repository = reply_commit_repository
             self.decision_engine = decision_engine
             built_engines.append(decision_engine)
 
@@ -190,6 +194,11 @@ def test_handler_rebuilds_when_decision_engine_changes(
         chat_module,
         "get_decision_engine",
         lambda: engine_ref.value,
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "ReplyCommitRepository",
+        lambda pg_pool: SimpleNamespace(pg_pool=pg_pool),
     )
     monkeypatch.setattr(chat_module, "MessageHandler", _Handler)
     monkeypatch.setattr(chat_module, "_handler", None)
@@ -219,7 +228,9 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         reply_to_message_id=None,
         request_trace_id="test-trace-send-fail",
         reason="at",
+        reaction_sent=False,
     )
+    reported_failures: list[Any] = []
 
     class _Handler:
         @staticmethod
@@ -254,10 +265,8 @@ async def test_send_failure_does_not_commit_reply_side_effects(
             calls.cancel = True
 
         @staticmethod
-        async def report_reply_failure(
-            **_kwargs: object,
-        ) -> None:
-            return None
+        async def report_reply_failure(**kwargs: object) -> None:
+            reported_failures.append(kwargs["failure"])
 
     async def _fail_send(_message: object) -> None:
         calls.send = True
@@ -281,6 +290,10 @@ async def test_send_failure_does_not_commit_reply_side_effects(
     assert not calls.commit
     assert calls.cancel
     assert calls.discard
+    # KOMARIBOT-11：失败分流的 reaction_sent 改读 pending_reply 字段真源；
+    # 表情未派发（False）时不再按「pending 存在且未送达」推导为 True
+    assert len(reported_failures) == 1
+    assert reported_failures[0].reaction_sent is False
 
 
 @pytest.mark.asyncio
@@ -386,7 +399,9 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
         reply_to_message_id=None,
         request_trace_id="test-trace-commit-fail",
         reason="at",
+        reaction_sent=True,
     )
+    reported_failures: list[Any] = []
 
     class _Handler:
         @staticmethod
@@ -410,10 +425,8 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
             calls.discard = True
 
         @staticmethod
-        async def report_reply_failure(
-            **_kwargs: object,
-        ) -> None:
-            return None
+        async def report_reply_failure(**kwargs: object) -> None:
+            reported_failures.append(kwargs["failure"])
 
     async def _send(_message: object) -> None:
         calls.send = True
@@ -428,6 +441,9 @@ async def test_commit_failure_after_delivery_does_not_release_reservation(
 
     assert calls.send
     assert not calls.discard
+    # KOMARIBOT-11：送达后提交失败，reaction_sent 改读 pending_reply 字段真源
+    assert len(reported_failures) == 1
+    assert reported_failures[0].reaction_sent is True
 
 
 @pytest.mark.asyncio
@@ -442,6 +458,7 @@ async def test_unknown_send_result_keeps_prepared_outbox_for_reconciliation(
         operation_id="reply-operation-unknown",
         request_trace_id="test-trace-unknown",
         reason="at",
+        reaction_sent=False,
     )
 
     class _Handler:

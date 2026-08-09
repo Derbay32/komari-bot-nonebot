@@ -54,22 +54,27 @@ def test_config_schema_rejects_too_small_profile_trait_limit() -> None:
         KomariMemoryConfigSchema(profile_trait_limit=0)
 
 
-def test_proactive_reservation_ttl_has_bounded_immediate_config() -> None:
-    config = KomariMemoryConfigSchema()
-    field_extra = KomariMemoryConfigSchema.model_fields[
-        "proactive_reservation_ttl_seconds"
-    ].json_schema_extra
+MIGRATED_TO_KOMARI_CHAT_FIELDS = (
+    "proactive_enabled",
+    "proactive_score_threshold",
+    "proactive_cooldown",
+    "proactive_max_per_hour",
+    "proactive_reservation_ttl_seconds",
+    "reply_commit_worker_interval_seconds",
+    "reply_commit_batch_size",
+    "reply_commit_lease_seconds",
+    "reply_commit_max_attempts",
+    "reply_commit_retry_base_seconds",
+    "reply_commit_tombstone_retention_days",
+)
 
-    assert config.proactive_reservation_ttl_seconds == 360
-    assert isinstance(field_extra, dict)
-    assert field_extra["apply_mode"] == "immediate"
 
-    import pytest
+def test_config_schema_no_longer_exposes_migrated_proactive_fields() -> None:
+    """频控/outbox 字段已迁入 komari_chat_config（KOMARIBOT-7）。"""
+    fields = KomariMemoryConfigSchema.model_fields
 
-    with pytest.raises(ValueError):
-        KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=29)
-    with pytest.raises(ValueError):
-        KomariMemoryConfigSchema(proactive_reservation_ttl_seconds=901)
+    for field_name in MIGRATED_TO_KOMARI_CHAT_FIELDS:
+        assert field_name not in fields
 
 
 def test_interaction_processing_lease_has_bounded_immediate_config() -> None:

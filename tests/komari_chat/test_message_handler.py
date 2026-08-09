@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import types
 from contextlib import asynccontextmanager
@@ -18,12 +19,27 @@ from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollecto
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pytest
 
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+
+
+def _patch_both_configs(
+    monkeypatch: "pytest.MonkeyPatch",
+    stub: "Callable[[], object]",
+) -> None:
+    """KOMARIBOT-7：迁出字段走 get_config、memory 字段走 get_memory_config。
+
+    两个名字都 patch 为同一鸭子类型桩：被测路径只会从各自名字读取
+    其字段，桩内同时持有迁出字段与 memory 字段时两处都能命中。
+    """
+    monkeypatch.setattr(message_handler_module, "get_config", stub)
+    monkeypatch.setattr(message_handler_module, "get_memory_config", stub)
 
 
 class _FakeEvent:
@@ -62,9 +78,8 @@ def _patch_config(
     *,
     bot_nickname: str = "小鞠知花",
 ) -> None:
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             bot_nickname=bot_nickname,
             bot_aliases=["小鞠", "小鞠知花", "komari"],
@@ -356,9 +371,8 @@ def test_read_buffers_uses_context_limit_instead_of_summary_limit(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             context_messages_limit=5,
             context_max_utf8_bytes=24_000,
@@ -416,11 +430,13 @@ def test_attempt_reply_only_rewrites_current_message(
 
     redis = _FakeRedis([previous_message])
     memory = _FakeMemory()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     build_prompt_kwargs: dict[str, object] = {}
     generate_with_tools_kwargs: dict[str, object] = {}
@@ -442,14 +458,14 @@ def test_attempt_reply_only_rewrites_current_message(
             favorability_reason="正常互动",
         )
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -538,70 +554,174 @@ def test_attempt_reply_only_rewrites_current_message(
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    pushed_record = redis.pushed_global_interactions[0]["record"]
-    assert isinstance(pushed_record, dict)
-    assert redis.pushed_global_interactions == [
+    # KOMARIBOT-10：送达后副作用只剩 outbox 一条路径；claim 返回 None
+    # 表示由后台 worker 稍后领取提交，这里只断言送达登记进入 outbox
+    assert repository.mark_delivered_calls == [
         {
-            "user_id": "user-1",
-            "trigger_size": 20,
-            "record": {
-                "version": 1,
-                "event": "发送当前待回复消息",
-                "result": "回复收到啦",
-                "emotion": "平静",
-                "display_name": "阿虚",
-                "message_id": "msg-2",
-                "timestamp": pushed_record["timestamp"],
-            },
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
         }
     ]
+    assert repository.claim_operation_calls == [pending_reply.operation_id]
+    assert redis.pushed_global_interactions == []
 
 
-def test_write_interaction_history_pushes_global_redis_buffer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_message_handler_has_no_direct_side_effect_path() -> None:
+    """直连副作用路径已删除，repository 为构造必填硬依赖（KOMARIBOT-10 守卫）。"""
+    removed_methods = (
+        "_commit_side_effects",
+        "_store_ai_reply",
+        "_write_interaction_history",
+    )
+    for method_name in removed_methods:
+        assert not hasattr(message_handler_module.MessageHandler, method_name), (
+            f"MessageHandler 不应再保留直连副作用方法 {method_name}"
+        )
+
+    signature = inspect.signature(message_handler_module.MessageHandler.__init__)
+    param = signature.parameters.get("reply_commit_repository")
+    assert param is not None, "MessageHandler.__init__ 缺少 reply_commit_repository 参数"
+    assert param.default is inspect.Parameter.empty, (
+        "reply_commit_repository 必须是构造必填参数"
+    )
+
+
+def test_generate_reply_core_has_no_dead_reason_params() -> None:
+    """KOMARIBOT-11 守卫：_reason/_reply_score 死参数已删除。"""
+    signature = inspect.signature(
+        message_handler_module.MessageHandler._generate_reply_core
+    )
+    assert "_reason" not in signature.parameters, "_reason 死参数应已删除"
+    assert "_reply_score" not in signature.parameters, "_reply_score 死参数应已删除"
+
+
+def _wire_reaction_sent_case(
+    monkeypatch: "pytest.MonkeyPatch",
+    *,
+    face_reaction_enabled: bool,
+) -> tuple[Any, MessageSchema]:
+    """reaction_sent 字段双分支公共布线（KOMARIBOT-11）。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
-    redis = _FakeRedis([])
     handler.redis = redis
-    handler.memory = _FakeMemory()
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    handler.memory = memory
+    handler._reaction_tasks = set()
+    handler.query_rewrite = _FakeQueryRewrite()
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="生成成功",
+            interaction_history={"event": "测试", "result": "生成成功", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="测试",
+        )
+
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
+            proactive_enabled=False,
+            context_messages_limit=10,
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
+            face_reaction_enabled=face_reaction_enabled,
+            face_reaction_id="76",
+            vision_tool_enabled=False,
+            error_notify_enabled=False,
         ),
     )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    asyncio.run(
-        handler._write_interaction_history(
-            message=MessageSchema(
-                user_id="user-1",
-                user_nickname="阿虚",
-                group_id="group-1",
-                content="当前待回复消息",
-                timestamp=2.0,
-                message_id="msg-2",
-            ),
-            new_record={"event": "新事件", "result": "新反应", "emotion": "新心情"},
-            lock_timeout_seconds=None,
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
+    monkeypatch.setattr(
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    )
+
+    message = MessageSchema(
+        user_id="user-1",
+        user_nickname="测试用户",
+        group_id="group-1",
+        content="待回复",
+        timestamp=1.0,
+        message_id="msg-1",
+    )
+    return handler, message
+
+
+def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
+    async def _dummy_reaction() -> None:
+        return None
+
+    return asyncio.run(
+        handler._attempt_reply(
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+            on_reply_triggered=_dummy_reaction,
         )
     )
 
-    assert len(redis.pushed_global_interactions) == 1
-    pushed = redis.pushed_global_interactions[0]
-    assert pushed["user_id"] == "user-1"
-    assert pushed["trigger_size"] == 20
-    record = pushed["record"]
-    assert isinstance(record, dict)
-    assert record["version"] == 1
-    assert record["event"] == "新事件"
-    assert record["result"] == "新反应"
-    assert record["emotion"] == "新心情"
-    assert record["display_name"] == "阿虚"
-    assert record["message_id"] == "msg-2"
+
+def test_pending_reply_reaction_sent_true_when_reaction_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ KOMARIBOT-11：表情真实派发时 PendingReply.reaction_sent=True。"""
+    handler, message = _wire_reaction_sent_case(
+        monkeypatch, face_reaction_enabled=True
+    )
+    pending_reply, stored, failure = _run_reaction_sent_attempt(handler, message)
+    assert failure is None
+    assert stored is True
+    assert pending_reply is not None
+    assert pending_reply.reaction_sent is True
+
+
+def test_pending_reply_reaction_sent_false_when_reaction_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ KOMARIBOT-11：face_reaction_enabled=False 边界下 reaction_sent=False。"""
+    handler, message = _wire_reaction_sent_case(
+        monkeypatch, face_reaction_enabled=False
+    )
+    pending_reply, stored, failure = _run_reaction_sent_attempt(handler, message)
+    assert failure is None
+    assert stored is True
+    assert pending_reply is not None
+    assert pending_reply.reaction_sent is False
 
 
 def test_resolve_reply_context_builds_user_side_text_context() -> None:
@@ -797,11 +917,6 @@ class _FakeRedisForDebug:
         self.pushed_messages: list[MessageSchema] = []
         self.pushed_global_interactions: list[dict[str, object]] = []
         self.global_interaction_buffer_calls: list[dict[str, object]] = []
-        self.reserve_proactive_calls: list[dict[str, object]] = []
-        self.confirm_proactive_calls: list[dict[str, object]] = []
-        self.renew_proactive_calls: list[dict[str, object]] = []
-        self.release_proactive_calls: list[dict[str, str]] = []
-        self.reservation_status = "reserved"
 
     async def get_buffer(self, group_id: str, limit: int = 100) -> list[MessageSchema]:
         del group_id, limit
@@ -824,32 +939,58 @@ class _FakeRedisForDebug:
             {"user_id": user_id, "record": record, "trigger_size": trigger_size}
         )
 
-    async def reserve_proactive_reply(
+
+class _FakeReservation:
+    """fake module 的预占句柄：续租/释放调用记录回所属服务（KOMARIBOT-9）。"""
+
+    def __init__(
         self,
+        service: "_FakeProactiveReservation",
         group_id: str,
         reservation_id: str,
-        *,
-        max_per_hour: int,
-        reservation_ttl_seconds: int,
-    ) -> str:
-        self.reserve_proactive_calls.append(
-            {
-                "group_id": group_id,
-                "reservation_id": reservation_id,
-                "max_per_hour": max_per_hour,
-                "reservation_ttl_seconds": reservation_ttl_seconds,
-            }
+    ) -> None:
+        self._service = service
+        self.group_id = group_id
+        self.reservation_id = reservation_id
+
+    async def renew(self) -> bool:
+        self._service.renew_calls.append(
+            {"group_id": self.group_id, "reservation_id": self.reservation_id}
         )
+        return self._service.renew_result
+
+    async def release(self) -> bool:
+        self._service.release_calls.append(
+            {"group_id": self.group_id, "reservation_id": self.reservation_id}
+        )
+        return True
+
+
+class _FakeProactiveReservation:
+    """fake proactive_reservation module：记录四动词调用，断言编排分支。"""
+
+    def __init__(self) -> None:
+        self.reserve_calls: list[dict[str, str]] = []
+        self.confirm_calls: list[dict[str, object]] = []
+        self.renew_calls: list[dict[str, str]] = []
+        self.release_calls: list[dict[str, str]] = []
+        self.reservation_status = "reserved"
+        self.renew_result = True
+
+    async def reserve(
+        self, group_id: str, reservation_id: str
+    ) -> _FakeReservation | str:
+        self.reserve_calls.append(
+            {"group_id": group_id, "reservation_id": reservation_id}
+        )
+        if self.reservation_status == "reserved":
+            return _FakeReservation(self, group_id, reservation_id)
         return self.reservation_status
 
-    async def confirm_proactive_reply(
-        self,
-        group_id: str,
-        reservation_id: str,
-        *,
-        cooldown_seconds: int,
+    async def confirm(
+        self, group_id: str, reservation_id: str, *, cooldown_seconds: int
     ) -> None:
-        self.confirm_proactive_calls.append(
+        self.confirm_calls.append(
             {
                 "group_id": group_id,
                 "reservation_id": reservation_id,
@@ -857,31 +998,45 @@ class _FakeRedisForDebug:
             }
         )
 
-    async def renew_proactive_reply(
-        self,
-        group_id: str,
-        reservation_id: str,
-        *,
-        reservation_ttl_seconds: int,
+
+class _FakeReplyCommitRepository:
+    """fake outbox 仓库：记录 mark_delivered/claim_operation，claim 默认返回 None。
+
+    KOMARIBOT-10：commit_delivered_reply 只剩 outbox 一条路径；claim 返回
+    None 表示副作用由后台 worker 稍后领取提交，测试只断言送达登记。
+    """
+
+    def __init__(self) -> None:
+        self.mark_delivered_calls: list[dict[str, object]] = []
+        self.claim_operation_calls: list[str] = []
+        self.claim_result: dict[str, Any] | None = None
+
+    async def has_active_operation(self, operation_id: str) -> bool:
+        del operation_id
+        return False
+
+    async def mark_delivered(
+        self, operation_id: str, *, platform_message_id: str | None = None
     ) -> bool:
-        self.renew_proactive_calls.append(
-            {
-                "group_id": group_id,
-                "reservation_id": reservation_id,
-                "reservation_ttl_seconds": reservation_ttl_seconds,
-            }
+        self.mark_delivered_calls.append(
+            {"operation_id": operation_id, "platform_message_id": platform_message_id}
         )
         return True
 
-    async def release_proactive_reply(
-        self,
-        group_id: str,
-        reservation_id: str,
-    ) -> bool:
-        self.release_proactive_calls.append(
-            {"group_id": group_id, "reservation_id": reservation_id}
-        )
-        return True
+    async def claim_operation(
+        self, operation_id: str, *, owner_token: str, lease_seconds: int
+    ) -> dict[str, Any] | None:
+        del owner_token, lease_seconds
+        self.claim_operation_calls.append(operation_id)
+        return self.claim_result
+
+
+def _wire_reply_commit_repository(
+    handler: object, repository: _FakeReplyCommitRepository
+) -> None:
+    """为 __new__ 构建的 handler 补上 outbox 硬依赖与 owner（KOMARIBOT-10）。"""
+    handler.reply_commit_repository = repository  # type: ignore[attr-defined]
+    handler._reply_commit_owner = "test-owner"  # type: ignore[attr-defined]
 
 
 class _FakeMemoryForDebug:
@@ -940,11 +1095,13 @@ def test_generate_debug_reply_skips_all_side_effects(
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
     fake_user_data = _FakeUserDataForDebug()
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    handler.proactive_reservation = reservation_svc
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -957,9 +1114,8 @@ def test_generate_debug_reply_skips_all_side_effects(
     )
 
     # 注入必要的全局配置
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             summary_max_buffer_size=500,
             memory_search_limit=3,
@@ -1022,10 +1178,11 @@ def test_generate_debug_reply_skips_all_side_effects(
     # 断言零副作用
     assert redis.pushed_messages == []  # 没有 push 当前消息或 AI 回复
     assert redis.pushed_global_interactions == []  # 没有写互动历史
-    assert redis.reserve_proactive_calls == []
-    assert redis.confirm_proactive_calls == []
-    assert redis.renew_proactive_calls == []
-    assert redis.release_proactive_calls == []
+    # debug 路径完全不触达预占 module（冷却/频控零副作用）
+    assert reservation_svc.reserve_calls == []
+    assert reservation_svc.confirm_calls == []
+    assert reservation_svc.renew_calls == []
+    assert reservation_svc.release_calls == []
     assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
 
 
@@ -1050,9 +1207,8 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             summary_max_buffer_size=500,
             memory_search_limit=3,
@@ -1132,9 +1288,8 @@ def test_generate_debug_reply_with_images_and_reply_context(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             summary_max_buffer_size=500,
             memory_search_limit=3,
@@ -1241,11 +1396,13 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
     fake_user_data = _FakeUserDataForDebug()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1256,14 +1413,14 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -1323,27 +1480,37 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    # 确认送达后提交回复副作用
-    assert fake_user_data.adjust_calls == [{"user_id": "user-1", "delta": 1}]
-    assert len(redis.pushed_messages) >= 2  # 至少：当前消息 + AI 回复
-    assert len(redis.pushed_global_interactions) >= 1
-    pushed_record = redis.pushed_global_interactions[0]["record"]
-    assert isinstance(pushed_record, dict)
-    assert pushed_record["event"] == "正常消息"
-    assert pushed_record["result"] == "正常回复"
-    assert pushed_record["emotion"] == "平静"
+    # KOMARIBOT-10：送达后副作用只剩 outbox 一条路径；claim 返回 None 表示
+    # 副作用由后台 worker 稍后领取提交，此处只断言送达登记，副作用断言由
+    # test_reply_commit_handler.py 的 outbox 编排测试继承
+    assert repository.mark_delivered_calls == [
+        {
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
+        }
+    ]
+    assert repository.claim_operation_calls == [pending_reply.operation_id]
+    assert fake_user_data.adjust_calls == []
+    assert redis.pushed_global_interactions == []
 
 
-def test_proactive_attempt_reserves_then_confirms_after_delivery(
+def test_proactive_attempt_reserves_then_enters_outbox_after_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """主动回复生成前预占，确认送达后才转为正式名额与冷却。"""
+    """主动回复生成前预占；送达确认后进入 outbox，confirm 由 outbox 步骤 1 驱动。
+
+    KOMARIBOT-10：直连 confirm 路径已删除；confirm-after-delivery 语义由
+    test_reply_commit_handler.py 的 outbox 编排测试继承。
+    """
     redis = _FakeRedisForDebug()
+    reservation_svc = _FakeProactiveReservation()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    commit_calls: list[dict[str, object]] = []
+    handler.proactive_reservation = reservation_svc
+    _wire_reply_commit_repository(handler, repository)
 
     async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
         return [], [], True
@@ -1356,20 +1523,16 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
             favorability_reason="主动关心",
         )
 
-    async def _fake_commit_side_effects(**kwargs: object) -> None:
-        commit_calls.append(dict(kwargs))
-
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
-    monkeypatch.setattr(handler, "_commit_side_effects", _fake_commit_side_effects)
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=True,
             proactive_max_per_hour=3,
             proactive_reservation_ttl_seconds=360,
             proactive_cooldown=300,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
         ),
     )
@@ -1401,35 +1564,28 @@ def test_proactive_attempt_reserves_then_confirms_after_delivery(
     assert failure is None
     assert pending_reply is not None
     assert pending_reply.proactive_reservation_id == "message-proactive"
-    assert redis.reserve_proactive_calls == [
-        {
-            "group_id": "group-proactive",
-            "reservation_id": "message-proactive",
-            "max_per_hour": 3,
-            "reservation_ttl_seconds": 360,
-        }
+    # 编排分支：reserve 一次、生成完成最终续租一次，送达前不 confirm 不 release
+    assert reservation_svc.reserve_calls == [
+        {"group_id": "group-proactive", "reservation_id": "message-proactive"}
     ]
-    assert redis.confirm_proactive_calls == []
-    assert redis.renew_proactive_calls == [
-        {
-            "group_id": "group-proactive",
-            "reservation_id": "message-proactive",
-            "reservation_ttl_seconds": 360,
-        }
+    assert reservation_svc.confirm_calls == []
+    assert reservation_svc.renew_calls == [
+        {"group_id": "group-proactive", "reservation_id": "message-proactive"}
     ]
-    assert commit_calls == []
+    assert repository.mark_delivered_calls == []
 
     asyncio.run(handler.commit_delivered_reply(pending_reply))
 
-    assert redis.confirm_proactive_calls == [
+    # 送达登记进入 outbox；confirm 不在此处内联，由 outbox 步骤 1 驱动
+    assert repository.mark_delivered_calls == [
         {
-            "group_id": "group-proactive",
-            "reservation_id": "message-proactive",
-            "cooldown_seconds": 300,
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
         }
     ]
-    assert len(commit_calls) == 1
-    assert redis.release_proactive_calls == []
+    assert repository.claim_operation_calls == [pending_reply.operation_id]
+    assert reservation_svc.confirm_calls == []
+    assert reservation_svc.release_calls == []
 
 
 def test_proactive_generation_failure_releases_reservation(
@@ -1437,10 +1593,12 @@ def test_proactive_generation_failure_releases_reservation(
 ) -> None:
     """主动回复生成失败时立即释放名额，不等待预占 TTL。"""
     redis = _FakeRedisForDebug()
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
+    handler.proactive_reservation = reservation_svc
 
     async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
         return [], [], True
@@ -1451,9 +1609,8 @@ def test_proactive_generation_failure_releases_reservation(
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fail_generate_core)
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=True,
             proactive_max_per_hour=3,
@@ -1492,13 +1649,10 @@ def test_proactive_generation_failure_releases_reservation(
     assert failure.stage == "generate"
     assert failure.error_type == "_FavorabilityReadError"
     assert failure.reaction_sent is False
-    assert redis.release_proactive_calls == [
-        {
-            "group_id": "group-proactive",
-            "reservation_id": "message-failed",
-        }
+    assert reservation_svc.release_calls == [
+        {"group_id": "group-proactive", "reservation_id": "message-failed"}
     ]
-    assert redis.confirm_proactive_calls == []
+    assert reservation_svc.confirm_calls == []
 
 
 def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
@@ -1518,9 +1672,8 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
     monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(bot_nickname="小鞠"),
     )
 
@@ -1651,9 +1804,8 @@ def test_reaction_scheduled_before_generate_core(
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1753,9 +1905,8 @@ def test_reaction_not_scheduled_when_disabled(
     handler.memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1853,9 +2004,8 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -1951,9 +2101,8 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
@@ -2040,16 +2189,16 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
 ) -> None:
     """reserve阶段Redis异常→ failure.reaction_sent=False（表情尚未派发，不补发群内错误文本）。"""
     redis = _FakeRedisForDebug()
-    redis.reservation_status = "error"
+    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = _FakeMemoryForDebug()
+    handler.proactive_reservation = reservation_svc
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=True,
             proactive_max_per_hour=3,
@@ -2061,15 +2210,13 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
         ),
     )
 
-    # 注入 reserve_proactive_reply 使其抛出异常
-    original_reserve = redis.reserve_proactive_reply
-
+    # 注入 reserve 使其抛出异常
     async def _failing_reserve(*_args: object, **_kwargs: object) -> str:
         del _args, _kwargs
         msg = "Redis 连接断开"
         raise RuntimeError(msg)
 
-    redis.reserve_proactive_reply = _failing_reserve  # type: ignore[method-assign]
+    reservation_svc.reserve = _failing_reserve  # type: ignore[method-assign]
 
     reaction_called = False
 
@@ -2108,9 +2255,6 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
     assert failure.reaction_sent is False
     assert reaction_called is False  # 还未到贴表情阶段
 
-    # 恢复原方法以避免影响其他测试
-    redis.reserve_proactive_reply = original_reserve  # type: ignore[method-assign]
-
 
 def test_commit_delivered_reply_does_not_trigger_reaction_callback(
     monkeypatch: pytest.MonkeyPatch,
@@ -2118,11 +2262,13 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
     """commit_delivered_reply 不再调用 on_reply_triggered 回调（表情已在生成前贴出）。"""
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
+    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
+    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
     monkeypatch.setattr(
@@ -2134,14 +2280,14 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
         ),
     )
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
+            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -2203,11 +2349,18 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
 
     # 验证 PendingReply 无 on_reply_triggered 字段
     assert not hasattr(pending_reply, "on_reply_triggered")
+    # KOMARIBOT-11：无表情回调时 reaction_sent 为真实派发结果 False
+    assert pending_reply.reaction_sent is False
 
     # commit_delivered_reply 应正常执行，不调用已删除的回调
     asyncio.run(handler.commit_delivered_reply(pending_reply))
-    # 副作用已正常提交（adjust + store_ai_reply + interaction_history）
-    assert len(redis.pushed_messages) >= 1
+    # KOMARIBOT-10：送达登记进入 outbox（副作用由 worker 领取提交）
+    assert repository.mark_delivered_calls == [
+        {
+            "operation_id": pending_reply.operation_id,
+            "platform_message_id": None,
+        }
+    ]
 
 
 def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
@@ -2221,9 +2374,8 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
     handler.redis = redis
     handler.memory = _FakeMemoryForDebug()
 
-    monkeypatch.setattr(
-        message_handler_module,
-        "get_config",
+    _patch_both_configs(
+        monkeypatch,
         lambda: SimpleNamespace(
             proactive_enabled=False,
             context_messages_limit=10,

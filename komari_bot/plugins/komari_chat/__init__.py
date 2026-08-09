@@ -17,6 +17,7 @@ from .handlers.message_handler import (
     PendingReply,
     ReplyFailureInfo,
 )
+from .repositories import ReplyCommitRepository
 from .services.error_notify import one_line_summary
 
 if TYPE_CHECKING:
@@ -35,8 +36,11 @@ from komari_bot.plugins import user_ban as user_ban_plugin
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
 
+from komari_bot.plugins.komari_chat.services.config_interface import (
+    get_config,
+    get_memory_config,
+)
 from komari_bot.plugins.komari_decision import get_decision_engine
-from komari_bot.plugins.komari_memory.services.config_interface import get_config
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠聊天",
@@ -76,6 +80,7 @@ def _get_or_build_handler() -> MessageHandler | None:
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
+            reply_commit_repository=ReplyCommitRepository(memory.pg_pool),
             decision_engine=decision_engine,
         )
     return _handler
@@ -123,7 +128,7 @@ driver.on_shutdown(_stop_reply_commit_worker)
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
     """在开始生成回复时，对触发消息添加表情反应（提示“正在生成”）。"""
-    config = get_config()
+    config = get_memory_config()
     if not config.face_reaction_enabled or not config.face_reaction_id:
         return
 
@@ -208,7 +213,7 @@ async def generate_debug_reply(
 @matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     """处理群聊消息。"""
-    config = get_config()
+    config = get_memory_config()
     if not config.plugin_enable:
         return
 
@@ -325,7 +330,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     pending_reply.operation_id,
                 )
         logger.exception("[KomariChat] 消息处理失败")
-        # 失败善后：pending_reply 存在说明表情已在生成前贴出；
+        # 失败善后：reaction_sent 以 PendingReply 字段为真源（生成前是否贴出表情）；
         # 回复未送达时补发群内错误文本，所有未处理异常均通知 SUPERUSER
         await handler.report_reply_failure(
             bot=bot,
@@ -339,7 +344,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     if pending_reply is not None
                     else None
                 ),
-                reaction_sent=pending_reply is not None and not reply_delivered,
+                reaction_sent=(
+                    pending_reply.reaction_sent
+                    if pending_reply is not None
+                    else False
+                ),
             ),
             reason=pending_reply.reason if pending_reply is not None else None,
         )
