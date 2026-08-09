@@ -22,13 +22,18 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-class _RerankService:
+class _ChatSceneRanker:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
-        self.calls = 0
+        self.calls: list[tuple[str, object | None]] = []
 
-    async def rank_message(self, _message: str) -> UnifiedRerankResult:
-        self.calls += 1
+    async def __call__(
+        self,
+        message_text: str,
+        *,
+        scene_runtime: object | None,
+    ) -> UnifiedRerankResult:
+        self.calls.append((message_text, scene_runtime))
         if self.error is not None:
             raise self.error
         return UnifiedRerankResult(
@@ -78,13 +83,20 @@ def _patch_decision_dependencies(
 def _build_engine(
     monkeypatch: pytest.MonkeyPatch,
     state_provider: Callable[[], DecisionRuntimeState],
-    rerank: _RerankService,
+    rerank: _ChatSceneRanker,
 ) -> DecisionEngine:
+    scene_runtime = object()
     engine = DecisionEngine(
         cast("Any", object()),
+        scene_runtime=cast("Any", scene_runtime),
         runtime_state_provider=state_provider,
     )
-    monkeypatch.setattr(engine, "_unified_rerank", rerank)
+    monkeypatch.setattr(
+        engine_module,
+        "rank_chat_message",
+        rerank,
+        raising=False,
+    )
     monkeypatch.setattr(engine, "_social_timing", _SocialTimingService())
     return engine
 
@@ -94,7 +106,7 @@ async def test_ready_runtime_executes_proactive_rerank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     filter_calls = _patch_decision_dependencies(monkeypatch)
-    rerank = _RerankService()
+    rerank = _ChatSceneRanker()
     engine = _build_engine(monkeypatch, DecisionRuntimeState.ready, rerank)
 
     outcome = await engine.evaluate(
@@ -104,7 +116,7 @@ async def test_ready_runtime_executes_proactive_rerank(
     )
 
     assert filter_calls == ["这是一条有意义的群聊消息"]
-    assert rerank.calls == 1
+    assert rerank.calls == [("这是一条有意义的群聊消息", engine._scene_runtime)]
     assert outcome.should_reply is True
     assert outcome.runtime_status is DecisionRuntimeStatus.READY
 
@@ -122,7 +134,7 @@ async def test_unavailable_runtime_skips_proactive_rerank(
     state: DecisionRuntimeState,
 ) -> None:
     filter_calls = _patch_decision_dependencies(monkeypatch)
-    rerank = _RerankService()
+    rerank = _ChatSceneRanker()
     engine = _build_engine(monkeypatch, lambda: state, rerank)
 
     outcome = await engine.evaluate(
@@ -132,7 +144,7 @@ async def test_unavailable_runtime_skips_proactive_rerank(
     )
 
     assert filter_calls == ["不会触发主动回复"]
-    assert rerank.calls == 0
+    assert rerank.calls == []
     assert outcome.memory_action == "store"
     assert outcome.should_reply is False
     assert outcome.runtime_status is state.status
@@ -143,7 +155,7 @@ async def test_explicit_trigger_bypasses_failed_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     filter_calls = _patch_decision_dependencies(monkeypatch)
-    rerank = _RerankService()
+    rerank = _ChatSceneRanker()
     engine = _build_engine(
         monkeypatch,
         lambda: DecisionRuntimeState.failed("测试初始化失败"),
@@ -157,7 +169,7 @@ async def test_explicit_trigger_bypasses_failed_runtime(
     )
 
     assert filter_calls == []
-    assert rerank.calls == 0
+    assert rerank.calls == []
     assert outcome.should_reply is True
     assert outcome.force_reply is True
     assert outcome.runtime_status is DecisionRuntimeStatus.FAILED
@@ -179,7 +191,7 @@ async def test_explicit_trigger_does_not_bypass_command_filter(
         "get_config",
         lambda: SimpleNamespace(),
     )
-    rerank = _RerankService()
+    rerank = _ChatSceneRanker()
     engine = _build_engine(monkeypatch, DecisionRuntimeState.ready, rerank)
 
     outcome = await engine.evaluate(
@@ -189,7 +201,7 @@ async def test_explicit_trigger_does_not_bypass_command_filter(
     )
 
     assert filter_calls == [".help"]
-    assert rerank.calls == 0
+    assert rerank.calls == []
     assert outcome.memory_action == "drop"
     assert outcome.should_reply is False
     assert outcome.filter_reason == "command"
@@ -200,7 +212,7 @@ async def test_transient_snapshot_loss_degrades_without_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_decision_dependencies(monkeypatch)
-    rerank = _RerankService(SceneRuntimeUnavailableError("快照暂不可用"))
+    rerank = _ChatSceneRanker(SceneRuntimeUnavailableError("快照暂不可用"))
     engine = _build_engine(monkeypatch, DecisionRuntimeState.ready, rerank)
 
     outcome = await engine.evaluate(
@@ -209,7 +221,7 @@ async def test_transient_snapshot_loss_degrades_without_exception(
         at_trigger=False,
     )
 
-    assert rerank.calls == 1
+    assert rerank.calls == [("运行中快照刚好失效", engine._scene_runtime)]
     assert outcome.should_reply is False
     assert outcome.runtime_status is DecisionRuntimeStatus.FAILED
     assert outcome.runtime_reason == "快照暂不可用"
