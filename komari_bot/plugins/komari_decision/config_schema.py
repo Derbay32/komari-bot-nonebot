@@ -176,7 +176,7 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
     )
     summary_embedding_instruction_query: str = Field(
         default=(
-            "任务：将群聊历史消息编码为群总结场景归类检索向量。"
+            "任务：将群聊消息编码为群总结场景归类检索向量。"
             "重点保留消息的对话意图、话题归属、事件类型与信息价值；"
             "忽略口头禅、语气词、无意义重复字符。"
         ),
@@ -216,7 +216,10 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         default=None,
         ge=0.0,
         le=1.0,
-        description="群总结归类相似度阈值；为空表示不启用余弦相似度兜底",
+        description=(
+            "群总结归类相似度阈值；为空表示未配置，显式余弦模式或 rerank "
+            "失败 fallback 需要配置该阈值"
+        ),
         json_schema_extra={"section_id": "summary_classification"},
     )
     summary_rerank_fallback_enabled: bool = Field(
@@ -228,7 +231,9 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         default=3,
         ge=1,
         le=10,
-        description="群总结归类 rerank 供应方连续失败进入降级的次数阈值",
+        description=(
+            "群总结归类 rerank 供应方持续失败、升级为不可用/诊断的累计次数阈值"
+        ),
         json_schema_extra={"section_id": "summary_classification"},
     )
     summary_rerank_failure_window_seconds: int = Field(

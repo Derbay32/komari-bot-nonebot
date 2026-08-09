@@ -9,7 +9,6 @@ from komari_bot.config.typed_config import (
     get_config_section_metadata,
 )
 
-
 SUMMARY_CONFIG_DEFAULTS: dict[str, object] = {
     "summary_scene_top_k": 4,
     "summary_rerank_enabled": True,
@@ -45,12 +44,12 @@ def test_decision_config_declares_ordered_chat_and_summary_sections() -> None:
         ("summary_classification", "群总结归类", 20),
     ]
 
-    for field_name in {
+    for field_name in (
         "scene_top_k",
         "embedding_instruction_query",
         "embedding_instruction_scene",
         "rerank_instruction",
-    }:
+    ):
         assert metadata.field_section_ids[field_name] == "chat_scene"
 
     for field_name in SUMMARY_CONFIG_FIELDS:
@@ -65,8 +64,8 @@ def test_summary_classification_config_has_safe_defaults() -> None:
     for field_name, expected in SUMMARY_CONFIG_DEFAULTS.items():
         assert getattr(config, field_name) == expected
 
-    assert getattr(config, "summary_embedding_instruction_query").strip()
-    assert getattr(config, "summary_rerank_instruction").strip()
+    assert config.summary_embedding_instruction_query.strip()
+    assert config.summary_rerank_instruction.strip()
 
 
 def test_summary_target_scene_identity_is_not_operator_configurable() -> None:

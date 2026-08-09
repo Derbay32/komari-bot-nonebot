@@ -48,7 +48,7 @@ depends_on: str | Sequence[str] | None = None
 _ADD_COLUMN_STATEMENTS: tuple[str, ...] = (
     "ALTER TABLE komari_decision_config ADD COLUMN "
     "summary_embedding_instruction_query VARCHAR DEFAULT "
-    "'任务：将群聊历史消息编码为群总结场景归类检索向量。重点保留消息的对话意图、话题归属、事件类型与信息价值；忽略口头禅、语气词、无意义重复字符。' "
+    "'任务：将群聊消息编码为群总结场景归类检索向量。重点保留消息的对话意图、话题归属、事件类型与信息价值；忽略口头禅、语气词、无意义重复字符。' "
     "NOT NULL",
     "ALTER TABLE komari_decision_config ADD COLUMN "
     "summary_rerank_instruction VARCHAR DEFAULT "
