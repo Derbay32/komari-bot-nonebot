@@ -64,6 +64,7 @@ class _EmbeddingProvider:
         rerank_scores: list[float] | None = None,
         embedding_ready: bool = True,
         rerank_enabled: bool = True,
+        rerank_provider_fingerprint: str = "a" * 16,
         embed_error: BaseException | None = None,
         rerank_error: BaseException | None = None,
     ) -> None:
@@ -71,6 +72,7 @@ class _EmbeddingProvider:
         self.rerank_scores = rerank_scores or []
         self.embedding_ready = embedding_ready
         self.rerank_enabled = rerank_enabled
+        self.rerank_provider_fingerprint = rerank_provider_fingerprint
         self.embed_error = embed_error
         self.rerank_error = rerank_error
         self.embed_calls: list[tuple[str, str]] = []
@@ -81,6 +83,9 @@ class _EmbeddingProvider:
 
     def is_embedding_ready(self) -> bool:
         return self.embedding_ready
+
+    def get_rerank_provider_fingerprint(self) -> str:
+        return self.rerank_provider_fingerprint
 
     async def embed(self, text: str, instruction: str = "") -> list[float]:
         self.embed_calls.append((text, instruction))
@@ -109,6 +114,27 @@ class _EmbeddingProvider:
             SimpleNamespace(index=index, relevance_score=score)
             for index, score in enumerate(self.rerank_scores)
         ]
+
+
+class _FailureBudget:
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+        self.record_calls: list[tuple[str, int]] = []
+        self.clear_calls: list[str] = []
+
+    async def record_failure(
+        self,
+        provider_fingerprint: str,
+        window_seconds: int,
+    ) -> int:
+        self.record_calls.append((provider_fingerprint, window_seconds))
+        count = self.counts.get(provider_fingerprint, 0) + 1
+        self.counts[provider_fingerprint] = count
+        return count
+
+    async def clear(self, provider_fingerprint: str) -> None:
+        self.clear_calls.append(provider_fingerprint)
+        self.counts.pop(provider_fingerprint, None)
 
 
 def _snapshot(
@@ -172,6 +198,7 @@ def _wire(
     runtime: _Runtime | None,
     provider: _EmbeddingProvider,
     runtime_state: DecisionRuntimeState | None = None,
+    failure_budget: object | None = None,
 ) -> None:
     monkeypatch.setattr(decision_plugin, "get_config", lambda: config)
     manager = SimpleNamespace(
@@ -183,6 +210,13 @@ def _wire(
         scene_classification,
         "_get_embedding_provider",
         lambda: provider,
+    )
+    budget = _FailureBudget() if failure_budget is None else failure_budget
+    monkeypatch.setattr(
+        scene_classification,
+        "_get_rerank_failure_budget",
+        lambda: budget,
+        raising=False,
     )
 
 
