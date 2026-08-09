@@ -1,10 +1,11 @@
-"""komari_bot.decision 判定契约共享包验收测试（ticket #28）。
+"""komari_bot.decision 判定契约共享包验收测试（ticket #28 / KOMARIBOT-27）。
 
 验收目标：
-- 共享包顶层统一 re-export 全部判定契约符号；
+- 共享包顶层统一 re-export 当前公开稳定契约符号；
 - 共享包保持零依赖纯件成色（不 import nonebot / redis / 插件内部类型）；
-- 契约类型行为与搬迁前逐字节等价（枚举值、dataclass 字段与顺序、类方法、
-  关键字-only 构造）。
+- 契约类型的字段与行为构成聊天/总结调用方可见的当前公开契约（枚举值、
+  dataclass 字段与顺序、类方法、关键字-only 构造）；KOMARIBOT-27 已从
+  DecisionOutcome 删除内部 rank_result，本包不再与旧宽重排契约等价。
 """
 
 from __future__ import annotations
@@ -159,7 +160,7 @@ def test_literal_aliases_match_legacy() -> None:
     }
 
 
-def test_decision_outcome_fields_match_legacy() -> None:
+def test_decision_outcome_fields_form_stable_public_contract() -> None:
     outcome = contracts.DecisionOutcome
     assert dataclasses.is_dataclass(outcome)
     assert _is_frozen_dataclass(outcome) is True
