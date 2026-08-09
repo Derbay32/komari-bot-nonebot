@@ -12,8 +12,17 @@ from nonebot.plugin import require
 
 # 这些导入需要放在 require 之上或者按需加载以防止循环依赖
 from .config_schema import DynamicConfigSchema
-from .embedding_service import EmbeddingService
-from .rerank_service import RerankResult, RerankService
+from .embedding_service import EmbeddingResponseValidationError, EmbeddingService
+from .request_safety import (
+    RemoteResponseDecodeError,
+    RemoteResponseTooLargeError,
+    RemoteServiceRequestError,
+)
+from .rerank_service import (
+    RerankResponseValidationError,
+    RerankResult,
+    RerankService,
+)
 
 try:
     driver = get_driver()
@@ -119,6 +128,11 @@ def is_rerank_enabled() -> bool:
     return state.rerank_service.enabled
 
 
+def is_embedding_ready() -> bool:
+    """检查 embedding service 是否已初始化。"""
+    return state.embedding_service is not None
+
+
 def get_embedding_model() -> str:
     """获取当前生效的 embedding 模型名。"""
     if state.embedding_service is not None:
@@ -135,3 +149,22 @@ def get_embedding_dimension() -> int | None:
     if config_manager is not None:
         return int(config_manager.get().embedding_dimension)
     return int(DynamicConfigSchema().embedding_dimension)
+
+
+__all__ = [
+    "EmbeddingResponseValidationError",
+    "EmbeddingService",
+    "RemoteResponseDecodeError",
+    "RemoteResponseTooLargeError",
+    "RemoteServiceRequestError",
+    "RerankResponseValidationError",
+    "RerankResult",
+    "RerankService",
+    "embed",
+    "embed_batch",
+    "get_embedding_dimension",
+    "get_embedding_model",
+    "is_embedding_ready",
+    "is_rerank_enabled",
+    "rerank",
+]

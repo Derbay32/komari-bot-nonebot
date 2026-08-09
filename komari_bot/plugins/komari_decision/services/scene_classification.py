@@ -21,6 +21,13 @@ from komari_bot.decision import (
     SummaryRequestClassificationResult,
     SummaryRequestUnavailableReason,
 )
+from komari_bot.plugins.embedding_provider import (
+    EmbeddingResponseValidationError,
+    RemoteResponseDecodeError,
+    RemoteResponseTooLargeError,
+    RemoteServiceRequestError,
+    RerankResponseValidationError,
+)
 
 if TYPE_CHECKING:
     from ..config_schema import KomariDecisionConfigSchema
@@ -32,6 +39,25 @@ if TYPE_CHECKING:
 
 # 群总结专用目标场景键：只允许存在于本 implementation，不对外暴露。
 _SUMMARY_SCENE_KEY = "scene_group_history_summary"
+
+# 已声明的 embedding 预期故障：远程请求/响应异常、传输超时（不含未初始化，
+# 后者通过独立的 RuntimeError 消息契约识别）
+_EMBEDDING_EXPECTED_ERRORS = (
+    RemoteServiceRequestError,
+    RemoteResponseTooLargeError,
+    RemoteResponseDecodeError,
+    EmbeddingResponseValidationError,
+    TimeoutError,
+)
+
+# 已声明的 rerank 预期故障：远程请求/响应异常、传输超时
+_RERANK_EXPECTED_ERRORS = (
+    RemoteServiceRequestError,
+    RemoteResponseTooLargeError,
+    RemoteResponseDecodeError,
+    RerankResponseValidationError,
+    TimeoutError,
+)
 
 
 def _is_numeric_summary_request(text: str) -> bool:
@@ -50,8 +76,15 @@ def _get_embedding_provider() -> Any:
 
 
 def _is_embedding_expected_error(exc: BaseException) -> bool:
-    """判断是否为已声明的 embedding 预期故障（未初始化或传输超时）。"""
-    if isinstance(exc, TimeoutError):
+    """判断是否为已声明的 embedding 预期故障（未初始化/传输超时/远程服务/响应校验）。"""
+    if isinstance(exc, _EMBEDDING_EXPECTED_ERRORS):
+        return True
+    return isinstance(exc, RuntimeError) and "尚未初始化" in str(exc)
+
+
+def _is_rerank_expected_error(exc: BaseException) -> bool:
+    """判断是否为已声明的 rerank 预期故障（未初始化/传输超时/远程服务/响应校验）。"""
+    if isinstance(exc, _RERANK_EXPECTED_ERRORS):
         return True
     return isinstance(exc, RuntimeError) and "尚未初始化" in str(exc)
 
@@ -102,7 +135,7 @@ async def _resolve_summary_snapshot(
     """刷新 runtime 并解析含群总结目标场景的快照。
 
     返回 (错误结果, 快照)：错误结果非 None 时快照恒为 None；
-    错误结果与快照皆非 None 时快照即为有效快照。
+    错误结果为 None 时快照即为有效快照（恒非 None）。
     """
     if scene_runtime is None:
         return _unavailable(SummaryRequestUnavailableReason.RUNTIME_UNAVAILABLE), None
@@ -141,10 +174,13 @@ async def _classify_with_rerank(
             top_n=len(top_scenes),
             instruction=config.summary_rerank_instruction,
         )
-    except TimeoutError:
-        # 提供者传输失败：本票不做失败预算与 fallback（KOMARIBOT-24），安全上报；
-        # 未声明的程序错误（如 RuntimeError/TypeError）继续传播
-        return _unavailable(SummaryRequestUnavailableReason.RERANK_UNAVAILABLE)
+    except Exception as exc:
+        # 仅白名单稳定类型（远程服务/响应校验/传输超时/未初始化）映射为不可用，
+        # 未声明的程序错误（如 RuntimeError/TypeError）继续传播；
+        # 本票不做失败预算与 fallback（KOMARIBOT-24）
+        if _is_rerank_expected_error(exc):
+            return _unavailable(SummaryRequestUnavailableReason.RERANK_UNAVAILABLE)
+        raise
 
     score_by_index: dict[int, float] = {}
     for result in rerank_results:
@@ -231,6 +267,29 @@ async def _classify_embedded(
     )
 
 
+def _resolve_classification_mode(
+    provider: Any,
+    config: KomariDecisionConfigSchema,
+) -> tuple[SummaryRequestClassificationResult | None, bool, float | None]:
+    """解析有效 rerank 模式与余弦阈值。
+
+    返回 (错误结果, 有效 rerank 模式, 相似度阈值)：embedding 未就绪或
+    余弦模式缺阈值时错误结果非 None；通过时错误结果为 None。
+    """
+    if not provider.is_embedding_ready():
+        # embedding service 未就绪：在余弦配置完整性判断前拦截，且不调用 embed
+        return _unavailable(SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE), False, None
+    # 有效 rerank 模式 = 配置允许且提供者实际开启；提供者关闭时走真实余弦模式
+    effective_rerank_mode = config.summary_rerank_enabled and bool(
+        provider.is_rerank_enabled()
+    )
+    similarity_threshold = config.summary_similarity_threshold
+    if not effective_rerank_mode and similarity_threshold is None:
+        # 余弦模式需要配置相似度阈值；缺失时不进入 embedding 流程
+        return _unavailable(SummaryRequestUnavailableReason.CONFIGURATION_INCOMPLETE), False, None
+    return None, effective_rerank_mode, similarity_threshold
+
+
 async def classify_summary_request(
     *,
     message_text: str,
@@ -240,7 +299,7 @@ async def classify_summary_request(
 ) -> SummaryRequestClassificationResult:
     """执行群总结请求场景归类（配置与运行时已由调用方冻结解析）。
 
-    流程：三态门控 → 数字快速识别 → 配置完整性 → runtime 刷新/快照/目标场景
+    流程：三态门控 → 数字快速识别 → 模式/配置解析 → runtime 刷新/快照/目标场景
     → query embedding → top-k 召回 → rerank 或显式余弦模式评分。
     """
     gated = _gate_checks(config, runtime_state)
@@ -251,14 +310,11 @@ async def classify_summary_request(
         return SummaryRequestClassificationResult.matched()
 
     provider = _get_embedding_provider()
-    # 有效 rerank 模式 = 配置允许且提供者实际开启；提供者关闭时走真实余弦模式
-    effective_rerank_mode = config.summary_rerank_enabled and bool(
-        provider.is_rerank_enabled()
+    mode_error, effective_rerank_mode, similarity_threshold = (
+        _resolve_classification_mode(provider, config)
     )
-    similarity_threshold = config.summary_similarity_threshold
-    if not effective_rerank_mode and similarity_threshold is None:
-        # 余弦模式需要配置相似度阈值；缺失时不进入 embedding 流程
-        return _unavailable(SummaryRequestUnavailableReason.CONFIGURATION_INCOMPLETE)
+    if mode_error is not None:
+        return mode_error
 
     resolve_error, snapshot = await _resolve_summary_snapshot(scene_runtime)
     if resolve_error is not None:
@@ -270,8 +326,9 @@ async def classify_summary_request(
             message_text,
             instruction=config.summary_embedding_instruction_query,
         )
-    except (TimeoutError, RuntimeError) as exc:
-        # 未初始化与传输超时为已声明的预期故障；其余程序错误继续传播
+    except Exception as exc:
+        # 仅白名单稳定类型（远程服务/响应校验/传输超时/未初始化）映射为不可用，
+        # 未声明 RuntimeError、TypeError、AssertionError 与取消继续传播
         if _is_embedding_expected_error(exc):
             return _unavailable(SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE)
         raise
