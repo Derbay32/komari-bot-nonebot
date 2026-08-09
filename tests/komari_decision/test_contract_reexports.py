@@ -16,6 +16,7 @@ EXPECTED_PLUGIN_ALL = {
     "PluginManager",
     "UnifiedCandidateRerankService",
     "UnifiedRerankResult",
+    "classify_summary_request",
     "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
@@ -42,3 +43,8 @@ def test_contract_symbols_are_shared_package_identities() -> None:
 def test_engine_service_stays_plugin_owned() -> None:
     service = decision_plugin.UnifiedCandidateRerankService
     assert service.__module__.startswith("komari_bot.plugins.komari_decision")
+
+
+def test_summary_classification_operation_stays_plugin_owned() -> None:
+    operation = decision_plugin.classify_summary_request
+    assert operation.__module__ == "komari_bot.plugins.komari_decision"
