@@ -1,6 +1,6 @@
 # Komari Management 前端对接说明
 
-> 最后同步：2026-08-07。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
+> 最后同步：2026-08-09。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
 
 Komari Management 统一把配置、提示词、判定场景、维护公告以及各业务插件的管理 API 挂载到 NoneBot2 的 FastAPI 应用。前端不需要对接独立的管理服务，所有接口共用同一后端 Origin、Bearer 鉴权和 CORS 配置。
 
@@ -221,15 +221,24 @@ user 上下文（用户标识）；其余诊断数据（异常正文、breadcrum
 凭据类字段（API Key、Token、密码、连接串、DSN、API 形状 URL 等）。
 已经发送的历史事件不会补发或恢复。
 
-详情响应中的关键字段：
+资源列表与详情响应中的关键字段：
 
 ```ts
+type ConfigSectionDescriptor = {
+  section_id: string;
+  display_name: string;
+  order: number;
+};
+
 type ConfigFieldMetadata = {
   secret: boolean;
   apply_mode: "immediate" | "rebuild" | "restart";
+  section_id: string | null;
 };
 
-type ConfigFieldState = ConfigFieldMetadata & {
+type ConfigFieldState = {
+  secret: boolean;
+  apply_mode: "immediate" | "rebuild" | "restart";
   configured_value: unknown;
   effective_value: unknown;
   source: string;
@@ -239,9 +248,26 @@ type ConfigFieldState = ConfigFieldMetadata & {
     | "process_startup_snapshot";
   restart_required: boolean;
 };
+
+// 资源级分区元数据：资源摘要（GET /resources 的 items[]）与
+// 资源详情（GET /resources/{resource_id}）都包含这一形状。
+type ConfigResourceMetadata = {
+  sections: ConfigSectionDescriptor[];
+  field_metadata: Record<string, ConfigFieldMetadata>;
+};
 ```
 
-前端渲染规则：
+`GET /resources` 的资源摘要与 `GET /resources/{resource_id}` 的详情都返回 `sections` 与 `field_metadata`。`sections` 是后端按 `(order, section_id)` 确定性排序后的分区描述符数组，`field_metadata[field_name].section_id` 是字段归属分区的唯一权威引用。
+
+分区渲染规则：
+
+- 表单按 `sections` 的数组顺序渲染分区标题与字段分组，不要按 `display_name` 重新排序，也不要假定分区声明顺序就是展示顺序；
+- 字段归属只看 `field_metadata[field_name].section_id`：前端不得根据字段名前缀（如 `tavily_`、`exa_`）猜测分区，也不得硬编码字段清单——Schema 新增字段会随接口自动出现在对应的 `field_metadata` 与 `sections` 中；
+- `section_id=null` 表示该字段未分区：统一渲染在全部已声明分区之后的“未分区”区域；未声明 `sections` 的资源（`sections: []`）所有字段都是 `null`，此时直接渲染平铺表单；
+- `sections` 只包含布局元数据（`section_id` / `display_name` / `order`），不含 `values`、`configured_value`、`effective_value`、默认值或任何秘密掩码。配置值只能从详情的 `values` 与 `field_states` 读取，禁止把 `sections` 当作值读取旁路，也不要假设分区元数据会暴露被掩码的秘密字段内容；
+- `ConfigFieldState` 是有意独立于 `ConfigFieldMetadata` 的扁平类型，不包含 `section_id`：布局信息只存在于资源级 `sections` 与 `field_metadata[field_name].section_id`，前端不要试图从 `field_states` 取分区。
+
+字段渲染规则（`secret`、`apply_mode`、`field_states`、`restart_required` 与掩码语义保持不变）：
 
 - 使用 `field_descriptions` 作为字段说明，使用 `field_metadata` 和 `field_states` 展示生效方式；
 - `apply_mode=immediate` 表示接口成功后已可确认即时生效；
@@ -476,9 +502,16 @@ Base path：`/api/v2/komari-search`
 | --- | --- | --- | --- |
 | `GET` | `/provider-descriptors` | `search:read` | 获取搜索提供者及其动态配置字段描述 |
 
-响应中的 `current_provider` 是默认搜索提供者，`available_providers` 是可选提供者 ID。`common_fields` 包含通用搜索、抓取和熔断配置；`providers` 按 `tavily`、`exa` 分组返回专用字段。
+该端点是无参数只读接口：只发送 Bearer Token，不携带请求体，也没有查询参数或路径参数。
+
+响应形状固定为四个键：`current_provider` 是默认搜索提供者，`available_providers` 是可选提供者 ID；`common_fields` 包含通用搜索、抓取和熔断配置，`providers` 按 `tavily`、`exa` 分组返回专用字段。
 
 每个字段包含 `field_name`、`field_type`、`description`、`default` 和 `secret`。这些数据由 `komari_search` 的 Pydantic Schema 动态生成，前端不得硬编码字段清单；`secret=true` 的字段输入和日志处理应遵循动态配置页面的秘密值规则。
+
+边界约定：
+
+- 本端点只表达 provider 条件字段（通用字段 + 按提供者分组的专用字段），不承载动态配置页面的视觉分区元数据：响应与 OpenAPI 中都没有 `sections` 或 `section_id`，前端不要在这里查找分区信息，也不要给搜索表单套用动态配置页面的 `sections` 归组逻辑；
+- 响应形状保持不变，前端以 `common_fields` 与 `providers[].fields` 作为该表单的唯一字段来源。
 
 ## 11. 前端实现优先级与验收清单
 
@@ -502,6 +535,9 @@ Base path：`/api/v2/komari-search`
 - Prompt 写入携带最新 `If-Match`，`409` 不会覆盖本地草稿；
 - `204`、字符串 `detail`、对象/数组 `detail` 均可处理；
 - 秘密字段掩码不会被回写；
+- 配置表单按 `sections` 的数组顺序渲染分区，字段按 `field_metadata.section_id` 归组，`section_id=null` 的字段显示在“未分区”区域，且不按字段名前缀或硬编码清单猜归属；
+- 分区元数据不参与值渲染：`values` 与 `field_states` 是唯一取值来源，`sections` 不承载任何配置值，也不能绕过秘密字段掩码；
+- 搜索提供者表单只使用 provider-descriptors 返回的 `common_fields` 与 `providers[].fields`，不依赖 `sections` / `section_id`；
 - `restart_required=true` 会明确提示重启；
 - 公告重试不会生成新的 request ID，也不会因 HTTP `200` 忽略单群失败；
 - 前端生产 Origin 已加入 CORS 白名单。
