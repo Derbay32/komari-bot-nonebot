@@ -13,9 +13,9 @@ from komari_bot.plugins.komari_decision.services.runtime_state import (
     DecisionRuntimeState,
     DecisionRuntimeStatus,
 )
-from komari_bot.plugins.komari_decision.services.unified_candidate_rerank import (
-    SceneRuntimeUnavailableError,
-    UnifiedRerankResult,
+from komari_bot.plugins.komari_decision.services.scene_classification import (
+    ChatRerankResult,
+    ChatSceneUnavailableError,
 )
 
 if TYPE_CHECKING:
@@ -32,11 +32,11 @@ class _ChatSceneRanker:
         message_text: str,
         *,
         scene_runtime: object | None,
-    ) -> UnifiedRerankResult:
+    ) -> ChatRerankResult:
         self.calls.append((message_text, scene_runtime))
         if self.error is not None:
             raise self.error
-        return UnifiedRerankResult(
+        return ChatRerankResult(
             alias_hit=False,
             candidates=[],
             score_map={},
@@ -212,7 +212,7 @@ async def test_transient_snapshot_loss_degrades_without_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_decision_dependencies(monkeypatch)
-    rerank = _ChatSceneRanker(SceneRuntimeUnavailableError("快照暂不可用"))
+    rerank = _ChatSceneRanker(ChatSceneUnavailableError("快照暂不可用"))
     engine = _build_engine(monkeypatch, DecisionRuntimeState.ready, rerank)
 
     outcome = await engine.evaluate(

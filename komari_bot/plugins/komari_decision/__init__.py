@@ -9,16 +9,13 @@ from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.decision import (
-    CandidateSchema,
     DecisionRuntimeState,
     DecisionRuntimeStatus,
     SummaryRequestClassificationResult,
-    UnifiedRerankResult,
 )
 
 from .services.config_interface import get_config, get_config_async
 from .services.decision_engine import DecisionEngine
-from .services.unified_candidate_rerank import UnifiedCandidateRerankService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,12 +68,9 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
-    "CandidateSchema",
     "DecisionRuntimeState",
     "DecisionRuntimeStatus",
     "PluginManager",
-    "UnifiedCandidateRerankService",
-    "UnifiedRerankResult",
     "classify_summary_request",
     "get_decision_engine",
     "get_plugin_manager",

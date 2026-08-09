@@ -15,14 +15,18 @@ query embedding 与真实余弦归类；401/403、其他 4xx（含 425）、缺�
 本地配置非法立即返回 RERANK_UNAVAILABLE，不消耗预算。聊天用途不启用
 失败预算/余弦 fallback，embed/rerank 非快照错误原样传播。
 
-本模块不创建 request trace / Agent Run。旧聊天宽 service
-UnifiedCandidateRerankService 的清理由 KOMARIBOT-27 处理。
+聊天专用候选、排序结果与 runtime 不可用异常（KOMARIBOT-27 起）只定义在本
+implementation 内部且不对外导出：聊天调用方只经顶层 ``get_decision_engine()``
+获得引擎，观察 ``DecisionOutcome`` 的稳定标量字段。
+
+本模块不创建 request trace / Agent Run。
 """
 
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 from nonebot import logger
 
@@ -31,11 +35,6 @@ from komari_bot.decision import (
     DecisionRuntimeStatus,
     SummaryRequestClassificationResult,
     SummaryRequestUnavailableReason,
-)
-from komari_bot.decision.unified_candidate_rerank import (
-    CandidateSchema,
-    SceneRuntimeUnavailableError,
-    UnifiedRerankResult,
 )
 from komari_bot.plugins.embedding_provider import (
     EmbeddingResponseValidationError,
@@ -60,6 +59,38 @@ if TYPE_CHECKING:
         SceneRuntimeService,
         SceneRuntimeSnapshot,
     )
+
+
+@dataclass(frozen=True)
+class ChatCandidate:
+    """聊天深归类的候选条目（KOMARIBOT-27 聊天专用，不对外导出）。"""
+
+    key: str
+    text: str
+    kind: Literal["fixed", "call", "scene"]
+    scene_id: str | None = None
+    embedding_similarity: float | None = None
+
+
+@dataclass(frozen=True)
+class ChatRerankResult:
+    """聊天深归类的单次 rerank 聚合结果（KOMARIBOT-27 聊天专用，不对外导出）。"""
+
+    alias_hit: bool
+    candidates: list[ChatCandidate]
+    score_map: dict[str, float]
+    meaningful_score: float
+    noise_score: float
+    call_direct_score: float | None
+    call_mention_score: float | None
+    best_scene_id: str | None
+    best_scene_score: float
+    meaningful_prior: float
+    noise_prior: float
+
+
+class ChatSceneUnavailableError(RuntimeError):
+    """scene 运行时快照暂不可用于聊天判定（KOMARIBOT-27 聊天专用，不对外导出）。"""
 
 # 群总结专用目标场景键：只允许存在于本 implementation，不对外暴露。
 _SUMMARY_SCENE_KEY = "scene_group_history_summary"
@@ -552,20 +583,20 @@ async def classify_summary_request(
 async def _resolve_chat_snapshot(
     scene_runtime: SceneRuntimeService | None,
 ) -> SceneRuntimeSnapshot:
-    """刷新聊天 runtime 并返回快照；刷新异常/快照缺失抛 SceneRuntimeUnavailableError。"""
+    """刷新聊天 runtime 并返回快照；刷新异常/快照缺失抛 ChatSceneUnavailableError。"""
     if scene_runtime is None:
         msg = "scene runtime snapshot 不可用，请先初始化/迁移 komari_decision scenes"
-        raise SceneRuntimeUnavailableError(msg)
+        raise ChatSceneUnavailableError(msg)
     try:
         await scene_runtime.refresh_if_runtime_updated()
     except Exception as exc:
-        logger.exception("[UnifiedRerank] 刷新 scene runtime cache 失败")
+        logger.exception("[KomariDecision] 刷新 scene runtime cache 失败")
         msg = "scene runtime cache 刷新失败"
-        raise SceneRuntimeUnavailableError(msg) from exc
+        raise ChatSceneUnavailableError(msg) from exc
     snapshot = scene_runtime.get_scene_candidates()
     if snapshot is None:
         msg = "scene runtime snapshot 不可用，请先初始化/迁移 komari_decision scenes"
-        raise SceneRuntimeUnavailableError(msg)
+        raise ChatSceneUnavailableError(msg)
     return snapshot
 
 
@@ -573,16 +604,16 @@ async def rank_chat_message(
     message_text: str,
     *,
     scene_runtime: SceneRuntimeService | None,
-) -> UnifiedRerankResult:
+) -> ChatRerankResult:
     """对单条聊天消息执行统一候选集单次 rerank（KOMARIBOT-26 内部 seam）。
 
     服务内部聊天专用 operation：与群总结共享 runtime 刷新、embedding provider、
     余弦召回与 rerank 基础实现，不对外暴露（不在 __all__、不提供 purpose 参数）。
-    逐项保留旧 ``UnifiedCandidateRerankService.rank_message`` 的可观察行为：
+    逐项保留旧聊天重排服务 ``rank_message`` 的可观察行为：
 
     - 每次调用读取聊天配置；别名 casefold + strip 子串匹配；
     - 刷新传入的同一 scene runtime 并读取同一 snapshot，刷新异常/快照缺失
-      包装为 ``SceneRuntimeUnavailableError``；
+      包装为 ``ChatSceneUnavailableError``；
     - 使用 ``embedding_instruction_query``，``scene_top_k`` 至少 1；
     - 候选顺序严格为 NOISE、MEANINGFUL、alias 命中时 CALL_DIRECT/CALL_MENTION、
       按余弦降序的 top-k general scenes；
@@ -619,14 +650,14 @@ async def rank_chat_message(
         max(1, config.scene_top_k),
     )
 
-    candidates: list[CandidateSchema] = [
-        CandidateSchema(
+    candidates: list[ChatCandidate] = [
+        ChatCandidate(
             key="NOISE",
             text=runtime_snapshot.fixed_candidates["NOISE"],
             kind="fixed",
             embedding_similarity=noise_prior,
         ),
-        CandidateSchema(
+        ChatCandidate(
             key="MEANINGFUL",
             text=runtime_snapshot.fixed_candidates["MEANINGFUL"],
             kind="fixed",
@@ -636,12 +667,12 @@ async def rank_chat_message(
     if alias_detected:
         candidates.extend(
             [
-                CandidateSchema(
+                ChatCandidate(
                     key="CALL_DIRECT",
                     text=runtime_snapshot.fixed_candidates["CALL_DIRECT"],
                     kind="call",
                 ),
-                CandidateSchema(
+                ChatCandidate(
                     key="CALL_MENTION",
                     text=runtime_snapshot.fixed_candidates["CALL_MENTION"],
                     kind="call",
@@ -649,7 +680,7 @@ async def rank_chat_message(
             ]
         )
     candidates.extend(
-        CandidateSchema(
+        ChatCandidate(
             key=f"SCENE::{scene.scene_id}",
             text=scene.text,
             kind="scene",
@@ -684,7 +715,7 @@ async def rank_chat_message(
             best_scene_id = item.scene_id
             best_scene_score = current
 
-    return UnifiedRerankResult(
+    return ChatRerankResult(
         alias_hit=alias_detected,
         candidates=candidates,
         score_map=score_map,

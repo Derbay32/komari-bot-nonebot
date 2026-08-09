@@ -15,7 +15,7 @@ status: proposed
 
 ## Consequences
 
-- `UnifiedCandidateRerankService` 及其宽重排契约退出跨插件暴露面并收回判定插件 implementation；调用方与测试只穿过新的窄 interface。
+- `UnifiedCandidateRerankService` 及其宽重排契约已退出跨插件暴露面并物理删除（KOMARIBOT-27），调用方与测试只穿过新的窄 interface。
 - 群总结专用 operation 内化启用门控、数字快速识别、一般场景归类、固定目标场景身份、用途配置和预期不可用语义；未命中放行普通聊天，不可用由群总结接入共享失败通知 module。
 - 聊天用途严格保持现有候选、分数与判定行为；总结用途共用场景 embedding，但拥有独立的 query、rerank、top-k 与阈值配置。
 - 实施受共享失败通知 module 与通用配置分区元数据两个独立 spec 阻塞；PostgreSQL 配置数据初始化另行解决，不阻塞 seam 实施，但决定全新部署何时自动具备总结场景与校准配置。

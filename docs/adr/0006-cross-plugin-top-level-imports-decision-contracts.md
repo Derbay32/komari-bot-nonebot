@@ -11,7 +11,7 @@
 
 ## Consequences
 
-- 新增第 8 个顶层共享包 `komari_bot/decision/`（延续 ADR-0005「按边界选桶」规则），承载 `DecisionOutcome` 及 Literal 别名、`DecisionRuntimeState/Status`、`UnifiedRerankResult`、`CandidateSchema`、`SceneRuntimeUnavailableError`、`TimingScoreBreakdown`、`FilterResult` 与 `DecisionEngineProtocol`；以上全部保持零依赖纯件成色，算法实现（rerank、timing 打分、preprocess、引擎本体）原样留在插件内。
+- 新增第 8 个顶层共享包 `komari_bot/decision/`（延续 ADR-0005「按边界选桶」规则），承载 `DecisionOutcome` 及 Literal 别名、`DecisionRuntimeState/Status`、`TimingScoreBreakdown`、`FilterResult` 与 `DecisionEngineProtocol`；以上全部保持零依赖纯件成色，算法实现（rerank、timing 打分、preprocess、引擎本体）原样留在插件内。聊天宽重排候选/结果契约（`UnifiedRerankResult`/`CandidateSchema`/`SceneRuntimeUnavailableError`）曾短期下沉本包，已于 KOMARIBOT-27 随旧宽重排服务一并退役，聊天专用类型只保留在判定插件深 implementation 内部。
 - `komari_decision/__init__.py` 新增 `get_decision_engine()` 惰性导出（依赖身份变化时重建、未就绪返回 `None`，语义与原 `komari_chat._get_or_build_handler` 逐字节等价）；`get_runtime_state` 导出随唯一消费方（komari_chat）迁移完成而退役。
 - `komari_management/scene_api.py` 的 `_fallback_repository` 旁路（decision 未就绪时自建 Repository 直连 PG）删除；decision 未就绪时场景管理 API 统一报服务未就绪，与既有 scene sync 报错风格一致。
 - 例外：管理插件 import 各插件 `config_schema.py` 注册管理资源是 config 体系既定模式（14 个插件统一如此），不视为违规，不在本规则约束范围。

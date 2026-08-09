@@ -1,7 +1,7 @@
 """群总结 rerank 失败预算：Redis 固定窗口原子计数（KOMARIBOT-24）。
 
 预算只服务于群总结归类的「持续降级 → 升级诊断」决策，不改变聊天侧
-DecisionEngine / UnifiedCandidateRerankService。
+DecisionEngine 深归类的行为。
 
 窗口语义是固定窗口：每次业务级最终 rerank 失败原子 INCR，首次失败设置
 EXPIRE，后续失败绝不刷新 TTL；窗口过期后重新从 1 计数。达到阈值后保留
