@@ -195,6 +195,40 @@ def test_komari_chat_config_revision_exists() -> None:
     assert "DROP TABLE komari_memory_config" not in revision_sql
 
 
+def test_komari_decision_summary_config_revision_exists() -> None:
+    """群总结归类配置列由 0005 revision 加入既有判定配置表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    summary_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "komari_decision_summary_config" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert summary_revision is not None
+    assert summary_revision.down_revision == "0004"
+
+    revision_sql = Path(summary_revision.path).read_text(encoding="utf-8")
+    columns = {
+        "summary_embedding_instruction_query",
+        "summary_rerank_instruction",
+        "summary_scene_top_k",
+        "summary_rerank_enabled",
+        "summary_rerank_threshold",
+        "summary_similarity_threshold",
+        "summary_rerank_fallback_enabled",
+        "summary_rerank_failure_threshold",
+        "summary_rerank_failure_window_seconds",
+    }
+    for column in columns:
+        assert column in revision_sql, column
+        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), column
+
+    assert "DROP TABLE komari_decision_config" not in revision_sql
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:
