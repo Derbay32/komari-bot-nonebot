@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 import aiohttp
@@ -14,6 +15,16 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+class RemoteServiceFailureKind(StrEnum):
+    """远程服务失败的稳定安全分类（不含 URL/正文/凭据）。"""
+
+    NETWORK = "network"
+    TIMEOUT = "timeout"
+    HTTP_STATUS = "http_status"
+    RESPONSE_INVALID = "response_invalid"
+    UNKNOWN = "unknown"
 
 
 class RequestSafetyConfigProtocol(Protocol):
@@ -28,7 +39,22 @@ class RequestSafetyConfigProtocol(Protocol):
 
 
 class RemoteServiceRequestError(RuntimeError):
-    """不包含 URL、正文或响应内容的稳定远程请求异常。"""
+    """不包含 URL、正文或响应内容的稳定远程请求异常。
+
+    携带安全的 ``status`` 与 ``failure_kind`` 元数据供调用方分类；
+    单参数旧构造仍兼容（status=None、failure_kind=UNKNOWN）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        failure_kind: RemoteServiceFailureKind = RemoteServiceFailureKind.UNKNOWN,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.failure_kind = failure_kind
 
 
 class RemoteResponseTooLargeError(RuntimeError):
@@ -90,6 +116,24 @@ def _get_status(error: Exception) -> int | None:
     return None
 
 
+def _classify_remote_error(
+    error: Exception,
+) -> tuple[RemoteServiceFailureKind, int | None]:
+    """对最终失败的远程异常做稳定安全分类（超时优先于连接类）。"""
+    if isinstance(error, TimeoutError):
+        return RemoteServiceFailureKind.TIMEOUT, None
+    if isinstance(
+        error,
+        (RemoteResponseDecodeError, RemoteResponseTooLargeError),
+    ):
+        return RemoteServiceFailureKind.RESPONSE_INVALID, None
+    if isinstance(error, aiohttp.ClientResponseError):
+        return RemoteServiceFailureKind.HTTP_STATUS, error.status
+    if isinstance(error, aiohttp.ClientConnectionError):
+        return RemoteServiceFailureKind.NETWORK, None
+    return RemoteServiceFailureKind.UNKNOWN, None
+
+
 def _is_retryable(error: Exception) -> bool:
     if isinstance(
         error,
@@ -140,6 +184,7 @@ async def request_with_retry[T](
                             await asyncio.sleep(delay)
                         continue
 
+                    failure_kind, safe_status = _classify_remote_error(error)
                     logger.error(
                         "[EmbeddingProvider] {} 请求失败: request_hash={} attempts={} "
                         "error_type={} status={}",
@@ -147,10 +192,14 @@ async def request_with_retry[T](
                         request_hash,
                         attempt,
                         type(error).__name__,
-                        status,
+                        safe_status,
                     )
                     msg = f"{service_name} 请求失败（{type(error).__name__}）"
-                    raise RemoteServiceRequestError(msg) from None
+                    raise RemoteServiceRequestError(
+                        msg,
+                        status=safe_status,
+                        failure_kind=failure_kind,
+                    ) from None
     except TimeoutError:
         logger.error(
             "[EmbeddingProvider] {} 请求超过业务总时限: request_hash={} "
@@ -160,7 +209,10 @@ async def request_with_retry[T](
             total_deadline,
         )
         msg = f"{service_name} 请求超时"
-        raise RemoteServiceRequestError(msg) from None
+        raise RemoteServiceRequestError(
+            msg,
+            failure_kind=RemoteServiceFailureKind.TIMEOUT,
+        ) from None
 
     raise AssertionError("远程请求重试循环异常退出")
 
@@ -168,6 +220,7 @@ async def request_with_retry[T](
 __all__ = [
     "RemoteResponseDecodeError",
     "RemoteResponseTooLargeError",
+    "RemoteServiceFailureKind",
     "RemoteServiceRequestError",
     "RequestSafetyConfigProtocol",
     "build_request_timeout",
