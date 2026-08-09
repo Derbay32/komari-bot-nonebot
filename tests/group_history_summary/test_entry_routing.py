@@ -395,7 +395,9 @@ async def test_unavailable_classification_uses_safe_reason_notification_policy(
         "exception",
         "模拟",
     )
-    assert all(value not in notification.group_text for value in forbidden)
+    group_text = notification.group_text
+    assert group_text is not None
+    assert all(value not in group_text for value in forbidden)
 
 
 @pytest.mark.asyncio
