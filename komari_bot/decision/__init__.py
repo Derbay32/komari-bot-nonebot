@@ -12,6 +12,11 @@ from .engine_protocol import DecisionEngineProtocol
 from .message_filter import FilterResult
 from .runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
 from .social_timing_service import TimingScoreBreakdown
+from .summary_request_classification import (
+    SummaryRequestClassificationResult,
+    SummaryRequestClassificationStatus,
+    SummaryRequestUnavailableReason,
+)
 from .unified_candidate_rerank import (
     CandidateSchema,
     SceneRuntimeUnavailableError,
@@ -29,6 +34,9 @@ __all__ = [
     "MemoryAction",
     "ReplyReason",
     "SceneRuntimeUnavailableError",
+    "SummaryRequestClassificationResult",
+    "SummaryRequestClassificationStatus",
+    "SummaryRequestUnavailableReason",
     "TimingScoreBreakdown",
     "UnifiedRerankResult",
 ]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
@@ -12,6 +12,7 @@ from komari_bot.decision import (
     CandidateSchema,
     DecisionRuntimeState,
     DecisionRuntimeStatus,
+    SummaryRequestClassificationResult,
     UnifiedRerankResult,
 )
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
     from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
+    from .config_schema import KomariDecisionConfigSchema
     from .repositories.scene_repository import SceneRepository
     from .services.scene_admin_service import SceneAdminService
     from .services.scene_embedding_worker import SceneEmbeddingWorker
@@ -75,6 +77,7 @@ __all__ = [
     "PluginManager",
     "UnifiedCandidateRerankService",
     "UnifiedRerankResult",
+    "classify_summary_request",
     "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
@@ -95,7 +98,17 @@ class PluginManager:
     @property
     def runtime_state(self) -> DecisionRuntimeState:
         """返回与动态开关及 scene 快照一致的当前状态。"""
-        config = get_config()
+        return self._resolve_runtime_state(get_config())
+
+    def _resolve_runtime_state(
+        self,
+        config: KomariDecisionConfigSchema,
+    ) -> DecisionRuntimeState:
+        """基于给定配置解析运行时三态（供 property 与归类 operation 复用）。
+
+        显式接收已冻结的配置，避免调用方（如 classify_summary_request）
+        在单次用途内二次读取配置。
+        """
         if not config.plugin_enable:
             return DecisionRuntimeState.disabled("komari_decision 已关闭")
         if not config.scene_persist_enabled:
@@ -263,6 +276,53 @@ def get_scene_admin_service() -> SceneAdminService | None:
     if manager is None:
         return None
     return manager.scene_admin
+
+
+async def classify_summary_request(
+    message_text: str,
+) -> SummaryRequestClassificationResult:
+    """群总结请求场景归类窄 operation（KOMARIBOT-23）。
+
+    每次调用动态解析当前 PluginManager 与 scene runtime，并在开始时只读取一次
+    配置冻结本次用途；调用方只能得到命中 / 未命中 / 不可用（带稳定原因码）。
+
+    输入先标准化（折叠空白并 trim），快速路径、embedding 与 rerank 使用同一文本。
+    """
+    from .services.scene_classification import (
+        classify_summary_request as _classify_summary_request,
+    )
+
+    config = get_config()
+    # 标准化：移除全部空白（含换行）并 trim，快速路径/embedding/rerank 共用同一文本
+    normalized_text = "".join(message_text.split())
+    manager = get_plugin_manager()
+    if manager is None:
+        runtime_state = DecisionRuntimeState.failed("插件管理器尚未初始化")
+        scene_runtime = None
+    else:
+        runtime_state = _resolve_manager_runtime_state(manager, config)
+        scene_runtime = manager.scene_runtime
+    return await _classify_summary_request(
+        message_text=normalized_text,
+        config=config,
+        runtime_state=runtime_state,
+        scene_runtime=scene_runtime,
+    )
+
+
+def _resolve_manager_runtime_state(
+    manager: Any,
+    config: KomariDecisionConfigSchema,
+) -> DecisionRuntimeState:
+    """解析插件管理器的运行时三态，显式使用冻结配置。
+
+    真实 PluginManager 走内部解析方法（不二次读取配置）；
+    无该方法的测试替身回退到 runtime_state 属性。
+    """
+    resolver: Any = getattr(manager, "_resolve_runtime_state", None)
+    if resolver is not None:
+        return resolver(config)
+    return manager.runtime_state
 
 
 _cached_decision_engine: DecisionEngine | None = None
