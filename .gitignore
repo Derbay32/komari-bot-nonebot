@@ -165,3 +165,6 @@ logs
 !tools/
 tools/*
 data/character_binding/.bindings.json.lock
+
+# Playwright MCP
+.playwright-mcp/
