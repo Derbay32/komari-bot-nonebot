@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import aiohttp
 import pytest
-from komari_bot.plugins.komari_decision.services.summary_rerank_failure_budget import (
-    RerankFailureBudgetUnavailableError,
-    SummaryRerankFailureBudget,
-)
 
 import komari_bot.plugins.komari_decision as decision_plugin
 from komari_bot.decision import (
@@ -25,6 +22,11 @@ from komari_bot.plugins.embedding_provider import (
     RerankResponseValidationError,
 )
 from komari_bot.plugins.embedding_provider.request_safety import request_with_retry
+from komari_bot.plugins.komari_decision.services import scene_classification
+from komari_bot.plugins.komari_decision.services.summary_rerank_failure_budget import (
+    RerankFailureBudgetUnavailableError,
+    SummaryRerankFailureBudget,
+)
 from tests.komari_decision.test_summary_request_classification import (
     _config,
     _EmbeddingProvider,
@@ -91,6 +93,27 @@ class _BrokenFailureBudget:
         raise RerankFailureBudgetUnavailableError
 
 
+class _ProgrammingErrorBudget:
+    async def record_failure(
+        self,
+        provider_fingerprint: str,
+        window_seconds: int,
+    ) -> int:
+        del provider_fingerprint, window_seconds
+        raise AssertionError("失败预算程序错误")
+
+    async def clear(self, provider_fingerprint: str) -> None:
+        del provider_fingerprint
+        raise AssertionError("失败预算清零程序错误")
+
+
+class _ProgrammingErrorRedis:
+    async def execute_command(self, *args: object) -> object:
+        del args
+        msg = "Redis adapter 程序错误"
+        raise AssertionError(msg)
+
+
 class _RequestConfig:
     request_connect_timeout_seconds = 1.0
     request_read_timeout_seconds = 1.0
@@ -138,6 +161,18 @@ async def test_failure_budget_uses_fixed_ttl_and_safe_fingerprint_keys() -> None
     await budget.clear(first_fingerprint)
     assert first_key not in redis.values
 
+    with pytest.raises(ValueError, match="指纹"):
+        await budget.record_failure("https://raw-endpoint.example?api_key=secret", 60)
+    assert all("raw-endpoint" not in key for key in redis.values)
+
+
+@pytest.mark.asyncio
+async def test_failure_budget_does_not_swallow_programming_errors() -> None:
+    budget = SummaryRerankFailureBudget(_ProgrammingErrorRedis())
+
+    with pytest.raises(AssertionError, match="Redis adapter 程序错误"):
+        await budget.record_failure("a" * 16, 60)
+
 
 def test_rerank_provider_fingerprint_isolated_by_endpoint_and_model(
     monkeypatch: pytest.MonkeyPatch,
@@ -178,6 +213,11 @@ def test_rerank_provider_fingerprint_isolated_by_endpoint_and_model(
             RemoteServiceFailureKind.NETWORK,
             None,
         ),
+        (
+            aiohttp.ClientPayloadError("payload interrupted"),
+            RemoteServiceFailureKind.NETWORK,
+            None,
+        ),
         (TimeoutError("timeout"), RemoteServiceFailureKind.TIMEOUT, None),
         (
             RemoteResponseDecodeError("响应不是合法 JSON"),
@@ -186,7 +226,10 @@ def test_rerank_provider_fingerprint_isolated_by_endpoint_and_model(
         ),
         (
             aiohttp.ClientResponseError(
-                request_info=SimpleNamespace(real_url="https://provider.invalid"),
+                request_info=cast(
+                    "Any",
+                    SimpleNamespace(real_url="https://provider.invalid"),
+                ),
                 history=(),
                 status=401,
                 message="unauthorized",
@@ -448,6 +491,48 @@ async def test_budget_unavailable_forbids_fallback_but_not_success(
     succeeded = await decision_plugin.classify_summary_request("请总结群聊内容")
     assert succeeded == SummaryRequestClassificationResult.matched()
     assert budget.clear_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_budget_programming_errors_continue_to_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = _ProgrammingErrorBudget()
+    provider = _EmbeddingProvider(rerank_error=_eligible_network_error())
+    _wire(
+        monkeypatch,
+        config=_config(summary_rerank_fallback_enabled=True),
+        runtime=_Runtime(_snapshot()),
+        provider=provider,
+        failure_budget=budget,
+    )
+
+    with pytest.raises(AssertionError, match="失败预算程序错误"):
+        await decision_plugin.classify_summary_request("请总结群聊内容")
+
+    provider.rerank_error = None
+    provider.rerank_scores = [0.9, 0.1]
+    with pytest.raises(AssertionError, match="失败预算清零程序错误"):
+        await decision_plugin.classify_summary_request("请总结群聊内容")
+
+
+def test_failure_budget_factory_does_not_swallow_programming_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from komari_bot.plugins import komari_memory
+
+    def _raise_programming_error() -> object:
+        msg = "Redis manager 程序错误"
+        raise TypeError(msg)
+
+    monkeypatch.setattr(
+        komari_memory,
+        "get_plugin_manager",
+        _raise_programming_error,
+    )
+
+    with pytest.raises(TypeError, match="Redis manager 程序错误"):
+        scene_classification._get_rerank_failure_budget()
 
 
 @pytest.mark.asyncio
