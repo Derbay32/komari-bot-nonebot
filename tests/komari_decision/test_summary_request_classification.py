@@ -7,6 +7,7 @@ import inspect
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -58,11 +59,13 @@ class _EmbeddingProvider:
         rerank_scores: list[float] | None = None,
         rerank_enabled: bool = True,
         embed_error: BaseException | None = None,
+        rerank_error: BaseException | None = None,
     ) -> None:
         self.query_vector = query_vector or [1.0, 0.0]
         self.rerank_scores = rerank_scores or []
         self.rerank_enabled = rerank_enabled
         self.embed_error = embed_error
+        self.rerank_error = rerank_error
         self.embed_calls: list[tuple[str, str]] = []
         self.rerank_calls: list[dict[str, object]] = []
 
@@ -90,6 +93,8 @@ class _EmbeddingProvider:
                 "instruction": instruction,
             }
         )
+        if self.rerank_error is not None:
+            raise self.rerank_error
         return [
             SimpleNamespace(index=index, relevance_score=score)
             for index, score in enumerate(self.rerank_scores)
@@ -242,6 +247,12 @@ async def test_numeric_fast_path_runs_only_after_runtime_gate(
     assert provider.embed_calls == []
     assert provider.rerank_calls == []
 
+    broad_numeric = await decision_plugin.classify_summary_request(
+        "请总结今天 8 点后的聊天"
+    )
+    assert broad_numeric == SummaryRequestClassificationResult.matched()
+    assert provider.embed_calls == []
+
 
 @pytest.mark.asyncio
 async def test_summary_operation_uses_only_general_scenes_and_frozen_config(
@@ -267,14 +278,13 @@ async def test_summary_operation_uses_only_general_scenes_and_frozen_config(
 
     provider = _EmbeddingProvider(rerank_scores=[0.9, 0.2])
     runtime = _Runtime(_snapshot())
+    manager = decision_plugin.PluginManager()
+    manager.scene_runtime = cast("Any", runtime)
     monkeypatch.setattr(decision_plugin, "get_config", _get_config)
     monkeypatch.setattr(
         decision_plugin,
         "get_plugin_manager",
-        lambda: SimpleNamespace(
-            runtime_state=DecisionRuntimeState.ready(),
-            scene_runtime=runtime,
-        ),
+        lambda: manager,
     )
     monkeypatch.setattr(
         scene_classification,
@@ -283,7 +293,7 @@ async def test_summary_operation_uses_only_general_scenes_and_frozen_config(
     )
 
     result = await decision_plugin.classify_summary_request(
-        "总结一下今天聊了什么"
+        "  总结一下\n今天聊了什么  "
     )
 
     assert result == SummaryRequestClassificationResult.matched()
@@ -350,6 +360,33 @@ async def test_explicit_cosine_mode_uses_real_similarity_without_rerank(
 
 
 @pytest.mark.asyncio
+async def test_provider_disabled_rerank_uses_real_cosine_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _EmbeddingProvider(
+        query_vector=[1.0, 0.0],
+        rerank_enabled=False,
+        rerank_scores=[0.0, 1.0],
+    )
+    _wire(
+        monkeypatch,
+        config=_config(
+            summary_rerank_enabled=True,
+            summary_similarity_threshold=0.8,
+        ),
+        runtime=_Runtime(_snapshot()),
+        provider=provider,
+    )
+
+    result = await decision_plugin.classify_summary_request(
+        "请把今天的群聊做个总结"
+    )
+
+    assert result == SummaryRequestClassificationResult.matched()
+    assert provider.rerank_calls == []
+
+
+@pytest.mark.asyncio
 async def test_cosine_mode_requires_configured_similarity_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -393,6 +430,11 @@ async def test_expected_runtime_scene_and_embedding_failures_are_safe(
             _EmbeddingProvider(embed_error=RuntimeError("EmbeddingProvider 尚未初始化")),
             SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE,
         ),
+        (
+            _Runtime(_snapshot()),
+            _EmbeddingProvider(embed_error=TimeoutError("embedding 请求超时")),
+            SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE,
+        ),
     ]
 
     for runtime, current_provider, reason in cases:
@@ -406,6 +448,33 @@ async def test_expected_runtime_scene_and_embedding_failures_are_safe(
             "总结一下今天聊了什么"
         )
         assert result == SummaryRequestClassificationResult.unavailable(reason)
+
+
+@pytest.mark.asyncio
+async def test_runtime_and_rerank_programming_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime(_snapshot(), refresh_error=AssertionError("runtime 程序错误"))
+    _wire(
+        monkeypatch,
+        config=_config(),
+        runtime=runtime,
+        provider=_EmbeddingProvider(),
+    )
+    with pytest.raises(AssertionError, match="runtime 程序错误"):
+        await decision_plugin.classify_summary_request("总结一下今天聊了什么")
+
+    provider = _EmbeddingProvider(
+        rerank_error=RuntimeError("未声明的 rerank 程序错误")
+    )
+    _wire(
+        monkeypatch,
+        config=_config(),
+        runtime=_Runtime(_snapshot()),
+        provider=provider,
+    )
+    with pytest.raises(RuntimeError, match="未声明的 rerank 程序错误"):
+        await decision_plugin.classify_summary_request("总结一下今天聊了什么")
 
 
 @pytest.mark.asyncio
