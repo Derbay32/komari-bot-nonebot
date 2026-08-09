@@ -129,7 +129,15 @@ def _classify_remote_error(
         return RemoteServiceFailureKind.RESPONSE_INVALID, None
     if isinstance(error, aiohttp.ClientResponseError):
         return RemoteServiceFailureKind.HTTP_STATUS, error.status
-    if isinstance(error, aiohttp.ClientConnectionError):
+    if isinstance(
+        error,
+        (
+            # ClientPayloadError 直接继承 ClientError（非 ClientConnectionError），
+            # 但语义上属于网络/载荷中断，与连接错误同归 NETWORK
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+        ),
+    ):
         return RemoteServiceFailureKind.NETWORK, None
     return RemoteServiceFailureKind.UNKNOWN, None
 

@@ -94,17 +94,24 @@ def _get_embedding_provider() -> Any:
 def _get_rerank_failure_budget() -> Any:
     """惰性获取群总结 rerank 失败预算存储。
 
-    经 komari_memory 顶层 ``get_redis_manager()`` 获取 ``RedisManager.redis``；
-    Redis 未就绪时构造不可用 store（记录失败时抛预算不可用）。
+    复用项目既有顶层 seam：经 ``komari_memory.get_plugin_manager()`` 获取
+    manager，取 ``manager.redis``（RedisManager）后再取其 ``.redis`` 客户端；
+    manager/RedisManager 不存在时构造不可用 store，``.redis`` 未初始化的
+    明确 RuntimeError 可降级。来自 get_plugin_manager() 等的未声明程序错误
+    （TypeError/AssertionError）继续传播，不宽捕获。
     """
     from komari_bot.plugins import komari_memory
 
-    redis_client: Any | None = None
+    manager = komari_memory.get_plugin_manager()
+    if manager is None:
+        return SummaryRerankFailureBudget(None)
+    memory_redis = manager.redis
+    if memory_redis is None:
+        return SummaryRerankFailureBudget(None)
     try:
-        redis_manager = komari_memory.get_redis_manager()
-        if redis_manager is not None:
-            redis_client = redis_manager.redis
-    except Exception:
+        redis_client = memory_redis.redis
+    except RuntimeError:
+        # RedisManager.redis 未初始化时的明确 RuntimeError：可降级为不可用 store
         redis_client = None
     return SummaryRerankFailureBudget(redis_client)
 
@@ -314,7 +321,14 @@ async def _resolve_budgeted_rerank_failure(
         config.summary_rerank_failure_threshold,
     )
     if count >= config.summary_rerank_failure_threshold:
-        # 达到阈值后不删除计数，后续失败仍升级
+        # 达到阈值后不删除计数，后续失败仍升级；error 级日志只含计数，
+        # 不含 endpoint/query/正文/凭据，原因码仍是唯一的升级标记
+        logger.error(
+            "[KomariDecision] 群总结 rerank 供应方持续降级失败，已耗尽失败预算: "
+            "count={} threshold={}",
+            count,
+            config.summary_rerank_failure_threshold,
+        )
         return _unavailable(
             SummaryRequestUnavailableReason.RERANK_FAILURE_BUDGET_EXHAUSTED
         )
@@ -331,11 +345,15 @@ async def _resolve_budgeted_rerank_failure(
 
 
 async def _best_effort_clear_rerank_budget(provider: Any) -> None:
-    """rerank 成功后清零失败预算；清零失败不得改变成功结果。"""
+    """rerank 成功后清零失败预算；清零失败不得改变成功结果。
+
+    只忽略明确的预算存储不可用（RerankFailureBudgetUnavailableError）；
+    预算实现或 provider 指纹获取中的未声明程序错误继续传播。
+    """
     try:
         budget = _get_rerank_failure_budget()
         await budget.clear(provider.get_rerank_provider_fingerprint())
-    except Exception:
+    except RerankFailureBudgetUnavailableError:
         logger.warning(
             "[KomariDecision] 群总结 rerank 失败预算清零失败，忽略"
         )
