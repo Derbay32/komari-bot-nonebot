@@ -262,7 +262,7 @@ type ConfigResourceMetadata = {
 分区渲染规则：
 
 - 表单按 `sections` 的数组顺序渲染分区标题与字段分组，不要按 `display_name` 重新排序，也不要假定分区声明顺序就是展示顺序；
-- 字段归属只看 `field_metadata[field_name].section_id`：前端不得根据字段名前缀（如 `tavily_`、`exa_`）猜测分区，也不得硬编码字段清单——Schema 新增字段会随接口自动出现在对应的 `field_metadata` 与 `sections` 中；
+- 字段归属只看 `field_metadata[field_name].section_id`：前端不得根据字段名前缀（如 `tavily_`、`exa_`）猜测分区，也不得硬编码字段清单。Schema 新增字段会随接口自动出现在 `field_metadata` 中，并归入其 `section_id` 指向的分区；
 - `section_id=null` 表示该字段未分区：统一渲染在全部已声明分区之后的“未分区”区域；未声明 `sections` 的资源（`sections: []`）所有字段都是 `null`，此时直接渲染平铺表单；
 - `sections` 只包含布局元数据（`section_id` / `display_name` / `order`），不含 `values`、`configured_value`、`effective_value`、默认值或任何秘密掩码。配置值只能从详情的 `values` 与 `field_states` 读取，禁止把 `sections` 当作值读取旁路，也不要假设分区元数据会暴露被掩码的秘密字段内容；
 - `ConfigFieldState` 是有意独立于 `ConfigFieldMetadata` 的扁平类型，不包含 `section_id`：布局信息只存在于资源级 `sections` 与 `field_metadata[field_name].section_id`，前端不要试图从 `field_states` 取分区。
