@@ -136,6 +136,8 @@ keep-runtime-typing = true
 [tool.ruff.lint.per-file-ignores]
 # 该测试是 ticket03 的不可变 seam 测试，保持其原始断言写法。
 "tests/config_manager/test_typed_models.py" = ["SIM300"]
+# KOMARIBOT-22 的不可变验收契约测试，保持主代理提交的原始断言写法。
+"tests/komari_decision/test_summary_classification_config.py" = ["I001", "PLC0208", "B009"]
 
 [tool.pyright]
 # For Pylance/Pyright configurations, see https://microsoft.github.io/pyright/#/configuration.
