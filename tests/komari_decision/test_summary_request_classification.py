@@ -18,6 +18,11 @@ from komari_bot.decision import (
     SummaryRequestClassificationStatus,
     SummaryRequestUnavailableReason,
 )
+from komari_bot.plugins.embedding_provider import (
+    EmbeddingResponseValidationError,
+    RemoteServiceRequestError,
+    RerankResponseValidationError,
+)
 from komari_bot.plugins.komari_decision.config_schema import (
     KomariDecisionConfigSchema,
 )
@@ -57,12 +62,14 @@ class _EmbeddingProvider:
         *,
         query_vector: list[float] | None = None,
         rerank_scores: list[float] | None = None,
+        embedding_ready: bool = True,
         rerank_enabled: bool = True,
         embed_error: BaseException | None = None,
         rerank_error: BaseException | None = None,
     ) -> None:
         self.query_vector = query_vector or [1.0, 0.0]
         self.rerank_scores = rerank_scores or []
+        self.embedding_ready = embedding_ready
         self.rerank_enabled = rerank_enabled
         self.embed_error = embed_error
         self.rerank_error = rerank_error
@@ -71,6 +78,9 @@ class _EmbeddingProvider:
 
     def is_rerank_enabled(self) -> bool:
         return self.rerank_enabled
+
+    def is_embedding_ready(self) -> bool:
+        return self.embedding_ready
 
     async def embed(self, text: str, instruction: str = "") -> list[float]:
         self.embed_calls.append((text, instruction))
@@ -387,6 +397,35 @@ async def test_provider_disabled_rerank_uses_real_cosine_mode(
 
 
 @pytest.mark.asyncio
+async def test_uninitialized_embedding_precedes_cosine_configuration_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _EmbeddingProvider(
+        embedding_ready=False,
+        rerank_enabled=False,
+        embed_error=AssertionError("不应调用未就绪的 embedding"),
+    )
+    _wire(
+        monkeypatch,
+        config=_config(
+            summary_rerank_enabled=True,
+            summary_similarity_threshold=None,
+        ),
+        runtime=_Runtime(_snapshot()),
+        provider=provider,
+    )
+
+    result = await decision_plugin.classify_summary_request(
+        "请把今天的群聊做个总结"
+    )
+
+    assert result == SummaryRequestClassificationResult.unavailable(
+        SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE
+    )
+    assert provider.embed_calls == []
+
+
+@pytest.mark.asyncio
 async def test_cosine_mode_requires_configured_similarity_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -435,6 +474,20 @@ async def test_expected_runtime_scene_and_embedding_failures_are_safe(
             _EmbeddingProvider(embed_error=TimeoutError("embedding 请求超时")),
             SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE,
         ),
+        (
+            _Runtime(_snapshot()),
+            _EmbeddingProvider(
+                embed_error=RemoteServiceRequestError("embedding_api 请求失败")
+            ),
+            SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE,
+        ),
+        (
+            _Runtime(_snapshot()),
+            _EmbeddingProvider(
+                embed_error=EmbeddingResponseValidationError("向量维度不匹配")
+            ),
+            SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE,
+        ),
     ]
 
     for runtime, current_provider, reason in cases:
@@ -475,6 +528,35 @@ async def test_runtime_and_rerank_programming_errors_propagate(
     )
     with pytest.raises(RuntimeError, match="未声明的 rerank 程序错误"):
         await decision_plugin.classify_summary_request("总结一下今天聊了什么")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        RemoteServiceRequestError("rerank_api 请求失败"),
+        RerankResponseValidationError("rerank 响应无效"),
+        RuntimeError("EmbeddingProvider 尚未初始化"),
+    ],
+)
+async def test_expected_rerank_failures_are_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    _wire(
+        monkeypatch,
+        config=_config(),
+        runtime=_Runtime(_snapshot()),
+        provider=_EmbeddingProvider(rerank_error=error),
+    )
+
+    result = await decision_plugin.classify_summary_request(
+        "总结一下今天聊了什么"
+    )
+
+    assert result == SummaryRequestClassificationResult.unavailable(
+        SummaryRequestUnavailableReason.RERANK_UNAVAILABLE
+    )
 
 
 @pytest.mark.asyncio
