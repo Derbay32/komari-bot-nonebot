@@ -26,6 +26,11 @@ from komari_bot.decision import (
     DecisionOutcome,
     DecisionRuntimeStatus,
 )
+from komari_bot.onebot import (
+    GroupTaskFailureNotification,
+    GroupTaskFailureNotifier,
+    RedisFailureNotificationCooldown,
+)
 from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
@@ -35,11 +40,6 @@ from ..repositories.reply_commit_repository import (
     ReplyCommitStep,
 )
 from ..services.config_interface import get_config, get_memory_config
-from ..services.error_notify import (
-    notify_superusers_reply_failure,
-    one_line_summary,
-    send_group_reply_error_text,
-)
 from ..services.image_downloader import (
     ImageDownloadPolicy,
     download_images_as_base64_aligned,
@@ -142,6 +142,9 @@ class PendingReply:
     proactive_reservation: Reservation | None = None
     reaction_sent: bool = False
     decision_payload: dict[str, object] | None = None
+
+
+GROUP_ERROR_TEXT = "啊、啊呜……对不起，脑袋里刚才突然乱成一团了……"
 
 
 @dataclass(frozen=True)
@@ -651,20 +654,40 @@ class MessageHandler:
     ) -> None:
         """回复失败善后：贴过表情则补发群内错误文本，并通知 SUPERUSER。
 
-        此方法自身不得抛出异常，避免破坏调用方的清理流程。
+        普通投递故障由共享通知边界隔离记录，不在此抛出；
+        任务取消（CancelledError）继续向上传播，不吞没。
         """
         try:
-            if failure.reaction_sent:
-                await send_group_reply_error_text(bot, event)
-            await notify_superusers_reply_failure(
+            notify_superusers = get_memory_config().error_notify_enabled
+        except Exception:
+            logger.exception(
+                "[KomariChat] 回复失败通知配置读取失败，静默 SUPERUSER 私聊"
+            )
+            notify_superusers = False
+        logger.debug(
+            "[KomariChat] 回复失败善后: reason={} error_type={}",
+            reason,
+            failure.error_type,
+        )
+        try:
+            notifier = GroupTaskFailureNotifier(
+                cooldown=RedisFailureNotificationCooldown(
+                    cast("Any", self.redis.redis)
+                ),
+            )
+            await notifier.notify(
                 bot=bot,
-                redis=self.redis,
-                group_id=str(event.group_id),
-                reason=reason,
-                stage=failure.stage,
-                error_type=failure.error_type,
-                summary=failure.summary,
-                request_trace_id=failure.request_trace_id,
+                notification=GroupTaskFailureNotification(
+                    group_id=int(event.group_id),
+                    message_id=int(event.message_id),
+                    group_text=GROUP_ERROR_TEXT if failure.reaction_sent else None,
+                    task_kind="chat_reply",
+                    stage=failure.stage,
+                    reason_code=failure.error_type,
+                    notify_superusers=notify_superusers,
+                    request_trace_id=failure.request_trace_id,
+                    summary=failure.summary,
+                ),
             )
         except Exception:
             logger.exception("[KomariChat] 回复失败善后上报异常")
@@ -1417,7 +1440,7 @@ class MessageHandler:
                 return None, False, ReplyFailureInfo(
                     stage="reserve",
                     error_type=type(exc).__name__,
-                    summary=one_line_summary(exc),
+                    summary=str(exc),
                     request_trace_id=request_trace_id,
                     reaction_sent=False,
                 )
@@ -1464,7 +1487,7 @@ class MessageHandler:
                 return None, False, ReplyFailureInfo(
                     stage="read_buffers",
                     error_type=type(exc).__name__,
-                    summary=one_line_summary(exc),
+                    summary=str(exc),
                     request_trace_id=request_trace_id,
                     reaction_sent=False,
                 )
@@ -1517,7 +1540,7 @@ class MessageHandler:
                 return None, stored, ReplyFailureInfo(
                     stage="generate",
                     error_type=type(exc).__name__,
-                    summary=one_line_summary(exc),
+                    summary=str(exc),
                     request_trace_id=request_trace_id,
                     reaction_sent=reaction_sent,
                 )
@@ -1530,7 +1553,7 @@ class MessageHandler:
                 return None, stored, ReplyFailureInfo(
                     stage="generate",
                     error_type=type(exc).__name__,
-                    summary=one_line_summary(exc),
+                    summary=str(exc),
                     request_trace_id=request_trace_id,
                     reaction_sent=reaction_sent,
                 )
