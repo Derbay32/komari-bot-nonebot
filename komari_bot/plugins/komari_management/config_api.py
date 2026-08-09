@@ -8,6 +8,10 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
+from komari_bot.config.typed_config import (
+    ConfigSectionMetadata,
+    get_config_section_metadata,
+)
 from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
@@ -47,16 +51,31 @@ class ConfigFieldMetadata(BaseModel):
 
     secret: bool
     apply_mode: ConfigApplyMode
+    section_id: str | None
 
 
-class ConfigFieldState(ConfigFieldMetadata):
-    """配置字段的持久化值与当前可确认生效状态。"""
+class ConfigFieldState(BaseModel):
+    """配置字段的持久化值与当前可确认生效状态。
 
+    不继承 ``ConfigFieldMetadata``，避免把纯布局字段 ``section_id`` 混入既有
+    ``field_states`` wire 契约。
+    """
+
+    secret: bool
+    apply_mode: ConfigApplyMode
     configured_value: Any
     effective_value: Any
     source: str
     effective_source: EffectiveValueSource
     restart_required: bool
+
+
+class ConfigSectionDescriptor(BaseModel):
+    """配置资源的视觉分区描述。"""
+
+    section_id: str
+    display_name: str
+    order: int
 
 
 class ConfigResourceSummary(BaseModel):
@@ -68,6 +87,7 @@ class ConfigResourceSummary(BaseModel):
     fields: list[str]
     field_descriptions: dict[str, str]
     field_metadata: dict[str, ConfigFieldMetadata]
+    sections: list[ConfigSectionDescriptor]
 
 
 class ConfigResourceDetail(ConfigResourceSummary):
@@ -152,7 +172,10 @@ def _get_default_apply_mode(config: BaseModel) -> ConfigApplyMode:
     return _parse_apply_mode(schema_extra.get("default_apply_mode"))
 
 
-def _get_field_metadata(config: BaseModel) -> dict[str, ConfigFieldMetadata]:
+def _get_field_metadata(
+    config: BaseModel,
+    section_metadata: ConfigSectionMetadata,
+) -> dict[str, ConfigFieldMetadata]:
     default_apply_mode = _get_default_apply_mode(config)
     public_fields = set(config.model_dump())
     metadata: dict[str, ConfigFieldMetadata] = {}
@@ -166,8 +189,22 @@ def _get_field_metadata(config: BaseModel) -> dict[str, ConfigFieldMetadata]:
             apply_mode=_parse_apply_mode(
                 extra.get("apply_mode", default_apply_mode),
             ),
+            section_id=section_metadata.field_section_ids[field_name],
         )
     return metadata
+
+
+def _get_section_descriptors(
+    section_metadata: ConfigSectionMetadata,
+) -> list[ConfigSectionDescriptor]:
+    return [
+        ConfigSectionDescriptor(
+            section_id=section.section_id,
+            display_name=section.display_name,
+            order=section.order,
+        )
+        for section in section_metadata.sections
+    ]
 
 
 def _mask_config_values(
@@ -221,7 +258,8 @@ async def _build_resource_summary(
 ) -> ConfigResourceSummary:
     manager = resource.manager_getter()
     config = await manager.get_async()
-    field_metadata = _get_field_metadata(config)
+    section_metadata = get_config_section_metadata(config.__class__)
+    field_metadata = _get_field_metadata(config, section_metadata)
     return ConfigResourceSummary(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
@@ -229,6 +267,7 @@ async def _build_resource_summary(
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
         field_metadata=field_metadata,
+        sections=_get_section_descriptors(section_metadata),
     )
 
 
@@ -238,7 +277,8 @@ async def _build_resource_detail(
     manager = resource.manager_getter()
     config = await manager.get_async()
     values = config.model_dump()
-    field_metadata = _get_field_metadata(config)
+    section_metadata = get_config_section_metadata(config.__class__)
+    field_metadata = _get_field_metadata(config, section_metadata)
     return ConfigResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
@@ -246,6 +286,7 @@ async def _build_resource_detail(
         fields=_get_fields(config),
         field_descriptions=_get_field_descriptions(config),
         field_metadata=field_metadata,
+        sections=_get_section_descriptors(section_metadata),
         values=_mask_config_values(values, field_metadata),
         field_states=_build_field_states(
             values=values,

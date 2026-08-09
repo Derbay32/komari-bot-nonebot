@@ -184,7 +184,7 @@ def test_typed_config_schema_rejects_unknown_field_section_reference() -> None:
 
 
 def test_typed_config_schema_rejects_invalid_sections_shape() -> None:
-    with pytest.raises(ValueError, match="sections 必须是列表"):
+    with pytest.raises(TypeError, match="sections 必须是列表"):
 
         class _InvalidSectionsShapeSchema(TypedConfigModel):
             model_config = typed_model_config(

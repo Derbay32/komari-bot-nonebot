@@ -24,8 +24,10 @@ from __future__ import annotations
 import importlib.util
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from sqlalchemy import DateTime, Table
@@ -37,6 +39,109 @@ _TypedConfigMetaBase = type(SQLModel)
 
 _VALIDATION_STATE = threading.local()
 """线程级构造保护：model_validate 内部会无参构造实例，需跳过二次校验。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigSectionDefinition:
+    """强类型配置 Schema 声明的视觉分区。"""
+
+    section_id: str
+    display_name: str
+    order: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigSectionMetadata:
+    """已校验并确定性排序的配置分区元数据。"""
+
+    sections: tuple[ConfigSectionDefinition, ...]
+    field_section_ids: MappingProxyType[str, str | None]
+
+
+def _require_non_empty_string(value: object, *, path: str) -> str:
+    if not isinstance(value, str):
+        msg = f"{path} 必须是字符串"
+        raise TypeError(msg)
+    if not value.strip() or value != value.strip():
+        msg = f"{path} 必须是无首尾空白的非空字符串"
+        raise ValueError(msg)
+    return value
+
+
+def get_config_section_metadata(model_type: type[Any]) -> ConfigSectionMetadata:
+    """读取并校验强类型配置 Schema 的分区声明。
+
+    模型级 ``json_schema_extra.sections`` 必须是 descriptor 列表；字段级
+    ``json_schema_extra.section_id`` 只保存对稳定分区 ID 的引用。返回结果按
+    ``order``、``section_id`` 排序，供管理接口和其他元数据消费者复用。
+    """
+    schema_extra = model_type.model_config.get("json_schema_extra")
+    raw_sections = schema_extra.get("sections") if isinstance(schema_extra, dict) else None
+    if raw_sections is None:
+        raw_sections = []
+    if not isinstance(raw_sections, list):
+        msg = f"{model_type.__name__}.json_schema_extra.sections 必须是列表"
+        raise TypeError(msg)
+
+    sections: list[ConfigSectionDefinition] = []
+    section_ids: set[str] = set()
+    required_keys = {"section_id", "display_name", "order"}
+    for index, raw_section in enumerate(raw_sections):
+        path = f"{model_type.__name__}.json_schema_extra.sections[{index}]"
+        if not isinstance(raw_section, dict):
+            msg = f"{path} 必须是对象"
+            raise TypeError(msg)
+        if set(raw_section) != required_keys:
+            msg = (
+                f"{path} 必须且只能包含 section_id、display_name、order"
+            )
+            raise ValueError(msg)
+        section_id = _require_non_empty_string(
+            raw_section["section_id"],
+            path=f"{path}.section_id",
+        )
+        if section_id in section_ids:
+            msg = f"{model_type.__name__} 的分区 ID {section_id} 重复"
+            raise ValueError(msg)
+        display_name = _require_non_empty_string(
+            raw_section["display_name"],
+            path=f"{path}.display_name",
+        )
+        order = raw_section["order"]
+        if not isinstance(order, int) or isinstance(order, bool):
+            msg = f"{path}.order 必须是整数"
+            raise TypeError(msg)
+        section_ids.add(section_id)
+        sections.append(
+            ConfigSectionDefinition(
+                section_id=section_id,
+                display_name=display_name,
+                order=order,
+            )
+        )
+
+    field_section_ids: dict[str, str | None] = {}
+    for field_name, field_info in model_type.model_fields.items():
+        field_extra = field_info.json_schema_extra
+        extra = field_extra if isinstance(field_extra, dict) else {}
+        raw_section_id = extra.get("section_id")
+        if raw_section_id is None:
+            field_section_ids[field_name] = None
+            continue
+        section_id = _require_non_empty_string(
+            raw_section_id,
+            path=f"{model_type.__name__}.字段 {field_name}.section_id",
+        )
+        if section_id not in section_ids:
+            msg = f"字段 {field_name} 引用了未声明分区 {section_id}"
+            raise ValueError(msg)
+        field_section_ids[field_name] = section_id
+
+    sections.sort(key=lambda section: (section.order, section.section_id))
+    return ConfigSectionMetadata(
+        sections=tuple(sections),
+        field_section_ids=MappingProxyType(field_section_ids),
+    )
 
 
 def _utcnow() -> datetime:
@@ -108,11 +213,15 @@ class _TypedConfigMetaclass(_TypedConfigMetaBase):
 
     元类 ``__init__`` 晚于 ``__init_subclass__``：SQLModel 在元类初始化阶段
     才构建 ``__table__`` 与 mapper，因此注册必须放在元类 ``__init__``，
-    ``__init_subclass__`` 时机拿不到 ``__table__``。
+    ``__init_subclass__`` 时机拿不到 ``__table__``。分区元数据也在这里校验，
+    让无效声明在应用启动与 Alembic Schema 加载阶段立即失败。
     """
 
     def __init__(cls, classname: str, bases: tuple[type, ...], dict_: dict[str, Any], **kw: Any) -> None:  # noqa: N805
         super().__init__(classname, bases, dict_, **kw)
+        typed_config_base = globals().get("TypedConfigModel")
+        if typed_config_base is not None and issubclass(cls, typed_config_base):
+            get_config_section_metadata(cls)
         # 注意：SQLModel 0.0.39 不支持表模型再子类化（继承字段的 sa_type
         # 元数据在重建列时丢失、字段类属性是映射列描述符），表模型的
         # 子类化视为未定义行为，测试替身请改用独立 Pydantic 模型。

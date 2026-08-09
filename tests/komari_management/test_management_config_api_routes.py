@@ -40,11 +40,16 @@ class _ConfigSchema(TypedConfigModel):
                 {
                     "section_id": "runtime",
                     "display_name": "运行控制",
-                    "order": 10,
+                    "order": 20,
                 },
                 {
                     "section_id": "access",
                     "display_name": "访问凭据",
+                    "order": 10,
+                },
+                {
+                    "section_id": "advanced",
+                    "display_name": "高级设置",
                     "order": 10,
                 },
             ],
@@ -212,9 +217,14 @@ async def test_config_routes_require_token_and_list_resources(app: App) -> None:
             "order": 10,
         },
         {
+            "section_id": "advanced",
+            "display_name": "高级设置",
+            "order": 10,
+        },
+        {
             "section_id": "runtime",
             "display_name": "运行控制",
-            "order": 10,
+            "order": 20,
         },
     ]
     assert payload["items"][0]["field_descriptions"] == {
@@ -276,9 +286,14 @@ async def test_config_routes_support_detail_reload_and_field_update(app: App) ->
             "order": 10,
         },
         {
+            "section_id": "advanced",
+            "display_name": "高级设置",
+            "order": 10,
+        },
+        {
             "section_id": "runtime",
             "display_name": "运行控制",
-            "order": 10,
+            "order": 20,
         },
     ]
     assert detail.json()["values"]["api_credentials"] == "******"
