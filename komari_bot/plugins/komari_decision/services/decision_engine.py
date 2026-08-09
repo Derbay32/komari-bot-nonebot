@@ -21,8 +21,8 @@ from komari_bot.decision.unified_candidate_rerank import (
 
 from .config_interface import get_config
 from .message_filter import is_command_message, preprocess_message
+from .scene_classification import rank_chat_message
 from .social_timing_service import SocialTimingService
-from .unified_candidate_rerank import UnifiedCandidateRerankService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,7 +48,6 @@ class DecisionEngine:
         self._redis = redis
         self._scene_runtime = scene_runtime
         self._runtime_state_provider = runtime_state_provider
-        self._unified_rerank = UnifiedCandidateRerankService(runtime_service=scene_runtime)
         self._social_timing = SocialTimingService(redis)
 
     def _get_runtime_state(self) -> DecisionRuntimeState:
@@ -173,7 +172,10 @@ class DecisionEngine:
             return self._build_degraded_outcome(runtime_state)
 
         try:
-            rank_result = await self._unified_rerank.rank_message(message_content)
+            rank_result = await rank_chat_message(
+                message_content,
+                scene_runtime=self._scene_runtime,
+            )
         except SceneRuntimeUnavailableError as exc:
             unavailable_state = DecisionRuntimeState.failed(str(exc))
             logger.warning(

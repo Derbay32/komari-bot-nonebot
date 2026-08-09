@@ -1,19 +1,22 @@
-"""群总结请求场景归类实现（KOMARIBOT-23 / KOMARIBOT-24）。
+"""场景 runtime 深归类实现（KOMARIBOT-23 / KOMARIBOT-24 / KOMARIBOT-26）。
 
-深场景归类 module：统一拥有场景 runtime 刷新、embedding 召回、评分与用途策略，
-对外只暴露「命中 / 未命中 / 不可用（带稳定原因码）」的窄 operation。
+深场景归类 module：统一拥有场景 runtime 刷新、embedding 召回、评分与用途策略。
+群总结对外只暴露「命中 / 未命中 / 不可用（带稳定原因码）」的窄 operation；
+聊天用途提供内部 ``rank_chat_message`` operation，与群总结共享 runtime 刷新、
+embedding provider、余弦召回与 rerank 基础实现（KOMARIBOT-26）。
 
-调用方不能传入 runtime、候选 flags、场景键、阈值或指令；目标场景键
+群总结调用方不能传入 runtime、候选 flags、场景键、阈值或指令；目标场景键
 ``_SUMMARY_SCENE_KEY`` 只存在于本 implementation 内部。
 
-rerank 供应方可降级失败（网络/超时/HTTP 408/429/5xx/响应格式错误）进入
+群总结 rerank 供应方可降级失败（网络/超时/HTTP 408/429/5xx/响应格式错误）进入
 固定窗口失败预算（KOMARIBOT-24）：达到阈值返回
 RERANK_FAILURE_BUDGET_EXHAUSTED；未达阈值且配置开启 fallback 时用已有
 query embedding 与真实余弦归类；401/403、其他 4xx（含 425）、缺少 URL 等
-本地配置非法立即返回 RERANK_UNAVAILABLE，不消耗预算。
+本地配置非法立即返回 RERANK_UNAVAILABLE，不消耗预算。聊天用途不启用
+失败预算/余弦 fallback，embed/rerank 非快照错误原样传播。
 
-本模块不创建 request trace / Agent Run，也不迁移既有聊天 DecisionEngine
-与 UnifiedCandidateRerankService（分别由 KOMARIBOT-26 / KOMARIBOT-27 处理）。
+本模块不创建 request trace / Agent Run。旧聊天宽 service
+UnifiedCandidateRerankService 的清理由 KOMARIBOT-27 处理。
 """
 
 from __future__ import annotations
@@ -29,6 +32,11 @@ from komari_bot.decision import (
     SummaryRequestClassificationResult,
     SummaryRequestUnavailableReason,
 )
+from komari_bot.decision.unified_candidate_rerank import (
+    CandidateSchema,
+    SceneRuntimeUnavailableError,
+    UnifiedRerankResult,
+)
 from komari_bot.plugins.embedding_provider import (
     EmbeddingResponseValidationError,
     RemoteResponseDecodeError,
@@ -39,6 +47,7 @@ from komari_bot.plugins.embedding_provider import (
     RerankResponseValidationError,
 )
 
+from .config_interface import get_config
 from .summary_rerank_failure_budget import (
     RerankFailureBudgetUnavailableError,
     SummaryRerankFailureBudget,
@@ -177,6 +186,52 @@ def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
     return dot / ((norm1**0.5) * (norm2**0.5))
 
 
+def _detect_alias(message: str, aliases: list[str]) -> bool:
+    """检查消息是否命中机器人别名（casefold + strip 后子串匹配）。"""
+    content = message.casefold()
+    for alias in aliases:
+        alias_clean = alias.strip().casefold()
+        if alias_clean and alias_clean in content:
+            return True
+    return False
+
+
+def _recall_top_general_scenes(
+    snapshot: SceneRuntimeSnapshot,
+    query_vector: list[float],
+    top_k: int,
+) -> list[SceneRuntimeGeneralCandidate]:
+    """按真实余弦相似度降序召回 top-k general scenes（群总结与聊天共用）。
+
+    只从 general_candidates 召回，绝不把 NOISE/MEANINGFUL/CALL_* 加入候选；
+    调用方负责传入至少为 1 的 top_k。
+    """
+    scored = sorted(
+        (
+            (_cosine_similarity(query_vector, candidate.embedding), candidate)
+            for candidate in snapshot.general_candidates
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    return [candidate for _, candidate in scored[:top_k]]
+
+
+def _aggregate_rerank_scores(
+    document_count: int,
+    rerank_results: Any,
+) -> dict[int, float]:
+    """按文档索引聚合 rerank 分数；越界/非法索引不写入，缺失索引取 0.0。
+
+    群总结与聊天共用同一聚合规则：best scene 在聚合后仍按缺失默认 0.0 比较。
+    """
+    score_by_index: dict[int, float] = {}
+    for result in rerank_results:
+        if 0 <= result.index < document_count:
+            score_by_index[result.index] = result.relevance_score
+    return score_by_index
+
+
 def _unavailable(reason: SummaryRequestUnavailableReason) -> SummaryRequestClassificationResult:
     """构造不可用结果。"""
     return SummaryRequestClassificationResult.unavailable(reason)
@@ -272,11 +327,7 @@ async def _classify_with_rerank(
     # rerank 成功：best-effort 清零失败预算，清零失败不影响成功结果
     await _best_effort_clear_rerank_budget(provider)
 
-    score_by_index: dict[int, float] = {}
-    for result in rerank_results:
-        if 0 <= result.index < len(top_scenes):
-            score_by_index[result.index] = result.relevance_score
-
+    score_by_index = _aggregate_rerank_scores(len(top_scenes), rerank_results)
     best_index = max(
         range(len(top_scenes)),
         key=lambda index: score_by_index.get(index, 0.0),
@@ -400,16 +451,11 @@ async def _classify_embedded(
     提供者关闭时退化为真实余弦模式，绝不接收伪造的位置分数。
     """
     # 只从 general_candidates 召回，绝不把 NOISE/MEANINGFUL/CALL_* 加入候选
-    top_k = max(1, config.summary_scene_top_k)
-    scored = sorted(
-        (
-            (_cosine_similarity(query_vector, candidate.embedding), candidate)
-            for candidate in snapshot.general_candidates
-        ),
-        key=lambda item: item[0],
-        reverse=True,
+    top_scenes = _recall_top_general_scenes(
+        snapshot,
+        query_vector,
+        max(1, config.summary_scene_top_k),
     )
-    top_scenes = [candidate for _, candidate in scored[:top_k]]
 
     if rerank_mode:
         return await _classify_with_rerank(
@@ -500,6 +546,160 @@ async def classify_summary_request(
         query_vector=query_vector,
         rerank_mode=effective_rerank_mode,
         similarity_threshold=similarity_threshold,
+    )
+
+
+async def _resolve_chat_snapshot(
+    scene_runtime: SceneRuntimeService | None,
+) -> SceneRuntimeSnapshot:
+    """刷新聊天 runtime 并返回快照；刷新异常/快照缺失抛 SceneRuntimeUnavailableError。"""
+    if scene_runtime is None:
+        msg = "scene runtime snapshot 不可用，请先初始化/迁移 komari_decision scenes"
+        raise SceneRuntimeUnavailableError(msg)
+    try:
+        await scene_runtime.refresh_if_runtime_updated()
+    except Exception as exc:
+        logger.exception("[UnifiedRerank] 刷新 scene runtime cache 失败")
+        msg = "scene runtime cache 刷新失败"
+        raise SceneRuntimeUnavailableError(msg) from exc
+    snapshot = scene_runtime.get_scene_candidates()
+    if snapshot is None:
+        msg = "scene runtime snapshot 不可用，请先初始化/迁移 komari_decision scenes"
+        raise SceneRuntimeUnavailableError(msg)
+    return snapshot
+
+
+async def rank_chat_message(
+    message_text: str,
+    *,
+    scene_runtime: SceneRuntimeService | None,
+) -> UnifiedRerankResult:
+    """对单条聊天消息执行统一候选集单次 rerank（KOMARIBOT-26 内部 seam）。
+
+    服务内部聊天专用 operation：与群总结共享 runtime 刷新、embedding provider、
+    余弦召回与 rerank 基础实现，不对外暴露（不在 __all__、不提供 purpose 参数）。
+    逐项保留旧 ``UnifiedCandidateRerankService.rank_message`` 的可观察行为：
+
+    - 每次调用读取聊天配置；别名 casefold + strip 子串匹配；
+    - 刷新传入的同一 scene runtime 并读取同一 snapshot，刷新异常/快照缺失
+      包装为 ``SceneRuntimeUnavailableError``；
+    - 使用 ``embedding_instruction_query``，``scene_top_k`` 至少 1；
+    - 候选顺序严格为 NOISE、MEANINGFUL、alias 命中时 CALL_DIRECT/CALL_MENTION、
+      按余弦降序的 top-k general scenes；
+    - 无条件调用 provider.rerank（不检查 rerank 开关），``rerank_instruction``
+      精排，``top_n`` 为全部聊天候选数；缺失 index 默认 0.0，best scene
+      首个最高分胜出；
+    - 不启用群总结失败预算/余弦 fallback/相似度阈值/稳定原因码/异常吞并，
+      embed/rerank 非快照错误继续原样传播。
+    """
+    provider = _get_embedding_provider()
+    config = get_config()
+
+    alias_detected = _detect_alias(message_text, config.bot_aliases)
+
+    runtime_snapshot = await _resolve_chat_snapshot(scene_runtime)
+
+    query_vector = await provider.embed(
+        message_text,
+        instruction=config.embedding_instruction_query,
+    )
+
+    noise_prior = _cosine_similarity(
+        query_vector,
+        runtime_snapshot.fixed_embeddings["NOISE"],
+    )
+    meaningful_prior = _cosine_similarity(
+        query_vector,
+        runtime_snapshot.fixed_embeddings["MEANINGFUL"],
+    )
+
+    top_scenes = _recall_top_general_scenes(
+        runtime_snapshot,
+        query_vector,
+        max(1, config.scene_top_k),
+    )
+
+    candidates: list[CandidateSchema] = [
+        CandidateSchema(
+            key="NOISE",
+            text=runtime_snapshot.fixed_candidates["NOISE"],
+            kind="fixed",
+            embedding_similarity=noise_prior,
+        ),
+        CandidateSchema(
+            key="MEANINGFUL",
+            text=runtime_snapshot.fixed_candidates["MEANINGFUL"],
+            kind="fixed",
+            embedding_similarity=meaningful_prior,
+        ),
+    ]
+    if alias_detected:
+        candidates.extend(
+            [
+                CandidateSchema(
+                    key="CALL_DIRECT",
+                    text=runtime_snapshot.fixed_candidates["CALL_DIRECT"],
+                    kind="call",
+                ),
+                CandidateSchema(
+                    key="CALL_MENTION",
+                    text=runtime_snapshot.fixed_candidates["CALL_MENTION"],
+                    kind="call",
+                ),
+            ]
+        )
+    candidates.extend(
+        CandidateSchema(
+            key=f"SCENE::{scene.scene_id}",
+            text=scene.text,
+            kind="scene",
+            scene_id=scene.scene_id,
+            embedding_similarity=_cosine_similarity(
+                query_vector, scene.embedding
+            ),
+        )
+        for scene in top_scenes
+    )
+
+    rerank_results = await provider.rerank(
+        query=message_text,
+        documents=[item.text for item in candidates],
+        top_n=len(candidates),
+        instruction=config.rerank_instruction,
+    )
+
+    score_by_index = _aggregate_rerank_scores(len(candidates), rerank_results)
+    score_map = {
+        item.key: score_by_index.get(index, 0.0)
+        for index, item in enumerate(candidates)
+    }
+
+    best_scene_id: str | None = None
+    best_scene_score = 0.0
+    for item in candidates:
+        if item.kind != "scene":
+            continue
+        current = score_map.get(item.key, 0.0)
+        if best_scene_id is None or current > best_scene_score:
+            best_scene_id = item.scene_id
+            best_scene_score = current
+
+    return UnifiedRerankResult(
+        alias_hit=alias_detected,
+        candidates=candidates,
+        score_map=score_map,
+        meaningful_score=score_map.get("MEANINGFUL", 0.0),
+        noise_score=score_map.get("NOISE", 0.0),
+        call_direct_score=(
+            score_map.get("CALL_DIRECT") if alias_detected else None
+        ),
+        call_mention_score=(
+            score_map.get("CALL_MENTION") if alias_detected else None
+        ),
+        best_scene_id=best_scene_id,
+        best_scene_score=best_scene_score,
+        meaningful_prior=meaningful_prior,
+        noise_prior=noise_prior,
     )
 
 
