@@ -33,9 +33,13 @@ if TYPE_CHECKING:
 # 群总结专用目标场景键：只允许存在于本 implementation，不对外暴露。
 _SUMMARY_SCENE_KEY = "scene_group_history_summary"
 
-# 数字快速识别：总结 + 数量 + 条（如「总结过去 50 条」）。
-# 命中即本地判定为群总结请求，不触发 runtime 刷新与 embedding/rerank。
-_NUMERIC_SUMMARY_PATTERN = re.compile(r"总结.*?(\d+)\s*条", re.DOTALL)
+
+def _is_numeric_summary_request(text: str) -> bool:
+    """数字快速识别：标准化文本同时包含「总结」与任意数字。
+
+    命中即本地判定为群总结请求，不触发 runtime 刷新与 embedding/rerank。
+    """
+    return "总结" in text and re.search(r"\d", text) is not None
 
 
 def _get_embedding_provider() -> Any:
@@ -45,9 +49,11 @@ def _get_embedding_provider() -> Any:
     return embedding_provider
 
 
-def _is_embedding_uninitialized_error(exc: RuntimeError) -> bool:
-    """判断是否为已声明的 EmbeddingProvider 未初始化故障。"""
-    return "尚未初始化" in str(exc)
+def _is_embedding_expected_error(exc: BaseException) -> bool:
+    """判断是否为已声明的 embedding 预期故障（未初始化或传输超时）。"""
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(exc, RuntimeError) and "尚未初始化" in str(exc)
 
 
 def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
@@ -102,11 +108,9 @@ async def _resolve_summary_snapshot(
         return _unavailable(SummaryRequestUnavailableReason.RUNTIME_UNAVAILABLE), None
     try:
         await scene_runtime.refresh_if_runtime_updated()
-    except TypeError:
-        # 编程错误与取消继续传播，禁止 catch-all 吞 bug
-        raise
-    except Exception:
-        # runtime 刷新为运维性数据库调用边界，其失败视为 runtime 不可用
+    except (RuntimeError, OSError):
+        # runtime 刷新为运维性数据库/传输调用边界，其失败视为 runtime 不可用；
+        # 其他程序错误（如 AssertionError/TypeError）与取消继续传播
         return _unavailable(SummaryRequestUnavailableReason.RUNTIME_UNAVAILABLE), None
     snapshot = scene_runtime.get_scene_candidates()
     if snapshot is None:
@@ -126,10 +130,10 @@ async def _classify_with_rerank(
     provider: Any,
     top_scenes: list[SceneRuntimeGeneralCandidate],
 ) -> SummaryRequestClassificationResult:
-    """使用总结专用 rerank 指令对 top-k 场景精排归类。"""
-    if not provider.is_rerank_enabled():
-        # 供应方关闭时绝不接收伪造的位置分数
-        return _unavailable(SummaryRequestUnavailableReason.RERANK_UNAVAILABLE)
+    """使用总结专用 rerank 指令对 top-k 场景精排归类。
+
+    调用方已确认配置与提供者均允许 rerank；此处只处理提供者传输失败。
+    """
     try:
         rerank_results = await provider.rerank(
             query=message_text,
@@ -137,10 +141,9 @@ async def _classify_with_rerank(
             top_n=len(top_scenes),
             instruction=config.summary_rerank_instruction,
         )
-    except TypeError:
-        raise
-    except Exception:
-        # 本票不做失败预算与 fallback（KOMARIBOT-24），最终失败安全上报
+    except TimeoutError:
+        # 提供者传输失败：本票不做失败预算与 fallback（KOMARIBOT-24），安全上报；
+        # 未声明的程序错误（如 RuntimeError/TypeError）继续传播
         return _unavailable(SummaryRequestUnavailableReason.RERANK_UNAVAILABLE)
 
     score_by_index: dict[int, float] = {}
@@ -197,7 +200,11 @@ async def _classify_embedded(
     rerank_mode: bool,
     similarity_threshold: float | None,
 ) -> SummaryRequestClassificationResult:
-    """对已嵌入的 query 执行 top-k 召回与 rerank/余弦模式化评分。"""
+    """对已嵌入的 query 执行 top-k 召回与 rerank/余弦模式化评分。
+
+    rerank_mode 为「配置允许且提供者实际开启」的有效模式；
+    提供者关闭时退化为真实余弦模式，绝不接收伪造的位置分数。
+    """
     # 只从 general_candidates 召回，绝不把 NOISE/MEANINGFUL/CALL_* 加入候选
     top_k = max(1, config.summary_scene_top_k)
     scored = sorted(
@@ -240,13 +247,17 @@ async def classify_summary_request(
     if gated is not None:
         return gated
 
-    if _NUMERIC_SUMMARY_PATTERN.search(message_text):
+    if _is_numeric_summary_request(message_text):
         return SummaryRequestClassificationResult.matched()
 
-    rerank_mode = config.summary_rerank_enabled
+    provider = _get_embedding_provider()
+    # 有效 rerank 模式 = 配置允许且提供者实际开启；提供者关闭时走真实余弦模式
+    effective_rerank_mode = config.summary_rerank_enabled and bool(
+        provider.is_rerank_enabled()
+    )
     similarity_threshold = config.summary_similarity_threshold
-    if not rerank_mode and similarity_threshold is None:
-        # 显式余弦模式需要配置相似度阈值；缺失时不进入 embedding 流程
+    if not effective_rerank_mode and similarity_threshold is None:
+        # 余弦模式需要配置相似度阈值；缺失时不进入 embedding 流程
         return _unavailable(SummaryRequestUnavailableReason.CONFIGURATION_INCOMPLETE)
 
     resolve_error, snapshot = await _resolve_summary_snapshot(scene_runtime)
@@ -254,14 +265,14 @@ async def classify_summary_request(
         return resolve_error
     assert snapshot is not None  # _resolve_summary_snapshot 构造不变量
 
-    provider = _get_embedding_provider()
     try:
         query_vector = await provider.embed(
             message_text,
             instruction=config.summary_embedding_instruction_query,
         )
-    except RuntimeError as exc:
-        if _is_embedding_uninitialized_error(exc):
+    except (TimeoutError, RuntimeError) as exc:
+        # 未初始化与传输超时为已声明的预期故障；其余程序错误继续传播
+        if _is_embedding_expected_error(exc):
             return _unavailable(SummaryRequestUnavailableReason.EMBEDDING_UNAVAILABLE)
         raise
 
@@ -271,7 +282,7 @@ async def classify_summary_request(
         provider=provider,
         snapshot=snapshot,
         query_vector=query_vector,
-        rerank_mode=rerank_mode,
+        rerank_mode=effective_rerank_mode,
         similarity_threshold=similarity_threshold,
     )
 
