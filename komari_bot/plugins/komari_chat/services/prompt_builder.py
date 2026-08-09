@@ -17,15 +17,13 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 from komari_bot.memory.profile_operations import profile_traits_to_list
-from komari_bot.plugins.komari_memory.config_schema import (  # noqa: TC001
-    KomariMemoryConfigSchema,
-)
+from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema  # noqa: TC001
 
 from .prompt_template import get_template
 from .reply_context import ReplyContext  # noqa: TC001
 
 if TYPE_CHECKING:
-    from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
+    from komari_bot.plugins.komari_memory import MemoryService
     from komari_bot.plugins.user_data.models import UserFavorability
 
 # 获取常识库插件
