@@ -12,24 +12,39 @@
 
 升级操作顺序（关键）：
 
-1. **备份数据库**（pg_dump 全量备份，迁移脚本只 upsert 不删数据，但备份是唯一保险）；
-2. 仅当库中 `komari_plugin_configs` 仍是 v1 键名结构（古老部署）时，按需执行 `poetry run python scripts/migrate_search_config_v2.py` 整理 search 配置键名；
-3. 补齐旧 JSONB 表与旧文件数据（按当前版本选择性执行，全部幂等可重跑）：
-   - `scripts/migrate_json_config_to_pg.py` —— 旧 `config/config_manager/*_config.json` → `komari_plugin_configs`
-   - `scripts/migrate_prompt_config_to_pg.py` —— 旧 `config/prompts/*.yaml` → `komari_prompt_configs`
-   - `scripts/migrate_character_binding_to_pg.py` —— 旧 `data/character_binding/bindings.json` → `komari_character_bindings`
-   - `scripts/migrate_komari_decision_scenes_to_pg.py` —— 旧 YAML 场景 → `komari_decision_scenes`
-4. **既有部署（库中已有 v1 表、无 `alembic_version`）必须先离线标记基线**，否则 prestart 的 `upgrade head` 会对既有表重复 `CREATE TABLE` 直接失败：
-   `poetry run python -m komari_bot.common.orm_bootstrap stamp 0001`
-   `stamp` 只写版本号不执行 DDL；随后执行 `upgrade head` 应用 0002/0003，并执行 `check` 验证零 diff——`check` 同时校验既有业务表结构与 ORM 模型精确一致，发现漂移必须先按原版本升级流程修复再继续。全新部署（空库）跳过 `stamp`，`upgrade head` 会从 0001 全量建表；
-5. 部署 v2.0.0 镜像：容器 prestart 自动执行 `upgrade head`（上一步已执行则为 no-op），失败 fail fast；
-6. 执行存量搬运主力脚本并核对 stdout 决算报告：
-   `poetry run python scripts/migrate_legacy_config_to_typed_tables.py`（`--dsn` 或 `SQLALCHEMY_DATABASE_URL` 指定连接，幂等可重跑）；
-7. 启动应用；`.env` / docker-compose 数据库配置只需 `SQLALCHEMY_DATABASE_URL`。
+**升级前**
 
-- 全新部署注意：0001 基线建表时从环境变量 `EMBEDDING_DIMENSION`（默认 512）读取向量列维度，必须与运行时 `embedding_dimension` 配置一致（不匹配时记忆/知识插件初始化会 fail fast）；既有部署走 `stamp` 不执行 DDL，不受影响。
-- 开发流程新增迁移守门：改过任何 SQLModel（`config_schema.py` / `prompt_schema.py` / `orm_models.py`）后必须 `python -m komari_bot.common.orm_bootstrap revision --autogenerate` 生成迁移，并跑 `check` 零 diff；CI `migration-check.yml` 同样执行 `upgrade head` + `check`。
-- 集成测试新增 `KOMARI_TEST_POSTGRES_URL` 门控的真实库模式。运行时必须同时提供两个变量且指向同一数据库（`SQLALCHEMY_DATABASE_URL` 是 NoneBot 驱动配置的来源，守卫会拒绝不一致的组合并 skip）：
+1. **先备份**：`pg_dump` 全量备份数据库。迁移脚本只 upsert 不删数据，但备份是唯一保险。
+2. 只有库还是 v1 键名结构的远古部署，才需要跑 `scripts/migrate_search_config_v2.py` 整理 search 配置键名；新部署跳过。
+
+**补齐旧数据（全部幂等，可重跑）**
+
+3. 按需执行四个搬运脚本，把旧 JSONB 表和旧文件搬进 PG：
+   - `scripts/migrate_json_config_to_pg.py`：旧 `config/config_manager/*_config.json` → `komari_plugin_configs`
+   - `scripts/migrate_prompt_config_to_pg.py`：旧 `config/prompts/*.yaml` → `komari_prompt_configs`
+   - `scripts/migrate_character_binding_to_pg.py`：旧 `data/character_binding/bindings.json` → `komari_character_bindings`
+   - `scripts/migrate_komari_decision_scenes_to_pg.py`：旧 YAML 场景 → `komari_decision_scenes`
+
+**老部署必须先标基线（最容易翻车的一步）**
+
+4. 库里已有 v1 业务表但没有 `alembic_version` 的部署，必须先离线执行 `stamp 0001` 再升级：
+   - `stamp 0001` 只写版本号、不建表；
+   - 随后 `upgrade head` 应用 0002/0003；
+   - 最后 `check` 验证零 diff——它同时校验既有业务表与 ORM 模型精确一致，发现漂移要先按原版本升级流程修复再继续。
+   - 跳过的后果：prestart 的 `upgrade head` 会对既有表重复 `CREATE TABLE`，直接失败。
+   - 全新部署（空库）跳过 stamp，`upgrade head` 会从 0001 全量建表。
+
+**升级与收尾**
+
+5. 部署 v2.0.0 镜像：容器 prestart 自动执行 `upgrade head`（老部署上一步已执行则为 no-op），失败 fail fast。
+6. 跑主力搬运脚本 `scripts/migrate_legacy_config_to_typed_tables.py`（`--dsn` 或 `SQLALCHEMY_DATABASE_URL` 指定连接，幂等可重跑），核对 stdout 决算报告。
+7. 启动应用；数据库配置只需 `SQLALCHEMY_DATABASE_URL`。
+
+**其他注意**
+
+- 全新部署：0001 基线建表时从 `EMBEDDING_DIMENSION`（默认 512）读取向量列维度，必须与运行时 `embedding_dimension` 配置一致，不匹配时记忆/知识插件初始化会 fail fast；老部署走 stamp 不建表，不受影响。
+- 开发守门：改过任何 SQLModel 后必须 autogenerate 生成迁移，并跑 `check` 零 diff；CI 的 migration-check 同样守门。
+- 集成测试：真实库模式需要 `SQLALCHEMY_DATABASE_URL` 与 `KOMARI_TEST_POSTGRES_URL` 同时提供且指向同一数据库，不一致会被守卫拒绝并 skip：
   `SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test poetry run pytest tests/`
 
 ### 新增
@@ -39,12 +54,14 @@
 
 ### 变更
 
-- 迁移数据库连接至 `nonebot-plugin-orm`
-- 优化跨插件引用边界，下沉部分共享逻辑类至共享层，仅允许通过插件顶层包暴露面进行插件间引用。
+- 迁移数据库连接至 `nonebot-plugin-orm`。
+- 优化跨插件引用边界，下沉部分共享逻辑类至共享层，仅允许通过插件顶层包暴露面进行插件间引用 (#41)。
+- 优化 chat 主动回复预占模块的生命周期，收敛为单一深模块。
 
 ### 修复
 
-- 修正 AGENTS.md / 插件 README 中关于连接池、配置表与已删脚本的过时描述，使其与实际代码一致。
+- 修正 AGENTS.md / 插件 README 中关于连接池、配置表与已删脚本的过时描述，使其与实际代码一致 (#40)。
+- 补全 chat 插件部分测试缺口 (#54)。
 
 ---
 
@@ -625,4 +642,4 @@
 
 ---
 
-*本 CHANGELOG 最后更新于 2026-08-07*
+*本 CHANGELOG 最后更新于 2026-08-09*
