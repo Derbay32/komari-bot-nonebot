@@ -69,6 +69,10 @@ _SILENT_NOTIFY_REASONS: frozenset[SummaryRequestUnavailableReason] = frozenset(
     }
 )
 
+# 进程级持久失败通知器：跨调用复用同一实例，使 SUPERUSER 私聊的共享冷却
+# 在整个进程生命周期内生效；群内固定提示不受冷却影响，仍每次发送。
+_classification_failure_notifier = GroupTaskFailureNotifier()
+
 summary_matcher = on_regex(
     r".*总结.*",
     rule=group_message_to_me_rule(),
@@ -134,8 +138,12 @@ async def _notify_classification_failure(
     reason_code: str,
     notify_superusers: bool,
 ) -> None:
-    """投递场景归类失败通知；群内 reply 段由通知边界自身负责。"""
-    await GroupTaskFailureNotifier().notify(
+    """投递场景归类失败通知；群内 reply 段由通知边界自身负责。
+
+    复用模块级持久通知器实例，保证 SUPERUSER 私聊的共享冷却在进程内
+    持续生效；群内固定提示仍每次发送。
+    """
+    await _classification_failure_notifier.notify(
         bot=bot,
         notification=_classification_notification(
             group_id=int(event.group_id),
