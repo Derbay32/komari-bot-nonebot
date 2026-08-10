@@ -56,6 +56,8 @@ class _PendingReply(Protocol):
 
 
 class _ReplyFulfillmentRepository(Protocol):
+    async def has_active_operation(self, operation_id: str) -> bool: ...
+
     async def prepare(self, payload: PendingReplyCommit) -> bool: ...
 
     async def cancel_prepared(self, operation_id: str) -> bool: ...
@@ -114,6 +116,12 @@ class _ReplyFulfillmentRepository(Protocol):
     async def cleanup_tombstones(self, *, retention_days: int) -> int: ...
 
 
+class ReplyFulfillmentQueryProtocol(Protocol):
+    """消息生成阶段使用的回复履约查询窄接口。"""
+
+    async def is_duplicate_event(self, operation_id: str) -> bool: ...
+
+
 class ReplyFulfillmentWorkflow:
     """统一执行单条回复履约。"""
 
@@ -132,6 +140,10 @@ class ReplyFulfillmentWorkflow:
         self.config_getter = config_getter
         self._owner_token = f"chat-{uuid.uuid4().hex}"
         self._last_cleanup = 0.0
+
+    async def is_duplicate_event(self, operation_id: str) -> bool:
+        """判断平台事件是否已有不可再次发送的履约记录。"""
+        return await self.repository.has_active_operation(operation_id)
 
     @staticmethod
     def _resolve_display_name(message: MessageSchema) -> str:
@@ -508,4 +520,8 @@ def build_reply_fulfillment_workflow(
     )
 
 
-__all__ = ["ReplyFulfillmentWorkflow", "build_reply_fulfillment_workflow"]
+__all__ = [
+    "ReplyFulfillmentQueryProtocol",
+    "ReplyFulfillmentWorkflow",
+    "build_reply_fulfillment_workflow",
+]

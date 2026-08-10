@@ -51,10 +51,6 @@ from ..services.llm_service import (
     generate_reply,
     generate_reply_with_tools,
 )
-from ..services.proactive_reservation import (
-    ProactiveReservationService,
-    Reservation,
-)
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
@@ -80,6 +76,12 @@ if TYPE_CHECKING:
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_memory import MemoryService
+
+    from ..services.proactive_reservation import (
+        ProactiveReservationService,
+        Reservation,
+    )
+    from ..services.reply_fulfillment_workflow import ReplyFulfillmentQueryProtocol
 
 AttemptReplyReason = Literal["at", "direct_call", "score"]
 ReplyAction = Literal[
@@ -168,15 +170,18 @@ class MessageHandler:
         self,
         redis: RedisManager,
         memory: MemoryService,
+        reply_fulfillment: ReplyFulfillmentQueryProtocol,
+        proactive_reservation: ProactiveReservationService,
         decision_engine: DecisionEngineProtocol,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
         self.memory = memory
+        self.reply_fulfillment = reply_fulfillment
         self.query_rewrite = QueryRewriteService()
         self._reaction_tasks: set[asyncio.Task[None]] = set()
         self.decision_engine = decision_engine
-        self.proactive_reservation = ProactiveReservationService(redis.redis)
+        self.proactive_reservation = proactive_reservation
 
     def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
         """检查是否 @ 了机器人。"""
@@ -532,6 +537,15 @@ class MessageHandler:
                     outcome=outcome,
                     reply_action="blocked_by_user_ban",
                 )
+            )
+            return None
+
+        operation_id = self._reply_operation_id(message)
+        if await self.reply_fulfillment.is_duplicate_event(operation_id):
+            logger.info(
+                "[KomariChat] 重复平台事件已有回复 operation，跳过生成: group={} message={}",
+                group_id,
+                message_id,
             )
             return None
 

@@ -18,6 +18,7 @@ from .handlers.message_handler import (
     PendingReply,
     ReplyFailureInfo,
 )
+from .services.proactive_reservation import ProactiveReservationService
 from .services.reply_fulfillment_workflow import (
     ReplyFulfillmentWorkflow,
     build_reply_fulfillment_workflow,
@@ -71,6 +72,7 @@ __plugin_meta__ = PluginMetadata(
 matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 
 _handler: MessageHandler | None = None
+_handler_workflow: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment_components: tuple[Any, Any, Any] | None = None
 _reply_commit_worker_task: asyncio.Task[None] | None = None
@@ -91,19 +93,37 @@ def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
 
 
 def _get_or_build_handler() -> MessageHandler | None:
-    global _handler  # noqa: PLW0603
+    global _handler, _handler_workflow  # noqa: PLW0603
 
     components = _resolve_runtime_components()
     if components is None:
         return None
     redis, memory, decision_engine = components
+    if (
+        _handler is not None
+        and _handler.decision_engine is decision_engine
+        and _handler_workflow is _reply_fulfillment
+        and _reply_fulfillment is not None
+    ):
+        return _handler
 
-    if _handler is None or _handler.decision_engine is not decision_engine:
+    workflow = _get_or_build_reply_fulfillment()
+    if workflow is None:
+        return None
+
+    if (
+        _handler is None
+        or _handler_workflow is not workflow
+        or _handler.decision_engine is not decision_engine
+    ):
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
+            reply_fulfillment=workflow,
+            proactive_reservation=workflow.proactive_reservation,
             decision_engine=decision_engine,
         )
+        _handler_workflow = workflow
     return _handler
 
 
@@ -115,9 +135,6 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
     if components is None:
         return None
     redis, memory, _decision_engine = components
-    handler = _get_or_build_handler()
-    if handler is None:
-        return None
 
     current_components = _reply_fulfillment_components
     same_components = current_components is not None and all(
@@ -125,10 +142,12 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
         for current, actual in zip(current_components, components, strict=True)
     )
     if _reply_fulfillment is None or not same_components:
+        redis_client = getattr(redis, "redis", redis)
+        proactive_reservation = ProactiveReservationService(redis_client)
         _reply_fulfillment = build_reply_fulfillment_workflow(
             pg_pool=memory.pg_pool,
             redis=redis,
-            proactive_reservation=handler.proactive_reservation,
+            proactive_reservation=proactive_reservation,
             user_data=user_data_plugin,
             config_getter=_get_reply_fulfillment_config,
         )
