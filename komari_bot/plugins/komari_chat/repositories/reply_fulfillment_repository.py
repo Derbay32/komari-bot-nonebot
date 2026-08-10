@@ -10,11 +10,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import asyncpg
-
+from typing import Any
 
 COMMITMENT_TYPES: tuple[str, ...] = (
     "proactive_reply_confirmation",
@@ -236,7 +232,7 @@ class ReplyFulfillmentDraft:
 class ReplyFulfillmentRepository:
     """回复履约父子记录的 PostgreSQL adapter。"""
 
-    def __init__(self, pg_pool: asyncpg.Pool[Any]) -> None:
+    def __init__(self, pg_pool: Any) -> None:
         self.pg_pool = pg_pool
 
     async def prepare(self, draft: ReplyFulfillmentDraft) -> bool:
