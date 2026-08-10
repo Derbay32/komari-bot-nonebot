@@ -239,64 +239,64 @@ class ReplyFulfillmentRepository:
         """在一个事务中插入一个父记录及其四个固定子项。"""
         async with self.pg_pool.acquire() as connection, connection.transaction():
             inserted = await connection.fetchval(
-                    """
-                    INSERT INTO komari_chat_reply_fulfillments (
-                        fulfillment_id,
-                        payload_hash,
-                        request_trace_id,
-                        trigger_message_id,
-                        trigger_user_id,
-                        group_id,
-                        bot_self_id,
-                        adapter_name,
-                        reply_target_message_id,
-                        reply_content,
-                        delivery_state
-                    )
-                    VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                        'NOT_STARTED'
-                    )
-                    ON CONFLICT (fulfillment_id) DO NOTHING
-                    RETURNING fulfillment_id
-                    """,
-                    draft.fulfillment_id,
-                    draft.payload_hash,
-                    draft.request_trace_id,
-                    draft.trigger_message_id,
-                    draft.trigger_user_id,
-                    draft.group_id,
-                    draft.bot_self_id,
-                    draft.adapter_name,
-                    draft.reply_target_message_id,
-                    draft.reply_content,
+                """
+                INSERT INTO komari_chat_reply_fulfillments (
+                    fulfillment_id,
+                    payload_hash,
+                    request_trace_id,
+                    trigger_message_id,
+                    trigger_user_id,
+                    group_id,
+                    bot_self_id,
+                    adapter_name,
+                    reply_target_message_id,
+                    reply_content,
+                    delivery_state
                 )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    'NOT_STARTED'
+                )
+                ON CONFLICT (fulfillment_id) DO NOTHING
+                RETURNING fulfillment_id
+                """,
+                draft.fulfillment_id,
+                draft.payload_hash,
+                draft.request_trace_id,
+                draft.trigger_message_id,
+                draft.trigger_user_id,
+                draft.group_id,
+                draft.bot_self_id,
+                draft.adapter_name,
+                draft.reply_target_message_id,
+                draft.reply_content,
+            )
             if inserted is None:
                 return False
 
             await connection.executemany(
-                    """
-                    INSERT INTO komari_chat_reply_fulfillment_commitments (
-                        fulfillment_id,
-                        commitment_type,
-                        payload
-                    )
-                    VALUES ($1, $2, $3::jsonb)
-                    """,
-                    [
-                        (
-                            draft.fulfillment_id,
-                            commitment.commitment_type,
-                            json.dumps(
-                                commitment.to_json(),
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                        )
-                        for commitment in draft.commitments
-                    ],
+                """
+                INSERT INTO komari_chat_reply_fulfillment_commitments (
+                    fulfillment_id,
+                    commitment_type,
+                    payload
                 )
+                VALUES ($1, $2, $3::jsonb)
+                """,
+                [
+                    (
+                        draft.fulfillment_id,
+                        commitment.commitment_type,
+                        json.dumps(
+                            commitment.to_json(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    for commitment in draft.commitments
+                ],
+            )
         return True
 
     async def mark_send_started(self, fulfillment_id: str) -> bool:
@@ -414,47 +414,46 @@ class ReplyFulfillmentRepository:
             return []
         async with self.pg_pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
-                    """
-                    WITH candidates AS (
-                        SELECT parent.fulfillment_id
-                        FROM komari_chat_reply_fulfillments AS parent
-                        WHERE parent.delivery_state = 'DELIVERED'
-                          AND parent.completed_at IS NULL
-                          AND (
-                              parent.lease_owner IS NULL
-                              OR parent.lease_expires_at <= NOW()
-                          )
-                          AND EXISTS (
-                              SELECT 1
-                              FROM
-                                  komari_chat_reply_fulfillment_commitments AS child
-                              WHERE child.fulfillment_id = parent.fulfillment_id
-                                AND (
-                                    child.state = 'PENDING'
-                                    OR (
-                                        child.state = 'RETRY_WAIT'
-                                        AND child.next_retry_at <= NOW()
-                                    )
+                """
+                WITH candidates AS (
+                    SELECT parent.fulfillment_id
+                    FROM komari_chat_reply_fulfillments AS parent
+                    WHERE parent.delivery_state = 'DELIVERED'
+                      AND parent.completed_at IS NULL
+                      AND (
+                          parent.lease_owner IS NULL
+                          OR parent.lease_expires_at <= NOW()
+                      )
+                      AND EXISTS (
+                          SELECT 1
+                          FROM komari_chat_reply_fulfillment_commitments AS child
+                          WHERE child.fulfillment_id = parent.fulfillment_id
+                            AND (
+                                child.state = 'PENDING'
+                                OR (
+                                    child.state = 'RETRY_WAIT'
+                                    AND child.next_retry_at <= NOW()
                                 )
-                          )
-                        ORDER BY
-                            COALESCE(parent.delivered_at, parent.prepared_at),
-                            parent.fulfillment_id
-                        FOR UPDATE OF parent SKIP LOCKED
-                        LIMIT $1
-                    )
-                    UPDATE komari_chat_reply_fulfillments AS parent
-                    SET lease_owner = $2,
-                        lease_expires_at = NOW() + ($3 * INTERVAL '1 second'),
-                        updated_at = NOW()
-                    FROM candidates
-                    WHERE parent.fulfillment_id = candidates.fulfillment_id
-                    RETURNING parent.*
-                    """,
-                    limit,
-                    owner_token,
-                    max(1, lease_seconds),
+                            )
+                      )
+                    ORDER BY
+                        COALESCE(parent.delivered_at, parent.prepared_at),
+                        parent.fulfillment_id
+                    FOR UPDATE OF parent SKIP LOCKED
+                    LIMIT $1
                 )
+                UPDATE komari_chat_reply_fulfillments AS parent
+                SET lease_owner = $2,
+                    lease_expires_at = NOW() + ($3 * INTERVAL '1 second'),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE parent.fulfillment_id = candidates.fulfillment_id
+                RETURNING parent.*
+                """,
+                limit,
+                owner_token,
+                max(1, lease_seconds),
+            )
         claimed = [dict(row) for row in rows]
         return sorted(
             claimed,
