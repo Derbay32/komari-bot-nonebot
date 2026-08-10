@@ -229,6 +229,106 @@ def test_komari_decision_summary_config_revision_exists() -> None:
     assert "DROP TABLE komari_decision_config" not in revision_sql
 
 
+def test_reply_fulfillment_parent_child_revision_exists() -> None:
+    """回复履约父子表由 0006 手写 revision 以正交事实建模。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    fulfillment_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_parent_child" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert fulfillment_revision is not None
+    assert fulfillment_revision.revision == "0006"
+    assert fulfillment_revision.down_revision == "0005"
+
+    revision_sql = Path(fulfillment_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+    child_table = "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS"
+
+    assert f"CREATE TABLE {parent_table}" in normalized
+    assert f"CREATE TABLE {child_table}" in normalized
+    assert (
+        f"FOREIGN KEY (FULFILLMENT_ID) REFERENCES {parent_table}(FULFILLMENT_ID) "
+        "ON DELETE CASCADE"
+    ) in normalized
+    assert "PRIMARY KEY (FULFILLMENT_ID, COMMITMENT_TYPE)" in normalized
+
+    for commitment_type in (
+        "PROACTIVE_REPLY_CONFIRMATION",
+        "FAVORABILITY_ADJUSTMENT",
+        "ASSISTANT_REPLY_HISTORY",
+        "INTERACTION_HISTORY",
+    ):
+        assert f"'{commitment_type}'" in normalized
+    for delivery_state in (
+        "NOT_STARTED",
+        "PENDING_CONFIRMATION",
+        "DELIVERED",
+        "NOT_DELIVERED",
+    ):
+        assert f"'{delivery_state}'" in normalized
+    for commitment_state in ("PENDING", "RETRY_WAIT", "COMPLETED", "FAILED"):
+        assert f"'{commitment_state}'" in normalized
+
+    parent_columns = {
+        "payload_hash",
+        "request_trace_id",
+        "trigger_message_id",
+        "trigger_user_id",
+        "group_id",
+        "bot_self_id",
+        "adapter_name",
+        "reply_target_message_id",
+        "reply_content",
+        "delivery_state",
+        "platform_message_id",
+        "prepared_at",
+        "send_started_at",
+        "delivered_at",
+        "not_delivered_at",
+        "lease_owner",
+        "lease_expires_at",
+        "completed_at",
+    }
+    child_columns = {
+        "commitment_type",
+        "state",
+        "attempt_count",
+        "next_retry_at",
+        "last_error_code",
+        "payload",
+        "completed_at",
+    }
+    for column in parent_columns | child_columns:
+        assert re.search(rf"\b{column.upper()}\b", normalized), column
+
+    assert "PAYLOAD JSONB" in normalized
+    assert "DELIVERY_STATE JSONB" not in normalized
+    assert "STATE JSONB" not in normalized
+    assert "LEASE_OWNER IS NULL" in normalized
+    assert "LEASE_EXPIRES_AT IS NULL" in normalized
+    assert normalized.count("CREATE INDEX") >= 2
+
+    child_drop = normalized.find(f"DROP TABLE {child_table}")
+    parent_drop = normalized.find(f"DROP TABLE {parent_table}")
+    assert 0 <= child_drop < parent_drop
+
+
+def test_reply_fulfillment_revision_is_self_contained() -> None:
+    """父子表迁移不得加载应用运行时，也不得删除旧 outbox。"""
+    revision_path = MIGRATIONS_DIR / "versions" / "0006_reply_fulfillment_parent_child.py"
+    revision_sql = revision_path.read_text(encoding="utf-8")
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+    assert "DROP TABLE komari_chat_reply_commit_outbox" not in revision_sql
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:
