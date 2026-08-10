@@ -102,7 +102,7 @@ def upgrade(name: str = "") -> None:
             attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
             next_retry_at TIMESTAMPTZ,
             last_error_code TEXT,
-            payload JSONB NOT NULL,
+            payload JSONB,
             completed_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

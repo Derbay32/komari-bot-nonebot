@@ -530,7 +530,7 @@ class ReplyFulfillmentRepository:
                     attempt_count = child.attempt_count + 1,
                     next_retry_at = NULL,
                     last_error_code = NULL,
-                    payload = '{}'::jsonb,
+                    payload = NULL,
                     completed_at = COALESCE(child.completed_at, NOW()),
                     updated_at = NOW()
                 FROM komari_chat_reply_fulfillments AS parent
