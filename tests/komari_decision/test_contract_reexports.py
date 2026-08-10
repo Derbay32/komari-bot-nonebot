@@ -1,7 +1,8 @@
-"""判定插件顶层 re-export 面验收测试（ticket #28 / #30 / #33）。
+"""判定插件顶层 re-export 面验收测试（ticket #28 / #30 / #33 / KOMARIBOT-27）。
 
 契约类型搬迁到 komari_bot.decision 共享包后，判定插件顶层导出契约符号与
-共享包中的对象为同一身份；ticket #33 起 get_runtime_state 从顶层导出退役。
+共享包中的对象为同一身份；ticket #33 起 get_runtime_state 从顶层导出退役；
+KOMARIBOT-27 起聊天宽重排候选/结果/服务从顶层与 services 暴露面退役。
 """
 
 from __future__ import annotations
@@ -10,12 +11,10 @@ import komari_bot.plugins.komari_decision as decision_plugin
 from komari_bot import decision as contracts
 
 EXPECTED_PLUGIN_ALL = {
-    "CandidateSchema",
     "DecisionRuntimeState",
     "DecisionRuntimeStatus",
     "PluginManager",
-    "UnifiedCandidateRerankService",
-    "UnifiedRerankResult",
+    "classify_summary_request",
     "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
@@ -35,10 +34,8 @@ def test_get_runtime_state_retired_from_top_level() -> None:
 def test_contract_symbols_are_shared_package_identities() -> None:
     assert decision_plugin.DecisionRuntimeState is contracts.DecisionRuntimeState
     assert decision_plugin.DecisionRuntimeStatus is contracts.DecisionRuntimeStatus
-    assert decision_plugin.CandidateSchema is contracts.CandidateSchema
-    assert decision_plugin.UnifiedRerankResult is contracts.UnifiedRerankResult
 
 
-def test_engine_service_stays_plugin_owned() -> None:
-    service = decision_plugin.UnifiedCandidateRerankService
-    assert service.__module__.startswith("komari_bot.plugins.komari_decision")
+def test_summary_classification_operation_stays_plugin_owned() -> None:
+    operation = decision_plugin.classify_summary_request
+    assert operation.__module__ == "komari_bot.plugins.komari_decision"

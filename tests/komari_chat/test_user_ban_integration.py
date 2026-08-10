@@ -46,7 +46,6 @@ class _DecisionEngine:
             call_direct_score=None,
             call_mention_score=None,
             filter_reason=None,
-            rank_result=None,
             timing_breakdown=None,
             runtime_status=DecisionRuntimeStatus.READY,
             runtime_reason="测试运行时已就绪",

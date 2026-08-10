@@ -14,15 +14,15 @@ from komari_bot.decision.decision_engine import (
 from komari_bot.decision.runtime_state import (
     DecisionRuntimeState,
 )
-from komari_bot.decision.unified_candidate_rerank import (
-    SceneRuntimeUnavailableError,
-    UnifiedRerankResult,
-)
 
 from .config_interface import get_config
 from .message_filter import is_command_message, preprocess_message
+from .scene_classification import (
+    ChatRerankResult,
+    ChatSceneUnavailableError,
+    rank_chat_message,
+)
 from .social_timing_service import SocialTimingService
-from .unified_candidate_rerank import UnifiedCandidateRerankService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,7 +48,6 @@ class DecisionEngine:
         self._redis = redis
         self._scene_runtime = scene_runtime
         self._runtime_state_provider = runtime_state_provider
-        self._unified_rerank = UnifiedCandidateRerankService(runtime_service=scene_runtime)
         self._social_timing = SocialTimingService(redis)
 
     def _get_runtime_state(self) -> DecisionRuntimeState:
@@ -91,7 +90,6 @@ class DecisionEngine:
             call_direct_score=None,
             call_mention_score=None,
             filter_reason=None,
-            rank_result=None,
             timing_breakdown=None,
             runtime_status=runtime_state.status,
             runtime_reason=runtime_state.reason,
@@ -127,7 +125,6 @@ class DecisionEngine:
                 call_direct_score=None,
                 call_mention_score=None,
                 filter_reason=None,
-                rank_result=None,
                 timing_breakdown=None,
                 runtime_status=runtime_state.status,
                 runtime_reason=runtime_state.reason,
@@ -158,7 +155,6 @@ class DecisionEngine:
                 call_direct_score=None,
                 call_mention_score=None,
                 filter_reason=filter_result.reason,
-                rank_result=None,
                 timing_breakdown=None,
                 runtime_status=runtime_state.status,
                 runtime_reason=runtime_state.reason,
@@ -173,8 +169,11 @@ class DecisionEngine:
             return self._build_degraded_outcome(runtime_state)
 
         try:
-            rank_result = await self._unified_rerank.rank_message(message_content)
-        except SceneRuntimeUnavailableError as exc:
+            rank_result = await rank_chat_message(
+                message_content,
+                scene_runtime=self._scene_runtime,
+            )
+        except ChatSceneUnavailableError as exc:
             unavailable_state = DecisionRuntimeState.failed(str(exc))
             logger.warning(
                 "[KomariDecision] scene runtime 暂不可用，跳过主动回复判定: {}",
@@ -217,7 +216,6 @@ class DecisionEngine:
                 call_direct_score=rank_result.call_direct_score,
                 call_mention_score=rank_result.call_mention_score,
                 filter_reason=None,
-                rank_result=rank_result,
                 timing_breakdown=timing_result,
                 runtime_status=runtime_state.status,
                 runtime_reason=runtime_state.reason,
@@ -242,7 +240,6 @@ class DecisionEngine:
             call_direct_score=rank_result.call_direct_score,
             call_mention_score=rank_result.call_mention_score,
             filter_reason=None,
-            rank_result=rank_result,
             timing_breakdown=timing_result,
             runtime_status=runtime_state.status,
             runtime_reason=runtime_state.reason,
@@ -262,7 +259,7 @@ class DecisionEngine:
 
     @staticmethod
     def _resolve_call_intent(
-        rank_result: UnifiedRerankResult,
+        rank_result: ChatRerankResult,
     ) -> tuple[CallIntent, float]:
         config = get_config()
 
@@ -282,7 +279,7 @@ class DecisionEngine:
         return "ambiguous", call_margin
 
     @staticmethod
-    def _should_drop_memory(rank_result: UnifiedRerankResult) -> bool:
+    def _should_drop_memory(rank_result: ChatRerankResult) -> bool:
         config = get_config()
         noise_delta = rank_result.noise_score - rank_result.meaningful_score
         return (

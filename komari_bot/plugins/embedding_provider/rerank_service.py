@@ -26,6 +26,13 @@ class RerankResult:
     relevance_score: float
 
 
+class RerankConfigurationError(ValueError):
+    """Rerank 本地配置非法（如缺少 rerank_api_url）。
+
+    属于本地配置问题而非供应方故障，调用方不应计入失败预算。
+    """
+
+
 class RerankResponseValidationError(ValueError):
     """Rerank API 返回结构不满足索引和分数约束。"""
 
@@ -181,7 +188,7 @@ class RerankService:
         if not url:
             logger.error("[EmbeddingProvider] rerank_api_url 为空")
             msg = "启用了 rerank，但是 rerank_api_url 为空"
-            raise ValueError(msg)
+            raise RerankConfigurationError(msg)
 
         requested_top_n = top_n if top_n is not None else self.config.rerank_top_n
         result_limit = max(1, min(requested_top_n, len(documents)))
@@ -252,4 +259,9 @@ class RerankService:
             logger.debug("[EmbeddingProvider] Rerank HTTP Session 已关闭")
 
 
-__all__ = ["RerankResponseValidationError", "RerankResult", "RerankService"]
+__all__ = [
+    "RerankConfigurationError",
+    "RerankResponseValidationError",
+    "RerankResult",
+    "RerankService",
+]

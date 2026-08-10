@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from .runtime_state import DecisionRuntimeStatus
     from .social_timing_service import TimingScoreBreakdown
-    from .unified_candidate_rerank import UnifiedRerankResult
 
 CallIntent = Literal["none", "ambiguous", "direct_call", "casual_mention"]
 MemoryAction = Literal["store", "drop"]
@@ -36,7 +35,6 @@ class DecisionOutcome:
     call_direct_score: float | None
     call_mention_score: float | None
     filter_reason: Literal["short", "history_repeat", "none", "command"] | None
-    rank_result: UnifiedRerankResult | None
     timing_breakdown: TimingScoreBreakdown | None
     runtime_status: DecisionRuntimeStatus
     runtime_reason: str

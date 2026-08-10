@@ -15,7 +15,21 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
     __tablename__ = "komari_decision_config"
 
     model_config = typed_model_config(
-        json_schema_extra={"default_apply_mode": "immediate"},
+        json_schema_extra={
+            "default_apply_mode": "immediate",
+            "sections": [
+                {
+                    "section_id": "chat_scene",
+                    "display_name": "聊天场景",
+                    "order": 10,
+                },
+                {
+                    "section_id": "summary_classification",
+                    "display_name": "群总结归类",
+                    "order": 20,
+                },
+            ],
+        },
     )
 
     plugin_enable: bool = Field(
@@ -45,7 +59,11 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         description="机器人别名列表（用于 alias 命中与 call-intent 判定）",
     )
     scene_top_k: int = Field(
-        default=4, ge=1, le=8, description="scene embedding 召回数量"
+        default=4,
+        ge=1,
+        le=8,
+        description="scene embedding 召回数量",
+        json_schema_extra={"section_id": "chat_scene"},
     )
     reply_threshold: float = Field(
         default=0.72, ge=0.0, le=1.0, description="回复判定阈值"
@@ -105,6 +123,7 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
             "忽略口头禅、语气词、无意义重复字符。"
         ),
         description="query embedding 的 instruction",
+        json_schema_extra={"section_id": "chat_scene"},
     )
     embedding_instruction_scene: str = Field(
         default=(
@@ -112,6 +131,7 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
             "突出场景核心意图、适用边界和区分点。"
         ),
         description="scene/candidate embedding 的 instruction",
+        json_schema_extra={"section_id": "chat_scene"},
     )
     rerank_instruction: str = Field(
         default=(
@@ -121,6 +141,7 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
             "3) 场景匹配（SCENE_*）。优先语义，不因礼貌措辞或语气强弱偏置。"
         ),
         description="统一候选集 rerank 的 instruction",
+        json_schema_extra={"section_id": "chat_scene"},
     )
     scene_persist_enabled: bool = Field(
         default=False,
@@ -152,6 +173,75 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
     )
     scene_keep_versions: int = Field(
         default=3, ge=1, le=20, description="保留的 READY scene 版本数量"
+    )
+    summary_embedding_instruction_query: str = Field(
+        default=(
+            "任务：将群聊消息编码为群总结场景归类检索向量。"
+            "重点保留消息的对话意图、话题归属、事件类型与信息价值；"
+            "忽略口头禅、语气词、无意义重复字符。"
+        ),
+        description="群总结归类 query embedding 的 instruction",
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_rerank_instruction: str = Field(
+        default=(
+            "你在做群聊总结候选场景归类精排。按语义匹配强度给候选打分："
+            "1) 消息与场景的归属度；"
+            "2) 场景区分度；"
+            "3) 信息价值。优先语义，不因礼貌措辞或语气强弱偏置。"
+        ),
+        description="群总结归类 rerank 的 instruction",
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_scene_top_k: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="群总结归类 scene embedding 召回数量",
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_rerank_enabled: bool = Field(
+        default=True,
+        description="是否对群总结归类候选启用 rerank 精排",
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_rerank_threshold: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="群总结归类 rerank 采纳分数阈值",
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_similarity_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "群总结归类相似度阈值；为空表示未配置，显式余弦模式或 rerank "
+            "失败 fallback 需要配置该阈值"
+        ),
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_rerank_fallback_enabled: bool = Field(
+        default=False,
+        description="群总结归类 rerank 供应方失败时是否回退到相似度兜底",
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_rerank_failure_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "群总结归类 rerank 供应方持续失败、升级为不可用/诊断的累计次数阈值"
+        ),
+        json_schema_extra={"section_id": "summary_classification"},
+    )
+    summary_rerank_failure_window_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="群总结归类 rerank 供应方失败统计窗口（秒）",
+        json_schema_extra={"section_id": "summary_classification"},
     )
 
     @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
