@@ -430,13 +430,11 @@ def test_attempt_reply_only_rewrites_current_message(
 
     redis = _FakeRedis([previous_message])
     memory = _FakeMemory()
-    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
-    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     build_prompt_kwargs: dict[str, object] = {}
     generate_with_tools_kwargs: dict[str, object] = {}
@@ -465,7 +463,6 @@ def test_attempt_reply_only_rewrites_current_message(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
-            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -552,26 +549,23 @@ def test_attempt_reply_only_rewrites_current_message(
     assert generate_with_tools_kwargs["max_favorability_delta"] == 5
     assert redis.pushed_global_interactions == []
 
-    asyncio.run(handler.commit_delivered_reply(pending_reply))
-
-    # KOMARIBOT-10：送达后副作用只剩 outbox 一条路径；claim 返回 None
-    # 表示由后台 worker 稍后领取提交，这里只断言送达登记进入 outbox
-    assert repository.mark_delivered_calls == [
-        {
-            "operation_id": pending_reply.operation_id,
-            "platform_message_id": None,
-        }
-    ]
-    assert repository.claim_operation_calls == [pending_reply.operation_id]
     assert redis.pushed_global_interactions == []
 
 
 def test_message_handler_has_no_direct_side_effect_path() -> None:
-    """直连副作用路径已删除，repository 为构造必填硬依赖（KOMARIBOT-10 守卫）。"""
+    """消息生成器不拥有回复履约编排或其存储 adapter。"""
     removed_methods = (
         "_commit_side_effects",
         "_store_ai_reply",
         "_write_interaction_history",
+        "prepare_pending_reply",
+        "cancel_prepared_reply",
+        "commit_delivered_reply",
+        "retry_pending_reply_commits",
+        "_reply_commit_heartbeat",
+        "_mark_reply_commit_step",
+        "_process_claimed_reply_commit",
+        "_finish_claimed_reply_commit",
     )
     for method_name in removed_methods:
         assert not hasattr(message_handler_module.MessageHandler, method_name), (
@@ -579,11 +573,7 @@ def test_message_handler_has_no_direct_side_effect_path() -> None:
         )
 
     signature = inspect.signature(message_handler_module.MessageHandler.__init__)
-    param = signature.parameters.get("reply_commit_repository")
-    assert param is not None, "MessageHandler.__init__ 缺少 reply_commit_repository 参数"
-    assert param.default is inspect.Parameter.empty, (
-        "reply_commit_repository 必须是构造必填参数"
-    )
+    assert "reply_commit_repository" not in signature.parameters
 
 
 def test_generate_reply_core_has_no_dead_reason_params() -> None:
@@ -999,46 +989,6 @@ class _FakeProactiveReservation:
         )
 
 
-class _FakeReplyCommitRepository:
-    """fake outbox 仓库：记录 mark_delivered/claim_operation，claim 默认返回 None。
-
-    KOMARIBOT-10：commit_delivered_reply 只剩 outbox 一条路径；claim 返回
-    None 表示副作用由后台 worker 稍后领取提交，测试只断言送达登记。
-    """
-
-    def __init__(self) -> None:
-        self.mark_delivered_calls: list[dict[str, object]] = []
-        self.claim_operation_calls: list[str] = []
-        self.claim_result: dict[str, Any] | None = None
-
-    async def has_active_operation(self, operation_id: str) -> bool:
-        del operation_id
-        return False
-
-    async def mark_delivered(
-        self, operation_id: str, *, platform_message_id: str | None = None
-    ) -> bool:
-        self.mark_delivered_calls.append(
-            {"operation_id": operation_id, "platform_message_id": platform_message_id}
-        )
-        return True
-
-    async def claim_operation(
-        self, operation_id: str, *, owner_token: str, lease_seconds: int
-    ) -> dict[str, Any] | None:
-        del owner_token, lease_seconds
-        self.claim_operation_calls.append(operation_id)
-        return self.claim_result
-
-
-def _wire_reply_commit_repository(
-    handler: object, repository: _FakeReplyCommitRepository
-) -> None:
-    """为 __new__ 构建的 handler 补上 outbox 硬依赖与 owner（KOMARIBOT-10）。"""
-    handler.reply_commit_repository = repository  # type: ignore[attr-defined]
-    handler._reply_commit_owner = "test-owner"  # type: ignore[attr-defined]
-
-
 class _FakeMemoryForDebug:
     def __init__(self) -> None:
         self.search_conversation_calls: list[dict[str, object]] = []
@@ -1396,13 +1346,11 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
     fake_user_data = _FakeUserDataForDebug()
-    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
-    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1420,7 +1368,6 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
-            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -1478,39 +1425,21 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     assert fake_user_data.adjust_calls == []
     assert redis.pushed_global_interactions == []
 
-    asyncio.run(handler.commit_delivered_reply(pending_reply))
-
-    # KOMARIBOT-10：送达后副作用只剩 outbox 一条路径；claim 返回 None 表示
-    # 副作用由后台 worker 稍后领取提交，此处只断言送达登记，副作用断言由
-    # test_reply_commit_handler.py 的 outbox 编排测试继承
-    assert repository.mark_delivered_calls == [
-        {
-            "operation_id": pending_reply.operation_id,
-            "platform_message_id": None,
-        }
-    ]
-    assert repository.claim_operation_calls == [pending_reply.operation_id]
     assert fake_user_data.adjust_calls == []
     assert redis.pushed_global_interactions == []
 
 
-def test_proactive_attempt_reserves_then_enters_outbox_after_delivery(
+def test_proactive_attempt_reserves_then_returns_frozen_pending_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """主动回复生成前预占；送达确认后进入 outbox，confirm 由 outbox 步骤 1 驱动。
-
-    KOMARIBOT-10：直连 confirm 路径已删除；confirm-after-delivery 语义由
-    test_reply_commit_handler.py 的 outbox 编排测试继承。
-    """
+    """主动回复生成前预占；送达前只返回携带该预占的待履约回复。"""
     redis = _FakeRedisForDebug()
     reservation_svc = _FakeProactiveReservation()
-    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.proactive_reservation = reservation_svc
-    _wire_reply_commit_repository(handler, repository)
 
     async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
         return [], [], True
@@ -1532,7 +1461,6 @@ def test_proactive_attempt_reserves_then_enters_outbox_after_delivery(
             proactive_max_per_hour=3,
             proactive_reservation_ttl_seconds=360,
             proactive_cooldown=300,
-            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
         ),
     )
@@ -1572,18 +1500,6 @@ def test_proactive_attempt_reserves_then_enters_outbox_after_delivery(
     assert reservation_svc.renew_calls == [
         {"group_id": "group-proactive", "reservation_id": "message-proactive"}
     ]
-    assert repository.mark_delivered_calls == []
-
-    asyncio.run(handler.commit_delivered_reply(pending_reply))
-
-    # 送达登记进入 outbox；confirm 不在此处内联，由 outbox 步骤 1 驱动
-    assert repository.mark_delivered_calls == [
-        {
-            "operation_id": pending_reply.operation_id,
-            "platform_message_id": None,
-        }
-    ]
-    assert repository.claim_operation_calls == [pending_reply.operation_id]
     assert reservation_svc.confirm_calls == []
     assert reservation_svc.release_calls == []
 
@@ -2256,19 +2172,17 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
     assert reaction_called is False  # 还未到贴表情阶段
 
 
-def test_commit_delivered_reply_does_not_trigger_reaction_callback(
+def test_pending_reply_does_not_retain_reaction_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """commit_delivered_reply 不再调用 on_reply_triggered 回调（表情已在生成前贴出）。"""
+    """表情回调只在生成前派发，不进入冻结的待履约回复。"""
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
-    repository = _FakeReplyCommitRepository()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
-    _wire_reply_commit_repository(handler, repository)
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
     monkeypatch.setattr(
@@ -2287,7 +2201,6 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
             context_messages_limit=10,
             summary_max_buffer_size=500,
             memory_search_limit=3,
-            reply_commit_lease_seconds=60,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
@@ -2351,17 +2264,6 @@ def test_commit_delivered_reply_does_not_trigger_reaction_callback(
     assert not hasattr(pending_reply, "on_reply_triggered")
     # KOMARIBOT-11：无表情回调时 reaction_sent 为真实派发结果 False
     assert pending_reply.reaction_sent is False
-
-    # commit_delivered_reply 应正常执行，不调用已删除的回调
-    asyncio.run(handler.commit_delivered_reply(pending_reply))
-    # KOMARIBOT-10：送达登记进入 outbox（副作用由 worker 领取提交）
-    assert repository.mark_delivered_calls == [
-        {
-            "operation_id": pending_reply.operation_id,
-            "platform_message_id": None,
-        }
-    ]
-
 
 def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
     monkeypatch: pytest.MonkeyPatch,
