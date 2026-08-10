@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import asyncpg
 import pytest
+
 from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository import (
     AssistantReplyHistoryPayload,
     FavorabilityAdjustmentPayload,
@@ -112,7 +113,7 @@ async def _repository_context(
     fulfillment_ids: list[str],
     *,
     max_size: int = 4,
-) -> AsyncIterator[tuple[ReplyFulfillmentRepository, asyncpg.Pool[Any]]]:
+) -> AsyncIterator[tuple[ReplyFulfillmentRepository, asyncpg.Pool]]:
     pool = await asyncpg.create_pool(_asyncpg_url(), min_size=1, max_size=max_size)
     try:
         yield ReplyFulfillmentRepository(pool), pool
@@ -157,7 +158,8 @@ async def test_concurrent_prepare_creates_one_parent_and_fixed_children() -> Non
             )
             children = await connection.fetch(
                 """
-                SELECT commitment_type, state, attempt_count, payload
+                SELECT commitment_type, state, attempt_count,
+                       jsonb_typeof(payload) AS payload_type
                 FROM komari_chat_reply_fulfillment_commitments
                 WHERE fulfillment_id = $1
                 ORDER BY commitment_type
@@ -174,7 +176,7 @@ async def test_concurrent_prepare_creates_one_parent_and_fixed_children() -> Non
         }
         assert all(row["state"] == "PENDING" for row in children)
         assert all(row["attempt_count"] == 0 for row in children)
-        assert all(isinstance(row["payload"], dict) for row in children)
+        assert all(row["payload_type"] == "object" for row in children)
 
 
 async def test_delivery_fact_only_moves_forward() -> None:
