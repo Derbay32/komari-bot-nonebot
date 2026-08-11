@@ -142,7 +142,9 @@ class ReplyFulfillmentRepository:
         """把待确认送达的回复推进为已送达。
 
         同一平台消息 ID 可重复确认（幂等）；冲突平台消息 ID 明确抛错，
-        不得覆盖既有送达事实。
+        不得覆盖既有送达事实。进入已送达的同时立即清除父
+        ``reply_content``——完整正文只在准备/发送阶段需要，送达后各
+        承诺继续消费各自冻结的子 payload。
         """
         async with self.pg_pool.acquire() as connection:
             changed = await connection.fetchval(
@@ -154,6 +156,7 @@ class ReplyFulfillmentRepository:
                         $2
                     ),
                     delivered_at = COALESCE(delivered_at, NOW()),
+                    reply_content = NULL,
                     updated_at = NOW()
                 WHERE fulfillment_id = $1
                   AND delivery_state = 'PENDING_CONFIRMATION'
@@ -190,14 +193,17 @@ class ReplyFulfillmentRepository:
         """明确失败或时效终止：回复进入未送达互斥终态。
 
         允许从未发送直接进入未送达（发送开始前过期），此时
-        ``send_started_at`` 保持 NULL。
+        ``send_started_at`` 保持 NULL。进入终态即清除父
+        ``reply_content`` 与全部子 payload（未送达不产生任何送达后
+        承诺），但保留子状态事实行，不物理删子行。
         """
-        async with self.pg_pool.acquire() as connection:
+        async with self.pg_pool.acquire() as connection, connection.transaction():
             changed = await connection.fetchval(
                 """
                 UPDATE komari_chat_reply_fulfillments
                 SET delivery_state = 'NOT_DELIVERED',
                     not_delivered_at = COALESCE(not_delivered_at, NOW()),
+                    reply_content = NULL,
                     updated_at = NOW()
                 WHERE fulfillment_id = $1
                   AND delivery_state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')
@@ -205,6 +211,16 @@ class ReplyFulfillmentRepository:
                 """,
                 fulfillment_id,
             )
+            if changed is not None:
+                await connection.execute(
+                    """
+                    UPDATE komari_chat_reply_fulfillment_commitments
+                    SET payload = NULL,
+                        updated_at = NOW()
+                    WHERE fulfillment_id = $1
+                    """,
+                    fulfillment_id,
+                )
         return changed is not None
 
     async def has_active_operation(self, fulfillment_id: str) -> bool:
@@ -476,7 +492,11 @@ class ReplyFulfillmentRepository:
         return renewed is not None
 
     async def release_lease(self, fulfillment_id: str, *, owner_token: str) -> bool:
-        """仅允许当前且未过期 owner 释放父租约。"""
+        """仅允许当前且未过期 owner 释放父租约。
+
+        同时服务承诺执行（未完成履约）与终态清理（已解决终态）两条
+        路径：已解决终态记录同样需要把租约归还给下一轮清理。
+        """
         async with self.pg_pool.acquire() as connection:
             released = await connection.fetchval(
                 """
@@ -487,7 +507,6 @@ class ReplyFulfillmentRepository:
                 WHERE fulfillment_id = $1
                   AND lease_owner = $2
                   AND lease_expires_at > NOW()
-                  AND completed_at IS NULL
                 RETURNING fulfillment_id
                 """,
                 fulfillment_id,
@@ -662,12 +681,18 @@ class ReplyFulfillmentRepository:
         *,
         owner_token: str,
     ) -> bool:
-        """仅在所有适用承诺完成后完成父履约并清除租约。"""
-        async with self.pg_pool.acquire() as connection:
+        """仅在所有适用承诺完成后完成父履约并清除租约。
+
+        完成门禁落库时防御性再清父 ``reply_content`` 与全部子 payload
+        ——即使此前某步崩溃残留了正文或载荷，进入完成终态也一并抹除，
+        不依赖调用方顺序。
+        """
+        async with self.pg_pool.acquire() as connection, connection.transaction():
             completed = await connection.fetchval(
                 """
                 UPDATE komari_chat_reply_fulfillments AS parent
                 SET completed_at = COALESCE(parent.completed_at, NOW()),
+                    reply_content = NULL,
                     lease_owner = NULL,
                     lease_expires_at = NULL,
                     updated_at = NOW()
@@ -687,7 +712,151 @@ class ReplyFulfillmentRepository:
                 fulfillment_id,
                 owner_token,
             )
+            if completed is not None:
+                await connection.execute(
+                    """
+                    UPDATE komari_chat_reply_fulfillment_commitments
+                    SET payload = NULL,
+                        updated_at = NOW()
+                    WHERE fulfillment_id = $1
+                    """,
+                    fulfillment_id,
+                )
         return completed is not None
+
+    async def claim_terminal_cleanup_candidates(
+        self,
+        *,
+        owner_token: str,
+        limit: int,
+        lease_seconds: int,
+        protection_days: int,
+    ) -> list[dict[str, Any]]:
+        """领取超过履约身份保护期的已解决终态，供两阶段清理处置。
+
+        候选只含 ``NOT_DELIVERED`` 或 ``DELIVERED + completed_at 非空``
+        两种已解决终态，以 ``not_delivered_at``/``completed_at`` 为保护
+        期起点；绝不含 ``PENDING_CONFIRMATION``、待处置
+        （``DELIVERED + FAILED/未完成``）或未满保护期的记录。领取即
+        登记终态清理租约。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT parent.fulfillment_id
+                    FROM komari_chat_reply_fulfillments AS parent
+                    WHERE (
+                        parent.delivery_state = 'NOT_DELIVERED'
+                        OR (
+                            parent.delivery_state = 'DELIVERED'
+                            AND parent.completed_at IS NOT NULL
+                        )
+                    )
+                      AND COALESCE(
+                          parent.completed_at,
+                          parent.not_delivered_at
+                      ) <= NOW() - ($1 * INTERVAL '1 second')
+                      AND (
+                          parent.lease_owner IS NULL
+                          OR parent.lease_expires_at <= NOW()
+                      )
+                    ORDER BY
+                        COALESCE(
+                            parent.completed_at,
+                            parent.not_delivered_at
+                        ),
+                        parent.fulfillment_id
+                    FOR UPDATE OF parent SKIP LOCKED
+                    LIMIT $2
+                )
+                UPDATE komari_chat_reply_fulfillments AS parent
+                SET lease_owner = $3,
+                    lease_expires_at = NOW() + ($4 * INTERVAL '1 second'),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE parent.fulfillment_id = candidates.fulfillment_id
+                RETURNING parent.*
+                """,
+                max(1, protection_days) * 86_400,
+                limit,
+                owner_token,
+                max(1, lease_seconds),
+            )
+        return [dict(row) for row in rows]
+
+    async def mark_idempotency_evidence_cleared(
+        self,
+        fulfillment_id: str,
+        *,
+        owner_token: str,
+    ) -> bool:
+        """在终态清理租约内落下游幂等证据已清除标记。
+
+        只在有效 owner 且已解决终态上落标记；返回 False 表示租约已
+        丢失或记录不满足终态，调用方不得继续删除父身份。
+        """
+        async with self.pg_pool.acquire() as connection:
+            marked = await connection.fetchval(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET idempotency_evidence_cleared_at = COALESCE(
+                        idempotency_evidence_cleared_at,
+                        NOW()
+                    ),
+                    updated_at = NOW()
+                WHERE fulfillment_id = $1
+                  AND lease_owner = $2
+                  AND lease_expires_at > NOW()
+                  AND (
+                      delivery_state = 'NOT_DELIVERED'
+                      OR (
+                          delivery_state = 'DELIVERED'
+                          AND completed_at IS NOT NULL
+                      )
+                  )
+                RETURNING fulfillment_id
+                """,
+                fulfillment_id,
+                owner_token,
+            )
+        return marked is not None
+
+    async def delete_terminal_tombstone(
+        self,
+        fulfillment_id: str,
+        *,
+        owner_token: str,
+    ) -> bool:
+        """在证据已清除且租约有效时删除父 tombstone（FK cascade 删子行）。
+
+        删除必须同时满足：已解决终态、``idempotency_evidence_cleared_at``
+        非空、当前有效 owner。任何条件不满足都返回 False，保证清理
+        顺序不可反转——下游证据先于父身份删除。
+        """
+        async with self.pg_pool.acquire() as connection:
+            deleted = await connection.fetchval(
+                """
+                DELETE FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                  AND lease_owner = $2
+                  AND lease_expires_at > NOW()
+                  AND idempotency_evidence_cleared_at IS NOT NULL
+                  AND (
+                      delivery_state = 'NOT_DELIVERED'
+                      OR (
+                          delivery_state = 'DELIVERED'
+                          AND completed_at IS NOT NULL
+                      )
+                  )
+                RETURNING fulfillment_id
+                """,
+                fulfillment_id,
+                owner_token,
+            )
+        return deleted is not None
 
 
 __all__ = [
