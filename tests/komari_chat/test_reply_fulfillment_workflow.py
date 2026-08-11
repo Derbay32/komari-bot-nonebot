@@ -23,11 +23,19 @@ class _FakeReplyFulfillmentRepository:
         self.cleanup_count = 0
 
     @property
-    def prepared_ids(self) -> set[str]:
+    def not_started_ids(self) -> set[str]:
         return {
             operation_id
             for operation_id, record in self._records.items()
-            if record["status"] == "PREPARED"
+            if record["delivery_state"] == "NOT_STARTED"
+        }
+
+    @property
+    def pending_confirmation_ids(self) -> set[str]:
+        return {
+            operation_id
+            for operation_id, record in self._records.items()
+            if record["delivery_state"] == "PENDING_CONFIRMATION"
         }
 
     @property
@@ -39,11 +47,11 @@ class _FakeReplyFulfillmentRepository:
         }
 
     @property
-    def cancelled_ids(self) -> set[str]:
+    def not_delivered_ids(self) -> set[str]:
         return {
             operation_id
             for operation_id, record in self._records.items()
-            if record["status"] == "CANCELLED"
+            if record["delivery_state"] == "NOT_DELIVERED"
         }
 
     def platform_message_id(self, operation_id: str) -> str | None:
@@ -91,6 +99,10 @@ class _FakeReplyFulfillmentRepository:
                 interaction.trigger_size if interaction is not None else 0
             ),
             "status": "PREPARED",
+            "delivery_state": "NOT_STARTED",
+            "bot_self_id": payload.bot_self_id,
+            "adapter_name": payload.adapter_name,
+            "reply_target_message_id": payload.reply_target_message_id,
             "proactive_confirmed_at": None,
             "favorability_applied_at": None,
             "ai_history_stored_at": None,
@@ -99,10 +111,21 @@ class _FakeReplyFulfillmentRepository:
         }
         return True
 
-    async def cancel_prepared(self, operation_id: str) -> bool:
+    async def mark_send_started(self, operation_id: str) -> bool:
         record = self._records[operation_id]
-        if record["status"] != "PREPARED":
+        if record["delivery_state"] != "NOT_STARTED":
             return False
+        record["delivery_state"] = "PENDING_CONFIRMATION"
+        return True
+
+    async def mark_not_delivered(self, operation_id: str) -> bool:
+        record = self._records[operation_id]
+        if record["delivery_state"] not in {
+            "NOT_STARTED",
+            "PENDING_CONFIRMATION",
+        }:
+            return False
+        record["delivery_state"] = "NOT_DELIVERED"
         record["status"] = "CANCELLED"
         return True
 
@@ -113,6 +136,9 @@ class _FakeReplyFulfillmentRepository:
         platform_message_id: str | None = None,
     ) -> bool:
         record = self._records[operation_id]
+        if record["delivery_state"] != "PENDING_CONFIRMATION":
+            return False
+        record["delivery_state"] = "DELIVERED"
         record["status"] = "DELIVERED"
         record["platform_message_id"] = platform_message_id
         return True
@@ -306,6 +332,7 @@ def _config() -> SimpleNamespace:
         reply_commit_retry_base_seconds=1,
         reply_commit_batch_size=20,
         reply_commit_tombstone_retention_days=30,
+        reply_fulfillment_freshness_seconds=120,
     )
 
 
@@ -367,16 +394,16 @@ def _workflow(
         proactive_reservation=proactive,
         user_data=user_data,
         config_getter=_config,
+        recovery_senders_getter=dict,
     )
     return workflow, repository, redis, proactive, user_data
 
 
-async def _send_success(_pending: object) -> dict[str, int]:
-    return {"message_id": 7788}
-
-
-def _definitive_failure(error: Exception) -> bool:
-    return isinstance(error, PermissionError)
+async def _send_success(_pending: object) -> object:
+    module = import_module(
+        "komari_bot.plugins.komari_chat.services.reply_fulfillment_workflow"
+    )
+    return module.ReplyDeliveryResult.delivered("7788")
 
 
 @pytest.mark.asyncio
@@ -386,11 +413,7 @@ async def test_fulfill_owns_delivery_and_all_post_delivery_commitments(
     workflow, repository, redis, proactive, user_data = _workflow(workflow_module)
     pending = _pending_reply("reply-operation-1")
 
-    await workflow.fulfill(
-        pending,
-        send_reply=_send_success,
-        is_definitive_send_failure=_definitive_failure,
-    )
+    await workflow.fulfill(pending, send_reply=_send_success)
 
     assert repository.completed_ids == {pending.operation_id}
     assert repository.platform_message_id(pending.operation_id) == "7788"
@@ -412,16 +435,11 @@ async def test_definitive_delivery_failure_terminates_without_commitments(
     )
 
     async def _send_rejected(_pending: object) -> object:
-        raise PermissionError("平台明确拒绝")
+        return workflow_module.ReplyDeliveryResult.not_delivered()
 
-    with pytest.raises(Exception, match="平台明确拒绝"):
-        await workflow.fulfill(
-            pending,
-            send_reply=_send_rejected,
-            is_definitive_send_failure=_definitive_failure,
-        )
+    assert await workflow.fulfill(pending, send_reply=_send_rejected) is False
 
-    assert repository.cancelled_ids == {pending.operation_id}
+    assert repository.not_delivered_ids == {pending.operation_id}
     assert reservation.release_count == 1
     assert proactive.confirmed == set()
     assert user_data.application_count == 0
@@ -430,7 +448,7 @@ async def test_definitive_delivery_failure_terminates_without_commitments(
 
 
 @pytest.mark.asyncio
-async def test_unknown_delivery_keeps_prepared_fulfillment_for_reconciliation(
+async def test_unknown_delivery_becomes_pending_confirmation(
     workflow_module: Any,
 ) -> None:
     workflow, repository, redis, proactive, user_data = _workflow(workflow_module)
@@ -441,16 +459,11 @@ async def test_unknown_delivery_keeps_prepared_fulfillment_for_reconciliation(
     )
 
     async def _send_unknown(_pending: object) -> object:
-        raise TimeoutError("平台结果未知")
+        return workflow_module.ReplyDeliveryResult.pending_confirmation()
 
-    with pytest.raises(Exception, match="平台结果未知"):
-        await workflow.fulfill(
-            pending,
-            send_reply=_send_unknown,
-            is_definitive_send_failure=_definitive_failure,
-        )
+    assert await workflow.fulfill(pending, send_reply=_send_unknown) is False
 
-    assert repository.prepared_ids == {pending.operation_id}
+    assert repository.pending_confirmation_ids == {pending.operation_id}
     assert reservation.release_count == 0
     assert proactive.confirmed == set()
     assert user_data.application_count == 0
@@ -466,17 +479,13 @@ async def test_recover_resumes_only_missing_commitments_without_resending(
     pending = _pending_reply("reply-operation-retry")
     send_count = 0
 
-    async def _send(_pending: object) -> dict[str, int]:
+    async def _send(_pending: object) -> object:
         nonlocal send_count
         send_count += 1
-        return {"message_id": 9001}
+        return workflow_module.ReplyDeliveryResult.delivered("9001")
 
     redis.fail_ai_once = True
-    await workflow.fulfill(
-        pending,
-        send_reply=_send,
-        is_definitive_send_failure=_definitive_failure,
-    )
+    await workflow.fulfill(pending, send_reply=_send)
 
     assert repository.completed_ids == set()
     assert user_data.application_count == 1
@@ -497,11 +506,7 @@ async def test_recover_preserves_lease_loss_and_failure_backoff_semantics(
     pending = _pending_reply("reply-operation-lease")
     redis.fail_ai_once = True
 
-    await workflow.fulfill(
-        pending,
-        send_reply=_send_success,
-        is_definitive_send_failure=_definitive_failure,
-    )
+    await workflow.fulfill(pending, send_reply=_send_success)
     first_application_count = user_data.application_count
 
     assert await workflow.recover_pending() == 1
