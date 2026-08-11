@@ -984,13 +984,17 @@ class ReplyFulfillmentRepository:
         for row in rows:
             item = dict(row)
             item.pop("delivery_state", None)
+            item.pop("total", None)
             item["commitments"] = sorted(
                 merged.get(str(row["fulfillment_id"]), []),
                 key=lambda child: _COMMITMENT_ORDER.get(
                     str(child["commitment_type"]), len(_COMMITMENT_ORDER)
                 ),
             )
-            item["status"] = derive_reply_fulfillment_status(item)
+            # 优先保留 SQL 已派生的可信状态；仅当安全行未携带 status 时才
+            # 按领域字段推导，绝不覆盖存储层判定结果。
+            if "status" not in item:
+                item["status"] = derive_reply_fulfillment_status(item)
             result.append(item)
         return result, int(rows[0]["total"])
 
@@ -1045,7 +1049,9 @@ class ReplyFulfillmentRepository:
                 str(child["commitment_type"]), len(_COMMITMENT_ORDER)
             ),
         )
-        detail["status"] = derive_reply_fulfillment_status(detail)
+        # 优先保留已有 status（安全行携带时），缺失才按领域字段推导。
+        if "status" not in detail:
+            detail["status"] = derive_reply_fulfillment_status(detail)
         if detail["status"] != "pending_confirmation":
             detail["reply_content"] = None
         return detail
@@ -1092,18 +1098,54 @@ class ReplyFulfillmentRepository:
                 """,
                 fulfillment_id,
             )
-        if existing is None:
-            return "not_found"
-        if existing["delivery_state"] == "DELIVERED":
-            existing_platform_id = existing["platform_message_id"]
-            if (
-                platform_message_id is not None
-                and existing_platform_id is not None
-                and str(existing_platform_id) != platform_message_id
-            ):
-                return "platform_message_conflict"
-            return "idempotent"
-        return "state_conflict"
+            if existing is None:
+                return "not_found"
+            if existing["delivery_state"] == "DELIVERED":
+                existing_platform_id = existing["platform_message_id"]
+                if (
+                    platform_message_id is not None
+                    and existing_platform_id is not None
+                    and str(existing_platform_id) != platform_message_id
+                ):
+                    return "platform_message_conflict"
+                if existing_platform_id is None and platform_message_id is not None:
+                    # 已送达但缺平台 ID 时后补证据：原子条件补写，只在并发下
+                    # 仍为 NULL 时生效；补写失败再核对最新证据决定冲突或幂等。
+                    # 冲突核对、补写与重读必须保持在同一个 acquire 上下文内。
+                    written = await connection.fetchval(
+                        """
+                        UPDATE komari_chat_reply_fulfillments
+                        SET platform_message_id = $2,
+                            updated_at = NOW()
+                        WHERE fulfillment_id = $1
+                          AND delivery_state = 'DELIVERED'
+                          AND platform_message_id IS NULL
+                        RETURNING fulfillment_id
+                        """,
+                        fulfillment_id,
+                        platform_message_id,
+                    )
+                    if written is None:
+                        latest = await connection.fetchrow(
+                            """
+                            SELECT platform_message_id
+                            FROM komari_chat_reply_fulfillments
+                            WHERE fulfillment_id = $1
+                            """,
+                            fulfillment_id,
+                        )
+                        latest_platform_id = (
+                            latest["platform_message_id"]
+                            if latest is not None
+                            else None
+                        )
+                        if (
+                            latest_platform_id is not None
+                            and str(latest_platform_id) != platform_message_id
+                        ):
+                            return "platform_message_conflict"
+                return "idempotent"
+            return "state_conflict"
 
     async def reconcile_not_delivered(self, fulfillment_id: str) -> dict[str, Any]:
         """原子确认未送达：PENDING_CONFIRMATION 进入互斥终态。

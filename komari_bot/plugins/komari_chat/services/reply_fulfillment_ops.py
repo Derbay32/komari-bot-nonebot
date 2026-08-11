@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from nonebot import logger
+
 from ..reply_fulfillment_domain import (
     COMMITMENT_TYPES,
     derive_reply_fulfillment_status,
@@ -66,10 +68,16 @@ def _project_commitment_summary(child: Mapping[str, Any]) -> dict[str, Any]:
 def _project_summary(row: Mapping[str, Any]) -> dict[str, Any]:
     """把存储行投影为不含正文与内部载荷的最小列表项。"""
     item: dict[str, Any] = {
-        field: _to_iso_text(row.get(field)) for field in _SUMMARY_FIELDS
+        field: _to_iso_text(row.get(field))
+        for field in _SUMMARY_FIELDS
+        if field != "status"
     }
     item["reply_fingerprint"] = row.get("reply_fingerprint") or row.get("payload_hash")
-    item["status"] = derive_reply_fulfillment_status(row)
+    # 优先保留存储层已派生的可信状态；仅当安全行未携带 status（如未
+    # 暴露 delivery_state 的投影行）时才按领域字段推导，绝不覆盖。
+    item["status"] = (
+        row["status"] if "status" in row else derive_reply_fulfillment_status(row)
+    )
     item["commitments"] = [
         _project_commitment_summary(child) for child in (row.get("commitments") or ())
     ]
@@ -190,6 +198,11 @@ class ReplyFulfillmentOpsService:
             try:
                 await self._proactive_reservation.release(group_id, reservation_id)
             except Exception:
+                # 固定安全警告，不记录异常正文或任何业务标识；终态不回滚，
+                # 预占由 Redis TTL 自然回收。
+                logger.warning(
+                    "[KomariChat] 履约对账释放主动回复预占失败，等待 TTL 回收"
+                )
                 released = False
             else:
                 released = True
@@ -219,9 +232,16 @@ class ReplyFulfillmentOpsService:
             raise ReplyFulfillmentOpsNotFoundError("回复履约或承诺不存在")
         if outcome == "state_conflict":
             raise ReplyFulfillmentOpsConflictError("承诺状态不允许续跑")
+        # 续跑成功后重新读取安全管理详情，按剩余兄弟状态返回真实派生
+        # 状态：仍有 FAILED 兄弟项必须 needs_disposition，不得伪报
+        # processing；投影不含任何 payload 或内部字段。
+        detail = await self._repository.get_for_management(fulfillment_id)
+        status = (
+            _project_detail(detail)["status"] if detail is not None else "processing"
+        )
         return {
             "fulfillment_id": fulfillment_id,
-            "status": "processing",
+            "status": status,
             "commitment_type": commitment_type,
             "state": "PENDING",
         }

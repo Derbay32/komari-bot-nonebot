@@ -26,17 +26,19 @@ from komari_bot.management.management_audit import (
     require_management_change_reason,
     require_management_request_id,
 )
-from komari_bot.plugins.komari_chat.reply_fulfillment_ops_errors import (
-    ReplyFulfillmentOpsConflictError,
-    ReplyFulfillmentOpsNotFoundError,
-    ReplyFulfillmentOpsValidationError,
-)
+from komari_bot.plugins import komari_chat as chat_plugin
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     from komari_bot.management.management_api import ManagementTokenSource
     from komari_bot.management.management_audit import ManagementAuditRecorder
+
+# 运维契约异常只经 komari_chat 顶层暴露面获取（ADR-0006），管理插件
+# 不得 import 任意 komari_chat.* 子模块。
+ReplyFulfillmentOpsConflictError = chat_plugin.ReplyFulfillmentOpsConflictError
+ReplyFulfillmentOpsNotFoundError = chat_plugin.ReplyFulfillmentOpsNotFoundError
+ReplyFulfillmentOpsValidationError = chat_plugin.ReplyFulfillmentOpsValidationError
 
 API_PREFIX = "/api/v2/reply-fulfillments"
 
@@ -165,8 +167,6 @@ class ResumeCommitmentResponse(BaseModel):
 
 def get_reply_fulfillment_ops_service() -> object | None:
     """经 komari_chat 顶层窄 seam 获取履约运维服务（不 deep import）。"""
-    from komari_bot.plugins import komari_chat as chat_plugin
-
     return chat_plugin.get_reply_fulfillment_ops_service()
 
 

@@ -17,6 +17,11 @@ from .handlers.message_handler import (
     PendingReply,
     ReplyFailureInfo,
 )
+from .reply_fulfillment_ops_errors import (
+    ReplyFulfillmentOpsConflictError,
+    ReplyFulfillmentOpsNotFoundError,
+    ReplyFulfillmentOpsValidationError,
+)
 from .services.proactive_reservation import ProactiveReservationService
 from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
 from .services.reply_fulfillment_ops import (
@@ -84,7 +89,7 @@ _handler_workflow: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment_components: tuple[Any, Any, Any] | None = None
 _reply_fulfillment_ops: ReplyFulfillmentOpsService | None = None
-_reply_fulfillment_ops_components: tuple[Any, Any, Any] | None = None
+_reply_fulfillment_ops_components: tuple[Any, Any] | None = None
 _reply_commit_worker_task: asyncio.Task[None] | None = None
 
 
@@ -100,6 +105,23 @@ def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
     if decision_engine is None:
         return None
     return memory_manager.redis, memory_manager.memory, decision_engine
+
+
+def _resolve_ops_components() -> tuple[Any, Any] | None:
+    """履约运维的窄运行时边界：只依赖 PostgreSQL 与 Redis。
+
+    判定引擎只服务聊天判定与旧 workflow 的 gating，运维对账不需要它；
+    本边界不触碰 ``_resolve_runtime_components`` 的 decision-engine
+    gating，避免影响 handler / legacy workflow 既有就绪语义。
+    """
+    memory_manager = get_memory_plugin_manager()
+    if (
+        memory_manager is None
+        or memory_manager.redis is None
+        or memory_manager.memory is None
+    ):
+        return None
+    return memory_manager.redis, memory_manager.memory
 
 
 def _get_or_build_handler() -> MessageHandler | None:
@@ -185,14 +207,15 @@ def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
     """顶层窄 seam：向管理插件提供履约运维服务，不暴露内部 adapter。
 
     只操作新父子表（不读取旧 outbox、不做双读双写），也不启动或唤醒
-    任何 worker；依赖未就绪时返回 None，由管理 API 翻译为 503。
+    任何 worker；只依赖 PostgreSQL 与 Redis，判定引擎故障不拖垮运维；
+    依赖未就绪时返回 None，由管理 API 翻译为 503。
     """
     global _reply_fulfillment_ops, _reply_fulfillment_ops_components  # noqa: PLW0603
 
-    components = _resolve_runtime_components()
+    components = _resolve_ops_components()
     if components is None:
         return None
-    redis, memory, _decision_engine = components
+    redis, memory = components
 
     current_components = _reply_fulfillment_ops_components
     same_components = current_components is not None and all(
@@ -408,3 +431,14 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             ),
             reason=pending_reply.reason if pending_reply is not None else None,
         )
+
+
+# 跨插件普通 import 只允许经本顶层暴露面（ADR-0006）：外部插件不得
+# import 任意 komari_chat.* 子模块。
+__all__ = [
+    "ReplyFulfillmentOpsConflictError",
+    "ReplyFulfillmentOpsNotFoundError",
+    "ReplyFulfillmentOpsValidationError",
+    "generate_debug_reply",
+    "get_reply_fulfillment_ops_service",
+]
