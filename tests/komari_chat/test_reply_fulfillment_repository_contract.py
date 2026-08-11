@@ -182,14 +182,17 @@ async def test_reconcile_delivered_persists_late_platform_evidence() -> None:
     class _Connection:
         def __init__(self) -> None:
             self.update_calls = 0
+            self.released = False
 
         async def fetchval(self, query: str, *_args: object) -> str | None:
+            assert not self.released, "连接已归还"
             if "UPDATE komari_chat_reply_fulfillments" not in query:
                 return None
             self.update_calls += 1
             return "reply-late" if self.update_calls == 2 else None
 
         async def fetchrow(self, *_args: object) -> dict[str, object]:
+            assert not self.released, "连接已归还"
             return {
                 "delivery_state": "DELIVERED",
                 "platform_message_id": None,
@@ -199,10 +202,11 @@ async def test_reconcile_delivered_persists_late_platform_evidence() -> None:
 
     class _Acquire:
         async def __aenter__(self) -> _Connection:
+            connection.released = False
             return connection
 
         async def __aexit__(self, *_args: object) -> None:
-            return None
+            connection.released = True
 
     class _Pool:
         def acquire(self) -> _Acquire:

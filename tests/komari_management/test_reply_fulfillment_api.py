@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 from fastapi import FastAPI
+
+from komari_bot.plugins.komari_management import reply_fulfillment_api
 from komari_bot.plugins.komari_management.reply_fulfillment_api import (
     API_PREFIX,
     create_reply_fulfillment_router,
 )
-
-from komari_bot.plugins.komari_management import reply_fulfillment_api
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -418,8 +418,8 @@ async def test_api_returns_503_when_ops_service_is_not_ready(app: App) -> None:
 
 def test_management_api_only_uses_komari_chat_top_level_seam() -> None:
     source = inspect.getsource(reply_fulfillment_api)
-    assert "komari_chat.repositories" not in source
-    assert "komari_chat.services" not in source
+    assert "from komari_bot.plugins.komari_chat." not in source
+    assert "import komari_bot.plugins.komari_chat." not in source
     assert "ReplyFulfillmentRepository" not in source
     assert hasattr(reply_fulfillment_api, "get_reply_fulfillment_ops_service")
 
