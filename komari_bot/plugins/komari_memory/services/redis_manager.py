@@ -48,7 +48,11 @@ if redis.call("LLEN", buffer_key) == 0 then
 end
 redis.call("RPUSH", buffer_key, payload)
 redis.call("SET", last_message_key, timestamp)
-redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
+if dedupe_ttl_seconds > 0 then
+    redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
+else
+    redis.call("SET", dedupe_key, "1")
+end
 return 1
 """
 _CHAT_COMMIT_INTERACTION_ONCE_SCRIPT = """
@@ -68,7 +72,11 @@ redis.call("RPUSH", interaction_key, payload)
 if redis.call("LLEN", interaction_key) >= trigger_size then
     redis.call("SADD", pending_key, user_id)
 end
-redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
+if dedupe_ttl_seconds > 0 then
+    redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
+else
+    redis.call("SET", dedupe_key, "1")
+end
 return 1
 """
 _GLOBAL_INTERACTION_PUSH_SCRIPT = """
@@ -87,7 +95,6 @@ if buffer_length >= trigger_size then
 end
 return buffer_length
 """
-_CHAT_COMMIT_DEDUPE_TTL_SECONDS = 31 * 24 * 60 * 60
 _INTERACTION_CLAIM_SCRIPT = """
 -- interaction_summary_claim
 local pending_key = KEYS[1]
@@ -364,9 +371,13 @@ class RedisManager:
         message: MessageSchema,
         *,
         operation_id: str,
-        dedupe_ttl_seconds: int = _CHAT_COMMIT_DEDUPE_TTL_SECONDS,
+        dedupe_ttl_seconds: int | None = None,
     ) -> bool:
-        """按聊天 operation ID 原子写入一次消息缓冲。"""
+        """按聊天 operation ID 原子写入一次消息缓冲。
+
+        ``dedupe_ttl_seconds`` 为 None 时防重键持久保留，直到履约终态
+        清理显式删除；显式传秒数则沿用旧固定 TTL 语义（旧生产路径）。
+        """
         data = {
             "user_id": message.user_id,
             "user_nickname": message.user_nickname,
@@ -386,7 +397,11 @@ class RedisManager:
             RedisKeys.last_message(group_id),
             json.dumps(data, ensure_ascii=False),
             message.timestamp,
-            max(1, dedupe_ttl_seconds),
+            (
+                max(1, dedupe_ttl_seconds)
+                if dedupe_ttl_seconds is not None
+                else 0
+            ),
         )
         return int(cast("int | str | bytes", result)) == 1
 
@@ -968,9 +983,13 @@ class RedisManager:
         record: dict[str, Any],
         trigger_size: int,
         operation_id: str,
-        dedupe_ttl_seconds: int = _CHAT_COMMIT_DEDUPE_TTL_SECONDS,
+        dedupe_ttl_seconds: int | None = None,
     ) -> bool:
-        """按聊天 operation ID 原子写入一次互动事件缓冲。"""
+        """按聊天 operation ID 原子写入一次互动事件缓冲。
+
+        ``dedupe_ttl_seconds`` 为 None 时防重键持久保留，直到履约终态
+        清理显式删除；显式传秒数则沿用旧固定 TTL 语义（旧生产路径）。
+        """
         result = await self.redis.execute_command(
             "EVAL",
             _CHAT_COMMIT_INTERACTION_ONCE_SCRIPT,
@@ -981,9 +1000,25 @@ class RedisManager:
             json.dumps(record, ensure_ascii=False),
             user_id,
             max(1, trigger_size),
-            max(1, dedupe_ttl_seconds),
+            (
+                max(1, dedupe_ttl_seconds)
+                if dedupe_ttl_seconds is not None
+                else 0
+            ),
         )
         return int(cast("int | str | bytes", result)) == 1
+
+    async def delete_chat_commit_evidence(self, operation_id: str) -> int:
+        """幂等删除聊天履约的两个 Redis 防重证据键，返回删除数量。
+
+        只删除 ``ai_history`` 与 ``interaction`` 两个证据键，绝不触碰
+        实际消息/互动 buffer；未解决履约的证据在显式清理前持久保留。
+        """
+        pipeline = self.redis.pipeline()
+        pipeline.delete(RedisKeys.chat_commit_step(operation_id, "ai_history"))
+        pipeline.delete(RedisKeys.chat_commit_step(operation_id, "interaction"))
+        results = await pipeline.execute()
+        return sum(int(result) for result in results)
 
     async def get_global_interaction_buffer(
         self,
