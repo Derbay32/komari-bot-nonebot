@@ -361,8 +361,9 @@ async def test_successful_send_is_delegated_once_to_reply_fulfillment(
 
     assert fulfill_calls == [pending_reply]
     assert len(delivery_responses) == 1
-    assert delivery_responses[0].state == "delivered"
-    assert delivery_responses[0].platform_message_id == "7788"
+    delivery_response = cast("Any", delivery_responses[0])
+    assert delivery_response.state == "delivered"
+    assert delivery_response.platform_message_id == "7788"
     assert len(bot.calls) == 1
 
 
