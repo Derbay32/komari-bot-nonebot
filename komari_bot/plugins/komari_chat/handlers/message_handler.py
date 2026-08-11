@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import time
@@ -34,6 +33,7 @@ from komari_bot.onebot import (
 from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
+from ..reply_fulfillment_domain import build_reply_fulfillment_id
 from ..services.config_interface import get_config, get_memory_config
 from ..services.image_downloader import (
     ImageDownloadPolicy,
@@ -122,7 +122,11 @@ class DebugReplyResult:
 
 @dataclass(frozen=True)
 class PendingReply:
-    """已生成但尚未确认送达的回复及其待提交副作用。"""
+    """已生成但尚未确认送达的回复及其待提交副作用。
+
+    bot_self_id 与 adapter_name 由 OneBot 边界的 bot.self_id 与
+    适配器身份冻结，随回复一起成为履约不可变身份的一部分。
+    """
 
     reply: str
     reply_to_message_id: str
@@ -130,6 +134,8 @@ class PendingReply:
     reply_result: ReplyResult
     force_reply: bool
     bot_nickname: str
+    bot_self_id: str
+    adapter_name: str
     reason: AttemptReplyReason
     reply_score: float | None
     operation_id: str
@@ -253,12 +259,12 @@ class MessageHandler:
 
     @staticmethod
     def _reply_operation_id(message: MessageSchema) -> str:
-        """由平台事件稳定生成聊天回复 operation ID。"""
-        source = (
-            f"v1\0{message.group_id}\0{message.message_id}\0{message.user_id}"
+        """由平台事件稳定生成聊天回复履约 ID（复用领域构建函数）。"""
+        return build_reply_fulfillment_id(
+            group_id=message.group_id,
+            trigger_message_id=message.message_id,
+            trigger_user_id=message.user_id,
         )
-        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        return f"reply-{digest}"
 
     @staticmethod
     def _extract_plain_text_from_message(message: object) -> str:
@@ -565,6 +571,8 @@ class MessageHandler:
             store_current=memory_store,
             caller_is_superuser=await SUPERUSER(bot, event),
             on_reply_triggered=on_reply_triggered,
+            bot_self_id=str(bot.self_id),
+            adapter_name=bot.type,
         )
         if pending_reply is not None:
             reply_action: ReplyAction = (
@@ -1065,6 +1073,8 @@ class MessageHandler:
         reason: AttemptReplyReason,
         reply_score: float | None,
         store_current: bool,
+        bot_self_id: str,
+        adapter_name: str,
         caller_is_superuser: bool = False,
         on_reply_triggered: ReplyTriggeredCallback | None = None,
     ) -> tuple[PendingReply | None, bool, ReplyFailureInfo | None]:
@@ -1278,6 +1288,8 @@ class MessageHandler:
                 reply_result=reply_result,
                 force_reply=force_reply,
                 bot_nickname=memory_config.bot_nickname,
+                bot_self_id=bot_self_id,
+                adapter_name=adapter_name,
                 reason=reason,
                 reply_score=reply_score,
                 operation_id=self._reply_operation_id(message),

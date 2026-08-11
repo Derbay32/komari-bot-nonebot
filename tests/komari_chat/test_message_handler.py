@@ -497,6 +497,8 @@ def test_attempt_reply_only_rewrites_current_message(
 
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -671,6 +673,8 @@ def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
 
     return asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=message,
             reply_to_message_id=message.message_id,
             image_urls=None,
@@ -1401,6 +1405,8 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
 
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -1475,6 +1481,8 @@ def test_proactive_attempt_reserves_then_returns_frozen_pending_reply(
 
     pending_reply, stored, failure = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=message,
             reply_to_message_id=message.message_id,
             image_urls=None,
@@ -1545,6 +1553,8 @@ def test_proactive_generation_failure_releases_reservation(
 
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=message,
             reply_to_message_id=message.message_id,
             image_urls=None,
@@ -1603,6 +1613,8 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
     )
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=message,
             reply_to_message_id=message.message_id,
             image_urls=None,
@@ -1786,6 +1798,8 @@ def test_reaction_scheduled_before_generate_core(
 
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -1886,6 +1900,8 @@ def test_reaction_not_scheduled_when_disabled(
 
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -1984,6 +2000,8 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
 
     _pending, _stored, failure = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -2081,6 +2099,8 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
 
     _pending, _stored, failure = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -2151,6 +2171,8 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
 
     _pending, _stored, failure = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -2244,6 +2266,8 @@ def test_pending_reply_does_not_retain_reaction_callback(
 
     result = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
@@ -2305,6 +2329,8 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
 
     _pending, _stored, failure = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=current_message,
             reply_to_message_id=current_message.message_id,
             image_urls=None,
