@@ -201,6 +201,16 @@ async def cleanup_favorability_operations(*, retention_days: int) -> int:
     return await db.cleanup_adjustment_ledger(retention_days=retention_days)
 
 
+async def delete_favorability_operation(operation_id: str) -> bool:
+    """按 operation_id 精确删除一条好感度幂等账本，幂等返回是否删除。
+
+    供履约终态清理在保护期结束时清除下游好感度证据；不替换
+    ``cleanup_favorability_operations`` 旧批量路径。
+    """
+    db = await get_db()
+    return await db.delete_favorability_operation(operation_id)
+
+
 async def get_user_count() -> int:
     """获取总用户数。"""
     db = await get_db()
@@ -236,6 +246,7 @@ __all__ = [
     "UserFavorability",
     "adjust_user_favorability",
     "cleanup_favorability_operations",
+    "delete_favorability_operation",
     "get_favorability_stage",
     "get_user_count",
     "get_user_favorability",
