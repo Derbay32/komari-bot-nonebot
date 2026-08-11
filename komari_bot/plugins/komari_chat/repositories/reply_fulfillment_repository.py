@@ -291,6 +291,10 @@ class ReplyFulfillmentRepository:
 
         满时效（``prepared_at`` 距今 >= 时效）的 NOT_STARTED 行转为
         未送达终态，``send_started_at`` 保持 NULL；未送达回复永不重发。
+        同一事务内清除父 ``reply_content`` 与全部子 payload——超时
+        分支同样进入未送达终态，不得长期保留冻结敏感内容；子状态
+        事实行保留（state 保持 PENDING），返回行只含父身份与时间戳，
+        不依赖被清除的载荷。
         """
         if limit <= 0:
             return []
@@ -309,6 +313,7 @@ class ReplyFulfillmentRepository:
                 UPDATE komari_chat_reply_fulfillments AS parent
                 SET delivery_state = 'NOT_DELIVERED',
                     not_delivered_at = COALESCE(not_delivered_at, NOW()),
+                    reply_content = NULL,
                     updated_at = NOW()
                 FROM candidates
                 WHERE parent.fulfillment_id = candidates.fulfillment_id
@@ -317,6 +322,16 @@ class ReplyFulfillmentRepository:
                 max(1, freshness_seconds),
                 limit,
             )
+            if rows:
+                await connection.execute(
+                    """
+                    UPDATE komari_chat_reply_fulfillment_commitments
+                    SET payload = NULL,
+                        updated_at = NOW()
+                    WHERE fulfillment_id = ANY($1::text[])
+                    """,
+                    [row["fulfillment_id"] for row in rows],
+                )
         return [dict(row) for row in rows]
 
     async def claim_operation(
