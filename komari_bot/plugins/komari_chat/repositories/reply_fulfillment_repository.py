@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from typing import Any
 
 from ..reply_fulfillment_domain import (
+    _COMMITMENT_PAYLOAD_TYPES,
     COMMITMENT_TYPES,
     AssistantReplyHistoryPayload,
     CommitmentPayload,
@@ -22,6 +24,11 @@ from ..reply_fulfillment_domain import (
     ReplyFulfillmentConflictError,
     ReplyFulfillmentDraft,
 )
+
+# 承诺类型到冻结领域值对象的固定映射，与领域模块保持单一事实来源。
+_COMMITMENT_ORDER = {
+    commitment_type: index for index, commitment_type in enumerate(COMMITMENT_TYPES)
+}
 
 
 class ReplyFulfillmentRepository:
@@ -200,6 +207,19 @@ class ReplyFulfillmentRepository:
             )
         return changed is not None
 
+    async def has_active_operation(self, fulfillment_id: str) -> bool:
+        """履约身份一旦持久化，就阻止同一事件再次发送。"""
+        async with self.pg_pool.acquire() as connection:
+            found = await connection.fetchval(
+                """
+                SELECT 1
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        return found is not None
+
     async def claim_fresh_not_started(
         self,
         *,
@@ -290,7 +310,11 @@ class ReplyFulfillmentRepository:
         owner_token: str,
         lease_seconds: int,
     ) -> dict[str, Any] | None:
-        """领取单个到期履约，并原子回收过期父租约。"""
+        """领取单个到期履约，并原子回收过期父租约。
+
+        领取条件：存在到期子项，或所有子项都已 COMPLETED 而父完成
+        标记尚未写入（父终态崩溃窗口恢复，只补父完成不重复子项）。
+        """
         async with self.pg_pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
@@ -305,17 +329,34 @@ class ReplyFulfillmentRepository:
                       parent.lease_owner IS NULL
                       OR parent.lease_expires_at <= NOW()
                   )
-                  AND EXISTS (
-                      SELECT 1
-                      FROM komari_chat_reply_fulfillment_commitments AS child
-                      WHERE child.fulfillment_id = parent.fulfillment_id
-                        AND (
-                            child.state = 'PENDING'
-                            OR (
-                                child.state = 'RETRY_WAIT'
-                                AND child.next_retry_at <= NOW()
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM komari_chat_reply_fulfillment_commitments AS child
+                          WHERE child.fulfillment_id = parent.fulfillment_id
+                            AND (
+                                child.state = 'PENDING'
+                                OR (
+                                    child.state = 'RETRY_WAIT'
+                                    AND child.next_retry_at <= NOW()
+                                )
                             )
-                        )
+                      )
+                      OR (
+                          EXISTS (
+                              SELECT 1
+                              FROM komari_chat_reply_fulfillment_commitments
+                              AS child
+                              WHERE child.fulfillment_id = parent.fulfillment_id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM komari_chat_reply_fulfillment_commitments
+                              AS child
+                              WHERE child.fulfillment_id = parent.fulfillment_id
+                                AND child.state <> 'COMPLETED'
+                          )
+                      )
                   )
                 RETURNING parent.*
                 """,
@@ -332,7 +373,11 @@ class ReplyFulfillmentRepository:
         limit: int,
         lease_seconds: int,
     ) -> list[dict[str, Any]]:
-        """按稳定顺序批量领取待处理履约，并跳过已锁父记录。"""
+        """按稳定顺序批量领取待处理履约，并跳过已锁父记录。
+
+        领取条件与 ``claim_operation`` 一致：存在到期子项，或所有子项
+        都已 COMPLETED 而父完成标记尚未写入（补父终态，不重复子项）。
+        """
         if limit <= 0:
             return []
         async with self.pg_pool.acquire() as connection, connection.transaction():
@@ -347,17 +392,35 @@ class ReplyFulfillmentRepository:
                           parent.lease_owner IS NULL
                           OR parent.lease_expires_at <= NOW()
                       )
-                      AND EXISTS (
-                          SELECT 1
-                          FROM komari_chat_reply_fulfillment_commitments AS child
-                          WHERE child.fulfillment_id = parent.fulfillment_id
-                            AND (
-                                child.state = 'PENDING'
-                                OR (
-                                    child.state = 'RETRY_WAIT'
-                                    AND child.next_retry_at <= NOW()
+                      AND (
+                          EXISTS (
+                              SELECT 1
+                              FROM komari_chat_reply_fulfillment_commitments
+                              AS child
+                              WHERE child.fulfillment_id = parent.fulfillment_id
+                                AND (
+                                    child.state = 'PENDING'
+                                    OR (
+                                        child.state = 'RETRY_WAIT'
+                                        AND child.next_retry_at <= NOW()
+                                    )
                                 )
-                            )
+                          )
+                          OR (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM komari_chat_reply_fulfillment_commitments
+                                  AS child
+                                  WHERE child.fulfillment_id = parent.fulfillment_id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM komari_chat_reply_fulfillment_commitments
+                                  AS child
+                                  WHERE child.fulfillment_id = parent.fulfillment_id
+                                    AND child.state <> 'COMPLETED'
+                              )
+                          )
                       )
                     ORDER BY
                         COALESCE(parent.delivered_at, parent.prepared_at),
@@ -432,6 +495,73 @@ class ReplyFulfillmentRepository:
             )
         return released is not None
 
+    async def load_claimed_commitments(
+        self,
+        fulfillment_id: str,
+        *,
+        owner_token: str,
+    ) -> list[dict[str, Any]] | None:
+        """在有效父 owner 下加载当前到期承诺及其经领域校验的载荷。
+
+        只返回 ``PENDING`` 或已到退避时间的 ``RETRY_WAIT`` 子项；父
+        租约不再属于 ``owner_token``（丢失或被回收）时返回 None，执行
+        器据此立即中止本轮。asyncpg 默认返回的 JSONB 文本先解码，再经
+        冻结领域值对象校验并规范化；解码或校验失败的损坏载荷保持原样
+        返回，由执行器按 ``invalid_payload`` 独立处置。返回顺序按
+        ``COMMITMENT_TYPES`` 稳定排序，不依赖存储返回顺序。
+        """
+        async with self.pg_pool.acquire() as connection:
+            owned = await connection.fetchval(
+                """
+                SELECT 1
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                  AND lease_owner = $2
+                  AND lease_expires_at > NOW()
+                  AND completed_at IS NULL
+                """,
+                fulfillment_id,
+                owner_token,
+            )
+            if owned is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT commitment_type, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                  AND (
+                      state = 'PENDING'
+                      OR (state = 'RETRY_WAIT' AND next_retry_at <= NOW())
+                  )
+                """,
+                fulfillment_id,
+            )
+        commitments: list[dict[str, Any]] = []
+        for row in rows:
+            commitment_type = str(row["commitment_type"])
+            payload_type = _COMMITMENT_PAYLOAD_TYPES[commitment_type]
+            canonical: Any = row["payload"]
+            if isinstance(canonical, str):
+                # asyncpg 默认把 JSONB 返回为文本，先解码再进入领域校验。
+                with suppress(TypeError, ValueError):
+                    canonical = json.loads(canonical)
+            if isinstance(canonical, dict):
+                with suppress(TypeError, ValueError):
+                    canonical = payload_type(**canonical).to_json()
+            commitments.append(
+                {
+                    "commitment_type": commitment_type,
+                    "payload": canonical,
+                }
+            )
+        return sorted(
+            commitments,
+            key=lambda item: _COMMITMENT_ORDER.get(
+                str(item["commitment_type"]), len(_COMMITMENT_ORDER)
+            ),
+        )
+
     async def mark_commitment_completed(
         self,
         fulfillment_id: str,
@@ -477,8 +607,13 @@ class ReplyFulfillmentRepository:
         error_code: str,
         max_attempts: int,
         retry_base_seconds: int,
+        retry_max_seconds: int = 3600,
     ) -> str | None:
-        """记录一个承诺的独立失败、退避或耗尽状态。"""
+        """记录一个承诺的独立失败、退避或耗尽状态。
+
+        ``retry_max_seconds`` 是执行器动态传入的退避上限；不写死 3600，
+        也不写入冻结载荷。
+        """
         async with self.pg_pool.acquire() as connection:
             state = await connection.fetchval(
                 """
@@ -493,7 +628,7 @@ class ReplyFulfillmentRepository:
                         ELSE NOW() + (
                             LEAST(
                                 $5 * POWER(2, GREATEST(child.attempt_count, 0)),
-                                3600
+                                $7
                             ) * INTERVAL '1 second'
                         )
                     END,
@@ -517,6 +652,7 @@ class ReplyFulfillmentRepository:
                 max(1, max_attempts),
                 max(1, retry_base_seconds),
                 owner_token,
+                max(1, retry_max_seconds),
             )
         return str(state) if state is not None else None
 
