@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from importlib import import_module, util
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from nonebot.adapters.onebot.v11 import ActionFailed
@@ -77,7 +77,7 @@ async def test_explicit_rich_failure_falls_back_to_plain_text() -> None:
     assert len(bot.calls) == 2
     assert bot.calls[1]["api"] == "send_group_msg"
     assert bot.calls[1]["group_id"] == 114514
-    plain_message = bot.calls[1]["message"]
+    plain_message = cast("list[Any]", bot.calls[1]["message"])
     assert len(plain_message) == 1
     assert plain_message[0].type == "text"
     assert plain_message[0].data == {"text": "回复正文"}

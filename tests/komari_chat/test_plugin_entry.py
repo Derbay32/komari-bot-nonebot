@@ -18,7 +18,7 @@ from nonebot.adapters.onebot.v11 import ActionFailed
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
+    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
     from nonebug import App
 
 
@@ -68,6 +68,38 @@ def _install_allowed_entry_dependencies(
     )
     monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
+
+
+class _EntryBot:
+    """记录 OneBot API 调用并按顺序返回受控结果。"""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[dict[str, object]] = []
+
+    async def call_api(self, api: str, **kwargs: object) -> object:
+        self.calls.append({"api": api, **kwargs})
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _pending_reply(
+    *,
+    reply: str = "测试回复",
+    reply_to_message_id: str | None = None,
+    request_trace_id: str = "test-trace",
+    reaction_sent: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        reply=reply,
+        reply_to_message_id=reply_to_message_id,
+        message=SimpleNamespace(group_id="114514"),
+        request_trace_id=request_trace_id,
+        reason="at",
+        reaction_sent=reaction_sent,
+    )
 
 
 @pytest.fixture
@@ -221,13 +253,7 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         fulfill=0,
         send=False,
     )
-    pending_reply = SimpleNamespace(
-        reply="测试回复",
-        reply_to_message_id=None,
-        request_trace_id="test-trace-send-fail",
-        reason="at",
-        reaction_sent=False,
-    )
+    pending_reply = _pending_reply(request_trace_id="test-trace-send-fail")
     reported_failures: list[Any] = []
 
     class _Handler:
@@ -243,6 +269,23 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         async def report_reply_failure(**kwargs: object) -> None:
             reported_failures.append(kwargs["failure"])
 
+    bot = _EntryBot(
+        [
+            ActionFailed(
+                status="failed",
+                retcode=100,
+                data=None,
+                message="模拟富文本发送失败",
+            ),
+            ActionFailed(
+                status="failed",
+                retcode=100,
+                data=None,
+                message="模拟纯文本发送失败",
+            ),
+        ]
+    )
+
     class _Workflow:
         @staticmethod
         async def fulfill(
@@ -253,16 +296,8 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         ) -> None:
             assert actual_pending_reply is pending_reply
             calls.fulfill += 1
-            await send_reply(actual_pending_reply)
-
-    async def _fail_send(_message: object) -> None:
-        calls.send = True
-        raise ActionFailed(
-            status="failed",
-            retcode=100,
-            data=None,
-            message="模拟明确发送失败",
-        )
+            result = await send_reply(actual_pending_reply)
+            calls.send = result.state == "not_delivered"
 
     _install_allowed_entry_dependencies(
         chat_module,
@@ -270,19 +305,16 @@ async def test_send_failure_does_not_commit_reply_side_effects(
         _Handler(),
         _Workflow(),
     )
-    monkeypatch.setattr(chat_module.matcher, "send", _fail_send)
 
     await chat_module.handle_group_message(
-        cast("Bot", cast("Any", object())),
+        cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 
     assert calls.fulfill == 1
     assert calls.send
-    # KOMARIBOT-11：失败分流的 reaction_sent 改读 pending_reply 字段真源；
-    # 表情未派发（False）时不再按「pending 存在且未送达」推导为 True
-    assert len(reported_failures) == 1
-    assert reported_failures[0].reaction_sent is False
+    assert len(bot.calls) == 2
+    assert reported_failures == []
 
 
 @pytest.mark.asyncio
@@ -292,7 +324,7 @@ async def test_successful_send_is_delegated_once_to_reply_fulfillment(
 ) -> None:
     fulfill_calls: list[object] = []
     delivery_responses: list[object] = []
-    pending_reply = SimpleNamespace(reply="测试回复", reply_to_message_id=None)
+    pending_reply = _pending_reply()
 
     class _Handler:
         @staticmethod
@@ -314,24 +346,24 @@ async def test_successful_send_is_delegated_once_to_reply_fulfillment(
             fulfill_calls.append(actual_pending_reply)
             delivery_responses.append(await send_reply(actual_pending_reply))
 
-    async def _send(_message: object) -> dict[str, int]:
-        return {"message_id": 7788}
-
+    bot = _EntryBot([{"message_id": 7788}])
     _install_allowed_entry_dependencies(
         chat_module,
         monkeypatch,
         _Handler(),
         _Workflow(),
     )
-    monkeypatch.setattr(chat_module.matcher, "send", _send)
 
     await chat_module.handle_group_message(
-        cast("Bot", cast("Any", object())),
+        cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 
     assert fulfill_calls == [pending_reply]
-    assert delivery_responses == [{"message_id": 7788}]
+    assert len(delivery_responses) == 1
+    assert delivery_responses[0].state == "delivered"
+    assert delivery_responses[0].platform_message_id == "7788"
+    assert len(bot.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -340,8 +372,7 @@ async def test_llm_cq_literal_is_sent_as_one_plain_text_segment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cq_literal = "[CQ:reply,id=1][CQ:at,qq=all][CQ:image,file=evil]"
-    pending_reply = SimpleNamespace(reply=cq_literal, reply_to_message_id=None)
-    sent_messages: list[Message] = []
+    pending_reply = _pending_reply(reply=cq_literal)
 
     class _Handler:
         @staticmethod
@@ -362,26 +393,22 @@ async def test_llm_cq_literal_is_sent_as_one_plain_text_segment(
         ) -> None:
             await send_reply(actual_pending_reply)
 
-    async def _send(message: Message) -> None:
-        sent_messages.append(message)
-
+    bot = _EntryBot([{}])
     _install_allowed_entry_dependencies(
         chat_module,
         monkeypatch,
         _Handler(),
         _Workflow(),
     )
-    monkeypatch.setattr(chat_module.matcher, "send", _send)
 
     await chat_module.handle_group_message(
-        cast("Bot", cast("Any", object())),
+        cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 
-    assert len(sent_messages) == 1
-    assert len(sent_messages[0]) == 1
-    assert sent_messages[0][0].type == "text"
-    assert sent_messages[0][0].data == {"text": cq_literal}
+    assert len(bot.calls) == 1
+    message = cast("list[dict[str, object]]", bot.calls[0]["message"])
+    assert message == [{"type": "text", "data": {"text": cq_literal}}]
 
 
 @pytest.mark.asyncio
@@ -390,11 +417,8 @@ async def test_fulfillment_failure_after_send_is_reported_by_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = SimpleNamespace(send=False, fulfill=0)
-    pending_reply = SimpleNamespace(
-        reply="测试回复",
-        reply_to_message_id=None,
+    pending_reply = _pending_reply(
         request_trace_id="test-trace-commit-fail",
-        reason="at",
         reaction_sent=True,
     )
     reported_failures: list[Any] = []
@@ -421,22 +445,20 @@ async def test_fulfillment_failure_after_send_is_reported_by_entry(
             **_kwargs: object,
         ) -> None:
             calls.fulfill += 1
-            await send_reply(actual_pending_reply)
+            result = await send_reply(actual_pending_reply)
+            calls.send = result.state == "delivered"
             raise RuntimeError("模拟送达后的履约提交失败")
 
-    async def _send(_message: object) -> None:
-        calls.send = True
-
+    bot = _EntryBot([{}])
     _install_allowed_entry_dependencies(
         chat_module,
         monkeypatch,
         _Handler(),
         _Workflow(),
     )
-    monkeypatch.setattr(chat_module.matcher, "send", _send)
 
     await chat_module.handle_group_message(
-        cast("Bot", cast("Any", object())),
+        cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 

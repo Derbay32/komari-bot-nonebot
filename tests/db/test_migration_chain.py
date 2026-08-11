@@ -375,6 +375,19 @@ def test_reply_delivery_recovery_revision_exists() -> None:
     assert "<= 300" in normalized
     assert f"ALTER TABLE {parent_table}" in normalized
     assert "CK_REPLY_FULFILLMENT_DELIVERY_TIMESTAMPS" in normalized
+    assert "IDX_REPLY_COMMIT_OUTBOX_DELIVERY_FRESHNESS" in normalized
+    assert re.search(
+        r'op\.execute\(\s*"DROP INDEX IF EXISTS '
+        r'idx_reply_commit_outbox_delivery_freshness"',
+        revision_sql,
+        re.IGNORECASE,
+    )
+    assert not re.search(
+        r'"ALTER TABLE komari_chat_reply_commit_outbox\s*"\s*'
+        r'"DROP INDEX',
+        revision_sql,
+        re.IGNORECASE,
+    )
 
     assert "DROP TABLE KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
     assert "DROP TABLE KOMARI_CHAT_REPLY_FULFILLMENTS" not in normalized
