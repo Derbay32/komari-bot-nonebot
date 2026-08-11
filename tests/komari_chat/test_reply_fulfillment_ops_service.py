@@ -140,6 +140,8 @@ class _Repository:
             existing = row["platform_message_id"]
             if existing is not None and platform_message_id not in {None, existing}:
                 return "platform_message_conflict"
+            if existing is None and platform_message_id is not None:
+                row["platform_message_id"] = platform_message_id
             return "idempotent"
         if state != "PENDING_CONFIRMATION":
             return "state_conflict"
@@ -300,6 +302,22 @@ async def test_list_projects_derived_states_without_body_or_internal_payloads(
 
 
 @pytest.mark.asyncio
+async def test_list_preserves_repository_derived_status_without_internal_state(
+    ops_module: Any,
+) -> None:
+    """安全 Repository 已推导的状态不应依赖内部 delivery_state 再计算。"""
+    service, repository, _proactive = _service(ops_module)
+    pending = _record("reply-safe-pending", delivery_state="PENDING_CONFIRMATION")
+    pending.pop("delivery_state")
+    pending["status"] = "pending_confirmation"
+    repository.seed(pending)
+
+    result = await service.list_fulfillments(status=None, limit=20, offset=0)
+
+    assert result["items"][0]["status"] == "pending_confirmation"
+
+
+@pytest.mark.asyncio
 async def test_detail_only_exposes_body_for_pending_confirmation(
     ops_module: Any,
 ) -> None:
@@ -374,6 +392,30 @@ async def test_confirm_delivered_without_platform_id_remains_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_confirm_delivered_replay_persists_late_platform_evidence(
+    ops_module: Any,
+) -> None:
+    """首次无平台 ID 后补同一送达证据时，不能只回显而不持久化。"""
+    service, repository, _proactive = _service(ops_module)
+    repository.seed(_record("reply-late-platform", delivery_state="PENDING_CONFIRMATION"))
+
+    await service.confirm_delivered(
+        "reply-late-platform",
+        platform_message_id=None,
+    )
+    replay = await service.confirm_delivered(
+        "reply-late-platform",
+        platform_message_id="platform-late-1",
+    )
+
+    assert replay["idempotent_replay"] is True
+    assert (
+        repository.records["reply-late-platform"]["platform_message_id"]
+        == "platform-late-1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_confirm_not_delivered_releases_reservation_without_running_commitments(
     ops_module: Any,
 ) -> None:
@@ -395,15 +437,27 @@ async def test_confirm_not_delivered_releases_reservation_without_running_commit
 @pytest.mark.asyncio
 async def test_not_delivered_fact_survives_reservation_release_failure(
     ops_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service, repository, proactive = _service(ops_module)
     repository.seed(_record("reply-release-failed", delivery_state="PENDING_CONFIRMATION"))
     proactive.error = ConnectionError("raw-release-error-canary")
+    warnings: list[str] = []
+
+    class _Logger:
+        @staticmethod
+        def warning(message: str, *_args: object) -> None:
+            warnings.append(message)
+
+    monkeypatch.setattr(ops_module, "logger", _Logger(), raising=False)
 
     result = await service.confirm_not_delivered("reply-release-failed")
 
     assert result == {"idempotent_replay": False, "reservation_released": False}
     assert repository.records["reply-release-failed"]["delivery_state"] == "NOT_DELIVERED"
+    assert warnings == ["[KomariChat] 履约对账释放主动回复预占失败，等待 TTL 回收"]
+    assert "raw-release-error-canary" not in repr(warnings)
+    assert "reply-release-failed" not in repr(warnings)
 
 
 @pytest.mark.asyncio
@@ -442,6 +496,30 @@ async def test_resume_only_failed_commitment_without_modifying_frozen_payload(
             "reply-needs-disposition",
             commitment_type="dynamic_commitment",
         )
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_needs_disposition_when_failed_sibling_remains(
+    ops_module: Any,
+) -> None:
+    """续跑单项后若仍有失败兄弟项，响应状态不得伪报 processing。"""
+    service, repository, _proactive = _service(ops_module)
+    row = _record(
+        "reply-multiple-failed",
+        delivery_state="DELIVERED",
+        failed="favorability_adjustment",
+    )
+    row["commitments"][2]["state"] = "FAILED"
+    row["commitments"][2]["attempt_count"] = 2
+    row["commitments"][2]["last_error_code"] = "service_unavailable"
+    repository.seed(row)
+
+    result = await service.resume_commitment(
+        "reply-multiple-failed",
+        commitment_type="favorability_adjustment",
+    )
+
+    assert result["status"] == "needs_disposition"
 
 
 def test_ops_public_methods_do_not_accept_internal_payload_or_owner_tokens(
