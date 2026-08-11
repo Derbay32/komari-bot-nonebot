@@ -3,9 +3,9 @@
 import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
-from nonebot import get_driver, logger, on_message
+from nonebot import get_bots, get_driver, logger, on_message
 from nonebot.adapters.onebot.v11 import ActionFailed, Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
@@ -19,8 +19,10 @@ from .handlers.message_handler import (
     ReplyFailureInfo,
 )
 from .services.proactive_reservation import ProactiveReservationService
+from .services.reply_delivery_onebot import OneBotReplySender
 from .services.reply_fulfillment_workflow import (
     ReplyFulfillmentWorkflow,
+    ReplySender,
     build_reply_fulfillment_workflow,
 )
 
@@ -54,6 +56,9 @@ def _get_reply_fulfillment_config() -> Any:
         reply_commit_batch_size=config.reply_commit_batch_size,
         reply_commit_tombstone_retention_days=(
             config.reply_commit_tombstone_retention_days
+        ),
+        reply_fulfillment_freshness_seconds=(
+            config.reply_fulfillment_freshness_seconds
         ),
     )
 
@@ -127,6 +132,21 @@ def _get_or_build_handler() -> MessageHandler | None:
     return _handler
 
 
+def _get_recovery_senders() -> dict[tuple[str, str], ReplySender]:
+    """按当前在线 Bot 建立恢复 sender 映射（精确身份匹配）。
+
+    恢复只允许冻结时的原 ``bot_self_id`` + ``adapter_name`` 精确匹配
+    的在线 Bot 领取；sender 直接使用 ``bot.call_api``，不依赖 matcher
+    的隐式事件上下文。
+    """
+    return {
+        (str(bot.self_id), str(bot.type)): cast(
+            "ReplySender", OneBotReplySender(bot)
+        )
+        for bot in get_bots().values()
+    }
+
+
 def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
     """构建并缓存回复履约工作流及其私有持久化 adapter。"""
     global _reply_fulfillment, _reply_fulfillment_components  # noqa: PLW0603
@@ -150,6 +170,7 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
             proactive_reservation=proactive_reservation,
             user_data=user_data_plugin,
             config_getter=_get_reply_fulfillment_config,
+            recovery_senders_getter=_get_recovery_senders,
         )
         _reply_fulfillment_components = components
     return _reply_fulfillment
@@ -329,7 +350,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         fulfilled = await workflow.fulfill(
             pending_reply,
             send_reply=_send_reply,
-            is_definitive_send_failure=lambda error: isinstance(error, ActionFailed),
         )
         if fulfilled is False:
             return

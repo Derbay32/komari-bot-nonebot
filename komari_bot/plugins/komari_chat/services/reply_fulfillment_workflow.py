@@ -1,7 +1,9 @@
 """聊天回复履约工作流。
 
 工作流统一拥有回复从准备、发送到送达后承诺完成的生命周期；旧宽表仓库只
-作为本模块内部的持久化 adapter 使用。
+作为本模块内部的持久化 adapter 使用。发送能力以窄边界注入：先持久准备、
+再持久登记发送开始，最后才调用平台发送；平台结果只以
+``ReplyDeliveryResult`` 翻译后的送达事实进入领域状态机。
 """
 
 from __future__ import annotations
@@ -10,7 +12,9 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from nonebot import logger
@@ -32,9 +36,27 @@ from ..repositories.reply_commit_repository import (
     ReplyCommitRepository,
     ReplyCommitStep,
 )
+from .reply_delivery_onebot import ReplyDeliveryResult
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Mapping
+
+ReplySender = Callable[[object], Awaitable[object]]
+BotIdentity = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class RecoveredReply:
+    """从持久 NOT_STARTED 记录恢复的发送载荷（与 OneBot 边界对齐）。"""
+
+    operation_id: str
+    group_id: str
+    reply: str
+    reply_to_message_id: str | None
+    source_message_id: str
+    bot_self_id: str
+    adapter_name: str
+    proactive_reservation_id: str | None
 
 
 class _PendingReply(Protocol):
@@ -84,12 +106,32 @@ class _ReplyFulfillmentRepository(Protocol):
 
     async def cancel_prepared(self, operation_id: str) -> bool: ...
 
+    async def mark_send_started(self, operation_id: str) -> bool: ...
+
     async def mark_delivered(
         self,
         operation_id: str,
         *,
         platform_message_id: str | None = None,
     ) -> bool: ...
+
+    async def mark_not_delivered(self, operation_id: str) -> bool: ...
+
+    async def claim_fresh_not_started(
+        self,
+        *,
+        bot_self_id: str,
+        adapter_name: str,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]: ...
+
+    async def expire_stale_not_started(
+        self,
+        *,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]: ...
 
     async def claim_operation(
         self,
@@ -204,6 +246,9 @@ class _LegacyReplyFulfillmentRepository:
                 if isinstance(interaction, InteractionHistoryPayload)
                 else 1
             ),
+            bot_self_id=draft.bot_self_id,
+            adapter_name=draft.adapter_name,
+            reply_target_message_id=draft.reply_target_message_id,
             frozen_payload_hash=draft.payload_hash,
         )
 
@@ -216,6 +261,9 @@ class _LegacyReplyFulfillmentRepository:
     async def cancel_prepared(self, operation_id: str) -> bool:
         return await self.repository.cancel_prepared(operation_id)
 
+    async def mark_send_started(self, operation_id: str) -> bool:
+        return await self.repository.mark_send_started(operation_id)
+
     async def mark_delivered(
         self,
         operation_id: str,
@@ -225,6 +273,35 @@ class _LegacyReplyFulfillmentRepository:
         return await self.repository.mark_delivered(
             operation_id,
             platform_message_id=platform_message_id,
+        )
+
+    async def mark_not_delivered(self, operation_id: str) -> bool:
+        return await self.repository.mark_not_delivered(operation_id)
+
+    async def claim_fresh_not_started(
+        self,
+        *,
+        bot_self_id: str,
+        adapter_name: str,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return await self.repository.claim_fresh_not_started(
+            bot_self_id=bot_self_id,
+            adapter_name=adapter_name,
+            freshness_seconds=freshness_seconds,
+            limit=limit,
+        )
+
+    async def expire_stale_not_started(
+        self,
+        *,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return await self.repository.expire_stale_not_started(
+            freshness_seconds=freshness_seconds,
+            limit=limit,
         )
 
     async def claim_operation(
@@ -387,12 +464,14 @@ class ReplyFulfillmentWorkflow:
         proactive_reservation: Any,
         user_data: Any,
         config_getter: Callable[[], Any],
+        recovery_senders_getter: Callable[[], Mapping[BotIdentity, ReplySender]],
     ) -> None:
         self.repository = repository
         self.redis = redis
         self.proactive_reservation = proactive_reservation
         self.user_data = user_data
         self.config_getter = config_getter
+        self.recovery_senders_getter = recovery_senders_getter
         self._owner_token = f"chat-{uuid.uuid4().hex}"
         self._last_cleanup = 0.0
 
@@ -500,9 +579,14 @@ class ReplyFulfillmentWorkflow:
         pending_reply: _PendingReply,
         *,
         send_reply: Callable[[_PendingReply], Awaitable[object]],
-        is_definitive_send_failure: Callable[[Exception], bool],
     ) -> bool:
-        """完成一次准备、发送登记和送达后承诺提交。"""
+        """原子编排一次回复履约：先持久准备，再登记发送开始，最后发送。
+
+        平台结果只以 ``ReplyDeliveryResult`` 进入状态机；为兼容既有
+        composition root 返回原始平台响应的发送闭包，原始响应按已送达
+        处理并提取平台消息 ID。待确认结果不释放预占、不自动重发；
+        发送开始后任何异常（含 ``CancelledError``）原样传播并保持待确认。
+        """
         if not pending_reply.reply_result.content:
             await self._release_reservation(pending_reply)
             return False
@@ -523,17 +607,57 @@ class ReplyFulfillmentWorkflow:
             await self._release_reservation(pending_reply)
             return False
 
+        started = await self.repository.mark_send_started(pending_reply.operation_id)
+        if not started:
+            msg = "回复发送开始登记失败，未调用平台发送能力"
+            raise RuntimeError(msg)
+
         try:
-            response = await send_reply(pending_reply)
+            delivery_result = await send_reply(pending_reply)
         except asyncio.CancelledError:
             raise
-        except Exception as error:
-            if is_definitive_send_failure(error):
-                await self.repository.cancel_prepared(pending_reply.operation_id)
-                await self._release_reservation(pending_reply)
+        except Exception:
+            logger.exception(
+                "[KomariChat] 发送开始后平台结果未知，保持待确认: operation={}",
+                pending_reply.operation_id,
+            )
             raise
 
-        platform_message_id = self._extract_platform_message_id(response)
+        if isinstance(delivery_result, ReplyDeliveryResult):
+            if delivery_result.state == "delivered":
+                return await self._mark_delivered_and_finish(
+                    pending_reply,
+                    platform_message_id=delivery_result.platform_message_id,
+                )
+            if delivery_result.state == "not_delivered":
+                await self.repository.mark_not_delivered(pending_reply.operation_id)
+                await self._release_reservation(pending_reply)
+                logger.info(
+                    "[KomariChat] 平台明确拒绝发送，回复未送达: group={} operation={}",
+                    pending_reply.message.group_id,
+                    pending_reply.operation_id,
+                )
+                return False
+            logger.info(
+                "[KomariChat] 发送结果未知，回复进入待确认对账: operation={}",
+                pending_reply.operation_id,
+            )
+            return False
+
+        # 兼容既有发送闭包：原始平台响应按已送达处理
+        platform_message_id = self._extract_platform_message_id(delivery_result)
+        return await self._mark_delivered_and_finish(
+            pending_reply,
+            platform_message_id=platform_message_id,
+        )
+
+    async def _mark_delivered_and_finish(
+        self,
+        pending_reply: _PendingReply,
+        *,
+        platform_message_id: str | None,
+    ) -> bool:
+        """已送达回复：持久化送达事实并继续提交送达后承诺。"""
         delivered = await self.repository.mark_delivered(
             pending_reply.operation_id,
             platform_message_id=platform_message_id,
@@ -761,14 +885,14 @@ class ReplyFulfillmentWorkflow:
         return True
 
     async def recover_pending(self) -> int:
-        """领取并恢复已送达但未完成的回复履约。"""
+        """恢复中断的回复履约：发送前恢复与已送达承诺续跑。"""
         config = self.config_getter()
         records = await self.repository.claim_pending(
             owner_token=self._owner_token,
             limit=int(config.reply_commit_batch_size),
             lease_seconds=int(config.reply_commit_lease_seconds),
         )
-        completed = 0
+        completed = await self._recover_not_started_deliveries()
         for record in records:
             if await self._finish_claimed(record):
                 completed += 1
@@ -785,6 +909,143 @@ class ReplyFulfillmentWorkflow:
                 )
         return completed
 
+    async def _recover_not_started_deliveries(self) -> int:
+        """恢复发送前中断：精确身份匹配的恢复发送与时效终止。
+
+        只有仍在时效内、且 Bot 与适配器精确匹配的 NOT_STARTED 回复才
+        允许恢复发送；满时效按未送达终止并释放持久预占。仓库未提供
+        领取/过期能力（旧 adapter 或测试替身）时跳过本阶段。
+        """
+        claim_fresh = getattr(self.repository, "claim_fresh_not_started", None)
+        expire_stale = getattr(self.repository, "expire_stale_not_started", None)
+        if claim_fresh is None or expire_stale is None:
+            return 0
+        config = self.config_getter()
+        freshness_seconds = int(config.reply_fulfillment_freshness_seconds)
+        limit = int(config.reply_commit_batch_size)
+        completed = 0
+        for (bot_self_id, adapter_name), sender in (
+            self.recovery_senders_getter().items()
+        ):
+            records = await claim_fresh(
+                bot_self_id=bot_self_id,
+                adapter_name=adapter_name,
+                freshness_seconds=freshness_seconds,
+                limit=limit,
+            )
+            for record in records:
+                if await self._finish_recovered(record, sender):
+                    completed += 1
+        expired = await expire_stale(
+            freshness_seconds=freshness_seconds,
+            limit=limit,
+        )
+        for record in expired:
+            await self._terminate_expired(record)
+        return completed
+
+    async def _finish_recovered(
+        self,
+        record: dict[str, Any],
+        sender: ReplySender,
+    ) -> bool:
+        """用恢复 sender 发送一条新鲜 NOT_STARTED 回复并翻译结果。
+
+        待确认结果保持待确认且永不自动重发；明确未送达则终止并释放
+        预占；恢复发送本身异常时保守保持待确认。
+        """
+        operation_id = str(record["operation_id"])
+        try:
+            delivery_result = await sender(self._recovered_reply(record))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "[KomariChat] 恢复发送结果未知，保持待确认: operation={}",
+                operation_id,
+            )
+            return False
+        if not isinstance(delivery_result, ReplyDeliveryResult):
+            msg = "平台发送边界必须返回 ReplyDeliveryResult"
+            raise TypeError(msg)
+        if delivery_result.state == "delivered":
+            marked = await self.repository.mark_delivered(
+                operation_id,
+                platform_message_id=delivery_result.platform_message_id,
+            )
+            if not marked:
+                logger.error(
+                    "[KomariChat] 恢复发送后无法持久化送达事实: operation={}",
+                    operation_id,
+                )
+                return False
+            claimed = await self.repository.claim_operation(
+                operation_id,
+                owner_token=self._owner_token,
+                lease_seconds=int(self.config_getter().reply_commit_lease_seconds),
+            )
+            if claimed is not None:
+                return await self._finish_claimed(claimed)
+            return True
+        if delivery_result.state == "not_delivered":
+            await self.repository.mark_not_delivered(operation_id)
+            await self._release_recovered_reservation(record)
+            logger.info(
+                "[KomariChat] 恢复发送被平台明确拒绝，回复未送达: operation={}",
+                operation_id,
+            )
+            return False
+        logger.info(
+            "[KomariChat] 恢复发送结果未知，保持待确认对账: operation={}",
+            operation_id,
+        )
+        return False
+
+    async def _terminate_expired(self, record: dict[str, Any]) -> None:
+        """满时效未发送的回复已由仓库转为未送达，只负责释放持久预占。"""
+        await self._release_recovered_reservation(record)
+
+    async def _release_recovered_reservation(
+        self,
+        record: dict[str, Any],
+    ) -> None:
+        """按持久化的群与预占 ID 幂等释放主动回复预占。"""
+        reservation_id = record.get("proactive_reservation_id")
+        if reservation_id is None:
+            return
+        try:
+            await self.proactive_reservation.release(
+                str(record["group_id"]),
+                str(reservation_id),
+            )
+        except Exception:
+            logger.exception(
+                "[KomariChat] 恢复终止回复的主动预占释放失败，等待 TTL 回收: group={}",
+                record.get("group_id"),
+            )
+
+    @staticmethod
+    def _recovered_reply(record: dict[str, Any]) -> RecoveredReply:
+        """把持久 NOT_STARTED 记录投影为恢复发送载荷。"""
+        return RecoveredReply(
+            operation_id=str(record["operation_id"]),
+            group_id=str(record["group_id"]),
+            reply=str(record["reply_content"]),
+            reply_to_message_id=(
+                str(record["reply_target_message_id"])
+                if record.get("reply_target_message_id") is not None
+                else None
+            ),
+            source_message_id=str(record["source_message_id"]),
+            bot_self_id=str(record["bot_self_id"]),
+            adapter_name=str(record["adapter_name"]),
+            proactive_reservation_id=(
+                str(record["proactive_reservation_id"])
+                if record.get("proactive_reservation_id") is not None
+                else None
+            ),
+        )
+
 
 def build_reply_fulfillment_workflow(
     *,
@@ -793,6 +1054,7 @@ def build_reply_fulfillment_workflow(
     proactive_reservation: Any,
     user_data: Any,
     config_getter: Callable[[], Any],
+    recovery_senders_getter: Callable[[], Mapping[BotIdentity, ReplySender]],
 ) -> ReplyFulfillmentWorkflow:
     """在 composition root 创建工作流并隐藏旧宽表 adapter。"""
     return ReplyFulfillmentWorkflow(
@@ -801,6 +1063,7 @@ def build_reply_fulfillment_workflow(
         proactive_reservation=proactive_reservation,
         user_data=user_data,
         config_getter=config_getter,
+        recovery_senders_getter=recovery_senders_getter,
     )
 
 
