@@ -308,14 +308,20 @@ class ReplyCommitmentWorkflow:
         解析持久载荷失败记为 ``invalid_payload``（不调用下游）；下游
         异常按稳定错误码分类后独立记失败预算并继续其他当前到期项。
         外部调用后、任何 ``mark_commitment_*`` 之前检查心跳租约：已
-        丢失则不落标记、不消费失败预算，外部结果由幂等 ID 下轮恢复。
+        丢失则优先按 ``lease_lost`` 有限退避（CAS 成功才写预算）；
+        完成标记结果未知同样按瞬态稳定码退避当前子项并继续兄弟项。
         """
         commitment_type = str(row["commitment_type"])
         try:
             payload = _build_payload(commitment_type, row["payload"])
         except (TypeError, ValueError):
             if lease_lost.is_set():
-                return False
+                return await self._mark_failed(
+                    fulfillment_id,
+                    commitment_type,
+                    "lease_lost",
+                    permanent=False,
+                )
             return await self._mark_failed(
                 fulfillment_id,
                 commitment_type,
@@ -332,8 +338,77 @@ class ReplyCommitmentWorkflow:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            return await self._mark_row_failure(
+                fulfillment_id,
+                commitment_type,
+                error,
+                lease_lost,
+            )
+        return await self._mark_row_success(
+            fulfillment_id,
+            commitment_type,
+            lease_lost,
+        )
+
+    async def _mark_row_failure(
+        self,
+        fulfillment_id: str,
+        commitment_type: str,
+        error: BaseException,
+        lease_lost: asyncio.Event,
+    ) -> bool:
+        """下游调用失败：心跳已丢失时租约丢失分类优先于原下游错误。"""
+        if lease_lost.is_set():
+            return await self._mark_failed(
+                fulfillment_id,
+                commitment_type,
+                "lease_lost",
+                permanent=False,
+            )
+        permanent, error_code = _classify_error(error)
+        return await self._mark_failed(
+            fulfillment_id,
+            commitment_type,
+            error_code,
+            permanent=permanent,
+        )
+
+    async def _mark_row_success(
+        self,
+        fulfillment_id: str,
+        commitment_type: str,
+        lease_lost: asyncio.Event,
+    ) -> bool:
+        """下游调用成功后落完成标记；结果未知时退避当前子项。
+
+        心跳已丢失时不写完成标记，按 ``lease_lost`` 有限退避；完成
+        标记抛连接/数据库异常属于该承诺结果未知，按瞬态稳定码独立
+        退避并继续兄弟项（幂等 ID 下轮恢复）。CAS 返回 False 视为
+        租约丢失，不消费失败预算。
+        """
+        if lease_lost.is_set():
+            return await self._mark_failed(
+                fulfillment_id,
+                commitment_type,
+                "lease_lost",
+                permanent=False,
+            )
+        try:
+            marked = await self.repository.mark_commitment_completed(
+                fulfillment_id,
+                commitment_type=commitment_type,
+                owner_token=self._owner_token,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
             if lease_lost.is_set():
-                return False
+                return await self._mark_failed(
+                    fulfillment_id,
+                    commitment_type,
+                    "lease_lost",
+                    permanent=False,
+                )
             permanent, error_code = _classify_error(error)
             return await self._mark_failed(
                 fulfillment_id,
@@ -341,14 +416,7 @@ class ReplyCommitmentWorkflow:
                 error_code,
                 permanent=permanent,
             )
-        if lease_lost.is_set():
-            return False
-        # CAS 失败视为租约丢失：不消费本项失败预算。
-        return await self.repository.mark_commitment_completed(
-            fulfillment_id,
-            commitment_type=commitment_type,
-            owner_token=self._owner_token,
-        )
+        return marked
 
     async def _mark_failed(
         self,
