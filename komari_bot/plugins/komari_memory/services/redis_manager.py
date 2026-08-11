@@ -397,11 +397,7 @@ class RedisManager:
             RedisKeys.last_message(group_id),
             json.dumps(data, ensure_ascii=False),
             message.timestamp,
-            (
-                max(1, dedupe_ttl_seconds)
-                if dedupe_ttl_seconds is not None
-                else 0
-            ),
+            (max(1, dedupe_ttl_seconds) if dedupe_ttl_seconds is not None else 0),
         )
         return int(cast("int | str | bytes", result)) == 1
 
@@ -1000,11 +996,7 @@ class RedisManager:
             json.dumps(record, ensure_ascii=False),
             user_id,
             max(1, trigger_size),
-            (
-                max(1, dedupe_ttl_seconds)
-                if dedupe_ttl_seconds is not None
-                else 0
-            ),
+            (max(1, dedupe_ttl_seconds) if dedupe_ttl_seconds is not None else 0),
         )
         return int(cast("int | str | bytes", result)) == 1
 
