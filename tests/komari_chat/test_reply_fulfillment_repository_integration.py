@@ -143,6 +143,80 @@ async def _prepare_delivered(
     assert await repository.mark_delivered(fulfillment_id) is True
 
 
+async def test_active_identity_query_covers_every_persisted_delivery_state() -> None:
+    """履约身份一旦持久化，所有送达状态都继续阻止同事件再次发送。"""
+    fulfillment_ids = [
+        f"active-not-started-{uuid4().hex}",
+        f"active-pending-{uuid4().hex}",
+        f"active-delivered-{uuid4().hex}",
+        f"active-not-delivered-{uuid4().hex}",
+    ]
+    async with _repository_context(fulfillment_ids) as (repository, _pool):
+        for fulfillment_id in fulfillment_ids:
+            assert await repository.prepare(_draft(fulfillment_id)) is True
+        assert await repository.mark_send_started(fulfillment_ids[1]) is True
+        assert await repository.mark_send_started(fulfillment_ids[2]) is True
+        assert await repository.mark_delivered(fulfillment_ids[2]) is True
+        assert await repository.mark_not_delivered(fulfillment_ids[3]) is True
+
+        for fulfillment_id in fulfillment_ids:
+            assert await repository.has_active_operation(fulfillment_id) is True
+        assert await repository.has_active_operation(f"missing-{uuid4().hex}") is False
+
+
+async def test_claimed_commitments_include_validated_payloads_in_domain_order() -> None:
+    """领取后的子项由 adapter 校验并按固定领域顺序返回。"""
+    fulfillment_id = f"claimed-payloads-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, _pool):
+        await _prepare_delivered(repository, fulfillment_id)
+        assert await repository.claim_operation(
+            fulfillment_id,
+            owner_token="worker-1",
+            lease_seconds=60,
+        ) is not None
+
+        commitments = await repository.load_claimed_commitments(
+            fulfillment_id,
+            owner_token="worker-1",
+        )
+
+        assert commitments is not None
+        assert [item["commitment_type"] for item in commitments] == [
+            "proactive_reply_confirmation",
+            "favorability_adjustment",
+            "assistant_reply_history",
+            "interaction_history",
+        ]
+        assert commitments[0]["payload"] == {
+            "group_id": "group-1",
+            "reservation_id": "reservation-1",
+            "cooldown_seconds": 300,
+        }
+        assert commitments[1]["payload"] == {
+            "user_id": "user-1",
+            "delta": 1,
+            "reason": "正常互动",
+        }
+        assert commitments[2]["payload"] == {
+            "group_id": "group-1",
+            "bot_nickname": "小鞠",
+            "reply_content": "持久化的角色回复",
+            "reply_timestamp": 123.5,
+        }
+        assert commitments[3]["payload"] == {
+            "user_id": "user-1",
+            "display_name": "测试用户",
+            "trigger_size": 20,
+            "reply_timestamp": 123.5,
+            "trigger_message_id": f"message-{fulfillment_id}",
+            "record": {
+                "event": "用户发言",
+                "result": "机器人回复",
+                "emotion": "平静",
+            },
+        }
+
+
 async def test_concurrent_prepare_creates_one_parent_and_fixed_children() -> None:
     """并发准备只产生一个父记录和一组固定、无重复的承诺子项。"""
     fulfillment_id = f"concurrent-prepare-{uuid4().hex}"
@@ -467,6 +541,7 @@ async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
             error_code="stale_owner",
             max_attempts=3,
             retry_base_seconds=1,
+            retry_max_seconds=3600,
         ) is None
         assert await repository.complete_fulfillment(
             fulfillment_id,
@@ -492,6 +567,7 @@ async def test_commitments_retry_independently_and_gate_parent_completion() -> N
             error_code="temporary_database_error",
             max_attempts=3,
             retry_base_seconds=10,
+            retry_max_seconds=3600,
         )
         assert failure_state == "RETRY_WAIT"
 
@@ -606,6 +682,7 @@ async def test_exhausted_child_blocks_completion_without_poisoning_siblings() ->
             error_code="invalid_payload",
             max_attempts=1,
             retry_base_seconds=1,
+            retry_max_seconds=3600,
         ) == "FAILED"
         assert await repository.complete_fulfillment(
             fulfillment_id,

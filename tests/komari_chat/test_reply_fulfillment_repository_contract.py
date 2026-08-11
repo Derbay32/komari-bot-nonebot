@@ -145,7 +145,15 @@ def test_new_adapter_is_not_wired_into_active_chat_path_yet() -> None:
     plugin_source = (
         project_root / "komari_bot/plugins/komari_chat/__init__.py"
     ).read_text(encoding="utf-8")
+    handler_source = (
+        project_root
+        / "komari_bot/plugins/komari_chat/handlers/message_handler.py"
+    ).read_text(encoding="utf-8")
 
     assert "reply_fulfillment_repository" not in workflow_source
     assert "reply_fulfillment_repository" not in plugin_source
+    assert "reply_fulfillment_repository" not in handler_source
     assert "reply_commit_repository" in workflow_source
+    assert "_LegacyReplyFulfillmentRepository(ReplyCommitRepository(pg_pool))" in (
+        workflow_source
+    )
