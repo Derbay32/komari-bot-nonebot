@@ -329,6 +329,72 @@ def test_reply_fulfillment_revision_is_self_contained() -> None:
     assert "DROP TABLE komari_chat_reply_commit_outbox" not in revision_sql
 
 
+def test_reply_delivery_recovery_revision_exists() -> None:
+    """0007 为旧运行路径补齐送达事实与回复时效，不提前切换父子表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    delivery_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_delivery_recovery" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert delivery_revision is not None
+    assert delivery_revision.revision == "0007"
+    assert delivery_revision.down_revision == "0006"
+
+    revision_sql = Path(delivery_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    old_table = "KOMARI_CHAT_REPLY_COMMIT_OUTBOX"
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+
+    assert f"ALTER TABLE {old_table}" in normalized
+    for column in (
+        "delivery_state",
+        "bot_self_id",
+        "adapter_name",
+        "reply_target_message_id",
+        "prepared_at",
+        "send_started_at",
+        "not_delivered_at",
+    ):
+        assert re.search(rf"\b{column.upper()}\b", normalized), column
+    for delivery_state in (
+        "NOT_STARTED",
+        "PENDING_CONFIRMATION",
+        "DELIVERED",
+        "NOT_DELIVERED",
+    ):
+        assert f"'{delivery_state}'" in normalized
+
+    assert "REPLY_FULFILLMENT_FRESHNESS_SECONDS" in normalized
+    assert "DEFAULT 120" in normalized
+    assert ">= 30" in normalized
+    assert "<= 300" in normalized
+    assert f"ALTER TABLE {parent_table}" in normalized
+    assert "CK_REPLY_FULFILLMENT_DELIVERY_TIMESTAMPS" in normalized
+    assert "IDX_REPLY_COMMIT_OUTBOX_DELIVERY_FRESHNESS" in normalized
+    assert re.search(
+        r'op\.execute\(\s*"DROP INDEX IF EXISTS '
+        r'idx_reply_commit_outbox_delivery_freshness"',
+        revision_sql,
+        re.IGNORECASE,
+    )
+    assert not re.search(
+        r'"ALTER TABLE komari_chat_reply_commit_outbox\s*"\s*'
+        r'"DROP INDEX',
+        revision_sql,
+        re.IGNORECASE,
+    )
+
+    assert "DROP TABLE KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
+    assert "DROP TABLE KOMARI_CHAT_REPLY_FULFILLMENTS" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:

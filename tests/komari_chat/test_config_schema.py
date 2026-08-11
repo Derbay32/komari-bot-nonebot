@@ -1,8 +1,8 @@
 """KomariChat 强类型配置 Schema 测试（KOMARIBOT-7 验收基线）。
 
 主动回复频控与 outbox 的 10 个活配置字段从 komari_memory_config 迁入
-komari_chat 自有强类型配置表 komari_chat_config；死字段
-proactive_score_threshold 随批删除，不迁移。
+komari_chat 自有强类型配置表 komari_chat_config；回复履约另有独立的回复
+时效字段。死字段 proactive_score_threshold 随批删除，不迁移。
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ EXPECTED_FIELD_DEFAULTS: dict[str, object] = {
     "reply_commit_max_attempts": 20,
     "reply_commit_retry_base_seconds": 5,
     "reply_commit_tombstone_retention_days": 30,
+    "reply_fulfillment_freshness_seconds": 120,
 }
 
 EXPECTED_FIELD_BOUNDS: dict[str, tuple[int, int]] = {
@@ -44,6 +45,7 @@ EXPECTED_FIELD_BOUNDS: dict[str, tuple[int, int]] = {
     "reply_commit_max_attempts": (1, 100),
     "reply_commit_retry_base_seconds": (1, 300),
     "reply_commit_tombstone_retention_days": (1, 365),
+    "reply_fulfillment_freshness_seconds": (30, 300),
 }
 
 

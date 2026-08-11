@@ -54,6 +54,9 @@ def _payload(operation_id: str) -> PendingReplyCommit:
         proactive_cooldown_seconds=300,
         global_interaction_enabled=True,
         global_interaction_trigger_size=20,
+        bot_self_id="bot-1",
+        adapter_name="onebot.v11",
+        reply_target_message_id="message-1",
     )
 
 
@@ -69,6 +72,7 @@ async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
         assert await repository.prepare(payload) is True
         assert await repository.prepare(payload) is False
         assert await repository.has_active_operation(payload.operation_id) is True
+        assert await repository.mark_send_started(payload.operation_id) is True
         assert await repository.mark_delivered(
             payload.operation_id,
             platform_message_id="platform-message-9",
@@ -144,6 +148,101 @@ async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
         await pool.close()
 
 
+async def test_delivery_recovery_facts_are_atomic_on_active_outbox() -> None:
+    """旧运行路径保存正交送达事实，并只向原 Bot 领取新鲜未发送回复。"""
+    run_id = uuid4().hex
+    fresh_id = f"delivery-fresh-{run_id}"
+    stale_id = f"delivery-stale-{run_id}"
+    mismatched_id = f"delivery-mismatch-{run_id}"
+    operation_ids = [fresh_id, stale_id, mismatched_id]
+    pool = await asyncpg.create_pool(_asyncpg_url(), min_size=1, max_size=2)
+    try:
+        repository = ReplyCommitRepository(pool)
+        for operation_id in operation_ids:
+            assert await repository.prepare(_payload(operation_id)) is True
+
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_commit_outbox
+                SET prepared_at = NOW() - INTERVAL '119 seconds'
+                WHERE operation_id = $1
+                """,
+                fresh_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_commit_outbox
+                SET prepared_at = NOW() - INTERVAL '120 seconds'
+                WHERE operation_id = $1
+                """,
+                stale_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_commit_outbox
+                SET bot_self_id = 'bot-2'
+                WHERE operation_id = $1
+                """,
+                mismatched_id,
+            )
+
+        claimed = await repository.claim_fresh_not_started(
+            bot_self_id="bot-1",
+            adapter_name="onebot.v11",
+            freshness_seconds=120,
+            limit=20,
+        )
+        assert [row["operation_id"] for row in claimed] == [fresh_id]
+        assert claimed[0]["delivery_state"] == "PENDING_CONFIRMATION"
+        assert claimed[0]["send_started_at"] is not None
+
+        expired = await repository.expire_stale_not_started(
+            freshness_seconds=120,
+            limit=20,
+        )
+        assert [row["operation_id"] for row in expired] == [stale_id]
+        assert expired[0]["delivery_state"] == "NOT_DELIVERED"
+        assert expired[0]["send_started_at"] is None
+        assert expired[0]["not_delivered_at"] is not None
+
+        assert await repository.mark_delivered(
+            fresh_id,
+            platform_message_id="platform-1",
+        ) is True
+        assert await repository.mark_delivered(
+            fresh_id,
+            platform_message_id="platform-1",
+        ) is True
+        with pytest.raises(ValueError, match="平台消息 ID 冲突"):
+            await repository.mark_delivered(
+                fresh_id,
+                platform_message_id="platform-2",
+            )
+
+        async with pool.acquire() as connection:
+            mismatch = await connection.fetchrow(
+                """
+                SELECT delivery_state, send_started_at
+                FROM komari_chat_reply_commit_outbox
+                WHERE operation_id = $1
+                """,
+                mismatched_id,
+            )
+        assert mismatch["delivery_state"] == "NOT_STARTED"
+        assert mismatch["send_started_at"] is None
+    finally:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                DELETE FROM komari_chat_reply_commit_outbox
+                WHERE operation_id = ANY($1::text[])
+                """,
+                operation_ids,
+            )
+        await pool.close()
+
+
 async def test_claim_pending_batch_limit_order_and_skip_locked() -> None:
     """批量领取：limit 生效、按时间+operation_id 稳定排序、SKIP LOCKED 跳过并发锁定行。"""
     run_id = uuid4().hex
@@ -154,6 +253,7 @@ async def test_claim_pending_batch_limit_order_and_skip_locked() -> None:
         for operation_id in operation_ids:
             payload = _payload(operation_id)
             assert await repository.prepare(payload) is True
+            assert await repository.mark_send_started(operation_id) is True
             assert await repository.mark_delivered(operation_id) is True
         # 错开 delivered_at（下标越小越老），验证候选按
         # COALESCE(next_retry_at, delivered_at, created_at) 升序稳定领取
@@ -243,6 +343,7 @@ async def test_claim_pending_reclaims_expired_leases() -> None:
         repository = ReplyCommitRepository(pool)
         payload = _payload(operation_id)
         assert await repository.prepare(payload) is True
+        assert await repository.mark_send_started(payload.operation_id) is True
         assert await repository.mark_delivered(operation_id) is True
         assert (
             await repository.claim_operation(
@@ -300,6 +401,7 @@ async def test_renew_lease_rejects_non_owner() -> None:
         repository = ReplyCommitRepository(pool)
         payload = _payload(operation_id)
         assert await repository.prepare(payload) is True
+        assert await repository.mark_send_started(payload.operation_id) is True
         assert await repository.mark_delivered(operation_id) is True
         assert (
             await repository.claim_operation(
@@ -362,6 +464,7 @@ async def test_renew_lease_rejects_non_owner() -> None:
         # 未进入 PROCESSING 的记录同样拒绝续租
         other_payload = _payload(other_operation_id)
         assert await repository.prepare(other_payload) is True
+        assert await repository.mark_send_started(other_operation_id) is True
         assert await repository.mark_delivered(other_operation_id) is True
         assert (
             await repository.renew_lease(
@@ -392,6 +495,7 @@ async def test_mark_failure_backs_off_and_returns_to_delivered() -> None:
         repository = ReplyCommitRepository(pool)
         payload = _payload(operation_id)
         assert await repository.prepare(payload) is True
+        assert await repository.mark_send_started(payload.operation_id) is True
         assert await repository.mark_delivered(operation_id) is True
         assert (
             await repository.claim_operation(
@@ -500,6 +604,7 @@ async def test_mark_failure_exhausts_attempts_to_failed() -> None:
         repository = ReplyCommitRepository(pool)
         payload = _payload(operation_id)
         assert await repository.prepare(payload) is True
+        assert await repository.mark_send_started(payload.operation_id) is True
         assert await repository.mark_delivered(operation_id) is True
 
         # 第一次失败：attempt=1 < max_attempts=2，仍回到 DELIVERED
@@ -594,6 +699,7 @@ async def test_cleanup_tombstones_only_removes_completed_cancelled() -> None:
         async def _complete_operation(operation_id: str) -> None:
             payload = _payload(operation_id)
             assert await repository.prepare(payload) is True
+            assert await repository.mark_send_started(operation_id) is True
             assert await repository.mark_delivered(operation_id) is True
             assert (
                 await repository.claim_operation(
@@ -625,6 +731,7 @@ async def test_cleanup_tombstones_only_removes_completed_cancelled() -> None:
 
         failed_payload = _payload(failed_old)
         assert await repository.prepare(failed_payload) is True
+        assert await repository.mark_send_started(failed_old) is True
         assert await repository.mark_delivered(failed_old) is True
         assert (
             await repository.claim_operation(

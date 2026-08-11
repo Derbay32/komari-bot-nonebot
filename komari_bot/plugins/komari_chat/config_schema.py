@@ -2,10 +2,13 @@
 
 主动回复频控与回复送达副作用 outbox 的 10 个活字段从
 ``komari_memory_config`` 迁入本表（KOMARIBOT-7），死字段
-``proactive_score_threshold`` 随迁出删除。
+``proactive_score_threshold`` 随迁出删除；回复履约另有独立的回复
+时效字段 ``reply_fulfillment_freshness_seconds``（TSK-81）。
 """
 
 from typing import ClassVar
+
+from sqlalchemy import CheckConstraint
 
 from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
@@ -18,6 +21,15 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
 
     model_config = typed_model_config(
         json_schema_extra={"default_apply_mode": "immediate"},
+    )
+
+    # 时效字段的数据库级 CHECK 与 0007 迁移保持一致，避免 autogenerate 漂移
+    __table_args__ = (
+        CheckConstraint(
+            "reply_fulfillment_freshness_seconds >= 30 "
+            "AND reply_fulfillment_freshness_seconds <= 300",
+            name="ck_komari_chat_config_reply_fulfillment_freshness",
+        ),
     )
 
     # 主动回复配置
@@ -84,4 +96,11 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         ge=1,
         le=365,
         description="已完成或取消的聊天 operation 防重记录保留天数",
+    )
+    reply_fulfillment_freshness_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=300,
+        description="回复准备完成到开始发送的时效窗口（秒），满时效未发送即按未送达终止",
+        json_schema_extra={"apply_mode": "immediate"},
     )

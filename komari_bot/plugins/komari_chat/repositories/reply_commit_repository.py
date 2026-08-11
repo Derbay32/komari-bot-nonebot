@@ -50,6 +50,9 @@ class PendingReplyCommit:
     proactive_cooldown_seconds: int
     global_interaction_enabled: bool
     global_interaction_trigger_size: int
+    bot_self_id: str
+    adapter_name: str
+    reply_target_message_id: str
     frozen_payload_hash: str | None = None
 
     def payload_hash(self) -> str:
@@ -73,6 +76,9 @@ class PendingReplyCommit:
             "proactive_cooldown_seconds": self.proactive_cooldown_seconds,
             "global_interaction_enabled": self.global_interaction_enabled,
             "global_interaction_trigger_size": self.global_interaction_trigger_size,
+            "bot_self_id": self.bot_self_id,
+            "adapter_name": self.adapter_name,
+            "reply_target_message_id": self.reply_target_message_id,
         }
         canonical = json.dumps(
             payload,
@@ -105,7 +111,12 @@ class ReplyCommitRepository:
         return bool(exists)
 
     async def prepare(self, payload: PendingReplyCommit) -> bool:
-        """原子插入发送意图，并区分幂等重投与履约冲突。"""
+        """原子插入发送意图，并区分幂等重投与履约冲突。
+
+        新插入行固定为 ``delivery_state='NOT_STARTED'``（发送前恢复的
+        唯一候选），并写入恢复所需的 Bot 身份与发送目标；历史行的
+        送达事实由迁移 backfill 保守建模。
+        """
         payload_hash = payload.payload_hash()
         async with self.pg_pool.acquire() as connection, connection.transaction():
             inserted = await connection.fetchval(
@@ -118,11 +129,14 @@ class ReplyCommitRepository:
                     favorability_delta, favorability_reason, interaction_history,
                     proactive_reservation_id, proactive_cooldown_seconds,
                     global_interaction_enabled, global_interaction_trigger_size,
+                    bot_self_id, adapter_name, reply_target_message_id,
+                    delivery_state,
                     status
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13::jsonb, $14, $15, $16, $17, 'PREPARED'
+                    $11, $12, $13::jsonb, $14, $15, $16, $17,
+                    $18, $19, $20, 'NOT_STARTED', 'PREPARED'
                 )
                 ON CONFLICT (operation_id) DO NOTHING
                 RETURNING payload_hash
@@ -144,6 +158,9 @@ class ReplyCommitRepository:
                 payload.proactive_cooldown_seconds,
                 payload.global_interaction_enabled,
                 payload.global_interaction_trigger_size,
+                payload.bot_self_id,
+                payload.adapter_name,
+                payload.reply_target_message_id,
             )
             if inserted is not None:
                 return True
@@ -165,27 +182,47 @@ class ReplyCommitRepository:
         return False
 
     async def cancel_prepared(self, operation_id: str) -> bool:
-        """发送失败时只取消尚未确认送达的意图并清除正文。"""
+        """取消尚未确认送达的发送意图，同步送达事实为未送达。
+
+        只推进状态与时间线，不修改冻结载荷、不覆盖平台消息 ID；未送达
+        终态按 0007 契约建模，身份防重记录随 tombstone 清理回收。
+        """
         async with self.pg_pool.acquire() as connection:
             cancelled = await connection.fetchval(
                 """
                 UPDATE komari_chat_reply_commit_outbox
                 SET status = 'CANCELLED',
-                    bot_nickname = NULL,
-                    user_nickname = NULL,
-                    reply_content = NULL,
-                    favorability_reason = NULL,
-                    interaction_history = NULL,
-                    proactive_reservation_id = NULL,
-                    platform_message_id = NULL,
+                    delivery_state = 'NOT_DELIVERED',
+                    not_delivered_at = COALESCE(not_delivered_at, NOW()),
                     updated_at = NOW()
                 WHERE operation_id = $1
                   AND status = 'PREPARED'
+                  AND delivery_state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')
                 RETURNING operation_id
                 """,
                 operation_id,
             )
         return cancelled is not None
+
+    async def mark_send_started(self, operation_id: str) -> bool:
+        """持久登记发送开始：NOT_STARTED 进入待确认送达。
+
+        平台发送能力只能在本次登记成功之后被调用；登记失败返回 False。
+        """
+        async with self.pg_pool.acquire() as connection:
+            changed = await connection.fetchval(
+                """
+                UPDATE komari_chat_reply_commit_outbox
+                SET delivery_state = 'PENDING_CONFIRMATION',
+                    send_started_at = COALESCE(send_started_at, NOW()),
+                    updated_at = NOW()
+                WHERE operation_id = $1
+                  AND delivery_state = 'NOT_STARTED'
+                RETURNING operation_id
+                """,
+                operation_id,
+            )
+        return changed is not None
 
     async def mark_delivered(
         self,
@@ -193,12 +230,17 @@ class ReplyCommitRepository:
         *,
         platform_message_id: str | None = None,
     ) -> bool:
-        """把 PREPARED 意图原子转换为可领取的 DELIVERED 任务。"""
+        """把已发送意图原子转换为可领取的 DELIVERED 任务。
+
+        同一平台消息 ID 可重复确认（幂等）；不同平台消息 ID 明确抛错，
+        不得覆盖既有送达事实。
+        """
         async with self.pg_pool.acquire() as connection:
             delivered = await connection.fetchval(
                 """
                 UPDATE komari_chat_reply_commit_outbox
                 SET status = 'DELIVERED',
+                    delivery_state = 'DELIVERED',
                     platform_message_id = COALESCE(platform_message_id, $2),
                     delivered_at = COALESCE(delivered_at, NOW()),
                     next_retry_at = NULL,
@@ -228,14 +270,126 @@ class ReplyCommitRepository:
             and existing_platform_id is not None
             and str(existing_platform_id) != platform_message_id
         ):
-            msg = "回复 operation 对应的平台消息 ID 冲突"
-            raise RuntimeError(msg)
+            msg = "平台消息 ID 冲突"
+            raise ValueError(msg)
         return existing["status"] in {
             "DELIVERED",
             "PROCESSING",
             "COMPLETED",
             "FAILED",
         }
+
+    async def mark_not_delivered(self, operation_id: str) -> bool:
+        """明确失败或时效终止：进入未送达终态并保留身份防重。
+
+        不修改冻结载荷；``status`` 转为 CANCELLED 以便防重记录随
+        tombstone 清理回收，未送达回复永不进入领取或重发候选。
+        """
+        async with self.pg_pool.acquire() as connection:
+            changed = await connection.fetchval(
+                """
+                UPDATE komari_chat_reply_commit_outbox
+                SET delivery_state = 'NOT_DELIVERED',
+                    status = 'CANCELLED',
+                    not_delivered_at = COALESCE(not_delivered_at, NOW()),
+                    updated_at = NOW()
+                WHERE operation_id = $1
+                  AND delivery_state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')
+                RETURNING operation_id
+                """,
+                operation_id,
+            )
+        return changed is not None
+
+    async def claim_fresh_not_started(
+        self,
+        *,
+        bot_self_id: str,
+        adapter_name: str,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """原子领取原 Bot 身份匹配、仍在时效内的未发送回复。
+
+        只有 ``bot_self_id`` 与 ``adapter_name`` 精确匹配且
+        ``prepared_at`` 距今未满时效的 NOT_STARTED 行才会被领取；
+        领取即登记发送开始（``PENDING_CONFIRMATION``）。
+        ``status='PREPARED'`` 守卫防止旧 ``cancel_prepared`` 造成的
+        delivery_state / status 正交失配行被误领取。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT operation_id
+                    FROM komari_chat_reply_commit_outbox
+                    WHERE delivery_state = 'NOT_STARTED'
+                      AND status = 'PREPARED'
+                      AND bot_self_id = $1
+                      AND adapter_name = $2
+                      AND prepared_at > NOW() - ($3 * INTERVAL '1 second')
+                    ORDER BY prepared_at, operation_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $4
+                )
+                UPDATE komari_chat_reply_commit_outbox outbox
+                SET delivery_state = 'PENDING_CONFIRMATION',
+                    send_started_at = COALESCE(send_started_at, NOW()),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE outbox.operation_id = candidates.operation_id
+                RETURNING outbox.*
+                """,
+                bot_self_id,
+                adapter_name,
+                max(1, freshness_seconds),
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def expire_stale_not_started(
+        self,
+        *,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """终止超过时效仍未发送的回复，返回被终止行供调用方释放预占。
+
+        满时效（``prepared_at`` 距今 >= 时效）的 NOT_STARTED 行转为
+        未送达终态，``send_started_at`` 保持 NULL；未送达回复永不重发。
+        ``status='PREPARED'`` 守卫防止旧 ``cancel_prepared`` 造成的
+        delivery_state / status 正交失配行被误终止。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT operation_id
+                    FROM komari_chat_reply_commit_outbox
+                    WHERE delivery_state = 'NOT_STARTED'
+                      AND status = 'PREPARED'
+                      AND prepared_at <= NOW() - ($1 * INTERVAL '1 second')
+                    ORDER BY prepared_at, operation_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $2
+                )
+                UPDATE komari_chat_reply_commit_outbox outbox
+                SET delivery_state = 'NOT_DELIVERED',
+                    status = 'CANCELLED',
+                    not_delivered_at = COALESCE(not_delivered_at, NOW()),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE outbox.operation_id = candidates.operation_id
+                RETURNING outbox.*
+                """,
+                max(1, freshness_seconds),
+                limit,
+            )
+        return [dict(row) for row in rows]
 
     async def claim_operation(
         self,

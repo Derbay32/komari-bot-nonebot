@@ -3,13 +3,12 @@
 import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
-from nonebot import get_driver, logger, on_message
-from nonebot.adapters.onebot.v11 import ActionFailed, Bot, GroupMessageEvent
+from nonebot import get_bots, get_driver, logger, on_message
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_rule
 
 from .handlers.message_handler import (
@@ -19,8 +18,10 @@ from .handlers.message_handler import (
     ReplyFailureInfo,
 )
 from .services.proactive_reservation import ProactiveReservationService
+from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
 from .services.reply_fulfillment_workflow import (
     ReplyFulfillmentWorkflow,
+    ReplySender,
     build_reply_fulfillment_workflow,
 )
 
@@ -54,6 +55,9 @@ def _get_reply_fulfillment_config() -> Any:
         reply_commit_batch_size=config.reply_commit_batch_size,
         reply_commit_tombstone_retention_days=(
             config.reply_commit_tombstone_retention_days
+        ),
+        reply_fulfillment_freshness_seconds=(
+            config.reply_fulfillment_freshness_seconds
         ),
     )
 
@@ -127,6 +131,21 @@ def _get_or_build_handler() -> MessageHandler | None:
     return _handler
 
 
+def _get_recovery_senders() -> dict[tuple[str, str], ReplySender]:
+    """按当前在线 Bot 建立恢复 sender 映射（精确身份匹配）。
+
+    恢复只允许冻结时的原 ``bot_self_id`` + ``adapter_name`` 精确匹配
+    的在线 Bot 领取；sender 直接使用 ``bot.call_api``，不依赖 matcher
+    的隐式事件上下文。
+    """
+    return {
+        (str(bot.self_id), str(bot.type)): cast(
+            "ReplySender", OneBotReplySender(bot)
+        )
+        for bot in get_bots().values()
+    }
+
+
 def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
     """构建并缓存回复履约工作流及其私有持久化 adapter。"""
     global _reply_fulfillment, _reply_fulfillment_components  # noqa: PLW0603
@@ -150,6 +169,7 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
             proactive_reservation=proactive_reservation,
             user_data=user_data_plugin,
             config_getter=_get_reply_fulfillment_config,
+            recovery_senders_getter=_get_recovery_senders,
         )
         _reply_fulfillment_components = components
     return _reply_fulfillment
@@ -305,31 +325,24 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             raise RuntimeError(msg)  # noqa: TRY301
 
         async def _send_reply(actual_pending_reply: Any) -> object:
-            reply = actual_pending_reply.reply
-            reply_to_message_id = actual_pending_reply.reply_to_message_id
-            if reply_to_message_id:
-                message_array = [
-                    {"type": "reply", "data": {"id": reply_to_message_id}},
-                    {"type": "text", "data": {"text": reply}},
-                ]
-                try:
-                    return await bot.call_api(
-                        "send_group_msg",
-                        group_id=int(event.group_id),
-                        message=message_array,
-                    )
-                except ActionFailed as error:
-                    logger.warning(
-                        "[KomariChat] 原生回复失败: {}，降级普通发送",
-                        error,
-                    )
-                    return await matcher.send(plain_text_message(reply))
-            return await matcher.send(plain_text_message(reply))
+            """用 OneBot 窄边界发送，统一富文本/纯文本降级与三态翻译。
+
+            发送载荷投影自履约冻结的群与引用目标，不依赖 matcher 的
+            隐式事件上下文；平台异常细节由边界翻译，不在此旁路。
+            """
+            request = cast(
+                "DeliveryRequest",
+                SimpleNamespace(
+                    group_id=actual_pending_reply.message.group_id,
+                    reply=actual_pending_reply.reply,
+                    reply_to_message_id=actual_pending_reply.reply_to_message_id,
+                ),
+            )
+            return await OneBotReplySender(bot)(request)
 
         fulfilled = await workflow.fulfill(
             pending_reply,
             send_reply=_send_reply,
-            is_definitive_send_failure=lambda error: isinstance(error, ActionFailed),
         )
         if fulfilled is False:
             return

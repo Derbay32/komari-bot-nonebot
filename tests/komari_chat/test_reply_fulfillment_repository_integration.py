@@ -253,6 +253,105 @@ async def test_delivery_fact_only_moves_forward() -> None:
         assert by_id[not_delivered_id]["not_delivered_at"] is not None
 
 
+async def test_delivery_confirmation_is_idempotent_and_conflicts_are_rejected() -> None:
+    """同平台消息 ID 可重复确认，冲突 ID 不得覆盖既有送达事实。"""
+    fulfillment_id = f"delivery-idempotent-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, pool):
+        assert await repository.prepare(_draft(fulfillment_id)) is True
+        assert await repository.mark_send_started(fulfillment_id) is True
+        assert await repository.mark_delivered(
+            fulfillment_id,
+            platform_message_id="platform-1",
+        ) is True
+        assert await repository.mark_delivered(
+            fulfillment_id,
+            platform_message_id="platform-1",
+        ) is True
+        with pytest.raises(ValueError, match="平台消息 ID 冲突"):
+            await repository.mark_delivered(
+                fulfillment_id,
+                platform_message_id="platform-2",
+            )
+
+        async with pool.acquire() as connection:
+            stored = await connection.fetchrow(
+                """
+                SELECT delivery_state, platform_message_id
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert stored["delivery_state"] == "DELIVERED"
+        assert stored["platform_message_id"] == "platform-1"
+
+
+async def test_not_started_recovery_respects_identity_and_freshness_boundary() -> None:
+    """父表 adapter 同步提供精确 Bot 领取和准备时间边界语义。"""
+    fresh_id = f"parent-fresh-{uuid4().hex}"
+    stale_id = f"parent-stale-{uuid4().hex}"
+    mismatch_id = f"parent-mismatch-{uuid4().hex}"
+    fulfillment_ids = [fresh_id, stale_id, mismatch_id]
+    async with _repository_context(fulfillment_ids) as (repository, pool):
+        for fulfillment_id in fulfillment_ids:
+            assert await repository.prepare(_draft(fulfillment_id)) is True
+
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET prepared_at = NOW() - INTERVAL '119 seconds'
+                WHERE fulfillment_id = $1
+                """,
+                fresh_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET prepared_at = NOW() - INTERVAL '120 seconds'
+                WHERE fulfillment_id = $1
+                """,
+                stale_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET adapter_name = 'other-adapter'
+                WHERE fulfillment_id = $1
+                """,
+                mismatch_id,
+            )
+
+        claimed = await repository.claim_fresh_not_started(
+            bot_self_id="bot-1",
+            adapter_name="onebot.v11",
+            freshness_seconds=120,
+            limit=20,
+        )
+        assert [row["fulfillment_id"] for row in claimed] == [fresh_id]
+        assert claimed[0]["delivery_state"] == "PENDING_CONFIRMATION"
+
+        expired = await repository.expire_stale_not_started(
+            freshness_seconds=120,
+            limit=20,
+        )
+        assert [row["fulfillment_id"] for row in expired] == [stale_id]
+        assert expired[0]["send_started_at"] is None
+        assert expired[0]["not_delivered_at"] is not None
+
+        async with pool.acquire() as connection:
+            mismatch = await connection.fetchrow(
+                """
+                SELECT delivery_state, send_started_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                mismatch_id,
+            )
+        assert mismatch["delivery_state"] == "NOT_STARTED"
+        assert mismatch["send_started_at"] is None
+
+
 async def test_claim_pending_is_disjoint_and_skips_locked_parent() -> None:
     """并发 worker 领取集合互斥，且 SKIP LOCKED 不被其他事务阻塞。"""
     fulfillment_ids = [f"claim-{index}-{uuid4().hex}" for index in range(5)]

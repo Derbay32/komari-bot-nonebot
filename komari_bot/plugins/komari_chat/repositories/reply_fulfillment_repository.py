@@ -132,7 +132,11 @@ class ReplyFulfillmentRepository:
         *,
         platform_message_id: str | None = None,
     ) -> bool:
-        """把待确认送达的回复推进为已送达。"""
+        """把待确认送达的回复推进为已送达。
+
+        同一平台消息 ID 可重复确认（幂等）；冲突平台消息 ID 明确抛错，
+        不得覆盖既有送达事实。
+        """
         async with self.pg_pool.acquire() as connection:
             changed = await connection.fetchval(
                 """
@@ -151,10 +155,36 @@ class ReplyFulfillmentRepository:
                 fulfillment_id,
                 platform_message_id,
             )
-        return changed is not None
+            if changed is not None:
+                return True
+            existing = await connection.fetchrow(
+                """
+                SELECT delivery_state, platform_message_id
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        if existing is None:
+            return False
+        if existing["delivery_state"] == "DELIVERED":
+            existing_platform_id = existing["platform_message_id"]
+            if (
+                platform_message_id is not None
+                and existing_platform_id is not None
+                and str(existing_platform_id) != platform_message_id
+            ):
+                msg = "平台消息 ID 冲突"
+                raise ValueError(msg)
+            return True
+        return False
 
     async def mark_not_delivered(self, fulfillment_id: str) -> bool:
-        """把待确认送达的回复推进为未送达终态。"""
+        """明确失败或时效终止：回复进入未送达互斥终态。
+
+        允许从未发送直接进入未送达（发送开始前过期），此时
+        ``send_started_at`` 保持 NULL。
+        """
         async with self.pg_pool.acquire() as connection:
             changed = await connection.fetchval(
                 """
@@ -163,12 +193,95 @@ class ReplyFulfillmentRepository:
                     not_delivered_at = COALESCE(not_delivered_at, NOW()),
                     updated_at = NOW()
                 WHERE fulfillment_id = $1
-                  AND delivery_state = 'PENDING_CONFIRMATION'
+                  AND delivery_state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')
                 RETURNING fulfillment_id
                 """,
                 fulfillment_id,
             )
         return changed is not None
+
+    async def claim_fresh_not_started(
+        self,
+        *,
+        bot_self_id: str,
+        adapter_name: str,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """原子领取原 Bot 身份匹配、仍在时效内的未发送履约。
+
+        只有 ``bot_self_id`` 与 ``adapter_name`` 精确匹配且
+        ``prepared_at`` 距今未满时效的 NOT_STARTED 行才会被领取；
+        领取即登记发送开始（``PENDING_CONFIRMATION``）。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT fulfillment_id
+                    FROM komari_chat_reply_fulfillments
+                    WHERE delivery_state = 'NOT_STARTED'
+                      AND bot_self_id = $1
+                      AND adapter_name = $2
+                      AND prepared_at > NOW() - ($3 * INTERVAL '1 second')
+                    ORDER BY prepared_at, fulfillment_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $4
+                )
+                UPDATE komari_chat_reply_fulfillments AS parent
+                SET delivery_state = 'PENDING_CONFIRMATION',
+                    send_started_at = COALESCE(send_started_at, NOW()),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE parent.fulfillment_id = candidates.fulfillment_id
+                RETURNING parent.*
+                """,
+                bot_self_id,
+                adapter_name,
+                max(1, freshness_seconds),
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def expire_stale_not_started(
+        self,
+        *,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """终止超过时效仍未发送的履约，返回被终止行供调用方释放预占。
+
+        满时效（``prepared_at`` 距今 >= 时效）的 NOT_STARTED 行转为
+        未送达终态，``send_started_at`` 保持 NULL；未送达回复永不重发。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT fulfillment_id
+                    FROM komari_chat_reply_fulfillments
+                    WHERE delivery_state = 'NOT_STARTED'
+                      AND prepared_at <= NOW() - ($1 * INTERVAL '1 second')
+                    ORDER BY prepared_at, fulfillment_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $2
+                )
+                UPDATE komari_chat_reply_fulfillments AS parent
+                SET delivery_state = 'NOT_DELIVERED',
+                    not_delivered_at = COALESCE(not_delivered_at, NOW()),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE parent.fulfillment_id = candidates.fulfillment_id
+                RETURNING parent.*
+                """,
+                max(1, freshness_seconds),
+                limit,
+            )
+        return [dict(row) for row in rows]
 
     async def claim_operation(
         self,

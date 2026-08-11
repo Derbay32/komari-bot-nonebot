@@ -65,6 +65,7 @@ def _config(*, global_interaction_enabled: bool = True) -> SimpleNamespace:
         reply_commit_retry_base_seconds=1,
         reply_commit_batch_size=20,
         reply_commit_tombstone_retention_days=30,
+        reply_fulfillment_freshness_seconds=120,
     )
 
 
@@ -140,6 +141,7 @@ def _workflow(
         config_getter=lambda: _config(
             global_interaction_enabled=global_interaction_enabled
         ),
+        recovery_senders_getter=dict,
     )
 
 
@@ -151,7 +153,6 @@ async def _freeze_before_delivery(workflow: Any, pending_reply: Any) -> None:
         await workflow.fulfill(
             pending_reply,
             send_reply=_cancel_after_freeze,
-            is_definitive_send_failure=lambda _error: False,
         )
 
 
@@ -279,7 +280,6 @@ async def test_inapplicable_commitments_are_absent_and_stay_frozen(
         await replacement_workflow.fulfill(
             pending,
             send_reply=lambda _pending: pytest.fail("重复履约不得重新发送"),
-            is_definitive_send_failure=lambda _error: False,
         )
     assert store.records[pending.operation_id] is draft
     assert [item.commitment_type for item in draft.commitments] == [
@@ -356,7 +356,6 @@ async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
     assert await workflow.fulfill(
         _pending_reply(workflow_module),
         send_reply=_send,
-        is_definitive_send_failure=lambda _error: False,
     ) is False
     assert send_count == 0
     assert len(store.records) == 1
@@ -365,7 +364,6 @@ async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
         await workflow.fulfill(
             _pending_reply(workflow_module, reply_content="冲突回复"),
             send_reply=_send,
-            is_definitive_send_failure=lambda _error: False,
         )
 
     assert send_count == 0
@@ -388,7 +386,6 @@ async def test_terminal_identity_still_prevents_resend(
     assert await workflow.fulfill(
         _pending_reply(workflow_module),
         send_reply=lambda _pending: pytest.fail("终态履约不得重新发送"),
-        is_definitive_send_failure=lambda _error: False,
     ) is False
     assert pending.operation_id not in store.records
     assert store.terminal_states[pending.operation_id] == terminal_state
