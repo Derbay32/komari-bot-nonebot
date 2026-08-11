@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from typing import Any
 
 from ..reply_fulfillment_domain import (
@@ -461,10 +462,10 @@ class ReplyFulfillmentRepository:
 
         只返回 ``PENDING`` 或已到退避时间的 ``RETRY_WAIT`` 子项；父
         租约不再属于 ``owner_token``（丢失或被回收）时返回 None，执行
-        器据此立即中止本轮。每项载荷通过冻结领域值对象校验后以规范化
-        JSON 返回；无法校验的损坏载荷保持原样返回，由执行器按
-        ``invalid_payload`` 独立处置。返回顺序按 ``COMMITMENT_TYPES``
-        稳定排序，不依赖存储返回顺序。
+        器据此立即中止本轮。asyncpg 默认返回的 JSONB 文本先解码，再经
+        冻结领域值对象校验并规范化；解码或校验失败的损坏载荷保持原样
+        返回，由执行器按 ``invalid_payload`` 独立处置。返回顺序按
+        ``COMMITMENT_TYPES`` 稳定排序，不依赖存储返回顺序。
         """
         async with self.pg_pool.acquire() as connection:
             owned = await connection.fetchval(
@@ -497,13 +498,14 @@ class ReplyFulfillmentRepository:
         for row in rows:
             commitment_type = str(row["commitment_type"])
             payload_type = _COMMITMENT_PAYLOAD_TYPES[commitment_type]
-            raw = row["payload"]
-            canonical: Any = raw
-            if isinstance(raw, dict):
-                try:
-                    canonical = payload_type(**raw).to_json()
-                except (TypeError, ValueError):
-                    canonical = raw
+            canonical: Any = row["payload"]
+            if isinstance(canonical, str):
+                # asyncpg 默认把 JSONB 返回为文本，先解码再进入领域校验。
+                with suppress(TypeError, ValueError):
+                    canonical = json.loads(canonical)
+            if isinstance(canonical, dict):
+                with suppress(TypeError, ValueError):
+                    canonical = payload_type(**canonical).to_json()
             commitments.append(
                 {
                     "commitment_type": commitment_type,
