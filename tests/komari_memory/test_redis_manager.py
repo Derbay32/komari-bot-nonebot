@@ -79,9 +79,23 @@ class _FakePipeline:
                 results.append(True)
             elif op == "delete":
                 (key,) = args
-                self._redis.data.pop(str(key), None)
-                self._redis.values.pop(str(key), None)
-                results.append(1)
+                redis_key = str(key)
+                existed = any(
+                    redis_key in store
+                    for store in (
+                        self._redis.data,
+                        self._redis.values,
+                        self._redis.sets,
+                        self._redis.zsets,
+                        self._redis.hashes,
+                    )
+                )
+                self._redis.data.pop(redis_key, None)
+                self._redis.values.pop(redis_key, None)
+                self._redis.sets.pop(redis_key, None)
+                self._redis.zsets.pop(redis_key, None)
+                self._redis.hashes.pop(redis_key, None)
+                results.append(int(existed))
         return results
 
 
@@ -919,6 +933,56 @@ def test_chat_commit_redis_steps_are_idempotent(monkeypatch: Any) -> None:
     assert len(asyncio.run(manager.get_global_interaction_buffer("user-1"))) == 1
     fake_redis = _get_fake_redis(manager)
     assert "user-1" in fake_redis.sets[RedisKeys.GLOBAL_INTERACTION_PENDING]
+
+
+def test_chat_commit_evidence_can_persist_until_explicit_cleanup(
+    monkeypatch: Any,
+) -> None:
+    manager = _build_manager(monkeypatch)
+    message = MessageSchema(
+        user_id="bot",
+        user_nickname="小鞠",
+        group_id="group-1",
+        content="持久去重证据",
+        timestamp=12.5,
+        message_id="bot-operation-persistent",
+        is_bot=True,
+    )
+
+    assert asyncio.run(
+        manager.push_message_once(
+            "group-1",
+            message,
+            operation_id="operation-persistent",
+            dedupe_ttl_seconds=None,
+        )
+    )
+    assert asyncio.run(
+        manager.push_global_interaction_once(
+            user_id="user-1",
+            record={"event": "问候", "result": "回应", "emotion": "平静"},
+            trigger_size=1,
+            operation_id="operation-persistent",
+            dedupe_ttl_seconds=None,
+        )
+    )
+
+    fake_redis = _get_fake_redis(manager)
+    assistant_key = RedisKeys.chat_commit_step(
+        "operation-persistent", "ai_history"
+    )
+    interaction_key = RedisKeys.chat_commit_step(
+        "operation-persistent", "interaction"
+    )
+    assert assistant_key in fake_redis.values
+    assert interaction_key in fake_redis.values
+
+    assert asyncio.run(manager.delete_chat_commit_evidence("operation-persistent")) == 2
+    assert asyncio.run(manager.delete_chat_commit_evidence("operation-persistent")) == 0
+    assert assistant_key not in fake_redis.values
+    assert interaction_key not in fake_redis.values
+    assert len(asyncio.run(manager.get_buffer("group-1"))) == 1
+    assert len(asyncio.run(manager.get_global_interaction_buffer("user-1"))) == 1
 
 
 def test_push_message_appends_messages_without_trimming(monkeypatch: Any) -> None:

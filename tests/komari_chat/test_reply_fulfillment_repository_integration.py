@@ -426,6 +426,22 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
         assert expired[0]["not_delivered_at"] is not None
 
         async with pool.acquire() as connection:
+            stale = await connection.fetchrow(
+                """
+                SELECT delivery_state, send_started_at, reply_content
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                stale_id,
+            )
+            stale_children = await connection.fetch(
+                """
+                SELECT state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                stale_id,
+            )
             mismatch = await connection.fetchrow(
                 """
                 SELECT delivery_state, send_started_at
@@ -434,6 +450,12 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
                 """,
                 mismatch_id,
             )
+        assert stale["delivery_state"] == "NOT_DELIVERED"
+        assert stale["send_started_at"] is None
+        assert stale["reply_content"] is None
+        assert len(stale_children) == 4
+        assert all(row["state"] == "PENDING" for row in stale_children)
+        assert all(row["payload"] is None for row in stale_children)
         assert mismatch["delivery_state"] == "NOT_STARTED"
         assert mismatch["send_started_at"] is None
 
@@ -831,3 +853,318 @@ async def test_exhausted_child_blocks_completion_without_poisoning_siblings() ->
             if commitment_type != "favorability_adjustment"
         )
         assert completed_at is None
+
+
+async def test_terminal_transitions_minimize_only_no_longer_needed_payloads() -> None:
+    """送达后清父正文，待处置只保留失败承诺自己的续跑载荷。"""
+    needs_disposition_id = f"minimal-disposition-{uuid4().hex}"
+    not_delivered_id = f"minimal-not-delivered-{uuid4().hex}"
+    fulfillment_ids = [needs_disposition_id, not_delivered_id]
+    async with _repository_context(fulfillment_ids) as (repository, pool):
+        await _prepare_delivered(repository, needs_disposition_id)
+        assert (
+            await repository.claim_operation(
+                needs_disposition_id,
+                owner_token="worker-minimal",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        for commitment_type in (
+            "proactive_reply_confirmation",
+            "assistant_reply_history",
+            "interaction_history",
+        ):
+            assert await repository.mark_commitment_completed(
+                needs_disposition_id,
+                commitment_type=commitment_type,
+                owner_token="worker-minimal",
+            )
+        assert (
+            await repository.mark_commitment_failed(
+                needs_disposition_id,
+                commitment_type="favorability_adjustment",
+                owner_token="worker-minimal",
+                error_code="invalid_payload",
+                max_attempts=1,
+                retry_base_seconds=1,
+            )
+            == "FAILED"
+        )
+        assert await repository.release_lease(
+            needs_disposition_id,
+            owner_token="worker-minimal",
+        )
+
+        assert await repository.prepare(_draft(not_delivered_id)) is True
+        assert await repository.mark_not_delivered(not_delivered_id) is True
+
+        async with pool.acquire() as connection:
+            disposition_parent = await connection.fetchrow(
+                """
+                SELECT payload_hash, reply_content, completed_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                needs_disposition_id,
+            )
+            disposition_children = await connection.fetch(
+                """
+                SELECT commitment_type, state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                needs_disposition_id,
+            )
+            not_delivered_parent = await connection.fetchrow(
+                """
+                SELECT payload_hash, reply_content, delivery_state,
+                       not_delivered_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                not_delivered_id,
+            )
+            not_delivered_children = await connection.fetch(
+                """
+                SELECT commitment_type, state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                not_delivered_id,
+            )
+
+        assert disposition_parent["payload_hash"] == "a" * 64
+        assert disposition_parent["reply_content"] is None
+        assert disposition_parent["completed_at"] is None
+        by_type = {row["commitment_type"]: row for row in disposition_children}
+        assert by_type["favorability_adjustment"]["state"] == "FAILED"
+        assert by_type["favorability_adjustment"]["payload"] is not None
+        assert all(
+            row["payload"] is None
+            for commitment_type, row in by_type.items()
+            if commitment_type != "favorability_adjustment"
+        )
+
+        assert not_delivered_parent["payload_hash"] == "a" * 64
+        assert not_delivered_parent["reply_content"] is None
+        assert not_delivered_parent["delivery_state"] == "NOT_DELIVERED"
+        assert not_delivered_parent["not_delivered_at"] is not None
+        assert len(not_delivered_children) == 4
+        assert all(row["state"] == "PENDING" for row in not_delivered_children)
+        assert all(row["payload"] is None for row in not_delivered_children)
+
+
+async def test_parent_completion_defensively_minimizes_all_terminal_payloads() -> None:
+    """父完成门禁落库时再次清正文与全部子 payload，修复崩溃残留。"""
+    fulfillment_id = f"minimal-completed-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, pool):
+        await _prepare_delivered(repository, fulfillment_id)
+        assert (
+            await repository.claim_operation(
+                fulfillment_id,
+                owner_token="worker-complete",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        for commitment_type in (
+            "proactive_reply_confirmation",
+            "favorability_adjustment",
+            "assistant_reply_history",
+            "interaction_history",
+        ):
+            assert await repository.mark_commitment_completed(
+                fulfillment_id,
+                commitment_type=commitment_type,
+                owner_token="worker-complete",
+            )
+
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET reply_content = '模拟崩溃残留正文'
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillment_commitments
+                SET payload = '{"leaked": true}'::jsonb
+                WHERE fulfillment_id = $1
+                  AND commitment_type = 'assistant_reply_history'
+                """,
+                fulfillment_id,
+            )
+
+        assert await repository.complete_fulfillment(
+            fulfillment_id,
+            owner_token="worker-complete",
+        )
+
+        async with pool.acquire() as connection:
+            parent = await connection.fetchrow(
+                """
+                SELECT payload_hash, reply_content, completed_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+            remaining_payloads = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                  AND payload IS NOT NULL
+                """,
+                fulfillment_id,
+            )
+
+        assert parent["payload_hash"] == "a" * 64
+        assert parent["reply_content"] is None
+        assert parent["completed_at"] is not None
+        assert remaining_payloads == 0
+
+
+async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
+    """只领超过保护期的已解决终态，证据 marker 前禁止删除父身份。"""
+    completed_id = f"cleanup-completed-{uuid4().hex}"
+    not_delivered_id = f"cleanup-not-delivered-{uuid4().hex}"
+    pending_id = f"cleanup-pending-{uuid4().hex}"
+    disposition_id = f"cleanup-disposition-{uuid4().hex}"
+    protected_id = f"cleanup-protected-{uuid4().hex}"
+    fulfillment_ids = [
+        completed_id,
+        not_delivered_id,
+        pending_id,
+        disposition_id,
+        protected_id,
+    ]
+    async with _repository_context(fulfillment_ids) as (repository, pool):
+        for fulfillment_id in (completed_id, protected_id):
+            await _prepare_delivered(repository, fulfillment_id)
+            assert (
+                await repository.claim_operation(
+                    fulfillment_id,
+                    owner_token=f"worker-{fulfillment_id}",
+                    lease_seconds=60,
+                )
+                is not None
+            )
+            for commitment_type in (
+                "proactive_reply_confirmation",
+                "favorability_adjustment",
+                "assistant_reply_history",
+                "interaction_history",
+            ):
+                assert await repository.mark_commitment_completed(
+                    fulfillment_id,
+                    commitment_type=commitment_type,
+                    owner_token=f"worker-{fulfillment_id}",
+                )
+            assert await repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token=f"worker-{fulfillment_id}",
+            )
+
+        assert await repository.prepare(_draft(not_delivered_id)) is True
+        assert await repository.mark_not_delivered(not_delivered_id) is True
+        assert await repository.prepare(_draft(pending_id)) is True
+        assert await repository.mark_send_started(pending_id) is True
+        await _prepare_delivered(repository, disposition_id)
+        assert (
+            await repository.claim_operation(
+                disposition_id,
+                owner_token="worker-disposition",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        assert (
+            await repository.mark_commitment_failed(
+                disposition_id,
+                commitment_type="favorability_adjustment",
+                owner_token="worker-disposition",
+                error_code="invalid_payload",
+                max_attempts=1,
+                retry_base_seconds=1,
+            )
+            == "FAILED"
+        )
+        assert await repository.release_lease(
+            disposition_id,
+            owner_token="worker-disposition",
+        )
+
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET completed_at = NOW() - INTERVAL '31 days'
+                WHERE fulfillment_id = $1
+                """,
+                completed_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET not_delivered_at = NOW() - INTERVAL '31 days'
+                WHERE fulfillment_id = $1
+                """,
+                not_delivered_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET prepared_at = NOW() - INTERVAL '60 days',
+                    send_started_at = NOW() - INTERVAL '60 days'
+                WHERE fulfillment_id = $1
+                """,
+                pending_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET delivered_at = NOW() - INTERVAL '60 days'
+                WHERE fulfillment_id = $1
+                """,
+                disposition_id,
+            )
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET completed_at = NOW() - INTERVAL '29 days'
+                WHERE fulfillment_id = $1
+                """,
+                protected_id,
+            )
+
+        claimed = await repository.claim_terminal_cleanup_candidates(
+            owner_token="cleanup-worker",
+            limit=20,
+            lease_seconds=60,
+            protection_days=30,
+        )
+        claimed_ids = {row["fulfillment_id"] for row in claimed}
+        assert claimed_ids == {completed_id, not_delivered_id}
+
+        for fulfillment_id in claimed_ids:
+            assert not await repository.delete_terminal_tombstone(
+                fulfillment_id,
+                owner_token="cleanup-worker",
+            )
+            assert await repository.mark_idempotency_evidence_cleared(
+                fulfillment_id,
+                owner_token="cleanup-worker",
+            )
+            assert await repository.delete_terminal_tombstone(
+                fulfillment_id,
+                owner_token="cleanup-worker",
+            )
+            assert not await repository.has_active_operation(fulfillment_id)
+
+        for fulfillment_id in (pending_id, disposition_id, protected_id):
+            assert await repository.has_active_operation(fulfillment_id)

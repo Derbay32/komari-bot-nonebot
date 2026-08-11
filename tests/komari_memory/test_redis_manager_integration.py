@@ -261,6 +261,26 @@ def test_real_redis_chat_commit_steps_are_idempotent(monkeypatch: Any) -> None:
 
             assert len(await manager.get_buffer("g1")) == 1
             assert len(await manager.get_global_interaction_buffer("u1")) == 1
+            assert (
+                await cast(
+                    "Any",
+                    client.ttl(RedisKeys.chat_commit_step("operation-1", "ai_history")),
+                )
+                == -1
+            )
+            assert (
+                await cast(
+                    "Any",
+                    client.ttl(
+                        RedisKeys.chat_commit_step("operation-1", "interaction")
+                    ),
+                )
+                == -1
+            )
+            assert await manager.delete_chat_commit_evidence("operation-1") == 2
+            assert await manager.delete_chat_commit_evidence("operation-1") == 0
+            assert len(await manager.get_buffer("g1")) == 1
+            assert len(await manager.get_global_interaction_buffer("u1")) == 1
             assert await cast(
                 "Any",
                 client.sismember(RedisKeys.GLOBAL_INTERACTION_PENDING, "u1"),

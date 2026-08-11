@@ -1,13 +1,17 @@
-"""送达后承诺执行器（独立兑现）。
+"""送达后承诺执行器（独立兑现）与终态两阶段清理。
 
 TSK-82：回复确认送达后，在单一父租约内按固定顺序串行尝试冻结的
 四项送达后承诺：主动回复确认、好感度调整、角色回复历史、互动历史。
 单项失败独立保存尝试、退避、稳定错误码与完成时间，失败不阻塞其他
 当前到期项；只有全部适用子项完成才完成父履约。
 
+TSK-83：履约进入完成/未送达终态并超过身份保护期后，
+``cleanup_terminal_fulfillments`` 先清除 Redis 防重证据与好感度账本，
+落证据清除标记，最后删除父 tombstone（FK cascade 删子行）；任一步
+中断都隔离当前父并释放租约，下轮恢复，顺序不可反转。
+
 本模块当前只由验收测试直接构造，不接线生产入口；正常聊天继续只走
-旧 outbox，禁止双写、双读或 fallback。TSK-87 之前不得提前 cutover，
-也不清理 tombstone、不迁移载荷最小化之外的生命周期。
+旧 outbox，禁止双写、双读或 fallback。TSK-87 之前不得提前 cutover。
 """
 
 from __future__ import annotations
@@ -98,6 +102,29 @@ class _CommitmentExecutorRepository(Protocol):
         owner_token: str,
     ) -> bool: ...
 
+    async def claim_terminal_cleanup_candidates(
+        self,
+        *,
+        owner_token: str,
+        limit: int,
+        lease_seconds: int,
+        protection_days: int,
+    ) -> list[dict[str, Any]]: ...
+
+    async def mark_idempotency_evidence_cleared(
+        self,
+        fulfillment_id: str,
+        *,
+        owner_token: str,
+    ) -> bool: ...
+
+    async def delete_terminal_tombstone(
+        self,
+        fulfillment_id: str,
+        *,
+        owner_token: str,
+    ) -> bool: ...
+
 
 def _build_payload(commitment_type: str, raw: object) -> Any:
     """把持久载荷构造成冻结领域值对象（invalid_payload 的分类点）。
@@ -165,11 +192,6 @@ def _classify_error(error: BaseException) -> tuple[bool, str]:
     return permanent, code
 
 
-def _redis_dedupe_ttl(config: Any) -> int:
-    """由冻结配置推导下游去重 TTL，不进入冻结载荷。"""
-    return max(1, int(config.reply_commit_tombstone_retention_days) + 1) * 86_400
-
-
 class ReplyCommitmentWorkflow:
     """在单一父租约内按固定顺序串行兑现送达后承诺。"""
 
@@ -210,6 +232,70 @@ class ReplyCommitmentWorkflow:
                 completed += 1
         return completed
 
+    async def cleanup_terminal_fulfillments(self) -> int:
+        """清理超过保护期的已解决终态，返回删除的父 tombstone 数。
+
+        按 batch/lease/保护期动态配置领取候选；每项履约先清除 Redis
+        防重证据与好感度幂等账本，落证据清除标记后再删父 tombstone。
+        记录已有证据标记时跳过下游清理直接删父。下游清理、标记、父
+        删除任一步异常都隔离当前父并尽力释放租约，让下轮恢复；
+        ``CancelledError`` 原样传播，不吞不重试。
+        """
+        config = self.config_getter()
+        claimed = await self.repository.claim_terminal_cleanup_candidates(
+            owner_token=self._owner_token,
+            limit=int(config.reply_commit_batch_size),
+            lease_seconds=int(config.reply_commit_lease_seconds),
+            protection_days=int(config.reply_commit_tombstone_retention_days),
+        )
+        cleaned = 0
+        for record in claimed:
+            fulfillment_id = str(record["fulfillment_id"])
+            try:
+                if await self._cleanup_terminal_record(record):
+                    cleaned += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # 终态清理控制面异常：不记录载荷与原始异常正文，只记
+                # fulfillment ID + 异常类型，尽力释放仍归自己的租约。
+                logger.warning(
+                    "[KomariChat] 履约终态清理控制面异常，本轮按失败处理: "
+                    "fulfillment={} error_type={}",
+                    fulfillment_id,
+                    type(error).__name__,
+                )
+                with suppress(Exception):
+                    await self.repository.release_lease(
+                        fulfillment_id,
+                        owner_token=self._owner_token,
+                    )
+        return cleaned
+
+    async def _cleanup_terminal_record(self, record: dict[str, Any]) -> bool:
+        """按两阶段顺序清理单个已解决终态，返回是否删除父 tombstone。
+
+        证据标记已持久化时（上一轮崩溃恢复）不再重复下游清理；标记
+        缺失时先清全部下游幂等证据再落标记，最后删父身份——顺序
+        不可反转，任一步失败由调用方隔离并归还租约。
+        """
+        fulfillment_id = str(record["fulfillment_id"])
+        evidence_cleared = record.get("idempotency_evidence_cleared_at") is not None
+        if not evidence_cleared:
+            await self.redis.delete_chat_commit_evidence(fulfillment_id)
+            await self.user_data.delete_favorability_operation(
+                f"{fulfillment_id}:favorability"
+            )
+            if not await self.repository.mark_idempotency_evidence_cleared(
+                fulfillment_id,
+                owner_token=self._owner_token,
+            ):
+                return False
+        return await self.repository.delete_terminal_tombstone(
+            fulfillment_id,
+            owner_token=self._owner_token,
+        )
+
     async def _finish_claimed(self, fulfillment_id: str, config: Any) -> bool:
         """在一轮父租约内兑现一个履约，返回是否完成父记录。
 
@@ -232,7 +318,6 @@ class ReplyCommitmentWorkflow:
             try:
                 completed = await self._process_claimed(
                     fulfillment_id,
-                    config,
                     lease_lost,
                 )
             except asyncio.CancelledError:
@@ -263,7 +348,6 @@ class ReplyCommitmentWorkflow:
     async def _process_claimed(
         self,
         fulfillment_id: str,
-        config: Any,
         lease_lost: asyncio.Event,
     ) -> bool:
         """按固定顺序处理当前到期子项，并在全部完成后门控父完成。"""
@@ -283,7 +367,6 @@ class ReplyCommitmentWorkflow:
             if lease_lost.is_set() or not await self._process_commitment_row(
                 fulfillment_id,
                 row,
-                config,
                 lease_lost,
             ):
                 return False
@@ -300,7 +383,6 @@ class ReplyCommitmentWorkflow:
         self,
         fulfillment_id: str,
         row: dict[str, Any],
-        config: Any,
         lease_lost: asyncio.Event,
     ) -> bool:
         """兑现单个当前到期承诺；返回 False 表示租约已丢失需中止。
@@ -333,7 +415,6 @@ class ReplyCommitmentWorkflow:
                 fulfillment_id,
                 commitment_type,
                 payload,
-                config,
             )
         except asyncio.CancelledError:
             raise
@@ -454,9 +535,13 @@ class ReplyCommitmentWorkflow:
         fulfillment_id: str,
         commitment_type: str,
         payload: Any,
-        config: Any,
     ) -> None:
-        """串行调用对应下游承诺能力；外部副作用依赖既有幂等 ID 恢复。"""
+        """串行调用对应下游承诺能力；外部副作用依赖既有幂等 ID 恢复。
+
+        未解决履约的 Redis 防重证据持久保留（不传 TTL），由终态清理
+        在保护期结束后显式删除，避免旧固定 TTL 失效后人工续跑重复
+        副作用。
+        """
         if commitment_type == "proactive_reply_confirmation":
             await self.proactive_reservation.confirm(
                 payload.group_id,
@@ -485,7 +570,7 @@ class ReplyCommitmentWorkflow:
                 payload.group_id,
                 bot_message,
                 operation_id=fulfillment_id,
-                dedupe_ttl_seconds=_redis_dedupe_ttl(config),
+                dedupe_ttl_seconds=None,
             )
             return
         if commitment_type == "interaction_history":
@@ -501,7 +586,7 @@ class ReplyCommitmentWorkflow:
                 record=interaction_record,
                 trigger_size=int(payload.trigger_size),
                 operation_id=fulfillment_id,
-                dedupe_ttl_seconds=_redis_dedupe_ttl(config),
+                dedupe_ttl_seconds=None,
             )
             return
         msg = f"不支持的承诺类型: {commitment_type!r}"

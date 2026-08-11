@@ -249,6 +249,28 @@ class UserDataDB:
             updated_at=row[2].isoformat(),
         )
 
+    async def delete_favorability_operation(self, operation_id: str) -> bool:
+        """精确删除一条好感度幂等账本，幂等返回是否实际删除。
+
+        只按 ``operation_id`` 主键删除单条账本，不影响好感度现值；
+        履约终态清理在保护期结束时用它清除下游幂等证据。
+        """
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                result = cast(
+                    "CursorResult[Any]",
+                    await session.execute(
+                        delete(UserFavorabilityAdjustmentLedgerRow).where(
+                            _LEDGER.c.operation_id == operation_id
+                        )
+                    ),
+                )
+        finally:
+            await session.close()
+        return int(result.rowcount or 0) > 0
+
     async def cleanup_adjustment_ledger(self, *, retention_days: int) -> int:
         """清理超过防重窗口的好感度 operation 账本。"""
         self._require_ready()

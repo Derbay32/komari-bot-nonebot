@@ -54,6 +54,10 @@ class _FakeUserDataDB:
     async def set_user_favorability(self, user_id: str, value: int) -> object:
         raise NotImplementedError
 
+    async def delete_favorability_operation(self, operation_id: str) -> bool:
+        self.deleted_operation_id = operation_id
+        return True
+
 
 def _patch_fake_db(user_data_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeUserDataDB.instances = []
@@ -168,6 +172,25 @@ async def test_get_db_does_not_return_cached_db_after_dynamic_disable(
         await user_data_module.get_db()
 
     assert user_data_module._db is cached
+
+
+@pytest.mark.asyncio
+async def test_delete_favorability_operation_uses_narrow_top_level_seam(
+    user_data_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_db(user_data_module, monkeypatch)
+
+    assert (
+        await user_data_module.delete_favorability_operation(
+            "reply-1:favorability"
+        )
+        is True
+    )
+
+    db = _FakeUserDataDB.instances[0]
+    assert db.deleted_operation_id == "reply-1:favorability"
+    assert "delete_favorability_operation" in user_data_module.__all__
 
 
 def test_lifecycle_is_registered_with_nonebot_driver(user_data_module: Any) -> None:
