@@ -18,6 +18,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Protocol
 
 import asyncpg
+from nonebot import logger
 from redis.exceptions import RedisError
 
 from komari_bot.plugins.komari_memory import MessageSchema
@@ -123,13 +124,26 @@ def _is_service_unavailable(error: BaseException) -> bool:
     return isinstance(error, RuntimeError) and "连接池未初始化" in str(error)
 
 
+def _is_idempotency_conflict(error: BaseException) -> bool:
+    """好感度幂等账本冲突的公开异常文本；持久化只写稳定码。
+
+    只对 user_data 已有的公开文本做窄匹配，普通未知 ``ValueError``
+    不会被误判为幂等冲突。
+    """
+    return isinstance(error, ValueError) and "operation_id 与既有请求载荷冲突" in str(
+        error
+    )
+
+
 def _classify_error(error: BaseException) -> tuple[bool, str]:
     """把异常翻译成稳定错误码；只持久化码本身，禁止异常正文。
 
     返回值形如 ``(永久, 错误码)``：永久错误立即耗尽（FAILED），
     瞬态错误按动态策略退避重试。
     """
-    if isinstance(error, ReplyFulfillmentConflictError):
+    if isinstance(error, ReplyFulfillmentConflictError) or _is_idempotency_conflict(
+        error
+    ):
         permanent, code = True, "idempotency_conflict"
     elif isinstance(error, TypeError):
         permanent, code = True, "protocol_violation"
@@ -178,7 +192,8 @@ class ReplyCommitmentWorkflow:
         """领取 DELIVERED 父项并兑现其当前到期承诺，返回完成父项数。
 
         每项履约在领取到的单一父租约内处理；租约丢失立即中止当前
-        履约，由下一次领取恢复。不清理 tombstone。
+        履约，由下一次领取恢复。不清理 tombstone。单父控制面异常被
+        隔离为本轮失败，不炸停同批其他父履约。
         """
         config = self.config_getter()
         claimed = await self.repository.claim_pending(
@@ -188,13 +203,21 @@ class ReplyCommitmentWorkflow:
         )
         completed = 0
         for record in claimed:
-            if await self._finish_claimed(str(record["fulfillment_id"])):
+            if await self._finish_claimed(
+                str(record["fulfillment_id"]),
+                config,
+            ):
                 completed += 1
         return completed
 
-    async def _finish_claimed(self, fulfillment_id: str) -> bool:
-        """在一轮父租约内兑现一个履约，返回是否完成父记录。"""
-        config = self.config_getter()
+    async def _finish_claimed(self, fulfillment_id: str, config: Any) -> bool:
+        """在一轮父租约内兑现一个履约，返回是否完成父记录。
+
+        领取时的配置快照用于本轮的领取/心跳租约；失败策略由
+        ``_mark_failed`` 在记录失败时动态读取。取消原样传播；其他
+        控制面异常（如完成标记数据库暂不可用）隔离为本轮失败并尽力
+        释放仍归自己的父租约，不消费子项失败预算。
+        """
         lease_seconds = max(1, int(config.reply_commit_lease_seconds))
         lease_lost = asyncio.Event()
         heartbeat = asyncio.create_task(
@@ -204,25 +227,38 @@ class ReplyCommitmentWorkflow:
                 lost=lease_lost,
             )
         )
-        cancelled = False
+        completed = False
         try:
-            return await self._process_claimed(
-                fulfillment_id,
-                config,
-                lease_lost,
-            )
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
+            try:
+                completed = await self._process_claimed(
+                    fulfillment_id,
+                    config,
+                    lease_lost,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # 完成标记等控制面异常：外部结果可能已成功但标记未知，
+                # 不调用 mark_commitment_failed，依赖幂等 ID 下轮恢复。
+                logger.warning(
+                    "[KomariChat] 履约兑现控制面异常，本轮按失败处理: "
+                    "fulfillment={} error_type={}",
+                    fulfillment_id,
+                    type(error).__name__,
+                )
+                completed = False
         finally:
             await self._stop_task(heartbeat)
-            if cancelled:
-                # 取消不记录失败预算；尽力释放仍归自己的父租约以便恢复。
+            if not completed:
+                # 尽力释放仍归自己的父租约（心跳续租暂时失败但 CAS 仍
+                # 有效时同样可回收）；真正丢失 owner 时 CAS 自然返回
+                # False，不能等自然过期。
                 with suppress(Exception):
                     await self.repository.release_lease(
                         fulfillment_id,
                         owner_token=self._owner_token,
                     )
+        return completed
 
     async def _process_claimed(
         self,
@@ -248,44 +284,41 @@ class ReplyCommitmentWorkflow:
                 fulfillment_id,
                 row,
                 config,
+                lease_lost,
             ):
                 return False
         if lease_lost.is_set():
             return False
-        completed = await self.repository.complete_fulfillment(
-            fulfillment_id,
-            owner_token=self._owner_token,
+        return bool(
+            await self.repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token=self._owner_token,
+            )
         )
-        if not completed:
-            # 全部适用子项尚未完成（含已 FAILED 项）：本轮释放父租约，
-            # 由后续轮次继续未完成项。
-            with suppress(Exception):
-                await self.repository.release_lease(
-                    fulfillment_id,
-                    owner_token=self._owner_token,
-                )
-            return False
-        return True
 
     async def _process_commitment_row(
         self,
         fulfillment_id: str,
         row: dict[str, Any],
         config: Any,
+        lease_lost: asyncio.Event,
     ) -> bool:
         """兑现单个当前到期承诺；返回 False 表示租约已丢失需中止。
 
         解析持久载荷失败记为 ``invalid_payload``（不调用下游）；下游
         异常按稳定错误码分类后独立记失败预算并继续其他当前到期项。
+        外部调用后、任何 ``mark_commitment_*`` 之前检查心跳租约：已
+        丢失则不落标记、不消费失败预算，外部结果由幂等 ID 下轮恢复。
         """
         commitment_type = str(row["commitment_type"])
         try:
             payload = _build_payload(commitment_type, row["payload"])
         except (TypeError, ValueError):
+            if lease_lost.is_set():
+                return False
             return await self._mark_failed(
                 fulfillment_id,
                 commitment_type,
-                config,
                 "invalid_payload",
                 permanent=True,
             )
@@ -299,14 +332,17 @@ class ReplyCommitmentWorkflow:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if lease_lost.is_set():
+                return False
             permanent, error_code = _classify_error(error)
             return await self._mark_failed(
                 fulfillment_id,
                 commitment_type,
-                config,
                 error_code,
                 permanent=permanent,
             )
+        if lease_lost.is_set():
+            return False
         # CAS 失败视为租约丢失：不消费本项失败预算。
         return await self.repository.mark_commitment_completed(
             fulfillment_id,
@@ -318,17 +354,17 @@ class ReplyCommitmentWorkflow:
         self,
         fulfillment_id: str,
         commitment_type: str,
-        config: Any,
         error_code: str,
         *,
         permanent: bool,
     ) -> bool:
-        """记录单项失败并应用动态策略；返回 False 表示租约已丢失。
+        """记录单项失败并应用当时的动态策略；返回 False 表示租约已丢失。
 
-        永久错误以 max_attempts=1 直接耗尽；瞬态错误使用配置的
-        最大尝试数与退避参数。配置变化影响下一次领取/失败，不进入
-        冻结载荷。
+        每次记录失败时重新读取配置，让 max attempts、退避基数/上限在
+        下一次失败时动态生效，不沿用领取时快照、不进入冻结载荷。
+        永久错误以 max_attempts=1 直接耗尽。
         """
+        config = self.config_getter()
         state = await self.repository.mark_commitment_failed(
             fulfillment_id,
             commitment_type=commitment_type,
