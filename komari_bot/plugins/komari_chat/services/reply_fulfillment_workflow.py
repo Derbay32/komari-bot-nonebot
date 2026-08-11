@@ -474,6 +474,12 @@ class ReplyFulfillmentWorkflow:
         self.recovery_senders_getter = recovery_senders_getter
         self._owner_token = f"chat-{uuid.uuid4().hex}"
         self._last_cleanup = 0.0
+        # 发送起始阶段进程内锁：直接路径从 prepare 前持有到
+        # mark_send_started 完成，恢复路径在领取/过期阶段持有同一锁，
+        # 阻止本进程 worker 在 prepare 与 mark 之间抢走刚插入的
+        # NOT_STARTED 行；锁不跨平台发送，崩溃于 prepare 后 / mark 前
+        # 仍保留可被恢复的可窗口。
+        self._send_start_lock = asyncio.Lock()
 
     async def is_duplicate_event(self, operation_id: str) -> bool:
         """判断平台事件是否已有不可再次发送的履约记录。"""
@@ -482,21 +488,6 @@ class ReplyFulfillmentWorkflow:
     @staticmethod
     def _resolve_display_name(message: MessageSchema) -> str:
         return str(message.user_nickname or message.user_id).strip() or message.user_id
-
-    @staticmethod
-    def _extract_platform_message_id(response: object) -> str | None:
-        """从发送响应中提取平台消息 ID。"""
-        candidate: object | None = None
-        if isinstance(response, dict):
-            candidate = response.get("message_id")
-            if candidate is None and isinstance(response.get("data"), dict):
-                candidate = response["data"].get("message_id")
-        else:
-            candidate = getattr(response, "message_id", None)
-        if candidate is None:
-            return None
-        value = str(candidate).strip()
-        return value or None
 
     async def _prepare(self, pending_reply: _PendingReply) -> bool:
         """注入履约工作流配置后准备一条不可变履约 Draft。"""
@@ -582,35 +573,39 @@ class ReplyFulfillmentWorkflow:
     ) -> bool:
         """原子编排一次回复履约：先持久准备，再登记发送开始，最后发送。
 
-        平台结果只以 ``ReplyDeliveryResult`` 进入状态机；为兼容既有
-        composition root 返回原始平台响应的发送闭包，原始响应按已送达
-        处理并提取平台消息 ID。待确认结果不释放预占、不自动重发；
-        发送开始后任何异常（含 ``CancelledError``）原样传播并保持待确认。
+        平台发送边界必须返回 ``ReplyDeliveryResult``，原始平台响应不进入
+        领域状态机；待确认结果不释放预占、不自动重发；发送开始后任何
+        异常（含 ``CancelledError``）原样传播并保持待确认。
         """
         if not pending_reply.reply_result.content:
             await self._release_reservation(pending_reply)
             return False
 
-        try:
-            prepared = await self._prepare(pending_reply)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await self._release_reservation(pending_reply)
-            raise
+        # 发送起始阶段持进程内锁：prepare 与 mark_send_started 之间不被
+        # 本进程恢复 worker 领取；锁不跨平台发送。
+        async with self._send_start_lock:
+            try:
+                prepared = await self._prepare(pending_reply)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self._release_reservation(pending_reply)
+                raise
 
-        if not prepared:
-            logger.info(
-                "[KomariChat] 重复回复 operation 已存在，取消本次发送: operation={}",
-                pending_reply.operation_id,
+            if not prepared:
+                logger.info(
+                    "[KomariChat] 重复回复 operation 已存在，取消本次发送: operation={}",
+                    pending_reply.operation_id,
+                )
+                await self._release_reservation(pending_reply)
+                return False
+
+            started = await self.repository.mark_send_started(
+                pending_reply.operation_id
             )
-            await self._release_reservation(pending_reply)
-            return False
-
-        started = await self.repository.mark_send_started(pending_reply.operation_id)
-        if not started:
-            msg = "回复发送开始登记失败，未调用平台发送能力"
-            raise RuntimeError(msg)
+            if not started:
+                msg = "回复发送开始登记失败，未调用平台发送能力"
+                raise RuntimeError(msg)
 
         try:
             delivery_result = await send_reply(pending_reply)
@@ -623,33 +618,29 @@ class ReplyFulfillmentWorkflow:
             )
             raise
 
-        if isinstance(delivery_result, ReplyDeliveryResult):
-            if delivery_result.state == "delivered":
-                return await self._mark_delivered_and_finish(
-                    pending_reply,
-                    platform_message_id=delivery_result.platform_message_id,
-                )
-            if delivery_result.state == "not_delivered":
-                await self.repository.mark_not_delivered(pending_reply.operation_id)
-                await self._release_reservation(pending_reply)
-                logger.info(
-                    "[KomariChat] 平台明确拒绝发送，回复未送达: group={} operation={}",
-                    pending_reply.message.group_id,
-                    pending_reply.operation_id,
-                )
-                return False
+        if not isinstance(delivery_result, ReplyDeliveryResult):
+            msg = "平台发送边界必须返回 ReplyDeliveryResult"
+            raise TypeError(msg)
+
+        if delivery_result.state == "delivered":
+            return await self._mark_delivered_and_finish(
+                pending_reply,
+                platform_message_id=delivery_result.platform_message_id,
+            )
+        if delivery_result.state == "not_delivered":
+            await self.repository.mark_not_delivered(pending_reply.operation_id)
+            await self._release_reservation(pending_reply)
             logger.info(
-                "[KomariChat] 发送结果未知，回复进入待确认对账: operation={}",
+                "[KomariChat] 平台明确拒绝发送，回复未送达: group={} operation={}",
+                pending_reply.message.group_id,
                 pending_reply.operation_id,
             )
             return False
-
-        # 兼容既有发送闭包：原始平台响应按已送达处理
-        platform_message_id = self._extract_platform_message_id(delivery_result)
-        return await self._mark_delivered_and_finish(
-            pending_reply,
-            platform_message_id=platform_message_id,
+        logger.info(
+            "[KomariChat] 发送结果未知，回复进入待确认对账: operation={}",
+            pending_reply.operation_id,
         )
+        return False
 
     async def _mark_delivered_and_finish(
         self,
@@ -914,7 +905,9 @@ class ReplyFulfillmentWorkflow:
 
         只有仍在时效内、且 Bot 与适配器精确匹配的 NOT_STARTED 回复才
         允许恢复发送；满时效按未送达终止并释放持久预占。仓库未提供
-        领取/过期能力（旧 adapter 或测试替身）时跳过本阶段。
+        领取/过期能力（旧 adapter 或测试替身）时跳过本阶段。领取与
+        过期在同一进程内锁内原子完成，避免与直接路径的
+        prepare → mark_send_started 区间竞争；平台发送在锁外执行。
         """
         claim_fresh = getattr(self.repository, "claim_fresh_not_started", None)
         expire_stale = getattr(self.repository, "expire_stale_not_started", None)
@@ -924,22 +917,25 @@ class ReplyFulfillmentWorkflow:
         freshness_seconds = int(config.reply_fulfillment_freshness_seconds)
         limit = int(config.reply_commit_batch_size)
         completed = 0
-        for (bot_self_id, adapter_name), sender in (
-            self.recovery_senders_getter().items()
-        ):
-            records = await claim_fresh(
-                bot_self_id=bot_self_id,
-                adapter_name=adapter_name,
+        claimed_records: list[tuple[dict[str, Any], ReplySender]] = []
+        async with self._send_start_lock:
+            for (bot_self_id, adapter_name), sender in (
+                self.recovery_senders_getter().items()
+            ):
+                records = await claim_fresh(
+                    bot_self_id=bot_self_id,
+                    adapter_name=adapter_name,
+                    freshness_seconds=freshness_seconds,
+                    limit=limit,
+                )
+                claimed_records.extend((record, sender) for record in records)
+            expired = await expire_stale(
                 freshness_seconds=freshness_seconds,
                 limit=limit,
             )
-            for record in records:
-                if await self._finish_recovered(record, sender):
-                    completed += 1
-        expired = await expire_stale(
-            freshness_seconds=freshness_seconds,
-            limit=limit,
-        )
+        for record, sender in claimed_records:
+            if await self._finish_recovered(record, sender):
+                completed += 1
         for record in expired:
             await self._terminate_expired(record)
         return completed

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import ActionFailed, MessageSegment
+from nonebot.exception import NetworkError
 
 if TYPE_CHECKING:
     from nonebot.internal.adapter import Bot
@@ -51,7 +52,7 @@ class ReplyDeliveryResult:
         return ReplyDeliveryResult(state="pending_confirmation")
 
 
-class _DeliveryRequest(Protocol):
+class DeliveryRequest(Protocol):
     """发送边界消费的回复载荷最小接口。"""
 
     @property
@@ -76,7 +77,7 @@ class OneBotReplySender:
         self.bot = bot
 
     @staticmethod
-    def _rich_message(request: _DeliveryRequest) -> list[dict[str, object]]:
+    def _rich_message(request: DeliveryRequest) -> list[dict[str, object]]:
         """富文本消息：OneBot 段数组（引用 + 文本）。"""
         segments: list[dict[str, object]] = []
         if request.reply_to_message_id:
@@ -87,7 +88,7 @@ class OneBotReplySender:
         return segments
 
     @staticmethod
-    def _plain_message(request: _DeliveryRequest) -> list[MessageSegment]:
+    def _plain_message(request: DeliveryRequest) -> list[MessageSegment]:
         """纯文本消息：单一文本段，禁止再次解析 CQ 码。"""
         return [MessageSegment.text(request.reply)]
 
@@ -103,14 +104,22 @@ class OneBotReplySender:
             return message_id
         return getattr(response, "message_id", None)
 
-    async def __call__(self, request: _DeliveryRequest) -> ReplyDeliveryResult:
-        """发送一次回复并翻译平台结果。"""
+    async def __call__(self, request: DeliveryRequest) -> ReplyDeliveryResult:
+        """发送一次回复并翻译平台结果。
+
+        消息组装在调用平台前完成，组装 / 转换等调用前编程错误直接
+        向上传播，不被翻译为送达事实。平台边界只捕获可判定的
+        明确失败（``ActionFailed``）与不确定结果（超时 /
+        ``NetworkError``）；``call_api`` 抛出的其他未知异常发生在发送
+        开始之后、无法判定是否已发出，保守翻译为待确认。
+        """
         group_id = int(request.group_id)
+        rich_message = self._rich_message(request)
         try:
             response = await self.bot.call_api(
                 "send_group_msg",
                 group_id=group_id,
-                message=self._rich_message(request),
+                message=rich_message,
             )
         except asyncio.CancelledError:
             raise
@@ -119,24 +128,30 @@ class OneBotReplySender:
                 "[KomariChat] 富文本发送被平台明确拒绝: {}，降级纯文本",
                 error,
             )
+            plain_message = self._plain_message(request)
             try:
                 response = await self.bot.call_api(
                     "send_group_msg",
                     group_id=group_id,
-                    message=self._plain_message(request),
+                    message=plain_message,
                 )
             except asyncio.CancelledError:
                 raise
             except ActionFailed:
                 # 两次明确失败：未送达
                 return ReplyDeliveryResult.not_delivered()
-            except Exception:
-                # 降级结果未知：保守待确认
+            except (TimeoutError, NetworkError):
                 return ReplyDeliveryResult.pending_confirmation()
+            except Exception:
+                # 降级发送抛出未知异常：无法判定是否已发出，保守待确认
+                return ReplyDeliveryResult.pending_confirmation()
+        except (TimeoutError, NetworkError):
+            return ReplyDeliveryResult.pending_confirmation()
         except Exception:
-            # 超时 / 网络错误 / 响应丢失等不确定错误：待确认
+            # call_api 抛出未知异常：发送开始后无法判定是否已发出，
+            # 保守待确认，交由对账决定送达事实
             return ReplyDeliveryResult.pending_confirmation()
         return ReplyDeliveryResult.delivered(self._platform_message_id(response))
 
 
-__all__ = ["OneBotReplySender", "ReplyDeliveryResult"]
+__all__ = ["DeliveryRequest", "OneBotReplySender", "ReplyDeliveryResult"]

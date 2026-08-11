@@ -6,10 +6,9 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from nonebot import get_bots, get_driver, logger, on_message
-from nonebot.adapters.onebot.v11 import ActionFailed, Bot, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_rule
 
 from .handlers.message_handler import (
@@ -19,7 +18,7 @@ from .handlers.message_handler import (
     ReplyFailureInfo,
 )
 from .services.proactive_reservation import ProactiveReservationService
-from .services.reply_delivery_onebot import OneBotReplySender
+from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
 from .services.reply_fulfillment_workflow import (
     ReplyFulfillmentWorkflow,
     ReplySender,
@@ -326,26 +325,20 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             raise RuntimeError(msg)  # noqa: TRY301
 
         async def _send_reply(actual_pending_reply: Any) -> object:
-            reply = actual_pending_reply.reply
-            reply_to_message_id = actual_pending_reply.reply_to_message_id
-            if reply_to_message_id:
-                message_array = [
-                    {"type": "reply", "data": {"id": reply_to_message_id}},
-                    {"type": "text", "data": {"text": reply}},
-                ]
-                try:
-                    return await bot.call_api(
-                        "send_group_msg",
-                        group_id=int(event.group_id),
-                        message=message_array,
-                    )
-                except ActionFailed as error:
-                    logger.warning(
-                        "[KomariChat] 原生回复失败: {}，降级普通发送",
-                        error,
-                    )
-                    return await matcher.send(plain_text_message(reply))
-            return await matcher.send(plain_text_message(reply))
+            """用 OneBot 窄边界发送，统一富文本/纯文本降级与三态翻译。
+
+            发送载荷投影自履约冻结的群与引用目标，不依赖 matcher 的
+            隐式事件上下文；平台异常细节由边界翻译，不在此旁路。
+            """
+            request = cast(
+                "DeliveryRequest",
+                SimpleNamespace(
+                    group_id=actual_pending_reply.message.group_id,
+                    reply=actual_pending_reply.reply,
+                    reply_to_message_id=actual_pending_reply.reply_to_message_id,
+                ),
+            )
+            return await OneBotReplySender(bot)(request)
 
         fulfilled = await workflow.fulfill(
             pending_reply,

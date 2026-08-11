@@ -182,22 +182,22 @@ class ReplyCommitRepository:
         return False
 
     async def cancel_prepared(self, operation_id: str) -> bool:
-        """发送失败时只取消尚未确认送达的意图并清除正文。"""
+        """取消尚未确认送达的发送意图，同步送达事实为未送达。
+
+        只推进状态与时间线，不修改冻结载荷、不覆盖平台消息 ID；未送达
+        终态按 0007 契约建模，身份防重记录随 tombstone 清理回收。
+        """
         async with self.pg_pool.acquire() as connection:
             cancelled = await connection.fetchval(
                 """
                 UPDATE komari_chat_reply_commit_outbox
                 SET status = 'CANCELLED',
-                    bot_nickname = NULL,
-                    user_nickname = NULL,
-                    reply_content = NULL,
-                    favorability_reason = NULL,
-                    interaction_history = NULL,
-                    proactive_reservation_id = NULL,
-                    platform_message_id = NULL,
+                    delivery_state = 'NOT_DELIVERED',
+                    not_delivered_at = COALESCE(not_delivered_at, NOW()),
                     updated_at = NOW()
                 WHERE operation_id = $1
                   AND status = 'PREPARED'
+                  AND delivery_state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')
                 RETURNING operation_id
                 """,
                 operation_id,
@@ -314,6 +314,8 @@ class ReplyCommitRepository:
         只有 ``bot_self_id`` 与 ``adapter_name`` 精确匹配且
         ``prepared_at`` 距今未满时效的 NOT_STARTED 行才会被领取；
         领取即登记发送开始（``PENDING_CONFIRMATION``）。
+        ``status='PREPARED'`` 守卫防止旧 ``cancel_prepared`` 造成的
+        delivery_state / status 正交失配行被误领取。
         """
         if limit <= 0:
             return []
@@ -324,6 +326,7 @@ class ReplyCommitRepository:
                     SELECT operation_id
                     FROM komari_chat_reply_commit_outbox
                     WHERE delivery_state = 'NOT_STARTED'
+                      AND status = 'PREPARED'
                       AND bot_self_id = $1
                       AND adapter_name = $2
                       AND prepared_at > NOW() - ($3 * INTERVAL '1 second')
@@ -356,6 +359,8 @@ class ReplyCommitRepository:
 
         满时效（``prepared_at`` 距今 >= 时效）的 NOT_STARTED 行转为
         未送达终态，``send_started_at`` 保持 NULL；未送达回复永不重发。
+        ``status='PREPARED'`` 守卫防止旧 ``cancel_prepared`` 造成的
+        delivery_state / status 正交失配行被误终止。
         """
         if limit <= 0:
             return []
@@ -366,6 +371,7 @@ class ReplyCommitRepository:
                     SELECT operation_id
                     FROM komari_chat_reply_commit_outbox
                     WHERE delivery_state = 'NOT_STARTED'
+                      AND status = 'PREPARED'
                       AND prepared_at <= NOW() - ($1 * INTERVAL '1 second')
                     ORDER BY prepared_at, operation_id
                     FOR UPDATE SKIP LOCKED
