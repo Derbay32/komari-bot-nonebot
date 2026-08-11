@@ -345,6 +345,10 @@ class _DummyBindingManager:
 
 class _DummyChatPlugin:
     @staticmethod
+    def get_reply_fulfillment_ops_service() -> object | None:
+        return None
+
+    @staticmethod
     async def generate_debug_reply(**kwargs: object) -> object:
         from komari_bot.plugins.agent_run_logger.diagnostic import (
             LLMDiagnosticCollector,
@@ -491,7 +495,12 @@ _inject_package_exports(
 )
 _inject_package_exports(
     "komari_chat",
-    {"generate_debug_reply": _DummyChatPlugin.generate_debug_reply},
+    {
+        "generate_debug_reply": _DummyChatPlugin.generate_debug_reply,
+        "get_reply_fulfillment_ops_service": (
+            _DummyChatPlugin.get_reply_fulfillment_ops_service
+        ),
+    },
 )
 _inject_package_exports(
     "agent_run_logger",

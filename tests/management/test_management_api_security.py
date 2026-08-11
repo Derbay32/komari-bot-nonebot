@@ -199,6 +199,10 @@ def test_permission_implication_uses_explicit_table_only() -> None:
         operator_id="announcement-sender",
         permissions=frozenset({"announce:send"}),
     ).has_permission("announce:read")
+    assert ManagementPrincipal(
+        operator_id="fulfillment-manager",
+        permissions=frozenset({"reply_fulfillment:manage"}),
+    ).has_permission("reply_fulfillment:read")
     assert not ManagementPrincipal(
         operator_id="config-deleter",
         permissions=frozenset({"config:delete"}),
