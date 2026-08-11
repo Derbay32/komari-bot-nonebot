@@ -392,6 +392,35 @@ async def test_not_started_reply_recovers_only_with_exact_original_bot(
     assert repository.records["reply-fresh"]["platform_message_id"] == "platform-2"
 
 
+async def test_recovered_payload_projection_errors_propagate(
+    workflow_module: Any,
+) -> None:
+    """持久载荷缺失属于编程/数据错误，不得伪装成平台结果未知。"""
+    repository = _DeliveryRepository()
+    proactive = _ProactiveReservation()
+    repository.seed_not_started("reply-broken", age_seconds=1)
+    repository.records["reply-broken"].pop("reply_content")
+    send_count = 0
+
+    async def _sender(_reply: object) -> object:
+        nonlocal send_count
+        send_count += 1
+        return workflow_module.ReplyDeliveryResult.delivered()
+
+    workflow = _workflow(
+        workflow_module,
+        repository,
+        proactive,
+        recovery_senders={("bot-1", "OneBot V11"): _sender},
+    )
+
+    with pytest.raises(KeyError, match="reply_content"):
+        await workflow.recover_pending()
+
+    assert send_count == 0
+    assert repository.pending_confirmation_ids == {"reply-broken"}
+
+
 async def test_freshness_boundary_expires_without_sending_and_releases_reservation(
     workflow_module: Any,
 ) -> None:
