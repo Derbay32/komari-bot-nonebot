@@ -78,6 +78,7 @@ def _pending_reply(
     interaction_history: dict[str, str] | None = None,
     proactive_reservation_id: str | None = "reservation-1",
     reply_timestamp: float = 2.0,
+    request_trace_id: str = "chat-message-1",
 ) -> Any:
     handler_module = import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
@@ -113,7 +114,7 @@ def _pending_reply(
         reason="score",
         reply_score=0.9,
         operation_id=fulfillment_id,
-        request_trace_id="chat-message-1",
+        request_trace_id=request_trace_id,
         reply_timestamp=reply_timestamp,
         proactive_reservation_id=proactive_reservation_id,
         proactive_reservation=(
@@ -268,11 +269,13 @@ async def test_inapplicable_commitments_are_absent_and_stay_frozen(
         store,
         global_interaction_enabled=True,
     )
-    assert await replacement_workflow.fulfill(
-        pending,
-        send_reply=lambda _pending: pytest.fail("重复履约不得重新发送"),
-        is_definitive_send_failure=lambda _error: False,
-    ) is False
+    with pytest.raises(ValueError, match="履约冲突"):
+        await replacement_workflow.fulfill(
+            pending,
+            send_reply=lambda _pending: pytest.fail("重复履约不得重新发送"),
+            is_definitive_send_failure=lambda _error: False,
+        )
+    assert store.records[pending.operation_id] is draft
     assert [item.commitment_type for item in draft.commitments] == [
         "favorability_adjustment",
         "assistant_reply_history",
@@ -304,6 +307,7 @@ async def test_payload_hash_is_canonical_and_covers_every_frozen_responsibility(
 
     assert len(baseline) == 64
     assert baseline == reordered
+    assert baseline == await _payload_hash(request_trace_id="chat-redelivery-2")
     assert len(
         {
             baseline,
