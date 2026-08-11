@@ -23,10 +23,12 @@ class _FrozenFulfillmentStore:
         self.terminal_states: dict[str, str] = {}
 
     async def has_active_operation(self, fulfillment_id: str) -> bool:
-        return fulfillment_id in self.records
+        return fulfillment_id in self.records or fulfillment_id in self.terminal_states
 
     async def prepare(self, draft: Any) -> bool:
         fulfillment_id = draft.fulfillment_id
+        if fulfillment_id in self.terminal_states:
+            return False
         current = self.records.get(fulfillment_id)
         if current is None:
             self.records[fulfillment_id] = draft
@@ -79,13 +81,14 @@ def _pending_reply(
     proactive_reservation_id: str | None = "reservation-1",
     reply_timestamp: float = 2.0,
     request_trace_id: str = "chat-message-1",
+    user_nickname: str = "测试用户",
 ) -> Any:
     handler_module = import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
     )
     message = MessageSchema(
         user_id="user-1",
-        user_nickname="测试用户",
+        user_nickname=user_nickname,
         group_id="group-1",
         content="用户正文",
         timestamp=1.0,
@@ -236,7 +239,10 @@ async def test_first_prepare_freezes_identity_target_and_applicable_commitments(
         },
         {
             "user_id": "user-1",
+            "display_name": "测试用户",
             "trigger_size": 20,
+            "reply_timestamp": 2.0,
+            "trigger_message_id": "message-1",
             "record": {"event": "发言", "result": "回复", "emotion": "平静"},
         },
     ]
@@ -325,10 +331,11 @@ async def test_payload_hash_is_canonical_and_covers_every_frozen_responsibility(
                     "emotion": "认真",
                 }
             ),
+            await _payload_hash(user_nickname="另一个显示名"),
             await _payload_hash(proactive_reservation_id=None),
             await _payload_hash(global_interaction_enabled=False),
         }
-    ) == 11
+    ) == 12
 
 
 async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
@@ -375,6 +382,7 @@ async def test_terminal_identity_still_prevents_resend(
     workflow = _workflow(workflow_module, store)
     pending = _pending_reply(workflow_module)
     await _freeze_before_delivery(workflow, pending)
+    store.records.pop(pending.operation_id)
     store.terminal_states[pending.operation_id] = terminal_state
 
     assert await workflow.fulfill(
@@ -382,4 +390,5 @@ async def test_terminal_identity_still_prevents_resend(
         send_reply=lambda _pending: pytest.fail("终态履约不得重新发送"),
         is_definitive_send_failure=lambda _error: False,
     ) is False
-    assert len(store.records) == 1
+    assert pending.operation_id not in store.records
+    assert store.terminal_states[pending.operation_id] == terminal_state

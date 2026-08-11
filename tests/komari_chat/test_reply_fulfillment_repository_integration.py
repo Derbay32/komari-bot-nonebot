@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -18,6 +19,7 @@ from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository im
     InteractionHistoryPayload,
     ProactiveReplyConfirmationPayload,
     ReplyCommitmentInput,
+    ReplyFulfillmentConflictError,
     ReplyFulfillmentDraft,
     ReplyFulfillmentRepository,
 )
@@ -96,7 +98,10 @@ def _draft(fulfillment_id: str) -> ReplyFulfillmentDraft:
                 commitment_type="interaction_history",
                 payload=InteractionHistoryPayload(
                     user_id="user-1",
+                    display_name="测试用户",
                     trigger_size=20,
+                    reply_timestamp=123.5,
+                    trigger_message_id=f"message-{fulfillment_id}",
                     record={
                         "event": "用户发言",
                         "result": "机器人回复",
@@ -177,6 +182,33 @@ async def test_concurrent_prepare_creates_one_parent_and_fixed_children() -> Non
         assert all(row["state"] == "PENDING" for row in children)
         assert all(row["attempt_count"] == 0 for row in children)
         assert all(row["payload_type"] == "object" for row in children)
+
+
+async def test_prepare_reuses_same_hash_and_rejects_payload_conflict() -> None:
+    """同一身份只接受首次冻结的责任，重复准备不会覆盖父子载荷。"""
+    fulfillment_id = f"prepare-conflict-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, pool):
+        draft = _draft(fulfillment_id)
+        assert await repository.prepare(draft) is True
+        assert await repository.prepare(draft) is False
+
+        with pytest.raises(ReplyFulfillmentConflictError, match="履约冲突"):
+            await repository.prepare(
+                replace(draft, payload_hash="b" * 64, reply_content="冲突回复")
+            )
+
+        async with pool.acquire() as connection:
+            stored = await connection.fetchrow(
+                """
+                SELECT payload_hash, reply_content
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert stored is not None
+        assert stored["payload_hash"] == "a" * 64
+        assert stored["reply_content"] == "持久化的角色回复"
 
 
 async def test_delivery_fact_only_moves_forward() -> None:

@@ -369,6 +369,8 @@ def test_normal_reservation_control_flow_is_not_a_failure(
 
     pending, stored, failure = asyncio.run(
         handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
             message=message,
             reply_to_message_id="99999",
             image_urls=None,

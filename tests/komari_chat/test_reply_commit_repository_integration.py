@@ -18,6 +18,14 @@ from komari_bot.plugins.komari_chat.repositories.reply_commit_repository import 
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
 
+pytestmark = [
+    pytest.mark.skipif(
+        not POSTGRES_URL,
+        reason="未配置真实 PostgreSQL 测试连接",
+    ),
+    pytest.mark.asyncio,
+]
+
 
 def _asyncpg_url() -> str:
     """剥离 ``+asyncpg`` scheme，得到 asyncpg 直连可解析的 URL。"""
@@ -49,8 +57,6 @@ def _payload(operation_id: str) -> PendingReplyCommit:
     )
 
 
-@pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
-@pytest.mark.asyncio
 async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
     run_id = uuid4().hex
     operation_id = f"operation-1-{run_id}"
@@ -123,9 +129,9 @@ async def test_reply_commit_outbox_prepare_claim_steps_and_tombstone() -> None:
         assert await repository.cancel_prepared(cancelled_payload.operation_id) is True
         assert (
             await repository.has_active_operation(cancelled_payload.operation_id)
-            is False
+            is True
         )
-        assert await repository.prepare(cancelled_payload) is True
+        assert await repository.prepare(cancelled_payload) is False
     finally:
         async with pool.acquire() as connection:
             await connection.execute(

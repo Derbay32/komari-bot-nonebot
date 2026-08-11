@@ -51,25 +51,45 @@ class _FakeReplyFulfillmentRepository:
         return str(value) if value is not None else None
 
     async def prepare(self, payload: Any) -> bool:
-        if payload.operation_id in self._records:
+        fulfillment_id = payload.fulfillment_id
+        if fulfillment_id in self._records:
             return False
-        self._records[payload.operation_id] = {
-            "operation_id": payload.operation_id,
+        payload_by_type = {
+            item.commitment_type: item.payload for item in payload.commitments
+        }
+        proactive = payload_by_type.get("proactive_reply_confirmation")
+        favorability = payload_by_type["favorability_adjustment"]
+        assistant = payload_by_type["assistant_reply_history"]
+        interaction = payload_by_type.get("interaction_history")
+        self._records[fulfillment_id] = {
+            "operation_id": fulfillment_id,
             "request_trace_id": payload.request_trace_id,
-            "source_message_id": payload.source_message_id,
+            "source_message_id": payload.trigger_message_id,
             "group_id": payload.group_id,
-            "user_id": payload.user_id,
-            "user_nickname": payload.user_nickname,
-            "bot_nickname": payload.bot_nickname,
+            "user_id": payload.trigger_user_id,
+            "user_nickname": (
+                interaction.display_name
+                if interaction is not None
+                else payload.trigger_user_id
+            ),
+            "bot_nickname": assistant.bot_nickname,
             "reply_content": payload.reply_content,
-            "reply_timestamp": payload.reply_timestamp,
-            "favorability_delta": payload.favorability_delta,
-            "favorability_reason": payload.favorability_reason,
-            "interaction_history": payload.interaction_history,
-            "proactive_reservation_id": payload.proactive_reservation_id,
-            "proactive_cooldown_seconds": payload.proactive_cooldown_seconds,
-            "global_interaction_enabled": payload.global_interaction_enabled,
-            "global_interaction_trigger_size": payload.global_interaction_trigger_size,
+            "reply_timestamp": assistant.reply_timestamp,
+            "favorability_delta": favorability.delta,
+            "favorability_reason": favorability.reason,
+            "interaction_history": (
+                dict(interaction.record) if interaction is not None else {}
+            ),
+            "proactive_reservation_id": (
+                proactive.reservation_id if proactive is not None else None
+            ),
+            "proactive_cooldown_seconds": (
+                proactive.cooldown_seconds if proactive is not None else 0
+            ),
+            "global_interaction_enabled": interaction is not None,
+            "global_interaction_trigger_size": (
+                interaction.trigger_size if interaction is not None else 0
+            ),
             "status": "PREPARED",
             "proactive_confirmed_at": None,
             "favorability_applied_at": None,
@@ -316,6 +336,8 @@ def _pending_reply(
         ),
         force_reply=False,
         bot_nickname="小鞠",
+        bot_self_id="bot-1",
+        adapter_name="onebot.v11",
         reason="score",
         reply_score=0.9,
         operation_id=operation_id,

@@ -17,6 +17,16 @@ from nonebot import logger
 
 from komari_bot.plugins.komari_memory import MessageSchema
 
+from ..reply_fulfillment_domain import (
+    AssistantReplyHistoryPayload,
+    FavorabilityAdjustmentPayload,
+    InteractionHistoryPayload,
+    ProactiveReplyConfirmationPayload,
+    ReplyCommitmentInput,
+    ReplyFulfillmentDraft,
+    build_reply_fulfillment_id,
+    build_reply_fulfillment_payload_hash,
+)
 from ..repositories.reply_commit_repository import (
     PendingReplyCommit,
     ReplyCommitRepository,
@@ -43,6 +53,18 @@ class _PendingReply(Protocol):
     def reply_result(self) -> Any: ...
 
     @property
+    def reply(self) -> str: ...
+
+    @property
+    def reply_to_message_id(self) -> str: ...
+
+    @property
+    def bot_self_id(self) -> str: ...
+
+    @property
+    def adapter_name(self) -> str: ...
+
+    @property
     def bot_nickname(self) -> str: ...
 
     @property
@@ -58,7 +80,7 @@ class _PendingReply(Protocol):
 class _ReplyFulfillmentRepository(Protocol):
     async def has_active_operation(self, operation_id: str) -> bool: ...
 
-    async def prepare(self, payload: PendingReplyCommit) -> bool: ...
+    async def prepare(self, draft: ReplyFulfillmentDraft) -> bool: ...
 
     async def cancel_prepared(self, operation_id: str) -> bool: ...
 
@@ -122,6 +144,239 @@ class ReplyFulfillmentQueryProtocol(Protocol):
     async def is_duplicate_event(self, operation_id: str) -> bool: ...
 
 
+class _LegacyReplyFulfillmentRepository:
+    """contract 前把冻结 Draft 适配到旧宽表。"""
+
+    def __init__(self, repository: ReplyCommitRepository) -> None:
+        self.repository = repository
+
+    @staticmethod
+    def _to_legacy_payload(draft: ReplyFulfillmentDraft) -> PendingReplyCommit:
+        payloads = {
+            item.commitment_type: item.payload for item in draft.commitments
+        }
+        favorability = payloads.get("favorability_adjustment")
+        assistant_history = payloads.get("assistant_reply_history")
+        if not isinstance(
+            favorability, FavorabilityAdjustmentPayload
+        ) or not isinstance(assistant_history, AssistantReplyHistoryPayload):
+            msg = "回复履约缺少固定的好感度或角色回复历史承诺"
+            raise TypeError(msg)
+
+        proactive = payloads.get("proactive_reply_confirmation")
+        interaction = payloads.get("interaction_history")
+        return PendingReplyCommit(
+            operation_id=draft.fulfillment_id,
+            request_trace_id=draft.request_trace_id,
+            source_message_id=draft.trigger_message_id,
+            group_id=draft.group_id,
+            user_id=draft.trigger_user_id,
+            user_nickname=(
+                interaction.display_name
+                if isinstance(interaction, InteractionHistoryPayload)
+                else draft.trigger_user_id
+            ),
+            bot_nickname=assistant_history.bot_nickname,
+            reply_content=draft.reply_content,
+            reply_timestamp=assistant_history.reply_timestamp,
+            favorability_delta=favorability.delta,
+            favorability_reason=favorability.reason,
+            interaction_history=(
+                dict(interaction.record)
+                if isinstance(interaction, InteractionHistoryPayload)
+                else {}
+            ),
+            proactive_reservation_id=(
+                proactive.reservation_id
+                if isinstance(proactive, ProactiveReplyConfirmationPayload)
+                else None
+            ),
+            proactive_cooldown_seconds=(
+                proactive.cooldown_seconds
+                if isinstance(proactive, ProactiveReplyConfirmationPayload)
+                else 0
+            ),
+            global_interaction_enabled=isinstance(
+                interaction, InteractionHistoryPayload
+            ),
+            global_interaction_trigger_size=(
+                interaction.trigger_size
+                if isinstance(interaction, InteractionHistoryPayload)
+                else 1
+            ),
+            frozen_payload_hash=draft.payload_hash,
+        )
+
+    async def has_active_operation(self, operation_id: str) -> bool:
+        return await self.repository.has_active_operation(operation_id)
+
+    async def prepare(self, draft: ReplyFulfillmentDraft) -> bool:
+        return await self.repository.prepare(self._to_legacy_payload(draft))
+
+    async def cancel_prepared(self, operation_id: str) -> bool:
+        return await self.repository.cancel_prepared(operation_id)
+
+    async def mark_delivered(
+        self,
+        operation_id: str,
+        *,
+        platform_message_id: str | None = None,
+    ) -> bool:
+        return await self.repository.mark_delivered(
+            operation_id,
+            platform_message_id=platform_message_id,
+        )
+
+    async def claim_operation(
+        self,
+        operation_id: str,
+        *,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> dict[str, Any] | None:
+        return await self.repository.claim_operation(
+            operation_id,
+            owner_token=owner_token,
+            lease_seconds=lease_seconds,
+        )
+
+    async def claim_pending(
+        self,
+        *,
+        owner_token: str,
+        limit: int,
+        lease_seconds: int,
+    ) -> list[dict[str, Any]]:
+        return await self.repository.claim_pending(
+            owner_token=owner_token,
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+
+    async def renew_lease(
+        self,
+        operation_id: str,
+        *,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> bool:
+        return await self.repository.renew_lease(
+            operation_id,
+            owner_token=owner_token,
+            lease_seconds=lease_seconds,
+        )
+
+    async def mark_step(
+        self,
+        operation_id: str,
+        *,
+        owner_token: str,
+        step: ReplyCommitStep,
+    ) -> bool:
+        return await self.repository.mark_step(
+            operation_id,
+            owner_token=owner_token,
+            step=step,
+        )
+
+    async def complete(self, operation_id: str, *, owner_token: str) -> bool:
+        return await self.repository.complete(operation_id, owner_token=owner_token)
+
+    async def mark_failure(
+        self,
+        operation_id: str,
+        *,
+        owner_token: str,
+        error_code: str,
+        max_attempts: int,
+        retry_base_seconds: int,
+    ) -> str | None:
+        return await self.repository.mark_failure(
+            operation_id,
+            owner_token=owner_token,
+            error_code=error_code,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+        )
+
+    async def cleanup_tombstones(self, *, retention_days: int) -> int:
+        return await self.repository.cleanup_tombstones(
+            retention_days=retention_days
+        )
+
+
+def build_reply_fulfillment_commitments(
+    *,
+    group_id: str,
+    user_id: str,
+    bot_nickname: str,
+    reply_content: str,
+    reply_timestamp: float,
+    trigger_message_id: str,
+    display_name: str,
+    favorability_delta: int,
+    favorability_reason: str,
+    interaction_history: dict[str, str],
+    proactive_reservation_id: str | None,
+    proactive_cooldown_seconds: int,
+    global_interaction_enabled: bool,
+    global_interaction_trigger_size: int,
+) -> tuple[ReplyCommitmentInput, ...]:
+    """按固定顺序冻结本次适用的承诺子集。
+
+    主动回复确认只在存在生成期预占时适用；互动历史只在动态功能开启时
+    适用；好感度调整与角色回复历史始终适用。不开放动态承诺注册。
+    """
+    commitments: list[ReplyCommitmentInput] = []
+    if proactive_reservation_id is not None:
+        commitments.append(
+            ReplyCommitmentInput(
+                commitment_type="proactive_reply_confirmation",
+                payload=ProactiveReplyConfirmationPayload(
+                    group_id=group_id,
+                    reservation_id=proactive_reservation_id,
+                    cooldown_seconds=proactive_cooldown_seconds,
+                ),
+            )
+        )
+    commitments.append(
+        ReplyCommitmentInput(
+            commitment_type="favorability_adjustment",
+            payload=FavorabilityAdjustmentPayload(
+                user_id=user_id,
+                delta=favorability_delta,
+                reason=favorability_reason,
+            ),
+        )
+    )
+    commitments.append(
+        ReplyCommitmentInput(
+            commitment_type="assistant_reply_history",
+            payload=AssistantReplyHistoryPayload(
+                group_id=group_id,
+                bot_nickname=bot_nickname,
+                reply_content=reply_content,
+                reply_timestamp=reply_timestamp,
+            ),
+        )
+    )
+    if global_interaction_enabled:
+        commitments.append(
+            ReplyCommitmentInput(
+                commitment_type="interaction_history",
+                payload=InteractionHistoryPayload(
+                    user_id=user_id,
+                    display_name=display_name,
+                    trigger_size=global_interaction_trigger_size,
+                    reply_timestamp=reply_timestamp,
+                    trigger_message_id=trigger_message_id,
+                    record=dict(interaction_history),
+                ),
+            )
+        )
+    return tuple(commitments)
+
+
 class ReplyFulfillmentWorkflow:
     """统一执行单条回复履约。"""
 
@@ -165,39 +420,68 @@ class ReplyFulfillmentWorkflow:
         return value or None
 
     async def _prepare(self, pending_reply: _PendingReply) -> bool:
-        """注入履约工作流配置后准备一条不可变履约。"""
+        """注入履约工作流配置后准备一条不可变履约 Draft。"""
         config = self.config_getter()
-        memory_config = self.config_getter()
         favorability_delta = pending_reply.reply_result.favorability_delta
         if favorability_delta is None:
             msg = "favorability_delta missing"
             raise ValueError(msg)
+        favorability_reason = pending_reply.reply_result.favorability_reason
+        if not favorability_reason:
+            msg = "favorability_reason missing"
+            raise ValueError(msg)
         interaction_history = pending_reply.reply_result.interaction_history
-        payload = PendingReplyCommit(
-            operation_id=pending_reply.operation_id,
-            request_trace_id=pending_reply.request_trace_id,
-            source_message_id=pending_reply.message.message_id,
+        if interaction_history is None:
+            msg = "interaction_history missing"
+            raise ValueError(msg)
+        interaction_record = {
+            "event": str(interaction_history["event"]),
+            "result": str(interaction_history["result"]),
+            "emotion": str(interaction_history["emotion"]),
+        }
+        display_name = self._resolve_display_name(pending_reply.message)
+        commitments = build_reply_fulfillment_commitments(
             group_id=pending_reply.message.group_id,
             user_id=pending_reply.message.user_id,
-            user_nickname=self._resolve_display_name(pending_reply.message),
             bot_nickname=pending_reply.bot_nickname,
-            reply_content=pending_reply.reply_result.content,
+            reply_content=pending_reply.reply,
             reply_timestamp=pending_reply.reply_timestamp,
+            trigger_message_id=pending_reply.message.message_id,
+            display_name=display_name,
             favorability_delta=favorability_delta,
-            favorability_reason=pending_reply.reply_result.favorability_reason,
-            interaction_history={
-                "event": str(interaction_history["event"]),
-                "result": str(interaction_history["result"]),
-                "emotion": str(interaction_history["emotion"]),
-            },
+            favorability_reason=favorability_reason,
+            interaction_history=interaction_record,
             proactive_reservation_id=pending_reply.proactive_reservation_id,
             proactive_cooldown_seconds=int(config.proactive_cooldown),
-            global_interaction_enabled=bool(memory_config.global_interaction_enabled),
+            global_interaction_enabled=bool(config.global_interaction_enabled),
             global_interaction_trigger_size=int(
-                memory_config.global_interaction_trigger_size
+                config.global_interaction_trigger_size
             ),
         )
-        return await self.repository.prepare(payload)
+        draft = ReplyFulfillmentDraft(
+            fulfillment_id=pending_reply.operation_id,
+            payload_hash=build_reply_fulfillment_payload_hash(
+                fulfillment_id=pending_reply.operation_id,
+                trigger_message_id=pending_reply.message.message_id,
+                trigger_user_id=pending_reply.message.user_id,
+                group_id=pending_reply.message.group_id,
+                bot_self_id=pending_reply.bot_self_id,
+                adapter_name=pending_reply.adapter_name,
+                reply_target_message_id=pending_reply.reply_to_message_id,
+                reply_content=pending_reply.reply,
+                commitments=commitments,
+            ),
+            request_trace_id=pending_reply.request_trace_id,
+            trigger_message_id=pending_reply.message.message_id,
+            trigger_user_id=pending_reply.message.user_id,
+            group_id=pending_reply.message.group_id,
+            bot_self_id=pending_reply.bot_self_id,
+            adapter_name=pending_reply.adapter_name,
+            reply_target_message_id=pending_reply.reply_to_message_id,
+            reply_content=pending_reply.reply,
+            commitments=commitments,
+        )
+        return await self.repository.prepare(draft)
 
     async def _release_reservation(self, pending_reply: _PendingReply) -> None:
         reservation = pending_reply.proactive_reservation
@@ -512,7 +796,7 @@ def build_reply_fulfillment_workflow(
 ) -> ReplyFulfillmentWorkflow:
     """在 composition root 创建工作流并隐藏旧宽表 adapter。"""
     return ReplyFulfillmentWorkflow(
-        repository=ReplyCommitRepository(pg_pool),
+        repository=_LegacyReplyFulfillmentRepository(ReplyCommitRepository(pg_pool)),
         redis=redis,
         proactive_reservation=proactive_reservation,
         user_data=user_data,
@@ -523,5 +807,6 @@ def build_reply_fulfillment_workflow(
 __all__ = [
     "ReplyFulfillmentQueryProtocol",
     "ReplyFulfillmentWorkflow",
+    "build_reply_fulfillment_id",
     "build_reply_fulfillment_workflow",
 ]

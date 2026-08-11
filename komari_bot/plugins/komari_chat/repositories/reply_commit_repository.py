@@ -10,6 +10,8 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..reply_fulfillment_domain import ReplyFulfillmentConflictError
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -48,9 +50,12 @@ class PendingReplyCommit:
     proactive_cooldown_seconds: int
     global_interaction_enabled: bool
     global_interaction_trigger_size: int
+    frozen_payload_hash: str | None = None
 
     def payload_hash(self) -> str:
         """计算载荷指纹，用于检测 operation ID 碰撞。"""
+        if self.frozen_payload_hash is not None:
+            return self.frozen_payload_hash
         payload = {
             "operation_id": self.operation_id,
             "request_trace_id": self.request_trace_id,
@@ -85,7 +90,7 @@ class ReplyCommitRepository:
         self.pg_pool = pg_pool
 
     async def has_active_operation(self, operation_id: str) -> bool:
-        """判断同一平台事件是否已有不可重发的意图或 tombstone。"""
+        """判断同一平台事件是否已有履约记录或终态身份。"""
         async with self.pg_pool.acquire() as connection:
             exists = await connection.fetchval(
                 """
@@ -93,7 +98,6 @@ class ReplyCommitRepository:
                     SELECT 1
                     FROM komari_chat_reply_commit_outbox
                     WHERE operation_id = $1
-                      AND status <> 'CANCELLED'
                 )
                 """,
                 operation_id,
@@ -101,10 +105,10 @@ class ReplyCommitRepository:
         return bool(exists)
 
     async def prepare(self, payload: PendingReplyCommit) -> bool:
-        """插入发送意图；活动 operation 已存在时返回 False。"""
+        """原子插入发送意图，并区分幂等重投与履约冲突。"""
         payload_hash = payload.payload_hash()
-        async with self.pg_pool.acquire() as connection:
-            row = await connection.fetchrow(
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            inserted = await connection.fetchval(
                 """
                 INSERT INTO komari_chat_reply_commit_outbox (
                     operation_id, payload_hash, request_trace_id,
@@ -120,39 +124,8 @@ class ReplyCommitRepository:
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                     $11, $12, $13::jsonb, $14, $15, $16, $17, 'PREPARED'
                 )
-                ON CONFLICT (operation_id) DO UPDATE
-                SET payload_hash = EXCLUDED.payload_hash,
-                    request_trace_id = EXCLUDED.request_trace_id,
-                    source_message_id = EXCLUDED.source_message_id,
-                    platform_message_id = NULL,
-                    group_id = EXCLUDED.group_id,
-                    user_id = EXCLUDED.user_id,
-                    user_nickname = EXCLUDED.user_nickname,
-                    bot_nickname = EXCLUDED.bot_nickname,
-                    reply_content = EXCLUDED.reply_content,
-                    reply_timestamp = EXCLUDED.reply_timestamp,
-                    favorability_delta = EXCLUDED.favorability_delta,
-                    favorability_reason = EXCLUDED.favorability_reason,
-                    interaction_history = EXCLUDED.interaction_history,
-                    proactive_reservation_id = EXCLUDED.proactive_reservation_id,
-                    proactive_cooldown_seconds = EXCLUDED.proactive_cooldown_seconds,
-                    global_interaction_enabled = EXCLUDED.global_interaction_enabled,
-                    global_interaction_trigger_size = EXCLUDED.global_interaction_trigger_size,
-                    status = 'PREPARED',
-                    proactive_confirmed_at = NULL,
-                    favorability_applied_at = NULL,
-                    ai_history_stored_at = NULL,
-                    interaction_stored_at = NULL,
-                    attempt_count = 0,
-                    next_retry_at = NULL,
-                    lease_owner = NULL,
-                    lease_expires_at = NULL,
-                    last_error_code = NULL,
-                    delivered_at = NULL,
-                    completed_at = NULL,
-                    updated_at = NOW()
-                WHERE komari_chat_reply_commit_outbox.status = 'CANCELLED'
-                RETURNING operation_id
+                ON CONFLICT (operation_id) DO NOTHING
+                RETURNING payload_hash
                 """,
                 payload.operation_id,
                 payload_hash,
@@ -172,7 +145,24 @@ class ReplyCommitRepository:
                 payload.global_interaction_enabled,
                 payload.global_interaction_trigger_size,
             )
-        return row is not None
+            if inserted is not None:
+                return True
+            existing_hash = await connection.fetchval(
+                """
+                SELECT payload_hash
+                FROM komari_chat_reply_commit_outbox
+                WHERE operation_id = $1
+                FOR SHARE
+                """,
+                payload.operation_id,
+            )
+        if existing_hash is None:
+            msg = "回复履约准备后未读取到持久身份"
+            raise RuntimeError(msg)
+        if str(existing_hash) != payload_hash:
+            msg = f"履约冲突: {payload.operation_id}"
+            raise ReplyFulfillmentConflictError(msg)
+        return False
 
     async def cancel_prepared(self, operation_id: str) -> bool:
         """发送失败时只取消尚未确认送达的意图并清除正文。"""
