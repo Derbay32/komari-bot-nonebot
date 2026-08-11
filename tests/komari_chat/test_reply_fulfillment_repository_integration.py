@@ -426,6 +426,22 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
         assert expired[0]["not_delivered_at"] is not None
 
         async with pool.acquire() as connection:
+            stale = await connection.fetchrow(
+                """
+                SELECT delivery_state, send_started_at, reply_content
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                stale_id,
+            )
+            stale_children = await connection.fetch(
+                """
+                SELECT state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                stale_id,
+            )
             mismatch = await connection.fetchrow(
                 """
                 SELECT delivery_state, send_started_at
@@ -434,6 +450,12 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
                 """,
                 mismatch_id,
             )
+        assert stale["delivery_state"] == "NOT_DELIVERED"
+        assert stale["send_started_at"] is None
+        assert stale["reply_content"] is None
+        assert len(stale_children) == 4
+        assert all(row["state"] == "PENDING" for row in stale_children)
+        assert all(row["payload"] is None for row in stale_children)
         assert mismatch["delivery_state"] == "NOT_STARTED"
         assert mismatch["send_started_at"] is None
 
