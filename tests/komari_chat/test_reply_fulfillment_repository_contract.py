@@ -62,7 +62,7 @@ def test_repository_contains_no_runtime_ddl() -> None:
 
 
 def test_new_adapter_is_not_wired_into_active_chat_path_yet() -> None:
-    """TSK-79 只 expand 存储；正常聊天继续使用旧 adapter，禁止双读写。"""
+    """contract 前只扩展履约能力；正常聊天继续使用旧 adapter，禁止双读写。"""
     project_root = Path(__file__).resolve().parents[2]
     workflow_source = (
         project_root
