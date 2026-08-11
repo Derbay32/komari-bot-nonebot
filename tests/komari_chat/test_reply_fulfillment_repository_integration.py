@@ -169,11 +169,14 @@ async def test_claimed_commitments_include_validated_payloads_in_domain_order() 
     fulfillment_id = f"claimed-payloads-{uuid4().hex}"
     async with _repository_context([fulfillment_id]) as (repository, _pool):
         await _prepare_delivered(repository, fulfillment_id)
-        assert await repository.claim_operation(
-            fulfillment_id,
-            owner_token="worker-1",
-            lease_seconds=60,
-        ) is not None
+        assert (
+            await repository.claim_operation(
+                fulfillment_id,
+                owner_token="worker-1",
+                lease_seconds=60,
+            )
+            is not None
+        )
 
         commitments = await repository.load_claimed_commitments(
             fulfillment_id,
@@ -296,10 +299,13 @@ async def test_delivery_fact_only_moves_forward() -> None:
         assert await repository.prepare(_draft(delivered_id)) is True
         assert await repository.mark_delivered(delivered_id) is False
         assert await repository.mark_send_started(delivered_id) is True
-        assert await repository.mark_delivered(
-            delivered_id,
-            platform_message_id="platform-1",
-        ) is True
+        assert (
+            await repository.mark_delivered(
+                delivered_id,
+                platform_message_id="platform-1",
+            )
+            is True
+        )
         assert await repository.mark_not_delivered(delivered_id) is False
 
         assert await repository.prepare(_draft(not_delivered_id)) is True
@@ -333,14 +339,20 @@ async def test_delivery_confirmation_is_idempotent_and_conflicts_are_rejected() 
     async with _repository_context([fulfillment_id]) as (repository, pool):
         assert await repository.prepare(_draft(fulfillment_id)) is True
         assert await repository.mark_send_started(fulfillment_id) is True
-        assert await repository.mark_delivered(
-            fulfillment_id,
-            platform_message_id="platform-1",
-        ) is True
-        assert await repository.mark_delivered(
-            fulfillment_id,
-            platform_message_id="platform-1",
-        ) is True
+        assert (
+            await repository.mark_delivered(
+                fulfillment_id,
+                platform_message_id="platform-1",
+            )
+            is True
+        )
+        assert (
+            await repository.mark_delivered(
+                fulfillment_id,
+                platform_message_id="platform-1",
+            )
+            is True
+        )
         with pytest.raises(ValueError, match="平台消息 ID 冲突"):
             await repository.mark_delivered(
                 fulfillment_id,
@@ -473,9 +485,7 @@ async def test_claim_pending_is_disjoint_and_skips_locked_parent() -> None:
                 ),
                 timeout=1,
             )
-            assert remaining_id not in {
-                row["fulfillment_id"] for row in skipped
-            }
+            assert remaining_id not in {row["fulfillment_id"] for row in skipped}
         finally:
             await transaction.rollback()
             await pool.release(locker)
@@ -485,9 +495,7 @@ async def test_claim_pending_is_disjoint_and_skips_locked_parent() -> None:
             limit=10,
             lease_seconds=60,
         )
-        assert {row["fulfillment_id"] for row in claimed_after_unlock} == {
-            remaining_id
-        }
+        assert {row["fulfillment_id"] for row in claimed_after_unlock} == {remaining_id}
 
 
 async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
@@ -495,16 +503,22 @@ async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
     fulfillment_id = f"lease-reclaim-{uuid4().hex}"
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
-        assert await repository.claim_operation(
-            fulfillment_id,
-            owner_token="old-owner",
-            lease_seconds=60,
-        ) is not None
-        assert await repository.renew_lease(
-            fulfillment_id,
-            owner_token="old-owner",
-            lease_seconds=60,
-        ) is True
+        assert (
+            await repository.claim_operation(
+                fulfillment_id,
+                owner_token="old-owner",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        assert (
+            await repository.renew_lease(
+                fulfillment_id,
+                owner_token="old-owner",
+                lease_seconds=60,
+            )
+            is True
+        )
 
         async with pool.acquire() as connection:
             await connection.execute(
@@ -516,11 +530,14 @@ async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
                 fulfillment_id,
             )
 
-        assert await repository.renew_lease(
-            fulfillment_id,
-            owner_token="old-owner",
-            lease_seconds=60,
-        ) is False
+        assert (
+            await repository.renew_lease(
+                fulfillment_id,
+                owner_token="old-owner",
+                lease_seconds=60,
+            )
+            is False
+        )
         reclaimed = await repository.claim_operation(
             fulfillment_id,
             owner_token="new-owner",
@@ -529,24 +546,33 @@ async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
         assert reclaimed is not None
         assert reclaimed["lease_owner"] == "new-owner"
 
-        assert await repository.mark_commitment_completed(
-            fulfillment_id,
-            commitment_type="favorability_adjustment",
-            owner_token="old-owner",
-        ) is False
-        assert await repository.mark_commitment_failed(
-            fulfillment_id,
-            commitment_type="favorability_adjustment",
-            owner_token="old-owner",
-            error_code="stale_owner",
-            max_attempts=3,
-            retry_base_seconds=1,
-            retry_max_seconds=3600,
-        ) is None
-        assert await repository.complete_fulfillment(
-            fulfillment_id,
-            owner_token="old-owner",
-        ) is False
+        assert (
+            await repository.mark_commitment_completed(
+                fulfillment_id,
+                commitment_type="favorability_adjustment",
+                owner_token="old-owner",
+            )
+            is False
+        )
+        assert (
+            await repository.mark_commitment_failed(
+                fulfillment_id,
+                commitment_type="favorability_adjustment",
+                owner_token="old-owner",
+                error_code="stale_owner",
+                max_attempts=3,
+                retry_base_seconds=1,
+                retry_max_seconds=3600,
+            )
+            is None
+        )
+        assert (
+            await repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token="old-owner",
+            )
+            is False
+        )
 
 
 async def test_commitments_retry_independently_and_gate_parent_completion() -> None:
@@ -554,11 +580,14 @@ async def test_commitments_retry_independently_and_gate_parent_completion() -> N
     fulfillment_id = f"child-retry-{uuid4().hex}"
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
-        assert await repository.claim_operation(
-            fulfillment_id,
-            owner_token="worker-1",
-            lease_seconds=60,
-        ) is not None
+        assert (
+            await repository.claim_operation(
+                fulfillment_id,
+                owner_token="worker-1",
+                lease_seconds=60,
+            )
+            is not None
+        )
 
         failure_state = await repository.mark_commitment_failed(
             fulfillment_id,
@@ -576,25 +605,37 @@ async def test_commitments_retry_independently_and_gate_parent_completion() -> N
             "assistant_reply_history",
             "interaction_history",
         ):
-            assert await repository.mark_commitment_completed(
-                fulfillment_id,
-                commitment_type=commitment_type,
-                owner_token="worker-1",
-            ) is True
+            assert (
+                await repository.mark_commitment_completed(
+                    fulfillment_id,
+                    commitment_type=commitment_type,
+                    owner_token="worker-1",
+                )
+                is True
+            )
 
-        assert await repository.complete_fulfillment(
-            fulfillment_id,
-            owner_token="worker-1",
-        ) is False
-        assert await repository.release_lease(
-            fulfillment_id,
-            owner_token="worker-1",
-        ) is True
-        assert await repository.claim_pending(
-            owner_token="worker-2",
-            limit=10,
-            lease_seconds=60,
-        ) == []
+        assert (
+            await repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token="worker-1",
+            )
+            is False
+        )
+        assert (
+            await repository.release_lease(
+                fulfillment_id,
+                owner_token="worker-1",
+            )
+            is True
+        )
+        assert (
+            await repository.claim_pending(
+                owner_token="worker-2",
+                limit=10,
+                lease_seconds=60,
+            )
+            == []
+        )
 
         async with pool.acquire() as connection:
             await connection.execute(
@@ -613,15 +654,21 @@ async def test_commitments_retry_independently_and_gate_parent_completion() -> N
             lease_seconds=60,
         )
         assert {row["fulfillment_id"] for row in reclaimed} == {fulfillment_id}
-        assert await repository.mark_commitment_completed(
-            fulfillment_id,
-            commitment_type="favorability_adjustment",
-            owner_token="worker-2",
-        ) is True
-        assert await repository.complete_fulfillment(
-            fulfillment_id,
-            owner_token="worker-2",
-        ) is True
+        assert (
+            await repository.mark_commitment_completed(
+                fulfillment_id,
+                commitment_type="favorability_adjustment",
+                owner_token="worker-2",
+            )
+            is True
+        )
+        assert (
+            await repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token="worker-2",
+            )
+            is True
+        )
 
         async with pool.acquire() as connection:
             parent = await connection.fetchrow(
@@ -659,35 +706,47 @@ async def test_exhausted_child_blocks_completion_without_poisoning_siblings() ->
     fulfillment_id = f"child-failed-{uuid4().hex}"
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
-        assert await repository.claim_operation(
-            fulfillment_id,
-            owner_token="worker-1",
-            lease_seconds=60,
-        ) is not None
+        assert (
+            await repository.claim_operation(
+                fulfillment_id,
+                owner_token="worker-1",
+                lease_seconds=60,
+            )
+            is not None
+        )
 
         for commitment_type in (
             "proactive_reply_confirmation",
             "assistant_reply_history",
             "interaction_history",
         ):
-            assert await repository.mark_commitment_completed(
+            assert (
+                await repository.mark_commitment_completed(
+                    fulfillment_id,
+                    commitment_type=commitment_type,
+                    owner_token="worker-1",
+                )
+                is True
+            )
+        assert (
+            await repository.mark_commitment_failed(
                 fulfillment_id,
-                commitment_type=commitment_type,
+                commitment_type="favorability_adjustment",
                 owner_token="worker-1",
-            ) is True
-        assert await repository.mark_commitment_failed(
-            fulfillment_id,
-            commitment_type="favorability_adjustment",
-            owner_token="worker-1",
-            error_code="invalid_payload",
-            max_attempts=1,
-            retry_base_seconds=1,
-            retry_max_seconds=3600,
-        ) == "FAILED"
-        assert await repository.complete_fulfillment(
-            fulfillment_id,
-            owner_token="worker-1",
-        ) is False
+                error_code="invalid_payload",
+                max_attempts=1,
+                retry_base_seconds=1,
+                retry_max_seconds=3600,
+            )
+            == "FAILED"
+        )
+        assert (
+            await repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token="worker-1",
+            )
+            is False
+        )
 
         async with pool.acquire() as connection:
             rows = await connection.fetch(

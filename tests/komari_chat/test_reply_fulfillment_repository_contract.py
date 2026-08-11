@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from contextlib import asynccontextmanager
 from importlib import import_module
 from pathlib import Path
 from types import MappingProxyType
@@ -124,6 +126,54 @@ def test_draft_requires_fixed_core_commitments_in_domain_order() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_claimed_commitments_decode_asyncpg_jsonb_text() -> None:
+    """asyncpg 默认返回的 JSONB 文本必须解码后再进入领域载荷校验。"""
+    module = _repository_module()
+
+    class _Connection:
+        async def fetchval(self, *_args: object) -> int:
+            return 1
+
+        async def fetch(self, *_args: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "commitment_type": "favorability_adjustment",
+                    "payload": json.dumps(
+                        {
+                            "user_id": "user-1",
+                            "delta": 1,
+                            "reason": "正常互动",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ]
+
+    class _Pool:
+        @asynccontextmanager
+        async def acquire(self) -> Any:
+            yield _Connection()
+
+    repository = module.ReplyFulfillmentRepository(_Pool())
+
+    commitments = await repository.load_claimed_commitments(
+        "reply-jsonb",
+        owner_token="worker-1",
+    )
+
+    assert commitments == [
+        {
+            "commitment_type": "favorability_adjustment",
+            "payload": {
+                "user_id": "user-1",
+                "delta": 1,
+                "reason": "正常互动",
+            },
+        }
+    ]
+
+
 def test_repository_contains_no_runtime_ddl() -> None:
     """运行时 adapter 只操作迁移管理的表，绝不创建或修改 schema。"""
     module = _repository_module()
@@ -146,8 +196,7 @@ def test_new_adapter_is_not_wired_into_active_chat_path_yet() -> None:
         project_root / "komari_bot/plugins/komari_chat/__init__.py"
     ).read_text(encoding="utf-8")
     handler_source = (
-        project_root
-        / "komari_bot/plugins/komari_chat/handlers/message_handler.py"
+        project_root / "komari_bot/plugins/komari_chat/handlers/message_handler.py"
     ).read_text(encoding="utf-8")
 
     assert "reply_fulfillment_repository" not in workflow_source

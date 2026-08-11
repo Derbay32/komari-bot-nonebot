@@ -27,9 +27,12 @@ class _CommitmentRepository:
         self.children: dict[str, dict[str, dict[str, Any]]] = {}
         self.load_in_reverse = False
         self.completion_mark_lost_for: set[str] = set()
+        self.completion_mark_error_for: set[str] = set()
         self.claim_lease_seconds: list[int] = []
         self.failure_policies: list[tuple[str, int, int, int]] = []
         self.renew_count = 0
+        self.renew_result: bool | None = None
+        self.release_count = 0
 
     def seed(
         self,
@@ -88,10 +91,7 @@ class _CommitmentRepository:
             children = self.children[fulfillment_id].values()
             has_due = any(
                 child["state"] == "PENDING"
-                or (
-                    child["state"] == "RETRY_WAIT"
-                    and child["next_retry_due"]
-                )
+                or (child["state"] == "RETRY_WAIT" and child["next_retry_due"])
                 for child in children
             )
             if (
@@ -118,10 +118,7 @@ class _CommitmentRepository:
             dict(child)
             for child in self.children[fulfillment_id].values()
             if child["state"] == "PENDING"
-            or (
-                child["state"] == "RETRY_WAIT"
-                and child["next_retry_due"]
-            )
+            or (child["state"] == "RETRY_WAIT" and child["next_retry_due"])
         ]
         if self.load_in_reverse:
             rows.reverse()
@@ -136,6 +133,8 @@ class _CommitmentRepository:
     ) -> bool:
         del lease_seconds
         self.renew_count += 1
+        if self.renew_result is not None:
+            return self.renew_result
         return self.parents[fulfillment_id]["lease_owner"] == owner_token
 
     async def release_lease(
@@ -147,6 +146,7 @@ class _CommitmentRepository:
         parent = self.parents[fulfillment_id]
         if parent["lease_owner"] != owner_token:
             return False
+        self.release_count += 1
         parent["lease_owner"] = None
         return True
 
@@ -158,6 +158,9 @@ class _CommitmentRepository:
         owner_token: str,
     ) -> bool:
         parent = self.parents[fulfillment_id]
+        if commitment_type in self.completion_mark_error_for:
+            self.completion_mark_error_for.remove(commitment_type)
+            raise ConnectionError("完成标记数据库暂不可用")
         if commitment_type in self.completion_mark_lost_for:
             self.completion_mark_lost_for.remove(commitment_type)
             parent["lease_owner"] = None
@@ -380,6 +383,8 @@ def _workflow(
     module: Any,
     repository: _CommitmentRepository,
     config: SimpleNamespace,
+    *,
+    config_getter: Any = None,
 ) -> tuple[Any, list[str], _Redis, _ProactiveReservation, _UserData]:
     events: list[str] = []
     redis = _Redis(events)
@@ -390,7 +395,7 @@ def _workflow(
         redis=redis,
         proactive_reservation=proactive,
         user_data=user_data,
-        config_getter=lambda: config,
+        config_getter=config_getter or (lambda: config),
     )
     return workflow, events, redis, proactive, user_data
 
@@ -487,9 +492,7 @@ async def test_multiple_failures_keep_independent_budgets_and_use_latest_policy(
     assert assistant_child.state == "RETRY_WAIT"
     assert proactive_child.attempt_count == 1
     assert assistant_child.attempt_count == 1
-    assert repository.snapshot(
-        "reply-multi-retry", "favorability_adjustment"
-    ).completed
+    assert repository.snapshot("reply-multi-retry", "favorability_adjustment").completed
     assert repository.snapshot("reply-multi-retry", "interaction_history").completed
 
     config.reply_commit_max_attempts = 1
@@ -505,12 +508,14 @@ async def test_multiple_failures_keep_independent_budgets_and_use_latest_policy(
         "proactive_reply_confirmation",
         "assistant_reply_history",
     ]
-    assert repository.snapshot(
-        "reply-multi-retry", "proactive_reply_confirmation"
-    ).state == "FAILED"
-    assert repository.snapshot(
-        "reply-multi-retry", "assistant_reply_history"
-    ).state == "FAILED"
+    assert (
+        repository.snapshot("reply-multi-retry", "proactive_reply_confirmation").state
+        == "FAILED"
+    )
+    assert (
+        repository.snapshot("reply-multi-retry", "assistant_reply_history").state
+        == "FAILED"
+    )
     assert repository.parent_completed("reply-multi-retry") is False
     assert repository.claim_lease_seconds[-1] == 60
     assert repository.failure_policies[-2:] == [
@@ -520,6 +525,41 @@ async def test_multiple_failures_keep_independent_budgets_and_use_latest_policy(
     assert await workflow.recover_pending() == 0
     assert proactive.calls == 2
     assert redis.assistant_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_policy_is_read_when_each_failure_is_recorded(
+    workflow_module: Any,
+) -> None:
+    repository = _CommitmentRepository()
+    repository.seed("reply-live-policy")
+    config = _config()
+    updated_config = _config()
+    updated_config.reply_commit_max_attempts = 9
+    updated_config.reply_commit_retry_base_seconds = 10
+    updated_config.reply_fulfillment_retry_max_seconds = 11
+    reads = 0
+
+    def _get_config() -> SimpleNamespace:
+        nonlocal reads
+        reads += 1
+        return config if reads <= 2 else updated_config
+
+    workflow, _events, _redis, proactive, user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+        config_getter=_get_config,
+    )
+    proactive.error = TimeoutError("主动回复超时")
+    user_data.error = TimeoutError("好感度超时")
+
+    assert await workflow.recover_pending() == 0
+
+    assert repository.failure_policies[:2] == [
+        ("proactive_reply_confirmation", 3, 2, 7),
+        ("favorability_adjustment", 9, 10, 11),
+    ]
 
 
 @pytest.mark.asyncio
@@ -593,6 +633,28 @@ async def test_known_permanent_errors_enter_disposition_immediately(
 
 
 @pytest.mark.asyncio
+async def test_value_error_idempotency_conflict_enters_disposition_immediately(
+    workflow_module: Any,
+) -> None:
+    repository = _CommitmentRepository()
+    repository.seed("reply-ledger-conflict")
+    config = _config()
+    workflow, _events, _redis, _proactive, user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+    )
+    user_data.error = ValueError("好感度 operation_id 与既有请求载荷冲突")
+
+    assert await workflow.recover_pending() == 0
+
+    child = repository.snapshot("reply-ledger-conflict", "favorability_adjustment")
+    assert child.state == "FAILED"
+    assert child.attempt_count == 1
+    assert child.last_error_code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
 async def test_dynamic_service_shutdown_retries_without_revoking_commitment(
     workflow_module: Any,
 ) -> None:
@@ -608,9 +670,7 @@ async def test_dynamic_service_shutdown_retries_without_revoking_commitment(
 
     assert await workflow.recover_pending() == 0
 
-    child = repository.snapshot(
-        "reply-service-disabled", "favorability_adjustment"
-    )
+    child = repository.snapshot("reply-service-disabled", "favorability_adjustment")
     assert child.state == "RETRY_WAIT"
     assert child.completed is False
     assert child.last_error_code == "service_unavailable"
@@ -638,9 +698,10 @@ async def test_lease_loss_stops_the_executor_and_idempotent_recovery_finishes(
         "proactive_reply_confirmation",
         "favorability_adjustment",
     ]
-    assert repository.snapshot(
-        "reply-lease-lost", "favorability_adjustment"
-    ).attempt_count == 0
+    assert (
+        repository.snapshot("reply-lease-lost", "favorability_adjustment").attempt_count
+        == 0
+    )
     assert repository.failure_policies == []
     assert redis.assistant_calls == 0
     assert redis.interaction_calls == 0
@@ -657,6 +718,28 @@ async def test_lease_loss_stops_the_executor_and_idempotent_recovery_finishes(
     assert user_data.calls == 2
     assert user_data.application_count == 1
     assert repository.parent_completed("reply-lease-lost") is True
+
+
+@pytest.mark.asyncio
+async def test_completion_mark_error_releases_lease_and_next_parent_still_runs(
+    workflow_module: Any,
+) -> None:
+    repository = _CommitmentRepository()
+    repository.seed("reply-mark-error")
+    repository.seed("reply-after-error")
+    repository.completion_mark_error_for.add("favorability_adjustment")
+    config = _config()
+    workflow, _events, _redis, _proactive, _user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+    )
+
+    assert await workflow.recover_pending() == 1
+
+    assert repository.parent_completed("reply-mark-error") is False
+    assert repository.has_lease("reply-mark-error") is False
+    assert repository.parent_completed("reply-after-error") is True
 
 
 @pytest.mark.asyncio
@@ -696,6 +779,46 @@ async def test_long_running_commitment_renews_the_single_parent_lease(
     renew_count = repository.renew_count
     await original_sleep(0)
     assert repository.renew_count == renew_count
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loss_stops_before_marking_and_releases_owned_lease(
+    workflow_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _CommitmentRepository()
+    repository.seed("reply-heartbeat-lost")
+    repository.renew_result = False
+    config = _config()
+    config.reply_commit_lease_seconds = 1
+    workflow, _events, _redis, _proactive, user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+    )
+    user_data.block = True
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_delay: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(workflow_module.asyncio, "sleep", _fast_sleep)
+    task = asyncio.create_task(workflow.recover_pending())
+    await user_data.started.wait()
+    for _ in range(20):
+        if repository.renew_count:
+            break
+        await original_sleep(0)
+    user_data.resume.set()
+
+    assert await task == 0
+    assert repository.renew_count >= 1
+    child = repository.snapshot("reply-heartbeat-lost", "favorability_adjustment")
+    assert child.attempt_count == 0
+    assert child.completed is False
+    assert repository.release_count == 1
+    assert repository.has_lease("reply-heartbeat-lost") is False
 
 
 @pytest.mark.asyncio
