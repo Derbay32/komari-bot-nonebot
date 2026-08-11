@@ -295,6 +295,8 @@ class _Redis:
         self.interaction_error: BaseException | None = None
         self.assistant_calls = 0
         self.interaction_calls = 0
+        self.assistant_ttls: list[int | None] = []
+        self.interaction_ttls: list[int | None] = []
         self._assistant_operations: set[str] = set()
         self._interaction_operations: set[str] = set()
 
@@ -304,9 +306,9 @@ class _Redis:
         _message: object,
         *,
         operation_id: str,
-        dedupe_ttl_seconds: int,
+        dedupe_ttl_seconds: int | None = None,
     ) -> bool:
-        del dedupe_ttl_seconds
+        self.assistant_ttls.append(dedupe_ttl_seconds)
         self.assistant_calls += 1
         self.events.append("assistant_reply_history")
         if self.assistant_error is not None:
@@ -322,9 +324,10 @@ class _Redis:
         record: dict[str, object],
         trigger_size: int,
         operation_id: str,
-        dedupe_ttl_seconds: int,
+        dedupe_ttl_seconds: int | None = None,
     ) -> bool:
-        del user_id, record, trigger_size, dedupe_ttl_seconds
+        del user_id, record, trigger_size
+        self.interaction_ttls.append(dedupe_ttl_seconds)
         self.interaction_calls += 1
         self.events.append("interaction_history")
         if self.interaction_error is not None:
@@ -932,3 +935,24 @@ async def test_only_delivered_fulfillments_run_their_frozen_subset(
     assert redis.interaction_calls == 0
     assert repository.parent_completed("reply-core-only") is True
     assert repository.parent_completed("reply-pending-confirmation") is False
+
+
+@pytest.mark.asyncio
+async def test_unresolved_fulfillment_uses_persistent_redis_idempotency_evidence(
+    workflow_module: Any,
+) -> None:
+    repository = _CommitmentRepository()
+    repository.seed("reply-persistent-evidence")
+    config = _config()
+    workflow, _events, redis, _proactive, user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+    )
+    user_data.error = TimeoutError("保持履约未解决")
+
+    assert await workflow.recover_pending() == 0
+
+    assert redis.assistant_ttls == [None]
+    assert redis.interaction_ttls == [None]
+    assert repository.parent_completed("reply-persistent-evidence") is False

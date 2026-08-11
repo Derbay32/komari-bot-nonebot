@@ -395,6 +395,47 @@ def test_reply_delivery_recovery_revision_exists() -> None:
     assert "IMPORT KOMARI_BOT" not in normalized
 
 
+def test_reply_fulfillment_lifecycle_revision_exists() -> None:
+    """0008 只扩展新父子模型的最小化与两阶段清理事实。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    lifecycle_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_lifecycle" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert lifecycle_revision is not None
+    assert lifecycle_revision.revision == "0008"
+    assert lifecycle_revision.down_revision == "0007"
+
+    revision_sql = Path(lifecycle_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+
+    assert f"ALTER TABLE {parent_table}" in normalized
+    assert "REPLY_CONTENT DROP NOT NULL" in normalized
+    assert "IDEMPOTENCY_EVIDENCE_CLEARED_AT" in normalized
+    assert "CREATE INDEX" in normalized
+    assert "COMPLETED_AT" in normalized
+    assert "NOT_DELIVERED_AT" in normalized
+
+    assert "KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
+    assert "INSERT INTO KOMARI_CHAT_REPLY_FULFILLMENTS" not in normalized
+    assert "DROP TABLE" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+    assert "REPLY_CONTENT SET NOT NULL" in normalized
+    assert re.search(
+        rf"UPDATE {parent_table} .*REPLY_CONTENT = ''",
+        normalized,
+    )
+    assert "DROP COLUMN IDEMPOTENCY_EVIDENCE_CLEARED_AT" in normalized
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:
