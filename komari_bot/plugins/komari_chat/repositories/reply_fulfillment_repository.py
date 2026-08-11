@@ -310,7 +310,11 @@ class ReplyFulfillmentRepository:
         owner_token: str,
         lease_seconds: int,
     ) -> dict[str, Any] | None:
-        """领取单个到期履约，并原子回收过期父租约。"""
+        """领取单个到期履约，并原子回收过期父租约。
+
+        领取条件：存在到期子项，或所有子项都已 COMPLETED 而父完成
+        标记尚未写入（父终态崩溃窗口恢复，只补父完成不重复子项）。
+        """
         async with self.pg_pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
@@ -325,17 +329,34 @@ class ReplyFulfillmentRepository:
                       parent.lease_owner IS NULL
                       OR parent.lease_expires_at <= NOW()
                   )
-                  AND EXISTS (
-                      SELECT 1
-                      FROM komari_chat_reply_fulfillment_commitments AS child
-                      WHERE child.fulfillment_id = parent.fulfillment_id
-                        AND (
-                            child.state = 'PENDING'
-                            OR (
-                                child.state = 'RETRY_WAIT'
-                                AND child.next_retry_at <= NOW()
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM komari_chat_reply_fulfillment_commitments AS child
+                          WHERE child.fulfillment_id = parent.fulfillment_id
+                            AND (
+                                child.state = 'PENDING'
+                                OR (
+                                    child.state = 'RETRY_WAIT'
+                                    AND child.next_retry_at <= NOW()
+                                )
                             )
-                        )
+                      )
+                      OR (
+                          EXISTS (
+                              SELECT 1
+                              FROM komari_chat_reply_fulfillment_commitments
+                              AS child
+                              WHERE child.fulfillment_id = parent.fulfillment_id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM komari_chat_reply_fulfillment_commitments
+                              AS child
+                              WHERE child.fulfillment_id = parent.fulfillment_id
+                                AND child.state <> 'COMPLETED'
+                          )
+                      )
                   )
                 RETURNING parent.*
                 """,
@@ -352,7 +373,11 @@ class ReplyFulfillmentRepository:
         limit: int,
         lease_seconds: int,
     ) -> list[dict[str, Any]]:
-        """按稳定顺序批量领取待处理履约，并跳过已锁父记录。"""
+        """按稳定顺序批量领取待处理履约，并跳过已锁父记录。
+
+        领取条件与 ``claim_operation`` 一致：存在到期子项，或所有子项
+        都已 COMPLETED 而父完成标记尚未写入（补父终态，不重复子项）。
+        """
         if limit <= 0:
             return []
         async with self.pg_pool.acquire() as connection, connection.transaction():
@@ -367,17 +392,35 @@ class ReplyFulfillmentRepository:
                           parent.lease_owner IS NULL
                           OR parent.lease_expires_at <= NOW()
                       )
-                      AND EXISTS (
-                          SELECT 1
-                          FROM komari_chat_reply_fulfillment_commitments AS child
-                          WHERE child.fulfillment_id = parent.fulfillment_id
-                            AND (
-                                child.state = 'PENDING'
-                                OR (
-                                    child.state = 'RETRY_WAIT'
-                                    AND child.next_retry_at <= NOW()
+                      AND (
+                          EXISTS (
+                              SELECT 1
+                              FROM komari_chat_reply_fulfillment_commitments
+                              AS child
+                              WHERE child.fulfillment_id = parent.fulfillment_id
+                                AND (
+                                    child.state = 'PENDING'
+                                    OR (
+                                        child.state = 'RETRY_WAIT'
+                                        AND child.next_retry_at <= NOW()
+                                    )
                                 )
-                            )
+                          )
+                          OR (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM komari_chat_reply_fulfillment_commitments
+                                  AS child
+                                  WHERE child.fulfillment_id = parent.fulfillment_id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM komari_chat_reply_fulfillment_commitments
+                                  AS child
+                                  WHERE child.fulfillment_id = parent.fulfillment_id
+                                    AND child.state <> 'COMPLETED'
+                              )
+                          )
                       )
                     ORDER BY
                         COALESCE(parent.delivered_at, parent.prepared_at),
