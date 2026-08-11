@@ -85,9 +85,7 @@ def downgrade(name: str = "") -> None:
         """
     )
 
-    op.execute(
-        "DROP INDEX IF EXISTS idx_reply_fulfillment_terminal_cleanup"
-    )
+    op.execute("DROP INDEX IF EXISTS idx_reply_fulfillment_terminal_cleanup")
     op.execute(
         """
         ALTER TABLE komari_chat_reply_fulfillments
