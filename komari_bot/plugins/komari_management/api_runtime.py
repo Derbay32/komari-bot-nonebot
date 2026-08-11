@@ -11,6 +11,7 @@ from .announce_api import register_announce_api
 from .config_api import register_config_api
 from .config_schema import DEFAULT_ANNOUNCE_STATUS_PAGE_URL
 from .prompt_api import register_prompt_api
+from .reply_fulfillment_api import register_reply_fulfillment_api
 from .scene_api import register_scene_api
 
 KNOWLEDGE_API_PREFIX = "/api/v2/komari-knowledge"
@@ -23,6 +24,7 @@ MANAGEMENT_CONFIG_API_PREFIX = "/api/v2/komari-management-config"
 MANAGEMENT_PROMPT_API_PREFIX = "/api/v2/komari-management-prompt"
 DECISION_SCENE_API_PREFIX = "/api/v2/komari-decision-scenes"
 USER_BAN_API_PREFIX = "/api/v2/komari-user-bans"
+REPLY_FULFILLMENT_API_PREFIX = "/api/v2/reply-fulfillments"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -50,6 +52,7 @@ class ManagementApiComponents:
     register_search_api: Callable[..., None]
     register_user_ban_api: Callable[..., None]
     user_ban_service_getter: Callable[[], object]
+    reply_fulfillment_service_getter: Callable[[], object | None]
     config_resources: tuple[ManagedConfigResource, ...]
     prompt_resources: tuple[ManagedPromptResource, ...]
 
@@ -121,6 +124,12 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         service_getter=components.user_ban_service_getter,
     )
+    register_reply_fulfillment_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+        service_getter=components.reply_fulfillment_service_getter,
+    )
     register_config_api(
         server_app,
         api_token=token_source,
@@ -166,7 +175,8 @@ def register_management_api_for_driver(
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, {MEMORY_API_PREFIX}, "
         f"{AGENT_RUN_LOG_API_PREFIX}, {SEARCH_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
-        f"{DECISION_SCENE_API_PREFIX}, {USER_BAN_API_PREFIX}"
+        f"{DECISION_SCENE_API_PREFIX}, {USER_BAN_API_PREFIX}, "
+        f"{REPLY_FULFILLMENT_API_PREFIX}"
     )
     logger.info(
         f"[Komari Management] 管理文档入口: docs={docs_url}, openapi={openapi_url}"

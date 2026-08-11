@@ -164,6 +164,32 @@ def resolve_management_request_id(
     return request_id
 
 
+def require_management_request_id(
+    value: Annotated[
+        str | None,
+        Header(alias="X-Request-ID"),
+    ] = None,
+) -> str:
+    """要求写操作显式提供合规的 request ID；缺失时不自动生成。
+
+    与 ``resolve_management_request_id`` 的自动生成语义互相独立：
+    本依赖只给需要严格审计链路 ID 的写接口使用，不影响其他接口
+    缺失时自动生成的既有行为。
+    """
+    request_id = str(value or "").strip()
+    if not request_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="写操作必须提供 X-Request-ID",
+        )
+    if not _REQUEST_ID_PATTERN.fullmatch(request_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="X-Request-ID 格式无效",
+        )
+    return request_id
+
+
 def hash_management_target(*parts: object) -> str:
     """为目标 ID 集合生成不可逆、顺序明确的审计关联哈希。"""
     digest = sha256()
@@ -270,5 +296,6 @@ __all__ = [
     "management_audit_span",
     "record_management_audit_event",
     "require_management_change_reason",
+    "require_management_request_id",
     "resolve_management_request_id",
 ]

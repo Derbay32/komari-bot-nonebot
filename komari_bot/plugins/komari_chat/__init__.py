@@ -19,6 +19,10 @@ from .handlers.message_handler import (
 )
 from .services.proactive_reservation import ProactiveReservationService
 from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
+from .services.reply_fulfillment_ops import (
+    ReplyFulfillmentOpsService,
+    build_reply_fulfillment_ops_service,
+)
 from .services.reply_fulfillment_workflow import (
     ReplyFulfillmentWorkflow,
     ReplySender,
@@ -79,6 +83,8 @@ _handler: MessageHandler | None = None
 _handler_workflow: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment_components: tuple[Any, Any, Any] | None = None
+_reply_fulfillment_ops: ReplyFulfillmentOpsService | None = None
+_reply_fulfillment_ops_components: tuple[Any, Any, Any] | None = None
 _reply_commit_worker_task: asyncio.Task[None] | None = None
 
 
@@ -173,6 +179,34 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
         )
         _reply_fulfillment_components = components
     return _reply_fulfillment
+
+
+def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
+    """顶层窄 seam：向管理插件提供履约运维服务，不暴露内部 adapter。
+
+    只操作新父子表（不读取旧 outbox、不做双读双写），也不启动或唤醒
+    任何 worker；依赖未就绪时返回 None，由管理 API 翻译为 503。
+    """
+    global _reply_fulfillment_ops, _reply_fulfillment_ops_components  # noqa: PLW0603
+
+    components = _resolve_runtime_components()
+    if components is None:
+        return None
+    redis, memory, _decision_engine = components
+
+    current_components = _reply_fulfillment_ops_components
+    same_components = current_components is not None and all(
+        current is actual
+        for current, actual in zip(current_components, components, strict=True)
+    )
+    if _reply_fulfillment_ops is None or not same_components:
+        redis_client = getattr(redis, "redis", redis)
+        _reply_fulfillment_ops = build_reply_fulfillment_ops_service(
+            pg_pool=memory.pg_pool,
+            redis_client=redis_client,
+        )
+        _reply_fulfillment_ops_components = components
+    return _reply_fulfillment_ops
 
 
 async def _reply_commit_worker() -> None:
