@@ -27,7 +27,8 @@ class _CommitmentRepository:
         self.children: dict[str, dict[str, dict[str, Any]]] = {}
         self.load_in_reverse = False
         self.completion_mark_lost_for: set[str] = set()
-        self.completion_mark_error_for: set[str] = set()
+        self.completion_mark_unknown_for: set[str] = set()
+        self.complete_parent_error_for: set[str] = set()
         self.claim_lease_seconds: list[int] = []
         self.failure_policies: list[tuple[str, int, int, int]] = []
         self.renew_count = 0
@@ -94,11 +95,14 @@ class _CommitmentRepository:
                 or (child["state"] == "RETRY_WAIT" and child["next_retry_due"])
                 for child in children
             )
+            needs_parent_completion = all(
+                child["state"] == "COMPLETED" for child in children
+            )
             if (
                 parent["delivery_state"] != "DELIVERED"
                 or parent["completed"]
                 or parent["lease_owner"] is not None
-                or not has_due
+                or not (has_due or needs_parent_completion)
             ):
                 continue
             parent["lease_owner"] = owner_token
@@ -158,9 +162,9 @@ class _CommitmentRepository:
         owner_token: str,
     ) -> bool:
         parent = self.parents[fulfillment_id]
-        if commitment_type in self.completion_mark_error_for:
-            self.completion_mark_error_for.remove(commitment_type)
-            raise ConnectionError("完成标记数据库暂不可用")
+        if commitment_type in self.completion_mark_unknown_for:
+            self.completion_mark_unknown_for.remove(commitment_type)
+            raise ConnectionError("完成标记结果未知")
         if commitment_type in self.completion_mark_lost_for:
             self.completion_mark_lost_for.remove(commitment_type)
             parent["lease_owner"] = None
@@ -218,6 +222,9 @@ class _CommitmentRepository:
         owner_token: str,
     ) -> bool:
         parent = self.parents[fulfillment_id]
+        if fulfillment_id in self.complete_parent_error_for:
+            self.complete_parent_error_for.remove(fulfillment_id)
+            raise ConnectionError("父完成标记结果未知")
         if parent["lease_owner"] != owner_token:
             return False
         if not all(
@@ -721,15 +728,15 @@ async def test_lease_loss_stops_the_executor_and_idempotent_recovery_finishes(
 
 
 @pytest.mark.asyncio
-async def test_completion_mark_error_releases_lease_and_next_parent_still_runs(
+async def test_completion_mark_unknown_backs_off_item_and_continues_batch(
     workflow_module: Any,
 ) -> None:
     repository = _CommitmentRepository()
-    repository.seed("reply-mark-error")
-    repository.seed("reply-after-error")
-    repository.completion_mark_error_for.add("favorability_adjustment")
+    repository.seed("reply-mark-unknown")
+    repository.seed("reply-after-unknown")
+    repository.completion_mark_unknown_for.add("favorability_adjustment")
     config = _config()
-    workflow, _events, _redis, _proactive, _user_data = _workflow(
+    workflow, _events, redis, _proactive, _user_data = _workflow(
         workflow_module,
         repository,
         config,
@@ -737,9 +744,45 @@ async def test_completion_mark_error_releases_lease_and_next_parent_still_runs(
 
     assert await workflow.recover_pending() == 1
 
-    assert repository.parent_completed("reply-mark-error") is False
-    assert repository.has_lease("reply-mark-error") is False
-    assert repository.parent_completed("reply-after-error") is True
+    uncertain = repository.snapshot("reply-mark-unknown", "favorability_adjustment")
+    assert uncertain.state == "RETRY_WAIT"
+    assert uncertain.attempt_count == 1
+    assert uncertain.last_error_code == "connection_error"
+    assert repository.snapshot(
+        "reply-mark-unknown", "assistant_reply_history"
+    ).completed
+    assert repository.snapshot("reply-mark-unknown", "interaction_history").completed
+    assert redis.assistant_calls == 2
+    assert redis.interaction_calls == 2
+    assert repository.parent_completed("reply-mark-unknown") is False
+    assert repository.has_lease("reply-mark-unknown") is False
+    assert repository.parent_completed("reply-after-unknown") is True
+
+
+@pytest.mark.asyncio
+async def test_parent_completion_unknown_is_reclaimed_without_repeating_children(
+    workflow_module: Any,
+) -> None:
+    repository = _CommitmentRepository()
+    repository.seed("reply-parent-unknown")
+    repository.complete_parent_error_for.add("reply-parent-unknown")
+    config = _config()
+    workflow, events, _redis, _proactive, _user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+    )
+
+    assert await workflow.recover_pending() == 0
+    assert events == list(COMMITMENT_TYPES)
+    assert repository.parent_completed("reply-parent-unknown") is False
+    assert repository.has_lease("reply-parent-unknown") is False
+
+    events.clear()
+    assert await workflow.recover_pending() == 1
+
+    assert events == []
+    assert repository.parent_completed("reply-parent-unknown") is True
 
 
 @pytest.mark.asyncio
@@ -815,7 +858,9 @@ async def test_heartbeat_loss_stops_before_marking_and_releases_owned_lease(
     assert await task == 0
     assert repository.renew_count >= 1
     child = repository.snapshot("reply-heartbeat-lost", "favorability_adjustment")
-    assert child.attempt_count == 0
+    assert child.state == "RETRY_WAIT"
+    assert child.attempt_count == 1
+    assert child.last_error_code == "lease_lost"
     assert child.completed is False
     assert repository.release_count == 1
     assert repository.has_lease("reply-heartbeat-lost") is False

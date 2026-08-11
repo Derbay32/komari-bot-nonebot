@@ -438,6 +438,64 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
         assert mismatch["send_started_at"] is None
 
 
+async def test_claim_pending_reclaims_parent_with_all_children_completed() -> None:
+    """子项全完成而父完成标记中断时，worker 仍能领取并补完父终态。"""
+    fulfillment_id = f"parent-completion-recovery-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, _pool):
+        await _prepare_delivered(repository, fulfillment_id)
+        assert (
+            await repository.claim_operation(
+                fulfillment_id,
+                owner_token="worker-1",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        for commitment_type in (
+            "proactive_reply_confirmation",
+            "favorability_adjustment",
+            "assistant_reply_history",
+            "interaction_history",
+        ):
+            assert (
+                await repository.mark_commitment_completed(
+                    fulfillment_id,
+                    commitment_type=commitment_type,
+                    owner_token="worker-1",
+                )
+                is True
+            )
+        assert (
+            await repository.release_lease(
+                fulfillment_id,
+                owner_token="worker-1",
+            )
+            is True
+        )
+
+        claimed = await repository.claim_pending(
+            owner_token="worker-2",
+            limit=10,
+            lease_seconds=60,
+        )
+
+        assert {row["fulfillment_id"] for row in claimed} == {fulfillment_id}
+        assert (
+            await repository.load_claimed_commitments(
+                fulfillment_id,
+                owner_token="worker-2",
+            )
+            == []
+        )
+        assert (
+            await repository.complete_fulfillment(
+                fulfillment_id,
+                owner_token="worker-2",
+            )
+            is True
+        )
+
+
 async def test_claim_pending_is_disjoint_and_skips_locked_parent() -> None:
     """并发 worker 领取集合互斥，且 SKIP LOCKED 不被其他事务阻塞。"""
     fulfillment_ids = [f"claim-{index}-{uuid4().hex}" for index in range(5)]
