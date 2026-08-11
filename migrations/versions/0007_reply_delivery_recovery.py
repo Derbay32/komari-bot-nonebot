@@ -201,7 +201,6 @@ def downgrade(name: str = "") -> None:
     )
 
     op.execute(
-        "ALTER TABLE komari_chat_reply_commit_outbox "
         "DROP INDEX IF EXISTS idx_reply_commit_outbox_delivery_freshness"
     )
     op.execute(

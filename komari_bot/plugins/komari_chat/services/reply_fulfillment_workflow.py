@@ -951,8 +951,9 @@ class ReplyFulfillmentWorkflow:
         预占；恢复发送本身异常时保守保持待确认。
         """
         operation_id = str(record["operation_id"])
+        recovered_reply = self._recovered_reply(record)
         try:
-            delivery_result = await sender(self._recovered_reply(record))
+            delivery_result = await sender(recovered_reply)
         except asyncio.CancelledError:
             raise
         except Exception:
