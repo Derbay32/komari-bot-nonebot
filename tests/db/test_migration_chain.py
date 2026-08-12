@@ -436,6 +436,38 @@ def test_reply_fulfillment_lifecycle_revision_exists() -> None:
     assert "DROP COLUMN IDEMPOTENCY_EVIDENCE_CLEARED_AT" in normalized
 
 
+def test_reply_fulfillment_alert_revision_exists() -> None:
+    """0009 只持久化两类告警转换的跨进程去重事实。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    alert_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_alert" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert alert_revision is not None
+    assert alert_revision.revision == "0009"
+    assert alert_revision.down_revision == "0008"
+
+    revision_sql = Path(alert_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+
+    assert "KOMARI_CHAT_REPLY_FULFILLMENTS" in normalized
+    assert "PENDING_CONFIRMATION_ALERTED_AT" in normalized
+    assert "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS" in normalized
+    assert "DISPOSITION_ALERTED_AT" in normalized
+    assert "DROP COLUMN PENDING_CONFIRMATION_ALERTED_AT" in normalized
+    assert "DROP COLUMN DISPOSITION_ALERTED_AT" in normalized
+
+    assert "KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
+    assert "DROP TABLE" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:
