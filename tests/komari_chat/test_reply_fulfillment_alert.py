@@ -87,6 +87,18 @@ class _AlertRepository:
                     break
             return claimed
 
+    def reset_disposition_claim(
+        self,
+        fulfillment_id: str,
+        commitment_type: str,
+    ) -> None:
+        """模拟人工续跑的代际重置：仓储清除该子项的告警标记。
+
+        只重置指定承诺；兄弟承诺的去重事实不受影响（与真实仓储的
+        ``resume_failed_commitment`` 语义一致）。
+        """
+        self._claimed_dispositions.discard((fulfillment_id, commitment_type))
+
 
 class _RecordingBot:
     def __init__(self, *, fail_users: set[int] | None = None) -> None:
@@ -171,6 +183,48 @@ async def test_concurrent_workers_only_dispatch_one_alert() -> None:
     assert sorted(results) == [0, 1]
     assert len(logger.bound) == 1
     assert len(bot.private_calls) == 1
+
+
+async def test_resumed_commitment_alert_new_generation_after_reexhaustion() -> None:
+    """人工续跑后再次耗尽必须产生新一代告警，兄弟承诺不连带重置。
+
+    第一次耗尽告警一次并被持久去重抑制；运维续跑清除该子项告警
+    标记后再次耗尽，同一（履约, 承诺）身份必须再次告警；兄弟承诺
+    的告警代际不受续跑影响，仍只告警一次。
+    """
+    repository = _AlertRepository()
+    repository.seed_disposition(
+        "reply-resume",
+        commitment_type="favorability_adjustment",
+        error_code="service_unavailable",
+    )
+    repository.seed_disposition(
+        "reply-resume",
+        commitment_type="assistant_reply_history",
+        error_code="service_unavailable",
+    )
+    bot = _RecordingBot()
+    logger = _RecordingLogger()
+    service = ReplyFulfillmentAlertService(
+        repository,
+        bots_provider=lambda: [bot],
+        superusers_provider=lambda: {"10001"},
+        logger=logger,
+    )
+
+    # 第一轮：两项待处置各告警一次，重复观察被抑制
+    assert await service.recover_alerts() == 2
+    assert await service.recover_alerts() == 0
+    assert len(bot.private_calls) == 2
+
+    # 人工续跑 favorability（只重置该子项告警代际）后再次耗尽
+    repository.reset_disposition_claim("reply-resume", "favorability_adjustment")
+    assert await service.recover_alerts() == 1
+    assert len(bot.private_calls) == 3
+
+    # 新一代同样被去重；兄弟承诺全程不重复告警
+    assert await service.recover_alerts() == 0
+    assert len(bot.private_calls) == 3
 
 
 async def test_no_online_bot_still_records_minimal_structured_alert() -> None:
