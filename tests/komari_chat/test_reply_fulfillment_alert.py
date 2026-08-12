@@ -199,8 +199,15 @@ async def test_no_online_bot_still_records_minimal_structured_alert() -> None:
             "error_code": None,
         }
     ]
+    rendered_log = "\n".join(logger.messages)
+    assert "fulfillment_id=reply-no-bot" in rendered_log
+    assert "status=pending_confirmation" in rendered_log
+    assert "commitment_type=-" in rendered_log
+    assert "error_code=-" in rendered_log
     assert "绝密回复正文" not in repr(logger.bound)
+    assert "绝密回复正文" not in rendered_log
     assert "绝密提示" not in repr(logger.bound)
+    assert "绝密提示" not in rendered_log
 
 
 async def test_private_delivery_is_best_effort_and_uses_allowlisted_fields() -> None:
@@ -222,7 +229,14 @@ async def test_private_delivery_is_best_effort_and_uses_allowlisted_fields() -> 
     service = ReplyFulfillmentAlertService(
         repository,
         bots_provider=lambda: [bot],
-        superusers_provider=lambda: {"invalid", "10001", "10002"},
+        superusers_provider=lambda: {
+            "invalid",
+            "0",
+            "-1",
+            "10001",
+            10001,
+            "10002",
+        },
         logger=logger,
     )
 
