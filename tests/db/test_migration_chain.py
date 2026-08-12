@@ -468,6 +468,55 @@ def test_reply_fulfillment_alert_revision_exists() -> None:
     assert "IMPORT KOMARI_BOT" not in normalized
 
 
+def test_reply_fulfillment_backfill_revision_exists() -> None:
+    """0010 在停机事务内预检并回填旧宽 outbox，仍保留旧表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    backfill_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_backfill" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert backfill_revision is not None
+    assert backfill_revision.revision == "0010"
+    assert backfill_revision.down_revision == "0009"
+
+    revision_sql = Path(backfill_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    old_table = "KOMARI_CHAT_REPLY_COMMIT_OUTBOX"
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+    child_table = "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS"
+
+    assert f"FROM {old_table}" in normalized
+    assert f"INSERT INTO {parent_table}" in normalized
+    assert f"INSERT INTO {child_table}" in normalized
+    assert "PENDING_CONFIRMATION" in normalized
+    assert "NOT_DELIVERED" in normalized
+    assert "RETRY_WAIT" in normalized
+    assert "FAILED" in normalized
+    assert "FOR UPDATE" in normalized
+    assert "REPLY_COMMIT_TOMBSTONE_RETENTION_DAYS" in normalized
+    assert "AMBIGUOUS_FAILED_COUNT=" in normalized
+    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    assert "COUNT(*)" in normalized
+    assert "COUNT(DISTINCT" in normalized
+    assert "LEASE_OWNER" in normalized
+    assert "LEASE_EXPIRES_AT" in normalized
+    assert "PAYLOAD_HASH" in normalized
+    assert "DISPOSITION_ALERTED_AT" in normalized
+    assert "PENDING_CONFIRMATION_ALERTED_AT" in normalized
+
+    assert f"DROP TABLE {old_table}" not in normalized
+    assert "DROP TABLE" not in normalized
+    assert "CREATE TABLE" not in normalized
+    assert "ALTER TABLE" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:
