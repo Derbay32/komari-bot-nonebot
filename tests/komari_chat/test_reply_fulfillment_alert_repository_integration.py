@@ -139,7 +139,9 @@ async def _prepare_delivered(
     assert await repository.mark_delivered(fulfillment_id)
 
 
-async def test_pending_confirmation_alert_claim_is_persistent_and_concurrent_safe() -> None:
+async def test_pending_confirmation_alert_claim_is_persistent_and_concurrent_safe() -> (
+    None
+):
     """待确认转换由数据库原子领取，并发与仓库重建都不会重复命中。"""
     fulfillment_id = f"alert-pending-{uuid4().hex}"
     async with _repository_context([fulfillment_id]) as (repository, pool):

@@ -96,7 +96,11 @@ def test_typed_config_tables_revision_exists() -> None:
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     typed_revision = next(
-        (rev for rev in revisions if "typed_plugin_config_tables" in Path(rev.path).name),
+        (
+            rev
+            for rev in revisions
+            if "typed_plugin_config_tables" in Path(rev.path).name
+        ),
         None,
     )
     assert typed_revision is not None
@@ -187,9 +191,9 @@ def test_komari_chat_config_revision_exists() -> None:
         "reply_commit_tombstone_retention_days",
     )
     for column in dropped_columns:
-        assert re.search(
-            rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql
-        ), column
+        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), (
+            column
+        )
 
     # 旧表保留（其余字段仍归 komari_memory 所有），只删列不删表
     assert "DROP TABLE komari_memory_config" not in revision_sql
@@ -224,7 +228,9 @@ def test_komari_decision_summary_config_revision_exists() -> None:
     }
     for column in columns:
         assert column in revision_sql, column
-        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), column
+        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), (
+            column
+        )
 
     assert "DROP TABLE komari_decision_config" not in revision_sql
 
@@ -321,7 +327,9 @@ def test_reply_fulfillment_parent_child_revision_exists() -> None:
 
 def test_reply_fulfillment_revision_is_self_contained() -> None:
     """父子表迁移不得加载应用运行时，也不得删除旧 outbox。"""
-    revision_path = MIGRATIONS_DIR / "versions" / "0006_reply_fulfillment_parent_child.py"
+    revision_path = (
+        MIGRATIONS_DIR / "versions" / "0006_reply_fulfillment_parent_child.py"
+    )
     revision_sql = revision_path.read_text(encoding="utf-8")
 
     assert "from komari_bot" not in revision_sql
@@ -334,11 +342,7 @@ def test_reply_delivery_recovery_revision_exists() -> None:
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     delivery_revision = next(
-        (
-            rev
-            for rev in revisions
-            if "reply_delivery_recovery" in Path(rev.path).name
-        ),
+        (rev for rev in revisions if "reply_delivery_recovery" in Path(rev.path).name),
         None,
     )
     assert delivery_revision is not None
@@ -441,11 +445,7 @@ def test_reply_fulfillment_alert_revision_exists() -> None:
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     alert_revision = next(
-        (
-            rev
-            for rev in revisions
-            if "reply_fulfillment_alert" in Path(rev.path).name
-        ),
+        (rev for rev in revisions if "reply_fulfillment_alert" in Path(rev.path).name),
         None,
     )
     assert alert_revision is not None
