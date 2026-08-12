@@ -495,6 +495,10 @@ poetry run python -m komari_bot.db.orm_bootstrap upgrade head
 poetry run python -m komari_bot.db.orm_bootstrap check   # 必须零 diff
 
 # 真实库集成测试（KOMARI_TEST_POSTGRES_URL 门控；两变量必须同库，否则守卫 skip）
+# 共享门控库必须先 upgrade head 且始终保持 head；迁移链驱动验收
+# （tests/db 的 0004/0010/0011 迁移测试与 legacy 配置脚本集成测试）在
+# 门控库派生的一次性隔离库（库名 = 门控库名 + 文件专属后缀）内重建迁移链，
+# 用例结束即 DROP，门控用户需要 CREATEDB 权限
 SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
 KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
   poetry run pytest tests/ -v

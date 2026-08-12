@@ -3,6 +3,11 @@
 测试脚本独立加载（不 import komari_bot 运行时代码），与脚本自身的
 独立性约束保持一致。集成测试走真实 PostgreSQL，环境变量门控：
 未设置 ``KOMARI_TEST_POSTGRES_URL`` 时跳过。
+
+隔离纪律：集成用例在从门控 DSN 派生的一次性隔离库（库名后缀
+``_legacycfg``）内先 ``upgrade head`` 再执行脚本验收，用例结束即
+DROP；共享门控库的版本与数据不受搬移影响，重复执行与执行顺序
+互不影响。门控用户需要 CREATEDB 权限。
 """
 
 from __future__ import annotations
@@ -11,10 +16,12 @@ import asyncio
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote, urlparse
 
 import asyncpg
 import pytest
@@ -71,9 +78,7 @@ class TestParseDsn:
     @staticmethod
     def test_url_encoded_credentials_are_decoded() -> None:
         module = _load_script_module()
-        parsed = module.parse_dsn(
-            "postgresql://user:p%40ss%2Fword@localhost:5432/db"
-        )
+        parsed = module.parse_dsn("postgresql://user:p%40ss%2Fword@localhost:5432/db")
         assert parsed["user"] == "user"
         assert parsed["password"] == "p@ss/word"
 
@@ -134,9 +139,7 @@ class TestPlanRowValues:
 
     @staticmethod
     def _spec(module: Any) -> Any:
-        spec = next(
-            s for s in module._RESOURCE_SPECS if s.key_value == "user_data"
-        )
+        spec = next(s for s in module._RESOURCE_SPECS if s.key_value == "user_data")
         assert spec.columns == (
             "plugin_enable",
             "initial_favorability",
@@ -164,7 +167,7 @@ class TestPlanRowValues:
     def test_full_row_migrates_all_keys() -> None:
         module = _load_script_module()
         spec = TestPlanRowValues._spec(module)
-        info = TestPlanRowValues._column_info( spec.columns)
+        info = TestPlanRowValues._column_info(spec.columns)
         planned = module.plan_row_values(
             spec,
             {
@@ -191,7 +194,7 @@ class TestPlanRowValues:
     def test_deprecated_and_unknown_keys_are_dropped() -> None:
         module = _load_script_module()
         spec = TestPlanRowValues._spec(module)
-        info = TestPlanRowValues._column_info( spec.columns)
+        info = TestPlanRowValues._column_info(spec.columns)
         planned = module.plan_row_values(
             spec,
             {
@@ -216,7 +219,7 @@ class TestPlanRowValues:
     def test_missing_not_null_columns_fall_back_to_defaults() -> None:
         module = _load_script_module()
         spec = TestPlanRowValues._spec(module)
-        info = TestPlanRowValues._column_info( spec.columns)
+        info = TestPlanRowValues._column_info(spec.columns)
         planned = module.plan_row_values(
             spec,
             {"plugin_enable": False},
@@ -232,7 +235,7 @@ class TestPlanRowValues:
     def test_missing_nullable_column_is_not_written() -> None:
         module = _load_script_module()
         spec = TestPlanRowValues._spec(module)
-        info = TestPlanRowValues._column_info( spec.columns)
+        info = TestPlanRowValues._column_info(spec.columns)
         planned = module.plan_row_values(
             spec,
             {"plugin_enable": True, "initial_favorability": 3},
@@ -245,7 +248,7 @@ class TestPlanRowValues:
     def test_none_value_treated_as_missing() -> None:
         module = _load_script_module()
         spec = TestPlanRowValues._spec(module)
-        info = TestPlanRowValues._column_info( spec.columns)
+        info = TestPlanRowValues._column_info(spec.columns)
         planned = module.plan_row_values(
             spec,
             {"plugin_enable": True, "initial_favorability": None},
@@ -263,11 +266,16 @@ class TestPlanRowValues:
         spec = next(s for s in module._RESOURCE_SPECS if s.key_value == "sr")
         info: dict[str, tuple[str, bool]] = {}
         for column in spec.columns:
-            info[column] = ("JSONB", False) if column in (
-                "user_whitelist",
-                "group_whitelist",
-                "sr_list",
-            ) else ("BOOLEAN", False)
+            info[column] = (
+                ("JSONB", False)
+                if column
+                in (
+                    "user_whitelist",
+                    "group_whitelist",
+                    "sr_list",
+                )
+                else ("BOOLEAN", False)
+            )
         planned = module.plan_row_values(
             spec,
             {"user_whitelist": ["1"]},
@@ -300,9 +308,7 @@ class TestPlanRowValues:
     def test_declared_column_missing_from_database_raises() -> None:
         module = _load_script_module()
         spec = TestPlanRowValues._spec(module)
-        info = TestPlanRowValues._column_info(
-            ("plugin_enable", "initial_favorability")
-        )
+        info = TestPlanRowValues._column_info(("plugin_enable", "initial_favorability"))
         with pytest.raises(RuntimeError, match="max_favorability_delta_per_reply"):
             module.plan_row_values(
                 spec,
@@ -315,7 +321,9 @@ class TestPlanRowValues:
         """离线脚本继续读取旧 JSONB 键，但只写新履约配置列。"""
         module = _load_script_module()
         spec = next(
-            item for item in module._RESOURCE_SPECS if item.target_table == "komari_chat_config"
+            item
+            for item in module._RESOURCE_SPECS
+            if item.target_table == "komari_chat_config"
         )
         expected_mapping = {
             "reply_commit_worker_interval_seconds": (
@@ -324,9 +332,7 @@ class TestPlanRowValues:
             "reply_commit_batch_size": "reply_fulfillment_batch_size",
             "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
             "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
-            "reply_commit_retry_base_seconds": (
-                "reply_fulfillment_retry_base_seconds"
-            ),
+            "reply_commit_retry_base_seconds": ("reply_fulfillment_retry_base_seconds"),
             "reply_commit_tombstone_retention_days": (
                 "reply_fulfillment_tombstone_retention_days"
             ),
@@ -350,8 +356,7 @@ class TestPlanRowValues:
 
         assert spec.legacy_key_map == expected_mapping
         assert {
-            new_name: planned.values[new_name]
-            for new_name in expected_mapping.values()
+            new_name: planned.values[new_name] for new_name in expected_mapping.values()
         } == {
             new_name: index
             for index, new_name in enumerate(expected_mapping.values(), 1)
@@ -375,9 +380,7 @@ class _FakeConnection:
         self.executed: list[tuple[str, tuple[object, ...]]] = []
         self.fetched_queries: list[str] = []
 
-    async def fetch(
-        self, query: str, *_args: object
-    ) -> list[dict[str, Any]]:
+    async def fetch(self, query: str, *_args: object) -> list[dict[str, Any]]:
         self.fetched_queries.append(query)
         if "information_schema.columns" in query:
             return self.info_schema
@@ -388,9 +391,7 @@ class _FakeConnection:
         pytest.fail(f"未预期的查询: {query}")
         return []
 
-    async def set_type_codec(
-        self, _type_name: str, **_kwargs: object
-    ) -> None:
+    async def set_type_codec(self, _type_name: str, **_kwargs: object) -> None:
         return None
 
     async def execute(self, query: str, *args: object) -> str:
@@ -404,9 +405,7 @@ class TestBuildUpsertSql:
     @staticmethod
     def test_sql_shape_only_writes_planned_columns() -> None:
         module = _load_script_module()
-        spec = next(
-            s for s in module._RESOURCE_SPECS if s.key_value == "user_data"
-        )
+        spec = next(s for s in module._RESOURCE_SPECS if s.key_value == "user_data")
         sql = module.build_upsert_sql(
             spec,
             {"plugin_enable": True, "initial_favorability": 0},
@@ -414,7 +413,7 @@ class TestBuildUpsertSql:
             ("plugin_enable",),
         )
         assert sql.startswith(
-            'INSERT INTO komari_user_data_config (id, revision, updated_at,'
+            "INSERT INTO komari_user_data_config (id, revision, updated_at,"
             ' "plugin_enable", "initial_favorability")'
         )
         assert "ON CONFLICT (id) DO UPDATE" in sql
@@ -430,9 +429,7 @@ class TestBuildUpsertSql:
     @staticmethod
     def test_sql_without_update_keys_still_valid() -> None:
         module = _load_script_module()
-        spec = next(
-            s for s in module._RESOURCE_SPECS if s.key_value == "user_data"
-        )
+        spec = next(s for s in module._RESOURCE_SPECS if s.key_value == "user_data")
         sql = module.build_upsert_sql(
             spec,
             {"plugin_enable": False, "initial_favorability": 0},
@@ -449,9 +446,7 @@ class TestMigrateLegacyConfigs:
     @staticmethod
     def _specs(module: Any) -> list[Any]:
         wanted = {"user_data", "komari_chat"}
-        return [
-            s for s in module._RESOURCE_SPECS if s.key_value in wanted
-        ]
+        return [s for s in module._RESOURCE_SPECS if s.key_value in wanted]
 
     @staticmethod
     def _info_schema(module: Any) -> list[dict[str, Any]]:
@@ -614,9 +609,7 @@ class TestRenderReport:
 
     @staticmethod
     def _result(module: Any) -> Any:
-        spec = next(
-            s for s in module._RESOURCE_SPECS if s.key_value == "user_data"
-        )
+        spec = next(s for s in module._RESOURCE_SPECS if s.key_value == "user_data")
         reports = [
             module.ResourceReport(
                 spec=spec,
@@ -630,9 +623,7 @@ class TestRenderReport:
             ),
             module.ResourceReport(
                 spec=next(
-                    s
-                    for s in module._RESOURCE_SPECS
-                    if s.key_value == "komari_chat"
+                    s for s in module._RESOURCE_SPECS if s.key_value == "komari_chat"
                 ),
                 migrated=False,
                 revision=None,
@@ -643,9 +634,7 @@ class TestRenderReport:
                 error=None,
             ),
         ]
-        return module.MigrationResult(
-            reports=reports, unknown_keys=["mystery_plugin"]
-        )
+        return module.MigrationResult(reports=reports, unknown_keys=["mystery_plugin"])
 
     @staticmethod
     def test_report_contains_three_lists_and_summary() -> None:
@@ -668,38 +657,85 @@ class TestRenderReport:
         assert "revision" in text
 
 
+def _parse_dsn(url: str) -> dict[str, Any]:
+    parsed = urlparse(url.replace("postgresql+asyncpg://", "postgresql://"))
+    return {
+        "host": parsed.hostname,
+        "port": parsed.port or 5432,
+        "database": parsed.path.lstrip("/"),
+        "user": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+    }
+
+
+def _run_bootstrap(url: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """在仓库根目录对指定数据库 URL 执行 orm_bootstrap 迁移命令。"""
+    env = os.environ.copy()
+    env["SQLALCHEMY_DATABASE_URL"] = url
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
+    return subprocess.run(
+        [sys.executable, "-m", "komari_bot.db.orm_bootstrap", *args],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+
+async def _recreate_scratch_database() -> dict[str, Any]:
+    """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。
+
+    隔离库名 = 门控库名 + ``_legacycfg``；先 DROP（FORCE 断开残留
+    连接）再 CREATE，重复执行幂等。门控用户需要 CREATEDB 权限。
+    """
+    base = _parse_dsn(POSTGRES_URL)
+    scratch = {**base, "database": f"{base['database']}_legacycfg"}
+    connection = await asyncpg.connect(**base)
+    try:
+        name = str(scratch["database"]).replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await connection.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        await connection.close()
+    return scratch
+
+
+async def _drop_scratch_database(database: str) -> None:
+    """删除一次性隔离库（finally 清理，重复删除安全）。"""
+    base = _parse_dsn(POSTGRES_URL)
+    connection = await asyncpg.connect(**base)
+    try:
+        name = database.replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await connection.close()
+
+
 @pytest.mark.skipif(
     not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试"
 )
 class TestMigrateLegacyConfigsIntegration:
-    """真实 PostgreSQL 集成测试：legacy 行 → 新表内容 + 报告 + 幂等。"""
+    """真实 PostgreSQL 集成测试：legacy 行 → 新表内容 + 报告 + 幂等。
 
-    _LEGACY_PLUGIN_TABLES = ("komari_user_data_config", "komari_sr_config")
-    _LEGACY_PROMPT_TABLES = ("komari_prompt_komari_chat",)
+    每个用例在一次性隔离库内先 ``upgrade head`` 再执行，结束即删库。
+    """
 
-    async def _reset(self, conn: Any) -> None:
-        for table in (
-            *self._LEGACY_PLUGIN_TABLES,
-            *self._LEGACY_PROMPT_TABLES,
-        ):
-            await conn.execute(f"DELETE FROM {table} WHERE id = 1")
-        await conn.execute(
-            "DELETE FROM komari_plugin_configs"
-            " WHERE plugin_name = ANY($1::text[])",
-            ["user_data", "sr"],
-        )
-        await conn.execute(
-            "DELETE FROM komari_prompt_configs WHERE resource_id = $1",
-            "komari_chat",
-        )
+    async def _prepare_head_scratch(self) -> dict[str, Any]:
+        scratch = await _recreate_scratch_database()
+        url = urlparse(POSTGRES_URL)._replace(path=f"/{scratch['database']}").geturl()
+        result = _run_bootstrap(url, "upgrade", "head")
+        assert result.returncode == 0, result.stderr
+        return scratch
 
     @pytest.mark.asyncio
     async def test_migrates_legacy_rows_and_is_idempotent(self) -> None:
         module = _load_script_module()
         updated_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
-        conn = await asyncpg.connect(**module.parse_dsn(POSTGRES_URL))
+        scratch = await self._prepare_head_scratch()
+        conn = await asyncpg.connect(**scratch)
         try:
-            await self._reset(conn)
             await conn.execute(
                 "INSERT INTO komari_plugin_configs"
                 " (plugin_name, schema_name, config_data, version, revision,"
@@ -824,11 +860,16 @@ class TestMigrateLegacyConfigsIntegration:
 
             second = await module.migrate_legacy_configs(
                 conn,
-                specs=[s for s in module._RESOURCE_SPECS if s.key_value in (
-                    "user_data",
-                    "sr",
-                    "komari_chat",
-                )],
+                specs=[
+                    s
+                    for s in module._RESOURCE_SPECS
+                    if s.key_value
+                    in (
+                        "user_data",
+                        "sr",
+                        "komari_chat",
+                    )
+                ],
             )
             row_after = await conn.fetchrow(
                 "SELECT id, revision, updated_at, plugin_enable,"
@@ -854,8 +895,8 @@ class TestMigrateLegacyConfigsIntegration:
                 "komari_chat": True,
             }
         finally:
-            await self._reset(conn)
             await conn.close()
+            await _drop_scratch_database(str(scratch["database"]))
 
     @pytest.mark.asyncio
     async def test_seeded_new_table_preserves_values_for_missing_keys(
@@ -863,9 +904,9 @@ class TestMigrateLegacyConfigsIntegration:
     ) -> None:
         """应用启动已播种的新表：缺键列保持播种值，不被默认值覆盖。"""
         module = _load_script_module()
-        conn = await asyncpg.connect(**module.parse_dsn(POSTGRES_URL))
+        scratch = await self._prepare_head_scratch()
+        conn = await asyncpg.connect(**scratch)
         try:
-            await self._reset(conn)
             # 模拟应用启动播种（insert_if_absent）
             await conn.execute(
                 "INSERT INTO komari_user_data_config"
@@ -889,11 +930,7 @@ class TestMigrateLegacyConfigsIntegration:
 
             result = await module.migrate_legacy_configs(
                 conn,
-                specs=[
-                    s
-                    for s in module._RESOURCE_SPECS
-                    if s.key_value == "user_data"
-                ],
+                specs=[s for s in module._RESOURCE_SPECS if s.key_value == "user_data"],
             )
             assert result.reports[0].migrated is True
             assert result.reports[0].defaulted_keys == [
@@ -912,5 +949,5 @@ class TestMigrateLegacyConfigsIntegration:
             assert row["initial_favorability"] == 99  # 播种值保留
             assert row["max_favorability_delta_per_reply"] == 77  # 播种值保留
         finally:
-            await self._reset(conn)
             await conn.close()
+            await _drop_scratch_database(str(scratch["database"]))
