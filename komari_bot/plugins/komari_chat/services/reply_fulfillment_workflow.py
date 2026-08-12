@@ -474,15 +474,10 @@ class ReplyFulfillmentWorkflow:
         """恢复发送前中断：精确身份匹配的恢复发送与时效终止。
 
         只有仍在时效内、且 Bot 与适配器精确匹配的 NOT_STARTED 回复才
-        允许恢复发送；满时效按未送达终止并释放持久预占。仓库未提供
-        领取/过期能力（测试替身）时跳过本阶段。领取与过期在同一进程
-        内锁内原子完成，避免与直接路径的 prepare → mark_send_started
-        区间竞争；平台发送在锁外执行。
+        允许恢复发送；满时效按未送达终止并释放持久预占。领取与过期在
+        同一进程内锁内原子完成，避免与直接路径的
+        prepare → mark_send_started 区间竞争；平台发送在锁外执行。
         """
-        claim_fresh = getattr(self.repository, "claim_fresh_not_started", None)
-        expire_stale = getattr(self.repository, "expire_stale_not_started", None)
-        if claim_fresh is None or expire_stale is None:
-            return 0
         config = self.config_getter()
         freshness_seconds = int(config.reply_fulfillment_freshness_seconds)
         limit = int(config.reply_fulfillment_batch_size)
@@ -492,14 +487,14 @@ class ReplyFulfillmentWorkflow:
             for (bot_self_id, adapter_name), sender in (
                 self.recovery_senders_getter().items()
             ):
-                records = await claim_fresh(
+                records = await self.repository.claim_fresh_not_started(
                     bot_self_id=bot_self_id,
                     adapter_name=adapter_name,
                     freshness_seconds=freshness_seconds,
                     limit=limit,
                 )
                 claimed_records.extend((record, sender) for record in records)
-            expired = await expire_stale(
+            expired = await self.repository.expire_stale_not_started(
                 freshness_seconds=freshness_seconds,
                 limit=limit,
             )
