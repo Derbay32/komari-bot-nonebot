@@ -40,7 +40,7 @@ Authorization: Bearer <management-token>
 - `401`：没有 Token、Token 错误或凭据已到撤销时间；
 - `403`：Token 有效，但没有当前接口所需权限。
 
-具名凭据支持精确权限、资源通配符（例如 `config:*`）和全局通配符 `*`。写权限自动包含同资源的读权限；`announce:send` 自动包含 `announce:read`。
+具名凭据支持精确权限、资源通配符（例如 `config:*`）和全局通配符 `*`。写权限自动包含同资源的读权限；`announce:send` 自动包含 `announce:read`，`reply_fulfillment:manage` 自动包含 `reply_fulfillment:read`。
 
 推荐先配置一个供管理后台使用的全权限凭据：
 
@@ -71,6 +71,7 @@ Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 
 | Agent Run 日志 | `agent_run_logs:read` | 无写接口 |
 | 搜索提供者描述 | `search:read` | 无写接口 |
 | 用户封禁 | `user_ban:read` | `user_ban:write` |
+| 回复履约对账 | `reply_fulfillment:read` | `reply_fulfillment:manage` |
 
 ### 2.2 审计写请求头
 
@@ -94,7 +95,8 @@ X-Komari-Change-Reason: update-sentry-pii-setting
 - 提示词：整份替换、单字段更新；
 - Scene：全量写入、局部更新、同步；
 - 维护公告：发送；
-- 用户封禁：封禁、解封。
+- 用户封禁：封禁、解封；
+- 回复履约对账：确认送达、确认未送达、承诺续跑。
 
 这些接口还接受：
 
@@ -103,6 +105,8 @@ X-Request-ID: web-019f7909-201b-7002
 ```
 
 调用方不传时后端会生成，但前端应主动生成并记录。格式为 1～64 个字符，首字符必须是字母或数字，后续只允许字母、数字、`_`、`.`、`:`、`-`。
+
+回复履约对账的写接口例外：`X-Request-ID` 是必填请求头，缺失返回 `400`，格式非法返回 `422`，后端不会自动生成——每个处置动作都必须绑定调用方显式分配的审计链路 ID。
 
 维护公告使用 `X-Request-ID` 作为持久化幂等键。重试同一次发送必须复用原 ID 和完全相同的请求体；新公告必须生成新 ID，不能让同一个 ID 对应不同内容。
 
@@ -415,6 +419,29 @@ Base path：`/api/v2/komari-user-bans`
 - `superuser_bypass=true` 表示该用户虽有记录但运行时仍会绕过封禁；
 - `notification` 是私信通知尝试结果，通知失败不会回滚封禁操作；
 - `POST` 和 `DELETE` 都必须携带审计请求头。
+
+## 7.5 回复履约对账页面
+
+Base path：`/api/v2/reply-fulfillments`
+
+| 方法 | 路径 | 权限 | 用途 |
+| --- | --- | --- | --- |
+| `GET` | `/fulfillments?status=&limit=20&offset=0` | `reply_fulfillment:read` | 分页列出履约最小身份与派生状态 |
+| `GET` | `/fulfillments/{fulfillment_id}` | `reply_fulfillment:read` | 获取履约详情（含核对正文） |
+| `POST` | `/fulfillments/{fulfillment_id}/confirm-delivered` | `reply_fulfillment:manage` | 确认送达 |
+| `POST` | `/fulfillments/{fulfillment_id}/confirm-not-delivered` | `reply_fulfillment:manage` | 确认未送达 |
+| `POST` | `/fulfillments/{fulfillment_id}/commitments/{commitment_type}/resume` | `reply_fulfillment:manage` | 续跑指定失败承诺 |
+
+派生状态固定为：`not_started`、`pending_confirmation`、`processing`、`needs_disposition`、`completed`、`not_delivered`。
+
+对接注意事项：
+
+- 列表与详情绝不返回回复正文或承诺载荷；列表只返回最小身份、派生状态、时间、稳定错误码与正文指纹 `reply_fingerprint`；
+- 只有 `pending_confirmation` 状态的详情返回 `reply_content` 核对正文，其他状态一律为 `null`；
+- 确认送达请求体为 `{"platform_message_id": "..."}`，平台消息 ID 可缺省；同一平台 ID 重放幂等，不同平台 ID 返回 `409`；
+- 确认未送达不可对已送达记录翻案；确认未送达与承诺续跑出现状态冲突时返回 `409`，未知承诺类型返回 `422`，履约不存在返回 `404`；
+- 三个写接口都必须携带 `X-Komari-Change-Reason` 与显式 `X-Request-ID`（缺失 `400`、格式非法 `422`）；
+- 后端审计日志只记录操作者、request ID、动作、目标哈希与安全结果，前端不得依赖接口响应之外的原始 ID 回显。
 
 ## 8. 知识库与帮助库页面
 

@@ -77,6 +77,7 @@ def _build_components() -> ManagementApiComponents:
         register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
+        reply_fulfillment_service_getter=lambda: None,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -138,6 +139,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
+    assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" not in schema["paths"]
     tag_names = {
         tag
@@ -154,4 +156,5 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         "komari-management-config",
         "komari-management-prompt",
         "komari-user-bans",
+        "reply-fulfillments",
     } <= tag_names

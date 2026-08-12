@@ -174,6 +174,107 @@ async def test_claimed_commitments_decode_asyncpg_jsonb_text() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_reconcile_delivered_persists_late_platform_evidence() -> None:
+    """已送达但缺平台 ID 时，后补证据必须原子持久化后再幂等返回。"""
+    module = _repository_module()
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.update_calls = 0
+            self.released = False
+
+        async def fetchval(self, query: str, *_args: object) -> str | None:
+            assert not self.released, "连接已归还"
+            if "UPDATE komari_chat_reply_fulfillments" not in query:
+                return None
+            self.update_calls += 1
+            return "reply-late" if self.update_calls == 2 else None
+
+        async def fetchrow(self, *_args: object) -> dict[str, object]:
+            assert not self.released, "连接已归还"
+            return {
+                "delivery_state": "DELIVERED",
+                "platform_message_id": None,
+            }
+
+    connection = _Connection()
+
+    class _Acquire:
+        async def __aenter__(self) -> _Connection:
+            connection.released = False
+            return connection
+
+        async def __aexit__(self, *_args: object) -> None:
+            connection.released = True
+
+    class _Pool:
+        def acquire(self) -> _Acquire:
+            return _Acquire()
+
+    repository = module.ReplyFulfillmentRepository(_Pool())
+
+    outcome = await repository.reconcile_delivered(
+        "reply-late",
+        platform_message_id="platform-late-1",
+    )
+
+    assert outcome == "idempotent"
+    assert connection.update_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_management_list_preserves_sql_derived_statuses() -> None:
+    """安全投影不得在缺少内部送达状态时覆盖 SQL 已推导的状态。"""
+    module = _repository_module()
+
+    class _Connection:
+        async def fetch(
+            self,
+            query: str,
+            *_args: object,
+        ) -> list[dict[str, object]]:
+            if "WITH derived AS" in query:
+                return [
+                    {
+                        "fulfillment_id": "reply-pending",
+                        "status": "pending_confirmation",
+                        "total": 2,
+                    },
+                    {
+                        "fulfillment_id": "reply-not-delivered",
+                        "status": "not_delivered",
+                        "total": 2,
+                    },
+                ]
+            return []
+
+    class _Acquire:
+        async def __aenter__(self) -> _Connection:
+            return _Connection()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Pool:
+        def acquire(self) -> _Acquire:
+            return _Acquire()
+
+    repository = module.ReplyFulfillmentRepository(_Pool())
+
+    rows, total = await repository.list_for_management(
+        status=None,
+        limit=20,
+        offset=0,
+    )
+
+    assert total == 2
+    assert [row["status"] for row in rows] == [
+        "pending_confirmation",
+        "not_delivered",
+    ]
+
+
 def test_repository_contains_no_runtime_ddl() -> None:
     """运行时 adapter 只操作迁移管理的表，绝不创建或修改 schema。"""
     module = _repository_module()

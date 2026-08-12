@@ -285,6 +285,32 @@ class ReplyFulfillmentDraft:
             raise ValueError(msg)
 
 
+def derive_reply_fulfillment_status(row: Mapping[str, Any]) -> str:
+    """按父子表字段推导管理派生状态（与存储 adapter 的 SQL 分支一致）。
+
+    固定状态集合：not_started / pending_confirmation / processing /
+    needs_disposition / completed / not_delivered。``row`` 至少携带
+    ``delivery_state``、``completed_at`` 与 ``commitments``（子项
+    状态事实），供管理投影复用，不读取任何载荷。
+    """
+    delivery_state = str(row.get("delivery_state") or "")
+    if delivery_state == "NOT_STARTED":
+        return "not_started"
+    if delivery_state == "PENDING_CONFIRMATION":
+        return "pending_confirmation"
+    if delivery_state == "NOT_DELIVERED":
+        return "not_delivered"
+    if row.get("completed_at") is not None:
+        return "completed"
+    commitments = row.get("commitments") or ()
+    if any(
+        isinstance(item, Mapping) and item.get("state") == "FAILED"
+        for item in commitments
+    ):
+        return "needs_disposition"
+    return "processing"
+
+
 def build_reply_fulfillment_id(
     *,
     group_id: str,
@@ -352,4 +378,5 @@ __all__ = [
     "ReplyFulfillmentDraft",
     "build_reply_fulfillment_id",
     "build_reply_fulfillment_payload_hash",
+    "derive_reply_fulfillment_status",
 ]

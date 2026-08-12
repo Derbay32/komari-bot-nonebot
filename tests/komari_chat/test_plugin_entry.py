@@ -200,6 +200,36 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
     assert calls.process
 
 
+def test_reply_fulfillment_ops_does_not_require_decision_engine(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """履约运维只依赖 PostgreSQL/Redis，不应被判定引擎故障拖垮。"""
+    redis = SimpleNamespace(redis=object())
+    memory = SimpleNamespace(pg_pool=object())
+    built: list[tuple[object, object]] = []
+    service = object()
+
+    monkeypatch.setattr(
+        chat_module,
+        "get_memory_plugin_manager",
+        lambda: SimpleNamespace(redis=redis, memory=memory),
+    )
+    monkeypatch.setattr(chat_module, "get_decision_engine", lambda: None)
+    monkeypatch.setattr(
+        chat_module,
+        "build_reply_fulfillment_ops_service",
+        lambda *, pg_pool, redis_client: (
+            built.append((pg_pool, redis_client)) or service
+        ),
+    )
+    monkeypatch.setattr(chat_module, "_reply_fulfillment_ops", None)
+    monkeypatch.setattr(chat_module, "_reply_fulfillment_ops_components", None)
+
+    assert chat_module.get_reply_fulfillment_ops_service() is service
+    assert built == [(memory.pg_pool, redis.redis)]
+
+
 def test_handler_rebuilds_when_decision_engine_changes(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,

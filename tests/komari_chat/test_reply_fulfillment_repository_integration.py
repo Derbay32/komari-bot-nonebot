@@ -1168,3 +1168,218 @@ async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
 
         for fulfillment_id in (pending_id, disposition_id, protected_id):
             assert await repository.has_active_operation(fulfillment_id)
+
+
+async def test_management_projection_filters_derived_states_without_sensitive_payloads() -> None:
+    """管理读取按派生状态筛选，只返回最小事实且不返回子 payload。"""
+    pending_id = f"ops-pending-{uuid4().hex}"
+    processing_id = f"ops-processing-{uuid4().hex}"
+    disposition_id = f"ops-disposition-{uuid4().hex}"
+    completed_id = f"ops-completed-{uuid4().hex}"
+    not_delivered_id = f"ops-not-delivered-{uuid4().hex}"
+    fulfillment_ids = [
+        pending_id,
+        processing_id,
+        disposition_id,
+        completed_id,
+        not_delivered_id,
+    ]
+    async with _repository_context(fulfillment_ids) as (repository, pool):
+        assert await repository.prepare(_draft(pending_id))
+        assert await repository.mark_send_started(pending_id)
+        for fulfillment_id in (processing_id, disposition_id, completed_id):
+            await _prepare_delivered(repository, fulfillment_id)
+        assert (
+            await repository.claim_operation(
+                disposition_id,
+                owner_token="ops-disposition-worker",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        assert (
+            await repository.mark_commitment_failed(
+                disposition_id,
+                commitment_type="favorability_adjustment",
+                owner_token="ops-disposition-worker",
+                error_code="service_unavailable",
+                max_attempts=1,
+                retry_base_seconds=1,
+            )
+            == "FAILED"
+        )
+        assert await repository.release_lease(
+            disposition_id,
+            owner_token="ops-disposition-worker",
+        )
+        assert (
+            await repository.claim_operation(
+                completed_id,
+                owner_token="ops-completed-worker",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        for commitment_type in (
+            "proactive_reply_confirmation",
+            "favorability_adjustment",
+            "assistant_reply_history",
+            "interaction_history",
+        ):
+            assert await repository.mark_commitment_completed(
+                completed_id,
+                commitment_type=commitment_type,
+                owner_token="ops-completed-worker",
+            )
+        assert await repository.complete_fulfillment(
+            completed_id,
+            owner_token="ops-completed-worker",
+        )
+        assert await repository.prepare(_draft(not_delivered_id))
+        assert await repository.mark_not_delivered(not_delivered_id)
+
+        rows, total = await repository.list_for_management(
+            status="needs_disposition",
+            limit=20,
+            offset=0,
+        )
+        assert total == 1
+        assert [row["fulfillment_id"] for row in rows] == [disposition_id]
+        assert rows[0]["status"] == "needs_disposition"
+        assert "payload" not in repr(rows)
+        assert "lease_owner" not in rows[0]
+        assert "lease_expires_at" not in rows[0]
+
+        detail = await repository.get_for_management(pending_id)
+        assert detail is not None
+        assert detail["status"] == "pending_confirmation"
+        assert detail["reply_content"] == "持久化的角色回复"
+        assert "payload" not in repr(detail)
+
+        delivered_detail = await repository.get_for_management(disposition_id)
+        assert delivered_detail is not None
+        assert delivered_detail["reply_content"] is None
+        async with pool.acquire() as connection:
+            raw_failed_payload = await connection.fetchval(
+                """
+                SELECT payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                  AND commitment_type = 'favorability_adjustment'
+                """,
+                disposition_id,
+            )
+        assert raw_failed_payload is not None
+
+
+async def test_management_reconciliation_and_resume_use_atomic_state_guards() -> None:
+    """对账与续跑只推进允许状态，重复证据幂等且不改冻结载荷。"""
+    delivered_id = f"ops-confirm-delivered-{uuid4().hex}"
+    not_delivered_id = f"ops-confirm-not-delivered-{uuid4().hex}"
+    resume_id = f"ops-resume-{uuid4().hex}"
+    fulfillment_ids = [delivered_id, not_delivered_id, resume_id]
+    async with _repository_context(fulfillment_ids, max_size=6) as (repository, pool):
+        for fulfillment_id in fulfillment_ids:
+            assert await repository.prepare(_draft(fulfillment_id))
+            assert await repository.mark_send_started(fulfillment_id)
+
+        assert (
+            await repository.reconcile_delivered(
+                delivered_id,
+                platform_message_id="platform-ops-1",
+            )
+            == "updated"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                delivered_id,
+                platform_message_id="platform-ops-1",
+            )
+            == "idempotent"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                delivered_id,
+                platform_message_id="platform-conflict",
+            )
+            == "platform_message_conflict"
+        )
+
+        not_delivered = await repository.reconcile_not_delivered(not_delivered_id)
+        assert not_delivered == {
+            "outcome": "updated",
+            "proactive_group_id": "group-1",
+            "proactive_reservation_id": "reservation-1",
+        }
+        assert await repository.reconcile_not_delivered(not_delivered_id) == {
+            "outcome": "idempotent"
+        }
+        assert await repository.reconcile_not_delivered(delivered_id) == {
+            "outcome": "state_conflict"
+        }
+
+        assert await repository.reconcile_delivered(
+            resume_id,
+            platform_message_id=None,
+        ) == "updated"
+        assert (
+            await repository.claim_operation(
+                resume_id,
+                owner_token="ops-failed-worker",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        assert (
+            await repository.mark_commitment_failed(
+                resume_id,
+                commitment_type="favorability_adjustment",
+                owner_token="ops-failed-worker",
+                error_code="service_unavailable",
+                max_attempts=1,
+                retry_base_seconds=1,
+            )
+            == "FAILED"
+        )
+        assert await repository.release_lease(
+            resume_id,
+            owner_token="ops-failed-worker",
+        )
+        async with pool.acquire() as connection:
+            payload_before = await connection.fetchval(
+                """
+                SELECT payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                  AND commitment_type = 'favorability_adjustment'
+                """,
+                resume_id,
+            )
+
+        first, second = await asyncio.gather(
+            repository.resume_failed_commitment(
+                resume_id,
+                commitment_type="favorability_adjustment",
+            ),
+            repository.resume_failed_commitment(
+                resume_id,
+                commitment_type="favorability_adjustment",
+            ),
+        )
+        assert sorted((first, second)) == ["state_conflict", "updated"]
+        async with pool.acquire() as connection:
+            resumed = await connection.fetchrow(
+                """
+                SELECT state, attempt_count, next_retry_at,
+                       last_error_code, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                  AND commitment_type = 'favorability_adjustment'
+                """,
+                resume_id,
+            )
+        assert resumed["state"] == "PENDING"
+        assert resumed["attempt_count"] == 0
+        assert resumed["next_retry_at"] is None
+        assert resumed["last_error_code"] is None
+        assert resumed["payload"] == payload_before
