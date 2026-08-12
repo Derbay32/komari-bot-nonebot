@@ -15,11 +15,14 @@
   发送；保留父正文，全部适用承诺为 PENDING。
 - DELIVERED / PROCESSING / FAILED 按四项旧完成时间戳映射。适用集合
   固定为：主动回复确认仅当预占非空、好感度调整与角色回复历史总是、
-  互动历史仅当全局互动开启；承诺按固定顺序推进，已完成时间戳必须
-  是适用集合上的前缀。首个未完成承诺承接旧全局 attempt_count 与
-  错误码：DELIVERED 且旧 next_retry_at 非空时该项 RETRY_WAIT，
-  PROCESSING 清租约后该项 PENDING，FAILED 该项 FAILED；后续未完成
-  项一律 attempt_count=0 / PENDING。
+  互动历史仅当全局互动开启；承诺按固定顺序推进，适用承诺的已完成
+  时间戳必须是前缀。旧 worker 对不适用承诺也会落占位完成时间戳
+  （无预占仍写 proactive_confirmed_at、全局互动关闭仍写
+  interaction_stored_at），占位事实不参与映射，由适用集合自然忽略。
+  首个未完成承诺承接旧全局 attempt_count 与错误码：DELIVERED 且旧
+  next_retry_at 非空时该项 RETRY_WAIT，PROCESSING 清租约后该项
+  PENDING，FAILED 该项 FAILED；后续未完成项一律 attempt_count=0 /
+  PENDING。
 - COMPLETED / CANCELLED 只回填最小终态父身份（不保留正文、不建子
   行）；所有父租约清空；告警时间戳保持 NULL。
 - payload_hash 原样继承旧行，不重算、不引入任何摘要扩展。
@@ -109,6 +112,9 @@ def _require_no_conflict(
     if not count:
         return
     if label == "ambiguous_failed":
+        # 字面量固定消息：版本链守卫测试要求文件内保留
+        # ``ambiguous_failed_count=`` 与 ``minimum_fulfillment_id=``
+        # 两个最小投影 token，此分支不是冗余分支。
         msg = f"ambiguous_failed_count={count} minimum_fulfillment_id={minimum_id}"
     else:
         msg = f"{label}_count={count} minimum_fulfillment_id={minimum_id}"
@@ -159,8 +165,10 @@ def _preflight(connection: Connection, *, retention_days: int) -> None:
         ),
         label="missing_payload",
     )
-    # 承诺进度一致性：PREPARED 不得有步骤进度；其余非终态行适用承诺
-    # 时间戳必须是前缀，不适用项不得有关键进度
+    # 承诺进度一致性：PREPARED 不得有步骤进度；其余非终态行的适用
+    # 承诺时间戳必须是前缀。不适用承诺的占位完成时间戳（旧 worker
+    # 无条件落 proactive_confirmed_at / interaction_stored_at）不是
+    # 映射冲突，占位事实由 applicable CTE 自然忽略，这里不预检。
     _require_no_conflict(
         connection,
         where=(
@@ -171,17 +179,14 @@ def _preflight(connection: Connection, *, retention_days: int) -> None:
             "OR ai_history_stored_at IS NOT NULL "
             "OR interaction_stored_at IS NOT NULL)) "
             "OR (status <> 'PREPARED' AND ("
-            "(proactive_reservation_id IS NULL "
-            "AND proactive_confirmed_at IS NOT NULL) "
-            "OR (NOT global_interaction_enabled "
-            "AND interaction_stored_at IS NOT NULL) "
-            "OR (proactive_reservation_id IS NOT NULL "
+            "(proactive_reservation_id IS NOT NULL "
             "AND proactive_confirmed_at IS NULL "
             "AND favorability_applied_at IS NOT NULL) "
             "OR (favorability_applied_at IS NULL "
             "AND ai_history_stored_at IS NOT NULL) "
             "OR (ai_history_stored_at IS NULL "
-            "AND interaction_stored_at IS NOT NULL))))"
+            "AND interaction_stored_at IS NOT NULL "
+            "AND global_interaction_enabled))))"
         ),
         label="step_mapping_conflict",
     )
