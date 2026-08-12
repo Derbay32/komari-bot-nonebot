@@ -4,8 +4,8 @@
 迁入本表（KOMARIBOT-7），死字段 ``proactive_score_threshold`` 随迁出
 删除；回复履约另有独立的回复时效字段
 ``reply_fulfillment_freshness_seconds``（TSK-81）。TSK-87 contract 后
-旧 ``reply_commit_*`` 配置名整体改名为 ``reply_fulfillment_*``，
-新增 ``reply_fulfillment_retry_max_seconds`` 退避上限字段。
+旧 outbox 时代的配置名已整体改名为 ``reply_fulfillment_*``，并新增
+``reply_fulfillment_retry_max_seconds`` 退避上限字段。
 """
 
 from typing import ClassVar
