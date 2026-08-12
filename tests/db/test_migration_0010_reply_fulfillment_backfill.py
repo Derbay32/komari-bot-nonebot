@@ -16,6 +16,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
+SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
 
 pytestmark = [
     pytest.mark.skipif(
@@ -24,12 +25,6 @@ pytestmark = [
     ),
     pytest.mark.asyncio,
 ]
-
-
-def _configured_database_url() -> str:
-    from nonebot import get_driver
-
-    return str(getattr(get_driver().config, "sqlalchemy_database_url", "") or "")
 
 
 def _same_database(left: str, right: str) -> bool:
@@ -245,7 +240,7 @@ async def _cleanup_rows(
 
 async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
     """六种旧状态原子转换，冻结指纹原样继承且终态只留最小身份。"""
-    if not _same_database(POSTGRES_URL, _configured_database_url()):
+    if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot 数据库配置不一致")
 
     result = _run_bootstrap("upgrade", "head")
@@ -297,7 +292,9 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
             now=now,
             proactive_reservation_id=None,
             global_interaction_enabled=False,
+            proactive_confirmed_at=now - timedelta(minutes=5),
             favorability_applied_at=now - timedelta(minutes=3),
+            interaction_stored_at=now - timedelta(minutes=2),
             attempt_count=3,
             lease_owner="legacy-worker",
             lease_expires_at=now + timedelta(hours=1),
@@ -504,7 +501,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
 
 async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
     """超过原 31 天幂等证据窗口的 FAILED 使整个 revision 回滚。"""
-    if not _same_database(POSTGRES_URL, _configured_database_url()):
+    if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot 数据库配置不一致")
 
     result = _run_bootstrap("upgrade", "head")
