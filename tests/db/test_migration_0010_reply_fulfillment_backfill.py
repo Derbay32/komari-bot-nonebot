@@ -1,4 +1,10 @@
-"""迁移 0010 旧回复履约回填的真实 PostgreSQL 验收。"""
+"""迁移 0010 旧回复履约回填的真实 PostgreSQL 验收。
+
+隔离纪律：链驱动验收不得搬移共享门控库的版本。每个用例在从门控
+DSN 派生的一次性隔离库（库名后缀 ``_mig0010``）内重建迁移链，
+用例结束即 DROP；共享门控库始终保持 head，重复执行与执行顺序
+互不影响。门控用户需要 CREATEDB 权限。
+"""
 
 from __future__ import annotations
 
@@ -48,9 +54,9 @@ def _parse_dsn(url: str) -> dict[str, Any]:
     }
 
 
-def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_bootstrap(url: str, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["SQLALCHEMY_DATABASE_URL"] = POSTGRES_URL
+    env["SQLALCHEMY_DATABASE_URL"] = url
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     return subprocess.run(
         [sys.executable, "-m", "komari_bot.db.orm_bootstrap", *args],
@@ -63,21 +69,38 @@ def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-async def _require_empty_reply_tables(connection: asyncpg.Connection) -> None:
-    counts = await connection.fetchrow(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM komari_chat_reply_commit_outbox) AS legacy_count,
-            (SELECT COUNT(*) FROM komari_chat_reply_fulfillments) AS parent_count,
-            (
-                SELECT COUNT(*)
-                FROM komari_chat_reply_fulfillment_commitments
-            ) AS child_count
-        """
-    )
-    assert counts is not None
-    if any(int(counts[key]) for key in counts):
-        pytest.skip("回复履约迁移验收要求专用空测试库")
+def _scratch_url(database: str) -> str:
+    """把门控 DSN 的库名替换为隔离库名，其余连接参数保持不变。"""
+    return urlparse(POSTGRES_URL)._replace(path=f"/{database}").geturl()
+
+
+async def _recreate_scratch_database() -> dict[str, Any]:
+    """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。
+
+    隔离库名 = 门控库名 + ``_mig0010``；先 DROP（FORCE 断开残留
+    连接）再 CREATE，重复执行幂等。门控用户需要 CREATEDB 权限。
+    """
+    base = _parse_dsn(POSTGRES_URL)
+    scratch = {**base, "database": f"{base['database']}_mig0010"}
+    connection = await asyncpg.connect(**base)
+    try:
+        name = str(scratch["database"]).replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await connection.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        await connection.close()
+    return scratch
+
+
+async def _drop_scratch_database(database: str) -> None:
+    """删除一次性隔离库（finally 清理，重复删除安全）。"""
+    base = _parse_dsn(POSTGRES_URL)
+    connection = await asyncpg.connect(**base)
+    try:
+        name = database.replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await connection.close()
 
 
 async def _insert_legacy_row(
@@ -211,41 +234,16 @@ async def _insert_legacy_row(
     )
 
 
-async def _cleanup_rows(
-    connection: asyncpg.Connection,
-    operation_ids: list[str],
-) -> None:
-    await connection.execute(
-        """
-        DELETE FROM komari_chat_reply_fulfillment_commitments
-        WHERE fulfillment_id = ANY($1::text[])
-        """,
-        operation_ids,
-    )
-    await connection.execute(
-        """
-        DELETE FROM komari_chat_reply_fulfillments
-        WHERE fulfillment_id = ANY($1::text[])
-        """,
-        operation_ids,
-    )
-    await connection.execute(
-        """
-        DELETE FROM komari_chat_reply_commit_outbox
-        WHERE operation_id = ANY($1::text[])
-        """,
-        operation_ids,
-    )
-
-
 async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
     """六种旧状态原子转换，冻结指纹原样继承且终态只留最小身份。"""
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot 数据库配置不一致")
 
-    result = _run_bootstrap("upgrade", "0010")
+    scratch = await _recreate_scratch_database()
+    scratch_url = _scratch_url(str(scratch["database"]))
+    result = _run_bootstrap(scratch_url, "upgrade", "0010")
     assert result.returncode == 0, result.stderr
-    connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
+    connection = await asyncpg.connect(**scratch)
     operation_ids = [
         "tsk86-prepared",
         "tsk86-delivered",
@@ -256,8 +254,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
     ]
     now = datetime.now(UTC)
     try:
-        await _require_empty_reply_tables(connection)
-        result = _run_bootstrap("downgrade", "0009")
+        result = _run_bootstrap(scratch_url, "downgrade", "0009")
         assert result.returncode == 0, result.stderr
 
         await _insert_legacy_row(
@@ -343,7 +340,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
             not_delivered_at=now - timedelta(minutes=1),
         )
 
-        result = _run_bootstrap("upgrade", "0010")
+        result = _run_bootstrap(scratch_url, "upgrade", "0010")
         assert result.returncode == 0, result.stderr
 
         parents = await connection.fetch(
@@ -465,7 +462,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
         )
 
         before_repeat = [dict(row) for row in parents] + [dict(row) for row in children]
-        result = _run_bootstrap("upgrade", "0010")
+        result = _run_bootstrap(scratch_url, "upgrade", "0010")
         assert result.returncode == 0, result.stderr
         repeated_parents = await connection.fetch(
             """
@@ -493,10 +490,8 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
             dict(row) for row in repeated_children
         ] == before_repeat
     finally:
-        await _cleanup_rows(connection, operation_ids)
-        result = _run_bootstrap("upgrade", "0010")
-        assert result.returncode == 0, result.stderr
         await connection.close()
+        await _drop_scratch_database(str(scratch["database"]))
 
 
 async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
@@ -504,15 +499,16 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot 数据库配置不一致")
 
-    result = _run_bootstrap("upgrade", "0010")
+    scratch = await _recreate_scratch_database()
+    scratch_url = _scratch_url(str(scratch["database"]))
+    result = _run_bootstrap(scratch_url, "upgrade", "0010")
     assert result.returncode == 0, result.stderr
-    connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
+    connection = await asyncpg.connect(**scratch)
     operation_ids = ["tsk86-safe-prepared", "tsk86-ambiguous-failed"]
     now = datetime.now(UTC)
     sensitive_reply = "不得出现在迁移错误里的正文"
     try:
-        await _require_empty_reply_tables(connection)
-        result = _run_bootstrap("downgrade", "0009")
+        result = _run_bootstrap(scratch_url, "downgrade", "0009")
         assert result.returncode == 0, result.stderr
         await _insert_legacy_row(
             connection,
@@ -545,7 +541,7 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
             sensitive_reply,
         )
 
-        result = _run_bootstrap("upgrade", "0010")
+        result = _run_bootstrap(scratch_url, "upgrade", "0010")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
         assert "ambiguous_failed_count=1" in output
@@ -590,7 +586,5 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
             == 2
         )
     finally:
-        await _cleanup_rows(connection, operation_ids)
-        result = _run_bootstrap("upgrade", "0010")
-        assert result.returncode == 0, result.stderr
         await connection.close()
+        await _drop_scratch_database(str(scratch["database"]))

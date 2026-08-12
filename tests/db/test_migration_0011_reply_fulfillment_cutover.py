@@ -1,4 +1,10 @@
-"""迁移 0011 回复履约原子切换的真实 PostgreSQL 验收。"""
+"""迁移 0011 回复履约原子切换的真实 PostgreSQL 验收。
+
+隔离纪律：0011 不可逆，链驱动验收不得搬移共享门控库的版本。
+每个用例在从门控 DSN 派生的一次性隔离库（库名后缀 ``_mig0011``）
+内重建迁移链，用例结束即 DROP；共享门控库始终保持 head，
+重复执行与执行顺序互不影响。门控用户需要 CREATEDB 权限。
+"""
 
 from __future__ import annotations
 
@@ -44,19 +50,6 @@ NEW_CONFIG_COLUMNS = (
     "reply_fulfillment_tombstone_retention_days",
 )
 DISTINCTIVE_VALUES = (17, 9, 121, 8, 13, 44)
-#: 0011 一对一改名的六列；retry_max 是新增列，不在映射内。
-RENAMED_CONFIG_COLUMNS = {
-    "reply_commit_worker_interval_seconds": (
-        "reply_fulfillment_worker_interval_seconds"
-    ),
-    "reply_commit_batch_size": "reply_fulfillment_batch_size",
-    "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
-    "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
-    "reply_commit_retry_base_seconds": "reply_fulfillment_retry_base_seconds",
-    "reply_commit_tombstone_retention_days": (
-        "reply_fulfillment_tombstone_retention_days"
-    ),
-}
 
 
 def _same_database(left: str, right: str) -> bool:
@@ -80,9 +73,9 @@ def _parse_dsn(url: str) -> dict[str, Any]:
     }
 
 
-def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_bootstrap(url: str, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["SQLALCHEMY_DATABASE_URL"] = POSTGRES_URL
+    env["SQLALCHEMY_DATABASE_URL"] = url
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     return subprocess.run(
         [sys.executable, "-m", "komari_bot.db.orm_bootstrap", *args],
@@ -93,6 +86,40 @@ def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
         check=False,
         timeout=300,
     )
+
+
+def _scratch_url(database: str) -> str:
+    """把门控 DSN 的库名替换为隔离库名，其余连接参数保持不变。"""
+    return urlparse(POSTGRES_URL)._replace(path=f"/{database}").geturl()
+
+
+async def _recreate_scratch_database() -> dict[str, Any]:
+    """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。
+
+    隔离库名 = 门控库名 + ``_mig0011``；先 DROP（FORCE 断开残留
+    连接）再 CREATE，重复执行幂等。门控用户需要 CREATEDB 权限。
+    """
+    base = _parse_dsn(POSTGRES_URL)
+    scratch = {**base, "database": f"{base['database']}_mig0011"}
+    connection = await asyncpg.connect(**base)
+    try:
+        name = str(scratch["database"]).replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await connection.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        await connection.close()
+    return scratch
+
+
+async def _drop_scratch_database(database: str) -> None:
+    """删除一次性隔离库（finally 清理，重复删除安全）。"""
+    base = _parse_dsn(POSTGRES_URL)
+    connection = await asyncpg.connect(**base)
+    try:
+        name = database.replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await connection.close()
 
 
 async def _table_exists(connection: asyncpg.Connection, table_name: str) -> bool:
@@ -145,9 +172,7 @@ async def _ensure_chat_config_row(connection: asyncpg.Connection) -> bool:
         "reply_fulfillment_freshness_seconds": 120,
     }
     columns_sql = ", ".join(["id", "revision", "updated_at", *value_columns])
-    placeholders = ", ".join(
-        f"${index}" for index in range(1, 4 + len(value_columns))
-    )
+    placeholders = ", ".join(f"${index}" for index in range(1, 4 + len(value_columns)))
     await connection.execute(
         f"INSERT INTO komari_chat_config ({columns_sql}) VALUES ({placeholders})",
         1,
@@ -319,14 +344,16 @@ async def test_cutover_aborts_and_rolls_back_when_backfill_is_missing() -> None:
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
-    result = _run_bootstrap("upgrade", "0010")
+    scratch = await _recreate_scratch_database()
+    scratch_url = _scratch_url(str(scratch["database"]))
+    result = _run_bootstrap(scratch_url, "upgrade", "0010")
     assert result.returncode == 0, result.stderr
-    connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
+    connection = await asyncpg.connect(**scratch)
     fulfillment_id = "tsk87-missing-parent"
     try:
         await _insert_legacy_prepared(connection, fulfillment_id)
 
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "head")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
         assert "missing_backfill_count=1" in output
@@ -350,12 +377,8 @@ async def test_cutover_aborts_and_rolls_back_when_backfill_is_missing() -> None:
             == 1
         )
     finally:
-        if await _table_exists(connection, "komari_chat_reply_commit_outbox"):
-            await connection.execute(
-                "DELETE FROM komari_chat_reply_commit_outbox WHERE operation_id = $1",
-                fulfillment_id,
-            )
         await connection.close()
+        await _drop_scratch_database(str(scratch["database"]))
 
 
 async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
@@ -363,15 +386,17 @@ async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
-    result = _run_bootstrap("upgrade", "0010")
+    scratch = await _recreate_scratch_database()
+    scratch_url = _scratch_url(str(scratch["database"]))
+    result = _run_bootstrap(scratch_url, "upgrade", "0010")
     assert result.returncode == 0, result.stderr
-    connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
+    connection = await asyncpg.connect(**scratch)
     fulfillment_id = "tsk87-missing-children"
     try:
         await _insert_legacy_prepared(connection, fulfillment_id)
         await _insert_parent_for_legacy(connection, fulfillment_id)
 
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "head")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
         assert "commitment_mismatch_count=1" in output
@@ -384,38 +409,27 @@ async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
         )
         assert await _table_exists(connection, "komari_chat_reply_commit_outbox")
     finally:
-        await connection.execute(
-            "DELETE FROM komari_chat_reply_fulfillments WHERE fulfillment_id = $1",
-            fulfillment_id,
-        )
-        if await _table_exists(connection, "komari_chat_reply_commit_outbox"):
-            await connection.execute(
-                "DELETE FROM komari_chat_reply_commit_outbox WHERE operation_id = $1",
-                fulfillment_id,
-            )
         await connection.close()
+        await _drop_scratch_database(str(scratch["database"]))
 
 
 async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -> None:
     """完整父子镜像通过门禁，配置值一对一保留且旧表被删除。
 
-    本测试把数据库推进到不可逆的 0011，必须保持为本文件最后执行的
-    用例；fail-fast 场景需在仍停留在 0010 时先行验证。
+    本用例在独立的隔离库内把迁移链推进到不可逆的 0011；隔离库随
+    用例结束删除，不污染共享门控库，因此用例间无执行顺序要求。
     """
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
-    result = _run_bootstrap("upgrade", "0010")
+    scratch = await _recreate_scratch_database()
+    scratch_url = _scratch_url(str(scratch["database"]))
+    result = _run_bootstrap(scratch_url, "upgrade", "0010")
     assert result.returncode == 0, result.stderr
-    connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
+    connection = await asyncpg.connect(**scratch)
     fulfillment_id = "tsk87-complete-cutover"
-    original_chat_row: asyncpg.Record | None = None
-    created_chat_row = False
     try:
-        original_chat_row = await connection.fetchrow(
-            "SELECT * FROM komari_chat_config WHERE id = 1"
-        )
-        created_chat_row = await _ensure_chat_config_row(connection)
+        await _ensure_chat_config_row(connection)
         set_clause = ", ".join(
             f"{column} = ${index}"
             for index, column in enumerate(OLD_CONFIG_COLUMNS, start=1)
@@ -427,12 +441,10 @@ async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -
         await _insert_legacy_prepared(connection, fulfillment_id)
         await _insert_parent_children_for_legacy(connection, fulfillment_id)
 
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "head")
         assert result.returncode == 0, result.stderr
 
-        assert not await _table_exists(
-            connection, "komari_chat_reply_commit_outbox"
-        )
+        assert not await _table_exists(connection, "komari_chat_reply_commit_outbox")
         assert await _table_exists(connection, "komari_chat_reply_fulfillments")
         assert await _table_exists(
             connection, "komari_chat_reply_fulfillment_commitments"
@@ -471,34 +483,5 @@ async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -
             == 4
         )
     finally:
-        if await _table_exists(connection, "komari_chat_reply_fulfillments"):
-            await connection.execute(
-                "DELETE FROM komari_chat_reply_fulfillments WHERE fulfillment_id = $1",
-                fulfillment_id,
-            )
-        if original_chat_row is not None and await _table_exists(
-            connection, "komari_chat_config"
-        ):
-            # 快照取自 0010（旧列名），0011 后需按改名映射恢复到新列；
-            # retry_max 无旧对应列，保留迁移写入的默认值即可。
-            current_columns = await _column_names(connection, "komari_chat_config")
-            restore_values: dict[str, object] = {}
-            for column, value in dict(original_chat_row).items():
-                if column == "updated_at":
-                    continue
-                target = RENAMED_CONFIG_COLUMNS.get(column, column)
-                if target in current_columns:
-                    restore_values[target] = value
-            set_clause = ", ".join(
-                f"{column} = ${index}"
-                for index, column in enumerate(restore_values, start=1)
-            )
-            await connection.execute(
-                f"UPDATE komari_chat_config SET {set_clause} WHERE id = 1",
-                *restore_values.values(),
-            )
-        elif created_chat_row and await _table_exists(
-            connection, "komari_chat_config"
-        ):
-            await connection.execute("DELETE FROM komari_chat_config WHERE id = 1")
         await connection.close()
+        await _drop_scratch_database(str(scratch["database"]))

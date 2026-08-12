@@ -1,17 +1,19 @@
 """迁移 0004 downgrade 空行防护验收测试（KOMARIBOT-13）。
 
 静态守卫沿用迁移链测试的文本校验手法；集成测试以
-``KOMARI_TEST_POSTGRES_URL`` 门控，与 nonebot 配置的
-``sqlalchemy_database_url`` 不同库时跳过（沿用既有守卫手法）。
+``KOMARI_TEST_POSTGRES_URL`` 门控，并要求 ``SQLALCHEMY_DATABASE_URL``
+与门控 DSN 同库，否则跳过（与 0010/0011 迁移验收同一守卫手法）。
 
-集成流程会把测试库临时回滚到 0003 再升级回 0004，``finally`` 中
-始终执行 ``upgrade 0004`` 恢复迁移状态，并把 ``komari_chat_config``
-单行数据还原为测试前快照。目标版本不可超过 0004：0011 起迁移链
-不可逆，停留在 head 将无法回滚到 0003。
+隔离纪律：0011 起迁移链不可逆，链驱动验收不得搬移共享门控库的
+版本。集成流程在从门控 DSN 派生的一次性隔离库（库名后缀
+``_mig0004``）内重建迁移链——先 upgrade 0004，再演练回滚 0003
+与升级恢复，用例结束即 DROP；共享门控库始终保持 head，重复执行
+与执行顺序互不影响。门控用户需要 CREATEDB 权限。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -25,11 +27,10 @@ import asyncpg
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MIGRATION_PATH = (
-    PROJECT_ROOT / "migrations" / "versions" / "0004_komari_chat_config.py"
-)
+MIGRATION_PATH = PROJECT_ROOT / "migrations" / "versions" / "0004_komari_chat_config.py"
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
+SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
 
 #: 迁移 0002/0004 之间 komari_memory_config 被 DROP 的 11 列。
 _DROPPED_COLUMNS = (
@@ -76,15 +77,9 @@ def test_downgrade_backfill_is_guarded_against_missing_chat_config_row() -> None
     列赋 NULL 而抛错；回填语句必须携带 EXISTS 守卫或 COALESCE 回落。
     """
     downgrade_body = _migration_downgrade_source()
-    assert re.search(
-        r"\bEXISTS\b|\bCOALESCE\b", downgrade_body, re.IGNORECASE
-    ), "downgrade 回填缺少空行防护（EXISTS 守卫或 COALESCE 回落）"
-
-
-def _configured_database_url() -> str:
-    from nonebot import get_driver
-
-    return str(getattr(get_driver().config, "sqlalchemy_database_url", "") or "")
+    assert re.search(r"\bEXISTS\b|\bCOALESCE\b", downgrade_body, re.IGNORECASE), (
+        "downgrade 回填缺少空行防护（EXISTS 守卫或 COALESCE 回落）"
+    )
 
 
 def _same_database(left: str, right: str) -> bool:
@@ -108,16 +103,16 @@ def _parse_dsn(url: str) -> dict[str, Any]:
     }
 
 
-def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_bootstrap(url: str, *args: str) -> subprocess.CompletedProcess[str]:
     """在仓库根目录执行 orm_bootstrap 迁移命令。
 
     子进程 cwd 必须是仓库根：nonebot-plugin-orm 按 cwd 相对的
     ``migrations/`` 定位版本链，nonebot 配置（含 ``.env`` 覆盖层）
-    也在该目录加载。``SQLALCHEMY_DATABASE_URL`` 经环境变量显式覆盖，
-    优先级高于 dotenv 文件。
+    也在该目录加载。``SQLALCHEMY_DATABASE_URL`` 经环境变量显式覆盖
+    为隔离库 URL，优先级高于 dotenv 文件。
     """
     env = os.environ.copy()
-    env["SQLALCHEMY_DATABASE_URL"] = POSTGRES_URL
+    env["SQLALCHEMY_DATABASE_URL"] = url
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     return subprocess.run(
         [sys.executable, "-m", "komari_bot.db.orm_bootstrap", *args],
@@ -128,6 +123,40 @@ def _run_bootstrap(*args: str) -> subprocess.CompletedProcess[str]:
         check=False,
         timeout=300,
     )
+
+
+def _scratch_url(database: str) -> str:
+    """把门控 DSN 的库名替换为隔离库名，其余连接参数保持不变。"""
+    return urlparse(POSTGRES_URL)._replace(path=f"/{database}").geturl()
+
+
+async def _recreate_scratch_database() -> dict[str, Any]:
+    """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。
+
+    隔离库名 = 门控库名 + ``_mig0004``；先 DROP（FORCE 断开残留
+    连接）再 CREATE，重复执行幂等。门控用户需要 CREATEDB 权限。
+    """
+    base = _parse_dsn(POSTGRES_URL)
+    scratch = {**base, "database": f"{base['database']}_mig0004"}
+    connection = await asyncpg.connect(**base)
+    try:
+        name = str(scratch["database"]).replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await connection.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        await connection.close()
+    return scratch
+
+
+async def _drop_scratch_database(database: str) -> None:
+    """删除一次性隔离库（finally 清理，重复删除安全）。"""
+    base = _parse_dsn(POSTGRES_URL)
+    connection = await asyncpg.connect(**base)
+    try:
+        name = database.replace('"', '""')
+        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await connection.close()
 
 
 def _expected_schema_defaults() -> dict[str, object]:
@@ -155,29 +184,25 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
     1. 空行：upgrade 0004 后 komari_chat_config 尚未初始化（无行），
        downgrade 不抛错，komari_memory_config 按 schema 默认值回填；
     2. 有行：活字段值原样回填，11 列结构复原；
-    3. 最终 upgrade 0004 恢复迁移状态，并还原配置数据快照。
+    3. 全程在一次性隔离库内执行，用例结束即删除，共享门控库的
+       版本不受搬移影响。
     """
-    if not _same_database(POSTGRES_URL, _configured_database_url()):
-        pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
+    if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
+        pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
-    result = _run_bootstrap("upgrade", "0004")
+    scratch = await _recreate_scratch_database()
+    scratch_url = _scratch_url(str(scratch["database"]))
+    result = _run_bootstrap(scratch_url, "upgrade", "0004")
     assert result.returncode == 0, result.stderr
 
-    conn = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
-    original_chat_row: asyncpg.Record | None = None
-    created_memory_row = False
+    conn = await asyncpg.connect(**scratch)
     try:
-        original_chat_row = await conn.fetchrow(
-            "SELECT * FROM komari_chat_config WHERE id = 1"
-        )
-        created_memory_row = await _ensure_memory_config_row(conn)
+        await _ensure_memory_config_row(conn)
 
         # === 场景一：komari_chat_config 无行 ===
         await conn.execute("DELETE FROM komari_chat_config WHERE id = 1")
-        result = _run_bootstrap("downgrade", "0003")
-        assert result.returncode == 0, (
-            f"空行场景 downgrade 失败: {result.stderr}"
-        )
+        result = _run_bootstrap(scratch_url, "downgrade", "0003")
+        assert result.returncode == 0, f"空行场景 downgrade 失败: {result.stderr}"
 
         chat_table_exists = await conn.fetchval(
             "SELECT to_regclass('komari_chat_config') IS NOT NULL"
@@ -199,23 +224,25 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
             )
 
         # === 场景二：komari_chat_config 有行，活字段原样回填 ===
-        result = _run_bootstrap("upgrade", "0004")
+        result = _run_bootstrap(scratch_url, "upgrade", "0004")
         assert result.returncode == 0, result.stderr
 
+        # 隔离库无运行时播种，先按 schema 默认值补插单行再写特色值
+        await _ensure_chat_config_row(conn)
         distinctive = dict(_expected_schema_defaults())
         distinctive.pop("proactive_score_threshold")
         distinctive["proactive_cooldown"] = 123
         distinctive["reply_commit_batch_size"] = 7
-        set_clause = ", ".join(f"{column} = ${index}" for index, column in enumerate(distinctive, start=1))
+        set_clause = ", ".join(
+            f"{column} = ${index}" for index, column in enumerate(distinctive, start=1)
+        )
         await conn.execute(
             f"UPDATE komari_chat_config SET {set_clause} WHERE id = 1",
             *distinctive.values(),
         )
 
-        result = _run_bootstrap("downgrade", "0003")
-        assert result.returncode == 0, (
-            f"有行场景 downgrade 失败: {result.stderr}"
-        )
+        result = _run_bootstrap(scratch_url, "downgrade", "0003")
+        assert result.returncode == 0, f"有行场景 downgrade 失败: {result.stderr}"
 
         memory_row = await conn.fetchrow(
             "SELECT * FROM komari_memory_config WHERE id = 1"
@@ -224,7 +251,11 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
         assert memory_row["proactive_cooldown"] == 123
         assert memory_row["reply_commit_batch_size"] == 7
         for column in _DROPPED_COLUMNS:
-            if column in ("proactive_cooldown", "reply_commit_batch_size", "proactive_score_threshold"):
+            if column in (
+                "proactive_cooldown",
+                "reply_commit_batch_size",
+                "proactive_score_threshold",
+            ):
                 continue
             expected = _expected_schema_defaults()[column]
             assert memory_row[column] == expected, column
@@ -232,32 +263,39 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
         memory_columns = await _memory_config_columns(conn)
         assert set(_DROPPED_COLUMNS) <= set(memory_columns), "有行场景 11 列结构未复原"
     finally:
-        # === 恢复：迁移回到 0004，数据还原为测试前快照 ===
-        result = _run_bootstrap("upgrade", "0004")
-        assert result.returncode == 0, result.stderr
-        if original_chat_row is not None:
-            chat_columns = [
-                column for column in dict(original_chat_row) if column != "updated_at"
-            ]
-            set_clause = ", ".join(
-                f"{column} = ${index}" for index, column in enumerate(chat_columns, start=1)
-            )
-            await conn.execute(
-                f"UPDATE komari_chat_config SET {set_clause} WHERE id = 1",
-                *[original_chat_row[column] for column in chat_columns],
-            )
-        else:
-            await conn.execute("DELETE FROM komari_chat_config WHERE id = 1")
-        if created_memory_row:
-            await conn.execute("DELETE FROM komari_memory_config WHERE id = 1")
         await conn.close()
+        await _drop_scratch_database(str(scratch["database"]))
+
+
+async def _ensure_chat_config_row(conn: asyncpg.Connection) -> None:
+    """0004 后隔离库无运行时播种，按 schema 默认值补插 chat 配置单行。
+
+    0004 版本下 ``komari_chat_config`` 的值列恰好是 10 个旧名活字段，
+    直接复用 ``_expected_schema_defaults()`` 的旧名 → 默认值映射。
+    """
+    exists = await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM komari_chat_config WHERE id = 1)"
+    )
+    if exists:
+        return
+    defaults = _expected_schema_defaults()
+    columns = list(defaults)
+    columns_sql = ", ".join(["id", "revision", "updated_at", *columns])
+    placeholders = ", ".join(f"${index}" for index in range(1, 4 + len(columns)))
+    await conn.execute(
+        f"INSERT INTO komari_chat_config ({columns_sql}) VALUES ({placeholders})",
+        1,
+        1,
+        datetime.now(UTC),
+        *defaults.values(),
+    )
 
 
 async def _ensure_memory_config_row(conn: asyncpg.Connection) -> bool:
     """确保 komari_memory_config 单行存在（无行时按 schema 默认插入）。
 
     Returns:
-        是否由本函数新建了该行（供 finally 决定是否删除以恢复原状）。
+        是否由本函数新建了该行。
     """
     exists = await conn.fetchval(
         "SELECT EXISTS (SELECT 1 FROM komari_memory_config WHERE id = 1)"
@@ -277,16 +315,29 @@ async def _ensure_memory_config_row(conn: asyncpg.Connection) -> bool:
         if column not in ("id", "revision", "updated_at")
         and column in type(defaults).model_fields
     ]
-    columns_sql = ", ".join(["id", "revision", "updated_at", *value_columns])
+    values = [getattr(defaults, column) for column in value_columns]
+    # JSONB 列（白名单等列表/字典字段）必须序列化并显式 ::jsonb 转型，
+    # 否则 asyncpg 把 list 当数组绑定而报 DataError
+    serialized = [
+        json.dumps(value, ensure_ascii=False)
+        if isinstance(value, (dict, list))
+        else value
+        for value in values
+    ]
     placeholders = ", ".join(
-        f"${index}" for index in range(1, 4 + len(value_columns))
+        f"${index}::jsonb"
+        if isinstance(values[index - 4], (dict, list))
+        else f"${index}"
+        for index in range(4, 4 + len(value_columns))
     )
+    columns_sql = ", ".join(["id", "revision", "updated_at", *value_columns])
     await conn.execute(
-        f"INSERT INTO komari_memory_config ({columns_sql}) VALUES ({placeholders})",
+        f"INSERT INTO komari_memory_config ({columns_sql})"
+        f" VALUES ($1, $2, $3, {placeholders})",
         1,
         1,
         datetime.now(UTC),
-        *[getattr(defaults, column) for column in value_columns],
+        *serialized,
     )
     return True
 
