@@ -1232,6 +1232,8 @@ class ReplyFulfillmentRepository:
         冻结 payload 一律不修改。并发续跑只有一个成功（``updated``）；
         子状态为 PENDING / RETRY_WAIT / COMPLETED 或父未完成条件不满足
         都返回 ``state_conflict``，身份或承诺不存在返回 ``not_found``。
+        续跑同时只复位本子项的 ``disposition_alerted_at``（同一承诺再次
+        耗尽属于新告警代际，允许再告警一次），绝不修改兄弟项标记。
         """
         async with self.pg_pool.acquire() as connection:
             updated = await connection.fetchval(
@@ -1242,6 +1244,7 @@ class ReplyFulfillmentRepository:
                     next_retry_at = NULL,
                     last_error_code = NULL,
                     completed_at = NULL,
+                    disposition_alerted_at = NULL,
                     updated_at = NOW()
                 FROM komari_chat_reply_fulfillments AS parent
                 WHERE child.fulfillment_id = $1
@@ -1280,6 +1283,94 @@ class ReplyFulfillmentRepository:
             if child_exists is None:
                 return "not_found"
         return "state_conflict"
+
+    async def claim_pending_confirmation_alerts(
+        self,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """原子领取首次进入待确认转换的履约，落父表告警去重时间戳。
+
+        只有 ``PENDING_CONFIRMATION`` 且 ``pending_confirmation_alerted_at``
+        为空的行才会被领取；领取即在同一事务内落时间戳，并发 worker
+        与仓库重建都不会重复命中。返回行只含告警白名单字段，绝不携带
+        父 ``reply_content``、群信息或任何内部身份。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT parent.fulfillment_id
+                    FROM komari_chat_reply_fulfillments AS parent
+                    WHERE parent.delivery_state = 'PENDING_CONFIRMATION'
+                      AND parent.pending_confirmation_alerted_at IS NULL
+                    ORDER BY parent.prepared_at, parent.fulfillment_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $1
+                )
+                UPDATE komari_chat_reply_fulfillments AS parent
+                SET pending_confirmation_alerted_at = NOW(),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE parent.fulfillment_id = candidates.fulfillment_id
+                RETURNING
+                    parent.fulfillment_id,
+                    'pending_confirmation'::text AS status,
+                    NULL::text AS commitment_type,
+                    NULL::text AS error_code
+                """,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def claim_commitment_disposition_alerts(
+        self,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """原子领取首次进入待处置转换的失败承诺，落子表告警去重时间戳。
+
+        领取身份是（``fulfillment_id``, ``commitment_type``）二元组：
+        只有 ``FAILED`` 且 ``disposition_alerted_at`` 为空、父已送达且
+        未完成的子项才会被领取，普通 ``RETRY_WAIT`` 自动重试永不成为
+        候选。领取即在同一事务内落时间戳，并发与重启不重复命中；返回
+        行只含白名单字段与稳定错误码，绝不携带冻结 payload。
+        """
+        if limit <= 0:
+            return []
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH candidates AS (
+                    SELECT child.fulfillment_id, child.commitment_type
+                    FROM komari_chat_reply_fulfillment_commitments AS child
+                    JOIN komari_chat_reply_fulfillments AS parent
+                      ON parent.fulfillment_id = child.fulfillment_id
+                    WHERE child.state = 'FAILED'
+                      AND child.disposition_alerted_at IS NULL
+                      AND parent.delivery_state = 'DELIVERED'
+                      AND parent.completed_at IS NULL
+                    ORDER BY child.fulfillment_id, child.commitment_type
+                    FOR UPDATE OF child SKIP LOCKED
+                    LIMIT $1
+                )
+                UPDATE komari_chat_reply_fulfillment_commitments AS child
+                SET disposition_alerted_at = NOW(),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE child.fulfillment_id = candidates.fulfillment_id
+                  AND child.commitment_type = candidates.commitment_type
+                RETURNING
+                    child.fulfillment_id,
+                    'needs_disposition'::text AS status,
+                    child.commitment_type,
+                    child.last_error_code AS error_code
+                """,
+                limit,
+            )
+        return [dict(row) for row in rows]
 
 
 __all__ = [
