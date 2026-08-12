@@ -1,9 +1,11 @@
 """Komari Chat 配置 Schema。
 
-主动回复频控与回复送达副作用 outbox 的 10 个活字段从
-``komari_memory_config`` 迁入本表（KOMARIBOT-7），死字段
-``proactive_score_threshold`` 随迁出删除；回复履约另有独立的回复
-时效字段 ``reply_fulfillment_freshness_seconds``（TSK-81）。
+主动回复频控与回复履约 worker 的 11 个活字段从 ``komari_memory_config``
+迁入本表（KOMARIBOT-7），死字段 ``proactive_score_threshold`` 随迁出
+删除；回复履约另有独立的回复时效字段
+``reply_fulfillment_freshness_seconds``（TSK-81）。TSK-87 contract 后
+旧 outbox 时代的配置名已整体改名为 ``reply_fulfillment_*``，并新增
+``reply_fulfillment_retry_max_seconds`` 退避上限字段。
 """
 
 from typing import ClassVar
@@ -60,42 +62,48 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"apply_mode": "immediate"},
     )
 
-    # 回复送达后副作用 outbox
-    reply_commit_worker_interval_seconds: int = Field(
+    # 回复履约后台 worker
+    reply_fulfillment_worker_interval_seconds: int = Field(
         default=5,
         ge=1,
         le=300,
-        description="聊天回复副作用 outbox 的后台扫描间隔（秒）",
+        description="回复履约后台 worker 的扫描间隔（秒）",
     )
-    reply_commit_batch_size: int = Field(
+    reply_fulfillment_batch_size: int = Field(
         default=20,
         ge=1,
         le=200,
-        description="聊天回复副作用 outbox 单轮最大领取数",
+        description="回复履约单轮最大领取数",
     )
-    reply_commit_lease_seconds: int = Field(
+    reply_fulfillment_lease_seconds: int = Field(
         default=120,
         ge=30,
         le=900,
-        description="聊天回复副作用 outbox worker 租约时长（秒）",
+        description="回复履约 worker 租约时长（秒）",
     )
-    reply_commit_max_attempts: int = Field(
+    reply_fulfillment_max_attempts: int = Field(
         default=20,
         ge=1,
         le=100,
-        description="聊天回复副作用 outbox 自动重试上限，耗尽后保留 FAILED 对账记录",
+        description="送达后承诺自动重试上限，耗尽后保留 FAILED 对账记录",
     )
-    reply_commit_retry_base_seconds: int = Field(
+    reply_fulfillment_retry_base_seconds: int = Field(
         default=5,
         ge=1,
         le=300,
-        description="聊天回复副作用 outbox 指数退避基准秒数",
+        description="送达后承诺指数退避基准秒数",
     )
-    reply_commit_tombstone_retention_days: int = Field(
+    reply_fulfillment_retry_max_seconds: int = Field(
+        default=3600,
+        ge=1,
+        le=86_400,
+        description="送达后承诺指数退避上限秒数",
+    )
+    reply_fulfillment_tombstone_retention_days: int = Field(
         default=30,
         ge=1,
         le=365,
-        description="已完成或取消的聊天 operation 防重记录保留天数",
+        description="已完成或未送达的履约身份保护期天数",
     )
     reply_fulfillment_freshness_seconds: int = Field(
         default=120,

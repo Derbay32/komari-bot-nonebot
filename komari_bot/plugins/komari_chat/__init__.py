@@ -58,12 +58,13 @@ def _get_reply_fulfillment_config() -> Any:
         proactive_cooldown=config.proactive_cooldown,
         global_interaction_enabled=memory_config.global_interaction_enabled,
         global_interaction_trigger_size=memory_config.global_interaction_trigger_size,
-        reply_commit_lease_seconds=config.reply_commit_lease_seconds,
-        reply_commit_max_attempts=config.reply_commit_max_attempts,
-        reply_commit_retry_base_seconds=config.reply_commit_retry_base_seconds,
-        reply_commit_batch_size=config.reply_commit_batch_size,
-        reply_commit_tombstone_retention_days=(
-            config.reply_commit_tombstone_retention_days
+        reply_fulfillment_lease_seconds=config.reply_fulfillment_lease_seconds,
+        reply_fulfillment_max_attempts=config.reply_fulfillment_max_attempts,
+        reply_fulfillment_retry_base_seconds=config.reply_fulfillment_retry_base_seconds,
+        reply_fulfillment_retry_max_seconds=config.reply_fulfillment_retry_max_seconds,
+        reply_fulfillment_batch_size=config.reply_fulfillment_batch_size,
+        reply_fulfillment_tombstone_retention_days=(
+            config.reply_fulfillment_tombstone_retention_days
         ),
         reply_fulfillment_freshness_seconds=(
             config.reply_fulfillment_freshness_seconds
@@ -90,7 +91,7 @@ _reply_fulfillment: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment_components: tuple[Any, Any, Any] | None = None
 _reply_fulfillment_ops: ReplyFulfillmentOpsService | None = None
 _reply_fulfillment_ops_components: tuple[Any, Any] | None = None
-_reply_commit_worker_task: asyncio.Task[None] | None = None
+_reply_fulfillment_worker_task: asyncio.Task[None] | None = None
 
 
 def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
@@ -198,9 +199,16 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
             user_data=user_data_plugin,
             config_getter=_get_reply_fulfillment_config,
             recovery_senders_getter=_get_recovery_senders,
+            bots_provider=get_bots,
+            superusers_provider=_get_superusers,
         )
         _reply_fulfillment_components = components
     return _reply_fulfillment
+
+
+def _get_superusers() -> set[str]:
+    """当前配置声明的 SUPERUSERS（告警私聊收件人）。"""
+    return set(get_driver().config.superusers)
 
 
 def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
@@ -232,34 +240,36 @@ def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
     return _reply_fulfillment_ops
 
 
-async def _reply_commit_worker() -> None:
-    """周期重试已经确认送达的聊天副作用 outbox。"""
+async def _reply_fulfillment_worker() -> None:
+    """周期恢复中断的回复履约：发送前恢复、承诺推进、告警与小时级清理。"""
     while True:
         try:
             workflow = _get_or_build_reply_fulfillment()
             if workflow is not None:
                 await workflow.recover_pending()
-            interval = get_config().reply_commit_worker_interval_seconds
+            interval = get_config().reply_fulfillment_worker_interval_seconds
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("[KomariChat] 回复 outbox 后台轮询失败")
+            logger.exception("[KomariChat] 回复履约后台轮询失败")
             interval = 5
         await asyncio.sleep(max(1, interval))
 
 
-async def _start_reply_commit_worker() -> None:
-    """启动单进程 outbox 轮询任务。"""
-    global _reply_commit_worker_task  # noqa: PLW0603
-    if _reply_commit_worker_task is None or _reply_commit_worker_task.done():
-        _reply_commit_worker_task = asyncio.create_task(_reply_commit_worker())
+async def _start_reply_fulfillment_worker() -> None:
+    """启动单进程回复履约轮询任务。"""
+    global _reply_fulfillment_worker_task  # noqa: PLW0603
+    if _reply_fulfillment_worker_task is None or _reply_fulfillment_worker_task.done():
+        _reply_fulfillment_worker_task = asyncio.create_task(
+            _reply_fulfillment_worker()
+        )
 
 
-async def _stop_reply_commit_worker() -> None:
-    """停止 outbox 轮询任务并等待退出。"""
-    global _reply_commit_worker_task  # noqa: PLW0603
-    task = _reply_commit_worker_task
-    _reply_commit_worker_task = None
+async def _stop_reply_fulfillment_worker() -> None:
+    """停止回复履约轮询任务并等待退出。"""
+    global _reply_fulfillment_worker_task  # noqa: PLW0603
+    task = _reply_fulfillment_worker_task
+    _reply_fulfillment_worker_task = None
     if task is None:
         return
     task.cancel()
@@ -268,8 +278,8 @@ async def _stop_reply_commit_worker() -> None:
 
 
 driver = get_driver()
-driver.on_startup(_start_reply_commit_worker)
-driver.on_shutdown(_stop_reply_commit_worker)
+driver.on_startup(_start_reply_fulfillment_worker)
+driver.on_shutdown(_stop_reply_fulfillment_worker)
 
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:

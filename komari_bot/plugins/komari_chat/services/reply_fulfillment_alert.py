@@ -10,7 +10,8 @@
 画像、互动载荷、提示词、推理、URL、凭据或原始异常。跨进程去重完全
 由仓库的持久化 claim 事实负责，本服务不维护任何进程内去重状态；
 普通 ``RETRY_WAIT``/自动瞬态重试不进入任何告警 claim，不在此生成
-告警。本服务是窄 seam，未被接到生产正常路径，也不触碰旧 outbox。
+告警。TSK-87 后本服务已由 ``ReplyFulfillmentWorkflow`` 接线到正常
+聊天与后台恢复路径，不触碰旧 outbox。
 """
 
 from __future__ import annotations

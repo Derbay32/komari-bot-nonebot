@@ -60,11 +60,12 @@ def _config(*, global_interaction_enabled: bool = True) -> SimpleNamespace:
         proactive_cooldown=300,
         global_interaction_enabled=global_interaction_enabled,
         global_interaction_trigger_size=20,
-        reply_commit_lease_seconds=60,
-        reply_commit_max_attempts=5,
-        reply_commit_retry_base_seconds=1,
-        reply_commit_batch_size=20,
-        reply_commit_tombstone_retention_days=30,
+        reply_fulfillment_batch_size=20,
+        reply_fulfillment_lease_seconds=60,
+        reply_fulfillment_max_attempts=5,
+        reply_fulfillment_retry_base_seconds=1,
+        reply_fulfillment_retry_max_seconds=3600,
+        reply_fulfillment_tombstone_retention_days=30,
         reply_fulfillment_freshness_seconds=120,
     )
 
@@ -135,13 +136,13 @@ def _workflow(
 ) -> Any:
     return workflow_module.ReplyFulfillmentWorkflow(
         repository=store,
-        redis=SimpleNamespace(),
         proactive_reservation=SimpleNamespace(),
-        user_data=SimpleNamespace(),
         config_getter=lambda: _config(
             global_interaction_enabled=global_interaction_enabled
         ),
         recovery_senders_getter=dict,
+        commitment_workflow=SimpleNamespace(),
+        alert_service=SimpleNamespace(),
     )
 
 

@@ -243,7 +243,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot 数据库配置不一致")
 
-    result = _run_bootstrap("upgrade", "head")
+    result = _run_bootstrap("upgrade", "0010")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
     operation_ids = [
@@ -343,7 +343,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
             not_delivered_at=now - timedelta(minutes=1),
         )
 
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap("upgrade", "0010")
         assert result.returncode == 0, result.stderr
 
         parents = await connection.fetch(
@@ -465,7 +465,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
         )
 
         before_repeat = [dict(row) for row in parents] + [dict(row) for row in children]
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap("upgrade", "0010")
         assert result.returncode == 0, result.stderr
         repeated_parents = await connection.fetch(
             """
@@ -494,7 +494,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
         ] == before_repeat
     finally:
         await _cleanup_rows(connection, operation_ids)
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap("upgrade", "0010")
         assert result.returncode == 0, result.stderr
         await connection.close()
 
@@ -504,7 +504,7 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot 数据库配置不一致")
 
-    result = _run_bootstrap("upgrade", "head")
+    result = _run_bootstrap("upgrade", "0010")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
     operation_ids = ["tsk86-safe-prepared", "tsk86-ambiguous-failed"]
@@ -545,7 +545,7 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
             sensitive_reply,
         )
 
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap("upgrade", "0010")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
         assert "ambiguous_failed_count=1" in output
@@ -591,6 +591,6 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
         )
     finally:
         await _cleanup_rows(connection, operation_ids)
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap("upgrade", "0010")
         assert result.returncode == 0, result.stderr
         await connection.close()

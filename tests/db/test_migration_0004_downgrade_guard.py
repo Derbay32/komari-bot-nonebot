@@ -4,9 +4,10 @@
 ``KOMARI_TEST_POSTGRES_URL`` 门控，与 nonebot 配置的
 ``sqlalchemy_database_url`` 不同库时跳过（沿用既有守卫手法）。
 
-集成流程会把测试库临时回滚到 0003 再升级回 head，``finally`` 中
-始终执行 ``upgrade head`` 恢复迁移状态，并把 ``komari_chat_config``
-单行数据还原为测试前快照。
+集成流程会把测试库临时回滚到 0003 再升级回 0004，``finally`` 中
+始终执行 ``upgrade 0004`` 恢复迁移状态，并把 ``komari_chat_config``
+单行数据还原为测试前快照。目标版本不可超过 0004：0011 起迁移链
+不可逆，停留在 head 将无法回滚到 0003。
 """
 
 from __future__ import annotations
@@ -47,6 +48,19 @@ _DROPPED_COLUMNS = (
 
 #: 死字段（KOMARIBOT-7 已从 schema 删除），downgrade 回填的默认值。
 _DEAD_FIELD_DEFAULT = 0.0
+
+_RENAMED_CONFIG_COLUMNS = {
+    "reply_commit_worker_interval_seconds": (
+        "reply_fulfillment_worker_interval_seconds"
+    ),
+    "reply_commit_batch_size": "reply_fulfillment_batch_size",
+    "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
+    "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
+    "reply_commit_retry_base_seconds": "reply_fulfillment_retry_base_seconds",
+    "reply_commit_tombstone_retention_days": (
+        "reply_fulfillment_tombstone_retention_days"
+    ),
+}
 
 
 def _migration_downgrade_source() -> str:
@@ -124,7 +138,8 @@ def _expected_schema_defaults() -> dict[str, object]:
 
     defaults = KomariChatConfigSchema()
     values: dict[str, object] = {
-        column: getattr(defaults, column) for column in _DROPPED_COLUMNS
+        column: getattr(defaults, _RENAMED_CONFIG_COLUMNS.get(column, column))
+        for column in _DROPPED_COLUMNS
         if column != "proactive_score_threshold"
     }
     values["proactive_score_threshold"] = _DEAD_FIELD_DEFAULT
@@ -137,15 +152,15 @@ def _expected_schema_defaults() -> dict[str, object]:
 async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
     """空行与有行两种场景的 downgrade 行为验证。
 
-    1. 空行：upgrade head 后 komari_chat_config 尚未初始化（无行），
+    1. 空行：upgrade 0004 后 komari_chat_config 尚未初始化（无行），
        downgrade 不抛错，komari_memory_config 按 schema 默认值回填；
     2. 有行：活字段值原样回填，11 列结构复原；
-    3. 最终 upgrade head 恢复迁移状态，并还原配置数据快照。
+    3. 最终 upgrade 0004 恢复迁移状态，并还原配置数据快照。
     """
     if not _same_database(POSTGRES_URL, _configured_database_url()):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
 
-    result = _run_bootstrap("upgrade", "head")
+    result = _run_bootstrap("upgrade", "0004")
     assert result.returncode == 0, result.stderr
 
     conn = await asyncpg.connect(**_parse_dsn(POSTGRES_URL))
@@ -184,7 +199,7 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
             )
 
         # === 场景二：komari_chat_config 有行，活字段原样回填 ===
-        result = _run_bootstrap("upgrade", "head")
+        result = _run_bootstrap("upgrade", "0004")
         assert result.returncode == 0, result.stderr
 
         distinctive = dict(_expected_schema_defaults())
@@ -217,8 +232,8 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
         memory_columns = await _memory_config_columns(conn)
         assert set(_DROPPED_COLUMNS) <= set(memory_columns), "有行场景 11 列结构未复原"
     finally:
-        # === 恢复：迁移回到 head，数据还原为测试前快照 ===
-        result = _run_bootstrap("upgrade", "head")
+        # === 恢复：迁移回到 0004，数据还原为测试前快照 ===
+        result = _run_bootstrap("upgrade", "0004")
         assert result.returncode == 0, result.stderr
         if original_chat_row is not None:
             chat_columns = [

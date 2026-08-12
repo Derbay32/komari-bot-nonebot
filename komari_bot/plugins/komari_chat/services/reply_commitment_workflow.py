@@ -10,8 +10,10 @@ TSK-83：履约进入完成/未送达终态并超过身份保护期后，
 落证据清除标记，最后删除父 tombstone（FK cascade 删子行）；任一步
 中断都隔离当前父并释放租约，下轮恢复，顺序不可反转。
 
-本模块当前只由验收测试直接构造，不接线生产入口；正常聊天继续只走
-旧 outbox，禁止双写、双读或 fallback。TSK-87 之前不得提前 cutover。
+TSK-87：本模块已接线生产正常路径：聊天入口送达持久化后经
+``recover_fulfillment`` 立即推进单履约承诺；后台 worker 的
+``recover_pending`` 批量推进到期履约，小时级执行终态清理。旧 outbox
+时代的配置名已全部改名为 ``reply_fulfillment_*``。
 """
 
 from __future__ import annotations
@@ -44,6 +46,14 @@ _COMMITMENT_ORDER = {
 
 class _CommitmentExecutorRepository(Protocol):
     """执行器消费的父子履约仓库窄接口。"""
+
+    async def claim_operation(
+        self,
+        fulfillment_id: str,
+        *,
+        owner_token: str,
+        lease_seconds: int,
+    ) -> dict[str, Any] | None: ...
 
     async def claim_pending(
         self,
@@ -220,8 +230,8 @@ class ReplyCommitmentWorkflow:
         config = self.config_getter()
         claimed = await self.repository.claim_pending(
             owner_token=self._owner_token,
-            limit=int(config.reply_commit_batch_size),
-            lease_seconds=int(config.reply_commit_lease_seconds),
+            limit=int(config.reply_fulfillment_batch_size),
+            lease_seconds=int(config.reply_fulfillment_lease_seconds),
         )
         completed = 0
         for record in claimed:
@@ -231,6 +241,22 @@ class ReplyCommitmentWorkflow:
             ):
                 completed += 1
         return completed
+
+    async def recover_fulfillment(self, fulfillment_id: str) -> bool:
+        """单履约承诺推进：对指定 DELIVERED 父项领取并兑现当前到期承诺。
+
+        聊天入口送达持久化后立即调用；身份不存在、未送达、已完成或
+        租约已被其他执行者持有时返回 False，不做任何重发或伪造完成。
+        """
+        config = self.config_getter()
+        record = await self.repository.claim_operation(
+            fulfillment_id,
+            owner_token=self._owner_token,
+            lease_seconds=int(config.reply_fulfillment_lease_seconds),
+        )
+        if record is None:
+            return False
+        return await self._finish_claimed(fulfillment_id, config)
 
     async def cleanup_terminal_fulfillments(self) -> int:
         """清理超过保护期的已解决终态，返回删除的父 tombstone 数。
@@ -244,9 +270,9 @@ class ReplyCommitmentWorkflow:
         config = self.config_getter()
         claimed = await self.repository.claim_terminal_cleanup_candidates(
             owner_token=self._owner_token,
-            limit=int(config.reply_commit_batch_size),
-            lease_seconds=int(config.reply_commit_lease_seconds),
-            protection_days=int(config.reply_commit_tombstone_retention_days),
+            limit=int(config.reply_fulfillment_batch_size),
+            lease_seconds=int(config.reply_fulfillment_lease_seconds),
+            protection_days=int(config.reply_fulfillment_tombstone_retention_days),
         )
         cleaned = 0
         for record in claimed:
@@ -304,7 +330,7 @@ class ReplyCommitmentWorkflow:
         控制面异常（如完成标记数据库暂不可用）隔离为本轮失败并尽力
         释放仍归自己的父租约，不消费子项失败预算。
         """
-        lease_seconds = max(1, int(config.reply_commit_lease_seconds))
+        lease_seconds = max(1, int(config.reply_fulfillment_lease_seconds))
         lease_lost = asyncio.Event()
         heartbeat = asyncio.create_task(
             self._heartbeat(
@@ -520,13 +546,10 @@ class ReplyCommitmentWorkflow:
             owner_token=self._owner_token,
             error_code=error_code,
             max_attempts=(
-                1 if permanent else max(1, int(config.reply_commit_max_attempts))
+                1 if permanent else max(1, int(config.reply_fulfillment_max_attempts))
             ),
-            retry_base_seconds=max(1, int(config.reply_commit_retry_base_seconds)),
-            retry_max_seconds=max(
-                1,
-                int(getattr(config, "reply_fulfillment_retry_max_seconds", 3600)),
-            ),
+            retry_base_seconds=max(1, int(config.reply_fulfillment_retry_base_seconds)),
+            retry_max_seconds=max(1, int(config.reply_fulfillment_retry_max_seconds)),
         )
         return state is not None
 

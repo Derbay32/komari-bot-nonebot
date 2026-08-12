@@ -26,12 +26,13 @@ EXPECTED_FIELD_DEFAULTS: dict[str, object] = {
     "proactive_cooldown": 300,
     "proactive_max_per_hour": 400,
     "proactive_reservation_ttl_seconds": 360,
-    "reply_commit_worker_interval_seconds": 5,
-    "reply_commit_batch_size": 20,
-    "reply_commit_lease_seconds": 120,
-    "reply_commit_max_attempts": 20,
-    "reply_commit_retry_base_seconds": 5,
-    "reply_commit_tombstone_retention_days": 30,
+    "reply_fulfillment_worker_interval_seconds": 5,
+    "reply_fulfillment_batch_size": 20,
+    "reply_fulfillment_lease_seconds": 120,
+    "reply_fulfillment_max_attempts": 20,
+    "reply_fulfillment_retry_base_seconds": 5,
+    "reply_fulfillment_retry_max_seconds": 3600,
+    "reply_fulfillment_tombstone_retention_days": 30,
     "reply_fulfillment_freshness_seconds": 120,
 }
 
@@ -39,12 +40,13 @@ EXPECTED_FIELD_BOUNDS: dict[str, tuple[int, int]] = {
     "proactive_cooldown": (5, 3600),
     "proactive_max_per_hour": (1, 800),
     "proactive_reservation_ttl_seconds": (30, 900),
-    "reply_commit_worker_interval_seconds": (1, 300),
-    "reply_commit_batch_size": (1, 200),
-    "reply_commit_lease_seconds": (30, 900),
-    "reply_commit_max_attempts": (1, 100),
-    "reply_commit_retry_base_seconds": (1, 300),
-    "reply_commit_tombstone_retention_days": (1, 365),
+    "reply_fulfillment_worker_interval_seconds": (1, 300),
+    "reply_fulfillment_batch_size": (1, 200),
+    "reply_fulfillment_lease_seconds": (30, 900),
+    "reply_fulfillment_max_attempts": (1, 100),
+    "reply_fulfillment_retry_base_seconds": (1, 300),
+    "reply_fulfillment_retry_max_seconds": (1, 86_400),
+    "reply_fulfillment_tombstone_retention_days": (1, 365),
     "reply_fulfillment_freshness_seconds": (30, 300),
 }
 
@@ -87,6 +89,18 @@ def test_migrated_fields_enforce_bounds() -> None:
 def test_config_schema_drops_dead_proactive_score_threshold() -> None:
     """死字段 proactive_score_threshold 不迁移。"""
     assert "proactive_score_threshold" not in KomariChatConfigSchema.model_fields
+
+
+def test_config_schema_drops_legacy_reply_commit_language() -> None:
+    """contract 后不保留旧字段别名或运行时兼容入口。"""
+    assert not {
+        "reply_commit_worker_interval_seconds",
+        "reply_commit_batch_size",
+        "reply_commit_lease_seconds",
+        "reply_commit_max_attempts",
+        "reply_commit_retry_base_seconds",
+        "reply_commit_tombstone_retention_days",
+    }.intersection(KomariChatConfigSchema.model_fields)
 
 
 def test_komari_chat_provides_own_config_interface() -> None:

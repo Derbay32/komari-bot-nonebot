@@ -380,12 +380,12 @@ def _payloads() -> dict[str, dict[str, Any]]:
 
 def _config() -> SimpleNamespace:
     return SimpleNamespace(
-        reply_commit_batch_size=20,
-        reply_commit_lease_seconds=30,
-        reply_commit_max_attempts=3,
-        reply_commit_retry_base_seconds=2,
+        reply_fulfillment_batch_size=20,
+        reply_fulfillment_lease_seconds=30,
+        reply_fulfillment_max_attempts=3,
+        reply_fulfillment_retry_base_seconds=2,
         reply_fulfillment_retry_max_seconds=7,
-        reply_commit_tombstone_retention_days=30,
+        reply_fulfillment_tombstone_retention_days=30,
     )
 
 
@@ -505,10 +505,10 @@ async def test_multiple_failures_keep_independent_budgets_and_use_latest_policy(
     assert repository.snapshot("reply-multi-retry", "favorability_adjustment").completed
     assert repository.snapshot("reply-multi-retry", "interaction_history").completed
 
-    config.reply_commit_max_attempts = 1
-    config.reply_commit_retry_base_seconds = 10
+    config.reply_fulfillment_max_attempts = 1
+    config.reply_fulfillment_retry_base_seconds = 10
     config.reply_fulfillment_retry_max_seconds = 11
-    config.reply_commit_lease_seconds = 60
+    config.reply_fulfillment_lease_seconds = 60
     repository.make_retries_due("reply-multi-retry")
     events.clear()
 
@@ -545,8 +545,8 @@ async def test_retry_policy_is_read_when_each_failure_is_recorded(
     repository.seed("reply-live-policy")
     config = _config()
     updated_config = _config()
-    updated_config.reply_commit_max_attempts = 9
-    updated_config.reply_commit_retry_base_seconds = 10
+    updated_config.reply_fulfillment_max_attempts = 9
+    updated_config.reply_fulfillment_retry_base_seconds = 10
     updated_config.reply_fulfillment_retry_max_seconds = 11
     reads = 0
 
@@ -796,7 +796,7 @@ async def test_long_running_commitment_renews_the_single_parent_lease(
     repository = _CommitmentRepository()
     repository.seed("reply-heartbeat")
     config = _config()
-    config.reply_commit_lease_seconds = 1
+    config.reply_fulfillment_lease_seconds = 1
     workflow, _events, _redis, _proactive, user_data = _workflow(
         workflow_module,
         repository,
@@ -811,14 +811,15 @@ async def test_long_running_commitment_renews_the_single_parent_lease(
 
     monkeypatch.setattr(workflow_module.asyncio, "sleep", _fast_sleep)
     task = asyncio.create_task(workflow.recover_pending())
-    await user_data.started.wait()
+    # 超时护栏：workflow 若在执行承诺前失败，测试必须快速红灯而非永久挂起
+    await asyncio.wait_for(user_data.started.wait(), timeout=5)
     for _ in range(20):
         if repository.renew_count:
             break
         await original_sleep(0)
     user_data.resume.set()
 
-    assert await task == 1
+    assert await asyncio.wait_for(task, timeout=5) == 1
     assert repository.renew_count >= 1
     assert repository.has_lease("reply-heartbeat") is False
 
@@ -836,7 +837,7 @@ async def test_heartbeat_loss_stops_before_marking_and_releases_owned_lease(
     repository.seed("reply-heartbeat-lost")
     repository.renew_result = False
     config = _config()
-    config.reply_commit_lease_seconds = 1
+    config.reply_fulfillment_lease_seconds = 1
     workflow, _events, _redis, _proactive, user_data = _workflow(
         workflow_module,
         repository,
@@ -851,14 +852,15 @@ async def test_heartbeat_loss_stops_before_marking_and_releases_owned_lease(
 
     monkeypatch.setattr(workflow_module.asyncio, "sleep", _fast_sleep)
     task = asyncio.create_task(workflow.recover_pending())
-    await user_data.started.wait()
+    # 超时护栏：workflow 若在执行承诺前失败，测试必须快速红灯而非永久挂起
+    await asyncio.wait_for(user_data.started.wait(), timeout=5)
     for _ in range(20):
         if repository.renew_count:
             break
         await original_sleep(0)
     user_data.resume.set()
 
-    assert await task == 0
+    assert await asyncio.wait_for(task, timeout=5) == 0
     assert repository.renew_count >= 1
     child = repository.snapshot("reply-heartbeat-lost", "favorability_adjustment")
     assert child.state == "RETRY_WAIT"

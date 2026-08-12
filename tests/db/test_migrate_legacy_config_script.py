@@ -310,6 +310,54 @@ class TestPlanRowValues:
                 info,
             )
 
+    @staticmethod
+    def test_chat_legacy_keys_map_to_fulfillment_columns() -> None:
+        """离线脚本继续读取旧 JSONB 键，但只写新履约配置列。"""
+        module = _load_script_module()
+        spec = next(
+            item for item in module._RESOURCE_SPECS if item.target_table == "komari_chat_config"
+        )
+        expected_mapping = {
+            "reply_commit_worker_interval_seconds": (
+                "reply_fulfillment_worker_interval_seconds"
+            ),
+            "reply_commit_batch_size": "reply_fulfillment_batch_size",
+            "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
+            "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
+            "reply_commit_retry_base_seconds": (
+                "reply_fulfillment_retry_base_seconds"
+            ),
+            "reply_commit_tombstone_retention_days": (
+                "reply_fulfillment_tombstone_retention_days"
+            ),
+        }
+        info: dict[str, tuple[str, bool]] = dict.fromkeys(
+            spec.columns, ("INTEGER", False)
+        )
+        info.update(
+            {
+                "proactive_enabled": ("BOOLEAN", False),
+                "proactive_cooldown": ("INTEGER", False),
+                "proactive_max_per_hour": ("INTEGER", False),
+                "proactive_reservation_ttl_seconds": ("INTEGER", False),
+                "reply_fulfillment_retry_max_seconds": ("INTEGER", False),
+                "reply_fulfillment_freshness_seconds": ("INTEGER", False),
+            }
+        )
+        source = {old_name: index for index, old_name in enumerate(expected_mapping, 1)}
+
+        planned = module.plan_row_values(spec, source, info)
+
+        assert spec.legacy_key_map == expected_mapping
+        assert {
+            new_name: planned.values[new_name]
+            for new_name in expected_mapping.values()
+        } == {
+            new_name: index
+            for index, new_name in enumerate(expected_mapping.values(), 1)
+        }
+        assert not set(expected_mapping).intersection(spec.columns)
+
 
 class _FakeConnection:
     """记录 execute 调用、按查询内容返回预设行的假 asyncpg 连接。"""
