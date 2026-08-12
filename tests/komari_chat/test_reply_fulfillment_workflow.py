@@ -1,4 +1,4 @@
-"""回复履约 workflow 的领域验收测试。"""
+"""回复履约 workflow 的 contract 阶段领域验收。"""
 
 from __future__ import annotations
 
@@ -12,306 +12,134 @@ import pytest
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Mapping
+
     from nonebug import App
 
 
-class _FakeReplyFulfillmentRepository:
-    """旧宽表 adapter 的内存替身，只向测试暴露领域投影。"""
+class _ParentChildRepository:
+    """只保存父送达事实与冻结子项的内存 adapter。"""
 
     def __init__(self) -> None:
-        self._records: dict[str, dict[str, Any]] = {}
-        self.cleanup_count = 0
+        self.records: dict[str, dict[str, Any]] = {}
 
     @property
-    def not_started_ids(self) -> set[str]:
+    def delivered_ids(self) -> set[str]:
         return {
-            operation_id
-            for operation_id, record in self._records.items()
-            if record["delivery_state"] == "NOT_STARTED"
+            fulfillment_id
+            for fulfillment_id, record in self.records.items()
+            if record["delivery_state"] == "DELIVERED"
         }
 
     @property
     def pending_confirmation_ids(self) -> set[str]:
         return {
-            operation_id
-            for operation_id, record in self._records.items()
+            fulfillment_id
+            for fulfillment_id, record in self.records.items()
             if record["delivery_state"] == "PENDING_CONFIRMATION"
-        }
-
-    @property
-    def completed_ids(self) -> set[str]:
-        return {
-            operation_id
-            for operation_id, record in self._records.items()
-            if record["status"] == "COMPLETED"
         }
 
     @property
     def not_delivered_ids(self) -> set[str]:
         return {
-            operation_id
-            for operation_id, record in self._records.items()
+            fulfillment_id
+            for fulfillment_id, record in self.records.items()
             if record["delivery_state"] == "NOT_DELIVERED"
         }
 
-    def platform_message_id(self, operation_id: str) -> str | None:
-        value = self._records[operation_id].get("platform_message_id")
-        return str(value) if value is not None else None
+    async def has_active_operation(self, fulfillment_id: str) -> bool:
+        return fulfillment_id in self.records
 
-    async def prepare(self, payload: Any) -> bool:
-        fulfillment_id = payload.fulfillment_id
-        if fulfillment_id in self._records:
+    async def prepare(self, draft: Any) -> bool:
+        if draft.fulfillment_id in self.records:
             return False
-        payload_by_type = {
-            item.commitment_type: item.payload for item in payload.commitments
-        }
-        proactive = payload_by_type.get("proactive_reply_confirmation")
-        favorability = payload_by_type["favorability_adjustment"]
-        assistant = payload_by_type["assistant_reply_history"]
-        interaction = payload_by_type.get("interaction_history")
-        self._records[fulfillment_id] = {
-            "operation_id": fulfillment_id,
-            "request_trace_id": payload.request_trace_id,
-            "source_message_id": payload.trigger_message_id,
-            "group_id": payload.group_id,
-            "user_id": payload.trigger_user_id,
-            "user_nickname": (
-                interaction.display_name
-                if interaction is not None
-                else payload.trigger_user_id
-            ),
-            "bot_nickname": assistant.bot_nickname,
-            "reply_content": payload.reply_content,
-            "reply_timestamp": assistant.reply_timestamp,
-            "favorability_delta": favorability.delta,
-            "favorability_reason": favorability.reason,
-            "interaction_history": (
-                dict(interaction.record) if interaction is not None else {}
-            ),
-            "proactive_reservation_id": (
-                proactive.reservation_id if proactive is not None else None
-            ),
-            "proactive_cooldown_seconds": (
-                proactive.cooldown_seconds if proactive is not None else 0
-            ),
-            "global_interaction_enabled": interaction is not None,
-            "global_interaction_trigger_size": (
-                interaction.trigger_size if interaction is not None else 0
-            ),
-            "status": "PREPARED",
+        self.records[draft.fulfillment_id] = {
+            "fulfillment_id": draft.fulfillment_id,
             "delivery_state": "NOT_STARTED",
-            "bot_self_id": payload.bot_self_id,
-            "adapter_name": payload.adapter_name,
-            "reply_target_message_id": payload.reply_target_message_id,
-            "proactive_confirmed_at": None,
-            "favorability_applied_at": None,
-            "ai_history_stored_at": None,
-            "interaction_stored_at": None,
-            "attempt_count": 0,
+            "platform_message_id": None,
+            "commitments": tuple(draft.commitments),
         }
         return True
 
-    async def mark_send_started(self, operation_id: str) -> bool:
-        record = self._records[operation_id]
+    async def mark_send_started(self, fulfillment_id: str) -> bool:
+        record = self.records[fulfillment_id]
         if record["delivery_state"] != "NOT_STARTED":
             return False
         record["delivery_state"] = "PENDING_CONFIRMATION"
         return True
 
-    async def mark_not_delivered(self, operation_id: str) -> bool:
-        record = self._records[operation_id]
+    async def mark_delivered(
+        self,
+        fulfillment_id: str,
+        *,
+        platform_message_id: str | None = None,
+    ) -> bool:
+        record = self.records[fulfillment_id]
+        if record["delivery_state"] != "PENDING_CONFIRMATION":
+            return False
+        record["delivery_state"] = "DELIVERED"
+        record["platform_message_id"] = platform_message_id
+        return True
+
+    async def mark_not_delivered(self, fulfillment_id: str) -> bool:
+        record = self.records[fulfillment_id]
         if record["delivery_state"] not in {
             "NOT_STARTED",
             "PENDING_CONFIRMATION",
         }:
             return False
         record["delivery_state"] = "NOT_DELIVERED"
-        record["status"] = "CANCELLED"
         return True
 
-    async def mark_delivered(
-        self,
-        operation_id: str,
-        *,
-        platform_message_id: str | None = None,
-    ) -> bool:
-        record = self._records[operation_id]
-        if record["delivery_state"] != "PENDING_CONFIRMATION":
-            return False
-        record["delivery_state"] = "DELIVERED"
-        record["status"] = "DELIVERED"
-        record["platform_message_id"] = platform_message_id
+    async def claim_fresh_not_started(self, **_kwargs: object) -> list[dict[str, Any]]:
+        return []
+
+    async def expire_stale_not_started(self, **_kwargs: object) -> list[dict[str, Any]]:
+        return []
+
+
+class _CommitmentWorkflow:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.fulfillment_ids: list[str] = []
+
+    async def recover_fulfillment(self, fulfillment_id: str) -> bool:
+        self.events.append("recover_fulfillment")
+        self.fulfillment_ids.append(fulfillment_id)
         return True
 
-    async def claim_operation(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        lease_seconds: int,
-    ) -> dict[str, Any] | None:
-        del owner_token, lease_seconds
-        record = self._records[operation_id]
-        if record["status"] != "DELIVERED":
-            return None
-        record["status"] = "PROCESSING"
-        record["attempt_count"] = int(record["attempt_count"]) + 1
-        return record
+    async def recover_pending(self) -> int:
+        self.events.append("recover_commitments")
+        return 0
 
-    async def claim_pending(
-        self,
-        *,
-        owner_token: str,
-        limit: int,
-        lease_seconds: int,
-    ) -> list[dict[str, Any]]:
-        del owner_token, lease_seconds
-        claimed: list[dict[str, Any]] = []
-        for record in self._records.values():
-            if record["status"] == "DELIVERED" and len(claimed) < limit:
-                record["status"] = "PROCESSING"
-                record["attempt_count"] = int(record["attempt_count"]) + 1
-                claimed.append(record)
-        return claimed
-
-    async def renew_lease(self, *_args: object, **_kwargs: object) -> bool:
-        return True
-
-    async def mark_step(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        step: str,
-    ) -> bool:
-        del owner_token
-        columns = {
-            "proactive_confirmed": "proactive_confirmed_at",
-            "favorability_applied": "favorability_applied_at",
-            "ai_history_stored": "ai_history_stored_at",
-            "interaction_stored": "interaction_stored_at",
-        }
-        self._records[operation_id][columns[step]] = object()
-        return True
-
-    async def complete(self, operation_id: str, *, owner_token: str) -> bool:
-        del owner_token
-        record = self._records[operation_id]
-        if not all(
-            record[column] is not None
-            for column in (
-                "proactive_confirmed_at",
-                "favorability_applied_at",
-                "ai_history_stored_at",
-                "interaction_stored_at",
-            )
-        ):
-            return False
-        record["status"] = "COMPLETED"
-        return True
-
-    async def mark_failure(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        error_code: str,
-        max_attempts: int,
-        retry_base_seconds: int,
-    ) -> str:
-        del owner_token, error_code, max_attempts, retry_base_seconds
-        self._records[operation_id]["status"] = "DELIVERED"
-        return "DELIVERED"
-
-    async def cleanup_tombstones(self, *, retention_days: int) -> int:
-        del retention_days
-        self.cleanup_count += 1
+    async def cleanup_terminal_fulfillments(self) -> int:
+        self.events.append("cleanup_terminal_fulfillments")
         return 0
 
 
-class _FakeRedis:
+class _AlertService:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def recover_alerts(self, **_kwargs: object) -> int:
+        self.events.append("recover_alerts")
+        return 0
+
+
+class _ProactiveReservation:
     def __init__(self) -> None:
-        self.ai_operations: set[str] = set()
-        self.interaction_operations: set[str] = set()
-        self.fail_ai_once = False
+        self.released: list[tuple[str, str]] = []
 
-    async def push_message_once(
-        self,
-        _group_id: str,
-        _message: MessageSchema,
-        *,
-        operation_id: str,
-        dedupe_ttl_seconds: int,
-    ) -> bool:
-        del dedupe_ttl_seconds
-        if self.fail_ai_once:
-            self.fail_ai_once = False
-            message = "模拟 Redis 短暂故障"
-            raise RuntimeError(message)
-        inserted = operation_id not in self.ai_operations
-        self.ai_operations.add(operation_id)
-        return inserted
-
-    async def push_global_interaction_once(
-        self,
-        *,
-        user_id: str,
-        record: dict[str, object],
-        trigger_size: int,
-        operation_id: str,
-        dedupe_ttl_seconds: int,
-    ) -> bool:
-        del user_id, record, trigger_size, dedupe_ttl_seconds
-        inserted = operation_id not in self.interaction_operations
-        self.interaction_operations.add(operation_id)
-        return inserted
+    async def release(self, group_id: str, reservation_id: str) -> None:
+        self.released.append((group_id, reservation_id))
 
 
-class _FakeProactiveReservationService:
-    def __init__(self) -> None:
-        self.confirmed: set[str] = set()
-
-    async def confirm(
-        self,
-        group_id: str,
-        reservation_id: str,
-        *,
-        cooldown_seconds: int,
-    ) -> None:
-        del group_id, cooldown_seconds
-        self.confirmed.add(reservation_id)
-
-
-class _FakeReservation:
+class _ReservationHandle:
     def __init__(self) -> None:
         self.release_count = 0
 
     async def release(self) -> None:
         self.release_count += 1
-
-
-class _FakeUserData:
-    def __init__(self) -> None:
-        self.operations: set[str] = set()
-        self.application_count = 0
-        self.cleanup_count = 0
-
-    async def adjust_user_favorability(
-        self,
-        _user_id: str,
-        _delta: int,
-        *,
-        operation_id: str,
-    ) -> SimpleNamespace:
-        if operation_id not in self.operations:
-            self.operations.add(operation_id)
-            self.application_count += 1
-        return SimpleNamespace(before=0, delta=_delta, after=_delta)
-
-    async def cleanup_favorability_operations(self, *, retention_days: int) -> int:
-        del retention_days
-        self.cleanup_count += 1
-        return 0
 
 
 @pytest.fixture
@@ -327,11 +155,12 @@ def _config() -> SimpleNamespace:
         proactive_cooldown=300,
         global_interaction_enabled=True,
         global_interaction_trigger_size=20,
-        reply_commit_lease_seconds=60,
-        reply_commit_max_attempts=5,
-        reply_commit_retry_base_seconds=1,
-        reply_commit_batch_size=20,
-        reply_commit_tombstone_retention_days=30,
+        reply_fulfillment_batch_size=20,
+        reply_fulfillment_lease_seconds=60,
+        reply_fulfillment_max_attempts=5,
+        reply_fulfillment_retry_base_seconds=1,
+        reply_fulfillment_retry_max_seconds=3600,
+        reply_fulfillment_tombstone_retention_days=30,
         reply_fulfillment_freshness_seconds=120,
     )
 
@@ -339,7 +168,7 @@ def _config() -> SimpleNamespace:
 def _pending_reply(
     operation_id: str,
     *,
-    reservation: _FakeReservation | None = None,
+    reservation: _ReservationHandle | None = None,
 ) -> Any:
     handler_module = import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
@@ -379,24 +208,26 @@ def _workflow(
     module: Any,
 ) -> tuple[
     Any,
-    _FakeReplyFulfillmentRepository,
-    _FakeRedis,
-    _FakeProactiveReservationService,
-    _FakeUserData,
+    _ParentChildRepository,
+    _CommitmentWorkflow,
+    _AlertService,
+    _ProactiveReservation,
+    list[str],
 ]:
-    repository = _FakeReplyFulfillmentRepository()
-    redis = _FakeRedis()
-    proactive = _FakeProactiveReservationService()
-    user_data = _FakeUserData()
+    events: list[str] = []
+    repository = _ParentChildRepository()
+    commitments = _CommitmentWorkflow(events)
+    alerts = _AlertService(events)
+    proactive = _ProactiveReservation()
     workflow = module.ReplyFulfillmentWorkflow(
         repository=repository,
-        redis=redis,
         proactive_reservation=proactive,
-        user_data=user_data,
         config_getter=_config,
         recovery_senders_getter=dict,
+        commitment_workflow=commitments,
+        alert_service=alerts,
     )
-    return workflow, repository, redis, proactive, user_data
+    return workflow, repository, commitments, alerts, proactive, events
 
 
 async def _send_success(_pending: object) -> object:
@@ -407,32 +238,31 @@ async def _send_success(_pending: object) -> object:
 
 
 @pytest.mark.asyncio
-async def test_fulfill_owns_delivery_and_all_post_delivery_commitments(
+async def test_fulfill_persists_delivery_before_delegating_commitments(
     workflow_module: Any,
 ) -> None:
-    workflow, repository, redis, proactive, user_data = _workflow(workflow_module)
+    workflow, repository, commitments, _alerts, _proactive, events = _workflow(
+        workflow_module
+    )
     pending = _pending_reply("reply-operation-1")
 
-    await workflow.fulfill(pending, send_reply=_send_success)
+    assert await workflow.fulfill(pending, send_reply=_send_success) is True
 
-    assert repository.completed_ids == {pending.operation_id}
-    assert repository.platform_message_id(pending.operation_id) == "7788"
-    assert proactive.confirmed == {"reservation-1"}
-    assert user_data.application_count == 1
-    assert redis.ai_operations == {pending.operation_id}
-    assert redis.interaction_operations == {pending.operation_id}
+    assert repository.delivered_ids == {pending.operation_id}
+    assert repository.records[pending.operation_id]["platform_message_id"] == "7788"
+    assert commitments.fulfillment_ids == [pending.operation_id]
+    assert events == ["recover_fulfillment", "recover_alerts"]
 
 
 @pytest.mark.asyncio
 async def test_definitive_delivery_failure_terminates_without_commitments(
     workflow_module: Any,
 ) -> None:
-    workflow, repository, redis, proactive, user_data = _workflow(workflow_module)
-    reservation = _FakeReservation()
-    pending = _pending_reply(
-        "reply-operation-rejected",
-        reservation=reservation,
+    workflow, repository, commitments, _alerts, proactive, _events = _workflow(
+        workflow_module
     )
+    reservation = _ReservationHandle()
+    pending = _pending_reply("reply-operation-rejected", reservation=reservation)
 
     async def _send_rejected(_pending: object) -> object:
         return workflow_module.ReplyDeliveryResult.not_delivered()
@@ -441,22 +271,19 @@ async def test_definitive_delivery_failure_terminates_without_commitments(
 
     assert repository.not_delivered_ids == {pending.operation_id}
     assert reservation.release_count == 1
-    assert proactive.confirmed == set()
-    assert user_data.application_count == 0
-    assert redis.ai_operations == set()
-    assert redis.interaction_operations == set()
+    assert proactive.released == []
+    assert commitments.fulfillment_ids == []
 
 
 @pytest.mark.asyncio
-async def test_unknown_delivery_becomes_pending_confirmation(
+async def test_unknown_delivery_is_alerted_without_running_commitments(
     workflow_module: Any,
 ) -> None:
-    workflow, repository, redis, proactive, user_data = _workflow(workflow_module)
-    reservation = _FakeReservation()
-    pending = _pending_reply(
-        "reply-operation-unknown",
-        reservation=reservation,
+    workflow, repository, commitments, _alerts, _proactive, events = _workflow(
+        workflow_module
     )
+    reservation = _ReservationHandle()
+    pending = _pending_reply("reply-operation-unknown", reservation=reservation)
 
     async def _send_unknown(_pending: object) -> object:
         return workflow_module.ReplyDeliveryResult.pending_confirmation()
@@ -465,65 +292,76 @@ async def test_unknown_delivery_becomes_pending_confirmation(
 
     assert repository.pending_confirmation_ids == {pending.operation_id}
     assert reservation.release_count == 0
-    assert proactive.confirmed == set()
-    assert user_data.application_count == 0
-    assert redis.ai_operations == set()
-    assert redis.interaction_operations == set()
+    assert commitments.fulfillment_ids == []
+    assert events == ["recover_alerts"]
 
 
 @pytest.mark.asyncio
-async def test_recover_resumes_only_missing_commitments_without_resending(
+async def test_recover_coordinates_commitments_alerts_and_hourly_cleanup(
     workflow_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow, repository, redis, proactive, user_data = _workflow(workflow_module)
-    pending = _pending_reply("reply-operation-retry")
-    send_count = 0
-
-    async def _send(_pending: object) -> object:
-        nonlocal send_count
-        send_count += 1
-        return workflow_module.ReplyDeliveryResult.delivered("9001")
-
-    redis.fail_ai_once = True
-    await workflow.fulfill(pending, send_reply=_send)
-
-    assert repository.completed_ids == set()
-    assert user_data.application_count == 1
-    assert await workflow.recover_pending() == 1
-    assert repository.completed_ids == {pending.operation_id}
-    assert send_count == 1
-    assert user_data.application_count == 1
-    assert proactive.confirmed == {"reservation-1"}
-    assert redis.ai_operations == {pending.operation_id}
-    assert redis.interaction_operations == {pending.operation_id}
-
-
-@pytest.mark.asyncio
-async def test_recover_preserves_lease_loss_and_failure_backoff_semantics(
-    workflow_module: Any,
-) -> None:
-    workflow, repository, redis, _proactive, user_data = _workflow(workflow_module)
-    pending = _pending_reply("reply-operation-lease")
-    redis.fail_ai_once = True
-
-    await workflow.fulfill(pending, send_reply=_send_success)
-    first_application_count = user_data.application_count
-
-    assert await workflow.recover_pending() == 1
-    assert repository.completed_ids == {pending.operation_id}
-    assert user_data.application_count == first_application_count
-
-
-@pytest.mark.asyncio
-async def test_recover_runs_terminal_identity_and_idempotency_cleanup(
-    workflow_module: Any,
-) -> None:
-    workflow, repository, _redis, _proactive, user_data = _workflow(workflow_module)
+    workflow, _repository, _commitments, _alerts, _proactive, events = _workflow(
+        workflow_module
+    )
+    clock = iter((3_601.0, 3_602.0))
+    monkeypatch.setattr(workflow_module.time, "monotonic", lambda: next(clock))
 
     assert await workflow.recover_pending() == 0
+    assert events == [
+        "recover_commitments",
+        "recover_alerts",
+        "cleanup_terminal_fulfillments",
+    ]
 
-    assert repository.cleanup_count == 1
-    assert user_data.cleanup_count == 1
+    events.clear()
+    assert await workflow.recover_pending() == 0
+    assert events == ["recover_commitments", "recover_alerts"]
+
+
+def test_builder_shares_one_parent_child_repository_across_workflow_services(
+    workflow_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: dict[str, object] = {}
+
+    class _Repository:
+        def __init__(self, pg_pool: object) -> None:
+            built["pool"] = pg_pool
+
+    class _Commitments:
+        def __init__(self, **kwargs: object) -> None:
+            built["commitment_repository"] = kwargs["repository"]
+
+    class _Alerts:
+        def __init__(self, **kwargs: object) -> None:
+            built["alert_repository"] = kwargs["repository"]
+            built["bots_provider"] = kwargs["bots_provider"]
+            built["superusers_provider"] = kwargs["superusers_provider"]
+
+    monkeypatch.setattr(workflow_module, "ReplyFulfillmentRepository", _Repository)
+    monkeypatch.setattr(workflow_module, "ReplyCommitmentWorkflow", _Commitments)
+    monkeypatch.setattr(workflow_module, "ReplyFulfillmentAlertService", _Alerts)
+    pg_pool = object()
+    bots_provider: Callable[[], Mapping[object, object]] = dict
+    superusers_provider: Callable[[], Iterable[object]] = tuple
+
+    workflow = workflow_module.build_reply_fulfillment_workflow(
+        pg_pool=pg_pool,
+        redis=object(),
+        proactive_reservation=object(),
+        user_data=object(),
+        config_getter=_config,
+        recovery_senders_getter=dict,
+        bots_provider=bots_provider,
+        superusers_provider=superusers_provider,
+    )
+
+    assert workflow.repository is built["commitment_repository"]
+    assert workflow.repository is built["alert_repository"]
+    assert built["pool"] is pg_pool
+    assert built["bots_provider"] is bots_provider
+    assert built["superusers_provider"] is superusers_provider
 
 
 def test_message_handler_does_not_own_reply_fulfillment_or_repository() -> None:
@@ -547,4 +385,6 @@ def test_message_handler_does_not_own_reply_fulfillment_or_repository() -> None:
     source = handler_module.__file__
     assert source is not None
     with Path(source).open(encoding="utf-8") as source_file:
-        assert "reply_commit_repository" not in source_file.read()
+        text = source_file.read()
+    assert "reply_commit_repository" not in text
+    assert "komari_chat_reply_commit_outbox" not in text

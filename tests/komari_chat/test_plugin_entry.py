@@ -612,11 +612,11 @@ async def test_startup_hook_starts_worker_and_shutdown_cancels_it(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """startup 钩子启动 outbox 轮询任务，shutdown 钩子取消并等待其终结。"""
+    """startup 钩子启动履约轮询任务，shutdown 钩子取消并等待其终结。"""
     # 模块加载时两个生命周期钩子已注册到 driver（nonebot lifespan 内部存储）
     lifespan = chat_module.driver._lifespan
-    assert chat_module._start_reply_commit_worker in lifespan._startup_funcs
-    assert chat_module._stop_reply_commit_worker in lifespan._shutdown_funcs
+    assert chat_module._start_reply_fulfillment_worker in lifespan._startup_funcs
+    assert chat_module._stop_reply_fulfillment_worker in lifespan._shutdown_funcs
 
     fake_asyncio = _FakeAsyncio()
     monkeypatch.setattr(chat_module, "asyncio", fake_asyncio)
@@ -631,7 +631,7 @@ async def test_startup_hook_starts_worker_and_shutdown_cancels_it(
     monkeypatch.setattr(
         chat_module,
         "get_config",
-        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+        lambda: SimpleNamespace(reply_fulfillment_worker_interval_seconds=30),
     )
     monkeypatch.setattr(
         chat_module,
@@ -640,14 +640,14 @@ async def test_startup_hook_starts_worker_and_shutdown_cancels_it(
         raising=False,
     )
 
-    await chat_module._start_reply_commit_worker()
-    task = chat_module._reply_commit_worker_task
+    await chat_module._start_reply_fulfillment_worker()
+    task = chat_module._reply_fulfillment_worker_task
     assert task is not None
     assert task is fake_asyncio.created_tasks[-1]
     assert not task.done()
 
     # 重复 start 幂等：任务已在运行时不重复创建
-    await chat_module._start_reply_commit_worker()
+    await chat_module._start_reply_fulfillment_worker()
     assert len(fake_asyncio.created_tasks) == 1
 
     # 第一拍：构建 handler、执行 retry，随后按配置间隔睡眠
@@ -656,8 +656,8 @@ async def test_startup_hook_starts_worker_and_shutdown_cancels_it(
     assert fake_asyncio.sleep_calls == [30]
 
     # shutdown：取消任务并等待退出，全局引用清空
-    await chat_module._stop_reply_commit_worker()
-    assert chat_module._reply_commit_worker_task is None
+    await chat_module._stop_reply_fulfillment_worker()
+    assert chat_module._reply_fulfillment_worker_task is None
     assert task.cancelled()
     assert task.done()
 
@@ -673,7 +673,7 @@ async def test_worker_interval_shrinks_to_five_seconds_after_polling_exception(
     monkeypatch.setattr(
         chat_module,
         "get_config",
-        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+        lambda: SimpleNamespace(reply_fulfillment_worker_interval_seconds=30),
     )
     errors_logged: list[int] = []
 
@@ -693,7 +693,7 @@ async def test_worker_interval_shrinks_to_five_seconds_after_polling_exception(
         async def recover_pending() -> int:
             attempts["count"] += 1
             if attempts["count"] == 1:
-                msg = "模拟 outbox 轮询失败"
+                msg = "模拟履约轮询失败"
                 raise RuntimeError(msg)
             return 0
 
@@ -704,8 +704,8 @@ async def test_worker_interval_shrinks_to_five_seconds_after_polling_exception(
         raising=False,
     )
 
-    await chat_module._start_reply_commit_worker()
-    task = chat_module._reply_commit_worker_task
+    await chat_module._start_reply_fulfillment_worker()
+    task = chat_module._reply_fulfillment_worker_task
     assert task is not None
 
     # 第一拍抛出普通异常：间隔收缩到 5 秒，并记录一条错误日志
@@ -718,7 +718,7 @@ async def test_worker_interval_shrinks_to_five_seconds_after_polling_exception(
     await _wait_for(lambda: len(fake_asyncio.sleep_calls) == 2)
     assert fake_asyncio.sleep_calls[1] == 30
 
-    await chat_module._stop_reply_commit_worker()
+    await chat_module._stop_reply_fulfillment_worker()
     assert task.cancelled()
 
 
@@ -733,7 +733,7 @@ async def test_worker_cancel_exits_cleanly_without_extra_side_effects(
     monkeypatch.setattr(
         chat_module,
         "get_config",
-        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+        lambda: SimpleNamespace(reply_fulfillment_worker_interval_seconds=30),
     )
     retry_calls: list[int] = []
 
@@ -750,8 +750,8 @@ async def test_worker_cancel_exits_cleanly_without_extra_side_effects(
         raising=False,
     )
 
-    await chat_module._start_reply_commit_worker()
-    task = chat_module._reply_commit_worker_task
+    await chat_module._start_reply_fulfillment_worker()
+    task = chat_module._reply_fulfillment_worker_task
     assert task is not None
     await _wait_for(lambda: len(fake_asyncio.sleep_calls) == 1)
     assert len(retry_calls) == 1
@@ -766,8 +766,8 @@ async def test_worker_cancel_exits_cleanly_without_extra_side_effects(
     assert fake_asyncio.sleep_calls == [30]
 
     # 收尾：shutdown 语义对已终结任务幂等，全局引用清空
-    await chat_module._stop_reply_commit_worker()
-    assert chat_module._reply_commit_worker_task is None
+    await chat_module._stop_reply_fulfillment_worker()
+    assert chat_module._reply_fulfillment_worker_task is None
 
 
 @pytest.mark.asyncio
@@ -781,7 +781,7 @@ async def test_worker_rethrows_cancelled_error_from_handler(
     monkeypatch.setattr(
         chat_module,
         "get_config",
-        lambda: SimpleNamespace(reply_commit_worker_interval_seconds=30),
+        lambda: SimpleNamespace(reply_fulfillment_worker_interval_seconds=30),
     )
     errors_logged: list[int] = []
 
@@ -808,8 +808,8 @@ async def test_worker_rethrows_cancelled_error_from_handler(
         raising=False,
     )
 
-    await chat_module._start_reply_commit_worker()
-    task = chat_module._reply_commit_worker_task
+    await chat_module._start_reply_fulfillment_worker()
+    task = chat_module._reply_fulfillment_worker_task
     assert task is not None
     with suppress(asyncio.CancelledError):
         await task

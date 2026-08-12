@@ -170,14 +170,6 @@ class _DeliveryRepository:
                 expired.append(dict(record))
         return expired
 
-    async def claim_operation(self, *_args: object, **_kwargs: object) -> None:
-        return None
-
-    async def claim_pending(self, **_kwargs: object) -> list[dict[str, Any]]:
-        return []
-
-    async def cleanup_tombstones(self, **_kwargs: object) -> int:
-        return 0
 
 
 class _ProactiveReservation:
@@ -209,11 +201,12 @@ def _config() -> SimpleNamespace:
         proactive_cooldown=300,
         global_interaction_enabled=True,
         global_interaction_trigger_size=20,
-        reply_commit_lease_seconds=60,
-        reply_commit_max_attempts=5,
-        reply_commit_retry_base_seconds=1,
-        reply_commit_batch_size=20,
-        reply_commit_tombstone_retention_days=30,
+        reply_fulfillment_batch_size=20,
+        reply_fulfillment_lease_seconds=60,
+        reply_fulfillment_max_attempts=5,
+        reply_fulfillment_retry_base_seconds=1,
+        reply_fulfillment_retry_max_seconds=3600,
+        reply_fulfillment_tombstone_retention_days=30,
         reply_fulfillment_freshness_seconds=120,
     )
 
@@ -266,12 +259,24 @@ def _workflow(
 ) -> Any:
     return module.ReplyFulfillmentWorkflow(
         repository=repository,
-        redis=SimpleNamespace(),
         proactive_reservation=proactive,
-        user_data=SimpleNamespace(),
         config_getter=_config,
         recovery_senders_getter=lambda: recovery_senders or {},
+        commitment_workflow=SimpleNamespace(
+            recover_fulfillment=_noop_recover_fulfillment,
+            recover_pending=_noop_recover_pending,
+            cleanup_terminal_fulfillments=_noop_recover_pending,
+        ),
+        alert_service=SimpleNamespace(recover_alerts=_noop_recover_pending),
     )
+
+
+async def _noop_recover_fulfillment(_fulfillment_id: str) -> bool:
+    return True
+
+
+async def _noop_recover_pending(**_kwargs: object) -> int:
+    return 0
 
 
 async def test_send_capability_observes_persisted_pending_confirmation(

@@ -517,6 +517,71 @@ def test_reply_fulfillment_backfill_revision_exists() -> None:
     assert "IMPORT KOMARI_BOT" not in normalized
 
 
+def test_reply_fulfillment_cutover_revision_exists() -> None:
+    """0011 完成停机 contract：门禁完整后改名配置并删除旧宽表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    cutover_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_cutover" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert cutover_revision is not None
+    assert cutover_revision.revision == "0011"
+    assert cutover_revision.down_revision == "0010"
+
+    revision_sql = Path(cutover_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    old_table = "KOMARI_CHAT_REPLY_COMMIT_OUTBOX"
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+    child_table = "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS"
+    config_table = "KOMARI_CHAT_CONFIG"
+    renamed_columns = {
+        "reply_commit_worker_interval_seconds": (
+            "reply_fulfillment_worker_interval_seconds"
+        ),
+        "reply_commit_batch_size": "reply_fulfillment_batch_size",
+        "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
+        "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
+        "reply_commit_retry_base_seconds": (
+            "reply_fulfillment_retry_base_seconds"
+        ),
+        "reply_commit_tombstone_retention_days": (
+            "reply_fulfillment_tombstone_retention_days"
+        ),
+    }
+
+    assert "FOR UPDATE" in normalized
+    assert f"FROM {old_table}" in normalized
+    assert f"FROM {parent_table}" in normalized
+    assert "MISSING_BACKFILL_COUNT=" in normalized
+    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    assert "COUNT(*)" in normalized
+    assert "COUNT(DISTINCT" in normalized
+    for old_name, new_name in renamed_columns.items():
+        assert re.search(
+            rf"ALTER TABLE {config_table} .*RENAME COLUMN "
+            rf"{old_name.upper()} TO {new_name.upper()}",
+            normalized,
+        ), old_name
+    assert "REPLY_FULFILLMENT_RETRY_MAX_SECONDS" in normalized
+    assert "DEFAULT 3600" in normalized
+    assert f"DROP TABLE {old_table}" in normalized
+    assert normalized.index("MISSING_BACKFILL_COUNT=") < normalized.index(
+        f"DROP TABLE {old_table}"
+    )
+
+    assert f"DROP TABLE {parent_table}" not in normalized
+    assert f"DROP TABLE {child_table}" not in normalized
+    assert f"DROP TABLE {config_table}" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+    assert "0011_REPLY_FULFILLMENT_CUTOVER_IS_IRREVERSIBLE" in normalized
+
+
 def test_migration_cli_can_inspect_chain_without_loading_application(
     tmp_path: Path,
 ) -> None:

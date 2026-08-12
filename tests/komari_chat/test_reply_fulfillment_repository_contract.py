@@ -7,9 +7,12 @@ from contextlib import asynccontextmanager
 from importlib import import_module
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 
 def _repository_module() -> Any:
@@ -152,7 +155,7 @@ async def test_claimed_commitments_decode_asyncpg_jsonb_text() -> None:
 
     class _Pool:
         @asynccontextmanager
-        async def acquire(self) -> Any:
+        async def acquire(self) -> AsyncIterator[Any]:
             yield _Connection()
 
     repository = module.ReplyFulfillmentRepository(_Pool())
@@ -286,24 +289,39 @@ def test_repository_contains_no_runtime_ddl() -> None:
     assert "DROP TABLE" not in source
 
 
-def test_new_adapter_is_not_wired_into_active_chat_path_yet() -> None:
-    """contract 前只扩展履约能力；正常聊天继续使用旧 adapter，禁止双读写。"""
+def test_new_adapter_is_the_only_active_chat_persistence_path() -> None:
+    """contract 后正常聊天只组装父子 adapter，不保留旧宽表兼容路径。"""
     project_root = Path(__file__).resolve().parents[2]
+    plugin_dir = project_root / "komari_bot/plugins/komari_chat"
     workflow_source = (
-        project_root
-        / "komari_bot/plugins/komari_chat/services/reply_fulfillment_workflow.py"
+        plugin_dir / "services/reply_fulfillment_workflow.py"
     ).read_text(encoding="utf-8")
-    plugin_source = (
-        project_root / "komari_bot/plugins/komari_chat/__init__.py"
-    ).read_text(encoding="utf-8")
+    plugin_source = (plugin_dir / "__init__.py").read_text(encoding="utf-8")
     handler_source = (
-        project_root / "komari_bot/plugins/komari_chat/handlers/message_handler.py"
+        plugin_dir / "handlers/message_handler.py"
     ).read_text(encoding="utf-8")
 
-    assert "reply_fulfillment_repository" not in workflow_source
-    assert "reply_fulfillment_repository" not in plugin_source
-    assert "reply_fulfillment_repository" not in handler_source
-    assert "reply_commit_repository" in workflow_source
-    assert "_LegacyReplyFulfillmentRepository(ReplyCommitRepository(pg_pool))" in (
-        workflow_source
-    )
+    assert "ReplyFulfillmentRepository" in workflow_source
+    assert "reply_fulfillment_repository" in workflow_source
+    assert "reply_commit_repository" not in workflow_source
+    assert "_LegacyReplyFulfillmentRepository" not in workflow_source
+    assert "ReplyCommitRepository" not in workflow_source
+    assert "komari_chat_reply_commit_outbox" not in workflow_source
+    assert "reply_commit_repository" not in plugin_source
+    assert "komari_chat_reply_commit_outbox" not in plugin_source
+    assert "reply_commit_repository" not in handler_source
+    assert "komari_chat_reply_commit_outbox" not in handler_source
+
+
+def test_legacy_reply_commit_repository_is_physically_deleted() -> None:
+    """旧 Repository 文件与对应集成测试不得留在当前代码树。"""
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert not (
+        project_root
+        / "komari_bot/plugins/komari_chat/repositories/reply_commit_repository.py"
+    ).exists()
+    assert not (
+        project_root
+        / "tests/komari_chat/test_reply_commit_repository_integration.py"
+    ).exists()

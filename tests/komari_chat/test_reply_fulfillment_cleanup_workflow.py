@@ -179,11 +179,12 @@ def _workflow(
         proactive_reservation=SimpleNamespace(),
         user_data=user_data,
         config_getter=lambda: SimpleNamespace(
-            reply_commit_batch_size=20,
-            reply_commit_lease_seconds=30,
-            reply_commit_max_attempts=3,
-            reply_commit_retry_base_seconds=2,
-            reply_commit_tombstone_retention_days=30,
+            reply_fulfillment_batch_size=20,
+            reply_fulfillment_lease_seconds=30,
+            reply_fulfillment_max_attempts=3,
+            reply_fulfillment_retry_base_seconds=2,
+            reply_fulfillment_retry_max_seconds=3600,
+            reply_fulfillment_tombstone_retention_days=30,
         ),
     )
     return workflow, repository, redis, user_data
@@ -292,7 +293,8 @@ async def test_cleanup_cancellation_propagates_without_deleting_tombstone(
     workflow, repository, redis, _user_data = _workflow(workflow_module)
     repository.seed("reply-cleanup-cancelled", resolved=True)
 
-    async def _cancel(_operation_id: str) -> int:
+    async def _cancel(operation_id: str) -> int:
+        del operation_id
         raise asyncio.CancelledError
 
     redis.delete_chat_commit_evidence = _cancel
