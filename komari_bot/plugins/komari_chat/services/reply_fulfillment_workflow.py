@@ -1,25 +1,28 @@
-"""聊天回复履约工作流。
+"""聊天回复履约统一工作流。
 
-工作流统一拥有回复从准备、发送到送达后承诺完成的生命周期；旧宽表仓库只
-作为本模块内部的持久化 adapter 使用。发送能力以窄边界注入：先持久准备、
-再持久登记发送开始，最后才调用平台发送；平台结果只以
+工作流统一拥有回复从准备、发送到全部送达后承诺完成的生命周期；
+持久化只走新父子模型 adapter（``ReplyFulfillmentRepository``），
+不再保留旧宽表兼容路径。发送能力以窄边界注入：先持久准备、再持久
+登记发送开始，最后才调用平台发送；平台结果只以
 ``ReplyDeliveryResult`` 翻译后的送达事实进入领域状态机。
+
+TSK-87 contract 后，送达后承诺推进、待处置续跑、终态清理与告警
+全部复用本模块的统一边界：``fulfill`` 送达持久化后立即委托
+``commitment_workflow.recover_fulfillment`` 并恢复告警；
+``recover_pending`` 依次协调发送前恢复、批量承诺推进、告警恢复与
+小时级终态清理。本模块不读取旧 outbox，不保留双读、双写或 fallback。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import time
+import time as _system_time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from nonebot import logger
-
-from komari_bot.plugins.komari_memory import MessageSchema
 
 from ..reply_fulfillment_domain import (
     AssistantReplyHistoryPayload,
@@ -31,18 +34,37 @@ from ..reply_fulfillment_domain import (
     build_reply_fulfillment_id,
     build_reply_fulfillment_payload_hash,
 )
-from ..repositories.reply_commit_repository import (
-    PendingReplyCommit,
-    ReplyCommitRepository,
-    ReplyCommitStep,
-)
+from ..repositories.reply_fulfillment_repository import ReplyFulfillmentRepository
+from .reply_commitment_workflow import ReplyCommitmentWorkflow
 from .reply_delivery_onebot import ReplyDeliveryResult
+from .reply_fulfillment_alert import (
+    ReplyFulfillmentAlertBot,
+    ReplyFulfillmentAlertService,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
+
+    from komari_bot.plugins.komari_memory import MessageSchema
 
 ReplySender = Callable[[object], Awaitable[object]]
 BotIdentity = tuple[str, str]
+
+
+class _MonotonicClock:
+    """小时级清理决策的单调时钟 seam。
+
+    独立包装 stdlib ``time.monotonic``：测试只替换本模块的
+    ``time.monotonic`` 即可控制清理节奏，不会像直接 patch 全局
+    ``time`` 模块那样泄漏到 asyncio 事件循环内部。
+    """
+
+    @staticmethod
+    def monotonic() -> float:
+        return _system_time.monotonic()
+
+
+time = _MonotonicClock()
 
 
 @dataclass(frozen=True)
@@ -100,22 +122,22 @@ class _PendingReply(Protocol):
 
 
 class _ReplyFulfillmentRepository(Protocol):
-    async def has_active_operation(self, operation_id: str) -> bool: ...
+    """本工作流消费的父子履约仓库窄接口。"""
+
+    async def has_active_operation(self, fulfillment_id: str) -> bool: ...
 
     async def prepare(self, draft: ReplyFulfillmentDraft) -> bool: ...
 
-    async def cancel_prepared(self, operation_id: str) -> bool: ...
-
-    async def mark_send_started(self, operation_id: str) -> bool: ...
+    async def mark_send_started(self, fulfillment_id: str) -> bool: ...
 
     async def mark_delivered(
         self,
-        operation_id: str,
+        fulfillment_id: str,
         *,
         platform_message_id: str | None = None,
     ) -> bool: ...
 
-    async def mark_not_delivered(self, operation_id: str) -> bool: ...
+    async def mark_not_delivered(self, fulfillment_id: str) -> bool: ...
 
     async def claim_fresh_not_started(
         self,
@@ -132,254 +154,12 @@ class _ReplyFulfillmentRepository(Protocol):
         freshness_seconds: int,
         limit: int,
     ) -> list[dict[str, Any]]: ...
-
-    async def claim_operation(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        lease_seconds: int,
-    ) -> dict[str, Any] | None: ...
-
-    async def claim_pending(
-        self,
-        *,
-        owner_token: str,
-        limit: int,
-        lease_seconds: int,
-    ) -> list[dict[str, Any]]: ...
-
-    async def renew_lease(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        lease_seconds: int,
-    ) -> bool: ...
-
-    async def mark_step(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        step: ReplyCommitStep,
-    ) -> bool: ...
-
-    async def complete(self, operation_id: str, *, owner_token: str) -> bool: ...
-
-    async def mark_failure(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        error_code: str,
-        max_attempts: int,
-        retry_base_seconds: int,
-    ) -> str | None: ...
-
-    async def cleanup_tombstones(self, *, retention_days: int) -> int: ...
 
 
 class ReplyFulfillmentQueryProtocol(Protocol):
     """消息生成阶段使用的回复履约查询窄接口。"""
 
     async def is_duplicate_event(self, operation_id: str) -> bool: ...
-
-
-class _LegacyReplyFulfillmentRepository:
-    """contract 前把冻结 Draft 适配到旧宽表。"""
-
-    def __init__(self, repository: ReplyCommitRepository) -> None:
-        self.repository = repository
-
-    @staticmethod
-    def _to_legacy_payload(draft: ReplyFulfillmentDraft) -> PendingReplyCommit:
-        payloads = {
-            item.commitment_type: item.payload for item in draft.commitments
-        }
-        favorability = payloads.get("favorability_adjustment")
-        assistant_history = payloads.get("assistant_reply_history")
-        if not isinstance(
-            favorability, FavorabilityAdjustmentPayload
-        ) or not isinstance(assistant_history, AssistantReplyHistoryPayload):
-            msg = "回复履约缺少固定的好感度或角色回复历史承诺"
-            raise TypeError(msg)
-
-        proactive = payloads.get("proactive_reply_confirmation")
-        interaction = payloads.get("interaction_history")
-        return PendingReplyCommit(
-            operation_id=draft.fulfillment_id,
-            request_trace_id=draft.request_trace_id,
-            source_message_id=draft.trigger_message_id,
-            group_id=draft.group_id,
-            user_id=draft.trigger_user_id,
-            user_nickname=(
-                interaction.display_name
-                if isinstance(interaction, InteractionHistoryPayload)
-                else draft.trigger_user_id
-            ),
-            bot_nickname=assistant_history.bot_nickname,
-            reply_content=draft.reply_content,
-            reply_timestamp=assistant_history.reply_timestamp,
-            favorability_delta=favorability.delta,
-            favorability_reason=favorability.reason,
-            interaction_history=(
-                dict(interaction.record)
-                if isinstance(interaction, InteractionHistoryPayload)
-                else {}
-            ),
-            proactive_reservation_id=(
-                proactive.reservation_id
-                if isinstance(proactive, ProactiveReplyConfirmationPayload)
-                else None
-            ),
-            proactive_cooldown_seconds=(
-                proactive.cooldown_seconds
-                if isinstance(proactive, ProactiveReplyConfirmationPayload)
-                else 0
-            ),
-            global_interaction_enabled=isinstance(
-                interaction, InteractionHistoryPayload
-            ),
-            global_interaction_trigger_size=(
-                interaction.trigger_size
-                if isinstance(interaction, InteractionHistoryPayload)
-                else 1
-            ),
-            bot_self_id=draft.bot_self_id,
-            adapter_name=draft.adapter_name,
-            reply_target_message_id=draft.reply_target_message_id,
-            frozen_payload_hash=draft.payload_hash,
-        )
-
-    async def has_active_operation(self, operation_id: str) -> bool:
-        return await self.repository.has_active_operation(operation_id)
-
-    async def prepare(self, draft: ReplyFulfillmentDraft) -> bool:
-        return await self.repository.prepare(self._to_legacy_payload(draft))
-
-    async def cancel_prepared(self, operation_id: str) -> bool:
-        return await self.repository.cancel_prepared(operation_id)
-
-    async def mark_send_started(self, operation_id: str) -> bool:
-        return await self.repository.mark_send_started(operation_id)
-
-    async def mark_delivered(
-        self,
-        operation_id: str,
-        *,
-        platform_message_id: str | None = None,
-    ) -> bool:
-        return await self.repository.mark_delivered(
-            operation_id,
-            platform_message_id=platform_message_id,
-        )
-
-    async def mark_not_delivered(self, operation_id: str) -> bool:
-        return await self.repository.mark_not_delivered(operation_id)
-
-    async def claim_fresh_not_started(
-        self,
-        *,
-        bot_self_id: str,
-        adapter_name: str,
-        freshness_seconds: int,
-        limit: int,
-    ) -> list[dict[str, Any]]:
-        return await self.repository.claim_fresh_not_started(
-            bot_self_id=bot_self_id,
-            adapter_name=adapter_name,
-            freshness_seconds=freshness_seconds,
-            limit=limit,
-        )
-
-    async def expire_stale_not_started(
-        self,
-        *,
-        freshness_seconds: int,
-        limit: int,
-    ) -> list[dict[str, Any]]:
-        return await self.repository.expire_stale_not_started(
-            freshness_seconds=freshness_seconds,
-            limit=limit,
-        )
-
-    async def claim_operation(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        lease_seconds: int,
-    ) -> dict[str, Any] | None:
-        return await self.repository.claim_operation(
-            operation_id,
-            owner_token=owner_token,
-            lease_seconds=lease_seconds,
-        )
-
-    async def claim_pending(
-        self,
-        *,
-        owner_token: str,
-        limit: int,
-        lease_seconds: int,
-    ) -> list[dict[str, Any]]:
-        return await self.repository.claim_pending(
-            owner_token=owner_token,
-            limit=limit,
-            lease_seconds=lease_seconds,
-        )
-
-    async def renew_lease(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        lease_seconds: int,
-    ) -> bool:
-        return await self.repository.renew_lease(
-            operation_id,
-            owner_token=owner_token,
-            lease_seconds=lease_seconds,
-        )
-
-    async def mark_step(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        step: ReplyCommitStep,
-    ) -> bool:
-        return await self.repository.mark_step(
-            operation_id,
-            owner_token=owner_token,
-            step=step,
-        )
-
-    async def complete(self, operation_id: str, *, owner_token: str) -> bool:
-        return await self.repository.complete(operation_id, owner_token=owner_token)
-
-    async def mark_failure(
-        self,
-        operation_id: str,
-        *,
-        owner_token: str,
-        error_code: str,
-        max_attempts: int,
-        retry_base_seconds: int,
-    ) -> str | None:
-        return await self.repository.mark_failure(
-            operation_id,
-            owner_token=owner_token,
-            error_code=error_code,
-            max_attempts=max_attempts,
-            retry_base_seconds=retry_base_seconds,
-        )
-
-    async def cleanup_tombstones(self, *, retention_days: int) -> int:
-        return await self.repository.cleanup_tombstones(
-            retention_days=retention_days
-        )
 
 
 def build_reply_fulfillment_commitments(
@@ -455,23 +235,28 @@ def build_reply_fulfillment_commitments(
 
 
 class ReplyFulfillmentWorkflow:
-    """统一执行单条回复履约。"""
+    """统一执行单条回复履约。
+
+    ``commitment_workflow`` 与 ``alert_service`` 与调用方共享同一个
+    ``ReplyFulfillmentRepository`` 实例（见 ``build_reply_fulfillment_workflow``），
+    保证父子模型只有一份持久化 adapter，不保留旧宽表兼容路径。
+    """
 
     def __init__(
         self,
         repository: _ReplyFulfillmentRepository,
-        redis: Any,
         proactive_reservation: Any,
-        user_data: Any,
         config_getter: Callable[[], Any],
         recovery_senders_getter: Callable[[], Mapping[BotIdentity, ReplySender]],
+        commitment_workflow: Any,
+        alert_service: Any,
     ) -> None:
         self.repository = repository
-        self.redis = redis
         self.proactive_reservation = proactive_reservation
-        self.user_data = user_data
         self.config_getter = config_getter
         self.recovery_senders_getter = recovery_senders_getter
+        self.commitment_workflow = commitment_workflow
+        self.alert_service = alert_service
         self._owner_token = f"chat-{uuid.uuid4().hex}"
         self._last_cleanup = 0.0
         # 发送起始阶段进程内锁：直接路径从 prepare 前持有到
@@ -574,8 +359,9 @@ class ReplyFulfillmentWorkflow:
         """原子编排一次回复履约：先持久准备，再登记发送开始，最后发送。
 
         平台发送边界必须返回 ``ReplyDeliveryResult``，原始平台响应不进入
-        领域状态机；待确认结果不释放预占、不自动重发；发送开始后任何
-        异常（含 ``CancelledError``）原样传播并保持待确认。
+        领域状态机；已送达持久化后立即推进承诺并恢复告警；明确未送达
+        终止并释放预占；待确认结果不释放预占、不自动重发、只恢复告警；
+        发送开始后任何异常（含 ``CancelledError``）原样传播并保持待确认。
         """
         if not pending_reply.reply_result.content:
             await self._release_reservation(pending_reply)
@@ -623,7 +409,7 @@ class ReplyFulfillmentWorkflow:
             raise TypeError(msg)
 
         if delivery_result.state == "delivered":
-            return await self._mark_delivered_and_finish(
+            return await self._finish_delivered(
                 pending_reply,
                 platform_message_id=delivery_result.platform_message_id,
             )
@@ -640,30 +426,26 @@ class ReplyFulfillmentWorkflow:
             "[KomariChat] 发送结果未知，回复进入待确认对账: operation={}",
             pending_reply.operation_id,
         )
+        await self.alert_service.recover_alerts()
         return False
 
-    async def _mark_delivered_and_finish(
+    async def _finish_delivered(
         self,
         pending_reply: _PendingReply,
         *,
         platform_message_id: str | None,
     ) -> bool:
-        """已送达回复：持久化送达事实并继续提交送达后承诺。"""
+        """已送达回复：持久化送达事实，立即推进承诺并恢复告警。"""
         delivered = await self.repository.mark_delivered(
             pending_reply.operation_id,
             platform_message_id=platform_message_id,
         )
         if not delivered:
-            msg = "回复已发送，但 outbox 无法标记为 DELIVERED"
+            msg = "回复已发送，但履约无法标记为 DELIVERED"
             raise RuntimeError(msg)
 
-        record = await self.repository.claim_operation(
-            pending_reply.operation_id,
-            owner_token=self._owner_token,
-            lease_seconds=int(self.config_getter().reply_commit_lease_seconds),
-        )
-        if record is not None:
-            await self._finish_claimed(record)
+        await self.commitment_workflow.recover_fulfillment(pending_reply.operation_id)
+        await self.alert_service.recover_alerts()
         logger.info(
             "[KomariChat] 回复已送达并进入持久副作用提交: group={} operation={}",
             pending_reply.message.group_id,
@@ -671,233 +453,21 @@ class ReplyFulfillmentWorkflow:
         )
         return True
 
-    async def _heartbeat(
-        self,
-        operation_id: str,
-        *,
-        lease_seconds: int,
-        lost: asyncio.Event,
-    ) -> None:
-        """处理送达后承诺期间的父级租约续期。"""
-        interval = max(1.0, lease_seconds / 3)
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                renewed = await self.repository.renew_lease(
-                    operation_id,
-                    owner_token=self._owner_token,
-                    lease_seconds=lease_seconds,
-                )
-            except Exception:
-                logger.exception("[KomariChat] 回复 outbox 租约续期失败")
-                lost.set()
-                return
-            if not renewed:
-                lost.set()
-                return
-
-    @staticmethod
-    async def _stop_task(task: asyncio.Task[None] | None) -> None:
-        if task is None:
-            return
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-
-    async def _mark_step(
-        self,
-        operation_id: str,
-        *,
-        step: ReplyCommitStep,
-        lease_lost: asyncio.Event,
-    ) -> None:
-        if lease_lost.is_set():
-            msg = "回复 outbox 处理租约已丢失"
-            raise RuntimeError(msg)
-        marked = await self.repository.mark_step(
-            operation_id,
-            owner_token=self._owner_token,
-            step=step,
-        )
-        if not marked:
-            msg = "回复 outbox 子步骤确认失败，租约可能已丢失"
-            raise RuntimeError(msg)
-
-    @staticmethod
-    def _parse_interaction_history(value: object) -> dict[str, str]:
-        decoded = json.loads(value) if isinstance(value, str) else value
-        if not isinstance(decoded, dict):
-            msg = "回复 outbox interaction_history 不是对象"
-            raise TypeError(msg)
-        return {
-            "event": str(decoded.get("event", "")).strip(),
-            "result": str(decoded.get("result", "")).strip(),
-            "emotion": str(decoded.get("emotion", "")).strip(),
-        }
-
-    async def _process_claimed(self, record: dict[str, Any]) -> None:
-        """按固定顺序幂等执行四项送达后承诺。"""
-        operation_id = str(record["operation_id"])
-        config = self.config_getter()
-        lease_seconds = int(config.reply_commit_lease_seconds)
-        lease_lost = asyncio.Event()
-        heartbeat = asyncio.create_task(
-            self._heartbeat(
-                operation_id,
-                lease_seconds=lease_seconds,
-                lost=lease_lost,
-            )
-        )
-        redis_dedupe_ttl_seconds = (
-            max(1, int(config.reply_commit_tombstone_retention_days) + 1) * 86_400
-        )
-        try:
-            if record.get("proactive_confirmed_at") is None:
-                reservation_id = record.get("proactive_reservation_id")
-                if reservation_id is not None:
-                    await self.proactive_reservation.confirm(
-                        str(record["group_id"]),
-                        str(reservation_id),
-                        cooldown_seconds=int(record["proactive_cooldown_seconds"]),
-                    )
-                await self._mark_step(
-                    operation_id,
-                    step="proactive_confirmed",
-                    lease_lost=lease_lost,
-                )
-
-            if record.get("favorability_applied_at") is None:
-                await self.user_data.adjust_user_favorability(
-                    str(record["user_id"]),
-                    int(record["favorability_delta"]),
-                    operation_id=f"{operation_id}:favorability",
-                )
-                await self._mark_step(
-                    operation_id,
-                    step="favorability_applied",
-                    lease_lost=lease_lost,
-                )
-
-            if record.get("ai_history_stored_at") is None:
-                reply_content = record.get("reply_content")
-                bot_nickname = record.get("bot_nickname")
-                if not isinstance(reply_content, str) or not isinstance(
-                    bot_nickname, str
-                ):
-                    msg = "回复 outbox AI 历史载荷缺失"
-                    raise ValueError(msg)
-                bot_message = MessageSchema(
-                    user_id="bot",
-                    user_nickname=bot_nickname,
-                    group_id=str(record["group_id"]),
-                    content=reply_content,
-                    timestamp=float(record["reply_timestamp"]),
-                    message_id=f"bot_{operation_id[-32:]}",
-                    is_bot=True,
-                )
-                await self.redis.push_message_once(
-                    bot_message.group_id,
-                    bot_message,
-                    operation_id=operation_id,
-                    dedupe_ttl_seconds=redis_dedupe_ttl_seconds,
-                )
-                await self._mark_step(
-                    operation_id,
-                    step="ai_history_stored",
-                    lease_lost=lease_lost,
-                )
-
-            if record.get("interaction_stored_at") is None:
-                if bool(record["global_interaction_enabled"]):
-                    history = self._parse_interaction_history(
-                        record.get("interaction_history")
-                    )
-                    global_record: dict[str, object] = {
-                        "version": 1,
-                        **history,
-                        "display_name": str(
-                            record.get("user_nickname") or record["user_id"]
-                        ),
-                        "timestamp": float(record["reply_timestamp"]),
-                        "message_id": str(record["source_message_id"]),
-                    }
-                    await self.redis.push_global_interaction_once(
-                        user_id=str(record["user_id"]),
-                        record=global_record,
-                        trigger_size=int(record["global_interaction_trigger_size"]),
-                        operation_id=operation_id,
-                        dedupe_ttl_seconds=redis_dedupe_ttl_seconds,
-                    )
-                await self._mark_step(
-                    operation_id,
-                    step="interaction_stored",
-                    lease_lost=lease_lost,
-                )
-
-            if lease_lost.is_set():
-                msg = "回复 outbox 完成前租约已丢失"
-                raise RuntimeError(msg)
-            completed = await self.repository.complete(
-                operation_id,
-                owner_token=self._owner_token,
-            )
-            if not completed:
-                msg = "回复 outbox 未满足完成条件或租约已丢失"
-                raise RuntimeError(msg)
-        finally:
-            await self._stop_task(heartbeat)
-
-    async def _finish_claimed(self, record: dict[str, Any]) -> bool:
-        """失败时保存无正文错误码并交给 adapter 计算退避。"""
-        operation_id = str(record["operation_id"])
-        try:
-            await self._process_claimed(record)
-        except Exception as error:
-            config = self.config_getter()
-            status = await self.repository.mark_failure(
-                operation_id,
-                owner_token=self._owner_token,
-                error_code=type(error).__name__,
-                max_attempts=int(config.reply_commit_max_attempts),
-                retry_base_seconds=int(config.reply_commit_retry_base_seconds),
-            )
-            if status == "FAILED":
-                logger.error(
-                    "[KomariChat] 回复 outbox 已耗尽重试，保留待人工对账: operation={}",
-                    operation_id,
-                )
-            else:
-                logger.warning(
-                    "[KomariChat] 回复 outbox 提交失败，已安排重试: operation={} error_type={}",
-                    operation_id,
-                    type(error).__name__,
-                )
-            return False
-        return True
-
     async def recover_pending(self) -> int:
-        """恢复中断的回复履约：发送前恢复与已送达承诺续跑。"""
-        config = self.config_getter()
-        records = await self.repository.claim_pending(
-            owner_token=self._owner_token,
-            limit=int(config.reply_commit_batch_size),
-            lease_seconds=int(config.reply_commit_lease_seconds),
-        )
+        """恢复中断的回复履约：发送前恢复、承诺推进、告警与小时级清理。
+
+        先恢复发送前中断的新鲜/过期履约，再批量推进已送达承诺，随后
+        恢复两类告警；每小时执行一次终态两阶段清理。清理周期由进程内
+        单调时钟控制，不读取任何持久状态。
+        """
         completed = await self._recover_not_started_deliveries()
-        for record in records:
-            if await self._finish_claimed(record):
-                completed += 1
+        completed += await self.commitment_workflow.recover_pending()
+        await self.alert_service.recover_alerts()
 
         now = time.monotonic()
         if now - self._last_cleanup >= 3600:
             self._last_cleanup = now
-            retention_days = int(config.reply_commit_tombstone_retention_days)
-            await self.repository.cleanup_tombstones(retention_days=retention_days)
-            cleanup = getattr(self.user_data, "cleanup_favorability_operations", None)
-            if callable(cleanup):
-                await cast("Callable[..., Awaitable[object]]", cleanup)(
-                    retention_days=retention_days
-                )
+            await self.commitment_workflow.cleanup_terminal_fulfillments()
         return completed
 
     async def _recover_not_started_deliveries(self) -> int:
@@ -905,9 +475,9 @@ class ReplyFulfillmentWorkflow:
 
         只有仍在时效内、且 Bot 与适配器精确匹配的 NOT_STARTED 回复才
         允许恢复发送；满时效按未送达终止并释放持久预占。仓库未提供
-        领取/过期能力（旧 adapter 或测试替身）时跳过本阶段。领取与
-        过期在同一进程内锁内原子完成，避免与直接路径的
-        prepare → mark_send_started 区间竞争；平台发送在锁外执行。
+        领取/过期能力（测试替身）时跳过本阶段。领取与过期在同一进程
+        内锁内原子完成，避免与直接路径的 prepare → mark_send_started
+        区间竞争；平台发送在锁外执行。
         """
         claim_fresh = getattr(self.repository, "claim_fresh_not_started", None)
         expire_stale = getattr(self.repository, "expire_stale_not_started", None)
@@ -915,7 +485,7 @@ class ReplyFulfillmentWorkflow:
             return 0
         config = self.config_getter()
         freshness_seconds = int(config.reply_fulfillment_freshness_seconds)
-        limit = int(config.reply_commit_batch_size)
+        limit = int(config.reply_fulfillment_batch_size)
         completed = 0
         claimed_records: list[tuple[dict[str, Any], ReplySender]] = []
         async with self._send_start_lock:
@@ -948,7 +518,8 @@ class ReplyFulfillmentWorkflow:
         """用恢复 sender 发送一条新鲜 NOT_STARTED 回复并翻译结果。
 
         待确认结果保持待确认且永不自动重发；明确未送达则终止并释放
-        预占；恢复发送本身异常时保守保持待确认。
+        预占；已送达持久化后立即推进承诺；恢复发送本身异常时保守保持
+        待确认。
         """
         operation_id = str(record["operation_id"])
         recovered_reply = self._recovered_reply(record)
@@ -976,13 +547,7 @@ class ReplyFulfillmentWorkflow:
                     operation_id,
                 )
                 return False
-            claimed = await self.repository.claim_operation(
-                operation_id,
-                owner_token=self._owner_token,
-                lease_seconds=int(self.config_getter().reply_commit_lease_seconds),
-            )
-            if claimed is not None:
-                return await self._finish_claimed(claimed)
+            await self.commitment_workflow.recover_fulfillment(operation_id)
             return True
         if delivery_result.state == "not_delivered":
             await self.repository.mark_not_delivered(operation_id)
@@ -1052,15 +617,37 @@ def build_reply_fulfillment_workflow(
     user_data: Any,
     config_getter: Callable[[], Any],
     recovery_senders_getter: Callable[[], Mapping[BotIdentity, ReplySender]],
+    bots_provider: Callable[[], Iterable[object] | Mapping[object, object]],
+    superusers_provider: Callable[[], Iterable[object]],
 ) -> ReplyFulfillmentWorkflow:
-    """在 composition root 创建工作流并隐藏旧宽表 adapter。"""
-    return ReplyFulfillmentWorkflow(
-        repository=_LegacyReplyFulfillmentRepository(ReplyCommitRepository(pg_pool)),
+    """在 composition root 组装统一履约工作流。
+
+    三个服务共享同一个 ``ReplyFulfillmentRepository`` 实例：父子模型
+    只有一份持久化 adapter，不保留旧宽表、不双写、不 fallback。
+    """
+    repository = ReplyFulfillmentRepository(pg_pool)
+    commitment_workflow = ReplyCommitmentWorkflow(
+        repository=repository,
         redis=redis,
         proactive_reservation=proactive_reservation,
         user_data=user_data,
         config_getter=config_getter,
+    )
+    alert_service = ReplyFulfillmentAlertService(
+        repository=repository,
+        bots_provider=cast(
+            "Callable[[], Iterable[ReplyFulfillmentAlertBot] | Mapping[object, ReplyFulfillmentAlertBot]]",
+            bots_provider,
+        ),
+        superusers_provider=superusers_provider,
+    )
+    return ReplyFulfillmentWorkflow(
+        repository=repository,
+        proactive_reservation=proactive_reservation,
+        config_getter=config_getter,
         recovery_senders_getter=recovery_senders_getter,
+        commitment_workflow=commitment_workflow,
+        alert_service=alert_service,
     )
 
 
