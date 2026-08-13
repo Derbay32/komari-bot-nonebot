@@ -31,17 +31,12 @@ from komari_bot.plugins.komari_memory import MessageSchema
 
 from ..reply_fulfillment_domain import (
     _COMMITMENT_PAYLOAD_TYPES,
-    COMMITMENT_TYPES,
     ReplyFulfillmentConflictError,
 )
+from ..repositories.reply_fulfillment_repository import _COMMITMENT_ORDER
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-# 承诺类型到冻结领域值对象的固定映射，与领域模块保持单一事实来源。
-_COMMITMENT_ORDER = {
-    commitment_type: index for index, commitment_type in enumerate(COMMITMENT_TYPES)
-}
 
 
 class _CommitmentExecutorRepository(Protocol):

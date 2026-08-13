@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import time as _system_time
-import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -257,7 +256,6 @@ class ReplyFulfillmentWorkflow:
         self.recovery_senders_getter = recovery_senders_getter
         self.commitment_workflow = commitment_workflow
         self.alert_service = alert_service
-        self._owner_token = f"chat-{uuid.uuid4().hex}"
         self._last_cleanup = 0.0
         # 发送起始阶段进程内锁：直接路径从 prepare 前持有到
         # mark_send_started 完成，恢复路径在领取/过期阶段持有同一锁，
