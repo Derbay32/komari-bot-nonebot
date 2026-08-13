@@ -181,7 +181,7 @@ async def test_disposition_alert_resets_only_on_authorized_resume() -> None:
     commitment_type = "favorability_adjustment"
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
-        assert await repository.claim_operation(
+        assert await repository.claim_lease(
             fulfillment_id,
             owner_token="alert-worker-1",
             lease_seconds=60,
@@ -241,7 +241,7 @@ async def test_disposition_alert_resets_only_on_authorized_resume() -> None:
             )
             == "updated"
         )
-        assert await repository.claim_operation(
+        assert await repository.claim_lease(
             fulfillment_id,
             owner_token="alert-worker-2",
             lease_seconds=60,
@@ -293,7 +293,7 @@ async def test_retry_wait_never_becomes_disposition_alert_candidate() -> None:
     fulfillment_id = f"alert-retry-{uuid4().hex}"
     async with _repository_context([fulfillment_id]) as (repository, _pool):
         await _prepare_delivered(repository, fulfillment_id)
-        assert await repository.claim_operation(
+        assert await repository.claim_lease(
             fulfillment_id,
             owner_token="retry-worker",
             lease_seconds=60,

@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 class _CommitmentExecutorRepository(Protocol):
     """执行器消费的父子履约仓库窄接口。"""
 
-    async def claim_operation(
+    async def claim_lease(
         self,
         fulfillment_id: str,
         *,
@@ -225,7 +225,7 @@ class ReplyCommitmentWorkflow:
         租约已被其他执行者持有时返回 False，不做任何重发或伪造完成。
         """
         config = self.config_getter()
-        record = await self.repository.claim_operation(
+        record = await self.repository.claim_lease(
             fulfillment_id,
             owner_token=self._owner_token,
             lease_seconds=int(config.reply_fulfillment_lease_seconds),

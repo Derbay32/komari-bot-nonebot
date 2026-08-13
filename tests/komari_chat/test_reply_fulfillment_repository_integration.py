@@ -163,8 +163,8 @@ async def test_active_identity_query_covers_every_persisted_delivery_state() -> 
         assert await repository.mark_not_delivered(fulfillment_ids[3]) is True
 
         for fulfillment_id in fulfillment_ids:
-            assert await repository.has_active_operation(fulfillment_id) is True
-        assert await repository.has_active_operation(f"missing-{uuid4().hex}") is False
+            assert await repository.has_fulfillment(fulfillment_id) is True
+        assert await repository.has_fulfillment(f"missing-{uuid4().hex}") is False
 
 
 async def test_claimed_commitments_include_validated_payloads_in_domain_order() -> None:
@@ -173,7 +173,7 @@ async def test_claimed_commitments_include_validated_payloads_in_domain_order() 
     async with _repository_context([fulfillment_id]) as (repository, _pool):
         await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 fulfillment_id,
                 owner_token="worker-1",
                 lease_seconds=60,
@@ -536,7 +536,7 @@ async def test_claim_pending_reclaims_parent_with_all_children_completed() -> No
     async with _repository_context([fulfillment_id]) as (repository, _pool):
         await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 fulfillment_id,
                 owner_token="worker-1",
                 lease_seconds=60,
@@ -654,7 +654,7 @@ async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 fulfillment_id,
                 owner_token="old-owner",
                 lease_seconds=60,
@@ -688,7 +688,7 @@ async def test_expired_lease_is_reclaimed_and_old_owner_loses_cas() -> None:
             )
             is False
         )
-        reclaimed = await repository.claim_operation(
+        reclaimed = await repository.claim_lease(
             fulfillment_id,
             owner_token="new-owner",
             lease_seconds=60,
@@ -731,7 +731,7 @@ async def test_commitments_retry_independently_and_gate_parent_completion() -> N
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 fulfillment_id,
                 owner_token="worker-1",
                 lease_seconds=60,
@@ -857,7 +857,7 @@ async def test_exhausted_child_blocks_completion_without_poisoning_siblings() ->
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 fulfillment_id,
                 owner_token="worker-1",
                 lease_seconds=60,
@@ -933,7 +933,7 @@ async def test_terminal_transitions_minimize_only_no_longer_needed_payloads() ->
     async with _repository_context(fulfillment_ids) as (repository, pool):
         await _prepare_delivered(repository, needs_disposition_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 needs_disposition_id,
                 owner_token="worker-minimal",
                 lease_seconds=60,
@@ -1031,7 +1031,7 @@ async def test_parent_completion_defensively_minimizes_all_terminal_payloads() -
     async with _repository_context([fulfillment_id]) as (repository, pool):
         await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 fulfillment_id,
                 owner_token="worker-complete",
                 lease_seconds=60,
@@ -1117,7 +1117,7 @@ async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
         for fulfillment_id in (completed_id, protected_id):
             await _prepare_delivered(repository, fulfillment_id)
             assert (
-                await repository.claim_operation(
+                await repository.claim_lease(
                     fulfillment_id,
                     owner_token=f"worker-{fulfillment_id}",
                     lease_seconds=60,
@@ -1146,7 +1146,7 @@ async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
         assert await repository.mark_send_started(pending_id) is True
         await _prepare_delivered(repository, disposition_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 disposition_id,
                 owner_token="worker-disposition",
                 lease_seconds=60,
@@ -1234,10 +1234,10 @@ async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
                 fulfillment_id,
                 owner_token="cleanup-worker",
             )
-            assert not await repository.has_active_operation(fulfillment_id)
+            assert not await repository.has_fulfillment(fulfillment_id)
 
         for fulfillment_id in (pending_id, disposition_id, protected_id):
-            assert await repository.has_active_operation(fulfillment_id)
+            assert await repository.has_fulfillment(fulfillment_id)
 
 
 async def test_management_projection_filters_derived_states_without_sensitive_payloads() -> None:
@@ -1260,7 +1260,7 @@ async def test_management_projection_filters_derived_states_without_sensitive_pa
         for fulfillment_id in (processing_id, disposition_id, completed_id):
             await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 disposition_id,
                 owner_token="ops-disposition-worker",
                 lease_seconds=60,
@@ -1283,7 +1283,7 @@ async def test_management_projection_filters_derived_states_without_sensitive_pa
             owner_token="ops-disposition-worker",
         )
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 completed_id,
                 owner_token="ops-completed-worker",
                 lease_seconds=60,
@@ -1393,7 +1393,7 @@ async def test_management_reconciliation_and_resume_use_atomic_state_guards() ->
             platform_message_id=None,
         ) == "updated"
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 resume_id,
                 owner_token="ops-failed-worker",
                 lease_seconds=60,
@@ -1775,7 +1775,7 @@ async def test_management_derived_status_consistent_with_domain_function_for_all
         for fulfillment_id in (processing_id, disposition_id, completed_id):
             await _prepare_delivered(repository, fulfillment_id)
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 disposition_id,
                 owner_token="derive-disposition-worker",
                 lease_seconds=60,
@@ -1801,7 +1801,7 @@ async def test_management_derived_status_consistent_with_domain_function_for_all
             is True
         )
         assert (
-            await repository.claim_operation(
+            await repository.claim_lease(
                 completed_id,
                 owner_token="derive-completed-worker",
                 lease_seconds=60,
