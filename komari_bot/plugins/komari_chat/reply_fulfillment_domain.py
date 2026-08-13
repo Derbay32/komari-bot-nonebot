@@ -285,21 +285,39 @@ class ReplyFulfillmentDraft:
             raise ValueError(msg)
 
 
-def derive_reply_fulfillment_status(row: Mapping[str, Any]) -> str:
-    """按父子表字段推导管理派生状态（与存储 adapter 的 SQL 分支一致）。
+# 管理派生状态的固定集合（唯一权威）：管理列表筛选、详情投影与存储
+# adapter 的 SQL CASE 生成共用本集合，杜绝派生状态双源漂移。
+REPLY_FULFILLMENT_STATUSES: tuple[str, ...] = (
+    "not_started",
+    "pending_confirmation",
+    "processing",
+    "needs_disposition",
+    "completed",
+    "not_delivered",
+)
 
-    固定状态集合：not_started / pending_confirmation / processing /
-    needs_disposition / completed / not_delivered。``row`` 至少携带
-    ``delivery_state``、``completed_at`` 与 ``commitments``（子项
-    状态事实），供管理投影复用，不读取任何载荷。
+# delivery_state 直推状态映射（唯一权威）：Python 推导与 SQL CASE
+# 生成共用本映射；未覆盖的 DELIVERED 态由函数/表达式内的子分支按
+# completed > needs_disposition > processing 优先级判定。
+_DELIVERY_STATE_STATUS_MAP: dict[str, str] = {
+    "NOT_STARTED": "not_started",
+    "PENDING_CONFIRMATION": "pending_confirmation",
+    "NOT_DELIVERED": "not_delivered",
+}
+
+
+def derive_reply_fulfillment_status(row: Mapping[str, Any]) -> str:
+    """按父子表字段推导管理派生状态（与 SQL CASE 生成同源）。
+
+    固定状态集合由 ``REPLY_FULFILLMENT_STATUSES`` 定义，delivery_state
+    直推分支取自 ``_DELIVERY_STATE_STATUS_MAP``，与
+    ``build_reply_fulfillment_status_case_sql`` 共用同一来源。``row``
+    至少携带 ``delivery_state``、``completed_at`` 与 ``commitments``
+    （子项状态事实），供管理投影复用，不读取任何载荷。
     """
     delivery_state = str(row.get("delivery_state") or "")
-    if delivery_state == "NOT_STARTED":
-        return "not_started"
-    if delivery_state == "PENDING_CONFIRMATION":
-        return "pending_confirmation"
-    if delivery_state == "NOT_DELIVERED":
-        return "not_delivered"
+    if delivery_state in _DELIVERY_STATE_STATUS_MAP:
+        return _DELIVERY_STATE_STATUS_MAP[delivery_state]
     if row.get("completed_at") is not None:
         return "completed"
     commitments = row.get("commitments") or ()
@@ -309,6 +327,43 @@ def derive_reply_fulfillment_status(row: Mapping[str, Any]) -> str:
     ):
         return "needs_disposition"
     return "processing"
+
+
+def build_reply_fulfillment_status_case_sql(
+    parent_alias: str = "parent",
+) -> str:
+    """生成管理派生状态 SQL CASE 表达式（与 Python 推导同源）。
+
+    与 ``derive_reply_fulfillment_status`` 共用 ``REPLY_FULFILLMENT_
+    STATUSES`` 与 ``_DELIVERY_STATE_STATUS_MAP``：delivery_state 直推
+    分支由映射逐项生成，DELIVERED 子分支按 completed > needs_disposition
+    > processing 判定（EXISTS 子查询命中任一 FAILED 子项即待处置）。
+    存储 adapter 的 ``list_for_management`` 拼接本表达式到派生视图，
+    保证列表筛选与详情投影的 status 同源；``parent_alias`` 为父表
+    别名，默认 ``parent``。
+    """
+    lines = [f"CASE {parent_alias}.delivery_state"]
+    for delivery_state, status in _DELIVERY_STATE_STATUS_MAP.items():
+        lines.append(f"    WHEN '{delivery_state}' THEN '{status}'")
+    lines.extend(
+        [
+            "    WHEN 'DELIVERED' THEN CASE",
+            f"        WHEN {parent_alias}.completed_at IS NOT NULL",
+            "            THEN 'completed'",
+            "        WHEN EXISTS (",
+            "            SELECT 1",
+            "            FROM komari_chat_reply_fulfillment_commitments",
+            "                AS failed_child",
+            "            WHERE failed_child.fulfillment_id =",
+            f"                  {parent_alias}.fulfillment_id",
+            "              AND failed_child.state = 'FAILED'",
+            "        ) THEN 'needs_disposition'",
+            "        ELSE 'processing'",
+            "    END",
+        ]
+    )
+    lines.append("END")
+    return "\n".join(lines)
 
 
 def build_reply_fulfillment_id(
@@ -368,6 +423,7 @@ def build_reply_fulfillment_payload_hash(
 
 __all__ = [
     "COMMITMENT_TYPES",
+    "REPLY_FULFILLMENT_STATUSES",
     "AssistantReplyHistoryPayload",
     "CommitmentPayload",
     "FavorabilityAdjustmentPayload",
@@ -378,5 +434,6 @@ __all__ = [
     "ReplyFulfillmentDraft",
     "build_reply_fulfillment_id",
     "build_reply_fulfillment_payload_hash",
+    "build_reply_fulfillment_status_case_sql",
     "derive_reply_fulfillment_status",
 ]
