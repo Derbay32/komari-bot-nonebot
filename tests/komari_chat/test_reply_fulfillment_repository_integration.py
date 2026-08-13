@@ -416,6 +416,9 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
         )
         assert [row["fulfillment_id"] for row in claimed] == [fresh_id]
         assert claimed[0]["delivery_state"] == "PENDING_CONFIRMATION"
+        # 领取行附带从主动回复确认承诺子 payload 投影的预占身份。
+        assert claimed[0]["proactive_group_id"] == "group-1"
+        assert claimed[0]["proactive_reservation_id"] == "reservation-1"
 
         expired = await repository.expire_stale_not_started(
             freshness_seconds=120,
@@ -424,6 +427,10 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
         assert [row["fulfillment_id"] for row in expired] == [stale_id]
         assert expired[0]["send_started_at"] is None
         assert expired[0]["not_delivered_at"] is not None
+        # 过期行在同事务清除子 payload 之前已取出预占身份并随返回行带出。
+        assert expired[0]["proactive_group_id"] == "group-1"
+        assert expired[0]["proactive_reservation_id"] == "reservation-1"
+        assert expired[0]["reply_content"] is None
 
         async with pool.acquire() as connection:
             stale = await connection.fetchrow(
@@ -458,6 +465,66 @@ async def test_not_started_recovery_respects_identity_and_freshness_boundary() -
         assert all(row["payload"] is None for row in stale_children)
         assert mismatch["delivery_state"] == "NOT_STARTED"
         assert mismatch["send_started_at"] is None
+
+
+async def test_recovery_rows_project_proactive_identity_from_child_payload() -> None:
+    """领取/过期返回行的预占身份来自子 payload；无子项的行投影为 None。"""
+    fresh_forced_id = f"parent-fresh-forced-{uuid4().hex}"
+    stale_forced_id = f"parent-stale-forced-{uuid4().hex}"
+    fulfillment_ids = [fresh_forced_id, stale_forced_id]
+    async with _repository_context(fulfillment_ids) as (repository, pool):
+        for fulfillment_id in fulfillment_ids:
+            draft = _draft(fulfillment_id)
+            assert await repository.prepare(
+                replace(
+                    draft,
+                    commitments=tuple(
+                        commitment
+                        for commitment in draft.commitments
+                        if commitment.commitment_type != "proactive_reply_confirmation"
+                    ),
+                )
+            ) is True
+
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET prepared_at = NOW() - INTERVAL '120 seconds'
+                WHERE fulfillment_id = $1
+                """,
+                stale_forced_id,
+            )
+
+        claimed = await repository.claim_fresh_not_started(
+            bot_self_id="bot-1",
+            adapter_name="onebot.v11",
+            freshness_seconds=120,
+            limit=20,
+        )
+        assert [row["fulfillment_id"] for row in claimed] == [fresh_forced_id]
+        assert claimed[0]["proactive_group_id"] is None
+        assert claimed[0]["proactive_reservation_id"] is None
+
+        expired = await repository.expire_stale_not_started(
+            freshness_seconds=120,
+            limit=20,
+        )
+        assert [row["fulfillment_id"] for row in expired] == [stale_forced_id]
+        assert expired[0]["proactive_group_id"] is None
+        assert expired[0]["proactive_reservation_id"] is None
+        assert expired[0]["reply_content"] is None
+
+        async with pool.acquire() as connection:
+            remaining_payloads = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1 AND payload IS NOT NULL
+                """,
+                stale_forced_id,
+            )
+        assert remaining_payloads == 0
 
 
 async def test_claim_pending_reclaims_parent_with_all_children_completed() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,11 +18,47 @@ if TYPE_CHECKING:
     from nonebug import App
 
 
+# 真实仓储 ``RETURNING parent.*`` 的父表键集
+# （migrations 0006 建表 + 0008/0009 增补列）。
+_PARENT_ROW_KEYS = (
+    "fulfillment_id",
+    "payload_hash",
+    "request_trace_id",
+    "trigger_message_id",
+    "trigger_user_id",
+    "group_id",
+    "bot_self_id",
+    "adapter_name",
+    "reply_target_message_id",
+    "reply_content",
+    "delivery_state",
+    "platform_message_id",
+    "prepared_at",
+    "send_started_at",
+    "delivered_at",
+    "not_delivered_at",
+    "lease_owner",
+    "lease_expires_at",
+    "completed_at",
+    "created_at",
+    "updated_at",
+    "idempotency_evidence_cleared_at",
+    "pending_confirmation_alerted_at",
+)
+
+
 class _ParentChildRepository:
-    """只保存父送达事实与冻结子项的内存 adapter。"""
+    """只保存父送达事实与冻结子项的内存 adapter（真实父子表形状）。
+
+    领取/过期返回行精确模拟真实仓储 ``RETURNING parent.*`` 键集，外加
+    从主动回复确认承诺子 payload 投影的 ``proactive_group_id`` /
+    ``proactive_reservation_id``；恢复路径以真实形状闭环。
+    """
 
     def __init__(self) -> None:
         self.records: dict[str, dict[str, Any]] = {}
+        self.commitment_payloads: dict[str, dict[str, dict[str, Any] | None]] = {}
+        self.now = datetime(2026, 8, 11, tzinfo=UTC)
 
     @property
     def delivered_ids(self) -> set[str]:
@@ -47,17 +84,122 @@ class _ParentChildRepository:
             if record["delivery_state"] == "NOT_DELIVERED"
         }
 
+    def _parent_row(
+        self,
+        draft: Any,
+        *,
+        prepared_at: datetime,
+    ) -> dict[str, Any]:
+        return {
+            "fulfillment_id": draft.fulfillment_id,
+            "payload_hash": draft.payload_hash,
+            "request_trace_id": draft.request_trace_id,
+            "trigger_message_id": draft.trigger_message_id,
+            "trigger_user_id": draft.trigger_user_id,
+            "group_id": draft.group_id,
+            "bot_self_id": draft.bot_self_id,
+            "adapter_name": draft.adapter_name,
+            "reply_target_message_id": draft.reply_target_message_id,
+            "reply_content": draft.reply_content,
+            "delivery_state": "NOT_STARTED",
+            "platform_message_id": None,
+            "prepared_at": prepared_at,
+            "send_started_at": None,
+            "delivered_at": None,
+            "not_delivered_at": None,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "completed_at": None,
+            "created_at": prepared_at,
+            "updated_at": prepared_at,
+            "idempotency_evidence_cleared_at": None,
+            "pending_confirmation_alerted_at": None,
+        }
+
+    def seed_not_started(
+        self,
+        fulfillment_id: str,
+        *,
+        age_seconds: int,
+        bot_self_id: str = "bot-1",
+        adapter_name: str = "OneBot V11",
+        group_id: str = "group-1",
+        reply_content: str = "恢复补发的回复",
+    ) -> None:
+        """按真实父表键直接播种一条发送前崩溃遗留的 NOT_STARTED 行。"""
+        prepared_at = self.now - timedelta(seconds=age_seconds)
+        self.records[fulfillment_id] = {
+            "fulfillment_id": fulfillment_id,
+            "payload_hash": "a" * 64,
+            "request_trace_id": f"trace-{fulfillment_id}",
+            "trigger_message_id": "message-1",
+            "trigger_user_id": "user-1",
+            "group_id": group_id,
+            "bot_self_id": bot_self_id,
+            "adapter_name": adapter_name,
+            "reply_target_message_id": "message-1",
+            "reply_content": reply_content,
+            "delivery_state": "NOT_STARTED",
+            "platform_message_id": None,
+            "prepared_at": prepared_at,
+            "send_started_at": None,
+            "delivered_at": None,
+            "not_delivered_at": None,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "completed_at": None,
+            "created_at": prepared_at,
+            "updated_at": prepared_at,
+            "idempotency_evidence_cleared_at": None,
+            "pending_confirmation_alerted_at": None,
+        }
+        self.commitment_payloads[fulfillment_id] = {
+            "proactive_reply_confirmation": {
+                "group_id": group_id,
+                "reservation_id": "reservation-1",
+                "cooldown_seconds": 300,
+            },
+            "favorability_adjustment": {
+                "user_id": "user-1",
+                "delta": 1,
+                "reason": "正常互动",
+            },
+            "assistant_reply_history": {
+                "group_id": group_id,
+                "bot_nickname": "小鞠",
+                "reply_content": reply_content,
+                "reply_timestamp": 2.0,
+            },
+        }
+
+    def _claimed_row(self, fulfillment_id: str) -> dict[str, Any]:
+        """按真实仓储返回形状投影：父表键 + 子 payload 预占投影。"""
+        record = self.records[fulfillment_id]
+        row = {key: record.get(key) for key in _PARENT_ROW_KEYS}
+        payload = self.commitment_payloads.get(fulfillment_id, {}).get(
+            "proactive_reply_confirmation"
+        )
+        row["proactive_group_id"] = (
+            payload.get("group_id") if isinstance(payload, dict) else None
+        )
+        row["proactive_reservation_id"] = (
+            payload.get("reservation_id") if isinstance(payload, dict) else None
+        )
+        return row
+
     async def has_active_operation(self, fulfillment_id: str) -> bool:
         return fulfillment_id in self.records
 
     async def prepare(self, draft: Any) -> bool:
         if draft.fulfillment_id in self.records:
             return False
-        self.records[draft.fulfillment_id] = {
-            "fulfillment_id": draft.fulfillment_id,
-            "delivery_state": "NOT_STARTED",
-            "platform_message_id": None,
-            "commitments": tuple(draft.commitments),
+        self.records[draft.fulfillment_id] = self._parent_row(
+            draft,
+            prepared_at=self.now,
+        )
+        self.commitment_payloads[draft.fulfillment_id] = {
+            commitment.commitment_type: commitment.to_json()
+            for commitment in draft.commitments
         }
         return True
 
@@ -66,6 +208,7 @@ class _ParentChildRepository:
         if record["delivery_state"] != "NOT_STARTED":
             return False
         record["delivery_state"] = "PENDING_CONFIRMATION"
+        record["send_started_at"] = self.now
         return True
 
     async def mark_delivered(
@@ -79,6 +222,8 @@ class _ParentChildRepository:
             return False
         record["delivery_state"] = "DELIVERED"
         record["platform_message_id"] = platform_message_id
+        record["delivered_at"] = self.now
+        record["reply_content"] = None
         return True
 
     async def mark_not_delivered(self, fulfillment_id: str) -> bool:
@@ -89,13 +234,62 @@ class _ParentChildRepository:
         }:
             return False
         record["delivery_state"] = "NOT_DELIVERED"
+        record["not_delivered_at"] = self.now
+        record["reply_content"] = None
+        for commitment_type in self.commitment_payloads.get(fulfillment_id, {}):
+            self.commitment_payloads[fulfillment_id][commitment_type] = None
         return True
 
-    async def claim_fresh_not_started(self, **_kwargs: object) -> list[dict[str, Any]]:
-        return []
+    async def claim_fresh_not_started(
+        self,
+        *,
+        bot_self_id: str,
+        adapter_name: str,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        claimed: list[dict[str, Any]] = []
+        for fulfillment_id, record in self.records.items():
+            age = (self.now - record["prepared_at"]).total_seconds()
+            if (
+                record["delivery_state"] == "NOT_STARTED"
+                and record["bot_self_id"] == bot_self_id
+                and record["adapter_name"] == adapter_name
+                and age < freshness_seconds
+                and len(claimed) < limit
+            ):
+                record["delivery_state"] = "PENDING_CONFIRMATION"
+                record["send_started_at"] = self.now
+                claimed.append(self._claimed_row(fulfillment_id))
+        return claimed
 
-    async def expire_stale_not_started(self, **_kwargs: object) -> list[dict[str, Any]]:
-        return []
+    async def expire_stale_not_started(
+        self,
+        *,
+        freshness_seconds: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        expired: list[dict[str, Any]] = []
+        for fulfillment_id, record in self.records.items():
+            age = (self.now - record["prepared_at"]).total_seconds()
+            if (
+                record["delivery_state"] == "NOT_STARTED"
+                and age >= freshness_seconds
+                and len(expired) < limit
+            ):
+                # 两段式顺序（与真实仓储同事务一致）：先取预占身份投影，
+                # 再翻转未送达终态并抹除父正文与子 payload。
+                row = self._claimed_row(fulfillment_id)
+                record["delivery_state"] = "NOT_DELIVERED"
+                record["not_delivered_at"] = self.now
+                record["reply_content"] = None
+                for commitment_type in self.commitment_payloads.get(fulfillment_id, {}):
+                    self.commitment_payloads[fulfillment_id][commitment_type] = None
+                row["delivery_state"] = "NOT_DELIVERED"
+                row["not_delivered_at"] = record["not_delivered_at"]
+                row["reply_content"] = None
+                expired.append(row)
+        return expired
 
 
 class _CommitmentWorkflow:
@@ -206,6 +400,8 @@ def _pending_reply(
 
 def _workflow(
     module: Any,
+    *,
+    recovery_senders: Mapping[tuple[str, str], Any] | None = None,
 ) -> tuple[
     Any,
     _ParentChildRepository,
@@ -223,7 +419,7 @@ def _workflow(
         repository=repository,
         proactive_reservation=proactive,
         config_getter=_config,
-        recovery_senders_getter=dict,
+        recovery_senders_getter=lambda: recovery_senders or {},
         commitment_workflow=commitments,
         alert_service=alerts,
     )
@@ -317,6 +513,43 @@ async def test_recover_coordinates_commitments_alerts_and_hourly_cleanup(
     events.clear()
     assert await workflow.recover_pending() == 0
     assert events == ["recover_commitments", "recover_alerts"]
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_restores_pre_send_crash_with_real_row_shape(
+    workflow_module: Any,
+) -> None:
+    """发送前崩溃恢复以真实父表行键闭环：领取→补发→送达→推进承诺。
+
+    恢复路径只消费真实 ``RETURNING parent.*`` 键（``fulfillment_id`` /
+    ``trigger_message_id`` 等），任何旧宽表键读取都会以 KeyError 失败。
+    """
+    sent: list[Any] = []
+
+    async def _sender(reply: object) -> object:
+        sent.append(reply)
+        return workflow_module.ReplyDeliveryResult.delivered("platform-77")
+
+    workflow, repository, commitments, _alerts, proactive, events = _workflow(
+        workflow_module,
+        recovery_senders={("bot-1", "OneBot V11"): _sender},
+    )
+    repository.seed_not_started("reply-recover-closed-loop", age_seconds=5)
+
+    assert await workflow.recover_pending() == 1
+
+    assert repository.delivered_ids == {"reply-recover-closed-loop"}
+    record = repository.records["reply-recover-closed-loop"]
+    assert record["platform_message_id"] == "platform-77"
+    assert record["reply_content"] is None
+    assert commitments.fulfillment_ids == ["reply-recover-closed-loop"]
+    assert events[0] == "recover_fulfillment"
+    assert proactive.released == []
+    assert len(sent) == 1
+    recovered_reply = sent[0]
+    assert recovered_reply.group_id == "group-1"
+    assert recovered_reply.reply == "恢复补发的回复"
+    assert recovered_reply.reply_to_message_id == "message-1"
 
 
 def test_builder_shares_one_parent_child_repository_across_workflow_services(
