@@ -67,10 +67,17 @@ class UserDataDB:
             logger.debug("[UserDataDB] PostgreSQL 连接初始化完成")
 
     def _require_ready(self) -> None:
-        """未初始化时拒绝读写，保持原“连接池未初始化”错误语义。"""
+        """未初始化时拒绝读写，保持原“连接池未初始化”错误语义。
+
+        抛出的异常实例携带 ``error_code="service_unavailable"``，供
+        上游（如 komari_chat 承诺执行器）按结构化错误码分类；类名与
+        正文保持原状，不做任何兼容层。
+        """
         if not self._ready:
             msg = "UserDataDB 连接池未初始化"
-            raise RuntimeError(msg)
+            error = cast("Any", RuntimeError(msg))
+            error.error_code = "service_unavailable"
+            raise error
 
     async def close(self) -> None:
         """重置就绪状态；engine 生命周期由 nonebot-plugin-orm 托管。"""
@@ -168,7 +175,9 @@ class UserDataDB:
                             raise RuntimeError(msg)
                         if existing_user != user_id or existing_delta != delta:
                             msg = "好感度 operation_id 与既有请求载荷冲突"
-                            raise ValueError(msg)
+                            error = cast("Any", ValueError(msg))
+                            error.error_code = "idempotency_conflict"
+                            raise error
                         return FavorabilityAdjustmentResult.from_values(
                             user_id=existing_user,
                             before=int(before_value),

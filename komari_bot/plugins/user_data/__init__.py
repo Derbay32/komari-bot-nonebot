@@ -23,9 +23,13 @@ if TYPE_CHECKING:
 class UserDataDisabledError(RuntimeError):
     """user_data 已被动态配置关闭。"""
 
+    error_code = "service_unavailable"
+
 
 class UserDataStoppingError(RuntimeError):
     """user_data 正在或已经关闭，不允许重新建立连接池。"""
+
+    error_code = "service_unavailable"
 
 
 __plugin_meta__ = PluginMetadata(
