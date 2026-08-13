@@ -654,7 +654,9 @@ async def test_value_error_idempotency_conflict_enters_disposition_immediately(
         repository,
         config,
     )
-    user_data.error = ValueError("好感度 operation_id 与既有请求载荷冲突")
+    error: Any = ValueError("好感度 operation_id 与既有请求载荷冲突")
+    error.error_code = "idempotency_conflict"
+    user_data.error = error
 
     assert await workflow.recover_pending() == 0
 
@@ -676,7 +678,9 @@ async def test_dynamic_service_shutdown_retries_without_revoking_commitment(
         repository,
         config,
     )
-    user_data.error = RuntimeError("UserDataDB 连接池未初始化")
+    error: Any = RuntimeError("UserDataDB 连接池未初始化")
+    error.error_code = "service_unavailable"
+    user_data.error = error
 
     assert await workflow.recover_pending() == 0
 

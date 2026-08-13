@@ -144,38 +144,21 @@ def _build_payload(commitment_type: str, raw: object) -> Any:
     return payload_type(**raw)
 
 
-def _is_service_unavailable(error: BaseException) -> bool:
-    """user_data 动态关闭、正在关闭或连接池未初始化。
-
-    按 user_data 插件的公开异常类名识别，避免在模块导入期 require
-    该插件；错误码仍只含稳定标识，不含异常正文。
-    """
-    error_type = type(error).__name__
-    if error_type in {"UserDataDisabledError", "UserDataStoppingError"}:
-        return True
-    return isinstance(error, RuntimeError) and "连接池未初始化" in str(error)
-
-
-def _is_idempotency_conflict(error: BaseException) -> bool:
-    """好感度幂等账本冲突的公开异常文本；持久化只写稳定码。
-
-    只对 user_data 已有的公开文本做窄匹配，普通未知 ``ValueError``
-    不会被误判为幂等冲突。
-    """
-    return isinstance(error, ValueError) and "operation_id 与既有请求载荷冲突" in str(
-        error
-    )
-
-
 def _classify_error(error: BaseException) -> tuple[bool, str]:
     """把异常翻译成稳定错误码；只持久化码本身，禁止异常正文。
 
     返回值形如 ``(永久, 错误码)``：永久错误立即耗尽（FAILED），
-    瞬态错误按动态策略退避重试。
+    瞬态错误按动态策略退避重试。下游异常携带 ``error_code`` 字符串
+    属性（类属性或实例属性均可）时按码分类：``idempotency_conflict``
+    / ``protocol_violation`` 永久、其余码瞬态；无码时退回既有
+    isinstance 类型映射。判定不读异常正文、不读异常类名，也无需
+    在模块导入期 require 任何下游插件（error_code 鸭子类型读取）。
     """
-    if isinstance(error, ReplyFulfillmentConflictError) or _is_idempotency_conflict(
-        error
-    ):
+    error_code = getattr(error, "error_code", None)
+    if isinstance(error_code, str):
+        permanent = error_code in {"idempotency_conflict", "protocol_violation"}
+        return permanent, error_code
+    if isinstance(error, ReplyFulfillmentConflictError):
         permanent, code = True, "idempotency_conflict"
     elif isinstance(error, TypeError):
         permanent, code = True, "protocol_violation"
@@ -190,8 +173,6 @@ def _classify_error(error: BaseException) -> tuple[bool, str]:
         (asyncpg.PostgresConnectionError, asyncpg.InterfaceError),
     ):
         permanent, code = False, "database_unavailable"
-    elif _is_service_unavailable(error):
-        permanent, code = False, "service_unavailable"
     else:
         permanent, code = False, "unexpected_error"
     return permanent, code
