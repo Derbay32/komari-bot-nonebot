@@ -31,9 +31,9 @@ from komari_bot.plugins.komari_memory import MessageSchema
 
 from ..reply_fulfillment_domain import (
     _COMMITMENT_PAYLOAD_TYPES,
+    COMMITMENT_ORDER,
     ReplyFulfillmentConflictError,
 )
-from ..repositories.reply_fulfillment_repository import _COMMITMENT_ORDER
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -362,8 +362,8 @@ class ReplyCommitmentWorkflow:
             return False
         for row in sorted(
             rows,
-            key=lambda item: _COMMITMENT_ORDER.get(
-                str(item["commitment_type"]), len(_COMMITMENT_ORDER)
+            key=lambda item: COMMITMENT_ORDER.get(
+                str(item["commitment_type"]), len(COMMITMENT_ORDER)
             ),
         ):
             if lease_lost.is_set() or not await self._process_commitment_row(
