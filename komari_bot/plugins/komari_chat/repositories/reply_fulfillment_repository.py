@@ -29,9 +29,6 @@ from ..reply_fulfillment_domain import (
     derive_reply_fulfillment_status,
 )
 
-# 承诺固定顺序的唯一权威定义在领域模块，本模块与服务模块引用同一
-# 映射（COMMITMENT_ORDER），不各自定义私有副本。
-
 
 class ReplyFulfillmentRepository:
     """回复履约父子记录的 PostgreSQL adapter。"""
@@ -171,7 +168,7 @@ class ReplyFulfillmentRepository:
         )
         return outcome == "updated"
 
-    async def has_active_operation(self, fulfillment_id: str) -> bool:
+    async def has_fulfillment(self, fulfillment_id: str) -> bool:
         """履约身份一旦持久化，就阻止同一事件再次发送。"""
         async with self.pg_pool.acquire() as connection:
             found = await connection.fetchval(
@@ -351,7 +348,7 @@ class ReplyFulfillmentRepository:
                 projection = {}
         return self._merge_proactive_reservation_projection(rows, projection)
 
-    async def claim_operation(
+    async def claim_lease(
         self,
         fulfillment_id: str,
         *,
@@ -423,7 +420,7 @@ class ReplyFulfillmentRepository:
     ) -> list[dict[str, Any]]:
         """按稳定顺序批量领取待处理履约，并跳过已锁父记录。
 
-        领取条件与 ``claim_operation`` 一致：存在到期子项，或所有子项
+        领取条件与 ``claim_lease`` 一致：存在到期子项，或所有子项
         都已 COMPLETED 而父完成标记尚未写入（补父终态，不重复子项）。
         """
         if limit <= 0:

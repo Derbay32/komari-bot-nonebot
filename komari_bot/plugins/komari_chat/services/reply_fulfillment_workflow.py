@@ -123,7 +123,7 @@ class _PendingReply(Protocol):
 class _ReplyFulfillmentRepository(Protocol):
     """本工作流消费的父子履约仓库窄接口。"""
 
-    async def has_active_operation(self, fulfillment_id: str) -> bool: ...
+    async def has_fulfillment(self, fulfillment_id: str) -> bool: ...
 
     async def prepare(self, draft: ReplyFulfillmentDraft) -> bool: ...
 
@@ -266,7 +266,7 @@ class ReplyFulfillmentWorkflow:
 
     async def is_duplicate_event(self, fulfillment_id: str) -> bool:
         """判断平台事件是否已有不可再次发送的履约记录。"""
-        return await self.repository.has_active_operation(fulfillment_id)
+        return await self.repository.has_fulfillment(fulfillment_id)
 
     @staticmethod
     def _resolve_display_name(message: MessageSchema) -> str:
@@ -378,7 +378,7 @@ class ReplyFulfillmentWorkflow:
 
             if not prepared:
                 logger.info(
-                    "[KomariChat] 重复回复 operation 已存在，取消本次发送: operation={}",
+                    "[KomariChat] 重复回复履约已存在，取消本次发送: fulfillment={}",
                     pending_reply.fulfillment_id,
                 )
                 await self._release_reservation(pending_reply)
@@ -397,7 +397,7 @@ class ReplyFulfillmentWorkflow:
             raise
         except Exception:
             logger.exception(
-                "[KomariChat] 发送开始后平台结果未知，保持待确认: operation={}",
+                "[KomariChat] 发送开始后平台结果未知，保持待确认: fulfillment={}",
                 pending_reply.fulfillment_id,
             )
             raise
@@ -415,13 +415,13 @@ class ReplyFulfillmentWorkflow:
             await self.repository.mark_not_delivered(pending_reply.fulfillment_id)
             await self._release_reservation(pending_reply)
             logger.info(
-                "[KomariChat] 平台明确拒绝发送，回复未送达: group={} operation={}",
+                "[KomariChat] 平台明确拒绝发送，回复未送达: group={} fulfillment={}",
                 pending_reply.message.group_id,
                 pending_reply.fulfillment_id,
             )
             return False
         logger.info(
-            "[KomariChat] 发送结果未知，回复进入待确认对账: operation={}",
+            "[KomariChat] 发送结果未知，回复进入待确认对账: fulfillment={}",
             pending_reply.fulfillment_id,
         )
         await self.alert_service.recover_alerts()
@@ -445,7 +445,7 @@ class ReplyFulfillmentWorkflow:
         await self.commitment_workflow.recover_fulfillment(pending_reply.fulfillment_id)
         await self.alert_service.recover_alerts()
         logger.info(
-            "[KomariChat] 回复已送达并进入持久副作用提交: group={} operation={}",
+            "[KomariChat] 回复已送达并进入持久副作用提交: group={} fulfillment={}",
             pending_reply.message.group_id,
             pending_reply.fulfillment_id,
         )
@@ -522,7 +522,7 @@ class ReplyFulfillmentWorkflow:
             raise
         except Exception:
             logger.exception(
-                "[KomariChat] 恢复发送结果未知，保持待确认: operation={}",
+                "[KomariChat] 恢复发送结果未知，保持待确认: fulfillment={}",
                 fulfillment_id,
             )
             return False
@@ -536,7 +536,7 @@ class ReplyFulfillmentWorkflow:
             )
             if not marked:
                 logger.error(
-                    "[KomariChat] 恢复发送后无法持久化送达事实: operation={}",
+                    "[KomariChat] 恢复发送后无法持久化送达事实: fulfillment={}",
                     fulfillment_id,
                 )
                 return False
@@ -546,12 +546,12 @@ class ReplyFulfillmentWorkflow:
             await self.repository.mark_not_delivered(fulfillment_id)
             await self._release_recovered_reservation(record)
             logger.info(
-                "[KomariChat] 恢复发送被平台明确拒绝，回复未送达: operation={}",
+                "[KomariChat] 恢复发送被平台明确拒绝，回复未送达: fulfillment={}",
                 fulfillment_id,
             )
             return False
         logger.info(
-            "[KomariChat] 恢复发送结果未知，保持待确认对账: operation={}",
+            "[KomariChat] 恢复发送结果未知，保持待确认对账: fulfillment={}",
             fulfillment_id,
         )
         return False

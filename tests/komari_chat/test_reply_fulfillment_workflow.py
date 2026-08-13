@@ -159,7 +159,7 @@ class _ParentChildRepository:
         )
         return row
 
-    async def has_active_operation(self, fulfillment_id: str) -> bool:
+    async def has_fulfillment(self, fulfillment_id: str) -> bool:
         return fulfillment_id in self.records
 
     async def prepare(self, draft: Any) -> bool:

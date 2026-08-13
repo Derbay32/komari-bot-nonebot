@@ -22,7 +22,7 @@ class _FrozenFulfillmentStore:
         self.records: dict[str, Any] = {}
         self.terminal_states: dict[str, str] = {}
 
-    async def has_active_operation(self, fulfillment_id: str) -> bool:
+    async def has_fulfillment(self, fulfillment_id: str) -> bool:
         return fulfillment_id in self.records or fulfillment_id in self.terminal_states
 
     async def prepare(self, draft: Any) -> bool:
