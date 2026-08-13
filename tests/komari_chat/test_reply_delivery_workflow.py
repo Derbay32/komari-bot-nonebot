@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+from tests.komari_chat.fulfillment_row_keys import PARENT_ROW_KEYS
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -19,34 +20,6 @@ if TYPE_CHECKING:
 
 ReplySender = Callable[[object], Awaitable[object]]
 BotIdentity = tuple[str, str]
-
-# 真实仓储 ``RETURNING parent.*`` 的父表键集
-# （migrations 0006 建表 + 0008/0009 增补列）。
-_PARENT_ROW_KEYS = (
-    "fulfillment_id",
-    "payload_hash",
-    "request_trace_id",
-    "trigger_message_id",
-    "trigger_user_id",
-    "group_id",
-    "bot_self_id",
-    "adapter_name",
-    "reply_target_message_id",
-    "reply_content",
-    "delivery_state",
-    "platform_message_id",
-    "prepared_at",
-    "send_started_at",
-    "delivered_at",
-    "not_delivered_at",
-    "lease_owner",
-    "lease_expires_at",
-    "completed_at",
-    "created_at",
-    "updated_at",
-    "idempotency_evidence_cleared_at",
-    "pending_confirmation_alerted_at",
-)
 
 # 领取/过期返回行在父表键之外附带的预占投影键：从主动回复确认承诺
 # 子 payload 投影，与管理对账路径 ``reconcile_not_delivered`` 同名。
@@ -197,7 +170,7 @@ class _DeliveryRepository:
     def _claimed_row(self, fulfillment_id: str) -> dict[str, Any]:
         """按真实仓储返回形状投影：宽松取键，缺失键留给工作流投影报错。"""
         record = self.records[fulfillment_id]
-        row = {key: record.get(key) for key in _PARENT_ROW_KEYS}
+        row = {key: record.get(key) for key in PARENT_ROW_KEYS}
         group_id, reservation_id = self._proactive_projection(fulfillment_id)
         row["proactive_group_id"] = group_id
         row["proactive_reservation_id"] = reservation_id
@@ -309,7 +282,7 @@ class _DeliveryRepository:
                 record["reply_content"] = None
                 for commitment_type in self.commitments.get(fulfillment_id, {}):
                     self.commitments[fulfillment_id][commitment_type] = None
-                row = {key: record.get(key) for key in _PARENT_ROW_KEYS}
+                row = {key: record.get(key) for key in PARENT_ROW_KEYS}
                 row["proactive_group_id"] = group_id
                 row["proactive_reservation_id"] = reservation_id
                 expired.append(row)
@@ -745,7 +718,7 @@ async def test_claim_and_expire_rows_match_real_parent_key_set(
         limit=20,
     )
 
-    expected = set(_PARENT_ROW_KEYS) | set(_PROJECTION_KEYS)
+    expected = set(PARENT_ROW_KEYS) | set(_PROJECTION_KEYS)
     assert len(claimed) == 1
     assert set(claimed[0]) == expected
     assert claimed[0]["fulfillment_id"] == "reply-keys-fresh"
