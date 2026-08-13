@@ -7,7 +7,11 @@ from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import DynamicConfigSchema
-from .database import UserDataDB
+from .database import (
+    FavorabilityIdempotencyConflictError,
+    UserDataDB,
+    UserDataUnavailableError,
+)
 from .models import (
     FavorabilityAdjustmentResult,
     FavorabilitySetResult,
@@ -243,10 +247,12 @@ async def set_user_favorability(
 
 __all__ = [
     "FavorabilityAdjustmentResult",
+    "FavorabilityIdempotencyConflictError",
     "FavorabilitySetResult",
     "FavorabilityStage",
     "UserDataDisabledError",
     "UserDataStoppingError",
+    "UserDataUnavailableError",
     "UserFavorability",
     "adjust_user_favorability",
     "cleanup_favorability_operations",
