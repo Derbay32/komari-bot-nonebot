@@ -71,11 +71,11 @@ time = _MonotonicClock()
 class RecoveredReply:
     """从持久 NOT_STARTED 记录恢复的发送载荷（与 OneBot 边界对齐）。"""
 
-    operation_id: str
+    fulfillment_id: str
     group_id: str
     reply: str
     reply_to_message_id: str | None
-    source_message_id: str
+    trigger_message_id: str
     bot_self_id: str
     adapter_name: str
     proactive_reservation_id: str | None
@@ -516,7 +516,7 @@ class ReplyFulfillmentWorkflow:
         预占；已送达持久化后立即推进承诺；恢复发送本身异常时保守保持
         待确认。
         """
-        operation_id = str(record["operation_id"])
+        fulfillment_id = str(record["fulfillment_id"])
         recovered_reply = self._recovered_reply(record)
         try:
             delivery_result = await sender(recovered_reply)
@@ -525,7 +525,7 @@ class ReplyFulfillmentWorkflow:
         except Exception:
             logger.exception(
                 "[KomariChat] 恢复发送结果未知，保持待确认: operation={}",
-                operation_id,
+                fulfillment_id,
             )
             return False
         if not isinstance(delivery_result, ReplyDeliveryResult):
@@ -533,28 +533,28 @@ class ReplyFulfillmentWorkflow:
             raise TypeError(msg)
         if delivery_result.state == "delivered":
             marked = await self.repository.mark_delivered(
-                operation_id,
+                fulfillment_id,
                 platform_message_id=delivery_result.platform_message_id,
             )
             if not marked:
                 logger.error(
                     "[KomariChat] 恢复发送后无法持久化送达事实: operation={}",
-                    operation_id,
+                    fulfillment_id,
                 )
                 return False
-            await self.commitment_workflow.recover_fulfillment(operation_id)
+            await self.commitment_workflow.recover_fulfillment(fulfillment_id)
             return True
         if delivery_result.state == "not_delivered":
-            await self.repository.mark_not_delivered(operation_id)
+            await self.repository.mark_not_delivered(fulfillment_id)
             await self._release_recovered_reservation(record)
             logger.info(
                 "[KomariChat] 恢复发送被平台明确拒绝，回复未送达: operation={}",
-                operation_id,
+                fulfillment_id,
             )
             return False
         logger.info(
             "[KomariChat] 恢复发送结果未知，保持待确认对账: operation={}",
-            operation_id,
+            fulfillment_id,
         )
         return False
 
@@ -566,34 +566,45 @@ class ReplyFulfillmentWorkflow:
         self,
         record: dict[str, Any],
     ) -> None:
-        """按持久化的群与预占 ID 幂等释放主动回复预占。"""
+        """按持久化的群与预占 ID 幂等释放主动回复预占。
+
+        预占身份来自主动回复确认承诺子 payload 的投影键（与对账路径
+        ``reconcile_not_delivered`` 返回键同名），父表没有预占列。
+        """
+        group_id = record.get("proactive_group_id")
         reservation_id = record.get("proactive_reservation_id")
-        if reservation_id is None:
+        if group_id is None or reservation_id is None:
             return
         try:
             await self.proactive_reservation.release(
-                str(record["group_id"]),
+                str(group_id),
                 str(reservation_id),
             )
         except Exception:
             logger.exception(
                 "[KomariChat] 恢复终止回复的主动预占释放失败，等待 TTL 回收: group={}",
-                record.get("group_id"),
+                group_id,
             )
 
     @staticmethod
     def _recovered_reply(record: dict[str, Any]) -> RecoveredReply:
         """把持久 NOT_STARTED 记录投影为恢复发送载荷。"""
+        reply_content = record["reply_content"]
+        if reply_content is None:
+            # 领取行在正常路径必然携带完整父正文；None 表示持久载荷
+            # 缺失（编程/数据错误），以 KeyError 原样传播，绝不伪装成
+            # 平台结果未知或发送空正文。
+            raise KeyError("reply_content")
         return RecoveredReply(
-            operation_id=str(record["operation_id"]),
+            fulfillment_id=str(record["fulfillment_id"]),
             group_id=str(record["group_id"]),
-            reply=str(record["reply_content"]),
+            reply=str(reply_content),
             reply_to_message_id=(
                 str(record["reply_target_message_id"])
                 if record.get("reply_target_message_id") is not None
                 else None
             ),
-            source_message_id=str(record["source_message_id"]),
+            trigger_message_id=str(record["trigger_message_id"]),
             bot_self_id=str(record["bot_self_id"]),
             adapter_name=str(record["adapter_name"]),
             proactive_reservation_id=(
