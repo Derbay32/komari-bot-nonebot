@@ -14,6 +14,7 @@ from typing import Any
 
 from ..reply_fulfillment_domain import (
     _COMMITMENT_PAYLOAD_TYPES,
+    COMMITMENT_ORDER,
     COMMITMENT_TYPES,
     REPLY_FULFILLMENT_STATUSES,
     AssistantReplyHistoryPayload,
@@ -28,11 +29,8 @@ from ..reply_fulfillment_domain import (
     derive_reply_fulfillment_status,
 )
 
-# 承诺类型到冻结领域值对象的固定映射，与领域模块保持单一事实来源；
-# 承诺固定顺序的唯一权威定义，回复承诺工作流引用同一映射。
-_COMMITMENT_ORDER = {
-    commitment_type: index for index, commitment_type in enumerate(COMMITMENT_TYPES)
-}
+# 承诺固定顺序的唯一权威定义在领域模块，本模块与服务模块引用同一
+# 映射（COMMITMENT_ORDER），不各自定义私有副本。
 
 
 class ReplyFulfillmentRepository:
@@ -608,8 +606,8 @@ class ReplyFulfillmentRepository:
             )
         return sorted(
             commitments,
-            key=lambda item: _COMMITMENT_ORDER.get(
-                str(item["commitment_type"]), len(_COMMITMENT_ORDER)
+            key=lambda item: COMMITMENT_ORDER.get(
+                str(item["commitment_type"]), len(COMMITMENT_ORDER)
             ),
         )
 
@@ -975,8 +973,8 @@ class ReplyFulfillmentRepository:
             item.pop("total", None)
             item["commitments"] = sorted(
                 merged.get(str(row["fulfillment_id"]), []),
-                key=lambda child: _COMMITMENT_ORDER.get(
-                    str(child["commitment_type"]), len(_COMMITMENT_ORDER)
+                key=lambda child: COMMITMENT_ORDER.get(
+                    str(child["commitment_type"]), len(COMMITMENT_ORDER)
                 ),
             )
             result.append(item)
@@ -1029,8 +1027,8 @@ class ReplyFulfillmentRepository:
                 }
                 for child in children
             ],
-            key=lambda child: _COMMITMENT_ORDER.get(
-                str(child["commitment_type"]), len(_COMMITMENT_ORDER)
+            key=lambda child: COMMITMENT_ORDER.get(
+                str(child["commitment_type"]), len(COMMITMENT_ORDER)
             ),
         )
         # 优先保留已有 status（安全行携带时），缺失才按领域字段推导。

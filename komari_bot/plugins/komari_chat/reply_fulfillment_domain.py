@@ -23,6 +23,12 @@ COMMITMENT_TYPES: tuple[str, ...] = (
     "interaction_history",
 )
 
+# 承诺固定顺序的唯一权威定义（由 COMMITMENT_TYPES 推导）：仓储模块
+# 与管理投影、服务模块执行器共用本映射，不得各自定义私有副本。
+COMMITMENT_ORDER: dict[str, int] = {
+    commitment_type: index for index, commitment_type in enumerate(COMMITMENT_TYPES)
+}
+
 
 class ReplyFulfillmentConflictError(ValueError):
     """同一履约身份再次携带不同冻结责任。"""
@@ -422,6 +428,7 @@ def build_reply_fulfillment_payload_hash(
 
 
 __all__ = [
+    "COMMITMENT_ORDER",
     "COMMITMENT_TYPES",
     "REPLY_FULFILLMENT_STATUSES",
     "AssistantReplyHistoryPayload",
