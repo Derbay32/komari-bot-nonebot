@@ -15,6 +15,7 @@ from typing import Any
 from ..reply_fulfillment_domain import (
     _COMMITMENT_PAYLOAD_TYPES,
     COMMITMENT_TYPES,
+    REPLY_FULFILLMENT_STATUSES,
     AssistantReplyHistoryPayload,
     CommitmentPayload,
     FavorabilityAdjustmentPayload,
@@ -23,6 +24,7 @@ from ..reply_fulfillment_domain import (
     ReplyCommitmentInput,
     ReplyFulfillmentConflictError,
     ReplyFulfillmentDraft,
+    build_reply_fulfillment_status_case_sql,
     derive_reply_fulfillment_status,
 )
 
@@ -31,18 +33,6 @@ from ..reply_fulfillment_domain import (
 _COMMITMENT_ORDER = {
     commitment_type: index for index, commitment_type in enumerate(COMMITMENT_TYPES)
 }
-
-# 管理派生状态的固定集合，与 derive_reply_fulfillment_status 保持一致。
-_MANAGEMENT_STATUSES = frozenset(
-    {
-        "not_started",
-        "pending_confirmation",
-        "processing",
-        "needs_disposition",
-        "completed",
-        "not_delivered",
-    }
-)
 
 
 class ReplyFulfillmentRepository:
@@ -160,48 +150,14 @@ class ReplyFulfillmentRepository:
         ``reply_content``——完整正文只在准备/发送阶段需要，送达后各
         承诺继续消费各自冻结的子 payload。
         """
-        async with self.pg_pool.acquire() as connection:
-            changed = await connection.fetchval(
-                """
-                UPDATE komari_chat_reply_fulfillments
-                SET delivery_state = 'DELIVERED',
-                    platform_message_id = COALESCE(
-                        platform_message_id,
-                        $2
-                    ),
-                    delivered_at = COALESCE(delivered_at, NOW()),
-                    reply_content = NULL,
-                    updated_at = NOW()
-                WHERE fulfillment_id = $1
-                  AND delivery_state = 'PENDING_CONFIRMATION'
-                RETURNING fulfillment_id
-                """,
-                fulfillment_id,
-                platform_message_id,
-            )
-            if changed is not None:
-                return True
-            existing = await connection.fetchrow(
-                """
-                SELECT delivery_state, platform_message_id
-                FROM komari_chat_reply_fulfillments
-                WHERE fulfillment_id = $1
-                """,
-                fulfillment_id,
-            )
-        if existing is None:
-            return False
-        if existing["delivery_state"] == "DELIVERED":
-            existing_platform_id = existing["platform_message_id"]
-            if (
-                platform_message_id is not None
-                and existing_platform_id is not None
-                and str(existing_platform_id) != platform_message_id
-            ):
-                msg = "平台消息 ID 冲突"
-                raise ValueError(msg)
-            return True
-        return False
+        outcome = await self._transition_to_delivered(
+            fulfillment_id,
+            platform_message_id=platform_message_id,
+        )
+        if outcome == "platform_message_conflict":
+            msg = "平台消息 ID 冲突"
+            raise ValueError(msg)
+        return outcome in ("updated", "idempotent")
 
     async def mark_not_delivered(self, fulfillment_id: str) -> bool:
         """明确失败或时效终止：回复进入未送达互斥终态。
@@ -211,31 +167,11 @@ class ReplyFulfillmentRepository:
         ``reply_content`` 与全部子 payload（未送达不产生任何送达后
         承诺），但保留子状态事实行，不物理删子行。
         """
-        async with self.pg_pool.acquire() as connection, connection.transaction():
-            changed = await connection.fetchval(
-                """
-                UPDATE komari_chat_reply_fulfillments
-                SET delivery_state = 'NOT_DELIVERED',
-                    not_delivered_at = COALESCE(not_delivered_at, NOW()),
-                    reply_content = NULL,
-                    updated_at = NOW()
-                WHERE fulfillment_id = $1
-                  AND delivery_state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')
-                RETURNING fulfillment_id
-                """,
-                fulfillment_id,
-            )
-            if changed is not None:
-                await connection.execute(
-                    """
-                    UPDATE komari_chat_reply_fulfillment_commitments
-                    SET payload = NULL,
-                        updated_at = NOW()
-                    WHERE fulfillment_id = $1
-                    """,
-                    fulfillment_id,
-                )
-        return changed is not None
+        outcome, _, _ = await self._transition_to_not_delivered(
+            fulfillment_id,
+            entry_states=("NOT_STARTED", "PENDING_CONFIRMATION"),
+        )
+        return outcome == "updated"
 
     async def has_active_operation(self, fulfillment_id: str) -> bool:
         """履约身份一旦持久化，就阻止同一事件再次发送。"""
@@ -965,18 +901,19 @@ class ReplyFulfillmentRepository:
 
         只返回最小身份、派生状态、时间、稳定错误码与正文指纹；绝不
         返回父 ``reply_content`` 或任何子 payload，也不暴露触发用户、
-        Bot 身份、适配器或内部租约。筛选与总数由 SQL 按派生状态计算
-        （与 ``derive_reply_fulfillment_status`` 的分支一致），返回行
+        Bot 身份、适配器或内部租约。筛选与总数由 SQL 按派生状态计算，
+        CASE 表达式由领域模块 ``build_reply_fulfillment_status_case_sql``
+        单一生成（与 ``derive_reply_fulfillment_status`` 同源），返回行
         的 ``status`` 由同一 CASE 表达式全量派生，保证投影与筛选同源。
         """
-        if status is not None and status not in _MANAGEMENT_STATUSES:
+        if status is not None and status not in REPLY_FULFILLMENT_STATUSES:
             msg = f"未知的回复履约派生状态: {status!r}"
             raise ValueError(msg)
         if limit <= 0:
             return [], 0
         async with self.pg_pool.acquire() as connection:
             rows = await connection.fetch(
-                """
+                f"""
                 WITH derived AS (
                     SELECT parent.fulfillment_id,
                            parent.request_trace_id,
@@ -990,25 +927,8 @@ class ReplyFulfillmentRepository:
                            parent.not_delivered_at,
                            parent.completed_at,
                            parent.delivery_state,
-                           CASE parent.delivery_state
-                               WHEN 'NOT_STARTED' THEN 'not_started'
-                               WHEN 'PENDING_CONFIRMATION'
-                                   THEN 'pending_confirmation'
-                               WHEN 'NOT_DELIVERED' THEN 'not_delivered'
-                               WHEN 'DELIVERED' THEN CASE
-                                   WHEN parent.completed_at IS NOT NULL
-                                       THEN 'completed'
-                                   WHEN EXISTS (
-                                       SELECT 1
-                                       FROM komari_chat_reply_fulfillment_commitments
-                                           AS failed_child
-                                       WHERE failed_child.fulfillment_id =
-                                             parent.fulfillment_id
-                                         AND failed_child.state = 'FAILED'
-                                   ) THEN 'needs_disposition'
-                                   ELSE 'processing'
-                               END
-                           END AS status
+                           {build_reply_fulfillment_status_case_sql()}
+                           AS status
                     FROM komari_chat_reply_fulfillments AS parent
                 )
                 SELECT fulfillment_id, request_trace_id, trigger_message_id,
@@ -1133,6 +1053,31 @@ class ReplyFulfillmentRepository:
         已送达的同时清除父 ``reply_content``，不同步批量执行任何承诺。
         其他状态返回 ``state_conflict``，身份不存在返回 ``not_found``。
         """
+        return await self._transition_to_delivered(
+            fulfillment_id,
+            platform_message_id=platform_message_id,
+            backfill_missing_platform_id=True,
+        )
+
+    async def _transition_to_delivered(
+        self,
+        fulfillment_id: str,
+        *,
+        platform_message_id: str | None,
+        backfill_missing_platform_id: bool = False,
+    ) -> str:
+        """单一送达状态机原语：带入口守卫的原子迁移到 DELIVERED。
+
+        运行时（``mark_delivered``）与对账（``reconcile_delivered``）
+        两侧语义差异全部收敛为本方法参数，公开方法只做结果形态映射：
+        ``backfill_missing_platform_id`` 控制已送达缺平台 ID 时是否
+        原子后补证据（对账侧补写并返回 ``idempotent``，运行时侧
+        不回填）；平台消息 ID 冲突统一上报 ``platform_message_conflict``，
+        由运行时侧映射为 ``ValueError``。结果形态为 outcome 字符串：
+        ``updated`` / ``idempotent`` / ``not_found`` / ``state_conflict`` /
+        ``platform_message_conflict``。冲突核对、条件补写与落败重读
+        保持在同一个 acquire 上下文内完成。
+        """
         async with self.pg_pool.acquire() as connection:
             changed = await connection.fetchval(
                 """
@@ -1172,7 +1117,11 @@ class ReplyFulfillmentRepository:
                     and str(existing_platform_id) != platform_message_id
                 ):
                     return "platform_message_conflict"
-                if existing_platform_id is None and platform_message_id is not None:
+                if (
+                    backfill_missing_platform_id
+                    and existing_platform_id is None
+                    and platform_message_id is not None
+                ):
                     # 已送达但缺平台 ID 时后补证据：原子条件补写，只在并发下
                     # 仍为 NULL 时生效；补写失败再核对最新证据决定冲突或幂等。
                     # 冲突核对、补写与重读必须保持在同一个 acquire 上下文内。
@@ -1220,6 +1169,38 @@ class ReplyFulfillmentRepository:
         ``{"outcome": "state_conflict"}``。返回的预占信息供调用方在
         终态落库后幂等释放。
         """
+        outcome, group_id, reservation_id = await self._transition_to_not_delivered(
+            fulfillment_id,
+            entry_states=("PENDING_CONFIRMATION",),
+            project_proactive_reservation=True,
+        )
+        if outcome != "updated":
+            return {"outcome": outcome}
+        return {
+            "outcome": "updated",
+            "proactive_group_id": group_id,
+            "proactive_reservation_id": reservation_id,
+        }
+
+    async def _transition_to_not_delivered(
+        self,
+        fulfillment_id: str,
+        *,
+        entry_states: tuple[str, ...],
+        project_proactive_reservation: bool = False,
+    ) -> tuple[str, Any, Any]:
+        """单一未送达状态机原语：带入口守卫的原子迁移到互斥终态。
+
+        运行时（``mark_not_delivered``）与对账（``reconcile_not_delivered``）
+        两侧语义差异全部收敛为本方法参数，公开方法只做结果形态映射：
+        ``entry_states`` 控制入口状态集合（运行时允许未发送直接进入，
+        对账仅 PENDING_CONFIRMATION）；``project_proactive_reservation``
+        控制在清载荷前先投影主动预占身份。同一事务内迁移成功时清除父
+        正文与全部子 payload；迁移失败按现状分类。返回
+        ``(outcome, proactive_group_id, proactive_reservation_id)``，
+        outcome 为 ``updated`` / ``idempotent`` / ``not_found`` /
+        ``state_conflict``，非 updated 时预占两键为 None。
+        """
         async with self.pg_pool.acquire() as connection, connection.transaction():
             changed = await connection.fetchval(
                 """
@@ -1229,10 +1210,11 @@ class ReplyFulfillmentRepository:
                     reply_content = NULL,
                     updated_at = NOW()
                 WHERE fulfillment_id = $1
-                  AND delivery_state = 'PENDING_CONFIRMATION'
+                  AND delivery_state = ANY($2::text[])
                 RETURNING fulfillment_id
                 """,
                 fulfillment_id,
+                entry_states,
             )
             if changed is None:
                 existing = await connection.fetchval(
@@ -1244,31 +1226,33 @@ class ReplyFulfillmentRepository:
                     fulfillment_id,
                 )
                 if existing is None:
-                    return {"outcome": "not_found"}
+                    return ("not_found", None, None)
                 if existing == "NOT_DELIVERED":
-                    return {"outcome": "idempotent"}
-                return {"outcome": "state_conflict"}
+                    return ("idempotent", None, None)
+                return ("state_conflict", None, None)
 
-            proactive = await connection.fetchrow(
-                """
-                SELECT payload
-                FROM komari_chat_reply_fulfillment_commitments
-                WHERE fulfillment_id = $1
-                  AND commitment_type = 'proactive_reply_confirmation'
-                """,
-                fulfillment_id,
-            )
-            proactive_payload: Any = (
-                proactive["payload"] if proactive is not None else None
-            )
-            if isinstance(proactive_payload, str):
-                with suppress(TypeError, ValueError):
-                    proactive_payload = json.loads(proactive_payload)
             group_id: Any = None
             reservation_id: Any = None
-            if isinstance(proactive_payload, dict):
-                group_id = proactive_payload.get("group_id")
-                reservation_id = proactive_payload.get("reservation_id")
+            if project_proactive_reservation:
+                # 两段式时序：先从子 payload 取预占投影，再清 payload。
+                proactive = await connection.fetchrow(
+                    """
+                    SELECT payload
+                    FROM komari_chat_reply_fulfillment_commitments
+                    WHERE fulfillment_id = $1
+                      AND commitment_type = 'proactive_reply_confirmation'
+                    """,
+                    fulfillment_id,
+                )
+                proactive_payload: Any = (
+                    proactive["payload"] if proactive is not None else None
+                )
+                if isinstance(proactive_payload, str):
+                    with suppress(TypeError, ValueError):
+                        proactive_payload = json.loads(proactive_payload)
+                if isinstance(proactive_payload, dict):
+                    group_id = proactive_payload.get("group_id")
+                    reservation_id = proactive_payload.get("reservation_id")
             await connection.execute(
                 """
                 UPDATE komari_chat_reply_fulfillment_commitments
@@ -1278,11 +1262,7 @@ class ReplyFulfillmentRepository:
                 """,
                 fulfillment_id,
             )
-        return {
-            "outcome": "updated",
-            "proactive_group_id": group_id,
-            "proactive_reservation_id": reservation_id,
-        }
+        return ("updated", group_id, reservation_id)
 
     async def resume_failed_commitment(
         self,
