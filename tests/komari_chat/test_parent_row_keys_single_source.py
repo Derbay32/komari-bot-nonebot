@@ -10,12 +10,11 @@
 
 from __future__ import annotations
 
-from tests.komari_chat.fulfillment_row_keys import PARENT_ROW_KEYS
-
 from tests.komari_chat import (
     test_reply_delivery_workflow,
     test_reply_fulfillment_workflow,
 )
+from tests.komari_chat.fulfillment_row_keys import PARENT_ROW_KEYS
 
 
 def test_shared_module_exports_parent_row_keys_literal() -> None:
