@@ -11,7 +11,7 @@ SQLModel 字段在 Pyright 下被推断为 Python 值类型而非列表达式，
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from nonebot import logger
 from sqlalchemy import delete, func, select, update
@@ -32,6 +32,26 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from .config_schema import DynamicConfigSchema
+
+class UserDataUnavailableError(RuntimeError):
+    """UserDataDB 连接池未初始化时抛出的异常。
+
+    ``error_code == "service_unavailable"``，供上游（如 komari_chat
+    承诺执行器）按结构化错误码分类；沿用既有 RuntimeError 语义。
+    """
+
+    error_code: ClassVar[str] = "service_unavailable"
+
+
+class FavorabilityIdempotencyConflictError(ValueError):
+    """好感度 operation_id 与既有请求载荷冲突时抛出的异常。
+
+    ``error_code == "idempotency_conflict"``，供上游按结构化错误码
+    区分幂等冲突；沿用既有 ValueError 语义。
+    """
+
+    error_code: ClassVar[str] = "idempotency_conflict"
+
 
 _FAV = UserFavorabilityRow.__table__
 _LEDGER = UserFavorabilityAdjustmentLedgerRow.__table__
@@ -69,15 +89,13 @@ class UserDataDB:
     def _require_ready(self) -> None:
         """未初始化时拒绝读写，保持原“连接池未初始化”错误语义。
 
-        抛出的异常实例携带 ``error_code="service_unavailable"``，供
-        上游（如 komari_chat 承诺执行器）按结构化错误码分类；类名与
-        正文保持原状，不做任何兼容层。
+        未就绪时抛 :class:`UserDataUnavailableError`，其类属性
+        ``error_code == "service_unavailable"``，供上游（如 komari_chat
+        承诺执行器）按结构化错误码分类；消息正文保持原状。
         """
         if not self._ready:
             msg = "UserDataDB 连接池未初始化"
-            error = cast("Any", RuntimeError(msg))
-            error.error_code = "service_unavailable"
-            raise error
+            raise UserDataUnavailableError(msg)
 
     async def close(self) -> None:
         """重置就绪状态；engine 生命周期由 nonebot-plugin-orm 托管。"""
@@ -175,9 +193,7 @@ class UserDataDB:
                             raise RuntimeError(msg)
                         if existing_user != user_id or existing_delta != delta:
                             msg = "好感度 operation_id 与既有请求载荷冲突"
-                            error = cast("Any", ValueError(msg))
-                            error.error_code = "idempotency_conflict"
-                            raise error
+                            raise FavorabilityIdempotencyConflictError(msg)
                         return FavorabilityAdjustmentResult.from_values(
                             user_id=existing_user,
                             before=int(before_value),
