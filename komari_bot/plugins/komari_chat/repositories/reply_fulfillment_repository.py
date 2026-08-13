@@ -26,7 +26,8 @@ from ..reply_fulfillment_domain import (
     derive_reply_fulfillment_status,
 )
 
-# 承诺类型到冻结领域值对象的固定映射，与领域模块保持单一事实来源。
+# 承诺类型到冻结领域值对象的固定映射，与领域模块保持单一事实来源；
+# 承诺固定顺序的唯一权威定义，回复承诺工作流引用同一映射。
 _COMMITMENT_ORDER = {
     commitment_type: index for index, commitment_type in enumerate(COMMITMENT_TYPES)
 }
@@ -966,7 +967,7 @@ class ReplyFulfillmentRepository:
         返回父 ``reply_content`` 或任何子 payload，也不暴露触发用户、
         Bot 身份、适配器或内部租约。筛选与总数由 SQL 按派生状态计算
         （与 ``derive_reply_fulfillment_status`` 的分支一致），返回行
-        的 ``status`` 由同一 Python 函数补齐，保证投影与筛选同源。
+        的 ``status`` 由同一 CASE 表达式全量派生，保证投影与筛选同源。
         """
         if status is not None and status not in _MANAGEMENT_STATUSES:
             msg = f"未知的回复履约派生状态: {status!r}"
@@ -1058,10 +1059,6 @@ class ReplyFulfillmentRepository:
                     str(child["commitment_type"]), len(_COMMITMENT_ORDER)
                 ),
             )
-            # 优先保留 SQL 已派生的可信状态；仅当安全行未携带 status 时才
-            # 按领域字段推导，绝不覆盖存储层判定结果。
-            if "status" not in item:
-                item["status"] = derive_reply_fulfillment_status(item)
             result.append(item)
         return result, int(rows[0]["total"])
 
