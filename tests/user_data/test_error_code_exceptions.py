@@ -91,9 +91,10 @@ def test_user_data_unavailable_error_type_contract(
 ) -> None:
     """验收点 1：基类与类属性 error_code（类上直接可取，不实例化）。"""
     cls = user_data_module.UserDataUnavailableError
+    error_code = getattr(cls, "error_code", None)
 
     assert issubclass(cls, RuntimeError)
-    assert cls.error_code == "service_unavailable"
+    assert error_code == "service_unavailable"
 
 
 def test_favorability_idempotency_conflict_error_type_contract(
@@ -101,9 +102,10 @@ def test_favorability_idempotency_conflict_error_type_contract(
 ) -> None:
     """验收点 1：基类与类属性 error_code（类上直接可取，不实例化）。"""
     cls = user_data_module.FavorabilityIdempotencyConflictError
+    error_code = getattr(cls, "error_code", None)
 
     assert issubclass(cls, ValueError)
-    assert cls.error_code == "idempotency_conflict"
+    assert error_code == "idempotency_conflict"
 
 
 def test_require_ready_raises_user_data_unavailable_error(
@@ -116,9 +118,10 @@ def test_require_ready_raises_user_data_unavailable_error(
         db._require_ready()
 
     exc = excinfo.value
+    error_code = getattr(exc, "error_code", None)
     assert str(exc) == _UNINITIALIZED_MESSAGE
     assert isinstance(exc, RuntimeError)
-    assert exc.error_code == "service_unavailable"
+    assert error_code == "service_unavailable"
 
 
 @pytest.mark.asyncio
@@ -132,9 +135,10 @@ async def test_uninitialized_entry_point_raises_user_data_unavailable_error(
         await db.get_user_count()
 
     exc = excinfo.value
+    error_code = getattr(exc, "error_code", None)
     assert str(exc) == _UNINITIALIZED_MESSAGE
     assert isinstance(exc, RuntimeError)
-    assert exc.error_code == "service_unavailable"
+    assert error_code == "service_unavailable"
 
 
 def test_favorability_idempotency_conflict_error_instance_contract(
@@ -142,7 +146,8 @@ def test_favorability_idempotency_conflict_error_instance_contract(
 ) -> None:
     """验收点 3：以既有消息正文实例化，类型 / error_code / 消息逐字保持。"""
     exc = user_data_module.FavorabilityIdempotencyConflictError(_CONFLICT_MESSAGE)
+    error_code = getattr(exc, "error_code", None)
 
     assert isinstance(exc, ValueError)
-    assert exc.error_code == "idempotency_conflict"
+    assert error_code == "idempotency_conflict"
     assert str(exc) == _CONFLICT_MESSAGE
