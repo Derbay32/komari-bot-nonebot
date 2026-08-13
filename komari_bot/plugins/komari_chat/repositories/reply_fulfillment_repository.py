@@ -249,6 +249,31 @@ class ReplyFulfillmentRepository:
             )
         return found is not None
 
+    async def _project_proactive_reservation_identities(
+        self,
+        connection: Any,
+        fulfillment_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """在同一事务内从子 payload 投影预占身份（与对账路径同名键）。
+
+        只取主动回复确认承诺子项的 ``group_id`` / ``reservation_id``；
+        无该子项或 payload 为 NULL 的行不出现，调用方按缺失补 None。
+        """
+        if not fulfillment_ids:
+            return {}
+        rows = await connection.fetch(
+            """
+            SELECT fulfillment_id,
+                   payload->>'group_id' AS proactive_group_id,
+                   payload->>'reservation_id' AS proactive_reservation_id
+            FROM komari_chat_reply_fulfillment_commitments
+            WHERE fulfillment_id = ANY($1::text[])
+              AND commitment_type = 'proactive_reply_confirmation'
+            """,
+            fulfillment_ids,
+        )
+        return {str(row["fulfillment_id"]): dict(row) for row in rows}
+
     async def claim_fresh_not_started(
         self,
         *,
@@ -261,7 +286,9 @@ class ReplyFulfillmentRepository:
 
         只有 ``bot_self_id`` 与 ``adapter_name`` 精确匹配且
         ``prepared_at`` 距今未满时效的 NOT_STARTED 行才会被领取；
-        领取即登记发送开始（``PENDING_CONFIRMATION``）。
+        领取即登记发送开始（``PENDING_CONFIRMATION``）。同一事务内对
+        领取到的行从主动回复确认承诺子 payload 投影预占身份，随返回行
+        带出 ``proactive_group_id`` / ``proactive_reservation_id`` 两键。
         """
         if limit <= 0:
             return []
@@ -292,7 +319,25 @@ class ReplyFulfillmentRepository:
                 max(1, freshness_seconds),
                 limit,
             )
-        return [dict(row) for row in rows]
+            projection = await self._project_proactive_reservation_identities(
+                connection,
+                [row["fulfillment_id"] for row in rows],
+            )
+        claimed: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["proactive_group_id"] = (
+                projection.get(str(row["fulfillment_id"]), {}).get(
+                    "proactive_group_id"
+                )
+            )
+            item["proactive_reservation_id"] = (
+                projection.get(str(row["fulfillment_id"]), {}).get(
+                    "proactive_reservation_id"
+                )
+            )
+            claimed.append(item)
+        return claimed
 
     async def expire_stale_not_started(
         self,
@@ -304,10 +349,12 @@ class ReplyFulfillmentRepository:
 
         满时效（``prepared_at`` 距今 >= 时效）的 NOT_STARTED 行转为
         未送达终态，``send_started_at`` 保持 NULL；未送达回复永不重发。
-        同一事务内清除父 ``reply_content`` 与全部子 payload——超时
-        分支同样进入未送达终态，不得长期保留冻结敏感内容；子状态
-        事实行保留（state 保持 PENDING），返回行只含父身份与时间戳，
-        不依赖被清除的载荷。
+        同一事务内按两段式顺序（与管理对账路径 ``reconcile_not_delivered``
+        一致）：UPDATE 父表后、清除子 payload 前先取出预占身份投影，
+        再执行子 payload 清除——超时分支同样进入未送达终态，不得长期
+        保留冻结敏感内容；子状态事实行保留（state 保持 PENDING），
+        返回行带出父身份与 ``proactive_group_id`` /
+        ``proactive_reservation_id`` 投影键。
         """
         if limit <= 0:
             return []
@@ -336,6 +383,10 @@ class ReplyFulfillmentRepository:
                 limit,
             )
             if rows:
+                projection = await self._project_proactive_reservation_identities(
+                    connection,
+                    [row["fulfillment_id"] for row in rows],
+                )
                 await connection.execute(
                     """
                     UPDATE komari_chat_reply_fulfillment_commitments
@@ -345,7 +396,23 @@ class ReplyFulfillmentRepository:
                     """,
                     [row["fulfillment_id"] for row in rows],
                 )
-        return [dict(row) for row in rows]
+            else:
+                projection = {}
+        expired: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["proactive_group_id"] = (
+                projection.get(str(row["fulfillment_id"]), {}).get(
+                    "proactive_group_id"
+                )
+            )
+            item["proactive_reservation_id"] = (
+                projection.get(str(row["fulfillment_id"]), {}).get(
+                    "proactive_reservation_id"
+                )
+            )
+            expired.append(item)
+        return expired
 
     async def claim_operation(
         self,
