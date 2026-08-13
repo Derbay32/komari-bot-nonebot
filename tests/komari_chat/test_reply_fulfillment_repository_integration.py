@@ -13,6 +13,9 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+from komari_bot.plugins.komari_chat.reply_fulfillment_domain import (
+    derive_reply_fulfillment_status,
+)
 from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository import (
     AssistantReplyHistoryPayload,
     FavorabilityAdjustmentPayload,
@@ -1450,3 +1453,446 @@ async def test_management_reconciliation_and_resume_use_atomic_state_guards() ->
         assert resumed["next_retry_at"] is None
         assert resumed["last_error_code"] is None
         assert resumed["payload"] == payload_before
+
+
+async def test_mark_delivered_clears_parent_content_immediately_and_missing_returns_false() -> None:
+    """进入已送达即清父正文但保留全部子 payload；不存在返回 False 且不回填平台 ID。"""
+    fulfillment_id = f"delivered-clear-{uuid4().hex}"
+    missing_id = f"delivered-missing-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, pool):
+        assert await repository.prepare(_draft(fulfillment_id)) is True
+        assert await repository.mark_send_started(fulfillment_id) is True
+        # 首次无平台 ID 确认：进入已送达且正文立即清除。
+        assert await repository.mark_delivered(fulfillment_id) is True
+        # 无平台 ID 重放幂等。
+        assert await repository.mark_delivered(fulfillment_id) is True
+        # 运行时路径不后补平台 ID（与对账路径不对称）：返回 True 但不落库回填。
+        assert (
+            await repository.mark_delivered(
+                fulfillment_id,
+                platform_message_id="platform-late",
+            )
+            is True
+        )
+        # 身份不存在返回 False。
+        assert await repository.mark_delivered(missing_id) is False
+
+        async with pool.acquire() as connection:
+            parent = await connection.fetchrow(
+                """
+                SELECT delivery_state, reply_content, platform_message_id,
+                       delivered_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+            children = await connection.fetch(
+                """
+                SELECT commitment_type, state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert parent["delivery_state"] == "DELIVERED"
+        assert parent["reply_content"] is None
+        assert parent["platform_message_id"] is None
+        assert parent["delivered_at"] is not None
+        assert len(children) == 4
+        assert all(row["payload"] is not None for row in children)
+
+
+async def test_mark_not_delivered_terminal_state_is_stable_on_replay() -> None:
+    """未送达互斥终态：重放不再推进、时间戳不漂移，也不翻案回已送达。"""
+    fulfillment_id = f"not-delivered-terminal-{uuid4().hex}"
+    missing_id = f"not-delivered-missing-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, pool):
+        assert await repository.prepare(_draft(fulfillment_id)) is True
+        # 未发送直接进入未送达终态，send_started_at 保持 NULL。
+        assert await repository.mark_not_delivered(fulfillment_id) is True
+
+        async with pool.acquire() as connection:
+            first = await connection.fetchrow(
+                """
+                SELECT delivery_state, not_delivered_at, reply_content
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert first["delivery_state"] == "NOT_DELIVERED"
+        assert first["not_delivered_at"] is not None
+        assert first["reply_content"] is None
+
+        # 终态重放是稳定 no-op：返回 False 且不改变状态与时间戳。
+        assert await repository.mark_not_delivered(fulfillment_id) is False
+        assert await repository.mark_delivered(fulfillment_id) is False
+        assert await repository.mark_not_delivered(missing_id) is False
+
+        async with pool.acquire() as connection:
+            second = await connection.fetchrow(
+                """
+                SELECT delivery_state, not_delivered_at, send_started_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+            children = await connection.fetch(
+                """
+                SELECT state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert second["delivery_state"] == "NOT_DELIVERED"
+        assert second["not_delivered_at"] == first["not_delivered_at"]
+        assert second["send_started_at"] is None
+        assert len(children) == 4
+        assert all(row["state"] == "PENDING" for row in children)
+        assert all(row["payload"] is None for row in children)
+
+
+async def test_reconcile_delivered_not_found_and_state_conflict_branches() -> None:
+    """对账确认送达：身份缺失与非法状态分别返回 not_found / state_conflict。"""
+    not_started_id = f"reconcile-not-started-{uuid4().hex}"
+    not_delivered_id = f"reconcile-nd-{uuid4().hex}"
+    missing_id = f"reconcile-missing-{uuid4().hex}"
+    async with _repository_context([not_started_id, not_delivered_id]) as (
+        repository,
+        _pool,
+    ):
+        assert await repository.prepare(_draft(not_started_id)) is True
+        assert await repository.prepare(_draft(not_delivered_id)) is True
+        assert await repository.mark_not_delivered(not_delivered_id) is True
+
+        assert (
+            await repository.reconcile_delivered(
+                missing_id,
+                platform_message_id="platform-x",
+            )
+            == "not_found"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                not_started_id,
+                platform_message_id="platform-x",
+            )
+            == "state_conflict"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                not_started_id,
+                platform_message_id=None,
+            )
+            == "state_conflict"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                not_delivered_id,
+                platform_message_id="platform-x",
+            )
+            == "state_conflict"
+        )
+
+
+async def test_reconcile_delivered_backfills_missing_platform_id_atomically() -> None:
+    """已送达缺平台 ID 时对账路径原子后补证据，冲突复核后拒绝异 ID。"""
+    fulfillment_id = f"reconcile-backfill-{uuid4().hex}"
+    async with _repository_context([fulfillment_id]) as (repository, pool):
+        assert await repository.prepare(_draft(fulfillment_id)) is True
+        assert await repository.mark_send_started(fulfillment_id) is True
+        assert await repository.mark_delivered(fulfillment_id) is True
+
+        async with pool.acquire() as connection:
+            before = await connection.fetchrow(
+                """
+                SELECT delivery_state, platform_message_id
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert before["delivery_state"] == "DELIVERED"
+        assert before["platform_message_id"] is None
+
+        assert (
+            await repository.reconcile_delivered(
+                fulfillment_id,
+                platform_message_id="platform-late-1",
+            )
+            == "idempotent"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                fulfillment_id,
+                platform_message_id="platform-late-1",
+            )
+            == "idempotent"
+        )
+        assert (
+            await repository.reconcile_delivered(
+                fulfillment_id,
+                platform_message_id="platform-conflict-1",
+            )
+            == "platform_message_conflict"
+        )
+        async with pool.acquire() as connection:
+            stored = await connection.fetchval(
+                """
+                SELECT platform_message_id
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert stored == "platform-late-1"
+
+
+async def test_reconcile_delivered_concurrent_backfill_loser_rechecks_conflict() -> None:
+    """并发后补平台 ID 只有一个生效，落败方复核最新证据判平台消息 ID 冲突。"""
+    fulfillment_id = f"reconcile-race-{uuid4().hex}"
+    async with _repository_context([fulfillment_id], max_size=6) as (
+        repository,
+        pool,
+    ):
+        assert await repository.prepare(_draft(fulfillment_id)) is True
+        assert await repository.mark_send_started(fulfillment_id) is True
+        assert await repository.mark_delivered(fulfillment_id) is True
+
+        first, second = await asyncio.gather(
+            repository.reconcile_delivered(
+                fulfillment_id,
+                platform_message_id="platform-race-a",
+            ),
+            repository.reconcile_delivered(
+                fulfillment_id,
+                platform_message_id="platform-race-b",
+            ),
+        )
+        assert sorted((first, second)) == [
+            "idempotent",
+            "platform_message_conflict",
+        ]
+        winner = "platform-race-a" if first == "idempotent" else "platform-race-b"
+        async with pool.acquire() as connection:
+            stored = await connection.fetchval(
+                """
+                SELECT platform_message_id
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert stored == winner
+
+
+async def test_reconcile_not_delivered_clears_payloads_within_same_transaction() -> None:
+    """对账未送达同事务清父正文与全部子 payload；缺失与非法状态分支明确。"""
+    fulfillment_id = f"reconcile-nd-updated-{uuid4().hex}"
+    not_started_id = f"reconcile-nd-not-started-{uuid4().hex}"
+    missing_id = f"reconcile-nd-missing-{uuid4().hex}"
+    async with _repository_context([fulfillment_id, not_started_id]) as (
+        repository,
+        pool,
+    ):
+        assert await repository.prepare(_draft(fulfillment_id)) is True
+        assert await repository.mark_send_started(fulfillment_id) is True
+        assert await repository.prepare(_draft(not_started_id)) is True
+
+        result = await repository.reconcile_not_delivered(fulfillment_id)
+        assert result == {
+            "outcome": "updated",
+            "proactive_group_id": "group-1",
+            "proactive_reservation_id": "reservation-1",
+        }
+        assert await repository.reconcile_not_delivered(not_started_id) == {
+            "outcome": "state_conflict"
+        }
+        assert await repository.reconcile_not_delivered(missing_id) == {
+            "outcome": "not_found"
+        }
+
+        async with pool.acquire() as connection:
+            parent = await connection.fetchrow(
+                """
+                SELECT delivery_state, reply_content, not_delivered_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+            children = await connection.fetch(
+                """
+                SELECT commitment_type, state, payload
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
+            )
+        assert parent["delivery_state"] == "NOT_DELIVERED"
+        assert parent["reply_content"] is None
+        assert parent["not_delivered_at"] is not None
+        assert len(children) == 4
+        assert all(row["state"] == "PENDING" for row in children)
+        assert all(row["payload"] is None for row in children)
+
+
+async def test_management_derived_status_consistent_with_domain_function_for_all_branches() -> None:
+    """管理列表筛选与详情投影的 SQL 派生状态与领域函数全分支一致。"""
+    not_started_fresh_id = f"derive-ns-fresh-{uuid4().hex}"
+    not_started_stale_id = f"derive-ns-stale-{uuid4().hex}"
+    pending_id = f"derive-pending-{uuid4().hex}"
+    processing_id = f"derive-processing-{uuid4().hex}"
+    disposition_id = f"derive-disposition-{uuid4().hex}"
+    completed_id = f"derive-completed-{uuid4().hex}"
+    not_delivered_id = f"derive-not-delivered-{uuid4().hex}"
+    fulfillment_ids = [
+        not_started_fresh_id,
+        not_started_stale_id,
+        pending_id,
+        processing_id,
+        disposition_id,
+        completed_id,
+        not_delivered_id,
+    ]
+    expected_status = {
+        not_started_fresh_id: "not_started",
+        not_started_stale_id: "not_started",
+        pending_id: "pending_confirmation",
+        processing_id: "processing",
+        disposition_id: "needs_disposition",
+        completed_id: "completed",
+        not_delivered_id: "not_delivered",
+    }
+    async with _repository_context(fulfillment_ids) as (repository, pool):
+        assert await repository.prepare(_draft(not_started_fresh_id)) is True
+        assert await repository.prepare(_draft(not_started_stale_id)) is True
+        assert await repository.prepare(_draft(pending_id)) is True
+        assert await repository.mark_send_started(pending_id) is True
+        for fulfillment_id in (processing_id, disposition_id, completed_id):
+            await _prepare_delivered(repository, fulfillment_id)
+        assert (
+            await repository.claim_operation(
+                disposition_id,
+                owner_token="derive-disposition-worker",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        assert (
+            await repository.mark_commitment_failed(
+                disposition_id,
+                commitment_type="favorability_adjustment",
+                owner_token="derive-disposition-worker",
+                error_code="service_unavailable",
+                max_attempts=1,
+                retry_base_seconds=1,
+            )
+            == "FAILED"
+        )
+        assert (
+            await repository.release_lease(
+                disposition_id,
+                owner_token="derive-disposition-worker",
+            )
+            is True
+        )
+        assert (
+            await repository.claim_operation(
+                completed_id,
+                owner_token="derive-completed-worker",
+                lease_seconds=60,
+            )
+            is not None
+        )
+        for commitment_type in (
+            "proactive_reply_confirmation",
+            "favorability_adjustment",
+            "assistant_reply_history",
+            "interaction_history",
+        ):
+            assert await repository.mark_commitment_completed(
+                completed_id,
+                commitment_type=commitment_type,
+                owner_token="derive-completed-worker",
+            )
+        assert (
+            await repository.complete_fulfillment(
+                completed_id,
+                owner_token="derive-completed-worker",
+            )
+            is True
+        )
+        assert await repository.prepare(_draft(not_delivered_id)) is True
+        assert await repository.mark_not_delivered(not_delivered_id) is True
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE komari_chat_reply_fulfillments
+                SET prepared_at = NOW() - INTERVAL '120 seconds'
+                WHERE fulfillment_id = $1
+                """,
+                not_started_stale_id,
+            )
+            parents = await connection.fetch(
+                """
+                SELECT fulfillment_id, delivery_state, completed_at
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = ANY($1::text[])
+                """,
+                fulfillment_ids,
+            )
+            children = await connection.fetch(
+                """
+                SELECT fulfillment_id, commitment_type, state
+                FROM komari_chat_reply_fulfillment_commitments
+                WHERE fulfillment_id = ANY($1::text[])
+                """,
+                fulfillment_ids,
+            )
+        child_states: dict[str, list[dict[str, str]]] = {}
+        for child in children:
+            child_states.setdefault(str(child["fulfillment_id"]), []).append(
+                {"state": str(child["state"])}
+            )
+
+        # 每个分支：领域函数推导 == SQL 列表筛选 == 详情投影。
+        for parent in parents:
+            fulfillment_id = str(parent["fulfillment_id"])
+            domain_status = derive_reply_fulfillment_status(
+                {
+                    "delivery_state": str(parent["delivery_state"]),
+                    "completed_at": parent["completed_at"],
+                    "commitments": child_states.get(fulfillment_id, []),
+                }
+            )
+            assert domain_status == expected_status[fulfillment_id]
+            detail = await repository.get_for_management(fulfillment_id)
+            assert detail is not None
+            assert detail["status"] == expected_status[fulfillment_id]
+
+        for status in sorted(set(expected_status.values())):
+            rows, total = await repository.list_for_management(
+                status=status,
+                limit=20,
+                offset=0,
+            )
+            expected_ids = {
+                fulfillment_id
+                for fulfillment_id, derived in expected_status.items()
+                if derived == status
+            }
+            assert {row["fulfillment_id"] for row in rows} == expected_ids
+            assert total == len(expected_ids)
+            assert all(row["status"] == status for row in rows)
+
+        rows, total = await repository.list_for_management(
+            status=None,
+            limit=20,
+            offset=0,
+        )
+        assert total == len(fulfillment_ids)
+        assert {row["fulfillment_id"] for row in rows} == set(fulfillment_ids)
