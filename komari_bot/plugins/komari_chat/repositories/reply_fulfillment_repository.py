@@ -209,6 +209,36 @@ class ReplyFulfillmentRepository:
         )
         return {str(row["fulfillment_id"]): dict(row) for row in rows}
 
+    def _merge_proactive_reservation_projection(
+        self,
+        rows: list[Any],
+        projection: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """把预占身份投影合并进行列表，供两个公开方法共用。
+
+        ``claim_fresh_not_started`` 与 ``expire_stale_not_started`` 取得
+        投影后合并语义一致：逐行 ``item = dict(row)`` 拷贝，以
+        ``projection.get(str(row["fulfillment_id"]), {}).get(...)`` 填
+        ``proactive_group_id`` / ``proactive_reservation_id`` 两键，
+        投影或键缺失时对应键为 None，行顺序保持输入顺序。与两个公开
+        方法原有的逐字相同合并循环行为一致。
+        """
+        merged: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["proactive_group_id"] = (
+                projection.get(str(row["fulfillment_id"]), {}).get(
+                    "proactive_group_id"
+                )
+            )
+            item["proactive_reservation_id"] = (
+                projection.get(str(row["fulfillment_id"]), {}).get(
+                    "proactive_reservation_id"
+                )
+            )
+            merged.append(item)
+        return merged
+
     async def claim_fresh_not_started(
         self,
         *,
@@ -258,21 +288,7 @@ class ReplyFulfillmentRepository:
                 connection,
                 [row["fulfillment_id"] for row in rows],
             )
-        claimed: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["proactive_group_id"] = (
-                projection.get(str(row["fulfillment_id"]), {}).get(
-                    "proactive_group_id"
-                )
-            )
-            item["proactive_reservation_id"] = (
-                projection.get(str(row["fulfillment_id"]), {}).get(
-                    "proactive_reservation_id"
-                )
-            )
-            claimed.append(item)
-        return claimed
+        return self._merge_proactive_reservation_projection(rows, projection)
 
     async def expire_stale_not_started(
         self,
@@ -333,21 +349,7 @@ class ReplyFulfillmentRepository:
                 )
             else:
                 projection = {}
-        expired: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["proactive_group_id"] = (
-                projection.get(str(row["fulfillment_id"]), {}).get(
-                    "proactive_group_id"
-                )
-            )
-            item["proactive_reservation_id"] = (
-                projection.get(str(row["fulfillment_id"]), {}).get(
-                    "proactive_reservation_id"
-                )
-            )
-            expired.append(item)
-        return expired
+        return self._merge_proactive_reservation_projection(rows, projection)
 
     async def claim_operation(
         self,
