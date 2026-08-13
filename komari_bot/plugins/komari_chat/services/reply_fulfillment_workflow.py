@@ -84,7 +84,7 @@ class _PendingReply(Protocol):
     """工作流消费的待履约回复最小接口。"""
 
     @property
-    def operation_id(self) -> str: ...
+    def fulfillment_id(self) -> str: ...
 
     @property
     def request_trace_id(self) -> str: ...
@@ -158,7 +158,7 @@ class _ReplyFulfillmentRepository(Protocol):
 class ReplyFulfillmentQueryProtocol(Protocol):
     """消息生成阶段使用的回复履约查询窄接口。"""
 
-    async def is_duplicate_event(self, operation_id: str) -> bool: ...
+    async def is_duplicate_event(self, fulfillment_id: str) -> bool: ...
 
 
 def build_reply_fulfillment_commitments(
@@ -264,9 +264,9 @@ class ReplyFulfillmentWorkflow:
         # 仍保留可被恢复的可窗口。
         self._send_start_lock = asyncio.Lock()
 
-    async def is_duplicate_event(self, operation_id: str) -> bool:
+    async def is_duplicate_event(self, fulfillment_id: str) -> bool:
         """判断平台事件是否已有不可再次发送的履约记录。"""
-        return await self.repository.has_active_operation(operation_id)
+        return await self.repository.has_active_operation(fulfillment_id)
 
     @staticmethod
     def _resolve_display_name(message: MessageSchema) -> str:
@@ -312,9 +312,9 @@ class ReplyFulfillmentWorkflow:
             ),
         )
         draft = ReplyFulfillmentDraft(
-            fulfillment_id=pending_reply.operation_id,
+            fulfillment_id=pending_reply.fulfillment_id,
             payload_hash=build_reply_fulfillment_payload_hash(
-                fulfillment_id=pending_reply.operation_id,
+                fulfillment_id=pending_reply.fulfillment_id,
                 trigger_message_id=pending_reply.message.message_id,
                 trigger_user_id=pending_reply.message.user_id,
                 group_id=pending_reply.message.group_id,
@@ -379,13 +379,13 @@ class ReplyFulfillmentWorkflow:
             if not prepared:
                 logger.info(
                     "[KomariChat] 重复回复 operation 已存在，取消本次发送: operation={}",
-                    pending_reply.operation_id,
+                    pending_reply.fulfillment_id,
                 )
                 await self._release_reservation(pending_reply)
                 return False
 
             started = await self.repository.mark_send_started(
-                pending_reply.operation_id
+                pending_reply.fulfillment_id
             )
             if not started:
                 msg = "回复发送开始登记失败，未调用平台发送能力"
@@ -398,7 +398,7 @@ class ReplyFulfillmentWorkflow:
         except Exception:
             logger.exception(
                 "[KomariChat] 发送开始后平台结果未知，保持待确认: operation={}",
-                pending_reply.operation_id,
+                pending_reply.fulfillment_id,
             )
             raise
 
@@ -412,17 +412,17 @@ class ReplyFulfillmentWorkflow:
                 platform_message_id=delivery_result.platform_message_id,
             )
         if delivery_result.state == "not_delivered":
-            await self.repository.mark_not_delivered(pending_reply.operation_id)
+            await self.repository.mark_not_delivered(pending_reply.fulfillment_id)
             await self._release_reservation(pending_reply)
             logger.info(
                 "[KomariChat] 平台明确拒绝发送，回复未送达: group={} operation={}",
                 pending_reply.message.group_id,
-                pending_reply.operation_id,
+                pending_reply.fulfillment_id,
             )
             return False
         logger.info(
             "[KomariChat] 发送结果未知，回复进入待确认对账: operation={}",
-            pending_reply.operation_id,
+            pending_reply.fulfillment_id,
         )
         await self.alert_service.recover_alerts()
         return False
@@ -435,19 +435,19 @@ class ReplyFulfillmentWorkflow:
     ) -> bool:
         """已送达回复：持久化送达事实，立即推进承诺并恢复告警。"""
         delivered = await self.repository.mark_delivered(
-            pending_reply.operation_id,
+            pending_reply.fulfillment_id,
             platform_message_id=platform_message_id,
         )
         if not delivered:
             msg = "回复已发送，但履约无法标记为 DELIVERED"
             raise RuntimeError(msg)
 
-        await self.commitment_workflow.recover_fulfillment(pending_reply.operation_id)
+        await self.commitment_workflow.recover_fulfillment(pending_reply.fulfillment_id)
         await self.alert_service.recover_alerts()
         logger.info(
             "[KomariChat] 回复已送达并进入持久副作用提交: group={} operation={}",
             pending_reply.message.group_id,
-            pending_reply.operation_id,
+            pending_reply.fulfillment_id,
         )
         return True
 

@@ -138,7 +138,7 @@ class PendingReply:
     adapter_name: str
     reason: AttemptReplyReason
     reply_score: float | None
-    operation_id: str
+    fulfillment_id: str
     request_trace_id: str
     reply_timestamp: float
     proactive_reservation_id: str | None = None
@@ -258,7 +258,7 @@ class MessageHandler:
         return round(value, 4)
 
     @staticmethod
-    def _reply_operation_id(message: MessageSchema) -> str:
+    def _reply_fulfillment_id(message: MessageSchema) -> str:
         """由平台事件稳定生成聊天回复履约 ID（复用领域构建函数）。"""
         return build_reply_fulfillment_id(
             group_id=message.group_id,
@@ -546,10 +546,10 @@ class MessageHandler:
             )
             return None
 
-        operation_id = self._reply_operation_id(message)
-        if await self.reply_fulfillment.is_duplicate_event(operation_id):
+        fulfillment_id = self._reply_fulfillment_id(message)
+        if await self.reply_fulfillment.is_duplicate_event(fulfillment_id):
             logger.info(
-                "[KomariChat] 重复平台事件已有回复 operation，跳过生成: group={} message={}",
+                "[KomariChat] 重复平台事件已有回复 fulfillment，跳过生成: group={} message={}",
                 group_id,
                 message_id,
             )
@@ -1292,7 +1292,7 @@ class MessageHandler:
                 adapter_name=adapter_name,
                 reason=reason,
                 reply_score=reply_score,
-                operation_id=self._reply_operation_id(message),
+                fulfillment_id=self._reply_fulfillment_id(message),
                 request_trace_id=request_trace_id,
                 reply_timestamp=time.time(),
                 proactive_reservation_id=reservation_id,

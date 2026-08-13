@@ -359,7 +359,7 @@ def _pending_reply(
         adapter_name="OneBot V11",
         reason="score",
         reply_score=0.9,
-        operation_id=operation_id,
+        fulfillment_id=operation_id,
         request_trace_id="chat-message-1",
         reply_timestamp=2.0,
         proactive_reservation_id="reservation-1",
@@ -410,11 +410,11 @@ async def test_send_capability_observes_persisted_pending_confirmation(
     pending = _pending_reply("reply-send-order")
 
     async def _send(_reply: object) -> object:
-        assert repository.pending_confirmation_ids == {pending.operation_id}
+        assert repository.pending_confirmation_ids == {pending.fulfillment_id}
         return workflow_module.ReplyDeliveryResult.delivered("platform-1")
 
     assert await workflow.fulfill(pending, send_reply=_send) is True
-    assert repository.delivered_ids == {pending.operation_id}
+    assert repository.delivered_ids == {pending.fulfillment_id}
 
 
 async def test_send_never_starts_when_persistent_start_transition_fails(
@@ -436,7 +436,7 @@ async def test_send_never_starts_when_persistent_start_transition_fails(
         await workflow.fulfill(pending, send_reply=_send)
 
     assert send_count == 0
-    assert repository.not_started_ids == {pending.operation_id}
+    assert repository.not_started_ids == {pending.fulfillment_id}
 
 
 async def test_unknown_delivery_stays_pending_and_is_never_resent(
@@ -460,19 +460,19 @@ async def test_unknown_delivery_stays_pending_and_is_never_resent(
     )
     pending = _pending_reply("reply-unknown")
     reservation = _ReservationHandle()
-    pending = _pending_reply(pending.operation_id, reservation=reservation)
+    pending = _pending_reply(pending.fulfillment_id, reservation=reservation)
 
     async def _send(_reply: object) -> object:
         return workflow_module.ReplyDeliveryResult.pending_confirmation()
 
     assert await workflow.fulfill(pending, send_reply=_send) is False
-    assert repository.pending_confirmation_ids == {pending.operation_id}
+    assert repository.pending_confirmation_ids == {pending.fulfillment_id}
     assert reservation.release_count == 0
 
     await workflow.recover_pending()
 
     assert recovery_send_count == 0
-    assert repository.pending_confirmation_ids == {pending.operation_id}
+    assert repository.pending_confirmation_ids == {pending.fulfillment_id}
 
 
 async def test_not_started_reply_recovers_only_with_exact_original_bot(
@@ -746,5 +746,5 @@ async def test_cancellation_after_send_started_propagates_without_release(
     with pytest.raises(asyncio.CancelledError):
         await workflow.fulfill(pending, send_reply=_cancel)
 
-    assert repository.pending_confirmation_ids == {pending.operation_id}
+    assert repository.pending_confirmation_ids == {pending.fulfillment_id}
     assert reservation.release_count == 0
