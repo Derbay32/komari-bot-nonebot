@@ -11,12 +11,13 @@ SQLModel 字段在 Pyright 下被推断为 Python 值类型而非列表达式，
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from nonebot import logger
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
+from .errors import FavorabilityIdempotencyConflictError, UserDataUnavailableError
 from .models import (
     FavorabilityAdjustmentResult,
     FavorabilitySetResult,
@@ -32,26 +33,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from .config_schema import DynamicConfigSchema
-
-class UserDataUnavailableError(RuntimeError):
-    """UserDataDB 连接池未初始化时抛出的异常。
-
-    ``error_code == "service_unavailable"``，供上游（如 komari_chat
-    承诺执行器）按结构化错误码分类；沿用既有 RuntimeError 语义。
-    """
-
-    error_code: ClassVar[str] = "service_unavailable"
-
-
-class FavorabilityIdempotencyConflictError(ValueError):
-    """好感度 operation_id 与既有请求载荷冲突时抛出的异常。
-
-    ``error_code == "idempotency_conflict"``，供上游按结构化错误码
-    区分幂等冲突；沿用既有 ValueError 语义。
-    """
-
-    error_code: ClassVar[str] = "idempotency_conflict"
-
 
 _FAV = UserFavorabilityRow.__table__
 _LEDGER = UserFavorabilityAdjustmentLedgerRow.__table__
