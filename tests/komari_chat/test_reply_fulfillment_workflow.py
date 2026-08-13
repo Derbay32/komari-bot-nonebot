@@ -362,7 +362,7 @@ def _pending_reply(
         adapter_name="onebot.v11",
         reason="score",
         reply_score=0.9,
-        operation_id=operation_id,
+        fulfillment_id=operation_id,
         request_trace_id="chat-message-1",
         reply_timestamp=2.0,
         proactive_reservation_id="reservation-1",
@@ -416,9 +416,9 @@ async def test_fulfill_persists_delivery_before_delegating_commitments(
 
     assert await workflow.fulfill(pending, send_reply=_send_success) is True
 
-    assert repository.delivered_ids == {pending.operation_id}
-    assert repository.records[pending.operation_id]["platform_message_id"] == "7788"
-    assert commitments.fulfillment_ids == [pending.operation_id]
+    assert repository.delivered_ids == {pending.fulfillment_id}
+    assert repository.records[pending.fulfillment_id]["platform_message_id"] == "7788"
+    assert commitments.fulfillment_ids == [pending.fulfillment_id]
     assert events == ["recover_fulfillment", "recover_alerts"]
 
 
@@ -437,7 +437,7 @@ async def test_definitive_delivery_failure_terminates_without_commitments(
 
     assert await workflow.fulfill(pending, send_reply=_send_rejected) is False
 
-    assert repository.not_delivered_ids == {pending.operation_id}
+    assert repository.not_delivered_ids == {pending.fulfillment_id}
     assert reservation.release_count == 1
     assert proactive.released == []
     assert commitments.fulfillment_ids == []
@@ -458,7 +458,7 @@ async def test_unknown_delivery_is_alerted_without_running_commitments(
 
     assert await workflow.fulfill(pending, send_reply=_send_unknown) is False
 
-    assert repository.pending_confirmation_ids == {pending.operation_id}
+    assert repository.pending_confirmation_ids == {pending.fulfillment_id}
     assert reservation.release_count == 0
     assert commitments.fulfillment_ids == []
     assert events == ["recover_alerts"]

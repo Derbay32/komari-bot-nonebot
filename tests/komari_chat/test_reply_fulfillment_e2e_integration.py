@@ -365,7 +365,7 @@ def _pending_reply(
         adapter_name="onebot.v11",
         reason="score",
         reply_score=0.9,
-        operation_id=fulfillment_id,
+        fulfillment_id=fulfillment_id,
         request_trace_id=f"trace-{run_id}",
         reply_timestamp=2.0,
         proactive_reservation_id=(

@@ -118,7 +118,7 @@ def _pending_reply(
         adapter_name=adapter_name,
         reason="score",
         reply_score=0.9,
-        operation_id=fulfillment_id,
+        fulfillment_id=fulfillment_id,
         request_trace_id=request_trace_id,
         reply_timestamp=reply_timestamp,
         proactive_reservation_id=proactive_reservation_id,
@@ -211,8 +211,8 @@ async def test_first_prepare_freezes_identity_target_and_applicable_commitments(
 
     await _freeze_before_delivery(workflow, pending)
 
-    draft = store.records[pending.operation_id]
-    assert draft.fulfillment_id == pending.operation_id
+    draft = store.records[pending.fulfillment_id]
+    assert draft.fulfillment_id == pending.fulfillment_id
     assert draft.trigger_message_id == "message-1"
     assert draft.trigger_user_id == "user-1"
     assert draft.group_id == "group-1"
@@ -266,7 +266,7 @@ async def test_inapplicable_commitments_are_absent_and_stay_frozen(
 
     await _freeze_before_delivery(workflow, pending)
 
-    draft = store.records[pending.operation_id]
+    draft = store.records[pending.fulfillment_id]
     assert [item.commitment_type for item in draft.commitments] == [
         "favorability_adjustment",
         "assistant_reply_history",
@@ -282,7 +282,7 @@ async def test_inapplicable_commitments_are_absent_and_stay_frozen(
             pending,
             send_reply=lambda _pending: pytest.fail("重复履约不得重新发送"),
         )
-    assert store.records[pending.operation_id] is draft
+    assert store.records[pending.fulfillment_id] is draft
     assert [item.commitment_type for item in draft.commitments] == [
         "favorability_adjustment",
         "assistant_reply_history",
@@ -305,7 +305,7 @@ async def test_payload_hash_is_canonical_and_covers_every_frozen_responsibility(
         )
         pending = _pending_reply(workflow_module, **pending_overrides)
         await _freeze_before_delivery(workflow, pending)
-        return str(store.records[pending.operation_id].payload_hash)
+        return str(store.records[pending.fulfillment_id].payload_hash)
 
     baseline = await _payload_hash()
     reordered = await _payload_hash(
@@ -346,7 +346,7 @@ async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
     workflow = _workflow(workflow_module, store)
     original = _pending_reply(workflow_module)
     await _freeze_before_delivery(workflow, original)
-    frozen = store.records[original.operation_id]
+    frozen = store.records[original.fulfillment_id]
     send_count = 0
 
     async def _send(_pending: object) -> object:
@@ -368,7 +368,7 @@ async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
         )
 
     assert send_count == 0
-    assert store.records[original.operation_id] is frozen
+    assert store.records[original.fulfillment_id] is frozen
     assert frozen.reply_content == "回复正文"
 
 
@@ -381,12 +381,12 @@ async def test_terminal_identity_still_prevents_resend(
     workflow = _workflow(workflow_module, store)
     pending = _pending_reply(workflow_module)
     await _freeze_before_delivery(workflow, pending)
-    store.records.pop(pending.operation_id)
-    store.terminal_states[pending.operation_id] = terminal_state
+    store.records.pop(pending.fulfillment_id)
+    store.terminal_states[pending.fulfillment_id] = terminal_state
 
     assert await workflow.fulfill(
         _pending_reply(workflow_module),
         send_reply=lambda _pending: pytest.fail("终态履约不得重新发送"),
     ) is False
-    assert pending.operation_id not in store.records
-    assert store.terminal_states[pending.operation_id] == terminal_state
+    assert pending.fulfillment_id not in store.records
+    assert store.terminal_states[pending.fulfillment_id] == terminal_state
