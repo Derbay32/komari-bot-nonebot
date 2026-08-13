@@ -27,6 +27,7 @@ def _pending_reply_field_names() -> set[str]:
 
 
 def _assert_second_parameter_named_fulfillment_id(func: object) -> None:
+    assert callable(func)
     parameters = list(inspect.signature(func).parameters.values())
     assert parameters[1].name == "fulfillment_id"
     assert "operation_id" not in [parameter.name for parameter in parameters]
@@ -41,7 +42,7 @@ def test_pending_reply_dataclass_has_no_operation_id_field() -> None:
 
 
 def test_pending_reply_protocol_exposes_fulfillment_id_property() -> None:
-    member = reply_fulfillment_workflow._PendingReply.fulfillment_id
+    member = getattr(reply_fulfillment_workflow._PendingReply, "fulfillment_id", None)
     assert isinstance(member, property)
 
 
