@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
@@ -300,12 +301,22 @@ class _ProactiveReservation:
         self.released.append((group_id, reservation_id))
 
 
-class _ReservationHandle:
-    def __init__(self) -> None:
-        self.release_count = 0
+@dataclass(frozen=True)
+class _ReservationHandoff:
+    """移交凭据 fake：冻结身份快照（reserve 时刻）+ 记录调用的幂等 release()。"""
 
-    async def release(self) -> None:
-        self.release_count += 1
+    group_id: str = "group-1"
+    reservation_id: str = "reservation-1"
+    cooldown_seconds: int = 300
+    release_calls: list[str] = field(default_factory=list)
+
+    @property
+    def release_count(self) -> int:
+        return len(self.release_calls)
+
+    async def release(self) -> bool:
+        self.release_calls.append(self.reservation_id)
+        return len(self.release_calls) == 1
 
 
 @pytest.fixture
@@ -334,13 +345,19 @@ def _config() -> SimpleNamespace:
 def _pending_reply(
     operation_id: str,
     *,
-    reservation: _ReservationHandle | None = None,
+    handoff: _ReservationHandoff | None = None,
+    reply_content: str = "回复正文",
+    favorability_delta: int | None = 1,
 ) -> Any:
     handler_module = import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
     )
+    if handoff is None:
+        # 与旧默认（proactive_reservation_id="reservation-1"）等价：
+        # 默认带一份 group-1 / reservation-1 / 300 秒快照的移交凭据
+        handoff = _ReservationHandoff()
     return handler_module.PendingReply(
-        reply="回复正文",
+        reply=reply_content,
         reply_to_message_id="message-1",
         message=MessageSchema(
             user_id="user-1",
@@ -351,9 +368,9 @@ def _pending_reply(
             message_id="message-1",
         ),
         reply_result=handler_module.ReplyResult(
-            content="回复正文",
+            content=reply_content,
             interaction_history={"event": "发言", "result": "回复", "emotion": "平静"},
-            favorability_delta=1,
+            favorability_delta=favorability_delta,
             favorability_reason="正常互动",
         ),
         force_reply=False,
@@ -365,8 +382,8 @@ def _pending_reply(
         fulfillment_id=operation_id,
         request_trace_id="chat-message-1",
         reply_timestamp=2.0,
-        proactive_reservation_id="reservation-1",
-        proactive_reservation=reservation,
+        proactive_reservation_id=handoff.reservation_id,
+        proactive_handoff=handoff,
     )
 
 
@@ -429,8 +446,8 @@ async def test_definitive_delivery_failure_terminates_without_commitments(
     workflow, repository, commitments, _alerts, proactive, _events = _workflow(
         workflow_module
     )
-    reservation = _ReservationHandle()
-    pending = _pending_reply("reply-operation-rejected", reservation=reservation)
+    handoff = _ReservationHandoff()
+    pending = _pending_reply("reply-operation-rejected", handoff=handoff)
 
     async def _send_rejected(_pending: object) -> object:
         return workflow_module.ReplyDeliveryResult.not_delivered()
@@ -438,7 +455,7 @@ async def test_definitive_delivery_failure_terminates_without_commitments(
     assert await workflow.fulfill(pending, send_reply=_send_rejected) is False
 
     assert repository.not_delivered_ids == {pending.fulfillment_id}
-    assert reservation.release_count == 1
+    assert handoff.release_count == 1
     assert proactive.released == []
     assert commitments.fulfillment_ids == []
 
@@ -450,8 +467,8 @@ async def test_unknown_delivery_is_alerted_without_running_commitments(
     workflow, repository, commitments, _alerts, _proactive, events = _workflow(
         workflow_module
     )
-    reservation = _ReservationHandle()
-    pending = _pending_reply("reply-operation-unknown", reservation=reservation)
+    handoff = _ReservationHandoff()
+    pending = _pending_reply("reply-operation-unknown", handoff=handoff)
 
     async def _send_unknown(_pending: object) -> object:
         return workflow_module.ReplyDeliveryResult.pending_confirmation()
@@ -459,9 +476,97 @@ async def test_unknown_delivery_is_alerted_without_running_commitments(
     assert await workflow.fulfill(pending, send_reply=_send_unknown) is False
 
     assert repository.pending_confirmation_ids == {pending.fulfillment_id}
-    assert reservation.release_count == 0
+    assert handoff.release_count == 0
     assert commitments.fulfillment_ids == []
     assert events == ["recover_alerts"]
+
+
+@pytest.mark.asyncio
+async def test_commitment_cooldown_comes_from_handoff_snapshot_not_live_config(
+    workflow_module: Any,
+) -> None:
+    """AC-3：承诺载荷的冷却时长来自 reserve 冻结快照（凭据），非现读配置。
+
+    凭据快照 42 秒与当前配置 proactive_cooldown=300 不同，证明承诺
+    载荷用的是预占时刻冻结值而非生成/履约时的配置。
+    """
+    workflow, repository, commitments, _alerts, _proactive, _events = _workflow(
+        workflow_module
+    )
+    handoff = _ReservationHandoff(cooldown_seconds=42)
+    pending = _pending_reply("reply-operation-snapshot", handoff=handoff)
+
+    assert await workflow.fulfill(pending, send_reply=_send_success) is True
+
+    payload = repository.commitment_payloads["reply-operation-snapshot"][
+        "proactive_reply_confirmation"
+    ]
+    assert payload["group_id"] == "group-1"
+    assert payload["reservation_id"] == "reservation-1"
+    assert payload["cooldown_seconds"] == 42
+    assert commitments.fulfillment_ids == ["reply-operation-snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_content_releases_handoff_without_sending(
+    workflow_module: Any,
+) -> None:
+    """回复内容为空：不发送、不推进承诺，凭据 release() 被调用（唯一释放入口）。"""
+    workflow, repository, commitments, _alerts, _proactive, _events = _workflow(
+        workflow_module
+    )
+    handoff = _ReservationHandoff()
+    pending = _pending_reply("reply-operation-empty", handoff=handoff, reply_content="")
+
+    assert await workflow.fulfill(pending, send_reply=_send_success) is False
+
+    assert handoff.release_count == 1
+    assert repository.records == {}
+    assert commitments.fulfillment_ids == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_failure_releases_handoff_and_propagates(
+    workflow_module: Any,
+) -> None:
+    """prepare 失败（favorability_delta 缺失）：释放凭据后原样上抛。"""
+    workflow, repository, _commitments, _alerts, _proactive, _events = _workflow(
+        workflow_module
+    )
+    handoff = _ReservationHandoff()
+    pending = _pending_reply(
+        "reply-operation-prepare-error",
+        handoff=handoff,
+        favorability_delta=None,
+    )
+
+    with pytest.raises(ValueError):
+        await workflow.fulfill(pending, send_reply=_send_success)
+
+    assert handoff.release_count == 1
+    assert repository.records == {}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_fulfillment_releases_handoff(
+    workflow_module: Any,
+) -> None:
+    """重复履约（prepare 返回 False）：释放凭据并取消本次发送，不重复推进承诺。"""
+    workflow, _repository, commitments, _alerts, _proactive, _events = _workflow(
+        workflow_module
+    )
+    first = _ReservationHandoff()
+    pending = _pending_reply("reply-operation-dup", handoff=first)
+
+    assert await workflow.fulfill(pending, send_reply=_send_success) is True
+
+    second_handoff = _ReservationHandoff()
+    duplicate = _pending_reply("reply-operation-dup", handoff=second_handoff)
+    assert await workflow.fulfill(duplicate, send_reply=_send_success) is False
+
+    assert second_handoff.release_count == 1
+    assert first.release_count == 0  # 已送达路径不经过凭据释放（确认通道推进承诺）
+    assert commitments.fulfillment_ids == ["reply-operation-dup"]
 
 
 @pytest.mark.asyncio
@@ -522,6 +627,26 @@ async def test_recover_pending_restores_pre_send_crash_with_real_row_shape(
     assert recovered_reply.group_id == "group-1"
     assert recovered_reply.reply == "恢复补发的回复"
     assert recovered_reply.reply_to_message_id == "message-1"
+
+
+@pytest.mark.asyncio
+async def test_stale_expiry_release_goes_through_persistence_channel(
+    workflow_module: Any,
+) -> None:
+    """满时效终止的恢复路径经持久化身份通道 release(group_id, reservation_id)。
+
+    恢复路径没有进程句柄/凭据，只能凭父行投影的群与预占 ID 释放；
+    凭据 release() 不参与（无对象可调）。
+    """
+    workflow, repository, _commitments, _alerts, proactive, _events = _workflow(
+        workflow_module
+    )
+    repository.seed_not_started("reply-recover-stale", age_seconds=9_999)
+
+    assert await workflow.recover_pending() == 0
+
+    assert repository.not_delivered_ids == {"reply-recover-stale"}
+    assert proactive.released == [("group-1", "reservation-1")]
 
 
 def test_builder_shares_one_parent_child_repository_across_workflow_services(
