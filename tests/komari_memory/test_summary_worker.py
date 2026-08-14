@@ -216,7 +216,7 @@ def _make_session(
         group_id=group_id,
         processing_key=processing_key,
         messages=messages if messages is not None else [_make_message()],
-        collector=collector if collector is not None else _FakeCollector(),
+        collector=collector,
         ledger=ledger if ledger is not None else DictChunkLedger(),
     )
 
