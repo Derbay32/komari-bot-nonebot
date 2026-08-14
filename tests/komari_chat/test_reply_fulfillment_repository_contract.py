@@ -1,0 +1,226 @@
+"""回复履约父子存储 adapter 的无数据库契约测试。"""
+
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from importlib import import_module
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+
+def _repository_module() -> Any:
+    return import_module(
+        "komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository"
+    )
+
+
+def test_commitment_inputs_use_fixed_typed_payloads() -> None:
+    """固定承诺只接受各自的强类型 payload，不接受任意 JSON 对象。"""
+    module = _repository_module()
+    expected_types = {
+        "proactive_reply_confirmation",
+        "favorability_adjustment",
+        "assistant_reply_history",
+        "interaction_history",
+    }
+
+    assert set(module.COMMITMENT_TYPES) == expected_types
+
+    valid = module.ReplyCommitmentInput(
+        commitment_type="favorability_adjustment",
+        payload=module.FavorabilityAdjustmentPayload(
+            user_id="user-1",
+            delta=1,
+            reason="正常互动",
+        ),
+    )
+    assert valid.commitment_type == "favorability_adjustment"
+
+    with pytest.raises((TypeError, ValueError)):
+        module.ReplyCommitmentInput(
+            commitment_type="favorability_adjustment",
+            payload={"user_id": "user-1", "delta": 1},
+        )
+
+    with pytest.raises((TypeError, ValueError)):
+        module.ReplyCommitmentInput(
+            commitment_type="dynamic_callback",
+            payload=valid.payload,
+        )
+
+
+def test_interaction_payload_copies_record_into_read_only_mapping() -> None:
+    """冻结载荷不与调用方共享可变字典，也不允许事后原地改写。"""
+    module = _repository_module()
+    source = {"event": "发言", "result": "回复", "emotion": "平静"}
+    payload = module.InteractionHistoryPayload(
+        user_id="user-1",
+        display_name="测试用户",
+        trigger_size=20,
+        reply_timestamp=2,
+        trigger_message_id="message-1",
+        record=source,
+    )
+
+    source["event"] = "被调用方篡改"
+
+    assert isinstance(payload.record, MappingProxyType)
+    assert payload.record["event"] == "发言"
+    assert payload.reply_timestamp == 2.0
+    with pytest.raises(TypeError):
+        cast("dict[str, str]", payload.record)["event"] = "原地篡改"
+
+
+def test_draft_requires_fixed_core_commitments_in_domain_order() -> None:
+    """适用集合可省略可选承诺，但不能丢失固定核心或打乱顺序。"""
+    module = _repository_module()
+    favorability = module.ReplyCommitmentInput(
+        commitment_type="favorability_adjustment",
+        payload=module.FavorabilityAdjustmentPayload(
+            user_id="user-1",
+            delta=1,
+            reason="正常互动",
+        ),
+    )
+    history = module.ReplyCommitmentInput(
+        commitment_type="assistant_reply_history",
+        payload=module.AssistantReplyHistoryPayload(
+            group_id="group-1",
+            bot_nickname="小鞠",
+            reply_content="回复正文",
+            reply_timestamp=2.0,
+        ),
+    )
+    fields = {
+        "fulfillment_id": "reply-1",
+        "payload_hash": "a" * 64,
+        "request_trace_id": "trace-1",
+        "trigger_message_id": "message-1",
+        "trigger_user_id": "user-1",
+        "group_id": "group-1",
+        "bot_self_id": "bot-1",
+        "adapter_name": "OneBot V11",
+        "reply_target_message_id": "message-1",
+        "reply_content": "回复正文",
+    }
+
+    valid = module.ReplyFulfillmentDraft(
+        **fields,
+        commitments=(favorability, history),
+    )
+    assert [item.commitment_type for item in valid.commitments] == [
+        "favorability_adjustment",
+        "assistant_reply_history",
+    ]
+
+    with pytest.raises(ValueError, match="必须包含"):
+        module.ReplyFulfillmentDraft(**fields, commitments=(favorability,))
+    with pytest.raises(ValueError, match="固定顺序"):
+        module.ReplyFulfillmentDraft(
+            **fields,
+            commitments=(history, favorability),
+        )
+
+
+@pytest.mark.asyncio
+async def test_claimed_commitments_decode_asyncpg_jsonb_text() -> None:
+    """asyncpg 默认返回的 JSONB 文本必须解码后再进入领域载荷校验。"""
+    module = _repository_module()
+
+    class _Connection:
+        async def fetchval(self, *_args: object) -> int:
+            return 1
+
+        async def fetch(self, *_args: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "commitment_type": "favorability_adjustment",
+                    "payload": json.dumps(
+                        {
+                            "user_id": "user-1",
+                            "delta": 1,
+                            "reason": "正常互动",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ]
+
+    class _Pool:
+        @asynccontextmanager
+        async def acquire(self) -> AsyncIterator[Any]:
+            yield _Connection()
+
+    repository = module.ReplyFulfillmentRepository(_Pool())
+
+    commitments = await repository.load_claimed_commitments(
+        "reply-jsonb",
+        owner_token="worker-1",
+    )
+
+    assert commitments == [
+        {
+            "commitment_type": "favorability_adjustment",
+            "payload": {
+                "user_id": "user-1",
+                "delta": 1,
+                "reason": "正常互动",
+            },
+        }
+    ]
+
+
+def test_repository_contains_no_runtime_ddl() -> None:
+    """运行时 adapter 只操作迁移管理的表，绝不创建或修改 schema。"""
+    module = _repository_module()
+    source_path = Path(module.__file__ or "")
+    source = source_path.read_text(encoding="utf-8").upper()
+
+    assert "CREATE TABLE" not in source
+    assert "ALTER TABLE" not in source
+    assert "DROP TABLE" not in source
+
+
+def test_new_adapter_is_the_only_active_chat_persistence_path() -> None:
+    """contract 后正常聊天只组装父子 adapter，不保留旧宽表兼容路径。"""
+    project_root = Path(__file__).resolve().parents[2]
+    plugin_dir = project_root / "komari_bot/plugins/komari_chat"
+    workflow_source = (
+        plugin_dir / "services/reply_fulfillment_workflow.py"
+    ).read_text(encoding="utf-8")
+    plugin_source = (plugin_dir / "__init__.py").read_text(encoding="utf-8")
+    handler_source = (
+        plugin_dir / "handlers/message_handler.py"
+    ).read_text(encoding="utf-8")
+
+    assert "ReplyFulfillmentRepository" in workflow_source
+    assert "reply_fulfillment_repository" in workflow_source
+    assert "reply_commit_repository" not in workflow_source
+    assert "_LegacyReplyFulfillmentRepository" not in workflow_source
+    assert "ReplyCommitRepository" not in workflow_source
+    assert "komari_chat_reply_commit_outbox" not in workflow_source
+    assert "reply_commit_repository" not in plugin_source
+    assert "komari_chat_reply_commit_outbox" not in plugin_source
+    assert "reply_commit_repository" not in handler_source
+    assert "komari_chat_reply_commit_outbox" not in handler_source
+
+
+def test_legacy_reply_commit_repository_is_physically_deleted() -> None:
+    """旧 Repository 文件与对应集成测试不得留在当前代码树。"""
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert not (
+        project_root
+        / "komari_bot/plugins/komari_chat/repositories/reply_commit_repository.py"
+    ).exists()
+    assert not (
+        project_root
+        / "tests/komari_chat/test_reply_commit_repository_integration.py"
+    ).exists()

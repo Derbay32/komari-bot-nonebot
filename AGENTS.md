@@ -495,6 +495,10 @@ poetry run python -m komari_bot.db.orm_bootstrap upgrade head
 poetry run python -m komari_bot.db.orm_bootstrap check   # 必须零 diff
 
 # 真实库集成测试（KOMARI_TEST_POSTGRES_URL 门控；两变量必须同库，否则守卫 skip）
+# 共享门控库必须先 upgrade head 且始终保持 head；迁移链驱动验收
+# （tests/db 的 0004/0010/0011 迁移测试与 legacy 配置脚本集成测试）在
+# 门控库派生的一次性隔离库（库名 = 门控库名 + 文件专属后缀）内重建迁移链，
+# 用例结束即 DROP，门控用户需要 CREATEDB 权限
 SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
 KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
   poetry run pytest tests/ -v
@@ -520,7 +524,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ### Issue tracker
 
-Issue 与 PRD 跟踪在 Plane 官方云项目 **KOMARIBOT**（经 Plane MCP 工具操作，**不用** `gh` CLI 管 ticket）；`/to-tickets` 拆出的实施 ticket 以父 spec work item 的 sub-issue 管理（`parent` 父子关系 + 原生内置 blocking 依赖，正文 `Blocked by` 声明作速读 fallback；自定义关系定义是付费功能，不可用）。See `docs/agents/issue-tracker.md`.
+Track issues and PRDs in the self-hosted Huly project **TSK** through the Huly MCP proxy tools, not through `gh`. Publish `/to-tickets` implementation tickets as sub-issues of their parent spec. Represent blocking edges with Huly's native issue relations and retain a textual `Blocked by` line as a quick-reading fallback. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

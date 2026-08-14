@@ -192,9 +192,9 @@ nonebot-plugin-orm `get_session` 访问；embedding 生成仍依赖
 
 ### 主动回复与判定
 
-> 主动回复频控（`proactive_*`）与回复送达副作用 outbox（`reply_commit_*`）
-> 的 10 个字段自 KOMARIBOT-7 起归 `komari_chat` 自有配置表
-> `komari_chat_config` 所有，不再由本插件配置承载；死字段
+> 主动回复频控（`proactive_*`）与回复履约副作用（`reply_fulfillment_*`，
+> TSK-87 前为 `reply_commit_*`）字段自 KOMARIBOT-7 起归 `komari_chat`
+> 自有配置表 `komari_chat_config` 所有，不再由本插件配置承载；死字段
 > `proactive_score_threshold` 已随迁出删除。
 
 | 配置项 | 默认值 | 说明 |

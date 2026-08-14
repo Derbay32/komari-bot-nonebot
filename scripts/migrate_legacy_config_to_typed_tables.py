@@ -77,6 +77,7 @@ class ResourceSpec:
     jsonb_defaults: dict[str, list[Any] | dict[str, Any]] = field(
         default_factory=dict
     )
+    legacy_key_map: dict[str, str] = field(default_factory=dict)
 
 
 #: legacy 行里出现的、新表没有对应列的弃用键（进入决算报告「丢弃」清单）。
@@ -384,10 +385,12 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "bot_aliases": [],
         },
     ),
-    # KOMARIBOT-7：komari_chat 拥有自有配置表后，legacy komari_memory 行里的
-    # 主动回复频控 / outbox 字段改投 komari_chat_config（同一 legacy 行，
-    # key_value 与 komari_memory 一致；proactive_score_threshold 死字段不迁移，
-    # 由 komari_memory 资源的 unknown 键丢弃逻辑一并清理）。
+    # KOMARIBOT-7 / TSK-87：komari_chat 拥有自有配置表后，legacy
+    # komari_memory 行里的主动回复频控字段改投 komari_chat_config；
+    # 回复履约 worker 字段在 TSK-87 contract 后改名，脚本继续读取旧
+    # JSONB 键（legacy_key_map），写入时映射到 reply_fulfillment_* 列。
+    # proactive_score_threshold 死字段不迁移，由 komari_memory 资源的
+    # unknown 键丢弃逻辑一并清理。
     ResourceSpec(
         legacy_table="komari_plugin_configs",
         legacy_key_column="plugin_name",
@@ -399,14 +402,28 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "proactive_cooldown",
             "proactive_max_per_hour",
             "proactive_reservation_ttl_seconds",
-            "reply_commit_worker_interval_seconds",
-            "reply_commit_batch_size",
-            "reply_commit_lease_seconds",
-            "reply_commit_max_attempts",
-            "reply_commit_retry_base_seconds",
-            "reply_commit_tombstone_retention_days",
+            "reply_fulfillment_worker_interval_seconds",
+            "reply_fulfillment_batch_size",
+            "reply_fulfillment_lease_seconds",
+            "reply_fulfillment_max_attempts",
+            "reply_fulfillment_retry_base_seconds",
+            "reply_fulfillment_tombstone_retention_days",
         ),
         deprecated_keys=_DEPRECATED_PLUGIN_KEYS,
+        legacy_key_map={
+            "reply_commit_worker_interval_seconds": (
+                "reply_fulfillment_worker_interval_seconds"
+            ),
+            "reply_commit_batch_size": "reply_fulfillment_batch_size",
+            "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
+            "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
+            "reply_commit_retry_base_seconds": (
+                "reply_fulfillment_retry_base_seconds"
+            ),
+            "reply_commit_tombstone_retention_days": (
+                "reply_fulfillment_tombstone_retention_days"
+            ),
+        },
     ),
     ResourceSpec(
         legacy_table="komari_plugin_configs",
@@ -700,6 +717,13 @@ def plan_row_values(
         raw = data.get(column)
         data_type, is_nullable = column_info[column]
         if raw is None:
+            # 新列名缺失时回退读取 legacy_key_map 声明的旧 JSONB 键
+            #（TSK-87 改名：旧键可读，写入只落新列）。
+            for legacy_key, target_column in spec.legacy_key_map.items():
+                if target_column == column and legacy_key in data:
+                    raw = data[legacy_key]
+                    break
+        if raw is None:
             # JSONB null / 缺失键：可空列不写入（保持 NULL / 播种值），
             # NOT NULL 列仅在 INSERT 路径回退类型默认值（不进入 update_keys，
             # 已播种行上的原值不会被覆盖）
@@ -712,7 +736,10 @@ def plan_row_values(
         migrated_keys.append(column)
 
     unknown_found = sorted(
-        set(data).difference(declared).difference(spec.deprecated_keys)
+        set(data)
+        .difference(declared)
+        .difference(spec.deprecated_keys)
+        .difference(spec.legacy_key_map)
     )
     deprecated_found = sorted(spec.deprecated_keys.intersection(data))
     dropped_keys = [*unknown_found, *deprecated_found]

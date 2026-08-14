@@ -96,7 +96,11 @@ def test_typed_config_tables_revision_exists() -> None:
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     typed_revision = next(
-        (rev for rev in revisions if "typed_plugin_config_tables" in Path(rev.path).name),
+        (
+            rev
+            for rev in revisions
+            if "typed_plugin_config_tables" in Path(rev.path).name
+        ),
         None,
     )
     assert typed_revision is not None
@@ -187,9 +191,9 @@ def test_komari_chat_config_revision_exists() -> None:
         "reply_commit_tombstone_retention_days",
     )
     for column in dropped_columns:
-        assert re.search(
-            rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql
-        ), column
+        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), (
+            column
+        )
 
     # 旧表保留（其余字段仍归 komari_memory 所有），只删列不删表
     assert "DROP TABLE komari_memory_config" not in revision_sql
@@ -224,9 +228,358 @@ def test_komari_decision_summary_config_revision_exists() -> None:
     }
     for column in columns:
         assert column in revision_sql, column
-        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), column
+        assert re.search(rf"DROP COLUMN (?:IF EXISTS )?{column}\b", revision_sql), (
+            column
+        )
 
     assert "DROP TABLE komari_decision_config" not in revision_sql
+
+
+def test_reply_fulfillment_parent_child_revision_exists() -> None:
+    """回复履约父子表由 0006 手写 revision 以正交事实建模。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    fulfillment_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_parent_child" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert fulfillment_revision is not None
+    assert fulfillment_revision.revision == "0006"
+    assert fulfillment_revision.down_revision == "0005"
+
+    revision_sql = Path(fulfillment_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+    child_table = "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS"
+
+    assert f"CREATE TABLE {parent_table}" in normalized
+    assert f"CREATE TABLE {child_table}" in normalized
+    assert (
+        f"FOREIGN KEY (FULFILLMENT_ID) REFERENCES {parent_table}(FULFILLMENT_ID) "
+        "ON DELETE CASCADE"
+    ) in normalized
+    assert "PRIMARY KEY (FULFILLMENT_ID, COMMITMENT_TYPE)" in normalized
+
+    for commitment_type in (
+        "PROACTIVE_REPLY_CONFIRMATION",
+        "FAVORABILITY_ADJUSTMENT",
+        "ASSISTANT_REPLY_HISTORY",
+        "INTERACTION_HISTORY",
+    ):
+        assert f"'{commitment_type}'" in normalized
+    for delivery_state in (
+        "NOT_STARTED",
+        "PENDING_CONFIRMATION",
+        "DELIVERED",
+        "NOT_DELIVERED",
+    ):
+        assert f"'{delivery_state}'" in normalized
+    for commitment_state in ("PENDING", "RETRY_WAIT", "COMPLETED", "FAILED"):
+        assert f"'{commitment_state}'" in normalized
+
+    parent_columns = {
+        "payload_hash",
+        "request_trace_id",
+        "trigger_message_id",
+        "trigger_user_id",
+        "group_id",
+        "bot_self_id",
+        "adapter_name",
+        "reply_target_message_id",
+        "reply_content",
+        "delivery_state",
+        "platform_message_id",
+        "prepared_at",
+        "send_started_at",
+        "delivered_at",
+        "not_delivered_at",
+        "lease_owner",
+        "lease_expires_at",
+        "completed_at",
+    }
+    child_columns = {
+        "commitment_type",
+        "state",
+        "attempt_count",
+        "next_retry_at",
+        "last_error_code",
+        "payload",
+        "completed_at",
+    }
+    for column in parent_columns | child_columns:
+        assert re.search(rf"\b{column.upper()}\b", normalized), column
+
+    assert "PAYLOAD JSONB" in normalized
+    assert "DELIVERY_STATE JSONB" not in normalized
+    assert "STATE JSONB" not in normalized
+    assert "LEASE_OWNER IS NULL" in normalized
+    assert "LEASE_EXPIRES_AT IS NULL" in normalized
+    assert normalized.count("CREATE INDEX") >= 2
+
+    child_drop = normalized.find(f"DROP TABLE {child_table}")
+    parent_drop = normalized.find(f"DROP TABLE {parent_table}")
+    assert 0 <= child_drop < parent_drop
+
+
+def test_reply_fulfillment_revision_is_self_contained() -> None:
+    """父子表迁移不得加载应用运行时，也不得删除旧 outbox。"""
+    revision_path = (
+        MIGRATIONS_DIR / "versions" / "0006_reply_fulfillment_parent_child.py"
+    )
+    revision_sql = revision_path.read_text(encoding="utf-8")
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+    assert "DROP TABLE komari_chat_reply_commit_outbox" not in revision_sql
+
+
+def test_reply_delivery_recovery_revision_exists() -> None:
+    """0007 为旧运行路径补齐送达事实与回复时效，不提前切换父子表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    delivery_revision = next(
+        (rev for rev in revisions if "reply_delivery_recovery" in Path(rev.path).name),
+        None,
+    )
+    assert delivery_revision is not None
+    assert delivery_revision.revision == "0007"
+    assert delivery_revision.down_revision == "0006"
+
+    revision_sql = Path(delivery_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    old_table = "KOMARI_CHAT_REPLY_COMMIT_OUTBOX"
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+
+    assert f"ALTER TABLE {old_table}" in normalized
+    for column in (
+        "delivery_state",
+        "bot_self_id",
+        "adapter_name",
+        "reply_target_message_id",
+        "prepared_at",
+        "send_started_at",
+        "not_delivered_at",
+    ):
+        assert re.search(rf"\b{column.upper()}\b", normalized), column
+    for delivery_state in (
+        "NOT_STARTED",
+        "PENDING_CONFIRMATION",
+        "DELIVERED",
+        "NOT_DELIVERED",
+    ):
+        assert f"'{delivery_state}'" in normalized
+
+    assert "REPLY_FULFILLMENT_FRESHNESS_SECONDS" in normalized
+    assert "DEFAULT 120" in normalized
+    assert ">= 30" in normalized
+    assert "<= 300" in normalized
+    assert f"ALTER TABLE {parent_table}" in normalized
+    assert "CK_REPLY_FULFILLMENT_DELIVERY_TIMESTAMPS" in normalized
+    assert "IDX_REPLY_COMMIT_OUTBOX_DELIVERY_FRESHNESS" in normalized
+    assert re.search(
+        r'op\.execute\(\s*"DROP INDEX IF EXISTS '
+        r'idx_reply_commit_outbox_delivery_freshness"',
+        revision_sql,
+        re.IGNORECASE,
+    )
+    assert not re.search(
+        r'"ALTER TABLE komari_chat_reply_commit_outbox\s*"\s*'
+        r'"DROP INDEX',
+        revision_sql,
+        re.IGNORECASE,
+    )
+
+    assert "DROP TABLE KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
+    assert "DROP TABLE KOMARI_CHAT_REPLY_FULFILLMENTS" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
+def test_reply_fulfillment_lifecycle_revision_exists() -> None:
+    """0008 只扩展新父子模型的最小化与两阶段清理事实。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    lifecycle_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_lifecycle" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert lifecycle_revision is not None
+    assert lifecycle_revision.revision == "0008"
+    assert lifecycle_revision.down_revision == "0007"
+
+    revision_sql = Path(lifecycle_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+
+    assert f"ALTER TABLE {parent_table}" in normalized
+    assert "REPLY_CONTENT DROP NOT NULL" in normalized
+    assert "IDEMPOTENCY_EVIDENCE_CLEARED_AT" in normalized
+    assert "CREATE INDEX" in normalized
+    assert "COMPLETED_AT" in normalized
+    assert "NOT_DELIVERED_AT" in normalized
+
+    assert "KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
+    assert "INSERT INTO KOMARI_CHAT_REPLY_FULFILLMENTS" not in normalized
+    assert "DROP TABLE" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+    assert "REPLY_CONTENT SET NOT NULL" in normalized
+    assert re.search(
+        rf"UPDATE {parent_table} .*REPLY_CONTENT = ''",
+        normalized,
+    )
+    assert "DROP COLUMN IDEMPOTENCY_EVIDENCE_CLEARED_AT" in normalized
+
+
+def test_reply_fulfillment_alert_revision_exists() -> None:
+    """0009 只持久化两类告警转换的跨进程去重事实。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    alert_revision = next(
+        (rev for rev in revisions if "reply_fulfillment_alert" in Path(rev.path).name),
+        None,
+    )
+    assert alert_revision is not None
+    assert alert_revision.revision == "0009"
+    assert alert_revision.down_revision == "0008"
+
+    revision_sql = Path(alert_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+
+    assert "KOMARI_CHAT_REPLY_FULFILLMENTS" in normalized
+    assert "PENDING_CONFIRMATION_ALERTED_AT" in normalized
+    assert "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS" in normalized
+    assert "DISPOSITION_ALERTED_AT" in normalized
+    assert "DROP COLUMN PENDING_CONFIRMATION_ALERTED_AT" in normalized
+    assert "DROP COLUMN DISPOSITION_ALERTED_AT" in normalized
+
+    assert "KOMARI_CHAT_REPLY_COMMIT_OUTBOX" not in normalized
+    assert "DROP TABLE" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
+def test_reply_fulfillment_backfill_revision_exists() -> None:
+    """0010 在停机事务内预检并回填旧宽 outbox，仍保留旧表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    backfill_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_backfill" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert backfill_revision is not None
+    assert backfill_revision.revision == "0010"
+    assert backfill_revision.down_revision == "0009"
+
+    revision_sql = Path(backfill_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    old_table = "KOMARI_CHAT_REPLY_COMMIT_OUTBOX"
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+    child_table = "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS"
+
+    assert f"FROM {old_table}" in normalized
+    assert f"INSERT INTO {parent_table}" in normalized
+    assert f"INSERT INTO {child_table}" in normalized
+    assert "PENDING_CONFIRMATION" in normalized
+    assert "NOT_DELIVERED" in normalized
+    assert "RETRY_WAIT" in normalized
+    assert "FAILED" in normalized
+    assert "FOR UPDATE" in normalized
+    assert "REPLY_COMMIT_TOMBSTONE_RETENTION_DAYS" in normalized
+    assert "AMBIGUOUS_FAILED_COUNT=" in normalized
+    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    assert "COUNT(*)" in normalized
+    assert "COUNT(DISTINCT" in normalized
+    assert "LEASE_OWNER" in normalized
+    assert "LEASE_EXPIRES_AT" in normalized
+    assert "PAYLOAD_HASH" in normalized
+    assert "DISPOSITION_ALERTED_AT" in normalized
+    assert "PENDING_CONFIRMATION_ALERTED_AT" in normalized
+
+    assert f"DROP TABLE {old_table}" not in normalized
+    assert "DROP TABLE" not in normalized
+    assert "CREATE TABLE" not in normalized
+    assert "ALTER TABLE" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
+def test_reply_fulfillment_cutover_revision_exists() -> None:
+    """0011 完成停机 contract：门禁完整后改名配置并删除旧宽表。"""
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    cutover_revision = next(
+        (
+            rev
+            for rev in revisions
+            if "reply_fulfillment_cutover" in Path(rev.path).name
+        ),
+        None,
+    )
+    assert cutover_revision is not None
+    assert cutover_revision.revision == "0011"
+    assert cutover_revision.down_revision == "0010"
+
+    revision_sql = Path(cutover_revision.path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+    old_table = "KOMARI_CHAT_REPLY_COMMIT_OUTBOX"
+    parent_table = "KOMARI_CHAT_REPLY_FULFILLMENTS"
+    child_table = "KOMARI_CHAT_REPLY_FULFILLMENT_COMMITMENTS"
+    config_table = "KOMARI_CHAT_CONFIG"
+    renamed_columns = {
+        "reply_commit_worker_interval_seconds": (
+            "reply_fulfillment_worker_interval_seconds"
+        ),
+        "reply_commit_batch_size": "reply_fulfillment_batch_size",
+        "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
+        "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
+        "reply_commit_retry_base_seconds": (
+            "reply_fulfillment_retry_base_seconds"
+        ),
+        "reply_commit_tombstone_retention_days": (
+            "reply_fulfillment_tombstone_retention_days"
+        ),
+    }
+
+    assert "FOR UPDATE" in normalized
+    assert f"FROM {old_table}" in normalized
+    assert f"FROM {parent_table}" in normalized
+    assert "MISSING_BACKFILL_COUNT=" in normalized
+    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    assert "COUNT(*)" in normalized
+    assert "COUNT(DISTINCT" in normalized
+    for old_name, new_name in renamed_columns.items():
+        assert re.search(
+            rf"ALTER TABLE {config_table} .*RENAME COLUMN "
+            rf"{old_name.upper()} TO {new_name.upper()}",
+            normalized,
+        ), old_name
+    assert "REPLY_FULFILLMENT_RETRY_MAX_SECONDS" in normalized
+    assert "DEFAULT 3600" in normalized
+    assert f"DROP TABLE {old_table}" in normalized
+    assert normalized.index("MISSING_BACKFILL_COUNT=") < normalized.index(
+        f"DROP TABLE {old_table}"
+    )
+
+    assert f"DROP TABLE {parent_table}" not in normalized
+    assert f"DROP TABLE {child_table}" not in normalized
+    assert f"DROP TABLE {config_table}" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+    assert "0011_REPLY_FULFILLMENT_CUTOVER_IS_IRREVERSIBLE" in normalized
 
 
 def test_migration_cli_can_inspect_chain_without_loading_application(

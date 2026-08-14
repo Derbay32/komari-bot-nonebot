@@ -272,6 +272,20 @@ def test_release_is_idempotent(
     assert asyncio.run(reservation.release()) is False
 
 
+def test_service_can_release_persisted_reservation_without_process_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """崩溃恢复只凭冻结的群与预占 ID 也能幂等释放 pending 名额。"""
+    service, fake = _build_service(monkeypatch)
+    reservation = asyncio.run(service.reserve("group-1", "message-1"))
+    assert isinstance(reservation, Reservation)
+
+    assert asyncio.run(service.release("group-1", "message-1")) is True
+    assert asyncio.run(service.release("group-1", "message-1")) is False
+    assert fake.zsets[_slots_key("group-1")] == {}
+    assert _cooldown_key("group-1") not in fake.values
+
+
 def test_release_does_not_revoke_confirmed_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

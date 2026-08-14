@@ -120,6 +120,24 @@ async def test_adjustment_operation_is_applied_once_under_concurrency() -> None:
             await session.close()
         assert score == 105
         assert ledger_count == 1
+        assert await database.delete_favorability_operation(operation_id) is True
+        assert await database.delete_favorability_operation(operation_id) is False
+
+        session = _open_session()
+        try:
+            ledger_count_after_cleanup = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(UserFavorabilityAdjustmentLedgerRow)
+                    .where(
+                        UserFavorabilityAdjustmentLedgerRow.__table__.c.operation_id
+                        == operation_id
+                    )
+                )
+            ).scalar_one()
+        finally:
+            await session.close()
+        assert ledger_count_after_cleanup == 0
     finally:
         session = _open_session()
         try:

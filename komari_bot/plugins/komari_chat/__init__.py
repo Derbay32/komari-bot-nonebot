@@ -2,13 +2,13 @@
 
 import asyncio
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, cast
+from types import SimpleNamespace
+from typing import Any, cast
 
-from nonebot import get_driver, logger, on_message
-from nonebot.adapters.onebot.v11 import ActionFailed, Bot, GroupMessageEvent
+from nonebot import get_bots, get_driver, logger, on_message
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_rule
 
 from .handlers.message_handler import (
@@ -17,10 +17,22 @@ from .handlers.message_handler import (
     PendingReply,
     ReplyFailureInfo,
 )
-from .repositories import ReplyCommitRepository
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable
+from .reply_fulfillment_ops_errors import (
+    ReplyFulfillmentOpsConflictError,
+    ReplyFulfillmentOpsNotFoundError,
+    ReplyFulfillmentOpsValidationError,
+)
+from .services.proactive_reservation import ProactiveReservationService
+from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
+from .services.reply_fulfillment_ops import (
+    ReplyFulfillmentOpsService,
+    build_reply_fulfillment_ops_service,
+)
+from .services.reply_fulfillment_workflow import (
+    ReplyFulfillmentWorkflow,
+    ReplySender,
+    build_reply_fulfillment_workflow,
+)
 
 # 依赖插件
 require("embedding_provider")
@@ -28,12 +40,36 @@ require("permission_manager")
 require("user_ban")
 require("komari_memory")
 require("komari_decision")
+require("user_data")
 
 from komari_bot.plugins import komari_memory as memory_plugin
 from komari_bot.plugins import permission_manager as permission_manager_plugin
 from komari_bot.plugins import user_ban as user_ban_plugin
+from komari_bot.plugins import user_data as user_data_plugin
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
+
+
+def _get_reply_fulfillment_config() -> Any:
+    """合并聊天配置与记忆配置中履约需要的只读字段。"""
+    config = get_config()
+    memory_config = get_memory_config()
+    return SimpleNamespace(
+        proactive_cooldown=config.proactive_cooldown,
+        global_interaction_enabled=memory_config.global_interaction_enabled,
+        global_interaction_trigger_size=memory_config.global_interaction_trigger_size,
+        reply_fulfillment_lease_seconds=config.reply_fulfillment_lease_seconds,
+        reply_fulfillment_max_attempts=config.reply_fulfillment_max_attempts,
+        reply_fulfillment_retry_base_seconds=config.reply_fulfillment_retry_base_seconds,
+        reply_fulfillment_retry_max_seconds=config.reply_fulfillment_retry_max_seconds,
+        reply_fulfillment_batch_size=config.reply_fulfillment_batch_size,
+        reply_fulfillment_tombstone_retention_days=(
+            config.reply_fulfillment_tombstone_retention_days
+        ),
+        reply_fulfillment_freshness_seconds=(
+            config.reply_fulfillment_freshness_seconds
+        ),
+    )
 
 from komari_bot.plugins.komari_chat.services.config_interface import (
     get_config,
@@ -50,7 +86,12 @@ __plugin_meta__ = PluginMetadata(
 matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 
 _handler: MessageHandler | None = None
-_reply_commit_worker_task: asyncio.Task[None] | None = None
+_handler_workflow: ReplyFulfillmentWorkflow | None = None
+_reply_fulfillment: ReplyFulfillmentWorkflow | None = None
+_reply_fulfillment_components: tuple[Any, Any, Any] | None = None
+_reply_fulfillment_ops: ReplyFulfillmentOpsService | None = None
+_reply_fulfillment_ops_components: tuple[Any, Any] | None = None
+_reply_fulfillment_worker_task: asyncio.Task[None] | None = None
 
 
 def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
@@ -67,52 +108,168 @@ def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
     return memory_manager.redis, memory_manager.memory, decision_engine
 
 
+def _resolve_ops_components() -> tuple[Any, Any] | None:
+    """履约运维的窄运行时边界：只依赖 PostgreSQL 与 Redis。
+
+    判定引擎只服务聊天判定与旧 workflow 的 gating，运维对账不需要它；
+    本边界不触碰 ``_resolve_runtime_components`` 的 decision-engine
+    gating，避免影响 handler / legacy workflow 既有就绪语义。
+    """
+    memory_manager = get_memory_plugin_manager()
+    if (
+        memory_manager is None
+        or memory_manager.redis is None
+        or memory_manager.memory is None
+    ):
+        return None
+    return memory_manager.redis, memory_manager.memory
+
+
 def _get_or_build_handler() -> MessageHandler | None:
-    global _handler  # noqa: PLW0603
+    global _handler, _handler_workflow  # noqa: PLW0603
 
     components = _resolve_runtime_components()
     if components is None:
         return None
     redis, memory, decision_engine = components
+    if (
+        _handler is not None
+        and _handler.decision_engine is decision_engine
+        and _handler_workflow is _reply_fulfillment
+        and _reply_fulfillment is not None
+    ):
+        return _handler
 
-    if _handler is None or _handler.decision_engine is not decision_engine:
+    workflow = _get_or_build_reply_fulfillment()
+    if workflow is None:
+        return None
+
+    if (
+        _handler is None
+        or _handler_workflow is not workflow
+        or _handler.decision_engine is not decision_engine
+    ):
         _handler = MessageHandler(
             redis=redis,
             memory=memory,
-            reply_commit_repository=ReplyCommitRepository(memory.pg_pool),
+            reply_fulfillment=workflow,
+            proactive_reservation=workflow.proactive_reservation,
             decision_engine=decision_engine,
         )
+        _handler_workflow = workflow
     return _handler
 
 
-async def _reply_commit_worker() -> None:
-    """周期重试已经确认送达的聊天副作用 outbox。"""
+def _get_recovery_senders() -> dict[tuple[str, str], ReplySender]:
+    """按当前在线 Bot 建立恢复 sender 映射（精确身份匹配）。
+
+    恢复只允许冻结时的原 ``bot_self_id`` + ``adapter_name`` 精确匹配
+    的在线 Bot 领取；sender 直接使用 ``bot.call_api``，不依赖 matcher
+    的隐式事件上下文。
+    """
+    return {
+        (str(bot.self_id), str(bot.type)): cast(
+            "ReplySender", OneBotReplySender(bot)
+        )
+        for bot in get_bots().values()
+    }
+
+
+def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
+    """构建并缓存回复履约工作流及其私有持久化 adapter。"""
+    global _reply_fulfillment, _reply_fulfillment_components  # noqa: PLW0603
+
+    components = _resolve_runtime_components()
+    if components is None:
+        return None
+    redis, memory, _decision_engine = components
+
+    current_components = _reply_fulfillment_components
+    same_components = current_components is not None and all(
+        current is actual
+        for current, actual in zip(current_components, components, strict=True)
+    )
+    if _reply_fulfillment is None or not same_components:
+        redis_client = getattr(redis, "redis", redis)
+        proactive_reservation = ProactiveReservationService(redis_client)
+        _reply_fulfillment = build_reply_fulfillment_workflow(
+            pg_pool=memory.pg_pool,
+            redis=redis,
+            proactive_reservation=proactive_reservation,
+            user_data=user_data_plugin,
+            config_getter=_get_reply_fulfillment_config,
+            recovery_senders_getter=_get_recovery_senders,
+            bots_provider=get_bots,
+            superusers_provider=_get_superusers,
+        )
+        _reply_fulfillment_components = components
+    return _reply_fulfillment
+
+
+def _get_superusers() -> set[str]:
+    """当前配置声明的 SUPERUSERS（告警私聊收件人）。"""
+    return set(get_driver().config.superusers)
+
+
+def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
+    """顶层窄 seam：向管理插件提供履约运维服务，不暴露内部 adapter。
+
+    只操作新父子表（不读取旧 outbox、不做双读双写），也不启动或唤醒
+    任何 worker；只依赖 PostgreSQL 与 Redis，判定引擎故障不拖垮运维；
+    依赖未就绪时返回 None，由管理 API 翻译为 503。
+    """
+    global _reply_fulfillment_ops, _reply_fulfillment_ops_components  # noqa: PLW0603
+
+    components = _resolve_ops_components()
+    if components is None:
+        return None
+    redis, memory = components
+
+    current_components = _reply_fulfillment_ops_components
+    same_components = current_components is not None and all(
+        current is actual
+        for current, actual in zip(current_components, components, strict=True)
+    )
+    if _reply_fulfillment_ops is None or not same_components:
+        redis_client = getattr(redis, "redis", redis)
+        _reply_fulfillment_ops = build_reply_fulfillment_ops_service(
+            pg_pool=memory.pg_pool,
+            redis_client=redis_client,
+        )
+        _reply_fulfillment_ops_components = components
+    return _reply_fulfillment_ops
+
+
+async def _reply_fulfillment_worker() -> None:
+    """周期恢复中断的回复履约：发送前恢复、承诺推进、告警与小时级清理。"""
     while True:
         try:
-            handler = _get_or_build_handler()
-            if handler is not None:
-                await handler.retry_pending_reply_commits()
-            interval = get_config().reply_commit_worker_interval_seconds
+            workflow = _get_or_build_reply_fulfillment()
+            if workflow is not None:
+                await workflow.recover_pending()
+            interval = get_config().reply_fulfillment_worker_interval_seconds
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("[KomariChat] 回复 outbox 后台轮询失败")
+            logger.exception("[KomariChat] 回复履约后台轮询失败")
             interval = 5
         await asyncio.sleep(max(1, interval))
 
 
-async def _start_reply_commit_worker() -> None:
-    """启动单进程 outbox 轮询任务。"""
-    global _reply_commit_worker_task  # noqa: PLW0603
-    if _reply_commit_worker_task is None or _reply_commit_worker_task.done():
-        _reply_commit_worker_task = asyncio.create_task(_reply_commit_worker())
+async def _start_reply_fulfillment_worker() -> None:
+    """启动单进程回复履约轮询任务。"""
+    global _reply_fulfillment_worker_task  # noqa: PLW0603
+    if _reply_fulfillment_worker_task is None or _reply_fulfillment_worker_task.done():
+        _reply_fulfillment_worker_task = asyncio.create_task(
+            _reply_fulfillment_worker()
+        )
 
 
-async def _stop_reply_commit_worker() -> None:
-    """停止 outbox 轮询任务并等待退出。"""
-    global _reply_commit_worker_task  # noqa: PLW0603
-    task = _reply_commit_worker_task
-    _reply_commit_worker_task = None
+async def _stop_reply_fulfillment_worker() -> None:
+    """停止回复履约轮询任务并等待退出。"""
+    global _reply_fulfillment_worker_task  # noqa: PLW0603
+    task = _reply_fulfillment_worker_task
+    _reply_fulfillment_worker_task = None
     if task is None:
         return
     task.cancel()
@@ -121,8 +278,8 @@ async def _stop_reply_commit_worker() -> None:
 
 
 driver = get_driver()
-driver.on_startup(_start_reply_commit_worker)
-driver.on_shutdown(_stop_reply_commit_worker)
+driver.on_startup(_start_reply_fulfillment_worker)
+driver.on_shutdown(_stop_reply_fulfillment_worker)
 
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
@@ -139,21 +296,6 @@ async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
         )
     except Exception as e:
         logger.debug("[KomariChat] 表情反应发送失败: {}", e)
-
-
-def _extract_platform_message_id(response: object) -> str | None:
-    """从 OneBot/NoneBot 发送结果中提取可对账的平台消息 ID。"""
-    candidate: object | None = None
-    if isinstance(response, dict):
-        candidate = response.get("message_id")
-        if candidate is None and isinstance(response.get("data"), dict):
-            candidate = response["data"].get("message_id")
-    else:
-        candidate = getattr(response, "message_id", None)
-    if candidate is None:
-        return None
-    value = str(candidate).strip()
-    return value or None
 
 
 async def generate_debug_reply(
@@ -234,10 +376,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         reply_allowed = False
 
     pending_reply: PendingReply | None = None
-    reply_delivered = False
-    reply_prepared = False
-    delivery_outcome = "not_sent"
-    platform_message_id: str | None = None
     try:
         pending_reply = await handler.process_message(
             bot,
@@ -248,86 +386,38 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         if pending_reply is None:
             return
 
-        reply = pending_reply.reply
-        reply_to_message_id = pending_reply.reply_to_message_id
-        if not reply:
-            await handler.discard_pending_reply(pending_reply)
-            return
+        workflow = _get_or_build_reply_fulfillment()
+        if workflow is None:
+            msg = "KomariChat 回复履约工作流未初始化"
+            raise RuntimeError(msg)  # noqa: TRY301
 
-        prepare_pending = getattr(handler, "prepare_pending_reply", None)
-        if callable(prepare_pending):
-            reply_prepared = bool(
-                await cast(
-                    "Awaitable[object]",
-                    prepare_pending(pending_reply),
-                )
+        async def _send_reply(actual_pending_reply: Any) -> object:
+            """用 OneBot 窄边界发送，统一富文本/纯文本降级与三态翻译。
+
+            发送载荷投影自履约冻结的群与引用目标，不依赖 matcher 的
+            隐式事件上下文；平台异常细节由边界翻译，不在此旁路。
+            """
+            request = cast(
+                "DeliveryRequest",
+                SimpleNamespace(
+                    group_id=actual_pending_reply.message.group_id,
+                    reply=actual_pending_reply.reply,
+                    reply_to_message_id=actual_pending_reply.reply_to_message_id,
+                ),
             )
-            if not reply_prepared:
-                logger.info("[KomariChat] 重复回复 operation 已存在，取消本次发送")
-                await handler.discard_pending_reply(pending_reply)
-                pending_reply = None
-                return
+            return await OneBotReplySender(bot)(request)
 
-        if reply_to_message_id:
-            message_array = [
-                {"type": "reply", "data": {"id": reply_to_message_id}},
-                {"type": "text", "data": {"text": reply}},
-            ]
-            try:
-                response = await bot.call_api(
-                    "send_group_msg",
-                    group_id=int(event.group_id),
-                    message=message_array,
-                )
-            except ActionFailed as e:
-                logger.warning("[KomariChat] 原生回复失败: {}，降级普通发送", e)
-                try:
-                    response = await matcher.send(plain_text_message(reply))
-                except ActionFailed:
-                    raise
-                except Exception:
-                    delivery_outcome = "unknown"
-                    raise
-            except Exception:
-                delivery_outcome = "unknown"
-                raise
-            platform_message_id = _extract_platform_message_id(response)
-        else:
-            try:
-                response = await matcher.send(plain_text_message(reply))
-            except ActionFailed:
-                raise
-            except Exception:
-                delivery_outcome = "unknown"
-                raise
-            platform_message_id = _extract_platform_message_id(response)
-        delivery_outcome = "delivered"
-        reply_delivered = True
-        await handler.commit_delivered_reply(
+        fulfilled = await workflow.fulfill(
             pending_reply,
-            platform_message_id=platform_message_id,
+            send_reply=_send_reply,
         )
+        if fulfilled is False:
+            return
+        decision_payload = getattr(pending_reply, "decision_payload", None)
+        log_decision = getattr(handler, "_log_decision", None)
+        if decision_payload is not None and callable(log_decision):
+            log_decision(decision_payload)
     except Exception as exc:
-        if pending_reply is not None and not reply_delivered:
-            if delivery_outcome == "not_sent":
-                if reply_prepared:
-                    cancel_prepared = getattr(handler, "cancel_prepared_reply", None)
-                    if callable(cancel_prepared):
-                        try:
-                            await cast(
-                                "Awaitable[object]",
-                                cancel_prepared(pending_reply),
-                            )
-                        except Exception:
-                            logger.exception(
-                                "[KomariChat] 发送失败后的 outbox 取消失败"
-                            )
-                await handler.discard_pending_reply(pending_reply)
-            else:
-                logger.error(
-                    "[KomariChat] 平台发送结果未知，保留 PREPARED 记录待对账: operation={}",
-                    pending_reply.operation_id,
-                )
         logger.exception("[KomariChat] 消息处理失败")
         # 失败善后：reaction_sent 以 PendingReply 字段为真源（生成前是否贴出表情）；
         # 回复未送达时补发群内错误文本，所有未处理异常均通知 SUPERUSER
@@ -351,3 +441,14 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             ),
             reason=pending_reply.reason if pending_reply is not None else None,
         )
+
+
+# 跨插件普通 import 只允许经本顶层暴露面（ADR-0006）：外部插件不得
+# import 任意 komari_chat.* 子模块。
+__all__ = [
+    "ReplyFulfillmentOpsConflictError",
+    "ReplyFulfillmentOpsNotFoundError",
+    "ReplyFulfillmentOpsValidationError",
+    "generate_debug_reply",
+    "get_reply_fulfillment_ops_service",
+]

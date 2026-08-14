@@ -295,14 +295,21 @@ class ProactiveReservationService:
             raise RuntimeError(msg)
         return code in {1, 2}
 
-    async def _release_reservation(self, reservation: Reservation) -> bool:
-        """释放尚未确认送达的主动回复预占；重复释放安全。"""
+    async def release(self, group_id: str, reservation_id: str) -> bool:
+        """按持久化的群与预占 ID 幂等释放 pending 名额（无需进程句柄）。
+
+        崩溃恢复只凭冻结的群与预占 ID 也能释放；永不撤销 confirmed 名额。
+        """
         result = await self._redis.execute_command(
             "EVAL",
             _PROACTIVE_RELEASE_SCRIPT,
             2,
-            self._cooldown_key(reservation.group_id),
-            self._slots_key(reservation.group_id),
-            reservation.reservation_id,
+            self._cooldown_key(group_id),
+            self._slots_key(group_id),
+            reservation_id,
         )
         return int(cast("int | str | bytes", result)) > 0
+
+    async def _release_reservation(self, reservation: Reservation) -> bool:
+        """释放尚未确认送达的主动回复预占；重复释放安全。"""
+        return await self.release(reservation.group_id, reservation.reservation_id)

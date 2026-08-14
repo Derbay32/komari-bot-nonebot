@@ -17,6 +17,7 @@ from nonebot import logger
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
+from .errors import FavorabilityIdempotencyConflictError, UserDataUnavailableError
 from .models import (
     FavorabilityAdjustmentResult,
     FavorabilitySetResult,
@@ -67,10 +68,15 @@ class UserDataDB:
             logger.debug("[UserDataDB] PostgreSQL 连接初始化完成")
 
     def _require_ready(self) -> None:
-        """未初始化时拒绝读写，保持原“连接池未初始化”错误语义。"""
+        """未初始化时拒绝读写，保持原“连接池未初始化”错误语义。
+
+        未就绪时抛 :class:`UserDataUnavailableError`，其类属性
+        ``error_code == "service_unavailable"``，供上游（如 komari_chat
+        承诺执行器）按结构化错误码分类；消息正文保持原状。
+        """
         if not self._ready:
             msg = "UserDataDB 连接池未初始化"
-            raise RuntimeError(msg)
+            raise UserDataUnavailableError(msg)
 
     async def close(self) -> None:
         """重置就绪状态；engine 生命周期由 nonebot-plugin-orm 托管。"""
@@ -168,7 +174,7 @@ class UserDataDB:
                             raise RuntimeError(msg)
                         if existing_user != user_id or existing_delta != delta:
                             msg = "好感度 operation_id 与既有请求载荷冲突"
-                            raise ValueError(msg)
+                            raise FavorabilityIdempotencyConflictError(msg)
                         return FavorabilityAdjustmentResult.from_values(
                             user_id=existing_user,
                             before=int(before_value),
@@ -248,6 +254,28 @@ class UserDataDB:
             after=after,
             updated_at=row[2].isoformat(),
         )
+
+    async def delete_favorability_operation(self, operation_id: str) -> bool:
+        """精确删除一条好感度幂等账本，幂等返回是否实际删除。
+
+        只按 ``operation_id`` 主键删除单条账本，不影响好感度现值；
+        履约终态清理在保护期结束时用它清除下游幂等证据。
+        """
+        self._require_ready()
+        session = _open_session()
+        try:
+            async with session.begin():
+                result = cast(
+                    "CursorResult[Any]",
+                    await session.execute(
+                        delete(UserFavorabilityAdjustmentLedgerRow).where(
+                            _LEDGER.c.operation_id == operation_id
+                        )
+                    ),
+                )
+        finally:
+            await session.close()
+        return int(result.rowcount or 0) > 0
 
     async def cleanup_adjustment_ledger(self, *, retention_days: int) -> int:
         """清理超过防重窗口的好感度 operation 账本。"""

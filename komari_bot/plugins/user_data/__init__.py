@@ -8,6 +8,12 @@ from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import DynamicConfigSchema
 from .database import UserDataDB
+from .errors import (
+    FavorabilityIdempotencyConflictError,
+    UserDataDisabledError,
+    UserDataStoppingError,
+    UserDataUnavailableError,
+)
 from .models import (
     FavorabilityAdjustmentResult,
     FavorabilitySetResult,
@@ -18,14 +24,6 @@ from .models import (
 
 if TYPE_CHECKING:
     from nonebot.internal.driver import Driver
-
-
-class UserDataDisabledError(RuntimeError):
-    """user_data 已被动态配置关闭。"""
-
-
-class UserDataStoppingError(RuntimeError):
-    """user_data 正在或已经关闭，不允许重新建立连接池。"""
 
 
 __plugin_meta__ = PluginMetadata(
@@ -201,6 +199,16 @@ async def cleanup_favorability_operations(*, retention_days: int) -> int:
     return await db.cleanup_adjustment_ledger(retention_days=retention_days)
 
 
+async def delete_favorability_operation(operation_id: str) -> bool:
+    """按 operation_id 精确删除一条好感度幂等账本，幂等返回是否删除。
+
+    供履约终态清理在保护期结束时清除下游好感度证据；不替换
+    ``cleanup_favorability_operations`` 旧批量路径。
+    """
+    db = await get_db()
+    return await db.delete_favorability_operation(operation_id)
+
+
 async def get_user_count() -> int:
     """获取总用户数。"""
     db = await get_db()
@@ -229,13 +237,16 @@ async def set_user_favorability(
 
 __all__ = [
     "FavorabilityAdjustmentResult",
+    "FavorabilityIdempotencyConflictError",
     "FavorabilitySetResult",
     "FavorabilityStage",
     "UserDataDisabledError",
     "UserDataStoppingError",
+    "UserDataUnavailableError",
     "UserFavorability",
     "adjust_user_favorability",
     "cleanup_favorability_operations",
+    "delete_favorability_operation",
     "get_favorability_stage",
     "get_user_count",
     "get_user_favorability",

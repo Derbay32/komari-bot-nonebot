@@ -344,6 +344,19 @@ class _DummyBindingManager:
 
 
 class _DummyChatPlugin:
+    class ReplyFulfillmentOpsConflictError(Exception):
+        pass
+
+    class ReplyFulfillmentOpsNotFoundError(Exception):
+        pass
+
+    class ReplyFulfillmentOpsValidationError(Exception):
+        pass
+
+    @staticmethod
+    def get_reply_fulfillment_ops_service() -> object | None:
+        return None
+
     @staticmethod
     async def generate_debug_reply(**kwargs: object) -> object:
         from komari_bot.plugins.agent_run_logger.diagnostic import (
@@ -491,7 +504,21 @@ _inject_package_exports(
 )
 _inject_package_exports(
     "komari_chat",
-    {"generate_debug_reply": _DummyChatPlugin.generate_debug_reply},
+    {
+        "generate_debug_reply": _DummyChatPlugin.generate_debug_reply,
+        "get_reply_fulfillment_ops_service": (
+            _DummyChatPlugin.get_reply_fulfillment_ops_service
+        ),
+        "ReplyFulfillmentOpsConflictError": (
+            _DummyChatPlugin.ReplyFulfillmentOpsConflictError
+        ),
+        "ReplyFulfillmentOpsNotFoundError": (
+            _DummyChatPlugin.ReplyFulfillmentOpsNotFoundError
+        ),
+        "ReplyFulfillmentOpsValidationError": (
+            _DummyChatPlugin.ReplyFulfillmentOpsValidationError
+        ),
+    },
 )
 _inject_package_exports(
     "agent_run_logger",

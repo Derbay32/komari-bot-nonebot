@@ -117,6 +117,7 @@ def _build_components() -> ManagementApiComponents:
         register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
+        reply_fulfillment_service_getter=lambda: None,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -173,6 +174,11 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/v2/komari-announce/maintenance" in schema["paths"]
     assert "/api/v2/komari-decision-scenes/scenes" in schema["paths"]
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
+    assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
+    assert (
+        "/api/v2/reply-fulfillments/fulfillments/{fulfillment_id}/confirm-delivered"
+        in schema["paths"]
+    )
     assert "/api/llm-provider/v1/reply-logs" not in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(
@@ -185,7 +191,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "/api/v2/agent-run-logs, /api/v2/komari-search, "
         "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
         "/api/v2/komari-announce, /api/v2/komari-decision-scenes, "
-        "/api/v2/komari-user-bans"
+        "/api/v2/komari-user-bans, /api/v2/reply-fulfillments"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "
@@ -260,6 +266,7 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                     "announce:read",
                     "scene:read",
                     "user_ban:read",
+                    "reply_fulfillment:read",
                 ],
             }
         ],
@@ -328,6 +335,10 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 "/api/v2/komari-user-bans/bans",
                 headers=headers,
                 json={"user_id": "10086", "scope": "chat"},
+            ),
+            await client.post(
+                "/api/v2/reply-fulfillments/fulfillments/reply-1/confirm-not-delivered",
+                headers=headers,
             ),
         ]
 
