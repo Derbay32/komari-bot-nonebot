@@ -22,17 +22,16 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
     from typing import Any
 
-from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
-    ConversationProcessingLifecycle,
-    InvalidChunkLedgerError,
-)
-
 from komari_bot.plugins.komari_memory.services import (
     conversation_processing_lifecycle as lifecycle_module,
 )
 from komari_bot.plugins.komari_memory.services.conversation_processing import (
     ConversationLeaseLostError,
     ConversationSnapshotClaim,
+)
+from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
+    ConversationProcessingLifecycle,
+    InvalidChunkLedgerError,
 )
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
