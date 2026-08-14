@@ -572,20 +572,21 @@ def test_lease_renewal_uses_frozen_ttl_not_live_config(
         await original_sleep(0)
 
     monkeypatch.setattr(proactive_reservation_module.asyncio, "sleep", _fast_sleep)
-    # 配置热更：ttl 改为 900 秒
-    monkeypatch.setattr(
-        proactive_reservation_module,
-        "get_config",
-        lambda: SimpleNamespace(
-            proactive_cooldown=300,
-            proactive_max_per_hour=10,
-            proactive_reservation_ttl_seconds=900,
-        ),
-    )
 
     async def _scenario() -> None:
         lease = await service.reserve("group-1", "message-1")
         assert isinstance(lease, ProactiveLease)
+        # 配置热更：ttl 改为 900 秒（须在 reserve 冻结快照之后，
+        # 续租延长量才按 reserve 时的 30 秒而非热更后的 900 秒）
+        monkeypatch.setattr(
+            proactive_reservation_module,
+            "get_config",
+            lambda: SimpleNamespace(
+                proactive_cooldown=300,
+                proactive_max_per_hour=10,
+                proactive_reservation_ttl_seconds=900,
+            ),
+        )
         async with lease:
             fake.now_ms += 10_000
             for _ in range(5):
