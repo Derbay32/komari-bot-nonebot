@@ -269,7 +269,9 @@ def test_reserve_is_atomic_for_concurrent_requests(
     results = asyncio.run(_reserve_pair())
 
     leases = [r for r in results if isinstance(r, ProactiveLease)]
-    denied = [r for r in results if isinstance(r, ReservationDenied)]
+    denied: list[ReservationDenied] = [
+        r for r in results if isinstance(r, ReservationDenied)
+    ]
     assert len(leases) == 1
     assert len(denied) == 1
     assert denied[0].reason == "cooldown"

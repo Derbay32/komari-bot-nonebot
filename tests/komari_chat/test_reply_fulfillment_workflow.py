@@ -501,6 +501,7 @@ async def test_commitment_cooldown_comes_from_handoff_snapshot_not_live_config(
     payload = repository.commitment_payloads["reply-operation-snapshot"][
         "proactive_reply_confirmation"
     ]
+    assert payload is not None
     assert payload["group_id"] == "group-1"
     assert payload["reservation_id"] == "reservation-1"
     assert payload["cooldown_seconds"] == 42
