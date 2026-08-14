@@ -7,12 +7,13 @@ from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import DynamicConfigSchema
-from .database import (
+from .database import UserDataDB
+from .errors import (
     FavorabilityIdempotencyConflictError,
-    UserDataDB,
+    UserDataDisabledError,
+    UserDataStoppingError,
     UserDataUnavailableError,
 )
-from .errors import UserDataDisabledError, UserDataStoppingError
 from .models import (
     FavorabilityAdjustmentResult,
     FavorabilitySetResult,
