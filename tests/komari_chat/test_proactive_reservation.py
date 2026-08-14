@@ -157,6 +157,22 @@ def _build_service(
     return service, fake
 
 
+@pytest.fixture
+def _fast_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把 module 的 asyncio.sleep 快进为立即返回，驱动续租后台循环。
+
+    保留对真实 sleep 的一次 ``await original_sleep(0)`` 让出事件循环，
+    语义与各租约生命周期测试原有的逐字快进块完全一致。
+    """
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_delay: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(proactive_reservation_module.asyncio, "sleep", _fast_sleep)
+
+
 # ── reserve 成功路径：租约形态 + 冻结快照 ──────────────────────
 
 
@@ -360,18 +376,13 @@ def test_handoff_release_does_not_revoke_confirmed_slot(
 
 def test_lease_renewal_extends_pending_ttl_while_active(
     monkeypatch: pytest.MonkeyPatch,
+    _fast_sleep: None,
 ) -> None:
     """进入 async with 后内部续租随时间前移延长 pending 成员 TTL。"""
     service, fake = _build_service(
         monkeypatch,
         proactive_reservation_ttl_seconds=30,
     )
-    original_sleep = asyncio.sleep
-
-    async def _fast_sleep(_delay: float) -> None:
-        await original_sleep(0)
-
-    monkeypatch.setattr(proactive_reservation_module.asyncio, "sleep", _fast_sleep)
 
     async def _scenario() -> None:
         lease = await service.reserve("group-1", "message-1")
@@ -390,18 +401,13 @@ def test_lease_renewal_extends_pending_ttl_while_active(
 
 def test_lease_renewal_stops_after_handoff(
     monkeypatch: pytest.MonkeyPatch,
+    _fast_sleep: None,
 ) -> None:
     """移交成功后续租停止：pending TTL 不再随时间前移被延长。"""
     service, fake = _build_service(
         monkeypatch,
         proactive_reservation_ttl_seconds=30,
     )
-    original_sleep = asyncio.sleep
-
-    async def _fast_sleep(_delay: float) -> None:
-        await original_sleep(0)
-
-    monkeypatch.setattr(proactive_reservation_module.asyncio, "sleep", _fast_sleep)
 
     async def _scenario() -> None:
         lease = await service.reserve("group-1", "message-1")
@@ -527,6 +533,7 @@ def test_handoff_after_exit_raises_state_error(
 
 def test_background_renewal_failure_does_not_kill_lease(
     monkeypatch: pytest.MonkeyPatch,
+    _fast_sleep: None,
 ) -> None:
     """内部续租遇一次失败只记日志，租约仍可用，后续 handoff 正常成功。
 
@@ -536,12 +543,6 @@ def test_background_renewal_failure_does_not_kill_lease(
         monkeypatch,
         proactive_reservation_ttl_seconds=30,
     )
-    original_sleep = asyncio.sleep
-
-    async def _fast_sleep(_delay: float) -> None:
-        await original_sleep(0)
-
-    monkeypatch.setattr(proactive_reservation_module.asyncio, "sleep", _fast_sleep)
 
     async def _scenario() -> None:
         lease = await service.reserve("group-1", "message-1")
@@ -562,18 +563,13 @@ def test_background_renewal_failure_does_not_kill_lease(
 
 def test_lease_renewal_uses_frozen_ttl_not_live_config(
     monkeypatch: pytest.MonkeyPatch,
+    _fast_sleep: None,
 ) -> None:
     """冻结快照不受配置热更漂移影响：续租延长量按 reserve 时的 ttl。"""
     service, fake = _build_service(
         monkeypatch,
         proactive_reservation_ttl_seconds=30,
     )
-    original_sleep = asyncio.sleep
-
-    async def _fast_sleep(_delay: float) -> None:
-        await original_sleep(0)
-
-    monkeypatch.setattr(proactive_reservation_module.asyncio, "sleep", _fast_sleep)
 
     async def _scenario() -> None:
         lease = await service.reserve("group-1", "message-1")
