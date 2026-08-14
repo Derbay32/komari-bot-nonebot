@@ -117,7 +117,7 @@ class _PendingReply(Protocol):
     def proactive_reservation_id(self) -> str | None: ...
 
     @property
-    def proactive_reservation(self) -> Any: ...
+    def proactive_handoff(self) -> Any: ...
 
 
 class _ReplyFulfillmentRepository(Protocol):
@@ -293,6 +293,7 @@ class ReplyFulfillmentWorkflow:
             "emotion": str(interaction_history["emotion"]),
         }
         display_name = self._resolve_display_name(pending_reply.message)
+        handoff = pending_reply.proactive_handoff
         commitments = build_reply_fulfillment_commitments(
             group_id=pending_reply.message.group_id,
             user_id=pending_reply.message.user_id,
@@ -305,7 +306,13 @@ class ReplyFulfillmentWorkflow:
             favorability_reason=favorability_reason,
             interaction_history=interaction_record,
             proactive_reservation_id=pending_reply.proactive_reservation_id,
-            proactive_cooldown_seconds=int(config.proactive_cooldown),
+            # 冷却时长取移交凭据的 reserve 冻结快照，不现读配置；无凭据
+            # （强制回复）路径维持现读配置语义。
+            proactive_cooldown_seconds=(
+                int(handoff.cooldown_seconds)
+                if handoff is not None
+                else int(config.proactive_cooldown)
+            ),
             global_interaction_enabled=bool(config.global_interaction_enabled),
             global_interaction_trigger_size=int(
                 config.global_interaction_trigger_size
@@ -337,11 +344,12 @@ class ReplyFulfillmentWorkflow:
         return await self.repository.prepare(draft)
 
     async def _release_reservation(self, pending_reply: _PendingReply) -> None:
-        reservation = pending_reply.proactive_reservation
-        if reservation is None:
+        """履约失败路径：经移交凭据幂等释放预占（无凭据则无事可做）。"""
+        handoff = pending_reply.proactive_handoff
+        if handoff is None:
             return
         try:
-            await reservation.release()
+            await handoff.release()
         except Exception:
             logger.exception(
                 "[KomariChat] 主动回复预占释放失败，将等待 TTL 回收: group={}",
