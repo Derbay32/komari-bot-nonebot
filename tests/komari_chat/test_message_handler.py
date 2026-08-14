@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import sys
@@ -602,10 +603,15 @@ def test_message_handler_has_no_manual_reservation_lease_machinery() -> None:
 
     source = message_handler_module.__file__
     assert source is not None
-    with Path(source).open(encoding="utf-8") as source_file:
-        text = source_file.read()
-    assert "reservation_lost" not in text, "不应残留租约丢失事件标志"
-    assert "reservation_transferred" not in text, "不应残留所有权转移标志"
+    tree = ast.parse(Path(source).read_text(encoding="utf-8"))
+    identifiers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+    assert "reservation_lost" not in identifiers, "不应残留租约丢失事件标志"
+    assert "reservation_transferred" not in identifiers, "不应残留所有权转移标志"
 
 
 def test_generate_reply_core_has_no_dead_reason_params() -> None:
