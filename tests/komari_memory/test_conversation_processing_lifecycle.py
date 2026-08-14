@@ -1,7 +1,7 @@
 """对话 processing 生命周期 module（TSK-150）L1 验收测试。
 
-被测 module（komari_bot/plugins/komari_memory/services/conversation_processing_lifecycle.py）
-尚不存在：本文件在收集阶段即因 import 失败而整体红态，这是 TDD 红阶段而非缺陷。
+被测 module：komari_bot/plugins/komari_memory/services/conversation_processing_lifecycle.py
+（经 TDD 红绿流程落地，本文件先行于实现提交）。
 
 - fake 形态与用例清单：docs/research/2026-08-15-processing-lifecycle-test-plan.md §1-§3；
 - 行为裁判：docs/research/2026-08-14-summary-processing-lifecycle-facts.md F1-F25；

@@ -1,8 +1,8 @@
 """KomariMemory 总结业务处理器 L2 测试（TSK-151）。
 
-被测 interface（komari_bot/plugins/komari_memory/handlers/summary_worker.py）中
-ConversationSummaryProcessor / SummaryCollectorProvider 尚不存在：本文件在收集
-阶段即因 import 失败而整体红态，这是 TDD 红阶段而非缺陷。
+被测 interface：komari_bot/plugins/komari_memory/handlers/summary_worker.py 的
+ConversationSummaryProcessor / SummaryCollectorProvider（经 TDD 红绿流程落地，本文件
+先行于实现提交）。
 
 - 用例清单：docs/research/2026-08-15-processing-lifecycle-test-plan.md §4；
 - 行为裁判：docs/research/2026-08-14-summary-processing-lifecycle-facts.md
