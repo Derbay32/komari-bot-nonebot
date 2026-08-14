@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import sys
 import types
 from contextlib import asynccontextmanager
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -21,12 +23,17 @@ from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchem
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    import pytest
+import pytest
 
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+proactive_reservation_module = import_module(
+    "komari_bot.plugins.komari_chat.services.proactive_reservation"
+)
+ReservationDenied = proactive_reservation_module.ReservationDenied
+ReservationLostError = proactive_reservation_module.ReservationLostError
 
 
 def _patch_both_configs(
@@ -578,6 +585,35 @@ def test_message_handler_has_no_direct_side_effect_path() -> None:
     assert "reply_commit_repository" not in signature.parameters
 
 
+def test_message_handler_has_no_manual_reservation_lease_machinery() -> None:
+    """AC-2 守卫：预占段无续租任务管理、无丢失事件、无所有权转移标志。
+
+    续租节奏、丢失裁决与失败路径释放全部收编到租约 module
+    （async with 退出协议结构默认完成）；handler 不得残留手工
+    heartbeat / lost event / transferred 标志 / finally 条件释放。
+    """
+    removed_methods = (
+        "_proactive_reservation_heartbeat",
+        "_release_proactive_reservation",
+    )
+    for method_name in removed_methods:
+        assert not hasattr(message_handler_module.MessageHandler, method_name), (
+            f"MessageHandler 不应再保留预占手工续租/释放方法 {method_name}"
+        )
+
+    source = message_handler_module.__file__
+    assert source is not None
+    tree = ast.parse(Path(source).read_text(encoding="utf-8"))
+    identifiers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+    assert "reservation_lost" not in identifiers, "不应残留租约丢失事件标志"
+    assert "reservation_transferred" not in identifiers, "不应残留所有权转移标志"
+
+
 def test_generate_reply_core_has_no_dead_reason_params() -> None:
     """KOMARIBOT-11 守卫：_reason/_reply_score 死参数已删除。"""
     signature = inspect.signature(
@@ -934,8 +970,32 @@ class _FakeRedisForDebug:
         )
 
 
-class _FakeReservation:
-    """fake module 的预占句柄：续租/释放调用记录回所属服务（KOMARIBOT-9）。"""
+class _FakeReservationHandoff:
+    """移交凭据 fake：冻结身份快照 + 记录调用的幂等 release()。"""
+
+    def __init__(
+        self,
+        group_id: str,
+        reservation_id: str,
+        cooldown_seconds: int,
+    ) -> None:
+        self.group_id = group_id
+        self.reservation_id = reservation_id
+        self.cooldown_seconds = cooldown_seconds
+        self.release_calls: list[str] = []
+
+    async def release(self) -> bool:
+        self.release_calls.append(self.reservation_id)
+        return len(self.release_calls) == 1
+
+
+class _FakeProactiveLease:
+    """租约形态 fake：async with + handoff()；不建模内部续租（module 自测覆盖）。
+
+    handoff 可注入 ReservationLostError 以驱动 handler 的丢失失败分流；
+    记录 entered / exited / handed_off 结构标志（只断言协议结构，不断言
+    释放等动词调用编排）。
+    """
 
     def __init__(
         self,
@@ -946,51 +1006,68 @@ class _FakeReservation:
         self._service = service
         self.group_id = group_id
         self.reservation_id = reservation_id
+        self.entered = False
+        self.exited = False
+        self.handed_off = False
 
-    async def renew(self) -> bool:
-        self._service.renew_calls.append(
-            {"group_id": self.group_id, "reservation_id": self.reservation_id}
-        )
-        return self._service.renew_result
+    async def __aenter__(self) -> "_FakeProactiveLease":
+        self.entered = True
+        return self
 
-    async def release(self) -> bool:
-        self._service.release_calls.append(
-            {"group_id": self.group_id, "reservation_id": self.reservation_id}
+    async def __aexit__(
+        self,
+        _exc_type: object,
+        _exc: object,
+        _tb: object,
+    ) -> None:
+        self.exited = True
+
+    async def handoff(self) -> _FakeReservationHandoff:
+        if self.handed_off:
+            msg = "重复 handoff"
+            raise proactive_reservation_module.ReservationStateError(msg)
+        if self._service.handoff_error is not None:
+            raise self._service.handoff_error
+        self.handed_off = True
+        return _FakeReservationHandoff(
+            self.group_id,
+            self.reservation_id,
+            self._service.cooldown_seconds,
         )
-        return True
 
 
 class _FakeProactiveReservation:
-    """fake proactive_reservation module：记录四动词调用，断言编排分支。"""
+    """租约形态的预占 module fake：reserve 返回租约或 ReservationDenied。
 
-    def __init__(self) -> None:
-        self.reserve_calls: list[dict[str, str]] = []
-        self.confirm_calls: list[dict[str, object]] = []
-        self.renew_calls: list[dict[str, str]] = []
-        self.release_calls: list[dict[str, str]] = []
-        self.reservation_status = "reserved"
-        self.renew_result = True
+    只提供领域结果开关（denied reason / handoff 错误），不记录动词调用
+    序列——handler 侧断言一律走领域结果（回复、失败信息、遥测文案、
+    租约协议结构）。
+    """
+
+    def __init__(
+        self,
+        *,
+        cooldown_seconds: int = 300,
+        denied_reason: str | None = None,
+        handoff_error: BaseException | None = None,
+    ) -> None:
+        self.cooldown_seconds = cooldown_seconds
+        self.denied_reason = denied_reason
+        self.handoff_error = handoff_error
+        self.last_lease: _FakeProactiveLease | None = None
 
     async def reserve(
         self, group_id: str, reservation_id: str
-    ) -> _FakeReservation | str:
-        self.reserve_calls.append(
-            {"group_id": group_id, "reservation_id": reservation_id}
-        )
-        if self.reservation_status == "reserved":
-            return _FakeReservation(self, group_id, reservation_id)
-        return self.reservation_status
-
-    async def confirm(
-        self, group_id: str, reservation_id: str, *, cooldown_seconds: int
-    ) -> None:
-        self.confirm_calls.append(
-            {
-                "group_id": group_id,
-                "reservation_id": reservation_id,
-                "cooldown_seconds": cooldown_seconds,
-            }
-        )
+    ) -> _FakeProactiveLease | ReservationDenied:
+        if self.denied_reason is not None:
+            return ReservationDenied(
+                group_id=group_id,
+                reservation_id=reservation_id,
+                reason=self.denied_reason,
+            )
+        lease = _FakeProactiveLease(self, group_id, reservation_id)
+        self.last_lease = lease
+        return lease
 
 
 class _FakeMemoryForDebug:
@@ -1049,13 +1126,11 @@ def test_generate_debug_reply_skips_all_side_effects(
     redis = _FakeRedisForDebug()
     memory = _FakeMemoryForDebug()
     fake_user_data = _FakeUserDataForDebug()
-    reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.memory = memory
-    handler.proactive_reservation = reservation_svc
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1132,11 +1207,8 @@ def test_generate_debug_reply_skips_all_side_effects(
     # 断言零副作用
     assert redis.pushed_messages == []  # 没有 push 当前消息或 AI 回复
     assert redis.pushed_global_interactions == []  # 没有写互动历史
-    # debug 路径完全不触达预占 module（冷却/频控零副作用）
-    assert reservation_svc.reserve_calls == []
-    assert reservation_svc.confirm_calls == []
-    assert reservation_svc.renew_calls == []
-    assert reservation_svc.release_calls == []
+    # debug 路径不触达预占 module（冷却/频控零副作用）：本测试未布线
+    # proactive_reservation，任何预占触达都会以 AttributeError 红灯
     assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
 
 
@@ -1435,12 +1507,16 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     assert redis.pushed_global_interactions == []
 
 
-def test_proactive_attempt_reserves_then_returns_frozen_pending_reply(
+def test_proactive_attempt_returns_pending_reply_carrying_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """主动回复生成前预占；送达前只返回携带该预占的待履约回复。"""
+    """主动回复生成前预占；送达前只返回携带移交凭据的待履约回复。
+
+    断言领域结果（回复内容、凭据冻结快照、租约协议结构），不断言
+    reserve/renew/release/confirm 动词调用编排。
+    """
     redis = _FakeRedisForDebug()
-    reservation_svc = _FakeProactiveReservation()
+    reservation_svc = _FakeProactiveReservation(cooldown_seconds=300)
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
@@ -1499,23 +1575,26 @@ def test_proactive_attempt_reserves_then_returns_frozen_pending_reply(
     assert stored is True
     assert failure is None
     assert pending_reply is not None
+    assert pending_reply.reply == "主动回复"
     assert pending_reply.proactive_reservation_id == "message-proactive"
-    # 编排分支：reserve 一次、生成完成最终续租一次，送达前不 confirm 不 release
-    assert reservation_svc.reserve_calls == [
-        {"group_id": "group-proactive", "reservation_id": "message-proactive"}
-    ]
-    assert reservation_svc.confirm_calls == []
-    assert reservation_svc.renew_calls == [
-        {"group_id": "group-proactive", "reservation_id": "message-proactive"}
-    ]
-    assert reservation_svc.confirm_calls == []
-    assert reservation_svc.release_calls == []
+    # 新形态：PendingReply 携带移交凭据（reserve 冻结快照），不再持活租约句柄
+    handoff = pending_reply.proactive_handoff
+    assert handoff is not None
+    assert handoff.group_id == "group-proactive"
+    assert handoff.reservation_id == "message-proactive"
+    assert handoff.cooldown_seconds == 300
+    assert not hasattr(pending_reply, "proactive_reservation")
+    # 租约经 async with 激活并 handoff 移交（协议结构，不断言动词调用编排）
+    lease = reservation_svc.last_lease
+    assert lease is not None
+    assert lease.entered is True
+    assert lease.handed_off is True
 
 
-def test_proactive_generation_failure_releases_reservation(
+def test_proactive_generation_failure_returns_failure_and_lease_exit_releases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """主动回复生成失败时立即释放名额，不等待预占 TTL。"""
+    """主动回复生成失败：失败路径未移交，预占释放由租约退出协议结构默认完成。"""
     redis = _FakeRedisForDebug()
     reservation_svc = _FakeProactiveReservation()
     handler = message_handler_module.MessageHandler.__new__(
@@ -1575,10 +1654,13 @@ def test_proactive_generation_failure_releases_reservation(
     assert failure.stage == "generate"
     assert failure.error_type == "_FavorabilityReadError"
     assert failure.reaction_sent is False
-    assert reservation_svc.release_calls == [
-        {"group_id": "group-proactive", "reservation_id": "message-failed"}
-    ]
-    assert reservation_svc.confirm_calls == []
+    # 失败路径未产生移交凭据：租约被 async with 正常退出，
+    # 释放由退出协议结构默认完成（无 finally 条件释放）
+    lease = reservation_svc.last_lease
+    assert lease is not None
+    assert lease.entered is True
+    assert lease.handed_off is False
+    assert lease.exited is True
 
 
 def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
@@ -2192,6 +2274,187 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
     assert failure.error_type == "RuntimeError"
     assert failure.reaction_sent is False
     assert reaction_called is False  # 还未到贴表情阶段
+
+
+class _RecordingLogger:
+    """记录 debug 文案的日志替身（遥测文案语义断言，不关心输出通道）。"""
+
+    def __init__(self) -> None:
+        self.debug_messages: list[str] = []
+
+    def debug(self, message: str, *_args: object, **_kwargs: object) -> None:
+        self.debug_messages.append(message)
+
+    def info(self, _message: str, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def warning(self, _message: str, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def exception(self, _message: str, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("denied_reason", "expected_log"),
+    [
+        ("cooldown", "[KomariChat] 主动回复冷却或生成预占中"),
+        ("rate_limited", "[KomariChat] 主动回复频率超限"),
+        ("duplicate", "[KomariChat] 主动回复消息已预占或已送达"),
+    ],
+)
+def test_proactive_denied_reason_records_branch_telemetry_and_returns_no_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    denied_reason: str,
+    expected_log: str,
+) -> None:
+    """ReservationDenied 按 reason 三分支记录遥测文案（原文案语义），正常控制流返回。"""
+    redis = _FakeRedisForDebug()
+    fake_logger = _RecordingLogger()
+    monkeypatch.setattr(message_handler_module, "logger", fake_logger)
+    reservation_svc = _FakeProactiveReservation(denied_reason=denied_reason)
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.proactive_reservation = reservation_svc
+    _patch_both_configs(
+        monkeypatch,
+        lambda: SimpleNamespace(
+            proactive_enabled=True,
+            proactive_max_per_hour=3,
+            proactive_reservation_ttl_seconds=360,
+            proactive_cooldown=300,
+            bot_nickname="小鞠",
+        ),
+    )
+    message = MessageSchema(
+        user_id="user-denied",
+        user_nickname="拒绝用户",
+        group_id="group-denied",
+        content="频控消息",
+        timestamp=1.0,
+        message_id="message-denied",
+    )
+
+    pending_reply, stored, failure = asyncio.run(
+        handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=False,
+            reason="score",
+            reply_score=0.95,
+            store_current=True,
+        )
+    )
+
+    assert pending_reply is None
+    assert stored is False
+    assert failure is None
+    assert fake_logger.debug_messages == [expected_log]
+
+
+def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ReservationLostError → ReplyFailureInfo(stage="generate", error_type="ProactiveReservationLostError")。
+
+    生成完成、移交时租约已丢失：表情已派发，failure.reaction_sent=True。
+    """
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    reservation_svc = _FakeProactiveReservation(
+        handoff_error=ReservationLostError(
+            group_id="group-lost",
+            reservation_id="message-lost",
+        )
+    )
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler._reaction_tasks = set()
+    handler.proactive_reservation = reservation_svc
+
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+        return [], [], True
+
+    async def _fake_generate_core(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="生成成功但租约已丢",
+            interaction_history={"event": "测试", "result": "生成成功", "emotion": "平静"},
+            favorability_delta=1,
+            favorability_reason="测试",
+        )
+
+    monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
+    monkeypatch.setattr(handler, "_generate_reply_core", _fake_generate_core)
+    _patch_both_configs(
+        monkeypatch,
+        lambda: SimpleNamespace(
+            proactive_enabled=True,
+            proactive_max_per_hour=3,
+            proactive_reservation_ttl_seconds=360,
+            proactive_cooldown=300,
+            bot_nickname="小鞠",
+            face_reaction_enabled=True,
+            face_reaction_id="76",
+            error_notify_enabled=False,
+        ),
+    )
+
+    reaction_called = False
+
+    async def _fake_reaction() -> None:
+        nonlocal reaction_called
+        reaction_called = True
+
+    message = MessageSchema(
+        user_id="user-lost",
+        user_nickname="丢失用户",
+        group_id="group-lost",
+        content="租约丢失消息",
+        timestamp=1.0,
+        message_id="message-lost",
+    )
+
+    pending_reply, stored, failure = asyncio.run(
+        handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
+            message=message,
+            reply_to_message_id=message.message_id,
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=False,
+            reason="score",
+            reply_score=0.95,
+            store_current=True,
+            on_reply_triggered=_fake_reaction,
+        )
+    )
+
+    assert pending_reply is None
+    assert stored is True
+    assert failure is not None
+    assert failure.stage == "generate"
+    assert failure.error_type == "ProactiveReservationLostError"
+    assert failure.reaction_sent is True
+    assert reaction_called is True
+    # 丢失路径未移交：租约退出协议承担释放
+    lease = reservation_svc.last_lease
+    assert lease is not None
+    assert lease.handed_off is False
+    assert lease.exited is True
 
 
 def test_pending_reply_does_not_retain_reaction_callback(

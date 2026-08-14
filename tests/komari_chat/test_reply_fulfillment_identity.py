@@ -42,9 +42,19 @@ class _FrozenFulfillmentStore:
         return fulfillment_id in self.records
 
 
-class _Reservation:
-    async def release(self) -> None:
-        return None
+class _ReservationHandoff:
+    """移交凭据 fake：冻结身份快照（与默认 pending 的预占身份一致）。
+
+    身份测试只关心承诺载荷冻结，凭据只需承载与默认预占一致的
+    group/reservation/cooldown 快照。
+    """
+
+    group_id = "group-1"
+    reservation_id = "reservation-1"
+    cooldown_seconds = 300
+
+    async def release(self) -> bool:
+        return True
 
 
 @pytest.fixture
@@ -122,8 +132,8 @@ def _pending_reply(
         request_trace_id=request_trace_id,
         reply_timestamp=reply_timestamp,
         proactive_reservation_id=proactive_reservation_id,
-        proactive_reservation=(
-            _Reservation() if proactive_reservation_id is not None else None
+        proactive_handoff=(
+            _ReservationHandoff() if proactive_reservation_id is not None else None
         ),
     )
 

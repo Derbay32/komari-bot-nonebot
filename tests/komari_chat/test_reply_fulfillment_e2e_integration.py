@@ -327,7 +327,7 @@ def _restarted_workflow(
 def _pending_reply(
     run_id: str,
     *,
-    reservation: proactive_module.Reservation | None,
+    handoff: proactive_module.ReservationHandoff | None,
     reservation_id: str | None = None,
     group_id: str = _E2E_GROUP_ID,
     user_id: str = _E2E_USER_ID,
@@ -371,9 +371,9 @@ def _pending_reply(
         proactive_reservation_id=(
             reservation_id
             if reservation_id is not None
-            else (reservation.reservation_id if reservation is not None else None)
+            else (handoff.reservation_id if handoff is not None else None)
         ),
-        proactive_reservation=reservation,
+        proactive_handoff=handoff,
     )
 
 
@@ -447,17 +447,19 @@ async def test_e2e_delivered_reply_full_lifecycle(
     )
     async with _stack(monkeypatch) as stack:
         try:
-            reservation = await stack.proactive.reserve(
+            lease = await stack.proactive.reserve(
                 _E2E_GROUP_ID, f"reservation-{run_id}"
             )
-            assert isinstance(reservation, proactive_module.Reservation)
+            assert isinstance(lease, proactive_module.ProactiveLease)
+            async with lease:
+                handoff = await lease.handoff()
 
             async def _send(_pending: object) -> ReplyDeliveryResult:
                 return ReplyDeliveryResult.delivered(
                     platform_message_id=f"platform-{run_id}"
                 )
 
-            pending = _pending_reply(run_id, reservation=reservation)
+            pending = _pending_reply(run_id, handoff=handoff)
             assert await stack.workflow.fulfill(pending, send_reply=_send) is True
 
             # 父终态完成且载荷最小化；平台消息 ID 持久化
@@ -528,7 +530,7 @@ async def test_e2e_delivered_reply_full_lifecycle(
             # 载荷必须与首次完全一致（含承诺子集），不同载荷属冲突语义
             duplicate = _pending_reply(
                 run_id,
-                reservation=None,
+                handoff=None,
                 reservation_id=f"reservation-{run_id}",
             )
             assert (
@@ -622,7 +624,7 @@ async def test_e2e_unresolved_fulfillment_keeps_persistent_evidence(
                     platform_message_id=f"platform-{run_id}"
                 )
 
-            pending = _pending_reply(run_id, reservation=None)
+            pending = _pending_reply(run_id, handoff=None)
             assert await stack.workflow.fulfill(pending, send_reply=_send) is True
 
             states = await _commitment_states(stack.pool, fulfillment_id)
@@ -700,7 +702,7 @@ async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
                     platform_message_id=f"platform-{run_id}"
                 )
 
-            pending = _pending_reply(run_id, reservation=None)
+            pending = _pending_reply(run_id, handoff=None)
             assert await stack.workflow.fulfill(pending, send_reply=_send) is True
             await _age_terminal_beyond_protection(stack.pool, fulfillment_id)
             ai_key, interaction_key = _evidence_keys(fulfillment_id)
@@ -796,14 +798,16 @@ async def test_e2e_recovery_after_prepare_crash_resends_and_advances_all_commitm
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            reservation = await stack.proactive.reserve(
+            lease = await stack.proactive.reserve(
                 group_id, f"reservation-{run_id}"
             )
-            assert isinstance(reservation, proactive_module.Reservation)
+            assert isinstance(lease, proactive_module.ProactiveLease)
+            async with lease:
+                handoff = await lease.handoff()
 
             pending = _pending_reply(
                 run_id,
-                reservation=reservation,
+                handoff=handoff,
                 group_id=group_id,
                 user_id=user_id,
             )
@@ -949,18 +953,20 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            reservation = await stack.proactive.reserve(
+            lease = await stack.proactive.reserve(
                 group_id, f"reservation-{run_id}"
             )
-            assert isinstance(reservation, proactive_module.Reservation)
-            reservation_member = f"pending:{reservation.reservation_id}"
+            assert isinstance(lease, proactive_module.ProactiveLease)
+            async with lease:
+                handoff = await lease.handoff()
+            reservation_member = f"pending:{handoff.reservation_id}"
 
             async def _send_unknown(_pending: object) -> ReplyDeliveryResult:
                 return ReplyDeliveryResult.pending_confirmation()
 
             pending = _pending_reply(
                 run_id,
-                reservation=reservation,
+                handoff=handoff,
                 group_id=group_id,
                 user_id=user_id,
             )
@@ -984,7 +990,7 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
             # 崩溃后预占仍真实占用
             assert (
                 await stack.redis_client.get(cooldown_key)
-                == reservation.reservation_id
+                == handoff.reservation_id
             )
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
@@ -1019,7 +1025,7 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
             assert after["delivery_state"] == "PENDING_CONFIRMATION"
             assert (
                 await stack.redis_client.get(cooldown_key)
-                == reservation.reservation_id
+                == handoff.reservation_id
             )
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
@@ -1050,15 +1056,17 @@ async def test_e2e_recovery_sender_unknown_result_keeps_pending_without_resend(
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            reservation = await stack.proactive.reserve(
+            lease = await stack.proactive.reserve(
                 group_id, f"reservation-{run_id}"
             )
-            assert isinstance(reservation, proactive_module.Reservation)
-            reservation_member = f"pending:{reservation.reservation_id}"
+            assert isinstance(lease, proactive_module.ProactiveLease)
+            async with lease:
+                handoff = await lease.handoff()
+            reservation_member = f"pending:{handoff.reservation_id}"
 
             pending = _pending_reply(
                 run_id,
-                reservation=reservation,
+                handoff=handoff,
                 group_id=group_id,
                 user_id=user_id,
             )
@@ -1081,7 +1089,7 @@ async def test_e2e_recovery_sender_unknown_result_keeps_pending_without_resend(
             # 保守待确认：预占仍真实占用
             assert (
                 await stack.redis_client.get(cooldown_key)
-                == reservation.reservation_id
+                == handoff.reservation_id
             )
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
@@ -1135,13 +1143,13 @@ async def test_e2e_recovery_only_claims_exact_original_bot_identity(
         try:
             pending_match = _pending_reply(
                 run_id,
-                reservation=None,
+                handoff=None,
                 group_id=group_id,
                 user_id=user_id,
             )
             pending_mismatch = _pending_reply(
                 mismatch_run_id,
-                reservation=None,
+                handoff=None,
                 group_id=group_id,
                 user_id=user_id,
             )
@@ -1250,14 +1258,16 @@ async def test_e2e_recovery_expiration_releases_real_reservation_and_minimizes_p
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            reservation = await stack.proactive.reserve(
+            lease = await stack.proactive.reserve(
                 group_id, f"reservation-{run_id}"
             )
-            assert isinstance(reservation, proactive_module.Reservation)
-            reservation_member = f"pending:{reservation.reservation_id}"
+            assert isinstance(lease, proactive_module.ProactiveLease)
+            async with lease:
+                handoff = await lease.handoff()
+            reservation_member = f"pending:{handoff.reservation_id}"
             assert (
                 await stack.redis_client.get(cooldown_key)
-                == reservation.reservation_id
+                == handoff.reservation_id
             )
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
@@ -1266,7 +1276,7 @@ async def test_e2e_recovery_expiration_releases_real_reservation_and_minimizes_p
 
             pending = _pending_reply(
                 run_id,
-                reservation=reservation,
+                handoff=handoff,
                 group_id=group_id,
                 user_id=user_id,
             )
@@ -1322,7 +1332,7 @@ async def test_e2e_recovery_expiration_releases_real_reservation_and_minimizes_p
             )
             assert (
                 await stack.proactive.release(
-                    group_id, reservation.reservation_id
+                    group_id, handoff.reservation_id
                 )
                 is False
             )
