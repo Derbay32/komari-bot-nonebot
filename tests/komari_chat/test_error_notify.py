@@ -13,6 +13,11 @@ message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 shared_notify_module = import_module("komari_bot.onebot.group_failure_notify")
+proactive_reservation_module = import_module(
+    "komari_bot.plugins.komari_chat.services.proactive_reservation"
+)
+ReservationDenied = proactive_reservation_module.ReservationDenied
+ReservationDeniedReason = proactive_reservation_module.ReservationDeniedReason
 
 MessageHandler = message_handler_module.MessageHandler
 ReplyFailureInfo = message_handler_module.ReplyFailureInfo
@@ -334,14 +339,22 @@ async def test_cancelled_error_from_delivery_propagates(
 @pytest.mark.parametrize("status", ["cooldown", "rate_limited", "duplicate"])
 def test_normal_reservation_control_flow_is_not_a_failure(
     monkeypatch: pytest.MonkeyPatch,
-    status: str,
+    status: ReservationDeniedReason,
 ) -> None:
     """主动回复正常控制状态不产生失败诊断。"""
 
     class _ReservationService:
+        """租约形态 fake：正常频控拒绝返回真实 ReservationDenied 对象。"""
+
         @staticmethod
-        async def reserve(_group_id: str, _reservation_id: str) -> str:
-            return status
+        async def reserve(
+            group_id: str, reservation_id: str
+        ) -> ReservationDenied:
+            return ReservationDenied(
+                group_id=group_id,
+                reservation_id=reservation_id,
+                reason=status,
+            )
 
     handler = MessageHandler.__new__(MessageHandler)
     handler.proactive_reservation = _ReservationService()

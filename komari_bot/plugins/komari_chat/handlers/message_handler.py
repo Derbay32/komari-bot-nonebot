@@ -9,7 +9,6 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Coroutine
-from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
@@ -51,6 +50,7 @@ from ..services.llm_service import (
     generate_reply,
     generate_reply_with_tools,
 )
+from ..services.proactive_reservation import ReservationDenied, ReservationLostError
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
@@ -78,8 +78,9 @@ if TYPE_CHECKING:
     from komari_bot.plugins.komari_memory import MemoryService
 
     from ..services.proactive_reservation import (
+        ProactiveLease,
         ProactiveReservationService,
-        Reservation,
+        ReservationHandoff,
     )
     from ..services.reply_fulfillment_workflow import ReplyFulfillmentQueryProtocol
 
@@ -142,7 +143,7 @@ class PendingReply:
     request_trace_id: str
     reply_timestamp: float
     proactive_reservation_id: str | None = None
-    proactive_reservation: Reservation | None = None
+    proactive_handoff: ReservationHandoff | None = None
     reaction_sent: bool = False
     decision_payload: dict[str, object] | None = None
 
@@ -1038,29 +1039,7 @@ class MessageHandler:
         )
         return reply_result
 
-    async def _release_proactive_reservation(
-        self,
-        reservation: Reservation,
-    ) -> None:
-        """尽力释放主动回复预占，失败时由 TTL 兜底。"""
-        try:
-            await reservation.release()
-        except Exception:
-            logger.exception(
-                "[KomariChat] 主动回复预占释放失败，将等待 TTL 回收: group={}",
-                reservation.group_id,
-            )
-
-    @staticmethod
-    async def _stop_background_task(task: asyncio.Task[None] | None) -> None:
-        """停止生成期预占续租任务。"""
-        if task is None:
-            return
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-
-    async def _attempt_reply(  # noqa: PLR0911
+    async def _attempt_reply(
         self,
         *,
         message: MessageSchema,
@@ -1088,13 +1067,9 @@ class MessageHandler:
         config = get_config()
         memory_config = get_memory_config()
         reservation_id: str | None = None
-        reservation: Reservation | None = None
-        reservation_transferred = False
-        reservation_heartbeat: asyncio.Task[None] | None = None
-        reservation_lost = asyncio.Event()
         request_trace_id = f"chat-{message.message_id}"
-        reaction_sent = False
 
+        lease: ProactiveLease | None = None
         if not force_reply:
             if not config.proactive_enabled:
                 return None, False, None
@@ -1115,35 +1090,35 @@ class MessageHandler:
                     request_trace_id=request_trace_id,
                     reaction_sent=False,
                 )
-            if isinstance(reserve_result, str):
-                match reserve_result:
+            if isinstance(reserve_result, ReservationDenied):
+                match reserve_result.reason:
                     case "cooldown":
                         logger.debug("[KomariChat] 主动回复冷却或生成预占中")
-                        return None, False, None
                     case "rate_limited":
                         logger.debug("[KomariChat] 主动回复频率超限")
-                        return None, False, None
                     case "duplicate":
                         logger.debug("[KomariChat] 主动回复消息已预占或已送达")
-                        return None, False, None
                     case _:
                         return None, False, ReplyFailureInfo(
                             stage="reserve",
                             error_type="UnknownReservationStatusError",
-                            summary=f"未知的主动回复预占状态: {reserve_result}",
+                            summary=f"未知的主动回复预占状态: {reserve_result.reason}",
                             request_trace_id=request_trace_id,
                             reaction_sent=False,
                         )
-            else:
-                reservation = reserve_result
-            reservation_heartbeat = asyncio.create_task(
-                self._proactive_reservation_heartbeat(
-                    reservation=reservation,
-                    lost=reservation_lost,
-                )
-            )
+                return None, False, None
+            lease = reserve_result
 
-        try:
+        async def _attempt_generation() -> (  # noqa: PLR0911
+            tuple[PendingReply | None, bool, ReplyFailureInfo | None]
+        ):
+            """在租约持有期内完成读取/生成，生成完成后内联续租裁决并移交凭据。
+
+            生成期失败由租约 ``async with`` 退出协议自动释放，本函数不持有
+            任何预占对象；强制回复（无租约）直接走同一生成路径。
+            """
+            reaction_sent = False
+
             # === 读取已有缓冲 ===
             try:
                 recent_messages, interaction_records, stored = await self._read_buffers(
@@ -1261,9 +1236,11 @@ class MessageHandler:
                     reaction_sent=reaction_sent,
                 )
 
-            if reservation is not None:
-                renewed = await reservation.renew()
-                if reservation_lost.is_set() or not renewed:
+            # === 生成完成：内联一次续租裁决，成功后才移交窄凭据 ===
+            if lease is not None:
+                try:
+                    handoff = await lease.handoff()
+                except ReservationLostError:
                     logger.warning(
                         "[KomariChat] 主动回复生成完成时预占租约已丢失，取消发送"
                     )
@@ -1274,6 +1251,18 @@ class MessageHandler:
                         request_trace_id=request_trace_id,
                         reaction_sent=reaction_sent,
                     )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return None, stored, ReplyFailureInfo(
+                        stage="generate",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    )
+            else:
+                handoff = None
 
             logger.info(
                 "[KomariMemory] 回复生成完成，等待发送: group={} reason={} score={}",
@@ -1296,35 +1285,15 @@ class MessageHandler:
                 request_trace_id=request_trace_id,
                 reply_timestamp=time.time(),
                 proactive_reservation_id=reservation_id,
-                proactive_reservation=reservation,
+                proactive_handoff=handoff,
                 reaction_sent=reaction_sent,
             )
-            reservation_transferred = True
             return pending_reply, stored, None
-        finally:
-            await self._stop_background_task(reservation_heartbeat)
-            if reservation is not None and not reservation_transferred:
-                await self._release_proactive_reservation(reservation)
 
-    async def _proactive_reservation_heartbeat(
-        self,
-        *,
-        reservation: Reservation,
-        lost: asyncio.Event,
-    ) -> None:
-        """LLM 生成期间周期续期主动回复预占。"""
-        interval = max(1.0, reservation.reservation_ttl_seconds / 3)
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                renewed = await reservation.renew()
-            except Exception:
-                logger.exception("[KomariChat] 主动回复预占续期失败")
-                lost.set()
-                return
-            if not renewed:
-                lost.set()
-                return
+        if lease is not None:
+            async with lease:
+                return await _attempt_generation()
+        return await _attempt_generation()
 
     async def generate_debug_reply(
         self,

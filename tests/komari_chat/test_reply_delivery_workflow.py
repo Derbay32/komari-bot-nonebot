@@ -297,12 +297,23 @@ class _ProactiveReservation:
         self.released.append((group_id, reservation_id))
 
 
-class _ReservationHandle:
-    def __init__(self) -> None:
+class _ReservationHandoff:
+    """移交凭据 fake：冻结身份快照 + 记录调用次数的幂等 release()。"""
+
+    def __init__(
+        self,
+        group_id: str = "group-1",
+        reservation_id: str = "reservation-1",
+        cooldown_seconds: int = 300,
+    ) -> None:
+        self.group_id = group_id
+        self.reservation_id = reservation_id
+        self.cooldown_seconds = cooldown_seconds
         self.release_count = 0
 
-    async def release(self) -> None:
+    async def release(self) -> bool:
         self.release_count += 1
+        return self.release_count == 1
 
 
 @pytest.fixture
@@ -331,11 +342,14 @@ def _config() -> SimpleNamespace:
 def _pending_reply(
     operation_id: str,
     *,
-    reservation: _ReservationHandle | None = None,
+    handoff: _ReservationHandoff | None = None,
 ) -> Any:
     handler_module = import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
     )
+    if handoff is None:
+        # 与旧默认（proactive_reservation_id="reservation-1"）等价
+        handoff = _ReservationHandoff()
     return handler_module.PendingReply(
         reply="回复正文",
         reply_to_message_id="message-1",
@@ -362,8 +376,8 @@ def _pending_reply(
         fulfillment_id=operation_id,
         request_trace_id="chat-message-1",
         reply_timestamp=2.0,
-        proactive_reservation_id="reservation-1",
-        proactive_reservation=reservation,
+        proactive_reservation_id=handoff.reservation_id,
+        proactive_handoff=handoff,
     )
 
 
@@ -459,15 +473,15 @@ async def test_unknown_delivery_stays_pending_and_is_never_resent(
         recovery_senders={("bot-1", "OneBot V11"): _recovery_send},
     )
     pending = _pending_reply("reply-unknown")
-    reservation = _ReservationHandle()
-    pending = _pending_reply(pending.fulfillment_id, reservation=reservation)
+    handoff = _ReservationHandoff()
+    pending = _pending_reply(pending.fulfillment_id, handoff=handoff)
 
     async def _send(_reply: object) -> object:
         return workflow_module.ReplyDeliveryResult.pending_confirmation()
 
     assert await workflow.fulfill(pending, send_reply=_send) is False
     assert repository.pending_confirmation_ids == {pending.fulfillment_id}
-    assert reservation.release_count == 0
+    assert handoff.release_count == 0
 
     await workflow.recover_pending()
 
@@ -737,8 +751,8 @@ async def test_cancellation_after_send_started_propagates_without_release(
     repository = _DeliveryRepository()
     proactive = _ProactiveReservation()
     workflow = _workflow(workflow_module, repository, proactive)
-    reservation = _ReservationHandle()
-    pending = _pending_reply("reply-cancelled", reservation=reservation)
+    handoff = _ReservationHandoff()
+    pending = _pending_reply("reply-cancelled", handoff=handoff)
 
     async def _cancel(_reply: object) -> object:
         raise asyncio.CancelledError
@@ -747,4 +761,4 @@ async def test_cancellation_after_send_started_propagates_without_release(
         await workflow.fulfill(pending, send_reply=_cancel)
 
     assert repository.pending_confirmation_ids == {pending.fulfillment_id}
-    assert reservation.release_count == 0
+    assert handoff.release_count == 0

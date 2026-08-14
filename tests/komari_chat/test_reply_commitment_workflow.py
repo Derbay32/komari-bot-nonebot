@@ -238,21 +238,28 @@ class _CommitmentRepository:
 
 
 class _ProactiveReservation:
+    """持久化身份确认通道 fake：记录 confirm 的 (group_id, reservation_id, cooldown)。
+
+    cooldown 来源为承诺载荷（其来源为 handoff 凭据的 reserve 冻结快照），
+    确认通道断言只需记录实参，验证载荷快照原样进入持久化调用。
+    """
+
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.error: BaseException | None = None
         self.calls = 0
+        self.confirm_calls: list[tuple[str, str, int]] = []
 
     async def confirm(
         self,
-        _group_id: str,
-        _reservation_id: str,
+        group_id: str,
+        reservation_id: str,
         *,
         cooldown_seconds: int,
     ) -> None:
-        del cooldown_seconds
         self.calls += 1
         self.events.append("proactive_reply_confirmation")
+        self.confirm_calls.append((group_id, reservation_id, cooldown_seconds))
         if self.error is not None:
             raise self.error
 
@@ -434,6 +441,41 @@ async def test_all_commitments_complete_in_domain_order_and_minimize_payloads(
         assert child.completed is True
         assert child.attempt_count == 1
         assert child.payload is None
+
+
+@pytest.mark.asyncio
+async def test_proactive_confirmation_uses_snapshot_cooldown_via_persistence_channel(
+    workflow_module: Any,
+) -> None:
+    """确认通道经持久化身份 confirm() 调用，cooldown 取承诺载荷（凭据快照来源）。
+
+    与履约侧快照用例呼应：载荷 cooldown_seconds=42（与配置 300 不同）
+    原样进入持久化确认调用，确认通道本身不现读配置。
+    """
+    repository = _CommitmentRepository()
+    payloads = _payloads()
+    payloads["proactive_reply_confirmation"] = {
+        "group_id": "group-1",
+        "reservation_id": "reservation-snapshot",
+        "cooldown_seconds": 42,
+    }
+    repository.seed("reply-confirm-snapshot", payloads=payloads)
+    config = _config()
+    workflow, _events, _redis, proactive, _user_data = _workflow(
+        workflow_module,
+        repository,
+        config,
+    )
+
+    assert await workflow.recover_pending() == 1
+
+    assert proactive.confirm_calls == [("group-1", "reservation-snapshot", 42)]
+    assert (
+        repository.snapshot(
+            "reply-confirm-snapshot", "proactive_reply_confirmation"
+        ).completed
+        is True
+    )
 
 
 @pytest.mark.asyncio
