@@ -1127,6 +1127,63 @@ async def test_heartbeat_loop_stop_set_exits_cleanly(
     assert not lease_lost.is_set()
 
 
+async def test_heartbeat_loop_logs_renew_error_via_exception(
+    install_wait_for: Callable[[int], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-156：续租异常改用 logger.exception（带 traceback），不再走 logger.warning。
+
+    与互动/忘却生命周期日志形态一致（F7 容错不对称语义不变，本用例只钉日志形态）；
+    message 沿用四个槽位 group/key/failures/error_type，failures 即连续失败计数。
+    """
+    install_wait_for(2)
+    fake = FakeProcessingStorage()
+    fake.renew_script = [RuntimeError("续租异常"), RuntimeError("续租异常")]
+    stop, lease_lost = asyncio.Event(), asyncio.Event()
+    exception_logs: list[tuple[object, tuple[object, ...]]] = []
+    warning_logs: list[tuple[object, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        lifecycle_module.logger,
+        "exception",
+        lambda message, *args: exception_logs.append((message, args)),
+    )
+    monkeypatch.setattr(
+        lifecycle_module.logger,
+        "warning",
+        lambda message, *args: warning_logs.append((message, args)),
+    )
+
+    await lifecycle_module._heartbeat_loop(
+        storage=fake,
+        group_id="g1",
+        processing_key="pk",
+        owner_token="owner",
+        stop=stop,
+        lease_lost=lease_lost,
+        interval=40.0,
+    )
+
+    # 容错不对称（F7）：异常连续 2 次才置 lost，续租恰好 2 次
+    assert lease_lost.is_set()
+    assert len(fake.renew_calls) == 2
+    # 每次续租异常都经 logger.exception 记录，恰好 2 次，四个槽位齐全
+    assert len(exception_logs) == 2
+    for message, args in exception_logs:
+        assert "续租异常" in str(message)
+        assert "group={}" in str(message)
+        assert "key={}" in str(message)
+        assert "failures={}" in str(message)
+        assert "error_type={}" in str(message)
+        assert args[0] == "g1"
+        assert args[1] == "pk"
+        assert args[3] == "RuntimeError"
+    # failures 计数随连续失败递增：第 1 次为 1、第 2 次为 2
+    assert exception_logs[0][1][2] == 1
+    assert exception_logs[1][1][2] == 2
+    # 该路径不再用 logger.warning 记录续租异常
+    assert warning_logs == []
+
+
 def test_module_reexports_lease_lost_error() -> None:
     """ConversationLeaseLostError 定义在 conversation_processing.py，module 重导出成立。"""
     assert lifecycle_module.ConversationLeaseLostError is ConversationLeaseLostError
