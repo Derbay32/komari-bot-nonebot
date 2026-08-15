@@ -13,8 +13,9 @@
 编排语义逐行搬运自 summary_worker.py 的 perform_summary / _renew_conversation_lease /
 _stop_summary_attempt / summary_worker_task 孤儿接管循环；测试面见
 docs/research/2026-08-15-processing-lifecycle-test-plan.md。
-冻结怪癖与 follow-up 标注见各方法注释（attempt_count=3 写死、lease-lost 被重试 3 次、
-set 回读不一致抛裸 RuntimeError 等），按严格冻结政策一律不修。
+冻结怪癖清单（TSK-155 已解除 attempt_count=3 写死、lease-lost 被重试 3 次
+两项）；仍冻结：set 回读不一致抛裸 RuntimeError，follow-up TSK-157，
+按严格冻结政策一律不修。
 """
 
 import asyncio
