@@ -36,6 +36,16 @@ class ConversationLeaseLostError(RuntimeError):
         super().__init__(f"对话 processing 租约已失效: {processing_key}")
 
 
+class ConversationChunkStateMismatchError(RuntimeError):
+    """分块阶段状态写入后 Lua 回读值与写入值不一致。"""
+
+    def __init__(self, field: str, expected: str, stored: str) -> None:
+        super().__init__(
+            f"对话分块阶段状态写入后不一致: field={field}, "
+            f"expected={expected!r}, stored={stored!r}"
+        )
+
+
 CONVERSATION_CLAIM_SCRIPT = """
 -- conversation_processing_claim_v2
 local source_key = KEYS[1]

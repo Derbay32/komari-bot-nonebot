@@ -24,6 +24,7 @@ from .conversation_processing import (
     CONVERSATION_GET_SCRIPT,
     CONVERSATION_RENEW_SCRIPT,
     CONVERSATION_RESTORE_SCRIPT,
+    ConversationChunkStateMismatchError,
     ConversationDeadLetter,
     ConversationLeaseLostError,
     ConversationSnapshotClaim,
@@ -632,7 +633,9 @@ class RedisManager:
             value=value,
         )
         if stored != value:
-            raise RuntimeError("对话分块阶段状态写入后不一致")
+            raise ConversationChunkStateMismatchError(
+                field=field, expected=value, stored=stored
+            )
 
     async def _operate_conversation_chunk_ledger(
         self,
