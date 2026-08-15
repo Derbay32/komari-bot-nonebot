@@ -46,6 +46,13 @@ class ConversationChunkStateMismatchError(RuntimeError):
         )
 
 
+class InvalidChunkLedgerError(RuntimeError):
+    """processing 快照的持久化分块账本损坏或不匹配。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"对话分块账本无效: {code}")
+
+
 CONVERSATION_CLAIM_SCRIPT = """
 -- conversation_processing_claim_v2
 local source_key = KEYS[1]

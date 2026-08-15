@@ -30,14 +30,10 @@ from .conversation_processing import (
     ConversationLeaseLostError,
     ConversationSnapshotClaim,
 )
+from .conversation_processing import (
+    InvalidChunkLedgerError as _InvalidChunkLedgerError,
+)
 from .redis_manager import MessageSchema
-
-
-class InvalidChunkLedgerError(RuntimeError):
-    """processing 快照的持久化分块账本损坏或不匹配。"""
-
-    def __init__(self, code: str) -> None:
-        super().__init__(f"对话分块账本无效: {code}")
 
 
 class _ProcessingStorage(Protocol):
@@ -208,7 +204,7 @@ class StorageChunkLedger:
         )
         # 冻结语义：manifest 门控内化，读回必须逐字节一致（F18）。
         if stored != manifest_json:
-            raise InvalidChunkLedgerError("manifest_mismatch")
+            raise _InvalidChunkLedgerError("manifest_mismatch")
         return stored
 
     async def get(self, field: str) -> str | None:

@@ -21,9 +21,9 @@ from nonebot_plugin_apscheduler import scheduler
 
 from ..agent import run_profile_agent
 from ..services.config_interface import get_config
+from ..services.conversation_processing import InvalidChunkLedgerError
 from ..services.conversation_processing_lifecycle import (
     ConversationProcessingLifecycle,
-    InvalidChunkLedgerError,
     ProcessingSession,
 )
 from ..services.llm_service import summarize_conversation
