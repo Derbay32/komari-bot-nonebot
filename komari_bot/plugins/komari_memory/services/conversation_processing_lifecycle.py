@@ -13,9 +13,8 @@
 编排语义逐行搬运自 summary_worker.py 的 perform_summary / _renew_conversation_lease /
 _stop_summary_attempt / summary_worker_task 孤儿接管循环；测试面见
 docs/research/2026-08-15-processing-lifecycle-test-plan.md。
-冻结怪癖清单（TSK-155 已解除 attempt_count=3 写死、lease-lost 被重试 3 次
-两项）；仍冻结：set 回读不一致抛裸 RuntimeError，follow-up TSK-157，
-按严格冻结政策一律不修。
+冻结怪癖说明：TSK-149 严格冻结期的三项怪癖（attempt_count 写死、
+lease-lost 被重试、set 回读裸 RuntimeError）已分别由 TSK-155 / TSK-157 解除。
 """
 
 import asyncio
@@ -270,7 +269,7 @@ async def _heartbeat_loop(
             )
         except Exception as error:
             consecutive_errors += 1
-            logger.warning(
+            logger.exception(
                 "[KomariMemory] 对话 processing 续租异常: group={} key={} "
                 "failures={} error_type={}",
                 group_id,
