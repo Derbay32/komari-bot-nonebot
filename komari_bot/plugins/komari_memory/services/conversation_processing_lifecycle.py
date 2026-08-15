@@ -25,7 +25,7 @@ from uuid import uuid4
 
 from nonebot import logger
 
-from ..core.retry import retry_async
+from ..core.retry import get_retry_attempts, retry_async
 from .conversation_processing import (
     ConversationLeaseLostError,
     ConversationSnapshotClaim,
@@ -304,7 +304,7 @@ async def _stop_processing_attempt(
     )
 
 
-@retry_async(max_attempts=3, base_delay=1.0)
+@retry_async(max_attempts=3, base_delay=1.0, exclude=(ConversationLeaseLostError,))
 async def _run_processing_attempt(
     storage: _ProcessingStorage,
     group_id: str,
@@ -315,8 +315,9 @@ async def _run_processing_attempt(
 ) -> None:
     """读缓冲 → 业务回调；每次尝试重建 session，幂等性依赖账本（F17/F21）。
 
-    冻结怪癖：ConversationLeaseLostError 也是 Exception，会被重试恰好 3 次后
-    原样抛出，与 dead-letter 分流无关——follow-up TSK-146 ⑥，不修。
+    TSK-155：ConversationLeaseLostError 经 exclude 排除，首次出现即原样抛出
+    （零 sleep、零重试日志），由外层按 lease-lost 分流（dead-letter / restore
+    零副作用），普通异常仍按原语义重试恰好 3 次。
     """
     messages = await storage.get_processing_conversation_buffer(
         group_id,
@@ -485,8 +486,9 @@ class ConversationProcessingLifecycle:
                 processing_task=processing_task,
             )
             if not isinstance(error, ConversationLeaseLostError):
-                # F12：attempt_count=3 是写死常量（与 retry_async 对齐），
-                # 并非真实重试次数——follow-up TSK-146 ⑥，不修。
+                # F12：attempt_count 透传 retry_async 的真实尝试次数（TSK-155）——
+                # 普通异常穷尽重试后附着 max_attempts；未经过包装层的异常
+                # （如门控续租/ack 失败）按至少 1 次兜底。
                 dead_lettered = False
                 try:
                     dead_lettered = await storage.dead_letter_processing_conversation_buffer(
@@ -494,7 +496,7 @@ class ConversationProcessingLifecycle:
                         processing_key,
                         owner_token,
                         failure_code=type(error).__name__,
-                        attempt_count=3,
+                        attempt_count=get_retry_attempts(error) or 1,
                     )
                 except Exception as cleanup_error:
                     logger.warning(
