@@ -457,7 +457,7 @@ class ConversationProcessingLifecycle:
                     )
                 )
             except Exception as cleanup_error:
-                logger.warning(
+                logger.exception(
                     "[KomariMemory] 取消总结后的快照恢复失败: group={} key={} "
                     "error_type={}",
                     group_id,
@@ -499,7 +499,7 @@ class ConversationProcessingLifecycle:
                         attempt_count=get_retry_attempts(error) or 1,
                     )
                 except Exception as cleanup_error:
-                    logger.warning(
+                    logger.exception(
                         "[KomariMemory] 对话快照移入 dead-letter 失败: group={} key={} "
                         "error_type={}",
                         group_id,
@@ -515,7 +515,7 @@ class ConversationProcessingLifecycle:
                             owner_token,
                         )
                     except Exception as cleanup_error:
-                        logger.warning(
+                        logger.exception(
                             "[KomariMemory] dead-letter 失败后的快照恢复失败: group={} "
                             "key={} error_type={}",
                             group_id,
