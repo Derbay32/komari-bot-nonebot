@@ -37,8 +37,10 @@ from komari_bot.plugins.komari_memory.handlers.summary_worker import (
     InvalidSummaryResultError,
     SummaryCollectorProvider,
 )
-from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
+from komari_bot.plugins.komari_memory.services.conversation_processing import (
     InvalidChunkLedgerError,
+)
+from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
     ProcessingSession,
 )
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema

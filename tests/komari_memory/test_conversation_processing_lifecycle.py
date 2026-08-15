@@ -28,10 +28,10 @@ from komari_bot.plugins.komari_memory.services import (
 from komari_bot.plugins.komari_memory.services.conversation_processing import (
     ConversationLeaseLostError,
     ConversationSnapshotClaim,
+    InvalidChunkLedgerError,
 )
 from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
     ConversationProcessingLifecycle,
-    InvalidChunkLedgerError,
 )
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
@@ -967,6 +967,14 @@ async def test_manifest_mismatch_dead_letters_invalid_chunk_ledger(
     assert len(fake_storage.dead_letter_calls) == 1
     assert fake_storage.dead_letter_calls[0]["failure_code"] == "InvalidChunkLedgerError"
     assert fake_storage.dead_letter_calls[0]["attempt_count"] == 3
+
+
+def test_invalid_chunk_ledger_error_owned_by_processing_domain_module() -> None:
+    """TSK-168：异常唯一权威定义在现有 services/conversation_processing 模块。"""
+    assert (
+        InvalidChunkLedgerError.__module__
+        == "komari_bot.plugins.komari_memory.services.conversation_processing"
+    )
 
 
 async def test_ledger_owner_loss_propagates_lease_lost(
