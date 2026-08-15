@@ -410,6 +410,24 @@ class _AlwaysFailProcessor:
         raise self.error
 
 
+class _ScriptedErrorsProcessor:
+    """按脚本序列依次抛异常，耗尽后重复最后一个；重试停止时机的裁判（TSK-155）。
+
+    钉「lease-lost 中途出现立即停止重试」时第 3 次调用绝不发生；若误发生，
+    抛出的仍是脚本最后一个异常实例，脚本不因越界改变异常类型。
+    """
+
+    def __init__(self, errors: list[Exception]) -> None:
+        self.errors = errors
+        self.process_calls = 0
+
+    async def process(self, session: _SessionView) -> None:
+        del session
+        self.process_calls += 1
+        last_index = min(self.process_calls, len(self.errors)) - 1
+        raise self.errors[last_index]
+
+
 class _ManifestMismatchProcessor:
     """经 ledger.initialize_manifest 读回 manifest 并逐字节比对；不一致抛 manifest_mismatch。"""
 
@@ -772,25 +790,88 @@ async def test_dead_letter_rejected_falls_back_to_restore(
     assert fake_storage.update_last_summary_calls == []
 
 
-async def test_processor_retried_exactly_three_times_including_lease_lost(
+async def test_lease_lost_from_processor_diverts_without_retry(
     fake_storage: FakeProcessingStorage,
+    fake_provider: FakeCollectorProvider,
     lifecycle: ConversationProcessingLifecycle,
 ) -> None:
-    """F17 冻结怪癖：ConversationLeaseLostError 也是 Exception，被重试恰好 3 次。
+    """TSK-155：ConversationLeaseLostError 首次出现即分流，不再重试。
 
-    该怪癖已列入 follow-up 清单（TSK-146 ⑥），此处按冻结现状编写，不修。
+    process 第一次调用即抛 lease-lost → 恰好 1 次调用；finalize(error) 以该异常收尾；
+    dead-letter / restore 零调用（F11 零副作用语义不变）；原异常实例原样抛出。
     """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
-    processor = _AlwaysFailProcessor(ConversationLeaseLostError("pk"))
+    lease_lost_error = ConversationLeaseLostError("pk")
+    processor = _AlwaysFailProcessor(lease_lost_error)
 
-    with pytest.raises(ConversationLeaseLostError):
+    with pytest.raises(ConversationLeaseLostError) as exc_info:
         await lifecycle.process_conversation_snapshot("g1", processor)
 
-    assert processor.process_calls == 3
+    assert exc_info.value is lease_lost_error  # 原异常实例原样抛出
+    assert processor.process_calls == 1  # 首次即分流，零重试
+    assert len(fake_provider.finalize_calls) == 1
+    assert fake_provider.finalize_calls[0][0] == "error"
+    assert fake_provider.finalize_calls[0][1] is lease_lost_error
     assert fake_storage.dead_letter_calls == []
     assert fake_storage.restore_calls == []
     assert fake_storage.ack_calls == []
     assert fake_storage.update_last_summary_calls == []
+
+
+async def test_ordinary_error_retried_three_times_then_dead_lettered(
+    fake_storage: FakeProcessingStorage,
+    fake_provider: FakeCollectorProvider,
+    lifecycle: ConversationProcessingLifecycle,
+) -> None:
+    """TSK-155：普通异常仍重试恰好 3 次后 dead-letter，attempt_count 透传真实重试次数。
+
+    对照式断言：dead-letter 的 attempt_count 必须等于 fake 的 process 实际调用计数，
+    钉住「透传真实重试次数」语义而非写死字面量。
+    """
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    value_error = ValueError("总结失败")
+    processor = _AlwaysFailProcessor(value_error)
+
+    with pytest.raises(ValueError, match="总结失败") as exc_info:
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert exc_info.value is value_error  # 原异常实例原样抛出
+    assert processor.process_calls == 3  # 普通异常重试 3 次语义不变
+    assert len(fake_storage.dead_letter_calls) == 1
+    assert fake_storage.dead_letter_calls[0]["failure_code"] == "ValueError"
+    assert fake_storage.dead_letter_calls[0]["attempt_count"] == processor.process_calls
+    assert fake_storage.restore_calls == []
+    assert fake_storage.ack_calls == []
+    assert fake_storage.update_last_summary_calls == []
+    assert fake_provider.finalize_calls[0][0] == "error"
+
+
+async def test_lease_lost_midway_stops_retry_immediately(
+    fake_storage: FakeProcessingStorage,
+    fake_provider: FakeCollectorProvider,
+    lifecycle: ConversationProcessingLifecycle,
+) -> None:
+    """TSK-155：重试中途首次出现 lease-lost → 立即停止，第 3 次不发生。
+
+    脚本化：第 1 次 ValueError、第 2 次 ConversationLeaseLostError → 恰好 2 次
+    process 调用；按 lease-lost 分流（dead-letter / restore 零调用）；抛出的
+    就是那个 lease-lost 实例。
+    """
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    lease_lost_error = ConversationLeaseLostError("pk")
+    processor = _ScriptedErrorsProcessor([ValueError("第一次失败"), lease_lost_error])
+
+    with pytest.raises(ConversationLeaseLostError) as exc_info:
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert exc_info.value is lease_lost_error  # 抛出的就是那个 lease-lost 实例
+    assert processor.process_calls == 2  # 第 3 次调用不发生
+    assert fake_storage.dead_letter_calls == []
+    assert fake_storage.restore_calls == []
+    assert fake_storage.ack_calls == []
+    assert fake_storage.update_last_summary_calls == []
+    assert fake_provider.finalize_calls[0][0] == "error"
+    assert fake_provider.finalize_calls[0][1] is lease_lost_error
 
 
 async def test_manifest_mismatch_dead_letters_invalid_chunk_ledger(
@@ -821,7 +902,11 @@ async def test_ledger_owner_loss_propagates_lease_lost(
     fake_storage: FakeProcessingStorage,
     lifecycle: ConversationProcessingLifecycle,
 ) -> None:
-    """F22：账本动词 owner 失效 → ConversationLeaseLostError 传播分流（无 dead-letter/restore）。"""
+    """F22 + TSK-155：账本动词 owner 失效 → lease-lost 首次出现即分流，不再被重试。
+
+    原用例钉「被重试恰好 3 次」（TSK-146 ⑥ 冻结怪癖），本票解除该怪癖后
+    同步改为恰好 1 次；零副作用语义（无 dead-letter/restore）不变。
+    """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.ledger_error = ConversationLeaseLostError("pk")
     processor = _LedgerErrorProcessor()
@@ -829,7 +914,7 @@ async def test_ledger_owner_loss_propagates_lease_lost(
     with pytest.raises(ConversationLeaseLostError):
         await lifecycle.process_conversation_snapshot("g1", processor)
 
-    assert processor.process_calls == 3
+    assert processor.process_calls == 1  # lease-lost 不再被重试
     assert fake_storage.dead_letter_calls == []
     assert fake_storage.restore_calls == []
     assert fake_storage.ack_calls == []
