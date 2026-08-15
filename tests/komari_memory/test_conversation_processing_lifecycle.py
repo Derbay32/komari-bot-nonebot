@@ -525,6 +525,36 @@ def lifecycle(
     return ConversationProcessingLifecycle(fake_storage, fake_provider)
 
 
+@pytest.fixture
+def logger_logs(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """logger.exception / logger.warning 双形态留痕（TSK-167）。"""
+
+    logs = SimpleNamespace(exception=[], warning=[])
+    monkeypatch.setattr(
+        lifecycle_module.logger,
+        "exception",
+        lambda message, *args: logs.exception.append((message, args)),
+    )
+    monkeypatch.setattr(
+        lifecycle_module.logger,
+        "warning",
+        lambda message, *args: logs.warning.append((message, args)),
+    )
+    return logs
+
+
+def _cleanup_warnings(
+    logs: SimpleNamespace,
+) -> list[tuple[object, tuple[object, ...]]]:
+    """仅取 cleanup（dead-letter/快照恢复）相关 warning，排除 retry_async 的重试 warning。"""
+
+    return [
+        entry
+        for entry in logs.warning
+        if "dead-letter" in str(entry[0]) or "快照恢复" in str(entry[0])
+    ]
+
+
 def _assert_claim_abort(fake: FakeProcessingStorage) -> None:
     """F1 公共断言：claim 三态非 claimed 时生命周期动作全部为零。"""
     assert fake.get_calls == []
@@ -741,8 +771,12 @@ async def test_cancel_with_restore_rejected_still_reraises(
     fake_storage: FakeProcessingStorage,
     fake_provider: FakeCollectorProvider,
     lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
 ) -> None:
-    """F10 缺口补测：取消后 restore 被拒（返回 False）仍 re-raise，仅 warning。"""
+    """F10 缺口补测 + TSK-167：取消后 restore 被拒（返回 False）仍 re-raise。
+
+    被拒属正常控制流，仅 warning 记录、不产生误导性 traceback（零 exception 日志）。
+    """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.restore_result = False
     processor = _BlockingProcessor(started=asyncio.Event())
@@ -757,13 +791,25 @@ async def test_cancel_with_restore_rejected_still_reraises(
     assert fake_storage.dead_letter_calls == []
     assert fake_storage.ack_calls == []
     assert fake_storage.update_last_summary_calls == []
+    assert len(logger_logs.warning) == 1
+    message, args = logger_logs.warning[0]
+    assert "取消总结后的快照恢复被拒绝" in str(message)
+    assert "group={}" in str(message)
+    assert "key={}" in str(message)
+    assert args[0] == "g1"
+    assert args[1] == fake_storage.restore_calls[0]["processing_key"]
+    assert logger_logs.exception == []
 
 
 async def test_cancel_with_restore_exception_still_reraises(
     fake_storage: FakeProcessingStorage,
     lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
 ) -> None:
-    """F10：取消后 restore 抛异常仍 re-raise，仅 warning。"""
+    """F10 + TSK-167：取消后 restore 抛异常仍 re-raise；经 logger.exception 记录完整 traceback。
+
+    消息模板与既有 group/key/error_type 三槽位保持不变；该路径不再使用 warning。
+    """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.restore_error = RuntimeError("恢复快照失败")
     processor = _BlockingProcessor(started=asyncio.Event())
@@ -777,6 +823,16 @@ async def test_cancel_with_restore_exception_still_reraises(
     assert fake_storage.dead_letter_calls == []
     assert fake_storage.ack_calls == []
     assert fake_storage.update_last_summary_calls == []
+    assert len(logger_logs.exception) == 1
+    message, args = logger_logs.exception[0]
+    assert "取消总结后的快照恢复失败" in str(message)
+    assert "group={}" in str(message)
+    assert "key={}" in str(message)
+    assert "error_type={}" in str(message)
+    assert args[0] == "g1"
+    assert args[1] == fake_storage.restore_calls[0]["processing_key"]
+    assert args[2] == "RuntimeError"
+    assert logger_logs.warning == []
 
 
 async def test_business_error_dead_letters_with_params_and_reraises(
@@ -828,8 +884,12 @@ async def test_get_lease_lost_skips_dead_letter_and_restore(
 async def test_dead_letter_failure_falls_back_to_restore(
     fake_storage: FakeProcessingStorage,
     lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
 ) -> None:
-    """F13 缺口补测：dead-letter 抛异常 → restore 兜底 → 仍 re-raise。"""
+    """F13 + TSK-167：dead-letter 抛异常 → logger.exception 记录 → restore 兜底 → 仍 re-raise。
+
+    异常路径只走 exception 形态；restore 成功不产生额外 cleanup warning。
+    """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.dead_letter_error = RuntimeError("dead-letter 失败")
     processor = _AlwaysFailProcessor(RuntimeError("总结失败"))
@@ -841,13 +901,27 @@ async def test_dead_letter_failure_falls_back_to_restore(
     assert len(fake_storage.restore_calls) == 1
     assert fake_storage.ack_calls == []
     assert fake_storage.update_last_summary_calls == []
+    assert len(logger_logs.exception) == 1
+    message, args = logger_logs.exception[0]
+    assert "对话快照移入 dead-letter 失败" in str(message)
+    assert "group={}" in str(message)
+    assert "key={}" in str(message)
+    assert "error_type={}" in str(message)
+    assert args[0] == "g1"
+    assert args[1] == fake_storage.dead_letter_calls[0]["processing_key"]
+    assert args[2] == "RuntimeError"
+    assert _cleanup_warnings(logger_logs) == []
 
 
 async def test_dead_letter_rejected_falls_back_to_restore(
     fake_storage: FakeProcessingStorage,
     lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
 ) -> None:
-    """F13 缺口补测：dead-letter 返回 False → restore 兜底 → 仍 re-raise。"""
+    """F13 + TSK-167：dead-letter 返回 False → restore 兜底 → 仍 re-raise。
+
+    纯控制流拒绝不产生 cleanup 日志（零 exception / 零 cleanup warning），避免误导性 traceback。
+    """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.dead_letter_result = False
     processor = _AlwaysFailProcessor(RuntimeError("总结失败"))
@@ -859,6 +933,108 @@ async def test_dead_letter_rejected_falls_back_to_restore(
     assert len(fake_storage.restore_calls) == 1
     assert fake_storage.ack_calls == []
     assert fake_storage.update_last_summary_calls == []
+    assert logger_logs.exception == []
+    assert _cleanup_warnings(logger_logs) == []
+
+
+async def test_dead_letter_and_fallback_restore_exceptions_log_both_via_exception(
+    fake_storage: FakeProcessingStorage,
+    lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
+) -> None:
+    """TSK-167：dead-letter 与兜底 restore 双重失败 → 两处均 exception 形态 → 仍 re-raise。
+
+    第一跳钉 dead-letter 失败日志，第二跳钉兜底恢复失败日志；消息模板与既有
+    group/key/error_type 三槽位不变；最终重新抛出原业务异常。
+    """
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    fake_storage.dead_letter_error = RuntimeError("dead-letter 失败")
+    fake_storage.restore_error = ConnectionError("兜底恢复失败")
+    processor = _AlwaysFailProcessor(RuntimeError("总结失败"))
+
+    with pytest.raises(RuntimeError, match="总结失败"):
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert len(fake_storage.dead_letter_calls) == 1
+    assert len(fake_storage.restore_calls) == 1
+    assert fake_storage.ack_calls == []
+    assert fake_storage.update_last_summary_calls == []
+    assert len(logger_logs.exception) == 2
+    first_message, first_args = logger_logs.exception[0]
+    assert "对话快照移入 dead-letter 失败" in str(first_message)
+    assert "group={}" in str(first_message)
+    assert "key={}" in str(first_message)
+    assert "error_type={}" in str(first_message)
+    assert first_args[0] == "g1"
+    assert first_args[1] == fake_storage.dead_letter_calls[0]["processing_key"]
+    assert first_args[2] == "RuntimeError"
+    second_message, second_args = logger_logs.exception[1]
+    assert "dead-letter 失败后的快照恢复失败" in str(second_message)
+    assert "group={}" in str(second_message)
+    assert "key={}" in str(second_message)
+    assert "error_type={}" in str(second_message)
+    assert second_args[0] == "g1"
+    assert second_args[1] == fake_storage.restore_calls[0]["processing_key"]
+    assert second_args[2] == "ConnectionError"
+    assert _cleanup_warnings(logger_logs) == []
+
+
+async def test_dead_letter_exception_fallback_restore_rejected_warns(
+    fake_storage: FakeProcessingStorage,
+    lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
+) -> None:
+    """TSK-167：dead-letter 抛异常后兜底 restore 返回 False → 恢复被拒仍 warning。
+
+    dead-letter 异常本身走 exception 形态；被拒属控制流，warning 无 traceback。
+    """
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    fake_storage.dead_letter_error = RuntimeError("dead-letter 失败")
+    fake_storage.restore_result = False
+    processor = _AlwaysFailProcessor(RuntimeError("总结失败"))
+
+    with pytest.raises(RuntimeError, match="总结失败"):
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert len(fake_storage.dead_letter_calls) == 1
+    assert len(fake_storage.restore_calls) == 1
+    assert len(logger_logs.exception) == 1
+    assert "对话快照移入 dead-letter 失败" in str(logger_logs.exception[0][0])
+    cleanup_warnings = _cleanup_warnings(logger_logs)
+    assert len(cleanup_warnings) == 1
+    message, args = cleanup_warnings[0]
+    assert "dead-letter 失败后的快照恢复被拒绝" in str(message)
+    assert "group={}" in str(message)
+    assert "key={}" in str(message)
+    assert args[0] == "g1"
+    assert args[1] == fake_storage.restore_calls[0]["processing_key"]
+
+
+async def test_dead_letter_rejected_fallback_restore_rejected_warns(
+    fake_storage: FakeProcessingStorage,
+    lifecycle: ConversationProcessingLifecycle,
+    logger_logs: SimpleNamespace,
+) -> None:
+    """TSK-167：dead-letter 返回 False 后兜底 restore 亦被拒 → 仅 warning，零 exception。"""
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    fake_storage.dead_letter_result = False
+    fake_storage.restore_result = False
+    processor = _AlwaysFailProcessor(RuntimeError("总结失败"))
+
+    with pytest.raises(RuntimeError, match="总结失败"):
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert len(fake_storage.dead_letter_calls) == 1
+    assert len(fake_storage.restore_calls) == 1
+    assert logger_logs.exception == []
+    cleanup_warnings = _cleanup_warnings(logger_logs)
+    assert len(cleanup_warnings) == 1
+    message, args = cleanup_warnings[0]
+    assert "dead-letter 失败后的快照恢复被拒绝" in str(message)
+    assert "group={}" in str(message)
+    assert "key={}" in str(message)
+    assert args[0] == "g1"
+    assert args[1] == fake_storage.restore_calls[0]["processing_key"]
 
 
 async def test_lease_lost_from_processor_diverts_without_retry(
