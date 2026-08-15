@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
     from typing import Any
 
+from komari_bot.plugins.komari_memory.core.retry import get_retry_attempts
 from komari_bot.plugins.komari_memory.services import (
     conversation_processing_lifecycle as lifecycle_module,
 )
@@ -648,13 +649,17 @@ async def test_gate_renew_exception_dead_letters_with_attempt_count_one(
     fake_provider: FakeCollectorProvider,
     lifecycle: ConversationProcessingLifecycle,
 ) -> None:
-    """TSK-164：门控续租抛非租约异常 → finalize(error) 原实例 + dead-letter 一次 → re-raise。
+    """TSK-164 + TSK-166：门控续租抛非租约异常 → finalize(error) 原实例 → dead-letter → re-raise。
 
     心跳恰好 2 次续租（脚本化 wait_for 驱动），第 3 次续租即显式门控；续租抛出
     未经过重试包装层的 RuntimeError，attempt_count 经 get_retry_attempts 取空后
-    兜底为 1；dead-letter 成功故不触发 restore 兜底；update_last_summary 仅在
-    ack 成功之后执行，此路径不得调用；续租已抛故 ack 未发出。
+    兜底为 1；finalize(error) 必须先于 dead-letter（F25 三态时机）；dead-letter
+    成功故不触发 restore 兜底；update_last_summary 仅在 ack 成功之后执行，此路径
+    不得调用；续租已抛故 ack 未发出。
     """
+    events: list[str] = []
+    fake_storage.events = events
+    fake_provider.events = events
     gate_error = RuntimeError("门控续租 redis 抖动")
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.renew_script = [True, True, gate_error]
@@ -675,6 +680,7 @@ async def test_gate_renew_exception_dead_letters_with_attempt_count_one(
     assert len(fake_provider.finalize_calls) == 1
     assert fake_provider.finalize_calls[0][0] == "error"
     assert fake_provider.finalize_calls[0][1] is gate_error
+    assert events.index("finalize:error") < events.index("dead_letter")
 
 
 async def test_gate_ack_exception_dead_letters_with_attempt_count_one(
@@ -682,12 +688,16 @@ async def test_gate_ack_exception_dead_letters_with_attempt_count_one(
     fake_provider: FakeCollectorProvider,
     lifecycle: ConversationProcessingLifecycle,
 ) -> None:
-    """TSK-164：门控 ack 抛非租约异常 → finalize(error) 原实例 + dead-letter 一次 → re-raise。
+    """TSK-164 + TSK-166：门控 ack 抛非租约异常 → finalize(error) 原实例 → dead-letter → re-raise。
 
     与门控续租抛错用例对称：renew 全部成功、ack 抛出未经过重试包装层的
-    RuntimeError，attempt_count 兜底为 1；dead-letter 成功故不触发 restore 兜底；
-    update_last_summary 不得执行；ack 恰好发出 1 次。
+    RuntimeError，attempt_count 兜底为 1；finalize(error) 必须先于 dead-letter
+    （F25 三态时机）；dead-letter 成功故不触发 restore 兜底；update_last_summary
+    不得执行；ack 恰好发出 1 次。
     """
+    events: list[str] = []
+    fake_storage.events = events
+    fake_provider.events = events
     ack_error = RuntimeError("门控 ack redis 抖动")
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     fake_storage.renew_script = [True, True, True]
@@ -709,6 +719,7 @@ async def test_gate_ack_exception_dead_letters_with_attempt_count_one(
     assert len(fake_provider.finalize_calls) == 1
     assert fake_provider.finalize_calls[0][0] == "error"
     assert fake_provider.finalize_calls[0][1] is ack_error
+    assert events.index("finalize:error") < events.index("dead_letter")
 
 
 async def test_cancel_finalizes_cancelled_first_and_restores_once(
@@ -922,11 +933,12 @@ async def test_lease_lost_midway_stops_retry_immediately(
     fake_provider: FakeCollectorProvider,
     lifecycle: ConversationProcessingLifecycle,
 ) -> None:
-    """TSK-155：重试中途首次出现 lease-lost → 立即停止，第 3 次不发生。
+    """TSK-155 + TSK-166：重试中途首次出现 lease-lost → 立即停止，第 3 次不发生。
 
     脚本化：第 1 次 ValueError、第 2 次 ConversationLeaseLostError → 恰好 2 次
     process 调用；按 lease-lost 分流（dead-letter / restore 零调用）；抛出的
-    就是那个 lease-lost 实例。
+    就是那个 lease-lost 实例，且携带真实尝试次数 2（TSK-166：exclude 命中时
+    retry_async 附着已发生的实际尝试次数）。
     """
     fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
     lease_lost_error = ConversationLeaseLostError("pk")
@@ -936,6 +948,7 @@ async def test_lease_lost_midway_stops_retry_immediately(
         await lifecycle.process_conversation_snapshot("g1", processor)
 
     assert exc_info.value is lease_lost_error  # 抛出的就是那个 lease-lost 实例
+    assert get_retry_attempts(lease_lost_error) == 2  # 真实尝试次数 2（TSK-166）
     assert processor.process_calls == 2  # 第 3 次调用不发生
     assert fake_storage.dead_letter_calls == []
     assert fake_storage.restore_calls == []
