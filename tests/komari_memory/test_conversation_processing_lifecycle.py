@@ -93,6 +93,7 @@ class FakeProcessingStorage:
         self.set_stop_after_renew: int | None = None
         self.ack_calls: list[dict[str, str]] = []
         self.ack_result: bool = True
+        self.ack_error: Exception | None = None
         self.restore_calls: list[dict[str, str]] = []
         self.restore_result: bool = True
         self.restore_error: Exception | None = None
@@ -228,6 +229,8 @@ class FakeProcessingStorage:
             {"group_id": group_id, "processing_key": processing_key, "owner_token": owner_token}
         )
         self._mark("ack")
+        if self.ack_error is not None:
+            raise self.ack_error
         return self.ack_result
 
     async def restore_processing_conversation_buffer(
@@ -638,6 +641,74 @@ async def test_gate_renew_false_before_ack_raises_lease_lost(
     assert fake_storage.restore_calls == []
     assert fake_storage.dead_letter_calls == []
     assert fake_storage.update_last_summary_calls == []
+
+
+async def test_gate_renew_exception_dead_letters_with_attempt_count_one(
+    fake_storage: FakeProcessingStorage,
+    fake_provider: FakeCollectorProvider,
+    lifecycle: ConversationProcessingLifecycle,
+) -> None:
+    """TSK-164：门控续租抛非租约异常 → finalize(error) 原实例 + dead-letter 一次 → re-raise。
+
+    心跳恰好 2 次续租（脚本化 wait_for 驱动），第 3 次续租即显式门控；续租抛出
+    未经过重试包装层的 RuntimeError，attempt_count 经 get_retry_attempts 取空后
+    兜底为 1；dead-letter 成功故不触发 restore 兜底；update_last_summary 仅在
+    ack 成功之后执行，此路径不得调用；续租已抛故 ack 未发出。
+    """
+    gate_error = RuntimeError("门控续租 redis 抖动")
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    fake_storage.renew_script = [True, True, gate_error]
+    processor = RecordingProcessor()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert exc_info.value is gate_error
+    assert len(processor.process_calls) == 1
+    assert len(fake_storage.renew_calls) == 3
+    assert fake_storage.ack_calls == []
+    assert len(fake_storage.dead_letter_calls) == 1
+    assert fake_storage.dead_letter_calls[0]["failure_code"] == "RuntimeError"
+    assert fake_storage.dead_letter_calls[0]["attempt_count"] == 1
+    assert fake_storage.restore_calls == []
+    assert fake_storage.update_last_summary_calls == []
+    assert len(fake_provider.finalize_calls) == 1
+    assert fake_provider.finalize_calls[0][0] == "error"
+    assert fake_provider.finalize_calls[0][1] is gate_error
+
+
+async def test_gate_ack_exception_dead_letters_with_attempt_count_one(
+    fake_storage: FakeProcessingStorage,
+    fake_provider: FakeCollectorProvider,
+    lifecycle: ConversationProcessingLifecycle,
+) -> None:
+    """TSK-164：门控 ack 抛非租约异常 → finalize(error) 原实例 + dead-letter 一次 → re-raise。
+
+    与门控续租抛错用例对称：renew 全部成功、ack 抛出未经过重试包装层的
+    RuntimeError，attempt_count 兜底为 1；dead-letter 成功故不触发 restore 兜底；
+    update_last_summary 不得执行；ack 恰好发出 1 次。
+    """
+    ack_error = RuntimeError("门控 ack redis 抖动")
+    fake_storage.buffer_items = [dict(_VALID_MESSAGE)]
+    fake_storage.renew_script = [True, True, True]
+    fake_storage.ack_error = ack_error
+    processor = RecordingProcessor()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await lifecycle.process_conversation_snapshot("g1", processor)
+
+    assert exc_info.value is ack_error
+    assert len(processor.process_calls) == 1
+    assert len(fake_storage.renew_calls) == 3
+    assert len(fake_storage.ack_calls) == 1
+    assert len(fake_storage.dead_letter_calls) == 1
+    assert fake_storage.dead_letter_calls[0]["failure_code"] == "RuntimeError"
+    assert fake_storage.dead_letter_calls[0]["attempt_count"] == 1
+    assert fake_storage.restore_calls == []
+    assert fake_storage.update_last_summary_calls == []
+    assert len(fake_provider.finalize_calls) == 1
+    assert fake_provider.finalize_calls[0][0] == "error"
+    assert fake_provider.finalize_calls[0][1] is ack_error
 
 
 async def test_cancel_finalizes_cancelled_first_and_restores_once(
