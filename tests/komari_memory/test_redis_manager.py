@@ -17,6 +17,9 @@ from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSch
 from komari_bot.plugins.komari_memory.services import (
     redis_manager as redis_manager_module,
 )
+from komari_bot.plugins.komari_memory.services.conversation_processing import (
+    ConversationChunkStateMismatchError,
+)
 from komari_bot.plugins.komari_memory.services.redis_keys import RedisKeys
 from komari_bot.plugins.komari_memory.services.redis_manager import (
     MessageSchema,
@@ -1221,6 +1224,81 @@ def test_chunk_ledger_survives_owner_takeover_and_is_removed_on_ack(
     )
     ledger_key = RedisKeys.buffer_processing_chunks("g1", "snapshot-1")
     assert ledger_key not in shared_redis.hashes
+
+
+def test_set_conversation_chunk_state_readback_consistent_does_not_raise(
+    monkeypatch: Any,
+) -> None:
+    """分块状态写入后 Lua 回读一致时不抛异常，且后续 get 能读到写入值。"""
+    manager = _build_manager(monkeypatch)
+    fake_redis = _get_fake_redis(manager)
+    fake_redis.data[RedisKeys.buffer("g1")] = [
+        json.dumps(_build_message(1).__dict__, ensure_ascii=False)
+    ]
+    claim = asyncio.run(
+        manager.claim_conversation_buffer("g1", "owner-1", "snapshot-1")
+    )
+    processing_key = str(claim.processing_key)
+
+    asyncio.run(
+        manager.set_conversation_chunk_state(
+            group_id="g1",
+            processing_key=processing_key,
+            owner_token="owner-1",
+            field="phase",
+            value="summarizing",
+        )
+    )
+    recovered = asyncio.run(
+        manager.get_conversation_chunk_state(
+            group_id="g1",
+            processing_key=processing_key,
+            owner_token="owner-1",
+            field="phase",
+        )
+    )
+    assert recovered == "summarizing"
+
+
+def test_set_conversation_chunk_state_readback_mismatch_raises_domain_error(
+    monkeypatch: Any,
+) -> None:
+    """回读值与写入值不一致时抛 ConversationChunkStateMismatchError 而非裸 RuntimeError。"""
+    manager = _build_manager(monkeypatch)
+    fake_redis = _get_fake_redis(manager)
+    fake_redis.data[RedisKeys.buffer("g1")] = [
+        json.dumps(_build_message(1).__dict__, ensure_ascii=False)
+    ]
+    claim = asyncio.run(
+        manager.claim_conversation_buffer("g1", "owner-1", "snapshot-1")
+    )
+    processing_key = str(claim.processing_key)
+    original_eval = fake_redis._eval_conversation_chunk_ledger
+
+    def _mismatched_readback(rest: list[object]) -> list[object]:
+        result = original_eval(rest)
+        return [result[0], "被篡改的回读值"]
+
+    monkeypatch.setattr(
+        fake_redis,
+        "_eval_conversation_chunk_ledger",
+        _mismatched_readback,
+    )
+
+    with pytest.raises(ConversationChunkStateMismatchError) as exc_info:
+        asyncio.run(
+            manager.set_conversation_chunk_state(
+                group_id="g1",
+                processing_key=processing_key,
+                owner_token="owner-1",
+                field="phase",
+                value="summarizing",
+            )
+        )
+    exc = exc_info.value
+    assert isinstance(exc, RuntimeError)
+    assert type(exc) is not RuntimeError
+    assert "写入后不一致" in str(exc)
 
 
 def test_conversation_dead_letter_is_queryable_and_requeues_atomically(
