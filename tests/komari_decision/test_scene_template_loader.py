@@ -9,13 +9,7 @@ import pytest
 from komari_bot.plugins.komari_decision.services.scene_template_loader import (
     PostgresSceneTemplateLoader,
 )
-
-_REQUIRED_FIXED_SCENE_KEYS = (
-    "NOISE",
-    "MEANINGFUL",
-    "CALL_DIRECT",
-    "CALL_MENTION",
-)
+from tests.komari_decision.required_fixed_scene_keys import REQUIRED_FIXED_SCENE_KEYS
 
 
 def _valid_rows() -> list[dict[str, Any]]:
@@ -29,7 +23,7 @@ def _valid_rows() -> list[dict[str, Any]]:
             "order_index": index,
             "content_hash": f"hash-{scene_key}",
         }
-        for index, scene_key in enumerate(_REQUIRED_FIXED_SCENE_KEYS, start=1)
+        for index, scene_key in enumerate(REQUIRED_FIXED_SCENE_KEYS, start=1)
     ]
     rows.append(
         {
@@ -60,7 +54,7 @@ class FakeSceneRepository:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing_key", _REQUIRED_FIXED_SCENE_KEYS)
+@pytest.mark.parametrize("missing_key", REQUIRED_FIXED_SCENE_KEYS)
 async def test_loader_rejects_each_missing_required_fixed_scene(
     missing_key: str,
 ) -> None:
@@ -78,7 +72,7 @@ async def test_loader_rejects_each_missing_required_fixed_scene(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_key", _REQUIRED_FIXED_SCENE_KEYS)
+@pytest.mark.parametrize("invalid_key", REQUIRED_FIXED_SCENE_KEYS)
 async def test_loader_rejects_required_scene_declared_as_general(
     invalid_key: str,
 ) -> None:
@@ -107,5 +101,5 @@ async def test_loader_returns_valid_fixed_and_general_scenes() -> None:
 
     payload = await loader.load_scene_template()
 
-    assert set(payload.fixed_candidates) == set(_REQUIRED_FIXED_SCENE_KEYS)
+    assert set(payload.fixed_candidates) == set(REQUIRED_FIXED_SCENE_KEYS)
     assert payload.general_scenes == [{"id": "GREETING", "text": "问候场景"}]

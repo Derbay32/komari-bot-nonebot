@@ -16,10 +16,9 @@ from komari_bot.plugins.komari_decision.services.scene_admin_service import (
     SceneAdminService,
 )
 from komari_bot.plugins.komari_management import scene_api
+from tests.komari_decision.required_fixed_scene_keys import REQUIRED_FIXED_SCENE_KEYS
 
-_REQUIRED_FIXED_SCENE_KEYS = frozenset(
-    {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
-)
+_EXPECTED_REQUIRED_FIXED_KEYS = frozenset(REQUIRED_FIXED_SCENE_KEYS)
 
 
 def _required_fixed_literal_locations() -> list[str]:
@@ -38,7 +37,7 @@ def _required_fixed_literal_locations() -> list[str]:
             }
             if len(values) != len(node.elts):
                 continue
-            if frozenset(values) == _REQUIRED_FIXED_SCENE_KEYS:
+            if frozenset(values) == _EXPECTED_REQUIRED_FIXED_KEYS:
                 locations.append(f"{source_file}:{node.lineno}")
     return locations
 
