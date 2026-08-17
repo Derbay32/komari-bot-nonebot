@@ -201,13 +201,12 @@ def test_upsert_scene_persists_legal_fixed_and_general_writes(
 
 
 def test_upsert_scene_rejects_padded_required_fixed_key_before_repository() -> None:
-    """回归：裁决以 trim 后的 key/type 为准，原值裁决会漏判并触达 Repository。
+    """回归：场景运维写入路径先规范化 key/type，再执行 required-fixed 裁决。
 
-    生产 `validate_required_fixed_scene_write` 先对 scene_key 与 scene_type
-    strip 再比较 required-fixed 集合；本测试用 scene_key=" NOISE "、
-    scene_type="general" 区分两种裁决：若按原值比较，padded key 不匹配
-    集合，写入会落到 Repository；按 trim 后裁决则应在 Repository 调用前
-    抛出领域 ValueError。
+    本测试用 scene_key=" NOISE "、scene_type="general" 区分规范化后裁决
+    与原值裁决：若按原值裁决，padded key 不会命中 required-fixed 集合，
+    会漏判并触达 Repository；规范化后裁决则应在 Repository 调用前抛出
+    领域 ValueError。
     """
     repository = FakeSceneRepository()
     service = _build_service(repository, _UNUSED_SYNC_SERVICE)
