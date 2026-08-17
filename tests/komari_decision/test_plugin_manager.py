@@ -55,8 +55,13 @@ class _FakeSceneEmbeddingWorker:
 
 
 class _FakeSceneAdminService:
-    def __init__(self, repository: _FakeSceneRepository) -> None:
+    def __init__(
+        self,
+        repository: _FakeSceneRepository,
+        sync_service: object | None = None,
+    ) -> None:
         self.repository = repository
+        self.sync_service = sync_service
 
 
 def _patch_config(
@@ -238,6 +243,114 @@ def test_initialize_recovers_active_cache_during_bootstrap(
     assert manager.scene_sync is not None
     assert manager.scene_embedding_worker is not None
     assert manager.runtime_state.status is DecisionRuntimeStatus.READY
+
+
+def test_initialize_shares_single_sync_service_with_admin_and_worker(
+    monkeypatch: Any,
+) -> None:
+    """TSK-179: SceneSyncService 只构造一次，admin 与 worker 收到同一实例。"""
+    manager = decision_plugin.PluginManager()
+    memory_module = sys.modules["komari_bot.plugins.komari_memory"]
+    created_sync: list[object] = []
+    admin_created: list[tuple[object, object | None]] = []
+    registered: dict[str, object] = {}
+
+    class _TrackingSyncService:
+        def __init__(self, repository: object) -> None:
+            self.repository = repository
+            created_sync.append(self)
+
+    class _TrackingAdminService:
+        def __init__(
+            self,
+            repository: object,
+            sync_service: object | None = None,
+        ) -> None:
+            admin_created.append((repository, sync_service))
+
+    monkeypatch.setattr(
+        nonebot.plugin,
+        "require",
+        lambda _name: object(),
+    )
+    monkeypatch.setattr(
+        memory_module,
+        "get_plugin_manager",
+        lambda: SimpleNamespace(pg_pool=object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        decision_plugin,
+        "require",
+        lambda name: memory_module if name == "komari_memory" else object(),
+    )
+    _patch_config(
+        monkeypatch,
+        plugin_enable=True,
+        scene_persist_enabled=True,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.repositories.scene_repository.SceneRepository",
+        _FakeSceneRepository,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_runtime_service.SceneRuntimeService",
+        _FakeSceneRuntimeService,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_sync_service.SceneSyncService",
+        _TrackingSyncService,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_embedding_worker.SceneEmbeddingWorker",
+        _FakeSceneEmbeddingWorker,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.services.scene_admin_service.SceneAdminService",
+        _TrackingAdminService,
+    )
+
+    def _register(
+        repository: object,
+        admin_service: object,
+        sync_service: object,
+        embedding_worker: object,
+        runtime_service: object,
+    ) -> None:
+        registered["repository"] = repository
+        registered["admin_service"] = admin_service
+        registered["sync_service"] = sync_service
+        registered["embedding_worker"] = embedding_worker
+        registered["runtime_service"] = runtime_service
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.register_scene_sync_task",
+        _register,
+    )
+
+    async def _noop_bootstrap() -> None:
+        """本测试只关心 wiring，不执行 bootstrap 内容。"""
+
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.bootstrap_scene_sync_task",
+        _noop_bootstrap,
+    )
+    monkeypatch.setattr(
+        "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.unregister_scene_sync_task",
+        lambda: None,
+    )
+
+    asyncio.run(manager.initialize())
+
+    assert len(created_sync) == 1
+    assert len(admin_created) == 1
+    sync_instance = created_sync[0]
+    assert isinstance(sync_instance, _TrackingSyncService)
+    assert admin_created[0][0] is sync_instance.repository
+    assert admin_created[0][1] is sync_instance
+    assert registered["sync_service"] is sync_instance
+    assert registered["admin_service"] is admin_created[0][0]
+    assert registered["repository"] is admin_created[0][0]
 
 
 def test_initialize_marks_plugin_disabled_without_loading_services(
