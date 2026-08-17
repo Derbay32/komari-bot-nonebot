@@ -3,7 +3,7 @@
 依赖已执行 ``alembic upgrade head`` 的迁移管理 schema（``KOMARI_TEST_POSTGRES_URL``
 门控）。本文件取代旧 ``test_scene_repository_leases.py`` 中与 asyncpg SQL 字符串
 耦合的 fake 单测：行为契约（fingerprint 唯一、租约认领/退避/失败标记、并发唯一
-认领者、运行时单例切换、场景 CRUD 与快照不可变）全部通过仓储公共接口在真实库
+认领者、运行时单例切换、场景存储与快照不可变）全部通过仓储公共接口在真实库
 上断言，行为覆盖不减少。数据准备与清理走同一套 SQLModel 表模型。
 """
 
@@ -272,89 +272,6 @@ async def test_upsert_and_get_scene_roundtrip() -> None:
         assert await repo.get_scene_by_key("SCENE_NOT_EXISTS") is None
     finally:
         await _cleanup(scene_keys=[scene_key])
-        await _reset_shared_orm_engine()
-
-
-@pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
-@pytest.mark.asyncio
-async def test_delete_scene_requires_not_reserved() -> None:
-    if not _same_database(POSTGRES_URL, _configured_database_url()):
-        pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
-    await _reset_shared_orm_engine()
-    repo = _repository()
-    try:
-        for reserved in ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"):
-            with pytest.raises(ValueError, match="必需 fixed scene 不允许删除"):
-                await repo.delete_scene(reserved)
-    finally:
-        await _reset_shared_orm_engine()
-
-
-@pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
-@pytest.mark.asyncio
-async def test_delete_scene_unreferenced_removes_row() -> None:
-    if not _same_database(POSTGRES_URL, _configured_database_url()):
-        pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
-    await _reset_shared_orm_engine()
-    repo = _repository()
-    scene_key = _make_scene_key()
-    try:
-        await _create_scene(repo, scene_key)
-        assert await repo.has_any_scene() is True
-        assert await repo.delete_scene(scene_key) is True
-        assert await repo.get_scene_by_key(scene_key) is None
-        assert await repo.delete_scene(scene_key) is False
-    finally:
-        await _cleanup(scene_keys=[scene_key])
-        await _reset_shared_orm_engine()
-
-
-@pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
-@pytest.mark.asyncio
-async def test_delete_scene_referenced_disables_instead_of_deleting() -> None:
-    if not _same_database(POSTGRES_URL, _configured_database_url()):
-        pytest.skip("KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致")
-    await _reset_shared_orm_engine()
-    repo = _repository()
-    tag = uuid4().hex
-    scene_key = _make_scene_key()
-    scene_set_id: int | None = None
-    try:
-        scene = await _create_scene(repo, scene_key, content_text="历史版本文本", order_index=3)
-        scene_set, _created = await repo.get_or_create_scene_set(
-            source_path=f"postgresql:integration:{tag}",
-            source_hash=_make_fingerprint(),
-            embedding_model="integration-model",
-            embedding_instruction_hash=f"inst-{tag}",
-        )
-        scene_set_id = int(scene_set["id"])
-        await repo.insert_scene_items(
-            scene_set_id,
-            [
-                {
-                    "scene_id": scene["id"],
-                    "scene_key": scene["scene_key"],
-                    "scene_type": scene["scene_type"],
-                    "content_text": scene["content_text"],
-                    "enabled": scene["enabled"],
-                    "order_index": scene["order_index"],
-                    "content_hash": scene["content_hash"],
-                    "status": "PENDING",
-                }
-            ],
-        )
-
-        assert await repo.delete_scene(scene_key) is True
-        current = await repo.get_scene_by_key(scene_key)
-        assert current is not None
-        assert current["enabled"] is False
-        items = await repo.list_items_by_set(scene_set_id)
-        assert items[0]["content_text"] == "历史版本文本"
-    finally:
-        await _cleanup(
-            set_ids=[scene_set_id] if scene_set_id is not None else None,
-            scene_keys=[scene_key],
-        )
         await _reset_shared_orm_engine()
 
 

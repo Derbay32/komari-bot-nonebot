@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     from komari_bot.management.management_audit import ManagementAuditRecorder
 
 API_PREFIX = "/api/v2/komari-decision-scenes"
-_REQUIRED_FIXED_KEYS = {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}
 
 
 class SceneSummary(BaseModel):
@@ -132,17 +131,6 @@ def _prepare_admin_service() -> Any:
     return service
 
 
-def _validate_required_fixed_update(scene_key: str, scene_type: str, *, enabled: bool) -> None:
-    if scene_key not in _REQUIRED_FIXED_KEYS:
-        return
-    if scene_type != "fixed":
-        msg = f"必需 fixed scene 不允许改为其他类型: {scene_key}"
-        raise _validation_error(msg)
-    if not enabled:
-        msg = f"必需 fixed scene 不允许禁用: {scene_key}"
-        raise _validation_error(msg)
-
-
 def create_scene_router(
     *,
     api_token: ManagementTokenSource,
@@ -200,11 +188,6 @@ def create_scene_router(
             target_hash=hash_management_target(scene_key),
             recorder=recorder,
         ):
-            _validate_required_fixed_update(
-                scene_key,
-                payload.scene_type,
-                enabled=payload.enabled,
-            )
             service = _prepare_admin_service()
             try:
                 row = await service.upsert_scene(
@@ -257,7 +240,6 @@ def create_scene_router(
                 if payload.order_index is not None
                 else int(current["order_index"])
             )
-            _validate_required_fixed_update(scene_key, scene_type, enabled=enabled)
             try:
                 row = await service.upsert_scene(
                     scene_key=scene_key,

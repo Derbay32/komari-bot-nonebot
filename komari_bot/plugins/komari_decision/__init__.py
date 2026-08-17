@@ -170,11 +170,7 @@ class PluginManager:
                 scene_repository,
                 batch_size=16,
             )
-            scene_admin = SceneAdminService(
-                scene_repository,
-                scene_runtime,
-                scene_embedding_worker,
-            )
+            scene_admin = SceneAdminService(scene_repository)
 
             # scene 表结构由 Alembic 迁移统一管理，此处不再执行 DDL。
             if not await scene_repository.has_any_scene():

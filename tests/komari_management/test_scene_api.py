@@ -1,8 +1,9 @@
-"""Scene 管理 API 边界测试（ticket #32）。
+"""Scene 管理 API 边界测试。
 
 验收目标：
-- 场景读写改走判定插件顶层 `get_scene_admin_service()` 暴露的场景运维服务；
-- 自建仓储旁路删除：判定插件未就绪时统一返回 503 服务未就绪；
+- 场景读写只走判定插件顶层暴露的场景运维服务；
+- 判定插件未就绪时优先返回 503，就绪后的领域校验失败映射为 422；
+- 管理适配器不重复裁决 required-fixed 规则，也不自建仓储旁路；
 - 管理插件内不再存在指向 komari_decision 内部子模块的 import（配置 Schema 豁免）。
 """
 
@@ -58,6 +59,7 @@ class _FakeSceneAdminService:
         self.list_calls: list[bool] = []
         self.get_calls: list[str] = []
         self.upsert_calls: list[dict[str, Any]] = []
+        self.upsert_error: ValueError | None = None
         _FakeSceneAdminService.instances.append(self)
 
     async def list_scenes(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -88,6 +90,8 @@ class _FakeSceneAdminService:
             "order_index": order_index,
         }
         self.upsert_calls.append(call)
+        if self.upsert_error is not None:
+            raise self.upsert_error
         row = dict(_SCENE_ROW)
         row.update(call)
         row["content_hash"] = "hash-updated"
@@ -201,6 +205,30 @@ async def test_scene_api_returns_503_when_decision_plugin_not_ready(
 
 
 @pytest.mark.asyncio
+async def test_scene_put_returns_503_before_required_fixed_validation(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _patch_admin_service(monkeypatch, None)
+
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        client = ctx.get_client()
+        response = await client.put(
+            f"{API_PREFIX}/scenes/NOISE",
+            headers=_write_headers(),
+            json={
+                "scene_type": "general",
+                "content_text": "非法改型",
+                "enabled": False,
+                "order_index": 0,
+            },
+        )
+
+    assert response.status_code == 503
+    assert "未就绪" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_scene_put_delegates_to_admin_service(
     app: App,
     monkeypatch: MonkeyPatch,
@@ -230,6 +258,101 @@ async def test_scene_put_delegates_to_admin_service(
             "content_text": "打招呼",
             "enabled": False,
             "order_index": 7,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scene_put_maps_ready_service_domain_validation_to_422(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    admin = _FakeSceneAdminService()
+    admin.upsert_error = ValueError("领域拒绝 required-fixed 改型")
+    _patch_admin_service(monkeypatch, admin)
+
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        client = ctx.get_client()
+        response = await client.put(
+            f"{API_PREFIX}/scenes/NOISE",
+            headers=_write_headers(),
+            json={
+                "scene_type": "general",
+                "content_text": "非法改型",
+                "enabled": True,
+                "order_index": 0,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "领域拒绝 required-fixed 改型"
+    assert admin.upsert_calls == [
+        {
+            "scene_key": "NOISE",
+            "scene_type": "general",
+            "content_text": "非法改型",
+            "enabled": True,
+            "order_index": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scene_patch_keeps_successful_update_response(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    admin = _FakeSceneAdminService()
+    _patch_admin_service(monkeypatch, admin)
+
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        client = ctx.get_client()
+        response = await client.patch(
+            f"{API_PREFIX}/scenes/NOISE",
+            headers=_write_headers(),
+            json={"content_text": "更新后的噪声内容", "order_index": 9},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["content_text"] == "更新后的噪声内容"
+    assert response.json()["order_index"] == 9
+    assert admin.upsert_calls == [
+        {
+            "scene_key": "NOISE",
+            "scene_type": "fixed",
+            "content_text": "更新后的噪声内容",
+            "enabled": True,
+            "order_index": 9,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scene_patch_maps_ready_service_domain_validation_to_422(
+    app: App,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    admin = _FakeSceneAdminService()
+    admin.upsert_error = ValueError("领域拒绝 required-fixed 禁用")
+    _patch_admin_service(monkeypatch, admin)
+
+    async with app.test_server(asgi=cast("Any", _build_app())) as ctx:
+        client = ctx.get_client()
+        response = await client.patch(
+            f"{API_PREFIX}/scenes/NOISE",
+            headers=_write_headers(),
+            json={"enabled": False},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "领域拒绝 required-fixed 禁用"
+    assert admin.upsert_calls == [
+        {
+            "scene_key": "NOISE",
+            "scene_type": "fixed",
+            "content_text": "噪声内容",
+            "enabled": False,
+            "order_index": 0,
         }
     ]
 

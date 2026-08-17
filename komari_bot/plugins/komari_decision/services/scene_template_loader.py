@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING, Protocol
 
 import yaml
 
+from ._fixed_scene_rules import find_missing_required_fixed_scene_keys
+
 _DEFAULT_SCENE_TEMPLATE_PATH = Path("config") / "prompts" / "komari_memory_scenes.yaml"
 _PG_SOURCE_PATH = "postgresql:komari_decision_scenes"
-_REQUIRED_FIXED_KEYS = ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION")
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -208,6 +209,7 @@ class PostgresSceneTemplateLoader:
     @staticmethod
     def _validate_scenes(rows: list[dict]) -> None:
         keys: set[str] = set()
+        fixed_keys: set[str] = set()
         general_count = 0
         for row in rows:
             scene_key = str(row.get("scene_key") or "").strip()
@@ -226,10 +228,12 @@ class PostgresSceneTemplateLoader:
             if not content_text:
                 msg = f"scene 内容不能为空: {scene_key}"
                 raise ValueError(msg)
-            if scene_type == "general":
+            if scene_type == "fixed":
+                fixed_keys.add(scene_key)
+            else:
                 general_count += 1
 
-        missing = [key for key in _REQUIRED_FIXED_KEYS if key not in keys]
+        missing = find_missing_required_fixed_scene_keys(fixed_keys)
         if missing:
             msg = f"PostgreSQL scenes 缺少必需 fixed keys: {missing}"
             raise ValueError(msg)
