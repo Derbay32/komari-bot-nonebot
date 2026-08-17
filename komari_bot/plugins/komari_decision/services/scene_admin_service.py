@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ._fixed_scene_rules import validate_required_fixed_scene_write
 from .config_interface import get_config
 
 if TYPE_CHECKING:
@@ -71,7 +72,12 @@ class SceneAdminService:
         enabled: bool = True,
         order_index: int = 0,
     ) -> dict[str, Any]:
-        """新增或更新 scene 内容记录，直通 SceneRepository.upsert_scene。"""
+        """校验必需 fixed scene 规则后新增或更新内容记录。"""
+        validate_required_fixed_scene_write(
+            scene_key=scene_key.strip(),
+            scene_type=scene_type.strip(),
+            enabled=enabled,
+        )
         return await self._repository.upsert_scene(
             scene_key=scene_key,
             scene_type=scene_type,
