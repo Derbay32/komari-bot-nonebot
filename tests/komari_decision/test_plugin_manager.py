@@ -55,15 +55,8 @@ class _FakeSceneEmbeddingWorker:
 
 
 class _FakeSceneAdminService:
-    def __init__(
-        self,
-        repository: _FakeSceneRepository,
-        runtime_service: _FakeSceneRuntimeService,
-        embedding_worker: _FakeSceneEmbeddingWorker,
-    ) -> None:
+    def __init__(self, repository: _FakeSceneRepository) -> None:
         self.repository = repository
-        self.runtime_service = runtime_service
-        self.embedding_worker = embedding_worker
 
 
 def _patch_config(

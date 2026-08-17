@@ -124,10 +124,38 @@ def test_runtime_load_and_switch() -> None:
     assert changed_after is False
 
 
-def test_runtime_load_keeps_strict_fixed_embedding_validation() -> None:
+@pytest.mark.parametrize(
+    "scene_key",
+    ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"),
+)
+def test_runtime_rejects_missing_required_fixed_candidate(scene_key: str) -> None:
     repository = FakeSceneRepository()
-    repository.items[1][0]["embedding"] = None
+    repository.items[1] = [
+        item for item in repository.items[1] if item["scene_key"] != scene_key
+    ]
     service = SceneRuntimeService(cast("Any", repository))
 
-    with pytest.raises(RuntimeError, match="active set 缺少固定候选或 embedding"):
+    with pytest.raises(RuntimeError) as exc_info:
         asyncio.run(service.load_active_set_cache())
+
+    assert scene_key in str(exc_info.value)
+    assert "固定候选或 embedding" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "scene_key",
+    ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"),
+)
+def test_runtime_rejects_missing_required_fixed_embedding(scene_key: str) -> None:
+    repository = FakeSceneRepository()
+    item = next(
+        item for item in repository.items[1] if item["scene_key"] == scene_key
+    )
+    item["embedding"] = None
+    service = SceneRuntimeService(cast("Any", repository))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(service.load_active_set_cache())
+
+    assert scene_key in str(exc_info.value)
+    assert "固定候选或 embedding" in str(exc_info.value)

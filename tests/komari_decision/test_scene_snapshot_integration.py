@@ -83,8 +83,8 @@ def _repository() -> SceneRepository:
 
 @pytest.mark.skipif(not POSTGRES_URL, reason="未配置真实 PostgreSQL 测试连接")
 @pytest.mark.asyncio
-async def test_scene_item_snapshot_survives_scene_edit_and_delete() -> None:
-    """历史 set 必须保留创建时文本，且被引用 scene 删除只能转为停用。"""
+async def test_scene_item_snapshot_survives_scene_edit_and_disable() -> None:
+    """当前 scene 编辑或停用后，历史 set 仍保留创建时文本。"""
     if not _same_database(POSTGRES_URL, _configured_database_url()):
         pytest.skip(
             "KOMARI_TEST_POSTGRES_URL 与 nonebot sqlalchemy_database_url 不一致"
@@ -140,12 +140,19 @@ async def test_scene_item_snapshot_survives_scene_edit_and_delete() -> None:
         assert immutable_items[0]["content_text"] == "历史版本文本"
         assert immutable_items[0]["order_index"] == 3
 
-        assert await repository.delete_scene(scene_key) is True
+        await repository.upsert_scene(
+            scene_key=scene_key,
+            scene_type="general",
+            content_text="当前版本已修改",
+            enabled=False,
+            order_index=99,
+        )
         current_scene = await repository.get_scene_by_key(scene_key)
         assert current_scene is not None
         assert current_scene["enabled"] is False
-        after_delete = await repository.list_items_by_set(scene_set_id)
-        assert after_delete[0]["content_text"] == "历史版本文本"
+        after_disable = await repository.list_items_by_set(scene_set_id)
+        assert after_disable[0]["content_text"] == "历史版本文本"
+        assert after_disable[0]["order_index"] == 3
     finally:
         session = _open_session()
         try:
