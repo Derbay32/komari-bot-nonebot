@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
 from fastapi import Path as ApiPath
 from nonebot import logger
-from nonebot.plugin import require
 from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
@@ -82,13 +81,12 @@ class ScenePatchRequest(BaseModel):
 class SceneSyncResponse(BaseModel):
     """Scene 同步触发响应。"""
 
-    triggered: bool
-    set_id: int | None = None
-    created: bool | None = None
-    reused_existing_set: bool | None = None
-    inserted_count: int | None = None
-    ready_count: int | None = None
-    pending_count: int | None = None
+    set_id: int
+    created: bool
+    reused_existing_set: bool
+    inserted_count: int
+    ready_count: int
+    pending_count: int
     detail: str
 
 
@@ -266,40 +264,32 @@ def create_scene_router(
             resource="komari_decision_scene_set",
             recorder=recorder,
         ) as audit:
-            require("komari_decision")
-            from komari_bot.plugins import komari_decision as decision_plugin
-
-            manager_getter = getattr(decision_plugin, "get_plugin_manager", None)
-            manager = manager_getter() if callable(manager_getter) else None
-            scene_sync = (
-                getattr(manager, "scene_sync", None) if manager is not None else None
+            service = _prepare_admin_service()
+            try:
+                result = await service.sync_scenes()
+            except ValueError as exc:
+                raise _validation_error(str(exc)) from exc
+            except Exception as exc:
+                logger.exception("[Komari Management] scene sync 执行失败")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="scene sync 执行失败",
+                ) from exc
+            audit.metadata.update(
+                {
+                    "created": bool(result.created),
+                    "inserted_count": int(result.inserted_count),
+                }
             )
-            if scene_sync is None:
-                audit.metadata["triggered"] = False
-                response = SceneSyncResponse(
-                    triggered=False,
-                    detail="scene sync 服务未就绪；请确认 komari_decision scene 持久化已启用",
-                )
-            else:
-                result = await scene_sync.build_scene_set()
-                audit.metadata.update(
-                    {
-                        "triggered": True,
-                        "created": bool(result.created),
-                        "inserted_count": int(result.inserted_count),
-                    }
-                )
-                response = SceneSyncResponse(
-                    triggered=True,
-                    set_id=result.set_id,
-                    created=result.created,
-                    reused_existing_set=result.reused_existing_set,
-                    inserted_count=result.inserted_count,
-                    ready_count=result.ready_count,
-                    pending_count=result.pending_count,
-                    detail="scene sync 已触发，embedding 可能由后台任务异步完成",
-                )
-            return response
+            return SceneSyncResponse(
+                set_id=result.set_id,
+                created=result.created,
+                reused_existing_set=result.reused_existing_set,
+                inserted_count=result.inserted_count,
+                ready_count=result.ready_count,
+                pending_count=result.pending_count,
+                detail="scene sync 已触发，embedding 可能由后台任务异步完成",
+            )
 
     return router
 
