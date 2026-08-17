@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -10,6 +11,9 @@ import pytest
 
 from komari_bot.plugins.komari_decision.services.scene_admin_service import (
     SceneAdminService,
+)
+from komari_bot.plugins.komari_decision.services.scene_sync_service import (
+    SceneSyncResult,
 )
 
 _REQUIRED_FIXED_SCENE_KEYS = (
@@ -65,8 +69,35 @@ class FakeSceneRepository:
         return dict(call)
 
 
-def _build_service(repository: FakeSceneRepository) -> SceneAdminService:
-    return SceneAdminService(repository=cast("Any", repository))
+class _FakeSyncService:
+    """SceneSyncService 桩：返回预设的 SceneSyncResult。"""
+
+    def __init__(self, result: SceneSyncResult) -> None:
+        self._result = result
+        self.build_calls = 0
+
+    async def build_scene_set(self) -> SceneSyncResult:
+        self.build_calls += 1
+        return self._result
+
+
+def _build_service(
+    repository: FakeSceneRepository,
+    sync_service: object | None = None,
+) -> SceneAdminService:
+    """构造 SceneAdminService。
+
+    TSK-179 起构造签名扩展为 (repository, sync_service)；既有 prune/upsert
+    用例不关心 sync 参数，helper 按当前签名自适应以在两阶段都可运行。
+    """
+    admin_class = cast("Any", SceneAdminService)
+    params = inspect.signature(SceneAdminService).parameters
+    if "sync_service" in params:
+        return admin_class(
+            repository=cast("Any", repository),
+            sync_service=sync_service,
+        )
+    return admin_class(repository=cast("Any", repository))
 
 
 def test_prune_old_sets_keeps_latest_and_active(monkeypatch: Any) -> None:
@@ -178,3 +209,32 @@ def test_upsert_scene_persists_legal_fixed_and_general_writes(
     }
     assert row == expected
     assert repository.upsert_scene_calls == [expected]
+
+
+def test_sync_scenes_returns_same_scene_sync_result_object() -> None:
+    """TSK-179: sync_scenes() 原样返回同一 SceneSyncResult 对象，不新增 DTO。"""
+    assert list(inspect.signature(SceneAdminService).parameters) == [
+        "repository",
+        "sync_service",
+    ], "TSK-179 要求 SceneAdminService 双参构造 (repository, sync_service)"
+
+    repository = FakeSceneRepository()
+    sync_result = SceneSyncResult(
+        set_id=5,
+        created=True,
+        reused_existing_set=False,
+        inserted_count=2,
+        ready_count=1,
+        pending_count=1,
+    )
+    sync_service = _FakeSyncService(sync_result)
+    admin_class = cast("Any", SceneAdminService)
+    service = admin_class(
+        repository=cast("Any", repository),
+        sync_service=sync_service,
+    )
+
+    result = asyncio.run(service.sync_scenes())
+
+    assert result is sync_result
+    assert sync_service.build_calls == 1

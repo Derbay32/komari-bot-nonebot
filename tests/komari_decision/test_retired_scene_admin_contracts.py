@@ -60,8 +60,12 @@ def test_required_fixed_scenes_are_not_in_plugin_top_level_exports() -> None:
     }
 
 
-def test_scene_admin_constructor_only_depends_on_repository() -> None:
-    assert list(inspect.signature(SceneAdminService).parameters) == ["repository"]
+def test_scene_admin_constructor_requires_repository_and_sync_service() -> None:
+    """TSK-179: 构造签名固定为 (repository, sync_service) 双参。"""
+    assert list(inspect.signature(SceneAdminService).parameters) == [
+        "repository",
+        "sync_service",
+    ]
 
 
 def test_scene_admin_interface_has_no_retired_manual_operations() -> None:

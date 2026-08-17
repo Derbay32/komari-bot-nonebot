@@ -10,6 +10,7 @@ from .config_interface import get_config
 
 if TYPE_CHECKING:
     from ..repositories.scene_repository import SceneRepository
+    from .scene_sync_service import SceneSyncResult, SceneSyncService
 
 
 @dataclass(frozen=True)
@@ -24,8 +25,17 @@ class ScenePruneResult:
 class SceneAdminService:
     """提供 scene 运维操作。"""
 
-    def __init__(self, repository: SceneRepository) -> None:
+    def __init__(
+        self,
+        repository: SceneRepository,
+        sync_service: SceneSyncService,
+    ) -> None:
         self._repository = repository
+        self._sync_service = sync_service
+
+    async def sync_scenes(self) -> SceneSyncResult:
+        """触发场景同步，原样返回 SceneSyncService 的现有 frozen 结果。"""
+        return await self._sync_service.build_scene_set()
 
     async def prune_old_sets(self, keep_versions: int | None = None) -> ScenePruneResult:
         """清理旧 READY set，保留最近 N 个和当前 active。"""
