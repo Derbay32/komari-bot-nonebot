@@ -11,14 +11,12 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.plugins.komari_decision.services.scene_sync_service import (
-    SceneSyncResult,
-)
 from komari_bot.plugins.komari_management import scene_api
 from komari_bot.plugins.komari_management.scene_api import (
     API_PREFIX,
@@ -51,7 +49,7 @@ _SCENE_ROW: dict[str, Any] = {
     "updated_at": "2026-08-07 00:00:00",
 }
 
-_SYNC_RESULT = SceneSyncResult(
+_SYNC_RESULT = SimpleNamespace(
     set_id=9,
     created=True,
     reused_existing_set=False,
@@ -74,7 +72,7 @@ class _FakeSceneAdminService:
         self.upsert_error: ValueError | None = None
         self.sync_calls = 0
         self.sync_error: Exception | None = None
-        self.sync_result: SceneSyncResult | None = None
+        self.sync_result: SimpleNamespace | None = None
         _FakeSceneAdminService.instances.append(self)
 
     async def list_scenes(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -112,7 +110,7 @@ class _FakeSceneAdminService:
         row["content_hash"] = "hash-updated"
         return row
 
-    async def sync_scenes(self) -> SceneSyncResult:
+    async def sync_scenes(self) -> SimpleNamespace:
         self.sync_calls += 1
         if self.sync_error is not None:
             raise self.sync_error
