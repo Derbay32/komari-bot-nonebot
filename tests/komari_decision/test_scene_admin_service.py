@@ -15,13 +15,9 @@ from komari_bot.plugins.komari_decision.services.scene_admin_service import (
 from komari_bot.plugins.komari_decision.services.scene_sync_service import (
     SceneSyncResult,
 )
+from tests.komari_decision.required_fixed_scene_keys import REQUIRED_FIXED_SCENE_KEYS
 
-_REQUIRED_FIXED_SCENE_KEYS = (
-    "NOISE",
-    "MEANINGFUL",
-    "CALL_DIRECT",
-    "CALL_MENTION",
-)
+_UNUSED_SYNC_SERVICE = SimpleNamespace()
 
 
 class FakeSceneRepository:
@@ -83,27 +79,20 @@ class _FakeSyncService:
 
 def _build_service(
     repository: FakeSceneRepository,
-    sync_service: object | None = None,
+    sync_service: object,
 ) -> SceneAdminService:
-    """构造 SceneAdminService。
-
-    TSK-179 起构造签名扩展为 (repository, sync_service)；既有 prune/upsert
-    用例不关心 sync 参数，helper 按当前签名自适应以在两阶段都可运行。
-    """
+    """构造 SceneAdminService（正式双参签名 (repository, sync_service)）。"""
     admin_class = cast("Any", SceneAdminService)
-    params = inspect.signature(SceneAdminService).parameters
-    if "sync_service" in params:
-        return admin_class(
-            repository=cast("Any", repository),
-            sync_service=sync_service,
-        )
-    return admin_class(repository=cast("Any", repository))
+    return admin_class(
+        repository=cast("Any", repository),
+        sync_service=sync_service,
+    )
 
 
 def test_prune_old_sets_keeps_latest_and_active(monkeypatch: Any) -> None:
     repository = FakeSceneRepository()
     repository.active_set_id = 1
-    service = _build_service(repository)
+    service = _build_service(repository, _UNUSED_SYNC_SERVICE)
     monkeypatch.setattr(
         "komari_bot.plugins.komari_decision.services.scene_admin_service.get_config",
         lambda: SimpleNamespace(scene_keep_versions=2),
@@ -127,7 +116,7 @@ def test_prune_old_sets_deletes_ready_sets_outside_keep_window(
         {"id": 1},
     ]
     repository.active_set_id = 2
-    service = _build_service(repository)
+    service = _build_service(repository, _UNUSED_SYNC_SERVICE)
     monkeypatch.setattr(
         "komari_bot.plugins.komari_decision.services.scene_admin_service.get_config",
         lambda: SimpleNamespace(scene_keep_versions=2),
@@ -139,12 +128,12 @@ def test_prune_old_sets_deletes_ready_sets_outside_keep_window(
     assert repository.deleted_ids == [3, 1]
 
 
-@pytest.mark.parametrize("scene_key", _REQUIRED_FIXED_SCENE_KEYS)
+@pytest.mark.parametrize("scene_key", REQUIRED_FIXED_SCENE_KEYS)
 def test_upsert_scene_rejects_required_fixed_type_change_before_repository(
     scene_key: str,
 ) -> None:
     repository = FakeSceneRepository()
-    service = _build_service(repository)
+    service = _build_service(repository, _UNUSED_SYNC_SERVICE)
 
     with pytest.raises(ValueError, match="必需 fixed scene 不允许改为其他类型"):
         asyncio.run(
@@ -159,12 +148,12 @@ def test_upsert_scene_rejects_required_fixed_type_change_before_repository(
     assert repository.upsert_scene_calls == []
 
 
-@pytest.mark.parametrize("scene_key", _REQUIRED_FIXED_SCENE_KEYS)
+@pytest.mark.parametrize("scene_key", REQUIRED_FIXED_SCENE_KEYS)
 def test_upsert_scene_rejects_disabled_required_fixed_before_repository(
     scene_key: str,
 ) -> None:
     repository = FakeSceneRepository()
-    service = _build_service(repository)
+    service = _build_service(repository, _UNUSED_SYNC_SERVICE)
 
     with pytest.raises(ValueError, match="必需 fixed scene 不允许禁用"):
         asyncio.run(
@@ -190,7 +179,7 @@ def test_upsert_scene_persists_legal_fixed_and_general_writes(
     write: dict[str, Any],
 ) -> None:
     repository = FakeSceneRepository()
-    service = _build_service(repository)
+    service = _build_service(repository, _UNUSED_SYNC_SERVICE)
 
     row = asyncio.run(
         service.upsert_scene(
@@ -209,6 +198,31 @@ def test_upsert_scene_persists_legal_fixed_and_general_writes(
     }
     assert row == expected
     assert repository.upsert_scene_calls == [expected]
+
+
+def test_upsert_scene_rejects_padded_required_fixed_key_before_repository() -> None:
+    """回归：裁决以 trim 后的 key/type 为准，原值裁决会漏判并触达 Repository。
+
+    生产 `validate_required_fixed_scene_write` 先对 scene_key 与 scene_type
+    strip 再比较 required-fixed 集合；本测试用 scene_key=" NOISE "、
+    scene_type="general" 区分两种裁决：若按原值比较，padded key 不匹配
+    集合，写入会落到 Repository；按 trim 后裁决则应在 Repository 调用前
+    抛出领域 ValueError。
+    """
+    repository = FakeSceneRepository()
+    service = _build_service(repository, _UNUSED_SYNC_SERVICE)
+
+    with pytest.raises(ValueError, match="必需 fixed scene 不允许改为其他类型"):
+        asyncio.run(
+            service.upsert_scene(
+                scene_key=" NOISE ",
+                scene_type="general",
+                content_text="非法改型",
+                enabled=True,
+            )
+        )
+
+    assert repository.upsert_scene_calls == []
 
 
 def test_sync_scenes_returns_same_scene_sync_result_object() -> None:
