@@ -252,7 +252,7 @@ def test_initialize_shares_single_sync_service_with_admin_and_worker(
     manager = decision_plugin.PluginManager()
     memory_module = sys.modules["komari_bot.plugins.komari_memory"]
     created_sync: list[object] = []
-    admin_created: list[tuple[object, object | None]] = []
+    admin_created: list[object] = []
     registered: dict[str, object] = {}
 
     class _TrackingSyncService:
@@ -266,7 +266,9 @@ def test_initialize_shares_single_sync_service_with_admin_and_worker(
             repository: object,
             sync_service: object | None = None,
         ) -> None:
-            admin_created.append((repository, sync_service))
+            self.repository = repository
+            self.sync_service = sync_service
+            admin_created.append(self)
 
     monkeypatch.setattr(
         nonebot.plugin,
@@ -345,12 +347,14 @@ def test_initialize_shares_single_sync_service_with_admin_and_worker(
     assert len(created_sync) == 1
     assert len(admin_created) == 1
     sync_instance = created_sync[0]
+    admin_instance = admin_created[0]
     assert isinstance(sync_instance, _TrackingSyncService)
-    assert admin_created[0][0] is sync_instance.repository
-    assert admin_created[0][1] is sync_instance
+    assert isinstance(admin_instance, _TrackingAdminService)
+    assert admin_instance.repository is sync_instance.repository
+    assert admin_instance.sync_service is sync_instance
     assert registered["sync_service"] is sync_instance
-    assert registered["admin_service"] is admin_created[0][0]
-    assert registered["repository"] is admin_created[0][0]
+    assert registered["admin_service"] is admin_instance
+    assert registered["repository"] is admin_instance.repository
 
 
 def test_initialize_marks_plugin_disabled_without_loading_services(
