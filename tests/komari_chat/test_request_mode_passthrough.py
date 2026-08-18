@@ -451,6 +451,28 @@ def test_vision_service_passes_vision_slot_mode(monkeypatch: Any) -> None:
         SimpleNamespace(get=lambda: SimpleNamespace(api_token="token")),
     )
 
+    # TSK-190：视觉描述 Prompt 经 chat Prompt 公开 loader seam 注入非空
+    # 测试值，无 DB 冷启动不再触碰 PostgreSQL。兼容 vision_service 本地
+    # get_template 绑定与 ``prompt_template.get_template`` 属性访问两种风格。
+    prompt_template_module = import_module(
+        "komari_bot.plugins.komari_chat.services.prompt_template"
+    )
+
+    async def _fake_vision_description_template() -> dict[str, str]:
+        return {"vision_description_prompt": "TEST-VISION-DESCRIPTION-PROMPT"}
+
+    monkeypatch.setattr(
+        prompt_template_module,
+        "get_template",
+        _fake_vision_description_template,
+    )
+    if hasattr(vision_service_module, "get_template"):
+        monkeypatch.setattr(
+            vision_service_module,
+            "get_template",
+            _fake_vision_description_template,
+        )
+
     descriptions = asyncio.run(
         vision_service_module.read_images(
             ["data:image/png;base64,AAAA"],
@@ -464,3 +486,6 @@ def test_vision_service_passes_vision_slot_mode(monkeypatch: Any) -> None:
     assert len(captured) == 1
     assert captured[0]["request_api"] == "responses"
     assert captured[0]["stream_enabled"] is True
+    content = captured[0]["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert content[0]["text"] == "TEST-VISION-DESCRIPTION-PROMPT"
