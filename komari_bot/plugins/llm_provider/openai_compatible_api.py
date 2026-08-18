@@ -766,10 +766,6 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         if reasoning_effort is not None:
             request_data["reasoning"] = {"effort": reasoning_effort}
-            # 保留顶层 reasoning_effort 直通键：TSK-193 验收基线要求
-            # 思考模式参数在双协议 wire 请求中一致可见；Chat 路径本就有
-            # 顶层键，Responses 路径同时保留结构化 reasoning 映射。
-            request_data["reasoning_effort"] = reasoning_effort
 
         extra_params = getattr(config, "extra_params", {})
         if not isinstance(extra_params, dict):
@@ -1079,9 +1075,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
                 f"  thinking_disabled: {thinking_disabled}\n"
-                # 保留旧日志字段名（日志兼容）：值等同 thinking_mode，
-                # 仅作诊断标记，不再驱动任何 wire 行为（TSK-193）。
-                f"  suppress_tool_choice: {bool(kwargs.get('thinking_mode', False))}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.frequency_penalty)}\n"
                 f"  request_api: {resolved_api}\n"
                 f"  stream_enabled: {resolved_stream}\n"
@@ -1202,9 +1195,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
                 f"  thinking_disabled: {thinking_disabled}\n"
-                # 保留旧日志字段名（日志兼容）：值等同 thinking_mode，
-                # 仅作诊断标记，不再驱动任何 wire 行为（TSK-193）。
-                f"  suppress_tool_choice: {bool(kwargs.get('thinking_mode', False))}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.frequency_penalty)}\n"
                 f"  request_api: {resolved_api}\n"
                 f"  stream_enabled: {resolved_stream}\n"

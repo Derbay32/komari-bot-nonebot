@@ -33,7 +33,7 @@ class AgentExecutionBudget:
     rounds: int
     per_round: int
     total: int
-    tool_call_mode: Literal["required", "prompt_guided"] = "required"
+    tool_call_mode: Literal["required", "prompt_guided"]
 
     @classmethod
     def from_config(cls, config: object) -> "AgentExecutionBudget":
@@ -41,9 +41,10 @@ class AgentExecutionBudget:
 
         预算字段来自 ``komari_chat`` 动态配置；缺失或非法时在任务起点
         立即失败，绝不静默回退到任何隐藏默认值（TSK-192）。工具调用
-        约束模式同样来自 ``komari_chat`` 动态配置：非法值明确失败；
-        字段缺失只可能来自未迁移的旧快照 / 测试替身（0014 之后生产 typed
-        配置必然携带该字段），按默认 ``required`` 兼容处理（TSK-193）。
+        约束模式同样来自 ``komari_chat`` 动态配置：缺失或非法值一律
+        明确失败，不做旧快照 / 测试替身兼容（协调式破坏升级；0014 之后
+        生产 typed 配置必然携带 ``agent_tool_call_mode``，保证正常路径
+        存在）。
         """
         rounds = getattr(config, "agent_max_rounds", None)
         per_round = getattr(config, "agent_max_tool_calls_per_round", None)
@@ -60,8 +61,12 @@ class AgentExecutionBudget:
             raise RuntimeError(msg)
         tool_call_mode = getattr(config, "agent_tool_call_mode", None)
         if tool_call_mode is None:
-            tool_call_mode = "required"
-        elif tool_call_mode not in VALID_TOOL_CALL_MODES:
+            msg = (
+                "配置缺少工具调用约束模式字段（agent_tool_call_mode），"
+                "无法冻结任务预算"
+            )
+            raise RuntimeError(msg)
+        if tool_call_mode not in VALID_TOOL_CALL_MODES:
             msg = (
                 "配置的工具调用约束模式非法（agent_tool_call_mode="
                 f"{tool_call_mode!r}），必须为 required 或 prompt_guided"
