@@ -110,6 +110,9 @@ class AgentRunCollector:
         self.calls: list[LLMCallTrace] = []
         self.tools: list[ToolExecutionTrace] = []
         self.errors: list[dict[str, str]] = []
+        # TSK-192：回复 Agent 执行预算（任务起点冻结值 + 任务结束消耗计数）
+        self._budget: dict[str, int] | None = None
+        self._budget_usage: dict[str, int] | None = None
         self._finalized = False
 
     @property
@@ -128,6 +131,40 @@ class AgentRunCollector:
         tool.parsed_arguments = sanitize_log_value(tool.parsed_arguments)
         tool.result = sanitize_log_value(tool.result)
         self.tools.append(tool)
+
+    def set_agent_budget(
+        self,
+        *,
+        rounds: int,
+        per_round: int,
+        total: int,
+    ) -> None:
+        """记录任务起点冻结的回复 Agent 执行预算（TSK-192）。
+
+        冻结发生在任务开始（首次读取配置）时；任务中途配置变更不影响
+        已记录值。
+        """
+        self._budget = {
+            "agent_max_rounds": rounds,
+            "agent_max_tool_calls_per_round": per_round,
+            "agent_max_total_tool_calls": total,
+        }
+
+    def set_agent_budget_usage(
+        self,
+        *,
+        rounds_used: int,
+        tool_calls_used: int,
+    ) -> None:
+        """记录任务结束时的预算实际消耗。
+
+        消耗计数与 completion 提出的工具调用数一致（含被整批拒绝的
+        批次），也即 ``record["rounds"]`` 中各轮响应内 tool_calls 之和。
+        """
+        self._budget_usage = {
+            "rounds_used": rounds_used,
+            "tool_calls_used": tool_calls_used,
+        }
 
     def add_error(self, phase: str, error_type: str, message: str) -> None:
         self.errors.append(
@@ -223,6 +260,16 @@ class AgentRunCollector:
         aggregate = self.aggregate_overall().model_dump()
         methods = sorted({call.method for call in self.calls if call.method})
         models = sorted({call.model for call in self.calls if call.model})
+        budget_block: dict[str, int] | None = None
+        if self._budget is not None:
+            budget_block = {
+                **self._budget,
+                **(
+                    self._budget_usage
+                    if self._budget_usage is not None
+                    else {"rounds_used": 0, "tool_calls_used": 0}
+                ),
+            }
         return sanitize_log_value(
             {
                 "schema_version": 3,
@@ -241,6 +288,7 @@ class AgentRunCollector:
                 "input": self.input_data,
                 "output": self.output_data,
                 "error": self.final_error,
+                "budget": budget_block,
                 "rounds": [call.model_dump(mode="json") for call in self.calls],
                 "tool_executions": [
                     tool.model_dump(mode="json") for tool in self.tools

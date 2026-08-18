@@ -94,6 +94,35 @@ def _patch_config(
     )
 
 
+def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
+    """合并 memory 字段与 TSK-192 预算字段的配置替身。
+
+    普通/debug 入口任务开始读取同一执行预算快照：stub 同时承载
+    ``get_config`` 与 ``get_memory_config`` 两个名字的字段。
+    """
+    values: dict[str, object] = {
+        "proactive_enabled": False,
+        "context_messages_limit": 10,
+        "context_max_utf8_bytes": 24_000,
+        "context_max_estimated_tokens": 6_000,
+        "summary_max_buffer_size": 500,
+        "memory_search_limit": 3,
+        "bot_nickname": "小鞠",
+        "memory_agent_lock_timeout_seconds": 5,
+        "global_interaction_enabled": True,
+        "global_interaction_trigger_size": 20,
+        "face_reaction_enabled": False,
+        "face_reaction_id": "76",
+        "vision_tool_enabled": False,
+        "error_notify_enabled": False,
+        "agent_max_rounds": 10,
+        "agent_max_tool_calls_per_round": 4,
+        "agent_max_total_tool_calls": 20,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_resolve_trigger_message_uses_nonebot_to_me(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -465,7 +494,7 @@ def test_attempt_reply_only_rewrites_current_message(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -552,7 +581,10 @@ def test_attempt_reply_only_rewrites_current_message(
     assert generate_with_tools_kwargs["caller_user_id"] == "user-1"
     assert generate_with_tools_kwargs["caller_group_id"] == "group-1"
     assert generate_with_tools_kwargs["caller_is_superuser"] is False
-    assert generate_with_tools_kwargs["max_tool_rounds"] == 5
+    assert generate_with_tools_kwargs["tools"] is not None
+    assert "max_tool_rounds" not in generate_with_tools_kwargs, (
+        "普通入口不得传递入口专属轮次封顶（TSK-192）"
+    )
     injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
     assert injected_favorability.favorability == 0
     assert generate_with_tools_kwargs["max_favorability_delta"] == 5
@@ -652,7 +684,7 @@ def _wire_reaction_sent_case(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -1145,7 +1177,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     # 注入必要的全局配置
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
@@ -1235,7 +1267,7 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     )
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
@@ -1256,6 +1288,7 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
         nonlocal collector_from_generate, trace_id_from_generate
         collector_from_generate = kwargs.get("collector")
         trace_id_from_generate = cast("str | None", kwargs.get("request_trace_id"))
+        assert "max_tool_rounds" not in kwargs, "debug 入口不得传递入口专属轮次封顶（TSK-192）"
         return llm_service_module.ReplyResult(
             content="带trace的回复",
             interaction_history={"event": "trace", "result": "trace回复", "emotion": "平静"},
@@ -1316,7 +1349,7 @@ def test_generate_debug_reply_with_images_and_reply_context(
     )
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
@@ -1439,7 +1472,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     )
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -1816,7 +1849,7 @@ def test_reaction_scheduled_before_generate_core(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -1919,7 +1952,7 @@ def test_reaction_not_scheduled_when_disabled(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -2020,7 +2053,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -2119,7 +2152,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -2481,7 +2514,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,

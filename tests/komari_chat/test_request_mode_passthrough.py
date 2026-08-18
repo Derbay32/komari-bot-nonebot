@@ -91,6 +91,10 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
         "llm_request_api_summary": "chat_completions",
         "llm_stream_enabled_summary": False,
         "bot_nickname": "小鞠",
+        # TSK-192：回复 Agent 预算默认值（与配置 Schema 一致）
+        "agent_max_rounds": 10,
+        "agent_max_tool_calls_per_round": 4,
+        "agent_max_total_tool_calls": 20,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
