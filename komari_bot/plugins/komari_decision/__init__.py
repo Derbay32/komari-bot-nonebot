@@ -175,7 +175,9 @@ class PluginManager:
             # scene 表结构由 Alembic 迁移统一管理，此处不再执行 DDL。
             if not await scene_repository.has_any_scene():
                 logger.warning(
-                    "[KomariDecision] komari_decision_scenes 为空；请运行迁移脚本或通过管理 API 初始化 scenes"
+                    "[KomariDecision] komari_decision_scenes 为空；"
+                    "请运行 python -m komari_bot.db.seed_bootstrap 播种初始场景，"
+                    "或通过管理 API 初始化 scenes"
                 )
             try:
                 loaded = await scene_runtime.load_active_set_cache()
