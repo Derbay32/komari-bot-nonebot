@@ -37,7 +37,6 @@ from tests.config.chat_prompt_field_contract import (
 from tests.config.prompt_field_contract import (
     PROMPT_RESOURCE_IDS,
     find_prompt_mapping,
-    prompt_marker_values,
     prompt_resource_field_names,
 )
 
@@ -216,11 +215,11 @@ def _require_memory_group_mapping(
     raw: dict[str, Any],
     resource_id: str,
 ) -> dict[str, Any]:
-    """定位 memory/group Prompt 块；缺失即视为 TSK-191 尚未实现。"""
+    """定位 memory/group Prompt 块；缺失即视为 TSK-191 资产回归。"""
     mapping = find_prompt_mapping(raw, resource_id)
     assert mapping is not None, (
         f"默认 seed 资产缺少 {resource_id} Prompt 初始数据块"
-        "（TSK-191 尚未实现：未找到判定键对应的映射）"
+        "（TSK-191 验收标准 1：未找到判定键对应的映射）"
     )
     return mapping
 
@@ -269,18 +268,16 @@ def test_seed_cli_rejects_prompt_section_with_blank_field(
 ) -> None:
     """TSK-188 决策 33：memory/group Prompt 字段空白时 CLI 在访问数据库前失败。
 
-    夹具 = 默认资产中注入带一个空白字段的完整 memory/group Prompt 块
-    （字段集与 Schema 一致，值用 marker）；当前实现不校验这两个资源，
-    会漏过校验并尝试连接不可达数据库，因此本用例是 TSK-191 的可解释 RED。
+    夹具 = 定位默认资产中对应的真实 Prompt 初始数据块（AC1 已要求存在），
+    把其中一个 Schema 字段置为纯空白后写临时 seed：字段集仍与 Schema 一致、
+    其余值沿用真实初始数据，CLI 必须在触碰数据库前失败并点名 seed 文件、
+    资源与字段。
     """
     raw = _load_default_seed()
-    assert find_prompt_mapping(raw, resource_id) is None, (
-        f"默认 seed 已含 {resource_id} 块时夹具应改用真实块"
-    )
+    section = _require_memory_group_mapping(raw, resource_id)
     fields = sorted(prompt_resource_field_names(resource_id))
-    section = prompt_marker_values(resource_id)
-    section[fields[0]] = "   "
-    raw[resource_id] = section
+    blank_field = fields[0]
+    section[blank_field] = "   "
 
     bad_file = tmp_path / f"blank-{resource_id}-field.yaml"
     bad_file.write_text(
@@ -292,6 +289,9 @@ def test_seed_cli_rejects_prompt_section_with_blank_field(
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0, output
     assert str(bad_file) in output, "报错必须指明出错的 seed 文件"
+    assert f"{resource_id} Prompt 字段 {blank_field}" in output, (
+        "报错必须点名资源与空白字段"
+    )
     assert UNREACHABLE_DB_URL.split("@")[-1] not in output, (
         f"{resource_id} Prompt 校验失败前不得尝试连接数据库"
     )
