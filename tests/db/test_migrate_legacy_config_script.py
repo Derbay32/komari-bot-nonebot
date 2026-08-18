@@ -939,7 +939,7 @@ class TestMigrateLegacyConfigsIntegration:
             assert prompt_row["system_prompt"] == "你是小鞠知花。"
             assert prompt_row["memory_ack"] == "好的。"
             assert prompt_row["memory_ack_role"] == "assistant"
-            assert prompt_row["cot_prefix"] == " thinking\n"
+            assert prompt_row["cot_prefix"] == "<thinking>\n"
             assert prompt_row["cot_prefix_role"] == "assistant"
             for column in new_chat_columns:
                 assert prompt_row[column] == "", (
