@@ -15,8 +15,9 @@
    任何格式或约束不满足都以非零退出码结束并指明出错的 seed 文件。
 2. **只插缺失、绝不覆盖**：场景按稳定 ``scene_key`` 执行
    ``INSERT ... ON CONFLICT DO NOTHING``，已有默认或管理员场景（含 disabled）
-   保持原值；聊天 Prompt 只新建缺失单行（id=1）并补齐空字符串字段，
-   非空自定义值绝不覆盖；两者均重复执行幂等（TSK-190 验收标准 6）。
+   保持原值；聊天 Prompt 只新建缺失单行（id=1）并补齐空字段
+   （``None``、空字符串与纯空白字符串均视为空），非空自定义值绝不覆盖；
+   两者均重复执行幂等（TSK-190 验收标准 6）。
 3. **写入后验证最终数据库状态足以冷启动**：校验 PostgreSQL 中必需 fixed
    场景齐全且可用、至少存在一个启用的一般场景，且聊天 Prompt 单行全部
    字段非空；不满足则命令失败，容器 prestart 的 ``set -e`` 会随之中止
@@ -464,10 +465,11 @@ async def _seed_chat_prompt_row(
     conn: Any,
     chat_prompt: dict[str, str],
 ) -> tuple[int, int]:
-    """新建缺失聊天 Prompt 单行并只补齐空字符串字段（TSK-190 AC6）。
+    """新建缺失聊天 Prompt 单行并只补齐空字段（TSK-190 AC6）。
 
-    返回 ``(新建行数, 补齐字段数)``：已存在且全字段非空时零写入；
-    只有实际发生变化才递增 revision/updated_at，重复执行幂等。
+    空字段定义为 ``None``、空字符串或纯空白字符串；非空自定义值绝不
+    覆盖。返回 ``(新建行数, 补齐字段数)``：已存在且全字段非空时零写入；
+    只有实际补齐才递增 revision/updated_at，重复执行幂等。
     """
     fields = sorted(chat_prompt)
     row = await conn.fetchrow("SELECT * FROM komari_prompt_komari_chat WHERE id = 1")
@@ -489,7 +491,7 @@ async def _seed_chat_prompt_row(
     updates = {
         field: chat_prompt[field]
         for field in fields
-        if row[field] is None or str(row[field]) == ""
+        if row[field] is None or not str(row[field]).strip()
     }
     if not updates:
         return 0, 0
