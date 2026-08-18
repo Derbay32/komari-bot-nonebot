@@ -33,6 +33,7 @@ from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..reply_fulfillment_domain import build_reply_fulfillment_id
+from ..services.agent_budget import AgentExecutionBudget
 from ..services.config_interface import get_config, get_memory_config
 from ..services.image_downloader import (
     ImageDownloadPolicy,
@@ -797,6 +798,10 @@ class MessageHandler:
         不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
         """
         config = get_memory_config()
+        # TSK-192：任务起点从 komari_chat 配置冻结回复 Agent 执行预算，
+        # 普通 / debug / 简单三条入口共享同一份冻结快照；
+        # 任务中配置变更不影响当前任务，只作用于下一个任务。
+        agent_budget = AgentExecutionBudget.from_config(get_config())
 
         # 查询重写（带 trace）
         if collector is not None:
@@ -1008,7 +1013,6 @@ class MessageHandler:
                 vision_model=vision_model,
                 vision_temperature=vision_temperature,
                 vision_max_tokens=vision_max_tokens,
-                max_tool_rounds=5,
                 memory_service=self.memory,
                 group_id=message.group_id,
                 allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
@@ -1022,6 +1026,7 @@ class MessageHandler:
                 vision_stream_enabled=vision_stream_enabled,
                 collector=collector,
                 parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
+                agent_budget=agent_budget,
             )
         else:
             reply_result = await generate_reply(
@@ -1030,6 +1035,7 @@ class MessageHandler:
                 request_trace_id=request_trace_id,
                 collector=collector,
                 parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
+                agent_budget=agent_budget,
             )
 
         logger.info(
