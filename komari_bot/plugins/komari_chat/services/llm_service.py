@@ -765,6 +765,27 @@ async def _build_fetch_tool_result(
     return await komari_search.fetch_page(urls, **fetch_kwargs)
 
 
+def _append_bare_text_correction(
+    current_messages: list[dict[str, Any]],
+) -> None:
+    """TSK-193：裸文本轮之后只追加代码拥有的短纠错 user 指令。
+
+    模型本轮的正文 / reasoning / continuation / output items 一律不回填
+    下一轮上下文；指令正文由代码构造，不包含任何模型输出内容，只说明
+    协议要求与下一步动作。
+    """
+    current_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "你还没有通过工具调用完成回复。"
+                "本轮必须调用已声明的工具；若已有足够信息，"
+                "请直接调用 final_response 提交最终回复。"
+            ),
+        }
+    )
+
+
 def _append_tool_retry_instruction(
     current_messages: list[dict[str, Any]],
     *,
@@ -892,8 +913,8 @@ async def generate_reply(
         结构化回复结果，包含最终正文与互动历史记录
 
     Note:
-        任务执行预算（轮次/单轮/总量）在任务起点从 ``config`` 读取一次并
-        冻结；简单回复入口不再整任务重试（TSK-192）。
+        任务执行预算（轮次/单轮/总量）与工具调用约束模式在任务起点从 ``config``
+        读取一次并冻结；简单回复入口不再整任务重试（TSK-192/TSK-193）。
     """
     if messages is not None:
         budget = (
@@ -906,6 +927,7 @@ async def generate_reply(
                 rounds=budget.rounds,
                 per_round=budget.per_round,
                 total=budget.total,
+                tool_call_mode=budget.tool_call_mode,
             )
         payload_stats = _summarize_prompt_messages(messages)
         logger.info(
@@ -1168,12 +1190,18 @@ async def _execute_tool_loop(
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
     last_retry_reason: str | None = None
+    # TSK-193：裸文本协议违例诊断延迟到任务结束统一写入（先于/共存于
+    # MaxRoundsExceeded 等终态错误，保证既有 errors[0] 语义不变）。
+    protocol_violations: list[tuple[str, str]] = []
 
     from komari_bot.plugins.agent_run_logger.diagnostic import (
         ToolExecutionTrace,
         record_completion_call,
         record_failed_call,
     )
+
+    # TSK-193：工具调用约束模式与预算三元组一起在任务起点冻结
+    tool_call_mode = budget.tool_call_mode
 
     try:
         for round_num in range(1, round_limit + 1):
@@ -1202,13 +1230,17 @@ async def _execute_tool_loop(
                 "temperature": temperature,
                 "max_tokens": int(max_tokens),
                 "tools": tool_definitions,
-                "tool_choice": "required",
                 "parallel_tool_calls": False,
                 "thinking_mode": thinking_mode,
                 "reasoning_effort": reasoning_effort,
                 "request_api": request_api,
                 "stream_enabled": stream_enabled,
             }
+            # TSK-193：required 每轮向 chat provider 明确提交 tool_choice="required"；
+            # prompt_guided 完全省略 tool_choice（不是传 None），由数据库
+            # Prompt 中的 tool_call_instruction 引导模型。
+            if tool_call_mode == "required":
+                request_data["tool_choice"] = "required"
             try:
                 async with _LLM_COMPLETION_SEMAPHORE:
                     completion = await _call_llm_completion(
@@ -1243,19 +1275,14 @@ async def _execute_tool_loop(
             if not completion.tool_calls:
                 last_retry_reason = (
                     f"{request_phase_prefix} 第 {round_num} 轮：模型未调用任何工具，"
-                    "但 tool_choice='required' 要求至少调用一个工具"
+                    "无法完成回复（裸文本不构成成功回复）"
                 )
-                # 空内容但带 continuation 时也必须回填，确保 Responses 推理项不丢轮次
-                if completion.content or getattr(completion, "continuation", None) is not None:
-                    current_messages.append(build_assistant_message(completion))
-                _append_tool_retry_instruction(
-                    current_messages,
-                    reason=last_retry_reason,
-                    expected_action=(
-                        f"必须调用某个工具；如果已有足够信息完成回复，"
-                        f"必须调用 {FINAL_RESPONSE_TOOL_NAME}。"
-                    ),
-                )
+                # TSK-193 硬协议：裸文本轮的正文 / reasoning / continuation /
+                # output items 一律不回填下一轮上下文；只保留最后有效上下文
+                # 并追加代码拥有的短纠错 user 指令。完整 completion 本身已由
+                # record_completion_call 保留在 Agent Run 中。
+                _append_bare_text_correction(current_messages)
+                protocol_violations.append((phase, last_retry_reason))
                 if collector is not None:
                     collector.add_tool(
                         ToolExecutionTrace(
@@ -1593,6 +1620,14 @@ async def _execute_tool_loop(
                 rounds_used=ledger.rounds_used,
                 tool_calls_used=ledger.tool_calls_used,
             )
+            # 裸文本协议违例本身是任务级诊断：终态错误（MaxRoundsExceeded
+            # 等）先记录，违例明细随后按轮次顺序补齐。
+            for violation_phase, violation_message in protocol_violations:
+                collector.add_error(
+                    phase=violation_phase,
+                    error_type="BareTextProtocolViolation",
+                    message=violation_message,
+                )
 
 
 async def generate_reply_with_tools(
@@ -1629,8 +1664,9 @@ async def generate_reply_with_tools(
         LLM completion 单次请求的瞬时网络/接口异常通过
         ``_call_llm_completion`` 内部局部重试。
 
-        任务执行预算（轮次/单轮/总量）在任务起点从 ``config`` 读取一次
-        并冻结；任务进行中配置变更不影响当前任务（TSK-192）。
+        任务执行预算（轮次/单轮/总量）与工具调用约束模式在任务起点从
+        ``config`` 读取一次并冻结；任务进行中配置变更不影响当前任务
+        （TSK-192/TSK-193）。
     """
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
@@ -1645,6 +1681,7 @@ async def generate_reply_with_tools(
             rounds=budget.rounds,
             per_round=budget.per_round,
             total=budget.total,
+            tool_call_mode=budget.tool_call_mode,
         )
 
     tool_definitions = _validate_tool_definitions([*tools, FINAL_RESPONSE_TOOL])
