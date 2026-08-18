@@ -791,6 +791,17 @@ class TestMigrateLegacyConfigsIntegration:
     async def test_migrates_legacy_rows_and_is_idempotent(self) -> None:
         module = _load_script_module()
         updated_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        #: TSK-190 legacy komari_chat Prompt 迁移输入：JSONB insert 与
+        #: “保留旧字段”断言共用同一真源，避免字面量转写不一致。
+        legacy_chat_prompt = {
+            "system_prompt": "你是小鞠知花。",
+            "memory_ack": "好的。",
+            "memory_ack_role": "assistant",
+            "output_instruction": "输出正文。",
+            "cot_prefix": "<think>\n",
+            "cot_prefix_role": "assistant",
+            "version": "1.0",
+        }
         scratch = await self._prepare_head_scratch()
         conn = await asyncpg.connect(**scratch)
         try:
@@ -841,18 +852,7 @@ class TestMigrateLegacyConfigsIntegration:
                 " VALUES ($1, $2, $3::jsonb, $4, $5, $6)",
                 "komari_chat",
                 "Komari Chat Prompt",
-                json.dumps(
-                    {
-                        "system_prompt": "你是小鞠知花。",
-                        "memory_ack": "好的。",
-                        "memory_ack_role": "assistant",
-                        "output_instruction": "输出正文。",
-                        "cot_prefix": "<think>\n",
-                        "cot_prefix_role": "assistant",
-                        "version": "1.0",
-                    },
-                    ensure_ascii=False,
-                ),
+                json.dumps(legacy_chat_prompt, ensure_ascii=False),
                 "1.0",
                 2,
                 updated_at,
@@ -936,11 +936,11 @@ class TestMigrateLegacyConfigsIntegration:
             assert prompt_row["id"] == 1
             assert prompt_row["revision"] == 2
             assert prompt_row["updated_at"] == updated_at
-            assert prompt_row["system_prompt"] == "你是小鞠知花。"
-            assert prompt_row["memory_ack"] == "好的。"
-            assert prompt_row["memory_ack_role"] == "assistant"
-            assert prompt_row["cot_prefix"] == "<thinking>\n"
-            assert prompt_row["cot_prefix_role"] == "assistant"
+            assert prompt_row["system_prompt"] == legacy_chat_prompt["system_prompt"]
+            assert prompt_row["memory_ack"] == legacy_chat_prompt["memory_ack"]
+            assert prompt_row["memory_ack_role"] == legacy_chat_prompt["memory_ack_role"]
+            assert prompt_row["cot_prefix"] == legacy_chat_prompt["cot_prefix"]
+            assert prompt_row["cot_prefix_role"] == legacy_chat_prompt["cot_prefix_role"]
             for column in new_chat_columns:
                 assert prompt_row[column] == "", (
                     f"新增行为列 {column} 在 legacy 迁移后必须为空（待 seed 补齐）"
