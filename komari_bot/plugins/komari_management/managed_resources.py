@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from pydantic import BaseModel
 
@@ -36,9 +35,11 @@ class ManagedConfigResource:
 
 @dataclass(frozen=True, slots=True)
 class ManagedPromptResource:
-    """可通过管理接口访问的提示词资源。"""
+    """可通过管理接口访问的提示词资源。
+
+    TSK-191：只承载资源身份（resource_id / display_name）；字段集合由
+    resource_id 对应的强类型 Prompt Schema 决定，不再携带 Python 默认正文。
+    """
 
     resource_id: str
     display_name: str
-    defaults: dict[str, str]
-    legacy_file_path: Path | None = None
