@@ -2,8 +2,10 @@
 
 TSK-191：三个 Prompt 资源（chat / memory summary / group history summary）
 全部以 PostgreSQL 为运行时真源，字段集合由强类型 Schema 决定；三者都不再
-定义 Python 长文本 ``DEFAULTS``（AC2）。因此本文件不再 import 任何
-``DEFAULTS`` 符号，字段集一律直接派生自 Schema。
+定义 Python 长文本 ``DEFAULTS``（AC2），旧的默认机制与临时兼容分支被物理
+删除（AC8：``ManagedPromptResource`` 不再有 ``defaults`` 字段、
+``PromptTemplateLoader`` 构造不再接受 ``defaults`` 参数）。因此本文件不再
+import 任何 ``DEFAULTS`` 符号，字段集一律直接派生自 Schema。
 """
 
 from __future__ import annotations
@@ -126,6 +128,19 @@ def test_prompt_schema_no_longer_defines_python_defaults(
         f"{module_name} 不得继续定义/导出 DEFAULTS"
         "（Python 长文本默认正文已全部迁入版本化初始数据）"
     )
+
+
+def test_managed_prompt_resource_no_longer_has_defaults_field() -> None:
+    """AC8(TSK-191)：ManagedPromptResource 不再携带 defaults 字段。
+
+    管理资源只承载 resource_id/display_name，字段集合由强类型 Schema
+    决定。当前实现仍有 ``defaults`` 字段，本用例是 TSK-191 的可解释 RED。
+    """
+    from komari_bot.plugins.komari_management.managed_resources import (
+        ManagedPromptResource,
+    )
+
+    assert "defaults" not in ManagedPromptResource.__dataclass_fields__
 
 
 def test_prompt_columns_are_text() -> None:

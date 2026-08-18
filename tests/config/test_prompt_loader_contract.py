@@ -6,7 +6,10 @@
   字段纯空白三种形态，成功路径绝不回退到 Python 默认正文（AC4）；
 - 成功加载后的最后有效缓存支持数据库短故障，恢复后按 revision 刷新
   （AC5）；
-- 模板值完全来自 PostgreSQL 快照，不并入任何默认正文（AC2/AC3）。
+- 模板值完全来自 PostgreSQL 快照，不并入任何默认正文（AC2/AC3）；
+- 完整性校验按 resource_id 对应 Schema 执行：stored row 混入其他资源
+  专属字段时即使本资源字段齐全也必须点名拒绝（跨资源拒绝，证明不是
+  三资源字段的全局 union）。
 
 存储缝只替换 ``prompt_storage.get_prompt_storage``，loader 走生产加载路径
 （当前实现会拿 memory/group 的 ``DEFAULTS`` 合并补全不完整快照，因此
@@ -25,6 +28,7 @@ import pytest
 from komari_bot.config import prompt_storage
 from komari_bot.config.prompt_storage import StoredPrompt
 from tests.config.prompt_field_contract import (
+    CROSS_RESOURCE_FOREIGN_FIELDS,
     PROMPT_RESOURCE_IDS,
     prompt_display_name,
     prompt_marker_values,
@@ -183,6 +187,32 @@ async def test_get_template_returns_stored_values_verbatim(
     template = await _loader_module(resource_id).get_template()
 
     assert template == row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource_id", PROMPT_RESOURCE_IDS)
+async def test_get_template_rejects_cross_resource_foreign_field(
+    monkeypatch: pytest.MonkeyPatch,
+    resource_id: str,
+) -> None:
+    """AC3/AC4(TSK-191)：stored row 混入其他资源专属字段必须点名拒绝。
+
+    完整性/白名单按 resource_id 对应 Schema 校验，不是三资源字段的全局
+    union：本资源字段齐全但携带异资源字段时也必须失败。当前 chat gate
+    只查缺失/空白、memory/group 无 gate，都会放行，因此本用例是
+    TSK-191 的可解释 RED。
+    """
+    _reset_all_loaders()
+    foreign_field = CROSS_RESOURCE_FOREIGN_FIELDS[resource_id]
+    row = prompt_marker_values(resource_id)
+    row[foreign_field] = "跨资源字段值"
+    _install_storage(monkeypatch, [_stored(resource_id, row, revision=1)])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _loader_module(resource_id).get_template()
+    _assert_error_names_resource_and_field(
+        exc_info.value, resource_id, foreign_field
+    )
 
 
 @pytest.mark.asyncio

@@ -14,13 +14,17 @@
   - ``komari_memory_summary``：包含 ``memory_summary_common_system``。
 
 - 测试输入值一律使用 marker（``marker-<字段名>``），禁止复制 seed 或生产
-  Prompt 正文；管理 API 测试通过 ``make_managed_prompt_resource`` 构造资源
-  对象，兼容 `ManagedPromptResource` 移除 ``defaults`` 字段后的构造方式。
+  Prompt 正文；管理资源经 ``make_managed_prompt_resource(resource_id,
+  display_name)`` 构造，这是 TSK-191 后的唯一形态：资源不再携带
+  ``defaults``（AC8），测试绝不传/透传 Python 默认正文；
+- ``CROSS_RESOURCE_FOREIGN_FIELDS`` 提供跨资源拒绝用例的注入字段：每个
+  资源取一个属于其他资源、不属于本资源 Schema 的字段，用于证明白名单与
+  完整性校验是 resource_id 对应 Schema，不是三资源字段的全局 union。
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from komari_bot.plugins.group_history_summary.prompt_schema import (
     DISPLAY_NAME as GROUP_HISTORY_DISPLAY_NAME,
@@ -52,6 +56,16 @@ PROMPT_RESOURCE_IDS: tuple[str, str, str] = (
     "komari_memory_summary",
     "group_history_summary",
 )
+
+#: 跨资源拒绝用例的注入字段：key 是目标资源，value 是注入的异资源字段。
+#: 每个 value 都属于其他某个资源的 Schema、但不属于目标资源 Schema
+#: （chat←group 的 planning_system_prompt；memory←chat/group 的
+#: system_prompt；group←chat 的 tool_call_instruction），覆盖三资源互证。
+CROSS_RESOURCE_FOREIGN_FIELDS: dict[str, str] = {
+    "komari_chat": "planning_system_prompt",
+    "komari_memory_summary": "system_prompt",
+    "group_history_summary": "tool_call_instruction",
+}
 
 INTERNAL_STORAGE_FIELDS: frozenset[str] = frozenset(
     {"id", "revision", "updated_at"}
@@ -143,21 +157,16 @@ def find_prompt_mapping(raw: object, resource_id: str) -> dict[str, Any] | None:
 def make_managed_prompt_resource(
     resource_id: str,
     display_name: str,
-    defaults: dict[str, str] | None = None,
 ) -> ManagedPromptResource:
-    """构造管理 Prompt 资源，兼容 defaults 字段存在与否两种实现形态。
+    """构造无 defaults 的管理 Prompt 资源（TSK-191 契约，唯一形态）。
 
-    TSK-191 后管理资源不再携带 Python 默认正文；若实现保留 ``defaults``
-    字段（如 Schema 字段占位符），测试照常透传，否则省略该参数。
+    绝不接受/透传 Python 默认正文：AC8 要求旧默认机制与兼容分支物理删除。
+    旧实现仍把 ``defaults`` 当作必填字段，这里用 ``cast(Any, ...)`` 让
+    测试只按新契约构造；实现移除字段后即为完全合法的直接构造。
     """
     from komari_bot.plugins.komari_management.managed_resources import (
         ManagedPromptResource,
     )
 
-    kwargs: dict[str, Any] = {
-        "resource_id": resource_id,
-        "display_name": display_name,
-    }
-    if "defaults" in ManagedPromptResource.__dataclass_fields__:
-        kwargs["defaults"] = {} if defaults is None else defaults
-    return ManagedPromptResource(**kwargs)
+    constructor = cast("Any", ManagedPromptResource)
+    return constructor(resource_id=resource_id, display_name=display_name)

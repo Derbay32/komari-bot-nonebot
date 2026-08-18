@@ -1,14 +1,15 @@
 """Komari Management Prompt 接口路由测试。
 
 TSK-191：管理 API 对三个 Prompt 资源继续支持完整读取、替换、局部更新与
-revision CAS（AC7）；字段白名单与完整性校验由强类型 Schema 决定，管理
-资源不再携带 Python 默认正文（AC2/AC3）。
+revision CAS（AC7）；字段白名单与完整性校验由 resource_id 对应强类型
+Schema 决定，管理资源不再携带 Python 默认正文（AC2/AC3/AC8）。
 
 测试缝只替换 ``prompt_storage.get_prompt_storage``（存储对象），路由层与
-``prompt_storage`` 的字段校验/合并逻辑全部走真实生产代码；
-``test_prompt_routes_*_without_defaults`` 用空 defaults 构造管理资源，
-断言字段集合仍完整来自 Schema —— 当前实现仍以 defaults 键集推导字段，
-因此这些用例是 TSK-191 的可解释 RED。
+``prompt_storage`` 的字段校验/合并逻辑全部走真实生产代码。管理资源一律
+经 ``make_managed_prompt_resource(resource_id, display_name)`` 按无
+defaults 形态构造 —— 旧实现把 ``defaults`` 当作必填字段，因此本文件的
+资源构造处整体是 TSK-191 的可解释 RED；实现后，字段集合来自 Schema、
+PATCH/PUT 白名单来自 Schema 与跨资源字段拒绝用例负责钉住新契约。
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from komari_bot.plugins.komari_management.prompt_api import (
     register_prompt_api,
 )
 from tests.config.prompt_field_contract import (
+    CROSS_RESOURCE_FOREIGN_FIELDS,
     PROMPT_RESOURCE_IDS,
     make_managed_prompt_resource,
     prompt_display_name,
@@ -58,11 +60,6 @@ def _write_headers(request_id: str, revision: int) -> dict[str, str]:
 
 def _read_headers() -> dict[str, str]:
     return {"Authorization": "Bearer secret-token-00000000"}
-
-
-def _schema_placeholder_defaults(resource_id: str) -> dict[str, str]:
-    """Schema 字段占位 defaults（模拟 TSK-191 后管理资源不携带正文）。"""
-    return {field: f"{field}-默认" for field in sorted(prompt_resource_field_names(resource_id))}
 
 
 class _FakePromptStorage:
@@ -159,21 +156,11 @@ def _build_app(
     *,
     stores: dict[str, _PromptStore] | None = None,
     audit_events: list[ManagementAuditEvent] | None = None,
-    resource_defaults: dict[str, dict[str, str]] | None = None,
     resource_ids: tuple[str, ...] = ("komari_chat",),
 ) -> FastAPI:
     if stores is None:
         assert store is not None, "必须提供 store 或 stores"
         stores = {resource_ids[0]: store}
-    if resource_defaults is None:
-        resource_defaults = {
-            resource_id: _schema_placeholder_defaults(resource_id)
-            for resource_id in resource_ids
-        }
-    if set(resource_defaults) != set(resource_ids):
-        raise AssertionError(  # noqa: TRY003
-            "resource_defaults 键必须与 resource_ids 一致"
-        )
 
     storage = _FakePromptStorage(stores)
     monkeypatch.setattr(storage_module, "get_prompt_storage", lambda: storage)
@@ -197,7 +184,6 @@ def _build_app(
             make_managed_prompt_resource(
                 resource_id,
                 prompt_display_name(resource_id),
-                resource_defaults[resource_id],
             )
             for resource_id in resource_ids
         ),
@@ -341,13 +327,6 @@ async def test_prompt_writes_require_matching_revision(
     assert store.revision == 1
 
 
-def _chat_behavior_defaults() -> dict[str, str]:
-    """聊天 Prompt 字段集的替身默认值（字段集合派生自强类型 Schema）。"""
-    from tests.config.chat_prompt_field_contract import chat_prompt_field_names
-
-    return {name: f"{name}-默认" for name in sorted(chat_prompt_field_names())}
-
-
 @pytest.mark.asyncio
 async def test_prompt_routes_expose_chat_behavior_fields_and_hide_removed_field(
     app: App,
@@ -362,14 +341,7 @@ async def test_prompt_routes_expose_chat_behavior_fields_and_hide_removed_field(
     store = _chat_store()
 
     async with app.test_server(
-        asgi=cast(
-            "Any",
-            _build_app(
-                monkeypatch,
-                store,
-                resource_defaults={"komari_chat": _chat_behavior_defaults()},
-            ),
-        )
+        asgi=cast("Any", _build_app(monkeypatch, store)),
     ) as ctx:
         client = ctx.get_client()
         headers = _read_headers()
@@ -398,14 +370,7 @@ async def test_prompt_routes_update_new_field_and_reject_removed_field(
     store = _chat_store()
 
     async with app.test_server(
-        asgi=cast(
-            "Any",
-            _build_app(
-                monkeypatch,
-                store,
-                resource_defaults={"komari_chat": _chat_behavior_defaults()},
-            ),
-        )
+        asgi=cast("Any", _build_app(monkeypatch, store)),
     ) as ctx:
         client = ctx.get_client()
         updated = await client.patch(
@@ -561,17 +526,16 @@ async def test_prompt_replace_rejects_incomplete_payload(
 
 
 @pytest.mark.asyncio
-async def test_prompt_list_exposes_schema_fields_without_defaults(
+async def test_prompt_list_exposes_schema_fields(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC3：管理资源不带默认正文时，字段集仍完整来自强类型 Schema。
+    """AC3：管理资源不携带 defaults 时，字段集仍完整来自强类型 Schema。
 
-    当前实现从 defaults 键集推导管理字段（``fields=sorted(resource.defaults)``），
-    空 defaults 下字段列表为空，因此本用例是 TSK-191 的可解释 RED。
+    实现不得再从 ``resource.defaults`` 推导字段；本用例在资源构造契约
+    落地后继续钉住列表字段集 == resource_id 对应 Schema 字段集。
     """
     stores = _all_resource_stores()
-    empty_defaults = {resource_id: {} for resource_id in PROMPT_RESOURCE_IDS}
 
     async with app.test_server(
         asgi=cast(
@@ -579,7 +543,6 @@ async def test_prompt_list_exposes_schema_fields_without_defaults(
             _build_app(
                 monkeypatch,
                 stores=stores,
-                resource_defaults=empty_defaults,
                 resource_ids=PROMPT_RESOURCE_IDS,
             ),
         )
@@ -596,18 +559,16 @@ async def test_prompt_list_exposes_schema_fields_without_defaults(
 
 
 @pytest.mark.asyncio
-async def test_prompt_patch_accepts_schema_field_without_defaults(
+async def test_prompt_patch_accepts_schema_field(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC3：无默认正文时 PATCH 仍按 Schema 白名单寻址字段。
+    """AC3：无 defaults 资源下 PATCH 仍按 Schema 白名单寻址字段。
 
-    当前实现按 ``resource.defaults`` 判断字段是否存在（
-    ``field_name not in resource.defaults`` → 404），空 defaults 下连
-    Schema 字段也被判 404，因此本用例是 TSK-191 的可解释 RED。
+    实现不得按 ``resource.defaults`` 判断字段是否存在——白名单必须来自
+    resource_id 对应强类型 Schema。
     """
     stores = _all_resource_stores()
-    empty_defaults = {resource_id: {} for resource_id in PROMPT_RESOURCE_IDS}
 
     async with app.test_server(
         asgi=cast(
@@ -615,7 +576,6 @@ async def test_prompt_patch_accepts_schema_field_without_defaults(
             _build_app(
                 monkeypatch,
                 stores=stores,
-                resource_defaults=empty_defaults,
                 resource_ids=PROMPT_RESOURCE_IDS,
             ),
         )
@@ -635,18 +595,16 @@ async def test_prompt_patch_accepts_schema_field_without_defaults(
 
 
 @pytest.mark.asyncio
-async def test_prompt_replace_accepts_full_schema_payload_without_defaults(
+async def test_prompt_replace_accepts_full_schema_payload(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC3：无默认正文时 PUT 完整 Schema 载荷通过校验并写入。
+    """AC3：无 defaults 资源下 PUT 完整 Schema 载荷通过校验并写入。
 
-    当前实现以 defaults 键集做白名单（``validate_prompt_values``），空
-    defaults 下完整 Schema 载荷被全部判为未知字段 → 422，因此本用例是
-    TSK-191 的可解释 RED。
+    实现不得以 defaults 键集做白名单——字段集必须来自 resource_id 对应
+    强类型 Schema。
     """
     stores = _all_resource_stores()
-    empty_defaults = {resource_id: {} for resource_id in PROMPT_RESOURCE_IDS}
 
     async with app.test_server(
         asgi=cast(
@@ -654,7 +612,6 @@ async def test_prompt_replace_accepts_full_schema_payload_without_defaults(
             _build_app(
                 monkeypatch,
                 stores=stores,
-                resource_defaults=empty_defaults,
                 resource_ids=PROMPT_RESOURCE_IDS,
             ),
         )
@@ -671,3 +628,79 @@ async def test_prompt_replace_accepts_full_schema_payload_without_defaults(
                 f"{resource_id} 完整 Schema 字段载荷必须通过 PUT 校验"
                 "（白名单来自强类型 Schema，而非 defaults）"
             )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "foreign_field"),
+    sorted(CROSS_RESOURCE_FOREIGN_FIELDS.items()),
+)
+@pytest.mark.asyncio
+async def test_prompt_replace_rejects_cross_resource_field(
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_id: str,
+    foreign_field: str,
+) -> None:
+    """AC3(TSK-191)：A 资源字段注入 B 资源 PUT 必须 422 且不写库。
+
+    白名单是 resource_id 对应 Schema；三资源字段的全局 union 会误收，
+    因此本用例是 TSK-191 的可解释 RED。
+    """
+    stores = _all_resource_stores()
+
+    async with app.test_server(
+        asgi=cast(
+            "Any",
+            _build_app(
+                monkeypatch,
+                stores=stores,
+                resource_ids=PROMPT_RESOURCE_IDS,
+            ),
+        )
+    ) as ctx:
+        client = ctx.get_client()
+        payload = prompt_marker_values(resource_id)
+        payload[foreign_field] = "跨资源字段值"
+        response = await client.put(
+            f"{API_PREFIX}/resources/{resource_id}",
+            json=payload,
+            headers=_write_headers(f"{resource_id}-cross-put", 1),
+        )
+
+    assert response.status_code == 422
+    assert stores[resource_id].revision == 1, "拒绝的载荷不得修改 revision"
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "foreign_field"),
+    sorted(CROSS_RESOURCE_FOREIGN_FIELDS.items()),
+)
+@pytest.mark.asyncio
+async def test_prompt_field_address_rejects_cross_resource_field(
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_id: str,
+    foreign_field: str,
+) -> None:
+    """AC3(TSK-191)：跨资源字段不可通过 PATCH 寻址（404），且不写库。"""
+    stores = _all_resource_stores()
+
+    async with app.test_server(
+        asgi=cast(
+            "Any",
+            _build_app(
+                monkeypatch,
+                stores=stores,
+                resource_ids=PROMPT_RESOURCE_IDS,
+            ),
+        )
+    ) as ctx:
+        client = ctx.get_client()
+        response = await client.patch(
+            f"{API_PREFIX}/resources/{resource_id}/fields/{foreign_field}",
+            json={"value": "不会写入"},
+            headers=_write_headers(f"{resource_id}-cross-patch", 1),
+        )
+
+    assert response.status_code == 404
+    assert stores[resource_id].revision == 1
