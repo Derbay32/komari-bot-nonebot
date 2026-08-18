@@ -11,7 +11,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+llm_service_module = import_module(
+    "komari_bot.plugins.komari_chat.services.llm_service"
+)
 retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
 
 
@@ -48,6 +50,23 @@ class _ObservableSemaphore:
         self.exited = True
 
 
+def _assert_agent_budget_consistent(rounds: int, per_round: int, total: int) -> None:
+    """预算三元组必须是真实 Schema 可接受状态。
+
+    与 test_agent_budget.py 相同的测试侧守卫：字段范围 2..20 / 1..8 /
+    2..64 且 ``per_round <= total <= rounds*per_round``；不 import 生产
+    validator 自证。任何 runtime budget fixture 都必须在返回前通过。
+    """
+
+    assert 2 <= rounds <= 20, f"agent_max_rounds 超出 2..20: {rounds}"
+    assert 1 <= per_round <= 8, f"agent_max_tool_calls_per_round 超出 1..8: {per_round}"
+    assert 2 <= total <= 64, f"agent_max_total_tool_calls 超出 2..64: {total}"
+    assert per_round <= total <= rounds * per_round, (
+        f"非法预算组合 rounds={rounds}, per_round={per_round}, total={total}："
+        "必须满足 per_round <= total <= rounds*per_round"
+    )
+
+
 def _build_config(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
         "llm_model_chat": "chat-model",
@@ -68,6 +87,11 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
         "agent_max_total_tool_calls": 20,
     }
     values.update(overrides)
+    _assert_agent_budget_consistent(
+        values["agent_max_rounds"],
+        values["agent_max_tool_calls_per_round"],
+        values["agent_max_total_tool_calls"],
+    )
     return SimpleNamespace(**values)
 
 
@@ -228,7 +252,9 @@ def test_generate_reply_with_tools_limits_llm_provider_concurrency(
 
     provider = _ConcurrentProvider()
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-    monkeypatch.setattr(llm_service_module, "_LLM_COMPLETION_SEMAPHORE", asyncio.Semaphore(2))
+    monkeypatch.setattr(
+        llm_service_module, "_LLM_COMPLETION_SEMAPHORE", asyncio.Semaphore(2)
+    )
 
     results = asyncio.run(_run_concurrent_replies())
 
@@ -299,9 +325,7 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     ) -> str:
         searched_queries.append(query)
         searched_trace_ids.append(request_trace_id)
-        searched_contexts.append(
-            (caller_user_id, caller_group_id, caller_is_superuser)
-        )
+        searched_contexts.append((caller_user_id, caller_group_id, caller_is_superuser))
         return "搜索结果：今天有一条新闻"
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
@@ -373,7 +397,9 @@ def test_generate_reply_with_tools_executes_read_profile_tool(monkeypatch: Any) 
     ]
 
     class _FakeMemory:
-        async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any]:
+        async def get_user_profile(
+            self, *, user_id: str, group_id: str
+        ) -> dict[str, Any]:
             assert user_id == "user-2"
             assert group_id == "group-1"
             return {
@@ -571,7 +597,9 @@ def test_read_profile_tool_filters_keys(monkeypatch: Any) -> None:
     ]
 
     class _FakeMemory:
-        async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any]:
+        async def get_user_profile(
+            self, *, user_id: str, group_id: str
+        ) -> dict[str, Any]:
             del user_id, group_id
             return {
                 "display_name": "长门",
@@ -648,7 +676,10 @@ def test_read_profile_tool_returns_not_found(monkeypatch: Any) -> None:
         )
     )
 
-    assert "not_found: 用户画像不存在" in fake_provider.completion_calls[1]["messages"][-1]["content"]
+    assert (
+        "not_found: 用户画像不存在"
+        in fake_provider.completion_calls[1]["messages"][-1]["content"]
+    )
 
 
 def test_read_profile_tool_denies_user_outside_visible_scope(monkeypatch: Any) -> None:
@@ -797,7 +828,9 @@ def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> 
 
     # 三轮空 tool_calls 在同一 _execute_tool_loop 内被纠错，不再触发外层重试。
     assert len(fake_provider.completion_calls) == 3
-    messages_lengths = [len(call["messages"]) for call in fake_provider.completion_calls]
+    messages_lengths = [
+        len(call["messages"]) for call in fake_provider.completion_calls
+    ]
     assert messages_lengths == sorted(messages_lengths)
     for call in fake_provider.completion_calls[1:]:
         assert any(
@@ -1351,10 +1384,15 @@ def test_execute_tool_loop_records_call_traces_in_collector(monkeypatch: Any) ->
     assert collector.calls[0].round_index == 0
     assert collector.calls[0].model == "chat-model"
     assert len(collector.tools) >= 1
-    assert any(t.tool_name == "final_response" and t.status == "success" for t in collector.tools)
+    assert any(
+        t.tool_name == "final_response" and t.status == "success"
+        for t in collector.tools
+    )
 
 
-def test_execute_tool_loop_records_favorability_pending_in_debug(monkeypatch: Any) -> None:
+def test_execute_tool_loop_records_favorability_pending_in_debug(
+    monkeypatch: Any,
+) -> None:
     """验证 debug 路径下 record_favorability_delta 只记录 pending，不调 adjust。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
@@ -1399,7 +1437,9 @@ def test_execute_tool_loop_records_favorability_pending_in_debug(monkeypatch: An
     assert result.content == "好感度pending回复"
     assert result.favorability_delta == 2
     assert result.favorability_reason == "友好互动"
-    favor_traces = [t for t in collector.tools if t.tool_name == "record_favorability_delta"]
+    favor_traces = [
+        t for t in collector.tools if t.tool_name == "record_favorability_delta"
+    ]
     assert len(favor_traces) == 1
     assert favor_traces[0].status == "success"
     assert favor_traces[0].parsed_arguments == {"delta": 2, "reason": "友好互动"}
@@ -1516,7 +1556,9 @@ def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) ->
     )
 
     assert result.content == "纠错后回复"
-    favor_traces = [t for t in collector.tools if t.tool_name == "record_favorability_delta"]
+    favor_traces = [
+        t for t in collector.tools if t.tool_name == "record_favorability_delta"
+    ]
     assert len(favor_traces) == 2
     statuses = {t.status for t in favor_traces}
     assert "error" in statuses
@@ -1629,7 +1671,7 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
     with pytest.raises(RuntimeError, match="最大轮数"):
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
-                config=_build_config(agent_max_rounds=2),
+                config=_build_config(agent_max_rounds=2, agent_max_total_tool_calls=8),
                 messages=[{"role": "user", "content": "查一下"}],
                 tools=[llm_service_module.SEARCH_WEB_TOOL],
                 collector=collector,
@@ -1996,9 +2038,7 @@ def test_fetch_page_tool_handles_url_parse_errors(
     ]
     fetched_urls_list: list[list[str]] = []
 
-    async def _fake_fetch_page(
-        urls: list[str], **_kwargs: object
-    ) -> str:
+    async def _fake_fetch_page(urls: list[str], **_kwargs: object) -> str:
         fetched_urls_list.append(list(urls))
         return "[抓取结果]"
 

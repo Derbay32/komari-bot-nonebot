@@ -11,6 +11,11 @@ provider 瞬时重试仍属同一逻辑轮次（AC8）、Agent Run 结构化预�
 生成入口（``MessageHandler.generate_debug_reply``），配合可控 provider 与
 业务工具替身；只断言可观察行为（provider 请求次数/轮次阶段/工具执行次数/
 结果/collector 记录），不断言私有计数 helper 或内部常量。
+
+所有预算 fixture 必须满足真实 Schema 约束（``per_round <= total <=
+rounds*per_round``，另含字段范围 2..20 / 1..8 / 2..64），由
+``_assert_agent_budget_consistent`` 在两个 builder 返回前守卫；禁止用
+SimpleNamespace 绕过 Pydantic 构造线上不可能状态。
 """
 
 from __future__ import annotations
@@ -34,7 +39,9 @@ from komari_bot.plugins.llm_provider.base_client import (
 )
 
 retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
-llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+llm_service_module = import_module(
+    "komari_bot.plugins.komari_chat.services.llm_service"
+)
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
@@ -75,7 +82,9 @@ def _completion(*tool_calls: LLMToolCallSchema) -> LLMCompletionResultSchema:
     )
 
 
-def _final_response_completion(content: str = "预算测试回复") -> LLMCompletionResultSchema:
+def _final_response_completion(
+    content: str = "预算测试回复",
+) -> LLMCompletionResultSchema:
     return _completion(
         _tool_call(
             "final_response",
@@ -193,6 +202,23 @@ class _FakeUserData:
         return SimpleNamespace(favorability=0)
 
 
+def _assert_agent_budget_consistent(rounds: int, per_round: int, total: int) -> None:
+    """测试侧守卫：预算三元组必须是真实 Schema 可接受状态。
+
+    线上 Pydantic 约束为字段范围 2..20 / 1..8 / 2..64 且
+    ``per_round <= total <= rounds*per_round``。故意不 import 生产
+    validator 自证；任何 runtime budget fixture 都必须在返回前通过。
+    """
+
+    assert 2 <= rounds <= 20, f"agent_max_rounds 超出 2..20: {rounds}"
+    assert 1 <= per_round <= 8, f"agent_max_tool_calls_per_round 超出 1..8: {per_round}"
+    assert 2 <= total <= 64, f"agent_max_total_tool_calls 超出 2..64: {total}"
+    assert per_round <= total <= rounds * per_round, (
+        f"非法预算组合 rounds={rounds}, per_round={per_round}, total={total}："
+        "必须满足 per_round <= total <= rounds*per_round"
+    )
+
+
 def _build_config(**overrides: Any) -> SimpleNamespace:
     """内存 + 预算字段合并的配置替身（TSK-192 默认 10/4/20）。"""
     values: dict[str, Any] = {
@@ -214,6 +240,11 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
         "agent_max_total_tool_calls": 20,
     }
     values.update(overrides)
+    _assert_agent_budget_consistent(
+        values["agent_max_rounds"],
+        values["agent_max_tool_calls_per_round"],
+        values["agent_max_total_tool_calls"],
+    )
     return SimpleNamespace(**values)
 
 
@@ -237,6 +268,11 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
     }
     values.update(_build_config().__dict__)
     values.update(overrides)
+    _assert_agent_budget_consistent(
+        values["agent_max_rounds"],
+        values["agent_max_tool_calls_per_round"],
+        values["agent_max_total_tool_calls"],
+    )
     return SimpleNamespace(**values)
 
 
@@ -316,7 +352,7 @@ def test_simple_reply_entry_uses_configured_budget_without_whole_task_retry(
     with pytest.raises(RuntimeError, match="最大轮数"):
         asyncio.run(
             llm_service_module.generate_reply(
-                config=_build_config(agent_max_rounds=2),
+                config=_build_config(agent_max_rounds=2, agent_max_total_tool_calls=8),
                 messages=[{"role": "user", "content": "你好"}],
             )
         )
@@ -326,7 +362,7 @@ def test_simple_reply_entry_uses_configured_budget_without_whole_task_retry(
 
 def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """普通回复入口（_attempt_reply）使用配置轮次，不再有调用点封顶 5。"""
-    config = _build_chat_config_stub(agent_max_rounds=2)
+    config = _build_chat_config_stub(agent_max_rounds=2, agent_max_total_tool_calls=8)
     provider = _ScriptedProvider([_completion() for _ in range(5)])
     handler, _search = _wire_handler(monkeypatch, config, provider)
 
@@ -354,7 +390,7 @@ def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_debug_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """debug 无副作用入口（generate_debug_reply）使用配置轮次，不再有调用点封顶 5。"""
-    config = _build_chat_config_stub(agent_max_rounds=2)
+    config = _build_chat_config_stub(agent_max_rounds=2, agent_max_total_tool_calls=8)
     provider = _ScriptedProvider([_completion() for _ in range(5)])
     handler, _search = _wire_handler(monkeypatch, config, provider)
 
@@ -373,7 +409,7 @@ def test_debug_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_next_task_receives_updated_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """任务之间配置变更只影响下一任务：同一入口第二次运行使用新轮次。"""
-    config = _build_config(agent_max_rounds=2)
+    config = _build_config(agent_max_rounds=2, agent_max_total_tool_calls=8)
     provider = _ScriptedProvider([_completion() for _ in range(6)])
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
     monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
@@ -407,7 +443,7 @@ def test_debug_entry_freezes_budget_snapshot_across_rounds(
     """任务内冻结：debug 入口中途 mutate 配置，当前任务仍按任务开始快照执行。
 
     使用旧实现无法达到的值：per_round=6（旧常量 4 会拒绝 6 连搜）；
-    任务执行中把三项预算全部改为 1，冻结实现仍完成后续轮次。
+    任务执行中把三项预算改为合法最小值（2/1/2），冻结实现仍完成后续轮次。
     """
     config = _build_chat_config_stub(
         agent_max_rounds=8,
@@ -433,10 +469,10 @@ def test_debug_entry_freezes_budget_snapshot_across_rounds(
     original_search_web = search.search_web
 
     async def _mutating_search_web(query: str, **kwargs: object) -> str:
-        # 模拟任务执行期间运维把预算改到最小（经公开 search_web 工具 seam 触发）
-        config.agent_max_rounds = 1
+        # 模拟任务执行期间运维把预算改成合法最小值（经公开 search_web 工具 seam 触发）
+        config.agent_max_rounds = 2
         config.agent_max_tool_calls_per_round = 1
-        config.agent_max_total_tool_calls = 1
+        config.agent_max_total_tool_calls = 2
         return await original_search_web(query, **kwargs)
 
     monkeypatch.setattr(
@@ -467,7 +503,7 @@ def test_normal_entry_freezes_budget_snapshot_across_rounds(
     config = _build_chat_config_stub(
         agent_max_rounds=3,
         agent_max_tool_calls_per_round=4,
-        agent_max_total_tool_calls=3,
+        agent_max_total_tool_calls=4,
     )
     provider = _ScriptedProvider(
         [
@@ -487,10 +523,10 @@ def test_normal_entry_freezes_budget_snapshot_across_rounds(
     original_search_web = search.search_web
 
     async def _mutating_search_web(query: str, **kwargs: object) -> str:
-        # 第一轮执行期间把预算改为最小值
-        config.agent_max_rounds = 1
+        # 第一轮执行期间把预算改为合法最小值（2/1/2 仍在 Schema 边界内）
+        config.agent_max_rounds = 2
         config.agent_max_tool_calls_per_round = 1
-        config.agent_max_total_tool_calls = 1
+        config.agent_max_total_tool_calls = 2
         return await original_search_web(query, **kwargs)
 
     monkeypatch.setattr(
@@ -520,7 +556,7 @@ def test_normal_entry_freezes_budget_snapshot_across_rounds(
     assert pending is not None
     assert pending.reply == "预算测试回复"
     assert search.queries == ["a"]
-    # 变更后的 1/1/1 若在任务内被重读，第 2、3 轮会被整批拒绝或提前终止
+    # 变更后的 2/1/2 若在任务内被重读，后续轮次会被整批拒绝或提前终止
     assert len(provider.completion_calls) == 3
 
 
@@ -608,7 +644,7 @@ def test_all_tool_call_outcomes_consume_total_budget(
     """成功、未知、参数错误、好感度、final_response 全部计入总预算（AC5）。"""
     config = _build_config(
         agent_max_rounds=5,
-        agent_max_tool_calls_per_round=8,
+        agent_max_tool_calls_per_round=4,
         agent_max_total_tool_calls=4,
     )
     provider = _ScriptedProvider(
@@ -634,7 +670,13 @@ def test_all_tool_call_outcomes_consume_total_budget(
                 _tool_call(
                     "final_response",
                     "{}",
-                    {"interaction_history": {"event": "e", "result": "r", "emotion": "m"}},
+                    {
+                        "interaction_history": {
+                            "event": "e",
+                            "result": "r",
+                            "emotion": "m",
+                        }
+                    },
                     call_id="call-final-bad",
                 )
             ),
@@ -668,11 +710,13 @@ def test_all_tool_call_outcomes_consume_total_budget(
     assert search.queries == ["a"]
 
 
-def test_execution_failure_consumes_total_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execution_failure_consumes_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """业务工具执行失败也计入总预算：两次失败后 final_response 被拒绝。"""
     config = _build_config(
         agent_max_rounds=3,
-        agent_max_tool_calls_per_round=4,
+        agent_max_tool_calls_per_round=2,
         agent_max_total_tool_calls=2,
     )
     provider = _ScriptedProvider(
@@ -709,7 +753,7 @@ def test_no_tool_round_consumes_rounds_only(monkeypatch: pytest.MonkeyPatch) -> 
     """无工具调用的轮次只消耗轮次预算，不增加工具计数（AC6）。"""
     config = _build_config(
         agent_max_rounds=3,
-        agent_max_tool_calls_per_round=4,
+        agent_max_tool_calls_per_round=2,
         agent_max_total_tool_calls=2,
     )
     provider = _ScriptedProvider(
@@ -747,7 +791,9 @@ def test_provider_transient_retry_stays_within_same_logical_round(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """provider 单 completion 瞬时故障重试仍属同一逻辑轮次（不新增轮次计数）。"""
-    provider = _ScriptedProvider([RuntimeError("瞬时网络故障"), _final_response_completion()])
+    provider = _ScriptedProvider(
+        [RuntimeError("瞬时网络故障"), _final_response_completion()]
+    )
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
     monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
 
@@ -773,11 +819,18 @@ def test_provider_transient_retry_stays_within_same_logical_round(
 def test_agent_run_records_frozen_budget_and_consumption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Agent Run 记录冻结预算与轮次/工具消耗，且保留既有记录结构。"""
+    """Agent Run 记录冻结预算与轮次/工具消耗，且保留既有记录结构。
+
+    ``record["budget"]`` 块（任务开始冻结的预算值 + rounds_used /
+    tool_calls_used）是本 ticket 选定的外部 JSONL contract，经公开
+    collector 构造 seam 观察；消耗计数与 ``record["rounds"]`` 的工具提案
+    数一致。只断言预算相关字段与既有顶层键存在，不复制/校验与预算无关的
+    完整正文（正文内容由 agent_run_logger 自有测试基线负责）。
+    """
     config = _build_config(
         agent_max_rounds=2,
         agent_max_tool_calls_per_round=4,
-        agent_max_total_tool_calls=3,
+        agent_max_total_tool_calls=4,
     )
     provider = _ScriptedProvider(
         [
@@ -789,10 +842,10 @@ def test_agent_run_records_frozen_budget_and_consumption(
     original_search_web = search.search_web
 
     async def _mutating_search_web(query: str, **kwargs: object) -> str:
-        # 任务执行期间把配置改为最小值：记录中必须是任务开始时的冻结预算
-        config.agent_max_rounds = 1
+        # 任务执行期间把配置改为合法最小值：记录中必须是任务开始时的冻结预算
+        config.agent_max_rounds = 2
         config.agent_max_tool_calls_per_round = 1
-        config.agent_max_total_tool_calls = 1
+        config.agent_max_total_tool_calls = 2
         return await original_search_web(query, **kwargs)
 
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
@@ -817,19 +870,19 @@ def test_agent_run_records_frozen_budget_and_consumption(
     budget = record["budget"]
     assert budget["agent_max_rounds"] == 2
     assert budget["agent_max_tool_calls_per_round"] == 4
-    assert budget["agent_max_total_tool_calls"] == 3
+    assert budget["agent_max_total_tool_calls"] == 4
     assert budget["rounds_used"] == 2
     assert budget["tool_calls_used"] == 2
 
     # 消耗计数与结构化 trace 一致，不断言/复制完整正文
     assert len(record["rounds"]) == budget["rounds_used"]
     proposed_calls = sum(
-        len(trace_entry["response"]["tool_calls"])
-        for trace_entry in record["rounds"]
+        len(trace_entry["response"]["tool_calls"]) for trace_entry in record["rounds"]
     )
     assert proposed_calls == budget["tool_calls_used"]
 
-    # 既有记录结构不因新增预算元数据而改变（脱敏边界不被削弱）
+    # 既有记录结构不因新增预算元数据而改变（脱敏边界不被削弱）；仅检查
+    # 顶层键存在，不校验与预算无关的正文内容
     for key in (
         "schema_version",
         "rounds",
@@ -840,9 +893,6 @@ def test_agent_run_records_frozen_budget_and_consumption(
         "output",
     ):
         assert key in record
-    assert record["rounds"][0]["response"]["tool_calls"][0]["function"]["name"] == (
-        "search_web"
-    )
 
 
 # ── 隐藏封顶删除（AC4 / 边界 AC10） ───────────────────────────────────
@@ -910,7 +960,7 @@ def test_provider_transient_retry_in_tool_loop_stays_same_logical_round(
     """工具路径下 provider 瞬时重试仍属同一逻辑轮，失败尝试不耗预算（AC8）。"""
     config = _build_config(
         agent_max_rounds=2,
-        agent_max_tool_calls_per_round=4,
+        agent_max_tool_calls_per_round=2,
         agent_max_total_tool_calls=2,
     )
     provider = _ScriptedProvider(

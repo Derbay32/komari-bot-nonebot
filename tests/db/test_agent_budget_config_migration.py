@@ -23,6 +23,7 @@ from urllib.parse import unquote, urlparse
 
 import asyncpg
 import pytest
+from asyncpg.exceptions import CheckViolationError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
@@ -155,7 +156,9 @@ async def _insert_row_without_budget_columns(
     value_columns = sorted(
         columns - {"id", "revision", "updated_at"} - set(AGENT_BUDGET_COLUMNS)
     )
-    missing = [column for column in value_columns if column not in _NON_BUDGET_COLUMN_DEFAULTS]
+    missing = [
+        column for column in value_columns if column not in _NON_BUDGET_COLUMN_DEFAULTS
+    ]
     assert not missing, f"测试默认值字典缺少列: {missing}"
     columns_sql = ", ".join(["id", "revision", "updated_at", *value_columns])
     placeholders = ", ".join(f"${index}" for index in range(1, 4 + len(value_columns)))
@@ -206,7 +209,9 @@ async def test_agent_budget_columns_defaults_check_constraint_and_zero_drift() -
             cross_field_constraints = [
                 str(row["definition"])
                 for row in constraint_rows
-                if all(column in str(row["definition"]) for column in AGENT_BUDGET_COLUMNS)
+                if all(
+                    column in str(row["definition"]) for column in AGENT_BUDGET_COLUMNS
+                )
             ]
             assert cross_field_constraints, (
                 "komari_chat_config 缺少同时引用三项预算列的 CHECK 约束"
@@ -223,14 +228,13 @@ async def test_agent_budget_columns_defaults_check_constraint_and_zero_drift() -
             # 跨字段非法组合被数据库 CHECK 拒绝
             for set_clause in (
                 # 单轮预算 > 总预算
-                "agent_max_tool_calls_per_round = 5,"
-                " agent_max_total_tool_calls = 4",
+                "agent_max_tool_calls_per_round = 5, agent_max_total_tool_calls = 4",
                 # 总预算 > 轮次 x 单轮预算
                 "agent_max_rounds = 2,"
                 " agent_max_tool_calls_per_round = 4,"
                 " agent_max_total_tool_calls = 9",
             ):
-                with pytest.raises(Exception, match="check constraint"):
+                with pytest.raises(CheckViolationError):
                     await conn.execute(
                         f"UPDATE komari_chat_config SET {set_clause} WHERE id = 1"
                     )
