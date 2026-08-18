@@ -147,3 +147,53 @@ async def test_read_images_records_error_in_collector(
     assert "图片读取失败" in result[0]
     assert len(collector.errors) >= 1
     assert collector.errors[0]["type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_read_image_uses_db_snapshot_prompt_for_vision_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5：视觉描述调用从 PostgreSQL 快照读取可调行为 Prompt。
+
+    通过公开 loader seam（chat prompt 模板 ``get_template``）注入替身值，
+    捕获发送给 LLM 提供者的真实请求载荷，断言描述文本来自快照而非
+    Python 常量；不真正调用外部模型。当前实现仍使用模块常量，
+    因此本用例是 TSK-190 的可解释 RED。
+    """
+    from komari_bot.plugins.komari_chat.services import (
+        prompt_template as chat_prompt_template,
+    )
+
+    _patch_vision_dependencies(monkeypatch)
+
+    captured: list[dict[str, Any]] = []
+
+    class _CapturingProvider:
+        async def generate_messages_completion(self, **kwargs: Any) -> Any:
+            captured.append(kwargs)
+            return SimpleNamespace(
+                content="图片描述：已按快照 Prompt 生成",
+                finish_reason="stop",
+                duration_ms=10.0,
+                usage=None,
+            )
+
+    async def fake_get_template() -> dict[str, str]:
+        return {"vision_description_prompt": "DB-SNAPSHOT-VISION-PROMPT"}
+
+    monkeypatch.setattr(vision_service_module, "llm_provider", _CapturingProvider())
+    monkeypatch.setattr(chat_prompt_template, "get_template", fake_get_template)
+
+    result = await vision_service_module.read_images(
+        ["data:image/png;base64,seed-fixture"],
+        vision_model="vision-model",
+    )
+
+    assert result == ["图片描述：已按快照 Prompt 生成"]
+    assert len(captured) == 1
+    messages = captured[0]["messages"]
+    assert messages[0]["role"] == "user"
+    content = messages[0]["content"]
+    assert content[0]["type"] == "text"
+    assert content[0]["text"] == "DB-SNAPSHOT-VISION-PROMPT"
+    assert "详细描述这张图片" not in content[0]["text"]

@@ -509,3 +509,102 @@ def test_private_engine_uses_orm_database_url(
 def test_prompt_storage_no_longer_builds_url_from_postgres_config() -> None:
     assert not hasattr(prompt_storage, "_build_database_url")
     assert not hasattr(prompt_storage, "get_shared_database_config")
+
+
+def test_loader_cold_start_without_stored_prompt_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC7：无 DB 初始值且无缓存时，Loader 冷启动必须明确失败。
+
+    TSK-188 决策 29/34：移除 Python 默认正文后，缺失数据库值时不再回退
+    到默认字典，而是抛出错误阻止冷启动。当前实现会返回空默认字典，
+    因此本用例是 TSK-190 的可解释 RED。
+    """
+    class _Storage:
+        def register_invalidator(self, _resource_id: str, _callback: object) -> None:
+            return
+
+    async def no_stored_values(_resource: object) -> prompt_storage.PromptValues:
+        return prompt_storage.PromptValues(values={}, stored=None)
+
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: _Storage())
+    monkeypatch.setattr(prompt_storage, "load_prompt_values_async", no_stored_values)
+    loader = PromptTemplateLoader(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        defaults={},
+        log_prefix="[Test]",
+    )
+
+    with pytest.raises(RuntimeError, match="Prompt"):
+        asyncio.run(loader.get_template_async())
+
+
+def test_async_loader_keeps_last_valid_cache_on_db_failure_and_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC7：成功加载后 DB 暂时故障继续使用最后有效缓存；恢复后刷新。
+
+    时间由测试驱动越过 1 秒陈限：命中缓存 → 读取失败回退缓存 →
+    恢复后重新读取新 revision 并刷新缓存。
+    """
+    class _Storage:
+        def register_invalidator(self, _resource_id: str, _callback: object) -> None:
+            return
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(prompt_storage, "monotonic", lambda: clock["now"])
+
+    calls = 0
+
+    async def fake_load_prompt_values(
+        _resource: object,
+    ) -> prompt_storage.PromptValues:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return prompt_storage.PromptValues(
+                values={"system_prompt": "PG 值 v1"},
+                stored=StoredPrompt(
+                    resource_id="test_prompt",
+                    prompt_data={"system_prompt": "PG 值 v1"},
+                    revision=1,
+                    updated_at=datetime.now(UTC),
+                ),
+            )
+        if calls == 2:
+            msg = "PG 暂时故障（测试模拟）"
+            raise RuntimeError(msg)
+        return prompt_storage.PromptValues(
+            values={"system_prompt": "PG 值 v2"},
+            stored=StoredPrompt(
+                resource_id="test_prompt",
+                prompt_data={"system_prompt": "PG 值 v2"},
+                revision=2,
+                updated_at=datetime.now(UTC),
+            ),
+        )
+
+    monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: _Storage())
+    monkeypatch.setattr(prompt_storage, "load_prompt_values_async", fake_load_prompt_values)
+    loader = PromptTemplateLoader(
+        resource_id="test_prompt",
+        display_name="测试 Prompt",
+        defaults={"system_prompt": "默认"},
+        log_prefix="[Test]",
+    )
+
+    assert asyncio.run(loader.get_template_async()) == {"system_prompt": "PG 值 v1"}
+    assert calls == 1
+
+    # 缓存仍新鲜：不触发读取
+    assert asyncio.run(loader.get_template_async()) == {"system_prompt": "PG 值 v1"}
+    assert calls == 1
+
+    # 越过陈限后读取失败：保留最后有效缓存
+    clock["now"] += 2.0
+    assert asyncio.run(loader.get_template_async()) == {"system_prompt": "PG 值 v1"}
+    assert calls == 2
+
+    # 恢复后读取新值并刷新缓存
+    clock["now"] += 2.0
+    assert asyncio.run(loader.get_template_async()) == {"system_prompt": "PG 值 v2"}
+    assert calls == 3

@@ -560,3 +560,96 @@ def test_build_prompt_injects_fetch_tool_hint(monkeypatch: Any) -> None:
         str(message["content"]) for message in messages_without
     )
     assert "fetch_page" not in joined_without
+
+
+async def _behavior_template() -> dict[str, str]:
+    """TSK-190 新字段集的替身模板：DB 快照值用 ASCII 标记，便于断言来源。
+
+    ``output_instruction`` 仍带一个旧值哨兵：实现后 builder 不得再把它
+    注入消息（当前实现会注入，构成可解释 RED）。
+    """
+    return {
+        "system_prompt": "SYS-ROLE",
+        "tool_call_instruction": "TOOL-CALL-INSTR",
+        "image_read_instruction": "IMAGE-READ-INSTR",
+        "delegated_vision_instruction": "DELEGATED-VISION-INSTR",
+        "vision_description_prompt": "VISION-DESC-PROMPT",
+        "profile_read_instruction": "PROFILE-READ-INSTR",
+        "search_web_instruction": "SEARCH-WEB-INSTR",
+        "fetch_page_instruction": "FETCH-PAGE-INSTR",
+        "memory_ack": "MEM-ACK",
+        "memory_ack_role": "assistant",
+        "cot_prefix": "COT",
+        "cot_prefix_role": "assistant",
+        "output_instruction": "OLD-OUTPUT-SENTINEL",
+    }
+
+
+def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruction(
+    monkeypatch: Any,
+) -> None:
+    """AC5：builder 从模板快照注入各可调行为 Prompt，不再注入 output_instruction。"""
+    _patch_dependencies(monkeypatch)
+    monkeypatch.setattr(prompt_builder_module, "get_template", _behavior_template)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="搜索并看看这张图",
+            memories=[],
+            config=_build_config(),
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            current_user_profile={
+                "display_name": "阿虚",
+                "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
+            },
+            image_urls=["data:image/png;base64,1"],
+            vision_tool_mode=True,
+            search_tool_mode=True,
+            fetch_tool_mode=True,
+        )
+    )
+
+    joined = "\n".join(str(message["content"]) for message in messages)
+    for marker in (
+        "SYS-ROLE",
+        "TOOL-CALL-INSTR",
+        "IMAGE-READ-INSTR",
+        "DELEGATED-VISION-INSTR",
+        "PROFILE-READ-INSTR",
+        "SEARCH-WEB-INSTR",
+        "FETCH-PAGE-INSTR",
+    ):
+        assert marker in joined, f"builder 未注入 DB 快照行为字段: {marker}"
+    assert "OLD-OUTPUT-SENTINEL" not in joined, (
+        "builder 不得再注入已删除的 output_instruction 内容"
+    )
+
+
+def test_build_prompt_keeps_dynamic_image_index_ranges_code_generated(
+    monkeypatch: Any,
+) -> None:
+    """AC5：图片索引范围等动态提示仍由代码生成，不进入 DB Prompt 字段。"""
+    _patch_dependencies(monkeypatch)
+    monkeypatch.setattr(prompt_builder_module, "get_template", _behavior_template)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="这两张图里有什么",
+            memories=[],
+            config=_build_config(),
+            current_user_id="user-1",
+            current_user_nickname="阿虚",
+            image_urls=["data:image/png;base64,1", "data:image/png;base64,2"],
+            vision_tool_mode=True,
+        )
+    )
+
+    joined = "\n".join(str(message["content"]) for message in messages)
+    # 替身模板中的 DB 值均为 ASCII 标记，不含“索引范围”/read_image 中文提示；
+    # 因此出现该短语只能来自代码生成的动态索引逻辑。
+    assert "索引范围" in joined, "动态图片索引提示必须由代码生成"
+    assert "read_image" in joined
+    assert all(marker not in joined for marker in ("SEARCH-WEB-INSTR", "FETCH-PAGE-INSTR")), (
+        "未启用搜索/抓取时不得注入对应 DB 行为字段"
+    )

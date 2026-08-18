@@ -130,3 +130,27 @@ def test_storage_metadata_is_hidden_from_model_dump() -> None:
 def test_prompt_model_keeps_strict_constructor_validation() -> None:
     with pytest.raises(ValidationError):
         KomariChatPromptSchema(system_prompt=123)  # pyright: ignore[reportArgumentType]
+
+
+def test_komari_chat_schema_replaces_output_instruction_with_behavior_fields() -> None:
+    """AC2：聊天 Prompt Schema 删除 output_instruction，新增独立行为字段。
+
+    精确点名字段（tool_call_instruction / image_read_instruction）按名称
+    断言；其余职责只断言存在互不相同的独立字段（见 oracle 模块）。
+    """
+    from tests.config.chat_prompt_field_contract import (
+        REMOVED_FIELD,
+        REQUIRED_EXACT_FIELDS,
+        chat_prompt_field_names,
+        resolve_behavior_field_names,
+    )
+
+    public_fields = chat_prompt_field_names()
+
+    assert REMOVED_FIELD not in public_fields
+    assert set(REQUIRED_EXACT_FIELDS) <= public_fields
+
+    resolved = resolve_behavior_field_names(public_fields)
+    assert set(resolved.values()).isdisjoint(REQUIRED_EXACT_FIELDS), (
+        "工具调用/图片读取职责之外的独立字段不得与精确点名字段复用"
+    )
