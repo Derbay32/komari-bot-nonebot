@@ -42,6 +42,14 @@ DEFAULT_SEED_FILE = (
 )
 CLI_MODULE = "komari_bot.db.seed_bootstrap"
 
+#: prestart 的公开执行 seam：与 docker/start.sh 实际 source 的是同一脚本。
+PRE_START_SCRIPT = PROJECT_ROOT / "docker" / "prestart.sh"
+ORM_BOOTSTRAP_MODULE = "komari_bot.db.orm_bootstrap"
+
+#: 假 python 应记录的两次调用（顺序即契约：先迁移，后播种）。
+MIGRATE_INVOCATION = f"-m {ORM_BOOTSTRAP_MODULE} upgrade head"
+SEED_INVOCATION = f"-m {CLI_MODULE}"
+
 #: 故意不可达的数据库地址：校验类用例必须在该地址被触碰前失败。
 UNREACHABLE_DB_URL = (
     "postgresql+asyncpg://seed_test:seed_test@seed-unreachable.invalid:1/seed_test"
@@ -69,6 +77,57 @@ def _run_seed_cli(
         check=False,
         timeout=120,
     )
+
+
+_FAKE_PYTHON_SCRIPT = """#!/bin/sh
+# 测试替身：把每次调用的参数原样追加到 FAKE_PYTHON_LOG，
+# 并按被调模块从环境变量读取退出码（缺省 0）。
+printf '%s\\n' "$*" >> "$FAKE_PYTHON_LOG"
+case "$*" in
+  *komari_bot.db.seed_bootstrap*)
+    exit "${FAKE_PYTHON_SEED_EXIT:-0}"
+    ;;
+esac
+exit "${FAKE_PYTHON_MIGRATE_EXIT:-0}"
+"""
+
+
+def _run_prestart_with_fake_python(
+    tmp_path: Path,
+    *,
+    migrate_exit: int = 0,
+    seed_exit: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """通过公开执行 seam 运行 prestart，并用受控假 python 记录调用。
+
+    PATH 前置只含一个假 ``python`` 可执行文件：它把每次调用的 ``-m ...``
+    参数原样追加到日志文件，并按所调模块返回测试指定的退出码。
+    返回 ``(进程结果, 调用日志路径)``；断言全部基于外部可观察行为
+    （真实脚本退出码 + 实际发生的 python 调用序列），不解析脚本文本。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python"
+    fake_python.write_text(_FAKE_PYTHON_SCRIPT, encoding="utf-8")
+    fake_python.chmod(0o755)
+
+    log_path = tmp_path / "python-invocations.log"
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["FAKE_PYTHON_LOG"] = str(log_path)
+    env["FAKE_PYTHON_MIGRATE_EXIT"] = str(migrate_exit)
+    env["FAKE_PYTHON_SEED_EXIT"] = str(seed_exit)
+
+    result = subprocess.run(
+        ["/bin/sh", str(PRE_START_SCRIPT)],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    return result, log_path
 
 
 def _scene_seed_text(
@@ -323,19 +382,38 @@ def test_seed_cli_rejects_invalid_seed_file_format(
     assert str(seed_file) in output, "报错必须指明出错的 seed 文件"
 
 
-def test_prestart_runs_upgrade_head_then_seed_bootstrap_with_fail_fast() -> None:
-    """AC2：prestart 严格按 upgrade head → 播种/校验顺序执行，set -e fail fast。"""
-    script = (PROJECT_ROOT / "docker" / "prestart.sh").read_text(encoding="utf-8")
-    assert "set -e" in script, "prestart 必须启用 set -e 使任一步失败即中止"
-    lines = script.splitlines()
-    upgrade_line = next(
-        line
-        for line in lines
-        if "orm_bootstrap" in line and "upgrade" in line
+def test_prestart_runs_upgrade_head_then_seed_bootstrap_with_fail_fast(
+    tmp_path: Path,
+) -> None:
+    """AC2 成功路径：prestart 先执行 upgrade head，再调用播种命令。"""
+    result, log_path = _run_prestart_with_fake_python(tmp_path)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, output
+    invocations = log_path.read_text(encoding="utf-8").splitlines()
+    assert invocations == [MIGRATE_INVOCATION, SEED_INVOCATION], (
+        "prestart 必须严格按 upgrade head → seed_bootstrap 顺序各执行一次"
     )
-    seed_line = next(line for line in lines if CLI_MODULE in line)
-    assert lines.index(seed_line) > lines.index(upgrade_line), (
-        "prestart 必须先 upgrade head 再执行播种命令"
+
+
+def test_prestart_fails_fast_when_migration_command_fails(tmp_path: Path) -> None:
+    """AC2：迁移命令失败时 prestart 非零退出，且不调用播种命令。"""
+    result, log_path = _run_prestart_with_fake_python(tmp_path, migrate_exit=1)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, output
+    invocations = log_path.read_text(encoding="utf-8").splitlines()
+    assert invocations == [MIGRATE_INVOCATION], (
+        "迁移失败时 prestart 必须非零退出且不得调用播种命令（迁移仅调用一次）"
+    )
+
+
+def test_prestart_fails_fast_when_seed_command_fails(tmp_path: Path) -> None:
+    """AC2：播种失败时 prestart 非零退出；迁移与播种各只调用一次。"""
+    result, log_path = _run_prestart_with_fake_python(tmp_path, seed_exit=1)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, output
+    invocations = log_path.read_text(encoding="utf-8").splitlines()
+    assert invocations == [MIGRATE_INVOCATION, SEED_INVOCATION], (
+        "播种失败前迁移与播种必须各执行恰好一次"
     )
 
 
