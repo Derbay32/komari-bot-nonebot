@@ -587,13 +587,18 @@ def merge_prompt_values(
     defaults: dict[str, str],
     prompt_data: dict[str, Any] | None,
 ) -> dict[str, str]:
-    """将存储值按允许字段合并到 defaults。"""
-    values = dict(defaults)
+    """将存储值按允许字段合并到 defaults。
+
+    存储值优先覆盖 defaults 中同名字段（仍只接受字符串、剔除尾随换行）；
+    defaults 为其余字段提供兜底。TSK-190 的 chat 资源以空 defaults 使用：
+    模板字段集完全来自存储快照（``stored=None`` 时仍返回空 dict，由
+    loader 冷启动 gate 拒绝空值）。
+    """
     if prompt_data is None:
-        return values
-    for key in defaults:
-        value = prompt_data.get(key)
-        if isinstance(value, str):
+        return dict(defaults)
+    values = dict(defaults)
+    for key, value in prompt_data.items():
+        if isinstance(value, str) and (key in defaults or not defaults):
             values[key] = value.rstrip("\n")
     return values
 
@@ -642,6 +647,11 @@ def load_prompt_values(resource: PromptResourceProtocol) -> PromptValues:
             for key in stored_keys & merged_keys
         )
         if added_keys or value_changed:
+            if not resource.defaults:
+                # TSK-190：chat 以空 defaults 使用，values 完全来自存储
+                # 快照，没有可同步写入的默认字段，跳过自动同步（避免每
+                # 次加载都触发一次注定失败的写入）。
+                return PromptValues(values=values, stored=stored)
             synced: StoredPrompt | None = None
             try:
                 prompt_data = dict(stored.prompt_data)
@@ -708,6 +718,11 @@ async def load_prompt_values_async(
         for key in stored_keys & merged_keys
     )
     if not added_keys and not value_changed:
+        return PromptValues(values=values, stored=stored)
+
+    if not resource.defaults:
+        # TSK-190：chat 以空 defaults 使用，values 完全来自存储快照，
+        # 没有可同步写入的默认字段，跳过自动同步。
         return PromptValues(values=values, stored=stored)
 
     synced: StoredPrompt | None = None
@@ -870,13 +885,32 @@ class PromptTemplateLoader:
 
     def _fallback_template(self) -> dict[str, str]:
         with self._cache_lock:
-            if not self._cache:
-                self._cache = dict(self.defaults)
+            if self._cache:
+                self._cache_checked_at = monotonic()
+                self._invalidated = False
+                return dict(self._cache)
+            if not self.defaults:
+                # TSK-190：chat 以空 defaults 使用时，无 DB 值且无缓存
+                # 必须明确失败（冷启动 gate），绝不静默返回空模板。
+                msg = (
+                    f"{self._log_prefix} Prompt 的 PostgreSQL 初始数据不可用且无缓存，"
+                    f"无法冷启动: {self.resource_id}"
+                )
+                raise RuntimeError(msg)
+            self._cache = dict(self.defaults)
             self._cache_checked_at = monotonic()
             self._invalidated = False
             return dict(self._cache)
 
     def _accept_loaded(self, loaded: PromptValues) -> dict[str, str]:
+        if loaded.stored is None and not loaded.values:
+            # TSK-190：stored=None 且 values 为空（chat 空 defaults）时
+            # 没有可用初始值，必须在冷启动阶段明确失败。
+            msg = (
+                f"{self._log_prefix} Prompt 的 PostgreSQL 初始数据缺失且无可用缓存，"
+                f"无法冷启动: {self.resource_id}"
+            )
+            raise RuntimeError(msg)
         updated_at = loaded.stored.updated_at if loaded.stored is not None else None
         revision = loaded.stored.revision if loaded.stored is not None else 0
         with self._cache_lock:

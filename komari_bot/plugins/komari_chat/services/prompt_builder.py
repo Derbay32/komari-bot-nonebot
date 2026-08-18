@@ -261,16 +261,16 @@ async def build_prompt(
     messages: list[dict[str, Any]] = []
 
     # ═══════════════════════════════════════
-    # ①② 静态 system — 角色设定 + 输出格式指令
+    # ① 静态 system — 角色设定 + 可调行为引导（正文来自 PostgreSQL 快照）
     # ═══════════════════════════════════════
     messages.append({"role": "system", "content": template["system_prompt"]})
-    messages.append({"role": "system", "content": template["output_instruction"]})
+    messages.append({"role": "system", "content": template["tool_call_instruction"]})
     messages.append(
         {
             "role": "system",
             "content": (
                 "<profile_tool_hint>\n"
-                "当前触发用户画像会在 <current_user_profile> 中给出；"
+                f"{template['profile_read_instruction']}\n"
                 "需要其他用户画像或缺失字段时调用 read_profile(user_id)，"
                 "不要猜测未提供的长期事实。\n"
                 "</profile_tool_hint>"
@@ -278,15 +278,23 @@ async def build_prompt(
         }
     )
     messages.append({"role": "system", "content": LLM_SECURITY_SYSTEM_INSTRUCTION})
+    if vision_tool_mode:
+        messages.append(
+            {"role": "system", "content": template["image_read_instruction"]}
+        )
+        messages.append(
+            {"role": "system", "content": template["delegated_vision_instruction"]}
+        )
+        messages.append(
+            {"role": "system", "content": template["vision_description_prompt"]}
+        )
     if search_tool_mode:
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    "[系统提示：当前对话启用了联网搜索工具 search_web。"
-                    "当用户明确要求搜索、询问最新资讯/数据、或涉及你不确定的事实时，"
-                    "请先调用 search_web 查询互联网；回答时要基于搜索结果如实说明，"
-                    "不要编造搜索结果中没有的信息。]"
+                    "[系统提示：当前对话启用了联网搜索工具 search_web。]\n"
+                    f"{template['search_web_instruction']}"
                 ),
             }
         )
@@ -295,11 +303,8 @@ async def build_prompt(
             {
                 "role": "system",
                 "content": (
-                    "[系统提示：当前对话启用了网页抓取工具 fetch_page。"
-                    "当搜索结果摘要不够详细、或用户提供了具体链接时，"
-                    "可调用 fetch_page 获取网页正文。"
-                    "一次调用可传入多个 URL，只传入你确实需要阅读的页面，"
-                    "不要批量抓取所有搜索结果。]"
+                    "[系统提示：当前对话启用了网页抓取工具 fetch_page。]\n"
+                    f"{template['fetch_page_instruction']}"
                 ),
             }
         )

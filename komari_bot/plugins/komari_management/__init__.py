@@ -26,10 +26,10 @@ from komari_bot.plugins.group_history_summary.prompt_schema import (
 )
 from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
 from komari_bot.plugins.komari_chat.prompt_schema import (
-    DEFAULTS as KOMARI_CHAT_PROMPT_DEFAULTS,
+    DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
 )
 from komari_bot.plugins.komari_chat.prompt_schema import (
-    DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
+    KomariChatPromptSchema,
 )
 from komari_bot.plugins.komari_decision.config_schema import KomariDecisionConfigSchema
 from komari_bot.plugins.komari_help.config_schema import (
@@ -83,6 +83,18 @@ class PluginState:
 
     def __init__(self) -> None:
         self.api_registered = False
+
+
+_PROMPT_STORAGE_FIELDS = frozenset({"id", "revision", "updated_at"})
+
+
+def _chat_prompt_resource_defaults() -> dict[str, str]:
+    """聊天 Prompt 管理资源的字段集与占位值（TSK-190）。
+
+    AC1/AC8：管理资源字段来自强类型 Schema，而非 chat Python 默认正文；
+    值仅作写入校验占位（空字符串），完整正文由版本化初始数据播种。
+    """
+    return dict.fromkeys(sorted(set(KomariChatPromptSchema.model_fields) - _PROMPT_STORAGE_FIELDS), "")
 
 
 def _load_management_components() -> ManagementApiComponents:
@@ -223,7 +235,7 @@ def _load_management_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name=KOMARI_CHAT_PROMPT_DISPLAY_NAME,
-                defaults=KOMARI_CHAT_PROMPT_DEFAULTS,
+                defaults=_chat_prompt_resource_defaults(),
                 legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
             ),
             ManagedPromptResource(
