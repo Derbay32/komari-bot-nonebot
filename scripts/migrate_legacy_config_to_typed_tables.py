@@ -10,7 +10,8 @@
 - 不 import 任何 ``komari_bot`` 运行时代码与新模型定义；
 - 键→列映射在下方 ``_RESOURCE_SPECS`` 中静态写死（与
   ``migrations/versions/0002_typed_plugin_config_tables.py``、
-  ``0003_typed_prompt_tables.py`` 逐列一致），运行时仅通过
+  ``0003_typed_prompt_tables.py``、TSK-190 的
+  ``0012_chat_prompt_behavior_columns.py`` 逐列一致），运行时仅通过
   information_schema 校验列存在性，不读取任何模型元数据；
 - 数据库直连只使用项目依赖里已有的 asyncpg；
 - 连接串来自命令行 ``--dsn`` 或环境变量 ``SQLALCHEMY_DATABASE_URL``
@@ -550,11 +551,20 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         legacy_data_column="prompt_data",
         key_value="komari_chat",
         target_table="komari_prompt_komari_chat",
+        # TSK-190：output_instruction 已被 0012 迁移显式删除，legacy 同名键
+        # 作为 dropped key 丢弃（不并入任何新字段）；新行为列先为空，
+        # 由统一 seed 补齐（列声明与 0012 的 DDL 逐列一致）。
         columns=(
             "system_prompt",
             "memory_ack",
             "memory_ack_role",
-            "output_instruction",
+            "tool_call_instruction",
+            "image_read_instruction",
+            "profile_read_instruction",
+            "search_web_instruction",
+            "fetch_page_instruction",
+            "delegated_vision_instruction",
+            "vision_description_prompt",
             "cot_prefix",
             "cot_prefix_role",
         ),
