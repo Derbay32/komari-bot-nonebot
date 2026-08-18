@@ -361,6 +361,37 @@ def test_seed_cli_rejects_duplicate_scene_keys(
     assert str(seed_file) in output
 
 
+def test_seed_cli_rejects_duplicate_key_inside_fixed_candidates(
+    tmp_path: Path,
+) -> None:
+    """AC6：fixed_candidates（YAML mapping）内同一键重复出现明确失败。
+
+    YAML 对 mapping 重复键默认静默覆盖，校验层必须独立检出；否则重复键
+    被折叠后会被漏过，命令会继续访问数据库而不是在校验阶段失败。
+    """
+    seed_file = tmp_path / "duplicate-fixed-key.yaml"
+    seed_file.write_text(
+        _scene_seed_text(
+            fixed_keys=(
+                "NOISE",
+                "MEANINGFUL",
+                "CALL_DIRECT",
+                "CALL_MENTION",
+                "NOISE",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = _run_seed_cli(seed_file=seed_file)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, output
+    assert "NOISE" in output, "失败信息必须点名重复的固定场景键"
+    assert str(seed_file) in output, "报错必须指明出错的 seed 文件"
+    assert "seed-unreachable.invalid" not in output, (
+        "seed 校验失败前不得尝试连接数据库"
+    )
+
+
 @pytest.mark.parametrize(
     "body",
     [
