@@ -2,8 +2,8 @@
 
 TSK-190：视觉描述 Prompt 经 chat Prompt 公开 loader
 （``services/prompt_template.get_template``）从 PostgreSQL 快照读取，
-不再保留任何 Python 长文本常量；loader 冷启动失败时降级为空文本，
-绝不复用旧常量正文。
+不再保留任何 Python 长文本常量；loader 冷启动失败或快照视觉描述字段
+缺失/空白时异常向上传播，绝不降级为空文本继续调用 LLM。
 """
 
 from __future__ import annotations
@@ -39,15 +39,19 @@ _VISION_READ_SEMAPHORE = asyncio.Semaphore(_VISION_READ_CONCURRENCY_LIMIT)
 async def _load_vision_description_prompt() -> str:
     """经 chat Prompt 公开 loader 读取视觉描述 Prompt（TSK-190 AC5）。
 
-    loader 在 PostgreSQL 无完整初始值且无缓存时明确抛错；此处异常路径
-    降级为空文本（不注入任何 Python 常量正文），调用方仍按错误格式串
-    返回读图失败提示，不阻断其它图片的并行读取。
+    loader 在 PostgreSQL 无完整初始值且无缓存时明确抛错，此处不吞异常：
+    非空图片输入时冷启动失败必须向上传播，调用方不会继续视觉 LLM 调用。
+    快照成功返回但视觉描述字段缺失/空白同样明确失败，绝不降级为空文本。
     """
-    try:
-        template = await get_template()
-    except Exception:
-        template = {}
-    return str(template.get("vision_description_prompt") or "")
+    template = await get_template()
+    prompt = template.get("vision_description_prompt")
+    if prompt is None or not str(prompt).strip():
+        msg = (
+            "Prompt 的视觉描述字段（vision_description_prompt）缺失或空白，"
+            "无法读取图片: komari_chat"
+        )
+        raise RuntimeError(msg)
+    return str(prompt)
 
 
 def _format_error(error: Exception) -> str:
