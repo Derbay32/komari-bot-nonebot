@@ -1,4 +1,4 @@
-"""Komari Memory 动态提示词构建服务（5 段式 OpenAI messages）。"""
+"""Komari Chat 动态提示词构建服务（多段式 OpenAI messages）。"""
 
 from __future__ import annotations
 
@@ -229,12 +229,12 @@ async def build_prompt(
     """构建面向 DeepSeek KV Cache 优化的 OpenAI 格式消息数组。
 
     结构：
-    ① system    — 静态角色设定
-    ② system    — 静态输出格式指令
-    ③ user/asst — 对话历史（Redis buffer 交替构造）
-    ④ user      — 动态上下文（时间、记忆、知识库、实体、当前好感度阶段）
-    ⑤ user      — 当前用户消息
-    ⑥ assistant — 旧版预填充（可选）
+    ① system    — 静态角色设定与工具/画像行为引导 + 安全边界
+                   （可选：读图 / 委托图片理解 / 搜索 / 抓取引导）
+    ② user/asst — 对话历史（Redis buffer 交替构造，含被引用消息）
+    ③ user      — 动态上下文（时间、记忆、知识库、实体、当前好感度阶段）
+    ④ user      — 当前用户消息
+    ⑤ assistant — 旧版预填充（可选）
 
     Args:
         user_message: 用户原始消息（用于生成回复）
@@ -250,7 +250,10 @@ async def build_prompt(
         reply_context: 当前消息引用的上下文（可选）
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
         query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
-        vision_tool_mode: 是否使用工具调用读图模式。开启时只注入图片索引说明，不嵌入 base64 图片块
+        vision_tool_mode: 是否使用工具调用读图模式。开启时注入 read_image
+            行为引导与动态图片索引说明，不嵌入 base64 图片块；视觉描述
+            正文（vision_description_prompt）只供 vision_service 子调用
+            消费，不注入主回复 Agent messages
         search_tool_mode: 是否启用联网搜索工具声明
         fetch_tool_mode: 是否启用网页抓取工具声明
 
@@ -261,16 +264,16 @@ async def build_prompt(
     messages: list[dict[str, Any]] = []
 
     # ═══════════════════════════════════════
-    # ①② 静态 system — 角色设定 + 输出格式指令
+    # ① 静态 system — 角色设定 + 可调行为引导 + 安全边界（正文来自 PostgreSQL 快照）
     # ═══════════════════════════════════════
     messages.append({"role": "system", "content": template["system_prompt"]})
-    messages.append({"role": "system", "content": template["output_instruction"]})
+    messages.append({"role": "system", "content": template["tool_call_instruction"]})
     messages.append(
         {
             "role": "system",
             "content": (
                 "<profile_tool_hint>\n"
-                "当前触发用户画像会在 <current_user_profile> 中给出；"
+                f"{template['profile_read_instruction']}\n"
                 "需要其他用户画像或缺失字段时调用 read_profile(user_id)，"
                 "不要猜测未提供的长期事实。\n"
                 "</profile_tool_hint>"
@@ -278,15 +281,20 @@ async def build_prompt(
         }
     )
     messages.append({"role": "system", "content": LLM_SECURITY_SYSTEM_INSTRUCTION})
+    if vision_tool_mode:
+        messages.append(
+            {"role": "system", "content": template["image_read_instruction"]}
+        )
+        messages.append(
+            {"role": "system", "content": template["delegated_vision_instruction"]}
+        )
     if search_tool_mode:
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    "[系统提示：当前对话启用了联网搜索工具 search_web。"
-                    "当用户明确要求搜索、询问最新资讯/数据、或涉及你不确定的事实时，"
-                    "请先调用 search_web 查询互联网；回答时要基于搜索结果如实说明，"
-                    "不要编造搜索结果中没有的信息。]"
+                    "[系统提示：当前对话启用了联网搜索工具 search_web。]\n"
+                    f"{template['search_web_instruction']}"
                 ),
             }
         )
@@ -295,17 +303,14 @@ async def build_prompt(
             {
                 "role": "system",
                 "content": (
-                    "[系统提示：当前对话启用了网页抓取工具 fetch_page。"
-                    "当搜索结果摘要不够详细、或用户提供了具体链接时，"
-                    "可调用 fetch_page 获取网页正文。"
-                    "一次调用可传入多个 URL，只传入你确实需要阅读的页面，"
-                    "不要批量抓取所有搜索结果。]"
+                    "[系统提示：当前对话启用了网页抓取工具 fetch_page。]\n"
+                    f"{template['fetch_page_instruction']}"
                 ),
             }
         )
 
     # ═══════════════════════════════════════
-    # ③ user/assistant — 对话历史
+    # ② user/assistant — 对话历史
     # ═══════════════════════════════════════
     if recent_messages:
         current_block: list[str] = []
@@ -370,7 +375,7 @@ async def build_prompt(
             )
 
     # ═══════════════════════════════════════
-    # ④ 动态 user — 时间 + 记忆 + 实体 + 知识库
+    # ③ 动态 user — 时间 + 记忆 + 实体 + 知识库
     # ═══════════════════════════════════════
     dynamic_parts: list[str] = []
 
@@ -634,7 +639,7 @@ async def build_prompt(
 
     if getattr(config, "assistant_prefill_enabled", False):
         # ═══════════════════════════════════════
-        # ⑥ assistant — 旧版预填充（可选）
+        # ⑤ assistant — 旧版预填充（可选）
         # ═══════════════════════════════════════
         messages.append(
             {

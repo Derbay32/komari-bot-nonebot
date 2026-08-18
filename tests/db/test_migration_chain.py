@@ -616,3 +616,59 @@ def test_migration_cli_can_inspect_chain_without_loading_application(
     output = f"{result.stdout}\n{result.stderr}"
     assert "config_manager" not in output
     assert "PostgresPool" not in output
+
+
+def test_chat_prompt_behavior_columns_revision_exists() -> None:
+    """AC3：0011 的直接后继 revision 显式删除 output_instruction 并新增行为列。
+
+    新列集合由强类型 Schema 与 0003 保留列差集推导，不猜测迁移实现；
+    迁移必须自包含（不导入运行时），并将删除旧列与新增新列落实在 DDL。
+    删除旧列接受项目允许的显式 Alembic 表达（``op.drop_column`` 或自包含
+    ``DROP COLUMN`` SQL），不锁定 raw SQL 实现；真实 schema 变更由
+    ``test_prompt_seed_bootstrap_integration.py`` 的隔离库迁移用例验证，
+    本用例承担无数据库的静态守卫。
+    """
+    from tests.config.chat_prompt_field_contract import (
+        new_chat_prompt_column_names,
+    )
+
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0011"]
+    assert len(children) == 1, f"0011 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    assert _has_explicit_drop_column(revision_sql, "output_instruction"), (
+        "迁移必须显式删除 output_instruction 列"
+        "（op.drop_column(..., 'output_instruction') 或 "
+        "DROP COLUMN [IF EXISTS] output_instruction SQL）"
+    )
+
+    for column in sorted(new_chat_prompt_column_names()):
+        assert re.search(rf"\b{re.escape(column)}\b", revision_sql), (
+            f"迁移必须新增聊天 Prompt 行为列: {column}"
+        )
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
+def _has_explicit_drop_column(revision_sql: str, column: str) -> bool:
+    """识别项目允许的显式列删除表达：``op.drop_column`` 或自包含 SQL。
+
+    真实删除行为由 PostgreSQL 集成测试（``test_prompt_seed_``
+    ``bootstrap_integration.py``）确认；静态守卫只要求显式表达存在，
+    不锁死 raw SQL 实现。
+    """
+    alembic_drop = re.search(
+        rf"op\.drop_column\(\s*(['\"])[^'\"]*\1\s*,\s*(['\"])"
+        rf"{re.escape(column)}\2",
+        revision_sql,
+        re.IGNORECASE,
+    )
+    raw_sql_drop = re.search(
+        rf"DROP\s+COLUMN(?:\s+IF\s+EXISTS)?\s+{re.escape(column)}\b",
+        revision_sql,
+        re.IGNORECASE,
+    )
+    return bool(alembic_drop or raw_sql_drop)

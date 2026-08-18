@@ -8,6 +8,12 @@
 ``_legacycfg``）内先 ``upgrade head`` 再执行脚本验收，用例结束即
 DROP；共享门控库的版本与数据不受搬移影响，重复执行与执行顺序
 互不影响。门控用户需要 CREATEDB 权限。
+
+TSK-190 语义：legacy JSONB 夹具仍可携带 ``output_instruction`` 作
+迁移输入，但 head 强类型表的查询/断言不得引用已删除列；脚本按新
+契约丢弃 ``output_instruction``（不并入任何新字段），保留其余自定义
+Prompt 字段，新增行为列在 legacy 迁移阶段保持空值（待统一 seed 补齐，
+补齐路径由 ``test_prompt_seed_bootstrap_integration.py`` 覆盖）。
 """
 
 from __future__ import annotations
@@ -33,6 +39,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/migrate_legacy_config_to_typed_tables.py"
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
+
+#: TSK-190 被删除列。本地镜像 ``tests/config/chat_prompt_field_contract.py``
+#: 的 ``REMOVED_FIELD``；本文件刻意不 import komari_bot 运行时代码（与脚本
+#: 自身独立性约束一致），因此就地声明并在 docstring 中指向 oracle。
+REMOVED_PROMPT_FIELD = "output_instruction"
+
+#: 0003 旧 Prompt 表保留列（TSK-190 迁移所删除字段之外的既有正文列）。
+#: 同上镜像 oracle 的 ``LEGACY_KEPT_CHAT_COLUMNS``。
+LEGACY_KEPT_CHAT_PROMPT_COLUMNS: frozenset[str] = frozenset(
+    {
+        "system_prompt",
+        "memory_ack",
+        "memory_ack_role",
+        "cot_prefix",
+        "cot_prefix_role",
+    }
+)
 
 
 def _load_script_module() -> Any:
@@ -684,6 +707,41 @@ def _run_bootstrap(url: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _chat_prompt_spec(module: Any) -> Any:
+    """聊天 Prompt 资源的静态声明（脚本内唯一真源）。"""
+    return next(
+        spec
+        for spec in module._RESOURCE_SPECS
+        if spec.legacy_table == "komari_prompt_configs"
+        and spec.key_value == "komari_chat"
+    )
+
+
+def _chat_prompt_declared_columns(module: Any) -> tuple[str, ...]:
+    """脚本静态声明的聊天 Prompt 列（随 TSK-190 落地自然剔除旧列/加入新列）。
+
+    不用硬编码新列名：查询列集合跟随脚本声明，head 表查询永远不会引用
+    已删除列（脚本更新后即不再声明 ``output_instruction``）。
+    """
+    return tuple(_chat_prompt_spec(module).columns)
+
+
+async def _column_names(
+    connection: asyncpg.Connection,
+    table_name: str,
+) -> set[str]:
+    """查询一张表当前的全部列名（用于删除验证，不引用已删除列）。"""
+    rows = await connection.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = $1
+        """,
+        table_name,
+    )
+    return {str(row["column_name"]) for row in rows}
+
+
 async def _recreate_scratch_database() -> dict[str, Any]:
     """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。
 
@@ -733,6 +791,17 @@ class TestMigrateLegacyConfigsIntegration:
     async def test_migrates_legacy_rows_and_is_idempotent(self) -> None:
         module = _load_script_module()
         updated_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        #: TSK-190 legacy komari_chat Prompt 迁移输入：JSONB insert 与
+        #: “保留旧字段”断言共用同一真源，避免字面量转写不一致。
+        legacy_chat_prompt = {
+            "system_prompt": "你是小鞠知花。",
+            "memory_ack": "好的。",
+            "memory_ack_role": "assistant",
+            "output_instruction": "输出正文。",
+            "cot_prefix": "<think>\n",
+            "cot_prefix_role": "assistant",
+            "version": "1.0",
+        }
         scratch = await self._prepare_head_scratch()
         conn = await asyncpg.connect(**scratch)
         try:
@@ -783,18 +852,7 @@ class TestMigrateLegacyConfigsIntegration:
                 " VALUES ($1, $2, $3::jsonb, $4, $5, $6)",
                 "komari_chat",
                 "Komari Chat Prompt",
-                json.dumps(
-                    {
-                        "system_prompt": "你是小鞠知花。",
-                        "memory_ack": "好的。",
-                        "memory_ack_role": "assistant",
-                        "output_instruction": "输出正文。",
-                        "cot_prefix": "<think>\n",
-                        "cot_prefix_role": "assistant",
-                        "version": "1.0",
-                    },
-                    ensure_ascii=False,
-                ),
+                json.dumps(legacy_chat_prompt, ensure_ascii=False),
                 "1.0",
                 2,
                 updated_at,
@@ -839,17 +897,59 @@ class TestMigrateLegacyConfigsIntegration:
             assert sr_row["list_chunk_size"] == 0
             assert sr_row["redis_db"] == 0
 
+            # ═══ TSK-190：聊天 Prompt 迁移语义 ═══
+            # 脚本静态声明不再包含已删除列，并随新 Schema 宣告新行为列
+            chat_spec = _chat_prompt_spec(module)
+            assert REMOVED_PROMPT_FIELD not in chat_spec.columns, (
+                "TSK-190 未实现：脚本不得再声明 output_instruction 列"
+            )
+            new_chat_columns = [
+                column
+                for column in chat_spec.columns
+                if column not in LEGACY_KEPT_CHAT_PROMPT_COLUMNS
+            ]
+            assert new_chat_columns, (
+                "TSK-190 未实现：脚本未声明任何新行为列"
+            )
+
+            chat_report = reports["komari_chat"]
+            assert chat_report.migrated is True
+            assert chat_report.revision == 2
+            assert set(chat_report.dropped_keys) == {
+                "version",
+                REMOVED_PROMPT_FIELD,
+            }, "legacy output_instruction 必须被丢弃，不并入任何新字段"
+            assert set(LEGACY_KEPT_CHAT_PROMPT_COLUMNS) <= set(
+                chat_report.migrated_keys
+            ), "旧的其他自定义 Prompt 字段必须保留"
+            assert set(chat_report.defaulted_keys) == set(new_chat_columns), (
+                "新增行为列在 legacy 迁移阶段保持空值（待 seed 补齐）"
+            )
+
+            # head 表查询列集合跟随脚本声明：永不引用已删除列
+            chat_select = ", ".join(
+                ["id", "revision", "updated_at", *_chat_prompt_declared_columns(module)]
+            )
             prompt_row = await conn.fetchrow(
-                "SELECT id, revision, updated_at, system_prompt, memory_ack,"
-                " memory_ack_role, output_instruction, cot_prefix,"
-                " cot_prefix_role FROM komari_prompt_komari_chat WHERE id = 1"
+                f"SELECT {chat_select} FROM komari_prompt_komari_chat WHERE id = 1"
             )
             assert prompt_row["id"] == 1
             assert prompt_row["revision"] == 2
             assert prompt_row["updated_at"] == updated_at
-            assert prompt_row["system_prompt"] == "你是小鞠知花。"
-            assert prompt_row["memory_ack"] == "好的。"
-            assert prompt_row["cot_prefix_role"] == "assistant"
+            assert prompt_row["system_prompt"] == legacy_chat_prompt["system_prompt"]
+            assert prompt_row["memory_ack"] == legacy_chat_prompt["memory_ack"]
+            assert prompt_row["memory_ack_role"] == legacy_chat_prompt["memory_ack_role"]
+            assert prompt_row["cot_prefix"] == legacy_chat_prompt["cot_prefix"]
+            assert prompt_row["cot_prefix_role"] == legacy_chat_prompt["cot_prefix_role"]
+            for column in new_chat_columns:
+                assert prompt_row[column] == "", (
+                    f"新增行为列 {column} 在 legacy 迁移后必须为空（待 seed 补齐）"
+                )
+            # 显式删除验证：head 表已不存在旧列（TSK-190 未实现时为可解释 RED）
+            head_columns = await _column_names(conn, "komari_prompt_komari_chat")
+            assert REMOVED_PROMPT_FIELD not in head_columns, (
+                "TSK-190 未实现：head 表仍存在 output_instruction 列"
+            )
 
             text = module.render_report(result)
             assert "已迁移键" in text
@@ -882,9 +982,7 @@ class TestMigrateLegacyConfigsIntegration:
                 " FROM komari_sr_config WHERE id = 1"
             )
             prompt_after = await conn.fetchrow(
-                "SELECT id, revision, updated_at, system_prompt, memory_ack,"
-                " memory_ack_role, output_instruction, cot_prefix,"
-                " cot_prefix_role FROM komari_prompt_komari_chat WHERE id = 1"
+                f"SELECT {chat_select} FROM komari_prompt_komari_chat WHERE id = 1"
             )
             assert dict(row_after) == dict(row)
             assert dict(sr_after) == dict(sr_row)

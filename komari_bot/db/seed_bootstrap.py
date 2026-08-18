@@ -1,4 +1,4 @@
-"""版本化初始数据播种入口（TSK-189）。
+"""版本化初始数据播种入口（TSK-189 / TSK-190）。
 
 统一、版本化且幂等的初始数据播种命令，供本地、容器 prestart 与 CI 复用：
 
@@ -9,16 +9,21 @@
 1. **seed 文件校验先于数据库访问**：默认读取
    ``komari_bot/db/initial_data/scenes.yaml``（可经 ``--seed-file`` 覆盖），
    校验 version、必需 fixed 场景、一般场景与 scene_key 唯一性，并在 YAML
-   解析阶段拒绝 mapping 重复键（PyYAML 默认静默覆盖）；任何格式或约束不
-   满足都以非零退出码结束并指明出错的 seed 文件，阻止冷启动。
-2. **只插缺失、绝不覆盖**：按稳定 ``scene_key`` 执行
+   解析阶段拒绝 mapping 重复键（PyYAML 默认静默覆盖）；TSK-190 起同时
+   校验聊天 Prompt 初始数据块：字段集合与强类型 Schema 一一对应、全部非空
+   字符串且共享内容预算通过，缺块/缺字段/违规在数据库访问前即失败，
+   任何格式或约束不满足都以非零退出码结束并指明出错的 seed 文件。
+2. **只插缺失、绝不覆盖**：场景按稳定 ``scene_key`` 执行
    ``INSERT ... ON CONFLICT DO NOTHING``，已有默认或管理员场景（含 disabled）
-   保持原值，重复执行幂等。
+   保持原值；聊天 Prompt 只新建缺失单行（id=1）并补齐空字段
+   （``None``、空字符串与纯空白字符串均视为空），非空自定义值绝不覆盖；
+   两者均重复执行幂等（TSK-190 验收标准 6）。
 3. **写入后验证最终数据库状态足以冷启动**：校验 PostgreSQL 中必需 fixed
-   场景齐全且可用、至少存在一个启用的一般场景；不满足则命令失败，容器
-   prestart 的 ``set -e`` 会随之中止应用启动（fail fast）。
+   场景齐全且可用、至少存在一个启用的一般场景，且聊天 Prompt 单行全部
+   字段非空；不满足则命令失败，容器 prestart 的 ``set -e`` 会随之中止
+   应用启动（fail fast）。
 4. **运行时从不读取本文件**：初始化数据只是 bootstrap seed，运行时的场景
-   快照一律从 PostgreSQL 构建（见 ADR-0011）。
+   快照与 Prompt 快照一律从 PostgreSQL 构建（见 ADR-0011）。
 
 数据库访问统一走 nonebot-plugin-orm 共享连接边界
 （``komari_bot.db.orm_connection.get_shared_orm_connection_pool``），
@@ -33,11 +38,18 @@ import hashlib
 import sys
 from collections.abc import Hashable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
 from yaml.constructor import ConstructorError
+
+from komari_bot.config.typed_config import ensure_typed_prompt_model
+from komari_bot.llm.content_budget import (
+    CONTENT_TEXT_BUDGET,
+    validate_text_budget,
+)
 
 from .orm_bootstrap import _bootstrap_nonebot
 
@@ -52,6 +64,11 @@ _REQUIRED_FIXED_SCENE_KEYS: tuple[str, ...] = (
     "MEANINGFUL",
     "CALL_DIRECT",
     "CALL_MENTION",
+)
+
+#: Prompt 强类型表继承自 TypedConfigModel 的存储专用字段。
+_PROMPT_STORAGE_FIELDS: frozenset[str] = frozenset(
+    {"id", "revision", "updated_at"}
 )
 
 
@@ -126,6 +143,9 @@ class SeedPayload:
     fixed_candidates: dict[str, str]
     general_scenes: list[dict[str, str]]
     items: list[SceneSeedItem]
+    #: 聊天 Prompt 初始值（TSK-190）；文件无聊天 Prompt 块时为空 dict，
+    #: 由 CLI 层按冷启动要求拒绝。
+    chat_prompt: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -136,6 +156,9 @@ class SeedReport:
     total: int
     fixed_count: int
     general_count: int
+    #: TSK-190：聊天 Prompt 新建行 / 补齐字段数。
+    chat_prompt_inserted: int = 0
+    chat_prompt_filled: int = 0
 
 
 @dataclass(frozen=True)
@@ -192,6 +215,94 @@ def _normalize_general_scenes(raw: object, path: Path) -> list[dict[str, str]]:
     if not normalized:
         msg = f"初始数据缺少一般场景（general_scenes 不能为空）: {path}"
         raise SeedValidationError(msg)
+    return normalized
+
+
+def _find_chat_prompt_mapping(raw: object) -> dict[str, Any] | None:
+    """在 seed 文档中定位聊天 Prompt 块（与测试 oracle 同一约定）。
+
+    返回包含 ``system_prompt`` 且不含 ``planning_system_prompt`` 的映射
+    （后者是 group_history_summary 的判别键）；找不到返回 ``None``。
+    遍历不修改原文档。
+    """
+
+    def walk(node: object) -> dict[str, Any] | None:
+        if isinstance(node, dict):
+            if "system_prompt" in node and "planning_system_prompt" not in node:
+                return node
+            for value in node.values():
+                found = walk(value)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = walk(value)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(raw)
+
+
+def _chat_prompt_schema_fields() -> set[str]:
+    """聊天 Prompt 强类型 Schema 的正文字段集（校验/写入共用真源）。
+
+    经 ``ensure_typed_prompt_model`` 安全加载器读取 prompt_schema 源文件，
+    不执行插件包 ``__init__``、不访问数据库，可离线用于 CLI 校验。
+    """
+    model_cls = ensure_typed_prompt_model("komari_chat")
+    if model_cls is None:
+        msg = "无法加载聊天 Prompt 强类型 Schema（komari_chat.prompt_schema）"
+        raise SeedValidationError(msg)
+    return set(model_cls.model_fields) - _PROMPT_STORAGE_FIELDS
+
+
+def _normalize_chat_prompt(raw: object, path: Path) -> dict[str, str]:
+    """校验并归一化聊天 Prompt 初始值；缺失块返回空 dict（由 CLI 层裁决）。
+
+    字段集合必须与强类型 Schema 一一对应，全部字段必须是非空字符串并
+    通过共享内容预算；旧 ``output_instruction`` 字段不在 Schema 中，
+    自然被未知字段校验拒绝。错误消息始终指明 seed 文件路径。
+    """
+    mapping = _find_chat_prompt_mapping(raw)
+    if mapping is None:
+        return {}
+
+    fields = _chat_prompt_schema_fields()
+    missing = sorted(fields - set(mapping))
+    if missing:
+        msg = (
+            "聊天 Prompt 初始数据缺少字段: "
+            f"{', '.join(missing)}（{path}）"
+        )
+        raise SeedValidationError(msg)
+    extra = sorted(set(mapping) - fields)
+    if extra:
+        msg = (
+            "聊天 Prompt 初始数据包含未知字段: "
+            f"{', '.join(extra)}（{path}）"
+        )
+        raise SeedValidationError(msg)
+
+    normalized: dict[str, str] = {}
+    for field in sorted(fields):
+        value = mapping[field]
+        if not isinstance(value, str) or not value.strip():
+            msg = (
+                f"聊天 Prompt 字段 {field} 的初始值必须是非空字符串"
+                f"（{path}）"
+            )
+            raise SeedValidationError(msg)
+        try:
+            validate_text_budget(
+                value,
+                label=f"聊天 Prompt 初始数据字段 {field}",
+                budget=CONTENT_TEXT_BUDGET,
+            )
+        except ValueError as exc:
+            msg = f"{exc}（{path}）"
+            raise SeedValidationError(msg) from exc
+        normalized[field] = value
     return normalized
 
 
@@ -261,6 +372,8 @@ def load_seed_file(path: Path) -> SeedPayload:
         )
         raise SeedValidationError(msg)
 
+    chat_prompt = _normalize_chat_prompt(raw, path)
+
     items: list[SceneSeedItem] = []
     order = 0
     for key, content in fixed_candidates.items():
@@ -294,6 +407,7 @@ def load_seed_file(path: Path) -> SeedPayload:
         fixed_candidates=fixed_candidates,
         general_scenes=general_scenes,
         items=items,
+        chat_prompt=chat_prompt,
     )
 
 
@@ -347,17 +461,84 @@ def verify_cold_start_state(rows: list[dict[str, Any]]) -> ColdStartState:
     )
 
 
+async def _seed_chat_prompt_row(
+    conn: Any,
+    chat_prompt: dict[str, str],
+) -> tuple[int, int]:
+    """新建缺失聊天 Prompt 单行并只补齐空字段（TSK-190 AC6）。
+
+    空字段定义为 ``None``、空字符串或纯空白字符串；非空自定义值绝不
+    覆盖。返回 ``(新建行数, 补齐字段数)``：已存在且全字段非空时零写入；
+    只有实际补齐才递增 revision/updated_at，重复执行幂等。
+    """
+    fields = sorted(chat_prompt)
+    row = await conn.fetchrow("SELECT * FROM komari_prompt_komari_chat WHERE id = 1")
+    if row is None:
+        columns = ", ".join(fields)
+        placeholders = ", ".join(f"${index}" for index in range(2, 2 + len(fields)))
+        await conn.execute(
+            "INSERT INTO komari_prompt_komari_chat"
+            " (id, revision, updated_at, "
+            + columns
+            + ") VALUES (1, 1, $1, "
+            + placeholders
+            + ")",
+            datetime.now(UTC),
+            *(chat_prompt[field] for field in fields),
+        )
+        return 1, 0
+
+    updates = {
+        field: chat_prompt[field]
+        for field in fields
+        if row[field] is None or not str(row[field]).strip()
+    }
+    if not updates:
+        return 0, 0
+    ordered = sorted(updates)
+    set_clause = ", ".join(
+        f'"{field}" = ${index}' for index, field in enumerate(ordered, start=2)
+    )
+    await conn.execute(
+        "UPDATE komari_prompt_komari_chat SET "
+        + set_clause
+        + ", revision = revision + 1, updated_at = $1 WHERE id = 1",
+        datetime.now(UTC),
+        *(updates[field] for field in ordered),
+    )
+    return 0, len(updates)
+
+
+async def _verify_chat_prompt_cold_start(conn: Any) -> None:
+    """写入后验证数据库聊天 Prompt 全字段非空（统一冷启动 gate 的一部分）。"""
+    fields = _chat_prompt_schema_fields()
+    row = await conn.fetchrow("SELECT * FROM komari_prompt_komari_chat WHERE id = 1")
+    if row is None:
+        msg = "聊天 Prompt 初始数据未写入数据库（komari_prompt_komari_chat 缺行）"
+        raise SeedVerificationError(msg)
+    empty = [
+        field
+        for field in sorted(fields)
+        if row[field] is None or not str(row[field]).strip()
+    ]
+    if empty:
+        msg = f"聊天 Prompt 初始数据字段为空: {', '.join(empty)}"
+        raise SeedVerificationError(msg)
+
+
 async def _seed_database(payload: SeedPayload) -> SeedReport:
-    """写入缺失场景并在写入后校验冷启动充分性。
+    """写入缺失场景与聊天 Prompt 初始数据，并在写入后校验冷启动充分性。
 
     数据库访问经 nonebot-plugin-orm 共享连接边界（shared engine pool）：
     只借还连接，不捕获也不 dispose 共享引擎（生命周期由 nonebot-plugin-orm
-    托管）；查询为既有场景表的只读与幂等插入，不使用任何运行时 DDL。
+    托管）；查询为既有表的只读与幂等写入，不使用任何运行时 DDL。
     """
     from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     pool = get_shared_orm_connection_pool()
     inserted = 0
+    chat_prompt_inserted = 0
+    chat_prompt_filled = 0
     async with pool.acquire() as conn:
         async with conn.transaction():
             for item in payload.items:
@@ -379,6 +560,11 @@ async def _seed_database(payload: SeedPayload) -> SeedReport:
                 )
                 if inserted_id is not None:
                     inserted += 1
+            chat_prompt_inserted, chat_prompt_filled = await _seed_chat_prompt_row(
+                conn,
+                payload.chat_prompt,
+            )
+        await _verify_chat_prompt_cold_start(conn)
         rows = await conn.fetch(
             """
             SELECT scene_key, scene_type, content_text, enabled
@@ -392,6 +578,8 @@ async def _seed_database(payload: SeedPayload) -> SeedReport:
         total=len(rows),
         fixed_count=state.fixed_count,
         general_count=state.general_count,
+        chat_prompt_inserted=chat_prompt_inserted,
+        chat_prompt_filled=chat_prompt_filled,
     )
 
 
@@ -426,6 +614,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"初始数据校验失败: {exc}", file=sys.stderr)  # noqa: T201
         raise SystemExit(1) from exc
 
+    if not payload.chat_prompt:
+        # TSK-190：聊天 Prompt 缺块视同校验失败，必须在数据库访问前中止
+        # （统一冷启动 gate；错误指明出错的 seed 文件）。
+        print(  # noqa: T201
+            f"初始数据校验失败: 缺少聊天 Prompt 初始数据块（{args.seed_file}）",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     # 校验通过后才初始化 NoneBot / 共享引擎，保证非法 seed 绝不触碰数据库。
     try:
         _bootstrap_nonebot()
@@ -448,7 +645,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(  # noqa: T201
         f"[seed_bootstrap] 场景初始数据播种完成: 新增 {report.inserted} 条，"
         f"共 {report.total} 条（fixed={report.fixed_count} "
-        f"general={report.general_count}）"
+        f"general={report.general_count}）；聊天 Prompt: "
+        f"新建 {report.chat_prompt_inserted} 行，"
+        f"补齐 {report.chat_prompt_filled} 个字段"
     )
 
 

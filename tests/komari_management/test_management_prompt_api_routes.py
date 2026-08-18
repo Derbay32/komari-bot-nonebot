@@ -41,6 +41,7 @@ def _build_app(
     monkeypatch: pytest.MonkeyPatch,
     store: _PromptStore,
     audit_events: list[ManagementAuditEvent] | None = None,
+    resource_defaults: dict[str, str] | None = None,
 ) -> FastAPI:
     from komari_bot.plugins.komari_management import prompt_api
 
@@ -142,7 +143,8 @@ def _build_app(
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name="Komari Chat Prompt",
-                defaults={
+                defaults=resource_defaults
+                or {
                     "system_prompt": "默认系统提示词",
                     "memory_ack": "默认确认",
                 },
@@ -273,3 +275,78 @@ async def test_prompt_writes_require_matching_revision(
     assert stale_revision.status_code == 409
     assert store.values["system_prompt"] == "你好"
     assert store.revision == 1
+
+
+def _chat_behavior_defaults() -> dict[str, str]:
+    """聊天 Prompt 字段集的替身默认值（字段集合派生自强类型 Schema）。"""
+    from tests.config.chat_prompt_field_contract import chat_prompt_field_names
+
+    return {name: f"{name}-默认" for name in sorted(chat_prompt_field_names())}
+
+
+def _chat_store() -> _PromptStore:
+    defaults = _chat_behavior_defaults()
+    return _PromptStore(values={name: f"v-{name}" for name in defaults})
+
+
+@pytest.mark.asyncio
+async def test_prompt_routes_expose_chat_behavior_fields_and_hide_removed_field(
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC8：管理 API 暴露新增行为字段，不再暴露已删除的 output_instruction。"""
+    from tests.config.chat_prompt_field_contract import (
+        REMOVED_FIELD,
+        REQUIRED_EXACT_FIELDS,
+    )
+
+    store = _chat_store()
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(monkeypatch, store, resource_defaults=_chat_behavior_defaults()))
+    ) as ctx:
+        client = ctx.get_client()
+        headers = {"Authorization": "Bearer secret-token-00000000"}
+        listed = await client.get(f"{API_PREFIX}/resources", headers=headers)
+        detail = await client.get(
+            f"{API_PREFIX}/resources/komari_chat", headers=headers
+        )
+
+    fields = set(listed.json()["items"][0]["fields"])
+    assert REMOVED_FIELD not in fields
+    for field in REQUIRED_EXACT_FIELDS:
+        assert field in fields, f"管理 API 必须暴露新字段 {field}"
+    assert detail.status_code == 200
+    assert REMOVED_FIELD not in detail.json()["values"]
+    assert "tool_call_instruction" in detail.json()["values"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_routes_update_new_field_and_reject_removed_field(
+    app: App,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC8：可更新新增字段；已删除字段不可寻址（404）。"""
+    from tests.config.chat_prompt_field_contract import REMOVED_FIELD
+
+    store = _chat_store()
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(monkeypatch, store, resource_defaults=_chat_behavior_defaults()))
+    ) as ctx:
+        client = ctx.get_client()
+        updated = await client.patch(
+            f"{API_PREFIX}/resources/komari_chat/fields/tool_call_instruction",
+            json={"value": "新的工具调用行为指引"},
+            headers=_write_headers("prompt-tool-call-update", store.revision),
+        )
+        removed = await client.patch(
+            f"{API_PREFIX}/resources/komari_chat/fields/{REMOVED_FIELD}",
+            json={"value": "不会写入"},
+            headers=_write_headers("prompt-removed-field", store.revision + 1),
+        )
+
+    assert updated.status_code == 200
+    assert updated.json()["values"]["tool_call_instruction"] == "新的工具调用行为指引"
+    assert removed.status_code == 404
+    assert store.values["tool_call_instruction"] == "新的工具调用行为指引"
