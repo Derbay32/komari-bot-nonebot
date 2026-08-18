@@ -10,6 +10,7 @@
 
 from typing import ClassVar
 
+from pydantic import model_validator
 from sqlalchemy import CheckConstraint
 
 from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
@@ -25,12 +26,18 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    # 时效字段的数据库级 CHECK 与 0007 迁移保持一致，避免 autogenerate 漂移
+    # 时效字段的数据库级 CHECK 与 0007 迁移保持一致，避免 autogenerate 漂移；
+    # 回复 Agent 预算的跨字段 CHECK 与 0013 迁移保持一致（TSK-192）
     __table_args__ = (
         CheckConstraint(
             "reply_fulfillment_freshness_seconds >= 30 "
             "AND reply_fulfillment_freshness_seconds <= 300",
             name="ck_komari_chat_config_reply_fulfillment_freshness",
+        ),
+        CheckConstraint(
+            "agent_max_tool_calls_per_round <= agent_max_total_tool_calls "
+            "AND agent_max_total_tool_calls <= agent_max_rounds * agent_max_tool_calls_per_round",
+            name="ck_komari_chat_config_agent_budget",
         ),
     )
 
@@ -112,3 +119,47 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         description="回复准备完成到开始发送的时效窗口（秒），满时效未发送即按未送达终止",
         json_schema_extra={"apply_mode": "immediate"},
     )
+
+    # 回复 Agent 执行预算（TSK-192）：三项预算在任务起点冻结，
+    # 中途配置变更只影响下一个任务。
+    agent_max_rounds: int = Field(
+        default=10,
+        ge=2,
+        le=20,
+        description="回复 Agent 最大逻辑轮次（每轮至多一次模型调用）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    agent_max_tool_calls_per_round: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="回复 Agent 单轮最大工具调用数（超量整批拒绝，不执行半批）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    agent_max_total_tool_calls: int = Field(
+        default=20,
+        ge=2,
+        le=64,
+        description="回复 Agent 整任务最大工具调用总数（模型提出的调用即计入）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+
+    @model_validator(mode="after")
+    def _validate_agent_budget(self) -> "KomariChatConfigSchema":
+        """跨字段校验：单轮预算 <= 总预算 <= 轮次 x 单轮预算。"""
+        if self.agent_max_tool_calls_per_round > self.agent_max_total_tool_calls:
+            msg = (
+                "agent_max_tool_calls_per_round 不能大于 "
+                "agent_max_total_tool_calls"
+            )
+            raise ValueError(msg)
+        if (
+            self.agent_max_total_tool_calls
+            > self.agent_max_rounds * self.agent_max_tool_calls_per_round
+        ):
+            msg = (
+                "agent_max_total_tool_calls 不能大于 "
+                "agent_max_rounds x agent_max_tool_calls_per_round"
+            )
+            raise ValueError(msg)
+        return self
