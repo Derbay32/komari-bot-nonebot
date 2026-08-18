@@ -8,8 +8,9 @@
 
 1. **seed 文件校验先于数据库访问**：默认读取
    ``komari_bot/db/initial_data/scenes.yaml``（可经 ``--seed-file`` 覆盖），
-   校验 version、必需 fixed 场景、一般场景与 scene_key 唯一性；任何格式或
-   约束不满足都以非零退出码结束并指明出错的 seed 文件，阻止冷启动。
+   校验 version、必需 fixed 场景、一般场景与 scene_key 唯一性，并在 YAML
+   解析阶段拒绝 mapping 重复键（PyYAML 默认静默覆盖）；任何格式或约束不
+   满足都以非零退出码结束并指明出错的 seed 文件，阻止冷启动。
 2. **只插缺失、绝不覆盖**：按稳定 ``scene_key`` 执行
    ``INSERT ... ON CONFLICT DO NOTHING``，已有默认或管理员场景（含 disabled）
    保持原值，重复执行幂等。
@@ -30,18 +31,18 @@ import argparse
 import asyncio
 import hashlib
 import sys
+from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import yaml
+from yaml.constructor import ConstructorError
 
 from .orm_bootstrap import _bootstrap_nonebot
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-    from sqlalchemy.ext.asyncio import AsyncEngine
 
 DEFAULT_SEED_FILE = Path(__file__).resolve().parent / "initial_data" / "scenes.yaml"
 
@@ -52,6 +53,49 @@ _REQUIRED_FIXED_SCENE_KEYS: tuple[str, ...] = (
     "CALL_DIRECT",
     "CALL_MENTION",
 )
+
+
+#: 由 ``flatten_mapping`` 特殊消费、不构成真实 mapping 键的 YAML 标签。
+_MAPPING_INTERNAL_TAGS: frozenset[str] = frozenset(
+    {
+        "tag:yaml.org,2002:merge",  # ``<<`` 合并键
+        "tag:yaml.org,2002:value",  # ``=`` 键（构造时改写为 str）
+    }
+)
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """局部 SafeLoader：构造 mapping 时拒绝重复键。
+
+    PyYAML 默认对 mapping 重复键静默覆盖（后出现的键胜出），校验依赖
+    构造结果，必须在构造前独立检出；仅本模块使用，不修改全局 loader，
+    正常资产（无重复键，含合法 merge 键）的行为与 ``yaml.safe_load``
+    完全一致。
+    """
+
+    def construct_mapping(
+        self,
+        node: yaml.MappingNode,
+        deep: bool = False,  # noqa: FBT001, FBT002  # 对齐 PyYAML 基类签名
+    ) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _value_node in node.value:
+            if key_node.tag in _MAPPING_INTERNAL_TAGS:
+                # merge/value 键由 flatten_mapping 消费，不参与重复键比较
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, Hashable):
+                # 非可哈希键由 PyYAML 下游按 unhashable key 拒绝，无需在此处理
+                continue
+            if key in seen:
+                raise ConstructorError(  # noqa: TRY003  # 第三方异常类的消息参数
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 class SeedValidationError(RuntimeError):
@@ -176,7 +220,10 @@ def load_seed_file(path: Path) -> SeedPayload:
     """
     path = path if path.is_absolute() else path.resolve()
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = yaml.load(
+            path.read_text(encoding="utf-8"),
+            Loader=_UniqueKeySafeLoader,
+        ) or {}
     except OSError as exc:
         msg = f"读取初始数据文件失败: {path}（{exc}）"
         raise SeedValidationError(msg) from exc
@@ -303,53 +350,41 @@ def verify_cold_start_state(rows: list[dict[str, Any]]) -> ColdStartState:
 async def _seed_database(payload: SeedPayload) -> SeedReport:
     """写入缺失场景并在写入后校验冷启动充分性。
 
-    数据库访问经 nonebot-plugin-orm 共享连接边界（shared engine pool），
-    不使用任何运行时 DDL；查询为既有场景/构建集表的只读与幂等插入。
+    数据库访问经 nonebot-plugin-orm 共享连接边界（shared engine pool）：
+    只借还连接，不捕获也不 dispose 共享引擎（生命周期由 nonebot-plugin-orm
+    托管）；查询为既有场景表的只读与幂等插入，不使用任何运行时 DDL。
     """
     from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     pool = get_shared_orm_connection_pool()
-    engine: AsyncEngine | None = None
     inserted = 0
-    try:
-        from nonebot_plugin_orm import get_session
-
-        session = get_session()
-        try:
-            engine = cast("AsyncEngine", session.bind)
-        finally:
-            await session.close()
-
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                for item in payload.items:
-                    inserted_id = await conn.fetchval(
-                        """
-                        INSERT INTO komari_decision_scenes
-                            (scene_key, scene_type, content_text, content_hash,
-                             enabled, order_index)
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                        ON CONFLICT (scene_key) DO NOTHING
-                        RETURNING id
-                        """,
-                        item.scene_key,
-                        item.scene_type,
-                        item.content_text,
-                        item.content_hash,
-                        item.enabled,
-                        item.order_index,
-                    )
-                    if inserted_id is not None:
-                        inserted += 1
-            rows = await conn.fetch(
-                """
-                SELECT scene_key, scene_type, content_text, enabled
-                FROM komari_decision_scenes
-                """
-            )
-    finally:
-        if engine is not None:
-            await engine.dispose()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for item in payload.items:
+                inserted_id = await conn.fetchval(
+                    """
+                    INSERT INTO komari_decision_scenes
+                        (scene_key, scene_type, content_text, content_hash,
+                         enabled, order_index)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (scene_key) DO NOTHING
+                    RETURNING id
+                    """,
+                    item.scene_key,
+                    item.scene_type,
+                    item.content_text,
+                    item.content_hash,
+                    item.enabled,
+                    item.order_index,
+                )
+                if inserted_id is not None:
+                    inserted += 1
+        rows = await conn.fetch(
+            """
+            SELECT scene_key, scene_type, content_text, enabled
+            FROM komari_decision_scenes
+            """
+        )
 
     state = verify_cold_start_state([dict(row) for row in rows])
     return SeedReport(
