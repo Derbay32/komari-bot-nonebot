@@ -793,21 +793,20 @@ def test_read_profile_output_applies_trait_character_and_token_budgets() -> None
     assert "traits_truncated: true" in output
 
 
-def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> None:
+def test_generate_reply_with_tools_requires_final_response_within_config_rounds(
+    monkeypatch: Any,
+) -> None:
+    """配置轮次=3 时，三轮空 tool_calls 用尽配置轮次后失败（非隐藏纠错上限）。
+
+    TSK-192 AC4：逻辑轮次只由配置预算 ``agent_max_rounds`` 决定，不存在隐藏
+    的 2/3/5/6 轮封顶。此处显式冻结合法预算 3 轮（per_round=4 / total=12），
+    三轮纠错后因配置轮次耗尽而失败。
+    """
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
-        SimpleNamespace(
-            content="",
-            tool_calls=[],
-        ),
-        SimpleNamespace(
-            content="",
-            tool_calls=[],
-        ),
-        SimpleNamespace(
-            content="",
-            tool_calls=[],
-        ),
+        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(content="", tool_calls=[]),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
 
@@ -819,19 +818,79 @@ def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> 
     with pytest.raises(RuntimeError, match="模型未调用任何工具"):
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
-                config=_build_config(),
+                config=_build_config(
+                    agent_max_rounds=3,
+                    agent_max_tool_calls_per_round=4,
+                    agent_max_total_tool_calls=12,
+                ),
                 messages=[{"role": "user", "content": "查一下"}],
                 tools=[llm_service_module.SEARCH_WEB_TOOL],
                 request_trace_id="chat-no-final-1",
             )
         )
 
-    # 三轮空 tool_calls 在同一 _execute_tool_loop 内被纠错，不再触发外层重试。
+    # 三轮空 tool_calls 在同一 _execute_tool_loop 内被纠错：配置的 3 个轮次
+    # 全部耗尽后任务因未完成 final_response 而失败，不再消耗第 4 轮。
     assert len(fake_provider.completion_calls) == 3
     messages_lengths = [
         len(call["messages"]) for call in fake_provider.completion_calls
     ]
     assert messages_lengths == sorted(messages_lengths)
+    for call in fake_provider.completion_calls[1:]:
+        assert any(
+            "必须调用" in str(message.get("content", ""))
+            for message in call["messages"]
+        )
+
+
+def test_generate_reply_with_tools_no_hidden_correction_cap_before_config_rounds(
+    monkeypatch: Any,
+) -> None:
+    """有业务工具时配置轮次 >3（5 轮）不会被隐藏 3 轮纠错上限提前终止。
+
+    TSK-192 AC4：前 4 轮空 tool_calls 只按配置消耗轮次，第 5 轮
+    final_response 必须成功；若实现存在隐藏纠错上限（如 3），第 3 轮就会
+    提前抛错。预算 5 / 4 / 12（per_round <= total <= rounds*per_round）合法。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        _completion(),
+        _completion(),
+        _completion(),
+        _completion(),
+        _completion(
+            _tool_call(
+                "final_response",
+                "{}",
+                {
+                    "content": "第五轮最终回复",
+                    "interaction_history": {
+                        "event": "连续四轮未调用工具",
+                        "result": "配置轮次结束前完成回复",
+                        "emotion": "平静",
+                    },
+                },
+            )
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(
+                agent_max_rounds=5,
+                agent_max_tool_calls_per_round=4,
+                agent_max_total_tool_calls=12,
+            ),
+            messages=[{"role": "user", "content": "不要提前终止"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            request_trace_id="chat-no-hidden-cap-1",
+        )
+    )
+
+    assert result.content == "第五轮最终回复"
+    assert len(fake_provider.completion_calls) == 5
+    # 第 2~5 轮都携带纠错指令：4 个空 tool_calls 轮次逐一消耗配置轮次
     for call in fake_provider.completion_calls[1:]:
         assert any(
             "必须调用" in str(message.get("content", ""))
