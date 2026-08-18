@@ -8,10 +8,10 @@
 ``reply_fulfillment_retry_max_seconds`` 退避上限字段。
 """
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import model_validator
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, Column, String
 
 from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
@@ -141,6 +141,22 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         ge=2,
         le=64,
         description="回复 Agent 整任务最大工具调用总数（模型提出的调用即计入）",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+
+    # 工具调用约束模式（TSK-193）：在任务起点与三项预算一起冻结；
+    # required=每轮强制模型提出工具调用（不兼容的思考模型明确失败），
+    # prompt_guided=省略服务端强制参数、只经数据库 Prompt 引导，
+    # 但裸文本仍不构成成功回复。无兼容值/宽松规范化。
+    agent_tool_call_mode: Literal["required", "prompt_guided"] = Field(
+        default="required",
+        sa_column=Column(
+            String(32), nullable=False, default="required"
+        ),
+        description=(
+            "回复 Agent 工具调用约束模式：required=每轮强制模型提出工具调用；"
+            "prompt_guided=省略服务端强制工具参数，仅经数据库 Prompt 引导"
+        ),
         json_schema_extra={"apply_mode": "immediate"},
     )
 

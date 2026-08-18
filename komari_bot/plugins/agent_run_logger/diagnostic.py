@@ -110,8 +110,9 @@ class AgentRunCollector:
         self.calls: list[LLMCallTrace] = []
         self.tools: list[ToolExecutionTrace] = []
         self.errors: list[dict[str, str]] = []
-        # TSK-192：回复 Agent 执行预算（任务起点冻结值 + 任务结束消耗计数）
-        self._budget: dict[str, int] | None = None
+        # TSK-192/TSK-193：回复 Agent 执行预算 + 工具调用约束模式
+        # （任务起点冻结值 + 任务结束消耗计数）
+        self._budget: dict[str, Any] | None = None
         self._budget_usage: dict[str, int] | None = None
         self._finalized = False
 
@@ -138,8 +139,9 @@ class AgentRunCollector:
         rounds: int,
         per_round: int,
         total: int,
+        tool_call_mode: str,
     ) -> None:
-        """记录任务起点冻结的回复 Agent 执行预算（TSK-192）。
+        """记录任务起点冻结的回复 Agent 执行预算与约束模式（TSK-192/193）。
 
         冻结发生在任务开始（首次读取配置）时；任务中途配置变更不影响
         已记录值。
@@ -148,6 +150,7 @@ class AgentRunCollector:
             "agent_max_rounds": rounds,
             "agent_max_tool_calls_per_round": per_round,
             "agent_max_total_tool_calls": total,
+            "agent_tool_call_mode": tool_call_mode,
         }
 
     def set_agent_budget_usage(
@@ -260,7 +263,7 @@ class AgentRunCollector:
         aggregate = self.aggregate_overall().model_dump()
         methods = sorted({call.method for call in self.calls if call.method})
         models = sorted({call.model for call in self.calls if call.model})
-        budget_block: dict[str, int] | None = None
+        budget_block: dict[str, Any] | None = None
         if self._budget is not None:
             budget_block = {
                 **self._budget,

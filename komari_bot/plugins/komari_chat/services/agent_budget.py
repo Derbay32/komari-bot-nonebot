@@ -1,8 +1,9 @@
-"""回复 Agent 任务级冻结执行预算（TSK-192）。
+"""回复 Agent 任务级冻结执行预算与工具调用约束模式（TSK-192 / TSK-193）。
 
-预算三元组（最大轮次 / 单轮工具上限 / 整任务工具上限）在任务起点从配置
-读取一次并冻结为不可变值对象；任务执行期间配置变更不影响进行中的任务，
-只作用于下一个任务。普通 / debug / 简单三条入口共用同一份冻结预算。
+预算三元组（最大轮次 / 单轮工具上限 / 整任务工具上限）与工具调用
+约束模式（``required | prompt_guided``）在任务起点从配置读取一次并冻结
+为不可变值对象；任务执行期间配置变更不影响进行中的任务，只作用于下
+一个任务。普通 / debug / 简单三条入口共用同一份冻结快照。
 
 计数规则：
 
@@ -19,23 +20,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
+
+#: 合法工具调用约束模式取值（无兼容值 / 宽松规范化）。
+VALID_TOOL_CALL_MODES: frozenset[str] = frozenset({"required", "prompt_guided"})
 
 
 @dataclass(frozen=True, slots=True)
 class AgentExecutionBudget:
-    """任务起点冻结的回复 Agent 执行预算值对象。"""
+    """任务起点冻结的回复 Agent 执行预算与约束模式值对象。"""
 
     rounds: int
     per_round: int
     total: int
+    tool_call_mode: Literal["required", "prompt_guided"]
 
     @classmethod
     def from_config(cls, config: object) -> "AgentExecutionBudget":
         """任务起点从配置读取一次并冻结；整个任务不再重读配置。
 
         预算字段来自 ``komari_chat`` 动态配置；缺失或非法时在任务起点
-        立即失败，绝不静默回退到任何隐藏默认值（TSK-192）。
+        立即失败，绝不静默回退到任何隐藏默认值（TSK-192）。工具调用
+        约束模式同样来自 ``komari_chat`` 动态配置：缺失或非法值一律
+        明确失败，不做旧快照 / 测试替身兼容（协调式破坏升级；0014 之后
+        生产 typed 配置必然携带 ``agent_tool_call_mode``，保证正常路径
+        存在）。
         """
         rounds = getattr(config, "agent_max_rounds", None)
         per_round = getattr(config, "agent_max_tool_calls_per_round", None)
@@ -50,10 +59,26 @@ class AgentExecutionBudget:
                 "agent_max_total_tool_calls），无法冻结任务预算"
             )
             raise RuntimeError(msg)
+        tool_call_mode = getattr(config, "agent_tool_call_mode", None)
+        if tool_call_mode is None:
+            msg = (
+                "配置缺少工具调用约束模式字段（agent_tool_call_mode），"
+                "无法冻结任务预算"
+            )
+            raise RuntimeError(msg)
+        if tool_call_mode not in VALID_TOOL_CALL_MODES:
+            msg = (
+                "配置的工具调用约束模式非法（agent_tool_call_mode="
+                f"{tool_call_mode!r}），必须为 required 或 prompt_guided"
+            )
+            raise RuntimeError(msg)
         return cls(
             rounds=cast("int", rounds),
             per_round=cast("int", per_round),
             total=cast("int", total),
+            tool_call_mode=cast(
+                "Literal['required', 'prompt_guided']", tool_call_mode
+            ),
         )
 
 

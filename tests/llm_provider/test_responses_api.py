@@ -374,6 +374,97 @@ def test_responses_request_translates_tool_choice_and_parallel(
     assert request["parallel_tool_calls"] is False
 
 
+def test_responses_thinking_mode_keeps_required_tool_choice(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：Responses 非流式请求中思考模式不再删除强制 tool_choice。
+
+    Responses 协议按官方 SDK 契约使用结构化 ``reasoning={"effort": ...}``；
+    顶层 ``reasoning_effort`` 是 Chat 专属键，Responses wire 请求不得携带。
+    """
+    responses = _FakeResponses(
+        response=_completed_response([_text_message_item("ok")])
+    )
+    client = _make_client(monkeypatch, responses)
+
+    async def _run() -> Any:
+        await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "你好"}],
+            model="gpt-x",
+            request_api="responses",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="required",
+            thinking_mode=True,
+            reasoning_effort="high",
+        )
+
+    asyncio.run(_run())
+
+    request = responses.last_kwargs
+    assert request is not None
+    assert request.get("tool_choice") == "required"
+    assert request["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in request
+
+
+def test_responses_stream_thinking_mode_keeps_required_tool_choice(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：Responses 流式请求中思考模式同样保留强制 tool_choice。
+
+    与流式无关：结构化 ``reasoning`` 且顶层 ``reasoning_effort`` 不得出现。
+    """
+    final_response = _completed_response(
+        [_text_message_item("流式回答")],
+        usage=_default_usage(),
+    )
+    stream = _FakeEventStream(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="流式"),
+            _terminal_event("response.completed", final_response),
+        ]
+    )
+    responses = _FakeResponses(stream=stream)
+    client = _make_client(monkeypatch, responses)
+
+    async def _run() -> Any:
+        return await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "你好"}],
+            model="gpt-x",
+            request_api="responses",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "query",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="required",
+            thinking_mode=True,
+            reasoning_effort="high",
+            stream_enabled=True,
+        )
+
+    asyncio.run(_run())
+
+    request = responses.last_kwargs
+    assert request is not None
+    assert request["stream"] is True
+    assert request.get("tool_choice") == "required"
+    assert request["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in request
+
+
 def test_responses_request_translates_response_format(
     monkeypatch: Any,
 ) -> None:

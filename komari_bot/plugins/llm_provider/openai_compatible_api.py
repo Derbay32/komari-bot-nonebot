@@ -83,17 +83,20 @@ class OpenAICompatibleClient(BaseLLMClient):
     def _resolve_thinking_params(
         model: str,
         **kwargs: object,
-    ) -> tuple[str | None, bool, bool]:
+    ) -> tuple[str | None, bool]:
         """解析思考模式相关参数。
 
         thinking_mode 与 reasoning_effort 均由调用方通过 kwargs 传入（per-call），
         不再读取任何全局配置。
 
         Returns:
-            (reasoning_effort, thinking_disabled, suppress_tool_choice)
+            (reasoning_effort, thinking_disabled)
             - reasoning_effort: 非 deepseek-v4 系且思考开启时返回 effort 值，否则 None
             - thinking_disabled: deepseek-v4 系且思考关闭时返回 True（注入 thinking:disabled）
-            - suppress_tool_choice: 思考模式启用时返回 True（跳过 tool_choice 注入）
+
+        TSK-193：provider 不再按思考模式隐式抑制调用方的 tool_choice；
+        调用方显式声明的工具选择要求必须原样进入最终 wire 请求，
+        是否省略由各业务调用方自己决定。
         """
         thinking_mode = bool(kwargs.get("thinking_mode", False))
         raw_effort = kwargs.get("reasoning_effort", "")
@@ -110,8 +113,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             else:
                 reasoning_effort = None
 
-        suppress_tool_choice = thinking_mode
-        return reasoning_effort, thinking_disabled, suppress_tool_choice
+        return reasoning_effort, thinking_disabled
 
     @staticmethod
     def _resolve_request_mode(
@@ -297,7 +299,6 @@ class OpenAICompatibleClient(BaseLLMClient):
         parallel_tool_calls: bool | None,
         reasoning_effort: str | None,
         thinking_disabled: bool,
-        suppress_tool_choice: bool,
     ) -> dict[str, Any]:
         """构造 Chat Completions 请求体（非流式行为逐字节保持）。"""
         request_data: dict[str, Any] = {
@@ -317,14 +318,8 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         if tools is not None:
             request_data["tools"] = tools
-        if tool_choice is not None and not suppress_tool_choice:
+        if tool_choice is not None:
             request_data["tool_choice"] = tool_choice
-        elif tool_choice is not None and suppress_tool_choice:
-            logger.warning(
-                "思考模式启用，已跳过 tool_choice 注入 (model={}, tool_choice={})",
-                model,
-                tool_choice,
-            )
         if parallel_tool_calls is not None:
             request_data["parallel_tool_calls"] = parallel_tool_calls
 
@@ -718,7 +713,6 @@ class OpenAICompatibleClient(BaseLLMClient):
         tool_choice: str | dict[str, Any] | None,
         parallel_tool_calls: bool | None,
         reasoning_effort: str | None,
-        suppress_tool_choice: bool,
     ) -> dict[str, Any]:
         """把统一请求翻译为 Responses 协议请求体。
 
@@ -758,15 +752,9 @@ class OpenAICompatibleClient(BaseLLMClient):
             if tools:
                 # 存在函数工具时请求加密推理内容，支持无状态推理续接
                 request_data["include"] = ["reasoning.encrypted_content"]
-        if tool_choice is not None and not suppress_tool_choice:
+        if tool_choice is not None:
             request_data["tool_choice"] = self._translate_responses_tool_choice(
                 tool_choice
-            )
-        elif tool_choice is not None and suppress_tool_choice:
-            logger.warning(
-                "思考模式启用，已跳过 tool_choice 注入 (model={}, tool_choice={})",
-                model,
-                tool_choice,
             )
         if parallel_tool_calls is not None:
             request_data["parallel_tool_calls"] = parallel_tool_calls
@@ -998,7 +986,6 @@ class OpenAICompatibleClient(BaseLLMClient):
         parallel_tool_calls: bool | None,
         reasoning_effort: str | None,
         thinking_disabled: bool,
-        suppress_tool_choice: bool,
         request_api: RequestApi,
         stream_enabled: bool,
     ) -> LLMCompletionResultSchema:
@@ -1015,7 +1002,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 reasoning_effort=reasoning_effort,
-                suppress_tool_choice=suppress_tool_choice,
             )
             if stream_enabled:
                 return await self._call_responses_stream(request_data)
@@ -1035,7 +1021,6 @@ class OpenAICompatibleClient(BaseLLMClient):
             parallel_tool_calls=parallel_tool_calls,
             reasoning_effort=reasoning_effort,
             thinking_disabled=thinking_disabled,
-            suppress_tool_choice=suppress_tool_choice,
         )
         if stream_enabled:
             return await self._call_chat_completion_stream(request_data)
@@ -1077,8 +1062,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         """
         config = cast("DynamicConfigSchema", config_manager.get())
         try:
-            reasoning_effort, thinking_disabled, suppress_tool_choice = (
-                self._resolve_thinking_params(model, **kwargs)
+            reasoning_effort, thinking_disabled = self._resolve_thinking_params(
+                model, **kwargs
             )
             resolved_api, resolved_stream = self._resolve_request_mode(
                 config, request_api, stream_enabled=stream_enabled
@@ -1090,7 +1075,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
                 f"  thinking_disabled: {thinking_disabled}\n"
-                f"  suppress_tool_choice: {suppress_tool_choice}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.frequency_penalty)}\n"
                 f"  request_api: {resolved_api}\n"
                 f"  stream_enabled: {resolved_stream}\n"
@@ -1123,7 +1107,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 parallel_tool_calls=parallel_tool_calls,
                 reasoning_effort=reasoning_effort,
                 thinking_disabled=thinking_disabled,
-                suppress_tool_choice=suppress_tool_choice,
                 request_api=resolved_api,
                 stream_enabled=resolved_stream,
             )
@@ -1193,8 +1176,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         """
         config = cast("DynamicConfigSchema", config_manager.get())
         try:
-            reasoning_effort, thinking_disabled, suppress_tool_choice = (
-                self._resolve_thinking_params(model, **kwargs)
+            reasoning_effort, thinking_disabled = self._resolve_thinking_params(
+                model, **kwargs
             )
             resolved_api, resolved_stream = self._resolve_request_mode(
                 config, request_api, stream_enabled=stream_enabled
@@ -1212,7 +1195,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 f"  max_tokens: {max_tokens if max_tokens is not None else config.max_tokens}\n"
                 f"  reasoning_effort: {reasoning_effort}\n"
                 f"  thinking_disabled: {thinking_disabled}\n"
-                f"  suppress_tool_choice: {suppress_tool_choice}\n"
                 f"  frequency_penalty: {kwargs.get('frequency_penalty', config.frequency_penalty)}\n"
                 f"  request_api: {resolved_api}\n"
                 f"  stream_enabled: {resolved_stream}\n"
@@ -1236,7 +1218,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                 parallel_tool_calls=parallel_tool_calls,
                 reasoning_effort=reasoning_effort,
                 thinking_disabled=thinking_disabled,
-                suppress_tool_choice=suppress_tool_choice,
                 request_api=resolved_api,
                 stream_enabled=resolved_stream,
             )
@@ -1294,7 +1275,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                     tool_choice=None,
                     parallel_tool_calls=None,
                     reasoning_effort=None,
-                    suppress_tool_choice=False,
                 )
                 if resolved_stream:
                     await self._call_responses_stream(request_data)
@@ -1315,7 +1295,6 @@ class OpenAICompatibleClient(BaseLLMClient):
                     parallel_tool_calls=None,
                     reasoning_effort=None,
                     thinking_disabled=False,
-                    suppress_tool_choice=False,
                 )
                 await self._call_chat_completion_stream(request_data)
             else:

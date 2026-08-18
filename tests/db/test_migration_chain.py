@@ -685,6 +685,42 @@ def test_agent_budget_config_revision_exists() -> None:
     assert "import komari_bot" not in revision_sql
 
 
+def test_agent_tool_call_mode_config_revision_exists() -> None:
+    """TSK-193：0013 的直接后继 revision 新增 agent_tool_call_mode 列。
+
+    新列必须带非空默认 ``required``（升级保留存量行的列默认补齐），
+    downgrade 必须显式回退删除该列；迁移需自包含。本用例是静态守卫：
+    只守新增 revision / 列名 / 非空默认 / 显式回退 / 自包含，不锁定 raw
+    SQL 形态；真实默认值与回退语义由
+    ``test_agent_tool_call_mode_migration.py`` 的隔离库用例验证。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0013"]
+    assert len(children) == 1, f"0013 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    assert re.search(r"\bagent_tool_call_mode\b", revision_sql), (
+        "迁移必须新增 agent_tool_call_mode 列"
+    )
+    assert re.search(
+        r"DEFAULT\s*'required'",
+        revision_sql,
+        re.IGNORECASE,
+    ), (
+        "迁移必须为非空 agent_tool_call_mode 声明默认值 'required'"
+        "（升级保留存量行）"
+    )
+    assert _has_explicit_drop_column(revision_sql, "agent_tool_call_mode"), (
+        "迁移 downgrade 必须显式回退删除 agent_tool_call_mode 列"
+        "（op.drop_column(..., 'agent_tool_call_mode') 或 "
+        "DROP COLUMN [IF EXISTS] agent_tool_call_mode SQL）"
+    )
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
 def _has_explicit_cross_field_check(revision_sql: str) -> bool:
     """识别显式跨字段 CHECK 声明，不锁定 SQL 字符串形态。
 

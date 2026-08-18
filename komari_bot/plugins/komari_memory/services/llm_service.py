@@ -304,14 +304,18 @@ async def _request_via_tool_calling(
         "request_api": config.llm_request_api_summary,
         "stream_enabled": config.llm_stream_enabled_summary,
         "tools": [_OUTPUT_SUMMARY_TOOL],
-        "tool_choice": {
-            "type": "function",
-            "function": {"name": "output_summary_result"},
-        },
         "parallel_tool_calls": False,
         "thinking_mode": config.llm_thinking_mode_summary,
         "reasoning_effort": config.llm_reasoning_effort_summary,
     }
+    # TSK-193：provider 不再按思考模式隐式删除 tool_choice；记忆工具总结
+    # 显式声明兼容策略——思考模式省略 tool_choice（保持既有行为），
+    # 非思考模式保留具名 tool_choice。
+    if not config.llm_thinking_mode_summary:
+        request_data["tool_choice"] = {
+            "type": "function",
+            "function": {"name": "output_summary_result"},
+        }
     try:
         completion = await llm_provider.generate_messages_completion(
             **request_data,

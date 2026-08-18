@@ -118,6 +118,9 @@ def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
         "agent_max_rounds": 10,
         "agent_max_tool_calls_per_round": 4,
         "agent_max_total_tool_calls": 20,
+        # TSK-193：工具调用约束模式（与配置 Schema 默认值一致；
+        # from_config 不再对缺字段回退隐藏默认，fixture 必须显式提供）
+        "agent_tool_call_mode": "required",
     }
     values.update(overrides)
     return SimpleNamespace(**values)

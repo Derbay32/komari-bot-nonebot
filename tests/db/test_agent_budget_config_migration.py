@@ -59,6 +59,9 @@ _NON_BUDGET_COLUMN_DEFAULTS: dict[str, object] = {
     "reply_fulfillment_retry_max_seconds": 3600,
     "reply_fulfillment_tombstone_retention_days": 30,
     "reply_fulfillment_freshness_seconds": 120,
+    # TSK-193：0014 新增的非空默认列（head 下插入“只让预算列走默认”
+    # 的行时必须显式提供或接受默认；纳入字典以保持 head 集成测试合法）
+    "agent_tool_call_mode": "required",
 }
 
 
