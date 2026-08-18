@@ -42,6 +42,7 @@ from komari_bot.config.typed_config import (
 from komari_bot.db.orm_config import get_orm_database_url
 from komari_bot.llm.content_budget import (
     CONTENT_TEXT_BUDGET,
+    ContentValidationError,
     validate_text_budget,
 )
 
@@ -57,16 +58,13 @@ _PromptOperation = Callable[[AsyncSession], Coroutine[Any, Any, T]]
 
 
 class PromptResourceProtocol(Protocol):
-    """Prompt 资源需要提供的字段。"""
+    """Prompt 资源需要提供的字段（TSK-191：不再携带 Python 默认正文）。"""
 
     @property
     def resource_id(self) -> str: ...
 
     @property
     def display_name(self) -> str: ...
-
-    @property
-    def defaults(self) -> dict[str, str]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,14 +78,6 @@ class StoredPrompt:
     prompt_data: dict[str, str]
     revision: int
     updated_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class PromptValues:
-    """合并 defaults 后的 prompt 值。"""
-
-    values: dict[str, str]
-    stored: StoredPrompt | None
 
 
 def _utcnow() -> datetime:
@@ -128,6 +118,25 @@ def _validated_write_values(
         msg = f"提示词写入缺少字段: {', '.join(missing_fields)}"
         raise ValueError(msg)
     return {name: prompt_data[name] for name in sorted(allowed)}
+
+
+def _resolve_prompt_model(resource_id: str) -> type[TypedConfigModel]:
+    """返回 Prompt 资源的强类型表模型；缺失时明确失败。"""
+    model_cls = ensure_typed_prompt_model(resource_id)
+    if model_cls is None:
+        msg = f"Prompt 资源 {resource_id} 未注册强类型 Prompt 表"
+        raise RuntimeError(msg)
+    return model_cls
+
+
+def prompt_resource_field_names(resource_id: str) -> set[str]:
+    """返回 Prompt 资源的正文字段名集合（不含存储专用字段）。
+
+    真源是 resource_id 对应的强类型 Prompt Schema（TSK-191）；管理 API、
+    loader 与 save/replace/update/load 等写入 seam 统一从本入口派生白名单，
+    不再依赖任何 Python 默认正文。
+    """
+    return _public_field_names(_resolve_prompt_model(resource_id))
 
 
 class PromptStorage:
@@ -583,38 +592,25 @@ def close_prompt_storage_if_created() -> None:
             _StorageState.storage = None
 
 
-def merge_prompt_values(
-    defaults: dict[str, str],
-    prompt_data: dict[str, Any] | None,
-) -> dict[str, str]:
-    """将存储值按允许字段合并到 defaults。
-
-    存储值优先覆盖 defaults 中同名字段（仍只接受字符串、剔除尾随换行）；
-    defaults 为其余字段提供兜底。TSK-190 的 chat 资源以空 defaults 使用：
-    模板字段集完全来自存储快照（``stored=None`` 时仍返回空 dict，由
-    loader 冷启动 gate 拒绝空值）。
-    """
-    if prompt_data is None:
-        return dict(defaults)
-    values = dict(defaults)
-    for key, value in prompt_data.items():
-        if isinstance(value, str) and (key in defaults or not defaults):
-            values[key] = value.rstrip("\n")
-    return values
-
-
 def validate_prompt_values(
-    defaults: dict[str, str],
+    resource: PromptResourceProtocol,
     values: Mapping[str, object],
 ) -> dict[str, str]:
-    """校验 prompt 字段并返回清洗后的完整数据。"""
-    unknown_fields = sorted(set(values) - set(defaults))
+    """按资源 Schema 校验字段载荷并返回清洗后的字段子集。
+
+    字段白名单来自 ``ensure_typed_prompt_model(resource.resource_id)`` 对应
+    的强类型 Schema（TSK-191）：未知/跨资源字段、空白字段与超预算字段一律
+    拒绝。允许传入单个字段（PATCH），也允许传入完整字段集（保存/替换由
+    调用方另行做集合完整性校验）。
+    """
+    allowed = prompt_resource_field_names(resource.resource_id)
+    unknown_fields = sorted(set(values) - allowed)
     if unknown_fields:
         fields = ", ".join(unknown_fields)
         msg = f"存在未知提示词字段: {fields}"
         raise ValueError(msg)
 
-    cleaned = dict(defaults)
+    cleaned: dict[str, str] = {}
     for key, value in values.items():
         if not isinstance(value, str) or not value.strip():
             msg = f"提示词字段 {key} 必须是非空字符串"
@@ -629,152 +625,101 @@ def validate_prompt_values(
     return cleaned
 
 
-def load_prompt_values(resource: PromptResourceProtocol) -> PromptValues:
-    """从 PG 读取 prompt，并与 defaults 合并。"""
-    storage = get_prompt_storage()
-    stored = storage.fetch(resource.resource_id)
-    values = merge_prompt_values(
-        defaults=resource.defaults,
-        prompt_data=stored.prompt_data if stored is not None else None,
-    )
-    if stored is not None:
-        stored_keys = set(stored.prompt_data)
-        merged_keys = set(values)
-        added_keys = merged_keys - stored_keys
-        removed_keys = stored_keys - merged_keys
-        value_changed = any(
-            stored.prompt_data.get(key) != values[key]
-            for key in stored_keys & merged_keys
+def _require_exact_prompt_fields(
+    resource: PromptResourceProtocol,
+    values: Mapping[str, object],
+) -> None:
+    """完整保存/替换必须与 Schema 字段集合恰好相等（缺失/未知均拒绝）。"""
+    allowed = prompt_resource_field_names(resource.resource_id)
+    unknown_fields = sorted(set(values) - allowed)
+    if unknown_fields:
+        fields = ", ".join(unknown_fields)
+        msg = f"存在未知提示词字段: {fields}"
+        raise ValueError(msg)
+    missing_fields = sorted(allowed - set(values))
+    if missing_fields:
+        fields = ", ".join(missing_fields)
+        msg = f"提示词写入缺少字段: {fields}"
+        raise ValueError(msg)
+
+
+def validate_prompt_snapshot(
+    resource: PromptResourceProtocol,
+    prompt_data: Mapping[str, object],
+) -> dict[str, str]:
+    """校验 PostgreSQL 快照足以冷启动并返回原样快照（TSK-191）。
+
+    字段必须与 resource_id 对应 Schema 恰好一致、全部为非空字符串且通过
+    共享内容预算；无行（空快照）/缺字段/空白字段/异资源（未知）字段或
+    超预算值都抛 ``RuntimeError`` 并点名 Prompt 资源与字段。只校验不改写
+    正文，绝不并入任何 Python 默认内容。
+    """
+    allowed = prompt_resource_field_names(resource.resource_id)
+    missing = sorted(allowed - set(prompt_data))
+    unknown = sorted(set(prompt_data) - allowed)
+    blank = sorted(
+        field
+        for field in sorted(allowed & set(prompt_data))
+        if (
+            not isinstance(prompt_data[field], str)
+            or not str(prompt_data[field]).strip()
         )
-        if added_keys or value_changed:
-            if not resource.defaults:
-                # TSK-190：chat 以空 defaults 使用，values 完全来自存储
-                # 快照，没有可同步写入的默认字段，跳过自动同步（避免每
-                # 次加载都触发一次注定失败的写入）。
-                return PromptValues(values=values, stored=stored)
-            synced: StoredPrompt | None = None
-            try:
-                prompt_data = dict(stored.prompt_data)
-                prompt_data.update(validate_prompt_values(resource.defaults, values))
-                synced = storage.update_if_unchanged(
-                    resource_id=resource.resource_id,
-                    prompt_data=prompt_data,
-                    expected_updated_at=stored.updated_at,
-                )
-                if synced is None:
-                    latest = storage.fetch(resource.resource_id)
-                    if latest is not None:
-                        stored = latest
-                        values = merge_prompt_values(
-                            defaults=resource.defaults,
-                            prompt_data=latest.prompt_data,
-                        )
-                    logger.warning(
-                        f"Prompt 配置自动同步跳过: "
-                        f"resource_id={resource.resource_id}, "
-                        "reason=stored_changed"
-                    )
-                else:
-                    stored = synced
-            except Exception as exc:
-                logger.warning(
-                    f"Prompt 配置自动同步失败: "
-                    f"resource_id={resource.resource_id}, "
-                    f"added_keys={sorted(added_keys)}, "
-                    f"removed_keys={sorted(removed_keys)}, "
-                    f"sync_result=failed, error={exc}"
-                )
-            else:
-                if synced is not None:
-                    logger.info(
-                        f"Prompt 配置已自动同步: "
-                        f"resource_id={resource.resource_id}, "
-                        f"added_keys={sorted(added_keys)}, "
-                        f"removed_keys={sorted(removed_keys)}, "
-                        "sync_result=success"
-                    )
-    return PromptValues(values=values, stored=stored)
+    )
+    problems: list[str] = []
+    if missing:
+        problems.append(f"缺失字段: {', '.join(missing)}")
+    if blank:
+        problems.append(f"空白字段: {', '.join(blank)}")
+    if unknown:
+        problems.append(f"未知字段: {', '.join(unknown)}")
+    if problems:
+        msg = (
+            f"komari_bot Prompt 资源 {resource.resource_id}"
+            f"（{resource.display_name}）的 PostgreSQL 快照不是完整 Prompt，"
+            f"无法冷启动: {'；'.join(problems)}"
+        )
+        raise RuntimeError(msg)
+
+    normalized: dict[str, str] = {}
+    for field in sorted(allowed):
+        value = prompt_data[field]
+        assert isinstance(value, str) and value.strip()
+        try:
+            validate_text_budget(
+                value,
+                label=f"Prompt 资源 {resource.resource_id} 字段 {field}",
+                budget=CONTENT_TEXT_BUDGET,
+            )
+        except ContentValidationError as exc:
+            msg = (
+                f"komari_bot Prompt 资源 {resource.resource_id}"
+                f"（{resource.display_name}）的 PostgreSQL 快照不符合内容预算，"
+                f"无法冷启动: {exc}"
+            )
+            raise RuntimeError(msg) from exc
+        normalized[field] = value
+    return normalized
+
+
+def load_prompt_values(resource: PromptResourceProtocol) -> StoredPrompt | None:
+    """从 PostgreSQL 读取 Prompt 快照（不合并任何默认正文）。"""
+    return get_prompt_storage().fetch(resource.resource_id)
 
 
 async def load_prompt_values_async(
     resource: PromptResourceProtocol,
-) -> PromptValues:
-    """异步读取 Prompt，并以 CAS 补齐新增默认字段。"""
-    storage = get_prompt_storage()
-    stored = await storage.fetch_async(resource.resource_id)
-    values = merge_prompt_values(
-        defaults=resource.defaults,
-        prompt_data=stored.prompt_data if stored is not None else None,
-    )
-    if stored is None:
-        return PromptValues(values=values, stored=None)
-
-    stored_keys = set(stored.prompt_data)
-    merged_keys = set(values)
-    added_keys = merged_keys - stored_keys
-    removed_keys = stored_keys - merged_keys
-    value_changed = any(
-        stored.prompt_data.get(key) != values[key]
-        for key in stored_keys & merged_keys
-    )
-    if not added_keys and not value_changed:
-        return PromptValues(values=values, stored=stored)
-
-    if not resource.defaults:
-        # TSK-190：chat 以空 defaults 使用，values 完全来自存储快照，
-        # 没有可同步写入的默认字段，跳过自动同步。
-        return PromptValues(values=values, stored=stored)
-
-    synced: StoredPrompt | None = None
-    try:
-        prompt_data = dict(stored.prompt_data)
-        prompt_data.update(validate_prompt_values(resource.defaults, values))
-        synced = await storage.update_if_unchanged_async(
-            resource_id=resource.resource_id,
-            prompt_data=prompt_data,
-            expected_updated_at=stored.updated_at,
-        )
-        if synced is None:
-            latest = await storage.fetch_async(resource.resource_id)
-            if latest is not None:
-                stored = latest
-                values = merge_prompt_values(
-                    defaults=resource.defaults,
-                    prompt_data=latest.prompt_data,
-                )
-            logger.warning(
-                "Prompt 配置自动同步跳过: resource_id={}, reason=stored_changed",
-                resource.resource_id,
-            )
-        else:
-            stored = synced
-    except Exception as exc:
-        logger.warning(
-            "Prompt 配置自动同步失败: resource_id={}, added_keys={}, "
-            "removed_keys={}, sync_result=failed, error={}",
-            resource.resource_id,
-            sorted(added_keys),
-            sorted(removed_keys),
-            type(exc).__name__,
-        )
-    else:
-        if synced is not None:
-            logger.info(
-                "Prompt 配置已自动同步: resource_id={}, added_keys={}, "
-                "removed_keys={}, sync_result=success",
-                resource.resource_id,
-                sorted(added_keys),
-                sorted(removed_keys),
-            )
-    return PromptValues(values=values, stored=stored)
+) -> StoredPrompt | None:
+    """异步读取 Prompt 快照（不合并任何默认正文）。"""
+    return await get_prompt_storage().fetch_async(resource.resource_id)
 
 
 def save_prompt_values(
     resource: PromptResourceProtocol,
     values: Mapping[str, object],
 ) -> StoredPrompt:
-    """校验并保存 prompt 配置。"""
-    cleaned = validate_prompt_values(resource.defaults, values)
+    """校验（字段必须与 Schema 恰好相等）并完整保存 prompt 配置。"""
+    _require_exact_prompt_fields(resource, values)
+    cleaned = validate_prompt_values(resource, values)
     return get_prompt_storage().upsert(
         resource_id=resource.resource_id,
         prompt_data=cleaned,
@@ -785,8 +730,9 @@ async def save_prompt_values_async(
     resource: PromptResourceProtocol,
     values: Mapping[str, object],
 ) -> StoredPrompt:
-    """异步校验并完整保存 Prompt，供迁移与显式覆盖场景使用。"""
-    cleaned = validate_prompt_values(resource.defaults, values)
+    """异步校验并完整保存 Prompt（字段集来自资源 Schema）。"""
+    _require_exact_prompt_fields(resource, values)
+    cleaned = validate_prompt_values(resource, values)
     return await get_prompt_storage().upsert_async(
         resource_id=resource.resource_id,
         prompt_data=cleaned,
@@ -799,8 +745,9 @@ async def replace_prompt_values_async(
     *,
     expected_revision: int,
 ) -> StoredPrompt | None:
-    """校验后按 revision 替换完整 Prompt。"""
-    cleaned = validate_prompt_values(resource.defaults, values)
+    """校验后按 revision 原子替换完整 Prompt（字段集必须与 Schema 恰好相等）。"""
+    _require_exact_prompt_fields(resource, values)
+    cleaned = validate_prompt_values(resource, values)
     return await get_prompt_storage().replace_if_revision_async(
         resource_id=resource.resource_id,
         prompt_data=cleaned,
@@ -815,11 +762,11 @@ async def update_prompt_field_async(
     *,
     expected_revision: int,
 ) -> StoredPrompt | None:
-    """校验并按 revision 更新单个 Prompt 字段，不覆盖其他字段。"""
-    if field_name not in resource.defaults:
+    """校验并按 revision 更新单个 Prompt 字段（白名单来自资源 Schema）。"""
+    if field_name not in prompt_resource_field_names(resource.resource_id):
         msg = f"存在未知提示词字段: {field_name}"
         raise ValueError(msg)
-    cleaned = validate_prompt_values(resource.defaults, {field_name: value})
+    cleaned = validate_prompt_values(resource, {field_name: value})
     if expected_revision == 0:
         return await get_prompt_storage().replace_if_revision_async(
             resource_id=resource.resource_id,
@@ -835,19 +782,17 @@ async def update_prompt_field_async(
 
 
 class PromptTemplateLoader:
-    """运行时 prompt 模板加载器。"""
+    """运行时 prompt 模板加载器（TSK-191：不再接受 Python 默认正文）。"""
 
     def __init__(
         self,
         *,
         resource_id: str,
         display_name: str,
-        defaults: dict[str, str],
         log_prefix: str,
     ) -> None:
         self.resource_id = resource_id
         self.display_name = display_name
-        self.defaults = defaults
         self._log_prefix = log_prefix
         self._cache: dict[str, str] = {}
         self._cache_updated_at: datetime | None = None
@@ -884,38 +829,37 @@ class PromptTemplateLoader:
         return None
 
     def _fallback_template(self) -> dict[str, str]:
+        """数据库读取异常时回退最后有效缓存；无缓存则冷启动明确失败。
+
+        TSK-191：不存在的 Python 默认正文，冷启动只可能来自 PostgreSQL；
+        无行/不完整是校验错误而非读取异常，不经过本路径。
+        """
         with self._cache_lock:
             if self._cache:
                 self._cache_checked_at = monotonic()
                 self._invalidated = False
                 return dict(self._cache)
-            if not self.defaults:
-                # TSK-190：chat 以空 defaults 使用时，无 DB 值且无缓存
-                # 必须明确失败（冷启动 gate），绝不静默返回空模板。
-                msg = (
-                    f"{self._log_prefix} Prompt 的 PostgreSQL 初始数据不可用且无缓存，"
-                    f"无法冷启动: {self.resource_id}"
-                )
-                raise RuntimeError(msg)
-            self._cache = dict(self.defaults)
-            self._cache_checked_at = monotonic()
-            self._invalidated = False
-            return dict(self._cache)
-
-    def _accept_loaded(self, loaded: PromptValues) -> dict[str, str]:
-        if loaded.stored is None and not loaded.values:
-            # TSK-190：stored=None 且 values 为空（chat 空 defaults）时
-            # 没有可用初始值，必须在冷启动阶段明确失败。
             msg = (
-                f"{self._log_prefix} Prompt 的 PostgreSQL 初始数据缺失且无可用缓存，"
-                f"无法冷启动: {self.resource_id}"
+                f"{self._log_prefix} komari_bot Prompt 资源 {self.resource_id}"
+                f"（{self.display_name}）的 PostgreSQL 初始数据不可用且无缓存，"
+                "无法冷启动"
             )
             raise RuntimeError(msg)
-        updated_at = loaded.stored.updated_at if loaded.stored is not None else None
-        revision = loaded.stored.revision if loaded.stored is not None else 0
+
+    def _accept_loaded(self, stored: StoredPrompt | None) -> dict[str, str]:
+        """缓存前校验 PostgreSQL 快照完整性（无行/缺字段/空白/异资源字段失败）。
+
+        校验失败时绝不写入缓存，异常向上传播；完整快照按 revision 为基线
+        写入新鲜缓存。最后有效缓存只在读取异常（DB 故障）时由
+        ``_fallback_template`` 容灾，恢复后按 revision 刷新。
+        """
+        prompt_data = stored.prompt_data if stored is not None else {}
+        values = validate_prompt_snapshot(self, prompt_data)
+        updated_at = stored.updated_at if stored is not None else None
+        revision = stored.revision if stored is not None else 0
         with self._cache_lock:
             changed = not self._cache or revision != self._cache_revision
-            self._cache = dict(loaded.values)
+            self._cache = dict(values)
             self._cache_updated_at = updated_at
             self._cache_revision = revision
             self._cache_checked_at = monotonic()
@@ -923,18 +867,12 @@ class PromptTemplateLoader:
             result = dict(self._cache)
 
         if changed:
-            if loaded.stored is None:
-                logger.warning(
-                    "{} Prompt 配置未写入 PostgreSQL，使用默认值",
-                    self._log_prefix,
-                )
-            else:
-                logger.info(
-                    "{} Prompt 配置已从 PostgreSQL 加载: {}, revision={}",
-                    self._log_prefix,
-                    self.resource_id,
-                    revision,
-                )
+            logger.info(
+                "{} Prompt 配置已从 PostgreSQL 加载: {}, revision={}",
+                self._log_prefix,
+                self.resource_id,
+                revision,
+            )
         return result
 
     def get_template(self) -> dict[str, str]:
@@ -956,7 +894,7 @@ class PromptTemplateLoader:
             loaded = load_prompt_values(self)
         except Exception:
             logger.warning(
-                "{} Prompt 配置读取失败，使用缓存或默认值",
+                "{} Prompt 配置读取失败，使用最后有效缓存",
                 self._log_prefix,
                 exc_info=True,
             )
@@ -979,7 +917,7 @@ class PromptTemplateLoader:
                 loaded = await load_prompt_values_async(self)
             except Exception:
                 logger.warning(
-                    "{} Prompt 配置异步读取失败，使用缓存或默认值",
+                    "{} Prompt 配置异步读取失败，使用最后有效缓存",
                     self._log_prefix,
                     exc_info=True,
                 )

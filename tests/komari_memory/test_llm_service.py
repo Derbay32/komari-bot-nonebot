@@ -9,6 +9,7 @@ from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSch
 from komari_bot.plugins.komari_memory.services import llm_service as llm_service_module
 from komari_bot.plugins.komari_memory.services.llm_service import summarize_conversation
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+from tests.config.prompt_field_contract import prompt_marker_values
 
 
 class _FakeLLMProvider:
@@ -109,6 +110,17 @@ def test_summarize_conversation_uses_json_mode_messages(monkeypatch: Any) -> Non
         ]
     )
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    # 本用例断言渲染后的工作流正文不含模板键名；在完整 marker 快照基础上
+    # 覆盖需要占位符替换的两个字段，保持字段集与 Schema 一致。
+    template = prompt_marker_values("komari_memory_summary")
+    template["summary_workflow_system"] = "工作流 {{json_response_example}}"
+    template["json_response_example"] = '{"memories": []}'
+
+    async def _template() -> dict[str, str]:
+        return dict(template)
+
+    monkeypatch.setattr(llm_service_module, "get_summary_template", _template)
 
     result = asyncio.run(
         _run_summarize_conversation(

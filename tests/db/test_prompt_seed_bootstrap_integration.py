@@ -1,4 +1,4 @@
-"""TSK-190 聊天 Prompt 数据库初始数据 —— PostgreSQL 集成验收。
+"""TSK-190/191 Prompt 数据库初始数据 —— PostgreSQL 集成验收。
 
 依赖已执行 ``alembic upgrade head`` 的迁移管理 schema
 （``KOMARI_TEST_POSTGRES_URL`` 门控，且与 ``SQLALCHEMY_DATABASE_URL``
@@ -9,15 +9,17 @@
 版本与数据不受影响。门控用户需要 CREATEDB 权限。
 
 覆盖清单（对应验收标准）：
-- 全新数据库：seed 把聊天 Prompt 完整初始值写入 PostgreSQL，字段与
-  强类型 Schema 一致，重复执行幂等（AC1/AC6/AC9）；
-- 部分已有：只补空字段、绝不覆盖非空自定义值，重复执行幂等（AC6/AC9）；
+- 全新数据库：seed 把三个 Prompt 资源（chat / memory summary / group
+  history summary）的完整初始值写入 PostgreSQL，字段与强类型 Schema 一致，
+  重复执行幂等（TSK-190/191 AC1/AC6/AC9）；
+- 部分已有：只补空字段（含纯空白）、绝不覆盖非空自定义值，重复执行幂等
+  （AC6/AC9）；
 - 已完整自定义：seed 完全不动已有非空 Prompt（AC6）；
 - 旧库迁移：0011 → head 显式删除 ``output_instruction`` 列并新增行为列，
-  被删除的自定义值不被并入任何新字段（AC3/AC9）。
+  被删除的自定义值不被并入任何新字段（TSK-190 AC3/AC9，仅 chat）。
 
 本文件断言不复制生产默认正文：期望值一律从默认 seed 资产经通用定位
-（``find_chat_prompt_mapping``）读取，或使用测试自有的字面量。
+（``find_prompt_mapping``，不锁定 YAML 布局）读取，或使用测试自有的字面量。
 """
 
 from __future__ import annotations
@@ -37,7 +39,12 @@ import yaml
 from komari_bot.db.seed_bootstrap import DEFAULT_SEED_FILE
 from tests.config.chat_prompt_field_contract import (
     LEGACY_CHAT_COLUMNS,
-    find_chat_prompt_mapping,
+)
+from tests.config.prompt_field_contract import (
+    PROMPT_RESOURCE_IDS,
+    find_prompt_mapping,
+    prompt_resource_field_names,
+    prompt_table_name,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -151,20 +158,17 @@ async def _prepare_head_scratch(
     return scratch, scratch_url
 
 
-def _chat_asset_values() -> dict[str, str]:
-    """从默认 seed 资产读取聊天 Prompt 初始值（通用定位，不锁定布局）。"""
+def _asset_values(resource_id: str) -> dict[str, str]:
+    """从默认 seed 资产读取指定 Prompt 资源的初始值（通用定位，不锁定布局）。"""
     raw = yaml.safe_load(DEFAULT_SEED_FILE.read_text(encoding="utf-8")) or {}
-    mapping = find_chat_prompt_mapping(raw)
-    assert mapping is not None, "默认 seed 资产缺少聊天 Prompt 初始数据块"
+    mapping = find_prompt_mapping(raw, resource_id)
+    assert mapping is not None, f"默认 seed 资产缺少 {resource_id} Prompt 初始数据块"
     return {str(field): str(value) for field, value in mapping.items()}
 
 
-def _chat_schema_fields() -> set[str]:
-    from komari_bot.plugins.komari_chat.prompt_schema import (
-        KomariChatPromptSchema,
-    )
-
-    return set(KomariChatPromptSchema.model_fields) - {"id", "revision", "updated_at"}
+def _schema_fields(resource_id: str) -> set[str]:
+    """Prompt 强类型 Schema 正文字段集（不含存储专用字段）。"""
+    return prompt_resource_field_names(resource_id)
 
 
 async def _column_names(
@@ -182,18 +186,20 @@ async def _column_names(
     return {str(row["column_name"]) for row in rows}
 
 
-async def _insert_chat_row(
+async def _insert_prompt_row(
     connection: asyncpg.Connection,
+    resource_id: str,
     values: dict[str, str],
     *,
     revision: int = 1,
 ) -> None:
-    """按强类型 Schema 当前列集合插入聊天 Prompt 单行（列集合运行时推导）。"""
+    """按强类型 Schema 当前列集合插入 Prompt 单行（列集合运行时推导）。"""
+    table = prompt_table_name(resource_id)
     fields = sorted(values)
     columns_sql = ", ".join(["id", "revision", "updated_at", *fields])
     placeholders = ", ".join(f"${index}" for index in range(1, 4 + len(fields)))
     await connection.execute(
-        f"INSERT INTO komari_prompt_komari_chat ({columns_sql})"
+        f"INSERT INTO {table} ({columns_sql})"
         f" VALUES ({placeholders})",
         1,
         revision,
@@ -202,17 +208,17 @@ async def _insert_chat_row(
     )
 
 
-async def _fetch_chat_row(
+async def _fetch_prompt_row(
     connection: asyncpg.Connection,
+    resource_id: str,
 ) -> dict[str, Any] | None:
-    row = await connection.fetchrow(
-        "SELECT * FROM komari_prompt_komari_chat WHERE id = 1"
-    )
+    table = prompt_table_name(resource_id)
+    row = await connection.fetchrow(f"SELECT * FROM {table} WHERE id = 1")
     return None if row is None else dict(row)
 
 
-async def test_fresh_db_seed_writes_complete_chat_prompt_row_and_is_idempotent() -> None:
-    """AC1/AC6/AC9-新库：seed 写入完整聊天 Prompt 初始值；重跑零变化。"""
+async def test_fresh_db_seed_writes_complete_prompt_rows_and_is_idempotent() -> None:
+    """AC1/AC6/AC9-新库：seed 写入三个资源完整 Prompt 行；重跑零变化。"""
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
@@ -223,25 +229,37 @@ async def test_fresh_db_seed_writes_complete_chat_prompt_row_and_is_idempotent()
 
         connection = await asyncpg.connect(**scratch)
         try:
-            row = await _fetch_chat_row(connection)
-            assert row is not None, "seed 后聊天 Prompt 单行必须存在"
-            schema_fields = _chat_schema_fields()
-            assert set(row) - {"id", "revision", "updated_at"} == schema_fields
+            for resource_id in PROMPT_RESOURCE_IDS:
+                row = await _fetch_prompt_row(connection, resource_id)
+                assert row is not None, (
+                    f"seed 后 {resource_id} Prompt 单行必须存在"
+                )
+                schema_fields = _schema_fields(resource_id)
+                assert set(row) - {"id", "revision", "updated_at"} == schema_fields
 
-            asset_values = _chat_asset_values()
-            for field in sorted(schema_fields):
-                assert bool(str(row[field]).strip()), (
-                    f"聊天 Prompt 字段 {field} 初始值不得为空"
+                asset_values = _asset_values(resource_id)
+                for field in sorted(schema_fields):
+                    assert bool(str(row[field]).strip()), (
+                        f"{resource_id} Prompt 字段 {field} 初始值不得为空"
+                    )
+                    assert row[field] == asset_values[field], (
+                        f"{resource_id} Prompt 字段 {field} 必须等于 seed 资产值"
+                    )
+                assert row["revision"] == 1
+
+            before_rows: dict[str, dict[str, Any] | None] = {}
+            for resource_id in PROMPT_RESOURCE_IDS:
+                before_rows[resource_id] = await _fetch_prompt_row(
+                    connection, resource_id
                 )
-                assert row[field] == asset_values[field], (
-                    f"聊天 Prompt 字段 {field} 必须等于 seed 资产值"
-                )
-            assert row["revision"] == 1
 
             result = _run_seed(scratch_url)
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-            row_after = await _fetch_chat_row(connection)
-            assert row_after == row, "重复播种不得产生 revision/content 变化"
+            for resource_id in PROMPT_RESOURCE_IDS:
+                row_after = await _fetch_prompt_row(connection, resource_id)
+                assert row_after == before_rows[resource_id], (
+                    f"重复播种不得产生 {resource_id} revision/content 变化"
+                )
         finally:
             await connection.close()
     finally:
@@ -251,10 +269,10 @@ async def test_fresh_db_seed_writes_complete_chat_prompt_row_and_is_idempotent()
 async def test_seed_fills_empty_fields_and_keeps_custom_values() -> None:
     """AC6/AC9：只补空字段（含纯空白）；非空自定义值原样保留；重跑幂等。
 
-    至少一个待补字段预置为纯空白（如 ``"   "``）：seed 必须把它视为空
-    字段用资产值补齐，同时绝不覆盖非空自定义值。当前实现只把 ``""``
-    视为空字段，纯空白不补齐并触发最终冷启动校验失败
-    （"聊天 Prompt 初始数据字段为空"），因此是 TSK-190 的清晰 RED。
+    每个资源预置两个非空自定义字段与一个纯空白字段，其余为空；seed 必须
+    把空白字段视为空字段用资产值补齐，同时绝不覆盖非空自定义值。当前实现
+    不播种 memory/group Prompt，其空白字段保持原样并触发断言失败，因此是
+    TSK-191 的清晰 RED（chat 侧在 TSK-190 已实现）。
     """
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
@@ -263,49 +281,64 @@ async def test_seed_fills_empty_fields_and_keeps_custom_values() -> None:
     try:
         connection = await asyncpg.connect(**scratch)
         try:
-            fields = sorted(_chat_schema_fields())
-            custom_fields = {"system_prompt", "tool_call_instruction"}
-            blank_field = sorted(set(fields) - custom_fields)[0]
-            values = {
-                field: (
-                    f"custom-{field}"
-                    if field in custom_fields
-                    else ("   " if field == blank_field else "")
-                )
-                for field in fields
-            }
-            await _insert_chat_row(connection, values)
+            asset_values: dict[str, dict[str, str]] = {}
+            for resource_id in PROMPT_RESOURCE_IDS:
+                fields = sorted(_schema_fields(resource_id))
+                custom_fields = {fields[0], fields[1]}
+                blank_field = fields[2]
+                values = {
+                    field: (
+                        f"custom-{resource_id}-{field}"
+                        if field in custom_fields
+                        else ("   " if field == blank_field else "")
+                    )
+                    for field in fields
+                }
+                await _insert_prompt_row(connection, resource_id, values)
+                asset_values[resource_id] = _asset_values(resource_id)
 
             result = _run_seed(scratch_url)
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
-            row = await _fetch_chat_row(connection)
-            assert row is not None
-            asset_values = _chat_asset_values()
-            for field in custom_fields:
-                assert row[field] == f"custom-{field}", (
-                    f"seed 不得覆盖非空自定义字段 {field}"
-                )
-            empty_before = [field for field in fields if field not in custom_fields]
-            for field in empty_before:
-                assert row[field] == asset_values[field], (
-                    f"seed 应补齐空字段 {field}"
-                )
-            assert row["revision"] >= 1
+            for resource_id in PROMPT_RESOURCE_IDS:
+                fields = sorted(_schema_fields(resource_id))
+                custom_fields = {fields[0], fields[1]}
+                row = await _fetch_prompt_row(connection, resource_id)
+                assert row is not None
+                for field in custom_fields:
+                    assert row[field] == f"custom-{resource_id}-{field}", (
+                        f"seed 不得覆盖 {resource_id} 非空自定义字段 {field}"
+                    )
+                empty_before = [
+                    field for field in fields if field not in custom_fields
+                ]
+                for field in empty_before:
+                    assert row[field] == asset_values[resource_id][field], (
+                        f"seed 应补齐 {resource_id} 空字段 {field}"
+                    )
+                assert row["revision"] >= 1
 
-            before = await _fetch_chat_row(connection)
+            before_rows: dict[str, dict[str, Any]] = {}
+            for resource_id in PROMPT_RESOURCE_IDS:
+                before_rows[resource_id] = (
+                    await _fetch_prompt_row(connection, resource_id)
+                ) or {}
+
             result = _run_seed(scratch_url)
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-            after = await _fetch_chat_row(connection)
-            assert before == after, "补齐后重复播种不得产生任何变化"
+            for resource_id in PROMPT_RESOURCE_IDS:
+                after = await _fetch_prompt_row(connection, resource_id)
+                assert after == before_rows[resource_id], (
+                    f"{resource_id} 补齐后重复播种不得产生任何变化"
+                )
         finally:
             await connection.close()
     finally:
         await _drop_scratch_database(str(scratch["database"]))
 
 
-async def test_seed_never_touches_fully_custom_row() -> None:
-    """AC6：全部字段已有非空自定义值时，seed 一次也不写入。"""
+async def test_seed_never_touches_fully_custom_rows() -> None:
+    """AC6：三个资源全部字段已有非空自定义值时，seed 一次也不写入。"""
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
@@ -313,22 +346,30 @@ async def test_seed_never_touches_fully_custom_row() -> None:
     try:
         connection = await asyncpg.connect(**scratch)
         try:
-            fields = sorted(_chat_schema_fields())
-            values = {field: f"custom-{field}" for field in fields}
-            await _insert_chat_row(connection, values, revision=2)
-
-            before = await _fetch_chat_row(connection)
-            result = _run_seed(scratch_url)
-            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-            after_first = await _fetch_chat_row(connection)
-            assert after_first == before, (
-                "首轮播种不得改写任何非空自定义字段或 revision"
-            )
+            before_rows: dict[str, dict[str, Any]] = {}
+            for resource_id in PROMPT_RESOURCE_IDS:
+                fields = sorted(_schema_fields(resource_id))
+                values = {field: f"custom-{resource_id}-{field}" for field in fields}
+                await _insert_prompt_row(connection, resource_id, values, revision=2)
+                before_rows[resource_id] = (
+                    await _fetch_prompt_row(connection, resource_id)
+                ) or {}
 
             result = _run_seed(scratch_url)
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-            after_second = await _fetch_chat_row(connection)
-            assert after_second == before, "重复播种仍不得改写自定义行"
+            for resource_id in PROMPT_RESOURCE_IDS:
+                after_first = await _fetch_prompt_row(connection, resource_id)
+                assert after_first == before_rows[resource_id], (
+                    f"首轮播种不得改写 {resource_id} 非空自定义字段或 revision"
+                )
+
+            result = _run_seed(scratch_url)
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            for resource_id in PROMPT_RESOURCE_IDS:
+                after_second = await _fetch_prompt_row(connection, resource_id)
+                assert after_second == before_rows[resource_id], (
+                    f"重复播种仍不得改写 {resource_id} 自定义行"
+                )
         finally:
             await connection.close()
     finally:
@@ -380,7 +421,7 @@ async def test_old_db_migration_drops_output_instruction_and_keeps_custom_fields
 
         columns = await _column_names(connection, "komari_prompt_komari_chat")
         assert "output_instruction" not in columns, "旧列 output_instruction 未删除"
-        schema_fields = _chat_schema_fields()
+        schema_fields = _schema_fields("komari_chat")
         for field in sorted(schema_fields):
             assert field in columns, f"新 Schema 字段 {field} 必须是数据库列"
 
@@ -388,7 +429,7 @@ async def test_old_db_migration_drops_output_instruction_and_keeps_custom_fields
         result = _run_seed(scratch_url)
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
-        row = await _fetch_chat_row(connection)
+        row = await _fetch_prompt_row(connection, "komari_chat")
         assert row is not None
         assert row["system_prompt"] == "旧库自定义系统提示词"
         assert row["memory_ack"] == "旧库自定义记忆确认"
@@ -396,7 +437,7 @@ async def test_old_db_migration_drops_output_instruction_and_keeps_custom_fields
         assert row["cot_prefix"] == "旧库自定义思维链前缀"
         assert row["cot_prefix_role"] == "system"
 
-        asset_values = _chat_asset_values()
+        asset_values = _asset_values("komari_chat")
         merged_new_fields = sorted(schema_fields - LEGACY_CHAT_COLUMNS)
         for field in merged_new_fields:
             assert row[field] == asset_values[field], (

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,11 +18,14 @@ from komari_bot.plugins.komari_management.api_runtime import (
 )
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
-    ManagedPromptResource,
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
 from komari_bot.plugins.komari_search.api import register_search_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
+from tests.config.prompt_field_contract import (
+    make_managed_prompt_resource,
+    prompt_display_name,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -126,11 +128,9 @@ def _build_components() -> ManagementApiComponents:
             ),
         ),
         prompt_resources=(
-            ManagedPromptResource(
-                resource_id="komari_chat",
-                display_name="Komari Chat Prompt",
-                defaults={"system_prompt": "默认值"},
-                legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
+            make_managed_prompt_resource(
+                "komari_chat",
+                prompt_display_name("komari_chat"),
             ),
         ),
     )

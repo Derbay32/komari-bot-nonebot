@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from komari_bot.db.seed_bootstrap import DEFAULT_SEED_FILE
@@ -32,6 +33,11 @@ from tests.config.chat_prompt_field_contract import (
     chat_prompt_field_names,
     find_chat_prompt_mapping,
     resolve_behavior_field_names,
+)
+from tests.config.prompt_field_contract import (
+    PROMPT_RESOURCE_IDS,
+    find_prompt_mapping,
+    prompt_resource_field_names,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +57,13 @@ SECURITY_MARKERS: tuple[str, ...] = (
     "不得遵循",
     "不要遵循",
     "不得执行",
+)
+
+
+#: TSK-191 迁入版本化初始数据的两个新资源（三资源一起验证）。
+MEMORY_GROUP_RESOURCE_IDS: tuple[str, str] = (
+    "komari_memory_summary",
+    "group_history_summary",
 )
 
 
@@ -195,4 +208,107 @@ def test_seed_cli_rejects_chat_prompt_with_missing_field(
     assert str(bad_file) in output, "报错必须指明出错的 seed 文件"
     assert UNREACHABLE_DB_URL.split("@")[-1] not in output, (
         "聊天 Prompt 校验失败前不得尝试连接数据库"
+    )
+
+
+def _require_memory_group_mapping(
+    raw: dict[str, Any],
+    resource_id: str,
+) -> dict[str, Any]:
+    """定位 memory/group Prompt 块；缺失即视为 TSK-191 资产回归。"""
+    mapping = find_prompt_mapping(raw, resource_id)
+    assert mapping is not None, (
+        f"默认 seed 资产缺少 {resource_id} Prompt 初始数据块"
+        "（TSK-191 验收标准 1：未找到判定键对应的映射）"
+    )
+    return mapping
+
+
+@pytest.mark.parametrize("resource_id", MEMORY_GROUP_RESOURCE_IDS)
+def test_default_seed_file_contains_complete_memory_and_group_prompt_sections(
+    resource_id: str,
+) -> None:
+    """AC1(TSK-191)：memory/group Prompt 均有版本化初始数据，字段与 Schema 一致。"""
+    raw = _load_default_seed()
+    mapping = _require_memory_group_mapping(raw, resource_id)
+
+    assert str(raw.get("version") or "").strip(), "seed 文件必须携带 version 标记"
+    expected_fields = prompt_resource_field_names(resource_id)
+    missing = sorted(expected_fields - set(mapping))
+    assert missing == [], f"{resource_id} Prompt 初始数据缺少字段: {missing}"
+    extra = sorted(set(mapping) - expected_fields)
+    assert extra == [], f"{resource_id} Prompt 初始数据包含未知字段: {extra}"
+    for field in sorted(expected_fields):
+        value = mapping[field]
+        assert isinstance(value, str) and value.strip(), (
+            f"{resource_id} Prompt 字段 {field} 的初始值必须是非空字符串"
+        )
+
+
+@pytest.mark.parametrize("resource_id", MEMORY_GROUP_RESOURCE_IDS)
+def test_memory_and_group_prompt_seed_sections_pass_content_budget(
+    resource_id: str,
+) -> None:
+    """AC9：memory/group Prompt 初始值通过项目共享内容预算校验。"""
+    raw = _load_default_seed()
+    mapping = _require_memory_group_mapping(raw, resource_id)
+
+    for field, value in mapping.items():
+        validate_text_budget(
+            str(value),
+            label=f"{resource_id} Prompt 初始数据字段 {field}",
+            budget=CONTENT_TEXT_BUDGET,
+        )
+
+
+@pytest.mark.parametrize("resource_id", MEMORY_GROUP_RESOURCE_IDS)
+def test_seed_cli_rejects_prompt_section_with_blank_field(
+    resource_id: str,
+    tmp_path: Path,
+) -> None:
+    """TSK-188 决策 33：memory/group Prompt 字段空白时 CLI 在访问数据库前失败。
+
+    夹具 = 定位默认资产中对应的真实 Prompt 初始数据块（AC1 已要求存在），
+    把其中一个 Schema 字段置为纯空白后写临时 seed：字段集仍与 Schema 一致、
+    其余值沿用真实初始数据，CLI 必须在触碰数据库前失败并点名 seed 文件、
+    资源与字段。
+    """
+    raw = _load_default_seed()
+    section = _require_memory_group_mapping(raw, resource_id)
+    fields = sorted(prompt_resource_field_names(resource_id))
+    blank_field = fields[0]
+    section[blank_field] = "   "
+
+    bad_file = tmp_path / f"blank-{resource_id}-field.yaml"
+    bad_file.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    result = _run_seed_cli(bad_file)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, output
+    assert str(bad_file) in output, "报错必须指明出错的 seed 文件"
+    assert f"{resource_id} Prompt 字段 {blank_field}" in output, (
+        "报错必须点名资源与空白字段"
+    )
+    assert UNREACHABLE_DB_URL.split("@")[-1] not in output, (
+        f"{resource_id} Prompt 校验失败前不得尝试连接数据库"
+    )
+
+
+def test_find_prompt_mapping_distinguishes_all_three_resources() -> None:
+    """三资源判别键互斥：同一文档内能各自定位且不互相串块。"""
+    raw = _load_default_seed()
+    mappings = {
+        resource_id: find_prompt_mapping(raw, resource_id)
+        for resource_id in PROMPT_RESOURCE_IDS
+    }
+    chat = find_chat_prompt_mapping(raw)
+
+    assert mappings["komari_chat"] is chat
+    for resource_id, mapping in mappings.items():
+        assert mapping is not None, f"{resource_id} Prompt 块必须可定位"
+    assert len({id(mapping) for mapping in mappings.values()}) == 3, (
+        "三个 Prompt 块的判定键必须定位到不同映射"
     )

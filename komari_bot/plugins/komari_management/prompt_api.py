@@ -11,10 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette import status
 
 from komari_bot.config.prompt_storage import (
-    PromptValues,
     StoredPrompt,
     load_prompt_values_async,
-    merge_prompt_values,
+    prompt_resource_field_names,
     replace_prompt_values_async,
     update_prompt_field_async,
 )
@@ -114,7 +113,7 @@ def _get_resource_map(
     return {resource.resource_id: resource for resource in resources}
 
 
-async def _load_prompt_values(resource: ManagedPromptResource) -> PromptValues:
+async def _load_prompt_values(resource: ManagedPromptResource) -> StoredPrompt | None:
     try:
         return await load_prompt_values_async(resource)
     except Exception as exc:
@@ -193,20 +192,20 @@ def _build_resource_summary(resource: ManagedPromptResource) -> PromptResourceSu
         config_source=_build_config_source(resource),
         storage_key=resource.resource_id,
         file_path=None,
-        fields=sorted(resource.defaults),
+        fields=sorted(prompt_resource_field_names(resource.resource_id)),
     )
 
 
 def _build_resource_detail(
     resource: ManagedPromptResource,
-    loaded: PromptValues | StoredPrompt,
+    stored: StoredPrompt | None,
 ) -> PromptResourceDetail:
-    if isinstance(loaded, PromptValues):
-        values = loaded.values
-        revision = loaded.stored.revision if loaded.stored is not None else 0
+    if stored is None:
+        values: dict[str, str] = {}
+        revision = 0
     else:
-        values = merge_prompt_values(resource.defaults, loaded.prompt_data)
-        revision = loaded.revision
+        values = stored.prompt_data
+        revision = stored.revision
     return PromptResourceDetail(
         resource_id=resource.resource_id,
         display_name=resource.display_name,
@@ -318,7 +317,7 @@ def create_prompt_router(
             recorder=recorder,
         ):
             resource = _resolve_resource(resource_id, resource_map)
-            if field_name not in resource.defaults:
+            if field_name not in prompt_resource_field_names(resource.resource_id):
                 detail = f"未找到提示词字段: {field_name}"
                 raise _not_found(detail)
             stored = await _update_prompt_field(
