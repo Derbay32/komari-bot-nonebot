@@ -40,6 +40,9 @@ from komari_bot.plugins.llm_provider.base_client import (
 )
 
 retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+agent_budget_module = import_module(
+    "komari_bot.plugins.komari_chat.services.agent_budget"
+)
 llm_service_module = import_module(
     "komari_bot.plugins.komari_chat.services.llm_service"
 )
@@ -1402,6 +1405,42 @@ def test_agent_run_records_frozen_tool_mode_violation_and_usage(
 
     # 后续合法 final_response 仍成功
     assert result.content == "违例后成功回复"
+
+
+# ── TSK-193 修订：from_config 严格 no-fallback 契约 ─────────────────────
+
+
+def test_from_config_missing_tool_call_mode_raises() -> None:
+    """运行时配置快照缺少 tool_call_mode 必须 RuntimeError，不得回退隐藏默认。
+
+    0014 之后生产 typed 配置必然携带 ``agent_tool_call_mode``；快照缺字段
+    只可能来自未迁移的旧快照或测试替身。TSK-193 验收基线修订后
+    ``from_config`` 不再对缺失字段静默按 ``required`` 兼容，测试 fixture
+    一律显式提供该字段（见 ``_build_config`` / ``_build_chat_config_stub``），
+    本用例把该契约固化为公开行为。
+    """
+    config = _build_config()
+    del config.agent_tool_call_mode
+    with pytest.raises(RuntimeError):
+        agent_budget_module.AgentExecutionBudget.from_config(config)
+
+
+@pytest.mark.parametrize("invalid", ["auto", "", "None", "required ", "Required"])
+def test_from_config_invalid_tool_call_mode_raises(invalid: str) -> None:
+    """非法 mode 值必须 RuntimeError，不允许宽松规范化或静默降级。"""
+    with pytest.raises(RuntimeError, match="必须为 required 或 prompt_guided"):
+        agent_budget_module.AgentExecutionBudget.from_config(
+            _build_config(agent_tool_call_mode=invalid)
+        )
+
+
+@pytest.mark.parametrize("mode", ["required", "prompt_guided"])
+def test_from_config_freeze_explicit_valid_mode(mode: str) -> None:
+    """合法 mode 显式冻结进预算快照；不依赖 dataclass / 配置隐藏默认。"""
+    budget = agent_budget_module.AgentExecutionBudget.from_config(
+        _build_config(agent_tool_call_mode=mode)
+    )
+    assert budget.tool_call_mode == mode
 
 
 def test_consecutive_bare_text_until_rounds_exhausted_is_diagnosable_protocol_failure(

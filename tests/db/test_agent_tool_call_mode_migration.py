@@ -46,9 +46,12 @@ pytestmark = [
 ]
 
 #: 0012 时刻 komari_chat_config 的存量业务列（不含 0013 预算列与
-#: 0014 新增列），供"存量行"插入使用；恰好等于
-#: _NON_BUDGET_COLUMN_DEFAULTS 的键集合，与历史 schema 语义一致。
-_EXPECTED_0012_VALUE_COLUMNS = tuple(sorted(_NON_BUDGET_COLUMN_DEFAULTS))
+#: 0014 新增列），供"存量行"插入使用；基于共享默认值字典扣除 0014
+#: 引入的 ``agent_tool_call_mode`` 后得到（共享字典随 head 演进，但本
+#: 文件清单固定为 0012 历史 schema，与迁移链语义一致）。
+_EXPECTED_0012_VALUE_COLUMNS = tuple(
+    sorted(set(_NON_BUDGET_COLUMN_DEFAULTS) - {"agent_tool_call_mode"})
+)
 
 
 def _parse_dsn(url: str) -> dict[str, Any]:

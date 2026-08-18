@@ -765,7 +765,8 @@ def test_generate_text_debug_log_uses_statistics(monkeypatch: Any) -> None:
     assert "tools_count: 1" in request_log
     assert "reasoning_effort: medium" in request_log
     assert "thinking_disabled: False" in request_log
-    assert "suppress_tool_choice: True" in request_log
+    # 已删除的隐式抑制策略不得在诊断日志中残留旧字段名（TSK-193 修订）
+    assert "suppress_tool_choice" not in request_log
     assert "has_response_format: True" in request_log
     assert "绝密 prompt 原文" not in request_log
     assert "绝密 system 原文" not in request_log
@@ -818,7 +819,8 @@ def test_generate_messages_debug_log_includes_request_flags(monkeypatch: Any) ->
     assert "has_parallel_tool_calls: True" in request_log
     assert "frequency_penalty: 0.1" in request_log
     assert "thinking_disabled: False" in request_log
-    assert "suppress_tool_choice: False" in request_log
+    # 已删除的隐式抑制策略不得在诊断日志中残留旧字段名（TSK-193 修订）
+    assert "suppress_tool_choice" not in request_log
 
 
 # ======================== 统一 usage 提取测试 ========================
