@@ -11,6 +11,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
 
@@ -50,6 +51,19 @@ EXPECTED_FIELD_BOUNDS: dict[str, tuple[int, int]] = {
     "reply_fulfillment_freshness_seconds": (30, 300),
 }
 
+# TSK-192：回复 Agent 执行预算字段（AC1/AC2）。
+EXPECTED_AGENT_BUDGET_DEFAULTS: dict[str, object] = {
+    "agent_max_rounds": 10,
+    "agent_max_tool_calls_per_round": 4,
+    "agent_max_total_tool_calls": 20,
+}
+
+EXPECTED_AGENT_BUDGET_BOUNDS: dict[str, tuple[int, int]] = {
+    "agent_max_rounds": (2, 20),
+    "agent_max_tool_calls_per_round": (1, 8),
+    "agent_max_total_tool_calls": (2, 64),
+}
+
 
 def test_config_schema_declares_typed_table_metadata() -> None:
     """komari_chat 配置表挂在 typed config 注册表约定的命名下。"""
@@ -84,6 +98,89 @@ def test_migrated_fields_enforce_bounds() -> None:
             KomariChatConfigSchema(**{field_name: lower - 1})
         with pytest.raises(ValueError):
             KomariChatConfigSchema(**{field_name: upper + 1})
+
+
+def test_agent_budget_fields_expose_expected_defaults() -> None:
+    """AC1：三项预算默认值为 10 / 4 / 20。"""
+    config = KomariChatConfigSchema()
+
+    assert set(EXPECTED_AGENT_BUDGET_DEFAULTS) <= set(KomariChatConfigSchema.model_fields)
+    for field_name, expected_default in EXPECTED_AGENT_BUDGET_DEFAULTS.items():
+        assert getattr(config, field_name) == expected_default, field_name
+
+
+def test_agent_budget_fields_enforce_bounds() -> None:
+    """AC1：轮次 2-20、单轮 1-8、总量 2-64，越界必须被拒绝。"""
+    for field_name, (lower, upper) in EXPECTED_AGENT_BUDGET_BOUNDS.items():
+        with pytest.raises(ValidationError):
+            KomariChatConfigSchema(**{field_name: lower - 1})
+        with pytest.raises(ValidationError):
+            KomariChatConfigSchema(**{field_name: upper + 1})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # total == per_round（下界相等边界合法）
+        {"agent_max_tool_calls_per_round": 4, "agent_max_total_tool_calls": 4},
+        # total == rounds * per_round（上界相等边界合法）
+        {
+            "agent_max_rounds": 2,
+            "agent_max_tool_calls_per_round": 4,
+            "agent_max_total_tool_calls": 8,
+        },
+        # 下界合法组合：total == per_round == 2，rounds=2 -> 2 <= 2 <= 4
+        {
+            "agent_max_rounds": 2,
+            "agent_max_tool_calls_per_round": 2,
+            "agent_max_total_tool_calls": 2,
+        },
+        # 上界合法组合：total == 20*8 == 64
+        {
+            "agent_max_rounds": 20,
+            "agent_max_tool_calls_per_round": 8,
+            "agent_max_total_tool_calls": 64,
+        },
+    ],
+)
+def test_agent_budget_cross_field_boundary_combinations_accepted(
+    overrides: dict[str, int],
+) -> None:
+    """AC2：单轮预算 <= 总预算 <= 轮次 x 单轮预算的相等边界组合可接受。"""
+    assert KomariChatConfigSchema(**overrides) is not None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # 单轮预算 > 总预算
+        {"agent_max_tool_calls_per_round": 5, "agent_max_total_tool_calls": 4},
+        # 总预算 > 轮次 x 单轮预算
+        {
+            "agent_max_rounds": 2,
+            "agent_max_tool_calls_per_round": 4,
+            "agent_max_total_tool_calls": 9,
+        },
+        # 同时越界与跨字段非法：total 161 > 20*8
+        {
+            "agent_max_rounds": 20,
+            "agent_max_tool_calls_per_round": 8,
+            "agent_max_total_tool_calls": 161,
+        },
+        # 单字段下界 + 跨字段：total=1 低于 2
+        {
+            "agent_max_rounds": 2,
+            "agent_max_tool_calls_per_round": 1,
+            "agent_max_total_tool_calls": 1,
+        },
+    ],
+)
+def test_agent_budget_cross_field_invalid_combinations_rejected(
+    overrides: dict[str, int],
+) -> None:
+    """AC2：Pydantic 拒绝跨字段非法组合。"""
+    with pytest.raises(ValidationError):
+        KomariChatConfigSchema(**overrides)
 
 
 def test_config_schema_drops_dead_proactive_score_threshold() -> None:

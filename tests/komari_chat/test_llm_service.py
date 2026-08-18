@@ -48,21 +48,27 @@ class _ObservableSemaphore:
         self.exited = True
 
 
-def _build_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        llm_model_chat="chat-model",
-        llm_temperature_chat=0.7,
-        llm_max_tokens_chat=1024,
-        llm_model_summary="summary-model",
-        llm_temperature_summary=0.3,
-        llm_max_tokens_summary=2048,
-        llm_thinking_mode_chat=False,
-        llm_reasoning_effort_chat="",
-        llm_thinking_mode_summary=False,
-        llm_reasoning_effort_summary="",
-        bot_nickname="小鞠",
-        response_tag="content",
-    )
+def _build_config(**overrides: Any) -> SimpleNamespace:
+    values: dict[str, Any] = {
+        "llm_model_chat": "chat-model",
+        "llm_temperature_chat": 0.7,
+        "llm_max_tokens_chat": 1024,
+        "llm_model_summary": "summary-model",
+        "llm_temperature_summary": 0.3,
+        "llm_max_tokens_summary": 2048,
+        "llm_thinking_mode_chat": False,
+        "llm_reasoning_effort_chat": "",
+        "llm_thinking_mode_summary": False,
+        "llm_reasoning_effort_summary": "",
+        "bot_nickname": "小鞠",
+        "response_tag": "content",
+        # TSK-192：回复 Agent 预算默认值（与配置 Schema 一致）
+        "agent_max_rounds": 10,
+        "agent_max_tool_calls_per_round": 4,
+        "agent_max_total_tool_calls": 20,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def _tool_call(
@@ -520,7 +526,6 @@ def test_generate_reply_with_tools_requires_favorability_before_final(
             config=_build_config(),
             messages=[{"role": "user", "content": "纠错"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
-            max_tool_rounds=3,
         )
     )
 
@@ -978,7 +983,6 @@ def test_generate_reply_with_tools_does_not_repeat_successful_search_after_final
             messages=[{"role": "user", "content": "搜一下新闻"}],
             tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-no-repeat-search-1",
-            max_tool_rounds=3,
         )
     )
 
@@ -1105,7 +1109,6 @@ def test_generate_reply_with_tools_recovers_invalid_favorability_delta(
             messages=[{"role": "user", "content": "打招呼"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
             request_trace_id="chat-favor-recover-1",
-            max_tool_rounds=3,
         )
     )
 
@@ -1508,7 +1511,6 @@ def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) ->
             config=_build_config(),
             messages=[{"role": "user", "content": "打招呼"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
-            max_tool_rounds=3,
             collector=collector,
         )
     )
@@ -1612,9 +1614,10 @@ def test_execute_tool_loop_records_no_tool_calls_in_collector(monkeypatch: Any) 
 
 
 def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> None:
-    """验证达到最大轮数时 collector 记录错误。"""
+    """验证达到配置的最大轮数时 collector 记录错误（TSK-192 预算配置驱动）。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
+        _completion(),
         _completion(),
         _completion(),
     ]
@@ -1626,10 +1629,9 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
     with pytest.raises(RuntimeError, match="最大轮数"):
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
-                config=_build_config(),
+                config=_build_config(agent_max_rounds=2),
                 messages=[{"role": "user", "content": "查一下"}],
                 tools=[llm_service_module.SEARCH_WEB_TOOL],
-                max_tool_rounds=2,
                 collector=collector,
             )
         )

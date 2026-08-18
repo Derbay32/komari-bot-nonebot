@@ -653,6 +653,46 @@ def test_chat_prompt_behavior_columns_revision_exists() -> None:
     assert "import komari_bot" not in revision_sql
 
 
+def test_agent_budget_config_revision_exists() -> None:
+    """TSK-192：0012 的直接后继 revision 新增三项回复 Agent 预算列。
+
+    新列（agent_max_rounds / agent_max_tool_calls_per_round /
+    agent_max_total_tool_calls）默认值 10/4/20，并必须声明同时引用
+    三列的跨字段 CHECK 约束（AC1/AC2 的数据库侧表达）；迁移需自包含。
+    真实 DDL 与约束语义由 ``test_agent_budget_config_migration.py`` 的
+    隔离库用例验证，本用例承担无数据库的静态守卫。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0012"]
+    assert len(children) == 1, f"0012 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    for column in (
+        "agent_max_rounds",
+        "agent_max_tool_calls_per_round",
+        "agent_max_total_tool_calls",
+    ):
+        assert re.search(rf"\b{re.escape(column)}\b", revision_sql), (
+            f"迁移必须新增预算列: {column}"
+        )
+    assert re.search(r"DEFAULT\s+10\b", revision_sql), "agent_max_rounds 默认 10"
+    assert re.search(r"DEFAULT\s+4\b", revision_sql), "agent_max_tool_calls_per_round 默认 4"
+    assert re.search(r"DEFAULT\s+20\b", revision_sql), "agent_max_total_tool_calls 默认 20"
+
+    check_text = re.search(r"CHECK\s*\([^)]*\)", revision_sql, re.IGNORECASE)
+    assert check_text is not None, "迁移必须声明跨字段 CHECK 约束"
+    for column in (
+        "agent_max_tool_calls_per_round",
+        "agent_max_total_tool_calls",
+        "agent_max_rounds",
+    ):
+        assert column in check_text.group(0), f"CHECK 约束必须引用 {column}"
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
 def _has_explicit_drop_column(revision_sql: str, column: str) -> bool:
     """识别项目允许的显式列删除表达：``op.drop_column`` 或自包含 SQL。
 
