@@ -5,7 +5,8 @@ TSK-190 迁移后的消息定位约定：
 - 替身模板不再提供已删除的 ``output_instruction``；角色/文风来自
   ``system_prompt``，可调行为字段经
   ``chat_prompt_field_names()`` + ``resolve_behavior_field_names()``
-  按职责生成 marker（当前 Schema 缺行为字段时在责任解析处清晰 RED）；
+  按职责生成 marker（Schema 缺字段时在责任解析处清晰失败）；视觉描述
+  职责字段只供 vision_service 子调用消费，不出现在主回复 Agent messages；
 - 断言按 role + 内容/标签定位目标消息（``_unique_message``），只在顺序
   本身是业务契约时（角色消息居首、引用块先于当前用户消息、用户消息收尾
   等）断言相对顺序，不锁定消息总数与固定下标；
@@ -37,8 +38,7 @@ async def _empty_search_by_keyword(_uid: str) -> list[object]:
 def _resolved_behavior_fields() -> dict[str, str]:
     """按职责解析聊天 Prompt 行为字段名（测试 oracle，不硬编码完整名称）。
 
-    当前 Schema（TSK-190 未实现）缺少独立行为字段时，在责任解析处抛出
-    断言错误——这是指向未实现新契约的可解释 RED。
+    Schema 缺少独立行为字段时，在责任解析处抛出断言错误。
     """
     from tests.config.chat_prompt_field_contract import (
         chat_prompt_field_names,
@@ -717,8 +717,9 @@ async def _behavior_template() -> dict[str, str]:
     ``image_read_instruction``）外，行为字段名不硬编码：经
     ``chat_prompt_field_names()`` + ``resolve_behavior_field_names()`` 从
     Schema 按职责推导，marker 由字段名派生；Schema 行为字段缺失时在责任
-    解析处清晰失败（当前 RED）。``output_instruction`` 仍带一个旧值哨兵：
-    实现后 builder 不得再把它注入消息（当前实现会注入，构成可解释 RED）。
+    解析处清晰失败。``output_instruction`` 已删除但仍带旧值哨兵：builder
+    不得再把它注入消息。视觉描述字段也放进模板：它只供 vision_service
+    子调用消费，主回复 Agent messages 不得出现其 marker。
     """
     from tests.config.chat_prompt_field_contract import (
         chat_prompt_field_names,
@@ -742,7 +743,13 @@ async def _behavior_template() -> dict[str, str]:
 def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruction(
     monkeypatch: Any,
 ) -> None:
-    """AC5：builder 从模板快照注入各可调行为 Prompt，不再注入 output_instruction。"""
+    """AC5：builder 从模板快照注入各可调行为 Prompt，不再注入 output_instruction。
+
+    主回复 builder 必须注入角色、tool_call、image_read、profile/search/
+    fetch/delegated image 行为字段；视觉描述职责字段
+    （``vision_description_prompt``）只供 vision_service 子调用消费，
+    必须明确断言其 marker 不出现在主 Agent messages。
+    """
     from tests.config.chat_prompt_field_contract import (
         chat_prompt_field_names,
         resolve_behavior_field_names,
@@ -771,14 +778,23 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
 
     joined = "\n".join(str(message["content"]) for message in messages)
     resolved = resolve_behavior_field_names(chat_prompt_field_names())
+    vision_field = resolved["视觉描述"]
     expected_markers = [
         "SYS-ROLE",
         "TOOL-CALL-INSTR",
         "IMAGE-READ-INSTR",
-        *(f"DB-{field.upper()}" for field in resolved.values()),
+        *(
+            f"DB-{field.upper()}"
+            for field in resolved.values()
+            if field != vision_field
+        ),
     ]
     for marker in expected_markers:
         assert marker in joined, f"builder 未注入 DB 快照行为字段: {marker}"
+    assert f"DB-{vision_field.upper()}" not in joined, (
+        "视觉描述职责字段只供 vision_service 子调用消费，"
+        "不得注入主回复 Agent messages"
+    )
     assert "OLD-OUTPUT-SENTINEL" not in joined, (
         "builder 不得再注入已删除的 output_instruction 内容"
     )

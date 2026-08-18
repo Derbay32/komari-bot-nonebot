@@ -249,7 +249,13 @@ async def test_fresh_db_seed_writes_complete_chat_prompt_row_and_is_idempotent()
 
 
 async def test_seed_fills_empty_fields_and_keeps_custom_values() -> None:
-    """AC6/AC9：只补空字段；非空自定义值原样保留；重跑幂等。"""
+    """AC6/AC9：只补空字段（含纯空白）；非空自定义值原样保留；重跑幂等。
+
+    至少一个待补字段预置为纯空白（如 ``"   "``）：seed 必须把它视为空
+    字段用资产值补齐，同时绝不覆盖非空自定义值。当前实现只把 ``""``
+    视为空字段，纯空白不补齐并触发最终冷启动校验失败
+    （"聊天 Prompt 初始数据字段为空"），因此是 TSK-190 的清晰 RED。
+    """
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
@@ -259,8 +265,13 @@ async def test_seed_fills_empty_fields_and_keeps_custom_values() -> None:
         try:
             fields = sorted(_chat_schema_fields())
             custom_fields = {"system_prompt", "tool_call_instruction"}
+            blank_field = sorted(set(fields) - custom_fields)[0]
             values = {
-                field: (f"custom-{field}" if field in custom_fields else "")
+                field: (
+                    f"custom-{field}"
+                    if field in custom_fields
+                    else ("   " if field == blank_field else "")
+                )
                 for field in fields
             }
             await _insert_chat_row(connection, values)

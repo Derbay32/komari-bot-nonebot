@@ -58,10 +58,47 @@ class _FakeLLMProvider:
             self.__class__.active -= 1
 
 
+def _vision_description_field() -> str:
+    """从 Schema 按职责解析视觉描述字段名（当前为 vision_description_prompt）。"""
+    from tests.config.chat_prompt_field_contract import (
+        chat_prompt_field_names,
+        resolve_behavior_field_names,
+    )
+
+    return resolve_behavior_field_names(chat_prompt_field_names())["视觉描述"]
+
+
+async def _fake_vision_description_template() -> dict[str, str]:
+    """经公开 loader seam 返回的非空测试视觉描述 Prompt（TSK-190 AC5，不触 DB）。"""
+    return {_vision_description_field(): "TEST-VISION-DESCRIPTION-PROMPT"}
+
+
+def _patch_vision_prompt_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    loader: Any,
+) -> None:
+    """经 chat Prompt 公开 loader seam 注入替身 loader。
+
+    vision_service 可能以 ``from ... import get_template`` 本地绑定使用
+    loader，也可能经 ``prompt_template.get_template`` 属性访问；两种风格
+    都覆盖，不锁死 import 风格。
+    """
+    from komari_bot.plugins.komari_chat.services import (
+        prompt_template as chat_prompt_template,
+    )
+
+    monkeypatch.setattr(chat_prompt_template, "get_template", loader)
+    if hasattr(vision_service_module, "get_template"):
+        monkeypatch.setattr(vision_service_module, "get_template", loader)
+
+
 def _patch_vision_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeLLMProvider.reset()
     monkeypatch.setattr(vision_service_module, "llm_provider_config_manager", _FakeConfigManager())
     monkeypatch.setattr(vision_service_module, "llm_provider", _FakeLLMProvider())
+    # 视觉描述 Prompt 经 chat Prompt 公开 loader seam 注入非空测试值，
+    # 既有并发/错误/collector 用例不依赖真实数据库。
+    _patch_vision_prompt_loader(monkeypatch, _fake_vision_description_template)
 
 
 @pytest.mark.asyncio
@@ -157,8 +194,8 @@ async def test_read_image_uses_db_snapshot_prompt_for_vision_description(
 
     通过公开 loader seam（chat prompt 模板 ``get_template``）注入替身值，
     捕获发送给 LLM 提供者的真实请求载荷，断言描述文本来自快照而非
-    Python 常量；不真正调用外部模型。当前实现仍使用模块常量且不经过
-    loader，因此本用例是 TSK-190 的可解释 RED。
+    Python 常量；不真正调用外部模型。当前实现经 loader 读取快照，
+    本用例验证 DB 快照值逐字到达视觉子调用载荷。
     """
     from komari_bot.plugins.komari_chat.services import (
         prompt_template as chat_prompt_template,
@@ -216,3 +253,53 @@ async def test_read_image_uses_db_snapshot_prompt_for_vision_description(
     assert content[0]["type"] == "text"
     assert content[0]["text"] == "DB-SNAPSHOT-VISION-PROMPT"
     assert "详细描述这张图片" not in content[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_read_images_propagates_loader_cold_start_failure_without_llm_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5/AC7：公开 loader 冷启动失败必须向上传播，不得降级为空文本继续调用。
+
+    非空图片输入时 ``read_images`` 必须把 ``RuntimeError("Prompt ...")``
+    传播给调用方，且不调用 LLM provider；禁止降级为空字符串、Python
+    常量或继续视觉调用。当前实现把 loader 异常吞掉并降级为空 Prompt
+    继续生成，因此本用例是 TSK-190 的可解释 RED。
+    """
+    _FakeLLMProvider.reset()
+    monkeypatch.setattr(
+        vision_service_module,
+        "llm_provider_config_manager",
+        _FakeConfigManager(),
+    )
+    monkeypatch.setattr(vision_service_module, "llm_provider", _FakeLLMProvider())
+
+    async def cold_start_failure() -> dict[str, str]:
+        msg = "Prompt 的 PostgreSQL 初始数据不可用且无缓存，无法冷启动: komari_chat"
+        raise RuntimeError(msg)
+
+    _patch_vision_prompt_loader(monkeypatch, cold_start_failure)
+
+    with pytest.raises(RuntimeError, match=r"^Prompt"):
+        await vision_service_module.read_images(
+            ["image-cold-start"],
+            vision_model="vision-model",
+        )
+    assert _FakeLLMProvider.max_active == 0, (
+        "loader 失败时不得调用 LLM provider"
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_images_empty_input_does_not_touch_prompt_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5：空图片列表直接返回 []，无需访问 loader。"""
+
+    async def fail_if_called() -> dict[str, str]:
+        msg = "空图片列表不应访问 chat Prompt loader"
+        raise AssertionError(msg)
+
+    _patch_vision_prompt_loader(monkeypatch, fail_if_called)
+
+    assert await vision_service_module.read_images([], vision_model="vision-model") == []
