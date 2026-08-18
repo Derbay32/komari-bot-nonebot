@@ -69,9 +69,7 @@ _INVALID_TOOL_SCHEMA_ERROR = "工具缺少对象参数 schema"
 _TOOL_SCHEMA_MISMATCH_ERROR = "工具参数 schema 与内置定义不一致"
 _LLM_COMPLETION_CONCURRENCY_LIMIT = 4
 _LLM_COMPLETION_SEMAPHORE = asyncio.Semaphore(_LLM_COMPLETION_CONCURRENCY_LIMIT)
-# 有业务工具时连续空 tool_calls 的纠错上限：纠错无进展即终止任务，
-# 而不是继续烧轮次；无业务工具的简单路径只烧轮次（TSK-192 AC6 基线）
-_MAX_NO_TOOL_CORRECTIONS = 3
+
 _MAX_TOOL_RESULT_CHARS = 8_000
 _MAX_READ_PROFILE_TRAITS = 16
 _MAX_READ_PROFILE_RESULT_CHARS = 4_000
@@ -1167,11 +1165,6 @@ async def _execute_tool_loop(
         FETCH_PAGE_TOOL_NAME,
         READ_PROFILE_TOOL_NAME,
     }
-    has_business_tool = any(
-        tool.get("function", {}).get("name") in known_business_tool_names
-        for tool in tool_definitions
-    )
-    consecutive_no_tool_rounds = 0
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
     last_retry_reason: str | None = None
@@ -1248,27 +1241,10 @@ async def _execute_tool_loop(
             )
 
             if not completion.tool_calls:
-                consecutive_no_tool_rounds += 1
                 last_retry_reason = (
                     f"{request_phase_prefix} 第 {round_num} 轮：模型未调用任何工具，"
                     "但 tool_choice='required' 要求至少调用一个工具"
                 )
-                if (
-                    has_business_tool
-                    and consecutive_no_tool_rounds >= _MAX_NO_TOOL_CORRECTIONS
-                ):
-                    msg = (
-                        f"{request_phase_prefix} 连续 {_MAX_NO_TOOL_CORRECTIONS} 轮"
-                        "模型未调用任何工具，纠错无进展，已终止任务："
-                        f"{last_retry_reason}"
-                    )
-                    if collector is not None:
-                        collector.add_error(
-                            phase=request_phase_prefix,
-                            error_type="NoToolCallsExceeded",
-                            message=msg,
-                        )
-                    raise RuntimeError(msg)
                 # 空内容但带 continuation 时也必须回填，确保 Responses 推理项不丢轮次
                 if completion.content or getattr(completion, "continuation", None) is not None:
                     current_messages.append(build_assistant_message(completion))
