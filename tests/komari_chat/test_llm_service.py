@@ -903,7 +903,7 @@ def test_generate_reply_with_tools_recovers_when_model_omits_tool_call(
 ) -> None:
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
-        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(content="让我想想先", tool_calls=[]),
         SimpleNamespace(
             content="",
             tool_calls=[
@@ -936,6 +936,11 @@ def test_generate_reply_with_tools_recovers_when_model_omits_tool_call(
     assert result.content == "纠错后输出"
     assert len(fake_provider.completion_calls) == 2
     second_messages = fake_provider.completion_calls[1]["messages"]
+    assert not any(
+        message.get("role") == "assistant"
+        and message.get("content") == "让我想想先"
+        for message in second_messages
+    ), "裸文本轮正文不得作为 assistant 消息进入下一轮"
     assert any(
         "必须调用" in str(message.get("content", ""))
         for message in second_messages
@@ -1000,6 +1005,124 @@ def test_generate_reply_with_tools_retries_invalid_final_response_in_same_sessio
         message.get("role") == "tool"
         and "final_response" in str(message.get("content", ""))
         and "content" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_generate_reply_with_tools_rejects_final_response_without_interaction_history(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：final_response 缺少 interaction_history 不得成功。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {"content": "缺互动记录的回复"},
+                    call_id="call-final-no-history",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "补完互动记录后输出",
+                        "interaction_history": {
+                            "event": "首次缺互动记录",
+                            "result": "补完后正常输出",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-history-ok",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "不带互动记录"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            request_trace_id="chat-no-history-1",
+        )
+    )
+
+    assert result.content == "补完互动记录后输出"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-final-no-history"
+        and "interaction_history" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_generate_reply_with_tools_rejects_final_response_with_incomplete_history(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：final_response.interaction_history 缺 event/result/emotion 不得成功。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "缺 emotion 的回复",
+                        "interaction_history": {"event": "e", "result": "r"},
+                    },
+                    call_id="call-final-incomplete",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "补全 emotion 后输出",
+                        "interaction_history": {
+                            "event": "首次缺 emotion",
+                            "result": "补全后正常输出",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-complete",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "残缺互动记录"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            request_trace_id="chat-incomplete-history-1",
+        )
+    )
+
+    assert result.content == "补全 emotion 后输出"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-final-incomplete"
+        and "event" in str(message.get("content", ""))
+        and "emotion" in str(message.get("content", ""))
         for message in second_messages
     )
 

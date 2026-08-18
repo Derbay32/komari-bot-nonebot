@@ -584,7 +584,12 @@ def test_allowed_extra_params_cannot_replace_final_wire_messages(
     }
 
 
-def test_thinking_mode_suppresses_tool_choice(monkeypatch: Any) -> None:
+def test_thinking_mode_passes_tool_choice_through(monkeypatch: Any) -> None:
+    """TSK-193：provider 不再按思考模式隐式抑制调用方 tool_choice。
+
+    旧行为：thinking_mode=True 时跳过 tool_choice 注入；
+    新契约：调用方显式声明的 tool_choice 必须原样到达 Chat wire 请求。
+    """
     class _FakeCompletions:
         def __init__(self) -> None:
             self.last_kwargs: dict[str, Any] | None = None
@@ -623,7 +628,7 @@ def test_thinking_mode_suppresses_tool_choice(monkeypatch: Any) -> None:
 
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
-        assert "tool_choice" not in request_data
+        assert request_data["tool_choice"] == "required"
         assert request_data["reasoning_effort"] == "high"
 
     asyncio.run(_run())

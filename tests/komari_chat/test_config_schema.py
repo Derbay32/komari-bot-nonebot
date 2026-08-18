@@ -183,6 +183,61 @@ def test_agent_budget_cross_field_invalid_combinations_rejected(
         KomariChatConfigSchema(**overrides)
 
 
+# ── TSK-193：工具调用约束模式字段（AC1） ────────────────────────────────
+
+EXPECTED_AGENT_TOOL_CALL_MODE_DEFAULT = "required"
+EXPECTED_AGENT_TOOL_CALL_MODE_CHOICES = ("required", "prompt_guided")
+
+
+def test_agent_tool_call_mode_is_typed_enum_with_default_required() -> None:
+    """AC1：agent_tool_call_mode 是强类型枚举，默认 required。"""
+    assert "agent_tool_call_mode" in KomariChatConfigSchema.model_fields
+    schema = KomariChatConfigSchema.model_json_schema()
+    property_schema = schema["properties"]["agent_tool_call_mode"]
+    assert property_schema.get("enum") == list(EXPECTED_AGENT_TOOL_CALL_MODE_CHOICES)
+    assert (
+        KomariChatConfigSchema.model_fields["agent_tool_call_mode"].default
+        == EXPECTED_AGENT_TOOL_CALL_MODE_DEFAULT
+    )
+
+
+@pytest.mark.parametrize("mode", EXPECTED_AGENT_TOOL_CALL_MODE_CHOICES)
+def test_agent_tool_call_mode_accepts_enum_values(mode: str) -> None:
+    """AC1：两个枚举值都可配置。"""
+    config = KomariChatConfigSchema(agent_tool_call_mode=mode)
+    assert config.model_dump()["agent_tool_call_mode"] == mode
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "auto",
+        "none",
+        "None",
+        "required ",
+        "Required",
+        "prompt_guided_extra",
+        "",
+    ],
+)
+def test_agent_tool_call_mode_rejects_invalid_values(invalid: str) -> None:
+    """AC1：枚举之外的值必须被 Pydantic 拒绝。"""
+    with pytest.raises(ValidationError):
+        KomariChatConfigSchema(agent_tool_call_mode=invalid)
+
+
+def test_agent_tool_call_mode_apply_mode_is_immediate() -> None:
+    """TSK-193：工具约束模式按管理元数据即时生效（无重启/重建）。"""
+    field = KomariChatConfigSchema.model_fields["agent_tool_call_mode"]
+    extra = field.json_schema_extra
+    if isinstance(extra, dict) and "apply_mode" in extra:
+        assert extra["apply_mode"] == "immediate"
+    # 模型级默认 apply_mode 也必须保持 immediate，字段未声明覆盖时同样即时生效
+    assert KomariChatConfigSchema.model_config.get("json_schema_extra") == {
+        "default_apply_mode": "immediate"
+    }
+
+
 def test_config_schema_drops_dead_proactive_score_threshold() -> None:
     """死字段 proactive_score_threshold 不迁移。"""
     assert "proactive_score_threshold" not in KomariChatConfigSchema.model_fields

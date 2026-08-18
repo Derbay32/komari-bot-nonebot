@@ -150,6 +150,97 @@ async def test_planner_passes_planning_slot_request_mode(monkeypatch: Any) -> No
 
 
 @pytest.mark.asyncio
+async def test_planner_plain_mode_keeps_auto_tool_choice(monkeypatch: Any) -> None:
+    """TSK-193：非思考模式的群总结规划保留既有 auto 选择。"""
+    import komari_bot.plugins.group_history_summary.planner_service as planner_module
+
+    llm_kwargs: list[dict[str, Any]] = []
+
+    async def _fake_gen(**kwargs: Any) -> object:
+        llm_kwargs.append(kwargs)
+        return SimpleNamespace(
+            content="规划完成",
+            tool_calls=[],
+            finish_reason="stop",
+            usage=None,
+            duration_ms=None,
+            reasoning_content=None,
+        )
+
+    monkeypatch.setattr(
+        planner_module.llm_provider, "generate_messages_completion", _fake_gen
+    )
+
+    await planner_module.plan_summary_request(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="123",
+        bot_self_id="999",
+        user_request="总结最近消息",
+        planning_model=PLANNING_MODEL,
+        planning_max_tokens=800,
+        planning_round_limit=3,
+        summary_default_count=50,
+        min_summary_count=10,
+        max_summary_count=200,
+        summary_tool_scan_limit=300,
+        fetch_batch_size=50,
+        planning_thinking_mode=False,
+        planning_request_api="responses",
+        planning_stream_enabled=False,
+        request_trace_id="trace",
+        collector=None,
+    )
+
+    assert llm_kwargs[0]["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_planner_thinking_mode_omits_tool_choice(monkeypatch: Any) -> None:
+    """TSK-193：思考模式的群总结规划保持省略 tool_choice，避免行为漂移。"""
+    import komari_bot.plugins.group_history_summary.planner_service as planner_module
+
+    llm_kwargs: list[dict[str, Any]] = []
+
+    async def _fake_gen(**kwargs: Any) -> object:
+        llm_kwargs.append(kwargs)
+        return SimpleNamespace(
+            content="规划完成",
+            tool_calls=[],
+            finish_reason="stop",
+            usage=None,
+            duration_ms=None,
+            reasoning_content=None,
+        )
+
+    monkeypatch.setattr(
+        planner_module.llm_provider, "generate_messages_completion", _fake_gen
+    )
+
+    await planner_module.plan_summary_request(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="123",
+        bot_self_id="999",
+        user_request="总结最近消息",
+        planning_model=PLANNING_MODEL,
+        planning_max_tokens=800,
+        planning_round_limit=3,
+        summary_default_count=50,
+        min_summary_count=10,
+        max_summary_count=200,
+        summary_tool_scan_limit=300,
+        fetch_batch_size=50,
+        planning_thinking_mode=True,
+        planning_request_api="responses",
+        planning_stream_enabled=False,
+        request_trace_id="trace",
+        collector=None,
+    )
+
+    assert "tool_choice" not in llm_kwargs[0], "思考模式必须保持省略 tool_choice"
+    assert llm_kwargs[0]["thinking_mode"] is True
+
+
+@pytest.mark.asyncio
 async def test_summarize_passes_summary_slot_request_mode(monkeypatch: Any) -> None:
     import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
 

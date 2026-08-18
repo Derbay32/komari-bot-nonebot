@@ -34,6 +34,7 @@ from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
 from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 from komari_bot.plugins.llm_provider.base_client import (
     LLMCompletionResultSchema,
+    LLMProviderContinuationSchema,
     LLMToolCallFunctionSchema,
     LLMToolCallSchema,
 )
@@ -45,6 +46,11 @@ llm_service_module = import_module(
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
+prompt_builder_module = import_module(
+    "komari_bot.plugins.komari_chat.services.prompt_builder"
+)
+
+from tests.config.prompt_field_contract import prompt_marker_values
 
 # ── 基础替身 ────────────────────────────────────────────────────────────
 
@@ -238,6 +244,8 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
         "agent_max_rounds": 10,
         "agent_max_tool_calls_per_round": 4,
         "agent_max_total_tool_calls": 20,
+        # TSK-193：工具调用约束模式（与配置 Schema 默认值一致）
+        "agent_tool_call_mode": "required",
     }
     values.update(overrides)
     _assert_agent_budget_consistent(
@@ -265,6 +273,7 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
         "face_reaction_id": "76",
         "vision_tool_enabled": False,
         "error_notify_enabled": False,
+        "knowledge_enabled": False,
     }
     values.update(_build_config().__dict__)
     values.update(overrides)
@@ -1002,3 +1011,444 @@ def test_public_entries_have_no_max_tool_rounds_parameter() -> None:
             getattr(llm_service_module, func_name)
         )
         assert "max_tool_rounds" not in signature.parameters, func_name
+
+
+# ── TSK-193：工具调用约束模式与裸文本硬协议 ────────────────────────────
+
+
+def _marker_template(*, instruction: str = "MARKER-工具调用指令-必须调用final_response") -> Any:
+    """经公开 Prompt loader seam 注入的完整 marker Prompt 快照。"""
+    template = dict(prompt_marker_values("komari_chat"))
+    template["tool_call_instruction"] = instruction
+    return template
+
+
+class _RichUserData(_FakeUserData):
+    """真实 build_prompt 需要好感度对象携带画像字段。"""
+
+    async def get_user_favorability(self, user_id: str) -> SimpleNamespace:
+        del user_id
+        return SimpleNamespace(
+            user_id="user-1",
+            favorability=0,
+            stage_index=0,
+            stage_name="初识",
+            stage_prompt="保持自然",
+        )
+
+
+def test_required_mode_sends_tool_choice_in_plain_and_thinking_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193 AC2：required 在普通与思考模式都向 provider 提交 tool_choice。"""
+    for thinking in (False, True):
+        config = _build_config(
+            agent_tool_call_mode="required",
+            llm_thinking_mode_chat=thinking,
+        )
+        provider = _ScriptedProvider([_final_response_completion()])
+        monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+        monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+
+        asyncio.run(
+            llm_service_module.generate_reply(
+                config=config,
+                messages=[{"role": "user", "content": "你好"}],
+            )
+        )
+
+        assert provider.completion_calls[0]["tool_choice"] == "required"
+        assert provider.completion_calls[0]["thinking_mode"] is thinking
+
+
+def test_prompt_guided_simple_entry_omits_tool_choice_and_injects_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193 AC3：prompt_guided 不发送 tool_choice，并注入 DB Prompt marker。
+
+    经公开 Prompt loader seam（prompt_builder.get_template）注入完整
+    marker 快照，用真实 build_prompt 构造消息，再经简单入口提交：
+    provider 收到的请求不得包含 tool_choice，且 messages 含 marker。
+    """
+    config = _build_config(
+        agent_tool_call_mode="prompt_guided",
+        knowledge_enabled=False,
+    )
+    template = _marker_template()
+    marker = template["tool_call_instruction"]
+    monkeypatch.setattr(
+        prompt_builder_module,
+        "get_template",
+        _template_loader(template),
+    )
+    provider = _ScriptedProvider([_final_response_completion()])
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+
+    messages = asyncio.run(
+        prompt_builder_module.build_prompt(
+            user_message="你好",
+            memories=[],
+            config=config,
+        )
+    )
+    asyncio.run(
+        llm_service_module.generate_reply(
+            config=config,
+            messages=messages,
+        )
+    )
+
+    call = provider.completion_calls[0]
+    assert "tool_choice" not in call, "prompt_guided 不得发送 tool_choice 参数"
+    rendered = "\n".join(str(message.get("content", "")) for message in call["messages"])
+    assert marker in rendered, "请求 messages 必须包含数据库 tool_call_instruction marker"
+
+
+def _template_loader(template: dict[str, str]) -> Any:
+    async def _loader() -> dict[str, str]:
+        return dict(template)
+
+    return _loader
+
+
+@pytest.mark.parametrize("entry", ["normal", "debug"])
+def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """TSK-193 AC3：普通 / debug 与简单入口的 prompt_guided 语义一致。"""
+    config = _build_chat_config_stub(agent_tool_call_mode="prompt_guided")
+    # handler 工具集含 record_favorability_delta：先记录好感度再 final_response
+    provider = _ScriptedProvider(
+        [
+            _completion(
+                _tool_call(
+                    "record_favorability_delta",
+                    '{"delta":0,"reason":"TSK193约束模式"}',
+                    {"delta": 0, "reason": "TSK193约束模式"},
+                    call_id="call-favor-tsk193",
+                )
+            ),
+            _final_response_completion(),
+        ]
+    )
+    handler, _search = _wire_handler(monkeypatch, config, provider)
+    template = _marker_template()
+    marker = template["tool_call_instruction"]
+    monkeypatch.setattr(
+        prompt_builder_module,
+        "get_template",
+        _template_loader(template),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "build_prompt",
+        _prompt_builder_wrapper,
+    )
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _RichUserData())
+
+    if entry == "debug":
+        result = asyncio.run(
+            handler.generate_debug_reply(
+                group_id="group-1",
+                user_id="user-1",
+                user_nickname="测试用户",
+                content="测试约束模式",
+            )
+        )
+        assert result.reply == "预算测试回复"
+    else:
+        pending, _stored, failure = asyncio.run(
+            handler._attempt_reply(
+                bot_self_id="bot-1",
+                adapter_name="OneBot V11",
+                message=_make_message(),
+                reply_to_message_id="msg-1",
+                image_urls=None,
+                reply_context=None,
+                reply_context_requested=False,
+                reply_context_refetched=False,
+                force_reply=True,
+                reason="at",
+                reply_score=1.0,
+                store_current=True,
+            )
+        )
+        assert failure is None
+        assert pending is not None
+        assert pending.reply == "预算测试回复"
+
+    call = provider.completion_calls[0]
+    assert "tool_choice" not in call, f"{entry} 入口 prompt_guided 不得发送 tool_choice"
+    rendered = "\n".join(str(message.get("content", "")) for message in call["messages"])
+    assert marker in rendered, f"{entry} 入口请求 messages 必须包含 marker"
+
+
+async def _prompt_builder_wrapper(**kwargs: Any) -> list[dict[str, object]]:
+    return await prompt_builder_module.build_prompt(**kwargs)
+
+
+def test_tool_call_mode_frozen_at_task_start_and_applies_next_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193：任务内冻结工具约束模式；下一任务才生效。"""
+    config = _build_config(
+        agent_tool_call_mode="prompt_guided",
+        agent_max_rounds=2,
+        agent_max_total_tool_calls=8,
+    )
+    provider = _ScriptedProvider(
+        [_search_completion("a"), _final_response_completion()]
+    )
+    search = _FakeSearch()
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+    monkeypatch.setattr(
+        llm_service_module,
+        "komari_search",
+        SimpleNamespace(search_web=search.search_web, fetch_page=search.fetch_page),
+    )
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+
+    original_search_web = search.search_web
+
+    async def _mutating_search_web(query: str, **kwargs: object) -> str:
+        # 任务执行期间运维把模式改为 required：冻结实现当前任务仍保持 prompt_guided
+        config.agent_tool_call_mode = "required"
+        return await original_search_web(query, **kwargs)
+
+    monkeypatch.setattr(
+        llm_service_module.komari_search,
+        "search_web",
+        _mutating_search_web,
+    )
+
+    asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=config,
+            messages=[{"role": "user", "content": "约束模式冻结"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+        )
+    )
+
+    assert len(provider.completion_calls) == 2
+    assert all("tool_choice" not in call for call in provider.completion_calls), (
+        "任务内配置变更不得影响已冻结的 prompt_guided 模式"
+    )
+    assert search.queries == ["a"]
+
+    # 下一任务读取新值：required 生效
+    provider2 = _ScriptedProvider([_final_response_completion()])
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider2)
+    asyncio.run(
+        llm_service_module.generate_reply(
+            config=config,
+            messages=[{"role": "user", "content": "下一任务"}],
+        )
+    )
+    assert provider2.completion_calls[0]["tool_choice"] == "required"
+
+
+class _RejectingProvider(_ScriptedProvider):
+    """模拟不兼容 required 的 provider：每轮都抛错，并记录请求。"""
+
+    async def generate_messages_completion(self, **kwargs: Any) -> Any:
+        self.completion_calls.append(kwargs)
+        raise RuntimeError("required_rejected")
+
+
+def test_required_thinking_provider_rejection_fails_clearly_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193 AC5：不兼容 provider 拒绝 required 时明确失败。
+
+    简单入口：异常经单请求瞬时重试后上抛；不得自动关闭思考、换模型、
+    删除 tool_choice 或改写模式。
+    """
+    config = _build_config(
+        agent_tool_call_mode="required",
+        llm_thinking_mode_chat=True,
+        agent_max_rounds=2,
+        agent_max_total_tool_calls=8,
+    )
+    provider = _RejectingProvider()
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+
+    with pytest.raises(RuntimeError, match="required_rejected"):
+        asyncio.run(
+            llm_service_module.generate_reply(
+                config=config,
+                messages=[{"role": "user", "content": "思考模式强制工具"}],
+            )
+        )
+
+    assert len(provider.completion_calls) == 3
+    for call in provider.completion_calls:
+        assert call["tool_choice"] == "required"
+        assert call["thinking_mode"] is True
+        assert call["model"] == "chat-model"
+
+
+def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193 AC5：消息处理公开失败 seam 走既有 ReplyFailureInfo 边界。
+
+    不重新铺整条群内错误 / SUPERUSER 通知 fixture（已有 test_error_notify
+    覆盖该边界），只断言失败诊断信息与请求不可变。
+    """
+    config = _build_chat_config_stub(
+        agent_tool_call_mode="required",
+        llm_thinking_mode_chat=True,
+    )
+    provider = _RejectingProvider()
+    handler, _search = _wire_handler(monkeypatch, config, provider)
+
+    pending, _stored, failure = asyncio.run(
+        handler._attempt_reply(
+            bot_self_id="bot-1",
+            adapter_name="OneBot V11",
+            message=_make_message(),
+            reply_to_message_id="msg-1",
+            image_urls=None,
+            reply_context=None,
+            reply_context_requested=False,
+            reply_context_refetched=False,
+            force_reply=True,
+            reason="at",
+            reply_score=1.0,
+            store_current=True,
+        )
+    )
+
+    assert pending is None
+    assert failure is not None
+    assert failure.stage == "generate"
+    assert failure.error_type == "RuntimeError"
+    for call in provider.completion_calls:
+        assert call["tool_choice"] == "required"
+        assert call["thinking_mode"] is True
+        assert call["model"] == "chat-model"
+
+
+def test_agent_run_records_frozen_tool_mode_violation_and_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193 AC7/AC9：裸文本违例保留完整诊断，消耗 1 轮但 0 工具调用。
+
+    记录冻结的 tool mode、协议违例与预算 usage；被拒绝的 completion 的
+    正文 / reasoning / continuation 完整留在 collector 投影中。
+    """
+    config = _build_config(
+        agent_tool_call_mode="prompt_guided",
+        agent_max_rounds=2,
+        agent_max_tool_calls_per_round=4,
+        agent_max_total_tool_calls=4,
+    )
+    continuation = LLMProviderContinuationSchema(
+        api="responses",
+        output_items=[{"type": "message", "id": "msg_1"}, {"type": "reasoning", "id": "rs_1"}],
+    )
+    provider = _ScriptedProvider(
+        [
+            LLMCompletionResultSchema(
+                content="裸文本违例正文",
+                reasoning_content="裸文本轮推理正文",
+                tool_calls=[],
+                finish_reason="stop",
+                continuation=continuation,
+            ),
+            _final_response_completion("违例后成功回复"),
+        ]
+    )
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+    collector = AgentRunCollector(request_id="tsk193-violation")
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=config,
+            messages=[{"role": "user", "content": "违例诊断"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            collector=collector,
+        )
+    )
+    collector.mark_finished(status="success", output=result)
+    record = collector.build_record()
+
+    # 被拒 completion 完整保留（正文 / reasoning / continuation）
+    first_response = record["rounds"][0]["response"]
+    assert first_response["content"] == "裸文本违例正文"
+    assert first_response["reasoning_content"] == "裸文本轮推理正文"
+    assert first_response["continuation"]["output_items"] == [
+        {"type": "message", "id": "msg_1"},
+        {"type": "reasoning", "id": "rs_1"},
+    ]
+
+    # 冻结 tool mode 与任务整体消耗：违例轮(0 工具) + 成功轮(1 工具)
+    assert record["budget"]["agent_tool_call_mode"] == "prompt_guided"
+    assert record["budget"]["rounds_used"] == 2
+    assert record["budget"]["tool_calls_used"] == 1
+    assert len(record["rounds"]) == 2
+    # 违例轮本身：1 个轮次、0 个工具调用
+    assert len(record["rounds"][0]["response"]["tool_calls"]) == 0
+
+    # 协议违例进入诊断错误列表（消息文本为既有可观察诊断文案）
+    assert record["errors"], "裸文本违例必须记录协议违例诊断"
+    assert any(
+        "未调用任何工具" in str(error.get("message", "")) for error in record["errors"]
+    )
+
+    # 后续合法 final_response 仍成功
+    assert result.content == "违例后成功回复"
+
+
+def test_consecutive_bare_text_until_rounds_exhausted_is_diagnosable_protocol_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-193 AC8：连续裸文本直到配置轮次耗尽抛出可诊断协议失败。
+
+    恰好消耗配置轮次（无隐藏纠错轮）；被拒轮次的正文不得回填，
+    第二轮请求中不存在 assistant 消息。
+    """
+    config = _build_config(
+        agent_tool_call_mode="required",
+        agent_max_rounds=2,
+        agent_max_tool_calls_per_round=4,
+        agent_max_total_tool_calls=4,
+    )
+    provider = _ScriptedProvider(
+        [
+            LLMCompletionResultSchema(
+                content="第一轮裸文本", tool_calls=[], finish_reason="stop"
+            ),
+            LLMCompletionResultSchema(
+                content="第二轮裸文本", tool_calls=[], finish_reason="stop"
+            ),
+        ]
+    )
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+    collector = AgentRunCollector(request_id="tsk193-rounds-exhausted")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            llm_service_module.generate_reply(
+                config=config,
+                messages=[{"role": "user", "content": "连续裸文本"}],
+                collector=collector,
+            )
+        )
+    collector.mark_finished(status="error", error=excinfo.value)
+    record = collector.build_record()
+
+    assert len(provider.completion_calls) == 2, "必须恰好消耗配置轮次，无隐藏纠错轮"
+    assert "未调用任何工具" in str(excinfo.value)
+    second_messages = provider.completion_calls[1]["messages"]
+    assert not any(
+        message.get("role") == "assistant" for message in second_messages
+    ), "裸文本轮不得作为 assistant 消息进入下一轮"
+    assert record["budget"]["rounds_used"] == 2
+    assert record["budget"]["tool_calls_used"] == 0
+    assert record["errors"], "轮次耗尽协议失败必须进入诊断错误列表"

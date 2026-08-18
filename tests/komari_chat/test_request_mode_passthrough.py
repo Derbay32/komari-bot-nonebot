@@ -296,8 +296,14 @@ def test_tool_loop_attaches_continuation_to_assistant_message(monkeypatch: Any) 
     ]
 
 
-def test_tool_loop_no_tool_retry_attaches_continuation(monkeypatch: Any) -> None:
-    """Ticket 07：无工具重试路径的 assistant 消息同样附着 continuation。"""
+def test_tool_loop_no_tool_retry_discards_content_and_continuation(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：无 tool_calls 的 completion 正文与 continuation 不进入下一轮。
+
+    旧行为：正文与续接信息作为 assistant 消息回填并附着 continuation；
+    新契约：只保留最后有效上下文 + 代码拥有的短纠错 user 指令。
+    """
     continuation = base_client_module.LLMProviderContinuationSchema(
         api="responses",
         output_items=[{"type": "message", "id": "msg_1"}],
@@ -326,15 +332,23 @@ def test_tool_loop_no_tool_retry_attaches_continuation(monkeypatch: Any) -> None
     assistant_messages = [
         message for message in second_round_messages if message["role"] == "assistant"
     ]
-    assert len(assistant_messages) == 1
-    assert assistant_messages[0]["content"] == "让我想想"
-    assert assistant_messages[0][CONTINUATION_KEY]["api"] == "responses"
+    assert assistant_messages == [], "裸文本轮不得作为 assistant 消息进入下一轮"
+    assert not any(
+        CONTINUATION_KEY in message for message in second_round_messages
+    ), "裸文本 continuation 不得进入下一轮 request messages"
+    correction = [
+        message
+        for message in second_round_messages
+        if message.get("role") == "user"
+    ]
+    assert correction, "裸文本轮后必须追加代码拥有的短纠错 user 指令"
+    assert "必须调用" in str(correction[-1].get("content", ""))
 
 
-def test_tool_loop_empty_content_retry_still_attaches_continuation(
+def test_tool_loop_empty_content_retry_discards_continuation(
     monkeypatch: Any,
 ) -> None:
-    """spec：空内容的无工具重试输出也必须附着 continuation，推理项不丢轮次。"""
+    """TSK-193：空内容的无工具输出携带的 continuation 也不得进入下一轮。"""
     continuation = base_client_module.LLMProviderContinuationSchema(
         api="responses",
         output_items=[{"type": "reasoning", "id": "rs_1"}],
@@ -360,14 +374,38 @@ def test_tool_loop_empty_content_retry_still_attaches_continuation(
 
     assert len(provider.completion_calls) == 2
     second_round_messages = provider.completion_calls[1]["messages"]
-    assistant_messages = [
-        message for message in second_round_messages if message["role"] == "assistant"
+    assert not any(
+        CONTINUATION_KEY in message for message in second_round_messages
+    ), "空内容无工具轮的 continuation 不得进入下一轮"
+
+
+def test_tool_loop_discards_reasoning_content_of_no_tool_completion(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：无 tool_calls 的 reasoning 正文也不得进入下一轮上下文。"""
+    provider = _RecordingProvider()
+    provider.completions = [
+        base_client_module.LLMCompletionResultSchema(
+            content="",
+            reasoning_content="秘密推理内容",
+            tool_calls=[],
+            finish_reason="stop",
+        ),
+        _final_response_completion(),
     ]
-    assert len(assistant_messages) == 1
-    assert assistant_messages[0][CONTINUATION_KEY]["api"] == "responses"
-    assert assistant_messages[0][CONTINUATION_KEY]["output_items"] == [
-        {"type": "reasoning", "id": "rs_1"}
-    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+
+    asyncio.run(
+        llm_service_module.generate_reply(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "你好"}],
+        )
+    )
+
+    assert len(provider.completion_calls) == 2
+    second_round_messages = provider.completion_calls[1]["messages"]
+    rendered = str(second_round_messages)
+    assert "秘密推理内容" not in rendered, "裸文本轮的 reasoning 不得进入下一轮"
 
 
 def test_summarize_conversation_passes_summary_slot_mode(monkeypatch: Any) -> None:
