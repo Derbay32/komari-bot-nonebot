@@ -205,7 +205,7 @@ def test_agent_tool_call_mode_is_typed_enum_with_default_required() -> None:
 def test_agent_tool_call_mode_accepts_enum_values(mode: str) -> None:
     """AC1：两个枚举值都可配置。"""
     config = KomariChatConfigSchema(agent_tool_call_mode=mode)
-    assert config.model_dump()["agent_tool_call_mode"] == mode
+    assert config.model_dump().get("agent_tool_call_mode") == mode
 
 
 @pytest.mark.parametrize(
@@ -228,7 +228,8 @@ def test_agent_tool_call_mode_rejects_invalid_values(invalid: str) -> None:
 
 def test_agent_tool_call_mode_apply_mode_is_immediate() -> None:
     """TSK-193：工具约束模式按管理元数据即时生效（无重启/重建）。"""
-    field = KomariChatConfigSchema.model_fields["agent_tool_call_mode"]
+    field = KomariChatConfigSchema.model_fields.get("agent_tool_call_mode")
+    assert field is not None, "agent_tool_call_mode 字段缺失"
     extra = field.json_schema_extra
     if isinstance(extra, dict) and "apply_mode" in extra:
         assert extra["apply_mode"] == "immediate"

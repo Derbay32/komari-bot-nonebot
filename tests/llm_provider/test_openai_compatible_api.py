@@ -628,7 +628,7 @@ def test_thinking_mode_passes_tool_choice_through(monkeypatch: Any) -> None:
 
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
-        assert request_data["tool_choice"] == "required"
+        assert request_data.get("tool_choice") == "required"
         assert request_data["reasoning_effort"] == "high"
 
     asyncio.run(_run())

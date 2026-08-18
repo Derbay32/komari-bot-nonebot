@@ -1387,7 +1387,7 @@ def test_agent_run_records_frozen_tool_mode_violation_and_usage(
     ]
 
     # 冻结 tool mode 与任务整体消耗：违例轮(0 工具) + 成功轮(1 工具)
-    assert record["budget"]["agent_tool_call_mode"] == "prompt_guided"
+    assert record["budget"].get("agent_tool_call_mode") == "prompt_guided"
     assert record["budget"]["rounds_used"] == 2
     assert record["budget"]["tool_calls_used"] == 1
     assert len(record["rounds"]) == 2

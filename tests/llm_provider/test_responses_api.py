@@ -406,7 +406,7 @@ def test_responses_thinking_mode_keeps_required_tool_choice(
 
     request = responses.last_kwargs
     assert request is not None
-    assert request["tool_choice"] == "required"
+    assert request.get("tool_choice") == "required"
     assert request["reasoning_effort"] == "high"
 
 
@@ -452,7 +452,7 @@ def test_responses_stream_thinking_mode_keeps_required_tool_choice(
     request = responses.last_kwargs
     assert request is not None
     assert request["stream"] is True
-    assert request["tool_choice"] == "required"
+    assert request.get("tool_choice") == "required"
     assert request["reasoning_effort"] == "high"
 
 

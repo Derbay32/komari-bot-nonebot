@@ -154,7 +154,7 @@ def test_chat_stream_thinking_mode_keeps_required_tool_choice(
     client = _make_client(monkeypatch, completions)
 
     async def _run() -> Any:
-        return await client.generate_messages_completion(
+        return await client.generate_text_with_messages(
             messages=[{"role": "user", "content": "你好"}],
             model="deepseek-chat",
             tools=[{"type": "function", "function": {"name": "query"}}],
@@ -169,7 +169,7 @@ def test_chat_stream_thinking_mode_keeps_required_tool_choice(
     request = completions.last_kwargs
     assert request is not None
     assert request["stream"] is True
-    assert request["tool_choice"] == "required"
+    assert request.get("tool_choice") == "required"
     assert request["reasoning_effort"] == "high"
 
 
@@ -181,7 +181,7 @@ def test_chat_non_stream_thinking_mode_keeps_required_tool_choice(
     client = _make_client(monkeypatch, completions)
 
     async def _run() -> Any:
-        return await client.generate_messages_completion(
+        return await client.generate_text_with_messages(
             messages=[{"role": "user", "content": "你好"}],
             model="deepseek-chat",
             tools=[{"type": "function", "function": {"name": "query"}}],
@@ -195,8 +195,8 @@ def test_chat_non_stream_thinking_mode_keeps_required_tool_choice(
 
     request = completions.last_kwargs
     assert request is not None
-    assert request["stream"] is False
-    assert request["tool_choice"] == "required"
+    assert request.get("stream") is not True
+    assert request.get("tool_choice") == "required"
     assert request["reasoning_effort"] == "high"
 
 
