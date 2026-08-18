@@ -42,6 +42,17 @@ UNREACHABLE_DB_URL = (
     "postgresql+asyncpg://seed_test:seed_test@seed-unreachable.invalid:1/seed_test"
 )
 
+#: AC4 安全语义弱标记：新初始数据必须承载显式安全/不可信上下文约束。
+#: 只做弱语义断言（稳定标记命中之一即可），不复制生产正文，不要求旧
+#: XML 输出协议；provider 侧安全边界仍由代码承担（单一职责）。
+SECURITY_MARKERS: tuple[str, ...] = (
+    "不可信",
+    "忽略",
+    "不得遵循",
+    "不要遵循",
+    "不得执行",
+)
+
 
 def _load_default_seed() -> dict[str, Any]:
     assert DEFAULT_SEED_FILE.is_file(), (
@@ -124,6 +135,24 @@ def test_chat_seed_keeps_role_style_text() -> None:
     joined = "\n".join(str(value) for value in chat.values())
     assert "小鞠" in joined or "知花" in joined, (
         "聊天 Prompt 初始数据必须保留角色正文（TSK-188 决策 27）"
+    )
+
+
+def test_chat_seed_keeps_security_constraints() -> None:
+    """AC4：初始数据保留明确的安全/不可信上下文约束。
+
+    弱语义断言：聊天 Prompt 初始值必须命中一组稳定安全标记之一（不可信
+    内容、忽略内嵌指令、不得遵循等）；不复制整段生产正文，也不要求旧
+    XML 输出协议。当前实现（无聊天 Prompt 初始数据）下本用例是
+    TSK-190 的可解释 RED。
+    """
+    raw = _load_default_seed()
+    chat = _require_chat_mapping(raw)
+
+    joined = "\n".join(str(value) for value in chat.values())
+    assert any(marker in joined for marker in SECURITY_MARKERS), (
+        "聊天 Prompt 初始数据必须包含明确的安全/不可信上下文约束"
+        f"（期望命中稳定标记之一: {', '.join(SECURITY_MARKERS)}）"
     )
 
 

@@ -22,9 +22,6 @@ from komari_bot.plugins.group_history_summary.prompt_schema import (
     GroupHistorySummaryPromptSchema,
 )
 from komari_bot.plugins.komari_chat.prompt_schema import (
-    DEFAULTS as KOMARI_CHAT_DEFAULTS,
-)
-from komari_bot.plugins.komari_chat.prompt_schema import (
     KomariChatPromptSchema,
 )
 from komari_bot.plugins.komari_memory.prompt_schema import (
@@ -34,15 +31,17 @@ from komari_bot.plugins.komari_memory.prompt_schema import (
     KomariMemorySummaryPromptSchema,
 )
 
+#: 每项 (resource_id, 表名, 模型, DEFAULTS)。komari_chat 的 DEFAULTS 随
+#: AC1 移除（Python 长文本默认正文不再提供聊天 Prompt），故为 None。
 RESOURCE_MODELS: tuple[
-    tuple[str, str, type[TypedConfigModel], dict[str, str]],
+    tuple[str, str, type[TypedConfigModel], dict[str, str] | None],
     ...,
 ] = (
     (
         "komari_chat",
         "komari_prompt_komari_chat",
         KomariChatPromptSchema,
-        KOMARI_CHAT_DEFAULTS,
+        None,
     ),
     (
         "komari_memory_summary",
@@ -103,9 +102,15 @@ def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
 
 
 def test_model_fields_match_runtime_defaults_exactly() -> None:
-    """模型正文字段与运行时 DEFAULTS 键一一对应，防止表结构与模板漂移。"""
+    """模型正文字段与运行时 DEFAULTS 键一一对应，防止表结构与模板漂移。
+
+    komari_chat 的 DEFAULTS 已随 AC1 移除（其字段集由 seed 契约测试与
+    Schema 责任解析验证）；memory/group 的 DEFAULTS 保留到 TSK-191。
+    """
     for _resource_id, _table_name, model_cls, defaults in RESOURCE_MODELS:
         public_fields = set(model_cls.model_fields) - INTERNAL_STORAGE_FIELDS
+        if defaults is None:
+            continue
         assert public_fields == set(defaults)
 
 
@@ -125,6 +130,23 @@ def test_storage_metadata_is_hidden_from_model_dump() -> None:
         dumped = model_cls().model_dump()
         assert INTERNAL_STORAGE_FIELDS.isdisjoint(dumped)
         assert "version" not in model_cls.model_fields
+
+
+def test_komari_chat_schema_no_longer_defines_python_defaults() -> None:
+    """AC1：聊天 Prompt 初始值不再由 Python 长文本默认字典 DEFAULTS 提供。
+
+    只要求 chat 资源先移除 DEFAULTS；memory/group 的 DEFAULTS 仍保留
+    （TSK-191 再统一移除 generic defaults 参数，本 ticket 不迫使
+    PromptTemplateLoader 全局 API 一次性破坏）。当前实现仍定义
+    DEFAULTS，因此本用例是 TSK-190 的可解释 RED。
+    """
+    import komari_bot.plugins.komari_chat.prompt_schema as chat_schema
+
+    assert "DEFAULTS" not in vars(chat_schema), (
+        "聊天 Prompt 不得继续定义/导出 DEFAULTS（Python 长文本默认正文移除）"
+    )
+    assert MEMORY_SUMMARY_DEFAULTS, "TSK-191 之前 memory DEFAULTS 仍应存在"
+    assert GROUP_HISTORY_DEFAULTS, "TSK-191 之前 group DEFAULTS 仍应存在"
 
 
 def test_prompt_model_keeps_strict_constructor_validation() -> None:

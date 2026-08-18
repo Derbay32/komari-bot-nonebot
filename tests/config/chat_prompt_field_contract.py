@@ -10,7 +10,7 @@
   实现决策 26 明确点名的字段名，按精确名称断言；
 - 其余职责（画像读取、联网搜索、网页抓取、委托图片理解、视觉描述）
   只按字段名关键词断言“存在独立行为字段”，不锁定完整命名；
-- seed 资产的聊天 Prompt 块定位约定：``_find_chat_prompt_mapping``
+- seed 资产的聊天 Prompt 块定位约定：``find_chat_prompt_mapping``
   查找包含 ``system_prompt`` 且不含 ``planning_system_prompt`` 的映射
   （后者是 group_history_summary 的判别键；komari_memory_summary 无
   ``system_prompt``），除此之外不锁定 YAML 布局。

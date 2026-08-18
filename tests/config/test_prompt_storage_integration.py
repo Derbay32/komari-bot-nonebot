@@ -22,7 +22,7 @@ from sqlalchemy import delete
 
 from komari_bot.config import prompt_storage as storage_module
 from komari_bot.config.prompt_storage import PromptStorage
-from komari_bot.plugins.komari_chat.prompt_schema import DEFAULTS
+from komari_bot.plugins.komari_chat.prompt_schema import KomariChatPromptSchema
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
 
@@ -82,7 +82,19 @@ async def _reset_table() -> None:
 
 
 def _prompt_data(**overrides: str) -> dict[str, str]:
-    return dict(DEFAULTS) | overrides
+    """聊天 Prompt 完整行值：由强类型 Schema 字段集生成，不依赖 DEFAULTS。
+
+    AC1 移除 Python 长文本默认字典后，本测试只关心存储 CAS 语义，字段值
+    使用测试自有字面量即可；字段集合仍与 Schema 保持一致。
+    """
+    fields = set(KomariChatPromptSchema.model_fields) - {
+        "id",
+        "revision",
+        "updated_at",
+    }
+    values = {name: f"测试填充 {name}" for name in sorted(fields)}
+    values.update(overrides)
+    return values
 
 
 @pytest.mark.skipif(

@@ -157,16 +157,26 @@ async def test_read_image_uses_db_snapshot_prompt_for_vision_description(
 
     通过公开 loader seam（chat prompt 模板 ``get_template``）注入替身值，
     捕获发送给 LLM 提供者的真实请求载荷，断言描述文本来自快照而非
-    Python 常量；不真正调用外部模型。当前实现仍使用模块常量，
-    因此本用例是 TSK-190 的可解释 RED。
+    Python 常量；不真正调用外部模型。当前实现仍使用模块常量且不经过
+    loader，因此本用例是 TSK-190 的可解释 RED。
     """
     from komari_bot.plugins.komari_chat.services import (
         prompt_template as chat_prompt_template,
+    )
+    from tests.config.chat_prompt_field_contract import (
+        chat_prompt_field_names,
+        resolve_behavior_field_names,
     )
 
     _patch_vision_dependencies(monkeypatch)
 
     captured: list[dict[str, Any]] = []
+
+    # 视觉描述字段名不在 ticket 中唯一指定：按职责从 Schema 解析，字段
+    # 缺失时在责任解析处清晰失败（当前 RED）；Schema 落地后再验证行为。
+    vision_description_field = resolve_behavior_field_names(
+        chat_prompt_field_names()
+    )["视觉描述"]
 
     class _CapturingProvider:
         async def generate_messages_completion(self, **kwargs: Any) -> Any:
@@ -179,10 +189,19 @@ async def test_read_image_uses_db_snapshot_prompt_for_vision_description(
             )
 
     async def fake_get_template() -> dict[str, str]:
-        return {"vision_description_prompt": "DB-SNAPSHOT-VISION-PROMPT"}
+        return {vision_description_field: "DB-SNAPSHOT-VISION-PROMPT"}
 
     monkeypatch.setattr(vision_service_module, "llm_provider", _CapturingProvider())
-    monkeypatch.setattr(chat_prompt_template, "get_template", fake_get_template)
+    # monkeypatch 源模块属性无法截获已 ``from ... import get_template`` 绑定
+    # 的本地符号；兼容两种正常实现：
+    # - vision_service 模块有本地 ``get_template``（导入绑定）→ patch 该绑定；
+    # - 否则走 ``chat_prompt_template.get_template`` 属性访问 → patch 源模块。
+    # 无论哪种，视觉服务都必须经由 chat Prompt 的公开 loader 契约取数，
+    # 不允许回退到 Python 常量。
+    if hasattr(vision_service_module, "get_template"):
+        monkeypatch.setattr(vision_service_module, "get_template", fake_get_template)
+    else:
+        monkeypatch.setattr(chat_prompt_template, "get_template", fake_get_template)
 
     result = await vision_service_module.read_images(
         ["data:image/png;base64,seed-fixture"],

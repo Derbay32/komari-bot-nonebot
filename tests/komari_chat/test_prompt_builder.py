@@ -565,18 +565,24 @@ def test_build_prompt_injects_fetch_tool_hint(monkeypatch: Any) -> None:
 async def _behavior_template() -> dict[str, str]:
     """TSK-190 新字段集的替身模板：DB 快照值用 ASCII 标记，便于断言来源。
 
-    ``output_instruction`` 仍带一个旧值哨兵：实现后 builder 不得再把它
-    注入消息（当前实现会注入，构成可解释 RED）。
+    除 TSK-188 决策 26 精确点名（``tool_call_instruction`` /
+    ``image_read_instruction``）外，行为字段名不硬编码：经
+    ``chat_prompt_field_names()`` + ``resolve_behavior_field_names()`` 从
+    Schema 按职责推导，marker 由字段名派生；Schema 行为字段缺失时在责任
+    解析处清晰失败（当前 RED）。``output_instruction`` 仍带一个旧值哨兵：
+    实现后 builder 不得再把它注入消息（当前实现会注入，构成可解释 RED）。
     """
+    from tests.config.chat_prompt_field_contract import (
+        chat_prompt_field_names,
+        resolve_behavior_field_names,
+    )
+
+    resolved = resolve_behavior_field_names(chat_prompt_field_names())
     return {
         "system_prompt": "SYS-ROLE",
         "tool_call_instruction": "TOOL-CALL-INSTR",
         "image_read_instruction": "IMAGE-READ-INSTR",
-        "delegated_vision_instruction": "DELEGATED-VISION-INSTR",
-        "vision_description_prompt": "VISION-DESC-PROMPT",
-        "profile_read_instruction": "PROFILE-READ-INSTR",
-        "search_web_instruction": "SEARCH-WEB-INSTR",
-        "fetch_page_instruction": "FETCH-PAGE-INSTR",
+        **{field: f"DB-{field.upper()}" for field in resolved.values()},
         "memory_ack": "MEM-ACK",
         "memory_ack_role": "assistant",
         "cot_prefix": "COT",
@@ -589,6 +595,11 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
     monkeypatch: Any,
 ) -> None:
     """AC5：builder 从模板快照注入各可调行为 Prompt，不再注入 output_instruction。"""
+    from tests.config.chat_prompt_field_contract import (
+        chat_prompt_field_names,
+        resolve_behavior_field_names,
+    )
+
     _patch_dependencies(monkeypatch)
     monkeypatch.setattr(prompt_builder_module, "get_template", _behavior_template)
 
@@ -611,15 +622,14 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
     )
 
     joined = "\n".join(str(message["content"]) for message in messages)
-    for marker in (
+    resolved = resolve_behavior_field_names(chat_prompt_field_names())
+    expected_markers = [
         "SYS-ROLE",
         "TOOL-CALL-INSTR",
         "IMAGE-READ-INSTR",
-        "DELEGATED-VISION-INSTR",
-        "PROFILE-READ-INSTR",
-        "SEARCH-WEB-INSTR",
-        "FETCH-PAGE-INSTR",
-    ):
+        *(f"DB-{field.upper()}" for field in resolved.values()),
+    ]
+    for marker in expected_markers:
         assert marker in joined, f"builder 未注入 DB 快照行为字段: {marker}"
     assert "OLD-OUTPUT-SENTINEL" not in joined, (
         "builder 不得再注入已删除的 output_instruction 内容"
@@ -630,6 +640,11 @@ def test_build_prompt_keeps_dynamic_image_index_ranges_code_generated(
     monkeypatch: Any,
 ) -> None:
     """AC5：图片索引范围等动态提示仍由代码生成，不进入 DB Prompt 字段。"""
+    from tests.config.chat_prompt_field_contract import (
+        chat_prompt_field_names,
+        resolve_behavior_field_names,
+    )
+
     _patch_dependencies(monkeypatch)
     monkeypatch.setattr(prompt_builder_module, "get_template", _behavior_template)
 
@@ -646,10 +661,15 @@ def test_build_prompt_keeps_dynamic_image_index_ranges_code_generated(
     )
 
     joined = "\n".join(str(message["content"]) for message in messages)
+    resolved = resolve_behavior_field_names(chat_prompt_field_names())
     # 替身模板中的 DB 值均为 ASCII 标记，不含“索引范围”/read_image 中文提示；
     # 因此出现该短语只能来自代码生成的动态索引逻辑。
     assert "索引范围" in joined, "动态图片索引提示必须由代码生成"
     assert "read_image" in joined
-    assert all(marker not in joined for marker in ("SEARCH-WEB-INSTR", "FETCH-PAGE-INSTR")), (
+    hidden_markers = (
+        f"DB-{resolved['联网搜索'].upper()}",
+        f"DB-{resolved['网页抓取'].upper()}",
+    )
+    assert all(marker not in joined for marker in hidden_markers), (
         "未启用搜索/抓取时不得注入对应 DB 行为字段"
     )
