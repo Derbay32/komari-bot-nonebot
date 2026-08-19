@@ -108,10 +108,10 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot \
 
 ## 聊天回复最终协议协调式破坏性升级（0012–0015，一次性）
 
-适用于从 0011 或更早版本升级到包含 0012–0015 的版本（TSK-188～194）。本升级把
-聊天回复的输出协议、回复 Agent 执行预算、工具调用约束模式与图片理解模式收敛为
-`komari_chat` 配置的唯一新契约：**不提供双读、双写、旧字段别名或运行时兼容回退**，
-升级后旧字段从 Schema、管理 API 与数据库中一并消失。
+适用于从 0011 或更早版本升级到包含 0012–0015 的版本。本升级把聊天回复的输出协议、
+回复 Agent 执行预算、工具调用约束模式与图片理解模式收敛为 `komari_chat` 配置的
+唯一新契约：**不提供双读、双写、旧字段别名或运行时兼容回退**，升级后旧字段从
+Schema、管理 API 与数据库中一并消失。
 
 ### 变更内容
 
@@ -138,24 +138,28 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot \
 
 ### 升级步骤（全新库与旧库通用）
 
-全新数据库与 0011 之前旧库的升级均从 0011 处继续：
+全新空库执行完整 `0001 → 0015` 版本链；已在 `0011` 或更早 revision 的旧库沿既有
+版本链顺序升级，不手工 stamp 到 `0011`，也不跳过中间迁移。
 
-1. 备份：`pg_dump` 全量备份数据库。备份是唯一保险，0012 起无完整降级路径。
-2. 升级到 head：
-   ```bash
-   poetry run python -m komari_bot.db.orm_bootstrap upgrade head
-   ```
-3. 播种初始数据（**升级后必须执行**；容器 prestart 已按
-   `upgrade head` → `seed_bootstrap` 顺序自动执行）：
-   ```bash
-   poetry run python -m komari_bot.db.seed_bootstrap
-   ```
-   播种只新建缺失场景与三个 Prompt 资源单行、只补齐空字段，绝不覆盖非空自定义值、
-   不删除管理员场景；旧 `output_instruction` 自定义内容不并入任何字段。
-4. 校验模型元数据零漂移：
-   ```bash
-   poetry run python -m komari_bot.db.orm_bootstrap check
-   ```
+1. 备份数据库：运行 `pg_dump` 全量导出。
+   检查：备份文件已生成、大小非零且可恢复读取（`pg_dump` 对应恢复工具能列出或读取
+   内容）。备份是唯一保险，`0012` 起无完整降级路径。
+2. 升级到 `head`：运行 `poetry run python -m komari_bot.db.orm_bootstrap upgrade head`。
+   检查：命令退出码为 `0`，且 `alembic_version` 为 `0015`。
+   回退：失败时该迁移事务已回滚、版本停留原样，修复后重跑本步骤。
+3. 播种初始数据：运行 `poetry run python -m komari_bot.db.seed_bootstrap`。
+   检查：命令退出码为 `0`，stdout 报告包含场景新增/总计与 Prompt 新建行/补齐字段
+   计数且无错误。播种只新建缺失场景与三个 Prompt 资源单行、只补齐空字段，绝不覆盖
+   非空自定义值、不删除管理员场景；旧 `output_instruction` 自定义内容不并入任何字段。
+   回退：失败时数据库未满足冷启动校验，恢复备份或修复后重跑本步骤。
+4. 校验模型元数据零漂移：运行 `poetry run python -m komari_bot.db.orm_bootstrap check`。
+   检查：命令退出码为 `0`，输出无 metadata diff（`No new upgrade operations
+   detected.`）。
+   回退：发现漂移时先按原版本升级流程修复，再重跑本步骤。
+
+**边界**：任一步失败都应停止启动新版应用，先恢复备份或修复后再重跑；容器 prestart
+已按 `upgrade head` → `seed_bootstrap` 顺序执行并以非零退出码中止（fail fast），
+手工升级时按上述检查逐项确认。
 
 ### 验收命令
 
