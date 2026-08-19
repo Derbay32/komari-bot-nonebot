@@ -71,6 +71,29 @@ class _FailureNotificationCooldown(Protocol):
     ) -> bool: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ImageFailureDiagnostic:
+    """图片理解失败的安全聚合摘要（TSK-196；白名单字段，无 URL/base64/正文）。
+
+    只包含模式、失败数量、去重排序后的失败阶段与归一化错误类型，供
+    SUPERUSER 诊断卡渲染；绝不携带图片 URL、base64、视觉描述或消息正文。
+    """
+
+    mode: str
+    failed_count: int
+    stages: tuple[str, ...]
+    error_types: tuple[str, ...]
+
+
+def image_failure_reason_code(diagnostic: ImageFailureDiagnostic) -> str:
+    """生成稳定、确定性的图片失败 reason_code（跨任务可去重）。
+
+    由模式与排序去重后的错误类型组成，与读取顺序无关；同一群+同一
+    reason_code 在不同任务间共享冷却去重。
+    """
+    return "_".join(("image", diagnostic.mode, *sorted(diagnostic.error_types)))
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GroupTaskFailureNotification:
     """调用方可提交的群任务失败通知窄契约。"""
@@ -84,6 +107,7 @@ class GroupTaskFailureNotification:
     notify_superusers: bool
     request_trace_id: str | None = None
     summary: str | None = None
+    image_diagnostic: ImageFailureDiagnostic | None = None
 
 
 class InMemoryFailureNotificationCooldown:
@@ -266,15 +290,30 @@ class GroupTaskFailureNotifier:
         lines = [
             f"任务: {notification.task_kind}",
             f"群: {notification.group_id}",
-            f"阶段: {notification.stage}",
-            f"原因: {notification.reason_code}",
         ]
-        if notification.request_trace_id:
-            lines.append(f"trace: {notification.request_trace_id}")
-        summary = _project_summary(notification.summary)
-        if summary:
-            lines.append(f"摘要: {summary}")
-        text = "\n".join(lines)
+        if notification.image_diagnostic is not None:
+            # TSK-196：图片失败汇总卡只渲染白名单字段；generic 阶段/原因/摘要
+            # 不进入该卡（避免与既有通用卡片格式混淆），且绝不出现 message_id。
+            diagnostic = notification.image_diagnostic
+            if notification.request_trace_id:
+                lines.append(f"trace: {notification.request_trace_id}")
+            lines.append(f"图片模式: {diagnostic.mode}")
+            lines.append(
+                f"失败阶段: {', '.join(sorted(set(diagnostic.stages)))}"
+            )
+            lines.append(f"失败数量: {diagnostic.failed_count}")
+            lines.append(
+                f"失败类型: {', '.join(sorted(set(diagnostic.error_types)))}"
+            )
+        else:
+            lines.append(f"阶段: {notification.stage}")
+            lines.append(f"原因: {notification.reason_code}")
+            if notification.request_trace_id:
+                lines.append(f"trace: {notification.request_trace_id}")
+            summary = _project_summary(notification.summary)
+            if summary:
+                lines.append(f"摘要: {summary}")
+        text = "\n".join(line for line in lines if line is not None)
         for user_id in _resolve_superuser_ids(self._superusers_provider):
             try:
                 await bot.send_private_msg(user_id=user_id, message=text)
