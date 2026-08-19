@@ -41,6 +41,22 @@ _BUSINESS_FIELD_PATTERN = re.compile(
     r"|消息正文\s*[:=：]",
     re.IGNORECASE,
 )
+#: 图片卡 trace 行的安全标识字符白名单（ASCII 字母数字 + ``._:-``，1..128）。
+_TRACE_SAFE_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
+
+
+def _project_safe_trace(trace: str | None) -> str | None:
+    """把请求 trace 投影为图片卡的窄安全值；非法/空值直接省略。
+
+    TSK-196 复审：图片失败汇总卡的 trace 行只允许项目 trace 的安全标识字符
+    （ASCII 字母数字与 ``._:-``，长度 1..128）；URL/base64/CQ/换行等恶意或
+    非法值直接省略，绝不把原值或替换值写卡。generic 卡保持现有格式。
+    """
+    if not trace:
+        return None
+    if _TRACE_SAFE_PATTERN.fullmatch(trace):
+        return trace
+    return None
 
 
 class _FailureNotificationBot(Protocol):
@@ -336,11 +352,12 @@ class GroupTaskFailureNotifier:
             # TSK-196 复审：图片失败汇总卡只渲染严格白名单字段——群/trace/
             # 图片模式/失败阶段/失败数量/失败类型；不含任务、generic 阶段/
             # 原因/摘要与 message_id。diagnostic 构造时已确定性去重排序，
-            # renderer 只消费已验证对象。
+            # renderer 只消费已验证对象；trace 经窄安全投影，非法/空值省略。
             diagnostic = notification.image_diagnostic
             lines = [f"群: {notification.group_id}"]
-            if notification.request_trace_id:
-                lines.append(f"trace: {notification.request_trace_id}")
+            safe_trace = _project_safe_trace(notification.request_trace_id)
+            if safe_trace:
+                lines.append(f"trace: {safe_trace}")
             lines.append(f"图片模式: {diagnostic.mode}")
             lines.append(f"失败阶段: {', '.join(diagnostic.stages)}")
             lines.append(f"失败数量: {diagnostic.failed_count}")
