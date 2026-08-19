@@ -339,6 +339,88 @@ async def test_image_diagnostic_card_without_trace_omits_trace_line() -> None:
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malicious_trace",
+    [
+        "https://evil.example/secret/path?token=abc123",
+        "data:image/png;base64,SUMSECRETUX==",
+        "[CQ:image,file=evil.png]",
+        "trace-abc\nevil_line",
+        "trace  with spaces",
+        "trace;DROP TABLE users;--",
+        "空trace",
+        "",
+        "a" * 129,
+    ],
+)
+async def test_image_diagnostic_card_omits_malicious_trace(
+    malicious_trace: str,
+) -> None:
+    """TSK-196 复审：图片卡的 trace 行只允许安全标识字符（ASCII 字母数字
+    ``._:-``，1..128）；URL/data URI/CQ/换行/空白/超长等恶意或非法值直接省略，
+    绝不把原值或替换值写卡，卡仍只含其余允许行。generic 卡保持现有格式。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            request_trace_id=malicious_trace,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    assert bot.group_calls == []
+    assert len(bot.private_calls) == 1
+    text = str(bot.private_calls[0]["message"])
+    # 恶意 trace 被省略：卡只含其余允许行，且 trace 原值/替换值绝不出现
+    assert text.splitlines() == [
+        "群: 12345",
+        "图片模式: delegated",
+        "失败阶段: vision",
+        "失败数量: 1",
+        "失败类型: vision_failed",
+    ]
+    assert "trace:" not in text
+    assert "evil.example" not in text
+    assert "SUMSECRETUX" not in text
+    assert "CQ:image" not in text
+    assert "DROP TABLE" not in text
+    assert "  with spaces" not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_card_allows_safe_trace_chars() -> None:
+    """TSK-196 复审：合法 trace（ASCII 字母数字 + ``._:-``）仍正常渲染。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            request_trace_id="chat-1234567890.abc:def-ghi",
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+    text = str(bot.private_calls[0]["message"])
+    assert "trace: chat-1234567890.abc:def-ghi" in text
+
+
 def test_image_diagnostic_rejects_invalid_and_malicious_values() -> None:
     """公开 dataclass 纵深防御：非法模式/阶段/错误类型、非正整数失败数、
     空集合以及恶意 URL/base64/CQ/换行值都必须 ValueError。"""

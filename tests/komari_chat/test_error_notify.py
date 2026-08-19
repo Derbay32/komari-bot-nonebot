@@ -443,6 +443,75 @@ async def test_image_failure_with_reaction_sends_group_apology_and_one_card(
 
 
 @pytest.mark.asyncio
+async def test_invalid_image_summary_mapping_failure_keeps_group_apology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-196 复审：图片 summary→diagnostic 映射意外失败时，不吞掉
+    reaction_sent=true 的群内固定道歉；fail-closed 静默 SU 图片卡，绝不把不合法
+    summary 降级为可能泄漏的 generic 私聊摘要。"""
+    _configure_runtime(monkeypatch)
+    bot = _FakeBot()
+    invalid_summary = ImageFailureSummary(
+        mode="delegated",
+        all_images_unavailable=True,
+        total_images=1,
+        attempted_images=1,
+        failed_images=1,
+        error_types=("vision_failed", "https://evil.example/path"),
+        stages=("vision",),
+    )
+
+    await _build_handler().report_reply_failure(
+        bot=bot,
+        event=_FakeEvent(),
+        failure=_failure(
+            reaction_sent=True,
+            reason_code="ImageUnderstandingFailureError",
+            summary="图片理解失败（mode=delegated）",
+            image_failure_summary=invalid_summary,
+        ),
+        reason="at",
+    )
+
+    # 群道歉恰一次，SU 私聊 0，不抛
+    _assert_group_reply(bot)
+    assert bot.send_private_msg_calls == []
+    # 不合法摘要绝不降级为 generic 私聊摘要（fail-closed）
+    assert all("图片理解失败" not in str(call["message"]) for call in bot.send_private_msg_calls)
+
+
+@pytest.mark.asyncio
+async def test_invalid_image_summary_mapping_failure_without_reaction_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-196 复审：reaction_sent=false 时映射失败群/私聊均 0，不抛。"""
+    _configure_runtime(monkeypatch)
+    bot = _FakeBot()
+    invalid_summary = ImageFailureSummary(
+        mode="delegated",
+        all_images_unavailable=True,
+        total_images=1,
+        attempted_images=1,
+        failed_images=1,
+        error_types=("vision_failed", "https://evil.example/path"),
+        stages=("vision",),
+    )
+
+    await _build_handler().report_reply_failure(
+        bot=bot,
+        event=_FakeEvent(),
+        failure=_failure(
+            reaction_sent=False,
+            image_failure_summary=invalid_summary,
+        ),
+        reason="at",
+    )
+
+    assert bot.call_api_calls == []
+    assert bot.send_private_msg_calls == []
+
+
+@pytest.mark.asyncio
 async def test_image_failure_switch_off_mutes_private_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
