@@ -11,8 +11,10 @@ import pytest
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     GroupTaskFailureNotifier,
+    ImageFailureDiagnostic,
     InMemoryFailureNotificationCooldown,
     RedisFailureNotificationCooldown,
+    image_failure_reason_code,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +59,7 @@ def _notification(
     group_text: str | None = "固定群内失败提示",
     notify_superusers: bool = True,
     summary: str | None = "上游返回空回复",
+    image_diagnostic: ImageFailureDiagnostic | None = None,
 ) -> GroupTaskFailureNotification:
     return GroupTaskFailureNotification(
         group_id=12345,
@@ -68,6 +71,7 @@ def _notification(
         notify_superusers=notify_superusers,
         request_trace_id="trace-abc",
         summary=summary,
+        image_diagnostic=image_diagnostic,
     )
 
 
@@ -253,6 +257,112 @@ async def test_summary_projection_removes_secrets_urls_and_extra_lines() -> None
     assert "绝密推理" not in text
     assert "tool_arguments" not in text
     assert "超" * 121 not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_card_renders_strict_whitelist_fields() -> None:
+    """图片失败汇总卡只渲染白名单字段，不出现 message_id/URL/base64/正文。
+
+    该卡替代“摘要卡 + 失败卡”的两张卡合并体：调用方显式传
+    ``image_diagnostic`` 时只渲染任务/群/trace/图片模式/失败阶段/失败数量/
+    失败类型，generic 卡片格式（任务/群/阶段/原因/trace/摘要）保持不变。
+    """
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    assert bot.group_calls == []
+    assert len(bot.private_calls) == 1
+    text = str(bot.private_calls[0]["message"])
+    assert "任务: chat_reply" in text
+    assert "群: 12345" in text
+    assert "trace: trace-abc" in text
+    assert "图片模式: delegated" in text
+    assert "失败阶段: vision" in text
+    assert "失败数量: 1" in text
+    assert "失败类型: vision_failed" in text
+    # 白名单：不渲染 generic 阶段/原因/摘要字段与 message_id
+    assert "99999" not in text
+    assert "阶段: generate" not in text
+    assert "原因: empty_reply" not in text
+    assert "摘要:" not in text
+    # 绝不出现可能泄漏的 URL/base64/正文/视觉描述
+    assert "https://" not in text
+    assert "base64" not in text
+    assert "data:image" not in text
+    assert "一只猫" not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_sorts_stages_and_error_types() -> None:
+    """图片卡按字典序渲染去重后的失败阶段与错误类型。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="native",
+        failed_count=3,
+        stages=("vision", "download", "download"),
+        error_types=("image_unavailable", "vision_failed", "image_unavailable"),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    text = str(bot.private_calls[0]["message"])
+    assert "图片模式: native" in text
+    assert "失败阶段: download, vision" in text
+    assert "失败数量: 3" in text
+    assert "失败类型: image_unavailable, vision_failed" in text
+
+
+def test_image_failure_reason_code_is_stable_and_deterministic() -> None:
+    """图片 reason_code 由模式与排序后的错误类型组成，跨任务稳定。"""
+    assert (
+        image_failure_reason_code(
+            ImageFailureDiagnostic(
+                mode="delegated",
+                failed_count=2,
+                stages=("vision", "download"),
+                error_types=("vision_failed", "image_unavailable"),
+            )
+        )
+        == "image_delegated_image_unavailable_vision_failed"
+    )
+    assert image_failure_reason_code(
+        ImageFailureDiagnostic(
+            mode="native",
+            failed_count=1,
+            stages=("download",),
+            error_types=("image_unavailable",),
+        )
+    ) == "image_native_image_unavailable"
+    # 错误类型顺序无关，结果确定性相同
+    assert image_failure_reason_code(
+        ImageFailureDiagnostic(
+            mode="delegated",
+            failed_count=1,
+            stages=("vision",),
+            error_types=("vision_failed",),
+        )
+    ) == "image_delegated_vision_failed"
 
 
 def test_notification_contract_rejects_business_payload_fields() -> None:
