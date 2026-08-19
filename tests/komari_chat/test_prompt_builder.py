@@ -770,7 +770,7 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
                 "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
             },
             image_urls=["data:image/png;base64,1"],
-            vision_tool_mode=True,
+            delegated_image_mode=True,
             search_tool_mode=True,
             fetch_tool_mode=True,
         )
@@ -820,7 +820,7 @@ def test_build_prompt_keeps_dynamic_image_index_ranges_code_generated(
             current_user_id="user-1",
             current_user_nickname="阿虚",
             image_urls=["data:image/png;base64,1", "data:image/png;base64,2"],
-            vision_tool_mode=True,
+            delegated_image_mode=True,
         )
     )
 

@@ -125,16 +125,18 @@ def test_tool_loop_passes_chat_slot_request_mode(monkeypatch: Any) -> None:
     assert call["stream_enabled"] is True
 
 
-def test_tool_loop_uses_vision_slot_request_mode(monkeypatch: Any) -> None:
-    """启用 read_image 工具时改用 vision 槽位参数。"""
+def test_tool_loop_keeps_chat_slot_with_read_image_tool(monkeypatch: Any) -> None:
+    """TSK-194：存在 read_image 工具时主循环仍使用聊天模型与 chat 槽位。
+
+    旧行为：只要启用了 read_image，整个工具循环就切到视觉模型与 vision 槽
+    位；新契约：主循环恒使用聊天模型 + chat request_api/stream 槽位，只有
+    read_image 视觉子调用才使用 vision 槽位参数。
+    """
     provider = _RecordingProvider()
     provider.completions = [_final_response_completion()]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    read_images_calls: list[dict[str, Any]] = []
-
-    async def _fake_read_images(*_args: Any, **kwargs: Any) -> list[str]:
-        read_images_calls.append(kwargs)
+    async def _fake_read_images(*_args: Any, **_kwargs: Any) -> list[str]:
         return ["描述"]
 
     monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
@@ -142,8 +144,8 @@ def test_tool_loop_uses_vision_slot_request_mode(monkeypatch: Any) -> None:
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(
-                llm_request_api_chat="chat_completions",
-                llm_stream_enabled_chat=False,
+                llm_request_api_chat="responses",
+                llm_stream_enabled_chat=True,
             ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
@@ -155,13 +157,19 @@ def test_tool_loop_uses_vision_slot_request_mode(monkeypatch: Any) -> None:
     )
 
     call = provider.completion_calls[0]
-    assert call["model"] == "vision-model"
+    assert call["model"] == "chat-model"
+    assert call["temperature"] == 0.7
+    assert call["max_tokens"] == 1024
     assert call["request_api"] == "responses"
     assert call["stream_enabled"] is True
 
 
 def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> None:
-    """read_image 业务工具把 vision 槽位模式传给视觉服务。"""
+    """TSK-194：read_image 业务工具把 vision 槽位模式传给视觉服务。
+
+    主循环保持在 chat 槽位（model=chat-model、chat request_api/stream），
+    而 read_image 视觉子调用携带 vision 模型与 vision 槽位模式。
+    """
     provider = _RecordingProvider()
     provider.completions = [
         base_client_module.LLMCompletionResultSchema(
@@ -183,7 +191,10 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
-            config=_build_config(),
+            config=_build_config(
+                llm_request_api_chat="chat_completions",
+                llm_stream_enabled_chat=False,
+            ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
             base64_images=["data:image/png;base64,AAAA"],
@@ -193,6 +204,12 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
         )
     )
 
+    assert len(provider.completion_calls) == 2
+    # 主循环两轮都使用聊天模型 + chat 槽位（含带 read_image 工具的一轮）
+    for call in provider.completion_calls:
+        assert call["model"] == "chat-model"
+        assert call["request_api"] == "chat_completions"
+        assert call["stream_enabled"] is False
     assert len(read_images_calls) == 1
     assert read_images_calls[0]["request_api"] == "responses"
     assert read_images_calls[0]["stream_enabled"] is True

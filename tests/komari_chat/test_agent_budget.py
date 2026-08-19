@@ -274,7 +274,8 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
         "global_interaction_trigger_size": 20,
         "face_reaction_enabled": False,
         "face_reaction_id": "76",
-        "vision_tool_enabled": False,
+        # TSK-194：图片理解模式（合并替身承载 get_config/get_memory_config）
+        "image_understanding_mode": "delegated",
         "error_notify_enabled": False,
         "knowledge_enabled": False,
     }

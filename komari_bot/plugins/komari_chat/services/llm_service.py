@@ -1157,14 +1157,18 @@ async def _execute_tool_loop(
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
-    vision_thinking_mode: bool = False,
-    vision_reasoning_effort: str = "",
     vision_request_api: str = "chat_completions",
     vision_stream_enabled: bool = False,
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
 ) -> ReplyResult:
-    """执行多轮工具调用循环，直到模型调用 final_response。"""
+    """执行多轮工具调用循环，直到模型调用 final_response。
+
+    TSK-194 / ADR-0010：主循环恒使用聊天模型与 chat 槽位（含原生模式
+    直接嵌入多模态图片）；vision_* 参数只供 read_image 视觉子调用消费
+    （``vision_model`` / ``vision_temperature`` / ``vision_max_tokens`` /
+    ``vision_request_api`` / ``vision_stream_enabled``）。
+    """
     current_messages = list(messages)
     tool_definitions = _validate_tool_definitions(tools)
     ledger = AgentBudgetLedger(budget)
@@ -1173,10 +1177,6 @@ async def _execute_tool_loop(
     # 任务内冻结：整个工具循环使用任务开始时的协议/流式配置
     chat_request_api = getattr(config, "llm_request_api_chat", "chat_completions")
     chat_stream_enabled = getattr(config, "llm_stream_enabled_chat", False)
-    has_vision_tool = any(
-        tool.get("function", {}).get("name") == READ_IMAGE_TOOL_NAME
-        for tool in tool_definitions
-    )
     requires_favorability_delta = any(
         tool.get("function", {}).get("name") == RECORD_FAVORABILITY_DELTA_TOOL_NAME
         for tool in tool_definitions
@@ -1206,22 +1206,18 @@ async def _execute_tool_loop(
     try:
         for round_num in range(1, round_limit + 1):
             ledger.consume_round()
-            if has_vision_tool:
-                model = vision_model
-                temperature = vision_temperature
-                max_tokens = vision_max_tokens
-                thinking_mode = vision_thinking_mode
-                reasoning_effort = vision_reasoning_effort
-                request_api = vision_request_api
-                stream_enabled = vision_stream_enabled
-            else:
-                model = config.llm_model_chat
-                temperature = config.llm_temperature_chat
-                max_tokens = config.llm_max_tokens_chat
-                thinking_mode = config.llm_thinking_mode_chat
-                reasoning_effort = config.llm_reasoning_effort_chat
-                request_api = chat_request_api
-                stream_enabled = chat_stream_enabled
+            # TSK-194 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
+            # read_image 工具的视觉子调用（vision_service）才使用 vision
+            # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
+            # 原生模式（native）图片作为多模态输入直接进入 (user) 消息，
+            # 仍走同一聊天槽位；模型拒图即任务失败，不自动降级。
+            model = config.llm_model_chat
+            temperature = config.llm_temperature_chat
+            max_tokens = config.llm_max_tokens_chat
+            thinking_mode = config.llm_thinking_mode_chat
+            reasoning_effort = config.llm_reasoning_effort_chat
+            request_api = chat_request_api
+            stream_enabled = chat_stream_enabled
 
             phase = f"{request_phase_prefix}_round_{round_num}"
             request_data = {
@@ -1647,8 +1643,6 @@ async def generate_reply_with_tools(
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
-    vision_thinking_mode: bool = False,
-    vision_reasoning_effort: str = "",
     vision_request_api: str = "chat_completions",
     vision_stream_enabled: bool = False,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -1666,7 +1660,8 @@ async def generate_reply_with_tools(
 
         任务执行预算（轮次/单轮/总量）与工具调用约束模式在任务起点从
         ``config`` 读取一次并冻结；任务进行中配置变更不影响当前任务
-        （TSK-192/TSK-193）。
+        （TSK-192/TSK-193）。TSK-194 起主循环恒使用聊天模型与 chat 槽位，
+        vision_* 参数只供 read_image 视觉子调用消费。
     """
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
@@ -1716,8 +1711,6 @@ async def generate_reply_with_tools(
         caller_group_id=caller_group_id,
         caller_is_superuser=caller_is_superuser,
         max_favorability_delta=max_favorability_delta,
-        vision_thinking_mode=vision_thinking_mode,
-        vision_reasoning_effort=vision_reasoning_effort,
         vision_request_api=vision_request_api,
         vision_stream_enabled=vision_stream_enabled,
         collector=collector,

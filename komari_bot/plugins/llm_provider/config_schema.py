@@ -133,7 +133,9 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
     vision_thinking_mode: bool = Field(
         default=False,
-        description="视觉模型是否处于思考模式（仅在聊天循环 has_vision_tool=True 切到 vision_model 时生效）。",
+        description="视觉模型是否处于思考模式。TSK-194 后主回复 Agent 恒使用"
+        " 聊天模型与 chat 槽位，不再存在 has_vision_tool 主循环切换；该字段"
+        " 仅保留为视觉槽位规格，供 read_image 视觉子调用后续使用。",
     )
     vision_reasoning_effort: str = Field(
         default="",
