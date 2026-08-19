@@ -1040,6 +1040,11 @@ class MessageHandler:
         # 覆盖未进入分支的场景）。
         native_download_failures = 0
         effective_total = 0
+        # TSK-196 复审：所有预期图片失败（native 全下载失败 / native provider
+        # 失败 / delegated 全部不可用）统一汇聚到本函数末尾的单点安全抛出点；
+        # 状态与成功结果提前初始化，覆盖未进入分支/异常提前退出场景。
+        _image_failure_summary: ImageFailureSummary | None = None
+        reply_result: ReplyResult | None = None
         if image_policy.is_delegated:
             # TSK-195 / ADR-0010：delegated 任务起点零预下载；引用消息图片
             # 在前、当前消息图片在后，索引在会话内稳定固定；只有首次
@@ -1103,189 +1108,219 @@ class MessageHandler:
                 if image is not None
             ] or None
             if effective_total > 0 and not reply_image_urls and not base64_image_urls:
-                # TSK-196：native 全部图片下载失败 → 主 LLM 之前终止，不切
-                # delegated、不触达视觉服务；异常只携带安全摘要。
-                raise ImageUnderstandingFailureError(
-                    _native_failure_summary(
-                        total_images=effective_total,
-                        download_failures=native_download_failures,
-                        provider_failed=False,
-                        all_unavailable=True,
-                    )
+                # TSK-196 复审：不在此直接 raise（该 frame 仍持有 raw locals）；
+                # 置位后跳过主 LLM，经末尾单点安全抛出点清空敏感 locals 再抛。
+                _image_failure_summary = _native_failure_summary(
+                    total_images=effective_total,
+                    download_failures=native_download_failures,
+                    provider_failed=False,
+                    all_unavailable=True,
                 )
-        use_search_tool = bool(
-            komari_search_plugin.is_search_available(
-                caller_user_id=message.user_id,
-                caller_group_id=message.group_id,
-                caller_is_superuser=caller_is_superuser,
-            )
-        )
-        use_fetch_tool = bool(
-            komari_search_plugin.is_fetch_available(
-                caller_user_id=message.user_id,
-                caller_group_id=message.group_id,
-                caller_is_superuser=caller_is_superuser,
-            )
-        )
-        allowed_profile_user_ids = {message.user_id}
-        allowed_profile_user_ids.update(
-            item.user_id
-            for item in recent_messages
-            if not item.is_bot and item.group_id == message.group_id and item.user_id
-        )
-        if (
-            reply_context is not None
-            and reply_context.source_side == "user"
-            and reply_context.user_id
-        ):
-            allowed_profile_user_ids.add(reply_context.user_id)
 
-        if reply_context_requested:
-            logger.info(
-                "[KomariMemory] 引用上下文追踪: group={} message={} enabled={} side={} text_chars={} image_count={} visible_sources={} refetched={} downloaded_images={}",
-                message.group_id,
-                message.message_id,
-                reply_context is not None,
-                reply_context.source_side if reply_context else "-",
-                len(reply_context.text) if reply_context else 0,
-                reply_context.image_count if reply_context else 0,
-                len(reply_context.image_sources) if reply_context else 0,
-                reply_context_refetched,
-                len(reply_image_urls or []),
-            )
-
-        if image_urls or reply_image_urls or image_session is not None:
-            quoted_viewable = (
-                image_session.quoted_count
-                if image_session is not None
-                else len(reply_image_urls or [])
-            )
-            current_viewable = (
-                image_session.current_count
-                if image_session is not None
-                else len(base64_image_urls or [])
-            )
-            base64_chars = (
-                0
-                if image_session is not None
-                else sum(len(url) for url in (reply_image_urls or []))
-                + sum(len(url) for url in (base64_image_urls or []))
-            )
-            logger.info(
-                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} image_mode={} delegated_tool={}",
-                request_trace_id,
-                message.group_id,
-                message.message_id,
-                reply_context.image_count if reply_context else 0,
-                quoted_viewable,
-                len(image_urls or []),
-                current_viewable,
-                len(message.content),
-                base64_chars,
-                len(memories),
-                image_policy.mode,
-                use_vision_tool,
-            )
-
-        try:
-            favorability = await user_data_plugin.get_user_favorability(message.user_id)
-        except Exception as exc:
-            logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
-            raise _FavorabilityReadError(str(exc)) from exc
-
-        prompt_messages = await build_prompt(
-            user_message=message.content,
-            search_query=rewritten_query,
-            memories=memories,
-            config=config,
-            recent_messages=recent_messages,
-            current_user_id=message.user_id,
-            current_user_nickname=message.user_nickname,
-            memory_service=self.memory,
-            group_id=message.group_id,
-            image_urls=base64_image_urls if image_session is None else None,
-            reply_context=reply_context,
-            reply_image_urls=reply_image_urls if image_session is None else None,
-            query_embedding=query_embedding,
-            favorability=favorability,
-            current_user_profile=current_user_profile,
-            interaction_records=interaction_records,
-            interaction_memories=interaction_memories,
-            delegated_image_mode=use_vision_tool,
-            delegated_quoted_image_count=(
-                image_session.quoted_count if image_session is not None else None
-            ),
-            delegated_current_image_count=(
-                image_session.current_count if image_session is not None else None
-            ),
-            search_tool_mode=use_search_tool,
-            fetch_tool_mode=use_fetch_tool,
-        )
-
-        tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
-        if use_vision_tool:
-            tools.append(READ_IMAGE_TOOL)
-        if use_search_tool:
-            tools.append(SEARCH_WEB_TOOL)
-        if use_fetch_tool:
-            tools.append(FETCH_PAGE_TOOL)
-
-        native_failure_pending = False
-        reply_result: ReplyResult | None = None
-        try:
-            if tools:
-                # TSK-195：委托模式的主循环只经 image_session 触达图片；
-                # 会话在任务起点构建（零预下载）并在任务结束后关闭。
-                reply_result = await generate_reply_with_tools(
-                    config=config,
-                    messages=prompt_messages,
-                    tools=tools,
-                    request_trace_id=request_trace_id,
-                    image_session=image_session if use_vision_tool else None,
-                    memory_service=self.memory,
-                    group_id=message.group_id,
-                    allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
+        if _image_failure_summary is None:
+            use_search_tool = bool(
+                komari_search_plugin.is_search_available(
                     caller_user_id=message.user_id,
                     caller_group_id=message.group_id,
                     caller_is_superuser=caller_is_superuser,
-                    max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
-                    collector=collector,
-                    parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
-                    agent_budget=agent_budget,
                 )
-            else:
-                reply_result = await generate_reply(
-                    config=config,
-                    messages=prompt_messages,
-                    request_trace_id=request_trace_id,
-                    collector=collector,
-                    parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
-                    agent_budget=agent_budget,
+            )
+            use_fetch_tool = bool(
+                komari_search_plugin.is_fetch_available(
+                    caller_user_id=message.user_id,
+                    caller_group_id=message.group_id,
+                    caller_is_superuser=caller_is_superuser,
                 )
-        except NativeMultimodalRequestError:
-            # TSK-196 复审：只在 except 内保存“应抛图片失败”标志（不 raise，
-            # 避免经 __context__ 保留 marker → 原 provider 异常对象链）；离开
-            # except/finally 后再抛 ImageUnderstandingFailureError，最终异常的
-            # cause/context 都为 None。只包装“主 provider 多模态调用失败”的
-            # 窄 marker，绝不切 delegated；其他异常（MaxRounds/工具预算/协议
-            # 校验/内部错误）即便 native 有图也原样传播，不误报为图片失败。
-            # delegated 的主循环已自行以 ImageUnderstandingFailureError 终止。
-            native_failure_pending = True
-        finally:
-            # TSK-195：delegated 会话持有的下载连接随任务结束释放（幂等，
-            # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
-            if image_session is not None:
-                await image_session.close()
+            )
+            allowed_profile_user_ids = {message.user_id}
+            allowed_profile_user_ids.update(
+                item.user_id
+                for item in recent_messages
+                if not item.is_bot and item.group_id == message.group_id and item.user_id
+            )
+            if (
+                reply_context is not None
+                and reply_context.source_side == "user"
+                and reply_context.user_id
+            ):
+                allowed_profile_user_ids.add(reply_context.user_id)
 
-        if native_failure_pending:
-            raise ImageUnderstandingFailureError(
-                _native_failure_summary(
+            if reply_context_requested:
+                logger.info(
+                    "[KomariMemory] 引用上下文追踪: group={} message={} enabled={} side={} text_chars={} image_count={} visible_sources={} refetched={} downloaded_images={}",
+                    message.group_id,
+                    message.message_id,
+                    reply_context is not None,
+                    reply_context.source_side if reply_context else "-",
+                    len(reply_context.text) if reply_context else 0,
+                    reply_context.image_count if reply_context else 0,
+                    len(reply_context.image_sources) if reply_context else 0,
+                    reply_context_refetched,
+                    len(reply_image_urls or []),
+                )
+
+            if image_urls or reply_image_urls or image_session is not None:
+                quoted_viewable = (
+                    image_session.quoted_count
+                    if image_session is not None
+                    else len(reply_image_urls or [])
+                )
+                current_viewable = (
+                    image_session.current_count
+                    if image_session is not None
+                    else len(base64_image_urls or [])
+                )
+                base64_chars = (
+                    0
+                    if image_session is not None
+                    else sum(len(url) for url in (reply_image_urls or []))
+                    + sum(len(url) for url in (base64_image_urls or []))
+                )
+                logger.info(
+                    "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} image_mode={} delegated_tool={}",
+                    request_trace_id,
+                    message.group_id,
+                    message.message_id,
+                    reply_context.image_count if reply_context else 0,
+                    quoted_viewable,
+                    len(image_urls or []),
+                    current_viewable,
+                    len(message.content),
+                    base64_chars,
+                    len(memories),
+                    image_policy.mode,
+                    use_vision_tool,
+                )
+
+            try:
+                favorability = await user_data_plugin.get_user_favorability(message.user_id)
+            except Exception as exc:
+                logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
+                raise _FavorabilityReadError(str(exc)) from exc
+
+            prompt_messages = await build_prompt(
+                user_message=message.content,
+                search_query=rewritten_query,
+                memories=memories,
+                config=config,
+                recent_messages=recent_messages,
+                current_user_id=message.user_id,
+                current_user_nickname=message.user_nickname,
+                memory_service=self.memory,
+                group_id=message.group_id,
+                image_urls=base64_image_urls if image_session is None else None,
+                reply_context=reply_context,
+                reply_image_urls=reply_image_urls if image_session is None else None,
+                query_embedding=query_embedding,
+                favorability=favorability,
+                current_user_profile=current_user_profile,
+                interaction_records=interaction_records,
+                interaction_memories=interaction_memories,
+                delegated_image_mode=use_vision_tool,
+                delegated_quoted_image_count=(
+                    image_session.quoted_count if image_session is not None else None
+                ),
+                delegated_current_image_count=(
+                    image_session.current_count if image_session is not None else None
+                ),
+                search_tool_mode=use_search_tool,
+                fetch_tool_mode=use_fetch_tool,
+            )
+
+            tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
+            if use_vision_tool:
+                tools.append(READ_IMAGE_TOOL)
+            if use_search_tool:
+                tools.append(SEARCH_WEB_TOOL)
+            if use_fetch_tool:
+                tools.append(FETCH_PAGE_TOOL)
+
+            native_failure_pending = False
+            try:
+                if tools:
+                    # TSK-195：委托模式的主循环只经 image_session 触达图片；
+                    # 会话在任务起点构建（零预下载）并在任务结束后关闭。
+                    reply_result = await generate_reply_with_tools(
+                        config=config,
+                        messages=prompt_messages,
+                        tools=tools,
+                        request_trace_id=request_trace_id,
+                        image_session=image_session if use_vision_tool else None,
+                        memory_service=self.memory,
+                        group_id=message.group_id,
+                        allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
+                        caller_user_id=message.user_id,
+                        caller_group_id=message.group_id,
+                        caller_is_superuser=caller_is_superuser,
+                        max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
+                        collector=collector,
+                        parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
+                        agent_budget=agent_budget,
+                    )
+                else:
+                    reply_result = await generate_reply(
+                        config=config,
+                        messages=prompt_messages,
+                        request_trace_id=request_trace_id,
+                        collector=collector,
+                        parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
+                        agent_budget=agent_budget,
+                    )
+            except NativeMultimodalRequestError:
+                # TSK-196 复审：只在 except 内保存“应抛图片失败”标志（不 raise，
+                # 避免经 __context__ 保留 marker → 原 provider 异常对象链）；离开
+                # except/finally 后再抛 ImageUnderstandingFailureError，最终异常的
+                # cause/context 都为 None。只包装“主 provider 多模态调用失败”的
+                # 窄 marker，绝不切 delegated；其他异常（MaxRounds/工具预算/协议
+                # 校验/内部错误）即便 native 有图也原样传播，不误报为图片失败。
+                # delegated 的主循环已自行以 ImageUnderstandingFailureError 终止。
+                native_failure_pending = True
+            except ImageUnderstandingFailureError as exc:
+                # TSK-196 复审：delegated 全部可用索引均已尝试且失败——工具循环
+                # 已以专用安全异常终止；只在 except 内保存其安全摘要（不 raise，
+                # 避免经 __context__ 保留原异常对象链），离开 except/finally 后
+                # 经末尾单点安全抛出点抛新异常（cause/context 都为 None）。其他
+                # 异常（MaxRounds/工具预算/协议/内部）即便 delegated 有图也原样
+                # 传播，不误报为图片失败。
+                _image_failure_summary = exc.summary
+            finally:
+                # TSK-195：delegated 会话持有的下载连接随任务结束释放（幂等，
+                # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
+                if image_session is not None:
+                    await image_session.close()
+
+            if native_failure_pending:
+                _image_failure_summary = _native_failure_summary(
                     total_images=effective_total,
                     download_failures=native_download_failures,
                     provider_failed=True,
                     all_unavailable=False,
                 )
-            )
+
+        # 单点安全抛出：所有预期图片失败（native 全下载失败 / native provider
+        # 失败 / delegated 全部不可用）统一在此清空本帧图片敏感 locals 后抛新
+        # 异常。抛前显式重绑函数参数 ``image_urls``/``reply_context``、来源与
+        # base64 列表、含 image_url 部件的 ``prompt_messages``、已 close 的
+        # ``image_session`` 与可能持 raw input_data 的 ``collector``；只重绑
+        # 本地名字，不触碰调用者传入的对象本体。最终异常 traceback 的
+        # ``_generate_reply_core`` frame 递归投影不含原 URL/base64/视觉描述；
+        # 不依赖 Sentry sanitizer 后处理。保留 safe summary/trace id/计数。
+        if _image_failure_summary is not None:
+            image_urls = None
+            reply_context = None
+            reply_sources = []
+            current_sources = []
+            combined_sources = []
+            aligned_images = None
+            reply_image_urls = None
+            base64_image_urls = None
+            prompt_messages = []
+            if image_session is not None:
+                await image_session.close()
+                image_session = None
+            collector = None
+            raise ImageUnderstandingFailureError(_image_failure_summary)
+
         assert reply_result is not None
 
         if (reply_image_urls or base64_image_urls) and native_download_failures:
@@ -1624,6 +1659,7 @@ class MessageHandler:
 
         try:
             reply_context_refetched = False
+            refetched_context: ReplyContext | None = None
             if (
                 _bot is not None
                 and reply_context is not None
@@ -1714,6 +1750,17 @@ class MessageHandler:
                 status="error",
                 error=exc,
             )
+            if isinstance(exc, ImageUnderstandingFailureError):
+                # TSK-196 复审：完成 collector 安全 finalize 与普通安全日志后，
+                # 显式重绑本帧图片敏感 locals（image_urls/reply_context/
+                # refetched_context/本地 collector）为 None 再 re-raise；保持
+                # 异常类型/summary 语义，最终 debug 异常 traceback 的
+                # komari_chat 帧递归投影不含 raw URL/base64。普通非图片 debug
+                # 错误语义不变。
+                image_urls = None
+                reply_context = None
+                refetched_context = None
+                collector = None
             raise
         result = DebugReplyResult(
             reply=reply_result.content,
