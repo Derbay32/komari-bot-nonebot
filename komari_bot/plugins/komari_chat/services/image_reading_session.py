@@ -446,14 +446,17 @@ class ImageReadingSession:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # 意外异常：安全日志（只含 index 与 scheme://host 标签），并缓存
-            # 为结构化失败，绝不让共享任务崩溃或泄漏原始 URL。
+        except Exception as exc:
+            # 意外异常：安全日志只记录 index、scheme://host 标签与归一化异常
+            # 类型；不捕获 traceback（栈帧局部变量 source/data_uri 含原始
+            # URL 与 base64，TSK-195 第二轮安全验收反馈），并缓存为结构化
+            # 失败，绝不让共享任务崩溃或泄漏原始 URL。
             logger.error(
-                "[ImageReadingSession] 读取图片发生未知错误: index={} source={}",
+                "[ImageReadingSession] 读取图片发生未知错误: index={} source={} "
+                "error_type={}",
                 index,
                 reference.source_label,
-                exc_info=True,
+                type(exc).__name__,
             )
             return _as_failure(
                 index,

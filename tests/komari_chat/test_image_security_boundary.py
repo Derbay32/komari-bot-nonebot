@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -306,3 +307,232 @@ def test_session_logs_keep_only_safe_source_labels(
         assert "example.com" in record, (
             f"[{level}] 日志缺少安全来源标签（scheme://host）: {record}"
         )
+
+
+# ── TSK-195 第二轮安全验收：异常路径不得泄漏原始 URL/base64 ───────────
+
+
+def _build_failing_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    downloader_error: Exception | None = None,
+    vision_error: Exception | None = None,
+) -> tuple[Any, list[tuple[str, str, dict[str, object]]]]:
+    """构造真实会话 + 抛异常的下载器/视觉 seam；返回会话与带 kwargs 的日志。"""
+    log_records: list[tuple[str, str, dict[str, object]]] = []
+
+    class _LogRecorder:
+        def info(self, *args: object, **kwargs: object) -> None:
+            log_records.append(("info", str(args), dict(kwargs)))
+
+        def warning(self, *args: object, **kwargs: object) -> None:
+            log_records.append(("warning", str(args), dict(kwargs)))
+
+        def error(self, *args: object, **kwargs: object) -> None:
+            log_records.append(("error", str(args), dict(kwargs)))
+
+        def debug(self, *args: object, **kwargs: object) -> None:
+            log_records.append(("debug", str(args), dict(kwargs)))
+
+    class _FailingDownloader:
+        def __init__(self, error: Exception | None) -> None:
+            self.error = error
+            self.calls: list[str] = []
+            self.downloaded_bytes: int = 0
+
+        async def download(self, url: str) -> str:
+            self.calls.append(url)
+            if self.error is not None:
+                raise self.error
+            return _DATA_URI
+
+        async def close(self) -> None:
+            return None
+
+    class _FailingVision:
+        def __init__(self, error: Exception | None) -> None:
+            self.error = error
+            self.calls: list[dict[str, Any]] = []
+
+        async def __call__(self, images: list[str], **kwargs: Any) -> list[str]:
+            self.calls.append({"images": list(images), **kwargs})
+            if self.error is not None:
+                raise self.error
+            return ["一只猫在窗台上"]
+
+    downloader = _FailingDownloader(downloader_error)
+    monkeypatch.setattr(
+        image_reading_session_module,
+        "ImageDownloadSession",
+        lambda _policy: downloader,
+    )
+    monkeypatch.setattr(
+        image_reading_session_module,
+        "read_images",
+        _FailingVision(vision_error),
+    )
+    monkeypatch.setattr(image_reading_session_module, "logger", _LogRecorder())
+
+    session = image_reading_session_module.ImageReadingSession.build(
+        quoted_sources=[],
+        current_sources=[_RAW_URL],
+        policy=image_downloader_module.ImageDownloadPolicy(),
+        vision_model="vision-model",
+    )
+    return session, log_records
+
+
+def _assert_logs_have_no_secrets_no_traceback(
+    log_records: list[tuple[str, str, dict[str, object]]],
+) -> None:
+    """断言会话日志不捕获 traceback（无 exc_info）且不含原始 URL/base64。"""
+    assert log_records, "读取图片应产生会话日志"
+    for level, record, kwargs in log_records:
+        assert "exc_info" not in kwargs, (
+            f"[{level}] 日志不得携带 traceback 捕获参数: {kwargs}"
+        )
+        assert _RAW_URL not in record, f"[{level}] 日志泄漏原始 URL: {record}"
+        assert _DATA_URI not in record, f"[{level}] 日志泄漏 data URI: {record}"
+        assert "/secret/" not in record and "photo.png" not in record
+        assert "token=abc123" not in record
+
+
+def test_session_downloader_exception_logs_normalized_type_no_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """下载器异常正文内嵌 secret URL/data URI 时，会话日志只记录归一化
+    异常类型（无 exc_info、无敏感正文），结果缓存为结构化失败。"""
+    leak_error = RuntimeError(f"download failed {_RAW_URL} {_DATA_URI}")
+    session, log_records = _build_failing_session(
+        monkeypatch,
+        downloader_error=leak_error,
+    )
+
+    result = asyncio.run(session.read(0))
+
+    assert result.status == "failure"
+    assert result.error_type == "vision_failed"
+    assert result.stage == "vision"
+    assert result.failure_message == "[图片读取失败: 未知错误]"
+    assert _RAW_URL not in str(result)
+    assert _DATA_URI not in str(result)
+
+    _assert_logs_have_no_secrets_no_traceback(log_records)
+    assert any(
+        "RuntimeError" in record for _level, record, _kwargs in log_records
+    ), "日志应记录归一化异常类型"
+
+
+def test_session_vision_exception_logs_normalized_type_no_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """视觉 seam 抛含敏感正文异常时，会话日志不捕获 traceback 且不含 secret。"""
+    leak_error = RuntimeError(f"vision failed {_RAW_URL} {_DATA_URI}")
+    session, log_records = _build_failing_session(
+        monkeypatch,
+        vision_error=leak_error,
+    )
+
+    result = asyncio.run(session.read(0))
+
+    assert result.status == "failure"
+    assert result.error_type == "vision_failed"
+    assert result.stage == "vision"
+    assert result.failure_message == "[图片读取失败: 未知错误]"
+    _assert_logs_have_no_secrets_no_traceback(log_records)
+    assert any(
+        "RuntimeError" in record for _level, record, _kwargs in log_records
+    ), "日志应记录归一化异常类型"
+
+
+def test_read_image_tool_failure_reaches_model_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全工具循环：视觉 seam 抛含 secret 正文异常时，主模型下一轮工具结果、
+    collector tool trace 与最终 projection 都不出现 URL/base64，只出现稳定
+    错误文本；日志不捕获 traceback。"""
+    provider = _RecordingProvider()
+    provider.completions = [
+        base_client_module.LLMCompletionResultSchema(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index": 0}',
+                    {"image_index": 0},
+                    call_id="call-image-secret",
+                )
+            ],
+            finish_reason="tool_calls",
+        ),
+        _final_response_completion(),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+
+    leak_error = RuntimeError(f"vision failed {_RAW_URL} {_DATA_URI}")
+    session, log_records = _build_failing_session(
+        monkeypatch,
+        vision_error=leak_error,
+    )
+
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="security-boundary-fail-1")
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            request_trace_id="security-boundary-fail-1",
+            image_session=session,
+            collector=collector,
+        )
+    )
+
+    assert result.content == "这只猫在窗台上。"
+
+    # 主模型两轮 messages（含失败工具结果）不得出现 URL path/query 或 base64
+    for call in provider.completion_calls:
+        rendered = str(call["messages"])
+        assert "example.com" not in rendered
+        assert "/secret/" not in rendered and "photo.png" not in rendered
+        assert "token=abc123" not in rendered
+        assert _DATA_URI not in rendered
+    # 失败工具结果只含稳定错误文本
+    second_round_messages = provider.completion_calls[1]["messages"]
+    tool_contents = [
+        message.get("content")
+        for message in second_round_messages
+        if message.get("role") == "tool"
+    ]
+    assert tool_contents, "第二轮上下文必须包含 read_image 失败工具结果"
+    assert any("图片读取失败" in str(content) for content in tool_contents)
+    assert all(_RAW_URL not in str(content) for content in tool_contents)
+    assert all(_DATA_URI not in str(content) for content in tool_contents)
+
+    # collector 内存 tool trace 只含安全信息
+    image_trace = next(
+        trace for trace in collector.tools if trace.tool_name == "read_image"
+    )
+    assert image_trace.status == "error"
+    assert image_trace.error_summary == "图片读取失败"
+    assert image_trace.parsed_arguments == {"image_index": 0}
+    assert _RAW_URL not in str(image_trace)
+    assert _DATA_URI not in str(image_trace)
+    assert "图片读取失败" in str(image_trace)
+
+    # 最终 projection 也不含 URL/base64
+    collector.mark_finished(status="error", error=RuntimeError("boom"))
+    record = collector.build_record()
+    record_json = json.dumps(record, ensure_ascii=False, default=str)
+    assert _RAW_URL not in record_json
+    assert _DATA_URI not in record_json
+    assert "example.com" not in record_json
+    assert "/secret/" not in record_json and "photo.png" not in record_json
+    assert "token=abc123" not in record_json
+
+    # 会话日志不捕获 traceback 且不含 secret
+    _assert_logs_have_no_secrets_no_traceback(log_records)
+    assert any(
+        "RuntimeError" in record for _level, record, _kwargs in log_records
+    ), "日志应记录归一化异常类型"

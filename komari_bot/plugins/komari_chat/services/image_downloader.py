@@ -331,7 +331,12 @@ async def _validate_download_url(url: str) -> bool:
         parsed = urlsplit(url)
         port = parsed.port
     except ValueError as exc:
-        logger.warning("[ImageDownloader] 图片 URL 解析失败: {}", exc)
+        # 只记录归一化异常类型，不记录 str(exc)：解析失败的 URL 内容不得
+        # 进入普通日志（TSK-195 第二轮安全验收反馈）。
+        logger.warning(
+            "[ImageDownloader] 图片 URL 解析失败: error_type={}",
+            type(exc).__name__,
+        )
         return False
 
     if (
@@ -572,20 +577,25 @@ async def _download_single_image(
                     active_budget,
                 )
         except (TimeoutError, aiohttp.ClientError) as exc:
+            # 只使用异常类型等安全码，绝不记录 str(exc)：aiohttp 异常正文
+            # 可能内嵌完整 URL path/query（TSK-195 第二轮安全验收反馈）。
+            error_code = type(exc).__name__
             if attempt < _DOWNLOAD_RETRY_ATTEMPTS:
-                outcome = _DownloadOutcome(retry_reason=str(exc))
+                outcome = _DownloadOutcome(retry_reason=error_code)
             else:
                 logger.warning(
-                    "[ImageDownloader] 下载失败: {} url={}",
-                    exc,
+                    "[ImageDownloader] 下载失败: error_type={} url={}",
+                    error_code,
                     _safe_url_label(current_url),
                 )
                 outcome = _DownloadOutcome(should_abort=True)
-        except Exception:
+        except Exception as exc:
+            # 不捕获 traceback：栈帧局部变量 current_url 含完整路径/query；
+            # 只记录归一化异常类型与安全来源标签。
             logger.warning(
-                "[ImageDownloader] 下载未知错误: url={}",
+                "[ImageDownloader] 下载未知错误: error_type={} url={}",
+                type(exc).__name__,
                 _safe_url_label(current_url),
-                exc_info=True,
             )
             outcome = _DownloadOutcome(should_abort=True)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from importlib import import_module
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -10,6 +11,11 @@ from typing import Any, ClassVar
 import pytest
 
 vision_service_module = import_module("komari_bot.plugins.komari_chat.services.vision_service")
+
+#: TSK-195 第二轮安全验收：secret URL path/query/token 与 data URI（模拟
+#: provider 异常正文可能内嵌的敏感内容）。
+_SECRET_URL = "https://secret.example/private/photo.png?token=abc123"
+_SECRET_DATA_URI = "data:image/png;base64,SUMSECRETUX=="
 
 
 class _FakeConfigManager:
@@ -131,6 +137,7 @@ async def test_read_images_returns_empty_list_for_empty_input() -> None:
 async def test_read_images_formats_single_image_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """视觉失败回主模型文本只含稳定异常类型（TSK-195 第二轮安全验收反馈）。"""
     _patch_vision_dependencies(monkeypatch)
     _FakeLLMProvider.fail_next = True
 
@@ -139,7 +146,7 @@ async def test_read_images_formats_single_image_failure(
         vision_model="vision-model",
     )
 
-    assert result == ["[图片读取失败: 视觉模型故障]"]
+    assert result == ["[图片读取失败: RuntimeError]"]
 
 
 @pytest.mark.asyncio
@@ -290,7 +297,119 @@ async def test_read_images_propagates_loader_cold_start_failure_without_llm_call
     )
 
 
+class _CapturingLogRecorder:
+    """记录日志调用与 kwargs，用于断言没有 exc_info/敏感正文。"""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def _record(
+        self,
+        level: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        self.records.append({"level": level, "args": args, "kwargs": dict(kwargs)})
+
+    def info(self, *args: Any, **kwargs: Any) -> None:
+        self._record("info", args, kwargs)
+
+    def warning(self, *args: Any, **kwargs: Any) -> None:
+        self._record("warning", args, kwargs)
+
+    def error(self, *args: Any, **kwargs: Any) -> None:
+        self._record("error", args, kwargs)
+
+    def debug(self, *args: Any, **kwargs: Any) -> None:
+        self._record("debug", args, kwargs)
+
+    def exception(self, *args: Any, **kwargs: Any) -> None:
+        self._record("exception", args, kwargs)
+
+
 @pytest.mark.asyncio
+async def test_read_images_failure_normalized_without_secret_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-195 第二轮：provider 异常正文内嵌 secret URL/data URI 时，视觉
+    失败回主模型与收集器的文本只含稳定异常类型，绝不泄漏 URL/base64；
+    日志不捕获 traceback（无 exc_info）且不含敏感正文。"""
+    _patch_vision_dependencies(monkeypatch)
+    recorder = _CapturingLogRecorder()
+    monkeypatch.setattr(vision_service_module, "logger", recorder)
+
+    class _SecretLeakingProvider:
+        async def generate_messages_completion(self, **kwargs: Any) -> Any:
+            del kwargs
+            msg = f"provider failed {_SECRET_URL} {_SECRET_DATA_URI}"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        vision_service_module,
+        "llm_provider",
+        _SecretLeakingProvider(),
+    )
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="test-vision-secret")
+    result = await vision_service_module.read_images(
+        [_SECRET_DATA_URI],
+        vision_model="vision-model",
+        request_trace_id="trace-secret",
+        parent_call_id="parent-secret",
+        collector=collector,
+    )
+
+    # 回主模型的工具文本只含稳定异常类型，绝不携带 provider 原始正文
+    assert result == ["[图片读取失败: RuntimeError]"]
+    assert _SECRET_URL not in result[0]
+    assert _SECRET_DATA_URI not in result[0]
+
+    # collector 内存 errors / call error 只含安全归一化信息
+    assert len(collector.errors) == 1
+    assert collector.errors[0]["type"] == "RuntimeError"
+    assert collector.errors[0]["message"] == "[图片读取失败: RuntimeError]"
+    assert _SECRET_URL not in str(collector.errors)
+    assert _SECRET_DATA_URI not in str(collector.errors)
+    assert len(collector.calls) == 1
+    call = collector.calls[0]
+    assert call.status == "error"
+    assert call.phase == "vision_read_image"
+    assert call.parent_call_id == "parent-secret"
+    assert call.error == {
+        "type": "RuntimeError",
+        "message": "[图片读取失败: RuntimeError]",
+    }
+    assert _SECRET_URL not in str(collector.calls)
+    assert _SECRET_DATA_URI not in str(collector.calls)
+
+    # 最终 projection（含 request 的既有结构化 trace）也不含敏感正文；
+    # 请求对象走现有 sanitizer 保留二进制摘要。
+    collector.mark_finished(status="error", error=RuntimeError("boom"))
+    record = collector.build_record()
+    record_json = json.dumps(record, ensure_ascii=False, default=str)
+    assert _SECRET_URL not in record_json
+    assert _SECRET_DATA_URI not in record_json
+    assert "/private/" not in record_json and "photo.png" not in record_json
+    assert "token=abc123" not in record_json
+    image_url_summary = record["rounds"][0]["request"]["messages"][0]["content"][1][
+        "image_url"
+    ]["url"]
+    assert image_url_summary["redacted_binary"] is True
+
+    # 日志不捕获 traceback（无 exc_info/exception）且不含敏感正文
+    assert recorder.records, "视觉失败应产生日志"
+    for item in recorder.records:
+        assert "exc_info" not in item["kwargs"], (
+            f"[{item['level']}] 日志不得携带 traceback 捕获参数: {item['kwargs']}"
+        )
+        serialized = json.dumps(item, ensure_ascii=False, default=str)
+        assert _SECRET_URL not in serialized
+        assert _SECRET_DATA_URI not in serialized
+        assert "/private/" not in serialized and "photo.png" not in serialized
+        assert "token=abc123" not in serialized
+
+
 async def test_read_images_empty_input_does_not_touch_prompt_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

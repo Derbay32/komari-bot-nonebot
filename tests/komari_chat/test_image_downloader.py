@@ -509,8 +509,17 @@ def test_download_session_accumulates_total_bytes_across_calls(
     )
     session = image_downloader.ImageDownloadSession(policy)
 
-    first = asyncio.run(session.download("https://93.184.216.34/a.png"))
-    second = asyncio.run(session.download("https://93.184.216.34/b.png"))
+    async def _scenario() -> tuple[str | None, str | None]:
+        # 同一 async scenario 内跨多次调用复用同一会话，结束时 finally close，
+        # 避免 unclosed aiohttp session / 跨 event loop 复用。
+        try:
+            first = await session.download("https://93.184.216.34/a.png")
+            second = await session.download("https://93.184.216.34/b.png")
+            return first, second
+        finally:
+            await session.close()
+
+    first, second = asyncio.run(_scenario())
 
     assert first == "data:image/png;base64,QQ=="
     assert second == "data:image/png;base64,QQ=="
@@ -549,8 +558,16 @@ def test_download_session_total_timeout_not_reset_across_calls(
     )
     session = image_downloader.ImageDownloadSession(policy)
 
-    first = asyncio.run(session.download("https://93.184.216.34/a.png"))
-    second = asyncio.run(session.download("https://93.184.216.34/b.png"))
+    async def _scenario() -> tuple[str | None, str | None]:
+        # 同一 async scenario 内跨多次调用复用同一会话，结束时 finally close。
+        try:
+            first = await session.download("https://93.184.216.34/a.png")
+            second = await session.download("https://93.184.216.34/b.png")
+            return first, second
+        finally:
+            await session.close()
+
+    first, second = asyncio.run(_scenario())
 
     assert first is not None
     assert second is None, "累计总时限耗尽后后续下载必须失败"
@@ -772,7 +789,7 @@ def test_download_session_serial_total_budget_not_reset_by_idle_wait(
 
     async def _run() -> tuple[str | None, str | None]:
         first = await session.download("https://93.184.216.34/a.png")
-        await asyncio.sleep(10)  # 模拟 LLM 轮次之间的无下载活动间隔
+        await asyncio.sleep(0.05)  # 模拟 LLM 轮次之间的无下载活动间隔（短且稳定）
         second = await session.download("https://93.184.216.34/b.png")
         await session.close()
         return first, second
