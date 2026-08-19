@@ -485,6 +485,91 @@ def test_batch_connector_rejects_dns_rebinding_target_before_connection(
     assert resolve_calls == 1
 
 
+def test_download_session_accumulates_total_bytes_across_calls(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：任务级下载会话跨多次调用共享同一字节账本（不重建）。"""
+    downloaded: list[str] = []
+
+    async def _fake_download(
+        _session: object,
+        url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        budget: image_downloader._DownloadBudget,
+    ) -> str:
+        downloaded.append(url)
+        assert await budget.consume(len(b"IMG"))
+        return "data:image/png;base64,QQ=="
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _fake_download)
+    policy = image_downloader.ImageDownloadPolicy(
+        max_total_bytes=100,
+        concurrency=2,
+        total_timeout_seconds=30.0,
+    )
+    session = image_downloader.ImageDownloadSession(policy)
+
+    first = asyncio.run(session.download("https://93.184.216.34/a.png"))
+    second = asyncio.run(session.download("https://93.184.216.34/b.png"))
+
+    assert first == "data:image/png;base64,QQ=="
+    assert second == "data:image/png;base64,QQ=="
+    assert downloaded == [
+        "https://93.184.216.34/a.png",
+        "https://93.184.216.34/b.png",
+    ]
+    # 两次调用共享同一个字节账本，不重新计数
+    assert session.downloaded_bytes == 3 * 2
+
+
+def test_download_session_total_timeout_not_reset_across_calls(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：总时限跨多次调用累计，不会被每次调用重置。"""
+    calls: list[int] = []
+
+    async def _fake_download(
+        _session: object,
+        _url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        _budget: image_downloader._DownloadBudget,
+    ) -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            await asyncio.sleep(0.05)
+        else:
+            await asyncio.sleep(0.2)
+        return "data:image/png;base64,QQ=="
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _fake_download)
+    policy = image_downloader.ImageDownloadPolicy(
+        max_total_bytes=100,
+        concurrency=2,
+        total_timeout_seconds=0.1,
+    )
+    session = image_downloader.ImageDownloadSession(policy)
+
+    first = asyncio.run(session.download("https://93.184.216.34/a.png"))
+    second = asyncio.run(session.download("https://93.184.216.34/b.png"))
+
+    assert first is not None
+    assert second is None, "累计总时限耗尽后后续下载必须失败"
+    assert len(calls) == 2
+
+
+def test_download_session_is_isolated_between_instances() -> None:
+    """TSK-195：不同任务级下载会话之间字节账本完全隔离。"""
+    first = image_downloader.ImageDownloadSession(
+        image_downloader.ImageDownloadPolicy(max_total_bytes=100)
+    )
+    second = image_downloader.ImageDownloadSession(
+        image_downloader.ImageDownloadPolicy(max_total_bytes=100)
+    )
+    assert first is not second
+    assert first.downloaded_bytes == 0
+    assert second.downloaded_bytes == 0
+
+
 def test_download_single_image_rejects_redirect_to_blocked_network() -> None:
     redirect = _FakeResponse(
         status=302,
