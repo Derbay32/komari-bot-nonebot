@@ -21,6 +21,8 @@ import asyncio
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, cast
 
+import pytest
+
 if TYPE_CHECKING:
     import pytest
 
@@ -186,12 +188,14 @@ def test_build_stable_indexes_quoted_first_preserves_original() -> None:
         (1, "quoted", 1),
         (2, "current", 0),
     ]
-    # 原始 URL 只在引用对象内（会话→安全下载器边界），不与计数/结果耦合
-    assert [ref.source for ref in refs] == [
-        _RAW_URLS[0],
-        _RAW_URLS[1],
-        _RAW_URLS[2],
-    ]
+    # 公开引用投影只含安全来源标签：原始 URL（path/query/token）不进引用对象
+    for ref in refs:
+        assert not hasattr(ref, "source"), "公开引用不得暴露原始 URL 字段"
+        assert ref.source_label == "https://example.com"
+        for rendered in (str(ref), repr(ref)):
+            assert "/secret/" not in rendered and ".png" not in rendered
+            assert "token=" not in rendered and "#frag" not in rendered
+            assert "example.com" in rendered
 
 
 def test_build_caps_references_at_max_images() -> None:
@@ -484,3 +488,154 @@ def test_close_releases_download_session(
     asyncio.run(session.close())
 
     assert downloader.close_calls == 1
+
+
+# ── 单飞取消 / close 生命周期（TSK-195 验收反馈） ──────────────────────
+
+
+def test_cancel_one_waiter_does_not_cancel_shared_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 index 并发多等待者：取消一个 waiter 不得取消共享下载/视觉任务。
+
+    另一个 waiter 仍拿到同一结果；只发生一次下载 + 一次视觉调用。
+    """
+    downloader = _SlowDownloader()
+    session, vision = _build_session(
+        monkeypatch,
+        current=[_RAW_URLS[2]],
+        downloader=downloader,
+    )
+
+    async def _scenario() -> tuple[Any, Any]:
+        waiter_a = asyncio.create_task(session.read(0))
+        await asyncio.sleep(0)  # 让 A 先创建共享任务并开始下载
+        waiter_b = asyncio.create_task(session.read(0))
+        await asyncio.sleep(0)
+        waiter_b.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_b
+        result_a = await waiter_a
+        await session.close()
+        return result_a, waiter_b
+
+    result_a, waiter_b = asyncio.run(_scenario())
+
+    assert waiter_b.cancelled()
+    assert result_a.status == "success"
+    assert downloader.calls == [_RAW_URLS[2]], "取消一个 waiter 不得触发重复下载"
+    assert len(vision.calls) == 1, "取消一个 waiter 不得触发重复视觉调用"
+
+
+def test_cancel_sole_waiter_caches_shared_task_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """唯一 waiter 取消后共享任务继续完成，结果必须缓存供后续 read 复用。
+
+    下一次 read 不得重新下载/视觉调用。
+    """
+    downloader = _SlowDownloader()
+    session, vision = _build_session(
+        monkeypatch,
+        current=[_RAW_URLS[2]],
+        downloader=downloader,
+    )
+
+    async def _scenario() -> Any:
+        waiter = asyncio.create_task(session.read(0))
+        await asyncio.sleep(0)  # 让下载开始
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        # 共享任务继续完成；等它结束后再读，结果必须已缓存
+        await asyncio.sleep(0.1)
+        result = await session.read(0)
+        await session.close()
+        return result
+
+    result = asyncio.run(_scenario())
+
+    assert result.status == "success"
+    assert downloader.calls == [_RAW_URLS[2]], "取消唯一 waiter 后不得重复下载"
+    assert len(vision.calls) == 1, "取消唯一 waiter 后不得重复视觉调用"
+
+
+def test_close_cancels_inflight_and_blocks_new_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close() 取消并等待在途任务，之后新读取被阻止且零外部调用。"""
+    downloader = _SlowDownloader()
+    session, vision = _build_session(
+        monkeypatch,
+        current=[_RAW_URLS[2]],
+        downloader=downloader,
+    )
+
+    async def _scenario() -> tuple[Any, int, int]:
+        waiter = asyncio.create_task(session.read(0))
+        await asyncio.sleep(0)  # read(0) 创建共享单飞任务
+        await asyncio.sleep(0)  # _read_one 开始下载（记录调用后进入慢速下载）
+        await session.close()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        # 关闭后新读取返回结构化失败，不产生下载/视觉调用
+        result = await session.read(0)
+        assert result.status == "failure"
+        assert result.error_type == "image_unavailable"
+        assert result.stage == "download"
+        return result, len(downloader.calls), len(vision.calls)
+
+    _result, download_calls, vision_calls = asyncio.run(_scenario())
+
+    assert download_calls == 1, "在途下载被取消（已开始但未完成），不得新增"
+    assert vision_calls == 0, "在途任务被取消，视觉调用未发生"
+    # close 幂等：二次关闭不报错
+    asyncio.run(session.close())
+
+
+def test_failure_summary_error_types_and_stages_are_sorted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """failure_summary 的 error_types/stages 必须稳定、确定性输出（排序）。
+
+    先 vision 失败后 download 失败，摘要仍按字典序输出，不依赖读取顺序。
+    """
+
+    class _UrlKeyedDownloader:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def download(self, url: str) -> str | None:
+            self.calls.append(url)
+            return None if url == _RAW_URLS[1] else "data:image/png;base64,MQ=="
+
+        async def close(self) -> None:
+            return None
+
+    class _FailingVision:
+        async def __call__(
+            self, images: list[str], **kwargs: object
+        ) -> list[str]:
+            del images, kwargs
+            return ["[图片读取失败: 视觉服务未返回结果]"]
+
+    session, _vision = _build_session(
+        monkeypatch,
+        current=[_RAW_URLS[0], _RAW_URLS[1]],
+        downloader=_UrlKeyedDownloader(),
+        vision=_FailingVision(),
+    )
+
+    first = asyncio.run(session.read(0))  # 下载成功、视觉失败 → vision_failed
+    second = asyncio.run(session.read(1))  # 下载失败 → image_unavailable
+    assert first.status == "failure"
+    assert second.status == "failure"
+
+    summary = session.failure_summary()
+    assert summary.failed_images == 2
+    assert summary.error_types == ("image_unavailable", "vision_failed"), (
+        "error_types 必须按字典序稳定输出，不依赖读取顺序"
+    )
+    assert summary.stages == ("download", "vision"), (
+        "stages 必须按字典序稳定输出，不依赖读取顺序"
+    )

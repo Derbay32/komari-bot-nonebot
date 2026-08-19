@@ -10,7 +10,8 @@ delegated 模式下，单个回复 Agent 任务拥有一个图片理解会话：
   读取同一索引单飞共享同一请求（不重复网络/视觉调用）；
 - 下载字节账本、并发信号量与累计总时限由会话（经 ``ImageDownloadSession``）
   统一拥有，跨多轮工具调用累计且不重建；会话实例之间完全隔离；
-- 原始 URL 只存在于本会话 → 安全下载器边界：不进入主模型 messages、
+- 原始 URL 只存在于会话内部私有映射 → 安全下载器边界：公开引用投影只含
+  稳定 index/origin/original_index/安全来源标签，不进入主模型 messages、
   工具结果、普通日志与 Agent Run/debug 投影；日志只保留安全来源标签/
   索引/计数；
 - 提供对全部失败状态的安全摘要（模式/阶段/失败数量/归一化错误类型），
@@ -22,6 +23,7 @@ delegated 模式下，单个回复 Agent 任务拥有一个图片理解会话：
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 
@@ -49,20 +51,18 @@ ImageStage = Literal["invalid", "download", "vision"]
 
 @dataclass(frozen=True, slots=True)
 class ImageReference:
-    """稳定图片引用；原始 URL 只在本会话与安全下载器边界存在。
+    """稳定图片引用（公开投影，不含原始 URL）。
 
     Attributes:
         index: 跨任务稳定索引（引用在前、当前在后，从 0 连续）。
         origin: 来源归属（quoted=被回复消息，current=当前消息）。
         original_index: 该来源原始图片列表中的序号（稳定，不因失败重编号）。
-        source: 原始 URL，仅在会话→安全下载器边界使用。
         source_label: 供日志/诊断的安全来源标签（scheme://host[:port]）。
     """
 
     index: int
     origin: ImageOrigin
     original_index: int
-    source: str
     source_label: str
 
     def __str__(self) -> str:
@@ -153,6 +153,7 @@ class ImageReadingSession:
     def __init__(
         self,
         references: list[ImageReference],
+        sources: list[str],
         policy: ImageDownloadPolicy,
         *,
         vision_model: str,
@@ -166,6 +167,11 @@ class ImageReadingSession:
         collector: "LLMDiagnosticCollector | None" = None,
     ) -> None:
         self._references = list(references)
+        #: 原始 URL 只存在于会话内部私有映射（index → source），仅传给安全
+        #: 下载器；公开引用投影（``ImageReference``）不携带原始 URL。
+        self._sources: dict[int, str] = dict(
+            zip((ref.index for ref in references), sources)
+        )
         self._by_index: dict[int, ImageReference] = {
             ref.index: ref for ref in references
         }
@@ -173,6 +179,7 @@ class ImageReadingSession:
         self._downloader = ImageDownloadSession(policy)
         self._results: dict[int, ImageReadResult] = {}
         self._inflight: dict[int, asyncio.Task[ImageReadResult]] = {}
+        self._closed = False
         self._vision_model = vision_model
         self._vision_temperature = vision_temperature
         self._vision_max_tokens = vision_max_tokens
@@ -209,12 +216,13 @@ class ImageReadingSession:
         """
         effective_max = policy.max_images if max_images is None else max_images
         references: list[ImageReference] = []
+        raw_sources: list[str] = []
         index = 0
         for origin in ("quoted", "current"):
-            sources = (
+            source_list = (
                 quoted_sources if origin == "quoted" else current_sources
             )
-            for original_index, source in enumerate(sources):
+            for original_index, source in enumerate(source_list):
                 if index >= effective_max:
                     break
                 references.append(
@@ -222,15 +230,16 @@ class ImageReadingSession:
                         index=index,
                         origin=cast("ImageOrigin", origin),
                         original_index=original_index,
-                        source=source,
                         source_label=safe_url_label(source),
                     )
                 )
+                raw_sources.append(source)
                 index += 1
             if index >= effective_max:
                 break
         return cls(
             references,
+            raw_sources,
             policy,
             vision_model=vision_model,
             vision_temperature=vision_temperature,
@@ -250,7 +259,8 @@ class ImageReadingSession:
 
     @property
     def references(self) -> tuple[ImageReference, ...]:
-        """稳定引用只读视图（source 仅用于安全下载调度，不越过本边界）。"""
+        """稳定引用只读视图（公开投影不含原始 URL；原始 URL 只在会话内部
+        私有映射 → 安全下载器边界）。"""
         return tuple(self._references)
 
     @property
@@ -297,95 +307,159 @@ class ImageReadingSession:
         if cached is not None:
             return cached
 
+        if self._closed:
+            return _as_failure(
+                index,
+                "[图片读取失败: 图片读取会话已关闭]",
+                error_type="image_unavailable",
+                stage="download",
+            )
+
         task = self._inflight.get(index)
         if task is not None:
-            return await task
+            # 加入已有单飞任务；asyncio.shield 保证当前 waiter 被取消时
+            # 不会把取消传播到共享任务（Python 3.11+ 取消会沿 await 传递），
+            # 其他 waiter 仍拿到同一结果。
+            return await asyncio.shield(task)
 
         task = asyncio.create_task(
-            self._read_one(reference, parent_call_id=parent_call_id)
+            self._read_one(
+                reference,
+                self._sources[index],
+                parent_call_id=parent_call_id,
+            )
         )
         self._inflight[index] = task
+        task.add_done_callback(self._make_read_done_callback(index))
         try:
-            result = await task
+            result = await asyncio.shield(task)
         except asyncio.CancelledError:
-            self._inflight.pop(index, None)
+            # 仅当前 waiter 被取消：共享单飞任务经 shield 继续执行，结果由
+            # done callback 缓存；不得把 in-flight 条目弹出（其他 waiter 和
+            # 新的 read 仍要加入同一任务）。
             raise
-        except Exception:  # 意外异常也缓存为结构化失败，绝不让任务崩溃
+        except Exception:  # 防御性兜底：_read_one 已自行处理异常
             result = _as_failure(
                 index,
                 "[图片读取失败: 未知错误]",
                 error_type="vision_failed",
                 stage="vision",
             )
-        self._inflight.pop(index, None)
-        self._results[index] = result
+        self._results.setdefault(index, result)
         return result
+
+    def _make_read_done_callback(
+        self, index: int
+    ) -> Callable[[asyncio.Task[ImageReadResult]], None]:
+        """共享单飞任务完成回调：弹出 in-flight 并把结果（或结构化失败）缓存。
+
+        无论是否有 waiter 正在 await 都会执行，保证唯一 waiter 被取消后
+        任务完成仍缓存结果；被取消的任务不缓存。
+        """
+
+        def _on_done(task: asyncio.Task[ImageReadResult]) -> None:
+            self._inflight.pop(index, None)
+            if task.cancelled():
+                return
+            if task.exception() is None:
+                self._results.setdefault(index, task.result())
+            else:
+                self._results.setdefault(
+                    index,
+                    _as_failure(
+                        index,
+                        "[图片读取失败: 未知错误]",
+                        error_type="vision_failed",
+                        stage="vision",
+                    ),
+                )
+
+        return _on_done
 
     async def _read_one(
         self,
         reference: ImageReference,
+        source: str,
         *,
         parent_call_id: str | None,
     ) -> ImageReadResult:
         """单张图片的懒下载 + 视觉描述；失败按索引缓存。"""
         index = reference.index
-        logger.info(
-            "[ImageReadingSession] 开始读取图片: index={} origin={} "
-            "original={} source={}",
-            index,
-            reference.origin,
-            reference.original_index,
-            reference.source_label,
-        )
-        data_uri = await self._downloader.download(reference.source)
-        if data_uri is None:
-            logger.warning(
-                "[ImageReadingSession] 图片下载或解码失败: index={} source={}",
+        try:
+            logger.info(
+                "[ImageReadingSession] 开始读取图片: index={} origin={} "
+                "original={} source={}",
                 index,
+                reference.origin,
+                reference.original_index,
                 reference.source_label,
             )
-            return _as_failure(
-                index,
-                "[图片读取失败: 图片下载或解码失败，无法读取该图片]",
-                error_type="image_unavailable",
-                stage="download",
-            )
+            data_uri = await self._downloader.download(source)
+            if data_uri is None:
+                logger.warning(
+                    "[ImageReadingSession] 图片下载或解码失败: index={} source={}",
+                    index,
+                    reference.source_label,
+                )
+                return _as_failure(
+                    index,
+                    "[图片读取失败: 图片下载或解码失败，无法读取该图片]",
+                    error_type="image_unavailable",
+                    stage="download",
+                )
 
-        descriptions = await read_images(
-            [data_uri],
-            vision_model=self._vision_model,
-            temperature=self._vision_temperature,
-            max_tokens=self._vision_max_tokens,
-            request_api=self._vision_request_api,
-            stream_enabled=self._vision_stream_enabled,
-            thinking_mode=self._vision_thinking_mode,
-            reasoning_effort=self._vision_reasoning_effort,
-            request_trace_id=(
-                self._request_trace_id if self._collector is not None else None
-            ),
-            parent_call_id=parent_call_id if self._collector is not None else None,
-            collector=self._collector,
-        )
-        description = descriptions[0] if descriptions else ""
-        if not description:
+            descriptions = await read_images(
+                [data_uri],
+                vision_model=self._vision_model,
+                temperature=self._vision_temperature,
+                max_tokens=self._vision_max_tokens,
+                request_api=self._vision_request_api,
+                stream_enabled=self._vision_stream_enabled,
+                thinking_mode=self._vision_thinking_mode,
+                reasoning_effort=self._vision_reasoning_effort,
+                request_trace_id=(
+                    self._request_trace_id if self._collector is not None else None
+                ),
+                parent_call_id=parent_call_id if self._collector is not None else None,
+                collector=self._collector,
+            )
+            description = descriptions[0] if descriptions else ""
+            if not description:
+                return _as_failure(
+                    index,
+                    "[图片读取失败: 视觉服务未返回结果]",
+                    error_type="vision_failed",
+                    stage="vision",
+                )
+            if description.startswith("[图片读取失败:"):
+                return _as_failure(
+                    index,
+                    description,
+                    error_type="vision_failed",
+                    stage="vision",
+                )
+            return ImageReadResult(
+                index=index,
+                status="success",
+                description=description,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 意外异常：安全日志（只含 index 与 scheme://host 标签），并缓存
+            # 为结构化失败，绝不让共享任务崩溃或泄漏原始 URL。
+            logger.error(
+                "[ImageReadingSession] 读取图片发生未知错误: index={} source={}",
+                index,
+                reference.source_label,
+                exc_info=True,
+            )
             return _as_failure(
                 index,
-                "[图片读取失败: 视觉服务未返回结果]",
+                "[图片读取失败: 未知错误]",
                 error_type="vision_failed",
                 stage="vision",
             )
-        if description.startswith("[图片读取失败:"):
-            return _as_failure(
-                index,
-                description,
-                error_type="vision_failed",
-                stage="vision",
-            )
-        return ImageReadResult(
-            index=index,
-            status="success",
-            description=description,
-        )
 
     def all_images_unavailable(self) -> bool:
         """所有可用引用均已被尝试读取且全部失败。"""
@@ -405,11 +479,12 @@ class ImageReadingSession:
             and attempted >= total
             and all(result.status == "failure" for result in self._results.values())
         )
+        # 稳定、确定性输出：按字典序去重，不依赖读取顺序（TSK-195 验收反馈）。
         error_types = tuple(
-            dict.fromkeys(result.error_type or "unknown" for result in failures)
+            sorted({result.error_type or "unknown" for result in failures})
         )
         stages = tuple(
-            dict.fromkeys(result.stage or "unknown" for result in failures)
+            sorted({result.stage or "unknown" for result in failures})
         )
         return ImageFailureSummary(
             mode="delegated",
@@ -422,7 +497,21 @@ class ImageReadingSession:
         )
 
     async def close(self) -> None:
-        """释放会话持有的下载连接（任务结束调用一次，可重复调用）。"""
+        """关闭会话：阻止新读取、取消并等待在途任务、释放下载连接。
+
+        幂等可重复调用；关闭后 ``read()`` 返回结构化失败且不产生任何下载
+        或视觉调用，也不会在关闭后继续写诊断收集器。
+        """
+        if self._closed:
+            await self._downloader.close()
+            return
+        self._closed = True
+        tasks = list(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight.clear()
         await self._downloader.close()
 
 
