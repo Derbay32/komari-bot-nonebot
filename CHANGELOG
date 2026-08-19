@@ -7,6 +7,12 @@
 ### 破坏性变更
 
 - 数据库连接唯一权威改为 nonebot-plugin-orm，需手动迁移后进行升级。
+- 聊天回复收敛为唯一新契约（0012–0015 协调式破坏性升级，TSK-188～194）：最终回复提交
+  （`final_response`）成为成功生成回复的唯一出口；回复 Agent 执行预算与工具调用约束模式
+  （`required` / `prompt_guided`）归 `komari_chat` 配置；图片理解拆分为 `native` / `delegated`
+  且旧图片配置从 `komari_memory` 一次性迁入 `komari_chat`，旧输出协议列与旧图片列被删除，
+  不提供双读、双写或运行时兼容回退；0012 起无完整降级路径。升级与播种步骤见
+  `migrations/README.md`。
 
 ### 运维注意
 
