@@ -187,7 +187,7 @@ def _to_image_diagnostic(
     """把安全的 ``ImageFailureSummary`` 投影为 onebot 窄诊断（仅白名单字段）。
 
     TSK-196 深模块边界：chat 领域只传递 ``ImageFailureSummary``，只有在
-    消息处理器的通知边界才经本本地窄 mapper 构造 onebot
+    消息处理器的通知边界才经本地窄 mapper 构造 onebot
     ``ImageFailureDiagnostic``；``ImageFailureDiagnostic`` 构造时运行时校验
     并确定性去重排序，恶意值（URL/base64/CQ/换行）会 ValueError。
     """
@@ -755,21 +755,42 @@ class MessageHandler:
             failure.error_type,
             failure.image_failure_summary is not None,
         )
+        # TSK-196 复审：图片 summary→diagnostic 映射单独隔离。映射意外失败时
+        # fail-closed 静默 SU 图片卡（绝不把不合法 summary 降级为可能泄漏的
+        # generic 私聊摘要），但仍经共享 notifier 发送 group_text（reaction_sent
+        # 分流），不吞掉既有群内固定道歉。
+        diagnostic: ImageFailureDiagnostic | None = None
+        mapping_failed = False
+        if failure.image_failure_summary is not None:
+            try:
+                diagnostic = _to_image_diagnostic(failure.image_failure_summary)
+            except Exception:
+                mapping_failed = True
+                # 不捕获 exc_info：本函数作用域可能持有 image_failure_summary，
+                # 避免任何含 URL/base64 的帧被写入日志（TSK-196 复审）。
+                logger.error("[KomariChat] 图片失败摘要→诊断映射失败，静默 SUPERUSER 私聊")
         try:
-            diagnostic = _to_image_diagnostic(failure.image_failure_summary)
             notifier = GroupTaskFailureNotifier(
                 cooldown=RedisFailureNotificationCooldown(
                     cast("Any", self.redis.redis)
                 ),
             )
-            # TSK-196：图片理解失败只经共享通知边界提交一次 SUPERUSER 汇总卡
-            # （``group_text`` 仍按 reaction_sent 分流）；同一群+同图片
-            # reason_code 跨任务共享 Redis 冷却，存储不可用故障开放。
-            reason_code = (
-                image_failure_reason_code(diagnostic)
-                if diagnostic is not None
-                else failure.error_type
-            )
+            if mapping_failed:
+                # fail-closed：notify_superusers=False + summary=None + 无诊断，
+                # 只投递 group_text（若 reaction_sent），不降级为 generic 摘要。
+                reason_code = failure.error_type
+                notify_superusers = False
+                summary = None
+            else:
+                # TSK-196：图片理解失败只经共享通知边界提交一次 SUPERUSER 汇总卡
+                # （``group_text`` 仍按 reaction_sent 分流）；同一群+同图片
+                # reason_code 跨任务共享 Redis 冷却，存储不可用故障开放。
+                reason_code = (
+                    image_failure_reason_code(diagnostic)
+                    if diagnostic is not None
+                    else failure.error_type
+                )
+                summary = None if diagnostic is not None else failure.summary
             await notifier.notify(
                 bot=bot,
                 notification=GroupTaskFailureNotification(
@@ -781,9 +802,7 @@ class MessageHandler:
                     reason_code=reason_code,
                     notify_superusers=notify_superusers,
                     request_trace_id=failure.request_trace_id,
-                    summary=(
-                        None if diagnostic is not None else failure.summary
-                    ),
+                    summary=summary,
                     image_diagnostic=diagnostic,
                 ),
             )
@@ -1211,6 +1230,8 @@ class MessageHandler:
         if use_fetch_tool:
             tools.append(FETCH_PAGE_TOOL)
 
+        native_failure_pending = False
+        reply_result: ReplyResult | None = None
         try:
             if tools:
                 # TSK-195：委托模式的主循环只经 image_session 触达图片；
@@ -1242,11 +1263,21 @@ class MessageHandler:
                     agent_budget=agent_budget,
                 )
         except NativeMultimodalRequestError:
-            # TSK-196 复审：只包装“主 provider 多模态调用失败”的窄 marker
-            # （from None，不保留原异常 cause/正文），绝不切 delegated；其他
-            # 异常（MaxRounds/工具预算/协议校验/内部错误）即便 native 有图
-            # 也原样传播，不误报为图片失败。delegated 的主循环已自行以
-            # ImageUnderstandingFailureError 终止（此处原样重抛）。
+            # TSK-196 复审：只在 except 内保存“应抛图片失败”标志（不 raise，
+            # 避免经 __context__ 保留 marker → 原 provider 异常对象链）；离开
+            # except/finally 后再抛 ImageUnderstandingFailureError，最终异常的
+            # cause/context 都为 None。只包装“主 provider 多模态调用失败”的
+            # 窄 marker，绝不切 delegated；其他异常（MaxRounds/工具预算/协议
+            # 校验/内部错误）即便 native 有图也原样传播，不误报为图片失败。
+            # delegated 的主循环已自行以 ImageUnderstandingFailureError 终止。
+            native_failure_pending = True
+        finally:
+            # TSK-195：delegated 会话持有的下载连接随任务结束释放（幂等，
+            # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
+            if image_session is not None:
+                await image_session.close()
+
+        if native_failure_pending:
             raise ImageUnderstandingFailureError(
                 _native_failure_summary(
                     total_images=effective_total,
@@ -1254,24 +1285,20 @@ class MessageHandler:
                     provider_failed=True,
                     all_unavailable=False,
                 )
-            ) from None
-        finally:
-            # TSK-195：delegated 会话持有的下载连接随任务结束释放（幂等，
-            # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
-            if image_session is not None:
-                await image_session.close()
+            )
+        assert reply_result is not None
 
         if (reply_image_urls or base64_image_urls) and native_download_failures:
             # TSK-196：native 部分下载失败且任务成功 → 聚合摘要附加到结果。
-                reply_result = replace(
-                    reply_result,
-                    image_failure_summary=_native_failure_summary(
-                        total_images=effective_total,
-                        download_failures=native_download_failures,
-                        provider_failed=False,
-                        all_unavailable=False,
-                    ),
-                )
+            reply_result = replace(
+                reply_result,
+                image_failure_summary=_native_failure_summary(
+                    total_images=effective_total,
+                    download_failures=native_download_failures,
+                    provider_failed=False,
+                    all_unavailable=False,
+                ),
+            )
 
         logger.info(
             "[KomariChat] 生成回复成功: len={} favorability_delta={}",

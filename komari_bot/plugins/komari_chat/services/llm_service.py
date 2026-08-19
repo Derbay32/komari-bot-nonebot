@@ -1256,6 +1256,8 @@ async def _execute_tool_loop(
             # Prompt 中的 tool_call_instruction 引导模型。
             if tool_call_mode == "required":
                 request_data["tool_choice"] = "required"
+            native_failure_pending = False
+            completion: Any = None
             try:
                 async with _LLM_COMPLETION_SEMAPHORE:
                     completion = await _call_llm_completion(
@@ -1281,13 +1283,18 @@ async def _execute_tool_loop(
                     ),
                 )
                 if has_image_parts:
-                    # TSK-196 复审：只把“主 provider 多模态调用失败”收敛为
-                    # 窄 marker（from None，不携带原 provider 异常 cause/正文）；
-                    # message_handler 只捕获该 marker 并转 native 图片失败摘要。
-                    # 其他异常（MaxRounds/预算/协议/内部）即便请求带图也原样
-                    # 传播，不误报为图片失败。
-                    raise NativeMultimodalRequestError from None
-                raise
+                    # TSK-196 复审：只把“主 provider 多模态调用失败”收敛为窄
+                    # marker。except 内只完成安全 record_failed_call 并置位“应抛
+                    # marker”局部状态；离开 except（exc 已清理、无 active
+                    # exception）后再 raise marker，使 marker.__cause__ 与
+                    # marker.__context__ 都为 None（from None 只抑制显示，仍会经
+                    # __context__ 保留原异常对象链）。其他异常（MaxRounds/预算/
+                    # 协议/内部）即便请求带图也原样传播，不误报为图片失败。
+                    native_failure_pending = True
+                else:
+                    raise
+            if native_failure_pending:
+                raise NativeMultimodalRequestError
 
             round_call_id = record_completion_call(
                 collector,
