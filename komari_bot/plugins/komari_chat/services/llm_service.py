@@ -25,12 +25,14 @@ from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_asy
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
-from .image_reading_session import ImageUnderstandingFailureError
+from .image_reading_session import (
+    ImageFailureSummary,
+    ImageUnderstandingFailureError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from komari_bot.onebot import ImageFailureDiagnostic
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_memory import MemoryService, MessageSchema
 
@@ -296,16 +298,17 @@ class InteractionHistoryRecord(TypedDict):
 class ReplyResult:
     """聊天回复正文与同步生成的互动历史。
 
-    ``image_diagnostic``（TSK-196）：任务成功但存在图片失败时附带的聚合
-    摘要，供消息处理器经共享通知边界向 SUPERUSER 提交一次图片汇总卡；
-    只含白名单字段，无 URL/base64/正文。
+    ``image_failure_summary``（TSK-196）：任务成功但存在图片失败时附带的
+    安全聚合摘要（``ImageFailureSummary``，无 URL/base64/正文/视觉描述）；
+    只在消息处理器的通知边界经本地窄 mapper 投影为 onebot
+    ``ImageFailureDiagnostic`` 并提交一次 SUPERUSER 图片汇总卡。
     """
 
     content: str
     interaction_history: InteractionHistoryRecord
     favorability_delta: int | None = None
     favorability_reason: str | None = None
-    image_diagnostic: ImageFailureDiagnostic | None = None
+    image_failure_summary: ImageFailureSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +378,18 @@ def _request_has_image_parts(messages: list[dict[str, Any]]) -> bool:
             if isinstance(part, dict) and part.get("type") == "image_url":
                 return True
     return False
+
+
+class NativeMultimodalRequestError(RuntimeError):
+    """native 模式带图请求主 provider 失败的窄 marker（TSK-196 复审）。
+
+    只在 ``_execute_tool_loop`` 对 ``_call_llm_completion`` 的 except seam
+    抛出：请求 messages 含 image parts 且主 provider 调用（重试耗尽后）
+    失败。不携带原 provider 异常正文/cause（``from None``）；message_handler
+    只捕获该 marker 并转为 ``ImageUnderstandingFailureError``（mode=native
+    摘要）。其他异常（MaxRounds/工具预算/协议校验/内部错误）即便请求带图
+    也原样传播，不误报为图片失败。
+    """
 
 
 class EntitySchema(BaseModel):
@@ -1210,11 +1225,6 @@ async def _execute_tool_loop(
     try:
         for round_num in range(1, round_limit + 1):
             ledger.consume_round()
-            # TSK-196：delegated 全部可用索引均已尝试且全部失败时，在下一轮
-            # 开始即以专用安全异常终止工具循环（不再给 final_response 机会）；
-            # 最后一次失败 read_image 的 ToolExecutionTrace 已写入 collector。
-            if image_session is not None and image_session.all_images_unavailable():
-                raise ImageUnderstandingFailureError(image_session.failure_summary())
             # TSK-194 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
             # read_image 工具的视觉子调用（vision_service）才使用 vision
             # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
@@ -1254,6 +1264,7 @@ async def _execute_tool_loop(
                         request_phase=phase,
                     )
             except Exception as exc:
+                has_image_parts = _request_has_image_parts(current_messages)
                 record_failed_call(
                     collector,
                     phase=phase,
@@ -1265,10 +1276,17 @@ async def _execute_tool_loop(
                     parent_call_id=parent_call_id,
                     message=(
                         f"[图片理解失败: {type(exc).__name__}]"
-                        if _request_has_image_parts(current_messages)
+                        if has_image_parts
                         else None
                     ),
                 )
+                if has_image_parts:
+                    # TSK-196 复审：只把“主 provider 多模态调用失败”收敛为
+                    # 窄 marker（from None，不携带原 provider 异常 cause/正文）；
+                    # message_handler 只捕获该 marker 并转 native 图片失败摘要。
+                    # 其他异常（MaxRounds/预算/协议/内部）即便请求带图也原样
+                    # 传播，不误报为图片失败。
+                    raise NativeMultimodalRequestError from None
                 raise
 
             round_call_id = record_completion_call(
@@ -1349,15 +1367,6 @@ async def _execute_tool_loop(
                 tool_name = tool_call.function.name
 
                 if tool_name == FINAL_RESPONSE_TOOL_NAME:
-                    if (
-                        image_session is not None
-                        and image_session.all_images_unavailable()
-                    ):
-                        # TSK-196：同轮 read_image 全部失败后再提交 final_response
-                        # 也必须终止；异常只携带安全摘要。
-                        raise ImageUnderstandingFailureError(
-                            image_session.failure_summary()
-                        )
                     if requires_favorability_delta and pending_favorability_delta is None:
                         err_msg = (
                             "必须先调用 record_favorability_delta 记录本轮好感度变化，"
@@ -1445,7 +1454,7 @@ async def _execute_tool_loop(
                             if image_summary.failed_images > 0:
                                 result = replace(
                                     result,
-                                    image_diagnostic=image_summary.to_diagnostic(),
+                                    image_failure_summary=image_summary,
                                 )
                         return result  # noqa: TRY300
                     except (ValueError, TypeError) as exc:
@@ -1596,6 +1605,19 @@ async def _execute_tool_loop(
                                 error_summary=execution.error_summary,
                                 result_summary=execution.result_summary,
                             )
+                        )
+                    # TSK-196 复审：每次 read_image 的 ToolExecutionTrace 已写入
+                    # collector 后立即检查全部可用索引是否均已尝试且失败；一旦
+                    # 成立，即使本任务是最后允许轮次、该轮仅 read_image 无
+                    # final_response，也以专用安全异常终止（绝不落入 MaxRounds
+                    # RuntimeError）。轮首/final_response 检查已收敛为本次检查。
+                    if (
+                        tool_name == READ_IMAGE_TOOL_NAME
+                        and image_session is not None
+                        and image_session.all_images_unavailable()
+                    ):
+                        raise ImageUnderstandingFailureError(
+                            image_session.failure_summary()
                         )
 
             has_messages_to_send = (

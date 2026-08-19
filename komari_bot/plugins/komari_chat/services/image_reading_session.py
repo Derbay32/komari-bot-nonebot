@@ -38,7 +38,6 @@ from .vision_service import read_images
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from komari_bot.onebot.group_failure_notify import ImageFailureDiagnostic
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 #: 图片来源归属：引用消息图片在前、当前消息图片在后。
@@ -106,17 +105,6 @@ class ImageFailureSummary:
     failed_images: int = 0
     error_types: tuple[str, ...] = ()
     stages: tuple[str, ...] = ()
-
-    def to_diagnostic(self) -> "ImageFailureDiagnostic":
-        """投影为 onebot 共享边界的窄诊断（仅白名单字段，无 URL/base64）。"""
-        from komari_bot.onebot.group_failure_notify import ImageFailureDiagnostic
-
-        return ImageFailureDiagnostic(
-            mode=self.mode,
-            failed_count=self.failed_images,
-            stages=self.stages,
-            error_types=self.error_types,
-        )
 
 
 def _as_failure(

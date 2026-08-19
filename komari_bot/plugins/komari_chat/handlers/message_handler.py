@@ -54,6 +54,7 @@ from ..services.llm_service import (
     RECORD_FAVORABILITY_DELTA_TOOL,
     SEARCH_WEB_TOOL,
     InteractionHistoryRecord,
+    NativeMultimodalRequestError,
     ReplyResult,
     generate_reply,
     generate_reply_with_tools,
@@ -166,8 +167,10 @@ class ReplyFailureInfo:
     reaction_sent 是失败分流边界标志：True 表示已向用户消息贴出“生成中”表情、
     用户正处于等待回复状态，失败时需要补发群内错误文本。
 
-    image_diagnostic（TSK-196）：图片理解失败时携带的聚合摘要（白名单字段，
-    无 URL/base64/正文）；存在时 ``report_reply_failure`` 只提交一张图片汇总卡。
+    image_failure_summary（TSK-196）：图片理解失败时携带的安全聚合摘要
+    （``ImageFailureSummary``，无 URL/base64/正文）；只在消息处理器的通知
+    边界经本地窄 mapper 投影为 onebot ``ImageFailureDiagnostic``，存在时
+    ``report_reply_failure`` 只提交一张图片汇总卡。
     """
 
     stage: str
@@ -175,7 +178,27 @@ class ReplyFailureInfo:
     summary: str | None
     request_trace_id: str | None
     reaction_sent: bool
-    image_diagnostic: ImageFailureDiagnostic | None = None
+    image_failure_summary: ImageFailureSummary | None = None
+
+
+def _to_image_diagnostic(
+    summary: ImageFailureSummary | None,
+) -> ImageFailureDiagnostic | None:
+    """把安全的 ``ImageFailureSummary`` 投影为 onebot 窄诊断（仅白名单字段）。
+
+    TSK-196 深模块边界：chat 领域只传递 ``ImageFailureSummary``，只有在
+    消息处理器的通知边界才经本本地窄 mapper 构造 onebot
+    ``ImageFailureDiagnostic``；``ImageFailureDiagnostic`` 构造时运行时校验
+    并确定性去重排序，恶意值（URL/base64/CQ/换行）会 ValueError。
+    """
+    if summary is None:
+        return None
+    return ImageFailureDiagnostic(
+        mode=summary.mode,
+        failed_count=summary.failed_images,
+        stages=summary.stages,
+        error_types=summary.error_types,
+    )
 
 
 def _native_failure_summary(
@@ -189,8 +212,11 @@ def _native_failure_summary(
 
     TSK-196：native 批量下载失败与带图主 LLM 失败统一投影为
     ``ImageFailureSummary``，供消息处理器经共享通知边界提交图片汇总卡。
+    provider 整体失败时，进入有效范围的全部图片都未被成功理解：失败数量
+    恒为 ``total_images``（即使部分图片下载成功、部分下载失败），
+    error_types/stages 同时保留 download+vision。
     """
-    failed = download_failures + (1 if provider_failed else 0)
+    failed = total_images if provider_failed else download_failures
     error_types: set[str] = set()
     stages: set[str] = set()
     if download_failures:
@@ -623,11 +649,11 @@ class MessageHandler:
             # TSK-196：成功任务带图片失败摘要 → 最多提交一次 SUPERUSER 图片
             # 汇总卡（``group_text=None`` 无群消息），与失败路径共用共享通知
             # 边界与冷却；debug 干跑走 ``generate_debug_reply`` 不经过这里。
-            if pending_reply.reply_result.image_diagnostic is not None:
+            if pending_reply.reply_result.image_failure_summary is not None:
                 await self._notify_image_failure_summary(
                     bot=bot,
                     event=event,
-                    diagnostic=pending_reply.reply_result.image_diagnostic,
+                    summary=pending_reply.reply_result.image_failure_summary,
                     request_trace_id=pending_reply.request_trace_id,
                 )
             reply_action: ReplyAction = (
@@ -727,9 +753,10 @@ class MessageHandler:
             "[KomariChat] 回复失败善后: reason={} error_type={} image={}",
             reason,
             failure.error_type,
-            failure.image_diagnostic is not None,
+            failure.image_failure_summary is not None,
         )
         try:
+            diagnostic = _to_image_diagnostic(failure.image_failure_summary)
             notifier = GroupTaskFailureNotifier(
                 cooldown=RedisFailureNotificationCooldown(
                     cast("Any", self.redis.redis)
@@ -739,8 +766,8 @@ class MessageHandler:
             # （``group_text`` 仍按 reaction_sent 分流）；同一群+同图片
             # reason_code 跨任务共享 Redis 冷却，存储不可用故障开放。
             reason_code = (
-                image_failure_reason_code(failure.image_diagnostic)
-                if failure.image_diagnostic is not None
+                image_failure_reason_code(diagnostic)
+                if diagnostic is not None
                 else failure.error_type
             )
             await notifier.notify(
@@ -755,34 +782,41 @@ class MessageHandler:
                     notify_superusers=notify_superusers,
                     request_trace_id=failure.request_trace_id,
                     summary=(
-                        None if failure.image_diagnostic is not None else failure.summary
+                        None if diagnostic is not None else failure.summary
                     ),
-                    image_diagnostic=failure.image_diagnostic,
+                    image_diagnostic=diagnostic,
                 ),
             )
         except Exception:
-            logger.exception("[KomariChat] 回复失败善后上报异常")
+            # 不捕获 exc_info：本函数作用域可能持有 image_failure_summary，
+            # 避免任何含 URL/base64 的帧被写入日志（TSK-196 复审）。
+            logger.error("[KomariChat] 回复失败善后上报异常")
 
     async def _notify_image_failure_summary(
         self,
         *,
         bot: Bot,
         event: GroupMessageEvent,
-        diagnostic: ImageFailureDiagnostic,
+        summary: ImageFailureSummary,
         request_trace_id: str,
     ) -> None:
         """成功任务带图片失败摘要时，最多提交一次 SUPERUSER 图片汇总卡。
 
-        不向群内发送任何消息（``group_text=None``）；``notify/cooldown/投递``
-        异常一律吞掉，不影响主流程；debug 干跑路径绝不调用本方法。
+        只在消息处理器的通知边界把领域 ``ImageFailureSummary`` 映射为 onebot
+        窄诊断（TSK-196 深模块边界）；不向群内发送任何消息
+        （``group_text=None``）；``notify/cooldown/投递/映射`` 异常一律吞掉，
+        不影响主流程；debug 干跑路径绝不调用本方法。
         """
         try:
+            diagnostic = _to_image_diagnostic(summary)
+            if diagnostic is None:
+                return
             notify_superusers = get_memory_config().error_notify_enabled
         except Exception:
-            logger.exception(
-                "[KomariChat] 图片失败汇总通知配置读取失败，静默 SUPERUSER 私聊"
+            logger.error(
+                "[KomariChat] 图片失败汇总配置/映射失败，静默 SUPERUSER 私聊"
             )
-            notify_superusers = False
+            return
         try:
             notifier = GroupTaskFailureNotifier(
                 cooldown=RedisFailureNotificationCooldown(
@@ -805,7 +839,7 @@ class MessageHandler:
                 ),
             )
         except Exception:
-            logger.exception("[KomariChat] 图片失败汇总上报异常")
+            logger.error("[KomariChat] 图片失败汇总上报异常")
 
     @staticmethod
     def _select_recent_context(
@@ -1207,13 +1241,12 @@ class MessageHandler:
                     parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                     agent_budget=agent_budget,
                 )
-        except Exception:
-            # TSK-196：native 带图请求失败 → 包装为安全图片失败（from None，
-            # 不保留原异常 cause/正文），绝不切 delegated；无图片进入请求的
-            # 普通 LLM 错误按原样传播，不误报为图片失败。delegated 的主循环
-            # 已自行以 ImageUnderstandingFailureError 终止（此处原样重抛）。
-            if not (reply_image_urls or base64_image_urls):
-                raise
+        except NativeMultimodalRequestError:
+            # TSK-196 复审：只包装“主 provider 多模态调用失败”的窄 marker
+            # （from None，不保留原异常 cause/正文），绝不切 delegated；其他
+            # 异常（MaxRounds/工具预算/协议校验/内部错误）即便 native 有图
+            # 也原样传播，不误报为图片失败。delegated 的主循环已自行以
+            # ImageUnderstandingFailureError 终止（此处原样重抛）。
             raise ImageUnderstandingFailureError(
                 _native_failure_summary(
                     total_images=effective_total,
@@ -1232,12 +1265,12 @@ class MessageHandler:
             # TSK-196：native 部分下载失败且任务成功 → 聚合摘要附加到结果。
                 reply_result = replace(
                     reply_result,
-                    image_diagnostic=_native_failure_summary(
+                    image_failure_summary=_native_failure_summary(
                         total_images=effective_total,
                         download_failures=native_download_failures,
                         provider_failed=False,
                         all_unavailable=False,
-                    ).to_diagnostic(),
+                    ),
                 )
 
         logger.info(
@@ -1410,8 +1443,8 @@ class MessageHandler:
                     summary=str(exc),
                     request_trace_id=request_trace_id,
                     reaction_sent=reaction_sent,
-                    image_diagnostic=(
-                        exc.summary.to_diagnostic()
+                    image_failure_summary=(
+                        exc.summary
                         if isinstance(exc, ImageUnderstandingFailureError)
                         else None
                     ),
