@@ -382,7 +382,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
 - `native`：图片经安全下载与校验后作为多模态输入直接交给聊天主模型（chat 槽位），不声明 / 不调用 `read_image` 工具；聊天模型对带图请求报错或拒图时本任务明确失败，不自动降级、不切 delegated、不调用视觉服务
 - `delegated`：只向主回复 Agent 暴露稳定图片索引与 `read_image` 工具，主工具循环恒使用聊天模型与 chat 槽位；视觉子调用（`vision_service`）才使用独立视觉模型与 vision 槽位（含 `vision_thinking_mode` / `vision_reasoning_effort`）
-- 当前 TSK-194 仍对当前消息与引用消息全批安全下载（默认最多 4 张、单图 8 MiB、总计 20 MiB、并发 2、总时限 45 秒）；按需下载与任务级缓存留给 TSK-195
+- TSK-195：delegated 任务起点零预下载，`ImageReadingSession`（任务级图片会话）持有稳定引用（引用消息在前、当前消息在后）、按索引成功/失败缓存与并发单飞、字节账本/并发信号量/累计总时限（跨多轮不重建）、全失败安全摘要（`all_images_unavailable` + 归一化错误类型，TSK-196 消费）；只有首次 `read_image(image_index)` 才经安全下载器懒下载；原始 URL 只存在于会话→安全下载器边界，不进主模型消息、工具结果、普通日志与 Agent Run/debug 投影；视觉描述经既有 `UntrustedContext`（`source_type=vision`）回流；主 prompt 只含稳定索引/来源/范围（无 URL/base64）
 - 域名必须由 aiohttp 建连阶段的受控 resolver 解析并校验，禁止恢复“预解析后再由客户端重新解析”的 DNS 重绑定窗口；每一跳重定向都执行同样校验
 - 图片 MIME 必须来自 Pillow 对真实文件的识别与解码结果，禁止信任响应 `Content-Type` 或 URL 后缀；仅接受 JPEG、PNG、GIF、WebP，并执行累计像素限制
 
