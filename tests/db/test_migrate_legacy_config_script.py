@@ -359,6 +359,8 @@ class TestPlanRowValues:
             "reply_commit_tombstone_retention_days": (
                 "reply_fulfillment_tombstone_retention_days"
             ),
+            # TSK-194：旧图片开关读入，写入模式枚举列（值经变换器转换）
+            "vision_tool_enabled": "image_understanding_mode",
         }
         info: dict[str, tuple[str, bool]] = dict.fromkeys(
             spec.columns, ("INTEGER", False)
@@ -371,20 +373,103 @@ class TestPlanRowValues:
                 "proactive_reservation_ttl_seconds": ("INTEGER", False),
                 "reply_fulfillment_retry_max_seconds": ("INTEGER", False),
                 "reply_fulfillment_freshness_seconds": ("INTEGER", False),
+                "image_understanding_mode": ("CHARACTER VARYING", False),
             }
         )
         source = {old_name: index for index, old_name in enumerate(expected_mapping, 1)}
+        source["vision_tool_enabled"] = True  # 变换器只接受布尔
 
         planned = module.plan_row_values(spec, source, info)
 
         assert spec.legacy_key_map == expected_mapping
-        assert {
-            new_name: planned.values[new_name] for new_name in expected_mapping.values()
-        } == {
+        # 值级变换：vision_tool_enabled 只接受布尔，缺键回退列默认 delegated
+        assert (
+            spec.column_transformers["image_understanding_mode"](raw=True) == "delegated"
+        )
+        assert (
+            spec.column_transformers["image_understanding_mode"](raw=False) == "native"
+        )
+        assert spec.default_value_overrides["image_understanding_mode"] == "delegated"
+        assert planned.values["image_understanding_mode"] == "delegated"
+        expected_non_vision = {  # 排包图片模式列的期望映射（保持与 source 同源）
             new_name: index
-            for index, new_name in enumerate(expected_mapping.values(), 1)
+            for index, (old_name, new_name) in enumerate(
+                (kv for kv in expected_mapping.items() if kv[0] != "vision_tool_enabled"),
+                1,
+            )
         }
+        assert {
+            new_name: planned.values[new_name]
+            for new_name in set(expected_mapping.values())
+            - {"image_understanding_mode"}
+        } == expected_non_vision
         assert not set(expected_mapping).intersection(spec.columns)
+
+    @staticmethod
+    def test_chat_vision_legacy_values_map_to_mode_enum() -> None:
+        """TSK-194：旧布尔开关双分支 → 模式枚举，预算同名直写。"""
+        module = _load_script_module()
+        spec = next(
+            item
+            for item in module._RESOURCE_SPECS
+            if item.target_table == "komari_chat_config"
+        )
+        info: dict[str, tuple[str, bool]] = dict.fromkeys(
+            spec.columns, ("INTEGER", False)
+        )
+        info.update(
+            {
+                "image_understanding_mode": ("CHARACTER VARYING", False),
+                "vision_image_download_connect_timeout_seconds": (
+                    "DOUBLE PRECISION",
+                    False,
+                ),
+                "vision_image_download_read_timeout_seconds": (
+                    "DOUBLE PRECISION",
+                    False,
+                ),
+                "vision_image_download_total_timeout_seconds": (
+                    "DOUBLE PRECISION",
+                    False,
+                ),
+            }
+        )
+        budgets = {
+            "vision_image_download_max_count": 6,
+            "vision_image_download_max_bytes": 9 * 1024 * 1024,
+            "vision_image_download_total_max_bytes": 21 * 1024 * 1024,
+            "vision_image_download_max_pixels": 41_000_000,
+            "vision_image_download_concurrency": 3,
+            "vision_image_download_connect_timeout_seconds": 6.0,
+            "vision_image_download_read_timeout_seconds": 31.0,
+            "vision_image_download_total_timeout_seconds": 46.0,
+        }
+
+        planned_delegated = module.plan_row_values(
+            spec,
+            {"vision_tool_enabled": True, **budgets},
+            info,
+        )
+        assert planned_delegated.values["image_understanding_mode"] == "delegated"
+        for column, expected in budgets.items():
+            assert planned_delegated.values[column] == expected
+
+        planned_native = module.plan_row_values(
+            spec,
+            {"vision_tool_enabled": False, **budgets},
+            info,
+        )
+        assert planned_native.values["image_understanding_mode"] == "native"
+        for column, expected in budgets.items():
+            assert planned_native.values[column] == expected
+
+        # legacy 缺开关：写入列级默认覆盖 delegated（非类型中性空串）
+        planned_missing = module.plan_row_values(spec, {**budgets}, info)
+        assert planned_missing.values["image_understanding_mode"] == "delegated"
+
+        # 非布尔值：变换器拒绝，报告失败而非静默降级
+        with pytest.raises(ValueError, match="vision_tool_enabled"):
+            module.plan_row_values(spec, {"vision_tool_enabled": "yes"}, info)
 
 
 class _FakeConnection:
@@ -992,6 +1077,111 @@ class TestMigrateLegacyConfigsIntegration:
                 "sr": True,
                 "komari_chat": True,
             }
+        finally:
+            await conn.close()
+            await _drop_scratch_database(str(scratch["database"]))
+
+    @pytest.mark.asyncio
+    async def test_legacy_memory_vision_config_migrates_to_chat(self) -> None:
+        """TSK-194：旧 komari_memory JSONB 视觉配置迁入 komari_chat_config。
+
+        vision_tool_enabled 布尔双分支 → image_understanding_mode 枚举；
+        8 项预算原样直写；旧开关与预算键对 memory 表为弃用键（head 无
+        对应列）进入丢弃清单；联动断言脚本静态声明不再引用已删除列。
+        """
+        module = _load_script_module()
+        updated_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        budgets = {
+            "vision_image_download_max_count": 6,
+            "vision_image_download_max_bytes": 9 * 1024 * 1024,
+            "vision_image_download_total_max_bytes": 21 * 1024 * 1024,
+            "vision_image_download_max_pixels": 41_000_000,
+            "vision_image_download_concurrency": 3,
+            "vision_image_download_connect_timeout_seconds": 6.0,
+            "vision_image_download_read_timeout_seconds": 31.0,
+            "vision_image_download_total_timeout_seconds": 46.0,
+        }
+        scratch = await self._prepare_head_scratch()
+        conn = await asyncpg.connect(**scratch)
+        try:
+            await conn.execute(
+                "INSERT INTO komari_plugin_configs"
+                " (plugin_name, schema_name, config_data, version, revision,"
+                " updated_at)"
+                " VALUES ($1, $2, $3::jsonb, $4, $5, $6)",
+                "komari_memory",
+                "DynamicConfigSchema",
+                json.dumps(
+                    {
+                        "vision_tool_enabled": True,
+                        **budgets,
+                    },
+                    ensure_ascii=False,
+                ),
+                "1.0",
+                9,
+                updated_at,
+            )
+
+            result = await module.migrate_legacy_configs(conn)
+            reports = {r.spec.key_value: r for r in result.reports}
+
+            memory_report = reports["komari_memory"]
+            assert memory_report.migrated is True
+            assert set(memory_report.dropped_keys) == {
+                "version",
+                "last_updated",
+                "schema_name",
+                "vision_tool_enabled",
+                *budgets.keys(),
+            }, "旧视觉开关与预算键对 memory 表无对应列，必须全部丢弃"
+
+            chat_row = await conn.fetchrow(
+                "SELECT image_understanding_mode,"
+                " vision_image_download_max_count,"
+                " vision_image_download_max_bytes,"
+                " vision_image_download_total_max_bytes,"
+                " vision_image_download_max_pixels,"
+                " vision_image_download_concurrency,"
+                " vision_image_download_connect_timeout_seconds,"
+                " vision_image_download_read_timeout_seconds,"
+                " vision_image_download_total_timeout_seconds"
+                " FROM komari_chat_config WHERE id = 1"
+            )
+            assert chat_row["image_understanding_mode"] == "delegated"
+            for column, expected in budgets.items():
+                assert chat_row[column] == expected, f"预算列 {column} 迁移失真"
+
+            # head 表已无 memory 旧视觉列；脚本声明物也须一致
+            memory_columns = await _column_names(conn, "komari_memory_config")
+            assert "vision_tool_enabled" not in memory_columns
+            memory_spec = next(
+                s for s in module._RESOURCE_SPECS if s.key_value == "komari_memory"
+            )
+            assert "vision_tool_enabled" not in memory_spec.columns
+            assert not {"vision_image_download_*"} & set(
+                memory_spec.columns
+            ), "memory 资源不得声明任何旧视觉字段"
+
+            # 双分支：更新同一 legacy 行 vision_tool_enabled=false → native
+            await conn.execute(
+                "UPDATE komari_plugin_configs SET config_data = $1::jsonb,"
+                " revision = 10 WHERE plugin_name = 'komari_memory'",
+                json.dumps({"vision_tool_enabled": False}, ensure_ascii=False),
+            )
+            await module.migrate_legacy_configs(conn)
+            native_row = await conn.fetchrow(
+                "SELECT image_understanding_mode FROM komari_chat_config WHERE id = 1"
+            )
+            assert native_row["image_understanding_mode"] == "native"
+            # 缺键预算列不覆盖已播种值（UPDATE 路径不写缺键列）
+            budget_after = await conn.fetchrow(
+                "SELECT vision_image_download_max_count,"
+                " vision_image_download_total_timeout_seconds"
+                " FROM komari_chat_config WHERE id = 1"
+            )
+            assert budget_after["vision_image_download_max_count"] == 6
+            assert budget_after["vision_image_download_total_timeout_seconds"] == 46.0
         finally:
             await conn.close()
             await _drop_scratch_database(str(scratch["database"]))

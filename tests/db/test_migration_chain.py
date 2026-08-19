@@ -721,6 +721,79 @@ def test_agent_tool_call_mode_config_revision_exists() -> None:
     assert "import komari_bot" not in revision_sql
 
 
+def test_image_understanding_config_revision_exists() -> None:
+    """TSK-194：0014 的直接后继 revision 迁移图片理解模式与 8 项预算。
+
+    同 revision 内完成：chat 表新增 image_understanding_mode（默认
+    delegated）与 8 项预算列 + 跨字段 CHECK；按旧 bool 双分支数据迁移
+    （UPDATE ... FROM komari_memory_config）；随后删除 memory 旧开关与
+    预算列；downgrade 显式回退。本用例是静态守卫，真实语义由
+    ``test_image_understanding_mode_migration.py`` 的隔离库用例验证。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0014"]
+    assert len(children) == 1, f"0014 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+
+    # 新列与默认值
+    assert re.search(r"\bimage_understanding_mode\b", normalized, re.IGNORECASE), (
+        "迁移必须新增 image_understanding_mode 列"
+    )
+    assert re.search(r"DEFAULT\s*'delegated'", normalized, re.IGNORECASE), (
+        "迁移必须为非空 image_understanding_mode 声明默认值 'delegated'"
+    )
+    for column in (
+        "vision_image_download_max_count",
+        "vision_image_download_max_bytes",
+        "vision_image_download_total_max_bytes",
+        "vision_image_download_max_pixels",
+        "vision_image_download_concurrency",
+        "vision_image_download_connect_timeout_seconds",
+        "vision_image_download_read_timeout_seconds",
+        "vision_image_download_total_timeout_seconds",
+    ):
+        assert re.search(rf"\b{re.escape(column)}\b", normalized, re.IGNORECASE), (
+            f"迁移必须新增预算列: {column}"
+        )
+
+    # 跨字段 CHECK（两个图片预算约束）
+    assert "CK_KOMARI_CHAT_CONFIG_IMAGE_BUDGET_BYTES" in normalized
+    assert "CK_KOMARI_CHAT_CONFIG_IMAGE_BUDGET_TIMEOUT" in normalized
+
+    # 数据迁移：旧 bool 双分支来自 komari_memory_config 单行
+    # （f-string 占位符在源文本中以 {_TABLE} / {_MEMORY_TABLE} 形式保留）
+    assert "UPDATE {_TABLE}" in normalized
+    assert "FROM {_MEMORY_TABLE}" in normalized
+    assert re.search(r"CASE WHEN M\.VISION_TOOL_ENABLED", normalized)
+
+    # 删除 memory 旧开关与预算列
+    for column in (
+        "vision_tool_enabled",
+        "vision_image_download_max_count",
+        "vision_image_download_max_bytes",
+        "vision_image_download_total_max_bytes",
+        "vision_image_download_max_pixels",
+        "vision_image_download_concurrency",
+        "vision_image_download_connect_timeout_seconds",
+        "vision_image_download_read_timeout_seconds",
+        "vision_image_download_total_timeout_seconds",
+    ):
+        assert _has_explicit_drop_column(revision_sql, column), (
+            f"迁移 downgrade/upgrade 必须处理 memory 旧列: {column}"
+        )
+
+    assert "DROP TABLE komari_memory_config" not in normalized
+    assert "DROP TABLE komari_chat_config" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
+
+
+
 def _has_explicit_cross_field_check(revision_sql: str) -> bool:
     """识别显式跨字段 CHECK 声明，不锁定 SQL 字符串形态。
 
