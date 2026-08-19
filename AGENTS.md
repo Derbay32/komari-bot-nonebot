@@ -22,7 +22,7 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | LLM | OpenAI 兼容接口 | DeepSeek / Gemini 双后端 |
 | Embedding | OpenAI 兼容 API（远程） | 默认 `BAAI/bge-small-zh-v1.5` |
 | 部署 | Docker + Docker Compose | Gunicorn + Uvicorn；prestart 自动 `upgrade head` |
-| CI/CD | Forgejo CI → Codeberg 容器注册表 | 发布 tag 自动构建；migration-check 守卫 schema 漂移 |
+| CI/CD | GitHub Actions → GitHub Container Registry | 所有 PR 执行静态、无服务、PostgreSQL/Redis 集成与迁移验收；发布 tag 自动构建镜像 |
 | Lint | Ruff (py313) + Pyright `standard` | 零容忍类型错误 |
 
 ## 目录结构
