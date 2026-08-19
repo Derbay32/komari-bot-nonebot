@@ -111,6 +111,7 @@ def _build_real_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[
     Any,
+    Any,
     list[dict[str, Any]],
     list[tuple[str, str]],
 ]:
@@ -125,9 +126,11 @@ def _build_real_session(
     class _Downloader:
         def __init__(self) -> None:
             self.calls: list[str] = []
+            self.downloaded_bytes: int = 0
 
         async def download(self, url: str) -> str:
             self.calls.append(url)
+            self.downloaded_bytes += len(_DATA_URI)
             return _DATA_URI
 
         async def close(self) -> None:
@@ -162,7 +165,7 @@ def _build_real_session(
         policy=image_downloader_module.ImageDownloadPolicy(),
         vision_model="vision-model",
     )
-    return session, read_images_calls, log_records
+    return session, downloader, read_images_calls, log_records
 
 
 def test_delegated_raw_url_never_reaches_model_messages_or_tool_results(
@@ -192,7 +195,7 @@ def test_delegated_raw_url_never_reaches_model_messages_or_tool_results(
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    session, read_images_calls, _logs = _build_real_session(monkeypatch)
+    session, _downloader, read_images_calls, _logs = _build_real_session(monkeypatch)
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
@@ -237,7 +240,7 @@ def test_vision_description_is_wrapped_with_untrusted_vision_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """vision 描述经 render_untrusted_context 包裹（source_type=vision）。"""
-    _session, _read_images_calls, _logs = _build_real_session(monkeypatch)
+    _session, _downloader, _read_images_calls, _logs = _build_real_session(monkeypatch)
 
     from komari_bot.llm.untrusted_context import (
         UntrustedContext,
@@ -256,11 +259,41 @@ def test_vision_description_is_wrapped_with_untrusted_vision_source(
     assert "一只猫" in rendered
 
 
+def test_agent_final_without_reading_has_zero_downloads_and_vision_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-195：Agent 可不读图直接 final_response，产生 0 下载 + 0 视觉调用。
+
+    任务级会话构建零预下载；即使声明了 read_image 工具，Agent 选择不读图
+    时也不得触达下载器或视觉模型（acceptance：0 downloads + 0 vision calls）。
+    """
+    provider = _RecordingProvider()
+    provider.completions = [_final_response_completion()]
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+
+    session, downloader, read_images_calls, _logs = _build_real_session(monkeypatch)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            request_trace_id="no-read-1",
+            image_session=session,
+        )
+    )
+
+    assert result.content == "这只猫在窗台上。"
+    assert session.downloaded_bytes == 0, "未读图不得发生任何下载"
+    assert downloader.calls == [], "未读图不得触达下载器"
+    assert read_images_calls == [], "未读图不得调用视觉模型"
+
+
 def test_session_logs_keep_only_safe_source_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """会话内部日志只记录安全来源标签，不记录 URL path/query/base64。"""
-    session, _read_images_calls, log_records = _build_real_session(monkeypatch)
+    session, _downloader, _read_images_calls, log_records = _build_real_session(monkeypatch)
 
     asyncio.run(session.read(0))
 
