@@ -570,6 +570,219 @@ def test_download_session_is_isolated_between_instances() -> None:
     assert second.downloaded_bytes == 0
 
 
+def test_download_session_serial_calls_accumulate_elapsed_time(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：串行调用累计耗时；0.3s 后剩余约 0.2s（total=0.5s）。
+
+    第一次 0.3s 成功，剩余约 0.2s；第二次 0.15s 成功（0.15 < 0.2）；
+    第三次 0.3s 必须超时（0.3 > 0.2）。
+    """
+    sleeps = iter([0.3, 0.15, 0.3])
+
+    async def _fake_download(
+        _session: object,
+        _url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        _budget: image_downloader._DownloadBudget,
+    ) -> str:
+        await asyncio.sleep(next(sleeps))
+        return "data:image/png;base64,QQ=="
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _fake_download)
+    policy = image_downloader.ImageDownloadPolicy(
+        max_total_bytes=100,
+        concurrency=2,
+        total_timeout_seconds=0.5,
+    )
+    session = image_downloader.ImageDownloadSession(policy)
+
+    async def _run() -> list[str | None]:
+        first = await session.download("https://93.184.216.34/a.png")
+        second = await session.download("https://93.184.216.34/b.png")
+        third = await session.download("https://93.184.216.34/c.png")
+        await session.close()
+        return [first, second, third]
+
+    results = asyncio.run(_run())
+
+    assert results[0] is not None
+    assert results[1] is not None, "剩余约 0.2s，0.15s 下载应成功"
+    assert results[2] is None, "串行累计 0.3s 后剩余约 0.2s，0.3s 下载必须超时"
+
+
+def test_download_session_concurrent_shares_deadline_no_double_count(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：并发不同 index 共享同一 deadline，重叠墙钟只计一次。
+
+    total=1.0s，两个并发下载各耗时 0.4s：重叠时段只计 0.4s（而非每个并发
+    各自读取完整剩余后合计越过预算），随后剩余约 0.6s；再一个 0.5s 串行
+    下载必须成功（旧实现会把并发重叠重复计成 0.8s 导致剩余耗尽而失败）。
+    """
+    sleeps = [0.4, 0.4, 0.5]
+    active = 0
+    max_active = 0
+
+    async def _fake_download(
+        _session: object,
+        _url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        _budget: image_downloader._DownloadBudget,
+    ) -> str:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(sleeps.pop(0))
+        finally:
+            active -= 1
+        return "data:image/png;base64,QQ=="
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _fake_download)
+    policy = image_downloader.ImageDownloadPolicy(
+        max_total_bytes=100,
+        concurrency=2,
+        total_timeout_seconds=1.0,
+    )
+    session = image_downloader.ImageDownloadSession(policy)
+
+    async def _run() -> list[str | None]:
+        first_two = await asyncio.gather(
+            session.download("https://93.184.216.34/a.png"),
+            session.download("https://93.184.216.34/b.png"),
+        )
+        third = await session.download("https://93.184.216.34/c.png")
+        await session.close()
+        return [*first_two, third]
+
+    results = asyncio.run(_run())
+
+    assert max_active == 2, "并发度必须达到 2（两个 index 同时下载）"
+    assert results[0] is not None and results[1] is not None
+    assert results[2] is not None, (
+        "两个并发 0.4s 下载的重叠时段只计 0.4s（剩余约 0.6s），0.5s 必须成功"
+    )
+
+
+def test_download_many_shares_cumulative_time_budget(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：download_many 与 download 共享同一累计时限。
+
+    total=0.7s：单图 0.4s 后剩余约 0.3s；随后 download_many 两个并发各
+    0.4s 共享该批 deadline 0.3s，两个都必须超时。旧实现给整批一个全新
+    total_timeout 会绕过累计时限而全部成功。
+    """
+    sleeps = iter([0.4, 0.4, 0.4])
+
+    async def _fake_download(
+        _session: object,
+        _url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        _budget: image_downloader._DownloadBudget,
+    ) -> str:
+        await asyncio.sleep(next(sleeps))
+        return "data:image/png;base64,QQ=="
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _fake_download)
+    policy = image_downloader.ImageDownloadPolicy(
+        max_total_bytes=100,
+        concurrency=2,
+        total_timeout_seconds=0.7,
+    )
+    session = image_downloader.ImageDownloadSession(policy)
+
+    async def _run() -> tuple[str | None, list[str | None]]:
+        first = await session.download("https://93.184.216.34/a.png")
+        batch = await session.download_many(
+            ["https://93.184.216.34/b.png", "https://93.184.216.34/c.png"]
+        )
+        await session.close()
+        return first, batch
+
+    first, batch = asyncio.run(_run())
+
+    assert first is not None
+    assert batch == [None, None], (
+        "download_many 必须与 download 共享累计时限，不得绕开预算"
+    )
+
+
+def test_download_session_timeout_cancels_inflight_download(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：总时限超时后底层下载协程必须被取消，不得悬挂。"""
+    cancelled: list[str] = []
+
+    async def _slow_download(
+        _session: object,
+        _url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        _budget: image_downloader._DownloadBudget,
+    ) -> str:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append("cancelled")
+            raise
+        return "data:late"
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _slow_download)
+    policy = image_downloader.ImageDownloadPolicy(total_timeout_seconds=0.05)
+    session = image_downloader.ImageDownloadSession(policy)
+
+    async def _run() -> str | None:
+        result = await session.download("https://example.com/a.png")
+        await session.close()
+        return result
+
+    result = asyncio.run(_run())
+
+    assert result is None
+    assert cancelled == ["cancelled"], "总时限超时后底层下载协程必须被取消"
+
+
+def test_download_session_serial_total_budget_not_reset_by_idle_wait(
+    monkeypatch: Any,
+) -> None:
+    """TSK-195：无下载活动的空闲等待不重置预算，也不计入预算。
+
+    total=0.5s：0.3s 下载后空等 10s（LLM 轮次之间），预算保持冻结（剩余约
+    0.2s）；再 0.3s 下载必须超时。
+    """
+    sleeps = iter([0.3, 0.3])
+
+    async def _fake_download(
+        _session: object,
+        _url: str,
+        _policy: image_downloader.ImageDownloadPolicy,
+        _budget: image_downloader._DownloadBudget,
+    ) -> str:
+        await asyncio.sleep(next(sleeps))
+        return "data:image/png;base64,QQ=="
+
+    monkeypatch.setattr(image_downloader, "_download_single_image", _fake_download)
+    policy = image_downloader.ImageDownloadPolicy(
+        max_total_bytes=100,
+        concurrency=2,
+        total_timeout_seconds=0.5,
+    )
+    session = image_downloader.ImageDownloadSession(policy)
+
+    async def _run() -> tuple[str | None, str | None]:
+        first = await session.download("https://93.184.216.34/a.png")
+        await asyncio.sleep(10)  # 模拟 LLM 轮次之间的无下载活动间隔
+        second = await session.download("https://93.184.216.34/b.png")
+        await session.close()
+        return first, second
+
+    first, second = asyncio.run(_run())
+
+    assert first is not None
+    assert second is None, "空闲等待不得重置累计总时限（剩余约 0.2s，0.3s 必须超时）"
+
+
 def test_download_single_image_rejects_redirect_to_blocked_network() -> None:
     redirect = _FakeResponse(
         status=302,
