@@ -652,8 +652,9 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
 
     async def _refusing_generate_with_tools(**kwargs: object) -> Any:
         generate_kwargs.update(kwargs)
-        msg = "chat provider 拒绝多模态图片请求"
-        raise RuntimeError(msg)
+        # TSK-196 复审：真实 seam 把主 provider 多模态调用失败收敛为窄 marker
+        # （不携带原异常 cause/正文）；fake 直接抛 marker 以驱动包装边界。
+        raise llm_service_module.NativeMultimodalRequestError
 
     read_images_called: list[object] = []
 

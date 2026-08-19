@@ -60,6 +60,7 @@ def _notification(
     notify_superusers: bool = True,
     summary: str | None = "上游返回空回复",
     image_diagnostic: ImageFailureDiagnostic | None = None,
+    request_trace_id: str | None = "trace-abc",
 ) -> GroupTaskFailureNotification:
     return GroupTaskFailureNotification(
         group_id=12345,
@@ -69,7 +70,7 @@ def _notification(
         stage="generate",
         reason_code=reason_code,
         notify_superusers=notify_superusers,
-        request_trace_id="trace-abc",
+        request_trace_id=request_trace_id,
         summary=summary,
         image_diagnostic=image_diagnostic,
     )
@@ -261,12 +262,10 @@ async def test_summary_projection_removes_secrets_urls_and_extra_lines() -> None
 
 @pytest.mark.asyncio
 async def test_image_diagnostic_card_renders_strict_whitelist_fields() -> None:
-    """图片失败汇总卡只渲染白名单字段，不出现 message_id/URL/base64/正文。
-
-    该卡替代“摘要卡 + 失败卡”的两张卡合并体：调用方显式传
-    ``image_diagnostic`` 时只渲染任务/群/trace/图片模式/失败阶段/失败数量/
-    失败类型，generic 卡片格式（任务/群/阶段/原因/trace/摘要）保持不变。
-    """
+    """图片失败汇总卡只渲染严格白名单字段：群/trace/图片模式/失败阶段/
+    失败数量/失败类型；不出现任务、message_id、generic 阶段/原因/摘要、
+    URL/base64/正文。generic 卡片格式（任务/群/阶段/原因/trace/摘要）
+    保持不变。"""
     bot = _RecordingBot()
     diagnostic = ImageFailureDiagnostic(
         mode="delegated",
@@ -287,13 +286,16 @@ async def test_image_diagnostic_card_renders_strict_whitelist_fields() -> None:
     assert bot.group_calls == []
     assert len(bot.private_calls) == 1
     text = str(bot.private_calls[0]["message"])
-    assert "任务: chat_reply" in text
-    assert "群: 12345" in text
-    assert "trace: trace-abc" in text
-    assert "图片模式: delegated" in text
-    assert "失败阶段: vision" in text
-    assert "失败数量: 1" in text
-    assert "失败类型: vision_failed" in text
+    # TSK-196 复审：图片卡不允许“任务”行，票面只等于这些允许行（trace 可选）
+    assert text.splitlines() == [
+        "群: 12345",
+        "trace: trace-abc",
+        "图片模式: delegated",
+        "失败阶段: vision",
+        "失败数量: 1",
+        "失败类型: vision_failed",
+    ]
+    assert "任务:" not in text
     # 白名单：不渲染 generic 阶段/原因/摘要字段与 message_id
     assert "99999" not in text
     assert "阶段: generate" not in text
@@ -304,6 +306,92 @@ async def test_image_diagnostic_card_renders_strict_whitelist_fields() -> None:
     assert "base64" not in text
     assert "data:image" not in text
     assert "一只猫" not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_card_without_trace_omits_trace_line() -> None:
+    """无 trace 时图片卡只渲染群/模式/阶段/数量/类型五条允许行。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="native",
+        failed_count=2,
+        stages=("download",),
+        error_types=("image_unavailable",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            request_trace_id=None,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    text = str(bot.private_calls[0]["message"])
+    assert text.splitlines() == [
+        "群: 12345",
+        "图片模式: native",
+        "失败阶段: download",
+        "失败数量: 2",
+        "失败类型: image_unavailable",
+    ]
+
+
+def test_image_diagnostic_rejects_invalid_and_malicious_values() -> None:
+    """公开 dataclass 纵深防御：非法模式/阶段/错误类型、非正整数失败数、
+    空集合以及恶意 URL/base64/CQ/换行值都必须 ValueError。"""
+    base: dict[str, object] = {
+        "mode": "delegated",
+        "failed_count": 1,
+        "stages": ("vision",),
+        "error_types": ("vision_failed",),
+    }
+
+    type_invalid_cases: list[tuple[dict[str, object], str]] = [
+        ({"failed_count": True}, "正整数"),
+        ({"failed_count": 1.5}, "正整数"),
+    ]
+    value_invalid_cases: list[tuple[dict[str, object], str]] = [
+        ({"mode": "hybrid"}, "模式"),
+        ({"mode": "native\nhttps://evil.example/a.png"}, "模式"),
+        ({"mode": "data:image/png;base64,AAAA"}, "模式"),
+        ({"failed_count": 0}, "正整数"),
+        ({"failed_count": -3}, "正整数"),
+        ({"stages": ()}, "不能为空"),
+        ({"stages": ("https://evil.example/a.png",)}, "失败阶段"),
+        ({"stages": ("download\n[CQ:image,file=x]",)}, "失败阶段"),
+        ({"stages": ("vision", "数据")}, "失败阶段"),
+        ({"error_types": ()}, "不能为空"),
+        ({"error_types": ("data:image/png;base64,AAAA",)}, "失败类型"),
+        ({"error_types": ("vision_failed\nsecret",)}, "失败类型"),
+        ({"error_types": ("[CQ:image,file=evil]",)}, "失败类型"),
+        ({"error_types": ("image_unavailable", "未知")}, "失败类型"),
+    ]
+    for kwargs, expected in type_invalid_cases:
+        with pytest.raises(TypeError, match=expected):
+            ImageFailureDiagnostic(**{**base, **kwargs})  # type: ignore[arg-type]
+    for kwargs, expected in value_invalid_cases:
+        with pytest.raises(ValueError, match=expected):
+            ImageFailureDiagnostic(**{**base, **kwargs})  # type: ignore[arg-type]
+
+
+def test_image_diagnostic_normalizes_stages_and_error_types_deterministically() -> None:
+    """构造时确定性去重排序：重复/乱序的阶段与错误类型收敛为字典序唯一值。"""
+    diagnostic = ImageFailureDiagnostic(
+        mode="native",
+        failed_count=3,
+        stages=("vision", "download", "download", "vision"),
+        error_types=(
+            "image_unavailable",
+            "vision_failed",
+            "vision_failed",
+            "image_unavailable",
+        ),
+    )
+    assert diagnostic.stages == ("download", "vision")
+    assert diagnostic.error_types == ("image_unavailable", "vision_failed")
 
 
 @pytest.mark.asyncio

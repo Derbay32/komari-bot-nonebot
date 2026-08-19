@@ -16,6 +16,10 @@ from komari_bot.onebot import (
     image_failure_reason_code,
 )
 
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
+ImageFailureSummary = image_reading_session_module.ImageFailureSummary
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
@@ -114,7 +118,7 @@ def _failure(
     reaction_sent: bool = True,
     reason_code: str = "EmptyReplyError",
     summary: str | None = "模型返回空回复",
-    image_diagnostic: ImageFailureDiagnostic | None = None,
+    image_failure_summary: ImageFailureSummary | None = None,
 ) -> object:
     return ReplyFailureInfo(
         stage="generate",
@@ -122,16 +126,19 @@ def _failure(
         summary=summary,
         request_trace_id="trace-abc",
         reaction_sent=reaction_sent,
-        image_diagnostic=image_diagnostic,
+        image_failure_summary=image_failure_summary,
     )
 
 
-def _image_diagnostic() -> ImageFailureDiagnostic:
-    return ImageFailureDiagnostic(
+def _image_summary() -> ImageFailureSummary:
+    return ImageFailureSummary(
         mode="delegated",
-        failed_count=1,
-        stages=("vision",),
+        all_images_unavailable=True,
+        total_images=1,
+        attempted_images=1,
+        failed_images=1,
         error_types=("vision_failed",),
+        stages=("vision",),
     )
 
 
@@ -370,7 +377,7 @@ async def test_image_failure_summary_reuses_shared_notifier_with_no_group_text(
     使用稳定的图片 reason_code，stage 与 summary 不进入卡片。"""
     _configure_runtime(monkeypatch)
     bot = _FakeBot()
-    diagnostic = _image_diagnostic()
+    summary = _image_summary()
 
     await _build_handler().report_reply_failure(
         bot=bot,
@@ -379,7 +386,7 @@ async def test_image_failure_summary_reuses_shared_notifier_with_no_group_text(
             reaction_sent=False,
             reason_code="ImageUnderstandingFailureError",
             summary="图片理解失败（mode=delegated）",
-            image_diagnostic=diagnostic,
+            image_failure_summary=summary,
         ),
         reason="at",
     )
@@ -387,13 +394,16 @@ async def test_image_failure_summary_reuses_shared_notifier_with_no_group_text(
     assert bot.call_api_calls == []
     assert len(bot.send_private_msg_calls) == 1
     card = str(bot.send_private_msg_calls[0]["message"])
-    assert "任务: chat_reply" in card
-    assert "群: 12345" in card
-    assert "trace: trace-abc" in card
-    assert "图片模式: delegated" in card
-    assert "失败阶段: vision" in card
-    assert "失败数量: 1" in card
-    assert "失败类型: vision_failed" in card
+    # TSK-196 复审：图片卡严格白名单，不含“任务”行
+    assert card.splitlines() == [
+        "群: 12345",
+        "trace: trace-abc",
+        "图片模式: delegated",
+        "失败阶段: vision",
+        "失败数量: 1",
+        "失败类型: vision_failed",
+    ]
+    assert "任务:" not in card
     # 白名单：不泄漏 message_id / URL / base64 / 正文 / 视觉描述
     assert "99999" not in card
     assert "https://" not in card
@@ -417,7 +427,7 @@ async def test_image_failure_with_reaction_sends_group_apology_and_one_card(
             reaction_sent=True,
             reason_code="ImageUnderstandingFailureError",
             summary="图片理解失败（mode=delegated）",
-            image_diagnostic=_image_diagnostic(),
+            image_failure_summary=_image_summary(),
         ),
         reason="at",
     )
@@ -427,6 +437,9 @@ async def test_image_failure_with_reaction_sends_group_apology_and_one_card(
     card = str(bot.send_private_msg_calls[0]["message"])
     assert "图片模式: delegated" in card
     assert "失败类型: vision_failed" in card
+    assert "任务:" not in card
+    assert "阶段: generate" not in card
+    assert "原因:" not in card
 
 
 @pytest.mark.asyncio
@@ -442,7 +455,7 @@ async def test_image_failure_switch_off_mutes_private_only(
         event=_FakeEvent(),
         failure=_failure(
             reaction_sent=True,
-            image_diagnostic=_image_diagnostic(),
+            image_failure_summary=_image_summary(),
         ),
         reason="at",
     )
@@ -459,7 +472,7 @@ async def test_image_failure_cooldown_dedupes_same_group_and_reason_across_tasks
     _configure_runtime(monkeypatch)
     handler = _build_handler()
     bot = _FakeBot()
-    diagnostic = _image_diagnostic()
+    diagnostic = _image_summary()
 
     for _ in range(2):
         await handler.report_reply_failure(
@@ -467,16 +480,19 @@ async def test_image_failure_cooldown_dedupes_same_group_and_reason_across_tasks
             event=_FakeEvent(),
             failure=_failure(
                 reaction_sent=False,
-                image_diagnostic=diagnostic,
+                image_failure_summary=diagnostic,
             ),
             reason="at",
         )
 
     assert len(bot.send_private_msg_calls) == 1
 
-    other = ImageFailureDiagnostic(
+    other = ImageFailureSummary(
         mode="native",
-        failed_count=2,
+        all_images_unavailable=True,
+        total_images=2,
+        attempted_images=2,
+        failed_images=2,
         stages=("download", "vision"),
         error_types=("image_unavailable", "vision_failed"),
     )
@@ -485,7 +501,7 @@ async def test_image_failure_cooldown_dedupes_same_group_and_reason_across_tasks
         event=_FakeEvent(),
         failure=_failure(
             reaction_sent=False,
-            image_diagnostic=other,
+            image_failure_summary=other,
         ),
         reason="at",
     )
@@ -507,7 +523,7 @@ async def test_image_failure_redis_fail_open_keeps_private_card(
         event=_FakeEvent(),
         failure=_failure(
             reaction_sent=False,
-            image_diagnostic=_image_diagnostic(),
+            image_failure_summary=_image_summary(),
         ),
         reason="at",
     )
@@ -558,13 +574,13 @@ async def test_process_message_success_with_image_failures_notifies_once(
         lambda _redis: object(),
     )
 
-    diagnostic = _image_diagnostic()
+    summary = _image_summary()
     reply_result = message_handler_module.ReplyResult(
         content="回复内容",
         interaction_history={"event": "看图", "result": "描述", "emotion": "平静"},
         favorability_delta=0,
         favorability_reason="无变化",
-        image_diagnostic=diagnostic,
+        image_failure_summary=summary,
     )
     pending = message_handler_module.PendingReply(
         reply="回复内容",
@@ -606,8 +622,14 @@ async def test_process_message_success_with_image_failures_notifies_once(
     notification = notifications[0]
     assert notification.group_text is None
     assert notification.task_kind == "chat_reply"
-    assert notification.reason_code == image_failure_reason_code(diagnostic)
-    assert notification.image_diagnostic == diagnostic
+    expected_diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    assert notification.reason_code == image_failure_reason_code(expected_diagnostic)
+    assert notification.image_diagnostic == expected_diagnostic
     assert notification.notify_superusers is True
     assert notification.group_id == 12345
     assert notification.message_id == 99999

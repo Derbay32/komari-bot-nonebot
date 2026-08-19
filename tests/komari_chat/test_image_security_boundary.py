@@ -515,11 +515,11 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
     )
 
     assert result.content == "这只猫在窗台上。"
-    assert result.image_diagnostic is not None
-    assert result.image_diagnostic.mode == "delegated"
-    assert result.image_diagnostic.failed_count == 1
-    assert result.image_diagnostic.error_types == ("vision_failed",)
-    assert result.image_diagnostic.stages == ("vision",)
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.mode == "delegated"
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
 
     # 主模型 messages（含失败工具结果）不得出现 URL path/query 或 base64
     for call in provider.completion_calls:
@@ -647,9 +647,9 @@ def test_delegated_repeated_read_does_not_inflate_failed_count(
         trace.parsed_arguments == {"image_index": 0} for trace in error_traces
     )
     # 聚合失败计数按唯一失败索引计，不因重复读取放大
-    assert result.image_diagnostic is not None
-    assert result.image_diagnostic.failed_count == 1
-    assert result.image_diagnostic.error_types == ("vision_failed",)
-    assert result.image_diagnostic.stages == ("vision",)
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
     # 会话日志仍不泄漏 secret
     _assert_logs_have_no_secrets_no_traceback(log_records)

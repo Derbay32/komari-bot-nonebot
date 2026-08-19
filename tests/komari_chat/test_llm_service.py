@@ -1589,12 +1589,12 @@ def test_generate_reply_with_tools_delegated_partial_failure_allows_honest_final
     assert image_session.read_calls == [(0, None)]
     # 只尝试了 index 0 且失败：并非全部可用索引均已尝试 → 不算全部不可用
     assert image_session.all_images_unavailable() is False
-    # 成功任务把聚合摘要附到结果（TSK-196 消费）
-    assert result.image_diagnostic is not None
-    assert result.image_diagnostic.mode == "delegated"
-    assert result.image_diagnostic.failed_count == 1
-    assert result.image_diagnostic.error_types == ("vision_failed",)
-    assert result.image_diagnostic.stages == ("vision",)
+    # 成功任务把聚合摘要附到结果（TSK-196 消费；深模块边界只传 ImageFailureSummary）
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.mode == "delegated"
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
     # 第二轮上下文保留 read_image 失败的结构化工具结果，供模型诚实收尾
     second_round_messages = fake_provider.completion_calls[1]["messages"]
     tool_contents = [
@@ -1761,6 +1761,175 @@ def test_generate_reply_with_tools_delegated_all_unavailable_same_round_final(
         )
 
     assert excinfo.value.summary.all_images_unavailable is True
+    assert len(fake_provider.completion_calls) == 1
+
+
+def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminates(
+    monkeypatch: Any,
+) -> None:
+    """TSK-196 复审：最后允许轮次、该轮仅 read_image 无 final_response，且
+    该次读取使全部可用索引均失败 → 以专用安全异常终止，绝不落入 MaxRounds
+    RuntimeError。
+
+    修复前 all_images_unavailable 只在轮首/final_response 检查：最后轮仅
+    read_image 时会漏终止而抛 MaxRounds。修复后每次 read_image 的
+    ToolExecutionTrace 写入 collector 后立即检查，最后一次失败 read_image 的
+    trace 保留。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-img-round1",
+                ),
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":1}',
+                    {"image_index": 1},
+                    call_id="call-img-round2",
+                ),
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            ),
+            image_reading_session_module.ImageReadResult(
+                index=1,
+                status="failure",
+                failure_message="[图片读取失败: 下载失败]",
+                error_type="image_unavailable",
+                stage="download",
+            ),
+        ]
+    )
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="test-delegated-last-round")
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
+        asyncio.run(
+            llm_service_module.generate_reply_with_tools(
+                config=_build_config(
+                    agent_max_rounds=2,
+                    agent_max_tool_calls_per_round=4,
+                    agent_max_total_tool_calls=8,
+                ),
+                messages=[{"role": "user", "content": "看图"}],
+                tools=[llm_service_module.READ_IMAGE_TOOL],
+                image_session=image_session,
+                collector=collector,
+            )
+        )
+
+    summary = excinfo.value.summary
+    assert summary.mode == "delegated"
+    assert summary.all_images_unavailable is True
+    assert summary.total_images == 2
+    assert summary.attempted_images == 2
+    assert summary.failed_images == 2
+    assert summary.error_types == ("image_unavailable", "vision_failed")
+    assert summary.stages == ("download", "vision")
+    # 是专用安全异常，绝非 MaxRounds RuntimeError
+    assert isinstance(
+        excinfo.value, image_reading_session_module.ImageUnderstandingFailureError
+    )
+    assert "https://" not in str(excinfo.value)
+    assert "base64" not in str(excinfo.value)
+    # 两轮 read_image 都执行，最后一次失败 read_image 的 Trace 已写入 collector
+    assert len(fake_provider.completion_calls) == 2
+    image_traces = [
+        trace for trace in collector.tools if trace.tool_name == "read_image"
+    ]
+    assert len(image_traces) == 2
+    assert [trace.parsed_arguments for trace in image_traces] == [
+        {"image_index": 0},
+        {"image_index": 1},
+    ]
+    assert all(trace.status == "error" for trace in image_traces)
+    assert all(trace.error_summary == "图片读取失败" for trace in image_traces)
+
+
+def test_generate_reply_with_tools_final_response_before_read_image_same_round(
+    monkeypatch: Any,
+) -> None:
+    """TSK-196 复审：同轮 final_response 排在 read_image 之前时，final_response
+    成功且后续 read_image 不执行（图片尚未尝试、all_images_unavailable 尚未
+    成立）；断言零 read、无摘要。不要为此改成预判失败。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "先提交最终回复",
+                        "interaction_history": {
+                            "event": "看图",
+                            "result": "未读取即回复",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-first",
+                ),
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-img-after-final",
+                ),
+            ],
+        )
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            image_session=image_session,
+        )
+    )
+
+    assert result.content == "先提交最终回复"
+    # 图片尚未尝试：零 read、无摘要，final_response 不因未读图而预判失败
+    assert image_session.read_calls == []
+    assert result.image_failure_summary is None
     assert len(fake_provider.completion_calls) == 1
 
 
@@ -2028,10 +2197,10 @@ def test_read_image_tool_records_error_when_vision_service_fails(
     assert image_trace.status == "error"
     assert image_trace.error_summary == "图片读取失败"
     assert image_trace.result_summary is None
-    assert result.image_diagnostic is not None
-    assert result.image_diagnostic.failed_count == 1
-    assert result.image_diagnostic.error_types == ("vision_failed",)
-    assert result.image_diagnostic.stages == ("vision",)
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
 
 
 def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) -> None:

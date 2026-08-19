@@ -356,7 +356,13 @@ def test_native_all_downloads_unavailable_terminates_before_llm(
 def test_native_multimodal_provider_failure_wraps_without_mode_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """native 带图请求 provider 报错 → 安全包装 mode=native 摘要（from None）。"""
+    """native 带图请求 provider 报错 → 安全包装 mode=native 摘要（from None）。
+
+    真实 seam（``_execute_tool_loop`` 对 ``_call_llm_completion`` 的 except）把
+    主 provider 多模态调用失败收敛为窄 marker ``NativeMultimodalRequestError``
+    （不携带原异常 cause/正文）；此处 fake generate 直接抛该 marker 以驱动
+    message_handler 的包装边界。
+    """
     config = _chat_config_stub(image_understanding_mode="native")
     handler, generate_kwargs, download_batches, build_prompt_kwargs = _wire_native_core(
         monkeypatch,
@@ -364,7 +370,7 @@ def test_native_multimodal_provider_failure_wraps_without_mode_switch(
         image_urls=["https://example.com/a.png"],
         download_results=["base64:https://example.com/a.png"],
         build_prompt_multimodal=True,
-        generate_error=RuntimeError(f"chat provider 拒绝多模态图片请求 {_RAW_URL} {_DATA_URI}"),
+        generate_error=llm_service_module.NativeMultimodalRequestError(),
     )
 
     with pytest.raises(ImageUnderstandingFailureError) as excinfo:
@@ -405,6 +411,154 @@ def test_native_multimodal_provider_failure_wraps_without_mode_switch(
     assert download_batches == [["https://example.com/a.png"]]
 
 
+# ── native 复审：generic 错误不包装、provider 失败 failed_count=total ──
+
+
+def test_native_generic_errors_with_images_are_not_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """native 带图请求但 generic 错误（MaxRounds/工具预算/协议校验/内部）
+    不包装为图片失败，原样传播。
+
+    TSK-196 复审：只包装“主 provider 多模态调用失败”的窄 marker；其他异常
+    即便请求带图也绝不误报 vision_failed。
+    """
+    config = _chat_config_stub(image_understanding_mode="native")
+    handler, _generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
+        monkeypatch,
+        config,
+        image_urls=["https://example.com/a.png"],
+        download_results=["base64:https://example.com/a.png"],
+        build_prompt_multimodal=True,
+        generate_error=RuntimeError(
+            "vision_tool 达到最大轮数或工具预算上限，模型仍未完成 final_response"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="达到最大轮数") as excinfo:
+        asyncio.run(
+            handler._generate_reply_core(
+                message=_make_message(),
+                recent_messages=[],
+                interaction_records=[],
+                image_urls=["https://example.com/a.png"],
+                reply_context=None,
+                reply_context_requested=False,
+                reply_context_refetched=False,
+                request_trace_id="chat-native-generic-1",
+            )
+        )
+
+    # 是普通 RuntimeError（MaxRounds 等），不是图片失败专用异常
+    assert not isinstance(
+        excinfo.value,
+        image_reading_session_module.ImageUnderstandingFailureError,
+    )
+
+
+def test_native_provider_failure_counts_all_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """native 3 张图全部下载成功但 provider 整体失败：failed_count 必须为
+    total_images（所有进入有效范围的图片都未被成功理解），不是 0+1。"""
+    config = _chat_config_stub(image_understanding_mode="native")
+    handler, _generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
+        monkeypatch,
+        config,
+        image_urls=[
+            "https://example.com/a.png",
+            "https://example.com/b.png",
+            "https://example.com/c.png",
+        ],
+        download_results=[
+            "base64:https://example.com/a.png",
+            "base64:https://example.com/b.png",
+            "base64:https://example.com/c.png",
+        ],
+        build_prompt_multimodal=True,
+        generate_error=llm_service_module.NativeMultimodalRequestError(),
+    )
+
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
+        asyncio.run(
+            handler._generate_reply_core(
+                message=_make_message(),
+                recent_messages=[],
+                interaction_records=[],
+                image_urls=[
+                    "https://example.com/a.png",
+                    "https://example.com/b.png",
+                    "https://example.com/c.png",
+                ],
+                reply_context=None,
+                reply_context_requested=False,
+                reply_context_refetched=False,
+                request_trace_id="chat-native-provider-total",
+            )
+        )
+
+    summary = excinfo.value.summary
+    assert summary.mode == "native"
+    assert summary.total_images == 3
+    assert summary.attempted_images == 3
+    assert summary.failed_images == 3, "provider 整体失败时失败数量必须等于 total_images"
+    assert summary.error_types == ("vision_failed",)
+    assert summary.stages == ("vision",)
+
+
+def test_native_partial_download_failure_plus_provider_failure_counts_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """native 部分下载失败后 provider 也失败：failed_count 仍为 total_images，
+    error_types/stages 同时包含 download+vision。"""
+    config = _chat_config_stub(image_understanding_mode="native")
+    handler, _generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
+        monkeypatch,
+        config,
+        image_urls=[
+            "https://example.com/bad.png",
+            "https://example.com/ok.png",
+            "https://example.com/ok2.png",
+        ],
+        download_results=[
+            None,
+            "base64:https://example.com/ok.png",
+            "base64:https://example.com/ok2.png",
+        ],
+        build_prompt_multimodal=True,
+        generate_error=llm_service_module.NativeMultimodalRequestError(),
+    )
+
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
+        asyncio.run(
+            handler._generate_reply_core(
+                message=_make_message(),
+                recent_messages=[],
+                interaction_records=[],
+                image_urls=[
+                    "https://example.com/bad.png",
+                    "https://example.com/ok.png",
+                    "https://example.com/ok2.png",
+                ],
+                reply_context=None,
+                reply_context_requested=False,
+                reply_context_refetched=False,
+                request_trace_id="chat-native-partial-provider",
+            )
+        )
+
+    summary = excinfo.value.summary
+    assert summary.mode == "native"
+    assert summary.total_images == 3
+    assert summary.failed_images == 3, "部分下载失败 + provider 失败时失败数量仍等于 total_images"
+    assert summary.error_types == ("image_unavailable", "vision_failed")
+    assert summary.stages == ("download", "vision")
+
+
 # ── native 部分下载失败 + 任务成功：聚合摘要附加到结果 ─────────────────
 
 
@@ -440,11 +594,11 @@ def test_native_partial_download_failure_success_attaches_diagnostic(
     )
 
     assert result.content == "回复内容"
-    assert result.image_diagnostic is not None
-    assert result.image_diagnostic.mode == "native"
-    assert result.image_diagnostic.failed_count == 1
-    assert result.image_diagnostic.error_types == ("image_unavailable",)
-    assert result.image_diagnostic.stages == ("download",)
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.mode == "native"
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("image_unavailable",)
+    assert result.image_failure_summary.stages == ("download",)
     assert generate_kwargs  # 任务继续进入主 LLM
 
 
