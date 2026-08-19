@@ -23,9 +23,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-if TYPE_CHECKING:
-    import pytest
-
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
 )
@@ -612,7 +609,7 @@ def test_failure_summary_error_types_and_stages_are_sorted(
         async def close(self) -> None:
             return None
 
-    class _FailingVision:
+    class _FailingVision(_FakeVision):
         async def __call__(
             self, images: list[str], **kwargs: object
         ) -> list[str]:

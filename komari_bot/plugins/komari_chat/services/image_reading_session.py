@@ -23,7 +23,6 @@ delegated 模式下，单个回复 Agent 任务拥有一个图片理解会话：
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 
@@ -37,6 +36,8 @@ from .image_downloader import (
 from .vision_service import read_images
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 #: 图片来源归属：引用消息图片在前、当前消息图片在后。
@@ -170,7 +171,7 @@ class ImageReadingSession:
         #: 原始 URL 只存在于会话内部私有映射（index → source），仅传给安全
         #: 下载器；公开引用投影（``ImageReference``）不携带原始 URL。
         self._sources: dict[int, str] = dict(
-            zip((ref.index for ref in references), sources)
+            zip((ref.index for ref in references), sources, strict=True)
         )
         self._by_index: dict[int, ImageReference] = {
             ref.index: ref for ref in references
