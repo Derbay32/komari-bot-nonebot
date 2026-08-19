@@ -105,3 +105,75 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot \
 | 0010 预检或回填失败 | 事务整体回滚，版本停留原样 | 旧版继续运行，处置后重试 |
 | 0011 切换校验失败 | 事务整体回滚，版本停留 0010，旧表仍在 | 可 `downgrade 0009` 或修复后重试 |
 | 0011 完成后任何故障 | 无 downgrade 路径 | 停新版，恢复升级前备份，启动旧版 |
+
+## 聊天回复最终协议协调式破坏性升级（0012–0015，一次性）
+
+适用于从 0011 或更早版本升级到包含 0012–0015 的版本（TSK-188～194）。本升级把
+聊天回复的输出协议、回复 Agent 执行预算、工具调用约束模式与图片理解模式收敛为
+`komari_chat` 配置的唯一新契约：**不提供双读、双写、旧字段别名或运行时兼容回退**，
+升级后旧字段从 Schema、管理 API 与数据库中一并消失。
+
+### 变更内容
+
+- **0012** `komari_prompt_komari_chat`：删除旧最终输出协议列 `output_instruction`，
+  其自定义内容永久丢弃、绝不并入任何新字段；新增 7 个独立行为列
+  （`tool_call_instruction` / `image_read_instruction` /
+  `profile_read_instruction` / `search_web_instruction` /
+  `fetch_page_instruction` / `delegated_vision_instruction` /
+  `vision_description_prompt`）。**0012 不可逆**：downgrade 明确拒绝，不承诺还原
+  已删除的 `output_instruction` 列或其自定义内容。
+- **0013** `komari_chat_config`：新增回复 Agent 执行预算
+  `agent_max_rounds`（默认 10）/ `agent_max_tool_calls_per_round`（默认 4）/
+  `agent_max_total_tool_calls`（默认 20），并声明跨字段 CHECK。
+- **0014** `komari_chat_config`：新增工具调用约束模式 `agent_tool_call_mode`
+  （非空默认 `required`，取值 `required` / `prompt_guided`）。
+- **0015** `komari_chat_config`：新增图片理解模式 `image_understanding_mode`
+  （默认 `delegated`，取值 `native` / `delegated`）与 8 项 `vision_image_download_*`
+  下载预算；按旧图片开关 bool 双分支精确迁移（开→`delegated`、关→`native`）并把
+  预算原样复制到 chat，随后从 `komari_memory_config` 删除旧开关与 8 项预算列
+  （不留 alias / 双读 / fallback）。
+
+新列的正文与初始数据由统一版本化播种（`seed_bootstrap`）写入，0012–0015 迁移只
+建列、不承载 Prompt 内容；升级后未播种的应用无法通过冷启动校验（fail fast）。
+
+### 升级步骤（全新库与旧库通用）
+
+全新数据库与 0011 之前旧库的升级均从 0011 处继续：
+
+1. 备份：`pg_dump` 全量备份数据库。备份是唯一保险，0012 起无完整降级路径。
+2. 升级到 head：
+   ```bash
+   poetry run python -m komari_bot.db.orm_bootstrap upgrade head
+   ```
+3. 播种初始数据（**升级后必须执行**；容器 prestart 已按
+   `upgrade head` → `seed_bootstrap` 顺序自动执行）：
+   ```bash
+   poetry run python -m komari_bot.db.seed_bootstrap
+   ```
+   播种只新建缺失场景与三个 Prompt 资源单行、只补齐空字段，绝不覆盖非空自定义值、
+   不删除管理员场景；旧 `output_instruction` 自定义内容不并入任何字段。
+4. 校验模型元数据零漂移：
+   ```bash
+   poetry run python -m komari_bot.db.orm_bootstrap check
+   ```
+
+### 验收命令
+
+真实 PostgreSQL 门控下的协调式升级验收（每个用例在从门控库派生的一次性隔离库内
+重建迁移链，结束即 DROP，门控用户需要 CREATEDB 权限）：
+
+```bash
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test \
+  poetry run pytest \
+    tests/db/test_tsk197_fresh_database_gate.py \
+    tests/db/test_tsk197_legacy_upgrade_gate.py
+```
+
+### 失败回滚矩阵
+
+| 故障点 | 结果 | 回滚动作 |
+| --- | --- | --- |
+| 0012–0015 任一执行失败 | 该 revision 事务回滚，版本停留原样 | 修复后重试升级 |
+| 0012 成功完成后退回 | 0012 downgrade 不可逆，无降级路径 | 停新版，恢复升级前备份，启动旧版 |
+| 0013–0015 成功完成后退回 | 可对称 `downgrade` 到 0012，但回退后新配置列消失 | 恢复备份或继续升级 |
