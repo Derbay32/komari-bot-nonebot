@@ -765,8 +765,8 @@ def test_download_session_serial_total_budget_not_reset_by_idle_wait(
 ) -> None:
     """TSK-195：无下载活动的空闲等待不重置预算，也不计入预算。
 
-    total=0.5s：0.3s 下载后空等 10s（LLM 轮次之间），预算保持冻结（剩余约
-    0.2s）；再 0.3s 下载必须超时。
+    total=0.5s：0.3s 下载后空等 0.05s（LLM 轮次之间的短且稳定的无下载
+    活动间隔），预算保持冻结（剩余约 0.2s）；再 0.3s 下载必须超时。
     """
     sleeps = iter([0.3, 0.3])
 

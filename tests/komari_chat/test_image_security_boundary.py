@@ -401,7 +401,8 @@ def test_session_downloader_exception_logs_normalized_type_no_traceback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """下载器异常正文内嵌 secret URL/data URI 时，会话日志只记录归一化
-    异常类型（无 exc_info、无敏感正文），结果缓存为结构化失败。"""
+    异常类型（无 exc_info、无敏感正文），结果缓存为结构化失败且归入下载
+    阶段（TSK-195 语义：下载故障不得误报为视觉故障）。"""
     leak_error = RuntimeError(f"download failed {_RAW_URL} {_DATA_URI}")
     session, log_records = _build_failing_session(
         monkeypatch,
@@ -411,9 +412,9 @@ def test_session_downloader_exception_logs_normalized_type_no_traceback(
     result = asyncio.run(session.read(0))
 
     assert result.status == "failure"
-    assert result.error_type == "vision_failed"
-    assert result.stage == "vision"
-    assert result.failure_message == "[图片读取失败: 未知错误]"
+    assert result.error_type == "image_unavailable"
+    assert result.stage == "download"
+    assert result.failure_message == "[图片读取失败: 图片下载或解码失败，无法读取该图片]"
     assert _RAW_URL not in str(result)
     assert _DATA_URI not in str(result)
 

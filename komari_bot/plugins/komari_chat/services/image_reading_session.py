@@ -384,31 +384,60 @@ class ImageReadingSession:
         *,
         parent_call_id: str | None,
     ) -> ImageReadResult:
-        """单张图片的懒下载 + 视觉描述；失败按索引缓存。"""
+        """单张图片的懒下载 + 视觉描述；失败按索引缓存。
+
+        安全异常边界按阶段拆分（TSK-195 语义修正）：下载阶段异常归
+        ``image_unavailable``/``download``，视觉阶段异常归
+        ``vision_failed``/``vision``，避免 TSK-196 安全摘要把下载故障误报
+        为视觉故障；两阶段异常日志都只记录 index/scheme://host 标签与归一
+        化异常类型，不捕获 traceback 也不记录 ``str(exc)``，CancelledError
+        两阶段都继续传播。
+        """
         index = reference.index
+        logger.info(
+            "[ImageReadingSession] 开始读取图片: index={} origin={} "
+            "original={} source={}",
+            index,
+            reference.origin,
+            reference.original_index,
+            reference.source_label,
+        )
+        # 阶段 1：安全下载器懒下载。下载/解码/SSRF 等异常统一归入下载阶段，
+        # 缓存为 image_unavailable/download，避免被 TSK-196 误报为视觉故障。
         try:
-            logger.info(
-                "[ImageReadingSession] 开始读取图片: index={} origin={} "
-                "original={} source={}",
+            data_uri = await self._downloader.download(source)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "[ImageReadingSession] 图片下载异常: index={} source={} "
+                "error_type={}",
                 index,
-                reference.origin,
-                reference.original_index,
+                reference.source_label,
+                type(exc).__name__,
+            )
+            return _as_failure(
+                index,
+                "[图片读取失败: 图片下载或解码失败，无法读取该图片]",
+                error_type="image_unavailable",
+                stage="download",
+            )
+        if data_uri is None:
+            logger.warning(
+                "[ImageReadingSession] 图片下载或解码失败: index={} source={}",
+                index,
                 reference.source_label,
             )
-            data_uri = await self._downloader.download(source)
-            if data_uri is None:
-                logger.warning(
-                    "[ImageReadingSession] 图片下载或解码失败: index={} source={}",
-                    index,
-                    reference.source_label,
-                )
-                return _as_failure(
-                    index,
-                    "[图片读取失败: 图片下载或解码失败，无法读取该图片]",
-                    error_type="image_unavailable",
-                    stage="download",
-                )
+            return _as_failure(
+                index,
+                "[图片读取失败: 图片下载或解码失败，无法读取该图片]",
+                error_type="image_unavailable",
+                stage="download",
+            )
 
+        # 阶段 2：独立视觉模型子调用。拒绝/超时/网络等异常统一归入视觉阶段，
+        # 缓存为 vision_failed/vision。
+        try:
             descriptions = await read_images(
                 [data_uri],
                 vision_model=self._vision_model,
@@ -424,35 +453,11 @@ class ImageReadingSession:
                 parent_call_id=parent_call_id if self._collector is not None else None,
                 collector=self._collector,
             )
-            description = descriptions[0] if descriptions else ""
-            if not description:
-                return _as_failure(
-                    index,
-                    "[图片读取失败: 视觉服务未返回结果]",
-                    error_type="vision_failed",
-                    stage="vision",
-                )
-            if description.startswith("[图片读取失败:"):
-                return _as_failure(
-                    index,
-                    description,
-                    error_type="vision_failed",
-                    stage="vision",
-                )
-            return ImageReadResult(
-                index=index,
-                status="success",
-                description=description,
-            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # 意外异常：安全日志只记录 index、scheme://host 标签与归一化异常
-            # 类型；不捕获 traceback（栈帧局部变量 source/data_uri 含原始
-            # URL 与 base64，TSK-195 第二轮安全验收反馈），并缓存为结构化
-            # 失败，绝不让共享任务崩溃或泄漏原始 URL。
             logger.error(
-                "[ImageReadingSession] 读取图片发生未知错误: index={} source={} "
+                "[ImageReadingSession] 图片视觉识别异常: index={} source={} "
                 "error_type={}",
                 index,
                 reference.source_label,
@@ -464,6 +469,26 @@ class ImageReadingSession:
                 error_type="vision_failed",
                 stage="vision",
             )
+        description = descriptions[0] if descriptions else ""
+        if not description:
+            return _as_failure(
+                index,
+                "[图片读取失败: 视觉服务未返回结果]",
+                error_type="vision_failed",
+                stage="vision",
+            )
+        if description.startswith("[图片读取失败:"):
+            return _as_failure(
+                index,
+                description,
+                error_type="vision_failed",
+                stage="vision",
+            )
+        return ImageReadResult(
+            index=index,
+            status="success",
+            description=description,
+        )
 
     def all_images_unavailable(self) -> bool:
         """所有可用引用均已被尝试读取且全部失败。"""
