@@ -1124,17 +1124,40 @@ class TestMigrateLegacyConfigsIntegration:
             )
 
             result = await module.migrate_legacy_configs(conn)
-            reports = {r.spec.key_value: r for r in result.reports}
-
-            memory_report = reports["komari_memory"]
+            # "komari_memory" 同名 key_value 对应两个 ResourceSpec（memory
+            # 表与 chat 表），必须按 target_table 分别取报告，禁止以
+            # key_value 为键折叠（会错选成 chat 报告）。
+            memory_report = next(
+                r
+                for r in result.reports
+                if r.spec.target_table == "komari_memory_config"
+            )
+            chat_report = next(
+                r
+                for r in result.reports
+                if r.spec.target_table == "komari_chat_config"
+            )
             assert memory_report.migrated is True
             assert set(memory_report.dropped_keys) == {
-                "version",
-                "last_updated",
-                "schema_name",
                 "vision_tool_enabled",
                 *budgets.keys(),
             }, "旧视觉开关与预算键对 memory 表无对应列，必须全部丢弃"
+            assert memory_report.migrated_keys == [], (
+                "memory 表已无视觉列，不得消费任何视觉键"
+            )
+
+            assert chat_report.migrated is True
+            assert set(chat_report.migrated_keys) == {
+                "image_understanding_mode",
+                *budgets.keys(),
+            }, "vision_tool_enabled 与预算必须作为 chat 已知键被消费"
+            assert chat_report.dropped_keys == [], (
+                "9 个视觉键对 chat 表有对应列，不得进入丢弃清单"
+            )
+            assert not set(chat_report.defaulted_keys) & {
+                "image_understanding_mode",
+                *budgets.keys(),
+            }, "9 个视觉键不得落回默认值"
 
             chat_row = await conn.fetchrow(
                 "SELECT image_understanding_mode,"

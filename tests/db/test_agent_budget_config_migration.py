@@ -157,8 +157,14 @@ async def _prepare_head_scratch() -> tuple[dict[str, Any], str]:
 
 async def _insert_row_without_budget_columns(
     connection: asyncpg.Connection,
+    *,
+    revision: int = 1,
 ) -> None:
-    """插入一行配置，只显式填充非预算列，让 0013 的列默认值生效。"""
+    """插入一行配置，只显式填充非预算列，让 0013 的列默认值生效。
+
+    ``revision`` 默认 1，保持既有调用语义；历史阶段（0015 之前）调用方
+    显式传入存量 revision，用于验证迁移不得触碰 CAS revision。
+    """
     exists = await connection.fetchval(
         "SELECT EXISTS (SELECT 1 FROM komari_chat_config WHERE id = 1)"
     )
@@ -180,7 +186,7 @@ async def _insert_row_without_budget_columns(
     await connection.execute(
         f"INSERT INTO komari_chat_config ({columns_sql}) VALUES ({placeholders})",
         1,
-        1,
+        revision,
         datetime.now(UTC),
         *[_NON_BUDGET_COLUMN_DEFAULTS[column] for column in value_columns],
     )

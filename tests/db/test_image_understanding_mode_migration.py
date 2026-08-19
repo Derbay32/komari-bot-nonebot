@@ -300,7 +300,10 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         conn = await asyncpg.connect(**scratch)
         try:
             await _insert_legacy_memory_row(conn)
-            await _insert_row_without_budget_columns(conn)
+            # 0014 阶段 chat 存量行携带历史 revision，验证 0015 不得触碰
+            await _insert_row_without_budget_columns(
+                conn, revision=_CHAT_LEGACY_REVISION
+            )
         finally:
             await conn.close()
 
