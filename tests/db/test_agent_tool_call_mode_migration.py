@@ -45,12 +45,23 @@ pytestmark = [
     pytest.mark.asyncio,
 ]
 
-#: 0012 时刻 komari_chat_config 的存量业务列（不含 0013 预算列与
-#: 0014 新增列），供"存量行"插入使用；基于共享默认值字典扣除 0014
-#: 引入的 ``agent_tool_call_mode`` 后得到（共享字典随 head 演进，但本
-#: 文件清单固定为 0012 历史 schema，与迁移链语义一致）。
-_EXPECTED_0012_VALUE_COLUMNS = tuple(
-    sorted(set(_NON_BUDGET_COLUMN_DEFAULTS) - {"agent_tool_call_mode"})
+#: 0012 时刻 komari_chat_config 的存量业务列（不含 0013 预算列 / 0014
+#: agent_tool_call_mode / 0015 图片列）。固定为 0012 历史 schema 的字面
+#: 清单，不随 head 的 `_NON_BUDGET_COLUMN_DEFAULTS` 字典演进——后续 head
+#: 新增列（如 TSK-194 图片字段）不得污染历史列集合 oracle。
+_EXPECTED_0012_VALUE_COLUMNS: tuple[str, ...] = (
+    "proactive_cooldown",
+    "proactive_enabled",
+    "proactive_max_per_hour",
+    "proactive_reservation_ttl_seconds",
+    "reply_fulfillment_batch_size",
+    "reply_fulfillment_freshness_seconds",
+    "reply_fulfillment_lease_seconds",
+    "reply_fulfillment_max_attempts",
+    "reply_fulfillment_retry_base_seconds",
+    "reply_fulfillment_retry_max_seconds",
+    "reply_fulfillment_tombstone_retention_days",
+    "reply_fulfillment_worker_interval_seconds",
 )
 
 

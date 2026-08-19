@@ -50,6 +50,22 @@ _DROPPED_COLUMNS = (
 #: 死字段（KOMARIBOT-7 已从 schema 删除），downgrade 回填的默认值。
 _DEAD_FIELD_DEFAULT = 0.0
 
+#: 0004 时代 komari_memory_config 仍持有、但 head schema（TSK-194 于
+#: 0015 迁入 komari_chat_config）已移除的 9 个视觉字段，均为 NOT NULL
+#: 且无默认值。历史 fixture 在 0004 时代表结构插入单行时必须显式补齐，
+#: 否则 INSERT 即 NOT NULL 违约。
+_HISTORICAL_MEMORY_VISION_DEFAULTS: dict[str, object] = {
+    "vision_tool_enabled": True,
+    "vision_image_download_max_count": 4,
+    "vision_image_download_max_bytes": 8 * 1024 * 1024,
+    "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+    "vision_image_download_max_pixels": 40_000_000,
+    "vision_image_download_concurrency": 2,
+    "vision_image_download_connect_timeout_seconds": 5.0,
+    "vision_image_download_read_timeout_seconds": 30.0,
+    "vision_image_download_total_timeout_seconds": 45.0,
+}
+
 _RENAMED_CONFIG_COLUMNS = {
     "reply_commit_worker_interval_seconds": (
         "reply_fulfillment_worker_interval_seconds"
@@ -316,6 +332,12 @@ async def _ensure_memory_config_row(conn: asyncpg.Connection) -> bool:
         and column in type(defaults).model_fields
     ]
     values = [getattr(defaults, column) for column in value_columns]
+    # TSK-194：0015 迁走前 memory 表仍持有 9 个视觉列（NOT NULL 无默认），
+    # head schema 已无对应字段；历史 fixture 须显式补齐，避免 NOT NULL 违约。
+    for column, value in _HISTORICAL_MEMORY_VISION_DEFAULTS.items():
+        if column in table_columns and column not in value_columns:
+            value_columns.append(column)
+            values.append(value)
     # JSONB 列（白名单等列表/字典字段）必须序列化并显式 ::jsonb 转型，
     # 否则 asyncpg 把 list 当数组绑定而报 DataError
     serialized = [

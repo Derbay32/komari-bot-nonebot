@@ -222,7 +222,7 @@ async def build_prompt(
     interaction_records: list[dict[str, Any]] | None = None,
     interaction_memories: list[dict[str, Any]] | None = None,
     *,
-    vision_tool_mode: bool = False,
+    delegated_image_mode: bool = False,
     search_tool_mode: bool = False,
     fetch_tool_mode: bool = False,
 ) -> list[dict[str, Any]]:
@@ -250,10 +250,12 @@ async def build_prompt(
         reply_context: 当前消息引用的上下文（可选）
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
         query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
-        vision_tool_mode: 是否使用工具调用读图模式。开启时注入 read_image
-            行为引导与动态图片索引说明，不嵌入 base64 图片块；视觉描述
-            正文（vision_description_prompt）只供 vision_service 子调用
-            消费，不注入主回复 Agent messages
+        delegated_image_mode: 委托读图模式（read_image 工具）。开启时注入
+            委托行为引导与动态图片索引说明，不把 base64 图片块嵌入 (user)
+            消息；视觉描述正文（vision_description_prompt）只供
+            vision_service 子调用消费，不注入主回复 Agent messages。
+            原生模式（native）关闭该开关：图片作为多模态输入直接嵌入
+            (user) 消息，由聊天模型原生理解，不暴露 read_image 工具。
         search_tool_mode: 是否启用联网搜索工具声明
         fetch_tool_mode: 是否启用网页抓取工具声明
 
@@ -281,7 +283,7 @@ async def build_prompt(
         }
     )
     messages.append({"role": "system", "content": LLM_SECURITY_SYSTEM_INSTRUCTION})
-    if vision_tool_mode:
+    if delegated_image_mode:
         messages.append(
             {"role": "system", "content": template["image_read_instruction"]}
         )
@@ -582,7 +584,7 @@ async def build_prompt(
 
     reply_intro_text = "\n".join(reply_intro_lines)
     has_multimodal_content = bool(reply_image_urls or image_urls)
-    if has_multimodal_content and vision_tool_mode:
+    if has_multimodal_content and delegated_image_mode:
         vision_lines: list[str] = []
         reply_image_count = len(reply_image_urls or [])
         current_image_count = len(image_urls or [])

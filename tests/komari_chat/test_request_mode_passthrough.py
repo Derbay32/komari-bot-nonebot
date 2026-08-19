@@ -125,16 +125,18 @@ def test_tool_loop_passes_chat_slot_request_mode(monkeypatch: Any) -> None:
     assert call["stream_enabled"] is True
 
 
-def test_tool_loop_uses_vision_slot_request_mode(monkeypatch: Any) -> None:
-    """启用 read_image 工具时改用 vision 槽位参数。"""
+def test_tool_loop_keeps_chat_slot_with_read_image_tool(monkeypatch: Any) -> None:
+    """TSK-194：存在 read_image 工具时主循环仍使用聊天模型与 chat 槽位。
+
+    旧行为：只要启用了 read_image，整个工具循环就切到视觉模型与 vision 槽
+    位；新契约：主循环恒使用聊天模型 + chat request_api/stream 槽位，只有
+    read_image 视觉子调用才使用 vision 槽位参数。
+    """
     provider = _RecordingProvider()
     provider.completions = [_final_response_completion()]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    read_images_calls: list[dict[str, Any]] = []
-
-    async def _fake_read_images(*_args: Any, **kwargs: Any) -> list[str]:
-        read_images_calls.append(kwargs)
+    async def _fake_read_images(*_args: Any, **_kwargs: Any) -> list[str]:
         return ["描述"]
 
     monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
@@ -142,8 +144,8 @@ def test_tool_loop_uses_vision_slot_request_mode(monkeypatch: Any) -> None:
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(
-                llm_request_api_chat="chat_completions",
-                llm_stream_enabled_chat=False,
+                llm_request_api_chat="responses",
+                llm_stream_enabled_chat=True,
             ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
@@ -155,13 +157,19 @@ def test_tool_loop_uses_vision_slot_request_mode(monkeypatch: Any) -> None:
     )
 
     call = provider.completion_calls[0]
-    assert call["model"] == "vision-model"
+    assert call["model"] == "chat-model"
+    assert call["temperature"] == 0.7
+    assert call["max_tokens"] == 1024
     assert call["request_api"] == "responses"
     assert call["stream_enabled"] is True
 
 
 def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> None:
-    """read_image 业务工具把 vision 槽位模式传给视觉服务。"""
+    """TSK-194：read_image 业务工具把 vision 槽位模式传给视觉服务。
+
+    主循环保持在 chat 槽位（model=chat-model、chat request_api/stream），
+    而 read_image 视觉子调用携带 vision 模型与 vision 槽位模式。
+    """
     provider = _RecordingProvider()
     provider.completions = [
         base_client_module.LLMCompletionResultSchema(
@@ -183,7 +191,10 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
-            config=_build_config(),
+            config=_build_config(
+                llm_request_api_chat="chat_completions",
+                llm_stream_enabled_chat=False,
+            ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
             base64_images=["data:image/png;base64,AAAA"],
@@ -193,6 +204,12 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
         )
     )
 
+    assert len(provider.completion_calls) == 2
+    # 主循环两轮都使用聊天模型 + chat 槽位（含带 read_image 工具的一轮）
+    for call in provider.completion_calls:
+        assert call["model"] == "chat-model"
+        assert call["request_api"] == "chat_completions"
+        assert call["stream_enabled"] is False
     assert len(read_images_calls) == 1
     assert read_images_calls[0]["request_api"] == "responses"
     assert read_images_calls[0]["stream_enabled"] is True
@@ -534,3 +551,120 @@ def test_vision_service_passes_vision_slot_mode(monkeypatch: Any) -> None:
     content = captured[0]["messages"][0]["content"]
     assert content[0]["type"] == "text"
     assert content[0]["text"] == "TEST-VISION-DESCRIPTION-PROMPT"
+
+
+def test_read_image_subcall_uses_vision_thinking_and_reasoning(
+    monkeypatch: Any,
+) -> None:
+    """TSK-194：主循环用 chat thinking/reasoning，read_image 子调用用 vision。
+
+    main loop 的两轮 completion 请求携带 chat 槽位（chat thinking/reasoning），
+    而 read_image 视觉子调用收到任务起点快照的 vision thinking/reasoning。
+    """
+    provider = _RecordingProvider()
+    provider.completions = [
+        base_client_module.LLMCompletionResultSchema(
+            content="",
+            tool_calls=[
+                _tool_call("read_image", '{"image_index": 0}', {"image_index": 0})
+            ],
+            finish_reason="tool_calls",
+        ),
+        _final_response_completion(),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+
+    read_images_calls: list[dict[str, Any]] = []
+
+    async def _fake_read_images(*_args: Any, **kwargs: Any) -> list[str]:
+        read_images_calls.append(kwargs)
+        return ["一只猫"]
+
+    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+
+    asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(
+                llm_thinking_mode_chat=False,
+                llm_reasoning_effort_chat="",
+            ),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            base64_images=["data:image/png;base64,AAAA"],
+            vision_model="vision-model",
+            vision_thinking_mode=True,
+            vision_reasoning_effort="high",
+        )
+    )
+
+    # 主循环两轮仍用 chat thinking/reasoning
+    assert len(provider.completion_calls) == 2
+    for call in provider.completion_calls:
+        assert call["thinking_mode"] is False
+        assert call["reasoning_effort"] == ""
+    # read_image 视觉子调用使用 vision thinking/reasoning（同一任务快照）
+    assert len(read_images_calls) == 1
+    assert read_images_calls[0]["thinking_mode"] is True
+    assert read_images_calls[0]["reasoning_effort"] == "high"
+
+
+def test_vision_service_passes_vision_thinking_and_reasoning(
+    monkeypatch: Any,
+) -> None:
+    """TSK-194：视觉服务最终 generate_messages_completion 请求携带推理参数。
+
+    ``read_images -> _read_single_image`` 把任务起点快照透传到 provider
+    请求（thinking_mode / reasoning_effort），不中途重读配置。
+    """
+    captured: list[dict[str, Any]] = []
+
+    class _Provider:
+        async def generate_messages_completion(self, **kwargs: Any) -> Any:
+            captured.append(kwargs)
+            return SimpleNamespace(
+                content="一只猫",
+                tool_calls=[],
+                finish_reason="stop",
+                usage=None,
+                duration_ms=1.0,
+                continuation=None,
+            )
+
+    monkeypatch.setattr(vision_service_module, "llm_provider", _Provider())
+    monkeypatch.setattr(
+        vision_service_module,
+        "llm_provider_config_manager",
+        SimpleNamespace(get=lambda: SimpleNamespace(api_token="token")),
+    )
+
+    prompt_template_module = import_module(
+        "komari_bot.plugins.komari_chat.services.prompt_template"
+    )
+
+    async def _fake_vision_description_template() -> dict[str, str]:
+        return {"vision_description_prompt": "TEST-VISION-DESCRIPTION-PROMPT"}
+
+    monkeypatch.setattr(
+        prompt_template_module,
+        "get_template",
+        _fake_vision_description_template,
+    )
+    if hasattr(vision_service_module, "get_template"):
+        monkeypatch.setattr(
+            vision_service_module,
+            "get_template",
+            _fake_vision_description_template,
+        )
+
+    asyncio.run(
+        vision_service_module.read_images(
+            ["data:image/png;base64,AAAA"],
+            vision_model="vision-model",
+            thinking_mode=True,
+            reasoning_effort="high",
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["thinking_mode"] is True
+    assert captured[0]["reasoning_effort"] == "high"

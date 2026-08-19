@@ -113,7 +113,17 @@ def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
         "global_interaction_trigger_size": 20,
         "face_reaction_enabled": False,
         "face_reaction_id": "76",
-        "vision_tool_enabled": False,
+        "image_understanding_mode": "delegated",
+        # TSK-194：图片下载预算 8 项字段（与配置 Schema/迁移 0015 默认值一致；
+        # ImageDownloadPolicy.from_config 不再对缺字段回退隐藏默认，fixture 必须显式提供）
+        "vision_image_download_max_count": 4,
+        "vision_image_download_max_bytes": 8 * 1024 * 1024,
+        "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+        "vision_image_download_max_pixels": 40_000_000,
+        "vision_image_download_concurrency": 2,
+        "vision_image_download_connect_timeout_seconds": 5.0,
+        "vision_image_download_read_timeout_seconds": 30.0,
+        "vision_image_download_total_timeout_seconds": 45.0,
         "error_notify_enabled": False,
         "agent_max_rounds": 10,
         "agent_max_tool_calls_per_round": 4,
@@ -698,7 +708,7 @@ def _wire_reaction_sent_case(
             global_interaction_trigger_size=20,
             face_reaction_enabled=face_reaction_enabled,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -1187,7 +1197,7 @@ def test_generate_debug_reply_skips_all_side_effects(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1277,7 +1287,7 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1359,7 +1369,7 @@ def test_generate_debug_reply_with_images_and_reply_context(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1484,7 +1494,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1863,7 +1873,7 @@ def test_reaction_scheduled_before_generate_core(
             global_interaction_trigger_size=20,
             face_reaction_enabled=True,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -1966,7 +1976,7 @@ def test_reaction_not_scheduled_when_disabled(
             global_interaction_trigger_size=20,
             face_reaction_enabled=False,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -2067,7 +2077,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
             global_interaction_trigger_size=20,
             face_reaction_enabled=True,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -2166,7 +2176,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
             global_interaction_trigger_size=20,
             face_reaction_enabled=True,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -2526,7 +2536,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )

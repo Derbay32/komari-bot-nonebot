@@ -55,7 +55,7 @@ from urllib.parse import unquote, urlsplit
 import asyncpg
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # 静态资源清单：键→列映射写死，与 migrations/0002、0003 的 DDL 逐列一致
@@ -79,11 +79,36 @@ class ResourceSpec:
         default_factory=dict
     )
     legacy_key_map: dict[str, str] = field(default_factory=dict)
+    #: 列值变换器：legacy 值直接 / 经 legacy_key_map 命中后先变换再写列
+    #:（如 vision_tool_enabled(bool) → image_understanding_mode(enum)）。
+    column_transformers: dict[str, "Callable[[Any], Any]"] = field(
+        default_factory=dict
+    )
+    #: 列级中性默认值覆盖：legacy 缺失且列 NOT NULL 时写入该值，
+    #: 替代类型中性默认值（如 image_understanding_mode 缺失时用 delegated）。
+    default_value_overrides: dict[str, Any] = field(default_factory=dict)
 
 
 #: legacy 行里出现的、新表没有对应列的弃用键（进入决算报告「丢弃」清单）。
 _DEPRECATED_PLUGIN_KEYS = frozenset({"version", "last_updated", "schema_name"})
 _DEPRECATED_PROMPT_KEYS = frozenset({"version", "last_updated", "display_name"})
+
+
+def _legacy_vision_tool_enabled_to_mode(raw: Any) -> str:
+    """TSK-194：旧 vision_tool_enabled 布尔双分支 → 图片理解模式枚举。
+
+    true → delegated（默认行为，Agent 经 read_image 工具读图）；
+    false → native（图片直接作为多模态输入给主模型）。
+    """
+    if raw is True:
+        return "delegated"
+    if raw is False:
+        return "native"
+    msg = (
+        "vision_tool_enabled 必须是布尔值，"
+        f"实际为 {type(raw).__name__}: {raw!r}"
+    )
+    raise ValueError(msg)
 
 _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
     ResourceSpec(
@@ -324,15 +349,6 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "llm_reasoning_effort_chat",
             "assistant_prefill_enabled",
             "dsv4_roleplay_instruct_mode",
-            "vision_tool_enabled",
-            "vision_image_download_max_count",
-            "vision_image_download_max_bytes",
-            "vision_image_download_total_max_bytes",
-            "vision_image_download_max_pixels",
-            "vision_image_download_concurrency",
-            "vision_image_download_connect_timeout_seconds",
-            "vision_image_download_read_timeout_seconds",
-            "vision_image_download_total_timeout_seconds",
             "llm_model_summary",
             "llm_temperature_summary",
             "llm_max_tokens_summary",
@@ -392,6 +408,9 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
     # JSONB 键（legacy_key_map），写入时映射到 reply_fulfillment_* 列。
     # proactive_score_threshold 死字段不迁移，由 komari_memory 资源的
     # unknown 键丢弃逻辑一并清理。
+    # TSK-194：图片理解模式与 8 项下载预算同样投 komari_chat_config；
+    # 旧 vision_tool_enabled 布尔经 column_transformers 变换为枚举，
+    # 缺失时（legacy 无开关）默认 delegated；预算键同名直写。
     ResourceSpec(
         legacy_table="komari_plugin_configs",
         legacy_key_column="plugin_name",
@@ -409,6 +428,15 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "reply_fulfillment_max_attempts",
             "reply_fulfillment_retry_base_seconds",
             "reply_fulfillment_tombstone_retention_days",
+            "image_understanding_mode",
+            "vision_image_download_max_count",
+            "vision_image_download_max_bytes",
+            "vision_image_download_total_max_bytes",
+            "vision_image_download_max_pixels",
+            "vision_image_download_concurrency",
+            "vision_image_download_connect_timeout_seconds",
+            "vision_image_download_read_timeout_seconds",
+            "vision_image_download_total_timeout_seconds",
         ),
         deprecated_keys=_DEPRECATED_PLUGIN_KEYS,
         legacy_key_map={
@@ -424,6 +452,13 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "reply_commit_tombstone_retention_days": (
                 "reply_fulfillment_tombstone_retention_days"
             ),
+            "vision_tool_enabled": "image_understanding_mode",
+        },
+        column_transformers={
+            "image_understanding_mode": _legacy_vision_tool_enabled_to_mode,
+        },
+        default_value_overrides={
+            "image_understanding_mode": "delegated",
         },
     ),
     ResourceSpec(
@@ -682,7 +717,9 @@ def _neutral_default(
     data_type: str,
     column_name: str,
 ) -> Any:
-    """缺失 NOT NULL 列时使用的类型中性默认值。"""
+    """缺失 NOT NULL 列时使用的类型中性默认值（可被列级覆盖）。"""
+    if column_name in spec.default_value_overrides:
+        return spec.default_value_overrides[column_name]
     if data_type == "BOOLEAN":
         return False
     if data_type in ("SMALLINT", "INTEGER", "BIGINT"):
@@ -728,14 +765,19 @@ def plan_row_values(
         data_type, is_nullable = column_info[column]
         if raw is None:
             # 新列名缺失时回退读取 legacy_key_map 声明的旧 JSONB 键
-            #（TSK-87 改名：旧键可读，写入只落新列）。
+            #（TSK-87 改名：旧键可读，写入只落新列；TSK-194：
+            # vision_tool_enabled → image_understanding_mode）。
             for legacy_key, target_column in spec.legacy_key_map.items():
                 if target_column == column and legacy_key in data:
                     raw = data[legacy_key]
                     break
+        if raw is not None and column in spec.column_transformers:
+            # 值级变换：如 vision_tool_enabled 布尔 → 模式枚举；
+            # 变换前的原始值既不写入也不进入决算清单。
+            raw = spec.column_transformers[column](raw)
         if raw is None:
             # JSONB null / 缺失键：可空列不写入（保持 NULL / 播种值），
-            # NOT NULL 列仅在 INSERT 路径回退类型默认值（不进入 update_keys，
+            # NOT NULL 列仅在 INSERT 路径回退默认值（不进入 update_keys，
             # 已播种行上的原值不会被覆盖）
             defaulted_keys.append(column)
             if not is_nullable:

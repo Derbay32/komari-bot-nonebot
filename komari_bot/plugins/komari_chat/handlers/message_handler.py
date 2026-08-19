@@ -36,10 +36,10 @@ from ..reply_fulfillment_domain import build_reply_fulfillment_id
 from ..services.agent_budget import AgentExecutionBudget
 from ..services.config_interface import get_config, get_memory_config
 from ..services.image_downloader import (
-    ImageDownloadPolicy,
     download_images_as_base64_aligned,
     extract_image_sources,
 )
+from ..services.image_understanding import ImageUnderstandingPolicy
 from ..services.llm_service import (
     FETCH_PAGE_TOOL,
     READ_IMAGE_TOOL,
@@ -801,7 +801,12 @@ class MessageHandler:
         # TSK-192：任务起点从 komari_chat 配置冻结回复 Agent 执行预算，
         # 普通 / debug / 简单三条入口共享同一份冻结快照；
         # 任务中配置变更不影响当前任务，只作用于下一个任务。
-        agent_budget = AgentExecutionBudget.from_config(get_config())
+        # TSK-194 / ADR-0010：图片理解模式与下载预算同为任务级冻结值——
+        # 普通 / debug 入口都在此处读取一次；原生模式图片直接交给聊天模型
+        # 多模态输入，委托模式暴露 read_image 工具。
+        chat_config = get_config()
+        agent_budget = AgentExecutionBudget.from_config(chat_config)
+        image_policy = ImageUnderstandingPolicy.from_config(chat_config)
 
         # 查询重写（带 trace）
         if collector is not None:
@@ -868,7 +873,7 @@ class MessageHandler:
         if combined_sources:
             aligned_images = await download_images_as_base64_aligned(
                 combined_sources,
-                ImageDownloadPolicy.from_config(config),
+                image_policy.download,
             )
             reply_boundary = len(reply_sources)
             reply_image_urls = [
@@ -882,9 +887,9 @@ class MessageHandler:
                 if image is not None
             ] or None
         all_base64_images = (reply_image_urls or []) + (base64_image_urls or [])
-        use_vision_tool = getattr(config, "vision_tool_enabled", True) and bool(
-            all_base64_images
-        )
+        # 委托模式才向回复 Agent 暴露 read_image 工具；原生模式图片作为
+        # 多模态输入直接嵌入 (user) 消息，由聊天模型原生理解。
+        use_vision_tool = image_policy.is_delegated and bool(all_base64_images)
         use_search_tool = bool(
             komari_search_plugin.is_search_available(
                 caller_user_id=message.user_id,
@@ -928,7 +933,7 @@ class MessageHandler:
 
         if image_urls or reply_image_urls:
             logger.info(
-                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} vision_tool_mode={}",
+                "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} image_mode={} delegated_tool={}",
                 request_trace_id,
                 message.group_id,
                 message.message_id,
@@ -940,6 +945,7 @@ class MessageHandler:
                 sum(len(url) for url in (reply_image_urls or []))
                 + sum(len(url) for url in (base64_image_urls or [])),
                 len(memories),
+                image_policy.mode,
                 use_vision_tool,
             )
 
@@ -967,7 +973,7 @@ class MessageHandler:
             current_user_profile=current_user_profile,
             interaction_records=interaction_records,
             interaction_memories=interaction_memories,
-            vision_tool_mode=use_vision_tool,
+            delegated_image_mode=use_vision_tool,
             search_tool_mode=use_search_tool,
             fetch_tool_mode=use_fetch_tool,
         )
@@ -984,24 +990,31 @@ class MessageHandler:
             vision_model = ""
             vision_temperature = 0.3
             vision_max_tokens = 1024
-            vision_thinking_mode = False
-            vision_reasoning_effort = ""
             vision_request_api = "chat_completions"
             vision_stream_enabled = False
+            vision_thinking_mode = False
+            vision_reasoning_effort = ""
             if use_vision_tool:
+                # TSK-194 / ADR-0010：视觉槽位全部参数（含推理参数）在任务
+                # 起点从 llm_provider 配置读取一次，随同一快照传递给
+                # read_image 视觉子调用，任务内不再重读。
                 vision_config = cast(
                     "DynamicConfigSchema", llm_provider_config_manager.get()
                 )
                 vision_model = vision_config.vision_model
                 vision_temperature = vision_config.vision_temperature
                 vision_max_tokens = vision_config.vision_max_tokens
-                vision_thinking_mode = vision_config.vision_thinking_mode
-                vision_reasoning_effort = vision_config.vision_reasoning_effort
                 vision_request_api = getattr(
                     vision_config, "vision_request_api", "chat_completions"
                 )
                 vision_stream_enabled = getattr(
                     vision_config, "vision_stream_enabled", False
+                )
+                vision_thinking_mode = bool(
+                    getattr(vision_config, "vision_thinking_mode", False)
+                )
+                vision_reasoning_effort = str(
+                    getattr(vision_config, "vision_reasoning_effort", "") or ""
                 )
 
             reply_result = await generate_reply_with_tools(
@@ -1020,10 +1033,10 @@ class MessageHandler:
                 caller_group_id=message.group_id,
                 caller_is_superuser=caller_is_superuser,
                 max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
-                vision_thinking_mode=vision_thinking_mode,
-                vision_reasoning_effort=vision_reasoning_effort,
                 vision_request_api=vision_request_api,
                 vision_stream_enabled=vision_stream_enabled,
+                vision_thinking_mode=vision_thinking_mode,
+                vision_reasoning_effort=vision_reasoning_effort,
                 collector=collector,
                 parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                 agent_budget=agent_budget,

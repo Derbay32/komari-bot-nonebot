@@ -62,6 +62,18 @@ _NON_BUDGET_COLUMN_DEFAULTS: dict[str, object] = {
     # TSK-193：0014 新增的非空默认列（head 下插入“只让预算列走默认”
     # 的行时必须显式提供或接受默认；纳入字典以保持 head 集成测试合法）
     "agent_tool_call_mode": "required",
+    # TSK-194：0015 新增的图片理解模式与 8 项下载预算（head 下插入
+    # “只让预算列走默认”的行时必须显式提供或接受默认；纳入字典以保持
+    # head 集成测试合法；其中 image_understanding_mode 为非空默认列）
+    "image_understanding_mode": "delegated",
+    "vision_image_download_max_count": 4,
+    "vision_image_download_max_bytes": 8 * 1024 * 1024,
+    "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+    "vision_image_download_max_pixels": 40_000_000,
+    "vision_image_download_concurrency": 2,
+    "vision_image_download_connect_timeout_seconds": 5.0,
+    "vision_image_download_read_timeout_seconds": 30.0,
+    "vision_image_download_total_timeout_seconds": 45.0,
 }
 
 
@@ -145,8 +157,14 @@ async def _prepare_head_scratch() -> tuple[dict[str, Any], str]:
 
 async def _insert_row_without_budget_columns(
     connection: asyncpg.Connection,
+    *,
+    revision: int = 1,
 ) -> None:
-    """插入一行配置，只显式填充非预算列，让 0013 的列默认值生效。"""
+    """插入一行配置，只显式填充非预算列，让 0013 的列默认值生效。
+
+    ``revision`` 默认 1，保持既有调用语义；历史阶段（0015 之前）调用方
+    显式传入存量 revision，用于验证迁移不得触碰 CAS revision。
+    """
     exists = await connection.fetchval(
         "SELECT EXISTS (SELECT 1 FROM komari_chat_config WHERE id = 1)"
     )
@@ -168,7 +186,7 @@ async def _insert_row_without_budget_columns(
     await connection.execute(
         f"INSERT INTO komari_chat_config ({columns_sql}) VALUES ({placeholders})",
         1,
-        1,
+        revision,
         datetime.now(UTC),
         *[_NON_BUDGET_COLUMN_DEFAULTS[column] for column in value_columns],
     )

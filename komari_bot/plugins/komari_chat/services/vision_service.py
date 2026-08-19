@@ -72,6 +72,8 @@ async def _read_single_image(
     max_tokens: int,
     request_api: str = "chat_completions",
     stream_enabled: bool = False,
+    thinking_mode: bool = False,
+    reasoning_effort: str = "",
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -100,6 +102,10 @@ async def _read_single_image(
         "max_tokens": int(max_tokens),
         "request_api": request_api,
         "stream_enabled": stream_enabled,
+        # TSK-194 / ADR-0010：视觉槽位推理参数在任务起点随 llm_provider
+        # 配置快照冻结，由 read_image 子调用携带（主循环恒用 chat 槽位）。
+        "thinking_mode": thinking_mode,
+        "reasoning_effort": reasoning_effort,
     }
     try:
         logger.info(
@@ -180,6 +186,8 @@ async def read_images(
     *,
     request_api: str = "chat_completions",
     stream_enabled: bool = False,
+    thinking_mode: bool = False,
+    reasoning_effort: str = "",
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -201,6 +209,8 @@ async def read_images(
                 max_tokens=max_tokens,
                 request_api=request_api,
                 stream_enabled=stream_enabled,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,
