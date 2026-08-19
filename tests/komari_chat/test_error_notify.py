@@ -6,10 +6,15 @@ import asyncio
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
-from komari_bot.onebot import ImageFailureDiagnostic, image_failure_reason_code
+from komari_bot.onebot import (
+    GroupTaskFailureNotification,
+    ImageFailureDiagnostic,
+    image_failure_reason_code,
+)
 
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
@@ -529,14 +534,17 @@ async def test_process_message_success_with_image_failures_notifies_once(
         is_duplicate_event=_is_duplicate_event
     )
 
-    notifications: list[object] = []
+    notifications: list[GroupTaskFailureNotification] = []
 
     class _RecordingNotifier:
         def __init__(self, **kwargs: object) -> None:
             del kwargs
 
         async def notify(
-            self, *, bot: object, notification: object
+            self,
+            *,
+            bot: object,
+            notification: GroupTaskFailureNotification,
         ) -> None:
             del bot
             notifications.append(notification)
@@ -615,7 +623,7 @@ class _ProcessEvent:
     to_me = False
     reply = None
     sender = SimpleNamespace(nickname="测试用户", card="")
-    message: list[object] = []
+    message: ClassVar[list[object]] = []
 
     @staticmethod
     def get_plaintext() -> str:

@@ -21,7 +21,6 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 from komari_bot.memory.profile_operations import profile_traits_to_list
-from komari_bot.onebot import ImageFailureDiagnostic
 from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_async
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
@@ -31,6 +30,7 @@ from .image_reading_session import ImageUnderstandingFailureError
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.onebot import ImageFailureDiagnostic
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_memory import MemoryService, MessageSchema
 

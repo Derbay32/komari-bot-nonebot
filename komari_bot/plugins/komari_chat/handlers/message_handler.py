@@ -983,9 +983,10 @@ class MessageHandler:
         # 委托模式才向回复 Agent 暴露 read_image 工具；原生模式图片作为
         # 多模态输入直接嵌入 (user) 消息，由聊天模型原生理解。
         use_vision_tool = False
-        # native 批量下载失败计数（仅 native 分支使用，初始化以覆盖未进入
-        # 分支的场景）。
+        # native 批量下载失败计数与有效图片数（仅 native 分支使用，初始化以
+        # 覆盖未进入分支的场景）。
         native_download_failures = 0
+        effective_total = 0
         if image_policy.is_delegated:
             # TSK-195 / ADR-0010：delegated 任务起点零预下载；引用消息图片
             # 在前、当前消息图片在后，索引在会话内稳定固定；只有首次
@@ -1206,7 +1207,7 @@ class MessageHandler:
                     parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                     agent_budget=agent_budget,
                 )
-        except Exception as exc:
+        except Exception:
             # TSK-196：native 带图请求失败 → 包装为安全图片失败（from None，
             # 不保留原异常 cause/正文），绝不切 delegated；无图片进入请求的
             # 普通 LLM 错误按原样传播，不误报为图片失败。delegated 的主循环
@@ -1227,9 +1228,8 @@ class MessageHandler:
             if image_session is not None:
                 await image_session.close()
 
-        if reply_image_urls or base64_image_urls:
-            if native_download_failures:
-                # TSK-196：native 部分下载失败且任务成功 → 聚合摘要附加到结果。
+        if (reply_image_urls or base64_image_urls) and native_download_failures:
+            # TSK-196：native 部分下载失败且任务成功 → 聚合摘要附加到结果。
                 reply_result = replace(
                     reply_result,
                     image_diagnostic=_native_failure_summary(

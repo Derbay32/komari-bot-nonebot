@@ -413,7 +413,7 @@ def test_native_partial_download_failure_success_attaches_diagnostic(
 ) -> None:
     """native 部分下载失败且任务成功 → ReplyResult 携带 mode=native 摘要。"""
     config = _chat_config_stub(image_understanding_mode="native")
-    handler, generate_kwargs, download_batches, _build_kwargs = _wire_native_core(
+    handler, generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
         monkeypatch,
         config,
         image_urls=[
@@ -456,7 +456,7 @@ def test_native_no_images_plain_llm_error_propagates_unwrapped(
 ) -> None:
     """native 无图片时的普通 LLM 错误按原样传播，不误报为图片失败。"""
     config = _chat_config_stub(image_understanding_mode="native")
-    handler, generate_kwargs, download_batches, _build_kwargs = _wire_native_core(
+    handler, _generate_kwargs, download_batches, _build_kwargs = _wire_native_core(
         monkeypatch,
         config,
         image_urls=None,
@@ -489,7 +489,7 @@ def test_agent_run_native_multimodal_failure_redacts_exception_message(
     """native 多模态请求失败：失败 LLM trace 进入 Agent Run，且异常正文
     内嵌的 URL/base64 被脱敏；final_error 只有安全模式摘要。"""
     config = _chat_config_stub(image_understanding_mode="native")
-    handler, generate_kwargs, download_batches, _build_kwargs = _wire_native_core(
+    handler, _generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
         monkeypatch,
         config,
         image_urls=["https://example.com/a.png"],
