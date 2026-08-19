@@ -6,10 +6,12 @@
 1. **跨表迁移**：0014 时代表结构上写入 memory 单行（vision_tool_enabled
    切换 + 8 项预算自定义值）与 chat 单行（无图片列）；``upgrade head``
    后 chat 以 bool 双分支映射出 ``image_understanding_mode``（true →
-   delegated）并原样复制 8 项预算，memory 的 9 个旧图片列被显式删除，
-   两表存量行数据全部保留；
+   delegated、false → native，两分支在链内分别验收）并原样复制 8 项
+   预算，memory 的 9 个旧图片列被显式删除，两表存量行数据全部保留；
 2. **降级回滚**：``downgrade 0014`` 重建 memory 旧列、按模式回填
    （delegated → true）与预算原样回填、删除 chat 新列，存量行保留；
+   随后把 memory 旧开关切到 false 再次 ``upgrade head``，验证第二条
+   upgrade 分支（false → native）对同一行不改变预算与 revision；
 3. **全新库默认与约束**：head 下只让图片列走数据库默认的一条 chat 行
    得到 ``delegated`` 与 8 项默认预算；两句图片预算跨字段 CHECK 拒绝
    非法组合（总字节 < 单图字节、总时限 < 连接超时）；
@@ -297,9 +299,13 @@ async def _insert_chat_row_leaving_image_defaults(
 async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> None:
     """AC1/AC2：跨表迁移、bool 双分支、旧列删除与降级回滚。
 
-    完整链路：upgrade 0014 → 写入 memory（自定义图片列）与 chat 存量行
-    → upgrade head（图片列迁入 chat、memory 删除 9 列）→ downgrade 0014
-    （重建 memory 旧列并回填、chat 删除新列）→ 回到 head 后 check 零漂移。
+    完整链路：
+    upgrade 0014 → 写入 memory（自定义图片列，vision_tool_enabled=true）
+    与 chat 存量行
+    → upgrade head（分支一：true → delegated、8 项预算原样复制）→
+    downgrade 0014（回滚：delegated → true、预算原样回填、chat 删除新列）
+    → memory 旧开关切 false → 再次 upgrade head（分支二：false → native、
+    预算与 revision 原样、memory 旧 9 列再次删除）→ 最后 check 零漂移。
     """
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
@@ -394,9 +400,64 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         finally:
             await conn.close()
 
-        # 回到 head 后模型元数据与迁移链零漂移
+        # 第二个 upgrade 分支：memory 旧开关切到 false 后再次 upgrade head。
+        # 翻转旧开关不触碰 revision 与预算，验证 false → native 映射及
+        # 0015 对存量数据只读（第二次不重复修改 chat 预算与两侧 revision）。
+        conn = await asyncpg.connect(**scratch)
+        try:
+            await conn.execute(
+                f"UPDATE {_MEMORY_TABLE} SET vision_tool_enabled = false"
+                " WHERE id = 1"
+            )
+            memory_revision = await conn.fetchval(
+                f"SELECT revision FROM {_MEMORY_TABLE} WHERE id = 1"
+            )
+            assert memory_revision == _MEMORY_LEGACY_REVISION, (
+                "翻转旧开关不得改动 memory revision"
+            )
+            budget_row = await conn.fetchrow(
+                f"SELECT {', '.join(_BUDGET_COLUMNS)}"
+                f" FROM {_MEMORY_TABLE} WHERE id = 1"
+            )
+            assert [budget_row[key] for key in _BUDGET_COLUMNS] == [
+                MEMORY_VISION_VALUES[key] for key in _BUDGET_COLUMNS
+            ], "翻转旧开关不得改动 memory 预算"
+        finally:
+            await conn.close()
+
         result = _run_bootstrap(scratch_url, "upgrade", "head")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        conn = await asyncpg.connect(**scratch)
+        try:
+            chat_columns = await _chat_image_columns(conn)
+            assert set(CHAT_IMAGE_COLUMNS) <= chat_columns, "head 的 chat 必须含图片列"
+
+            memory_columns = await _memory_columns(conn)
+            assert not set(MEMORY_LEGACY_IMAGE_COLUMNS) & memory_columns, (
+                "head 的 memory 不得再含 0014 历史图片列"
+            )
+            assert "image_understanding_mode" not in memory_columns
+
+            # bool 双分支 false → native；8 项预算原样复制
+            row = await _fetched_image_row(conn)
+            assert row[0] == "native", "vision_tool_enabled=false 应映射 native"
+            expected = tuple(
+                MEMORY_VISION_VALUES[column]
+                for column in _BUDGET_COLUMNS
+            )
+            assert row[1:] == expected, "8 项预算应原样从 memory 复制到 chat"
+            chat_revision = await conn.fetchval(
+                f"SELECT revision FROM {_CHAT_TABLE} WHERE id = 1"
+            )
+            assert chat_revision == _CHAT_LEGACY_REVISION, "chat 存量数据必须保留"
+            memory_revision = await conn.fetchval(
+                f"SELECT revision FROM {_MEMORY_TABLE} WHERE id = 1"
+            )
+            assert memory_revision == _MEMORY_LEGACY_REVISION, "memory 存量数据必须保留"
+        finally:
+            await conn.close()
+
+        # 回到 head 后模型元数据与迁移链零漂移
         check_result = _run_bootstrap(scratch_url, "check")
         assert check_result.returncode == 0, (
             f"{check_result.stdout}\n{check_result.stderr}"
