@@ -1235,7 +1235,6 @@ class MessageHandler:
             if use_fetch_tool:
                 tools.append(FETCH_PAGE_TOOL)
 
-            native_failure_pending = False
             try:
                 if tools:
                     # TSK-195：委托模式的主循环只经 image_session 触达图片；
@@ -1267,14 +1266,20 @@ class MessageHandler:
                         agent_budget=agent_budget,
                     )
             except NativeMultimodalRequestError:
-                # TSK-196 复审：只在 except 内保存“应抛图片失败”标志（不 raise，
-                # 避免经 __context__ 保留 marker → 原 provider 异常对象链）；离开
-                # except/finally 后再抛 ImageUnderstandingFailureError，最终异常的
-                # cause/context 都为 None。只包装“主 provider 多模态调用失败”的
-                # 窄 marker，绝不切 delegated；其他异常（MaxRounds/工具预算/协议
-                # 校验/内部错误）即便 native 有图也原样传播，不误报为图片失败。
-                # delegated 的主循环已自行以 ImageUnderstandingFailureError 终止。
-                native_failure_pending = True
+                # TSK-196 复审：只在 except 内直接构造安全摘要并赋值（不 raise，
+                # 避免经 __context__ 保留 marker → 原 provider 异常对象链；也不
+                # 引用原异常对象，只取已算好的计数/总数），统一经末尾单点安全
+                # 抛出点抛 ImageUnderstandingFailureError，最终异常的 cause/context
+                # 都为 None。只包装“主 provider 多模态调用失败”的窄 marker，绝不
+                # 切 delegated；其他异常（MaxRounds/工具预算/协议校验/内部错误）
+                # 即便 native 有图也原样传播，不误报为图片失败。delegated 的主
+                # 循环已自行以 ImageUnderstandingFailureError 终止。
+                _image_failure_summary = _native_failure_summary(
+                    total_images=effective_total,
+                    download_failures=native_download_failures,
+                    provider_failed=True,
+                    all_unavailable=False,
+                )
             except ImageUnderstandingFailureError as exc:
                 # TSK-196 复审：delegated 全部可用索引均已尝试且失败——工具循环
                 # 已以专用安全异常终止；只在 except 内保存其安全摘要（不 raise，
@@ -1288,14 +1293,6 @@ class MessageHandler:
                 # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
                 if image_session is not None:
                     await image_session.close()
-
-            if native_failure_pending:
-                _image_failure_summary = _native_failure_summary(
-                    total_images=effective_total,
-                    download_failures=native_download_failures,
-                    provider_failed=True,
-                    all_unavailable=False,
-                )
 
         # 单点安全抛出：所有预期图片失败（native 全下载失败 / native provider
         # 失败 / delegated 全部不可用）统一在此清空本帧图片敏感 locals 后抛新

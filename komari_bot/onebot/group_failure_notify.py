@@ -375,7 +375,7 @@ class GroupTaskFailureNotifier:
             summary = _project_summary(notification.summary)
             if summary:
                 lines.append(f"摘要: {summary}")
-        text = "\n".join(line for line in lines if line is not None)
+        text = "\n".join(lines)
         for user_id in _resolve_superuser_ids(self._superusers_provider):
             try:
                 await bot.send_private_msg(user_id=user_id, message=text)
