@@ -992,7 +992,12 @@ class MessageHandler:
             vision_max_tokens = 1024
             vision_request_api = "chat_completions"
             vision_stream_enabled = False
+            vision_thinking_mode = False
+            vision_reasoning_effort = ""
             if use_vision_tool:
+                # TSK-194 / ADR-0010：视觉槽位全部参数（含推理参数）在任务
+                # 起点从 llm_provider 配置读取一次，随同一快照传递给
+                # read_image 视觉子调用，任务内不再重读。
                 vision_config = cast(
                     "DynamicConfigSchema", llm_provider_config_manager.get()
                 )
@@ -1004,6 +1009,12 @@ class MessageHandler:
                 )
                 vision_stream_enabled = getattr(
                     vision_config, "vision_stream_enabled", False
+                )
+                vision_thinking_mode = bool(
+                    getattr(vision_config, "vision_thinking_mode", False)
+                )
+                vision_reasoning_effort = str(
+                    getattr(vision_config, "vision_reasoning_effort", "") or ""
                 )
 
             reply_result = await generate_reply_with_tools(
@@ -1024,6 +1035,8 @@ class MessageHandler:
                 max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
                 vision_request_api=vision_request_api,
                 vision_stream_enabled=vision_stream_enabled,
+                vision_thinking_mode=vision_thinking_mode,
+                vision_reasoning_effort=vision_reasoning_effort,
                 collector=collector,
                 parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                 agent_budget=agent_budget,

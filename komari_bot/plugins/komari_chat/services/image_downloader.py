@@ -46,17 +46,13 @@ _FORMAT_MIME_TYPES = {
 }
 
 
-def _read_config_int(config: object, field_name: str, default: int) -> int:
-    return int(getattr(config, field_name, default))
-
-
-def _read_config_float(config: object, field_name: str, default: float) -> float:
-    return float(getattr(config, field_name, default))
-
-
 @dataclass(frozen=True)
 class ImageDownloadPolicy:
-    """单条消息的图片下载资源预算。"""
+    """单条消息的图片下载资源预算。
+
+    构造默认值仅供下载器纯调用方（无配置可读）直接构造策略使用；
+    ``from_config`` 不依赖这些默认值（见下）。
+    """
 
     max_images: int = _DEFAULT_MAX_IMAGE_COUNT
     max_image_bytes: int = _DEFAULT_MAX_IMAGE_BYTES
@@ -69,51 +65,80 @@ class ImageDownloadPolicy:
 
     @classmethod
     def from_config(cls, config: object) -> ImageDownloadPolicy:
-        """从动态配置构建策略，并兼容尚未包含新字段的测试替身。"""
-        max_total_bytes = _read_config_int(
-            config,
+        """任务起点从 ``komari_chat`` 配置读取一次并冻结图片下载预算。
+
+        TSK-194 / ADR-0010 协调式破坏升级：0015 之后生产 typed 配置必须
+        携带全部 8 项预算字段且满足 chat 表跨字段 CHECK；任一字段缺失立即
+        明确失败，绝不静默回退 Python 默认值、旧 ``komari_memory`` 别名或
+        历史快照；类型非法用 ``TypeError`` 表示。本方法由调用方在任务起点
+        读取一次，任务内不再重读。
+        """
+        field_names = (
+            "vision_image_download_max_count",
+            "vision_image_download_max_bytes",
             "vision_image_download_total_max_bytes",
-            _DEFAULT_MAX_TOTAL_BYTES,
+            "vision_image_download_max_pixels",
+            "vision_image_download_concurrency",
+            "vision_image_download_connect_timeout_seconds",
+            "vision_image_download_read_timeout_seconds",
+            "vision_image_download_total_timeout_seconds",
         )
+        missing = [
+            name for name in field_names if getattr(config, name, None) is None
+        ]
+        if missing:
+            msg = (
+                "配置缺少图片下载预算字段"
+                f"（{', '.join(sorted(missing))}），无法冻结下载策略"
+            )
+            raise RuntimeError(msg)
+
+        raw = {name: getattr(config, name) for name in field_names}
+        for name in (
+            "vision_image_download_max_count",
+            "vision_image_download_max_bytes",
+            "vision_image_download_total_max_bytes",
+            "vision_image_download_max_pixels",
+            "vision_image_download_concurrency",
+        ):
+            value = raw[name]
+            if not isinstance(value, int) or isinstance(value, bool):
+                msg = (
+                    f"配置的图片下载预算字段非法（{name}={value!r}），"
+                    "无法冻结下载策略"
+                )
+                raise TypeError(msg)
+        for name in (
+            "vision_image_download_connect_timeout_seconds",
+            "vision_image_download_read_timeout_seconds",
+            "vision_image_download_total_timeout_seconds",
+        ):
+            value = raw[name]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                msg = (
+                    f"配置的图片下载预算字段非法（{name}={value!r}），"
+                    "无法冻结下载策略"
+                )
+                raise TypeError(msg)
+
+        max_total_bytes = int(raw["vision_image_download_total_max_bytes"])
         return cls(
-            max_images=_read_config_int(
-                config,
-                "vision_image_download_max_count",
-                _DEFAULT_MAX_IMAGE_COUNT,
-            ),
+            max_images=raw["vision_image_download_max_count"],
             max_image_bytes=min(
-                _read_config_int(
-                    config,
-                    "vision_image_download_max_bytes",
-                    _DEFAULT_MAX_IMAGE_BYTES,
-                ),
+                raw["vision_image_download_max_bytes"],
                 max_total_bytes,
             ),
             max_total_bytes=max_total_bytes,
-            max_pixels=_read_config_int(
-                config,
-                "vision_image_download_max_pixels",
-                _DEFAULT_MAX_PIXELS,
+            max_pixels=raw["vision_image_download_max_pixels"],
+            concurrency=raw["vision_image_download_concurrency"],
+            connect_timeout_seconds=float(
+                raw["vision_image_download_connect_timeout_seconds"]
             ),
-            concurrency=_read_config_int(
-                config,
-                "vision_image_download_concurrency",
-                _DEFAULT_DOWNLOAD_CONCURRENCY,
+            read_timeout_seconds=float(
+                raw["vision_image_download_read_timeout_seconds"]
             ),
-            connect_timeout_seconds=_read_config_float(
-                config,
-                "vision_image_download_connect_timeout_seconds",
-                _DEFAULT_CONNECT_TIMEOUT_SECONDS,
-            ),
-            read_timeout_seconds=_read_config_float(
-                config,
-                "vision_image_download_read_timeout_seconds",
-                _DEFAULT_READ_TIMEOUT_SECONDS,
-            ),
-            total_timeout_seconds=_read_config_float(
-                config,
-                "vision_image_download_total_timeout_seconds",
-                _DEFAULT_TOTAL_TIMEOUT_SECONDS,
+            total_timeout_seconds=float(
+                raw["vision_image_download_total_timeout_seconds"]
             ),
         )
 

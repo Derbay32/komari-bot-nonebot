@@ -133,13 +133,16 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
     vision_thinking_mode: bool = Field(
         default=False,
-        description="视觉模型是否处于思考模式。TSK-194 后主回复 Agent 恒使用"
-        " 聊天模型与 chat 槽位，不再存在 has_vision_tool 主循环切换；该字段"
-        " 仅保留为视觉槽位规格，供 read_image 视觉子调用后续使用。",
+        description="视觉模型是否处于思考模式。该字段仅作用于 read_image 视觉"
+        " 子调用（vision_service）的请求：主回复 Agent 恒使用聊天模型与 chat"
+        " 槽位，不再存在 has_vision_tool 主循环切换；任务起点快照冻结，"
+        " 任务内不重读。",
     )
     vision_reasoning_effort: str = Field(
         default="",
-        description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
+        description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat；"
+        " 仅作用于 read_image 视觉子调用（vision_service）的请求，主工具循环"
+        " 恒使用 chat 槽位。",
     )
 
     @field_validator("extra_params")

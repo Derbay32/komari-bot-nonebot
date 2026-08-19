@@ -670,6 +670,8 @@ async def _build_image_tool_result(
     vision_max_tokens: int,
     vision_request_api: str = "chat_completions",
     vision_stream_enabled: bool = False,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -688,6 +690,10 @@ async def _build_image_tool_result(
         max_tokens=vision_max_tokens,
         request_api=vision_request_api,
         stream_enabled=vision_stream_enabled,
+        # TSK-194 / ADR-0010：视觉推理参数随任务起点 llm_provider 配置
+        # 快照冻结，仅作用于 read_image 视觉子调用（主循环恒用 chat 槽位）。
+        thinking_mode=vision_thinking_mode,
+        reasoning_effort=vision_reasoning_effort,
         request_trace_id=request_trace_id if collector is not None else None,
         parent_call_id=parent_call_id if collector is not None else None,
         collector=collector,
@@ -1020,6 +1026,8 @@ async def _execute_business_tool(
     caller_is_superuser: bool,
     vision_request_api: str = "chat_completions",
     vision_stream_enabled: bool = False,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
@@ -1048,6 +1056,8 @@ async def _execute_business_tool(
                 vision_max_tokens=vision_max_tokens,
                 vision_request_api=vision_request_api,
                 vision_stream_enabled=vision_stream_enabled,
+                vision_thinking_mode=vision_thinking_mode,
+                vision_reasoning_effort=vision_reasoning_effort,
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,
@@ -1159,6 +1169,8 @@ async def _execute_tool_loop(
     max_favorability_delta: int = 5,
     vision_request_api: str = "chat_completions",
     vision_stream_enabled: bool = False,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
 ) -> ReplyResult:
@@ -1167,7 +1179,8 @@ async def _execute_tool_loop(
     TSK-194 / ADR-0010：主循环恒使用聊天模型与 chat 槽位（含原生模式
     直接嵌入多模态图片）；vision_* 参数只供 read_image 视觉子调用消费
     （``vision_model`` / ``vision_temperature`` / ``vision_max_tokens`` /
-    ``vision_request_api`` / ``vision_stream_enabled``）。
+    ``vision_request_api`` / ``vision_stream_enabled`` /
+    ``vision_thinking_mode`` / ``vision_reasoning_effort``）。
     """
     current_messages = list(messages)
     tool_definitions = _validate_tool_definitions(tools)
@@ -1530,6 +1543,8 @@ async def _execute_tool_loop(
                         caller_is_superuser=caller_is_superuser,
                         vision_request_api=vision_request_api,
                         vision_stream_enabled=vision_stream_enabled,
+                        vision_thinking_mode=vision_thinking_mode,
+                        vision_reasoning_effort=vision_reasoning_effort,
                         request_trace_id=request_trace_id,
                         parent_call_id=round_call_id,
                         collector=collector,
@@ -1645,6 +1660,8 @@ async def generate_reply_with_tools(
     max_favorability_delta: int = 5,
     vision_request_api: str = "chat_completions",
     vision_stream_enabled: bool = False,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
     agent_budget: AgentExecutionBudget | None = None,
@@ -1661,7 +1678,8 @@ async def generate_reply_with_tools(
         任务执行预算（轮次/单轮/总量）与工具调用约束模式在任务起点从
         ``config`` 读取一次并冻结；任务进行中配置变更不影响当前任务
         （TSK-192/TSK-193）。TSK-194 起主循环恒使用聊天模型与 chat 槽位，
-        vision_* 参数只供 read_image 视觉子调用消费。
+        vision_* 参数（含 ``vision_thinking_mode`` / ``vision_reasoning_effort``）
+        只供 read_image 视觉子调用消费。
     """
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
@@ -1713,6 +1731,8 @@ async def generate_reply_with_tools(
         max_favorability_delta=max_favorability_delta,
         vision_request_api=vision_request_api,
         vision_stream_enabled=vision_stream_enabled,
+        vision_thinking_mode=vision_thinking_mode,
+        vision_reasoning_effort=vision_reasoning_effort,
         collector=collector,
         parent_call_id=parent_call_id,
     )

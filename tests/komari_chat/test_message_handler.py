@@ -114,6 +114,16 @@ def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
         "face_reaction_enabled": False,
         "face_reaction_id": "76",
         "image_understanding_mode": "delegated",
+        # TSK-194：图片下载预算 8 项字段（与配置 Schema/迁移 0015 默认值一致；
+        # ImageDownloadPolicy.from_config 不再对缺字段回退隐藏默认，fixture 必须显式提供）
+        "vision_image_download_max_count": 4,
+        "vision_image_download_max_bytes": 8 * 1024 * 1024,
+        "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+        "vision_image_download_max_pixels": 40_000_000,
+        "vision_image_download_concurrency": 2,
+        "vision_image_download_connect_timeout_seconds": 5.0,
+        "vision_image_download_read_timeout_seconds": 30.0,
+        "vision_image_download_total_timeout_seconds": 45.0,
         "error_notify_enabled": False,
         "agent_max_rounds": 10,
         "agent_max_tool_calls_per_round": 4,

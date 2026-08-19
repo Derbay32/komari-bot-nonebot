@@ -551,3 +551,120 @@ def test_vision_service_passes_vision_slot_mode(monkeypatch: Any) -> None:
     content = captured[0]["messages"][0]["content"]
     assert content[0]["type"] == "text"
     assert content[0]["text"] == "TEST-VISION-DESCRIPTION-PROMPT"
+
+
+def test_read_image_subcall_uses_vision_thinking_and_reasoning(
+    monkeypatch: Any,
+) -> None:
+    """TSK-194：主循环用 chat thinking/reasoning，read_image 子调用用 vision。
+
+    main loop 的两轮 completion 请求携带 chat 槽位（chat thinking/reasoning），
+    而 read_image 视觉子调用收到任务起点快照的 vision thinking/reasoning。
+    """
+    provider = _RecordingProvider()
+    provider.completions = [
+        base_client_module.LLMCompletionResultSchema(
+            content="",
+            tool_calls=[
+                _tool_call("read_image", '{"image_index": 0}', {"image_index": 0})
+            ],
+            finish_reason="tool_calls",
+        ),
+        _final_response_completion(),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+
+    read_images_calls: list[dict[str, Any]] = []
+
+    async def _fake_read_images(*_args: Any, **kwargs: Any) -> list[str]:
+        read_images_calls.append(kwargs)
+        return ["一只猫"]
+
+    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+
+    asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(
+                llm_thinking_mode_chat=False,
+                llm_reasoning_effort_chat="",
+            ),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            base64_images=["data:image/png;base64,AAAA"],
+            vision_model="vision-model",
+            vision_thinking_mode=True,
+            vision_reasoning_effort="high",
+        )
+    )
+
+    # 主循环两轮仍用 chat thinking/reasoning
+    assert len(provider.completion_calls) == 2
+    for call in provider.completion_calls:
+        assert call["thinking_mode"] is False
+        assert call["reasoning_effort"] == ""
+    # read_image 视觉子调用使用 vision thinking/reasoning（同一任务快照）
+    assert len(read_images_calls) == 1
+    assert read_images_calls[0]["thinking_mode"] is True
+    assert read_images_calls[0]["reasoning_effort"] == "high"
+
+
+def test_vision_service_passes_vision_thinking_and_reasoning(
+    monkeypatch: Any,
+) -> None:
+    """TSK-194：视觉服务最终 generate_messages_completion 请求携带推理参数。
+
+    ``read_images -> _read_single_image`` 把任务起点快照透传到 provider
+    请求（thinking_mode / reasoning_effort），不中途重读配置。
+    """
+    captured: list[dict[str, Any]] = []
+
+    class _Provider:
+        async def generate_messages_completion(self, **kwargs: Any) -> Any:
+            captured.append(kwargs)
+            return SimpleNamespace(
+                content="一只猫",
+                tool_calls=[],
+                finish_reason="stop",
+                usage=None,
+                duration_ms=1.0,
+                continuation=None,
+            )
+
+    monkeypatch.setattr(vision_service_module, "llm_provider", _Provider())
+    monkeypatch.setattr(
+        vision_service_module,
+        "llm_provider_config_manager",
+        SimpleNamespace(get=lambda: SimpleNamespace(api_token="token")),
+    )
+
+    prompt_template_module = import_module(
+        "komari_bot.plugins.komari_chat.services.prompt_template"
+    )
+
+    async def _fake_vision_description_template() -> dict[str, str]:
+        return {"vision_description_prompt": "TEST-VISION-DESCRIPTION-PROMPT"}
+
+    monkeypatch.setattr(
+        prompt_template_module,
+        "get_template",
+        _fake_vision_description_template,
+    )
+    if hasattr(vision_service_module, "get_template"):
+        monkeypatch.setattr(
+            vision_service_module,
+            "get_template",
+            _fake_vision_description_template,
+        )
+
+    asyncio.run(
+        vision_service_module.read_images(
+            ["data:image/png;base64,AAAA"],
+            vision_model="vision-model",
+            thinking_mode=True,
+            reasoning_effort="high",
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["thinking_mode"] is True
+    assert captured[0]["reasoning_effort"] == "high"

@@ -1436,6 +1436,95 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
     ]
 
 
+def test_generate_reply_with_tools_delegated_vision_failure_allows_honest_final(
+    monkeypatch: Any,
+) -> None:
+    """TSK-194：delegated read_image 视觉子调用失败时返回结构化失败工具结果。
+
+    把现有 ``[图片读取失败: ...]`` 工具结果回给主 Agent 并允许其诚实调用
+    final_response；主循环 messages 不得嵌入原图、不得切 native，仍使用
+    聊天模型与 chat 槽位（thinking/reasoning 不为 vision 值影响）。
+    """
+    fake_provider = _FakeLLMProvider("<content>")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-image-fail",
+                ),
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "我看不到这张图片的内容",
+                        "interaction_history": {
+                            "event": "发图让我看",
+                            "result": "尽力描述了但看不到",
+                            "emotion": "抱歉",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    async def _failing_read_images(*_args: Any, **_kwargs: Any) -> list[str]:
+        return ["[图片读取失败: 视觉模型拒绝读取]"]
+
+    monkeypatch.setattr(llm_service_module, "read_images", _failing_read_images)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(
+                llm_request_api_chat="chat_completions",
+                llm_stream_enabled_chat=False,
+                llm_thinking_mode_chat=False,
+                llm_reasoning_effort_chat="",
+            ),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            base64_images=["data:image/png;base64,AAAA"],
+            vision_model="vision-model",
+            vision_request_api="responses",
+            vision_stream_enabled=True,
+            vision_thinking_mode=True,
+            vision_reasoning_effort="high",
+        )
+    )
+
+    assert result.content == "我看不到这张图片的内容"
+    # 主循环两轮仍用聊天模型与 chat 槽位（不切 native / 视觉模型）
+    for call in fake_provider.completion_calls:
+        assert call["model"] == "chat-model"
+        assert call["request_api"] == "chat_completions"
+        assert call["stream_enabled"] is False
+        assert call["thinking_mode"] is False
+        assert call["reasoning_effort"] == ""
+    # 主循环 messages 不得嵌入原图（原图只按索引交给视觉子调用）
+    rendered = str(fake_provider.completion_calls)
+    assert "data:image/png;base64,AAAA" not in rendered
+    # 第二轮上下文保留 read_image 失败的结构化工具结果，供模型诚实收尾
+    second_round_messages = fake_provider.completion_calls[1]["messages"]
+    tool_contents = [
+        message.get("content")
+        for message in second_round_messages
+        if message.get("role") == "tool"
+    ]
+    assert tool_contents, "第二轮上下文必须包含 read_image 失败工具结果"
+    assert any("图片读取失败" in str(content) for content in tool_contents)
+
+
 def test_summarize_conversation_escapes_untrusted_prompt_text(
     monkeypatch: Any,
 ) -> None:

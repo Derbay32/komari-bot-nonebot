@@ -286,6 +286,18 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
         values["agent_max_tool_calls_per_round"],
         values["agent_max_total_tool_calls"],
     )
+    # TSK-194：图片下载预算 8 项字段（ImageDownloadPolicy.from_config 严格
+    # no-fallback，fixture 必须显式提供，避免隐式回退默认值）。
+    values.setdefault("vision_image_download_max_count", 4)
+    values.setdefault("vision_image_download_max_bytes", 8 * 1024 * 1024)
+    values.setdefault(
+        "vision_image_download_total_max_bytes", 20 * 1024 * 1024
+    )
+    values.setdefault("vision_image_download_max_pixels", 40_000_000)
+    values.setdefault("vision_image_download_concurrency", 2)
+    values.setdefault("vision_image_download_connect_timeout_seconds", 5.0)
+    values.setdefault("vision_image_download_read_timeout_seconds", 30.0)
+    values.setdefault("vision_image_download_total_timeout_seconds", 45.0)
     return SimpleNamespace(**values)
 
 
