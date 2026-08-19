@@ -55,9 +55,8 @@ pytestmark = [
 _MEMORY_TABLE = "komari_memory_config"
 _CHAT_TABLE = "komari_chat_config"
 
-#: 0015 迁入 chat 的图片列（模式 + 8 项预算），与迁移脚本 / Schema 一致。
-IMAGE_COLUMNS: tuple[str, ...] = (
-    "image_understanding_mode",
+#: 8 项图片下载预算列，chat head 与 memory 0014 历史两集合共有的部分。
+_BUDGET_COLUMNS: tuple[str, ...] = (
     "vision_image_download_max_count",
     "vision_image_download_max_bytes",
     "vision_image_download_total_max_bytes",
@@ -68,8 +67,18 @@ IMAGE_COLUMNS: tuple[str, ...] = (
     "vision_image_download_total_timeout_seconds",
 )
 
-#: head 下图片列的服务端默认值（不显式赋值时的值）。
-IMAGE_DEFAULT_VALUES: dict[str, object] = {
+#: chat head 图片列集合：image_understanding_mode + 8 项预算（0015 新增）。
+CHAT_IMAGE_COLUMNS: tuple[str, ...] = ("image_understanding_mode", *_BUDGET_COLUMNS)
+
+#: memory 0014 历史图片列集合：vision_tool_enabled + 8 项预算（0002 建列，
+#: 0015 从 memory 删除；downgrade 0014 必须重建这 9 列）。
+MEMORY_LEGACY_IMAGE_COLUMNS: tuple[str, ...] = (
+    "vision_tool_enabled",
+    *_BUDGET_COLUMNS,
+)
+
+#: head 下 chat 图片列的服务端默认值（不显式赋值时的值）。
+CHAT_IMAGE_DEFAULT_VALUES: dict[str, object] = {
     "image_understanding_mode": "delegated",
     "vision_image_download_max_count": 4,
     "vision_image_download_max_bytes": 8 * 1024 * 1024,
@@ -95,6 +104,10 @@ MEMORY_VISION_VALUES: dict[str, object] = {
     "vision_image_download_read_timeout_seconds": 31.0,
     "vision_image_download_total_timeout_seconds": 46.0,
 }
+
+#: 两套列集合与其值字典结构自洽，防止后续改动时列集漂移。
+assert set(MEMORY_LEGACY_IMAGE_COLUMNS) == set(MEMORY_VISION_VALUES)
+assert set(CHAT_IMAGE_COLUMNS) == set(CHAT_IMAGE_DEFAULT_VALUES)
 
 #: 0014 时代 memory 单行使用的 revision（区别于 chat 的 revision，验证
 #: 存量数据不被迁移触碰）。
@@ -263,7 +276,7 @@ async def _insert_chat_row_leaving_image_defaults(
         f" WHERE table_name = '{_CHAT_TABLE}'"
     )
     columns = _reread_columns(rows)
-    value_columns = sorted(columns - {"id", "revision", "updated_at"} - set(IMAGE_COLUMNS))
+    value_columns = sorted(columns - {"id", "revision", "updated_at"} - set(CHAT_IMAGE_COLUMNS))
     missing = [column for column in value_columns if column not in values]
     assert not missing, f"测试默认值字典缺少列: {missing}"
 
@@ -313,18 +326,13 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         conn = await asyncpg.connect(**scratch)
         try:
             chat_columns = await _chat_image_columns(conn)
-            assert set(IMAGE_COLUMNS) <= chat_columns, "head 的 chat 必须含图片列"
+            assert set(CHAT_IMAGE_COLUMNS) <= chat_columns, "head 的 chat 必须含图片列"
 
             memory_columns = await _memory_columns(conn)
-            assert not set(IMAGE_COLUMNS) & memory_columns, (
-                "head 的 memory 不得再含图片列"
+            assert not set(MEMORY_LEGACY_IMAGE_COLUMNS) & memory_columns, (
+                "head 的 memory 不得再含 0014 历史图片列"
             )
-            assert "vision_tool_enabled" not in memory_columns
-            for legacy in (
-                "vision_image_download_max_count",
-                "vision_image_download_connect_timeout_seconds",
-            ):
-                assert legacy not in memory_columns
+            assert "image_understanding_mode" not in memory_columns
 
             # bool 双分支 true → delegated；8 项预算原样复制
             row = await _fetched_image_row(conn)
@@ -334,7 +342,7 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
             assert row[0] == "delegated", "vision_tool_enabled=true 应映射 delegated"
             expected = tuple(
                 MEMORY_VISION_VALUES[column]
-                for column in IMAGE_COLUMNS[1:]
+                for column in _BUDGET_COLUMNS
             )
             assert row[1:] == expected, "8 项预算应原样从 memory 复制到 chat"
             assert chat_revision == _CHAT_LEGACY_REVISION, "chat 存量数据必须保留"
@@ -353,14 +361,16 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         conn = await asyncpg.connect(**scratch)
         try:
             chat_columns = await _chat_image_columns(conn)
-            assert not set(IMAGE_COLUMNS) & chat_columns, "downgrade 必须删除 chat 新列"
+            assert not set(CHAT_IMAGE_COLUMNS) & chat_columns, "downgrade 必须删除 chat 新列"
             chat_revision = await conn.fetchval(
                 f"SELECT revision FROM {_CHAT_TABLE} WHERE id = 1"
             )
             assert chat_revision == _CHAT_LEGACY_REVISION, "downgrade 不得删除 chat 存量行"
 
             memory_columns = await _memory_columns(conn)
-            assert set(IMAGE_COLUMNS) <= memory_columns, "downgrade 必须重建 memory 旧列"
+            assert set(MEMORY_LEGACY_IMAGE_COLUMNS) <= memory_columns, (
+                "downgrade 必须重建 memory 0014 历史图片列"
+            )
             memory_row = await conn.fetchrow(
                 f"SELECT vision_tool_enabled,"
                 " vision_image_download_max_count,"
@@ -376,19 +386,9 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
             assert memory_row["vision_tool_enabled"] is True, (
                 "delegated 应回填为 true"
             )
-            legacy_keys = (
-                "vision_image_download_max_count",
-                "vision_image_download_max_bytes",
-                "vision_image_download_total_max_bytes",
-                "vision_image_download_max_pixels",
-                "vision_image_download_concurrency",
-                "vision_image_download_connect_timeout_seconds",
-                "vision_image_download_read_timeout_seconds",
-                "vision_image_download_total_timeout_seconds",
-            )
             assert [
-                memory_row[key] for key in legacy_keys
-            ] == [MEMORY_VISION_VALUES[key] for key in legacy_keys], (
+                memory_row[key] for key in _BUDGET_COLUMNS
+            ] == [MEMORY_VISION_VALUES[key] for key in _BUDGET_COLUMNS], (
                 "预算应从 chat 原样回填到 memory"
             )
         finally:
@@ -424,7 +424,8 @@ async def test_image_columns_defaults_and_checks_at_head() -> None:
             await _insert_chat_row_leaving_image_defaults(conn)
             row = await _fetched_image_row(conn)
             assert tuple(row) == tuple(
-                IMAGE_DEFAULT_VALUES[column] for column in IMAGE_COLUMNS
+                CHAT_IMAGE_DEFAULT_VALUES[column]
+                for column in CHAT_IMAGE_COLUMNS
             ), "全新行图片列应使用数据库默认值"
 
             # 跨字段 CHECK：总字节 >= 单图字节
