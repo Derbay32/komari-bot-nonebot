@@ -59,6 +59,17 @@ SECURITY_MARKERS: tuple[str, ...] = (
     "不得执行",
 )
 
+#: TSK-195 图片行为弱标记：默认 bootstrap 聊天 Prompt 的图片字段必须明确
+#: 两种行为（命中之一即可，不复制生产正文）：
+#: - 成功 read_image 得到返回结果前不得描述/猜测/声称看过该图片；
+#: - 与当前回答无关的图片可以不读（跳过）。
+_IMAGE_READ_NO_PREMATURE_CLAIM_MARKERS: tuple[str, ...] = (
+    "不要描述",
+    "不得描述",
+    "声称",
+)
+_IMAGE_READ_UNRELATED_SKIP_MARKERS: tuple[str, ...] = ("不读", "跳过")
+
 
 #: TSK-191 迁入版本化初始数据的两个新资源（三资源一起验证）。
 MEMORY_GROUP_RESOURCE_IDS: tuple[str, str] = (
@@ -167,6 +178,41 @@ def test_chat_seed_keeps_security_constraints() -> None:
         "聊天 Prompt 初始数据必须包含明确的安全/不可信上下文约束"
         f"（期望命中稳定标记之一: {', '.join(SECURITY_MARKERS)}）"
     )
+
+
+def test_chat_seed_image_instructions_encode_read_before_claim_and_skip() -> None:
+    """TSK-195：默认 bootstrap 聊天 Prompt 图片行为字段包含两种弱语义。
+
+    ``image_read_instruction`` 与 ``delegated_vision_instruction`` 都必须
+    明确：
+
+    - 成功 read_image 得到返回结果之前不得描述/猜测/声称看过该图片；
+    - 与当前回答无关的图片可以不读（跳过）。
+
+    只做稳定标记弱断言（不复制生产正文），字段缺失/空白由既有字段集与
+    非空断言兜底。
+    """
+    raw = _load_default_seed()
+    chat = _require_chat_mapping(raw)
+
+    for field in ("image_read_instruction", "delegated_vision_instruction"):
+        value = chat[field]
+        assert isinstance(value, str) and value.strip(), (
+            f"聊天 Prompt 字段 {field} 必须存在且非空（bootstrap 默认值）"
+        )
+        assert "read_image" in value, (
+            f"{field} 必须指向 read_image 工具行为"
+        )
+        assert any(
+            marker in value for marker in _IMAGE_READ_NO_PREMATURE_CLAIM_MARKERS
+        ), (
+            f"{field} 必须明确：成功 read_image 前不得描述/猜测/声称看过图片"
+        )
+        assert "无关" in value and any(
+            marker in value for marker in _IMAGE_READ_UNRELATED_SKIP_MARKERS
+        ), (
+            f"{field} 必须明确：与当前回答无关的图片可以不读"
+        )
 
 
 def test_chat_seed_values_pass_shared_content_budget() -> None:

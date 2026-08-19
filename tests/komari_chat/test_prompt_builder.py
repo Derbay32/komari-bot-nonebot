@@ -819,8 +819,10 @@ def test_build_prompt_keeps_dynamic_image_index_ranges_code_generated(
             config=_build_config(),
             current_user_id="user-1",
             current_user_nickname="阿虚",
-            image_urls=["data:image/png;base64,1", "data:image/png;base64,2"],
+            image_urls=None,
             delegated_image_mode=True,
+            delegated_quoted_image_count=0,
+            delegated_current_image_count=2,
         )
     )
 

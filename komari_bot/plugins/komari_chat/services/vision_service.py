@@ -55,11 +55,12 @@ async def _load_vision_description_prompt() -> str:
 
 
 def _format_error(error: Exception) -> str:
-    """格式化读图失败信息，避免把过长异常塞回主模型。"""
-    message = str(error).strip() or error.__class__.__name__
-    if len(message) > 200:
-        message = f"{message[:200]}..."
-    return message
+    """归一化读图失败信息（TSK-195 第二轮安全验收反馈）。
+
+    只返回异常类型名作为稳定错误码；该值会回流主模型工具结果与诊断
+    收集器，绝不携带 provider 原始异常消息、URL 或 data URI。
+    """
+    return type(error).__name__
 
 
 async def _read_single_image(
@@ -146,12 +147,17 @@ async def _read_single_image(
             len(description),
         )
     except Exception as error:
+        error_type = _format_error(error)
+        failure_text = f"[图片读取失败: {error_type}]"
+        # 普通日志只记录 index/model 与归一化异常类型：不捕获 traceback
+        # （栈帧局部变量 image_data_uri/request_data 含 base64），不记录
+        # str(error)（provider 异常正文可能内嵌 URL/data URI，TSK-195 第
+        # 二轮安全验收反馈）。
         logger.warning(
-            "[VisionService] 图片读取失败: index={} model={} error={}",
+            "[VisionService] 图片读取失败: index={} model={} error_type={}",
             image_index,
             vision_model,
-            error,
-            exc_info=True,
+            error_type,
         )
         if collector is not None:
             from komari_bot.plugins.agent_run_logger.diagnostic import (
@@ -167,13 +173,14 @@ async def _read_single_image(
                 request=request_data,
                 error=error,
                 parent_call_id=parent_call_id,
+                message=failure_text,
             )
             collector.add_error(
                 phase="vision_read_image",
-                error_type=type(error).__name__,
-                message=_format_error(error),
+                error_type=error_type,
+                message=failure_text,
             )
-        return f"[图片读取失败: {_format_error(error)}]"
+        return failure_text
     else:
         return description
 

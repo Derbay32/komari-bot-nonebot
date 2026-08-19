@@ -385,8 +385,14 @@ def record_failed_call(
     request: dict[str, Any],
     error: BaseException,
     parent_call_id: str | None = None,
+    message: str | None = None,
 ) -> None:
-    """把一次失败的逻辑 LLM 调用追加到收集器。"""
+    """把一次失败的逻辑 LLM 调用追加到收集器。
+
+    ``message`` 覆盖默认的 ``str(error)``：当异常正文可能携带敏感内容
+    （内嵌 URL / data URI / base64 等）时，调用方必须传入安全归一化
+    消息；类型字段仍保留原始异常类型名（TSK-195 第二轮安全验收反馈）。
+    """
     if collector is None:
         return
     collector.add_call(
@@ -398,7 +404,10 @@ def record_failed_call(
             model=model,
             status="error",
             request=request,
-            error={"type": type(error).__name__, "message": str(error)},
+            error={
+                "type": type(error).__name__,
+                "message": message if message is not None else str(error),
+            },
             request_api=_request_mode_value(request, "request_api"),
             stream_enabled=_request_mode_value(request, "stream_enabled"),
         )

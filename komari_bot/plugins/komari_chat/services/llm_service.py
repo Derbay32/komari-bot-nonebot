@@ -25,13 +25,14 @@ from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_asy
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
-from .vision_service import read_images
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_memory import MemoryService, MessageSchema
+
+    from .image_reading_session import ImageReadingSessionProtocol
 
 # 依赖 llm_provider 插件
 require("llm_provider")
@@ -664,41 +665,28 @@ async def _build_image_tool_result(
     *,
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
-    base64_images: list[str],
-    vision_model: str,
-    vision_temperature: float,
-    vision_max_tokens: int,
-    vision_request_api: str = "chat_completions",
-    vision_stream_enabled: bool = False,
-    vision_thinking_mode: bool = False,
-    vision_reasoning_effort: str = "",
-    request_trace_id: str | None = None,
+    image_session: ImageReadingSessionProtocol,
     parent_call_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
 ) -> str:
-    """执行 read_image 工具并返回工具消息内容。"""
+    """执行 read_image 工具并返回工具消息内容。
+
+    TSK-195：只经稳定 ``image_index`` 调用会话；主循环请求、工具结果与
+    诊断只见到索引与结构化结果，原始 URL 与 base64 不越过会话边界。
+    全部可用引用均失败时在工具结果中附加 ``all_images_unavailable``
+    领域标记，但委托模式仍允许主 Agent 诚实提交文字回复。
+    """
     image_index = _parse_image_index(parsed_arguments, raw_arguments)
     if image_index is None:
         return "[图片读取失败: image_index 参数缺失或格式错误]"
-    if image_index < 0 or image_index >= len(base64_images):
-        return f"[图片读取失败: image_index={image_index} 超出范围，当前可读图片数量为 {len(base64_images)}]"
-
-    descriptions = await read_images(
-        [base64_images[image_index]],
-        vision_model=vision_model,
-        temperature=vision_temperature,
-        max_tokens=vision_max_tokens,
-        request_api=vision_request_api,
-        stream_enabled=vision_stream_enabled,
-        # TSK-194 / ADR-0010：视觉推理参数随任务起点 llm_provider 配置
-        # 快照冻结，仅作用于 read_image 视觉子调用（主循环恒用 chat 槽位）。
-        thinking_mode=vision_thinking_mode,
-        reasoning_effort=vision_reasoning_effort,
-        request_trace_id=request_trace_id if collector is not None else None,
-        parent_call_id=parent_call_id if collector is not None else None,
-        collector=collector,
-    )
-    return descriptions[0] if descriptions else "[图片读取失败: 视觉服务未返回结果]"
+    result = await image_session.read(image_index, parent_call_id=parent_call_id)
+    if result.status == "success":
+        return result.description or "[图片读取失败: 视觉服务未返回结果]"
+    if result.status == "failure" and image_session.all_images_unavailable():
+        return (
+            f"{result.failure_message or '[图片读取失败]'}"
+            " [all_images_unavailable=true]"
+        )
+    return result.failure_message or "[图片读取失败]"
 
 
 async def _build_search_tool_result(
@@ -950,10 +938,7 @@ async def generate_reply(
             messages=messages,
             tools=[FINAL_RESPONSE_TOOL],
             request_trace_id=request_trace_id,
-            base64_images=None,
-            vision_model="",
-            vision_temperature=0.3,
-            vision_max_tokens=1024,
+            image_session=None,
             budget=budget,
             memory_service=None,
             group_id=None,
@@ -1012,10 +997,7 @@ def _build_tool_log_args(tool_call: Any) -> dict[str, Any]:
 async def _execute_business_tool(
     *,
     tool_call: Any,
-    base64_images: list[str],
-    vision_model: str,
-    vision_temperature: float,
-    vision_max_tokens: int,
+    image_session: ImageReadingSessionProtocol | None,
     phase_prefix: str,
     round_num: int,
     memory_service: MemoryService | None,
@@ -1024,13 +1006,8 @@ async def _execute_business_tool(
     caller_user_id: str | None,
     caller_group_id: str | None,
     caller_is_superuser: bool,
-    vision_request_api: str = "chat_completions",
-    vision_stream_enabled: bool = False,
-    vision_thinking_mode: bool = False,
-    vision_reasoning_effort: str = "",
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
 ) -> _BusinessToolExecution:
     """执行业务工具并构造 tool 消息。
 
@@ -1047,26 +1024,22 @@ async def _execute_business_tool(
 
     match tool_name:
         case "read_image":
-            content = await _build_image_tool_result(
-                raw_arguments=raw_arguments,
-                parsed_arguments=parsed_arguments,
-                base64_images=base64_images,
-                vision_model=vision_model,
-                vision_temperature=vision_temperature,
-                vision_max_tokens=vision_max_tokens,
-                vision_request_api=vision_request_api,
-                vision_stream_enabled=vision_stream_enabled,
-                vision_thinking_mode=vision_thinking_mode,
-                vision_reasoning_effort=vision_reasoning_effort,
-                request_trace_id=request_trace_id,
-                parent_call_id=parent_call_id,
-                collector=collector,
-            )
-            if content.startswith("[图片读取失败:"):
+            if image_session is None:
+                content = "[图片读取失败: 当前模式下未启用图片读取]"
                 status = "error"
                 error_summary = "图片读取失败"
             else:
-                result_summary = f"description_chars={len(content)}"
+                content = await _build_image_tool_result(
+                    raw_arguments=raw_arguments,
+                    parsed_arguments=parsed_arguments,
+                    image_session=image_session,
+                    parent_call_id=parent_call_id,
+                )
+                if content.startswith("[图片读取失败:"):
+                    status = "error"
+                    error_summary = "图片读取失败"
+                else:
+                    result_summary = f"description_chars={len(content)}"
         case "search_web":
             content = await _build_search_tool_result(
                 raw_arguments=raw_arguments,
@@ -1155,10 +1128,7 @@ async def _execute_tool_loop(
     tools: Sequence[dict[str, Any]],
     *,
     request_trace_id: str | None,
-    base64_images: list[str] | None,
-    vision_model: str,
-    vision_temperature: float,
-    vision_max_tokens: int,
+    image_session: ImageReadingSessionProtocol | None,
     budget: AgentExecutionBudget,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
@@ -1167,20 +1137,15 @@ async def _execute_tool_loop(
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
-    vision_request_api: str = "chat_completions",
-    vision_stream_enabled: bool = False,
-    vision_thinking_mode: bool = False,
-    vision_reasoning_effort: str = "",
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
 ) -> ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。
 
-    TSK-194 / ADR-0010：主循环恒使用聊天模型与 chat 槽位（含原生模式
-    直接嵌入多模态图片）；vision_* 参数只供 read_image 视觉子调用消费
-    （``vision_model`` / ``vision_temperature`` / ``vision_max_tokens`` /
-    ``vision_request_api`` / ``vision_stream_enabled`` /
-    ``vision_thinking_mode`` / ``vision_reasoning_effort``）。
+    TSK-194/ADR-0010：主循环恒使用聊天模型与 chat 槽位（含原生模式
+    直接嵌入多模态图片）；TSK-195 起 ``read_image`` 视觉子调用的模型/
+    槽位/预算统一由任务级 ``image_session`` 持有，原始 URL 与 base64 不
+    越过会话边界。
     """
     current_messages = list(messages)
     tool_definitions = _validate_tool_definitions(tools)
@@ -1529,10 +1494,7 @@ async def _execute_tool_loop(
                 try:
                     execution = await _execute_business_tool(
                         tool_call=tool_call,
-                        base64_images=base64_images or [],
-                        vision_model=vision_model,
-                        vision_temperature=vision_temperature,
-                        vision_max_tokens=vision_max_tokens,
+                        image_session=image_session,
                         phase_prefix=request_phase_prefix,
                         round_num=round_num,
                         memory_service=memory_service,
@@ -1541,13 +1503,8 @@ async def _execute_tool_loop(
                         caller_user_id=caller_user_id,
                         caller_group_id=caller_group_id,
                         caller_is_superuser=caller_is_superuser,
-                        vision_request_api=vision_request_api,
-                        vision_stream_enabled=vision_stream_enabled,
-                        vision_thinking_mode=vision_thinking_mode,
-                        vision_reasoning_effort=vision_reasoning_effort,
                         request_trace_id=request_trace_id,
                         parent_call_id=round_call_id,
-                        collector=collector,
                     )
                 except Exception as exc:  # 向模型回写后继续会话
                     tool_error_results.append(
@@ -1647,10 +1604,7 @@ async def generate_reply_with_tools(
     *,
     tools: Sequence[dict[str, Any]],
     request_trace_id: str | None = None,
-    base64_images: list[str] | None = None,
-    vision_model: str = "",
-    vision_temperature: float = 0.3,
-    vision_max_tokens: int = 1024,
+    image_session: ImageReadingSessionProtocol | None = None,
     memory_service: MemoryService | None = None,
     group_id: str | None = None,
     allowed_profile_user_ids: frozenset[str] = frozenset(),
@@ -1658,10 +1612,6 @@ async def generate_reply_with_tools(
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
-    vision_request_api: str = "chat_completions",
-    vision_stream_enabled: bool = False,
-    vision_thinking_mode: bool = False,
-    vision_reasoning_effort: str = "",
     collector: "LLMDiagnosticCollector | None" = None,
     parent_call_id: str | None = None,
     agent_budget: AgentExecutionBudget | None = None,
@@ -1678,8 +1628,9 @@ async def generate_reply_with_tools(
         任务执行预算（轮次/单轮/总量）与工具调用约束模式在任务起点从
         ``config`` 读取一次并冻结；任务进行中配置变更不影响当前任务
         （TSK-192/TSK-193）。TSK-194 起主循环恒使用聊天模型与 chat 槽位，
-        vision_* 参数（含 ``vision_thinking_mode`` / ``vision_reasoning_effort``）
-        只供 read_image 视觉子调用消费。
+        ``image_session``（delegated 任务级图片会话，TSK-195）是主循环
+        唯一触达图片的方式：视觉模型/槽位/预算由会话持有，原始 URL 与
+        base64 不越过会话边界；``None`` 表示本任务未启用图片读取。
     """
     if not tools:
         raise ValueError(_EMPTY_TOOLS_ERROR)
@@ -1708,7 +1659,7 @@ async def generate_reply_with_tools(
         "[KomariChat] Tool 回复请求追踪: trace_id={} tools={} images={} max_rounds={}",
         request_trace_id or "-",
         tool_names,
-        len(base64_images) if base64_images else 0,
+        image_session.total_count if image_session is not None else 0,
         budget.rounds,
     )
 
@@ -1717,10 +1668,7 @@ async def generate_reply_with_tools(
         messages=messages,
         tools=tool_definitions,
         request_trace_id=request_trace_id,
-        base64_images=base64_images,
-        vision_model=vision_model,
-        vision_temperature=vision_temperature,
-        vision_max_tokens=vision_max_tokens,
+        image_session=image_session,
         budget=budget,
         memory_service=memory_service,
         group_id=group_id,
@@ -1729,10 +1677,6 @@ async def generate_reply_with_tools(
         caller_group_id=caller_group_id,
         caller_is_superuser=caller_is_superuser,
         max_favorability_delta=max_favorability_delta,
-        vision_request_api=vision_request_api,
-        vision_stream_enabled=vision_stream_enabled,
-        vision_thinking_mode=vision_thinking_mode,
-        vision_reasoning_effort=vision_reasoning_effort,
         collector=collector,
         parent_call_id=parent_call_id,
     )

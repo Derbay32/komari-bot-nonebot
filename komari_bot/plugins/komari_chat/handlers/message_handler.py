@@ -39,6 +39,7 @@ from ..services.image_downloader import (
     download_images_as_base64_aligned,
     extract_image_sources,
 )
+from ..services.image_reading_session import ImageReadingSession
 from ..services.image_understanding import ImageUnderstandingPolicy
 from ..services.llm_service import (
     FETCH_PAGE_TOOL,
@@ -870,7 +871,47 @@ class MessageHandler:
 
         reply_image_urls: list[str] | None = None
         base64_image_urls: list[str] | None = None
-        if combined_sources:
+        image_session: ImageReadingSession | None = None
+        # 委托模式才向回复 Agent 暴露 read_image 工具；原生模式图片作为
+        # 多模态输入直接嵌入 (user) 消息，由聊天模型原生理解。
+        use_vision_tool = False
+        if image_policy.is_delegated:
+            # TSK-195 / ADR-0010：delegated 任务起点零预下载；引用消息图片
+            # 在前、当前消息图片在后，索引在会话内稳定固定；只有首次
+            # read_image(image_index) 才经安全下载器懒下载该索引并交给视觉
+            # 子调用。构造会话不触达网络，视觉槽位参数在任务起点冻结一次。
+            if combined_sources:
+                vision_config = cast(
+                    "DynamicConfigSchema", llm_provider_config_manager.get()
+                )
+                image_session = ImageReadingSession.build(
+                    quoted_sources=reply_sources,
+                    current_sources=current_sources,
+                    policy=image_policy.download,
+                    vision_model=vision_config.vision_model,
+                    vision_temperature=vision_config.vision_temperature,
+                    vision_max_tokens=vision_config.vision_max_tokens,
+                    vision_request_api=getattr(
+                        vision_config, "vision_request_api", "chat_completions"
+                    ),
+                    vision_stream_enabled=getattr(
+                        vision_config, "vision_stream_enabled", False
+                    ),
+                    vision_thinking_mode=bool(
+                        getattr(vision_config, "vision_thinking_mode", False)
+                    ),
+                    vision_reasoning_effort=str(
+                        getattr(vision_config, "vision_reasoning_effort", "") or ""
+                    ),
+                    request_trace_id=(
+                        request_trace_id if collector is not None else None
+                    ),
+                    collector=collector,
+                )
+                use_vision_tool = True
+        # native：任务起点批量安全下载并校验，data URI 直接进入聊天
+        # 多模态输入，不暴露 read_image 工具。
+        elif combined_sources:
             aligned_images = await download_images_as_base64_aligned(
                 combined_sources,
                 image_policy.download,
@@ -886,10 +927,6 @@ class MessageHandler:
                 for image in aligned_images[reply_boundary:]
                 if image is not None
             ] or None
-        all_base64_images = (reply_image_urls or []) + (base64_image_urls or [])
-        # 委托模式才向回复 Agent 暴露 read_image 工具；原生模式图片作为
-        # 多模态输入直接嵌入 (user) 消息，由聊天模型原生理解。
-        use_vision_tool = image_policy.is_delegated and bool(all_base64_images)
         use_search_tool = bool(
             komari_search_plugin.is_search_available(
                 caller_user_id=message.user_id,
@@ -931,19 +968,34 @@ class MessageHandler:
                 len(reply_image_urls or []),
             )
 
-        if image_urls or reply_image_urls:
+        if image_urls or reply_image_urls or image_session is not None:
+            quoted_viewable = (
+                image_session.quoted_count
+                if image_session is not None
+                else len(reply_image_urls or [])
+            )
+            current_viewable = (
+                image_session.current_count
+                if image_session is not None
+                else len(base64_image_urls or [])
+            )
+            base64_chars = (
+                0
+                if image_session is not None
+                else sum(len(url) for url in (reply_image_urls or []))
+                + sum(len(url) for url in (base64_image_urls or []))
+            )
             logger.info(
                 "[KomariMemory] 多模态回复追踪: trace_id={} group={} message={} quoted_images={} quoted_downloaded_images={} original_images={} downloaded_images={} plaintext_chars={} base64_chars={} memories={} image_mode={} delegated_tool={}",
                 request_trace_id,
                 message.group_id,
                 message.message_id,
                 reply_context.image_count if reply_context else 0,
-                len(reply_image_urls or []),
+                quoted_viewable,
                 len(image_urls or []),
-                len(base64_image_urls or []),
+                current_viewable,
                 len(message.content),
-                sum(len(url) for url in (reply_image_urls or []))
-                + sum(len(url) for url in (base64_image_urls or [])),
+                base64_chars,
                 len(memories),
                 image_policy.mode,
                 use_vision_tool,
@@ -965,15 +1017,21 @@ class MessageHandler:
             current_user_nickname=message.user_nickname,
             memory_service=self.memory,
             group_id=message.group_id,
-            image_urls=base64_image_urls,
+            image_urls=base64_image_urls if image_session is None else None,
             reply_context=reply_context,
-            reply_image_urls=reply_image_urls,
+            reply_image_urls=reply_image_urls if image_session is None else None,
             query_embedding=query_embedding,
             favorability=favorability,
             current_user_profile=current_user_profile,
             interaction_records=interaction_records,
             interaction_memories=interaction_memories,
             delegated_image_mode=use_vision_tool,
+            delegated_quoted_image_count=(
+                image_session.quoted_count if image_session is not None else None
+            ),
+            delegated_current_image_count=(
+                image_session.current_count if image_session is not None else None
+            ),
             search_tool_mode=use_search_tool,
             fetch_tool_mode=use_fetch_tool,
         )
@@ -986,70 +1044,41 @@ class MessageHandler:
         if use_fetch_tool:
             tools.append(FETCH_PAGE_TOOL)
 
-        if tools:
-            vision_model = ""
-            vision_temperature = 0.3
-            vision_max_tokens = 1024
-            vision_request_api = "chat_completions"
-            vision_stream_enabled = False
-            vision_thinking_mode = False
-            vision_reasoning_effort = ""
-            if use_vision_tool:
-                # TSK-194 / ADR-0010：视觉槽位全部参数（含推理参数）在任务
-                # 起点从 llm_provider 配置读取一次，随同一快照传递给
-                # read_image 视觉子调用，任务内不再重读。
-                vision_config = cast(
-                    "DynamicConfigSchema", llm_provider_config_manager.get()
+        try:
+            if tools:
+                # TSK-195：委托模式的主循环只经 image_session 触达图片；
+                # 会话在任务起点构建（零预下载）并在任务结束后关闭。
+                reply_result = await generate_reply_with_tools(
+                    config=config,
+                    messages=prompt_messages,
+                    tools=tools,
+                    request_trace_id=request_trace_id,
+                    image_session=image_session if use_vision_tool else None,
+                    memory_service=self.memory,
+                    group_id=message.group_id,
+                    allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
+                    caller_user_id=message.user_id,
+                    caller_group_id=message.group_id,
+                    caller_is_superuser=caller_is_superuser,
+                    max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
+                    collector=collector,
+                    parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
+                    agent_budget=agent_budget,
                 )
-                vision_model = vision_config.vision_model
-                vision_temperature = vision_config.vision_temperature
-                vision_max_tokens = vision_config.vision_max_tokens
-                vision_request_api = getattr(
-                    vision_config, "vision_request_api", "chat_completions"
+            else:
+                reply_result = await generate_reply(
+                    config=config,
+                    messages=prompt_messages,
+                    request_trace_id=request_trace_id,
+                    collector=collector,
+                    parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
+                    agent_budget=agent_budget,
                 )
-                vision_stream_enabled = getattr(
-                    vision_config, "vision_stream_enabled", False
-                )
-                vision_thinking_mode = bool(
-                    getattr(vision_config, "vision_thinking_mode", False)
-                )
-                vision_reasoning_effort = str(
-                    getattr(vision_config, "vision_reasoning_effort", "") or ""
-                )
-
-            reply_result = await generate_reply_with_tools(
-                config=config,
-                messages=prompt_messages,
-                tools=tools,
-                request_trace_id=request_trace_id,
-                base64_images=all_base64_images if use_vision_tool else None,
-                vision_model=vision_model,
-                vision_temperature=vision_temperature,
-                vision_max_tokens=vision_max_tokens,
-                memory_service=self.memory,
-                group_id=message.group_id,
-                allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
-                caller_user_id=message.user_id,
-                caller_group_id=message.group_id,
-                caller_is_superuser=caller_is_superuser,
-                max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
-                vision_request_api=vision_request_api,
-                vision_stream_enabled=vision_stream_enabled,
-                vision_thinking_mode=vision_thinking_mode,
-                vision_reasoning_effort=vision_reasoning_effort,
-                collector=collector,
-                parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
-                agent_budget=agent_budget,
-            )
-        else:
-            reply_result = await generate_reply(
-                config=config,
-                messages=prompt_messages,
-                request_trace_id=request_trace_id,
-                collector=collector,
-                parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
-                agent_budget=agent_budget,
-            )
+        finally:
+            # TSK-195：delegated 会话持有的下载连接随任务结束释放（幂等，
+            # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
+            if image_session is not None:
+                await image_session.close()
 
         logger.info(
             "[KomariChat] 生成回复成功: len={} favorability_delta={}",

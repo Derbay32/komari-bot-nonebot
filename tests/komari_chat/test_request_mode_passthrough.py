@@ -12,6 +12,12 @@ vision_service_module = import_module("komari_bot.plugins.komari_chat.services.v
 query_rewrite_module = import_module(
     "komari_bot.plugins.komari_chat.services.query_rewrite_service"
 )
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
+image_downloader_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_downloader"
+)
 base_client_module = import_module("komari_bot.plugins.llm_provider.base_client")
 
 CONTINUATION_KEY = base_client_module.CONTINUATION_METADATA_KEY
@@ -32,6 +38,101 @@ class _RecordingProvider:
     async def generate_text(self, **kwargs: Any) -> str:
         self.text_calls.append(kwargs)
         return '{"summary": "测试总结内容", "entities": [], "user_interactions": [], "importance": 2}'
+
+
+class _FakeImageSession:
+    """TSK-195：最小图片会话替身（窄 Protocol），按结果队列返回 read 结果。"""
+
+    def __init__(
+        self,
+        results: list[Any] | None = None,
+    ) -> None:
+        self.results = results if results is not None else []
+        self.read_calls: list[tuple[int, str | None]] = []
+
+    @property
+    def total_count(self) -> int:
+        return max(len(self.results), 1)
+
+    async def read(
+        self,
+        index: int,
+        *,
+        parent_call_id: str | None = None,
+    ) -> Any:
+        self.read_calls.append((index, parent_call_id))
+        if index < 0 or index >= len(self.results):
+            return image_reading_session_module.ImageReadResult(
+                index=index,
+                status="invalid_index",
+                failure_message="[图片读取失败: image_index 超出范围]",
+                error_type="invalid_index",
+                stage="invalid",
+            )
+        return self.results[index]
+
+    def all_images_unavailable(self) -> bool:
+        return bool(self.results) and all(
+            result.status == "failure" for result in self.results
+        )
+
+    def failure_summary(self) -> Any:
+        return image_reading_session_module.ImageFailureSummary(
+            all_images_unavailable=self.all_images_unavailable(),
+            total_images=len(self.results),
+        )
+
+
+def _build_real_reading_session(
+    monkeypatch: Any,
+    *,
+    vision_request_api: str = "chat_completions",
+    vision_stream_enabled: bool = False,
+    vision_thinking_mode: bool = False,
+    vision_reasoning_effort: str = "",
+) -> tuple[Any, list[dict[str, Any]]]:
+    """TSK-195：真实任务级图片会话 + 打桩视觉/下载 seam，返回调用记录。
+
+    ``generate_reply_with_tools`` 只收到该会话；``read_image`` 视觉子调用
+    （``read_images``）经模块级 seam 记录并返回描述，任务级 ``read`` 懒下载
+    由 seam 返回 data URI（不触网）。
+    """
+    read_images_calls: list[dict[str, Any]] = []
+
+    async def _fake_read_images(images: list[str], **kwargs: Any) -> list[str]:
+        read_images_calls.append({"images": list(images), **kwargs})
+        return ["一只猫"]
+
+    class _Downloader:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def download(self, url: str) -> str:
+            self.calls.append(url)
+            return "data:image/png;base64,AAAA"
+
+        async def close(self) -> None:
+            return None
+
+    downloader = _Downloader()
+    monkeypatch.setattr(image_reading_session_module, "read_images", _fake_read_images)
+    monkeypatch.setattr(
+        image_reading_session_module,
+        "ImageDownloadSession",
+        lambda _policy: downloader,
+    )
+    session = image_reading_session_module.ImageReadingSession.build(
+        quoted_sources=[],
+        current_sources=["https://example.com/a.png"],
+        policy=image_downloader_module.ImageDownloadPolicy(),
+        vision_model="vision-model",
+        vision_request_api=vision_request_api,
+        vision_stream_enabled=vision_stream_enabled,
+        vision_thinking_mode=vision_thinking_mode,
+        vision_reasoning_effort=vision_reasoning_effort,
+    )
+    return session, read_images_calls
+
 
 
 def _tool_call(
@@ -136,10 +237,13 @@ def test_tool_loop_keeps_chat_slot_with_read_image_tool(monkeypatch: Any) -> Non
     provider.completions = [_final_response_completion()]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    async def _fake_read_images(*_args: Any, **_kwargs: Any) -> list[str]:
-        return ["描述"]
-
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+    session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0, status="success", description="描述"
+            )
+        ]
+    )
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
@@ -149,10 +253,7 @@ def test_tool_loop_keeps_chat_slot_with_read_image_tool(monkeypatch: Any) -> Non
             ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["data:image/png;base64,AAAA"],
-            vision_model="vision-model",
-            vision_request_api="responses",
-            vision_stream_enabled=True,
+            image_session=session,
         )
     )
 
@@ -181,13 +282,11 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    read_images_calls: list[dict[str, Any]] = []
-
-    async def _fake_read_images(*_args: Any, **kwargs: Any) -> list[str]:
-        read_images_calls.append(kwargs)
-        return ["一只猫"]
-
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+    session, read_images_calls = _build_real_reading_session(
+        monkeypatch,
+        vision_request_api="responses",
+        vision_stream_enabled=True,
+    )
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
@@ -197,10 +296,7 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
             ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["data:image/png;base64,AAAA"],
-            vision_model="vision-model",
-            vision_request_api="responses",
-            vision_stream_enabled=True,
+            image_session=session,
         )
     )
 
@@ -211,6 +307,8 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
         assert call["request_api"] == "chat_completions"
         assert call["stream_enabled"] is False
     assert len(read_images_calls) == 1
+    # TSK-195：只读图片由任务级会话懒下载后交给视觉子调用（data URI 不透出）
+    assert read_images_calls[0]["images"] == ["data:image/png;base64,AAAA"]
     assert read_images_calls[0]["request_api"] == "responses"
     assert read_images_calls[0]["stream_enabled"] is True
 
@@ -288,19 +386,20 @@ def test_tool_loop_attaches_continuation_to_assistant_message(monkeypatch: Any) 
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    async def _fake_read_images(*_args: Any, **_kwargs: Any) -> list[str]:
-        return ["一只猫"]
-
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+    session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0, status="success", description="一只猫"
+            )
+        ]
+    )
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(llm_request_api_chat="responses"),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["data:image/png;base64,AAAA"],
-            vision_model="vision-model",
-            vision_request_api="responses",
+            image_session=session,
         )
     )
 
@@ -574,13 +673,11 @@ def test_read_image_subcall_uses_vision_thinking_and_reasoning(
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
 
-    read_images_calls: list[dict[str, Any]] = []
-
-    async def _fake_read_images(*_args: Any, **kwargs: Any) -> list[str]:
-        read_images_calls.append(kwargs)
-        return ["一只猫"]
-
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+    session, read_images_calls = _build_real_reading_session(
+        monkeypatch,
+        vision_thinking_mode=True,
+        vision_reasoning_effort="high",
+    )
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
@@ -590,10 +687,7 @@ def test_read_image_subcall_uses_vision_thinking_and_reasoning(
             ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["data:image/png;base64,AAAA"],
-            vision_model="vision-model",
-            vision_thinking_mode=True,
-            vision_reasoning_effort="high",
+            image_session=session,
         )
     )
 
