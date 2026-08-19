@@ -188,11 +188,6 @@ class _TimeBudget:
         self._active = 0
         self._lock = asyncio.Lock()
 
-    @property
-    def remaining(self) -> float:
-        """当前可用的剩余秒数（已耗尽时为 0）。"""
-        return max(0.0, self._remaining)
-
     async def acquire(self) -> float | None:
         """下载尝试开始前调用；返回共享绝对 deadline，预算耗尽返回 None。"""
         async with self._lock:

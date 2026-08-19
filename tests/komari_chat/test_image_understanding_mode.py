@@ -63,7 +63,8 @@ if TYPE_CHECKING:
         ImageReadingSession,
     )
 
-ImageUnderstandingPolicy = image_understanding_module.ImageUnderstandingPolicy#: 与配置 Schema / 迁移 0015 默认值一致的图片下载预算 8 项字段。
+#: 与配置 Schema / 迁移 0015 默认值一致的图片下载预算 8 项字段。
+ImageUnderstandingPolicy = image_understanding_module.ImageUnderstandingPolicy
 _CHAT_BUDGET_FIELDS: dict[str, object] = {
     "vision_image_download_max_count": 4,
     "vision_image_download_max_bytes": 8 * 1024 * 1024,

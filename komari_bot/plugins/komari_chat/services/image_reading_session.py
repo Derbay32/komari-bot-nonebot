@@ -289,6 +289,8 @@ class ImageReadingSession:
 
         并发重复读取同一索引单飞共享同一进行中的下载与视觉请求；任务级
         下载预算与总时限由会话内唯一的 ``ImageDownloadSession`` 持有。
+        会话关闭后任何索引（即使关闭前已缓存成功/失败）都返回结构化会话
+        关闭失败，且绝不触发下载或视觉调用。
         原始 URL 不越过本边界：主循环/工具结果/诊断只见索引与结构化结果。
         """
         reference = self._by_index.get(index)
@@ -304,10 +306,6 @@ class ImageReadingSession:
                 stage="invalid",
             )
 
-        cached = self._results.get(index)
-        if cached is not None:
-            return cached
-
         if self._closed:
             return _as_failure(
                 index,
@@ -315,6 +313,10 @@ class ImageReadingSession:
                 error_type="image_unavailable",
                 stage="download",
             )
+
+        cached = self._results.get(index)
+        if cached is not None:
+            return cached
 
         task = self._inflight.get(index)
         if task is not None:

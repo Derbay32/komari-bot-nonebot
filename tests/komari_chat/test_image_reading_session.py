@@ -590,6 +590,53 @@ def test_close_cancels_inflight_and_blocks_new_reads(
     asyncio.run(session.close())
 
 
+def test_close_then_read_returns_session_closed_failure_even_if_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close() 后即使 index 已缓存成功/失败，read 也返回会话关闭失败。
+
+    关闭后任何索引读取都返回结构化 session-closed failure，且绝不触发
+    下载/视觉调用（调用次数不增加）。
+    """
+    # 场景一：关闭前已缓存成功 → close 后返回会话关闭失败
+    downloader = _FakeDownloader("data:image/png;base64,MQ==")
+    session, vision = _build_session(
+        monkeypatch,
+        current=[_RAW_URLS[2]],
+        downloader=downloader,
+    )
+    first = asyncio.run(session.read(0))
+    assert first.status == "success"
+    asyncio.run(session.close())
+
+    after = asyncio.run(session.read(0))
+    assert after.status == "failure"
+    assert after.error_type == "image_unavailable"
+    assert after.stage == "download"
+    assert after.failure_message is not None and "已关闭" in after.failure_message
+    assert downloader.calls == [_RAW_URLS[2]], "关闭后不得再次下载"
+    assert len(vision.calls) == 1, "关闭后不得再次调用视觉模型"
+
+    # 场景二：关闭前已缓存失败 → close 后同样返回会话关闭失败
+    failing_downloader = _FakeDownloader(None)
+    session, vision = _build_session(
+        monkeypatch,
+        current=[_RAW_URLS[2]],
+        downloader=failing_downloader,
+    )
+    failed = asyncio.run(session.read(0))
+    assert failed.status == "failure"
+    asyncio.run(session.close())
+
+    after = asyncio.run(session.read(0))
+    assert after.status == "failure"
+    assert after.error_type == "image_unavailable"
+    assert after.stage == "download"
+    assert after.failure_message is not None and "已关闭" in after.failure_message
+    assert failing_downloader.calls == [_RAW_URLS[2]], "关闭后不得再次下载"
+    assert len(vision.calls) == 0, "下载失败场景关闭后不得调用视觉模型"
+
+
 def test_failure_summary_error_types_and_stages_are_sorted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
