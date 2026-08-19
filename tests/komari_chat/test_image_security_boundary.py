@@ -317,8 +317,14 @@ def _build_failing_session(
     *,
     downloader_error: Exception | None = None,
     vision_error: Exception | None = None,
+    sources: list[str] | None = None,
 ) -> tuple[Any, list[tuple[str, str, dict[str, object]]]]:
-    """构造真实会话 + 抛异常的下载器/视觉 seam；返回会话与带 kwargs 的日志。"""
+    """构造真实会话 + 抛异常的下载器/视觉 seam；返回会话与带 kwargs 的日志。
+
+    TSK-196：下载器/视觉 seam 只在首次调用抛错（其余调用成功），以便构造
+    多图会话中“首图失败、其余成功”的部分失败场景；单图场景行为不变。
+    """
+    source_list = sources if sources is not None else [_RAW_URL]
     log_records: list[tuple[str, str, dict[str, object]]] = []
 
     class _LogRecorder:
@@ -339,10 +345,12 @@ def _build_failing_session(
             self.error = error
             self.calls: list[str] = []
             self.downloaded_bytes: int = 0
+            self._raised = False
 
         async def download(self, url: str) -> str:
             self.calls.append(url)
-            if self.error is not None:
+            if self.error is not None and not self._raised:
+                self._raised = True
                 raise self.error
             return _DATA_URI
 
@@ -353,10 +361,12 @@ def _build_failing_session(
         def __init__(self, error: Exception | None) -> None:
             self.error = error
             self.calls: list[dict[str, Any]] = []
+            self._raised = False
 
         async def __call__(self, images: list[str], **kwargs: Any) -> list[str]:
             self.calls.append({"images": list(images), **kwargs})
-            if self.error is not None:
+            if self.error is not None and not self._raised:
+                self._raised = True
                 raise self.error
             return ["一只猫在窗台上"]
 
@@ -375,7 +385,7 @@ def _build_failing_session(
 
     session = image_reading_session_module.ImageReadingSession.build(
         quoted_sources=[],
-        current_sources=[_RAW_URL],
+        current_sources=source_list,
         policy=image_downloader_module.ImageDownloadPolicy(),
         vision_model="vision-model",
     )
@@ -449,9 +459,10 @@ def test_session_vision_exception_logs_normalized_type_no_traceback(
 def test_read_image_tool_failure_reaches_model_without_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """全工具循环：视觉 seam 抛含 secret 正文异常时，主模型下一轮工具结果、
-    collector tool trace 与最终 projection 都不出现 URL/base64，只出现稳定
-    错误文本；日志不捕获 traceback。"""
+    """全工具循环（部分失败）：视觉 seam 抛含 secret 正文异常时，主模型下一
+    轮工具结果、collector tool trace 与最终 projection 都不出现 URL/base64，
+    只出现稳定错误文本；日志不捕获 traceback。首图失败、次图成功 → 部分失败
+    允许诚实收尾（TSK-196），并携带聚合摘要。"""
     provider = _RecordingProvider()
     provider.completions = [
         base_client_module.LLMCompletionResultSchema(
@@ -466,6 +477,18 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
             ],
             finish_reason="tool_calls",
         ),
+        base_client_module.LLMCompletionResultSchema(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index": 1}',
+                    {"image_index": 1},
+                    call_id="call-image-ok",
+                )
+            ],
+            finish_reason="tool_calls",
+        ),
         _final_response_completion(),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
@@ -474,6 +497,7 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
     session, log_records = _build_failing_session(
         monkeypatch,
         vision_error=leak_error,
+        sources=[_RAW_URL, "https://example.com/public/photo.png"],
     )
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
@@ -491,8 +515,13 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
     )
 
     assert result.content == "这只猫在窗台上。"
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.mode == "delegated"
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
 
-    # 主模型两轮 messages（含失败工具结果）不得出现 URL path/query 或 base64
+    # 主模型 messages（含失败工具结果）不得出现 URL path/query 或 base64
     for call in provider.completion_calls:
         rendered = str(call["messages"])
         assert "example.com" not in rendered
@@ -500,30 +529,34 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
         assert "token=abc123" not in rendered
         assert _DATA_URI not in rendered
     # 失败工具结果只含稳定错误文本
-    second_round_messages = provider.completion_calls[1]["messages"]
-    tool_contents = [
-        message.get("content")
-        for message in second_round_messages
+    tool_messages = [
+        message
+        for call in provider.completion_calls
+        for message in call["messages"]
         if message.get("role") == "tool"
     ]
-    assert tool_contents, "第二轮上下文必须包含 read_image 失败工具结果"
-    assert any("图片读取失败" in str(content) for content in tool_contents)
-    assert all(_RAW_URL not in str(content) for content in tool_contents)
-    assert all(_DATA_URI not in str(content) for content in tool_contents)
+    assert tool_messages, "上下文必须包含 read_image 工具结果"
+    assert any("图片读取失败" in str(content) for content in tool_messages)
+    assert all(_RAW_URL not in str(content) for content in tool_messages)
+    assert all(_DATA_URI not in str(content) for content in tool_messages)
 
-    # collector 内存 tool trace 只含安全信息
-    image_trace = next(
+    # collector 内存 tool trace：首图 error、次图 success，均无 secret
+    image_traces = [
         trace for trace in collector.tools if trace.tool_name == "read_image"
-    )
-    assert image_trace.status == "error"
-    assert image_trace.error_summary == "图片读取失败"
-    assert image_trace.parsed_arguments == {"image_index": 0}
-    assert _RAW_URL not in str(image_trace)
-    assert _DATA_URI not in str(image_trace)
-    assert "图片读取失败" in str(image_trace)
+    ]
+    assert len(image_traces) == 2
+    assert image_traces[0].status == "error"
+    assert image_traces[0].error_summary == "图片读取失败"
+    assert image_traces[0].parsed_arguments == {"image_index": 0}
+    assert image_traces[1].status == "success"
+    assert image_traces[1].parsed_arguments == {"image_index": 1}
+    for image_trace in image_traces:
+        assert _RAW_URL not in str(image_trace)
+        assert _DATA_URI not in str(image_trace)
+        assert "图片读取失败" in str(image_trace) or image_trace.status == "success"
 
     # 最终 projection 也不含 URL/base64
-    collector.mark_finished(status="error", error=RuntimeError("boom"))
+    collector.mark_finished(status="success", output={"reply": result.content})
     record = collector.build_record()
     record_json = json.dumps(record, ensure_ascii=False, default=str)
     assert _RAW_URL not in record_json
@@ -537,3 +570,86 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
     assert any(
         "RuntimeError" in record for _level, record, _kwargs in log_records
     ), "日志应记录归一化异常类型"
+
+
+def test_delegated_repeated_read_does_not_inflate_failed_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重复 index 不膨胀失败计数；每次 read_image 工具调用仍保留 Trace。
+
+    TSK-196：模型在单轮内重复读取同一失败索引（含缓存命中）时，每次工具
+    调用都记录 ToolExecutionTrace，但聚合 failed_count 按唯一失败索引计，
+    不因重复读取放大；重复读取复用会话缓存，不产生第二次网络/视觉调用。
+    """
+    provider = _RecordingProvider()
+    provider.completions = [
+        base_client_module.LLMCompletionResultSchema(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index": 0}',
+                    {"image_index": 0},
+                    call_id="call-0a",
+                ),
+                _tool_call(
+                    "read_image",
+                    '{"image_index": 0}',
+                    {"image_index": 0},
+                    call_id="call-0b",
+                ),
+                _tool_call(
+                    "read_image",
+                    '{"image_index": 1}',
+                    {"image_index": 1},
+                    call_id="call-1",
+                ),
+            ],
+            finish_reason="tool_calls",
+        ),
+        _final_response_completion(),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
+
+    session, log_records = _build_failing_session(
+        monkeypatch,
+        vision_error=RuntimeError(f"vision failed {_RAW_URL} {_DATA_URI}"),
+        sources=[_RAW_URL, "https://example.com/public/ok.png"],
+    )
+
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="repeated-read-1")
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            request_trace_id="repeated-read-1",
+            image_session=session,
+            collector=collector,
+        )
+    )
+
+    assert result.content == "这只猫在窗台上。"
+    image_traces = [
+        trace for trace in collector.tools if trace.tool_name == "read_image"
+    ]
+    assert len(image_traces) == 3, "每次 read_image 工具调用都保留 Trace"
+    assert [trace.parsed_arguments for trace in image_traces] == [
+        {"image_index": 0},
+        {"image_index": 0},
+        {"image_index": 1},
+    ]
+    error_traces = [trace for trace in image_traces if trace.status == "error"]
+    assert len(error_traces) == 2, "两次 index=0 工具调用都返回失败文本"
+    assert all(
+        trace.parsed_arguments == {"image_index": 0} for trace in error_traces
+    )
+    # 聚合失败计数按唯一失败索引计，不因重复读取放大
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
+    # 会话日志仍不泄漏 secret
+    _assert_logs_have_no_secrets_no_traceback(log_records)

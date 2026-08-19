@@ -3,13 +3,17 @@
 from .group_failure_notify import (
     GroupTaskFailureNotification,
     GroupTaskFailureNotifier,
+    ImageFailureDiagnostic,
     InMemoryFailureNotificationCooldown,
     RedisFailureNotificationCooldown,
+    image_failure_reason_code,
 )
 
 __all__ = [
     "GroupTaskFailureNotification",
     "GroupTaskFailureNotifier",
+    "ImageFailureDiagnostic",
     "InMemoryFailureNotificationCooldown",
     "RedisFailureNotificationCooldown",
+    "image_failure_reason_code",
 ]

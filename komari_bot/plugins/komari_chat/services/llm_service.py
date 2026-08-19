@@ -7,7 +7,7 @@ import html
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from nonebot import logger
@@ -25,6 +25,10 @@ from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_asy
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
+from .image_reading_session import (
+    ImageFailureSummary,
+    ImageUnderstandingFailureError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -292,12 +296,19 @@ class InteractionHistoryRecord(TypedDict):
 
 @dataclass(frozen=True)
 class ReplyResult:
-    """聊天回复正文与同步生成的互动历史。"""
+    """聊天回复正文与同步生成的互动历史。
+
+    ``image_failure_summary``（TSK-196）：任务成功但存在图片失败时附带的
+    安全聚合摘要（``ImageFailureSummary``，无 URL/base64/正文/视觉描述）；
+    只在消息处理器的通知边界经本地窄 mapper 投影为 onebot
+    ``ImageFailureDiagnostic`` 并提交一次 SUPERUSER 图片汇总卡。
+    """
 
     content: str
     interaction_history: InteractionHistoryRecord
     favorability_delta: int | None = None
     favorability_reason: str | None = None
+    image_failure_summary: ImageFailureSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -350,6 +361,35 @@ def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]
         "image_parts": image_parts,
         "image_url_chars": image_url_chars,
     }
+
+
+def _request_has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    """请求 messages 是否含多模态 image_url 部件（native 直接嵌入）。
+
+    TSK-196：native 带图请求失败时，Agent Run 的 LLM trace 不得记录
+    ``str(exc)``（异常正文可能内嵌 URL/data URI/base64），只记录归一化
+    异常类型；delegated 主循环请求不含 image 部件，保持既有 ``str(exc)``。
+    """
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
+
+
+class NativeMultimodalRequestError(RuntimeError):
+    """native 模式带图请求主 provider 失败的窄 marker（TSK-196 复审）。
+
+    只在 ``_execute_tool_loop`` 对 ``_call_llm_completion`` 的 except seam
+    抛出：请求 messages 含 image parts 且主 provider 调用（重试耗尽后）
+    失败。不携带原 provider 异常正文/cause（``from None``）；message_handler
+    只捕获该 marker 并转为 ``ImageUnderstandingFailureError``（mode=native
+    摘要）。其他异常（MaxRounds/工具预算/协议校验/内部错误）即便请求带图
+    也原样传播，不误报为图片失败。
+    """
 
 
 class EntitySchema(BaseModel):
@@ -673,7 +713,8 @@ async def _build_image_tool_result(
     TSK-195：只经稳定 ``image_index`` 调用会话；主循环请求、工具结果与
     诊断只见到索引与结构化结果，原始 URL 与 base64 不越过会话边界。
     全部可用引用均失败时在工具结果中附加 ``all_images_unavailable``
-    领域标记，但委托模式仍允许主 Agent 诚实提交文字回复。
+    领域标记；TSK-196 起该状态由工具循环以专用异常终止，不再允许
+    final_response 成功。
     """
     image_index = _parse_image_index(parsed_arguments, raw_arguments)
     if image_index is None:
@@ -1215,6 +1256,8 @@ async def _execute_tool_loop(
             # Prompt 中的 tool_call_instruction 引导模型。
             if tool_call_mode == "required":
                 request_data["tool_choice"] = "required"
+            native_failure_pending = False
+            completion: Any = None
             try:
                 async with _LLM_COMPLETION_SEMAPHORE:
                     completion = await _call_llm_completion(
@@ -1223,6 +1266,7 @@ async def _execute_tool_loop(
                         request_phase=phase,
                     )
             except Exception as exc:
+                has_image_parts = _request_has_image_parts(current_messages)
                 record_failed_call(
                     collector,
                     phase=phase,
@@ -1232,8 +1276,25 @@ async def _execute_tool_loop(
                     request=request_data,
                     error=exc,
                     parent_call_id=parent_call_id,
+                    message=(
+                        f"[图片理解失败: {type(exc).__name__}]"
+                        if has_image_parts
+                        else None
+                    ),
                 )
-                raise
+                if has_image_parts:
+                    # TSK-196 复审：只把“主 provider 多模态调用失败”收敛为窄
+                    # marker。except 内只完成安全 record_failed_call 并置位“应抛
+                    # marker”局部状态；离开 except（exc 已清理、无 active
+                    # exception）后再 raise marker，使 marker.__cause__ 与
+                    # marker.__context__ 都为 None（from None 只抑制显示，仍会经
+                    # __context__ 保留原异常对象链）。其他异常（MaxRounds/预算/
+                    # 协议/内部）即便请求带图也原样传播，不误报为图片失败。
+                    native_failure_pending = True
+                else:
+                    raise
+            if native_failure_pending:
+                raise NativeMultimodalRequestError
 
             round_call_id = record_completion_call(
                 collector,
@@ -1393,6 +1454,15 @@ async def _execute_tool_loop(
                                     result_summary=f"content_chars={len(result.content)}",
                                 )
                             )
+                        # TSK-196：成功任务但存在图片失败时，把聚合摘要附加到
+                        # 结果，供消息处理器提交一次 SUPERUSER 图片汇总卡。
+                        if image_session is not None:
+                            image_summary = image_session.failure_summary()
+                            if image_summary.failed_images > 0:
+                                result = replace(
+                                    result,
+                                    image_failure_summary=image_summary,
+                                )
                         return result  # noqa: TRY300
                     except (ValueError, TypeError) as exc:
                         tool_error_results.append(
@@ -1542,6 +1612,19 @@ async def _execute_tool_loop(
                                 error_summary=execution.error_summary,
                                 result_summary=execution.result_summary,
                             )
+                        )
+                    # TSK-196 复审：每次 read_image 的 ToolExecutionTrace 已写入
+                    # collector 后立即检查全部可用索引是否均已尝试且失败；一旦
+                    # 成立，即使本任务是最后允许轮次、该轮仅 read_image 无
+                    # final_response，也以专用安全异常终止（绝不落入 MaxRounds
+                    # RuntimeError）。轮首/final_response 检查已收敛为本次检查。
+                    if (
+                        tool_name == READ_IMAGE_TOOL_NAME
+                        and image_session is not None
+                        and image_session.all_images_unavailable()
+                    ):
+                        raise ImageUnderstandingFailureError(
+                            image_session.failure_summary()
                         )
 
             has_messages_to_send = (

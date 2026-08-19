@@ -11,8 +11,10 @@ import pytest
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     GroupTaskFailureNotifier,
+    ImageFailureDiagnostic,
     InMemoryFailureNotificationCooldown,
     RedisFailureNotificationCooldown,
+    image_failure_reason_code,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +59,8 @@ def _notification(
     group_text: str | None = "固定群内失败提示",
     notify_superusers: bool = True,
     summary: str | None = "上游返回空回复",
+    image_diagnostic: ImageFailureDiagnostic | None = None,
+    request_trace_id: str | None = "trace-abc",
 ) -> GroupTaskFailureNotification:
     return GroupTaskFailureNotification(
         group_id=12345,
@@ -66,8 +70,9 @@ def _notification(
         stage="generate",
         reason_code=reason_code,
         notify_superusers=notify_superusers,
-        request_trace_id="trace-abc",
+        request_trace_id=request_trace_id,
         summary=summary,
+        image_diagnostic=image_diagnostic,
     )
 
 
@@ -253,6 +258,281 @@ async def test_summary_projection_removes_secrets_urls_and_extra_lines() -> None
     assert "绝密推理" not in text
     assert "tool_arguments" not in text
     assert "超" * 121 not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_card_renders_strict_whitelist_fields() -> None:
+    """图片失败汇总卡只渲染严格白名单字段：群/trace/图片模式/失败阶段/
+    失败数量/失败类型；不出现任务、message_id、generic 阶段/原因/摘要、
+    URL/base64/正文。generic 卡片格式（任务/群/阶段/原因/trace/摘要）
+    保持不变。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    assert bot.group_calls == []
+    assert len(bot.private_calls) == 1
+    text = str(bot.private_calls[0]["message"])
+    # TSK-196 复审：图片卡不允许“任务”行，票面只等于这些允许行（trace 可选）
+    assert text.splitlines() == [
+        "群: 12345",
+        "trace: trace-abc",
+        "图片模式: delegated",
+        "失败阶段: vision",
+        "失败数量: 1",
+        "失败类型: vision_failed",
+    ]
+    assert "任务:" not in text
+    # 白名单：不渲染 generic 阶段/原因/摘要字段与 message_id
+    assert "99999" not in text
+    assert "阶段: generate" not in text
+    assert "原因: empty_reply" not in text
+    assert "摘要:" not in text
+    # 绝不出现可能泄漏的 URL/base64/正文/视觉描述
+    assert "https://" not in text
+    assert "base64" not in text
+    assert "data:image" not in text
+    assert "一只猫" not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_card_without_trace_omits_trace_line() -> None:
+    """无 trace 时图片卡只渲染群/模式/阶段/数量/类型五条允许行。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="native",
+        failed_count=2,
+        stages=("download",),
+        error_types=("image_unavailable",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            request_trace_id=None,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    text = str(bot.private_calls[0]["message"])
+    assert text.splitlines() == [
+        "群: 12345",
+        "图片模式: native",
+        "失败阶段: download",
+        "失败数量: 2",
+        "失败类型: image_unavailable",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malicious_trace",
+    [
+        "https://evil.example/secret/path?token=abc123",
+        "data:image/png;base64,SUMSECRETUX==",
+        "[CQ:image,file=evil.png]",
+        "trace-abc\nevil_line",
+        "trace  with spaces",
+        "trace;DROP TABLE users;--",
+        "空trace",
+        "",
+        "a" * 129,
+    ],
+)
+async def test_image_diagnostic_card_omits_malicious_trace(
+    malicious_trace: str,
+) -> None:
+    """TSK-196 复审：图片卡的 trace 行只允许安全标识字符（ASCII 字母数字
+    ``._:-``，1..128）；URL/data URI/CQ/换行/空白/超长等恶意或非法值直接省略，
+    绝不把原值或替换值写卡，卡仍只含其余允许行。generic 卡保持现有格式。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            request_trace_id=malicious_trace,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    assert bot.group_calls == []
+    assert len(bot.private_calls) == 1
+    text = str(bot.private_calls[0]["message"])
+    # 恶意 trace 被省略：卡只含其余允许行，且 trace 原值/替换值绝不出现
+    assert text.splitlines() == [
+        "群: 12345",
+        "图片模式: delegated",
+        "失败阶段: vision",
+        "失败数量: 1",
+        "失败类型: vision_failed",
+    ]
+    assert "trace:" not in text
+    assert "evil.example" not in text
+    assert "SUMSECRETUX" not in text
+    assert "CQ:image" not in text
+    assert "DROP TABLE" not in text
+    assert "  with spaces" not in text
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_card_allows_safe_trace_chars() -> None:
+    """TSK-196 复审：合法 trace（ASCII 字母数字 + ``._:-``）仍正常渲染。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="delegated",
+        failed_count=1,
+        stages=("vision",),
+        error_types=("vision_failed",),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            request_trace_id="chat-1234567890.abc:def-ghi",
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+    text = str(bot.private_calls[0]["message"])
+    assert "trace: chat-1234567890.abc:def-ghi" in text
+
+
+def test_image_diagnostic_rejects_invalid_and_malicious_values() -> None:
+    """公开 dataclass 纵深防御：非法模式/阶段/错误类型、非正整数失败数、
+    空集合以及恶意 URL/base64/CQ/换行值都必须 ValueError。"""
+    base: dict[str, object] = {
+        "mode": "delegated",
+        "failed_count": 1,
+        "stages": ("vision",),
+        "error_types": ("vision_failed",),
+    }
+
+    type_invalid_cases: list[tuple[dict[str, object], str]] = [
+        ({"failed_count": True}, "正整数"),
+        ({"failed_count": 1.5}, "正整数"),
+    ]
+    value_invalid_cases: list[tuple[dict[str, object], str]] = [
+        ({"mode": "hybrid"}, "模式"),
+        ({"mode": "native\nhttps://evil.example/a.png"}, "模式"),
+        ({"mode": "data:image/png;base64,AAAA"}, "模式"),
+        ({"failed_count": 0}, "正整数"),
+        ({"failed_count": -3}, "正整数"),
+        ({"stages": ()}, "不能为空"),
+        ({"stages": ("https://evil.example/a.png",)}, "失败阶段"),
+        ({"stages": ("download\n[CQ:image,file=x]",)}, "失败阶段"),
+        ({"stages": ("vision", "数据")}, "失败阶段"),
+        ({"error_types": ()}, "不能为空"),
+        ({"error_types": ("data:image/png;base64,AAAA",)}, "失败类型"),
+        ({"error_types": ("vision_failed\nsecret",)}, "失败类型"),
+        ({"error_types": ("[CQ:image,file=evil]",)}, "失败类型"),
+        ({"error_types": ("image_unavailable", "未知")}, "失败类型"),
+    ]
+    for kwargs, expected in type_invalid_cases:
+        with pytest.raises(TypeError, match=expected):
+            ImageFailureDiagnostic(**{**base, **kwargs})  # type: ignore[arg-type]
+    for kwargs, expected in value_invalid_cases:
+        with pytest.raises(ValueError, match=expected):
+            ImageFailureDiagnostic(**{**base, **kwargs})  # type: ignore[arg-type]
+
+
+def test_image_diagnostic_normalizes_stages_and_error_types_deterministically() -> None:
+    """构造时确定性去重排序：重复/乱序的阶段与错误类型收敛为字典序唯一值。"""
+    diagnostic = ImageFailureDiagnostic(
+        mode="native",
+        failed_count=3,
+        stages=("vision", "download", "download", "vision"),
+        error_types=(
+            "image_unavailable",
+            "vision_failed",
+            "vision_failed",
+            "image_unavailable",
+        ),
+    )
+    assert diagnostic.stages == ("download", "vision")
+    assert diagnostic.error_types == ("image_unavailable", "vision_failed")
+
+
+@pytest.mark.asyncio
+async def test_image_diagnostic_sorts_stages_and_error_types() -> None:
+    """图片卡按字典序渲染去重后的失败阶段与错误类型。"""
+    bot = _RecordingBot()
+    diagnostic = ImageFailureDiagnostic(
+        mode="native",
+        failed_count=3,
+        stages=("vision", "download", "download"),
+        error_types=("image_unavailable", "vision_failed", "image_unavailable"),
+    )
+    await _notifier().notify(  # type: ignore[arg-type]
+        bot=bot,
+        notification=_notification(
+            group_text=None,
+            reason_code=image_failure_reason_code(diagnostic),
+            summary=None,
+            image_diagnostic=diagnostic,
+        ),
+    )
+
+    text = str(bot.private_calls[0]["message"])
+    assert "图片模式: native" in text
+    assert "失败阶段: download, vision" in text
+    assert "失败数量: 3" in text
+    assert "失败类型: image_unavailable, vision_failed" in text
+
+
+def test_image_failure_reason_code_is_stable_and_deterministic() -> None:
+    """图片 reason_code 由模式与排序后的错误类型组成，跨任务稳定。"""
+    assert (
+        image_failure_reason_code(
+            ImageFailureDiagnostic(
+                mode="delegated",
+                failed_count=2,
+                stages=("vision", "download"),
+                error_types=("vision_failed", "image_unavailable"),
+            )
+        )
+        == "image_delegated_image_unavailable_vision_failed"
+    )
+    assert image_failure_reason_code(
+        ImageFailureDiagnostic(
+            mode="native",
+            failed_count=1,
+            stages=("download",),
+            error_types=("image_unavailable",),
+        )
+    ) == "image_native_image_unavailable"
+    # 错误类型顺序无关，结果确定性相同
+    assert image_failure_reason_code(
+        ImageFailureDiagnostic(
+            mode="delegated",
+            failed_count=1,
+            stages=("vision",),
+            error_types=("vision_failed",),
+        )
+    ) == "image_delegated_vision_failed"
 
 
 def test_notification_contract_rejects_business_payload_fields() -> None:

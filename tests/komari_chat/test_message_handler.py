@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import sys
 import types
 from contextlib import asynccontextmanager
@@ -29,6 +30,9 @@ message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
 proactive_reservation_module = import_module(
     "komari_bot.plugins.komari_chat.services.proactive_reservation"
 )
@@ -1451,6 +1455,138 @@ def test_generate_debug_reply_with_images_and_reply_context(
     assert build_prompt_kwargs.get("image_urls") == [
         "base64:https://example.com/img.png"
     ]
+
+
+def test_generate_debug_reply_with_image_failure_summary_never_notifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-196 复审：debug 干跑在 core 返回带 partial image_failure_summary
+    时，只把安全结果保留在 collector/output，绝不调用通知边界或发送任何
+    群/私聊消息（不依赖“代码没走 process_message”的注释来保证）。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+    _patch_both_configs(
+        monkeypatch,
+        lambda: _chat_memory_stub(
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            image_understanding_mode="native",
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    summary = image_reading_session_module.ImageFailureSummary(
+        mode="native",
+        all_images_unavailable=False,
+        total_images=2,
+        attempted_images=2,
+        failed_images=1,
+        error_types=("image_unavailable",),
+        stages=("download",),
+    )
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="debug附图回复",
+            interaction_history={"event": "附图", "result": "回复", "emotion": "平静"},
+            favorability_delta=0,
+            favorability_reason="无变化",
+            image_failure_summary=summary,
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    async def _download_images(
+        urls: list[str],
+        _policy: object,
+    ) -> list[str | None]:
+        del urls
+        return [None, "base64:https://example.com/ok.png"]
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "download_images_as_base64_aligned",
+        _download_images,
+    )
+
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
+
+    class _RecordingBot:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        async def call_api(self, api: str, **kwargs: object) -> object:
+            self.calls.append((api, kwargs))
+            return {"message_id": 1}
+
+        async def send_private_msg(self, **kwargs: object) -> None:
+            self.calls.append(("send_private_msg", kwargs))
+
+    bot = _RecordingBot()
+
+    def _forbidden_notifier(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("debug 路径禁止构造通知器")  # noqa: TRY003
+
+    monkeypatch.setattr(
+        message_handler_module, "GroupTaskFailureNotifier", _forbidden_notifier
+    )
+
+    async def _forbidden_notify(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("debug 路径禁止调用汇总")  # noqa: TRY003
+
+    monkeypatch.setattr(handler, "_notify_image_failure_summary", _forbidden_notify)
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-img-fail",
+            user_id="user-debug-img",
+            user_nickname="图片用户",
+            content="看图",
+            image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+            reply_context=None,
+            _bot=bot,  # type: ignore[arg-type]
+        )
+    )
+
+    assert result.reply == "debug附图回复"
+    # 零通知：不构造 notifier、不调汇总、bot 零群/私聊调用
+    assert bot.calls == []
+    # 安全结果保留在 collector/output：output 投影含 mode=native 摘要且无 URL
+    record = result.collector.build_record()
+    rendered = json.dumps(record, ensure_ascii=False, default=str)
+    assert "native" in rendered
+    assert "image_unavailable" in rendered
+    assert "example.com" not in rendered
+    assert "base64" not in rendered
 
 
 def test_normal_attempt_reply_defers_side_effects_until_delivery(
