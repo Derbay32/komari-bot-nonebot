@@ -30,6 +30,9 @@ GROUP_ERROR_TEXT = "啊、啊呜……对不起，脑袋里刚才突然乱成一
 class _FakeBot:
     """记录群消息与私聊投递，并可注入边界失败。"""
 
+    self_id = "bot-1"
+    type = "OneBot V11"
+
     def __init__(
         self,
         *,

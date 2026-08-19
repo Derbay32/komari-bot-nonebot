@@ -7,7 +7,7 @@ import html
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from nonebot import logger
@@ -21,10 +21,12 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 from komari_bot.memory.profile_operations import profile_traits_to_list
+from komari_bot.onebot import ImageFailureDiagnostic
 from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_async
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
+from .image_reading_session import ImageUnderstandingFailureError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -292,12 +294,18 @@ class InteractionHistoryRecord(TypedDict):
 
 @dataclass(frozen=True)
 class ReplyResult:
-    """聊天回复正文与同步生成的互动历史。"""
+    """聊天回复正文与同步生成的互动历史。
+
+    ``image_diagnostic``（TSK-196）：任务成功但存在图片失败时附带的聚合
+    摘要，供消息处理器经共享通知边界向 SUPERUSER 提交一次图片汇总卡；
+    只含白名单字段，无 URL/base64/正文。
+    """
 
     content: str
     interaction_history: InteractionHistoryRecord
     favorability_delta: int | None = None
     favorability_reason: str | None = None
+    image_diagnostic: ImageFailureDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -350,6 +358,23 @@ def _summarize_prompt_messages(messages: list[dict[str, Any]]) -> dict[str, int]
         "image_parts": image_parts,
         "image_url_chars": image_url_chars,
     }
+
+
+def _request_has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    """请求 messages 是否含多模态 image_url 部件（native 直接嵌入）。
+
+    TSK-196：native 带图请求失败时，Agent Run 的 LLM trace 不得记录
+    ``str(exc)``（异常正文可能内嵌 URL/data URI/base64），只记录归一化
+    异常类型；delegated 主循环请求不含 image 部件，保持既有 ``str(exc)``。
+    """
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
 
 
 class EntitySchema(BaseModel):
@@ -673,7 +698,8 @@ async def _build_image_tool_result(
     TSK-195：只经稳定 ``image_index`` 调用会话；主循环请求、工具结果与
     诊断只见到索引与结构化结果，原始 URL 与 base64 不越过会话边界。
     全部可用引用均失败时在工具结果中附加 ``all_images_unavailable``
-    领域标记，但委托模式仍允许主 Agent 诚实提交文字回复。
+    领域标记；TSK-196 起该状态由工具循环以专用异常终止，不再允许
+    final_response 成功。
     """
     image_index = _parse_image_index(parsed_arguments, raw_arguments)
     if image_index is None:
@@ -1184,6 +1210,11 @@ async def _execute_tool_loop(
     try:
         for round_num in range(1, round_limit + 1):
             ledger.consume_round()
+            # TSK-196：delegated 全部可用索引均已尝试且全部失败时，在下一轮
+            # 开始即以专用安全异常终止工具循环（不再给 final_response 机会）；
+            # 最后一次失败 read_image 的 ToolExecutionTrace 已写入 collector。
+            if image_session is not None and image_session.all_images_unavailable():
+                raise ImageUnderstandingFailureError(image_session.failure_summary())
             # TSK-194 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
             # read_image 工具的视觉子调用（vision_service）才使用 vision
             # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
@@ -1232,6 +1263,11 @@ async def _execute_tool_loop(
                     request=request_data,
                     error=exc,
                     parent_call_id=parent_call_id,
+                    message=(
+                        f"[图片理解失败: {type(exc).__name__}]"
+                        if _request_has_image_parts(current_messages)
+                        else None
+                    ),
                 )
                 raise
 
@@ -1313,6 +1349,15 @@ async def _execute_tool_loop(
                 tool_name = tool_call.function.name
 
                 if tool_name == FINAL_RESPONSE_TOOL_NAME:
+                    if (
+                        image_session is not None
+                        and image_session.all_images_unavailable()
+                    ):
+                        # TSK-196：同轮 read_image 全部失败后再提交 final_response
+                        # 也必须终止；异常只携带安全摘要。
+                        raise ImageUnderstandingFailureError(
+                            image_session.failure_summary()
+                        )
                     if requires_favorability_delta and pending_favorability_delta is None:
                         err_msg = (
                             "必须先调用 record_favorability_delta 记录本轮好感度变化，"
@@ -1393,6 +1438,15 @@ async def _execute_tool_loop(
                                     result_summary=f"content_chars={len(result.content)}",
                                 )
                             )
+                        # TSK-196：成功任务但存在图片失败时，把聚合摘要附加到
+                        # 结果，供消息处理器提交一次 SUPERUSER 图片汇总卡。
+                        if image_session is not None:
+                            image_summary = image_session.failure_summary()
+                            if image_summary.failed_images > 0:
+                                result = replace(
+                                    result,
+                                    image_diagnostic=image_summary.to_diagnostic(),
+                                )
                         return result  # noqa: TRY300
                     except (ValueError, TypeError) as exc:
                         tool_error_results.append(

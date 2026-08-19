@@ -27,7 +27,9 @@ from komari_bot.decision import (
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     GroupTaskFailureNotifier,
+    ImageFailureDiagnostic,
     RedisFailureNotificationCooldown,
+    image_failure_reason_code,
 )
 from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
@@ -39,7 +41,11 @@ from ..services.image_downloader import (
     download_images_as_base64_aligned,
     extract_image_sources,
 )
-from ..services.image_reading_session import ImageReadingSession
+from ..services.image_reading_session import (
+    ImageFailureSummary,
+    ImageReadingSession,
+    ImageUnderstandingFailureError,
+)
 from ..services.image_understanding import ImageUnderstandingPolicy
 from ..services.llm_service import (
     FETCH_PAGE_TOOL,
@@ -159,6 +165,9 @@ class ReplyFailureInfo:
 
     reaction_sent 是失败分流边界标志：True 表示已向用户消息贴出“生成中”表情、
     用户正处于等待回复状态，失败时需要补发群内错误文本。
+
+    image_diagnostic（TSK-196）：图片理解失败时携带的聚合摘要（白名单字段，
+    无 URL/base64/正文）；存在时 ``report_reply_failure`` 只提交一张图片汇总卡。
     """
 
     stage: str
@@ -166,6 +175,39 @@ class ReplyFailureInfo:
     summary: str | None
     request_trace_id: str | None
     reaction_sent: bool
+    image_diagnostic: ImageFailureDiagnostic | None = None
+
+
+def _native_failure_summary(
+    *,
+    total_images: int,
+    download_failures: int,
+    provider_failed: bool,
+    all_unavailable: bool,
+) -> ImageFailureSummary:
+    """构造 native 模式图片失败安全摘要（无 URL/base64/正文）。
+
+    TSK-196：native 批量下载失败与带图主 LLM 失败统一投影为
+    ``ImageFailureSummary``，供消息处理器经共享通知边界提交图片汇总卡。
+    """
+    failed = download_failures + (1 if provider_failed else 0)
+    error_types: set[str] = set()
+    stages: set[str] = set()
+    if download_failures:
+        error_types.add("image_unavailable")
+        stages.add("download")
+    if provider_failed:
+        error_types.add("vision_failed")
+        stages.add("vision")
+    return ImageFailureSummary(
+        mode="native",
+        all_images_unavailable=all_unavailable,
+        total_images=total_images,
+        attempted_images=total_images,
+        failed_images=failed,
+        error_types=tuple(sorted(error_types)),
+        stages=tuple(sorted(stages)),
+    )
 
 
 class _FavorabilityReadError(RuntimeError):
@@ -578,6 +620,16 @@ class MessageHandler:
             adapter_name=bot.type,
         )
         if pending_reply is not None:
+            # TSK-196：成功任务带图片失败摘要 → 最多提交一次 SUPERUSER 图片
+            # 汇总卡（``group_text=None`` 无群消息），与失败路径共用共享通知
+            # 边界与冷却；debug 干跑走 ``generate_debug_reply`` 不经过这里。
+            if pending_reply.reply_result.image_diagnostic is not None:
+                await self._notify_image_failure_summary(
+                    bot=bot,
+                    event=event,
+                    diagnostic=pending_reply.reply_result.image_diagnostic,
+                    request_trace_id=pending_reply.request_trace_id,
+                )
             reply_action: ReplyAction = (
                 "replied_forced" if outcome.force_reply else "replied"
             )
@@ -672,10 +724,65 @@ class MessageHandler:
             )
             notify_superusers = False
         logger.debug(
-            "[KomariChat] 回复失败善后: reason={} error_type={}",
+            "[KomariChat] 回复失败善后: reason={} error_type={} image={}",
             reason,
             failure.error_type,
+            failure.image_diagnostic is not None,
         )
+        try:
+            notifier = GroupTaskFailureNotifier(
+                cooldown=RedisFailureNotificationCooldown(
+                    cast("Any", self.redis.redis)
+                ),
+            )
+            # TSK-196：图片理解失败只经共享通知边界提交一次 SUPERUSER 汇总卡
+            # （``group_text`` 仍按 reaction_sent 分流）；同一群+同图片
+            # reason_code 跨任务共享 Redis 冷却，存储不可用故障开放。
+            reason_code = (
+                image_failure_reason_code(failure.image_diagnostic)
+                if failure.image_diagnostic is not None
+                else failure.error_type
+            )
+            await notifier.notify(
+                bot=bot,
+                notification=GroupTaskFailureNotification(
+                    group_id=int(event.group_id),
+                    message_id=int(event.message_id),
+                    group_text=GROUP_ERROR_TEXT if failure.reaction_sent else None,
+                    task_kind="chat_reply",
+                    stage=failure.stage,
+                    reason_code=reason_code,
+                    notify_superusers=notify_superusers,
+                    request_trace_id=failure.request_trace_id,
+                    summary=(
+                        None if failure.image_diagnostic is not None else failure.summary
+                    ),
+                    image_diagnostic=failure.image_diagnostic,
+                ),
+            )
+        except Exception:
+            logger.exception("[KomariChat] 回复失败善后上报异常")
+
+    async def _notify_image_failure_summary(
+        self,
+        *,
+        bot: Bot,
+        event: GroupMessageEvent,
+        diagnostic: ImageFailureDiagnostic,
+        request_trace_id: str,
+    ) -> None:
+        """成功任务带图片失败摘要时，最多提交一次 SUPERUSER 图片汇总卡。
+
+        不向群内发送任何消息（``group_text=None``）；``notify/cooldown/投递``
+        异常一律吞掉，不影响主流程；debug 干跑路径绝不调用本方法。
+        """
+        try:
+            notify_superusers = get_memory_config().error_notify_enabled
+        except Exception:
+            logger.exception(
+                "[KomariChat] 图片失败汇总通知配置读取失败，静默 SUPERUSER 私聊"
+            )
+            notify_superusers = False
         try:
             notifier = GroupTaskFailureNotifier(
                 cooldown=RedisFailureNotificationCooldown(
@@ -687,17 +794,18 @@ class MessageHandler:
                 notification=GroupTaskFailureNotification(
                     group_id=int(event.group_id),
                     message_id=int(event.message_id),
-                    group_text=GROUP_ERROR_TEXT if failure.reaction_sent else None,
+                    group_text=None,
                     task_kind="chat_reply",
-                    stage=failure.stage,
-                    reason_code=failure.error_type,
+                    stage="generate",
+                    reason_code=image_failure_reason_code(diagnostic),
                     notify_superusers=notify_superusers,
-                    request_trace_id=failure.request_trace_id,
-                    summary=failure.summary,
+                    request_trace_id=request_trace_id,
+                    summary=None,
+                    image_diagnostic=diagnostic,
                 ),
             )
         except Exception:
-            logger.exception("[KomariChat] 回复失败善后上报异常")
+            logger.exception("[KomariChat] 图片失败汇总上报异常")
 
     @staticmethod
     def _select_recent_context(
@@ -875,6 +983,9 @@ class MessageHandler:
         # 委托模式才向回复 Agent 暴露 read_image 工具；原生模式图片作为
         # 多模态输入直接嵌入 (user) 消息，由聊天模型原生理解。
         use_vision_tool = False
+        # native 批量下载失败计数（仅 native 分支使用，初始化以覆盖未进入
+        # 分支的场景）。
+        native_download_failures = 0
         if image_policy.is_delegated:
             # TSK-195 / ADR-0010：delegated 任务起点零预下载；引用消息图片
             # 在前、当前消息图片在后，索引在会话内稳定固定；只有首次
@@ -916,6 +1027,16 @@ class MessageHandler:
                 combined_sources,
                 image_policy.download,
             )
+            # 进入下载范围的有效图片数（超出 max_images 被截断丢弃的部分不计
+            # 入总数与失败数，与 delegated 会话 total_count 语义一致）。
+            effective_total = min(
+                len(combined_sources), image_policy.download.max_images
+            )
+            native_download_failures = sum(
+                1
+                for image in aligned_images[:effective_total]
+                if image is None
+            )
             reply_boundary = len(reply_sources)
             reply_image_urls = [
                 image
@@ -927,6 +1048,17 @@ class MessageHandler:
                 for image in aligned_images[reply_boundary:]
                 if image is not None
             ] or None
+            if effective_total > 0 and not reply_image_urls and not base64_image_urls:
+                # TSK-196：native 全部图片下载失败 → 主 LLM 之前终止，不切
+                # delegated、不触达视觉服务；异常只携带安全摘要。
+                raise ImageUnderstandingFailureError(
+                    _native_failure_summary(
+                        total_images=effective_total,
+                        download_failures=native_download_failures,
+                        provider_failed=False,
+                        all_unavailable=True,
+                    )
+                )
         use_search_tool = bool(
             komari_search_plugin.is_search_available(
                 caller_user_id=message.user_id,
@@ -1074,11 +1206,39 @@ class MessageHandler:
                     parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                     agent_budget=agent_budget,
                 )
+        except Exception as exc:
+            # TSK-196：native 带图请求失败 → 包装为安全图片失败（from None，
+            # 不保留原异常 cause/正文），绝不切 delegated；无图片进入请求的
+            # 普通 LLM 错误按原样传播，不误报为图片失败。delegated 的主循环
+            # 已自行以 ImageUnderstandingFailureError 终止（此处原样重抛）。
+            if not (reply_image_urls or base64_image_urls):
+                raise
+            raise ImageUnderstandingFailureError(
+                _native_failure_summary(
+                    total_images=effective_total,
+                    download_failures=native_download_failures,
+                    provider_failed=True,
+                    all_unavailable=False,
+                )
+            ) from None
         finally:
             # TSK-195：delegated 会话持有的下载连接随任务结束释放（幂等，
             # 可重复调用；构造即零预下载，未读取也不持有 open 连接）。
             if image_session is not None:
                 await image_session.close()
+
+        if reply_image_urls or base64_image_urls:
+            if native_download_failures:
+                # TSK-196：native 部分下载失败且任务成功 → 聚合摘要附加到结果。
+                reply_result = replace(
+                    reply_result,
+                    image_diagnostic=_native_failure_summary(
+                        total_images=effective_total,
+                        download_failures=native_download_failures,
+                        provider_failed=False,
+                        all_unavailable=False,
+                    ).to_diagnostic(),
+                )
 
         logger.info(
             "[KomariChat] 生成回复成功: len={} favorability_delta={}",
@@ -1250,6 +1410,11 @@ class MessageHandler:
                     summary=str(exc),
                     request_trace_id=request_trace_id,
                     reaction_sent=reaction_sent,
+                    image_diagnostic=(
+                        exc.summary.to_diagnostic()
+                        if isinstance(exc, ImageUnderstandingFailureError)
+                        else None
+                    ),
                 )
             else:
                 await agent_run_logger_plugin.finalize_collector(

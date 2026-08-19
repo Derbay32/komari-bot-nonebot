@@ -38,6 +38,7 @@ from .vision_service import read_images
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from komari_bot.onebot.group_failure_notify import ImageFailureDiagnostic
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 #: 图片来源归属：引用消息图片在前、当前消息图片在后。
@@ -92,15 +93,30 @@ class ImageReadResult:
 
 @dataclass(frozen=True, slots=True)
 class ImageFailureSummary:
-    """全部失败状态的安全摘要（TSK-196 后续消费；无 URL/base64/正文）。"""
+    """全部失败状态的安全摘要（TSK-196 消费；无 URL/base64/正文）。
 
-    mode: Literal["delegated"] = "delegated"
+    ``mode`` 区分图片理解模式：delegated 由任务级图片会话汇总，native 由
+    聊天核心在批量下载/主 LLM 失败时汇总；两模式共用同一诊断投影。
+    """
+
+    mode: Literal["native", "delegated"] = "delegated"
     all_images_unavailable: bool = False
     total_images: int = 0
     attempted_images: int = 0
     failed_images: int = 0
     error_types: tuple[str, ...] = ()
     stages: tuple[str, ...] = ()
+
+    def to_diagnostic(self) -> "ImageFailureDiagnostic":
+        """投影为 onebot 共享边界的窄诊断（仅白名单字段，无 URL/base64）。"""
+        from komari_bot.onebot.group_failure_notify import ImageFailureDiagnostic
+
+        return ImageFailureDiagnostic(
+            mode=self.mode,
+            failed_count=self.failed_images,
+            stages=self.stages,
+            error_types=self.error_types,
+        )
 
 
 def _as_failure(
@@ -117,6 +133,19 @@ def _as_failure(
         error_type=error_type,
         stage=stage,
     )
+
+
+class ImageUnderstandingFailureError(RuntimeError):
+    """图片理解失败专用异常；只携带安全摘要（无 URL/base64/正文）。
+
+    TSK-196：delegated 全部可用索引均已尝试且失败、native 全部下载失败或
+    带图请求主 LLM 失败时，以本异常终止回复任务；``str()`` 只含模式，
+    通知/日志/Agent Run 不保留原异常正文或 cause。
+    """
+
+    def __init__(self, summary: ImageFailureSummary) -> None:
+        self.summary = summary
+        super().__init__(f"图片理解失败（mode={summary.mode}）")
 
 
 @runtime_checkable
@@ -552,4 +581,5 @@ __all__ = [
     "ImageReadingSession",
     "ImageReadingSessionProtocol",
     "ImageReference",
+    "ImageUnderstandingFailureError",
 ]

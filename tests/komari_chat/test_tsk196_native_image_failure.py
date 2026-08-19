@@ -366,7 +366,6 @@ def test_native_multimodal_provider_failure_wraps_without_mode_switch(
         build_prompt_multimodal=True,
         generate_error=RuntimeError(f"chat provider 拒绝多模态图片请求 {_RAW_URL} {_DATA_URI}"),
     )
-    del handler
 
     with pytest.raises(ImageUnderstandingFailureError) as excinfo:
         asyncio.run(
@@ -423,7 +422,6 @@ def test_native_partial_download_failure_success_attaches_diagnostic(
         ],
         download_results=[None, "base64:https://example.com/ok.png"],
     )
-    del handler
 
     result = asyncio.run(
         handler._generate_reply_core(
@@ -464,7 +462,6 @@ def test_native_no_images_plain_llm_error_propagates_unwrapped(
         image_urls=None,
         generate_error=RuntimeError("普通文本生成失败"),
     )
-    del handler
 
     with pytest.raises(RuntimeError, match="普通文本生成失败"):
         asyncio.run(
@@ -500,7 +497,6 @@ def test_agent_run_native_multimodal_failure_redacts_exception_message(
         build_prompt_multimodal=True,
         real_generate=True,
     )
-    del handler
 
     async def _fail_completion(**kwargs: object) -> None:
         del kwargs

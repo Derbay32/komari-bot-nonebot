@@ -603,9 +603,10 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
     """native：chat provider 对带图请求报错/拒图时，本任务明确失败。
 
     驱动公开生成 seam（真实 ``_generate_reply_core``）：图片作为多模态输入
-    交给聊天槽位后，模拟 chat provider 拒绝该请求并抛错；断言错误向上传
-    播（不静默降级），且不声明/调用 read_image、不切 delegated、不触摸
-    视觉服务（read_images 保持未调用）。
+    交给聊天槽位后，模拟 chat provider 拒绝该请求并抛错；TSK-196 起该失败
+    被安全包装为 ``ImageUnderstandingFailureError``（mode=native，``from
+    None`` 不保留原异常正文），仍不切 delegated、不声明/调用 read_image、
+    不触摸视觉服务（read_images 保持未调用），也不静默降级。
     """
     config = _chat_config_stub(image_understanding_mode="native")
     handler = message_handler_module.MessageHandler.__new__(
@@ -701,8 +702,21 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
             request_trace_id="chat-native-fail-1",
         )
 
-    with pytest.raises(RuntimeError, match="拒绝多模态图片请求"):
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
         asyncio.run(_run())
+
+    # TSK-196：包装只携带 mode=native 摘要，不保留原异常 cause/正文
+    summary = excinfo.value.summary
+    assert summary.mode == "native"
+    assert summary.all_images_unavailable is False
+    assert summary.total_images == 1
+    assert summary.failed_images == 1
+    assert summary.error_types == ("vision_failed",)
+    assert summary.stages == ("vision",)
+    assert excinfo.value.__cause__ is None
+    assert "拒绝多模态图片请求" not in str(excinfo.value)
 
     tools = generate_kwargs.get("tools")
     tool_names: set[str] = set()
