@@ -27,7 +27,8 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
     )
 
     # 时效字段的数据库级 CHECK 与 0007 迁移保持一致，避免 autogenerate 漂移；
-    # 回复 Agent 预算的跨字段 CHECK 与 0013 迁移保持一致（TSK-192）
+    # 回复 Agent 预算的跨字段 CHECK 与 0013 迁移保持一致（TSK-192）；
+    # 图片下载预算的跨字段 CHECK 与 0015 迁移保持一致（TSK-194）。
     __table_args__ = (
         CheckConstraint(
             "reply_fulfillment_freshness_seconds >= 30 "
@@ -38,6 +39,15 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
             "agent_max_tool_calls_per_round <= agent_max_total_tool_calls "
             "AND agent_max_total_tool_calls <= agent_max_rounds * agent_max_tool_calls_per_round",
             name="ck_komari_chat_config_agent_budget",
+        ),
+        CheckConstraint(
+            "vision_image_download_total_max_bytes >= vision_image_download_max_bytes",
+            name="ck_komari_chat_config_image_budget_bytes",
+        ),
+        CheckConstraint(
+            "vision_image_download_total_timeout_seconds >= "
+            "vision_image_download_connect_timeout_seconds",
+            name="ck_komari_chat_config_image_budget_timeout",
         ),
     )
 
@@ -160,6 +170,79 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"apply_mode": "immediate"},
     )
 
+    # 图片理解模式与下载预算（TSK-194）：从 komari_memory_config 迁入，
+    # 模式与 8 项预算在任务起点按 chat 配置冻结；旧 memory 字段不保留
+    # alias / 双读 / fallback。
+    image_understanding_mode: Literal["native", "delegated"] = Field(
+        default="delegated",
+        sa_column=Column(
+            String(32), nullable=False, default="delegated"
+        ),
+        description=(
+            "图片理解模式：native=图片经安全下载与校验后作为多模态输入直接"
+            "给聊天主模型（不声明 read_image 工具）；delegated=向回复 Agent "
+            "暴露 read_image 工具，由独立视觉模型子调用读取图片描述。"
+            "两种模式均不自动降级"
+        ),
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_count: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="单条消息最多下载的当前消息与引用消息图片总数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=64 * 1024,
+        le=16 * 1024 * 1024,
+        description="单张图片响应体最大字节数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_total_max_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=64 * 1024,
+        le=32 * 1024 * 1024,
+        description="单条消息全部图片响应体累计最大字节数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_max_pixels: int = Field(
+        default=40_000_000,
+        ge=1_000_000,
+        le=100_000_000,
+        description="单张静态图片或动画全部帧的累计像素上限",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="单条消息图片下载最大并发数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_connect_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=15.0,
+        description="单次图片连接超时秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_read_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=60.0,
+        description="单次图片响应读取停顿超时秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+    vision_image_download_total_timeout_seconds: float = Field(
+        default=45.0,
+        ge=5.0,
+        le=90.0,
+        description="单条消息全部图片下载总时限秒数",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
+
     @model_validator(mode="after")
     def _validate_agent_budget(self) -> "KomariChatConfigSchema":
         """跨字段校验：单轮预算 <= 总预算 <= 轮次 x 单轮预算。"""
@@ -178,4 +261,17 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
                 "agent_max_rounds x agent_max_tool_calls_per_round"
             )
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_image_download_budget(self) -> "KomariChatConfigSchema":
+        """跨字段校验：总字节上限 >= 单图字节上限，总时限 >= 连接超时。"""
+        if self.vision_image_download_total_max_bytes < (
+            self.vision_image_download_max_bytes
+        ):
+            raise ValueError("图片总字节上限不能小于单图字节上限")
+        if self.vision_image_download_total_timeout_seconds < (
+            self.vision_image_download_connect_timeout_seconds
+        ):
+            raise ValueError("图片下载总时限不能小于连接超时")
         return self

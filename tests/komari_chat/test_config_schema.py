@@ -239,6 +239,157 @@ def test_agent_tool_call_mode_apply_mode_is_immediate() -> None:
     }
 
 
+# ── TSK-194：图片理解模式与下载预算字段（AC1/AC2） ───────────────────
+
+EXPECTED_IMAGE_UNDERSTANDING_MODE_DEFAULT = "delegated"
+EXPECTED_IMAGE_UNDERSTANDING_MODE_CHOICES = ("native", "delegated")
+
+EXPECTED_IMAGE_BUDGET_DEFAULTS: dict[str, object] = {
+    "vision_image_download_max_count": 4,
+    "vision_image_download_max_bytes": 8 * 1024 * 1024,
+    "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+    "vision_image_download_max_pixels": 40_000_000,
+    "vision_image_download_concurrency": 2,
+    "vision_image_download_connect_timeout_seconds": 5.0,
+    "vision_image_download_read_timeout_seconds": 30.0,
+    "vision_image_download_total_timeout_seconds": 45.0,
+}
+
+EXPECTED_IMAGE_BUDGET_BOUNDS: dict[str, tuple[int | float, int | float]] = {
+    "vision_image_download_max_count": (1, 8),
+    "vision_image_download_max_bytes": (64 * 1024, 16 * 1024 * 1024),
+    "vision_image_download_total_max_bytes": (64 * 1024, 32 * 1024 * 1024),
+    "vision_image_download_max_pixels": (1_000_000, 100_000_000),
+    "vision_image_download_concurrency": (1, 4),
+    "vision_image_download_connect_timeout_seconds": (0.5, 15.0),
+    "vision_image_download_read_timeout_seconds": (1.0, 60.0),
+    "vision_image_download_total_timeout_seconds": (5.0, 90.0),
+}
+
+
+def test_image_understanding_mode_is_typed_enum_with_default_delegated() -> None:
+    """AC1：image_understanding_mode 是强类型枚举，默认 delegated。"""
+    assert "image_understanding_mode" in KomariChatConfigSchema.model_fields
+    schema = KomariChatConfigSchema.model_json_schema()
+    property_schema = schema["properties"]["image_understanding_mode"]
+    assert property_schema.get("enum") == list(
+        EXPECTED_IMAGE_UNDERSTANDING_MODE_CHOICES
+    )
+    assert (
+        KomariChatConfigSchema.model_fields[
+            "image_understanding_mode"
+        ].default
+        == EXPECTED_IMAGE_UNDERSTANDING_MODE_DEFAULT
+    )
+
+
+@pytest.mark.parametrize("mode", EXPECTED_IMAGE_UNDERSTANDING_MODE_CHOICES)
+def test_image_understanding_mode_accepts_enum_values(mode: str) -> None:
+    """AC1：native / delegated 都可配置。"""
+    config = KomariChatConfigSchema(image_understanding_mode=mode)
+    assert config.model_dump().get("image_understanding_mode") == mode
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "auto",
+        "disabled",
+        "None",
+        "native ",
+        "delegated_extra",
+        "",
+    ],
+)
+def test_image_understanding_mode_rejects_invalid_values(invalid: str) -> None:
+    """AC1：枚举之外的值必须被 Pydantic 拒绝（无兼容值/宽松规范化）。"""
+    with pytest.raises(ValidationError):
+        KomariChatConfigSchema(image_understanding_mode=invalid)
+
+
+def test_image_understanding_mode_apply_mode_is_immediate() -> None:
+    """AC1：图片理解模式按管理元数据即时生效。"""
+    field = KomariChatConfigSchema.model_fields.get("image_understanding_mode")
+    assert field is not None, "image_understanding_mode 字段缺失"
+    extra = field.json_schema_extra
+    if isinstance(extra, dict) and "apply_mode" in extra:
+        assert extra["apply_mode"] == "immediate"
+
+
+def test_image_budget_fields_expose_expected_defaults() -> None:
+    """AC2：8 项图片下载预算默认值与原 komari_memory_config 完全一致。"""
+    config = KomariChatConfigSchema()
+
+    assert set(EXPECTED_IMAGE_BUDGET_DEFAULTS) <= set(
+        KomariChatConfigSchema.model_fields
+    )
+    for field_name, expected_default in EXPECTED_IMAGE_BUDGET_DEFAULTS.items():
+        assert getattr(config, field_name) == expected_default, field_name
+
+
+def test_image_budget_fields_enforce_bounds() -> None:
+    """AC2：单字段范围校验原样保留，越界值必须被拒绝。"""
+    for field_name, (lower, upper) in EXPECTED_IMAGE_BUDGET_BOUNDS.items():
+        with pytest.raises(ValidationError):
+            KomariChatConfigSchema(**{field_name: lower - 1})
+        with pytest.raises(ValidationError):
+            KomariChatConfigSchema(**{field_name: upper + 1})
+
+
+def test_image_budget_apply_mode_is_immediate() -> None:
+    """AC2：8 项预算字段全部即时生效。"""
+    for field_name in EXPECTED_IMAGE_BUDGET_DEFAULTS:
+        field = KomariChatConfigSchema.model_fields[field_name]
+        extra = field.json_schema_extra
+        assert isinstance(extra, dict), field_name
+        assert extra["apply_mode"] == "immediate", field_name
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # 相等边界合法：total == max_bytes
+        {
+            "vision_image_download_max_bytes": 2 * 1024 * 1024,
+            "vision_image_download_total_max_bytes": 2 * 1024 * 1024,
+        },
+        # 相等边界合法：total_timeout == connect_timeout
+        {
+            "vision_image_download_connect_timeout_seconds": 10.0,
+            "vision_image_download_total_timeout_seconds": 10.0,
+        },
+    ],
+)
+def test_image_budget_cross_field_boundary_combinations_accepted(
+    overrides: dict[str, object],
+) -> None:
+    """AC2：跨字段相等边界组合可接受。"""
+    assert KomariChatConfigSchema(**overrides) is not None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # 总字节上限 < 单图字节上限
+        {
+            "vision_image_download_max_bytes": 2 * 1024 * 1024,
+            "vision_image_download_total_max_bytes": 1024 * 1024,
+        },
+        # 总时限 < 连接超时
+        {
+            "vision_image_download_connect_timeout_seconds": 10.0,
+            "vision_image_download_total_timeout_seconds": 5.0,
+        },
+    ],
+)
+def test_image_budget_cross_field_invalid_combinations_rejected(
+    overrides: dict[str, object],
+) -> None:
+    """AC2：Pydantic 拒绝跨字段非法组合。"""
+    with pytest.raises(ValidationError):
+        KomariChatConfigSchema(**overrides)
+
+
 def test_config_schema_drops_dead_proactive_score_threshold() -> None:
     """死字段 proactive_score_threshold 不迁移。"""
     assert "proactive_score_threshold" not in KomariChatConfigSchema.model_fields

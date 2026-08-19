@@ -68,6 +68,20 @@ MIGRATED_TO_KOMARI_CHAT_FIELDS = (
     "reply_commit_tombstone_retention_days",
 )
 
+# TSK-194：图片理解模式与 8 项下载预算整体迁入 komari_chat_config；
+# memory 侧物理删除（不保留 alias / 双读 / fallback）。
+MIGRATED_TO_KOMARI_CHAT_VISION_FIELDS = (
+    "vision_tool_enabled",
+    "vision_image_download_max_count",
+    "vision_image_download_max_bytes",
+    "vision_image_download_total_max_bytes",
+    "vision_image_download_max_pixels",
+    "vision_image_download_concurrency",
+    "vision_image_download_connect_timeout_seconds",
+    "vision_image_download_read_timeout_seconds",
+    "vision_image_download_total_timeout_seconds",
+)
+
 
 def test_config_schema_no_longer_exposes_migrated_proactive_fields() -> None:
     """频控/outbox 字段已迁入 komari_chat_config（KOMARIBOT-7）。"""
@@ -75,6 +89,17 @@ def test_config_schema_no_longer_exposes_migrated_proactive_fields() -> None:
 
     for field_name in MIGRATED_TO_KOMARI_CHAT_FIELDS:
         assert field_name not in fields
+
+
+def test_config_schema_no_longer_exposes_migrated_vision_fields() -> None:
+    """TSK-194：9 个旧图片字段从 komari_memory_config 物理删除。"""
+    fields = KomariMemoryConfigSchema.model_fields
+
+    for field_name in MIGRATED_TO_KOMARI_CHAT_VISION_FIELDS:
+        assert field_name not in fields
+    dumped = KomariMemoryConfigSchema().model_dump()
+    for field_name in MIGRATED_TO_KOMARI_CHAT_VISION_FIELDS:
+        assert field_name not in dumped
 
 
 def test_interaction_processing_lease_has_bounded_immediate_config() -> None:
@@ -94,41 +119,19 @@ def test_interaction_processing_lease_has_bounded_immediate_config() -> None:
         KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=7201)
 
 
-def test_vision_image_download_limits_are_bounded_and_immediate() -> None:
-    config = KomariMemoryConfigSchema()
-    expected_defaults = {
-        "vision_image_download_max_count": 4,
-        "vision_image_download_max_bytes": 8 * 1024 * 1024,
-        "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
-        "vision_image_download_max_pixels": 40_000_000,
-        "vision_image_download_concurrency": 2,
-        "vision_image_download_connect_timeout_seconds": 5.0,
-        "vision_image_download_read_timeout_seconds": 30.0,
-        "vision_image_download_total_timeout_seconds": 45.0,
-    }
-
-    for field_name, expected_default in expected_defaults.items():
-        assert getattr(config, field_name) == expected_default
-        field_extra = KomariMemoryConfigSchema.model_fields[
-            field_name
-        ].json_schema_extra
-        assert isinstance(field_extra, dict)
-        assert field_extra["apply_mode"] == "immediate"
-
-
-def test_vision_image_download_rejects_inconsistent_batch_budgets() -> None:
-    import pytest
-
-    with pytest.raises(ValueError, match="总字节上限"):
-        KomariMemoryConfigSchema(
-            vision_image_download_max_bytes=2 * 1024 * 1024,
-            vision_image_download_total_max_bytes=1024 * 1024,
-        )
-    with pytest.raises(ValueError, match="总时限"):
-        KomariMemoryConfigSchema(
-            vision_image_download_connect_timeout_seconds=10,
-            vision_image_download_total_timeout_seconds=5,
-        )
+def test_vision_image_download_budget_no_longer_lives_in_memory() -> None:
+    """TSK-194：图片下载预算字段已迁入 komari_chat_config，memory 无对应列。"""
+    fields = KomariMemoryConfigSchema.model_fields
+    assert not {
+        "vision_image_download_max_count",
+        "vision_image_download_max_bytes",
+        "vision_image_download_total_max_bytes",
+        "vision_image_download_max_pixels",
+        "vision_image_download_concurrency",
+        "vision_image_download_connect_timeout_seconds",
+        "vision_image_download_read_timeout_seconds",
+        "vision_image_download_total_timeout_seconds",
+    }.intersection(fields)
 
 
 def test_config_schema_request_protocol_defaults() -> None:
