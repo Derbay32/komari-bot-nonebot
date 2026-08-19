@@ -71,12 +71,24 @@ class _FailureNotificationCooldown(Protocol):
     ) -> bool: ...
 
 
+_VALID_IMAGE_DIAGNOSTIC_MODES = frozenset({"native", "delegated"})
+_VALID_IMAGE_DIAGNOSTIC_STAGES = frozenset({"invalid", "download", "vision"})
+_VALID_IMAGE_DIAGNOSTIC_ERROR_TYPES = frozenset(
+    {"invalid_index", "image_unavailable", "vision_failed"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ImageFailureDiagnostic:
     """图片理解失败的安全聚合摘要（TSK-196；白名单字段，无 URL/base64/正文）。
 
     只包含模式、失败数量、去重排序后的失败阶段与归一化错误类型，供
     SUPERUSER 诊断卡渲染；绝不携带图片 URL、base64、视觉描述或消息正文。
+    纵深防御（TSK-196 复审）：构造时运行时校验并确定性去重排序——mode 仅
+    native/delegated、stage 仅 invalid/download/vision、error type 仅
+    invalid_index/image_unavailable/vision_failed、failed_count 必须是
+    正整数（bool 禁止）、stage/error 至少一项；恶意 URL/base64/CQ/换行值
+    一律 ``ValueError``。renderer 只消费已验证对象。
     """
 
     mode: str
@@ -84,14 +96,47 @@ class ImageFailureDiagnostic:
     stages: tuple[str, ...]
     error_types: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        if self.mode not in _VALID_IMAGE_DIAGNOSTIC_MODES:
+            msg = f"非法图片失败模式: {self.mode!r}"
+            raise ValueError(msg)
+        if isinstance(self.failed_count, bool) or not isinstance(
+            self.failed_count, int
+        ):
+            msg = "failed_count 必须是正整数"
+            raise TypeError(msg)
+        if self.failed_count <= 0:
+            msg = "failed_count 必须是正整数（大于 0）"
+            raise ValueError(msg)
+        stages = tuple(sorted(set(self.stages)))
+        if not stages:
+            msg = "stages 不能为空"
+            raise ValueError(msg)
+        if any(stage not in _VALID_IMAGE_DIAGNOSTIC_STAGES for stage in stages):
+            msg = f"非法失败阶段: {stages!r}"
+            raise ValueError(msg)
+        error_types = tuple(sorted(set(self.error_types)))
+        if not error_types:
+            msg = "error_types 不能为空"
+            raise ValueError(msg)
+        if any(
+            error_type not in _VALID_IMAGE_DIAGNOSTIC_ERROR_TYPES
+            for error_type in error_types
+        ):
+            msg = f"非法失败类型: {error_types!r}"
+            raise ValueError(msg)
+        object.__setattr__(self, "stages", stages)
+        object.__setattr__(self, "error_types", error_types)
+
 
 def image_failure_reason_code(diagnostic: ImageFailureDiagnostic) -> str:
     """生成稳定、确定性的图片失败 reason_code（跨任务可去重）。
 
-    由模式与排序去重后的错误类型组成，与读取顺序无关；同一群+同一
-    reason_code 在不同任务间共享冷却去重。
+    由模式与排序去重后的错误类型组成（``ImageFailureDiagnostic`` 构造时已
+    归一化），与读取顺序无关；同一群+同一 reason_code 在不同任务间共享冷却
+    去重。
     """
-    return "_".join(("image", diagnostic.mode, *sorted(diagnostic.error_types)))
+    return "_".join(("image", diagnostic.mode, *diagnostic.error_types))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -287,27 +332,27 @@ class GroupTaskFailureNotifier:
         if not acquired:
             return
 
-        lines = [
-            f"任务: {notification.task_kind}",
-            f"群: {notification.group_id}",
-        ]
         if notification.image_diagnostic is not None:
-            # TSK-196：图片失败汇总卡只渲染白名单字段；generic 阶段/原因/摘要
-            # 不进入该卡（避免与既有通用卡片格式混淆），且绝不出现 message_id。
+            # TSK-196 复审：图片失败汇总卡只渲染严格白名单字段——群/trace/
+            # 图片模式/失败阶段/失败数量/失败类型；不含任务、generic 阶段/
+            # 原因/摘要与 message_id。diagnostic 构造时已确定性去重排序，
+            # renderer 只消费已验证对象。
             diagnostic = notification.image_diagnostic
+            lines = [f"群: {notification.group_id}"]
             if notification.request_trace_id:
                 lines.append(f"trace: {notification.request_trace_id}")
             lines.append(f"图片模式: {diagnostic.mode}")
-            lines.append(
-                f"失败阶段: {', '.join(sorted(set(diagnostic.stages)))}"
-            )
+            lines.append(f"失败阶段: {', '.join(diagnostic.stages)}")
             lines.append(f"失败数量: {diagnostic.failed_count}")
-            lines.append(
-                f"失败类型: {', '.join(sorted(set(diagnostic.error_types)))}"
-            )
+            lines.append(f"失败类型: {', '.join(diagnostic.error_types)}")
         else:
-            lines.append(f"阶段: {notification.stage}")
-            lines.append(f"原因: {notification.reason_code}")
+            # generic 卡片保持原格式（任务/群/阶段/原因/trace/摘要）
+            lines = [
+                f"任务: {notification.task_kind}",
+                f"群: {notification.group_id}",
+                f"阶段: {notification.stage}",
+                f"原因: {notification.reason_code}",
+            ]
             if notification.request_trace_id:
                 lines.append(f"trace: {notification.request_trace_id}")
             summary = _project_summary(notification.summary)
