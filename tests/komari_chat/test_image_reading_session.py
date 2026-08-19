@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     import pytest
@@ -31,7 +31,14 @@ image_downloader_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_downloader"
 )
 
-ImageReadingSession = image_reading_session_module.ImageReadingSession
+from komari_bot.plugins.komari_chat.services.image_reading_session import (
+    ImageReadingSession,
+)
+
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_chat.services.image_downloader import (
+        ImageDownloadPolicy,
+    )
 
 _RAW_URLS = [
     "https://example.com/secret/path/quoted-0.png?token=abc#frag",
@@ -40,7 +47,7 @@ _RAW_URLS = [
 ]
 
 
-def _policy(**overrides: object) -> image_downloader_module.ImageDownloadPolicy:
+def _policy(**overrides: object) -> ImageDownloadPolicy:
     values: dict[str, object] = {
         "max_images": 4,
         "max_image_bytes": 8 * 1024 * 1024,
@@ -59,15 +66,15 @@ class _FakeDownloader:
     """可控下载器：记录调用并返回预设结果（str | None | callable）。"""
 
     def __init__(self, results: Any = "data:image/png;base64,QQ==") -> None:
-        self.results = results
+        self.results: Any = results
         self.calls: list[str] = []
         self.close_calls = 0
 
     async def download(self, url: str) -> str | None:
         self.calls.append(url)
         if callable(self.results):
-            return self.results()
-        return self.results
+            return cast("str | None", self.results())
+        return cast("str | None", self.results)
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -173,7 +180,7 @@ def test_build_stable_indexes_quoted_first_preserves_original() -> None:
     assert session.quoted_count == 2
     assert session.current_count == 1
 
-    refs = list(session._references)
+    refs = list(session.references)
     assert [(ref.index, ref.origin, ref.original_index) for ref in refs] == [
         (0, "quoted", 0),
         (1, "quoted", 1),
@@ -199,7 +206,7 @@ def test_build_caps_references_at_max_images() -> None:
     assert session.total_count == 2
     assert session.quoted_count == 2
     assert session.current_count == 0
-    assert [(ref.index, ref.origin, ref.original_index) for ref in session._references] == [
+    assert [(ref.index, ref.origin, ref.original_index) for ref in session.references] == [
         (0, "quoted", 0),
         (1, "quoted", 1),
     ]
@@ -291,6 +298,7 @@ def test_repeated_failure_read_reuses_same_failure(
     assert first.status == "failure"
     assert first.error_type == "image_unavailable"
     assert first.failure_message == second.failure_message
+    assert first.failure_message is not None
     assert "图片读取失败" in first.failure_message
     assert downloader.calls == [_RAW_URLS[2]]
     assert len(vision.calls) == 0, "下载失败不得触发视觉调用"
@@ -334,6 +342,7 @@ def test_invalid_and_out_of_range_index_zero_external_calls(
     for result in results:
         assert result.status == "invalid_index"
         assert result.error_type == "invalid_index"
+        assert result.failure_message is not None
         assert "超出范围" in result.failure_message
     assert len(vision.calls) == 0
 

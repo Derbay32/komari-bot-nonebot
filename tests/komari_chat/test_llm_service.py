@@ -15,6 +15,53 @@ llm_service_module = import_module(
     "komari_bot.plugins.komari_chat.services.llm_service"
 )
 retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
+
+
+class _FakeImageSession:
+    """TSK-195：最小图片会话替身（窄 Protocol），按结果队列返回 read 结果。"""
+
+    def __init__(
+        self,
+        results: list[Any],
+    ) -> None:
+        self.results = results
+        self.read_calls: list[tuple[int, str | None]] = []
+
+    @property
+    def total_count(self) -> int:
+        return max(len(self.results), 1)
+
+    async def read(
+        self,
+        index: int,
+        *,
+        parent_call_id: str | None = None,
+    ) -> Any:
+        self.read_calls.append((index, parent_call_id))
+        if index < 0 or index >= len(self.results):
+            return image_reading_session_module.ImageReadResult(
+                index=index,
+                status="invalid_index",
+                failure_message="[图片读取失败: image_index 超出范围]",
+                error_type="invalid_index",
+                stage="invalid",
+            )
+        return self.results[index]
+
+    def all_images_unavailable(self) -> bool:
+        return bool(self.results) and all(
+            result.status == "failure" for result in self.results
+        )
+
+    def failure_summary(self) -> Any:
+        return image_reading_session_module.ImageFailureSummary(
+            all_images_unavailable=self.all_images_unavailable(),
+            total_images=len(self.results),
+        )
+
 
 
 class _FakeLLMProvider:
@@ -1382,28 +1429,19 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
         ),
     ]
     searched_queries: list[str] = []
-    read_images_payloads: list[list[str]] = []
-
-    async def _fake_read_images(
-        images: list[str],
-        *,
-        vision_model: str,
-        temperature: float,
-        max_tokens: int,
-        **_: object,
-    ) -> list[str]:
-        read_images_payloads.append(images)
-        assert vision_model == "vision-model"
-        assert temperature == 0.2
-        assert max_tokens == 512
-        return ["图片描述：是一只猫"]
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0, status="success", description="图片描述：是一只猫"
+            )
+        ]
+    )
 
     async def _fake_search_web(query: str, **_kwargs: object) -> str:
         searched_queries.append(query)
         return "搜索结果：天气晴"
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
     monkeypatch.setattr(
         llm_service_module,
         "komari_search",
@@ -1419,15 +1457,14 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
                 llm_service_module.SEARCH_WEB_TOOL,
             ],
             request_trace_id="chat-combined-tools-1",
-            base64_images=["base64-image-0"],
-            vision_model="vision-model",
-            vision_temperature=0.2,
-            vision_max_tokens=512,
+            image_session=image_session,
         )
     )
 
     assert result.content == "看图并搜索后的回答"
-    assert read_images_payloads == [["base64-image-0"]]
+    assert image_session.read_calls == [(0, None)], (
+        "read_image 只按稳定索引读取，不见 URL/base64"
+    )
     assert searched_queries == ["天气"]
     assert fake_provider.completion_calls[0]["tools"] == [
         llm_service_module.READ_IMAGE_TOOL,
@@ -1479,10 +1516,17 @@ def test_generate_reply_with_tools_delegated_vision_failure_allows_honest_final(
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
 
-    async def _failing_read_images(*_args: Any, **_kwargs: Any) -> list[str]:
-        return ["[图片读取失败: 视觉模型拒绝读取]"]
-
-    monkeypatch.setattr(llm_service_module, "read_images", _failing_read_images)
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            )
+        ]
+    )
 
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
@@ -1494,12 +1538,7 @@ def test_generate_reply_with_tools_delegated_vision_failure_allows_honest_final(
             ),
             messages=[{"role": "user", "content": "看图"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["data:image/png;base64,AAAA"],
-            vision_model="vision-model",
-            vision_request_api="responses",
-            vision_stream_enabled=True,
-            vision_thinking_mode=True,
-            vision_reasoning_effort="high",
+            image_session=image_session,
         )
     )
 
@@ -1514,6 +1553,9 @@ def test_generate_reply_with_tools_delegated_vision_failure_allows_honest_final(
     # 主循环 messages 不得嵌入原图（原图只按索引交给视觉子调用）
     rendered = str(fake_provider.completion_calls)
     assert "data:image/png;base64,AAAA" not in rendered
+    assert image_session.read_calls == [(0, None)]
+    # 全部可用图片失败 → 工具结果携带 all_images_unavailable 标记
+    assert image_session.all_images_unavailable() is True
     # 第二轮上下文保留 read_image 失败的结构化工具结果，供模型诚实收尾
     second_round_messages = fake_provider.completion_calls[1]["messages"]
     tool_contents = [
@@ -1523,6 +1565,7 @@ def test_generate_reply_with_tools_delegated_vision_failure_allows_honest_final(
     ]
     assert tool_contents, "第二轮上下文必须包含 read_image 失败工具结果"
     assert any("图片读取失败" in str(content) for content in tool_contents)
+    assert any("all_images_unavailable=true" in str(content) for content in tool_contents)
 
 
 def test_summarize_conversation_escapes_untrusted_prompt_text(
@@ -1751,11 +1794,18 @@ def test_read_image_tool_records_error_when_vision_service_fails(
         ),
     ]
 
-    async def _fake_read_images(*_args: object, **_kwargs: object) -> list[str]:
-        return ["[图片读取失败: 视觉模型故障]"]
-
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型故障]",
+                error_type="vision_failed",
+                stage="vision",
+            )
+        ]
+    )
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-image-tool-failed")
@@ -1764,8 +1814,7 @@ def test_read_image_tool_records_error_when_vision_service_fails(
             config=_build_config(),
             messages=[{"role": "user", "content": "看看图片"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["base64-image-0"],
-            vision_model="vision-model",
+            image_session=image_session,
             collector=collector,
         )
     )

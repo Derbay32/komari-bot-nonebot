@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 
 from nonebot import logger
 
@@ -118,6 +118,29 @@ def _as_failure(
     )
 
 
+@runtime_checkable
+class ImageReadingSessionProtocol(Protocol):
+    """回复工具循环消费的最小会话契约（窄 Protocol）。
+
+    主循环请求/诊断只会见到稳定 ``image_index`` 与结构化结果；原始 URL、
+    base64 与下载细节不越过该契约。
+    """
+
+    @property
+    def total_count(self) -> int: ...
+
+    async def read(
+        self,
+        index: int,
+        *,
+        parent_call_id: str | None = None,
+    ) -> ImageReadResult: ...
+
+    def all_images_unavailable(self) -> bool: ...
+
+    def failure_summary(self) -> ImageFailureSummary: ...
+
+
 class ImageReadingSession:
     """单个回复 Agent 任务的图片理解会话（delegated）。
 
@@ -168,7 +191,15 @@ class ImageReadingSession:
         current_sources: list[str],
         policy: ImageDownloadPolicy,
         max_images: int | None = None,
-        **vision_params: object,
+        vision_model: str,
+        vision_temperature: float = 0.3,
+        vision_max_tokens: int = 1024,
+        vision_request_api: str = "chat_completions",
+        vision_stream_enabled: bool = False,
+        vision_thinking_mode: bool = False,
+        vision_reasoning_effort: str = "",
+        request_trace_id: str | None = None,
+        collector: "LLMDiagnosticCollector | None" = None,
     ) -> "ImageReadingSession":
         """从引用消息与当前消息的来源构造会话；索引稳定且引用在前。
 
@@ -198,12 +229,29 @@ class ImageReadingSession:
                 index += 1
             if index >= effective_max:
                 break
-        return cls(references, policy, **vision_params)
+        return cls(
+            references,
+            policy,
+            vision_model=vision_model,
+            vision_temperature=vision_temperature,
+            vision_max_tokens=vision_max_tokens,
+            vision_request_api=vision_request_api,
+            vision_stream_enabled=vision_stream_enabled,
+            vision_thinking_mode=vision_thinking_mode,
+            vision_reasoning_effort=vision_reasoning_effort,
+            request_trace_id=request_trace_id,
+            collector=collector,
+        )
 
     @property
     def total_count(self) -> int:
         """可读取图片总数（稳定索引范围 0..total_count-1）。"""
         return len(self._references)
+
+    @property
+    def references(self) -> tuple[ImageReference, ...]:
+        """稳定引用只读视图（source 仅用于安全下载调度，不越过本边界）。"""
+        return tuple(self._references)
 
     @property
     def quoted_count(self) -> int:
@@ -269,9 +317,8 @@ class ImageReadingSession:
                 error_type="vision_failed",
                 stage="vision",
             )
-        finally:
-            self._inflight.pop(index, None)
-            self._results[index] = result
+        self._inflight.pop(index, None)
+        self._results[index] = result
         return result
 
     async def _read_one(
@@ -383,5 +430,6 @@ __all__ = [
     "ImageFailureSummary",
     "ImageReadResult",
     "ImageReadingSession",
+    "ImageReadingSessionProtocol",
     "ImageReference",
 ]

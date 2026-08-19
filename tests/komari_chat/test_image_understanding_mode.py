@@ -7,21 +7,22 @@
   缺失或非法都明确失败，绝不回退 Python 默认值 / 旧 memory 别名
   （TSK-194/ADR-0010 协调式破坏升级）；
 - ``_generate_reply_core`` 按模式切换：native 时图片作为多模态输入嵌入
-  (user) 消息且不暴露 ``read_image`` 工具（不把 base64 交给工具循环），
-  delegated 时暴露 ``read_image`` 并把下载后的 base64 交给视觉子调用；
+  (user) 消息且不暴露 ``read_image`` 工具（不把图片交给工具循环），
+  delegated 时暴露 ``read_image`` 且任务起点零预下载，只向工具循环
+  传入任务级 ``image_session``（稳定索引计数，无 URL/base64，TSK-195）；
 - 禁止自动降级的可观察失败：native 时 chat provider 对带图请求报错则本
   任务明确失败（不声明/调用 read_image、不切 delegated、不调视觉服务）；
 - 真实任务冻结：同一 ``_generate_reply_core`` 任务中途修改 chat 配置的
-  ``image_understanding_mode`` 与一项预算，当前任务仍用起点快照，下一
-  次任务才用新值；且每个任务只读取一次 chat config、agent budget 与
-  image policy 来自同一快照对象；
+  ``image_understanding_mode`` 与一项预算，当前任务仍用起点快照（delegated
+  会话按起点预算截断），下一次任务才用新值；且每个任务只读取一次 chat
+  config、agent budget 与 image policy 来自同一快照对象；
 - 两种模式共用同一份下载预算与同一 chat 槽位主循环（主循环模型选择见
   ``test_request_mode_passthrough.py`` 的 chat 槽位断言）。
 
 本文件沿用 ``test_agent_budget.py`` 的测试 seam：公开无副作用生成核心
 （``_generate_reply_core``）配合可控 provider 与业务工具替身；只断言
-可观察行为（build_prompt 输入 / 工具集合 / base64 传递 / 下载批次），
-不断言私有 helper。
+可观察行为（build_prompt 输入 / 工具集合 / 图片会话 / 下载批次），不断言
+私有 helper。
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ import sys
 import types
 from importlib import import_module
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -44,6 +45,9 @@ image_understanding_module = import_module(
 image_downloader_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_downloader"
 )
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
 llm_service_module = import_module(
     "komari_bot.plugins.komari_chat.services.llm_service"
 )
@@ -54,9 +58,12 @@ agent_budget_module = import_module(
     "komari_bot.plugins.komari_chat.services.agent_budget"
 )
 
-ImageUnderstandingPolicy = image_understanding_module.ImageUnderstandingPolicy
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_chat.services.image_reading_session import (
+        ImageReadingSession,
+    )
 
-#: 与配置 Schema / 迁移 0015 默认值一致的图片下载预算 8 项字段。
+ImageUnderstandingPolicy = image_understanding_module.ImageUnderstandingPolicy#: 与配置 Schema / 迁移 0015 默认值一致的图片下载预算 8 项字段。
 _CHAT_BUDGET_FIELDS: dict[str, object] = {
     "vision_image_download_max_count": 4,
     "vision_image_download_max_bytes": 8 * 1024 * 1024,
@@ -153,6 +160,19 @@ def _make_message(message_id: str = "img-msg-1") -> Any:
         content="看看这张图",
         timestamp=1.0,
         message_id=message_id,
+    )
+
+
+def _vision_stub() -> SimpleNamespace:
+    """TSK-194 视觉槽位全部参数（含推理参数）的替身。"""
+    return SimpleNamespace(
+        vision_model="vision-model",
+        vision_temperature=0.3,
+        vision_max_tokens=1024,
+        vision_request_api="chat_completions",
+        vision_stream_enabled=False,
+        vision_thinking_mode=False,
+        vision_reasoning_effort="",
     )
 
 
@@ -414,10 +434,15 @@ def test_native_mode_embeds_images_and_hides_read_image_tool(
     assert "read_image" not in tool_names, "native 模式不得暴露 read_image 工具"
 
 
-def test_delegated_mode_exposes_read_image_tool_with_base64(
+def test_delegated_mode_zero_predownload_and_exposes_read_image_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """delegated：暴露 read_image 并把下载后的 base64 交给视觉子调用。"""
+    """TSK-195：delegated 任务起点零预下载，仍暴露 read_image 并传入会话。
+
+    断言代理主消息/prompt 不带任何 URL/base64（只有稳定索引计数），且
+    ``generate_reply_with_tools`` 收到任务级 ``image_session`` 而非原始
+    URL/base64 列表；download 层零触达。
+    """
     config = _chat_config_stub(image_understanding_mode="delegated")
     handler, generate_kwargs, download_batches, build_prompt_kwargs = _wire_generate_core(
         monkeypatch,
@@ -426,19 +451,123 @@ def test_delegated_mode_exposes_read_image_tool_with_base64(
     )
     del handler
 
-    assert download_batches == [
-        ["https://example.com/a.png", "https://example.com/b.png"]
-    ]
+    assert download_batches == [], "delegated 任务起点零预下载，不得触达下载器"
     assert build_prompt_kwargs.get("delegated_image_mode") is True
-    assert generate_kwargs.get("base64_images") == [
-        "base64:https://example.com/a.png",
-        "base64:https://example.com/b.png",
-    ]
+    assert build_prompt_kwargs.get("image_urls") is None
+    assert build_prompt_kwargs.get("reply_image_urls") is None
+    assert build_prompt_kwargs.get("delegated_quoted_image_count") == 0
+    assert build_prompt_kwargs.get("delegated_current_image_count") == 2
+    session = generate_kwargs.get("image_session")
+    assert session is not None, "delegated 必须把任务级图片会话交给工具循环"
+    session = cast("ImageReadingSession", session)
+    assert session.total_count == 2
+    assert session.current_count == 2
+    assert generate_kwargs.get("base64_images") is None
     tools = generate_kwargs.get("tools")
     tool_names: set[str] = set()
     if isinstance(tools, list):
         tool_names = {str(tool["function"]["name"]) for tool in tools}
     assert "read_image" in tool_names, "delegated 模式必须暴露 read_image 工具"
+
+
+def test_delegated_mode_quoted_images_first_stable_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-195：delegated 引用消息图片在前、当前消息图片在后，索引稳定。"""
+    config = _chat_config_stub(image_understanding_mode="delegated")
+    reply_context = message_handler_module.ReplyContext(
+        source_side="user",
+        message_id="quoted-msg-1",
+        user_id="quoted-user",
+        user_nickname="被回复者",
+        text="被回复文本",
+        image_sources=(
+            "https://example.com/quoted-0.png",
+            "https://example.com/quoted-1.png",
+        ),
+        image_count=2,
+        has_visible_image=True,
+    )
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = _FakeRedis()
+    handler.memory = _FakeMemory()
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
+    monkeypatch.setattr(
+        message_handler_module,
+        "llm_provider_config_manager",
+        SimpleNamespace(get=lambda: _vision_stub()),
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+
+    build_prompt_kwargs: dict[str, object] = {}
+
+    async def _fake_build_prompt(**kwargs: object) -> list[dict[str, object]]:
+        build_prompt_kwargs.update(kwargs)
+        return [{"role": "user", "content": "test"}]
+
+    generate_kwargs: dict[str, object] = {}
+
+    async def _fake_generate_with_tools(**kwargs: object) -> Any:
+        generate_kwargs.update(kwargs)
+        return llm_service_module.ReplyResult(
+            content="回复内容",
+            interaction_history={"event": "看图", "result": "结果", "emotion": "好奇"},
+            favorability_delta=0,
+            favorability_reason="无变化",
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools
+    )
+
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
+
+    async def _run() -> Any:
+        return await handler._generate_reply_core(
+            message=_make_message(),
+            recent_messages=[],
+            interaction_records=[],
+            image_urls=["https://example.com/current-0.png"],
+            reply_context=reply_context,
+            reply_context_requested=True,
+            reply_context_refetched=False,
+            request_trace_id="delegated-quoted-1",
+        )
+
+    asyncio.run(_run())
+
+    assert build_prompt_kwargs.get("delegated_quoted_image_count") == 2
+    assert build_prompt_kwargs.get("delegated_current_image_count") == 1
+    session = generate_kwargs.get("image_session")
+    assert session is not None
+    session = cast("ImageReadingSession", session)
+    assert session.total_count == 3
+    assert session.quoted_count == 2
+    assert session.current_count == 1
+    assert [(ref.origin, ref.original_index) for ref in session.references] == [
+        ("quoted", 0),
+        ("quoted", 1),
+        ("current", 0),
+    ]
 
 
 def test_no_images_no_vision_tool_in_either_mode(
@@ -459,7 +588,9 @@ def test_no_images_no_vision_tool_in_either_mode(
         if isinstance(tools, list):
             tool_names = {str(tool["function"]["name"]) for tool in tools}
         assert "read_image" not in tool_names, f"{mode} 无图片不应暴露 read_image"
-        assert generate_kwargs.get("base64_images") is None
+        assert generate_kwargs.get("image_session") is None, (
+            f"{mode} 无图片不应创建图片会话"
+        )
 
 
 # ── 禁止自动降级的可观察失败（TSK-194） ────────────────────────────────
@@ -545,7 +676,9 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
         "download_images_as_base64_aligned",
         _download_images,
     )
-    monkeypatch.setattr(llm_service_module, "read_images", _recording_read_images)
+    monkeypatch.setattr(
+        image_reading_session_module, "read_images", _recording_read_images
+    )
 
     embedding_package_name = "komari_bot.plugins.embedding_provider"
     embedding_fake = types.ModuleType(embedding_package_name)
@@ -577,8 +710,8 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
     assert "read_image" not in tool_names, (
         "native 模式不得声明 read_image（chat provider 失败也不得切 delegated）"
     )
-    assert generate_kwargs.get("base64_images") is None, (
-        "native 模式不得把 base64 交给工具循环（无 read_image 消费方）"
+    assert generate_kwargs.get("image_session") is None, (
+        "native 模式不得为工具循环创建图片会话（图片只走多模态输入）"
     )
     assert build_prompt_kwargs.get("delegated_image_mode") is False
     assert read_images_called == [], "native 模式禁止调用视觉服务（read_image 子调用）"
@@ -672,6 +805,8 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         ),
     )
 
+    build_prompt_calls = {"count": 0}
+
     async def _download_images(
         urls: list[str],
         policy: object,
@@ -679,15 +814,17 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         max_images = policy.max_images  # type: ignore[attr-defined]
         download_batches.append(list(urls[:max_images]))
         download_policies.append(policy)
-        if len(download_batches) == 1:
-            # 任务中途修改 chat 配置：当前任务已冻结，只影响下一个任务
-            config.image_understanding_mode = "native"
-            config.vision_image_download_max_count = 7
         selected = [f"base64:{url}" for url in urls[:max_images]]
         return [*selected, *([None] * (len(urls) - max_images))]
 
     async def _fake_build_prompt(**kwargs: object) -> list[dict[str, object]]:
         del kwargs
+        build_prompt_calls["count"] += 1
+        if build_prompt_calls["count"] == 1:
+            # 任务中途修改 chat 配置：当前任务已冻结（TSK-195 会话容量按
+            # 起点预算 max_count=2 截断），只影响下一个任务
+            config.image_understanding_mode = "native"
+            config.vision_image_download_max_count = 7
         return [{"role": "user", "content": "test"}]
 
     async def _fake_generate_with_tools(**kwargs: object) -> Any:
@@ -732,21 +869,23 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
 
     asyncio.run(_run_first())
 
-    # 当前任务使用起点快照
+    # 当前任务使用起点快照（delegated + max_count=2 ⇒ 会话上限 2 张）
     assert get_config_calls == [config], "每个任务最多读取一次 chat config"
     assert budget_args == [config] and policy_args == [config]
     assert budget_args[0] is policy_args[0], (
         "agent budget 与 image policy 来自同一快照对象"
     )
-    assert download_batches[0] == urls[:2], "当前任务仍使用起点 max_count=2"
-    assert download_policies[0].max_images == 2  # type: ignore[attr-defined]
+    assert download_batches == [], "delegated 任务起点零预下载，不触达下载器"
     first_tools = generate_calls[0]["tools"]
     assert isinstance(first_tools, list)
     first_names = {str(tool["function"]["name"]) for tool in first_tools}
     assert "read_image" in first_names, "当前任务使用起点 delegated 模式"
-    assert generate_calls[0]["base64_images"] == [
-        f"base64:{url}" for url in urls[:2]
-    ]
+    first_session = generate_calls[0].get("image_session")
+    assert first_session is not None
+    first_session = cast("ImageReadingSession", first_session)
+    assert first_session.total_count == 2, "起点预算 max_count=2 截断会话容量"
+    assert first_session.current_count == 2
+    assert generate_calls[0].get("base64_images") is None
 
     async def _run_second() -> Any:
         return await handler._generate_reply_core(
@@ -762,12 +901,12 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
 
     asyncio.run(_run_second())
 
-    # 下一次任务使用新值
+    # 下一次任务使用新值（native + max_count=7）
     assert len(get_config_calls) == 2, "每个任务只读取一次 chat config"
-    assert download_batches[1] == urls, "下一任务使用新的 max_count=7"
-    assert download_policies[1].max_images == 7  # type: ignore[attr-defined]
+    assert download_batches[0] == urls, "下一任务使用新的 max_count=7"
+    assert download_policies[0].max_images == 7  # type: ignore[attr-defined]
     second_tools = generate_calls[1]["tools"]
     assert isinstance(second_tools, list)
     second_names = {str(tool["function"]["name"]) for tool in second_tools}
     assert "read_image" not in second_names, "下一任务使用 native 模式"
-    assert generate_calls[1]["base64_images"] is None
+    assert generate_calls[1]["image_session"] is None

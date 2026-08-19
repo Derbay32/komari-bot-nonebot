@@ -601,12 +601,12 @@ class ImageDownloadSession:
     """
 
     __slots__ = (
-        "policy",
         "_budget",
-        "_semaphore",
         "_elapsed_seconds",
         "_lock",
+        "_semaphore",
         "_session",
+        "policy",
     )
 
     def __init__(self, policy: ImageDownloadPolicy) -> None:
