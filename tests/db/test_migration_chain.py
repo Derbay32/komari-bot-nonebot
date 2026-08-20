@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
@@ -649,6 +650,31 @@ def test_chat_prompt_behavior_columns_revision_exists() -> None:
 
     assert "from komari_bot" not in revision_sql
     assert "import komari_bot" not in revision_sql
+
+
+def test_chat_prompt_behavior_columns_downgrade_is_irreversible() -> None:
+    """TSK-190/197：0012 的 downgrade 明确不可逆，不承诺还原已删自定义 Prompt。
+
+    直接加载迁移模块并调用 ``downgrade()``（真实执行，非文本扫描）：
+    必须抛出带 ``0012_CHAT_PROMPT_BEHAVIOR_COLUMNS_IS_IRREVERSIBLE`` 标记的
+    ``RuntimeError``；被删除的 ``output_instruction`` 自定义内容按 TSK-190
+    契约永久丢弃，不并入任何新字段。
+    """
+    import importlib.util
+
+    migration_path = next(
+        rev
+        for rev in sorted((MIGRATIONS_DIR / "versions").glob("*.py"))
+        if "0012_chat_prompt_behavior_columns" in rev.name
+    )
+    spec = importlib.util.spec_from_file_location("mig_0012_guard", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.revision == "0012"
+    with pytest.raises(RuntimeError, match="0012_CHAT_PROMPT_BEHAVIOR_COLUMNS_IS_IRREVERSIBLE"):
+        module.downgrade()
 
 
 def test_agent_budget_config_revision_exists() -> None:
