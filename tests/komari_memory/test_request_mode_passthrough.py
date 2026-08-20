@@ -152,6 +152,70 @@ def test_summary_tool_calling_layer_passes_summary_slot_request_mode(
     assert call["stream_enabled"] is True
 
 
+def test_summary_tool_calling_plain_mode_keeps_named_tool_choice(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：非思考模式的记忆工具总结保留既有具名 tool_choice。"""
+    tool_completion = SimpleNamespace(
+        tool_calls=[
+            SimpleNamespace(
+                function=SimpleNamespace(name="output_summary_result"),
+                parsed_arguments={
+                    "memories": [{"content": "具名选择总结记忆", "importance": 4}]
+                },
+            )
+        ]
+    )
+    fake_provider = _RecordingLLMProvider(["__raise__", tool_completion])
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    asyncio.run(
+        _run_summarize(
+            messages=[_make_message(content="周末一起吃拉面吧")],
+            config=_make_config(llm_thinking_mode_summary=False),
+            participants=["10001"],
+            display_name_map={"10001": "阿明"},
+        )
+    )
+
+    call = fake_provider.completion_calls[0]
+    assert call["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "output_summary_result"},
+    }
+
+
+def test_summary_tool_calling_thinking_mode_omits_tool_choice(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：思考模式的记忆工具总结保持省略 tool_choice，避免行为漂移。"""
+    tool_completion = SimpleNamespace(
+        tool_calls=[
+            SimpleNamespace(
+                function=SimpleNamespace(name="output_summary_result"),
+                parsed_arguments={
+                    "memories": [{"content": "思考模式总结记忆", "importance": 4}]
+                },
+            )
+        ]
+    )
+    fake_provider = _RecordingLLMProvider(["__raise__", tool_completion])
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    asyncio.run(
+        _run_summarize(
+            messages=[_make_message(content="周末一起吃拉面吧")],
+            config=_make_config(llm_thinking_mode_summary=True),
+            participants=["10001"],
+            display_name_map={"10001": "阿明"},
+        )
+    )
+
+    call = fake_provider.completion_calls[0]
+    assert "tool_choice" not in call, "思考模式必须保持省略 tool_choice 的既有行为"
+    assert call["thinking_mode"] is True
+
+
 def test_summary_direct_output_layer_passes_summary_slot_request_mode(
     monkeypatch: Any,
 ) -> None:
@@ -369,6 +433,85 @@ def test_profile_agent_passes_summary_slot_request_mode(monkeypatch: Any) -> Non
     assert llm_calls
     assert llm_calls[0]["request_api"] == "responses"
     assert llm_calls[0]["stream_enabled"] is True
+
+
+def test_profile_agent_plain_mode_keeps_auto_tool_choice(monkeypatch: Any) -> None:
+    """TSK-193：非思考模式的记忆画像 Agent 保留既有 auto 选择。"""
+    module = _load_profile_agent_service(monkeypatch)
+    _patch_profile_agent_harness(module, monkeypatch)
+    llm_calls: list[dict[str, Any]] = []
+
+    async def _fake_completion(**kwargs: Any) -> Any:
+        llm_calls.append(dict(kwargs))
+        return _final_completion()
+
+    monkeypatch.setattr(
+        module, "llm_provider", SimpleNamespace(generate_messages_completion=_fake_completion)
+    )
+
+    class _Staging:
+        async def preview(self) -> Any:
+            return SimpleNamespace(staged_count=0, diff=[], summary="空")
+
+        async def discard(self) -> None:
+            return None
+
+    asyncio.run(
+        module._run_profile_agent_locked(
+            staging=_Staging(),
+            conversation_text="对话",
+            participants=["10001"],
+            display_name_map={"10001": "阿明"},
+            bot_user_ids=set(),
+            config=_make_config(llm_thinking_mode_summary=False),
+            trace_id="trace-1",
+            collector=None,
+        )
+    )
+
+    assert llm_calls[0]["tool_choice"] == "auto"
+
+
+def test_profile_agent_thinking_mode_omits_tool_choice(monkeypatch: Any) -> None:
+    """TSK-193：思考模式的记忆画像 Agent 保持省略 tool_choice 的既有行为。
+
+    provider 不再隐式抑制 tool_choice；调用方显式声明兼容策略，
+    思考模式由画像 Agent 自己省略 tool_choice。
+    """
+    module = _load_profile_agent_service(monkeypatch)
+    _patch_profile_agent_harness(module, monkeypatch)
+    llm_calls: list[dict[str, Any]] = []
+
+    async def _fake_completion(**kwargs: Any) -> Any:
+        llm_calls.append(dict(kwargs))
+        return _final_completion()
+
+    monkeypatch.setattr(
+        module, "llm_provider", SimpleNamespace(generate_messages_completion=_fake_completion)
+    )
+
+    class _Staging:
+        async def preview(self) -> Any:
+            return SimpleNamespace(staged_count=0, diff=[], summary="空")
+
+        async def discard(self) -> None:
+            return None
+
+    asyncio.run(
+        module._run_profile_agent_locked(
+            staging=_Staging(),
+            conversation_text="对话",
+            participants=["10001"],
+            display_name_map={"10001": "阿明"},
+            bot_user_ids=set(),
+            config=_make_config(llm_thinking_mode_summary=True),
+            trace_id="trace-1",
+            collector=None,
+        )
+    )
+
+    assert "tool_choice" not in llm_calls[0], "思考模式必须保持省略 tool_choice"
+    assert llm_calls[0]["thinking_mode"] is True
 
 
 def test_profile_agent_attaches_continuation_to_assistant_message(

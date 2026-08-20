@@ -7,6 +7,7 @@ import base64
 import ipaddress
 import re
 import socket
+import time
 import warnings
 from dataclasses import dataclass
 from io import BytesIO
@@ -46,17 +47,13 @@ _FORMAT_MIME_TYPES = {
 }
 
 
-def _read_config_int(config: object, field_name: str, default: int) -> int:
-    return int(getattr(config, field_name, default))
-
-
-def _read_config_float(config: object, field_name: str, default: float) -> float:
-    return float(getattr(config, field_name, default))
-
-
 @dataclass(frozen=True)
 class ImageDownloadPolicy:
-    """单条消息的图片下载资源预算。"""
+    """单条消息的图片下载资源预算。
+
+    构造默认值仅供下载器纯调用方（无配置可读）直接构造策略使用；
+    ``from_config`` 不依赖这些默认值（见下）。
+    """
 
     max_images: int = _DEFAULT_MAX_IMAGE_COUNT
     max_image_bytes: int = _DEFAULT_MAX_IMAGE_BYTES
@@ -69,51 +66,80 @@ class ImageDownloadPolicy:
 
     @classmethod
     def from_config(cls, config: object) -> ImageDownloadPolicy:
-        """从动态配置构建策略，并兼容尚未包含新字段的测试替身。"""
-        max_total_bytes = _read_config_int(
-            config,
+        """任务起点从 ``komari_chat`` 配置读取一次并冻结图片下载预算。
+
+        TSK-194 / ADR-0010 协调式破坏升级：0015 之后生产 typed 配置必须
+        携带全部 8 项预算字段且满足 chat 表跨字段 CHECK；任一字段缺失立即
+        明确失败，绝不静默回退 Python 默认值、旧 ``komari_memory`` 别名或
+        历史快照；类型非法用 ``TypeError`` 表示。本方法由调用方在任务起点
+        读取一次，任务内不再重读。
+        """
+        field_names = (
+            "vision_image_download_max_count",
+            "vision_image_download_max_bytes",
             "vision_image_download_total_max_bytes",
-            _DEFAULT_MAX_TOTAL_BYTES,
+            "vision_image_download_max_pixels",
+            "vision_image_download_concurrency",
+            "vision_image_download_connect_timeout_seconds",
+            "vision_image_download_read_timeout_seconds",
+            "vision_image_download_total_timeout_seconds",
         )
+        missing = [
+            name for name in field_names if getattr(config, name, None) is None
+        ]
+        if missing:
+            msg = (
+                "配置缺少图片下载预算字段"
+                f"（{', '.join(sorted(missing))}），无法冻结下载策略"
+            )
+            raise RuntimeError(msg)
+
+        raw = {name: getattr(config, name) for name in field_names}
+        for name in (
+            "vision_image_download_max_count",
+            "vision_image_download_max_bytes",
+            "vision_image_download_total_max_bytes",
+            "vision_image_download_max_pixels",
+            "vision_image_download_concurrency",
+        ):
+            value = raw[name]
+            if not isinstance(value, int) or isinstance(value, bool):
+                msg = (
+                    f"配置的图片下载预算字段非法（{name}={value!r}），"
+                    "无法冻结下载策略"
+                )
+                raise TypeError(msg)
+        for name in (
+            "vision_image_download_connect_timeout_seconds",
+            "vision_image_download_read_timeout_seconds",
+            "vision_image_download_total_timeout_seconds",
+        ):
+            value = raw[name]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                msg = (
+                    f"配置的图片下载预算字段非法（{name}={value!r}），"
+                    "无法冻结下载策略"
+                )
+                raise TypeError(msg)
+
+        max_total_bytes = int(raw["vision_image_download_total_max_bytes"])
         return cls(
-            max_images=_read_config_int(
-                config,
-                "vision_image_download_max_count",
-                _DEFAULT_MAX_IMAGE_COUNT,
-            ),
+            max_images=raw["vision_image_download_max_count"],
             max_image_bytes=min(
-                _read_config_int(
-                    config,
-                    "vision_image_download_max_bytes",
-                    _DEFAULT_MAX_IMAGE_BYTES,
-                ),
+                raw["vision_image_download_max_bytes"],
                 max_total_bytes,
             ),
             max_total_bytes=max_total_bytes,
-            max_pixels=_read_config_int(
-                config,
-                "vision_image_download_max_pixels",
-                _DEFAULT_MAX_PIXELS,
+            max_pixels=raw["vision_image_download_max_pixels"],
+            concurrency=raw["vision_image_download_concurrency"],
+            connect_timeout_seconds=float(
+                raw["vision_image_download_connect_timeout_seconds"]
             ),
-            concurrency=_read_config_int(
-                config,
-                "vision_image_download_concurrency",
-                _DEFAULT_DOWNLOAD_CONCURRENCY,
+            read_timeout_seconds=float(
+                raw["vision_image_download_read_timeout_seconds"]
             ),
-            connect_timeout_seconds=_read_config_float(
-                config,
-                "vision_image_download_connect_timeout_seconds",
-                _DEFAULT_CONNECT_TIMEOUT_SECONDS,
-            ),
-            read_timeout_seconds=_read_config_float(
-                config,
-                "vision_image_download_read_timeout_seconds",
-                _DEFAULT_READ_TIMEOUT_SECONDS,
-            ),
-            total_timeout_seconds=_read_config_float(
-                config,
-                "vision_image_download_total_timeout_seconds",
-                _DEFAULT_TOTAL_TIMEOUT_SECONDS,
+            total_timeout_seconds=float(
+                raw["vision_image_download_total_timeout_seconds"]
             ),
         )
 
@@ -140,6 +166,47 @@ class _DownloadBudget:
                 return False
             self.consumed_bytes += byte_count
             return True
+
+
+class _TimeBudget:
+    """任务级下载总时限：下载活动区间的并集耗时（TSK-195）。
+
+    语义：
+
+    - 首个在途下载启动时从冻结的剩余值派生共享绝对 deadline；并发在途
+      下载共享同一 deadline，重叠墙钟时段只计一次；
+    - 全部在途下载结束后冻结剩余值（``deadline - now``），下一批从剩余
+      值继续；无下载活动的间隔（例如 LLM 轮次之间）不消耗预算也不重置；
+    - 每个下载尝试（含信号量等待）从 ``acquire`` 到 ``release`` 都在同一
+      批内参与总时限。
+    """
+
+    def __init__(self, total_seconds: float) -> None:
+        self.total_seconds = total_seconds
+        self._remaining = total_seconds
+        self._deadline: float | None = None
+        self._active = 0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> float | None:
+        """下载尝试开始前调用；返回共享绝对 deadline，预算耗尽返回 None。"""
+        async with self._lock:
+            if self._deadline is None:
+                if self._remaining <= 0:
+                    return None
+                self._deadline = time.monotonic() + self._remaining
+            self._active += 1
+            return self._deadline
+
+    async def release(self) -> None:
+        """下载尝试结束后调用（成功/失败/取消都释放一次）。"""
+        async with self._lock:
+            self._active -= 1
+            if self._active <= 0:
+                self._active = 0
+                if self._deadline is not None:
+                    self._remaining = max(0.0, self._deadline - time.monotonic())
+                    self._deadline = None
 
 
 class _PublicAddressResolver(AbstractResolver):
@@ -249,13 +316,22 @@ def _safe_url_label(url: str) -> str:
         return "<invalid-url>"
 
 
+#: 供任务级图片会话等外部模块复用的安全日志标签（不含 path/query/userinfo）。
+safe_url_label = _safe_url_label
+
+
 async def _validate_download_url(url: str) -> bool:
     """校验 URL 结构与字面地址；域名地址在实际建连时校验。"""
     try:
         parsed = urlsplit(url)
         port = parsed.port
     except ValueError as exc:
-        logger.warning("[ImageDownloader] 图片 URL 解析失败: {}", exc)
+        # 只记录归一化异常类型，不记录 str(exc)：解析失败的 URL 内容不得
+        # 进入普通日志（TSK-195 第二轮安全验收反馈）。
+        logger.warning(
+            "[ImageDownloader] 图片 URL 解析失败: error_type={}",
+            type(exc).__name__,
+        )
         return False
 
     if (
@@ -496,20 +572,25 @@ async def _download_single_image(
                     active_budget,
                 )
         except (TimeoutError, aiohttp.ClientError) as exc:
+            # 只使用异常类型等安全码，绝不记录 str(exc)：aiohttp 异常正文
+            # 可能内嵌完整 URL path/query（TSK-195 第二轮安全验收反馈）。
+            error_code = type(exc).__name__
             if attempt < _DOWNLOAD_RETRY_ATTEMPTS:
-                outcome = _DownloadOutcome(retry_reason=str(exc))
+                outcome = _DownloadOutcome(retry_reason=error_code)
             else:
                 logger.warning(
-                    "[ImageDownloader] 下载失败: {} url={}",
-                    exc,
+                    "[ImageDownloader] 下载失败: error_type={} url={}",
+                    error_code,
                     _safe_url_label(current_url),
                 )
                 outcome = _DownloadOutcome(should_abort=True)
-        except Exception:
+        except Exception as exc:
+            # 不捕获 traceback：栈帧局部变量 current_url 含完整路径/query；
+            # 只记录归一化异常类型与安全来源标签。
             logger.warning(
-                "[ImageDownloader] 下载未知错误: url={}",
+                "[ImageDownloader] 下载未知错误: error_type={} url={}",
+                type(exc).__name__,
                 _safe_url_label(current_url),
-                exc_info=True,
             )
             outcome = _DownloadOutcome(should_abort=True)
 
@@ -546,95 +627,173 @@ async def _download_single_image(
     return None
 
 
-async def _download_with_semaphore(
-    session: aiohttp.ClientSession,
-    url: str,
-    policy: ImageDownloadPolicy,
-    budget: _DownloadBudget,
-    semaphore: asyncio.Semaphore,
-) -> str | None:
-    async with semaphore:
-        return await _download_single_image(session, url, policy, budget)
+class ImageDownloadSession:
+    """单个任务的多图下载会话：跨多次调用共享字节账本、并发与累计总时限。
+
+    - 同一任务的全部图片下载共享同一个 ``_DownloadBudget``（响应体总字节）、
+      同一并发信号量以及累计下载总时限；字节账本/信号量/时限不会因为多次
+      调用而重建（TSK-195）；
+    - 总时限采用“下载活动区间的并集耗时”：首个在途下载启动共享 deadline，
+      并发在途下载共享同一 deadline（重叠墙钟只计一次），全部在途下载结束
+      后冻结剩余值，下一批从剩余值继续；无下载活动的等待（例如 LLM 轮次
+      之间）不消耗也不重置预算；
+    - ``download()`` 与 ``download_many()`` 走同一会话账本/时限路径，不存在
+      能绕开累计时限的第二套批量实现；
+    - 每个会话实例相互隔离，任务结束调用 ``close()`` 释放连接后丢弃。
+    """
+
+    __slots__ = (
+        "_budget",
+        "_semaphore",
+        "_session",
+        "_time_budget",
+        "policy",
+    )
+
+    def __init__(self, policy: ImageDownloadPolicy) -> None:
+        self.policy = policy
+        self._budget = _DownloadBudget(policy.max_total_bytes)
+        self._semaphore = asyncio.Semaphore(policy.concurrency)
+        self._time_budget = _TimeBudget(policy.total_timeout_seconds)
+        self._session: aiohttp.ClientSession | None = None
+
+    @property
+    def downloaded_bytes(self) -> int:
+        """本任务已累计下载的响应体字节数。"""
+        return self._budget.consumed_bytes
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        """惰性建立带 SSRF/DNS 重绑定防护的 aiohttp 会话并跨调用复用。
+
+        同步创建（无 await 间隙），并发下载尝试不可能重复建会话。
+        """
+        if self._session is None:
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                connect=self.policy.connect_timeout_seconds,
+                sock_connect=self.policy.connect_timeout_seconds,
+                sock_read=self.policy.read_timeout_seconds,
+            )
+            connector = aiohttp.TCPConnector(
+                resolver=_PublicAddressResolver(),
+                use_dns_cache=False,
+            )
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+            )
+        return self._session
+
+    async def close(self) -> None:
+        """释放本任务持有的下载连接（任务结束调用一次，可重复调用）。"""
+        session = self._session
+        self._session = None
+        if session is not None:
+            await session.close()
+
+    async def _download_attempt(self, url: str) -> str | None:
+        """一次下载尝试：加入共享累计总时限并执行单图下载。
+
+        信号量等待与下载本体一起落在该批共享 deadline 内；总时限耗尽时
+        返回 ``None``，超时由 ``asyncio.timeout_at`` 取消底层下载协程。
+        """
+        deadline = await self._time_budget.acquire()
+        if deadline is None:
+            logger.warning(
+                "[ImageDownloader] 任务级图片下载总时限已耗尽，"
+                "本任务不再消耗下载预算"
+            )
+            return None
+        try:
+            session = self._ensure_session()
+            async with asyncio.timeout_at(deadline):
+                async with self._semaphore:
+                    return await _download_single_image(
+                        session,
+                        url,
+                        self.policy,
+                        self._budget,
+                    )
+        except TimeoutError:
+            logger.warning(
+                "[ImageDownloader] 单图下载超过任务剩余总时限: "
+                "seconds={} url={}",
+                f"{max(0.0, deadline - time.monotonic()):.1f}",
+                _safe_url_label(url),
+            )
+            return None
+        finally:
+            await self._time_budget.release()
+
+    async def download(self, url: str) -> str | None:
+        """按需下载单张图片，与其他并发下载共享字节账本与累计总时限。
+
+        返回经 SSRF/重定向/真实 MIME/完整性/像素校验后的 base64 data URI；
+        任一环节失败返回 ``None``。同一会话内的多次调用共享同一份字节账本
+        与“下载活动区间并集耗时”累计总时限：并发重叠只计一次、空闲等待
+        不重置预算。
+        """
+        return await self._download_attempt(url)
+
+    async def download_many(self, urls: list[str]) -> list[str | None]:
+        """并发批量下载并按输入位置返回结果；与 ``download`` 共享同一账本。
+
+        每个索引的下载走与 ``download()`` 相同的 ``_download_attempt``
+        路径（同一字节账本、并发信号量与累计总时限），不存在能绕开累计
+        时限的第二套批量实现。超过 ``max_images`` 的输入位置保持 ``None``
+        并记录警告。
+        """
+        if not urls:
+            return []
+
+        selected_urls = urls[: self.policy.max_images]
+        results: list[str | None] = [None] * len(urls)
+        tasks: list[asyncio.Task[str | None]] = [
+            asyncio.create_task(self._download_attempt(url))
+            for url in selected_urls
+        ]
+        try:
+            selected_results = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        results[: len(selected_results)] = selected_results
+        succeeded = sum(result is not None for result in results)
+        if len(urls) > self.policy.max_images:
+            logger.warning(
+                "[ImageDownloader] 图片数量超过单条消息上限: total={} limit={}",
+                len(urls),
+                self.policy.max_images,
+            )
+        if succeeded < len(urls):
+            logger.warning(
+                "[ImageDownloader] {} / {} 张图片下载成功，响应体累计 {} bytes",
+                succeeded,
+                len(urls),
+                self._budget.consumed_bytes,
+            )
+        return results
 
 
 async def download_images_as_base64_aligned(
     urls: list[str],
     policy: ImageDownloadPolicy | None = None,
 ) -> list[str | None]:
-    """按输入位置返回下载结果，并对整批图片应用共享资源预算。"""
-    if not urls:
-        return []
+    """按输入位置返回下载结果，并对整批图片应用共享资源预算。
 
+    保留给原生批量路径与独立调用方的兼容入口：内部新建一个任务级
+    ``ImageDownloadSession`` 并执行一次性批量下载；无论成功与否都会关闭
+    会话持有的连接（可靠 close，不泄漏 aiohttp 会话）。
+    """
     active_policy = policy or ImageDownloadPolicy()
-    selected_urls = urls[: active_policy.max_images]
-    results: list[str | None] = [None] * len(urls)
-    budget = _DownloadBudget(active_policy.max_total_bytes)
-    semaphore = asyncio.Semaphore(active_policy.concurrency)
-    timeout = aiohttp.ClientTimeout(
-        total=None,
-        connect=active_policy.connect_timeout_seconds,
-        sock_connect=active_policy.connect_timeout_seconds,
-        sock_read=active_policy.read_timeout_seconds,
-    )
-    connector = aiohttp.TCPConnector(
-        resolver=_PublicAddressResolver(),
-        use_dns_cache=False,
-    )
-
-    tasks: list[asyncio.Task[str | None]] = []
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        tasks = [
-            asyncio.create_task(
-                _download_with_semaphore(
-                    session,
-                    url,
-                    active_policy,
-                    budget,
-                    semaphore,
-                )
-            )
-            for url in selected_urls
-        ]
-        selected_results: list[str | None] | None = None
-        try:
-            async with asyncio.timeout(active_policy.total_timeout_seconds):
-                selected_results = await asyncio.gather(*tasks)
-        except TimeoutError:
-            logger.warning(
-                "[ImageDownloader] 单条消息图片下载超过总时限: seconds={}",
-                active_policy.total_timeout_seconds,
-            )
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        if selected_results is None:
-            selected_results = [
-                task.result()
-                if task.done() and not task.cancelled() and task.exception() is None
-                else None
-                for task in tasks
-            ]
-
-    results[: len(selected_results)] = selected_results
-    succeeded = sum(result is not None for result in results)
-    if len(urls) > active_policy.max_images:
-        logger.warning(
-            "[ImageDownloader] 图片数量超过单条消息上限: total={} limit={}",
-            len(urls),
-            active_policy.max_images,
-        )
-    if succeeded < len(urls):
-        logger.warning(
-            "[ImageDownloader] {} / {} 张图片下载成功，响应体累计 {} bytes",
-            succeeded,
-            len(urls),
-            budget.consumed_bytes,
-        )
-    return results
+    session_obj = ImageDownloadSession(active_policy)
+    try:
+        return await session_obj.download_many(urls)
+    finally:
+        await session_obj.close()
 
 
 async def download_images_as_base64(

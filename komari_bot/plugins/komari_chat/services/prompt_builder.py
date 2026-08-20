@@ -1,4 +1,4 @@
-"""Komari Memory 动态提示词构建服务（5 段式 OpenAI messages）。"""
+"""Komari Chat 动态提示词构建服务（多段式 OpenAI messages）。"""
 
 from __future__ import annotations
 
@@ -222,19 +222,21 @@ async def build_prompt(
     interaction_records: list[dict[str, Any]] | None = None,
     interaction_memories: list[dict[str, Any]] | None = None,
     *,
-    vision_tool_mode: bool = False,
+    delegated_image_mode: bool = False,
+    delegated_quoted_image_count: int | None = None,
+    delegated_current_image_count: int | None = None,
     search_tool_mode: bool = False,
     fetch_tool_mode: bool = False,
 ) -> list[dict[str, Any]]:
     """构建面向 DeepSeek KV Cache 优化的 OpenAI 格式消息数组。
 
     结构：
-    ① system    — 静态角色设定
-    ② system    — 静态输出格式指令
-    ③ user/asst — 对话历史（Redis buffer 交替构造）
-    ④ user      — 动态上下文（时间、记忆、知识库、实体、当前好感度阶段）
-    ⑤ user      — 当前用户消息
-    ⑥ assistant — 旧版预填充（可选）
+    ① system    — 静态角色设定与工具/画像行为引导 + 安全边界
+                   （可选：读图 / 委托图片理解 / 搜索 / 抓取引导）
+    ② user/asst — 对话历史（Redis buffer 交替构造，含被引用消息）
+    ③ user      — 动态上下文（时间、记忆、知识库、实体、当前好感度阶段）
+    ④ user      — 当前用户消息
+    ⑤ assistant — 旧版预填充（可选）
 
     Args:
         user_message: 用户原始消息（用于生成回复）
@@ -250,7 +252,17 @@ async def build_prompt(
         reply_context: 当前消息引用的上下文（可选）
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
         query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
-        vision_tool_mode: 是否使用工具调用读图模式。开启时只注入图片索引说明，不嵌入 base64 图片块
+        delegated_image_mode: 委托读图模式（read_image 工具）。开启时注入
+            委托行为引导与动态图片索引说明，不把 base64 图片块嵌入 (user)
+            消息；视觉描述正文（vision_description_prompt）只供
+            vision_service 子调用消费，不注入主回复 Agent messages。
+            原生模式（native）关闭该开关：图片作为多模态输入直接嵌入
+            (user) 消息，由聊天模型原生理解，不暴露 read_image 工具。
+        delegated_quoted_image_count: 委托模式下任务级会话中被引用消息
+            的可读图片数量（引用在前，索引 0..n-1）；仅计数，不含任何
+            URL，构造即零预下载，主 prompt 只出现稳定索引/范围。
+        delegated_current_image_count: 委托模式下任务级会话中当前消息的
+            可读图片数量（索引 n..n+m-1）；仅计数，同上。
         search_tool_mode: 是否启用联网搜索工具声明
         fetch_tool_mode: 是否启用网页抓取工具声明
 
@@ -260,17 +272,29 @@ async def build_prompt(
     template = await get_template()
     messages: list[dict[str, Any]] = []
 
+    # TSK-195：delegated 模式不在主 prompt 出现任何图片 URL/base64，只用
+    # 任务级会话的稳定计数表述可读图片（引用在前、当前在后）；原生模式
+    # 继续沿用下载后的 data URI 列表。
+    if delegated_image_mode:
+        quoted_image_viewable = bool(delegated_quoted_image_count)
+        viewable_reply_count = delegated_quoted_image_count or 0
+        viewable_current_count = delegated_current_image_count or 0
+    else:
+        quoted_image_viewable = bool(reply_image_urls)
+        viewable_reply_count = len(reply_image_urls or [])
+        viewable_current_count = len(image_urls or [])
+
     # ═══════════════════════════════════════
-    # ①② 静态 system — 角色设定 + 输出格式指令
+    # ① 静态 system — 角色设定 + 可调行为引导 + 安全边界（正文来自 PostgreSQL 快照）
     # ═══════════════════════════════════════
     messages.append({"role": "system", "content": template["system_prompt"]})
-    messages.append({"role": "system", "content": template["output_instruction"]})
+    messages.append({"role": "system", "content": template["tool_call_instruction"]})
     messages.append(
         {
             "role": "system",
             "content": (
                 "<profile_tool_hint>\n"
-                "当前触发用户画像会在 <current_user_profile> 中给出；"
+                f"{template['profile_read_instruction']}\n"
                 "需要其他用户画像或缺失字段时调用 read_profile(user_id)，"
                 "不要猜测未提供的长期事实。\n"
                 "</profile_tool_hint>"
@@ -278,15 +302,20 @@ async def build_prompt(
         }
     )
     messages.append({"role": "system", "content": LLM_SECURITY_SYSTEM_INSTRUCTION})
+    if delegated_image_mode:
+        messages.append(
+            {"role": "system", "content": template["image_read_instruction"]}
+        )
+        messages.append(
+            {"role": "system", "content": template["delegated_vision_instruction"]}
+        )
     if search_tool_mode:
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    "[系统提示：当前对话启用了联网搜索工具 search_web。"
-                    "当用户明确要求搜索、询问最新资讯/数据、或涉及你不确定的事实时，"
-                    "请先调用 search_web 查询互联网；回答时要基于搜索结果如实说明，"
-                    "不要编造搜索结果中没有的信息。]"
+                    "[系统提示：当前对话启用了联网搜索工具 search_web。]\n"
+                    f"{template['search_web_instruction']}"
                 ),
             }
         )
@@ -295,17 +324,14 @@ async def build_prompt(
             {
                 "role": "system",
                 "content": (
-                    "[系统提示：当前对话启用了网页抓取工具 fetch_page。"
-                    "当搜索结果摘要不够详细、或用户提供了具体链接时，"
-                    "可调用 fetch_page 获取网页正文。"
-                    "一次调用可传入多个 URL，只传入你确实需要阅读的页面，"
-                    "不要批量抓取所有搜索结果。]"
+                    "[系统提示：当前对话启用了网页抓取工具 fetch_page。]\n"
+                    f"{template['fetch_page_instruction']}"
                 ),
             }
         )
 
     # ═══════════════════════════════════════
-    # ③ user/assistant — 对话历史
+    # ② user/assistant — 对话历史
     # ═══════════════════════════════════════
     if recent_messages:
         current_block: list[str] = []
@@ -356,7 +382,7 @@ async def build_prompt(
                 "</quoted_message>"
             )
         if reply_context.image_count > 0:
-            if reply_image_urls:
+            if quoted_image_viewable:
                 assistant_reply_parts.append(
                     f"（你上一条还发了 {reply_context.image_count} 张图片，下面附上用户正在回复的引用图片。）"
                 )
@@ -370,7 +396,7 @@ async def build_prompt(
             )
 
     # ═══════════════════════════════════════
-    # ④ 动态 user — 时间 + 记忆 + 实体 + 知识库
+    # ③ 动态 user — 时间 + 记忆 + 实体 + 知识库
     # ═══════════════════════════════════════
     dynamic_parts: list[str] = []
 
@@ -557,7 +583,7 @@ async def build_prompt(
                     "</quoted_message>"
                 )
             if reply_context.image_count > 0:
-                if reply_image_urls:
+                if quoted_image_viewable:
                     reply_intro_lines.append(
                         f"- {reply_name}（被回复）发送了 {reply_context.image_count} 张图片。"
                     )
@@ -566,7 +592,7 @@ async def build_prompt(
                         f"- {reply_name}（被回复）发送了 {reply_context.image_count} 张图片，但当前不可直接查看。"
                     )
         elif reply_context.image_count > 0:
-            if reply_image_urls:
+            if quoted_image_viewable:
                 reply_intro_lines.append(
                     f"（以下是你上一条被引用的 {reply_context.image_count} 张图片）"
                 )
@@ -576,11 +602,11 @@ async def build_prompt(
                 )
 
     reply_intro_text = "\n".join(reply_intro_lines)
-    has_multimodal_content = bool(reply_image_urls or image_urls)
-    if has_multimodal_content and vision_tool_mode:
+    has_multimodal_content = bool(viewable_reply_count or viewable_current_count)
+    if has_multimodal_content and delegated_image_mode:
         vision_lines: list[str] = []
-        reply_image_count = len(reply_image_urls or [])
-        current_image_count = len(image_urls or [])
+        reply_image_count = viewable_reply_count
+        current_image_count = viewable_current_count
         total_image_count = reply_image_count + current_image_count
         if total_image_count > 0:
             vision_lines.append(
@@ -634,7 +660,7 @@ async def build_prompt(
 
     if getattr(config, "assistant_prefill_enabled", False):
         # ═══════════════════════════════════════
-        # ⑥ assistant — 旧版预填充（可选）
+        # ⑤ assistant — 旧版预填充（可选）
         # ═══════════════════════════════════════
         messages.append(
             {

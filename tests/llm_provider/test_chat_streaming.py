@@ -145,6 +145,61 @@ def test_chat_stream_request_sets_stream_and_include_usage(
     assert request["stream_options"] == {"include_usage": True}
 
 
+def test_chat_stream_thinking_mode_keeps_required_tool_choice(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：Chat 流式请求中思考模式不再删除调用方的强制 tool_choice。"""
+    stream = _FakeStream([_usage_chunk(), _text_chunk("ok", finish_reason="stop")])
+    completions = _FakeCompletions(stream=stream)
+    client = _make_client(monkeypatch, completions)
+
+    async def _run() -> Any:
+        return await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "你好"}],
+            model="deepseek-chat",
+            tools=[{"type": "function", "function": {"name": "query"}}],
+            tool_choice="required",
+            thinking_mode=True,
+            reasoning_effort="high",
+            stream_enabled=True,
+        )
+
+    asyncio.run(_run())
+
+    request = completions.last_kwargs
+    assert request is not None
+    assert request["stream"] is True
+    assert request.get("tool_choice") == "required"
+    assert request["reasoning_effort"] == "high"
+
+
+def test_chat_non_stream_thinking_mode_keeps_required_tool_choice(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：Chat 非流式请求中思考模式同样保留强制 tool_choice。"""
+    completions = _FakeCompletions()
+    client = _make_client(monkeypatch, completions)
+
+    async def _run() -> Any:
+        return await client.generate_text_with_messages(
+            messages=[{"role": "user", "content": "你好"}],
+            model="deepseek-chat",
+            tools=[{"type": "function", "function": {"name": "query"}}],
+            tool_choice="required",
+            thinking_mode=True,
+            reasoning_effort="high",
+            stream_enabled=False,
+        )
+
+    asyncio.run(_run())
+
+    request = completions.last_kwargs
+    assert request is not None
+    assert request.get("stream") is not True
+    assert request.get("tool_choice") == "required"
+    assert request["reasoning_effort"] == "high"
+
+
 def test_chat_stream_aggregates_text_reasoning_finish_and_usage(
     monkeypatch: Any,
 ) -> None:

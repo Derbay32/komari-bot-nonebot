@@ -606,13 +606,17 @@ async def plan_summary_request(
             "temperature": 0.1,
             "max_tokens": planning_max_tokens,
             "tools": tools,
-            "tool_choice": "auto",
             "parallel_tool_calls": False,
             "thinking_mode": planning_thinking_mode,
             "reasoning_effort": planning_reasoning_effort,
             "request_api": planning_request_api,
             "stream_enabled": planning_stream_enabled,
         }
+        # TSK-193：provider 不再按思考模式隐式删除 tool_choice；群总结
+        # 规划器显式声明兼容策略——思考模式省略 tool_choice（保持既有
+        # 行为），非思考模式保留 auto 选择。
+        if not planning_thinking_mode:
+            request_data["tool_choice"] = "auto"
         try:
             completion = cast(
                 "LLMCompletionResultSchema",

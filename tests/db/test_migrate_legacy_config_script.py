@@ -8,6 +8,12 @@
 ``_legacycfg``）内先 ``upgrade head`` 再执行脚本验收，用例结束即
 DROP；共享门控库的版本与数据不受搬移影响，重复执行与执行顺序
 互不影响。门控用户需要 CREATEDB 权限。
+
+TSK-190 语义：legacy JSONB 夹具仍可携带 ``output_instruction`` 作
+迁移输入，但 head 强类型表的查询/断言不得引用已删除列；脚本按新
+契约丢弃 ``output_instruction``（不并入任何新字段），保留其余自定义
+Prompt 字段，新增行为列在 legacy 迁移阶段保持空值（待统一 seed 补齐，
+补齐路径由 ``test_prompt_seed_bootstrap_integration.py`` 覆盖）。
 """
 
 from __future__ import annotations
@@ -33,6 +39,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/migrate_legacy_config_to_typed_tables.py"
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
+
+#: TSK-190 被删除列。本地镜像 ``tests/config/chat_prompt_field_contract.py``
+#: 的 ``REMOVED_FIELD``；本文件刻意不 import komari_bot 运行时代码（与脚本
+#: 自身独立性约束一致），因此就地声明并在 docstring 中指向 oracle。
+REMOVED_PROMPT_FIELD = "output_instruction"
+
+#: 0003 旧 Prompt 表保留列（TSK-190 迁移所删除字段之外的既有正文列）。
+#: 同上镜像 oracle 的 ``LEGACY_KEPT_CHAT_COLUMNS``。
+LEGACY_KEPT_CHAT_PROMPT_COLUMNS: frozenset[str] = frozenset(
+    {
+        "system_prompt",
+        "memory_ack",
+        "memory_ack_role",
+        "cot_prefix",
+        "cot_prefix_role",
+    }
+)
 
 
 def _load_script_module() -> Any:
@@ -336,6 +359,8 @@ class TestPlanRowValues:
             "reply_commit_tombstone_retention_days": (
                 "reply_fulfillment_tombstone_retention_days"
             ),
+            # TSK-194：旧图片开关读入，写入模式枚举列（值经变换器转换）
+            "vision_tool_enabled": "image_understanding_mode",
         }
         info: dict[str, tuple[str, bool]] = dict.fromkeys(
             spec.columns, ("INTEGER", False)
@@ -348,20 +373,103 @@ class TestPlanRowValues:
                 "proactive_reservation_ttl_seconds": ("INTEGER", False),
                 "reply_fulfillment_retry_max_seconds": ("INTEGER", False),
                 "reply_fulfillment_freshness_seconds": ("INTEGER", False),
+                "image_understanding_mode": ("CHARACTER VARYING", False),
             }
         )
         source = {old_name: index for index, old_name in enumerate(expected_mapping, 1)}
+        source["vision_tool_enabled"] = True  # 变换器只接受布尔
 
         planned = module.plan_row_values(spec, source, info)
 
         assert spec.legacy_key_map == expected_mapping
-        assert {
-            new_name: planned.values[new_name] for new_name in expected_mapping.values()
-        } == {
+        # 值级变换：vision_tool_enabled 只接受布尔，缺键回退列默认 delegated
+        assert (
+            spec.column_transformers["image_understanding_mode"](raw=True) == "delegated"
+        )
+        assert (
+            spec.column_transformers["image_understanding_mode"](raw=False) == "native"
+        )
+        assert spec.default_value_overrides["image_understanding_mode"] == "delegated"
+        assert planned.values["image_understanding_mode"] == "delegated"
+        expected_non_vision = {  # 排包图片模式列的期望映射（保持与 source 同源）
             new_name: index
-            for index, new_name in enumerate(expected_mapping.values(), 1)
+            for index, (old_name, new_name) in enumerate(
+                (kv for kv in expected_mapping.items() if kv[0] != "vision_tool_enabled"),
+                1,
+            )
         }
+        assert {
+            new_name: planned.values[new_name]
+            for new_name in set(expected_mapping.values())
+            - {"image_understanding_mode"}
+        } == expected_non_vision
         assert not set(expected_mapping).intersection(spec.columns)
+
+    @staticmethod
+    def test_chat_vision_legacy_values_map_to_mode_enum() -> None:
+        """TSK-194：旧布尔开关双分支 → 模式枚举，预算同名直写。"""
+        module = _load_script_module()
+        spec = next(
+            item
+            for item in module._RESOURCE_SPECS
+            if item.target_table == "komari_chat_config"
+        )
+        info: dict[str, tuple[str, bool]] = dict.fromkeys(
+            spec.columns, ("INTEGER", False)
+        )
+        info.update(
+            {
+                "image_understanding_mode": ("CHARACTER VARYING", False),
+                "vision_image_download_connect_timeout_seconds": (
+                    "DOUBLE PRECISION",
+                    False,
+                ),
+                "vision_image_download_read_timeout_seconds": (
+                    "DOUBLE PRECISION",
+                    False,
+                ),
+                "vision_image_download_total_timeout_seconds": (
+                    "DOUBLE PRECISION",
+                    False,
+                ),
+            }
+        )
+        budgets = {
+            "vision_image_download_max_count": 6,
+            "vision_image_download_max_bytes": 9 * 1024 * 1024,
+            "vision_image_download_total_max_bytes": 21 * 1024 * 1024,
+            "vision_image_download_max_pixels": 41_000_000,
+            "vision_image_download_concurrency": 3,
+            "vision_image_download_connect_timeout_seconds": 6.0,
+            "vision_image_download_read_timeout_seconds": 31.0,
+            "vision_image_download_total_timeout_seconds": 46.0,
+        }
+
+        planned_delegated = module.plan_row_values(
+            spec,
+            {"vision_tool_enabled": True, **budgets},
+            info,
+        )
+        assert planned_delegated.values["image_understanding_mode"] == "delegated"
+        for column, expected in budgets.items():
+            assert planned_delegated.values[column] == expected
+
+        planned_native = module.plan_row_values(
+            spec,
+            {"vision_tool_enabled": False, **budgets},
+            info,
+        )
+        assert planned_native.values["image_understanding_mode"] == "native"
+        for column, expected in budgets.items():
+            assert planned_native.values[column] == expected
+
+        # legacy 缺开关：写入列级默认覆盖 delegated（非类型中性空串）
+        planned_missing = module.plan_row_values(spec, {**budgets}, info)
+        assert planned_missing.values["image_understanding_mode"] == "delegated"
+
+        # 非布尔值：变换器拒绝，报告失败而非静默降级
+        with pytest.raises(ValueError, match="vision_tool_enabled"):
+            module.plan_row_values(spec, {"vision_tool_enabled": "yes"}, info)
 
 
 class _FakeConnection:
@@ -684,6 +792,41 @@ def _run_bootstrap(url: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _chat_prompt_spec(module: Any) -> Any:
+    """聊天 Prompt 资源的静态声明（脚本内唯一真源）。"""
+    return next(
+        spec
+        for spec in module._RESOURCE_SPECS
+        if spec.legacy_table == "komari_prompt_configs"
+        and spec.key_value == "komari_chat"
+    )
+
+
+def _chat_prompt_declared_columns(module: Any) -> tuple[str, ...]:
+    """脚本静态声明的聊天 Prompt 列（随 TSK-190 落地自然剔除旧列/加入新列）。
+
+    不用硬编码新列名：查询列集合跟随脚本声明，head 表查询永远不会引用
+    已删除列（脚本更新后即不再声明 ``output_instruction``）。
+    """
+    return tuple(_chat_prompt_spec(module).columns)
+
+
+async def _column_names(
+    connection: asyncpg.Connection,
+    table_name: str,
+) -> set[str]:
+    """查询一张表当前的全部列名（用于删除验证，不引用已删除列）。"""
+    rows = await connection.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = $1
+        """,
+        table_name,
+    )
+    return {str(row["column_name"]) for row in rows}
+
+
 async def _recreate_scratch_database() -> dict[str, Any]:
     """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。
 
@@ -733,6 +876,17 @@ class TestMigrateLegacyConfigsIntegration:
     async def test_migrates_legacy_rows_and_is_idempotent(self) -> None:
         module = _load_script_module()
         updated_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        #: TSK-190 legacy komari_chat Prompt 迁移输入：JSONB insert 与
+        #: “保留旧字段”断言共用同一真源，避免字面量转写不一致。
+        legacy_chat_prompt = {
+            "system_prompt": "你是小鞠知花。",
+            "memory_ack": "好的。",
+            "memory_ack_role": "assistant",
+            "output_instruction": "输出正文。",
+            "cot_prefix": "<think>\n",
+            "cot_prefix_role": "assistant",
+            "version": "1.0",
+        }
         scratch = await self._prepare_head_scratch()
         conn = await asyncpg.connect(**scratch)
         try:
@@ -783,18 +937,7 @@ class TestMigrateLegacyConfigsIntegration:
                 " VALUES ($1, $2, $3::jsonb, $4, $5, $6)",
                 "komari_chat",
                 "Komari Chat Prompt",
-                json.dumps(
-                    {
-                        "system_prompt": "你是小鞠知花。",
-                        "memory_ack": "好的。",
-                        "memory_ack_role": "assistant",
-                        "output_instruction": "输出正文。",
-                        "cot_prefix": "<think>\n",
-                        "cot_prefix_role": "assistant",
-                        "version": "1.0",
-                    },
-                    ensure_ascii=False,
-                ),
+                json.dumps(legacy_chat_prompt, ensure_ascii=False),
                 "1.0",
                 2,
                 updated_at,
@@ -839,17 +982,59 @@ class TestMigrateLegacyConfigsIntegration:
             assert sr_row["list_chunk_size"] == 0
             assert sr_row["redis_db"] == 0
 
+            # ═══ TSK-190：聊天 Prompt 迁移语义 ═══
+            # 脚本静态声明不再包含已删除列，并随新 Schema 宣告新行为列
+            chat_spec = _chat_prompt_spec(module)
+            assert REMOVED_PROMPT_FIELD not in chat_spec.columns, (
+                "TSK-190 未实现：脚本不得再声明 output_instruction 列"
+            )
+            new_chat_columns = [
+                column
+                for column in chat_spec.columns
+                if column not in LEGACY_KEPT_CHAT_PROMPT_COLUMNS
+            ]
+            assert new_chat_columns, (
+                "TSK-190 未实现：脚本未声明任何新行为列"
+            )
+
+            chat_report = reports["komari_chat"]
+            assert chat_report.migrated is True
+            assert chat_report.revision == 2
+            assert set(chat_report.dropped_keys) == {
+                "version",
+                REMOVED_PROMPT_FIELD,
+            }, "legacy output_instruction 必须被丢弃，不并入任何新字段"
+            assert set(LEGACY_KEPT_CHAT_PROMPT_COLUMNS) <= set(
+                chat_report.migrated_keys
+            ), "旧的其他自定义 Prompt 字段必须保留"
+            assert set(chat_report.defaulted_keys) == set(new_chat_columns), (
+                "新增行为列在 legacy 迁移阶段保持空值（待 seed 补齐）"
+            )
+
+            # head 表查询列集合跟随脚本声明：永不引用已删除列
+            chat_select = ", ".join(
+                ["id", "revision", "updated_at", *_chat_prompt_declared_columns(module)]
+            )
             prompt_row = await conn.fetchrow(
-                "SELECT id, revision, updated_at, system_prompt, memory_ack,"
-                " memory_ack_role, output_instruction, cot_prefix,"
-                " cot_prefix_role FROM komari_prompt_komari_chat WHERE id = 1"
+                f"SELECT {chat_select} FROM komari_prompt_komari_chat WHERE id = 1"
             )
             assert prompt_row["id"] == 1
             assert prompt_row["revision"] == 2
             assert prompt_row["updated_at"] == updated_at
-            assert prompt_row["system_prompt"] == "你是小鞠知花。"
-            assert prompt_row["memory_ack"] == "好的。"
-            assert prompt_row["cot_prefix_role"] == "assistant"
+            assert prompt_row["system_prompt"] == legacy_chat_prompt["system_prompt"]
+            assert prompt_row["memory_ack"] == legacy_chat_prompt["memory_ack"]
+            assert prompt_row["memory_ack_role"] == legacy_chat_prompt["memory_ack_role"]
+            assert prompt_row["cot_prefix"] == legacy_chat_prompt["cot_prefix"]
+            assert prompt_row["cot_prefix_role"] == legacy_chat_prompt["cot_prefix_role"]
+            for column in new_chat_columns:
+                assert prompt_row[column] == "", (
+                    f"新增行为列 {column} 在 legacy 迁移后必须为空（待 seed 补齐）"
+                )
+            # 显式删除验证：head 表已不存在旧列（TSK-190 未实现时为可解释 RED）
+            head_columns = await _column_names(conn, "komari_prompt_komari_chat")
+            assert REMOVED_PROMPT_FIELD not in head_columns, (
+                "TSK-190 未实现：head 表仍存在 output_instruction 列"
+            )
 
             text = module.render_report(result)
             assert "已迁移键" in text
@@ -882,9 +1067,7 @@ class TestMigrateLegacyConfigsIntegration:
                 " FROM komari_sr_config WHERE id = 1"
             )
             prompt_after = await conn.fetchrow(
-                "SELECT id, revision, updated_at, system_prompt, memory_ack,"
-                " memory_ack_role, output_instruction, cot_prefix,"
-                " cot_prefix_role FROM komari_prompt_komari_chat WHERE id = 1"
+                f"SELECT {chat_select} FROM komari_prompt_komari_chat WHERE id = 1"
             )
             assert dict(row_after) == dict(row)
             assert dict(sr_after) == dict(sr_row)
@@ -894,6 +1077,134 @@ class TestMigrateLegacyConfigsIntegration:
                 "sr": True,
                 "komari_chat": True,
             }
+        finally:
+            await conn.close()
+            await _drop_scratch_database(str(scratch["database"]))
+
+    @pytest.mark.asyncio
+    async def test_legacy_memory_vision_config_migrates_to_chat(self) -> None:
+        """TSK-194：旧 komari_memory JSONB 视觉配置迁入 komari_chat_config。
+
+        vision_tool_enabled 布尔双分支 → image_understanding_mode 枚举；
+        8 项预算原样直写；旧开关与预算键对 memory 表为弃用键（head 无
+        对应列）进入丢弃清单；联动断言脚本静态声明不再引用已删除列。
+        """
+        module = _load_script_module()
+        updated_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        budgets = {
+            "vision_image_download_max_count": 6,
+            "vision_image_download_max_bytes": 9 * 1024 * 1024,
+            "vision_image_download_total_max_bytes": 21 * 1024 * 1024,
+            "vision_image_download_max_pixels": 41_000_000,
+            "vision_image_download_concurrency": 3,
+            "vision_image_download_connect_timeout_seconds": 6.0,
+            "vision_image_download_read_timeout_seconds": 31.0,
+            "vision_image_download_total_timeout_seconds": 46.0,
+        }
+        scratch = await self._prepare_head_scratch()
+        conn = await asyncpg.connect(**scratch)
+        try:
+            await conn.execute(
+                "INSERT INTO komari_plugin_configs"
+                " (plugin_name, schema_name, config_data, version, revision,"
+                " updated_at)"
+                " VALUES ($1, $2, $3::jsonb, $4, $5, $6)",
+                "komari_memory",
+                "DynamicConfigSchema",
+                json.dumps(
+                    {
+                        "vision_tool_enabled": True,
+                        **budgets,
+                    },
+                    ensure_ascii=False,
+                ),
+                "1.0",
+                9,
+                updated_at,
+            )
+
+            result = await module.migrate_legacy_configs(conn)
+            # "komari_memory" 同名 key_value 对应两个 ResourceSpec（memory
+            # 表与 chat 表），必须按 target_table 分别取报告，禁止以
+            # key_value 为键折叠（会错选成 chat 报告）。
+            memory_report = next(
+                r
+                for r in result.reports
+                if r.spec.target_table == "komari_memory_config"
+            )
+            chat_report = next(
+                r
+                for r in result.reports
+                if r.spec.target_table == "komari_chat_config"
+            )
+            assert memory_report.migrated is True
+            assert set(memory_report.dropped_keys) == {
+                "vision_tool_enabled",
+                *budgets.keys(),
+            }, "旧视觉开关与预算键对 memory 表无对应列，必须全部丢弃"
+            assert memory_report.migrated_keys == [], (
+                "memory 表已无视觉列，不得消费任何视觉键"
+            )
+
+            assert chat_report.migrated is True
+            assert set(chat_report.migrated_keys) == {
+                "image_understanding_mode",
+                *budgets.keys(),
+            }, "vision_tool_enabled 与预算必须作为 chat 已知键被消费"
+            assert chat_report.dropped_keys == [], (
+                "9 个视觉键对 chat 表有对应列，不得进入丢弃清单"
+            )
+            assert not set(chat_report.defaulted_keys) & {
+                "image_understanding_mode",
+                *budgets.keys(),
+            }, "9 个视觉键不得落回默认值"
+
+            chat_row = await conn.fetchrow(
+                "SELECT image_understanding_mode,"
+                " vision_image_download_max_count,"
+                " vision_image_download_max_bytes,"
+                " vision_image_download_total_max_bytes,"
+                " vision_image_download_max_pixels,"
+                " vision_image_download_concurrency,"
+                " vision_image_download_connect_timeout_seconds,"
+                " vision_image_download_read_timeout_seconds,"
+                " vision_image_download_total_timeout_seconds"
+                " FROM komari_chat_config WHERE id = 1"
+            )
+            assert chat_row["image_understanding_mode"] == "delegated"
+            for column, expected in budgets.items():
+                assert chat_row[column] == expected, f"预算列 {column} 迁移失真"
+
+            # head 表已无 memory 旧视觉列；脚本声明物也须一致
+            memory_columns = await _column_names(conn, "komari_memory_config")
+            assert "vision_tool_enabled" not in memory_columns
+            memory_spec = next(
+                s for s in module._RESOURCE_SPECS if s.key_value == "komari_memory"
+            )
+            assert "vision_tool_enabled" not in memory_spec.columns
+            assert not {"vision_image_download_*"} & set(
+                memory_spec.columns
+            ), "memory 资源不得声明任何旧视觉字段"
+
+            # 双分支：更新同一 legacy 行 vision_tool_enabled=false → native
+            await conn.execute(
+                "UPDATE komari_plugin_configs SET config_data = $1::jsonb,"
+                " revision = 10 WHERE plugin_name = 'komari_memory'",
+                json.dumps({"vision_tool_enabled": False}, ensure_ascii=False),
+            )
+            await module.migrate_legacy_configs(conn)
+            native_row = await conn.fetchrow(
+                "SELECT image_understanding_mode FROM komari_chat_config WHERE id = 1"
+            )
+            assert native_row["image_understanding_mode"] == "native"
+            # 缺键预算列不覆盖已播种值（UPDATE 路径不写缺键列）
+            budget_after = await conn.fetchrow(
+                "SELECT vision_image_download_max_count,"
+                " vision_image_download_total_timeout_seconds"
+                " FROM komari_chat_config WHERE id = 1"
+            )
+            assert budget_after["vision_image_download_max_count"] == 6
+            assert budget_after["vision_image_download_total_timeout_seconds"] == 46.0
         finally:
             await conn.close()
             await _drop_scratch_database(str(scratch["database"]))

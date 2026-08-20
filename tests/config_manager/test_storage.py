@@ -22,6 +22,11 @@ class _LoopThread:
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.thread.start()
+        loop_started = threading.Event()
+        self.loop.call_soon_threadsafe(loop_started.set)
+        if not loop_started.wait(timeout=1.0):
+            msg = "测试事件循环未能及时启动"
+            raise RuntimeError(msg)
 
     def stop(self) -> None:
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -46,12 +51,14 @@ def test_sync_bridge_timeout_cancels_in_flight_operation(
     storage_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(storage_module, "_CONFIG_STORAGE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(storage_module, "_CONFIG_STORAGE_TIMEOUT_SECONDS", 0.2)
     storage = storage_module.ConfigStorage()
     runner = _LoopThread()
+    operation_started = threading.Event()
     cancelled = threading.Event()
 
     async def _never_finishes(_session: object) -> str:
+        operation_started.set()
         try:
             await asyncio.sleep(60)
             msg = "不应完成"
@@ -66,11 +73,13 @@ def test_sync_bridge_timeout_cancels_in_flight_operation(
     monkeypatch.setattr(
         storage, "_run_on_app_session", _fake_run_on_app_session
     )
+    monkeypatch.setattr(storage, "_start_watch_task", lambda _loop: None)
     storage.bind_app_loop(runner.loop)
 
     try:
         with pytest.raises(RuntimeError, match="配置存储操作超时"):
             storage.fetch("user_data")
+        assert operation_started.is_set() is True
         assert cancelled.wait(timeout=1.0) is True
     finally:
         asyncio.run_coroutine_threadsafe(

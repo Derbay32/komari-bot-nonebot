@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,11 +18,14 @@ from komari_bot.plugins.komari_management.api_runtime import (
 )
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
-    ManagedPromptResource,
 )
 from komari_bot.plugins.komari_memory.api import register_memory_api
 from komari_bot.plugins.komari_search.api import register_search_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
+from tests.config.prompt_field_contract import (
+    make_managed_prompt_resource,
+    prompt_display_name,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -126,11 +128,9 @@ def _build_components() -> ManagementApiComponents:
             ),
         ),
         prompt_resources=(
-            ManagedPromptResource(
-                resource_id="komari_chat",
-                display_name="Komari Chat Prompt",
-                defaults={"system_prompt": "默认值"},
-                legacy_file_path=Path("config") / "prompts" / "komari_memory.yaml",
+            make_managed_prompt_resource(
+                "komari_chat",
+                prompt_display_name("komari_chat"),
             ),
         ),
     )
@@ -173,6 +173,18 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/v2/komari-announce/groups" in schema["paths"]
     assert "/api/v2/komari-announce/maintenance" in schema["paths"]
     assert "/api/v2/komari-decision-scenes/scenes" in schema["paths"]
+    assert "/api/v2/komari-decision-scenes/sync" in schema["paths"]
+    sync_response_schema = schema["components"]["schemas"]["SceneSyncResponse"]
+    assert set(sync_response_schema.get("required", [])) == {
+        "set_id",
+        "created",
+        "reused_existing_set",
+        "inserted_count",
+        "ready_count",
+        "pending_count",
+        "detail",
+    }
+    assert "triggered" not in sync_response_schema.get("properties", {})
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
     assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
     assert (
@@ -330,6 +342,10 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 "/api/v2/komari-decision-scenes/scenes/TEST",
                 headers=headers,
                 json={"scene_type": "general", "content_text": "测试"},
+            ),
+            await client.post(
+                "/api/v2/komari-decision-scenes/sync",
+                headers=headers,
             ),
             await client.post(
                 "/api/v2/komari-user-bans/bans",

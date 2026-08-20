@@ -248,43 +248,6 @@ class SceneRepository:
             await session.close()
         return dict(row)
 
-    async def delete_scene(self, scene_key: str) -> bool:
-        """删除未引用 scene；已有历史 set 引用时仅停用当前版本。"""
-        if scene_key in {"NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION"}:
-            msg = f"必需 fixed scene 不允许删除: {scene_key}"
-            raise ValueError(msg)
-        session = _open_session()
-        try:
-            async with session.begin():
-                referenced = (
-                    await session.execute(
-                        select(_ITEMS.c.id)
-                        .select_from(_ITEMS)
-                        .join(_SCENES, _SCENES.c.id == _ITEMS.c.scene_id)
-                        .where(_SCENES.c.scene_key == scene_key)
-                        .limit(1)
-                    )
-                ).first()
-                if referenced is not None:
-                    result = cast(
-                        "CursorResult[Any]",
-                        await session.execute(
-                            update(_SCENES)
-                            .where(_SCENES.c.scene_key == scene_key)
-                            .values(enabled=False, updated_at=func.now())
-                        ),
-                    )
-                else:
-                    result = cast(
-                        "CursorResult[Any]",
-                        await session.execute(
-                            delete(_SCENES).where(_SCENES.c.scene_key == scene_key)
-                        ),
-                    )
-        finally:
-            await session.close()
-        return int(result.rowcount or 0) > 0
-
     async def has_any_scene(self) -> bool:
         """检查 scene 内容表是否已有记录。"""
         session = _open_session()

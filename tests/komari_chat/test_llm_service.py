@@ -11,8 +11,83 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+llm_service_module = import_module(
+    "komari_bot.plugins.komari_chat.services.llm_service"
+)
 retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
+
+
+class _FakeImageSession:
+    """TSK-195：最小图片会话替身（窄 Protocol），按结果队列返回 read 结果。
+
+    TSK-196：按真实会话语义追踪已尝试索引——``all_images_unavailable`` 只在
+    全部可用索引均已被尝试且全部失败时为真（只读其中一张失败不算全部失败）。
+    """
+
+    def __init__(
+        self,
+        results: list[Any],
+        *,
+        mode: str = "delegated",
+    ) -> None:
+        self.results = results
+        self.mode = mode
+        self.read_calls: list[tuple[int, str | None]] = []
+        self._attempted: set[int] = set()
+
+    @property
+    def total_count(self) -> int:
+        return len(self.results)
+
+    async def read(
+        self,
+        index: int,
+        *,
+        parent_call_id: str | None = None,
+    ) -> Any:
+        self.read_calls.append((index, parent_call_id))
+        self._attempted.add(index)
+        if index < 0 or index >= len(self.results):
+            return image_reading_session_module.ImageReadResult(
+                index=index,
+                status="invalid_index",
+                failure_message="[图片读取失败: image_index 超出范围]",
+                error_type="invalid_index",
+                stage="invalid",
+            )
+        return self.results[index]
+
+    def all_images_unavailable(self) -> bool:
+        return (
+            self.total_count > 0
+            and len(self._attempted) >= self.total_count
+            and all(
+                self.results[index].status == "failure"
+                for index in self._attempted
+            )
+        )
+
+    def failure_summary(self) -> Any:
+        failures = [
+            self.results[index]
+            for index in self._attempted
+            if self.results[index].status == "failure"
+        ]
+        return image_reading_session_module.ImageFailureSummary(
+            mode=self.mode,
+            all_images_unavailable=self.all_images_unavailable(),
+            total_images=self.total_count,
+            attempted_images=len(self._attempted),
+            failed_images=len(failures),
+            error_types=tuple(
+                sorted({result.error_type or "unknown" for result in failures})
+            ),
+            stages=tuple(sorted({result.stage or "unknown" for result in failures})),
+        )
+
 
 
 class _FakeLLMProvider:
@@ -48,21 +123,52 @@ class _ObservableSemaphore:
         self.exited = True
 
 
-def _build_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        llm_model_chat="chat-model",
-        llm_temperature_chat=0.7,
-        llm_max_tokens_chat=1024,
-        llm_model_summary="summary-model",
-        llm_temperature_summary=0.3,
-        llm_max_tokens_summary=2048,
-        llm_thinking_mode_chat=False,
-        llm_reasoning_effort_chat="",
-        llm_thinking_mode_summary=False,
-        llm_reasoning_effort_summary="",
-        bot_nickname="小鞠",
-        response_tag="content",
+def _assert_agent_budget_consistent(rounds: int, per_round: int, total: int) -> None:
+    """预算三元组必须是真实 Schema 可接受状态。
+
+    与 test_agent_budget.py 相同的测试侧守卫：字段范围 2..20 / 1..8 /
+    2..64 且 ``per_round <= total <= rounds*per_round``；不 import 生产
+    validator 自证。任何 runtime budget fixture 都必须在返回前通过。
+    """
+
+    assert 2 <= rounds <= 20, f"agent_max_rounds 超出 2..20: {rounds}"
+    assert 1 <= per_round <= 8, f"agent_max_tool_calls_per_round 超出 1..8: {per_round}"
+    assert 2 <= total <= 64, f"agent_max_total_tool_calls 超出 2..64: {total}"
+    assert per_round <= total <= rounds * per_round, (
+        f"非法预算组合 rounds={rounds}, per_round={per_round}, total={total}："
+        "必须满足 per_round <= total <= rounds*per_round"
     )
+
+
+def _build_config(**overrides: Any) -> SimpleNamespace:
+    values: dict[str, Any] = {
+        "llm_model_chat": "chat-model",
+        "llm_temperature_chat": 0.7,
+        "llm_max_tokens_chat": 1024,
+        "llm_model_summary": "summary-model",
+        "llm_temperature_summary": 0.3,
+        "llm_max_tokens_summary": 2048,
+        "llm_thinking_mode_chat": False,
+        "llm_reasoning_effort_chat": "",
+        "llm_thinking_mode_summary": False,
+        "llm_reasoning_effort_summary": "",
+        "bot_nickname": "小鞠",
+        "response_tag": "content",
+        # TSK-192：回复 Agent 预算默认值（与配置 Schema 一致）
+        "agent_max_rounds": 10,
+        "agent_max_tool_calls_per_round": 4,
+        "agent_max_total_tool_calls": 20,
+        # TSK-193：工具调用约束模式（与配置 Schema 默认值一致；
+        # from_config 不再对缺字段回退隐藏默认，fixture 必须显式提供）
+        "agent_tool_call_mode": "required",
+    }
+    values.update(overrides)
+    _assert_agent_budget_consistent(
+        values["agent_max_rounds"],
+        values["agent_max_tool_calls_per_round"],
+        values["agent_max_total_tool_calls"],
+    )
+    return SimpleNamespace(**values)
 
 
 def _tool_call(
@@ -222,7 +328,9 @@ def test_generate_reply_with_tools_limits_llm_provider_concurrency(
 
     provider = _ConcurrentProvider()
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-    monkeypatch.setattr(llm_service_module, "_LLM_COMPLETION_SEMAPHORE", asyncio.Semaphore(2))
+    monkeypatch.setattr(
+        llm_service_module, "_LLM_COMPLETION_SEMAPHORE", asyncio.Semaphore(2)
+    )
 
     results = asyncio.run(_run_concurrent_replies())
 
@@ -293,9 +401,7 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     ) -> str:
         searched_queries.append(query)
         searched_trace_ids.append(request_trace_id)
-        searched_contexts.append(
-            (caller_user_id, caller_group_id, caller_is_superuser)
-        )
+        searched_contexts.append((caller_user_id, caller_group_id, caller_is_superuser))
         return "搜索结果：今天有一条新闻"
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
@@ -367,7 +473,9 @@ def test_generate_reply_with_tools_executes_read_profile_tool(monkeypatch: Any) 
     ]
 
     class _FakeMemory:
-        async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any]:
+        async def get_user_profile(
+            self, *, user_id: str, group_id: str
+        ) -> dict[str, Any]:
             assert user_id == "user-2"
             assert group_id == "group-1"
             return {
@@ -520,7 +628,6 @@ def test_generate_reply_with_tools_requires_favorability_before_final(
             config=_build_config(),
             messages=[{"role": "user", "content": "纠错"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
-            max_tool_rounds=3,
         )
     )
 
@@ -566,7 +673,9 @@ def test_read_profile_tool_filters_keys(monkeypatch: Any) -> None:
     ]
 
     class _FakeMemory:
-        async def get_user_profile(self, *, user_id: str, group_id: str) -> dict[str, Any]:
+        async def get_user_profile(
+            self, *, user_id: str, group_id: str
+        ) -> dict[str, Any]:
             del user_id, group_id
             return {
                 "display_name": "长门",
@@ -643,7 +752,10 @@ def test_read_profile_tool_returns_not_found(monkeypatch: Any) -> None:
         )
     )
 
-    assert "not_found: 用户画像不存在" in fake_provider.completion_calls[1]["messages"][-1]["content"]
+    assert (
+        "not_found: 用户画像不存在"
+        in fake_provider.completion_calls[1]["messages"][-1]["content"]
+    )
 
 
 def test_read_profile_tool_denies_user_outside_visible_scope(monkeypatch: Any) -> None:
@@ -757,21 +869,20 @@ def test_read_profile_output_applies_trait_character_and_token_budgets() -> None
     assert "traits_truncated: true" in output
 
 
-def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> None:
+def test_generate_reply_with_tools_requires_final_response_within_config_rounds(
+    monkeypatch: Any,
+) -> None:
+    """配置轮次=3 时，三轮空 tool_calls 用尽配置轮次后失败（非隐藏纠错上限）。
+
+    TSK-192 AC4：逻辑轮次只由配置预算 ``agent_max_rounds`` 决定，不存在隐藏
+    的 2/3/5/6 轮封顶。此处显式冻结合法预算 3 轮（per_round=4 / total=12），
+    三轮纠错后因配置轮次耗尽而失败。
+    """
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
-        SimpleNamespace(
-            content="",
-            tool_calls=[],
-        ),
-        SimpleNamespace(
-            content="",
-            tool_calls=[],
-        ),
-        SimpleNamespace(
-            content="",
-            tool_calls=[],
-        ),
+        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(content="", tool_calls=[]),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
 
@@ -783,17 +894,79 @@ def test_generate_reply_with_tools_requires_final_response(monkeypatch: Any) -> 
     with pytest.raises(RuntimeError, match="模型未调用任何工具"):
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
-                config=_build_config(),
+                config=_build_config(
+                    agent_max_rounds=3,
+                    agent_max_tool_calls_per_round=4,
+                    agent_max_total_tool_calls=12,
+                ),
                 messages=[{"role": "user", "content": "查一下"}],
                 tools=[llm_service_module.SEARCH_WEB_TOOL],
                 request_trace_id="chat-no-final-1",
             )
         )
 
-    # 三轮空 tool_calls 在同一 _execute_tool_loop 内被纠错，不再触发外层重试。
+    # 三轮空 tool_calls 在同一 _execute_tool_loop 内被纠错：配置的 3 个轮次
+    # 全部耗尽后任务因未完成 final_response 而失败，不再消耗第 4 轮。
     assert len(fake_provider.completion_calls) == 3
-    messages_lengths = [len(call["messages"]) for call in fake_provider.completion_calls]
+    messages_lengths = [
+        len(call["messages"]) for call in fake_provider.completion_calls
+    ]
     assert messages_lengths == sorted(messages_lengths)
+    for call in fake_provider.completion_calls[1:]:
+        assert any(
+            "必须调用" in str(message.get("content", ""))
+            for message in call["messages"]
+        )
+
+
+def test_generate_reply_with_tools_no_hidden_correction_cap_before_config_rounds(
+    monkeypatch: Any,
+) -> None:
+    """有业务工具时配置轮次 >3（5 轮）不会被隐藏 3 轮纠错上限提前终止。
+
+    TSK-192 AC4：前 4 轮空 tool_calls 只按配置消耗轮次，第 5 轮
+    final_response 必须成功；若实现存在隐藏纠错上限（如 3），第 3 轮就会
+    提前抛错。预算 5 / 4 / 12（per_round <= total <= rounds*per_round）合法。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        _completion(),
+        _completion(),
+        _completion(),
+        _completion(),
+        _completion(
+            _tool_call(
+                "final_response",
+                "{}",
+                {
+                    "content": "第五轮最终回复",
+                    "interaction_history": {
+                        "event": "连续四轮未调用工具",
+                        "result": "配置轮次结束前完成回复",
+                        "emotion": "平静",
+                    },
+                },
+            )
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(
+                agent_max_rounds=5,
+                agent_max_tool_calls_per_round=4,
+                agent_max_total_tool_calls=12,
+            ),
+            messages=[{"role": "user", "content": "不要提前终止"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            request_trace_id="chat-no-hidden-cap-1",
+        )
+    )
+
+    assert result.content == "第五轮最终回复"
+    assert len(fake_provider.completion_calls) == 5
+    # 第 2~5 轮都携带纠错指令：4 个空 tool_calls 轮次逐一消耗配置轮次
     for call in fake_provider.completion_calls[1:]:
         assert any(
             "必须调用" in str(message.get("content", ""))
@@ -806,7 +979,7 @@ def test_generate_reply_with_tools_recovers_when_model_omits_tool_call(
 ) -> None:
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
-        SimpleNamespace(content="", tool_calls=[]),
+        SimpleNamespace(content="让我想想先", tool_calls=[]),
         SimpleNamespace(
             content="",
             tool_calls=[
@@ -839,6 +1012,11 @@ def test_generate_reply_with_tools_recovers_when_model_omits_tool_call(
     assert result.content == "纠错后输出"
     assert len(fake_provider.completion_calls) == 2
     second_messages = fake_provider.completion_calls[1]["messages"]
+    assert not any(
+        message.get("role") == "assistant"
+        and message.get("content") == "让我想想先"
+        for message in second_messages
+    ), "裸文本轮正文不得作为 assistant 消息进入下一轮"
     assert any(
         "必须调用" in str(message.get("content", ""))
         for message in second_messages
@@ -903,6 +1081,124 @@ def test_generate_reply_with_tools_retries_invalid_final_response_in_same_sessio
         message.get("role") == "tool"
         and "final_response" in str(message.get("content", ""))
         and "content" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_generate_reply_with_tools_rejects_final_response_without_interaction_history(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：final_response 缺少 interaction_history 不得成功。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {"content": "缺互动记录的回复"},
+                    call_id="call-final-no-history",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "补完互动记录后输出",
+                        "interaction_history": {
+                            "event": "首次缺互动记录",
+                            "result": "补完后正常输出",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-history-ok",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "不带互动记录"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            request_trace_id="chat-no-history-1",
+        )
+    )
+
+    assert result.content == "补完互动记录后输出"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-final-no-history"
+        and "interaction_history" in str(message.get("content", ""))
+        for message in second_messages
+    )
+
+
+def test_generate_reply_with_tools_rejects_final_response_with_incomplete_history(
+    monkeypatch: Any,
+) -> None:
+    """TSK-193：final_response.interaction_history 缺 event/result/emotion 不得成功。"""
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "缺 emotion 的回复",
+                        "interaction_history": {"event": "e", "result": "r"},
+                    },
+                    call_id="call-final-incomplete",
+                )
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "补全 emotion 后输出",
+                        "interaction_history": {
+                            "event": "首次缺 emotion",
+                            "result": "补全后正常输出",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-complete",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "残缺互动记录"}],
+            tools=[llm_service_module.SEARCH_WEB_TOOL],
+            request_trace_id="chat-incomplete-history-1",
+        )
+    )
+
+    assert result.content == "补全 emotion 后输出"
+    second_messages = fake_provider.completion_calls[1]["messages"]
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-final-incomplete"
+        and "event" in str(message.get("content", ""))
+        and "emotion" in str(message.get("content", ""))
         for message in second_messages
     )
 
@@ -978,7 +1274,6 @@ def test_generate_reply_with_tools_does_not_repeat_successful_search_after_final
             messages=[{"role": "user", "content": "搜一下新闻"}],
             tools=[llm_service_module.SEARCH_WEB_TOOL],
             request_trace_id="chat-no-repeat-search-1",
-            max_tool_rounds=3,
         )
     )
 
@@ -1105,7 +1400,6 @@ def test_generate_reply_with_tools_recovers_invalid_favorability_delta(
             messages=[{"role": "user", "content": "打招呼"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
             request_trace_id="chat-favor-recover-1",
-            max_tool_rounds=3,
         )
     )
 
@@ -1161,28 +1455,19 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
         ),
     ]
     searched_queries: list[str] = []
-    read_images_payloads: list[list[str]] = []
-
-    async def _fake_read_images(
-        images: list[str],
-        *,
-        vision_model: str,
-        temperature: float,
-        max_tokens: int,
-        **_: object,
-    ) -> list[str]:
-        read_images_payloads.append(images)
-        assert vision_model == "vision-model"
-        assert temperature == 0.2
-        assert max_tokens == 512
-        return ["图片描述：是一只猫"]
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0, status="success", description="图片描述：是一只猫"
+            )
+        ]
+    )
 
     async def _fake_search_web(query: str, **_kwargs: object) -> str:
         searched_queries.append(query)
         return "搜索结果：天气晴"
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
     monkeypatch.setattr(
         llm_service_module,
         "komari_search",
@@ -1198,21 +1483,454 @@ def test_generate_reply_with_tools_executes_combined_tools(monkeypatch: Any) -> 
                 llm_service_module.SEARCH_WEB_TOOL,
             ],
             request_trace_id="chat-combined-tools-1",
-            base64_images=["base64-image-0"],
-            vision_model="vision-model",
-            vision_temperature=0.2,
-            vision_max_tokens=512,
+            image_session=image_session,
         )
     )
 
     assert result.content == "看图并搜索后的回答"
-    assert read_images_payloads == [["base64-image-0"]]
+    assert image_session.read_calls == [(0, None)], (
+        "read_image 只按稳定索引读取，不见 URL/base64"
+    )
     assert searched_queries == ["天气"]
     assert fake_provider.completion_calls[0]["tools"] == [
         llm_service_module.READ_IMAGE_TOOL,
         llm_service_module.SEARCH_WEB_TOOL,
         llm_service_module.FINAL_RESPONSE_TOOL,
     ]
+
+
+def test_generate_reply_with_tools_delegated_partial_failure_allows_honest_final(
+    monkeypatch: Any,
+) -> None:
+    """TSK-194/TSK-196：delegated 部分失败（并非全部可用索引均已尝试且失败）
+    时返回结构化失败工具结果并允许诚实 final_response。
+
+    把 ``[图片读取失败: ...]`` 工具结果回给主 Agent 并允许其诚实调用
+    final_response；主循环 messages 不得嵌入原图、不得切 native，仍使用
+    聊天模型与 chat 槽位（thinking/reasoning 不为 vision 值影响）。任务
+    成功结束时把聚合图片失败摘要附到 ``ReplyResult``（TSK-196 消费）。
+    """
+    fake_provider = _FakeLLMProvider("<content>")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-image-fail",
+                ),
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "有一张图片暂时看不了，我基于其他信息回答",
+                        "interaction_history": {
+                            "event": "发图让我看",
+                            "result": "尽力描述了但部分看不到",
+                            "emotion": "抱歉",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            ),
+            image_reading_session_module.ImageReadResult(
+                index=1,
+                status="success",
+                description="另一张图片的描述",
+            ),
+        ]
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(
+                llm_request_api_chat="chat_completions",
+                llm_stream_enabled_chat=False,
+                llm_thinking_mode_chat=False,
+                llm_reasoning_effort_chat="",
+            ),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            image_session=image_session,
+        )
+    )
+
+    assert result.content == "有一张图片暂时看不了，我基于其他信息回答"
+    # 主循环两轮仍用聊天模型与 chat 槽位（不切 native / 视觉模型）
+    for call in fake_provider.completion_calls:
+        assert call["model"] == "chat-model"
+        assert call["request_api"] == "chat_completions"
+        assert call["stream_enabled"] is False
+        assert call["thinking_mode"] is False
+        assert call["reasoning_effort"] == ""
+    # 主循环 messages 不得嵌入原图（原图只按索引交给视觉子调用）
+    rendered = str(fake_provider.completion_calls)
+    assert "data:image/png;base64,AAAA" not in rendered
+    assert image_session.read_calls == [(0, None)]
+    # 只尝试了 index 0 且失败：并非全部可用索引均已尝试 → 不算全部不可用
+    assert image_session.all_images_unavailable() is False
+    # 成功任务把聚合摘要附到结果（TSK-196 消费；深模块边界只传 ImageFailureSummary）
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.mode == "delegated"
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
+    # 第二轮上下文保留 read_image 失败的结构化工具结果，供模型诚实收尾
+    second_round_messages = fake_provider.completion_calls[1]["messages"]
+    tool_contents = [
+        message.get("content")
+        for message in second_round_messages
+        if message.get("role") == "tool"
+    ]
+    assert tool_contents, "第二轮上下文必须包含 read_image 失败工具结果"
+    assert any("图片读取失败" in str(content) for content in tool_contents)
+
+
+def test_generate_reply_with_tools_delegated_all_unavailable_terminates(
+    monkeypatch: Any,
+) -> None:
+    """TSK-196：delegated 全部可用索引均已尝试且全部失败时，以专用安全异常
+    终止工具循环，不允许 final_response 成功。
+
+    单图失败（唯一索引已尝试且失败）即触发；异常只携带
+    ``ImageFailureSummary``（无 URL/base64/视觉描述/原异常正文）；最后一次
+    失败 read_image 的 ``ToolExecutionTrace`` 已写入 collector。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-image-fail",
+                ),
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "我不该成功提交",
+                        "interaction_history": {
+                            "event": "看图",
+                            "result": "应被终止",
+                            "emotion": "抱歉",
+                        },
+                    },
+                    call_id="call-final",
+                )
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            )
+        ]
+    )
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="test-delegated-all-fail")
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
+        asyncio.run(
+            llm_service_module.generate_reply_with_tools(
+                config=_build_config(),
+                messages=[{"role": "user", "content": "看图"}],
+                tools=[llm_service_module.READ_IMAGE_TOOL],
+                image_session=image_session,
+                collector=collector,
+            )
+        )
+
+    summary = excinfo.value.summary
+    assert summary.mode == "delegated"
+    assert summary.all_images_unavailable is True
+    assert summary.total_images == 1
+    assert summary.attempted_images == 1
+    assert summary.failed_images == 1
+    assert summary.error_types == ("vision_failed",)
+    assert summary.stages == ("vision",)
+    # 异常正文只携带模式摘要，不携带 URL/base64/视觉描述
+    assert "https://" not in str(excinfo.value)
+    assert "base64" not in str(excinfo.value)
+    # 最后一次失败 read_image 的 ToolExecutionTrace 已写入 collector
+    image_traces = [
+        trace for trace in collector.tools if trace.tool_name == "read_image"
+    ]
+    assert len(image_traces) == 1
+    assert image_traces[0].status == "error"
+    assert image_traces[0].error_summary == "图片读取失败"
+    # 下一轮开始即被终止，final_response 未被执行
+    assert len(fake_provider.completion_calls) == 1
+
+
+def test_generate_reply_with_tools_delegated_all_unavailable_same_round_final(
+    monkeypatch: Any,
+) -> None:
+    """TSK-196：同轮 read_image 全部失败后再提交 final_response 也必须终止。
+
+    即使 read_image 与 final_response 出现在同一轮 tool_calls，全部索引均已
+    尝试且失败时 final_response 不得成功。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-image-fail",
+                ),
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "同轮也不该成功",
+                        "interaction_history": {
+                            "event": "看图",
+                            "result": "应被终止",
+                            "emotion": "抱歉",
+                        },
+                    },
+                    call_id="call-final",
+                ),
+            ],
+        )
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 下载失败]",
+                error_type="image_unavailable",
+                stage="download",
+            )
+        ]
+    )
+
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
+        asyncio.run(
+            llm_service_module.generate_reply_with_tools(
+                config=_build_config(),
+                messages=[{"role": "user", "content": "看图"}],
+                tools=[llm_service_module.READ_IMAGE_TOOL],
+                image_session=image_session,
+            )
+        )
+
+    assert excinfo.value.summary.all_images_unavailable is True
+    assert len(fake_provider.completion_calls) == 1
+
+
+def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminates(
+    monkeypatch: Any,
+) -> None:
+    """TSK-196 复审：最后允许轮次、该轮仅 read_image 无 final_response，且
+    该次读取使全部可用索引均失败 → 以专用安全异常终止，绝不落入 MaxRounds
+    RuntimeError。
+
+    修复前 all_images_unavailable 只在轮首/final_response 检查：最后轮仅
+    read_image 时会漏终止而抛 MaxRounds。修复后每次 read_image 的
+    ToolExecutionTrace 写入 collector 后立即检查，最后一次失败 read_image 的
+    trace 保留。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-img-round1",
+                ),
+            ],
+        ),
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "read_image",
+                    '{"image_index":1}',
+                    {"image_index": 1},
+                    call_id="call-img-round2",
+                ),
+            ],
+        ),
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            ),
+            image_reading_session_module.ImageReadResult(
+                index=1,
+                status="failure",
+                failure_message="[图片读取失败: 下载失败]",
+                error_type="image_unavailable",
+                stage="download",
+            ),
+        ]
+    )
+    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+
+    collector = LLMDiagnosticCollector(request_id="test-delegated-last-round")
+    with pytest.raises(
+        image_reading_session_module.ImageUnderstandingFailureError
+    ) as excinfo:
+        asyncio.run(
+            llm_service_module.generate_reply_with_tools(
+                config=_build_config(
+                    agent_max_rounds=2,
+                    agent_max_tool_calls_per_round=4,
+                    agent_max_total_tool_calls=8,
+                ),
+                messages=[{"role": "user", "content": "看图"}],
+                tools=[llm_service_module.READ_IMAGE_TOOL],
+                image_session=image_session,
+                collector=collector,
+            )
+        )
+
+    summary = excinfo.value.summary
+    assert summary.mode == "delegated"
+    assert summary.all_images_unavailable is True
+    assert summary.total_images == 2
+    assert summary.attempted_images == 2
+    assert summary.failed_images == 2
+    assert summary.error_types == ("image_unavailable", "vision_failed")
+    assert summary.stages == ("download", "vision")
+    # 是专用安全异常，绝非 MaxRounds RuntimeError
+    assert isinstance(
+        excinfo.value, image_reading_session_module.ImageUnderstandingFailureError
+    )
+    assert "https://" not in str(excinfo.value)
+    assert "base64" not in str(excinfo.value)
+    # 两轮 read_image 都执行，最后一次失败 read_image 的 Trace 已写入 collector
+    assert len(fake_provider.completion_calls) == 2
+    image_traces = [
+        trace for trace in collector.tools if trace.tool_name == "read_image"
+    ]
+    assert len(image_traces) == 2
+    assert [trace.parsed_arguments for trace in image_traces] == [
+        {"image_index": 0},
+        {"image_index": 1},
+    ]
+    assert all(trace.status == "error" for trace in image_traces)
+    assert all(trace.error_summary == "图片读取失败" for trace in image_traces)
+
+
+def test_generate_reply_with_tools_final_response_before_read_image_same_round(
+    monkeypatch: Any,
+) -> None:
+    """TSK-196 复审：同轮 final_response 排在 read_image 之前时，final_response
+    成功且后续 read_image 不执行（图片尚未尝试、all_images_unavailable 尚未
+    成立）；断言零 read、无摘要。不要为此改成预判失败。
+    """
+    fake_provider = _FakeLLMProvider("")
+    fake_provider.completions = [
+        SimpleNamespace(
+            content="",
+            tool_calls=[
+                _tool_call(
+                    "final_response",
+                    "{}",
+                    {
+                        "content": "先提交最终回复",
+                        "interaction_history": {
+                            "event": "看图",
+                            "result": "未读取即回复",
+                            "emotion": "平静",
+                        },
+                    },
+                    call_id="call-final-first",
+                ),
+                _tool_call(
+                    "read_image",
+                    '{"image_index":0}',
+                    {"image_index": 0},
+                    call_id="call-img-after-final",
+                ),
+            ],
+        )
+    ]
+    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
+
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型拒绝读取]",
+                error_type="vision_failed",
+                stage="vision",
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        llm_service_module.generate_reply_with_tools(
+            config=_build_config(),
+            messages=[{"role": "user", "content": "看图"}],
+            tools=[llm_service_module.READ_IMAGE_TOOL],
+            image_session=image_session,
+        )
+    )
+
+    assert result.content == "先提交最终回复"
+    # 图片尚未尝试：零 read、无摘要，final_response 不因未读图而预判失败
+    assert image_session.read_calls == []
+    assert result.image_failure_summary is None
+    assert len(fake_provider.completion_calls) == 1
 
 
 def test_summarize_conversation_escapes_untrusted_prompt_text(
@@ -1348,10 +2066,15 @@ def test_execute_tool_loop_records_call_traces_in_collector(monkeypatch: Any) ->
     assert collector.calls[0].round_index == 0
     assert collector.calls[0].model == "chat-model"
     assert len(collector.tools) >= 1
-    assert any(t.tool_name == "final_response" and t.status == "success" for t in collector.tools)
+    assert any(
+        t.tool_name == "final_response" and t.status == "success"
+        for t in collector.tools
+    )
 
 
-def test_execute_tool_loop_records_favorability_pending_in_debug(monkeypatch: Any) -> None:
+def test_execute_tool_loop_records_favorability_pending_in_debug(
+    monkeypatch: Any,
+) -> None:
     """验证 debug 路径下 record_favorability_delta 只记录 pending，不调 adjust。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
@@ -1396,7 +2119,9 @@ def test_execute_tool_loop_records_favorability_pending_in_debug(monkeypatch: An
     assert result.content == "好感度pending回复"
     assert result.favorability_delta == 2
     assert result.favorability_reason == "友好互动"
-    favor_traces = [t for t in collector.tools if t.tool_name == "record_favorability_delta"]
+    favor_traces = [
+        t for t in collector.tools if t.tool_name == "record_favorability_delta"
+    ]
     assert len(favor_traces) == 1
     assert favor_traces[0].status == "success"
     assert favor_traces[0].parsed_arguments == {"delta": 2, "reason": "友好互动"}
@@ -1434,11 +2159,23 @@ def test_read_image_tool_records_error_when_vision_service_fails(
         ),
     ]
 
-    async def _fake_read_images(*_args: object, **_kwargs: object) -> list[str]:
-        return ["[图片读取失败: 视觉模型故障]"]
-
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    monkeypatch.setattr(llm_service_module, "read_images", _fake_read_images)
+    image_session = _FakeImageSession(
+        [
+            image_reading_session_module.ImageReadResult(
+                index=0,
+                status="failure",
+                failure_message="[图片读取失败: 视觉模型故障]",
+                error_type="vision_failed",
+                stage="vision",
+            ),
+            image_reading_session_module.ImageReadResult(
+                index=1,
+                status="success",
+                description="正常图片描述",
+            ),
+        ]
+    )
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     collector = LLMDiagnosticCollector(request_id="test-image-tool-failed")
@@ -1447,12 +2184,12 @@ def test_read_image_tool_records_error_when_vision_service_fails(
             config=_build_config(),
             messages=[{"role": "user", "content": "看看图片"}],
             tools=[llm_service_module.READ_IMAGE_TOOL],
-            base64_images=["base64-image-0"],
-            vision_model="vision-model",
+            image_session=image_session,
             collector=collector,
         )
     )
 
+    # 部分失败：只尝试 index 0（失败），任务仍允许诚实收尾
     assert result.content == "图片读取失败后的回复"
     [image_trace] = [
         trace for trace in collector.tools if trace.tool_name == "read_image"
@@ -1460,6 +2197,10 @@ def test_read_image_tool_records_error_when_vision_service_fails(
     assert image_trace.status == "error"
     assert image_trace.error_summary == "图片读取失败"
     assert image_trace.result_summary is None
+    assert result.image_failure_summary is not None
+    assert result.image_failure_summary.failed_images == 1
+    assert result.image_failure_summary.error_types == ("vision_failed",)
+    assert result.image_failure_summary.stages == ("vision",)
 
 
 def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) -> None:
@@ -1508,13 +2249,14 @@ def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) ->
             config=_build_config(),
             messages=[{"role": "user", "content": "打招呼"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
-            max_tool_rounds=3,
             collector=collector,
         )
     )
 
     assert result.content == "纠错后回复"
-    favor_traces = [t for t in collector.tools if t.tool_name == "record_favorability_delta"]
+    favor_traces = [
+        t for t in collector.tools if t.tool_name == "record_favorability_delta"
+    ]
     assert len(favor_traces) == 2
     statuses = {t.status for t in favor_traces}
     assert "error" in statuses
@@ -1612,9 +2354,10 @@ def test_execute_tool_loop_records_no_tool_calls_in_collector(monkeypatch: Any) 
 
 
 def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> None:
-    """验证达到最大轮数时 collector 记录错误。"""
+    """验证达到配置的最大轮数时 collector 记录错误（TSK-192 预算配置驱动）。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
+        _completion(),
         _completion(),
         _completion(),
     ]
@@ -1626,10 +2369,9 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
     with pytest.raises(RuntimeError, match="最大轮数"):
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
-                config=_build_config(),
+                config=_build_config(agent_max_rounds=2, agent_max_total_tool_calls=8),
                 messages=[{"role": "user", "content": "查一下"}],
                 tools=[llm_service_module.SEARCH_WEB_TOOL],
-                max_tool_rounds=2,
                 collector=collector,
             )
         )
@@ -1994,9 +2736,7 @@ def test_fetch_page_tool_handles_url_parse_errors(
     ]
     fetched_urls_list: list[list[str]] = []
 
-    async def _fake_fetch_page(
-        urls: list[str], **_kwargs: object
-    ) -> str:
+    async def _fake_fetch_page(urls: list[str], **_kwargs: object) -> str:
         fetched_urls_list.append(list(urls))
         return "[抓取结果]"
 

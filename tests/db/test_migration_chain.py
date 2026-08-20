@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
@@ -546,9 +547,7 @@ def test_reply_fulfillment_cutover_revision_exists() -> None:
         "reply_commit_batch_size": "reply_fulfillment_batch_size",
         "reply_commit_lease_seconds": "reply_fulfillment_lease_seconds",
         "reply_commit_max_attempts": "reply_fulfillment_max_attempts",
-        "reply_commit_retry_base_seconds": (
-            "reply_fulfillment_retry_base_seconds"
-        ),
+        "reply_commit_retry_base_seconds": ("reply_fulfillment_retry_base_seconds"),
         "reply_commit_tombstone_retention_days": (
             "reply_fulfillment_tombstone_retention_days"
         ),
@@ -616,3 +615,274 @@ def test_migration_cli_can_inspect_chain_without_loading_application(
     output = f"{result.stdout}\n{result.stderr}"
     assert "config_manager" not in output
     assert "PostgresPool" not in output
+
+
+def test_chat_prompt_behavior_columns_revision_exists() -> None:
+    """AC3：0011 的直接后继 revision 显式删除 output_instruction 并新增行为列。
+
+    新列集合由强类型 Schema 与 0003 保留列差集推导，不猜测迁移实现；
+    迁移必须自包含（不导入运行时），并将删除旧列与新增新列落实在 DDL。
+    删除旧列接受项目允许的显式 Alembic 表达（``op.drop_column`` 或自包含
+    ``DROP COLUMN`` SQL），不锁定 raw SQL 实现；真实 schema 变更由
+    ``test_prompt_seed_bootstrap_integration.py`` 的隔离库迁移用例验证，
+    本用例承担无数据库的静态守卫。
+    """
+    from tests.config.chat_prompt_field_contract import (
+        new_chat_prompt_column_names,
+    )
+
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0011"]
+    assert len(children) == 1, f"0011 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    assert _has_explicit_drop_column(revision_sql, "output_instruction"), (
+        "迁移必须显式删除 output_instruction 列"
+        "（op.drop_column(..., 'output_instruction') 或 "
+        "DROP COLUMN [IF EXISTS] output_instruction SQL）"
+    )
+
+    for column in sorted(new_chat_prompt_column_names()):
+        assert re.search(rf"\b{re.escape(column)}\b", revision_sql), (
+            f"迁移必须新增聊天 Prompt 行为列: {column}"
+        )
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
+def test_chat_prompt_behavior_columns_downgrade_is_irreversible() -> None:
+    """TSK-190/197：0012 的 downgrade 明确不可逆，不承诺还原已删自定义 Prompt。
+
+    直接加载迁移模块并调用 ``downgrade()``（真实执行，非文本扫描）：
+    必须抛出带 ``0012_CHAT_PROMPT_BEHAVIOR_COLUMNS_IS_IRREVERSIBLE`` 标记的
+    ``RuntimeError``；被删除的 ``output_instruction`` 自定义内容按 TSK-190
+    契约永久丢弃，不并入任何新字段。
+    """
+    import importlib.util
+
+    migration_path = next(
+        rev
+        for rev in sorted((MIGRATIONS_DIR / "versions").glob("*.py"))
+        if "0012_chat_prompt_behavior_columns" in rev.name
+    )
+    spec = importlib.util.spec_from_file_location("mig_0012_guard", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.revision == "0012"
+    with pytest.raises(RuntimeError, match="0012_CHAT_PROMPT_BEHAVIOR_COLUMNS_IS_IRREVERSIBLE"):
+        module.downgrade()
+
+
+def test_agent_budget_config_revision_exists() -> None:
+    """TSK-192：0012 的直接后继 revision 新增三项回复 Agent 预算列。
+
+    新列（agent_max_rounds / agent_max_tool_calls_per_round /
+    agent_max_total_tool_calls）必须显式声明跨字段 CHECK（AC1/AC2 的
+    数据库侧表达），迁移需自包含。本用例是静态守卫：只守新增 revision /
+    列名 / 自包含 / 显式约束声明，不锁定 raw SQL 的 ``DEFAULT 10`` /
+    ``CHECK(...)`` 文本形态（接受 Alembic op 或 SQLModel 合法表达）；
+    真实默认值与约束语义由 ``test_agent_budget_config_migration.py`` 的
+    隔离库用例验证。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0012"]
+    assert len(children) == 1, f"0012 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    for column in (
+        "agent_max_rounds",
+        "agent_max_tool_calls_per_round",
+        "agent_max_total_tool_calls",
+    ):
+        assert re.search(rf"\b{re.escape(column)}\b", revision_sql), (
+            f"迁移必须新增预算列: {column}"
+        )
+    assert _has_explicit_cross_field_check(revision_sql), (
+        "迁移必须显式声明跨字段 CHECK（op.create_check_constraint / "
+        "CheckConstraint / 含三列的 CHECK SQL 任一形态）"
+    )
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
+def test_agent_tool_call_mode_config_revision_exists() -> None:
+    """TSK-193：0013 的直接后继 revision 新增 agent_tool_call_mode 列。
+
+    新列必须带非空默认 ``required``（升级保留存量行的列默认补齐），
+    downgrade 必须显式回退删除该列；迁移需自包含。本用例是静态守卫：
+    只守新增 revision / 列名 / 非空默认 / 显式回退 / 自包含，不锁定 raw
+    SQL 形态；真实默认值与回退语义由
+    ``test_agent_tool_call_mode_migration.py`` 的隔离库用例验证。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0013"]
+    assert len(children) == 1, f"0013 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    assert re.search(r"\bagent_tool_call_mode\b", revision_sql), (
+        "迁移必须新增 agent_tool_call_mode 列"
+    )
+    assert re.search(
+        r"DEFAULT\s*'required'",
+        revision_sql,
+        re.IGNORECASE,
+    ), (
+        "迁移必须为非空 agent_tool_call_mode 声明默认值 'required'"
+        "（升级保留存量行）"
+    )
+    assert _has_explicit_drop_column(revision_sql, "agent_tool_call_mode"), (
+        "迁移 downgrade 必须显式回退删除 agent_tool_call_mode 列"
+        "（op.drop_column(..., 'agent_tool_call_mode') 或 "
+        "DROP COLUMN [IF EXISTS] agent_tool_call_mode SQL）"
+    )
+
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
+def test_image_understanding_config_revision_exists() -> None:
+    """TSK-194：0014 的直接后继 revision 迁移图片理解模式与 8 项预算。
+
+    同 revision 内完成：chat 表新增 image_understanding_mode（默认
+    delegated）与 8 项预算列 + 跨字段 CHECK；按旧 bool 双分支数据迁移
+    （UPDATE ... FROM komari_memory_config）；随后删除 memory 旧开关与
+    预算列；downgrade 显式回退。本用例是静态守卫，真实语义由
+    ``test_image_understanding_mode_migration.py`` 的隔离库用例验证。
+    """
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0014"]
+    assert len(children) == 1, f"0014 的直接后继 revision 必须唯一: {children}"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+
+    # 新列与默认值
+    assert re.search(r"\bimage_understanding_mode\b", normalized, re.IGNORECASE), (
+        "迁移必须新增 image_understanding_mode 列"
+    )
+    assert re.search(r"DEFAULT\s*'delegated'", normalized, re.IGNORECASE), (
+        "迁移必须为非空 image_understanding_mode 声明默认值 'delegated'"
+    )
+    for column in (
+        "vision_image_download_max_count",
+        "vision_image_download_max_bytes",
+        "vision_image_download_total_max_bytes",
+        "vision_image_download_max_pixels",
+        "vision_image_download_concurrency",
+        "vision_image_download_connect_timeout_seconds",
+        "vision_image_download_read_timeout_seconds",
+        "vision_image_download_total_timeout_seconds",
+    ):
+        assert re.search(rf"\b{re.escape(column)}\b", normalized, re.IGNORECASE), (
+            f"迁移必须新增预算列: {column}"
+        )
+
+    # 跨字段 CHECK（两个图片预算约束）
+    assert "CK_KOMARI_CHAT_CONFIG_IMAGE_BUDGET_BYTES" in normalized
+    assert "CK_KOMARI_CHAT_CONFIG_IMAGE_BUDGET_TIMEOUT" in normalized
+
+    # 数据迁移：旧 bool 双分支来自 komari_memory_config 单行
+    # （f-string 占位符在源文本中以 {_TABLE} / {_MEMORY_TABLE} 形式保留）
+    assert "UPDATE {_TABLE}" in normalized
+    assert "FROM {_MEMORY_TABLE}" in normalized
+    assert re.search(r"CASE WHEN M\.VISION_TOOL_ENABLED", normalized)
+
+    # 删除 memory 旧开关与预算列
+    for column in (
+        "vision_tool_enabled",
+        "vision_image_download_max_count",
+        "vision_image_download_max_bytes",
+        "vision_image_download_total_max_bytes",
+        "vision_image_download_max_pixels",
+        "vision_image_download_concurrency",
+        "vision_image_download_connect_timeout_seconds",
+        "vision_image_download_read_timeout_seconds",
+        "vision_image_download_total_timeout_seconds",
+    ):
+        assert _has_explicit_drop_column(revision_sql, column), (
+            f"迁移 downgrade/upgrade 必须处理 memory 旧列: {column}"
+        )
+
+    assert "DROP TABLE komari_memory_config" not in normalized
+    assert "DROP TABLE komari_chat_config" not in normalized
+    assert "FROM KOMARI_BOT" not in normalized
+    assert "IMPORT KOMARI_BOT" not in normalized
+
+
+
+
+
+def _has_explicit_cross_field_check(revision_sql: str) -> bool:
+    """识别显式跨字段 CHECK 声明，不锁定 SQL 字符串形态。
+
+    接受 Alembic ``op.create_check_constraint``、SQLModel/SQLAlchemy
+    ``CheckConstraint`` 或 raw / ``op.execute`` SQL 中的 ``CHECK (...)``，
+    只要同一声明同时引用三项预算列即认可；不校验默认值文本或约束命名。
+    真实约束语义由 PostgreSQL 隔离库用例验证。
+    """
+    budget_columns = (
+        "agent_max_tool_calls_per_round",
+        "agent_max_total_tool_calls",
+        "agent_max_rounds",
+    )
+
+    def _mentions_all(text: str) -> bool:
+        return all(
+            re.search(rf"\b{re.escape(column)}\b", text) for column in budget_columns
+        )
+
+    def _paren_body(position: int) -> str:
+        """从 ``(`` 之后的 position 扫描平衡括号，返回括号体。"""
+        depth = 1
+        index = position
+        while index < len(revision_sql) and depth:
+            if revision_sql[index] == "(":
+                depth += 1
+            elif revision_sql[index] == ")":
+                depth -= 1
+            index += 1
+        return revision_sql[position : index - 1]
+
+    # raw SQL / op.execute 字符串内的 CHECK (...)
+    for match in re.finditer(r"\bCHECK\s*\(", revision_sql, re.IGNORECASE):
+        if _mentions_all(_paren_body(match.end())):
+            return True
+
+    # Alembic op.create_check_constraint(...) 或 SQLModel CheckConstraint(...)
+    for match in re.finditer(
+        r"\b(?:op\.create_check_constraint|CheckConstraint)\s*\(",
+        revision_sql,
+    ):
+        if _mentions_all(_paren_body(match.end())):
+            return True
+
+    return False
+
+
+def _has_explicit_drop_column(revision_sql: str, column: str) -> bool:
+    """识别项目允许的显式列删除表达：``op.drop_column`` 或自包含 SQL。
+
+    真实删除行为由 PostgreSQL 集成测试（``test_prompt_seed_``
+    ``bootstrap_integration.py``）确认；静态守卫只要求显式表达存在，
+    不锁死 raw SQL 实现。
+    """
+    alembic_drop = re.search(
+        rf"op\.drop_column\(\s*(['\"])[^'\"]*\1\s*,\s*(['\"])"
+        rf"{re.escape(column)}\2",
+        revision_sql,
+        re.IGNORECASE,
+    )
+    raw_sql_drop = re.search(
+        rf"DROP\s+COLUMN(?:\s+IF\s+EXISTS)?\s+{re.escape(column)}\b",
+        revision_sql,
+        re.IGNORECASE,
+    )
+    return bool(alembic_drop or raw_sql_drop)

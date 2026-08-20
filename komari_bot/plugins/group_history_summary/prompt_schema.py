@@ -2,8 +2,9 @@
 
 本模块无副作用：只依赖 common 层 typed_config，不导入业务插件包、不访问
 数据库，可被 Alembic 迁移环境与 ``typed_config`` 安全加载器直接加载。
-``DEFAULTS`` 是该资源全部 Prompt 字段默认值的唯一定义来源，运行时模板
-加载器（``prompt_template.py``）与管理 API 均从这里导入。
+TSK-191：完整 Prompt 初始正文由版本化初始数据（``seed_bootstrap`` +
+``initial_data`` 资产）写入 PostgreSQL，本模块不再定义/导出 Python 长文本
+``DEFAULTS``；字段名即强类型 Schema 的自解释契约。
 """
 
 from __future__ import annotations
@@ -16,25 +17,6 @@ from komari_bot.config.typed_config import Field, TypedPromptModel
 
 RESOURCE_ID = "group_history_summary"
 DISPLAY_NAME = "Group History Summary Prompt"
-
-# 默认模板值（PG 配置缺失或读取失败时使用）
-DEFAULTS: dict[str, str] = {
-    "system_prompt": "你是一个专业的群聊总结助手，只基于聊天记录归纳事实。",
-    "planning_system_prompt": (
-        "你是一个群聊消息检索助手。"
-        "你的任务是根据用户的总结请求，决定需要获取哪些聊天记录。"
-        "你可以调用工具来获取群聊消息，请根据用户需求选择合适的工具和参数。"
-        "获取到足够消息后，简短说明规划完成即可。"
-    ),
-    "memory_ack": "已收到聊天记录，我先梳理重点。",
-    "memory_ack_role": "assistant",
-    "output_instruction": (
-        "请仅输出总结正文，使用 <content></content> 包裹。"
-        "正文控制在 120-220 字，尽量清晰、紧凑、客观。"
-    ),
-    "cot_prefix": "<think>\n我先按时间梳理讨论脉络，再输出总结。\n",
-    "cot_prefix_role": "assistant",
-}
 
 
 class GroupHistorySummaryPromptSchema(TypedPromptModel, table=True):

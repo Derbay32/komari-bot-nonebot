@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from nonebot import logger
 
-_REQUIRED_FIXED_KEYS = ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION")
+from ._fixed_scene_rules import find_missing_required_fixed_scene_keys
 
 if TYPE_CHECKING:
     from ..repositories.scene_repository import SceneRepository
@@ -83,11 +83,8 @@ class SceneRuntimeService:
                     )
                 )
 
-        missing = [
-            key
-            for key in _REQUIRED_FIXED_KEYS
-            if key not in fixed_candidates or key not in fixed_embeddings
-        ]
+        available_fixed_keys = fixed_candidates.keys() & fixed_embeddings.keys()
+        missing = find_missing_required_fixed_scene_keys(available_fixed_keys)
         if missing:
             msg = f"active set 缺少固定候选或 embedding: {missing}"
             raise RuntimeError(msg)

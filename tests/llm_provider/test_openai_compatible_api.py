@@ -584,7 +584,12 @@ def test_allowed_extra_params_cannot_replace_final_wire_messages(
     }
 
 
-def test_thinking_mode_suppresses_tool_choice(monkeypatch: Any) -> None:
+def test_thinking_mode_passes_tool_choice_through(monkeypatch: Any) -> None:
+    """TSK-193：provider 不再按思考模式隐式抑制调用方 tool_choice。
+
+    旧行为：thinking_mode=True 时跳过 tool_choice 注入；
+    新契约：调用方显式声明的 tool_choice 必须原样到达 Chat wire 请求。
+    """
     class _FakeCompletions:
         def __init__(self) -> None:
             self.last_kwargs: dict[str, Any] | None = None
@@ -623,7 +628,7 @@ def test_thinking_mode_suppresses_tool_choice(monkeypatch: Any) -> None:
 
         request_data = fake_client.chat.completions.last_kwargs
         assert request_data is not None
-        assert "tool_choice" not in request_data
+        assert request_data.get("tool_choice") == "required"
         assert request_data["reasoning_effort"] == "high"
 
     asyncio.run(_run())
@@ -760,7 +765,8 @@ def test_generate_text_debug_log_uses_statistics(monkeypatch: Any) -> None:
     assert "tools_count: 1" in request_log
     assert "reasoning_effort: medium" in request_log
     assert "thinking_disabled: False" in request_log
-    assert "suppress_tool_choice: True" in request_log
+    # 已删除的隐式抑制策略不得在诊断日志中残留旧字段名（TSK-193 修订）
+    assert "suppress_tool_choice" not in request_log
     assert "has_response_format: True" in request_log
     assert "绝密 prompt 原文" not in request_log
     assert "绝密 system 原文" not in request_log
@@ -813,7 +819,8 @@ def test_generate_messages_debug_log_includes_request_flags(monkeypatch: Any) ->
     assert "has_parallel_tool_calls: True" in request_log
     assert "frequency_penalty: 0.1" in request_log
     assert "thinking_disabled: False" in request_log
-    assert "suppress_tool_choice: False" in request_log
+    # 已删除的隐式抑制策略不得在诊断日志中残留旧字段名（TSK-193 修订）
+    assert "suppress_tool_choice" not in request_log
 
 
 # ======================== 统一 usage 提取测试 ========================

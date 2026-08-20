@@ -170,12 +170,16 @@ async def _run_profile_agent_locked(
             "request_api": config.llm_request_api_summary,
             "stream_enabled": config.llm_stream_enabled_summary,
             "tools": PROFILE_AGENT_TOOLS,
-            "tool_choice": "auto",
             "parallel_tool_calls": False,
             "thinking_mode": config.llm_thinking_mode_summary,
             "reasoning_effort": config.llm_reasoning_effort_summary,
             "request_round_index": round_index + 1,
         }
+        # TSK-193：provider 不再按思考模式隐式删除 tool_choice；
+        # 画像 Agent 显式声明兼容策略——思考模式省略 tool_choice
+        # （保持既有行为），非思考模式保留 auto 选择。
+        if not config.llm_thinking_mode_summary:
+            request_data["tool_choice"] = "auto"
         try:
             completion = await llm_provider.generate_messages_completion(
                 **request_data,

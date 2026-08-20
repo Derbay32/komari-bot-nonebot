@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import sys
 import types
 from contextlib import asynccontextmanager
@@ -29,6 +30,9 @@ message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+image_reading_session_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_reading_session"
+)
 proactive_reservation_module = import_module(
     "komari_bot.plugins.komari_chat.services.proactive_reservation"
 )
@@ -92,6 +96,48 @@ def _patch_config(
             bot_aliases=["小鞠", "小鞠知花", "komari"],
         ),
     )
+
+
+def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
+    """合并 memory 字段与 TSK-192 预算字段的配置替身。
+
+    普通/debug 入口任务开始读取同一执行预算快照：stub 同时承载
+    ``get_config`` 与 ``get_memory_config`` 两个名字的字段。
+    """
+    values: dict[str, object] = {
+        "proactive_enabled": False,
+        "context_messages_limit": 10,
+        "context_max_utf8_bytes": 24_000,
+        "context_max_estimated_tokens": 6_000,
+        "summary_max_buffer_size": 500,
+        "memory_search_limit": 3,
+        "bot_nickname": "小鞠",
+        "memory_agent_lock_timeout_seconds": 5,
+        "global_interaction_enabled": True,
+        "global_interaction_trigger_size": 20,
+        "face_reaction_enabled": False,
+        "face_reaction_id": "76",
+        "image_understanding_mode": "delegated",
+        # TSK-194：图片下载预算 8 项字段（与配置 Schema/迁移 0015 默认值一致；
+        # ImageDownloadPolicy.from_config 不再对缺字段回退隐藏默认，fixture 必须显式提供）
+        "vision_image_download_max_count": 4,
+        "vision_image_download_max_bytes": 8 * 1024 * 1024,
+        "vision_image_download_total_max_bytes": 20 * 1024 * 1024,
+        "vision_image_download_max_pixels": 40_000_000,
+        "vision_image_download_concurrency": 2,
+        "vision_image_download_connect_timeout_seconds": 5.0,
+        "vision_image_download_read_timeout_seconds": 30.0,
+        "vision_image_download_total_timeout_seconds": 45.0,
+        "error_notify_enabled": False,
+        "agent_max_rounds": 10,
+        "agent_max_tool_calls_per_round": 4,
+        "agent_max_total_tool_calls": 20,
+        # TSK-193：工具调用约束模式（与配置 Schema 默认值一致；
+        # from_config 不再对缺字段回退隐藏默认，fixture 必须显式提供）
+        "agent_tool_call_mode": "required",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def test_resolve_trigger_message_uses_nonebot_to_me(
@@ -465,7 +511,7 @@ def test_attempt_reply_only_rewrites_current_message(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -552,7 +598,10 @@ def test_attempt_reply_only_rewrites_current_message(
     assert generate_with_tools_kwargs["caller_user_id"] == "user-1"
     assert generate_with_tools_kwargs["caller_group_id"] == "group-1"
     assert generate_with_tools_kwargs["caller_is_superuser"] is False
-    assert generate_with_tools_kwargs["max_tool_rounds"] == 5
+    assert generate_with_tools_kwargs["tools"] is not None
+    assert "max_tool_rounds" not in generate_with_tools_kwargs, (
+        "普通入口不得传递入口专属轮次封顶（TSK-192）"
+    )
     injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
     assert injected_favorability.favorability == 0
     assert generate_with_tools_kwargs["max_favorability_delta"] == 5
@@ -652,7 +701,7 @@ def _wire_reaction_sent_case(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -663,7 +712,7 @@ def _wire_reaction_sent_case(
             global_interaction_trigger_size=20,
             face_reaction_enabled=face_reaction_enabled,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -1145,14 +1194,14 @@ def test_generate_debug_reply_skips_all_side_effects(
     # 注入必要的全局配置
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1235,14 +1284,14 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     )
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1256,6 +1305,7 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
         nonlocal collector_from_generate, trace_id_from_generate
         collector_from_generate = kwargs.get("collector")
         trace_id_from_generate = cast("str | None", kwargs.get("request_trace_id"))
+        assert "max_tool_rounds" not in kwargs, "debug 入口不得传递入口专属轮次封顶（TSK-192）"
         return llm_service_module.ReplyResult(
             content="带trace的回复",
             interaction_history={"event": "trace", "result": "trace回复", "emotion": "平静"},
@@ -1316,14 +1366,14 @@ def test_generate_debug_reply_with_images_and_reply_context(
     )
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             summary_max_buffer_size=500,
             memory_search_limit=3,
             bot_nickname="小鞠",
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1407,6 +1457,138 @@ def test_generate_debug_reply_with_images_and_reply_context(
     ]
 
 
+def test_generate_debug_reply_with_image_failure_summary_never_notifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-196 复审：debug 干跑在 core 返回带 partial image_failure_summary
+    时，只把安全结果保留在 collector/output，绝不调用通知边界或发送任何
+    群/私聊消息（不依赖“代码没走 process_message”的注释来保证）。"""
+    redis = _FakeRedisForDebug()
+    memory = _FakeMemoryForDebug()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.memory = memory
+    handler.query_rewrite = _FakeQueryRewrite()
+    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kwargs: False,
+            is_fetch_available=lambda **_kwargs: False,
+        ),
+    )
+    _patch_both_configs(
+        monkeypatch,
+        lambda: _chat_memory_stub(
+            summary_max_buffer_size=500,
+            memory_search_limit=3,
+            bot_nickname="小鞠",
+            memory_agent_lock_timeout_seconds=5,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+            image_understanding_mode="native",
+        ),
+    )
+
+    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
+        return [{"role": "user", "content": "test"}]
+
+    summary = image_reading_session_module.ImageFailureSummary(
+        mode="native",
+        all_images_unavailable=False,
+        total_images=2,
+        attempted_images=2,
+        failed_images=1,
+        error_types=("image_unavailable",),
+        stages=("download",),
+    )
+
+    async def _fake_generate(**_kwargs: object) -> object:
+        return llm_service_module.ReplyResult(
+            content="debug附图回复",
+            interaction_history={"event": "附图", "result": "回复", "emotion": "平静"},
+            favorability_delta=0,
+            favorability_reason="无变化",
+            image_failure_summary=summary,
+        )
+
+    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
+    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+
+    async def _download_images(
+        urls: list[str],
+        _policy: object,
+    ) -> list[str | None]:
+        del urls
+        return [None, "base64:https://example.com/ok.png"]
+
+    monkeypatch.setattr(
+        message_handler_module,
+        "download_images_as_base64_aligned",
+        _download_images,
+    )
+
+    embedding_package_name = "komari_bot.plugins.embedding_provider"
+    embedding_fake = types.ModuleType(embedding_package_name)
+    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", embedding_fake, raising=False
+    )
+
+    class _RecordingBot:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        async def call_api(self, api: str, **kwargs: object) -> object:
+            self.calls.append((api, kwargs))
+            return {"message_id": 1}
+
+        async def send_private_msg(self, **kwargs: object) -> None:
+            self.calls.append(("send_private_msg", kwargs))
+
+    bot = _RecordingBot()
+
+    def _forbidden_notifier(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("debug 路径禁止构造通知器")  # noqa: TRY003
+
+    monkeypatch.setattr(
+        message_handler_module, "GroupTaskFailureNotifier", _forbidden_notifier
+    )
+
+    async def _forbidden_notify(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("debug 路径禁止调用汇总")  # noqa: TRY003
+
+    monkeypatch.setattr(handler, "_notify_image_failure_summary", _forbidden_notify)
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-img-fail",
+            user_id="user-debug-img",
+            user_nickname="图片用户",
+            content="看图",
+            image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+            reply_context=None,
+            _bot=bot,  # type: ignore[arg-type]
+        )
+    )
+
+    assert result.reply == "debug附图回复"
+    # 零通知：不构造 notifier、不调汇总、bot 零群/私聊调用
+    assert bot.calls == []
+    # 安全结果保留在 collector/output：output 投影含 mode=native 摘要且无 URL
+    record = result.collector.build_record()
+    rendered = json.dumps(record, ensure_ascii=False, default=str)
+    assert "native" in rendered
+    assert "image_unavailable" in rendered
+    assert "example.com" not in rendered
+    assert "base64" not in rendered
+
+
 def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1439,7 +1621,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     )
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -1448,7 +1630,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
         ),
     )
 
@@ -1816,7 +1998,7 @@ def test_reaction_scheduled_before_generate_core(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -1827,7 +2009,7 @@ def test_reaction_scheduled_before_generate_core(
             global_interaction_trigger_size=20,
             face_reaction_enabled=True,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -1919,7 +2101,7 @@ def test_reaction_not_scheduled_when_disabled(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -1930,7 +2112,7 @@ def test_reaction_not_scheduled_when_disabled(
             global_interaction_trigger_size=20,
             face_reaction_enabled=False,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -2020,7 +2202,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -2031,7 +2213,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
             global_interaction_trigger_size=20,
             face_reaction_enabled=True,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -2119,7 +2301,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -2130,7 +2312,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
             global_interaction_trigger_size=20,
             face_reaction_enabled=True,
             face_reaction_id="76",
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )
@@ -2481,7 +2663,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
 
     _patch_both_configs(
         monkeypatch,
-        lambda: SimpleNamespace(
+        lambda: _chat_memory_stub(
             proactive_enabled=False,
             context_messages_limit=10,
             summary_max_buffer_size=500,
@@ -2490,7 +2672,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
             memory_agent_lock_timeout_seconds=5,
             global_interaction_enabled=True,
             global_interaction_trigger_size=20,
-            vision_tool_enabled=False,
+            image_understanding_mode="native",
             error_notify_enabled=False,
         ),
     )

@@ -353,7 +353,7 @@ async def test_cutover_aborts_and_rolls_back_when_backfill_is_missing() -> None:
     try:
         await _insert_legacy_prepared(connection, fulfillment_id)
 
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
         assert "missing_backfill_count=1" in output
@@ -396,7 +396,7 @@ async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
         await _insert_legacy_prepared(connection, fulfillment_id)
         await _insert_parent_for_legacy(connection, fulfillment_id)
 
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
         assert "commitment_mismatch_count=1" in output
@@ -441,7 +441,7 @@ async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -
         await _insert_legacy_prepared(connection, fulfillment_id)
         await _insert_parent_children_for_legacy(connection, fulfillment_id)
 
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode == 0, result.stderr
 
         assert not await _table_exists(connection, "komari_chat_reply_commit_outbox")

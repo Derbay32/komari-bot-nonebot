@@ -10,46 +10,30 @@ import pytest
 from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
     SceneRuntimeService,
 )
+from tests.komari_decision.required_fixed_scene_keys import REQUIRED_FIXED_SCENE_KEYS
+
+_ITEM_LABELS = {
+    "NOISE": "noise",
+    "MEANINGFUL": "meaningful",
+    "CALL_DIRECT": "direct",
+    "CALL_MENTION": "mention",
+}
 
 
 def _build_items(tag: str) -> list[dict]:
-    return [
+    items = [
         {
-            "scene_key": "NOISE",
+            "scene_key": scene_key,
             "scene_type": "fixed",
-            "content_text": f"{tag} noise",
-            "embedding": [0.1, 0.1],
-            "order_index": 0,
+            "content_text": f"{tag} {_ITEM_LABELS[scene_key]}",
+            "embedding": [0.1 * (index + 1), 0.1 * (index + 1)],
+            "order_index": index,
             "status": "READY",
             "enabled": True,
-        },
-        {
-            "scene_key": "MEANINGFUL",
-            "scene_type": "fixed",
-            "content_text": f"{tag} meaningful",
-            "embedding": [0.2, 0.2],
-            "order_index": 1,
-            "status": "READY",
-            "enabled": True,
-        },
-        {
-            "scene_key": "CALL_DIRECT",
-            "scene_type": "fixed",
-            "content_text": f"{tag} direct",
-            "embedding": [0.3, 0.3],
-            "order_index": 2,
-            "status": "READY",
-            "enabled": True,
-        },
-        {
-            "scene_key": "CALL_MENTION",
-            "scene_type": "fixed",
-            "content_text": f"{tag} mention",
-            "embedding": [0.4, 0.4],
-            "order_index": 3,
-            "status": "READY",
-            "enabled": True,
-        },
+        }
+        for index, scene_key in enumerate(REQUIRED_FIXED_SCENE_KEYS)
+    ]
+    items.append(
         {
             "scene_key": f"SCENE_{tag.upper()}",
             "scene_type": "general",
@@ -58,8 +42,9 @@ def _build_items(tag: str) -> list[dict]:
             "order_index": 4,
             "status": "READY",
             "enabled": True,
-        },
-    ]
+        }
+    )
+    return items
 
 
 class FakeSceneRepository:
@@ -124,10 +109,38 @@ def test_runtime_load_and_switch() -> None:
     assert changed_after is False
 
 
-def test_runtime_load_keeps_strict_fixed_embedding_validation() -> None:
+@pytest.mark.parametrize(
+    "scene_key",
+    REQUIRED_FIXED_SCENE_KEYS,
+)
+def test_runtime_rejects_missing_required_fixed_candidate(scene_key: str) -> None:
     repository = FakeSceneRepository()
-    repository.items[1][0]["embedding"] = None
+    repository.items[1] = [
+        item for item in repository.items[1] if item["scene_key"] != scene_key
+    ]
     service = SceneRuntimeService(cast("Any", repository))
 
-    with pytest.raises(RuntimeError, match="active set 缺少固定候选或 embedding"):
+    with pytest.raises(RuntimeError) as exc_info:
         asyncio.run(service.load_active_set_cache())
+
+    assert scene_key in str(exc_info.value)
+    assert "固定候选或 embedding" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "scene_key",
+    REQUIRED_FIXED_SCENE_KEYS,
+)
+def test_runtime_rejects_missing_required_fixed_embedding(scene_key: str) -> None:
+    repository = FakeSceneRepository()
+    item = next(
+        item for item in repository.items[1] if item["scene_key"] == scene_key
+    )
+    item["embedding"] = None
+    service = SceneRuntimeService(cast("Any", repository))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(service.load_active_set_cache())
+
+    assert scene_key in str(exc_info.value)
+    assert "固定候选或 embedding" in str(exc_info.value)

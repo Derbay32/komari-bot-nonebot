@@ -22,7 +22,7 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | LLM | OpenAI 兼容接口 | DeepSeek / Gemini 双后端 |
 | Embedding | OpenAI 兼容 API（远程） | 默认 `BAAI/bge-small-zh-v1.5` |
 | 部署 | Docker + Docker Compose | Gunicorn + Uvicorn；prestart 自动 `upgrade head` |
-| CI/CD | Forgejo CI → Codeberg 容器注册表 | 发布 tag 自动构建；migration-check 守卫 schema 漂移 |
+| CI/CD | GitHub Actions → GitHub Container Registry | 所有 PR 执行静态、无服务、PostgreSQL/Redis 集成与迁移验收；发布 tag 自动构建镜像 |
 | Lint | Ruff (py313) + Pyright `standard` | 零容忍类型错误 |
 
 ## 目录结构
@@ -174,7 +174,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 ### 1. 配置管理 (`config_manager`)
 
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（15 张，迁移 0002 建表、0004 为 komari_chat 补充）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
-- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
+- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`，从 `komari_memory_config` 迁出后不保留 alias / 双读 / fallback；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：`komari_plugin_configs` 在 v2.0.0 保留（仅承载存量数据，运行时不读写），`DROP` 由后续版本的 autogenerate revision 执行
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
@@ -377,13 +377,15 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动历史、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
 - 底层依赖未初始化时抛出 `RuntimeError`（可展示的错误信息）
 
-视觉服务（`vision_service.py`）：
-- 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`
-- 保留原 prompt、模型参数、并发信号量、空结果和错误文本语义
-- 视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace
-- 图片下载器对当前消息和引用消息应用同一批次预算：默认最多 4 张、单图 8 MiB、总计 20 MiB、并发 2、总时限 45 秒；配置更新即时生效
+视觉服务与图片理解（`vision_service.py` / `image_understanding.py`，TSK-194/ADR-0010）：
+- 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`；视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace，最终请求携带任务起点快照冻结的 `thinking_mode` / `reasoning_effort`，任务内不重读
+- 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
+- `native`：图片经安全下载与校验后作为多模态输入直接交给聊天主模型（chat 槽位），不声明 / 不调用 `read_image` 工具；聊天模型对带图请求报错或拒图时本任务明确失败，不自动降级、不切 delegated、不调用视觉服务
+- `delegated`：只向主回复 Agent 暴露稳定图片索引与 `read_image` 工具，主工具循环恒使用聊天模型与 chat 槽位；视觉子调用（`vision_service`）才使用独立视觉模型与 vision 槽位（含 `vision_thinking_mode` / `vision_reasoning_effort`）
+- TSK-195：delegated 任务起点零预下载，`ImageReadingSession`（任务级图片会话）持有稳定引用（引用消息在前、当前消息在后）、按索引成功/失败缓存与并发单飞（取消任意 waiter 不取消共享下载/视觉任务，任务完成结果仍缓存）、字节账本/并发信号量/累计总时限（跨多轮不重建；总时限为下载活动区间的并集耗时，并发重叠只计一次、空闲不消耗不重置，`download()` 与 `download_many()` 共用同一账本）、全失败安全摘要（`all_images_unavailable` + 归一化错误类型，TSK-196 消费）；只有首次 `read_image(image_index)` 才经安全下载器懒下载；原始 URL 只存在于会话内部私有映射→安全下载器边界（公开引用只含稳定 index/origin/source_label），不进主模型消息、工具结果、普通日志与 Agent Run/debug 投影；任务结束 `close()` 阻止新读取、取消并等待在途读取后再释放下载连接；视觉描述经既有 `UntrustedContext`（`source_type=vision`）回流；主 prompt 只含稳定索引/来源/范围（无 URL/base64）
 - 域名必须由 aiohttp 建连阶段的受控 resolver 解析并校验，禁止恢复“预解析后再由客户端重新解析”的 DNS 重绑定窗口；每一跳重定向都执行同样校验
 - 图片 MIME 必须来自 Pillow 对真实文件的识别与解码结果，禁止信任响应 `Content-Type` 或 URL 后缀；仅接受 JPEG、PNG、GIF、WebP，并执行累计像素限制
+- TSK-196：图片理解失败统一汇总与安全终止。delegated 部分失败（非全部可用索引均已尝试且失败）保留结构化 `read_image` 失败工具结果并允许 `final_response`，成功任务把聚合摘要附加到 `ReplyResult.image_failure_summary`；全部可用索引均已尝试且失败（含同轮 `read_image`+`final_response`、以及最后允许轮次仅 `read_image` 无 `final_response`）在每次 `read_image` 的 ToolExecutionTrace 写入后立即以 `ImageUnderstandingFailureError`（只携带 `ImageFailureSummary`，`str()` 仅含模式）终止（绝不落入 MaxRounds RuntimeError），最后一次失败工具 Trace 保留；同轮 `final_response` 排在 `read_image` 之前时 `final_response` 成功且后续 `read_image` 不执行（不预判失败）。native 全部下载失败在主 LLM 前终止；主 provider 多模态调用失败在 llm_service 的 `_call_llm_completion` except seam 收敛为窄 marker `NativeMultimodalRequestError`（离开 except 后 raise，`cause/context=None`，不携带原异常 cause/正文，Agent Run LLM trace 只记录归一化异常类型），message_handler 只捕获该 marker 并包装为 `mode=native` 摘要（不切 delegated），其他异常（MaxRounds/工具预算/协议校验/内部）即便 native 有图也原样传播；provider 整体失败时 `failed_count` 恒为 `total_images`（部分下载失败 + provider 失败时 error_types/stages 同时含 download+vision）；部分下载失败成功任务同样附带摘要；无图片的普通 LLM 错误原样传播。`_generate_reply_core` 对所有预期图片失败（native 全下载失败 / native provider 失败 / delegated 全部不可用）统一汇聚到单点安全抛出：先保存安全 `ImageFailureSummary`（delegated 原异常与 native marker 都在 except 内只保存摘要、不 raise），离开 except/finally 后抛新 `ImageUnderstandingFailureError`（`cause/context=None`，异常链彻底断开，不残留原 provider 异常对象）；抛前显式清空该 frame 的图片敏感 traceback locals（函数参数 `image_urls`/`reply_context`、`reply_sources`/`current_sources`/`combined_sources`、`aligned_images`/`reply_image_urls`/`base64_image_urls`、含 image_url 部件的 `prompt_messages`、已 close 后置 None 的 `image_session`、可能持 raw input_data 的 `collector`），只重绑本地名字不触碰调用者对象，最终异常 traceback 的 komari_chat 帧递归投影不含原 URL/base64/视觉描述（不依赖 Sentry sanitizer 后处理）；`generate_debug_reply` 图片失败重抛前在 collector 安全 finalize 与普通安全日志后同样清空其帧的 `image_urls`/`reply_context`/`refetched_context`/`collector` 局部再 re-raise，普通非图片 debug 错误语义不变。成功路径 `process_message` 经共享 `GroupTaskFailureNotifier` 最多提交一次 SUPERUSER 图片汇总卡（`group_text=None` 无群消息，`image_failure_reason_code` 稳定去重键，`error_notify_enabled` 关闭只静默私聊），失败路径 `report_reply_failure` 对图片失败只发一张汇总卡（`reaction_sent` → 群内固定错误文本），debug 干跑绝不通知（只把安全结果保留在 collector/output）；`ImageFailureSummary` 只在 message_handler 通知边界经本地窄 mapper 投影为 onebot `ImageFailureDiagnostic`（构造时运行时校验并确定性去重排序，mode/stage/error type 白名单、failed_count 正整数），summary→diagnostic 映射失败 fail-closed：静默 SUPERUSER 图片卡且不降级为可能泄漏的 generic 私聊摘要，但仍经共享 notifier 投递 `group_text`（reaction_sent 分流），不吞掉既有群内固定道歉；图片卡只渲染群/trace/模式/失败阶段/失败数量/错误类型（不含任务），无 URL/base64/正文/视觉描述
 
 ### 7. 群聊总结执行服务 (`group_history_summary`)
 
