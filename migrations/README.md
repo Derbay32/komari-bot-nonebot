@@ -133,28 +133,34 @@ Schema、管理 API 与数据库中一并消失。
   预算原样复制到 chat，随后从 `komari_memory_config` 删除旧开关与 8 项预算列
   （不留 alias / 双读 / fallback）。
 
-新列的正文与初始数据由统一版本化播种（`seed_bootstrap`）写入，0012–0015 迁移只
-建列、不承载 Prompt 内容；升级后未播种的应用无法通过冷启动校验（fail fast）。
+0012–0015 只做结构迁移，不写入 Prompt 或场景正文：新增/删除列并搬运旧配置值
+（0012 删除旧输出协议列，0015 把旧图片配置值迁入 chat 并删除 memory 旧列）。
+Prompt 与场景正文由统一版本化播种（`seed_bootstrap`）写入；升级后未播种的应用
+无法通过冷启动校验（fail fast）。
 
 ### 升级步骤（全新库与旧库通用）
 
 全新空库执行完整 `0001 → 0015` 版本链；已在 `0011` 或更早 revision 的旧库沿既有
 版本链顺序升级，不手工 stamp 到 `0011`，也不跳过中间迁移。
 
-1. 备份数据库：运行 `pg_dump` 全量导出。
-   检查：备份文件已生成、大小非零且可恢复读取（`pg_dump` 对应恢复工具能列出或读取
-   内容）。备份是唯一保险，`0012` 起无完整降级路径。
-2. 升级到 `head`：运行 `poetry run python -m komari_bot.db.orm_bootstrap upgrade head`。
-   检查：命令退出码为 `0`，且 `alembic_version` 为 `0015`。
+1. 备份数据库：运行
+   `pg_dump --format=custom --file=komari_bot_before_0012.dump "postgresql://user:pass@host:5432/komari_bot"`
+   全量导出。检查：运行
+   `pg_restore --list komari_bot_before_0012.dump`，能列出备份内容且文件大小非零。
+   备份是唯一保险，`0012` 起无完整降级路径。
+2. 升级到 `head`：运行
+   `poetry run python -m komari_bot.db.orm_bootstrap upgrade head`。
+   检查：运行 `poetry run python -m komari_bot.db.orm_bootstrap current`，
+   输出 `0015 (head)`。
    回退：失败时该迁移事务已回滚、版本停留原样，修复后重跑本步骤。
 3. 播种初始数据：运行 `poetry run python -m komari_bot.db.seed_bootstrap`。
    检查：命令退出码为 `0`，stdout 报告包含场景新增/总计与 Prompt 新建行/补齐字段
    计数且无错误。播种只新建缺失场景与三个 Prompt 资源单行、只补齐空字段，绝不覆盖
    非空自定义值、不删除管理员场景；旧 `output_instruction` 自定义内容不并入任何字段。
    回退：失败时数据库未满足冷启动校验，恢复备份或修复后重跑本步骤。
-4. 校验模型元数据零漂移：运行 `poetry run python -m komari_bot.db.orm_bootstrap check`。
-   检查：命令退出码为 `0`，输出无 metadata diff（`No new upgrade operations
-   detected.`）。
+4. 校验模型元数据零漂移：运行
+   `poetry run python -m komari_bot.db.orm_bootstrap check`。
+   检查：命令退出码为 `0`，且未生成或报告任何新的升级操作（无 metadata diff）。
    回退：发现漂移时先按原版本升级流程修复，再重跑本步骤。
 
 **边界**：任一步失败都应停止启动新版应用，先恢复备份或修复后再重跑；容器 prestart
