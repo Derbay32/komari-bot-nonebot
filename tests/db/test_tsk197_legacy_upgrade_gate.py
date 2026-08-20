@@ -8,9 +8,10 @@ Prompt（含 ``output_instruction`` 自定义值）+ 旧图片开关（
 
 - 旧聊天 Prompt 的 ``output_instruction`` 列被显式删除，7 个新行为列就位；
   被删除的自定义内容绝不并入任何新字段（TSK-190 契约）；
-- 旧图片开关按 bool 双分支精确迁移（false → ``native``）且 8 项预算原样
-  复制到 ``komari_chat_config``；memory 的 9 个旧图片列被删除（不留 alias /
-  双读 / fallback）；chat 存量 revision 不被迁移触碰；
+- 旧图片开关按 bool 双分支精确迁移（false → ``native``、true →
+  ``delegated``），两个分支都验证 8 项预算原样复制到 ``komari_chat_config``
+  且 memory 的 9 个旧图片列被删除（不留 alias / 双读 / fallback）；chat
+  存量 revision 不被迁移触碰；
 - 0013 预算列 / 0014 工具约束列 / 0015 图片列以数据库默认值补齐存量行
   （``agent_tool_call_mode`` = required、预算 = 10/4/20）；
 - 播种补齐新 Prompt 行为字段且只补空字段、绝不覆盖非空自定义值，重复播种
@@ -25,54 +26,39 @@ head。门控用户需要 CREATEDB 权限。无 ``KOMARI_TEST_POSTGRES_URL`` 或
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
-from urllib.parse import unquote, urlparse
 
 import asyncpg
 import pytest
-import yaml
 
-from komari_bot.db.seed_bootstrap import DEFAULT_SEED_FILE
 from tests.config.chat_prompt_field_contract import LEGACY_CHAT_COLUMNS
 from tests.config.prompt_field_contract import (
-    find_prompt_mapping,
     prompt_resource_field_names,
-    prompt_table_name,
 )
-from tests.db.test_agent_budget_config_migration import (
-    _insert_row_without_budget_columns,
-    _run_bootstrap,
-    _same_database,
-    _scratch_url,
-)
-from tests.db.test_image_understanding_mode_migration import (
-    _BUDGET_COLUMNS,
-    _CHAT_LEGACY_REVISION,
-    _MEMORY_LEGACY_REVISION,
+from tests.db.tsk197_gate_support import (
+    BUDGET_COLUMNS,
+    CHAT_LEGACY_REVISION,
+    HEAD_REVISION,
     MEMORY_LEGACY_IMAGE_COLUMNS,
+    MEMORY_LEGACY_REVISION,
     MEMORY_VISION_VALUES,
-    _memory_row_value,
+    POSTGRES_URL,
+    SKIP_NO_POSTGRES,
+    SQLALCHEMY_URL,
+    asset_values,
+    drop_scratch_database,
+    fetch_prompt_row,
+    insert_row_without_budget_columns,
+    memory_row_value,
+    recreate_scratch_database,
+    run_bootstrap,
+    run_seed,
+    same_database,
+    scratch_url,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+pytestmark = [SKIP_NO_POSTGRES, pytest.mark.asyncio]
 
-POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
-SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-
-pytestmark = [
-    pytest.mark.skipif(
-        not POSTGRES_URL,
-        reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试",
-    ),
-    pytest.mark.asyncio,
-]
-
-HEAD_REVISION = "0015"
 LEGACY_REVISION = "0011"
 CHAT_TABLE = "komari_chat_config"
 MEMORY_TABLE = "komari_memory_config"
@@ -81,57 +67,13 @@ PROMPT_TABLE = "komari_prompt_komari_chat"
 #: 旧库自定义 output_instruction 值：升级后必须消失且不并入任何字段。
 CUSTOM_OUTPUT_MARKER = "CUSTOM-OUTPUT-MARKER-tsk197"
 
-
-def _parse_dsn(url: str) -> dict[str, Any]:
-    parsed = urlparse(url.replace("postgresql+asyncpg://", "postgresql://"))
-    return {
-        "host": parsed.hostname,
-        "port": parsed.port or 5432,
-        "database": parsed.path.lstrip("/"),
-        "user": unquote(parsed.username or ""),
-        "password": unquote(parsed.password or ""),
-    }
-
-
-def _run_seed(url: str) -> subprocess.CompletedProcess[str]:
-    """以公开 CLI 形式执行播种命令（与 prestart / 本地 / CI 同一命令）。"""
-    env = os.environ.copy()
-    env["SQLALCHEMY_DATABASE_URL"] = url
-    env["PYTHONPATH"] = str(PROJECT_ROOT)
-    return subprocess.run(
-        [sys.executable, "-m", "komari_bot.db.seed_bootstrap"],
-        cwd=PROJECT_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
-    )
-
-
-async def _recreate_scratch_database() -> dict[str, Any]:
-    """重建本文件的一次性隔离库并返回其 asyncpg 连接参数。"""
-    base = _parse_dsn(POSTGRES_URL)
-    scratch = {**base, "database": f"{base['database']}_tsk197legacy"}
-    connection = await asyncpg.connect(**base)
-    try:
-        name = str(scratch["database"]).replace('"', '""')
-        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await connection.execute(f'CREATE DATABASE "{name}"')
-    finally:
-        await connection.close()
-    return scratch
-
-
-async def _drop_scratch_database(database: str) -> None:
-    """删除一次性隔离库（finally 清理，重复删除安全）。"""
-    base = _parse_dsn(POSTGRES_URL)
-    connection = await asyncpg.connect(**base)
-    try:
-        name = database.replace('"', '""')
-        await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-    finally:
-        await connection.close()
+#: 旧图片开关 bool 双分支：false → native、true → delegated。隔离库后缀
+#: 每个分支唯一（参数化并行/重复运行安全）。
+LEGACY_VISION_BRANCHES = [
+    # (expected_image_mode, scratch_suffix)
+    ("native", "_tsk197legacy_native"),
+    ("delegated", "_tsk197legacy_delegated"),
+]
 
 
 async def _insert_legacy_prompt_row(connection: asyncpg.Connection) -> None:
@@ -188,7 +130,7 @@ async def _insert_legacy_memory_row(
         else:
             meta = live_columns[column]
             values.append(
-                _memory_row_value(
+                memory_row_value(
                     meta["data_type"],
                     nullable=meta["is_nullable"] == "YES",
                 )
@@ -199,7 +141,7 @@ async def _insert_legacy_memory_row(
     await connection.execute(
         f"INSERT INTO {MEMORY_TABLE} ({columns_sql}) VALUES ({placeholders})",
         1,
-        _MEMORY_LEGACY_REVISION,
+        MEMORY_LEGACY_REVISION,
         datetime.now(UTC),
         *values,
     )
@@ -214,56 +156,47 @@ async def _column_names(connection: asyncpg.Connection, table: str) -> set[str]:
     return {str(row["column_name"]) for row in rows}
 
 
-def _asset_values(resource_id: str) -> dict[str, str]:
-    """从默认 seed 资产读取指定 Prompt 资源的初始值（通用定位，不锁定布局）。"""
-    raw = yaml.safe_load(DEFAULT_SEED_FILE.read_text(encoding="utf-8")) or {}
-    mapping = find_prompt_mapping(raw, resource_id)
-    assert mapping is not None, f"默认 seed 资产缺少 {resource_id} Prompt 初始数据块"
-    return {str(field): str(value) for field, value in mapping.items()}
-
-
-async def _fetch_prompt_row(
-    connection: asyncpg.Connection,
-    resource_id: str,
-) -> dict[str, Any] | None:
-    table = prompt_table_name(resource_id)
-    row = await connection.fetchrow(f"SELECT * FROM {table} WHERE id = 1")
-    return None if row is None else dict(row)
-
-
-@pytest.mark.skipif(
-    not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试"
+@pytest.mark.parametrize(
+    ("expected_mode", "scratch_suffix"),
+    LEGACY_VISION_BRANCHES,
 )
-async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanly() -> None:
+async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanly(
+    expected_mode: str,
+    scratch_suffix: str,
+) -> None:
     """AC2/AC3：旧配置库一次性升级到 head，值按 spec 迁移且弃用列被删除。
 
     完整链路：upgrade 0011 → 构造旧 Prompt / 旧图片开关 + 自定义预算 /
     旧 chat 存量行 → upgrade head → 校验列与值迁移 → seed（只补空字段、
-    旧自定义 output 不并入任何字段、幂等）→ check 零漂移。
+    旧自定义 output 不并入任何字段、幂等）→ check 零漂移。bool 双分支
+    （false→native / true→delegated）在各自隔离库中分别验收。
     """
-    if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
+    vision_tool_enabled = expected_mode == "delegated"
+    if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
     chat_schema_fields = prompt_resource_field_names("komari_chat")
-    scratch = await _recreate_scratch_database()
-    scratch_url = _scratch_url(str(scratch["database"]))
+    scratch = await recreate_scratch_database(scratch_suffix)
+    db_url = scratch_url(str(scratch["database"]))
     try:
         # 停在旧 revision：按 0011 时代表结构构造旧配置库
-        result = _run_bootstrap(scratch_url, "upgrade", LEGACY_REVISION)
+        result = run_bootstrap(db_url, "upgrade", LEGACY_REVISION)
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)
         try:
             await _insert_legacy_prompt_row(connection)
-            await _insert_legacy_memory_row(connection, vision_tool_enabled=False)
-            await _insert_row_without_budget_columns(
-                connection, revision=_CHAT_LEGACY_REVISION
+            await _insert_legacy_memory_row(
+                connection, vision_tool_enabled=vision_tool_enabled
+            )
+            await insert_row_without_budget_columns(
+                connection, revision=CHAT_LEGACY_REVISION
             )
         finally:
             await connection.close()
 
         # 升级到 head
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "head")
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)
@@ -287,7 +220,8 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
             )
             assert "image_understanding_mode" not in memory_columns
 
-            # 旧图片开关 false → native；8 项预算原样复制；chat 存量 revision 保留
+            # 旧图片开关 bool 双分支映射；8 项预算原样复制；chat 存量
+            # revision 保留
             chat_image_row = await connection.fetchrow(
                 "SELECT image_understanding_mode,"
                 " vision_image_download_max_count,"
@@ -300,17 +234,17 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
                 " vision_image_download_total_timeout_seconds"
                 f" FROM {CHAT_TABLE} WHERE id = 1"
             )
-            assert chat_image_row["image_understanding_mode"] == "native", (
-                "vision_tool_enabled=false 应映射 native"
+            assert chat_image_row["image_understanding_mode"] == expected_mode, (
+                f"vision_tool_enabled={vision_tool_enabled} 应映射 {expected_mode}"
             )
             assert [
-                chat_image_row[column] for column in _BUDGET_COLUMNS
-            ] == [MEMORY_VISION_VALUES[column] for column in _BUDGET_COLUMNS], (
+                chat_image_row[column] for column in BUDGET_COLUMNS
+            ] == [MEMORY_VISION_VALUES[column] for column in BUDGET_COLUMNS], (
                 "8 项预算应原样从 memory 复制到 chat"
             )
             assert await connection.fetchval(
                 f"SELECT revision FROM {CHAT_TABLE} WHERE id = 1"
-            ) == _CHAT_LEGACY_REVISION, "chat 存量数据必须保留"
+            ) == CHAT_LEGACY_REVISION, "chat 存量数据必须保留"
 
             # 0013/0014 新列以数据库默认值补齐存量行
             chat_defaults_row = await connection.fetchrow(
@@ -328,12 +262,12 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
             # memory 存量 revision 保留
             assert await connection.fetchval(
                 f"SELECT revision FROM {MEMORY_TABLE} WHERE id = 1"
-            ) == _MEMORY_LEGACY_REVISION, "memory 存量数据必须保留"
+            ) == MEMORY_LEGACY_REVISION, "memory 存量数据必须保留"
         finally:
             await connection.close()
 
         # 播种：只补新行为字段，绝不覆盖非空自定义值；旧 output 不并入任何字段
-        result = _run_seed(scratch_url)
+        result = run_seed(db_url)
         output = f"{result.stdout}\n{result.stderr}"
         assert result.returncode == 0, output
         assert "新建 2 行" in output, (
@@ -342,7 +276,7 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
 
         connection = await asyncpg.connect(**scratch)
         try:
-            row = await _fetch_prompt_row(connection, "komari_chat")
+            row = await fetch_prompt_row(connection, "komari_chat")
             assert row is not None
             assert row["system_prompt"] == "旧库自定义系统提示词"
             assert row["memory_ack"] == "旧库自定义记忆确认"
@@ -350,12 +284,12 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
             assert row["cot_prefix"] == "旧库自定义思维链前缀"
             assert row["cot_prefix_role"] == "system"
 
-            asset_values = _asset_values("komari_chat")
+            expected_values = asset_values("komari_chat")
             merged_new_fields = sorted(
                 chat_schema_fields - LEGACY_CHAT_COLUMNS
             )
             for field in merged_new_fields:
-                assert row[field] == asset_values[field], (
+                assert row[field] == expected_values[field], (
                     f"迁移后 seed 应补齐新字段 {field}"
                 )
 
@@ -371,17 +305,17 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
 
             # 重复播种幂等
             before = dict(row)
-            result = _run_seed(scratch_url)
+            result = run_seed(db_url)
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-            after = await _fetch_prompt_row(connection, "komari_chat")
+            after = await fetch_prompt_row(connection, "komari_chat")
             assert after == before, "重复播种不得改写 chat Prompt 行"
         finally:
             await connection.close()
 
         # 模型元数据零漂移
-        check_result = _run_bootstrap(scratch_url, "check")
+        check_result = run_bootstrap(db_url, "check")
         assert check_result.returncode == 0, (
             f"{check_result.stdout}\n{check_result.stderr}"
         )
     finally:
-        await _drop_scratch_database(str(scratch["database"]))
+        await drop_scratch_database(str(scratch["database"]))
