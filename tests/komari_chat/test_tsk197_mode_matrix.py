@@ -63,6 +63,13 @@ MATRIX = [
 
 IMAGE_URL = "https://example.com/matrix/a.png"
 VISION_DESCRIPTION = "这是一张测试图片的视觉描述"
+#: 与来源 URL 完全无关的固定安全图片 data URI（1x1 PNG 测试 payload）。
+#: native/delegated 下载替身统一返回它；旧实现把原始 URL 直接拼进
+#: "base64:" 前缀，把来源 URL 泄漏进所谓安全图片数据，与既定安全边界相反。
+SAFE_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
 
 
 def _matrix_build_prompt(image_mode: str) -> Any:
@@ -126,7 +133,7 @@ def _wire_matrix_handler(
         _policy: object,
     ) -> list[str | None]:
         native_download_batches.append(list(urls))
-        return [f"base64:{url}" for url in urls]
+        return [SAFE_IMAGE_DATA_URI for _ in urls]
 
     monkeypatch.setattr(
         message_handler_module,
@@ -140,7 +147,7 @@ def _wire_matrix_handler(
     async def _delegated_download(self: object, url: str) -> str | None:
         del self
         delegated_downloads.append(url)
-        return f"base64:{url}"
+        return SAFE_IMAGE_DATA_URI
 
     monkeypatch.setattr(
         image_downloader_module.ImageDownloadSession,
@@ -277,8 +284,19 @@ def test_tool_and_image_mode_matrix(
         ]
         assert image_parts, "主 provider 必须收到 image_url 多模态部件"
         assert [part["image_url"]["url"] for part in image_parts] == [
-            "base64:" + IMAGE_URL
-        ], "主 provider 收到的图片必须是安全 base64 内容（下载器产物）"
+            SAFE_IMAGE_DATA_URI
+        ], "主 provider 收到的图片必须精确等于安全 data URI（下载器产物，与来源 URL 无关）"
+
+        # 扫描 native 全部轮次 provider messages：原始 URL 不得出现在任何
+        # 消息中（主 provider 只应收到与来源 URL 无关的安全 data URI）
+        native_rendered = "\n".join(
+            str(message)
+            for call in provider.completion_calls
+            for message in call["messages"]
+        )
+        assert IMAGE_URL not in native_rendered, (
+            "native 主循环 messages 不得泄漏原始 URL"
+        )
     else:
         # delegated：read_image 经真实工具循环与真实图片会话执行
         assert native_download_batches == [], (
@@ -288,16 +306,23 @@ def test_tool_and_image_mode_matrix(
             "read_image 必须经安全下载器恰好下载一次原始图片"
         )
         assert len(vision_calls) == 1, "read_image 必须触发恰好一次视觉子调用"
-        assert vision_calls[0][0] == ["base64:" + IMAGE_URL], (
-            "视觉子调用必须收到安全 base64 输入（下载器产物）"
+        assert vision_calls[0][0] == [SAFE_IMAGE_DATA_URI], (
+            "视觉子调用必须收到安全 data URI 输入（下载器产物，与来源 URL 无关）"
         )
 
-        # 主循环消息不得出现 URL/base64（TSK-195 稳定索引边界）
-        rendered = "\n".join(
-            str(message.get("content", "")) for message in first["messages"]
+        # 主循环 messages 不得出现原始 URL / base64 / 安全 data URI
+        # （TSK-195 稳定索引边界：主 Agent 只能看稳定索引与视觉描述）。
+        # 扫描全部轮次（不能只扫 first call），防止后续轮次泄漏。
+        all_rendered = "\n".join(
+            str(message)
+            for call in provider.completion_calls
+            for message in call["messages"]
         )
-        assert IMAGE_URL not in rendered, "delegated 主循环不得泄漏原始 URL"
-        assert "base64:" not in rendered, "delegated 主循环不得泄漏 base64"
+        assert IMAGE_URL not in all_rendered, "delegated 主循环不得泄漏原始 URL"
+        assert "base64:" not in all_rendered, "delegated 主循环不得泄漏 base64"
+        assert SAFE_IMAGE_DATA_URI not in all_rendered, (
+            "delegated 主循环不得出现安全图片 data URI（只能看稳定索引与视觉描述）"
+        )
 
         # read_image 工具结果以 vision 不可信上下文回流主循环
         second = provider.completion_calls[1]
