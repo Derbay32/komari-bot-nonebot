@@ -1,4 +1,4 @@
-"""TSK-222 运行时测试共享基础设施（测试专用，不承载生产语义）。
+"""TSK-222/TSK-223 运行时测试共享基础设施（测试专用，不承载生产语义）。
 
 提供：
 
@@ -9,7 +9,8 @@
   ``Field(default_factory=...)`` 生成新对象，不共享可变默认值；
 - ``AdmissionStorageFake``：无服务配置存储 fake——没有后台轮询任务，
   捕获真实 ``ConfigManager`` 注册的 watcher 回调，由测试通过 ``deliver()``
-  显式投递快照；
+  显式投递快照；TSK-223 扩展了严格 CAS（``update_fields_if_revision_async``）
+  与逐方法错误注入 / 调用计数 / 全断裂开关，承载管理控制面 PUT 契约；
 - ``start_runtime`` / ``install_singleton``：用真实 ``ConfigManager`` 与真实
   ``_AdmissionRuntime`` 拉起运行时，并把实例 monkeypatch 成
   ``komari_bot.plugins.group_admission.runtime._runtime`` module singleton。
@@ -20,6 +21,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -61,13 +63,35 @@ def stored_policy(revision: int, policy: object) -> StoredConfig:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AdmissionCasCall:
+    """一次严格 CAS 写入调用的完整入参记录（测试断言用）。"""
+
+    plugin_name: str
+    field_names: frozenset[str]
+    expected_revision: int
+    config_dump: dict[str, Any] = field(default_factory=dict)
+
+
 class AdmissionStorageFake:
     """无服务配置存储 fake。
 
-    复刻真实 ``ConfigStorage`` 被 ``ConfigManager`` 消费的最小接口面
+    复刻真实 ``ConfigStorage`` 被 ``ConfigManager`` 消费的接口面
     （``register_watcher`` / ``fetch`` / ``fetch_async`` /
-    ``insert_if_absent_async``），但不启动任何后台轮询任务；快照投递完全
-    由测试经 ``deliver()`` 驱动，保持确定性。
+    ``insert_if_absent_async`` / ``update_if_unchanged_async`` /
+    ``update_fields_if_revision_async``），但不启动任何后台轮询任务；快照
+    投递完全由测试经 ``deliver()`` 驱动，保持确定性。
+
+    TSK-223 控制面契约依赖的错误注入开关（全部可变、逐方法独立）：
+
+    - ``fetch_error`` / ``insert_error`` / ``cas_error``：单方法抛错；
+    - ``force_cas_conflict``：CAS 恒返回 ``None``（revision 冲突）；
+    - ``break_all(error)``：所有读写方法调用即抛，用于证明同步读取面无隐
+      藏 I/O；``restore_all()`` 恢复。
+
+    CAS 语义与真实存储一致：仅当 ``expected_revision`` 等于当前存储
+    revision 时原子写入并返回 ``revision + 1`` 的新快照，否则返回 ``None``；
+    每次调用都完整记录进 ``cas_calls`` 供 exactly-once 断言。
     """
 
     def __init__(
@@ -77,9 +101,15 @@ class AdmissionStorageFake:
         fetch_error: Exception | None = None,
     ) -> None:
         self._initial = initial
-        self._fetch_error = fetch_error
+        self.fetch_error = fetch_error
+        self.insert_error: Exception | None = None
+        self.cas_error: Exception | None = None
+        self.force_cas_conflict = False
+        self.broken_error: Exception | None = None
         self.fetch_calls = 0
         self.insert_calls = 0
+        self.update_if_unchanged_calls = 0
+        self.cas_calls: list[AdmissionCasCall] = []
         self.watcher_callbacks: list[Callable[[StoredConfig], None]] = []
         self.fetch_started: asyncio.Event | None = None
         self.fetch_gate: asyncio.Event | None = None
@@ -96,6 +126,31 @@ class AdmissionStorageFake:
         for callback in tuple(self.watcher_callbacks):
             callback(stored)
 
+    def set_stored(self, stored: StoredConfig) -> None:
+        """模拟外部受支持写入：直接替换存储快照，不经 watcher 投递。
+
+        控制面 GET 必须经真实持久刷新观察到该变化；只读缓存/LKG 的实现
+        在此显形（red）。
+        """
+        self._initial = stored
+
+    def break_all(self, error: Exception) -> None:
+        """令全部读写方法调用即抛（证明同步面无隐藏 I/O）。"""
+        self.broken_error = error
+
+    def restore_all(self) -> None:
+        """清除全断裂开关（单方法错误注入保持原值）。"""
+        self.broken_error = None
+
+    def _raise_if_broken(self) -> None:
+        if self.broken_error is not None:
+            raise self.broken_error
+
+    @property
+    def current_revision(self) -> int:
+        """当前存储快照 revision（无记录为 0）。"""
+        return self._initial.revision if self._initial is not None else 0
+
     # --------------------- ConfigStorage 最小接口面 ---------------------
 
     def register_watcher(
@@ -111,15 +166,17 @@ class AdmissionStorageFake:
     def fetch(self, plugin_name: str) -> StoredConfig | None:
         del plugin_name
         self.fetch_calls += 1
-        if self._fetch_error is not None:
-            raise self._fetch_error
+        self._raise_if_broken()
+        if self.fetch_error is not None:
+            raise self.fetch_error
         return self._initial
 
     async def fetch_async(self, plugin_name: str) -> StoredConfig | None:
         del plugin_name
         self.fetch_calls += 1
-        if self._fetch_error is not None:
-            raise self._fetch_error
+        self._raise_if_broken()
+        if self.fetch_error is not None:
+            raise self.fetch_error
         if self.fetch_started is not None:
             self.fetch_started.set()
         if self.fetch_gate is not None:
@@ -137,7 +194,72 @@ class AdmissionStorageFake:
     ) -> StoredConfig:
         del plugin_name
         self.insert_calls += 1
+        self._raise_if_broken()
+        if self.insert_error is not None:
+            raise self.insert_error
         stored = stored_policy(1, config.model_dump().get("policy", {}))
+        self._initial = stored
+        return stored
+
+    async def update_if_unchanged_async(
+        self,
+        *,
+        plugin_name: str,
+        config: BaseModel,
+        expected_updated_at: datetime,
+    ) -> StoredConfig | None:
+        """按 ``updated_at`` 的整份配置 CAS（归一化同步路径使用）。"""
+        del plugin_name
+        self.update_if_unchanged_calls += 1
+        self._raise_if_broken()
+        current = self._initial
+        if current is None or current.updated_at != expected_updated_at:
+            return None
+        new_revision = current.revision + 1
+        stored = StoredConfig(
+            plugin_name=PLUGIN_NAME,
+            config_data=config.model_dump(mode="json"),
+            revision=new_revision,
+            updated_at=_UPDATED_AT_BASE + timedelta(seconds=new_revision),
+        )
+        self._initial = stored
+        return stored
+
+    async def update_fields_if_revision_async(
+        self,
+        *,
+        plugin_name: str,
+        config: BaseModel,
+        field_names: set[str],
+        expected_revision: int,
+    ) -> StoredConfig | None:
+        """严格 CAS：revision 匹配时恰一次原子写入，否则返回 ``None``。
+
+        调用记录先于 ``cas_error`` 注入生效：写失败同样要能断言「恰好一次
+        调用」契约。
+        """
+        self._raise_if_broken()
+        self.cas_calls.append(
+            AdmissionCasCall(
+                plugin_name=plugin_name,
+                field_names=frozenset(field_names),
+                expected_revision=expected_revision,
+                config_dump=config.model_dump(mode="json"),
+            )
+        )
+        if self.cas_error is not None:
+            raise self.cas_error
+        if self.force_cas_conflict:
+            return None
+        if expected_revision != self.current_revision:
+            return None
+        new_revision = expected_revision + 1
+        stored = StoredConfig(
+            plugin_name=plugin_name,
+            config_data=config.model_dump(mode="json"),
+            revision=new_revision,
+            updated_at=_UPDATED_AT_BASE + timedelta(seconds=new_revision),
+        )
         self._initial = stored
         return stored
 
@@ -188,9 +310,22 @@ def install_singleton(
 ) -> None:
     """把真实 ``_AdmissionRuntime`` 实例安装为 module singleton。
 
-    顶层 ``adjudicate`` / ``get_runtime_state`` 必须在调用时经
-    ``runtime._runtime`` 属性解析 singleton；生产不得提供
+    顶层 ``adjudicate`` / ``get_runtime_state`` 与 TSK-223 管理控制面必须
+    在调用时经 ``runtime._runtime`` 属性解析 singleton；生产不得提供
     ``_install_for_testing`` / reset hook / Fake / Protocol。
     """
     runtime_module = import_runtime_module()
     monkeypatch.setattr(runtime_module, "_runtime", runtime)
+
+
+def detach_runtime_listener(
+    manager: ConfigManager,
+    runtime: Any,
+) -> None:
+    """注销运行时自己注册的快照 listener，模拟「已持久化但未本地发布」。
+
+    只摘除 ``runtime._on_snapshot`` 这一个回调；其他 listener（例如控制面
+    自行注册的）保持不动。摘除后严格 CAS 成功不会把新修订发布进运行时，
+    用于验收 ``snapshot_publish_failed`` 契约。
+    """
+    manager.unregister_snapshot_listener(runtime._on_snapshot)

@@ -1,11 +1,14 @@
-"""TSK-222：acceptance manifest 自身的最小契约测试。
+"""TSK-222/TSK-223：acceptance manifest 自身的最小契约测试。
 
 验收目标（manifest 作为测试真源必须自洽）：
 
-- contract/effect 稳定 ID 唯一且前缀形态受控；
+- contract/effect/management 稳定 ID 唯一且前缀形态受控；
 - 每行全部字段非空；
 - 本票恰好登记核心四项契约，anchor 指向本票实际可收集的 pytest node；
 - 核心模块不拥有受治理业务效果，effect 登记保持空；
+- TSK-223 阶段 A 登记六条管理控制面契约行，全部属 ``system_control_plane``
+  分类（不把全局控制面 CAS 当成需要群裁决的 BUSINESS 效果），anchor 同
+  样可被收集；
 - 不在生产代码登记 manifest ID（生产边界由依赖边界测试单独守护）。
 """
 
@@ -21,8 +24,10 @@ import pytest
 from tests.group_admission.acceptance_manifest import (
     ADMISSION_CONTRACT_CASES,
     ADMISSION_EFFECT_CASES,
+    ADMISSION_MANAGEMENT_CASES,
     AdmissionContractCase,
     AdmissionEffectCase,
+    AdmissionManagementCase,
 )
 
 pytestmark = pytest.mark.group_admission_acceptance
@@ -36,6 +41,15 @@ EXPECTED_CORE_CONTRACT_IDS = {
     "group_admission.contract.lifecycle",
 }
 
+EXPECTED_MANAGEMENT_CASE_IDS = {
+    "group_admission.management.policy_get",
+    "group_admission.management.policy_put_strict_cas",
+    "group_admission.management.status_projection",
+    "group_admission.management.error_whitelist",
+    "group_admission.management.audit_safety",
+    "group_admission.management.registration_surface",
+}
+
 
 def test_contract_case_ids_are_unique_and_well_formed() -> None:
     contract_ids = [case.contract_id for case in ADMISSION_CONTRACT_CASES]
@@ -45,6 +59,15 @@ def test_contract_case_ids_are_unique_and_well_formed() -> None:
 
     effect_ids = [case.effect_id for case in ADMISSION_EFFECT_CASES]
     assert len(effect_ids) == len(set(effect_ids)), "effect ID 必须唯一"
+
+    management_ids = [
+        case.management_case_id for case in ADMISSION_MANAGEMENT_CASES
+    ]
+    assert len(management_ids) == len(set(management_ids)), "management ID 必须唯一"
+    for management_id in management_ids:
+        assert management_id.startswith("group_admission.management."), (
+            management_id
+        )
 
 
 def test_contract_cases_register_exactly_the_four_core_contracts() -> None:
@@ -67,6 +90,12 @@ def test_every_manifest_row_has_non_empty_fields() -> None:
             value = getattr(case, field.name)
             assert isinstance(value, str) and value.strip(), (
                 f"{case.effect_id} 字段 {field.name} 为空"
+            )
+    for case in ADMISSION_MANAGEMENT_CASES:
+        for field in dataclasses.fields(case):
+            value = getattr(case, field.name)
+            assert isinstance(value, str) and value.strip(), (
+                f"{case.management_case_id} 字段 {field.name} 为空"
             )
 
 
@@ -92,13 +121,38 @@ def test_effect_cases_are_empty_because_core_module_owns_no_governed_sink() -> N
     """核心裁决模块只输出裁决与状态，不拥有受治理业务效果接缝。
 
     平台输出、持久写入、LLM/工具调用等效果行由 TSK-224 及后续效果所有者票
-    登记；本票保持空 tuple，不替未来插件发明 effect row。
+    登记；本票保持空 tuple，不替未来插件发明 effect row。管理控制面 CAS
+    写入是全局系统配置维护，不是需要群裁决的 BUSINESS 效果，因此登记在
+    ``ADMISSION_MANAGEMENT_CASES`` 而非 effect 行。
     """
     assert ADMISSION_EFFECT_CASES == ()
 
 
+def test_management_cases_register_exactly_the_phase_a_control_plane() -> None:
+    """阶段 A 恰好登记六条控制面契约行，全部属系统控制面分类。"""
+    assert {case.management_case_id for case in ADMISSION_MANAGEMENT_CASES} == (
+        EXPECTED_MANAGEMENT_CASE_IDS
+    )
+    for case in ADMISSION_MANAGEMENT_CASES:
+        assert case.owner_module == "komari_bot.plugins.group_admission"
+        assert case.source_symbol == "register_group_admission_api"
+        assert case.work_category == "system_control_plane", (
+            f"{case.management_case_id} 被错误分类为业务效果: "
+            f"{case.work_category}"
+        )
+        assert case.endpoint.startswith(
+            ("GET /api/v2/group-admission", "PUT /api/v2/group-admission", "GET/PUT /api/v2/group-admission")
+        ), case.endpoint
+    assert dataclasses.is_dataclass(AdmissionManagementCase)
+    params = getattr(AdmissionManagementCase, "__dataclass_params__", None)
+    assert bool(getattr(params, "frozen", False)) is True
+
+
 def test_contract_anchors_are_collectable_pytest_nodes() -> None:
     anchors = [case.acceptance_anchor for case in ADMISSION_CONTRACT_CASES]
+    anchors.extend(
+        case.acceptance_anchor for case in ADMISSION_MANAGEMENT_CASES
+    )
     for anchor in anchors:
         assert anchor.startswith("tests/group_admission/"), anchor
 
