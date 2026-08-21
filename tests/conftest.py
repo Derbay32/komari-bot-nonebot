@@ -413,8 +413,17 @@ class _DummyDecisionPlugin:
     pass
 
 
+class _DummyGroupAdmissionPlugin:
+    """require("group_admission") 只作加载声明，返回值不承载业务符号。
+
+    业务裁决/状态符号一律由真实顶层包暴露面提供（ADR-0006），本票不对
+    该包注入 shim，保证测试能验证真实顶层 ``__all__``。
+    """
+
+
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
+    "group_admission": _DummyGroupAdmissionPlugin(),
     "llm_provider": _DummyLLMProvider(),
     "agent_run_logger": _DummyAgentRunLoggerPlugin(),
     "embedding_provider": _DummyEmbeddingPlugin(),
@@ -443,10 +452,26 @@ def _fake_require(name: str) -> object:
 nonebot.plugin.require = _fake_require
 
 
-# 为 komari_debug 测试注入包级导出到 shim
+# 为 komari_debug 测试注入包级导出到 shim；group_admission 按 ADR-0006 从
+# config_manager 顶层 import 版本化快照类型，因此注入真实类型身份（来自 .manager
+# 子模块），dummy get_config_manager 保留且不获得新业务行为。
+from komari_bot.plugins.config_manager.manager import (
+    ConfigManager as _RealConfigManager,
+)
+from komari_bot.plugins.config_manager.manager import (
+    ConfigSnapshot as _RealConfigSnapshot,
+)
+
 _inject_package_exports(
     "config_manager",
     {"get_config_manager": _DummyConfigManagerPlugin.get_config_manager},
+)
+_inject_package_exports(
+    "config_manager",
+    {
+        "ConfigManager": _RealConfigManager,
+        "ConfigSnapshot": _RealConfigSnapshot,
+    },
 )
 _inject_package_exports(
     "character_binding",
