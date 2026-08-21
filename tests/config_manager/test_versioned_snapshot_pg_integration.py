@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import suppress
 from typing import Any
 from urllib.parse import urlparse
 
@@ -46,6 +47,21 @@ def _same_database(left: str, right: str) -> bool:
     )
 
 
+async def _reset_shared_orm_engine() -> None:
+    """清空 nonebot-plugin-orm 共享引擎连接池（每个测试独立事件循环）。"""
+    from nonebot import require
+
+    require("nonebot_plugin_orm")
+    import nonebot_plugin_orm as orm_module
+
+    engines = getattr(orm_module, "_engines", None)
+    if not engines:
+        return
+    for engine in list(engines.values()):
+        with suppress(Exception):
+            await engine.dispose()
+
+
 async def _reset_table() -> None:
     from nonebot import require
 
@@ -71,6 +87,7 @@ async def test_versioned_snapshot_listener_and_strict_cas_over_real_storage() ->
 
     loop = asyncio.get_running_loop()
     await storage_module.close_config_storage_if_created()
+    await _reset_shared_orm_engine()
 
     manager = ConfigManager(PLUGIN_NAME, UserDataConfigSchema)
     bootstrap = ConfigStorage()
@@ -144,3 +161,4 @@ async def test_versioned_snapshot_listener_and_strict_cas_over_real_storage() ->
         await external.close_async()
         await storage_module.close_config_storage_if_created()
         await _reset_table()
+        await _reset_shared_orm_engine()
