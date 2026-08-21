@@ -43,6 +43,7 @@ require("nonebot_plugin_orm")
 
 from .manager import (
     ConfigManager,
+    ConfigSnapshot,
     get_config_manager,
     get_registered_config_managers,
     initialize_registered_config_managers_async,
@@ -57,6 +58,7 @@ __plugin_meta__ = PluginMetadata(
 
 __all__ = [
     "ConfigManager",
+    "ConfigSnapshot",
     "get_config_manager",
     "get_registered_config_managers",
     "initialize_registered_config_managers_async",
