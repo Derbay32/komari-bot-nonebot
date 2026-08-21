@@ -344,8 +344,8 @@ async def test_fact_finalization_requires_legal_non_empty_attribution(
         adjudicate,
     )
 
-    result = adjudicate(  # type: ignore[arg-type] 故意非法归属
-        attribution,
+    result = adjudicate(
+        attribution,  # type: ignore[arg-type] 故意非法归属
         intent=AdmissionIntent.FACT_FINALIZATION,
     )
 
@@ -408,8 +408,8 @@ async def test_technical_cleanup_rejects_illegal_attribution_elements(
         adjudicate,
     )
 
-    result = adjudicate(  # type: ignore[arg-type] 故意非法归属
-        attribution,
+    result = adjudicate(
+        attribution,  # type: ignore[arg-type] 故意非法归属
         intent=AdmissionIntent.TECHNICAL_CLEANUP,
     )
 

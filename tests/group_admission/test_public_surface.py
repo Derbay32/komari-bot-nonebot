@@ -10,6 +10,10 @@
 - ``is_ready`` 仅 READY 为 true，DEGRADED（按 LKG 裁决）不是 ready；
 - ``adjudicate`` 同步、无位置 ``intent``、默认 ``BUSINESS``；
   ``get_runtime_state`` 同步、无参数；
+- 签名注解运行时真实：``typing.get_type_hints`` 在运行时成功解析两个可调用面，
+  结果即公开契约类型（``Collection[int]`` / ``AdmissionIntent`` /
+  ``AdmissionResult`` / ``AdmissionRuntimeState``），不因 TYPE_CHECKING-only
+  import 抛 NameError；
 - reason code / problem code 闭集是真实类型契约：``typing.get_type_hints``
   解析出的 ``Literal`` args 精确等于冻结闭集（含本票 ``adjudicate`` 不会
   产生的 ``private_input_rejected``），不靠扫描字符串字面量证明。
@@ -20,6 +24,7 @@
 
 from __future__ import annotations
 
+import collections.abc
 import dataclasses
 import enum
 import inspect
@@ -258,6 +263,37 @@ def test_get_runtime_state_is_a_sync_no_argument_callable() -> None:
     )
     parameters = inspect.signature(get_runtime_state).parameters
     assert list(parameters) == [], "get_runtime_state 不接受任何参数"
+
+
+def test_adjudicate_type_hints_resolve_at_runtime() -> None:
+    """公开注解真实性：``adjudicate`` 签名注解必须在运行时全部可解析。
+
+    ``typing.get_type_hints`` 不得因 TYPE_CHECKING-only import 抛 NameError；
+    只断言解析结果是公开契约类型（``Collection[int]`` / ``AdmissionIntent`` /
+    ``AdmissionResult``），不固定内部实现。
+    """
+    admission = _import_package()
+
+    hints = typing.get_type_hints(admission.adjudicate)
+
+    group_ids_hint = hints["associated_group_ids"]
+    assert typing.get_origin(group_ids_hint) is collections.abc.Collection, (
+        f"associated_group_ids 必须解析为 Collection[int]，实际为 {group_ids_hint!r}"
+    )
+    assert typing.get_args(group_ids_hint) == (int,), (
+        f"associated_group_ids 元素类型必须为 int，实际为 {group_ids_hint!r}"
+    )
+    assert hints["intent"] is admission.AdmissionIntent
+    assert hints["return"] is admission.AdmissionResult
+
+
+def test_get_runtime_state_type_hints_resolve_at_runtime() -> None:
+    """``get_runtime_state`` 返回注解运行时真实：解析为 ``AdmissionRuntimeState``。"""
+    admission = _import_package()
+
+    hints = typing.get_type_hints(admission.get_runtime_state)
+
+    assert hints["return"] is admission.AdmissionRuntimeState
 
 
 def _frozen_literal_values(hint: object, *, field: str) -> set[str]:
