@@ -82,7 +82,7 @@ komari-bot/
 │                                          #   user_data/komari_custom/komari_management/komari_decision）
 │
 ├── docs/
-│   ├── adr/                              #   架构决策记录（0001–0004）
+│   ├── adr/                              #   架构决策记录（0001–0012）
 │   ├── config/                           #   旧版配置归档（迁移输入源）
 │   ├── local/                            #   本地工具脚本
 │   ├── reviews/                          #   代码审查记录
@@ -541,7 +541,7 @@ Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/
 | 文档 | 位置 | 用途 |
 |------|------|------|
 | 任务交接记录 | `docs/handoff/` | 历史任务详情、跨会话交接文档 |
-| 架构决策记录 | `docs/adr/`（0001–0004） | 搜索抽象、管理 API v2、绑定迁移、ORM/强类型配置迁移 |
+| 架构决策记录 | `docs/adr/`（0001–0012） | 搜索抽象、管理 API v2、绑定迁移、ORM/强类型配置迁移等 |
 | 组件文档 | `docs/*.md` | 各插件的详细设计文档 |
 | 迁移说明 | `migrations/README.md` | Alembic 工作流与存量配置搬运 |
 | Agent skill 配置 | `docs/agents/*.md` | issue tracker / triage 标签 / 领域文档约定 |
