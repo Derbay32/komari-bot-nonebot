@@ -12,7 +12,8 @@ driver hooks、管理 HTTP Adapter、遥测或事件前置钩子；生产装配�
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+# 签名注解必须在运行时可解析：typing.get_type_hints() 依赖本符号
+from collections.abc import Collection  # noqa: TC003
 
 from nonebot.plugin import PluginMetadata, require
 
@@ -24,9 +25,6 @@ from .contracts import (
     AdmissionRuntimeState,
     AdmissionRuntimeStatus,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Collection
 
 require("config_manager")
 
