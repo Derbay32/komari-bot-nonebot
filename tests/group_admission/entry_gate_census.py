@@ -1,0 +1,105 @@
+"""TSK-224 event gate frozen census (test truth source, not test module).
+
+EventCensusRow: event_class, category, family, attribution_source, acceptance_anchor.
+MatcherEntryRow: entry_id, source_path, source_symbol, factory, event_family, effect_ids, acceptance_anchor.
+
+``ONEBOT_EVENT_CENSUS`` / ``MATCHER_ENTRY_CENSUS`` 是严格的确定性枚举：
+新增 V11 事件子类或 matcher 注册行必须一并更新本 census，否则对应测试失败。
+
+``ONEBOT_EVENT_CENSUS``: 22 个 OneBot V11 事件子类。
+``MATCHER_ENTRY_CENSUS``: 26 个 matcher 注册项。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class EventCensusRow:
+    event_class: str
+    category: str
+    family: str
+    attribution_source: str
+    acceptance_anchor: str
+
+
+@dataclass(frozen=True, slots=True)
+class MatcherEntryRow:
+    entry_id: str
+    source_path: str
+    source_symbol: str
+    factory: str
+    event_family: str
+    effect_ids: tuple[str, ...]
+    acceptance_anchor: str
+
+
+_CENSUS_ANCHOR = "tests/group_admission/test_entry_gate_census.py::test_event_census_exact_descendants"
+_MATCHER_ANCHOR = "tests/group_admission/test_entry_gate_census.py::test_matcher_census_exact_registrations"
+_EFFECT_ID = "group_admission.effect.inbound_matcher_dispatch"
+
+_E = EventCensusRow
+_M = MatcherEntryRow
+
+ONEBOT_EVENT_CENSUS: tuple[EventCensusRow, ...] = (
+    # group_business (12)
+    _E("GroupMessageEvent", "group_business", "message", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupUploadNoticeEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupAdminNoticeEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupDecreaseNoticeEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupIncreaseNoticeEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupBanNoticeEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupRecallNoticeEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("NotifyEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("PokeNotifyEvent", "group_business", "notice", "optional_positive_group_id", _CENSUS_ANCHOR),
+    _E("LuckyKingNotifyEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("HonorNotifyEvent", "group_business", "notice", "group_id_field", _CENSUS_ANCHOR),
+    _E("GroupRequestEvent", "group_business", "request", "group_id_field", _CENSUS_ANCHOR),
+    # private_input (1)
+    _E("PrivateMessageEvent", "private_input", "message", "none", _CENSUS_ANCHOR),
+    # system_meta (3)
+    _E("MetaEvent", "system_meta", "meta_event", "none", _CENSUS_ANCHOR),
+    _E("LifecycleMetaEvent", "system_meta", "meta_event", "none", _CENSUS_ANCHOR),
+    _E("HeartbeatMetaEvent", "system_meta", "meta_event", "none", _CENSUS_ANCHOR),
+    # unsupported_business_fail_closed (6)
+    _E("FriendAddNoticeEvent", "unsupported_business_fail_closed", "notice", "none", _CENSUS_ANCHOR),
+    _E("FriendRecallNoticeEvent", "unsupported_business_fail_closed", "notice", "none", _CENSUS_ANCHOR),
+    _E("FriendRequestEvent", "unsupported_business_fail_closed", "request", "none", _CENSUS_ANCHOR),
+    _E("MessageEvent", "unsupported_business_fail_closed", "message", "none", _CENSUS_ANCHOR),
+    _E("NoticeEvent", "unsupported_business_fail_closed", "notice", "none", _CENSUS_ANCHOR),
+    _E("RequestEvent", "unsupported_business_fail_closed", "request", "none", _CENSUS_ANCHOR),
+)
+
+MATCHER_ENTRY_CENSUS: tuple[MatcherEntryRow, ...] = (
+    # on_message (1)
+    _M("matcher.komari_chat.__init__.matcher", "komari_bot/plugins/komari_chat/__init__.py", "matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    # on_regex (1)
+    _M("matcher.group_history_summary.__init__.summary_matcher", "komari_bot/plugins/group_history_summary/__init__.py", "summary_matcher", "on_regex", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    # on_notice (1)
+    _M("matcher.komari_custom.vote_handler.vote_notice", "komari_bot/plugins/komari_custom/vote_handler.py", "vote_notice", "on_notice", "notice", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    # on_command (23)
+    _M("matcher.komari_custom.__init__.custom", "komari_bot/plugins/komari_custom/__init__.py", "custom", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_custom.__init__.custom_action", "komari_bot/plugins/komari_custom/__init__.py", "custom_action", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_root", "komari_bot/plugins/komari_debug/commands.py", "debug_root", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_favor_get", "komari_bot/plugins/komari_debug/commands.py", "debug_favor_get", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_favor_set", "komari_bot/plugins/komari_debug/commands.py", "debug_favor_set", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_bind_set", "komari_bot/plugins/komari_debug/commands.py", "debug_bind_set", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_bind_del", "komari_bot/plugins/komari_debug/commands.py", "debug_bind_del", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_bind_list", "komari_bot/plugins/komari_debug/commands.py", "debug_bind_list", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_reply", "komari_bot/plugins/komari_debug/commands.py", "debug_reply", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_summary", "komari_bot/plugins/komari_debug/commands.py", "debug_summary", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_debug.commands.debug_notify", "komari_bot/plugins/komari_debug/commands.py", "debug_notify", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_help.commands.help_cmd", "komari_bot/plugins/komari_help/commands.py", "help_cmd", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_help.commands.help_list_cmd", "komari_bot/plugins/komari_help/commands.py", "help_list_cmd", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_help.commands.help_refresh_cmd", "komari_bot/plugins/komari_help/commands.py", "help_refresh_cmd", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.user_ban.commands.ban_matcher", "komari_bot/plugins/user_ban/commands.py", "ban_matcher", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.user_ban.commands.unban_matcher", "komari_bot/plugins/user_ban/commands.py", "unban_matcher", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.character_binding.commands.bind", "komari_bot/plugins/character_binding/commands.py", "bind", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.character_binding.commands.bind_set", "komari_bot/plugins/character_binding/commands.py", "bind_set", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.character_binding.commands.bind_del", "komari_bot/plugins/character_binding/commands.py", "bind_del", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.character_binding.commands.bind_list", "komari_bot/plugins/character_binding/commands.py", "bind_list", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.sr.__init__.sr", "komari_bot/plugins/sr/__init__.py", "sr", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.sr.__init__.sr_custom", "komari_bot/plugins/sr/__init__.py", "sr_custom", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.sr.__init__.sr_manage", "komari_bot/plugins/sr/__init__.py", "sr_manage", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+)
