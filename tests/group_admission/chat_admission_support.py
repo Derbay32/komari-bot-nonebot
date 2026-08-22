@@ -64,12 +64,30 @@ class ScriptedAdjudicate:
         if state not in ADMIT_STATES:
             raise ValueError(f"未知脚本状态: {state}")  # noqa: TRY003
         self.state = state
+        self._sequence: tuple[str, ...] | None = None
+        self._seq_index = 0
         self.calls: list[tuple[object, object]] = []
 
     def set_state(self, state: str) -> None:
         if state not in ADMIT_STATES:
             raise ValueError(f"未知脚本状态: {state}")  # noqa: TRY003
         self.state = state
+        self._sequence = None
+        self._seq_index = 0
+
+    def set_sequence(self, *states: str) -> None:
+        """登记依次返回的准入序列（admitted→restricted→…）。
+
+        每次调用顺序取一个状态，取尽后保持最后一个；用于多时点接缝与
+        「恢复准入不复活」验收。
+        """
+        if not states:
+            raise ValueError("set_sequence 至少需要一个状态")  # noqa: TRY003
+        for s in states:
+            if s not in ADMIT_STATES:
+                raise ValueError(f"未知脚本状态: {s}")  # noqa: TRY003
+        self._sequence = states
+        self._seq_index = 0
 
     def __call__(
         self,
@@ -79,6 +97,12 @@ class ScriptedAdjudicate:
         **kwargs: object,
     ) -> AdmissionResult:
         del kwargs
+        if (
+            self._sequence is not None
+            and self._seq_index < len(self._sequence)
+        ):
+            self.state = self._sequence[self._seq_index]
+            self._seq_index += 1
         effective_intent = (
             intent if intent is not None else AdmissionIntent.BUSINESS
         )

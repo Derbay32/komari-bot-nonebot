@@ -626,8 +626,8 @@ ADMISSION_EFFECT_CASES += (
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
-            "tests/group_admission/test_chat_effect_manifest.py"
-            "::test_tool_fetch_page_effect_registered"
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_fetch_page_restricted_blocks_fetch"
         ),
     ),
 )
@@ -643,8 +643,8 @@ ADMISSION_EFFECT_CASES += (
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
-            "tests/group_admission/test_chat_effect_manifest.py"
-            "::test_vision_completion_effect_registered"
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_vision_completion_restricted_blocks_vision_llm"
         ),
     ),
     AdmissionEffectCase(
@@ -656,8 +656,8 @@ ADMISSION_EFFECT_CASES += (
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
-            "tests/group_admission/test_chat_effect_manifest.py"
-            "::test_image_download_effect_registered"
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_image_download_restricted_blocks_download"
         ),
     ),
     AdmissionEffectCase(
@@ -669,8 +669,8 @@ ADMISSION_EFFECT_CASES += (
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
-            "tests/group_admission/test_chat_effect_manifest.py"
-            "::test_reply_send_effect_registered"
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_reply_send_restricted_blocks_outbound"
         ),
     ),
     AdmissionEffectCase(
