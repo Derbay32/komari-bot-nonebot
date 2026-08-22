@@ -28,11 +28,17 @@ from tests.group_admission.management_support import (
     put_headers,
 )
 from tests.group_admission.observability_support import (
+    EVENT_RUNTIME_FAILED,
+    EVENT_RUNTIME_RECOVERED,
+    EVENT_RUNTIME_REMINDER,
+    RECOVERY_STABILITY_SECONDS,
+    REMINDER_INTERVAL_SECONDS,
     FakeAdmissionBot,
     FakeUtcClock,
     MutableBotsProvider,
     MutableSuperusersProvider,
     SentPrivateMessage,
+    assert_exact_card,
     build_runtime_kwargs,
     card_texts,
     deliver_snapshot_direct,
@@ -389,4 +395,102 @@ async def test_failed_recipient_retry_does_not_duplicate_succeeded(
     )
     assert delivered_user_ids.count(42) == 1, (
         "重试必须补投此前失败的收件人"
+    )
+
+
+async def test_cold_failure_start_reminder_recovery_cards_match_exact_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """冷故障 episode：start → 1800s 提醒 → ready 稳定 60s 恢复，三卡逐张精确。
+
+    场景（bot42 全程在线）：process 投递 fault_start；clock +1800 再 process 投递
+    reminder；storage.deliver ready@rev1 后 clock +60 再 process 投递 recovered。
+    依次用 ``assert_exact_card`` 断言每张卡：字段集必须是 §7 冻结白名单子集、
+    不得含 ``occurrence_count``，且 event/status/problem_code/duration_seconds/
+    started_at（恢复含 resolved_at）全部等于预期值。
+    """
+    clock = FakeUtcClock()
+    t0 = clock.now
+    bot = FakeAdmissionBot("bot42")
+    storage = AdmissionStorageFake(
+        fetch_error=RuntimeError("pg cold start failure")
+    )
+
+    runtime, _manager = await start_runtime(
+        monkeypatch,
+        storage,
+        runtime_kwargs=_cold_failure_kwargs(
+            clock,
+            MutableBotsProvider((bot,)),
+            MutableSuperusersProvider((42,)),
+        ),
+    )
+
+    # 1) 冷故障 start 卡
+    await runtime.process_observability()
+    cards = card_texts((bot,))
+    assert len(cards) == 1, f"首次 process 必须恰一张起始卡: {len(cards)}"
+    user_id, text = cards[0]
+    assert user_id == 42
+    assert_exact_card(
+        text,
+        expected={
+            "event": EVENT_RUNTIME_FAILED,
+            "status": "failed",
+            "problem_code": "storage_unavailable",
+            "configured_revision": None,
+            "effective_revision": None,
+            "using_last_known_good": False,
+            "duration_seconds": 0,
+            "started_at": t0.isoformat(),
+        },
+    )
+
+    # 2) +1800 秒提醒卡
+    clock.advance(seconds=REMINDER_INTERVAL_SECONDS)
+    await runtime.process_observability()
+    cards = card_texts((bot,))
+    assert len(cards) == 2, f"1800 秒必须投递提醒卡，实际 {len(cards)}"
+    user_id, text = cards[1]
+    assert user_id == 42
+    assert_exact_card(
+        text,
+        expected={
+            "event": EVENT_RUNTIME_REMINDER,
+            "status": "failed",
+            "problem_code": "storage_unavailable",
+            "configured_revision": None,
+            "effective_revision": None,
+            "using_last_known_good": False,
+            "duration_seconds": REMINDER_INTERVAL_SECONDS,
+            "started_at": t0.isoformat(),
+        },
+    )
+
+    # 3) 存储就绪；ready 稳定 60 秒后恢复卡
+    storage.deliver(stored_policy(1, {"mode": "blacklist", "group_ids": []}))
+    assert runtime.get_state().status.value == "ready", "deliver ready@rev1 后必须立即 READY"
+    t_recovery = clock.advance(seconds=RECOVERY_STABILITY_SECONDS)
+    await runtime.process_observability()
+    cards = card_texts((bot,))
+    assert len(cards) == 3, f"恢复后必须恰三张卡，实际 {len(cards)}"
+    user_id, text = cards[2]
+    assert user_id == 42
+    assert_exact_card(
+        text,
+        resolved=True,
+        expected={
+            "event": EVENT_RUNTIME_RECOVERED,
+            "status": "ready",
+            "problem_code": "storage_unavailable",
+            "configured_revision": 1,
+            "effective_revision": 1,
+            "using_last_known_good": False,
+            "duration_seconds": int((t_recovery - t0).total_seconds()),
+            "started_at": t0.isoformat(),
+            "resolved_at": t_recovery.isoformat(),
+        },
+    )
+    assert int((t_recovery - t0).total_seconds()) == (
+        REMINDER_INTERVAL_SECONDS + RECOVERY_STABILITY_SECONDS
     )

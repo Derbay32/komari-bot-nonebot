@@ -161,6 +161,29 @@ POLICY_EXTRA_KEYS = frozenset(
 #: policy_published source 封闭值集。
 POLICY_SOURCES = frozenset({"startup", "watcher", "management"})
 
+#: SUPERUSER 故障/恢复私聊卡「key: value」字段白名单（TSK-217 §7 冻结）。
+#: fault_start / runtime_reminder 恒允许这些键；recovered / combined 额外允许
+#: resolved_at。occurrence_count 或任何其他键均不允许。
+FAULT_CARD_FIELDS = frozenset(
+    {
+        "event",
+        "status",
+        "problem_code",
+        "configured_revision",
+        "effective_revision",
+        "using_last_known_good",
+        "duration_seconds",
+        "started_at",
+    }
+)
+FAULT_RESOLVED_CARD_FIELDS = FAULT_CARD_FIELDS | {"resolved_at"}
+
+#: 明确点名的禁止字段（供断言失败消息可读）。
+FAULT_CARD_FORBIDDEN_KEY = "occurrence_count"
+
+#: offline fault→recovery 合并卡首行固定文案（非 ``key: value`` 行，解析时跳过）。
+COMBINED_CARD_BANNER = "群聊准入运行时故障期间发生且现已恢复"
+
 _EVENT_PREFIX = "group_admission."
 
 
@@ -455,6 +478,62 @@ def card_texts(bots: Iterable[FakeAdmissionBot]) -> list[tuple[int, str]]:
             (sent.user_id, str(sent.message)) for sent in bot.sent
         )
     return collected
+
+
+def _parse_card_fields(card_text: str) -> dict[str, str]:
+    """把 SUPERUSER 故障/恢复私聊卡解析为 ``{key: value}`` 字段映射（全部字符串）。
+
+    只解析 ``key: value`` 形态的行；首行固定合并文案
+    （``COMBINED_CARD_BANNER``）与空行跳过。遇到非 ``key: value`` 行即断言
+    失败，防止未经解析的正文混入字段集。
+    """
+    fields: dict[str, str] = {}
+    for raw_line in card_text.splitlines():
+        line = raw_line.strip()
+        if not line or line == COMBINED_CARD_BANNER:
+            continue
+        key, separator, value = line.partition(": ")
+        assert separator, f"卡文本含非「key: value」行: {line!r}"
+        fields[key] = value
+    return fields
+
+
+def assert_exact_card(
+    card_text: str,
+    *,
+    expected: Mapping[str, object],
+    resolved: bool = False,
+    combined: bool = False,
+) -> None:
+    """断言一张 SUPERUSER 故障/恢复卡满足 TSK-217 §7 冻结白名单与期望值。
+
+    - 卡字段集合必须严格等于 ``FAULT_CARD_FIELDS``（``resolved=True`` 时
+      ``FAULT_RESOLVED_CARD_FIELDS``）；出现任何白名单外字段
+      （含禁止字段 ``occurrence_count`` / ``FAULT_CARD_FORBIDDEN_KEY``）即失败；
+    - ``expected`` 的全部字段必须出现，且渲染值（字符串）逐字段相等；
+    - ``combined=True`` 时首行必须为 ``COMBINED_CARD_BANNER`` 合并文案。
+    """
+    allowed = FAULT_RESOLVED_CARD_FIELDS if resolved else FAULT_CARD_FIELDS
+    lines = card_text.splitlines()
+    if combined:
+        assert lines and lines[0].strip() == COMBINED_CARD_BANNER, (
+            f"合并卡必须首行为 {COMBINED_CARD_BANNER!r}"
+        )
+    fields = _parse_card_fields(card_text)
+    actual = set(fields)
+    missing = allowed - actual
+    extra = actual - allowed
+    assert not missing and not extra, (
+        f"卡字段集不严格等于白名单: "
+        f"缺失={sorted(missing)}, 多余={sorted(extra)}"
+    )
+    assert FAULT_CARD_FORBIDDEN_KEY not in fields, (
+        f"卡不得包含禁止字段 {FAULT_CARD_FORBIDDEN_KEY!r}: {card_text!r}"
+    )
+    for key, expected_value in expected.items():
+        assert str(fields[key]) == str(expected_value), (
+            f"字段 {key}={fields[key]!r} 不等于预期 {expected_value!r}"
+        )
 
 
 def runtime_log_projection(record: Any) -> dict[str, Any]:
