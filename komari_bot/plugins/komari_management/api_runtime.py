@@ -25,6 +25,7 @@ MANAGEMENT_PROMPT_API_PREFIX = "/api/v2/komari-management-prompt"
 DECISION_SCENE_API_PREFIX = "/api/v2/komari-decision-scenes"
 USER_BAN_API_PREFIX = "/api/v2/komari-user-bans"
 REPLY_FULFILLMENT_API_PREFIX = "/api/v2/reply-fulfillments"
+GROUP_ADMISSION_API_PREFIX = "/api/v2/group-admission"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -52,6 +53,7 @@ class ManagementApiComponents:
     register_search_api: Callable[..., None]
     register_user_ban_api: Callable[..., None]
     user_ban_service_getter: Callable[[], object]
+    register_group_admission_api: Callable[..., None]
     reply_fulfillment_service_getter: Callable[[], object | None]
     config_resources: tuple[ManagedConfigResource, ...]
     prompt_resources: tuple[ManagedPromptResource, ...]
@@ -124,6 +126,11 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         service_getter=components.user_ban_service_getter,
     )
+    components.register_group_admission_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+    )
     register_reply_fulfillment_api(
         server_app,
         api_token=token_source,
@@ -176,6 +183,7 @@ def register_management_api_for_driver(
         f"{AGENT_RUN_LOG_API_PREFIX}, {SEARCH_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
         f"{DECISION_SCENE_API_PREFIX}, {USER_BAN_API_PREFIX}, "
+        f"{GROUP_ADMISSION_API_PREFIX}, "
         f"{REPLY_FULFILLMENT_API_PREFIX}"
     )
     logger.info(
