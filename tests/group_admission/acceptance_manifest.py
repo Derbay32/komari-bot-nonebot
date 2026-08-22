@@ -28,6 +28,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tests.group_admission.command_effect_sink import (
+    COMMAND_EFFECT_SINK_CENSUS,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class AdmissionContractCase:
@@ -365,4 +369,39 @@ ADMISSION_OBSERVABILITY_CASES: tuple[AdmissionObservabilityCase, ...] = (
             "::test_extended_canary_bundle_self_check_and_report_shape"
         ),
     ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionCommandEffectCase:
+    """一条受治理命令业务效果登记行（TSK-227）。
+
+    与 ``ADMISSION_EFFECT_CASES`` 中核心模块自己拥有的入口门禁行不同，
+    本行由各业务插件命令 handler 的效果 owner 持有：``owner_module`` 取
+    对应插件顶层包，``effect_id`` 前缀 ``group_admission.effect.command.``。
+    它不是控制面 / 观测行，不冒充需要逐群裁决的 governed BUSINESS effect。
+    """
+
+    effect_id: str
+    owner_module: str
+    matcher_entry_id: str
+    sink_kind: str
+    intent: str
+    work_category: str
+    acceptance_anchor: str
+
+
+#: TSK-227 命令业务效果登记：由 ``command_effect_sink`` census 派生，保证
+#: manifest 与 sink census 单一真源一致；不手工复制字段。
+ADMISSION_COMMAND_EFFECT_CASES: tuple[AdmissionCommandEffectCase, ...] = tuple(
+    AdmissionCommandEffectCase(
+        effect_id=row.effect_id,
+        owner_module=row.owner_module,
+        matcher_entry_id=row.entry_id,
+        sink_kind=row.sink_kind,
+        intent="business",
+        work_category=row.work_category,
+        acceptance_anchor=row.acceptance_anchor,
+    )
+    for row in COMMAND_EFFECT_SINK_CENSUS
 )

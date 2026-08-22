@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from importlib import import_module
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
 
 from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification
 from komari_bot.plugins.user_ban.models import (
     BanMutationResult,
     BanRecord,
@@ -26,6 +28,21 @@ if TYPE_CHECKING:
 def commands_module(app: App) -> Any:
     del app
     return import_module("komari_bot.plugins.user_ban.commands")
+
+
+@pytest.fixture(autouse=True)
+def _admit_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    commands_module: Any,
+) -> None:
+    """放行统一准入复查，命令单测专注既有领域逻辑。"""
+
+    def _adjudicate(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            qualification=AdmissionQualification.BUSINESS,
+        )
+
+    monkeypatch.setattr(commands_module, "adjudicate", _adjudicate)
 
 
 class _Service:
@@ -53,15 +70,15 @@ class _Service:
         )
 
 
-def _event(text: str, *, user_id: int) -> PrivateMessageEvent:
+def _event(text: str, *, user_id: int) -> GroupMessageEvent:
     message = Message(text)
-    return PrivateMessageEvent.model_construct(
+    return GroupMessageEvent.model_construct(
         time=1,
         self_id=669293859,
         post_type="message",
-        sub_type="friend",
+        sub_type="normal",
         user_id=user_id,
-        message_type="private",
+        message_type="group",
         message_id=1,
         message=message,
         original_message=message,
@@ -70,6 +87,8 @@ def _event(text: str, *, user_id: int) -> PrivateMessageEvent:
         sender=Sender.model_construct(user_id=user_id, nickname="tester", card=""),
         to_me=True,
         reply=None,
+        group_id=114514,
+        anonymous=None,
     )
 
 

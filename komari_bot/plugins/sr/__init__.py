@@ -8,7 +8,9 @@ from nonebot.params import Command, CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata, require
 
+from komari_bot.onebot import get_user_nickname
 from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification, adjudicate
 
 from .commands import AddCommand, DeleteCommand
 from .config import Config
@@ -42,18 +44,33 @@ config = get_plugin_config(Config)
 
 # 依赖配置管理插件
 require("config_manager")
-# 依赖权限管理插件
-require("permission_manager")
+# 依赖统一群聊准入插件
+require("group_admission")
 # 依赖用户名绑定插件
 require("character_binding")
 
 from komari_bot.plugins import character_binding
 from komari_bot.plugins import config_manager as config_manager_plugin
-from komari_bot.plugins import permission_manager as permission_manager_plugin
 
 # 初始化配置管理器
 config_manager = config_manager_plugin.get_config_manager("sr", DynamicConfigSchema)
 driver = get_driver()
+
+
+async def _admission_gate(event: MessageEvent) -> bool:
+    """统一准入复查与本插件自有开关的前置门。
+
+    先由 ``group_admission`` 裁决关联群（命令只会在群内触发）：获准后继续读
+    取本插件自身 ``plugin_enable`` 进一步收窄；任一环节不满足都静默跳过，
+    不提示、不响应。``plugin_enable`` 只收窄不扩张：准入资格始终由裁决决定。
+    """
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return False
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
+        return False
+    config = await config_manager.get_async()
+    return bool(getattr(config, "plugin_enable", True))
 
 
 async def _record_undo_or_warn(user_id: str, command: object, result: str) -> str:
@@ -139,14 +156,21 @@ async def sr_switch(
     if not await SUPERUSER(bot, event):
         await sr_manage.finish("❌ 仅限 SUPERUSER 使用")
 
+    # 统一准入复查（仅裁决关联群，不读本插件开关，避免当局被拒无法自救）
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
+        return
+
     _, action = cmd
     config = cast("DynamicConfigSchema", await config_manager.get_async())
 
     match action:
         case "status":
-            # 显示插件状态信息
-            permission_info = permission_manager_plugin.format_permission_info(config)
-            await sr_manage.finish(plain_text_message(f"SR {permission_info}"))
+            # 显示插件自身开关状态
+            status_text = "已启用" if config.plugin_enable else "已禁用"
+            await sr_manage.finish(plain_text_message(f"SR {status_text}"))
 
         case "on" | "off":
             # 切换插件开关
@@ -171,24 +195,16 @@ async def sr_switch(
 
 @sr.handle()
 async def sr_function(
-    bot: Bot, event: MessageEvent, args: Message = CommandArg()
+    event: MessageEvent, args: Message = CommandArg()
 ) -> None:
+    # 统一准入复查与插件开关前置门：不通过则静默跳过
+    if not await _admission_gate(event):
+        return
+
     # 获取用户信息
     user_id = event.get_user_id()
-    user_nickname = (
-        (event.sender.nickname or event.sender.card or user_id)
-        if event.sender
-        else user_id
-    )
+    user_nickname = get_user_nickname(event)
     username = character_binding.get_character_name(user_id, user_nickname)
-
-    # 使用运行时配置进行权限检查
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, await config_manager.get_async()
-    )
-    if not can_use:
-        logger.info(f"用户 {username}({user_id}) 请求被拒绝，原因：{reason}。")
-        await sr.finish(plain_text_message(f"❌ {reason}"))
 
     try:
         # 如果有额外参数，作为自定义消息加入最终回复
@@ -226,25 +242,19 @@ async def sr_function(
 
 @sr_custom.handle()
 async def sr_usrcustom(
-    bot: Bot,
     event: MessageEvent,
     cmd: tuple[str, ...] = Command(),
     args: Message = CommandArg(),
 ) -> None:
+    # 统一准入复查与插件开关前置门：不通过则静默跳过
+    if not await _admission_gate(event):
+        return
+
     # 初始化命令层
     _, action = cmd
 
     # 获取用户信息
     user_id = event.get_user_id()
-    user_nickname = permission_manager_plugin.get_user_nickname(event)
-
-    # 使用运行时配置进行权限检查
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, await config_manager.get_async()
-    )
-    if not can_use:
-        logger.info(f"用户 {user_nickname}({user_id}) 请求被拒绝，原因：{reason}。")
-        await sr.finish(plain_text_message(f"❌ {reason}"))
 
     try:
         match action:

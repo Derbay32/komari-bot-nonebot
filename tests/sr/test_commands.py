@@ -13,6 +13,7 @@ from nonebot.adapters.onebot.v11.event import Sender
 from pydantic import ValidationError
 
 from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -43,20 +44,6 @@ class _AtomicListConfigManager:
             await asyncio.sleep(0)
             self.sr_list = list(mutator(list(self.sr_list)))
             return SimpleNamespace(sr_list=list(self.sr_list))
-
-
-class _StubPermissionManagerPlugin:
-    @staticmethod
-    async def check_runtime_permission(
-        _bot: object,
-        _event: object,
-        _config: object,
-    ) -> tuple[bool, str]:
-        return True, ""
-
-    @staticmethod
-    def format_permission_info(_config: object) -> str:
-        return "已启用"
 
 
 class _StubCharacterBinding:
@@ -105,8 +92,8 @@ def _patch_sr_dependencies(
     monkeypatch.setattr(sr_module, "config_manager", _StubConfigManager(sr_list))
     monkeypatch.setattr(
         sr_module,
-        "permission_manager_plugin",
-        _StubPermissionManagerPlugin(),
+        "adjudicate",
+        lambda *_args: SimpleNamespace(qualification=AdmissionQualification.BUSINESS),
     )
     monkeypatch.setattr(sr_module, "character_binding", _StubCharacterBinding())
 
