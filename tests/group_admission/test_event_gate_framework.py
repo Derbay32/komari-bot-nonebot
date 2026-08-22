@@ -6,7 +6,7 @@ C admitted GroupMessage下run_preprocessor抛IgnoredException：rule到、handle
 D admitted群下两个test event preprocessor共用order：gate_start→side_effect顺序严格，phase_trace空（rule/run_pre/handler/run_post/event_post未执行）。
 E 五registries快照进出context=快照，module import residue不计。
 
-当前生产缺gate：A组telemetry family0未赋值（RED），B未拦截（RED），C/D/E仍按预期运行。
+门禁未注册时：A组telemetry family0未赋值，B未拦截，C/D/E仍按预期运行。
 
 group-business 事件类从 ``entry_gate_census.ONEBOT_EVENT_CENSUS`` 消费，确保每个 census
 类获得行为 anchor 且无重复列表。
@@ -18,12 +18,18 @@ import asyncio
 from typing import Any
 
 import pytest
+from nonebot import on_message
 from nonebot.adapters.onebot.v11.event import (
     Event,
     GroupMessageEvent,
 )
 from nonebot.exception import IgnoredException
-from nonebot.message import event_postprocessor, run_postprocessor, run_preprocessor
+from nonebot.message import (
+    event_postprocessor,
+    event_preprocessor,
+    run_postprocessor,
+    run_preprocessor,
+)
 
 from tests.group_admission.entry_gate_census import ONEBOT_EVENT_CENSUS
 from tests.group_admission.entry_gate_support import (
@@ -48,27 +54,23 @@ pytestmark = pytest.mark.group_admission_acceptance
 # ---------------------------------------------------------------------------
 
 # 类名 → 实际 class 的惰性映射
-_V11_EVENT_CLASSES: dict[str, type[Event]] | None = None
-
-
 def _get_v11_class(name: str) -> type[Event]:
-    """惰性加载 V11 Event 类。"""
-    cls_map = _V11_EVENT_CLASSES
-    if cls_map is None:
-        import importlib
-        mod = importlib.import_module("nonebot.adapters.onebot.v11.event")
-        event_cls = mod.Event
+    """返回 V11 Event 类名对应的 class。"""
+    import importlib
 
-        def _walk(cls: type[Any], seen: set[str]) -> dict[str, type[Event]]:
-            result: dict[str, type[Event]] = {}
-            for sub in cls.__subclasses__():
-                if sub.__module__ == mod.__name__ and sub.__name__ not in seen:
-                    seen.add(sub.__name__)
-                    result[sub.__name__] = sub
-                    result.update(_walk(sub, seen))
-            return result
+    mod = importlib.import_module("nonebot.adapters.onebot.v11.event")
+    event_cls = mod.Event
 
-        cls_map = _walk(event_cls, set())
+    def _walk(cls: type[Any], seen: set[str]) -> dict[str, type[Event]]:
+        result: dict[str, type[Event]] = {}
+        for sub in cls.__subclasses__():
+            if sub.__module__ == mod.__name__ and sub.__name__ not in seen:
+                seen.add(sub.__name__)
+                result[sub.__name__] = sub
+                result.update(_walk(sub, seen))
+        return result
+
+    cls_map = _walk(event_cls, set())
     return cls_map[name]
 
 
@@ -224,7 +226,7 @@ async def test_c_downstream_narrowing(monkeypatch: pytest.MonkeyPatch) -> None:
     trace: set[str] = set()
     event = make_v11_event(GroupMessageEvent, group_id=100, message_type="group")
     async with event_gate_context():
-        m = __import__("nonebot").on_message(rule=lambda: (trace.add("rule"), True)[1], priority=1, block=False)
+        m = on_message(rule=lambda: (trace.add("rule"), True)[1], priority=1, block=False)
         @m.handle()
         async def _h() -> None: trace.add("handler")
         @run_preprocessor
@@ -254,7 +256,7 @@ async def test_d_concurrent_preprocessors(monkeypatch: pytest.MonkeyPatch) -> No
     event = make_v11_event(GroupMessageEvent, group_id=100, message_type="group")
     async with event_gate_context():
         register_phase_probe(phase_trace, "message")
-        ep = __import__("nonebot").message.event_preprocessor
+        ep = event_preprocessor
         @ep
         async def _sr() -> None:
             trace.append("gate_start")
@@ -275,15 +277,15 @@ async def test_d_concurrent_preprocessors(monkeypatch: pytest.MonkeyPatch) -> No
 # E ---------------------------------------------------------------------------
 
 async def test_e_registry_restore(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.group_admission.entry_gate_support import _snapshot_registries
+    from tests.group_admission.entry_gate_support import snapshot_event_registries
     _app = await _env(monkeypatch, {"mode": "blacklist", "group_ids": []})
-    snapshot = _snapshot_registries()
+    snapshot = snapshot_event_registries()
     bot = ProbeBot()
     trace: list[str] = []
     async with event_gate_context():
         register_phase_probe(trace, "message")
         await dispatch(bot, make_v11_event(GroupMessageEvent, group_id=100, message_type="group"))
-    after = _snapshot_registries()
+    after = snapshot_event_registries()
     assert after["matchers"].keys() == snapshot["matchers"].keys()
     for k in snapshot["matchers"]:
         assert len(after["matchers"][k]) == len(snapshot["matchers"][k])

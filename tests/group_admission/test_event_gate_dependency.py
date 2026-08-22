@@ -1,6 +1,6 @@
 """TSK-224 slice4: event gate dependency & registration boundary.
 
-1. event_gate.py exists (RED: missing), __init__ AST imports it, __all__ exact 8 symbols, no install_hook.
+1. event_gate.py module must exist, __init__ must import it via AST, __all__ exact 8 symbols, no install_hook.
 2. Gate exactly one @event_preprocessor async _admission_event_gate; forbidden: run_preprocessor, on_*, Matcher, cancel/create_task, AgentRun, cross-plugin imports. IgnoredException required.
 3. Runtime registry: event_gate_context loads exactly one preprocessor whose .call.__module__ is gate module.
 """
@@ -83,7 +83,7 @@ def _check_forbidden_ast(source: str) -> list[str]:
 
 
 def test_event_gate_module_exists() -> None:
-    assert GATE.is_file(), "event_gate.py missing (RED)"
+    assert GATE.is_file(), "event_gate module must exist"
 
 
 def test_package_init_imports_event_gate() -> None:
@@ -101,7 +101,7 @@ def test_package_init_imports_event_gate() -> None:
             for a in n.names:
                 if "event_gate" in a.name:
                     found = True
-    assert found, "__init__.py must import event_gate (RED)"
+    assert found, "package must import event_gate"
 
 
 def test_package_all_exact_eight_symbols() -> None:
@@ -119,13 +119,13 @@ def test_package_all_exact_eight_symbols() -> None:
     pytest.fail("no __all__")
 
 
-# 2. event_gate.py content (RED: missing)
+# 2. event_gate.py content contract
 
 
 def test_event_gate_has_exactly_one_event_preprocessor() -> None:
     src = _read_gate()
     if src is None:
-        pytest.fail("event_gate.py missing (RED)")
+        pytest.fail("event_gate.py missing")
     tree = ast.parse(src, filename=str(GATE))
     names = [
         node.name
@@ -141,7 +141,7 @@ def test_event_gate_has_exactly_one_event_preprocessor() -> None:
 def test_event_gate_gate_function_is_async() -> None:
     src = _read_gate()
     if src is None:
-        pytest.fail("event_gate.py missing (RED)")
+        pytest.fail("event_gate.py missing")
     tree = ast.parse(src, filename=str(GATE))
     for n in ast.walk(tree):
         if isinstance(n, ast.AsyncFunctionDef) and n.name == "_admission_event_gate":
@@ -152,7 +152,7 @@ def test_event_gate_gate_function_is_async() -> None:
 def test_event_gate_no_forbidden_ast_patterns() -> None:
     src = _read_gate()
     if src is None:
-        pytest.fail("event_gate.py missing (RED)")
+        pytest.fail("event_gate.py missing")
     violations = _check_forbidden_ast(src)
     assert not violations, f"forbidden AST patterns: {violations}"
 
@@ -160,7 +160,7 @@ def test_event_gate_no_forbidden_ast_patterns() -> None:
 def test_event_gate_no_forbidden_imports() -> None:
     src = _read_gate()
     if src is None:
-        pytest.fail("event_gate.py missing (RED)")
+        pytest.fail("event_gate.py missing")
     tree = ast.parse(src, filename=str(GATE))
     for n in ast.walk(tree):
         if isinstance(n, ast.Import):
@@ -173,7 +173,7 @@ def test_event_gate_no_forbidden_imports() -> None:
 def test_event_gate_has_ignored_exception() -> None:
     src = _read_gate()
     if src is None:
-        pytest.fail("event_gate.py missing (RED)")
+        pytest.fail("event_gate.py missing")
     assert "IgnoredException" in src
 
 

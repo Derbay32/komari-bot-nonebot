@@ -12,9 +12,8 @@
 注册对应探针，分发事件，读取同一 app 的 status。无私有生产性断言、
 catch/skip/sleep。
 
-当前生产缺少 ``event_gate`` 模块：私有消息/无归属/畸形/失败运行时
-产生非空 trace（未拦截），MetaEvent 正常通过（trace 完整）。这就是
-有意义的 RED 失败。Slice1 受限测试（test_event_gate_flow.py）不变。
+门禁未注册时：私有消息/无归属/畸形/失败运行时产生非空 trace（未拦截），
+MetaEvent 正常通过（trace 完整）。
 """
 
 from __future__ import annotations
@@ -297,10 +296,8 @@ async def test_future_unsupported_events_fail_closed(
 ) -> None:
     """未来未注册事件子类被门控拒绝：trace 空、bot 零、遥测 group_attribution_unavailable。
 
-    当前生产 isinstance 实现使全部 3 种变体 FAIL：
-    - FutureGroupMessageEvent 被 _GROUP_BUSINESS_CLASSES 捕获 → 非空 trace（RED）
-    - FuturePrivateMessageEvent 被 PrivateMessageEvent 捕获 → private_input_rejected（RED）
-    - FutureHeartbeatMetaEvent 被 MetaEvent tuple 捕获 → 放行 / 完整 trace（RED）
+    isinstance 会无差别吸纳子类，破坏闭集。精确类身份检查确保未注册子类
+    落入 fail-closed 分支，不会被闭集错误捕获。
     """
     app, _rt, _mgr = await _base_env(monkeypatch)
     event = make_v11_event(event_cls, **overrides)

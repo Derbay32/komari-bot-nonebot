@@ -239,7 +239,7 @@ async def dispatch(bot: object, event: object) -> None:
     await _msg_mod.handle_event(cast_bot, cast_event)
 
 
-def _snapshot_registries() -> dict[str, Any]:
+def snapshot_event_registries() -> dict[str, Any]:
     """返回五组注册表的浅拷贝快照字典。"""
     return {
         "matchers": dict(_matcher_mod.matchers.items()),
@@ -277,11 +277,10 @@ def _restore_registries(snapshot: dict[str, Any]) -> None:
 async def event_gate_context() -> AsyncIterator[None]:
     """异步上下文管理器：快照、清空、加载事件门控、恢复注册表。
 
-    生产 ``event_gate`` 模块未注册其 ``event_preprocessor`` 时，消息
-    不会被拦截，流经完整五阶段而非零阶段，导致测试失败（RED）。
+    测试失败：门禁未注册时消息不被拦截，流经完整五阶段而非零阶段。
     ``finally`` 块仍精确恢复注册表。
     """
-    snapshot = _snapshot_registries()
+    snapshot = snapshot_event_registries()
     _clear_registries()
 
     try:

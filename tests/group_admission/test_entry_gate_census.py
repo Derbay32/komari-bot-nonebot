@@ -2,7 +2,7 @@
 
 1. ONEBOT_EVENT_CENSUS == 22 V11 Event descendants (excl root Event), category counts exact, family/attribution_source match class defs; new adapter class fails.
 2. MATCHER_ENTRY_CENSUS == 26 matcher registrations (1 on_message, 1 on_regex, 1 on_notice, 23 on_command); AST scan; added/deleted fails.
-3. AST event_preprocessor scan: event_gate.py expected 1 entry (currently RED: missing).
+3. AST event_preprocessor scan: event_gate.py expected 1 entry.
 4. All census anchors collectable by pytest --collect-only.
 """
 
@@ -253,14 +253,14 @@ def test_matcher_census_source_paths_match_ast_scan() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. event_preprocessor AST scan (expected 1 entry from event_gate.py, RED)
+# 3. event_preprocessor AST scan (expected 1 entry from event_gate.py)
 # ---------------------------------------------------------------------------
 
 
 def test_event_preprocessor_census() -> None:
     actual = _scan_preprocessors()
     expected = {"komari_bot/plugins/group_admission/event_gate.py": "_admission_event_gate"}
-    assert actual == expected, f"preprocessors={actual} (RED: event_gate.py missing)"
+    assert actual == expected, f"preprocessors={actual}"
 
 
 def test_no_other_event_preprocessors() -> None:
