@@ -24,6 +24,7 @@ from komari_bot.memory.profile_operations import profile_traits_to_list
 from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_async
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
+from .admission_gate import effect_business_admitted
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
 from .image_reading_session import (
     ImageFailureSummary,
@@ -1063,6 +1064,18 @@ async def _execute_business_tool(
     result_summary: str | None = None
     error_summary: str | None = None
 
+    # TSK-225：每个工具 body 前准入裁决（chat.tool_dispatch / tool_search /
+    # tool_fetch_page）。受限/故障关闭时安静丢弃该工具，不执行工具体、不向
+    # 模型回填结果、不复活；一次裁决只授权紧随其后的这一个工具效果。
+    if not effect_business_admitted(group_id=group_id):
+        return _BusinessToolExecution(
+            message=None,
+            tool_name=tool_name,
+            status="blocked",
+            error="准入拒绝",
+            error_summary="准入拒绝",
+        )
+
     match tool_name:
         case "read_image":
             if image_session is None:
@@ -1225,7 +1238,15 @@ async def _execute_tool_loop(
     try:
         for round_num in range(1, round_limit + 1):
             ledger.consume_round()
-            # TSK-194 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
+            # TSK-225：每轮聊天 LLM/provider 前准入裁决。受限或故障关闭时
+            # 安静丢弃本轮结果，不进入 provider、不落任何待恢复补执行状态、
+            # 不复活；一次裁决只授权本轮的这一个不可分效果。
+            if not effect_business_admitted(group_id=group_id):
+                return ReplyResult(
+                    content="",
+                    interaction_history={"event": "", "result": "", "emotion": ""},
+                )
+            # TSK-192 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
             # read_image 工具的视觉子调用（vision_service）才使用 vision
             # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
             # 原生模式（native）图片作为多模态输入直接进入 (user) 消息，

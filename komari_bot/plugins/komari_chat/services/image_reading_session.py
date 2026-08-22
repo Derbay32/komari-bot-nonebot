@@ -183,7 +183,10 @@ class ImageReadingSession:
         vision_reasoning_effort: str = "",
         request_trace_id: str | None = None,
         collector: "LLMDiagnosticCollector | None" = None,
+        group_id: str | None = None,
     ) -> None:
+        #: 任务归属群：图片下载 / 视觉等瞬时效果在其前按此群裁决（TSK-225）。
+        self._group_id = group_id
         self._references = list(references)
         #: 原始 URL 只存在于会话内部私有映射（index → source），仅传给安全
         #: 下载器；公开引用投影（``ImageReference``）不携带原始 URL。
@@ -225,12 +228,14 @@ class ImageReadingSession:
         vision_reasoning_effort: str = "",
         request_trace_id: str | None = None,
         collector: "LLMDiagnosticCollector | None" = None,
+        group_id: str | None = None,
     ) -> "ImageReadingSession":
         """从引用消息与当前消息的来源构造会话；索引稳定且引用在前。
 
         ``quoted_sources`` 在前、``current_sources`` 在后；超过
         ``max_images``（默认为 ``policy.max_images``）的来源不进入可读
-        集合。构造本身零预下载。
+        集合；构造本身零预下载。``group_id`` 为任务归属群，供图片下载 /
+        视觉等瞬时效果在效果前按群裁决（TSK-225）。
         """
         effective_max = policy.max_images if max_images is None else max_images
         references: list[ImageReference] = []
@@ -268,6 +273,7 @@ class ImageReadingSession:
             vision_reasoning_effort=vision_reasoning_effort,
             request_trace_id=request_trace_id,
             collector=collector,
+            group_id=group_id,
         )
 
     @property
@@ -310,6 +316,19 @@ class ImageReadingSession:
         关闭失败，且绝不触发下载或视觉调用。
         原始 URL 不越过本边界：主循环/工具结果/诊断只见索引与结构化结果。
         """
+        # TSK-225：每个 ``read()`` 都是独立的瞬时图片下载/视觉效果，在
+        # dispatch 前按任务归属群各自裁决（并发 sibling 隔离）；受限/故障
+        # 关闭时安静丢弃本索引，不启动下载、不缓存「待恢复补执行」状态。
+        from .admission_gate import effect_business_admitted
+
+        if not effect_business_admitted(group_id=self._group_id):
+            return _as_failure(
+                index,
+                "[图片读取失败: 图片读取被准入拒绝]",
+                error_type="image_unavailable",
+                stage="download",
+            )
+
         reference = self._by_index.get(index)
         if reference is None:
             return ImageReadResult(
@@ -471,6 +490,7 @@ class ImageReadingSession:
                 ),
                 parent_call_id=parent_call_id if self._collector is not None else None,
                 collector=self._collector,
+                group_id=self._group_id,
             )
         except asyncio.CancelledError:
             raise

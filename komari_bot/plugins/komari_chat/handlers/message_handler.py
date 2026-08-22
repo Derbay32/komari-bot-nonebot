@@ -41,6 +41,7 @@ from ..services.image_downloader import (
     download_images_as_base64_aligned,
     extract_image_sources,
 )
+from ..services.admission_gate import effect_business_admitted
 from ..services.image_reading_session import (
     ImageFailureSummary,
     ImageReadingSession,
@@ -400,7 +401,12 @@ class MessageHandler:
         *,
         bot: Bot,
         reply: Reply,
+        group_id: str | None = None,
     ) -> Reply | None:
+        # TSK-225：chat.group_read——get_msg 群平台读取前按该群裁决；受限/
+        # 故障关闭时安静丢弃，不发起 get_msg，不落可复活状态。
+        if not effect_business_admitted(group_id=group_id):
+            return None
         try:
             payload = await bot.get_msg(message_id=int(reply.message_id))
             return type_validate_python(Reply, payload)
@@ -417,8 +423,13 @@ class MessageHandler:
         *,
         bot: Bot,
         message_id: str,
+        group_id: str | None = None,
     ) -> ReplyContext | None:
         """按消息 ID 补取引用消息并构造上下文。"""
+        # TSK-225：get_msg 群平台读取前按该群裁决（chat.group_read）；受限
+        # 安静丢弃，不发起 get_msg。
+        if not effect_business_admitted(group_id=group_id):
+            return None
         try:
             payload = await bot.get_msg(message_id=int(message_id))
             reply = type_validate_python(Reply, payload)
@@ -452,7 +463,9 @@ class MessageHandler:
         if not self._should_refetch_reply_context(context=context):
             return ResolvedReplyContext(context=context, refetched=False)
 
-        refetched_reply = await self._refetch_reply(bot=bot, reply=event.reply)
+        refetched_reply = await self._refetch_reply(
+            bot=bot, reply=event.reply, group_id=str(event.group_id)
+        )
         if refetched_reply is None:
             return ResolvedReplyContext(context=context, refetched=True)
 
@@ -702,10 +715,13 @@ class MessageHandler:
     def _schedule_reply_reaction(
         self,
         callback: ReplyTriggeredCallback | None,
+        group_id: str | None = None,
     ) -> bool:
         """在生成回复前 fire-and-forget 派发表情反应；返回是否已派发。
 
         表情发送失败维持静默 DEBUG 日志语义，不阻塞生成。
+        TSK-225：chat.reaction——表情 fire-and-forget 派发前按该群裁决；
+        受限时在 ``asyncio.create_task`` 前同步判定并返回未派发，不启动回调。
         """
         config = get_memory_config()
         if (
@@ -713,6 +729,8 @@ class MessageHandler:
             or not config.face_reaction_enabled
             or not config.face_reaction_id
         ):
+            return False
+        if not effect_business_admitted(group_id=group_id):
             return False
         task = asyncio.create_task(callback())
         self._reaction_tasks.add(task)
@@ -791,6 +809,10 @@ class MessageHandler:
                     else failure.error_type
                 )
                 summary = None if diagnostic is not None else failure.summary
+            # TSK-225：chat.fixed_failure_text——群内固定错误文本/失败通知前按
+            # 该群裁决；受限时安静丢弃，不触发普通失败通知，不消耗重试。
+            if not effect_business_admitted(group_id=int(event.group_id)):
+                return
             await notifier.notify(
                 bot=bot,
                 notification=GroupTaskFailureNotification(
@@ -986,7 +1008,12 @@ class MessageHandler:
         try:
             from komari_bot.plugins import embedding_provider
 
-            query_embedding = await embedding_provider.embed(rewritten_query)
+            if not effect_business_admitted(group_id=message.group_id):
+                # TSK-225：chat.embedding——查询向量化（Embedding 子效果）前
+                # 按该群裁决；受限时不发起 embed 外呼，静默降级为无向量。
+                query_embedding = None
+            else:
+                query_embedding = await embedding_provider.embed(rewritten_query)
         except Exception as e:
             logger.warning("[KomariMemory] 预生成查询特征向量失败: {}", e)
             query_embedding = None
@@ -1077,6 +1104,7 @@ class MessageHandler:
                         request_trace_id if collector is not None else None
                     ),
                     collector=collector,
+                    group_id=message.group_id,
                 )
                 use_vision_tool = True
         # native：任务起点批量安全下载并校验，data URI 直接进入聊天
@@ -1439,7 +1467,9 @@ class MessageHandler:
                 )
 
             # === 生成前贴出“生成中”表情（与生成并列，fire-and-forget） ===
-            reaction_sent = self._schedule_reply_reaction(on_reply_triggered)
+            reaction_sent = self._schedule_reply_reaction(
+                on_reply_triggered, group_id=message.group_id
+            )
 
             # === 纯读取/生成核心 ===
             collector = agent_run_logger_plugin.create_collector(
@@ -1665,6 +1695,7 @@ class MessageHandler:
                 refetched_context = await self._refetch_reply_context_by_message_id(
                     bot=_bot,
                     message_id=reply_context.message_id,
+                    group_id=group_id,
                 )
                 reply_context_refetched = True
                 if refetched_context is not None:
