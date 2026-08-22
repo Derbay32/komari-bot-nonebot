@@ -26,13 +26,6 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"apply_mode": "restart"},
     )
 
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
-    )
-
     similarity_threshold: float = Field(
         default=0.60,
         ge=0.0,
@@ -80,8 +73,6 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
 
     @field_validator(
-        "user_whitelist",
-        "group_whitelist",
         "disabled_auto_help_plugins",
         mode="before",
     )

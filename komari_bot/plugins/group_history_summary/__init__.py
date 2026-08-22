@@ -41,11 +41,13 @@ from komari_bot.plugins import config_manager as config_manager_plugin
 
 require("group_admission")
 require("agent_run_logger")
-require("permission_manager")
-from komari_bot.plugins import permission_manager as permission_manager_plugin
 
 require("character_binding")
 require("komari_decision")
+from komari_bot.plugins.group_admission import (
+    AdmissionQualification,
+    adjudicate,
+)
 
 config_manager = config_manager_plugin.get_config_manager(
     "group_history_summary", DynamicConfigSchema
@@ -222,10 +224,10 @@ async def handle_group_history_summary(
     if not config.plugin_enable:
         return
 
-    can_use, _ = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config
-    )
-    if not can_use:
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return
 
     if not await check_group_history_supported(bot):

@@ -68,13 +68,6 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
 
     plugin_enable: bool = Field(default=True, description="插件启用状态")
 
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
-    )
-
     redis_db: int = Field(
         default=0,
         ge=0,
@@ -202,20 +195,6 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
             msg = "summary_tool_scan_limit 不能小于 max_summary_count"
             raise ValueError(msg)
         return self
-
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
-    @classmethod
-    def parse_list_string(cls, value: Any) -> Any:
-        """处理从 .env 格式解析列表。"""
-        if isinstance(value, str):
-            import json
-
-            try:
-                parsed = json.loads(value)
-                return [str(item) for item in parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [item.strip() for item in value.split(",") if item.strip()]
-        return value
 
     @field_validator("dsv4_roleplay_instruct_mode", mode="before")
     @classmethod

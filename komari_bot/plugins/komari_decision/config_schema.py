@@ -38,12 +38,6 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
             "是否启用主动回复判定；关闭时聊天仅响应显式 @、文本 @ 别名或回复机器人"
         ),
     )
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
-    )
     filter_min_length: int = Field(
         default=3, ge=1, le=20, description="最短消息长度阈值（字符数）"
     )
@@ -244,7 +238,7 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"section_id": "summary_classification"},
     )
 
-    @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
+    @field_validator("bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
         """处理从 .env 格式解析列表。"""

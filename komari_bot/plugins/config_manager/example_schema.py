@@ -33,34 +33,5 @@ class ExampleConfigSchema(BaseModel):
     # 插件控制
     plugin_enable: bool = Field(default=False, description="插件启用状态")
 
-    # 白名单配置
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户"
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊"
-    )
-
     # 你的自定义字段
     # custom_field: str = Field(default="", description="自定义配置")
-
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
-    @classmethod
-    def parse_list_string(cls, v: Any) -> Any:
-        """处理从 .env 格式解析列表。
-
-        Args:
-            v: 输入值，可能是字符串或列表
-
-        Returns:
-            解析后的字符串列表
-        """
-        if isinstance(v, str):
-            import json
-
-            try:
-                parsed = json.loads(v)
-                return [str(item) for item in parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [item.strip() for item in v.split(",") if item.strip()]
-        return v

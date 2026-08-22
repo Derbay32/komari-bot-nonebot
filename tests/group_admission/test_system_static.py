@@ -7,8 +7,8 @@
   命令模块自身不得直接开辟私连，唯一允许的受影响用户生命周期私连 sink 是
   ``user_ban/notifications.py``。
 - AC7：``get_user_nickname`` 类 nickname helper 迁到 OneBot utility
-  （``komari_bot/onebot/``）；``sr`` 不再从 permission_manager import，迁移后
-  permission_manager 不再作为 utility 容器（不复制新权限 helper）。
+  （``komari_bot/onebot/``）；``sr`` 等业务插件改为自持 plugin_enable 并统一
+  走 group_admission 裁决，不再依赖旧运行时权限辅助容器。
 - AC8：不新增静态 matcher rule 权限捕获（``on_command(..., rule=/permission=)``）。
 """
 
@@ -138,7 +138,7 @@ def test_private_lifecycle_sink_whitelist() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC7：helper 迁移到 OneBot utility，sr 不再依赖 permission_manager
+# AC7：helper 迁移到 OneBot utility，sr 接入统一准入
 # ---------------------------------------------------------------------------
 
 _NICKNAME_SYMBOL = "get_user_nickname"
@@ -164,22 +164,18 @@ def test_nickname_helper_lives_in_onebot_utility() -> None:
     )
 
 
-def test_sr_imports_nickname_from_onebot_not_permission_manager() -> None:
-    """AC7（红基线）：sr 的 nickname helper 来源必须是 komari_bot.onebot，不再 import permission_manager。"""
+def test_sr_imports_nickname_from_onebot_utility() -> None:
+    """AC7（红基线）：sr 的 nickname helper 来源必须是 komari_bot.onebot。"""
     sr_path = _module_path("sr/__init__.py")
     targets = _import_targets(sr_path)
-    pm_deps = {t for t in targets if "permission_manager" in t}
-    assert pm_deps == set(), (
-        f"sr 仍从 permission_manager import（AC7 未迁移）: {pm_deps}"
-    )
     onebot_deps = {t for t in targets if t.startswith("komari_bot.onebot")}
     assert onebot_deps, "sr 未从 komari_bot.onebot 导入 helper（AC7 未实现）"
 
 
-def test_help_does_not_depend_on_permission_manager_utility() -> None:
-    """AC7：komari_help 同样移除对 permission_manager runtime 便捷函数的依赖。"""
+def test_help_uses_unified_admission_gate() -> None:
+    """AC7：komari_help 命令统一走 group_admission 裁决（sr 模式）。"""
     path = _module_path("komari_help/commands.py")
     targets = _import_targets(path)
-    assert not {t for t in targets if "permission_manager" in t}, (
-        "komari_help 仍依赖 permission_manager（AC7 未迁移）"
+    assert any("group_admission" in t or "adjudicate" in t for t in targets), (
+        "komari_help 命令未接入统一准入裁决（AC7 未实现）"
     )

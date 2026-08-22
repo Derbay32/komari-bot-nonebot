@@ -6,8 +6,8 @@
 
 - 存储专用字段（``id`` / ``revision`` / ``updated_at``）由
   ``TypedConfigModel`` 基类提供；
-- 本资源不提供 ``plugin_enable`` 关闭总闸，也不提供
-  ``user_whitelist`` / ``group_whitelist`` 等旧名单兼容参数（统一准入接管）。
+- 本资源不提供 ``plugin_enable`` 关闭总闸，也不提供旧名单兼容参数
+  （统一准入接管）。
 """
 
 from __future__ import annotations

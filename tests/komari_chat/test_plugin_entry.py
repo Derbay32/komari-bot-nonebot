@@ -36,15 +36,6 @@ def _install_allowed_entry_dependencies(
         face_reaction_id="",
     )
 
-    class _PermissionPlugin:
-        @staticmethod
-        async def check_runtime_permission(
-            _bot: object,
-            _event: object,
-            _config: object,
-        ) -> tuple[bool, str]:
-            return True, ""
-
     class _BanPlugin:
         class BanServiceUnavailableError(Exception):
             pass
@@ -66,7 +57,12 @@ def _install_allowed_entry_dependencies(
         lambda: workflow,
         raising=False,
     )
-    monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
+    def _adjudicate_allowed(_groups: object) -> object:
+        return SimpleNamespace(
+            qualification=chat_module.AdmissionQualification.BUSINESS
+        )
+
+    monkeypatch.setattr(chat_module, "adjudicate", _adjudicate_allowed)
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
 
 
@@ -146,23 +142,17 @@ def chat_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_empty_group_whitelist_is_delegated_to_permission_manager(
+async def test_admission_gate_controls_group_message_processing(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = SimpleNamespace(permission=False, process=False)
-    config = SimpleNamespace(plugin_enable=True, group_whitelist=[])
+    calls = SimpleNamespace(process=False)
+    config = SimpleNamespace(plugin_enable=True)
 
-    class _PermissionPlugin:
-        @staticmethod
-        async def check_runtime_permission(
-            _bot: object,
-            _event: object,
-            actual_config: object,
-        ) -> tuple[bool, str]:
-            assert actual_config is config
-            calls.permission = True
-            return True, ""
+    def _adjudicate_allowed(_groups: object) -> object:
+        return SimpleNamespace(
+            qualification=chat_module.AdmissionQualification.BUSINESS
+        )
 
     class _BanPlugin:
         class BanServiceUnavailableError(Exception):
@@ -188,7 +178,7 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
     monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
-    monkeypatch.setattr(chat_module, "permission_manager_plugin", _PermissionPlugin())
+    monkeypatch.setattr(chat_module, "adjudicate", _adjudicate_allowed)
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
 
     await chat_module.handle_group_message(
@@ -196,7 +186,6 @@ async def test_empty_group_whitelist_is_delegated_to_permission_manager(
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
     )
 
-    assert calls.permission
     assert calls.process
 
 
