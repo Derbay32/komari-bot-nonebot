@@ -273,3 +273,46 @@ async def test_attribution_card_content_stays_within_safe_fields(
             },
             context="归属异常日志",
         )
+
+
+async def test_post_close_invalid_attribution_telemetry_only_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close 后迟到的非法归属裁决：基础遥测照常 +1，观测侧全部 no-op。
+
+    关闭运行时后再调用 ``adjudicate(["bad"], event_family="message")``：
+    ``adjudications_total`` / ``group_attribution_unavailable`` / ``business``
+    / family 基础遥测仍恰 +1，但不得再开归属窗口、不得产生任何
+    ``group_admission.*`` 结构化日志、不得排队/投递通知卡，且
+    ``process_observability`` 整体 no-op。只经日志 capture 与 Bot 可观察效果
+    断言，不触碰 pending 内部列表。
+    """
+    clock = FakeUtcClock()
+    bot = FakeAdmissionBot("bot-postclose-attribution")
+    storage = AdmissionStorageFake(
+        stored_policy(1, atomic_policy("blacklist", []))
+    )
+    app, runtime, _manager = await prepare_control_plane(
+        monkeypatch, storage, runtime_kwargs=_window_kwargs(clock, bot)
+    )
+
+    await runtime.close()
+
+    with capture_admission_logs() as capture:
+        runtime.adjudicate(["bad"], event_family="message")
+        await runtime.process_observability()
+        capture.assert_no_events()
+
+    assert bot.sent == []
+    assert bot.attempts == 0
+
+    async with asgi_client(app) as client:
+        response = await client.get(
+            STATUS_PATH, headers=auth_headers(READER_TOKEN)
+        )
+    assert response.status_code == 200, response.text
+    telemetry = response.json()["telemetry"]
+    assert telemetry["adjudications_total"] == 1
+    assert telemetry["by_reason_code"]["group_attribution_unavailable"] == 1
+    assert telemetry["by_intent"]["business"] == 1
+    assert telemetry["attribution_failures_by_event_family"]["message"] == 1

@@ -204,6 +204,51 @@ async def test_reminders_every_30_minutes_without_duplicates(
     assert len(card_texts((bot,))) == 3
 
 
+async def test_reminder_leap_over_multiple_intervals_is_one_per_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """时钟一次推进跨多个 30 分钟间隔：每 tick 恰一条且锚定原网格边界。
+
+    冷启动失败后首次 process 恰送一张 start 卡；把时钟一次推进至少 7200 秒
+    （跨越 4 个原始 30 分钟边界）后，process 恰生成/发送 1 条提醒；同一时刻
+    再次 process 幂等，不得生成/发送第二条；下一次提醒必须落在下一个原始网
+    格边界（本时点 +1800）才触发。据此杜绝「滑移推进 next_reminder_at」在
+    同 tick 重复 process 时新发出的多条提醒。
+    """
+    clock = FakeUtcClock()
+    bot = FakeAdmissionBot("bot-multiinterval")
+    storage = AdmissionStorageFake(
+        fetch_error=RuntimeError("pg cold start failure")
+    )
+    _app, runtime, _manager = await prepare_control_plane(
+        monkeypatch, storage, runtime_kwargs=_episode_kwargs(clock, bot)
+    )
+
+    # 冷失败首次 process：只送一张起始卡，无提醒
+    await runtime.process_observability()
+    assert len(card_texts((bot,))) == 1, "首次 process 必须恰送一张起始卡"
+
+    # 一次推进至少 7200s（跨越 4 个原始 30 分钟边界）：恰 1 条提醒
+    clock.advance(seconds=7200)
+    with capture_admission_logs() as capture:
+        await runtime.process_observability()
+        assert len(capture.by_event(EVENT_RUNTIME_REMINDER)) == 1, (
+            capture.event_names()
+        )
+        # 同一时刻再次 process：幂等，不得生成/发送第二条
+        await runtime.process_observability()
+        assert len(capture.by_event(EVENT_RUNTIME_REMINDER)) == 1
+    assert len(card_texts((bot,))) == 2, "领先一个时间片至多一条提醒卡"
+
+    # 下一原始网格边界（本时点 +1800）才出现下一条
+    clock.advance(seconds=REMINDER_INTERVAL_SECONDS)
+    with capture_admission_logs() as capture:
+        await runtime.process_observability()
+        assert len(capture.by_event(EVENT_RUNTIME_REMINDER)) == 1
+
+    assert len(card_texts((bot,))) == 3, "起始卡 + 恰两条提醒卡"
+
+
 async def test_recovery_needs_60s_stability_and_failure_within_keeps_episode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
