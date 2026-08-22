@@ -97,6 +97,7 @@ async def test_new_with_title_creates_session_title(
 ) -> None:
     session = await manager.create_session(100, "200", title=" 标题 ")
 
+    assert session is not None
     assert session.title == "标题"
     saved = await manager.get_session(100, "200")
     assert saved is not None

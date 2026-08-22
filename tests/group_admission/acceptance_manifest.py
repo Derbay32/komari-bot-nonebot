@@ -176,6 +176,106 @@ ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = (
             "::test_event_gate_restricted_message_observes_no_phases"
         ),
     ),
+    #: TSK-226 komari_custom 群归属生命周期效果登记。
+    #:
+    #: 每条受治理业务效果都带独立的 ``effect_id`` 前缀
+    #: ``group_admission.effect.custom.*``，intent 覆盖 ``business`` /
+    #: ``fact_finalization``，owner_module 均为 ``komari_custom``。AC1 要求
+    #: 各阶段、intent、平台读取/发送与 global commit 具有独立 effect ID 与
+    #: anchor（锚点指向真实 pytest node）。proposal → 知识库的 global commit
+    #: （``add_knowledge`` 成功）在提案 `publishing->voting->approving->
+    #: approved` 生命周期之外属于单个不可分效果，携带本群 lineage 裁决。
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.session_business_clock",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="CustomSessionManager",
+        sink_kind="redis_edit_session_cas",
+        intent="business",
+        attribution_source="custom:session:{group_id}:{user_id}",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_restricted_session_edit_session_state_is_frozen_and_no_pttl_renewal"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.publishing_claim",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="ProposalPublicationService",
+        intent="business",
+        sink_kind="claim_publication",
+        attribution_source="proposal.group_id",
+        work_category="factual_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_restricted_claim_does_not_acquire_business_lease"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.vote_message_send",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="ProposalPublicationService/__init__",
+        intent="business",
+        sink_kind="onebot_send_group_msg",
+        attribution_source="proposal.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_restricted_vote_message_not_dispatched"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.emoji_like_read",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="vote_handler.fetch_and_update_votes",
+        intent="business",
+        sink_kind="onebot_fetch_emoji_like",
+        attribution_source="proposal.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_restricted_emoji_like_not_read"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.knowledge_commit",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="vote_handler.approve_if_ready",
+        intent="business",
+        sink_kind="knowledge_add_global_commit",
+        attribution_source="proposal.group_id",
+        work_category="factual_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_approved_fact_finalization_no_duplicate_commit"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.approval_notice",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="vote_handler.approve_if_ready",
+        intent="business",
+        sink_kind="onebot_send_group_msg",
+        attribution_source="proposal.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_no_approval_notification_resend"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.custom.publication_reconciliation",
+        owner_module="komari_bot.plugins.komari_custom",
+        source_symbol="ProposalPublicationService",
+        intent="fact_finalization",
+        sink_kind="publication_reconciliation",
+        attribution_source="proposal.group_id",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_custom_proposal_admission.py"
+            "::test_publication_absence_is_unknown_and_never_auto_resends"
+        ),
+    ),
 )
 
 #: TSK-223 阶段 A 管理控制面契约行：经顶层 ``register_group_admission_api``

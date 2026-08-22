@@ -121,6 +121,11 @@ class ProposalRepository:
             vote_count=int(row.vote_count),
             required_votes=int(row.required_votes),
             voted_users=[str(item) for item in row.voted_users],
+            vote_epoch=int(row.vote_epoch),
+            vote_baseline_voters=[
+                str(item) for item in row.vote_baseline_voters
+            ],
+            dormant_seen=bool(row.dormant_seen),
             created_at=row.created_at,
             updated_at=row.updated_at,
             approved_at=row.approved_at,
@@ -533,6 +538,49 @@ class ProposalRepository:
             await session.close()
         return self._row_to_proposal(row) if row is not None else None
 
+    async def mark_dormant(self, proposal_id: int) -> None:
+        """受限（休眠）期内记下休眠标记，供恢复获准后识别换届轮换。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(_P.c.id == proposal_id)
+            .values(dormant_seen=True, updated_at=func.now())
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                await session.execute(statement)
+        finally:
+            await session.close()
+
+    async def rotate_vote_epoch(
+        self,
+        proposal_id: int,
+        baseline_voters: list[str],
+    ) -> Proposal | None:
+        """恢复轮换：把沉睡期平台累积票整批记录为旧轮 baseline，轮次 +1。
+
+        轮次 +1 后新轮有效票 = 当前投票者 - baseline；并清除休眠标记。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(_P.c.id == proposal_id)
+            .values(
+                vote_epoch=_P.c.vote_epoch + 1,
+                vote_baseline_voters=baseline_voters,
+                dormant_seen=False,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        return self._row_to_proposal(row) if row is not None else None
+
     async def claim_for_approval(
         self,
         proposal_id: int,
@@ -643,6 +691,41 @@ class ProposalRepository:
                 await session.execute(statement)
         finally:
             await session.close()
+
+    async def mark_hold(
+        self,
+        proposal_id: int,
+        approval_token: str,
+        hold_code: str,
+    ) -> Proposal | None:
+        """把认领中的提案收敛为运维 hold（closed hold）。
+
+        知识写入 / 发布等出现不可自动恢复的冲突时，把提案移出可重试的投票 / 认
+        领流程并终止，阻断后续认领与采纳通知，等待另行鉴权的数据修复。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(
+                _P.c.id == proposal_id,
+                _P.c.status == "approving",
+                _P.c.approval_token == approval_token,
+            )
+            .values(
+                status="hold",
+                approval_token=None,
+                approval_started_at=None,
+                publication_error_code=hold_code,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        return self._row_to_proposal(row) if row is not None else None
 
     async def mark_approved(
         self,

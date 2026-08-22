@@ -28,6 +28,7 @@ from typing import ClassVar
 from sqlalchemy import (
     ARRAY,
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Index,
@@ -125,6 +126,30 @@ class ProposalRow(_ProposalModelBase, table=True):
             ARRAY(Text),
             nullable=False,
             server_default=text("'{}'"),
+        ),
+    )
+    vote_epoch: int = Field(
+        default=0,
+        sa_column=Column(
+            Integer,
+            nullable=False,
+            server_default=text("1"),
+        ),
+    )
+    vote_baseline_voters: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(
+            ARRAY(Text),
+            nullable=False,
+            server_default=text("'{}'"),
+        ),
+    )
+    dormant_seen: bool = Field(
+        default=False,
+        sa_column=Column(
+            Boolean,
+            nullable=False,
+            server_default=text("false"),
         ),
     )
     created_at: datetime = Field(

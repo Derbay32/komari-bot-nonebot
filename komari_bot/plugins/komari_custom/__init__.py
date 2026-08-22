@@ -366,6 +366,10 @@ async def _commit_proposal(
             "❌ 提案发布失败，编辑内容已保留；可再次使用 .custom confirm 重试"
         )
 
+    if proposal is None:
+        # 受限群不开展业务：不投递、不消耗重试、不删除编辑会话。
+        await custom_action.finish()
+
     message_id = proposal.vote_message_id
     if message_id is None:
         msg = "已发布提案缺少投票消息 ID"

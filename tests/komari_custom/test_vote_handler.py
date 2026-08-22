@@ -43,6 +43,7 @@ class _Repository:
             proposer_id=10001,
             vote_count=1,
             required_votes=3,
+            group_id=456,
         )
 
     async def initialize(self) -> None:
@@ -152,6 +153,7 @@ async def test_concurrent_approval_only_writes_one_knowledge_entry(
         vote_count=3,
         required_votes=3,
         group_id=456,
+        vote_epoch=1,
     )
 
     class _ApprovalRepository:
@@ -230,6 +232,7 @@ async def test_failed_knowledge_write_releases_approval_claim(
         vote_count=3,
         required_votes=3,
         group_id=456,
+        vote_epoch=1,
     )
     repository = SimpleNamespace(
         get_by_id=AsyncMock(return_value=proposal),
