@@ -49,6 +49,13 @@ EXPECTED_CORE_CONTRACT_IDS = {
 
 EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.inbound_matcher_dispatch",
+    "group_admission.effect.custom.session_business_clock",
+    "group_admission.effect.custom.publishing_claim",
+    "group_admission.effect.custom.vote_message_send",
+    "group_admission.effect.custom.emoji_like_read",
+    "group_admission.effect.custom.knowledge_commit",
+    "group_admission.effect.custom.approval_notice",
+    "group_admission.effect.custom.publication_reconciliation",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {
@@ -175,19 +182,47 @@ def test_effect_case_shape_covers_required_attribution_fields() -> None:
 
 
 def test_effect_case_inbound_matcher_dispatch_registered() -> None:
-    """ADMISSION_EFFECT_CASES 恰好登记入口门禁效果行。
+    """ADMISSION_EFFECT_CASES 恰好登记入口效果与 TSK-226 custom 效果行。
 
-    TSK-224 已登记一条入口门禁效果 ``inbound_matcher_dispatch``，
-    不替代下游效果行。
+    TSK-224 登记入口门禁效果 ``inbound_matcher_dispatch``；TSK-226 追加
+    komari_custom 群归属生命周期效果行（独立 effect ID）。两行来源与意图不
+    同，各自按模块校验。
     """
     assert {case.effect_id for case in ADMISSION_EFFECT_CASES} == (
         EXPECTED_EFFECT_CASE_IDS
     )
-    for case in ADMISSION_EFFECT_CASES:
-        assert case.owner_module == "komari_bot.plugins.group_admission"
-        assert case.intent == "business"
-        assert case.attribution_source == "onebot_v11_event_group_id"
-        assert case.work_category == "transient_interaction"
+
+
+def test_effect_case_inbound_row_shape_is_frozen() -> None:
+    """入口门禁单行保持固定形状：owner=group_admission/business/transient。"""
+    inbound_cases = [
+        case
+        for case in ADMISSION_EFFECT_CASES
+        if case.effect_id == "group_admission.effect.inbound_matcher_dispatch"
+    ]
+    assert len(inbound_cases) == 1
+    case = inbound_cases[0]
+    assert case.owner_module == "komari_bot.plugins.group_admission"
+    assert case.intent == "business"
+    assert case.attribution_source == "onebot_v11_event_group_id"
+    assert case.work_category == "transient_interaction"
+
+
+def test_custom_effect_case_rows_are_attributed() -> None:
+    """TSK-226 custom 效果行归属 komari_custom，intent 仅取受控闭集。"""
+    custom_prefix = "group_admission.effect.custom."
+    custom_cases = [
+        case
+        for case in ADMISSION_EFFECT_CASES
+        if case.effect_id.startswith(custom_prefix)
+    ]
+    assert len(custom_cases) >= 1, "TSK-226 必须登记 custom 效果行"
+    for case in custom_cases:
+        assert case.owner_module == "komari_bot.plugins.komari_custom", (
+            f"{case.effect_id} 归属模块越界: {case.owner_module}"
+        )
+        assert case.intent in {"business", "fact_finalization"}, case.effect_id
+        assert case.attribution_source.strip() and case.sink_kind.strip()
 
 
 def test_management_cases_register_exactly_the_phase_a_control_plane() -> None:
