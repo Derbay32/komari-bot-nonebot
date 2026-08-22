@@ -3,7 +3,7 @@
 本模块在 ``group_admission`` 包导入时自动注册一个 ``event_preprocessor``
 前置处理器，拦截所有 NoneBot 事件并按群聊准入策略进行粗门禁裁决。
 
-事件分类（基于精确 OneBot V11 具体类型，不泛化适配新子类）：
+事件分类（基于精确 OneBot V11 具体运行时类，禁止 isinstance 泛化吸纳新子类）：
 
 - system_meta（MetaEvent / LifecycleMetaEvent / HeartbeatMetaEvent）：
   直接放行，不做任何准入裁决；
@@ -48,9 +48,16 @@ from nonebot.message import event_preprocessor
 from . import runtime as _runtime_module
 from .contracts import AdmissionIntent, AdmissionQualification
 
-# 12 类群业务事件闭集：isinstance 检查用 tuple。
+# 3 类系统元事件闭集：精确运行时类身份（不接纳子类）。
+_SYSTEM_META_CLASSES: frozenset[type[Event]] = frozenset({
+    MetaEvent,
+    LifecycleMetaEvent,
+    HeartbeatMetaEvent,
+})
+
+# 12 类群业务事件闭集：frozenset 精确运行时类身份（不接纳子类）。
 # 精确锁定 OneBot V11 具体类型，不通过 getattr/泛化继承接纳新适配器子类。
-_GROUP_BUSINESS_CLASSES: tuple[type[Event], ...] = (
+_GROUP_BUSINESS_CLASSES: frozenset[type[Event]] = frozenset({
     GroupMessageEvent,
     GroupUploadNoticeEvent,
     GroupAdminNoticeEvent,
@@ -63,12 +70,13 @@ _GROUP_BUSINESS_CLASSES: tuple[type[Event], ...] = (
     LuckyKingNotifyEvent,
     HonorNotifyEvent,
     GroupRequestEvent,
-)
+})
 
 
 def _event_family(event: Event) -> str:
     """根据事件祖先确定封闭事件族（message / notice / request / unknown）。
 
+    仅用于安全闭族遥测（event_family），不参与门禁分类裁决。
     MetaEvent 应在调用本函数前被处理，不会进入此分支。
     """
     if isinstance(event, MessageEvent):
@@ -89,19 +97,22 @@ async def _admission_event_gate(event: Event) -> None:
     3. group_business → 提取 group_id 并裁决；获准放行，否则拒绝；
     4. unsupported failclosed → 以空关联群裁决，恒定拒绝。
     """
-    # 1. system_meta：精确匹配三种 MetaEvent，直接放行
-    if isinstance(event, (MetaEvent, LifecycleMetaEvent, HeartbeatMetaEvent)):
+    # 运行时精确类身份：一次捕获，用于所有闭集检查（禁止 isinstance 泛化吸纳新子类）
+    event_class = type(event)
+
+    # 1. system_meta：精确运行时类身份匹配三种 MetaEvent，直接放行
+    if event_class in _SYSTEM_META_CLASSES:
         return
 
-    # 2. private_input：PrivateMessageEvent → 静默拒绝
-    if isinstance(event, PrivateMessageEvent):
+    # 2. private_input：精确运行时类身份匹配 PrivateMessageEvent → 静默拒绝
+    if event_class is PrivateMessageEvent:
         _runtime_module._runtime.record_private_input_rejected(
             event_family="message"
         )
         raise IgnoredException("group_admission_rejected") from None
 
-    # 3. group_business：12 类群业务事件
-    if isinstance(event, _GROUP_BUSINESS_CLASSES):
+    # 3. group_business：精确运行时类身份匹配 12 类群业务事件闭集
+    if event_class in _GROUP_BUSINESS_CLASSES:
         raw_group_id = getattr(event, "group_id", None)
         if type(raw_group_id) is int and raw_group_id > 0:
             group_ids: list[int] = [raw_group_id]
@@ -115,7 +126,8 @@ async def _admission_event_gate(event: Event) -> None:
             return
         raise IgnoredException("group_admission_rejected") from None
 
-    # 4. unsupported failclosed：所有其他事件（基类、好友事件、未知子类等）
+    # 4. unsupported failclosed：所有未列在以上闭集中的事件（含基类、子类、未被
+    #    显式列出的未知事件类型），以空关联群 BUSINESS 裁决（恒定被拒）
     family = _event_family(event)
     _runtime_module._runtime.adjudicate(
         [], intent=AdmissionIntent.BUSINESS, event_family=family
