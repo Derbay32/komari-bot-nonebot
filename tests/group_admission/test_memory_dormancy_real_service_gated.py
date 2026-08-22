@@ -88,6 +88,64 @@ async def test_ac4_dormancy_freezes_snapshot_ttl_real_redis(
         await client.aclose()
 
 
+async def test_ac4_resume_restores_remaining_time_not_reset_to_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """补项2（AC4 恢复剩余时间）：休眠恢复只恢复剩余 TTL，不重新满额。
+
+    用真实 RedisManager 建立 processing 快照，记录其存活 TTL；经
+    ``claim_existing_conversation_processing`` 模拟休眠后恢复认领，恢复后的
+    快照 TTL 不得比休眠前更长（复用剩余时间，「不重新满额」）。
+    """
+    if not REDIS_URL:
+        pytest.skip("未配置真实 Redis")
+    import redis.asyncio as aioredis
+
+    from komari_bot.plugins.komari_memory.services.redis_manager import (
+        MessageSchema,
+        RedisManager,
+    )
+
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    group_id = f"tsk230b-{uuid4().hex[:10]}"
+    try:
+        cfg = SimpleNamespace(
+            conversation_processing_lease_seconds=60,
+            conversation_snapshot_ttl_seconds=300,
+        )
+        from komari_bot.plugins.komari_memory.services import redis_manager as rm
+
+        monkeypatch.setattr(rm, "get_config", lambda: cfg)
+        mgr = RedisManager(cfg)  # type: ignore[arg-type] -- 真实连接配置简化
+        mgr._redis = client
+        await client.flushdb()
+        msg = MessageSchema(
+            user_id="u1",
+            user_nickname="阿明",
+            group_id=group_id,
+            content="恢复剩余时间验收",
+            timestamp=1.0,
+            message_id="m1",
+        )
+        await mgr.push_message(group_id, msg)
+        claim = await mgr.claim_conversation_buffer(group_id, "owner-a", "toka")
+        assert claim.status == "claimed"
+        key = _processing_key(group_id, "toka")
+        before = await client.pttl(key)
+        # 休眠后由另一 owner 恢复接管同一快照（resume claim on existing）。
+        resumed = await mgr.claim_existing_conversation_processing(
+            group_id, key, "owner-b"
+        )
+        assert resumed.status == "claimed"
+        after = await client.pttl(key)
+        # 不重新满额：恢复后的剩余 TTL 不高于休眠前的存活 TTL。
+        assert after is not None and after > 0
+        assert after <= before, "恢复后不应把快照 TTL 重置得更满"
+    finally:
+        await client.flushdb()
+        await client.aclose()
+
+
 async def test_ac9_fresh_process_restores_real_redis_and_writes_no_lkg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

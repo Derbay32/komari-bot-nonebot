@@ -184,7 +184,11 @@ local payload = cjson.encode({
 })
 redis.call('SET', current_key, processing_key, 'EX', snapshot_ttl_seconds)
 redis.call('SET', lease_key, payload, 'PX', lease_ms)
-redis.call('EXPIRE', processing_key, snapshot_ttl_seconds)
+-- 休眠恢复只恢复剩余时间（补项2）：快照已有存活 TTL 时保留，不重新满额；
+-- 仅对无 TTL 的旧式残留快照补设安全 TTL。
+if redis.call('PTTL', processing_key) < 0 then
+    redis.call('EXPIRE', processing_key, snapshot_ttl_seconds)
+end
 return {1, processing_key}
 """
 
