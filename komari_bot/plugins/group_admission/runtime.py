@@ -242,6 +242,9 @@ class _PendingNotification:
     resolved_at: datetime | None = None
     pending_recipients: list[int] | None = None
     event_family: str | None = None
+    configured_revision: int | None = None
+    effective_revision: int | None = None
+    using_last_known_good: bool | None = None
 
 
 @dataclass(slots=True)
@@ -1293,6 +1296,9 @@ class _AdmissionRuntime:
                     started_at=episode.started_at,
                     occurrence_count=1,
                     duration_seconds=0,
+                    configured_revision=state.configured_revision,
+                    effective_revision=state.effective_revision,
+                    using_last_known_good=state.using_last_known_good,
                 )
             )
         if state.status is AdmissionRuntimeStatus.FAILED:
@@ -1349,6 +1355,9 @@ class _AdmissionRuntime:
                     started_at=episode.started_at,
                     occurrence_count=episode.occurrence_count,
                     duration_seconds=duration_seconds,
+                    configured_revision=state.configured_revision,
+                    effective_revision=state.effective_revision,
+                    using_last_known_good=state.using_last_known_good,
                 )
             )
         if state.status is AdmissionRuntimeStatus.FAILED:
@@ -1412,6 +1421,9 @@ class _AdmissionRuntime:
             merged_start.occurrence_count = episode.occurrence_count
             merged_start.duration_seconds = duration_seconds
             merged_start.resolved_at = now
+            merged_start.configured_revision = state.configured_revision
+            merged_start.effective_revision = state.effective_revision
+            merged_start.using_last_known_good = state.using_last_known_good
         else:
             self._pending_notifications.append(
                 _PendingNotification(
@@ -1422,6 +1434,9 @@ class _AdmissionRuntime:
                     occurrence_count=episode.occurrence_count,
                     duration_seconds=duration_seconds,
                     resolved_at=now,
+                    configured_revision=state.configured_revision,
+                    effective_revision=state.effective_revision,
+                    using_last_known_good=state.using_last_known_good,
                 )
             )
         logger.bind(
@@ -1478,7 +1493,9 @@ class _AdmissionRuntime:
             (
                 f"status: {notification.status}",
                 f"problem_code: {notification.problem_code}",
-                f"occurrence_count: {notification.occurrence_count}",
+                f"configured_revision: {notification.configured_revision}",
+                f"effective_revision: {notification.effective_revision}",
+                f"using_last_known_good: {notification.using_last_known_good}",
                 f"duration_seconds: {notification.duration_seconds}",
                 "started_at: "
                 f"{_format_rfc3339(notification.started_at)}",
