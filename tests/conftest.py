@@ -6,9 +6,13 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import nonebot.plugin
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -563,3 +567,44 @@ _inject_package_exports(
         "generate_completion": _DummyLLMProvider.generate_completion,
     },
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_event_gate_preprocessor(request: pytest.FixtureRequest) -> Iterator[None]:
+    """隔离 ``group_admission`` 全局事件门禁前置处理器。
+
+    默认（无 ``group_admission_acceptance`` 标记）移除
+    ``_admission_event_gate`` 前置处理器，使现有 matcher 单元测试保持
+    隔离运行。标记为 ``group_admission_acceptance`` 的测试保留真实
+    全局门禁，由 ``event_gate_context`` 管理生命周期。
+
+    TSK-224 引入的全局事件门禁在 ``event_gate`` 模块 import 时自动注册
+    到 ``nonebot.message._event_preprocessors``。单跑特定测试文件时不受
+    影响，但全量测试套件中该门禁会拦截 komari_debug / komari_help / sr /
+    user_ban 等插件的 matcher 测试事件，导致 63 个假阳性失败。
+    """
+    # 延迟 import 避免模块加载副作用
+    from nonebot.message import _event_preprocessors
+
+    # 收集门禁条目：call.__module__ 匹配 event_gate 模块的 Dependent 对象
+    gate_entries = {
+        dep
+        for dep in _event_preprocessors
+        if getattr(dep, "call", None) is not None
+        and getattr(dep.call, "__module__", None)
+        == "komari_bot.plugins.group_admission.event_gate"
+    }
+
+    # 判断当前测试是否属于门禁验收套件
+    has_marker = (
+        request.node.get_closest_marker("group_admission_acceptance") is not None
+    )
+
+    if not has_marker and gate_entries:
+        _event_preprocessors.difference_update(gate_entries)
+
+    try:
+        yield
+    finally:
+        if not has_marker and gate_entries:
+            _event_preprocessors.update(gate_entries)
