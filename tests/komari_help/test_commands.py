@@ -11,7 +11,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification
 from komari_bot.plugins.komari_help import rendering as rendering_module
 from komari_bot.plugins.komari_help.models import HelpEntry, HelpSearchResult
 
@@ -27,19 +27,9 @@ class _StubConfigManager:
         return self.config
 
 
-class _StubPermissionManager:
-    def __init__(self, result: tuple[bool, str]) -> None:
-        self.result = result
-        self.seen_configs: list[object] = []
-
-    async def check_runtime_permission(
-        self,
-        _bot: object,
-        _event: object,
-        config: object,
-    ) -> tuple[bool, str]:
-        self.seen_configs.append(config)
-        return self.result
+def _adjudicate_business(*_args: object, **_kwargs: object) -> object:
+    """返回获准裁决替身，供命令单测放行统一准入。"""
+    return SimpleNamespace(qualification=AdmissionQualification.BUSINESS)
 
 
 def _create_onebot_bot(ctx: Any) -> Bot:
@@ -215,10 +205,9 @@ async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
         user_whitelist=[],
         group_whitelist=[],
     )
-    permission_manager = _StubPermissionManager((False, "插件当前已禁用"))
 
     def fail_get_engine() -> None:
-        msg = "权限拒绝后不应访问帮助引擎"
+        msg = "插件关闭后不应访问帮助引擎"
         raise AssertionError(msg)
 
     monkeypatch.setattr(
@@ -226,11 +215,8 @@ async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
         "config_manager",
         _StubConfigManager(config),
     )
-    monkeypatch.setattr(
-        commands_module,
-        "permission_manager_plugin",
-        permission_manager,
-    )
+    # 准入裁决放行，只验证本插件 plugin_enable=false 走静默跳过
+    monkeypatch.setattr(commands_module, "adjudicate", _adjudicate_business)
     monkeypatch.setattr(commands_module, "get_engine", fail_get_engine)
 
     matcher = getattr(commands_module, matcher_name)
@@ -240,14 +226,6 @@ async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
         ctx.receive_event(bot, event)
         ctx.should_ignore_permission(matcher=matcher)
         ctx.should_pass_rule(matcher=matcher)
-        ctx.should_call_send(
-            event,
-            plain_text_message("❌ 插件当前已禁用"),
-            bot=bot,
-        )
-        ctx.should_finished()
-
-    assert permission_manager.seen_configs == [config]
 
 
 @pytest.mark.asyncio
@@ -290,7 +268,6 @@ async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
         user_whitelist=[],
         group_whitelist=[],
     )
-    permission_manager = _StubPermissionManager((False, "插件当前已禁用"))
 
     async def allow_superuser(_bot: object, _event: object) -> bool:
         return True
@@ -300,11 +277,8 @@ async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
         "config_manager",
         _StubConfigManager(config),
     )
-    monkeypatch.setattr(
-        commands_module,
-        "permission_manager_plugin",
-        permission_manager,
-    )
+    # 准入裁决放行，只验证 SUPERUSER 通过后 plugin_enable=false 仍静默跳过
+    monkeypatch.setattr(commands_module, "adjudicate", _adjudicate_business)
     monkeypatch.setattr(commands_module, "SUPERUSER", allow_superuser)
 
     matcher = commands_module.help_refresh_cmd
@@ -314,11 +288,3 @@ async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
         ctx.receive_event(bot, event)
         ctx.should_ignore_permission(matcher=matcher)
         ctx.should_pass_rule(matcher=matcher)
-        ctx.should_call_send(
-            event,
-            plain_text_message("❌ 插件当前已禁用"),
-            bot=bot,
-        )
-        ctx.should_finished()
-
-    assert permission_manager.seen_configs == [config]
