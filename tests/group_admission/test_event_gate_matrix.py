@@ -239,3 +239,84 @@ async def test_failed_runtime_rejects_group_message(
     assert telemetry["adjudications_total"] == 1
     assert telemetry["by_reason_code"]["effective_policy_unavailable"] == 1
     assert telemetry["attribution_failures_by_event_family"]["message"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Case 6: 3 种未来未注册事件子类全部故障关闭
+# （module != adapter，census 忽略）
+# ---------------------------------------------------------------------------
+
+
+class FutureGroupMessageEvent(GroupMessageEvent):
+    """未来未注册的 GroupMessage 子类。"""
+
+
+class FuturePrivateMessageEvent(PrivateMessageEvent):
+    """未来未注册的 PrivateMessage 子类。"""
+
+
+class FutureHeartbeatMetaEvent(HeartbeatMetaEvent):
+    """未来未注册的 HeartbeatMeta 子类。"""
+
+
+@pytest.mark.parametrize(
+    ("event_cls", "overrides", "probe_family", "expected_attribution_family"),
+    [
+        (
+            FutureGroupMessageEvent,
+            {"message_type": "group"},
+            "message",
+            "message",
+        ),
+        (
+            FuturePrivateMessageEvent,
+            {"message_type": "private"},
+            "message",
+            "message",
+        ),
+        (
+            FutureHeartbeatMetaEvent,
+            {
+                "post_type": "meta_event",
+                "meta_event_type": "heartbeat",
+                "status": None,
+                "interval": 0,
+            },
+            "meta_event",
+            "unknown",
+        ),
+    ],
+    ids=["future-group-message", "future-private-message", "future-heartbeat-meta"],
+)
+async def test_future_unsupported_events_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    event_cls: type[Event],
+    overrides: dict[str, object],
+    probe_family: str,
+    expected_attribution_family: str,
+) -> None:
+    """未来未注册事件子类被门控拒绝：trace 空、bot 零、遥测 group_attribution_unavailable。
+
+    当前生产 isinstance 实现使全部 3 种变体 FAIL：
+    - FutureGroupMessageEvent 被 _GROUP_BUSINESS_CLASSES 捕获 → 非空 trace（RED）
+    - FuturePrivateMessageEvent 被 PrivateMessageEvent 捕获 → private_input_rejected（RED）
+    - FutureHeartbeatMetaEvent 被 MetaEvent tuple 捕获 → 放行 / 完整 trace（RED）
+    """
+    app, _rt, _mgr = await _base_env(monkeypatch)
+    event = make_v11_event(event_cls, **overrides)
+    trace, telemetry, bot = await _dispatch_and_read(app, event, probe_family)
+
+    # 所有变体必须被拦截：trace 空、bot 零
+    assert trace == [], f"期望拦截（空 trace），实际 {trace}"
+    assert bot.calls == [], f"bot.calls={bot.calls}"
+
+    # 遥测记一次 group_attribution_unavailable
+    assert telemetry["adjudications_total"] == 1
+    assert telemetry["by_reason_code"]["group_attribution_unavailable"] == 1
+    assert (
+        telemetry["attribution_failures_by_event_family"][expected_attribution_family]
+        == 1
+    )
+
+    # Private 子类不是 private_input_rejected，Meta 子类不是 system pass
+    assert telemetry["by_reason_code"].get("private_input_rejected", 0) == 0
