@@ -121,6 +121,7 @@ class ProposalRepository:
             vote_count=int(row.vote_count),
             required_votes=int(row.required_votes),
             voted_users=[str(item) for item in row.voted_users],
+            vote_epoch=int(row.vote_epoch),
             created_at=row.created_at,
             updated_at=row.updated_at,
             approved_at=row.approved_at,

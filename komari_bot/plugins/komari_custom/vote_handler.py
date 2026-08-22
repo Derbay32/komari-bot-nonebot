@@ -152,15 +152,18 @@ async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
     if state.repository is None or state.knowledge_plugin is None:
         return
     proposal = await state.repository.get_by_id(proposal_id)
-    if proposal is None or proposal.status == "approved":
-        return
-    if proposal.status not in {"voting", "approving"}:
+    if proposal is None or proposal.status not in {"voting", "approving"}:
         return
 
     # 采纳提交与通知前的统一业务裁决；受限则跳过且不补发采纳通知。
     # 已认领采纳（前次于 add 已提交 knowledge / 正在处理）：本轮不重复提交，
     # 避免同一 source_key 重复 add/embedding；唯一认领由租约与 claim 保证。
     if not business_admitted(proposal.group_id) or proposal.status == "approving":
+        return
+
+    # 沉眠/预活跃轮次（vote_epoch==0）：恢复准入后的首次业务处理按换届式轮换，
+    # 上一 epoch 累计票不具跨 epoch 达标效力，须经新轮 fetch 刷新后才可采纳。
+    if getattr(proposal, "vote_epoch", 0) <= 0:
         return
 
     approval_token = uuid4().hex

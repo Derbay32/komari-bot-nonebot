@@ -39,6 +39,10 @@ class Proposal(BaseModel):
     vote_count: int = 0
     required_votes: int
     voted_users: list[str] = Field(default_factory=list)
+    #: 投票计数所属的生效轮次（vote epoch）。``0`` 表示从未激活当前轮次
+    #:（沉眠期累计票不具跨 epoch 达标效力）；恢复准入后首次业务处理按换届式轮
+    #: 换，上一轮计票不参与新轮采纳。
+    vote_epoch: int = 0
     created_at: datetime
     updated_at: datetime
     approved_at: datetime | None = None
