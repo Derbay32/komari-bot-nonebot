@@ -613,8 +613,8 @@ ADMISSION_EFFECT_CASES += (
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
-            "tests/group_admission/test_chat_effect_manifest.py"
-            "::test_embedding_effect_registered"
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_embedding_restricted_blocks_query_embedding"
         ),
     ),
     AdmissionEffectCase(
@@ -682,8 +682,8 @@ ADMISSION_EFFECT_CASES += (
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
-            "tests/group_admission/test_chat_effect_manifest.py"
-            "::test_debug_public_effect_registered"
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_debug_public_restricted_blocks_group_public_output"
         ),
     ),
 )

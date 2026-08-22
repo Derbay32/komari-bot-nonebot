@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import sys
+import types
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+
+import komari_bot.plugins as plugins_package
 
 from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
@@ -254,6 +258,162 @@ async def test_concurrent_sibling_admitted_completes_restricted_not_started(
     assert len(dl.calls) == 1, ("并发 sibling：获准者完成下载，受限者不启动；"
                                 "已 dispatch 结果不外溢")
 
+
+
+# ---------------------------------------------------------------------------
+# 强制补充项：embedding（chat.embedding）真实行为断言
+# ---------------------------------------------------------------------------
+
+
+async def test_embedding_restricted_blocks_query_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chat.embedding：查询向量化前按群裁决，受限时不发起 embed 外呼。
+
+    驱动「效果所在的最近生产函数」``MessageHandler._generate_reply_core``：
+    embedding 子效果位于其中对 ``embedding_provider.embed`` 的调用点。
+    """
+    s = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, s)
+
+    embed_calls: list[str] = []
+
+    class _EmbedSpy:
+        async def embed(self, text: str) -> list[float]:
+            embed_calls.append(text)
+            return [0.1]
+
+    class _Mem:
+        async def search_conversations(self, **_kw: object) -> list[object]:
+            return []
+
+        async def search_interaction_events(self, **_kw: object) -> list[object]:
+            return []
+
+        async def get_user_profile(self, **_kw: object) -> None:
+            return None
+
+    class _Rewrite:
+        async def rewrite_query(self, current_query: str, **_kw: object) -> str:
+            del _kw
+            return current_query
+
+    async def _async_favorability(_user_id: str) -> object:
+        del _user_id
+        return SimpleNamespace(favorability=0)
+
+    handler = mh.MessageHandler.__new__(mh.MessageHandler)
+    handler.memory = _Mem()
+    handler.query_rewrite = _Rewrite()
+
+    conf = SimpleNamespace(
+        memory_search_limit=3,
+        image_understanding_mode="native",
+        agent_max_rounds=10,
+        agent_max_tool_calls_per_round=4,
+        agent_max_total_tool_calls=20,
+        agent_tool_call_mode="required",
+        bot_nickname="小鞠",
+        face_reaction_enabled=False,
+        face_reaction_id="76",
+        error_notify_enabled=False,
+        vision_image_download_max_count=4,
+        vision_image_download_max_bytes=8 * 1024 * 1024,
+        vision_image_download_total_max_bytes=20 * 1024 * 1024,
+        vision_image_download_max_pixels=40_000_000,
+        vision_image_download_concurrency=2,
+        vision_image_download_connect_timeout_seconds=5.0,
+        vision_image_download_read_timeout_seconds=30.0,
+        vision_image_download_total_timeout_seconds=45.0,
+    )
+    monkeypatch.setattr(mh, "get_config", lambda: conf)
+    monkeypatch.setattr(mh, "get_memory_config", lambda: conf)
+    async def _build_prompt(**_kw: object) -> list[object]:
+        del _kw
+        return []
+
+    monkeypatch.setattr(mh, "build_prompt", _build_prompt)
+    monkeypatch.setattr(
+        mh,
+        "komari_search_plugin",
+        SimpleNamespace(
+            is_search_available=lambda **_kw: False,
+            is_fetch_available=lambda **_kw: False,
+        ),
+    )
+
+    async def _gen(**_kw: object) -> object:
+        del _kw
+        return llm.ReplyResult(
+            content="ok",
+            interaction_history={"event": "e", "result": "r", "emotion": "m"},
+        )
+
+    monkeypatch.setattr(mh, "generate_reply_with_tools", _gen)
+    monkeypatch.setattr(mh, "generate_reply", _gen)
+    emb = types.ModuleType("komari_bot.plugins.embedding_provider")
+    emb.embed = _EmbedSpy().embed  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "komari_bot.plugins.embedding_provider", emb)
+    monkeypatch.setattr(
+        plugins_package, "embedding_provider", emb, raising=False
+    )
+    monkeypatch.setattr(
+        mh,
+        "user_data_plugin",
+        SimpleNamespace(
+            get_user_favorability=_async_favorability,
+            get_config=lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
+        ),
+    )
+
+    message = mh.MessageSchema(
+        user_id="u1",
+        user_nickname="昵称",
+        group_id="100",
+        content="你好",
+        timestamp=1.0,
+        message_id="m1",
+    )
+    await handler._generate_reply_core(
+        message=message,
+        recent_messages=[],
+        interaction_records=[],
+        image_urls=None,
+        reply_context=None,
+        reply_context_requested=False,
+        reply_context_refetched=False,
+        request_trace_id="t",
+    )
+    assert s.calls != [], "chat.embedding 效果前未调用 adjudicate"
+    assert embed_calls == [], "chat.embedding 在受限准入下仍发起了 embed 外呼"
+
+
+# ---------------------------------------------------------------------------
+# 强制补充项：debug_public（chat.debug_public）真实行为断言
+# ---------------------------------------------------------------------------
+
+
+async def test_debug_public_restricted_blocks_group_public_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chat.debug_public：debug 干跑的群公开输出前按群裁决，受限时丢弃。
+
+    驱动「效果所在的最近生产函数」``generate_debug_reply``（komari_chat
+    入口）：受限时静默返回空回复，不进入 LLM / 不产生可送达群内的公开输出。
+    """
+    s = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, s)
+    mod = _fresh_chat_module(monkeypatch)
+    collector = SimpleNamespace(request_id="debug-1", buffer=[])
+    result = await mod.generate_debug_reply(
+        group_id=str(GROUP_ID),
+        user_id="5",
+        user_nickname="n",
+        content="x",
+        collector=collector,
+    )
+    assert s.calls != [], "chat.debug_public 群公开输出前未调用 adjudicate"
+    assert result.reply == "", "受限准入下 debug 群公开输出应被安静丢弃"
 
 
 def _fresh_chat_module(monkeypatch: pytest.MonkeyPatch) -> Any:
