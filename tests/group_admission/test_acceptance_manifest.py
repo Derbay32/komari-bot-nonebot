@@ -5,9 +5,9 @@
 - contract/effect/management/observability 稳定 ID 唯一且前缀形态受控；
 - 每行全部字段非空；
 - 本票恰好登记核心四项契约，anchor 指向本票实际可收集的 pytest node；
-- 核心模块不拥有受治理业务效果，effect 登记保持空（控制面 CAS 属
+- 核心模块不拥有受治理业务效果，effect 登记保持单条（控制面 CAS 属
   ``system_control_plane``，可观测性/通知属 ``operational_diagnostic``，都不冒
-  充 governed BUSINESS effect）；
+  充 governed BUSINESS effect）；TSK-224 已登记一条入口门禁效果，不替代下游；
 - TSK-223 阶段 A 登记六条管理控制面契约行，全部属 ``system_control_plane``
   分类（不把全局控制面 CAS 当成需要群裁决的 BUSINESS 效果），anchor 同
   样可被收集；
@@ -45,6 +45,10 @@ EXPECTED_CORE_CONTRACT_IDS = {
     "group_admission.contract.runtime_state",
     "group_admission.contract.snapshot_publish",
     "group_admission.contract.lifecycle",
+}
+
+EXPECTED_EFFECT_CASE_IDS = {
+    "group_admission.effect.inbound_matcher_dispatch",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {
@@ -170,17 +174,20 @@ def test_effect_case_shape_covers_required_attribution_fields() -> None:
     assert bool(getattr(params, "frozen", False)) is True
 
 
-def test_effect_cases_are_empty_because_core_module_owns_no_governed_sink() -> None:
-    """核心裁决模块只输出裁决与状态，不拥有受治理业务效果接缝。
+def test_effect_case_inbound_matcher_dispatch_registered() -> None:
+    """ADMISSION_EFFECT_CASES 恰好登记入口门禁效果行。
 
-    平台输出、持久写入、LLM/工具调用等效果行由 TSK-224 及后续效果所有者票
-    登记；本票保持空 tuple，不替未来插件发明 effect row。管理控制面 CAS
-    写入是全局系统配置维护（``system_control_plane``），登记在
-    ``ADMISSION_MANAGEMENT_CASES``；阶段 B 的计数/窗口/故障期与 SUPERUSER
-    通知是封闭运维诊断（``operational_diagnostic``），登记在
-    ``ADMISSION_OBSERVABILITY_CASES``；两者都不冒充需要逐群裁决的受治理业务效果。
+    TSK-224 已登记一条入口门禁效果 ``inbound_matcher_dispatch``，
+    不替代下游效果行。
     """
-    assert ADMISSION_EFFECT_CASES == ()
+    assert {case.effect_id for case in ADMISSION_EFFECT_CASES} == (
+        EXPECTED_EFFECT_CASE_IDS
+    )
+    for case in ADMISSION_EFFECT_CASES:
+        assert case.owner_module == "komari_bot.plugins.group_admission"
+        assert case.intent == "business"
+        assert case.attribution_source == "onebot_v11_event_group_id"
+        assert case.work_category == "transient_interaction"
 
 
 def test_management_cases_register_exactly_the_phase_a_control_plane() -> None:
@@ -229,6 +236,9 @@ def test_contract_anchors_are_collectable_pytest_nodes() -> None:
     )
     anchors.extend(
         case.acceptance_anchor for case in ADMISSION_OBSERVABILITY_CASES
+    )
+    anchors.extend(
+        case.acceptance_anchor for case in ADMISSION_EFFECT_CASES
     )
     for anchor in anchors:
         assert anchor.startswith("tests/group_admission/"), anchor

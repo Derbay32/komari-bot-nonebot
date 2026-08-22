@@ -142,16 +142,37 @@ ADMISSION_CONTRACT_CASES: tuple[AdmissionContractCase, ...] = (
     ),
 )
 
-#: 核心裁决模块不拥有任何受治理业务效果接缝：它只输出裁决与运行时状态，
-#: 不执行平台输出、持久写入、LLM/工具调用或平台读取。效果行由 TSK-224+
-#: 的效果所有者票（入口门禁、聊天、履约、记忆、提案、总结、管理）登记，
-#: 本票不替未来插件发明 effect row。
+#: TSK-224 slice4 效果登记：入口门禁效果行。
 #:
-#: 阶段 B 补充冻结：管理控制面 CAS 写入属 ``system_control_plane``（登记在
-#: ``ADMISSION_MANAGEMENT_CASES``）；计数/窗口/故障期与 SUPERUSER 通知属
-#: ``operational_diagnostic`` 运维诊断（登记在 ``ADMISSION_OBSERVABILITY_CASES``）。
-#: 两者都不冒充需要逐群裁决的 governed BUSINESS effect，因此本 tuple 保持空。
-ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = ()
+#: ``group_admission.effect.inbound_matcher_dispatch`` 是事件门控的唯一受治理
+#: 业务效果——它经过裁决后把准入群事件投递到 ``nonebot_matcher_dispatch``。
+#: 此效果属于 ``transient_interaction`` 工作类别（瞬时互动），不持久化、
+#: 不写入存储。
+#:
+#: 核心裁决模块（``adjudicate`` / ``get_runtime_state``）仍不拥有任何受治理
+#: 业务效果接缝：它只输出裁决与运行时状态，不执行平台输出、持久写入、
+#: LLM/工具调用或平台读取。管理控制面 CAS 写入属 ``system_control_plane``
+#: （登记在 ``ADMISSION_MANAGEMENT_CASES``）；可观测性属
+#: ``operational_diagnostic``（登记在 ``ADMISSION_OBSERVABILITY_CASES``）；
+#: 两者都不冒充需要逐群裁决的 governed BUSINESS effect。
+#:
+#: TSK-224 已登记入口门禁效果。下游效果（聊天、履约、记忆、提案、总结等）
+#: 由后续票各自登记，本票不替代。
+ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.inbound_matcher_dispatch",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_admission_event_gate",
+        sink_kind="nonebot_matcher_dispatch",
+        intent="business",
+        attribution_source="onebot_v11_event_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_event_gate_flow.py"
+            "::test_event_gate_restricted_message_observes_no_phases"
+        ),
+    ),
+)
 
 #: TSK-223 阶段 A 管理控制面契约行：经顶层 ``register_group_admission_api``
 #: 装配的三个专属端点 + 错误契约 + 安全审计 + 注册面。全部属系统控制面分

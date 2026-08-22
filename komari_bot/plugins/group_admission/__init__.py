@@ -9,8 +9,11 @@ ADR-0012 与 CONTEXT.md「群聊准入」。
 ``register_group_admission_api`` 管理控制面装配入口。
 
 TSK-223 已落地管理 HTTP Adapter（``register_group_admission_api``，经
-``komari_management`` 装配）与基础 status / telemetry 投影；本票仍不挂
-driver hooks、final mount 或事件前置钩子，生产装配收尾由后续票落地。
+``komari_management`` 装配）与基础 status / telemetry 投影。
+TSK-224 已挂载全局事件前置钩子（``event_preprocessor``，经
+``event_gate`` 模块 import 时自动注册）。生产运行时启动与最终管理
+装配（``driver.on_startup`` / ``on_shutdown`` 与传统 mount 收尾）
+仍由后续 TSK-232 落地。
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from collections.abc import Collection  # noqa: TC003
 
 from nonebot.plugin import PluginMetadata, require
 
+from . import event_gate  # noqa: F401 — TSK-224 自动注册事件前置处理器
 from . import runtime as _runtime_module
 from .contracts import (
     AdmissionIntent,
