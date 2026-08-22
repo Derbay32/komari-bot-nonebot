@@ -24,6 +24,7 @@ from komari_bot.memory.profile_operations import profile_traits_to_list
 from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_async
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
+from .admission_gate import effect_business_admitted
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
 from .image_reading_session import (
     ImageFailureSummary,
@@ -735,22 +736,18 @@ async def _build_search_tool_result(
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
     request_trace_id: str | None = None,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
 ) -> str:
-    """执行 search_web 工具并返回工具消息内容。"""
+    """执行 search_web 工具并返回工具消息内容。
+
+    调用者级名单门控已随 ADR-0012 / TSK-225 从 komari_search 移除；本边界
+    只转发查询与 trace，不再携带 caller 参数。
+    """
     query = _parse_search_query(parsed_arguments, raw_arguments)
     if query is None:
         return "[搜索失败：query 参数缺失或格式错误]"
-    search_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
-    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
-        search_kwargs.update(
-            caller_user_id=caller_user_id,
-            caller_group_id=caller_group_id,
-            caller_is_superuser=caller_is_superuser,
-        )
-    return await komari_search.search_web(query, **search_kwargs)
+    return await komari_search.search_web(
+        query, request_trace_id=request_trace_id
+    )
 
 
 def _parse_fetch_urls(
@@ -782,22 +779,16 @@ async def _build_fetch_tool_result(
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
     request_trace_id: str | None = None,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
 ) -> str:
-    """执行 fetch_page 工具并返回工具消息内容。"""
+    """执行 fetch_page 工具并返回工具消息内容。
+
+    调用者级名单门控已随 ADR-0012 / TSK-225 从 komari_search 移除；本边界
+    只转发 URL 与 trace，不再携带 caller 参数。
+    """
     urls = _parse_fetch_urls(parsed_arguments, raw_arguments)
     if urls is None:
         return "[抓取失败：urls 参数缺失或格式错误]"
-    fetch_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
-    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
-        fetch_kwargs.update(
-            caller_user_id=caller_user_id,
-            caller_group_id=caller_group_id,
-            caller_is_superuser=caller_is_superuser,
-        )
-    return await komari_search.fetch_page(urls, **fetch_kwargs)
+    return await komari_search.fetch_page(urls, request_trace_id=request_trace_id)
 
 
 def _append_bare_text_correction(
@@ -1062,6 +1053,22 @@ async def _execute_business_tool(
     status = "success"
     result_summary: str | None = None
     error_summary: str | None = None
+    # ADR-0012 / TSK-225：caller 名单门控从搜索/抓取边界移除后，本函数不再
+    # 使用 caller_group_id / caller_is_superuser（read_profile 仍用
+    # caller_user_id 判定本人画像）；显式消费以免误报未用参数。
+    del caller_group_id, caller_is_superuser
+
+    # TSK-225：每个工具 body 前准入裁决（chat.tool_dispatch / tool_search /
+    # tool_fetch_page）。受限/故障关闭时安静丢弃该工具，不执行工具体、不向
+    # 模型回填结果、不复活；一次裁决只授权紧随其后的这一个工具效果。
+    if not effect_business_admitted(group_id=group_id):
+        return _BusinessToolExecution(
+            message=None,
+            tool_name=tool_name,
+            status="blocked",
+            error="准入拒绝",
+            error_summary="准入拒绝",
+        )
 
     match tool_name:
         case "read_image":
@@ -1086,9 +1093,6 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
                 request_trace_id=request_trace_id,
-                caller_user_id=caller_user_id,
-                caller_group_id=caller_group_id,
-                caller_is_superuser=caller_is_superuser,
             )
             if content.startswith("[搜索失败"):
                 status = "error"
@@ -1100,9 +1104,6 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
                 request_trace_id=request_trace_id,
-                caller_user_id=caller_user_id,
-                caller_group_id=caller_group_id,
-                caller_is_superuser=caller_is_superuser,
             )
             if content.startswith("[抓取失败"):
                 status = "error"
@@ -1225,7 +1226,15 @@ async def _execute_tool_loop(
     try:
         for round_num in range(1, round_limit + 1):
             ledger.consume_round()
-            # TSK-194 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
+            # TSK-225：每轮聊天 LLM/provider 前准入裁决。受限或故障关闭时
+            # 安静丢弃本轮结果，不进入 provider、不落任何待恢复补执行状态、
+            # 不复活；一次裁决只授权本轮的这一个不可分效果。
+            if not effect_business_admitted(group_id=group_id):
+                return ReplyResult(
+                    content="",
+                    interaction_history={"event": "", "result": "", "emotion": ""},
+                )
+            # TSK-192 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
             # read_image 工具的视觉子调用（vision_service）才使用 vision
             # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
             # 原生模式（native）图片作为多模态输入直接进入 (user) 消息，

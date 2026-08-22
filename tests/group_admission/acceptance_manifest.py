@@ -276,6 +276,23 @@ ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = (
             "::test_publication_absence_is_unknown_and_never_auto_resends"
         ),
     ),
+    # TSK-225 聊天即时效果登记：komari_chat 及其直接编排的可独立撤销瞬时
+    # 效果（LLM 轮 / 工具 dispatch / 搜索 / 抓页 / 视觉 / 图片下载 /
+    # Embedding / 平台读取 / 表情 / 群输出 / 固定失败文本 / debug 群公开输
+    # 出）。全部属瞬时互动，intent=business，归属来自聊天消息所在群。
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.llm_round",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="_execute_tool_loop/_call_llm_completion",
+        sink_kind="llm_provider_round",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_llm_round_restricted_blocks_provider_call"
+        ),
+    ),
 )
 
 #: TSK-223 阶段 A 管理控制面契约行：经顶层 ``register_group_admission_api``
@@ -504,4 +521,169 @@ ADMISSION_COMMAND_EFFECT_CASES: tuple[AdmissionCommandEffectCase, ...] = tuple(
         acceptance_anchor=row.acceptance_anchor,
     )
     for row in COMMAND_EFFECT_SINK_CENSUS
+)
+
+
+# TSK-225：在闭合枚举既有效果行之外追加的 komari_chat 效果行（census 双向
+# 一致见 test_chat_effect_manifest；行为级/契约级 anchor 见对应测试文件）。
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.tool_dispatch",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="_execute_business_tool",
+        sink_kind="tool_body_execution",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_tool_dispatch_restricted_blocks_tool_body"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.tool_search",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="_build_search_tool_result",
+        sink_kind="komari_search_http",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_tool_search_restricted_blocks_search_web"
+        ),
+    ),
+)
+
+
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.group_read",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="MessageHandler._refetch_reply",
+        sink_kind="onebot_get_msg",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_group_read_restricted_blocks_get_msg"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.reaction",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="MessageHandler._schedule_reply_reaction",
+        sink_kind="onebot_set_msg_emoji_like",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_reaction_restricted_blocks_fire_and_forget"
+        ),
+    ),
+)
+
+
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.fixed_failure_text",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="MessageHandler.report_reply_failure",
+        sink_kind="onebot_group_error_text",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_fixed_failure_text_restricted_not_notified"
+        ),
+    ),
+)
+
+
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.embedding",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="embedding_provider",
+        sink_kind="embedding_https",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_embedding_restricted_blocks_query_embedding"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.tool_fetch_page",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="_build_fetch_tool_result",
+        sink_kind="komari_search_http",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_fetch_page_restricted_blocks_fetch"
+        ),
+    ),
+)
+
+
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.vision_completion",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="vision_service.read_image",
+        sink_kind="vision_llm_round",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_vision_completion_restricted_blocks_vision_llm"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.image_download",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="image_downloader.download_images",
+        sink_kind="image_http_download",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_image_download_restricted_blocks_download"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.reply_send",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="OneBotReplySender",
+        sink_kind="onebot_send_group_msg",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_reply_send_restricted_blocks_outbound"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.debug_public",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="generate_debug_reply",
+        sink_kind="onebot_debug_public_output",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_seam_admission.py"
+            "::test_debug_public_restricted_blocks_group_public_output"
+        ),
+    ),
 )

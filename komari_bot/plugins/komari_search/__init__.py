@@ -47,10 +47,8 @@ __all__ = [
 ]
 
 require("config_manager")
-require("permission_manager")
 
 from komari_bot.plugins import config_manager as config_manager_plugin
-from komari_bot.plugins import permission_manager as permission_manager_plugin
 
 config_manager = config_manager_plugin.get_config_manager(
     "komari_search",
@@ -79,7 +77,6 @@ type FetchFlightKey = frozenset[str]
 _fetch_inflight: dict[FetchFlightKey, asyncio.Task[str]] = {}
 
 _SEARCH_ERROR_DISABLED = "[搜索失败：DISABLED]"
-_SEARCH_ERROR_PERMISSION = "[搜索失败：PERMISSION_DENIED]"
 _SEARCH_ERROR_CONFIG = "[搜索失败：CONFIG_ERROR]"
 _SEARCH_ERROR_INVALID_QUERY = "[搜索失败：INVALID_QUERY]"
 _SEARCH_ERROR_TIMEOUT = "[搜索失败：TIMEOUT]"
@@ -90,7 +87,6 @@ _SEARCH_QUERY_LIMIT_ERROR = (
 )
 
 _FETCH_ERROR_DISABLED = "[抓取失败：DISABLED]"
-_FETCH_ERROR_PERMISSION = "[抓取失败：PERMISSION_DENIED]"
 _FETCH_ERROR_CONFIG = "[抓取失败：CONFIG_ERROR]"
 _FETCH_ERROR_INVALID_URLS = "[抓取失败：INVALID_URLS]"
 _FETCH_ERROR_TIMEOUT = "[抓取失败：TIMEOUT]"
@@ -190,65 +186,30 @@ def _get_config() -> DynamicConfigSchema:
     return config.model_copy(update={"search_api_key": env_key})
 
 
-def _is_caller_allowed(
-    config: DynamicConfigSchema,
-    *,
-    caller_user_id: str | None,
-    caller_group_id: str | None,
-    caller_is_superuser: bool,
-) -> bool:
-    """对调用者执行统一动态权限检查；缺失受限上下文时默认拒绝。"""
-    if not caller_is_superuser:
-        if config.user_whitelist and not caller_user_id:
-            return False
-        if config.group_whitelist and not caller_group_id:
-            return False
-    allowed, _reason = permission_manager_plugin.check_context_permission(
-        config,
-        user_id=caller_user_id or "",
-        group_id=caller_group_id,
-        is_superuser=caller_is_superuser,
-    )
-    return bool(allowed)
+def is_search_available() -> bool:
+    """判断是否具备注册 search_web 工具的条件（策略无感，不猜群/调用者）。
 
-
-def is_search_available(
-    *,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
-) -> bool:
-    """判断当前调用者是否具备注册 search_web 工具的条件。"""
+    调用者级白名单门控已随 ADR-0012 / TSK-225 移除：群准入由编排层在效果
+    前统一裁决，本 Adapter 只判断自身 search 能力是否就绪（含插件开关）。
+    """
     config = _get_config()
     return (
-        config.search_enabled
+        config.plugin_enable
+        and config.search_enabled
         and bool(config.search_api_key.strip())
-        and _is_caller_allowed(
-            config,
-            caller_user_id=caller_user_id,
-            caller_group_id=caller_group_id,
-            caller_is_superuser=caller_is_superuser,
-        )
     )
 
 
-def is_fetch_available(
-    *,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
-) -> bool:
-    """判断当前调用者是否具备注册 fetch_page 工具的条件。"""
+def is_fetch_available() -> bool:
+    """判断是否具备注册 fetch_page 工具的条件（策略无感，不猜群/调用方）。
+
+    调用者级白名单门控已随 ADR-0012 / TSK-225 移除（见 is_search_available）。
+    """
     config = _get_config()
     return (
-        config.fetch_enabled
+        config.plugin_enable
+        and config.fetch_enabled
         and bool(config.search_api_key.strip())
-        and _is_caller_allowed(
-            config,
-            caller_user_id=caller_user_id,
-            caller_group_id=caller_group_id,
-            caller_is_superuser=caller_is_superuser,
-        )
     )
 
 
@@ -342,22 +303,12 @@ def _get_search_precheck_error(
     config: DynamicConfigSchema,
     api_key: str,
     normalized_query: str,
-    caller_user_id: str | None,
-    caller_group_id: str | None,
-    caller_is_superuser: bool,
 ) -> str | None:
     """返回搜索调用前的配置/查询错误。"""
     if not config.plugin_enable:
         return _SEARCH_ERROR_DISABLED
     if not config.search_enabled:
         return _SEARCH_ERROR_DISABLED
-    if not _is_caller_allowed(
-        config,
-        caller_user_id=caller_user_id,
-        caller_group_id=caller_group_id,
-        caller_is_superuser=caller_is_superuser,
-    ):
-        return _SEARCH_ERROR_PERMISSION
     if not api_key:
         return _SEARCH_ERROR_CONFIG
     if not normalized_query:
@@ -369,22 +320,12 @@ def _get_fetch_precheck_error(
     *,
     config: DynamicConfigSchema,
     api_key: str,
-    caller_user_id: str | None,
-    caller_group_id: str | None,
-    caller_is_superuser: bool,
 ) -> str | None:
     """返回抓取调用前的配置错误。"""
     if not config.plugin_enable:
         return _FETCH_ERROR_DISABLED
     if not config.fetch_enabled:
         return _FETCH_ERROR_DISABLED
-    if not _is_caller_allowed(
-        config,
-        caller_user_id=caller_user_id,
-        caller_group_id=caller_group_id,
-        caller_is_superuser=caller_is_superuser,
-    ):
-        return _FETCH_ERROR_PERMISSION
     if not api_key:
         return _FETCH_ERROR_CONFIG
     return None
@@ -564,11 +505,12 @@ async def search_web(
     query: str,
     *,
     request_trace_id: str | None = None,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
 ) -> str:
-    """调用配置的搜索提供者搜索互联网并返回格式化结果文本。"""
+    """调用配置的搜索提供者搜索互联网并返回格式化结果文本。
+
+    策略无感：不接收/不解释调用者级群/用户名单门控（ADR-0012 / TSK-225），
+    群准入由编排层在效果前统一裁决。
+    """
     config = _get_config()
     api_key = config.search_api_key.strip()
     if not isinstance(query, str):
@@ -582,9 +524,6 @@ async def search_web(
         config=config,
         api_key=api_key,
         normalized_query=normalized_query,
-        caller_user_id=caller_user_id,
-        caller_group_id=caller_group_id,
-        caller_is_superuser=caller_is_superuser,
     )
     if precheck_error is not None:
         return precheck_error
@@ -703,20 +642,18 @@ async def fetch_page(
     urls: list[str],
     *,
     request_trace_id: str | None = None,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
 ) -> str:
-    """抓取指定网页正文并返回格式化结果文本（仅 single-flight 去重，不缓存）。"""
+    """抓取指定网页正文并返回格式化结果文本（仅 single-flight 去重，不缓存）。
+
+    策略无感：不接收/不解释调用者级群/用户名单门控（ADR-0012 / TSK-225），
+    群准入由编排层在效果前统一裁决。
+    """
     config = _get_config()
     api_key = config.search_api_key.strip()
 
     precheck_error = _get_fetch_precheck_error(
         config=config,
         api_key=api_key,
-        caller_user_id=caller_user_id,
-        caller_group_id=caller_group_id,
-        caller_is_superuser=caller_is_superuser,
     )
     if precheck_error is not None:
         return precheck_error
