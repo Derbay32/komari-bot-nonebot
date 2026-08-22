@@ -38,8 +38,8 @@ if TYPE_CHECKING:
     from sqlalchemy import Connection
 
 
-revision: str = "0011"
-down_revision: str | Sequence[str] | None = "0010"
+revision: str = "0013"
+down_revision: str | Sequence[str] | None = "0012"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -224,16 +224,19 @@ def upgrade(name: str = "") -> None:
     _add_retry_max_column(connection)
     # 门禁通过后旧宽表物理删除；新父子表与配置表保留
     connection.execute(text("DROP TABLE komari_chat_reply_commit_outbox"))
+    # TSK-232：清 legacy JSONB 名单存储（旧 komari_plugin_configs 表），
+    # 统一准入策略已收敛到 komari_group_admission_config，物理落下不再保留
+    connection.execute(text("DROP TABLE IF EXISTS komari_plugin_configs"))
 
 
 def downgrade(name: str = "") -> None:
     if name:
         return
 
-    # 0011 为不可逆 contract：旧宽表已物理删除，改名/新增列与新父子
-    # 模型已全面接管生产路径，不提供任何回退别名或兼容入口。
+    # 0013 为不可逆 coordinated contract：旧宽表已物理删除，改名/新增列
+    # 与新父子模型、统一准入已全面接管生产路径，不提供任何回退别名或兼容入口。
     msg = (
-        "0011_REPLY_FULFILLMENT_CUTOVER_IS_IRREVERSIBLE: 旧宽 outbox "
-        "已物理删除，回复履约已整体切换到新父子模型，不允许回退"
+        "0013_TSK232_IS_IRREVERSIBLE: 旧宽 outbox 与 legacy JSONB 名单已"
+        "物理删除，回复履约与统一准入已整体接管，不允许回退"
     )
     raise RuntimeError(msg)

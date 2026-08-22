@@ -38,8 +38,8 @@ from alembic import op
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-revision: str = "0001"
-down_revision: str | Sequence[str] | None = None
+revision: str = "0002"
+down_revision: str | Sequence[str] | None = "0001"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -118,13 +118,9 @@ def downgrade(name: str = "") -> None:
         "DROP TABLE komari_user_ban_cache_state",
         "DROP TABLE komari_user_bans",
         # Prompt 与插件动态配置
-        "DROP TABLE komari_prompt_configs",
-        "DROP TABLE komari_plugin_configs",
         # 独立函数（触发器已随表删除）
         "DROP FUNCTION bump_komari_search_index_version()",
         "DROP FUNCTION update_updated_at_column()",
-        "DROP FUNCTION komari_notify_prompt_config_change()",
-        "DROP FUNCTION komari_notify_plugin_config_change()",
         # pgvector 扩展（所有 vector 列已随表删除）
         "DROP EXTENSION vector",
     )
@@ -140,8 +136,6 @@ def _build_upgrade_statements(
     """组装 upgrade 全部 DDL/DML，按依赖顺序排列。"""
     return (
         *_pgvector_statements(),
-        *_plugin_config_statements(),
-        *_prompt_config_statements(),
         *_user_ban_statements(),
         *_character_binding_statements(),
         *_user_data_statements(),
@@ -153,84 +147,12 @@ def _build_upgrade_statements(
         *_help_statements(dimension, create_hnsw=create_hnsw),
         *_reply_commit_statements(),
         *_agent_run_log_statements(),
+        *_typed_and_prompt_statements(),
     )
 
 
 def _pgvector_statements() -> tuple[str, ...]:
     return ("CREATE EXTENSION IF NOT EXISTS vector",)
-
-
-def _plugin_config_statements() -> tuple[str, ...]:
-    """config_manager 插件动态配置表与变更通知。"""
-    return (
-        """
-        CREATE TABLE komari_plugin_configs (
-            plugin_name VARCHAR(128) PRIMARY KEY,
-            schema_name VARCHAR(128) NOT NULL,
-            config_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-            version VARCHAR(32) NOT NULL DEFAULT '1.0',
-            revision BIGINT NOT NULL DEFAULT 1,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        """
-        CREATE INDEX idx_komari_plugin_configs_updated_at
-            ON komari_plugin_configs (updated_at DESC)
-        """,
-        # 配置变更 pg_notify 通知函数
-        """
-        CREATE FUNCTION komari_notify_plugin_config_change()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            PERFORM pg_notify('komari_plugin_config_changed', NEW.plugin_name);
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql
-        """,
-        """
-        CREATE TRIGGER trg_komari_plugin_config_changed
-        AFTER INSERT OR UPDATE ON komari_plugin_configs
-        FOR EACH ROW
-        EXECUTE FUNCTION komari_notify_plugin_config_change()
-        """,
-    )
-
-
-def _prompt_config_statements() -> tuple[str, ...]:
-    """Prompt 专用配置表与变更通知。"""
-    return (
-        """
-        CREATE TABLE komari_prompt_configs (
-            resource_id VARCHAR(128) PRIMARY KEY,
-            display_name VARCHAR(128) NOT NULL,
-            prompt_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-            version VARCHAR(32) NOT NULL DEFAULT '1.0',
-            revision BIGINT NOT NULL DEFAULT 1,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        """
-        CREATE INDEX idx_komari_prompt_configs_updated_at
-            ON komari_prompt_configs (updated_at DESC)
-        """,
-        """
-        CREATE FUNCTION komari_notify_prompt_config_change()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            PERFORM pg_notify('komari_prompt_config_changed', NEW.resource_id);
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql
-        """,
-        """
-        CREATE TRIGGER trg_komari_prompt_config_changed
-        AFTER INSERT OR UPDATE ON komari_prompt_configs
-        FOR EACH ROW
-        EXECUTE FUNCTION komari_notify_prompt_config_change()
-        """,
-    )
 
 
 def _user_ban_statements() -> tuple[str, ...]:
@@ -1057,3 +979,444 @@ def _agent_run_log_statements() -> tuple[str, ...]:
         ON komari_agent_run_log_index USING GIN (methods)
         """,
     )
+
+
+# 强类型配置表（14 张；komari_chat_config 由 0003 单独建表）。
+_TABLE_STATEMENTS: tuple[str, ...] = (
+    """
+
+    CREATE TABLE komari_agent_run_logger_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        log_enabled BOOLEAN NOT NULL,
+        retention_days INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_embedding_provider_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        embedding_model VARCHAR NOT NULL,
+        embedding_api_url VARCHAR NOT NULL,
+        embedding_api_key VARCHAR NOT NULL,
+        embedding_dimension INTEGER NOT NULL,
+        request_connect_timeout_seconds FLOAT NOT NULL,
+        request_read_timeout_seconds FLOAT NOT NULL,
+        request_total_timeout_seconds FLOAT NOT NULL,
+        request_retry_attempts INTEGER NOT NULL,
+        request_retry_backoff_seconds FLOAT NOT NULL,
+        response_max_bytes INTEGER NOT NULL,
+        rerank_enabled BOOLEAN NOT NULL,
+        rerank_model VARCHAR NOT NULL,
+        rerank_api_url VARCHAR NOT NULL,
+        rerank_api_key VARCHAR NOT NULL,
+        rerank_top_n INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_group_history_summary_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        redis_db INTEGER NOT NULL,
+        summary_lock_ttl_seconds INTEGER NOT NULL,
+        history_min_coverage_ratio FLOAT NOT NULL,
+        min_summary_count INTEGER NOT NULL,
+        max_summary_count INTEGER NOT NULL,
+        fetch_batch_size INTEGER NOT NULL,
+        summary_default_count INTEGER NOT NULL,
+        summary_planning_model VARCHAR NOT NULL,
+        summary_planning_max_tokens INTEGER NOT NULL,
+        summary_planning_round_limit INTEGER NOT NULL,
+        summary_planning_request_api VARCHAR(32) NOT NULL,
+        summary_planning_stream_enabled BOOLEAN NOT NULL,
+        summary_planning_thinking_mode BOOLEAN NOT NULL,
+        summary_planning_reasoning_effort VARCHAR NOT NULL,
+        summary_tool_scan_limit INTEGER NOT NULL,
+        summary_model VARCHAR NOT NULL,
+        summary_temperature FLOAT NOT NULL,
+        summary_max_tokens INTEGER NOT NULL,
+        summary_request_api VARCHAR(32) NOT NULL,
+        summary_stream_enabled BOOLEAN NOT NULL,
+        summary_thinking_mode BOOLEAN NOT NULL,
+        summary_reasoning_effort VARCHAR NOT NULL,
+        assistant_prefill_enabled BOOLEAN NOT NULL,
+        dsv4_roleplay_instruct_mode VARCHAR NOT NULL,
+        layout_params JSONB NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_custom_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        required_votes INTEGER NOT NULL,
+        vote_emoji_id VARCHAR NOT NULL,
+        proposal_expire_hours INTEGER NOT NULL,
+        list_chunk_size INTEGER NOT NULL,
+        max_proposals_per_user INTEGER NOT NULL,
+        redis_db INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_decision_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        filter_min_length INTEGER NOT NULL,
+        filter_history_check_size INTEGER NOT NULL,
+        message_buffer_size INTEGER NOT NULL,
+        bot_aliases JSONB NOT NULL,
+        scene_top_k INTEGER NOT NULL,
+        reply_threshold FLOAT NOT NULL,
+        timing_weight FLOAT NOT NULL,
+        noise_conf_threshold FLOAT NOT NULL,
+        noise_margin_threshold FLOAT NOT NULL,
+        call_margin_threshold FLOAT NOT NULL,
+        social_window_activity_seconds INTEGER NOT NULL,
+        social_window_dialogue_seconds INTEGER NOT NULL,
+        social_silence_seconds INTEGER NOT NULL,
+        social_bot_cooldown_seconds INTEGER NOT NULL,
+        social_timing_mention_bonus FLOAT NOT NULL,
+        social_timing_silence_bonus FLOAT NOT NULL,
+        social_timing_activity_max_penalty FLOAT NOT NULL,
+        social_timing_dialogue_penalty FLOAT NOT NULL,
+        social_timing_cooldown_max_penalty FLOAT NOT NULL,
+        social_timing_activity_threshold INTEGER NOT NULL,
+        social_timing_activity_slope_denominator INTEGER NOT NULL,
+        embedding_instruction_query VARCHAR NOT NULL,
+        embedding_instruction_scene VARCHAR NOT NULL,
+        rerank_instruction VARCHAR NOT NULL,
+        scene_persist_enabled BOOLEAN NOT NULL,
+        scene_sync_poll_seconds INTEGER NOT NULL,
+        scene_embedding_lease_seconds INTEGER NOT NULL,
+        scene_embedding_max_attempts INTEGER NOT NULL,
+        scene_embedding_retry_base_seconds INTEGER NOT NULL,
+        scene_keep_versions INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_help_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        similarity_threshold FLOAT NOT NULL,
+        layer1_limit INTEGER NOT NULL,
+        layer2_limit INTEGER NOT NULL,
+        total_limit INTEGER NOT NULL,
+        default_result_limit INTEGER NOT NULL,
+        max_reply_result_count INTEGER NOT NULL,
+        query_rewrite_rules JSONB NOT NULL,
+        auto_scan_on_startup BOOLEAN NOT NULL,
+        disabled_auto_help_plugins JSONB NOT NULL,
+        show_category_emoji BOOLEAN NOT NULL,
+        max_content_preview_length INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_knowledge_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        similarity_threshold FLOAT NOT NULL,
+        query_rewrite_rules JSONB NOT NULL,
+        layer1_limit INTEGER NOT NULL,
+        layer2_limit INTEGER NOT NULL,
+        total_limit INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_management_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        api_credentials JSONB NOT NULL,
+        api_allowed_origins JSONB NOT NULL,
+        announce_status_page_url VARCHAR NOT NULL,
+        announce_max_group_count INTEGER NOT NULL,
+        announce_send_interval_seconds FLOAT NOT NULL,
+        announce_request_cooldown_seconds FLOAT NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_memory_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        redis_db INTEGER NOT NULL,
+        llm_model_chat VARCHAR NOT NULL,
+        llm_temperature_chat FLOAT NOT NULL,
+        llm_max_tokens_chat INTEGER NOT NULL,
+        llm_request_api_chat VARCHAR(32) NOT NULL,
+        llm_stream_enabled_chat BOOLEAN NOT NULL,
+        llm_thinking_mode_chat BOOLEAN NOT NULL,
+        llm_reasoning_effort_chat VARCHAR NOT NULL,
+        assistant_prefill_enabled BOOLEAN NOT NULL,
+        dsv4_roleplay_instruct_mode VARCHAR NOT NULL,
+        vision_tool_enabled BOOLEAN NOT NULL,
+        vision_image_download_max_count INTEGER NOT NULL,
+        vision_image_download_max_bytes INTEGER NOT NULL,
+        vision_image_download_total_max_bytes INTEGER NOT NULL,
+        vision_image_download_max_pixels INTEGER NOT NULL,
+        vision_image_download_concurrency INTEGER NOT NULL,
+        vision_image_download_connect_timeout_seconds FLOAT NOT NULL,
+        vision_image_download_read_timeout_seconds FLOAT NOT NULL,
+        vision_image_download_total_timeout_seconds FLOAT NOT NULL,
+        llm_model_summary VARCHAR NOT NULL,
+        llm_temperature_summary FLOAT NOT NULL,
+        llm_max_tokens_summary INTEGER NOT NULL,
+        llm_request_api_summary VARCHAR(32) NOT NULL,
+        llm_stream_enabled_summary BOOLEAN NOT NULL,
+        llm_thinking_mode_summary BOOLEAN NOT NULL,
+        llm_reasoning_effort_summary VARCHAR NOT NULL,
+        knowledge_enabled BOOLEAN NOT NULL,
+        knowledge_limit INTEGER NOT NULL,
+        summary_idle_timeout INTEGER NOT NULL,
+        summary_min_messages INTEGER NOT NULL,
+        summary_max_buffer_size INTEGER NOT NULL,
+        conversation_snapshot_ttl_seconds INTEGER NOT NULL,
+        conversation_processing_lease_seconds INTEGER NOT NULL,
+        profile_snapshot_ttl_seconds INTEGER NOT NULL,
+        profile_snapshot_enable BOOLEAN NOT NULL,
+        profile_trait_limit INTEGER NOT NULL,
+        memory_agent_max_rounds INTEGER NOT NULL,
+        memory_agent_staging_ttl_seconds INTEGER NOT NULL,
+        memory_agent_max_tool_calls INTEGER NOT NULL,
+        memory_agent_max_read_profiles INTEGER NOT NULL,
+        memory_agent_max_write_operations INTEGER NOT NULL,
+        memory_agent_lock_timeout_seconds INTEGER,
+        memory_search_limit INTEGER NOT NULL,
+        context_messages_limit INTEGER NOT NULL,
+        context_max_utf8_bytes INTEGER NOT NULL,
+        context_max_estimated_tokens INTEGER NOT NULL,
+        global_interaction_enabled BOOLEAN NOT NULL,
+        global_interaction_trigger_size INTEGER NOT NULL,
+        global_interaction_summary_interval_minutes INTEGER NOT NULL,
+        global_interaction_processing_lease_seconds INTEGER NOT NULL,
+        proactive_enabled BOOLEAN NOT NULL,
+        proactive_score_threshold FLOAT NOT NULL,
+        proactive_cooldown INTEGER NOT NULL,
+        proactive_max_per_hour INTEGER NOT NULL,
+        proactive_reservation_ttl_seconds INTEGER NOT NULL,
+        reply_commit_worker_interval_seconds INTEGER NOT NULL,
+        reply_commit_batch_size INTEGER NOT NULL,
+        reply_commit_lease_seconds INTEGER NOT NULL,
+        reply_commit_max_attempts INTEGER NOT NULL,
+        reply_commit_retry_base_seconds INTEGER NOT NULL,
+        reply_commit_tombstone_retention_days INTEGER NOT NULL,
+        bot_nickname VARCHAR NOT NULL,
+        response_tag VARCHAR NOT NULL,
+        forgetting_enabled BOOLEAN NOT NULL,
+        forgetting_importance_threshold INTEGER NOT NULL,
+        forgetting_decay_factor FLOAT NOT NULL,
+        forgetting_access_boost FLOAT NOT NULL,
+        forgetting_min_age_days INTEGER NOT NULL,
+        forgetting_fuzzify_concurrency INTEGER NOT NULL,
+        forgetting_job_lease_seconds INTEGER NOT NULL,
+        query_rewrite_history_limit INTEGER NOT NULL,
+        bot_aliases JSONB NOT NULL,
+        face_reaction_enabled BOOLEAN NOT NULL,
+        face_reaction_id VARCHAR NOT NULL,
+        error_notify_enabled BOOLEAN NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_search_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        search_provider VARCHAR(16) NOT NULL,
+        search_api_key VARCHAR NOT NULL,
+        search_enabled BOOLEAN NOT NULL,
+        max_results INTEGER NOT NULL,
+        result_content_limit INTEGER NOT NULL,
+        search_timeout_seconds FLOAT NOT NULL,
+        fetch_enabled BOOLEAN NOT NULL,
+        fetch_max_urls INTEGER NOT NULL,
+        fetch_content_limit INTEGER NOT NULL,
+        fetch_timeout_seconds FLOAT NOT NULL,
+        tavily_search_depth VARCHAR(16) NOT NULL,
+        tavily_include_answer BOOLEAN NOT NULL,
+        exa_search_type VARCHAR(16) NOT NULL,
+        exa_fetch_format VARCHAR(16) NOT NULL,
+        circuit_breaker_failure_threshold INTEGER NOT NULL,
+        circuit_breaker_recovery_seconds FLOAT NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_sentry_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        dsn VARCHAR NOT NULL,
+        environment VARCHAR NOT NULL,
+        release VARCHAR NOT NULL,
+        debug BOOLEAN NOT NULL,
+        error_sample_rate FLOAT NOT NULL,
+        traces_sample_rate FLOAT NOT NULL,
+        profiles_sample_rate FLOAT NOT NULL,
+        attach_stacktrace BOOLEAN NOT NULL,
+        send_default_pii BOOLEAN NOT NULL,
+        max_breadcrumbs INTEGER NOT NULL,
+        shutdown_timeout FLOAT NOT NULL,
+        breadcrumb_level VARCHAR NOT NULL,
+        sentry_logs_level VARCHAR NOT NULL,
+        event_level VARCHAR NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_llm_provider_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        api_token VARCHAR NOT NULL,
+        api_base VARCHAR NOT NULL,
+        model VARCHAR NOT NULL,
+        request_api VARCHAR(32) NOT NULL,
+        stream_enabled BOOLEAN NOT NULL,
+        temperature FLOAT NOT NULL,
+        max_tokens INTEGER NOT NULL,
+        timeout_seconds FLOAT NOT NULL,
+        summary_task_rpm_limit INTEGER NOT NULL,
+        chat_rpm_limit INTEGER NOT NULL,
+        frequency_penalty FLOAT NOT NULL,
+        extra_params JSONB NOT NULL,
+        vision_model VARCHAR NOT NULL,
+        vision_request_api VARCHAR(32) NOT NULL,
+        vision_stream_enabled BOOLEAN NOT NULL,
+        vision_temperature FLOAT NOT NULL,
+        vision_max_tokens INTEGER NOT NULL,
+        vision_thinking_mode BOOLEAN NOT NULL,
+        vision_reasoning_effort VARCHAR NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_sr_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        sr_list JSONB NOT NULL,
+        list_chunk_size INTEGER NOT NULL,
+        redis_db INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_user_data_config (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        plugin_enable BOOLEAN NOT NULL,
+        initial_favorability INTEGER NOT NULL,
+        max_favorability_delta_per_reply INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+)
+
+# Prompt 强类型表（3 张）。
+_PROMPT_TABLE_STATEMENTS: tuple[str, ...] = (
+    """
+
+    CREATE TABLE komari_prompt_komari_chat (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        system_prompt TEXT NOT NULL,
+        memory_ack TEXT NOT NULL,
+        memory_ack_role TEXT NOT NULL,
+        output_instruction TEXT NOT NULL,
+        cot_prefix TEXT NOT NULL,
+        cot_prefix_role TEXT NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_prompt_memory_summary (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        memory_summary_common_system TEXT NOT NULL,
+        profile_agent_workflow_system TEXT NOT NULL,
+        summary_workflow_system TEXT NOT NULL,
+        json_response_example TEXT NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+    """
+
+    CREATE TABLE komari_prompt_group_history_summary (
+        id INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        system_prompt TEXT NOT NULL,
+        planning_system_prompt TEXT NOT NULL,
+        memory_ack TEXT NOT NULL,
+        memory_ack_role TEXT NOT NULL,
+        output_instruction TEXT NOT NULL,
+        cot_prefix TEXT NOT NULL,
+        cot_prefix_role TEXT NOT NULL,
+        PRIMARY KEY (id)
+    )
+    
+    """,
+)
+
+
+def _typed_and_prompt_statements() -> tuple[str, ...]:
+    return (*_TABLE_STATEMENTS, *_PROMPT_TABLE_STATEMENTS)
+

@@ -50,8 +50,8 @@ if TYPE_CHECKING:
     from sqlalchemy import Connection
 
 
-revision: str = "0010"
-down_revision: str | Sequence[str] | None = "0009"
+revision: str = "0011"
+down_revision: str | Sequence[str] | None = "0010"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

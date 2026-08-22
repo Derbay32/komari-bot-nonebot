@@ -29,8 +29,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-revision: str = "0007"
-down_revision: str | Sequence[str] | None = "0006"
+revision: str = "0006"
+down_revision: str | Sequence[str] | None = "0005"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
