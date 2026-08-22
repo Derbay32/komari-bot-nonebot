@@ -139,3 +139,84 @@ async def test_ac6_global_commit_adjudicates_full_associated_group_set(
         "全局 commit 前必须覆盖完整关联群集合"
     )
     assert memory.insert_calls, "获准群贡献应完成全局 commit"
+
+
+class _MixedPartitionAdjudicate:
+    """补1 混批替身：gB 受限，其余获准（按身份而非顺序裁决）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+        self._restricted = {"gB"}
+
+    def __call__(self, associated_group_ids: object, **kwargs: object) -> object:
+        del kwargs
+        from komari_bot.plugins.group_admission import (
+            AdmissionQualification,
+            AdmissionResult,
+        )
+
+        self.calls.append(associated_group_ids)
+        if associated_group_ids in self._restricted:
+            return AdmissionResult(
+                qualification=AdmissionQualification.REJECTED,
+                effective_revision=1,
+                reason_code="policy_restricted",
+            )
+        return AdmissionResult(
+            qualification=AdmissionQualification.BUSINESS,
+            effective_revision=1,
+            reason_code="policy_admitted",
+        )
+
+
+async def test_ac6_mixed_restricted_partition_does_not_block_admitted_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """补项1（AC6 混批）：admitted 群贡献不被同批次 restricted 群拖累。
+
+    分区处理/独立提交：gA 获准入、gB 受限，worker 仍应完成 gA 分区的全局
+    commit（insert 被调用），受限的 gB 贡献休眠、不阻断获准入分区。
+    """
+    adjudicate = _MixedPartitionAdjudicate()
+    import komari_bot.plugins.group_admission as admission_package
+
+    monkeypatch.setattr(admission_package, "adjudicate", adjudicate)
+    redis = _FakeRedis([_record("gA"), _record("gB")])
+    memory = _FakeMemory()
+    monkeypatch.setattr(worker_module, "get_config", _make_config)
+    monkeypatch.setattr(
+        worker_module.agent_run_logger_plugin, "create_collector", lambda *a, **k: None  # noqa: ARG005 -- 收集器注入哨兵
+    )
+
+    async def _noop_finalize(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        worker_module.agent_run_logger_plugin, "finalize_collector", _noop_finalize
+    )
+
+    async def _noop(_delay: float) -> None:
+        """不等待。"""
+
+    monkeypatch.setattr(asyncio, "sleep", _noop)
+
+    async def _fake_summarize(**_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(event_summary="s", importance=4)
+
+    monkeypatch.setattr(worker_module, "summarize_interaction_events", _fake_summarize)
+
+    await worker_module._process_claimed_user(
+        redis=redis,  # type: ignore[arg-type] -- 记录型 fake 注入
+        memory=memory,  # type: ignore[arg-type] -- 记录型 fake 注入
+        user_id="u1",
+        owner_token="owner",
+        lease_seconds=30,
+    )
+
+    assert "gA" in set(adjudicate.calls) and "gB" in set(adjudicate.calls), (
+        "混批必须逐个关联群裁决（gA/gB 均被 consult）"
+    )
+    assert memory.insert_calls, "获准入分区（gA）的全局 commit 不被受限分区（gB）拖累"
+    assert redis.requeue_calls == [], "获准入分区完成后不应因受限分区重新入队"

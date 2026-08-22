@@ -15,6 +15,7 @@ from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
 from ..core.retry import retry_async
+from ..services.admission import memory_admitted_partition_groups
 from ..services.config_interface import get_config
 from ..services.interaction_event_summary_service import (
     MAX_INTERACTION_SUMMARY_RECORDS,
@@ -309,6 +310,19 @@ async def _summarize_processing_key(
     """处理一个 processing 快照；失败由 retry 装饰器重试。"""
     raw_records = await redis.get_processing_global_interactions(processing_key)
     records = _filter_valid_records(raw_records)
+    if not records:
+        return
+    # 全局 commit 前按 (group_id, user_id) 分区逐群独立裁决（ADR-0012 / AC6）。
+    # 受限于休眠的群贡献在此处以最小归属投影被跳过，获准群贡献携带 lineage 保留
+    # 到紧随的不可逆 insert_interaction_event global commit，混批互不阻塞（补项1）。
+    admitted_groups = memory_admitted_partition_groups(
+        group_ids=[record.get("group_id") for record in records]
+    )
+    if not admitted_groups:
+        return
+    records = [
+        record for record in records if record.get("group_id") in set(admitted_groups)
+    ]
     if not records:
         return
     if collector is not None:
