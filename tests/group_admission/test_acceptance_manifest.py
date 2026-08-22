@@ -68,6 +68,12 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.chat.reply_send",
     "group_admission.effect.chat.fixed_failure_text",
     "group_admission.effect.chat.debug_public",
+    "group_admission.effect.summary.history_read",
+    "group_admission.effect.summary.planning_llm",
+    "group_admission.effect.summary.summary_llm",
+    "group_admission.effect.summary.image_render",
+    "group_admission.effect.summary.group_output",
+    "group_admission.effect.summary.debug_public",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {

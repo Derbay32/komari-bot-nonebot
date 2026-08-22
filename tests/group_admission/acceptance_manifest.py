@@ -687,3 +687,93 @@ ADMISSION_EFFECT_CASES += (
         ),
     ),
 )
+
+
+# TSK-229 群历史总结 (group_history_summary) 与调试总结的逐效果准入登记。
+#
+# 总结是瞬时互动 (transient_interaction, 见 ADR-0012「瞬时互动被拒绝后立即
+# 终止，恢复准入后不复活」)：群历史平台读取、planning LLM、summary LLM、
+# 图片渲染与平台输出各自拥有独立 effect ID 前缀 group_admission.effect.summary.，
+# 归属来自总结命令所在群 group_history_summary_group_id，intent 均为 business。
+# ``summary.group_output`` 约束普通总结在群内逐条输出（文本/图片）的平台发送；
+# ``summary.debug_public`` 约束 ``.debug summary --public`` 群公开脱敏结果。
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.summary.history_read",
+        owner_module="komari_bot.plugins.group_history_summary",
+        source_symbol="history_service.fetch_group_history_messages",
+        sink_kind="onebot_get_group_msg_history",
+        intent="business",
+        attribution_source="group_history_summary_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_summary_admission.py"
+            "::test_history_read_restricted_blocks_platform_read"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.summary.planning_llm",
+        owner_module="komari_bot.plugins.group_history_summary",
+        source_symbol="planner_service.plan_summary_request",
+        sink_kind="llm_provider_round",
+        intent="business",
+        attribution_source="group_history_summary_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_summary_admission.py"
+            "::test_planning_llm_restricted_blocks_provider"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.summary.summary_llm",
+        owner_module="komari_bot.plugins.group_history_summary",
+        source_symbol="summarize_service.summarize_history_messages",
+        sink_kind="llm_provider_round",
+        intent="business",
+        attribution_source="group_history_summary_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_summary_admission.py"
+            "::test_summary_llm_restricted_blocks_provider"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.summary.image_render",
+        owner_module="komari_bot.plugins.group_history_summary",
+        source_symbol="image_renderer.render_summary_image_pages_base64",
+        sink_kind="image_render_pages",
+        intent="business",
+        attribution_source="group_history_summary_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_summary_admission.py"
+            "::test_image_render_restricted_blocks_render"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.summary.group_output",
+        owner_module="komari_bot.plugins.group_history_summary",
+        source_symbol="handle_group_history_summary",
+        sink_kind="onebot_send_group_msg",
+        intent="business",
+        attribution_source="group_history_summary_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_summary_admission.py"
+            "::test_handler_group_output_restricted_blocks_per_send"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.summary.debug_public",
+        owner_module="komari_bot.plugins.komari_debug",
+        source_symbol="reporting.build_and_send_diagnostic_report",
+        sink_kind="onebot_debug_public_output",
+        intent="business",
+        attribution_source="debug_summary_target_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_summary_admission.py"
+            "::test_debug_public_restricted_blocks_group_keeps_private"
+        ),
+    ),
+)
