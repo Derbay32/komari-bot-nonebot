@@ -13,6 +13,11 @@ from komari_bot.llm.content_budget import (
     ContentValidationError,
     normalize_required_text,
 )
+from komari_bot.management.admission_gate import (
+    gate_item,
+    gate_single,
+    resolve_admission_intent,
+)
 from komari_bot.management.management_api import (
     create_bearer_auth_dependency,
     ensure_management_cors,
@@ -360,19 +365,22 @@ def create_memory_router(
         ),
     ) -> ConversationDeadLetterListResponse:
         dead_letters = await redis_manager.list_conversation_dead_letters(limit=limit)
+        intent = resolve_admission_intent("business")
+        items = [
+            ConversationDeadLetterEntry(
+                group_id=item.group_id,
+                snapshot_id=item.snapshot_id,
+                failure_code=item.failure_code,
+                attempt_count=item.attempt_count,
+                failed_at_ms=item.failed_at_ms,
+                message_count=item.message_count,
+                chunk_state_count=item.chunk_state_count,
+            )
+            for item in dead_letters
+            if gate_item(group_id=item.group_id, intent=intent)
+        ]
         return ConversationDeadLetterListResponse(
-            items=[
-                ConversationDeadLetterEntry(
-                    group_id=item.group_id,
-                    snapshot_id=item.snapshot_id,
-                    failure_code=item.failure_code,
-                    attempt_count=item.attempt_count,
-                    failed_at_ms=item.failed_at_ms,
-                    message_count=item.message_count,
-                    chunk_state_count=item.chunk_state_count,
-                )
-                for item in dead_letters
-            ],
+            items=items,
             limit=limit,
         )
 
@@ -396,6 +404,17 @@ def create_memory_router(
             snapshot_id,
             label="快照 ID",
         )
+        granted, gate_status = gate_single(
+            group_id=normalized_group_id,
+            intent=resolve_admission_intent("business"),
+        )
+        if not granted:
+            if gate_status == 503:
+                raise _dead_letter_service_unavailable()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="该群目标处于受限状态",
+            )
         restored_count = await redis_manager.requeue_conversation_dead_letter(
             group_id=normalized_group_id,
             snapshot_id=normalized_snapshot_id,
@@ -459,6 +478,17 @@ def create_memory_router(
         payload: ConversationCreateRequest,
         service: MemoryServiceProtocol = Depends(service_dependency),  # noqa: FAST002
     ) -> ConversationEntry:
+        granted, gate_status = gate_single(
+            group_id=payload.group_id,
+            intent=resolve_admission_intent("business"),
+        )
+        if not granted:
+            if gate_status == 503:
+                raise _service_unavailable()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="该群目标处于受限状态",
+            )
         try:
             item = await service.create_conversation_entry(
                 group_id=payload.group_id,
