@@ -25,6 +25,7 @@ from komari_bot.plugins.komari_custom import vote_handler
 from komari_bot.plugins.komari_custom.models import Proposal
 from komari_bot.plugins.komari_custom.publication_service import (
     ProposalPublicationDraft,
+    ProposalPublicationError,
     ProposalPublicationReconciliationRequiredError,
     ProposalPublicationService,
 )
@@ -636,4 +637,66 @@ async def test_knowledge_source_conflict_enters_closed_hold(
 
     assert repository.proposal.status not in {"voting", "approving"}, (
         "知识冲突必须收敛到 closed hold，而不是可重试的评议状态"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC4 — 同 revision 不重复领取租约，仅 revision 变化才重新裁决（生产路径）
+# ---------------------------------------------------------------------------
+
+
+async def test_publish_no_reclaim_same_revision_and_re_adjudicates_on_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """驱动真实 ProposalPublicationService.publish：同 revision 短截、新 revision 重裁决。
+
+    probe 序列：revision=1 admitted → 同 revision=1 → revision=2 restricted。
+    可观察断言：认领次数（repository.claimed_ids）只增长在「新 revision 且
+    admitted」的分支上；同 revision 的重复调用不新增认领；revision 变化才触发
+    新一轮裁决。
+    """
+    probe = AdmissionProbe(admitted=True, revision=1)
+    install_admission_probe(monkeypatch, probe)
+    repository = _MemoryPublicationRepository()
+    service = ProposalPublicationService(repository)
+
+    async def _send(_proposal: Proposal) -> object:
+        msg = "模拟平台发送失败"
+        raise RuntimeError(msg)
+
+    def _definitive(_exc: object) -> bool:
+        return True
+
+    async def _attempt_publish() -> None:
+        with pytest.raises(ProposalPublicationError):
+            await service.publish(
+                _draft(),
+                remembered_message_id=None,
+                send_message=_send,
+                remember_message_id=_ignore_message_id,
+                is_definitive_send_failure=_definitive,
+            )
+
+    # revision=1 admitted：首次认领并进入 failed/send_rejected（可重领）
+    await _attempt_publish()
+    first_claims = len(repository.claimed_ids)
+    adjudications_after_first = probe.adjudicate_count
+    assert first_claims == 1
+    assert adjudications_after_first >= 1
+
+    # 同 revision（仍为 1，admitted）：不得重复认领业务租约、不得重复裁决
+    await _attempt_publish()
+    assert len(repository.claimed_ids) == first_claims, "同 revision 不重复领取"
+    assert probe.adjudicate_count == adjudications_after_first, (
+        "同 revision 不重复触发裁决副作用"
+    )
+
+    # revision 变化为 2 且受限：重新裁决为受限，且不认领新租约
+    probe.set_admitted(admitted=False, revision=2)
+    await _attempt_publish()
+    assert probe.adjudicate_count == adjudications_after_first + 1, (
+        "新 revision 才重新裁决"
+    )
+    assert len(repository.claimed_ids) == first_claims, (
+        "受限新 revision 不得认领业务租约"
     )
