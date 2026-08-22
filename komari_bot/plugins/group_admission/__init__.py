@@ -5,9 +5,12 @@
 ADR-0012 与 CONTEXT.md「群聊准入」。
 
 业务调用面只有两个同步无 I/O 的 callable：``adjudicate`` 与
-``get_runtime_state``，顶层同时重导出五个契约类型身份。本票不注册
-driver hooks、管理 HTTP Adapter、遥测或事件前置钩子；生产装配由后续
-票落地。
+``get_runtime_state``，顶层同时重导出五个契约类型身份与
+``register_group_admission_api`` 管理控制面装配入口。
+
+TSK-223 已落地管理 HTTP Adapter（``register_group_admission_api``，经
+``komari_management`` 装配）与基础 status / telemetry 投影；本票仍不挂
+driver hooks、final mount 或事件前置钩子，生产装配收尾由后续票落地。
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from .contracts import (
     AdmissionRuntimeState,
     AdmissionRuntimeStatus,
 )
+from .management_api import register_group_admission_api
 
 require("config_manager")
 
@@ -42,6 +46,7 @@ __all__ = [
     "AdmissionRuntimeStatus",
     "adjudicate",
     "get_runtime_state",
+    "register_group_admission_api",
 ]
 
 
