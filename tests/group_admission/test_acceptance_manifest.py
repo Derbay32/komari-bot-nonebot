@@ -74,6 +74,12 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.summary.image_render",
     "group_admission.effect.summary.group_output",
     "group_admission.effect.summary.debug_public",
+    "group_admission.effect.fulfillment.prepare",
+    "group_admission.effect.fulfillment.send_start",
+    "group_admission.effect.fulfillment.recover_send",
+    "group_admission.effect.fulfillment.reconcile",
+    "group_admission.effect.fulfillment.commitment",
+    "group_admission.effect.fulfillment.cleanup",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {
@@ -259,6 +265,26 @@ def test_chat_effect_case_rows_are_attributed() -> None:
         assert case.intent == "business", case.effect_id
         assert case.work_category == "transient_interaction", case.effect_id
         assert case.attribution_source == "komari_chat_message_group_id"
+
+
+def test_fulfillment_effect_case_rows_are_attributed() -> None:
+    """TSK-228 回复履约冻结承诺效果行归属 komari_chat，intent/work 受控。"""
+    full_prefix = "group_admission.effect.fulfillment."
+    rows = [
+        case
+        for case in ADMISSION_EFFECT_CASES
+        if case.effect_id.startswith(full_prefix)
+    ]
+    assert len(rows) >= 2, "TSK-228 必须登记 fulfillment 效果行"
+    for case in rows:
+        assert case.owner_module == "komari_bot.plugins.komari_chat", case.effect_id
+        assert case.intent in {"business", "fact_finalization", "technical_cleanup"}
+        assert case.work_category in {
+            "transient_interaction",
+            "fact_finalization",
+            "technical_cleanup",
+        }, case.effect_id
+        assert case.attribution_source == "reply_fulfillment.group_id", case.effect_id
 
 
 def test_management_cases_register_exactly_the_phase_a_control_plane() -> None:

@@ -777,3 +777,91 @@ ADMISSION_EFFECT_CASES += (
         ),
     ),
 )
+
+
+# TSK-228 回复履约冻结承诺准入效果登记：komari_chat reply fulfillment 各阶段
+# 准入时点（effect_id 前缀 ``group_admission.effect.fulfillment.*``）。生成结
+# 束、完整 Draft 持久准备前为 BUSINESS；NOT_STARTED->PENDING_CONFIRMATION 的
+# 发送开始时点为 BUSINESS（恢复发送复用 recover_send）；送达/未送达对账与每
+# 项冻结送达后承诺为 FACT_FINALIZATION；租约/预占/终态幂等证据清理为
+# TECHNICAL_CLEANUP。归属继承父记录群（``parent.fulfillment.group_id``）。
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.fulfillment.prepare",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="ReplyFulfillmentWorkflow._prepare",
+        sink_kind="reply_persistent_draft",
+        intent="business",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_fulfillment_admission.py"
+            "::test_restricted_prepare_keeps_minimal_identity"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.fulfillment.send_start",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="ReplyFulfillmentWorkflow.fulfill/mark_send_started",
+        sink_kind="outbox_mark_send_started",
+        intent="business",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_fulfillment_admission.py"
+            "::test_fulfill_unknown_delivery_reconciles_never_resends"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.fulfillment.recover_send",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="ReplyFulfillmentWorkflow._recover_not_started_deliveries",
+        sink_kind="onebot_reserve_send",
+        intent="business",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_fulfillment_admission.py"
+            "::test_restricted_not_started_terminates_not_resurrect"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.fulfillment.reconcile",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="reply_fulfillment_ops/ReplyFulfillmentWorkflow",
+        sink_kind="delivery_reconciliation",
+        intent="fact_finalization",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_fulfillment_admission.py"
+            "::test_commitment_reconcile_consults_fact_finalization"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.fulfillment.commitment",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="ReplyCommitmentWorkflow._execute_commitment",
+        sink_kind="frozen_commitment_executor",
+        intent="fact_finalization",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_fulfillment_admission.py"
+            "::test_commitment_reconcile_consults_fact_finalization"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.fulfillment.cleanup",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="ReplyCommitmentWorkflow.cleanup_terminal_fulfillments",
+        sink_kind="terminal_evidence_cleanup",
+        attribution_source="reply_fulfillment.group_id",
+        intent="technical_cleanup",
+        work_category="technical_cleanup",
+        acceptance_anchor=(
+            "tests/group_admission/test_fulfillment_admission.py"
+            "::test_cleanup_terminal_consults_technical_cleanup"
+        ),
+    ),
+)

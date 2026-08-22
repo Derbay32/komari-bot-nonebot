@@ -128,6 +128,18 @@ class _CommitmentRepository:
             rows.reverse()
         return rows
 
+    async def load_parent_attribution(
+        self,
+        fulfillment_id: str,
+    ) -> dict[str, Any] | None:
+        parent = self.parents.get(fulfillment_id)
+        if parent is None:
+            return None
+        return {
+            "fulfillment_id": fulfillment_id,
+            "group_id": "group-1",
+        }
+
     async def renew_lease(
         self,
         fulfillment_id: str,
