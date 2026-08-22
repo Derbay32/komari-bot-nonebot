@@ -103,11 +103,11 @@ async def test_ac1_restricted_conversation_reader_fail_if_called(
     lifecycle = _make_lifecycle(storage)
     fail_if_called = FailIfCalledProcessor()
 
-    await lifecycle.process_conversation_snapshot("g1", fail_if_called)
+    await lifecycle.process_conversation_snapshot("10001", fail_if_called)
 
     assert scripted.calls, "生产未在读取正文前同步调用 adjudicate"
-    assert [call[0] for call in scripted.calls] == ["g1"], (
-        "效果前裁决必须携带关联群归属"
+    assert [call[0] for call in scripted.calls] == [[10001]], (
+        "效果前裁决必须以归一化正整数单元素集合携带关联群归属"
     )
     assert storage.get_calls == [], "受限群仍读取了对话正文 buffer"
     assert fail_if_called.called is False, "受限群仍执行了正文处理步骤"
@@ -120,13 +120,13 @@ async def test_ac1_candidate_discovery_reads_only_identity(
     scripted = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
     storage = DormantProcessingStorage()
-    storage.active_groups = ["g200"]
-    storage.should_trigger = {"g200": True}
+    storage.active_groups = ["10200"]
+    storage.should_trigger = {"10200": True}
     lifecycle = ConversationProcessingLifecycle(storage, NoopCollectorProvider())
 
     scenario = PersistentWorkScenario(
         scenario_id="ac1-discovery",
-        group_id="g200",
+        group_id="10200",
         ad_revision=1,
         qualifications=(RESTRICTED,),
     )
@@ -150,8 +150,8 @@ async def test_ac2_restricted_no_business_lease_no_failure_budget_no_dead_letter
     scripted = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
     storage = DormantProcessingStorage()
-    storage.active_groups = ["g1"]
-    storage.should_trigger = {"g1": True}
+    storage.active_groups = ["10001"]
+    storage.should_trigger = {"10001": True}
     lifecycle = _make_lifecycle(storage)
 
     await lifecycle.run_worker_cycle(lambda: FailIfCalledProcessor())
@@ -166,14 +166,14 @@ async def test_ac2_restricted_no_business_lease_no_failure_budget_no_dead_letter
 def test_ac3_sidecar_revision_latch_avoids_reclaim_until_change() -> None:
     """AC3：同 revision 不重裁决重领取；新 revision 或 failed→ready 才重裁决。"""
     sidecar = RevisionSidecar()
-    sidecar.save("g1", 7)
+    sidecar.save("10001", 7)
     # 同 revision：不变 → 不重领取（保持休眠）。
-    assert sidecar.revision_changed("g1", 7) is False
+    assert sidecar.revision_changed("10001", 7) is False
     # 新 revision：变化 → 重裁决。
-    assert sidecar.revision_changed("g1", 8) is True
+    assert sidecar.revision_changed("10001", 8) is True
     # failed 冷启动（无 deferred）→ 视为变化 → 重裁决。
     fresh = RevisionSidecar()
-    assert fresh.revision_changed("g9", 1) is True
+    assert fresh.revision_changed("10009", 1) is True
 
 
 async def test_ac3_restricted_no_business_reclaim_across_same_revision(
@@ -185,8 +185,8 @@ async def test_ac3_restricted_no_business_reclaim_across_same_revision(
     storage = DormantProcessingStorage()
     lifecycle = _make_lifecycle(storage)
 
-    await lifecycle.process_conversation_snapshot("g1", RecordingProcessor())
-    await lifecycle.process_conversation_snapshot("g1", RecordingProcessor())
+    await lifecycle.process_conversation_snapshot("10001", RecordingProcessor())
+    await lifecycle.process_conversation_snapshot("10001", RecordingProcessor())
 
     assert scripted.calls, "生产未在每次处理前裁决"
     assert storage.claim_calls == [], "同 revision 受限处理仍重复领取业务租约"
@@ -263,7 +263,7 @@ async def test_ac5_in_flight_work_may_finish_but_write_before_is_discarded_on_re
     provider = _CommitAwareProcessor()
     scripted.set_sequence("admitted", "restricted")
 
-    await lifecycle.process_conversation_snapshot("g1", provider)
+    await lifecycle.process_conversation_snapshot("10001", provider)
 
     assert scripted.calls, "写结果前必须重新裁决（撤销点）"
     assert provider.committed == [], "撤销后写结果必须丢弃，不得持久化"
@@ -297,9 +297,89 @@ async def test_ac5_in_flight_completes_and_persists_when_admitted(
     lifecycle = _make_lifecycle(storage)
     provider = _CommitAwareProcessor()
 
-    done = await lifecycle.process_conversation_snapshot("g1", provider)
+    done = await lifecycle.process_conversation_snapshot("10001", provider)
 
     assert scripted.calls, "获准处理也必须先裁决"
     assert done is True, "获准组必须走完生命周期"
     assert provider.pending, "获准组 in-flight 工作应真正执行（有非空正文）"
     assert provider.committed != [], "获准入开始的工作完成后应正常持久化产物"
+
+
+async def test_admission_calls_pass_real_attribution_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """形状契约：记忆侧裁决传参必须能通过真实 ``_validate_attribution``。
+
+    真实 ``adjudicate`` 只接受正整数集合；标量或字符串元素会被判归属不可用而
+    故障关闭（全体休眠）。scripted 桩不校验形状，本用例把桩抓到的实际传参喂给
+    真实归因校验，锁死「归一化集合传参」防标量/字符串回归。
+    """
+    from komari_bot.plugins.group_admission import (
+        AdmissionQualification,
+        AdmissionResult,
+    )
+    from komari_bot.plugins.group_admission.runtime import _validate_attribution
+    from komari_bot.plugins.komari_memory.services.admission import (
+        memory_admitted_partition_groups,
+    )
+
+    scripted = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    storage = _NonEmptyStorage()
+    lifecycle = _make_lifecycle(storage)
+
+    done = await lifecycle.process_conversation_snapshot("10001", RecordingProcessor())
+
+    class _EmptyRejectedAdjudicate:
+        """空归属（空集合）拒绝、非空集合获准的形状感知替身。
+
+        与真实 ``adjudicate`` 一致：空集合走 ``group_attribution_unavailable``
+        故障关闭，非空正整数集合按桩语义获准。
+        """
+
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def __call__(self, associated_group_ids: object, **kwargs: object) -> object:
+            del kwargs
+            self.calls.append(associated_group_ids)
+            if isinstance(associated_group_ids, list) and not associated_group_ids:
+                return AdmissionResult(
+                    qualification=AdmissionQualification.REJECTED,
+                    effective_revision=1,
+                    reason_code="group_attribution_unavailable",
+                )
+            return AdmissionResult(
+                qualification=AdmissionQualification.BUSINESS,
+                effective_revision=1,
+                reason_code="policy_admitted",
+            )
+
+    partition_stub = _EmptyRejectedAdjudicate()
+    import komari_bot.plugins.group_admission as admission_package
+
+    monkeypatch.setattr(admission_package, "adjudicate", partition_stub)
+    admitted = memory_admitted_partition_groups(
+        group_ids=["10001", 10002, "g-not-a-number"]
+    )
+
+    assert done is True
+    assert admitted == ["10001", 10002], "获准清单保留调用方原始群号表示"
+    empty_calls = [c for c in partition_stub.calls if isinstance(c, list) and not c]
+    assert empty_calls, "不可归因群必须以空集合走归属失败路径"
+    partition_args = [
+        call for call in partition_stub.calls if isinstance(call, list) and call
+    ]
+    assert partition_args, "分区裁决传参必须是集合形态而非裸标量"
+    for raw in [*partition_args]:
+        assert _validate_attribution(raw) is not None, (
+            f"传参 {raw!r} 无法通过真实归因校验，运行时会被故障关闭"
+        )
+    conversation_args = [
+        call[0] for call in scripted.calls if isinstance(call[0], list)
+    ]
+    assert conversation_args, "对话裁决传参必须是集合形态而非裸标量"
+    for raw in conversation_args:
+        assert _validate_attribution(raw) is not None, (
+            f"传参 {raw!r} 无法通过真实归因校验，运行时会被故障关闭"
+        )

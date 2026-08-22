@@ -99,7 +99,7 @@ async def test_ac6_global_commit_adjudicates_full_associated_group_set(
     """
     scripted = ScriptedAdjudicate("admitted")
     install_scripted_adjudicate(monkeypatch, scripted)
-    redis = _FakeRedis([_record("gA"), _record("gB")])
+    redis = _FakeRedis([_record("10001"), _record("10002")])
     memory = _FakeMemory()
     monkeypatch.setattr(worker_module, "get_config", _make_config)
     monkeypatch.setattr(
@@ -134,19 +134,21 @@ async def test_ac6_global_commit_adjudicates_full_associated_group_set(
     )
 
     assert scripted.calls, "全局 commit 前未对关联群集合裁决"
-    associated = {c[0] for c in scripted.calls}
-    assert "gA" in associated and "gB" in associated, (
-        "全局 commit 前必须覆盖完整关联群集合"
+    associated = {
+        tuple(call[0]) for call in scripted.calls if isinstance(call[0], list)
+    }
+    assert (10001,) in associated and (10002,) in associated, (
+        "全局 commit 前必须以归一化正整数集合覆盖完整关联群"
     )
     assert memory.insert_calls, "获准群贡献应完成全局 commit"
 
 
 class _MixedPartitionAdjudicate:
-    """补1 混批替身：gB 受限，其余获准（按身份而非顺序裁决）。"""
+    """补1 混批替身：10002 受限，其余获准（按身份而非顺序裁决）。"""
 
     def __init__(self) -> None:
         self.calls: list[object] = []
-        self._restricted = {"gB"}
+        self._restricted = {(10002,)}
 
     def __call__(self, associated_group_ids: object, **kwargs: object) -> object:
         del kwargs
@@ -156,7 +158,12 @@ class _MixedPartitionAdjudicate:
         )
 
         self.calls.append(associated_group_ids)
-        if associated_group_ids in self._restricted:
+        normalized = (
+            tuple(associated_group_ids)
+            if isinstance(associated_group_ids, (list, tuple))
+            else None
+        )
+        if normalized in self._restricted:
             return AdmissionResult(
                 qualification=AdmissionQualification.REJECTED,
                 effective_revision=1,
@@ -174,14 +181,14 @@ async def test_ac6_mixed_restricted_partition_does_not_block_admitted_partition(
 ) -> None:
     """补项1（AC6 混批）：admitted 群贡献不被同批次 restricted 群拖累。
 
-    分区处理/独立提交：gA 获准入、gB 受限，worker 仍应完成 gA 分区的全局
-    commit（insert 被调用），受限的 gB 贡献休眠、不阻断获准入分区。
+    分区处理/独立提交：10001 获准入、10002 受限，worker 仍应完成 10001 分区
+    的全局 commit（insert 被调用），受限的 10002 贡献休眠、不阻断获准入分区。
     """
     adjudicate = _MixedPartitionAdjudicate()
     import komari_bot.plugins.group_admission as admission_package
 
     monkeypatch.setattr(admission_package, "adjudicate", adjudicate)
-    redis = _FakeRedis([_record("gA"), _record("gB")])
+    redis = _FakeRedis([_record("10001"), _record("10002")])
     memory = _FakeMemory()
     monkeypatch.setattr(worker_module, "get_config", _make_config)
     monkeypatch.setattr(
@@ -215,8 +222,11 @@ async def test_ac6_mixed_restricted_partition_does_not_block_admitted_partition(
         lease_seconds=30,
     )
 
-    assert "gA" in set(adjudicate.calls) and "gB" in set(adjudicate.calls), (
-        "混批必须逐个关联群裁决（gA/gB 均被 consult）"
+    consulted = {
+        tuple(c) if isinstance(c, (list, tuple)) else None for c in adjudicate.calls
+    }
+    assert (10001,) in consulted and (10002,) in consulted, (
+        "混批必须逐个关联群裁决（10001/10002 均被 consult）"
     )
-    assert memory.insert_calls, "获准入分区（gA）的全局 commit 不被受限分区（gB）拖累"
+    assert memory.insert_calls, "获准入分区（10001）的全局 commit 不被受限分区（10002）拖累"
     assert redis.requeue_calls == [], "获准入分区完成后不应因受限分区重新入队"

@@ -110,7 +110,7 @@ async def test_ac4_resume_restores_remaining_time_not_reset_to_full(
     group_id = f"tsk230b-{uuid4().hex[:10]}"
     try:
         cfg = SimpleNamespace(
-            conversation_processing_lease_seconds=60,
+            conversation_processing_lease_seconds=1,
             conversation_snapshot_ttl_seconds=300,
         )
         from komari_bot.plugins.komari_memory.services import redis_manager as rm
@@ -131,7 +131,11 @@ async def test_ac4_resume_restores_remaining_time_not_reset_to_full(
         claim = await mgr.claim_conversation_buffer(group_id, "owner-a", "toka")
         assert claim.status == "claimed"
         key = _processing_key(group_id, "toka")
+        # 休眠：短租约自然过期（claim_existing 只接管租约已死的孤儿快照，
+        # 活跃租约按生产语义返回 busy），快照本体仍在冻结 TTL 内存活。
+        await asyncio.sleep(1.2)
         before = await client.pttl(key)
+        assert before is not None and before > 0, "休眠窗内快照应仍存活"
         # 休眠后由另一 owner 恢复接管同一快照（resume claim on existing）。
         resumed = await mgr.claim_existing_conversation_processing(
             group_id, key, "owner-b"
