@@ -11,6 +11,7 @@ from nonebot.adapters.onebot.v11 import Bot, NoticeEvent  # noqa: TC002
 
 from komari_bot.onebot.onebot_messages import plain_text_message
 
+from .admission import business_admitted
 from .proposal_repository import ProposalRepository  # noqa: TC001
 
 if TYPE_CHECKING:
@@ -108,8 +109,18 @@ async def fetch_and_update_votes(
     message_id: int,
     proposal_id: int,
 ) -> Any | None:
-    """主动拉取表情回应用户并覆盖本地投票计数。"""
+    """主动拉取表情回应用户并覆盖本地投票计数。
+
+    表情回应读取前先对目标群做业务裁决：受限群不触达平台读取（独立治理效果），
+    返回 ``None`` 并保持静默。
+    """
     if state.repository is None or state.config_manager is None:
+        return None
+    proposal = await state.repository.get_by_id(proposal_id)
+    if proposal is None:
+        return None
+    # 平台读取：消费具体群业务内容，读取前按该群裁决。
+    if not business_admitted(proposal.group_id):
         return None
     config = state.config_manager.get()
     try:
@@ -122,9 +133,6 @@ async def fetch_and_update_votes(
         logger.debug("[KomariCustom] 主动拉取表情回应失败: {}", e)
         return None
 
-    proposal = await state.repository.get_by_id(proposal_id)
-    if proposal is None:
-        return None
     user_ids = _extract_vote_user_ids(result)
     excluded_user_ids = {str(proposal.proposer_id), str(bot.self_id)}
     valid_users = sorted(
@@ -134,13 +142,25 @@ async def fetch_and_update_votes(
 
 
 async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
-    """票数达标时写入知识库并通知群聊。"""
+    """票数达标时写入知识库并通知群聊。
+
+    knowledge commit（``add_knowledge`` 的不可逆全局提交）与采纳通知都属独立
+    受治理业务效果：效果前对本群业务裁决。受限时跳过提交与通知、不补发；已认
+    领采纳（``approving``）的历史读属已提交 knowledge 的既成事实，不做重复
+    add/embedding。
+    """
     if state.repository is None or state.knowledge_plugin is None:
         return
     proposal = await state.repository.get_by_id(proposal_id)
     if proposal is None or proposal.status == "approved":
         return
     if proposal.status not in {"voting", "approving"}:
+        return
+
+    # 采纳提交与通知前的统一业务裁决；受限则跳过且不补发采纳通知。
+    # 已认领采纳（前次于 add 已提交 knowledge / 正在处理）：本轮不重复提交，
+    # 避免同一 source_key 重复 add/embedding；唯一认领由租约与 claim 保证。
+    if not business_admitted(proposal.group_id) or proposal.status == "approving":
         return
 
     approval_token = uuid4().hex
@@ -168,6 +188,11 @@ async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
             approval_token,
         )
     except Exception:
+        if _is_knowledge_source_conflict():
+            # knowledge source_key 冲突：进入运维 closed hold，阻断后续合同，
+            # 绝不停留在可重试的投票 / 认领状态。
+            await state.repository.mark_hold(claimed.id, approval_token, "knowledge_source_conflict")
+            raise
         await state.repository.release_approval(claimed.id, approval_token)
         raise
 
@@ -238,6 +263,21 @@ def extract_keywords(title: str) -> list[str]:
     words = [word for word in re.split(r"[\s,，。.!！?？、/\\|:：;；]+", title) if word]
     keywords = list(dict.fromkeys([title.strip(), *words]))
     return keywords[:8] if keywords else ["群友提案"]
+
+
+def _is_knowledge_source_conflict() -> bool:
+    """知识源键冲突哨兵：``add_knowledge`` 因 source_key 冲突不可恢复地失败。
+
+    真实知识层对 ``source_key`` 幂等 upsert，正常情况下不会抛出冲突；此处只
+    识别「运维/数据面显式标出的来源冲突」并收敛为 closed hold。其他知识写入
+    失败按可重试处理（释放认领）。
+    """
+    import sys
+
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return False
+    return "knowledge_source_conflict" in str(exc)
 
 
 def _get_int_attr(event: NoticeEvent, name: str) -> int | None:

@@ -15,6 +15,12 @@ from komari_bot.llm.content_budget import (
     TITLE_TEXT_BUDGET,
     normalize_required_text,
 )
+from komari_bot.plugins.group_admission import (
+    AdmissionIntent,
+    AdmissionQualification,
+    adjudicate,
+    get_runtime_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -23,6 +29,8 @@ if TYPE_CHECKING:
 
 PUBLICATION_LEASE_SECONDS = 300
 _PUBLISHED_STATUSES = frozenset({"voting", "approving", "approved"})
+#: 发布认领的 version 缓存里「没有处理过」的哨兵，与进程内从未持有的修订区分。
+_UNPROCESSED = -1
 
 
 @dataclass(frozen=True)
@@ -141,6 +149,10 @@ class ProposalPublicationService:
 
     def __init__(self, repository: PublicationRepository) -> None:
         self._repository = repository
+        #: 每个 publication_key 最近一次已裁决并认领的 effective revision。
+        #: 只作为「是否需要重新裁决」的短路键，不把 admitted 结果缓存成永久
+        #: 通行证；同 revision 下新效果点仍走本地复查（见 ``_resolve_claim``）。
+        self._processed_revision: dict[str, int | None] = {}
 
     async def publish(
         self,
@@ -150,24 +162,38 @@ class ProposalPublicationService:
         send_message: Callable[[Proposal], Awaitable[object]],
         remember_message_id: Callable[[int], Awaitable[None]],
         is_definitive_send_failure: Callable[[Exception], bool] | None = None,
-    ) -> Proposal:
-        """发布或恢复同一提案，成功时保证记录已进入投票及以后状态。"""
-        current = await self._repository.get_by_publication_key(
-            draft.publication_key
-        )
+    ) -> Proposal | None:
+        """发布或恢复同一提案，成功时保证记录已进入投票及以后状态。
+
+        受限群返回 ``None``：不领取业务租约、不投递投票消息、不耗 retry、不
+        进 dead-letter。返回 ``None`` 也可由「同 revision 已处理且受限收敛」
+        产生，调用方按未发布处理即可。
+        """
+        key = draft.publication_key
+        current = await self._repository.get_by_publication_key(key)
         published = self._published_proposal(current)
         if published is not None:
             return published
 
         if current is not None and remembered_message_id is not None:
             recovered = await self._repository.recover_publication(
-                draft.publication_key,
+                key,
                 remembered_message_id,
             )
             if recovered is not None:
                 return recovered
 
+        if not self._proceed_at_revision(key, draft.group_id):
+            # 同 revision 且已处理过：按持久进度回放既定结果，不重复领取租约；
+            # 或受限（含新 revision 受限）时不进入业务流程。
+            return self._replay_or_reject(current)
+
         if self._requires_reconciliation(current):
+            # publication absence / delivery unknown：收尾须经既成事实收尾裁决，
+            # 永不自动重发。
+            adjudicate(
+                (draft.group_id,), intent=AdmissionIntent.FACT_FINALIZATION
+            )
             raise ProposalPublicationReconciliationRequiredError(
                 "publication_reconciliation_required"
             )
@@ -286,3 +312,43 @@ class ProposalPublicationService:
         return normalized_started_at <= now - timedelta(
             seconds=PUBLICATION_LEASE_SECONDS
         )
+
+    def _proceed_at_revision(self, publication_key: str, group_id: int) -> bool:
+        """判定本次调用是否应当进入认领流程。
+
+        以 effective revision 为键做裁决缓存：
+        - 同 revision 已处理过该 publication_key：不再重复裁决、不再领取业务
+          租约（短路，交 ``_replay_or_reject`` 按持久进度回放）；
+        - 否则在效果前同步裁决一次并记录本次修订；受限时不领全局，回 false。
+        """
+        current_revision = get_runtime_state().effective_revision
+        processed = self._processed_revision.get(publication_key, _UNPROCESSED)
+        if processed == current_revision:
+            return False
+        result = adjudicate((group_id,), intent=AdmissionIntent.BUSINESS)
+        self._processed_revision[publication_key] = current_revision
+        return result.qualification is AdmissionQualification.BUSINESS
+
+    def _replay_or_reject(self, current: Proposal | None) -> Proposal | None:
+        """同 revision 已处理或受限时的收敛：不认领、不投递、不耗 retry。
+
+        已处理过同 revision：按持久进度回放既定结果（可重试失败回放为失败，
+        发布中回放为进行中、冲突回放为冲突），但绝不重复领取租约。受限时直接
+        返回 None（不产生任何受治理业务效果）。
+        """
+        if self._published_proposal(current) is not None:
+            return current
+        if current is None:
+            return None
+        if current.status == "failed":
+            code = current.publication_error_code or "publication_failed"
+            if code == "delivery_unknown":
+                raise ProposalPublicationReconciliationRequiredError(
+                    "publication_reconciliation_required"
+                )
+            raise ProposalPublicationError(code)
+        if current.status == "publishing":
+            raise ProposalPublicationInProgressError("publication_in_progress")
+        if current.status == "hold":
+            raise ProposalPublicationError("publication_held")
+        raise ProposalPublicationError("publication_state_conflict")

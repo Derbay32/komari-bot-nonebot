@@ -13,7 +13,9 @@ from komari_bot.llm.content_budget import (
     normalize_required_text,
 )
 
-ProposalStatus = Literal["publishing", "failed", "voting", "approving", "approved"]
+ProposalStatus = Literal[
+    "publishing", "failed", "voting", "approving", "approved", "hold"
+]
 SessionPhase = Literal["title", "content", "review"]
 UndoAction = Literal["append", "replace", "delete"]
 

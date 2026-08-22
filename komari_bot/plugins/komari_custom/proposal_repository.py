@@ -644,6 +644,41 @@ class ProposalRepository:
         finally:
             await session.close()
 
+    async def mark_hold(
+        self,
+        proposal_id: int,
+        approval_token: str,
+        hold_code: str,
+    ) -> Proposal | None:
+        """把认领中的提案收敛为运维 hold（closed hold）。
+
+        知识写入 / 发布等出现不可自动恢复的冲突时，把提案移出可重试的投票 / 认
+        领流程并终止，阻断后续认领与采纳通知，等待另行鉴权的数据修复。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(
+                _P.c.id == proposal_id,
+                _P.c.status == "approving",
+                _P.c.approval_token == approval_token,
+            )
+            .values(
+                status="hold",
+                approval_token=None,
+                approval_started_at=None,
+                publication_error_code=hold_code,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        return self._row_to_proposal(row) if row is not None else None
+
     async def mark_approved(
         self,
         proposal_id: int,
