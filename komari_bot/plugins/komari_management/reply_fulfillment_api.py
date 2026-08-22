@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from komari_bot.management.admission_gate import (
+    gate_item,
+    gate_single,
+    resolve_admission_intent,
+)
 from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
@@ -220,6 +225,25 @@ def create_reply_fulfillment_router(
                 detail="回复履约处置请求不合法",
             ) from exc
 
+    def _raise_group_gate(status: int | None) -> None:
+        """把群目标准入拒绝投影为 HTTP，不泄漏策略细节或群号。"""
+        if status == 503:
+            raise HTTPException(
+                status_code=503,
+                detail="群准入运行时不可用",
+            )
+        raise HTTPException(status_code=403, detail="该群目标处于受限状态")
+
+    async def _load_target_group_id(
+        service: ReplyFulfillmentOpsProtocol,
+        fulfillment_id: str,
+    ) -> object:
+        """先取详情归因群号，再做准入裁决与下游执行（TSK-231）。"""
+        detail = await service.get_fulfillment(fulfillment_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="回复履约不存在")
+        return detail.get("group_id")
+
     @router.get("/fulfillments", response_model=ReplyFulfillmentListResponse)
     async def list_fulfillments(
         status: Annotated[ReplyFulfillmentStatusValue | None, Query()] = None,
@@ -233,6 +257,14 @@ def create_reply_fulfillment_router(
             limit=limit,
             offset=offset,
         )
+        intent = resolve_admission_intent("business")
+        items = [
+            item
+            for item in result["items"]
+            if gate_item(group_id=item.get("group_id"), intent=intent)
+        ]
+        result["items"] = items
+        result["total"] = len(items)
         return ReplyFulfillmentListResponse.model_validate(result)
 
     @router.get(
@@ -272,6 +304,13 @@ def create_reply_fulfillment_router(
             recorder=recorder,
         ) as audit:
             service = _require_service()
+            group_id = await _load_target_group_id(service, fulfillment_id)
+            granted, gate_status = gate_single(
+                group_id=group_id,
+                intent=resolve_admission_intent("fact_finalization"),
+            )
+            if not granted:
+                _raise_group_gate(gate_status)
             platform_message_id = (
                 payload.platform_message_id if payload is not None else None
             )
@@ -306,6 +345,13 @@ def create_reply_fulfillment_router(
             recorder=recorder,
         ) as audit:
             service = _require_service()
+            group_id = await _load_target_group_id(service, fulfillment_id)
+            granted, gate_status = gate_single(
+                group_id=group_id,
+                intent=resolve_admission_intent("technical_cleanup"),
+            )
+            if not granted:
+                _raise_group_gate(gate_status)
             result = await _run_ops(service.confirm_not_delivered(fulfillment_id))
             audit.metadata.update(
                 {
@@ -338,6 +384,13 @@ def create_reply_fulfillment_router(
             recorder=recorder,
         ) as audit:
             service = _require_service()
+            group_id = await _load_target_group_id(service, fulfillment_id)
+            granted, gate_status = gate_single(
+                group_id=group_id,
+                intent=resolve_admission_intent("fact_finalization"),
+            )
+            if not granted:
+                _raise_group_gate(gate_status)
             result = await _run_ops(
                 service.resume_commitment(
                     fulfillment_id,
