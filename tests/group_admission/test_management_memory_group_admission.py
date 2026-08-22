@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 from fastapi import FastAPI
 
@@ -24,7 +22,6 @@ from komari_bot.plugins.group_admission.contracts import (
     AdmissionResult,
 )
 from komari_bot.plugins.komari_memory.api import API_PREFIX, create_memory_router
-
 from tests.group_admission.chat_admission_support import ScriptedAdjudicate
 from tests.group_admission.management_admission_support import (
     ALLOWED_GROUP_ID,
@@ -47,7 +44,7 @@ def _build_app(service: FakeMemoryService) -> "FastAPI":
     app.include_router(
         create_memory_router(
             api_token=MANAGEMENT_CREDENTIALS,
-            service_getter=lambda: service,
+            service_getter=lambda: service,  # type: ignore[arg-type] -- 测试用 fake 注入
             redis_getter=lambda: None,
         )
     )
@@ -58,11 +55,11 @@ def _create_headers() -> dict[str, str]:
     return auth_headers(MEMORY_WRITE)
 
 
-def _admitted_intents(scripted):
+def _admitted_intents(scripted: ScriptedAdjudicate) -> list[object]:
     return [intent for (_g, intent) in scripted.calls]
 
 
-async def test_create_conversation_admitted_executes(monkeypatch) -> None:
+async def test_create_conversation_admitted_executes(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1 admitted: 单目标获准执行，且裁决在落库前以 BUSINESS。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
@@ -79,7 +76,7 @@ async def test_create_conversation_admitted_executes(monkeypatch) -> None:
     assert service.create_calls, "获准态应允许落库"
 
 
-async def test_create_conversation_restricted_forbidden(monkeypatch) -> None:
+async def test_create_conversation_restricted_forbidden(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1 restricted: 受限群 -> 403，不下游落库。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -95,7 +92,7 @@ async def test_create_conversation_restricted_forbidden(monkeypatch) -> None:
     assert scripted.calls, "单目标写前未裁决"
 
 
-async def test_create_conversation_policy_unavailable_503(monkeypatch) -> None:
+async def test_create_conversation_policy_unavailable_503(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1: effective policy unavailable -> 503，且不落库。"""
     scripted = ScriptedAdjudicate("failed")
     install_scripted(monkeypatch, scripted)
@@ -111,19 +108,25 @@ async def test_create_conversation_policy_unavailable_503(monkeypatch) -> None:
     assert scripted.calls, "主权化前未裁决"
 
 
-async def test_create_conversation_attribution_failure_503(monkeypatch) -> None:
+async def test_create_conversation_attribution_failure_503(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1: 服务端归属失败（group_attribution_unavailable）-> 503，不执行。"""
     scripted = ScriptedAdjudicate("admitted")
+    install_scripted(monkeypatch, scripted)
 
-    async def _attribution_failed(groups, *, intent="business", **_kwargs):
+    def _attribution_failed(
+        groups: object, *, intent: str = "business", **_kwargs: object
+    ) -> AdmissionResult:
+        del groups, intent
         return AdmissionResult(
             qualification=AdmissionQualification.REJECTED,
             effective_revision=1,
             reason_code="group_attribution_unavailable",
         )
 
-    scripted.__call__ = _attribution_failed  # type: ignore[method-assign]
-    install_scripted(monkeypatch, scripted)
+    # 直接覆盖包顶层 adjudicate：实例 __call__ 赋值不参与特殊方法查表，无效。
+    import komari_bot.plugins.group_admission as admission_package
+
+    monkeypatch.setattr(admission_package, "adjudicate", _attribution_failed)
     service = FakeMemoryService(group_ids=[ALLOWED_GROUP_ID])
     async with asgi_client(_build_app(service)) as client:
         resp = await client.post(
@@ -135,7 +138,7 @@ async def test_create_conversation_attribution_failure_503(monkeypatch) -> None:
     assert service.create_calls == [], "归属失败仍落库"
 
 
-async def test_create_conversation_missing_field_422(monkeypatch) -> None:
+async def test_create_conversation_missing_field_422() -> None:
     """AC1 422: 请求缺必填字段 -> 422（pydantic 契约，当前已满足）。"""
     service = FakeMemoryService(group_ids=[ALLOWED_GROUP_ID])
     async with asgi_client(_build_app(service)) as client:

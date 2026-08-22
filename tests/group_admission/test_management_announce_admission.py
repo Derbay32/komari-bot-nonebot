@@ -17,11 +17,13 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.plugins.komari_management.announce_api import API_PREFIX, register_announce_api
+from komari_bot.plugins.komari_management.announce_api import (
+    API_PREFIX,
+    register_announce_api,
+)
 from komari_bot.plugins.komari_management.announcement_repository import (
     InMemoryAnnouncementDispatchRepository,
 )
-
 from tests.group_admission.chat_admission_support import ScriptedAdjudicate
 from tests.group_admission.management_admission_support import (
     ALLOWED_GROUP_ID,
@@ -70,7 +72,7 @@ def _payload(group_ids: list[int]) -> dict[str, Any]:
     }
 
 
-async def test_announce_single_restricted_forbidden(monkeypatch) -> None:
+async def test_announce_single_restricted_forbidden(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1 single-restricted: 公告单目标受限 -> 403，不发送。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -90,7 +92,7 @@ async def test_announce_single_restricted_forbidden(monkeypatch) -> None:
     assert scripted.calls, "公告发送前未裁决"
 
 
-async def test_announce_batch_restricted_not_blocking_allowed(monkeypatch) -> None:
+async def test_announce_batch_restricted_not_blocking_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC4: 批量逐目标裁决；受限目标不阻塞合法目标、不计业务失败/重试。"""
     scripted = ScriptedAdjudicate("admitted")
     scripted.set_sequence("admitted", "restricted")
@@ -108,7 +110,7 @@ async def test_announce_batch_restricted_not_blocking_allowed(monkeypatch) -> No
         )
     assert resp.status_code == 200
     body = resp.json()
-    sent_ids = [int(msg.get("group_id")) for msg in bot.sent_messages]
+    sent_ids = [int(msg.get("group_id") or 0) for msg in bot.sent_messages]
     assert int(ALLOWED_GROUP_ID) in sent_ids, "合法目标应被发送"
     assert int(RESTRICTED_GROUP_ID) not in sent_ids, "受限目标仍被发送"
     result_ids = {item["group_id"] for item in body["results"]}
@@ -118,7 +120,7 @@ async def test_announce_batch_restricted_not_blocking_allowed(monkeypatch) -> No
     assert len(scripted.calls) == 2, "每个目标各需一次裁决"
 
 
-async def test_announce_replay_same_payload_never_resends(monkeypatch) -> None:
+async def test_announce_replay_same_payload_never_resends(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC6: 相同 request/payload 幂等回放不重发；adjudicate 只裁决一次发送。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
@@ -143,12 +145,13 @@ async def test_announce_replay_same_payload_never_resends(monkeypatch) -> None:
     assert len(bot.sent_messages) == 1, "幂等回放不得重发"
 
 
-async def test_announce_delivery_unknown_never_resends(monkeypatch) -> None:
+async def test_announce_delivery_unknown_never_resends(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC6: delivery unknown 永不重发；受限/unknown 终态不随恢复复活。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
 
     async def _fail_delivery(api: str, **kwargs: Any) -> Any:
+        del kwargs
         if api == "get_group_list":
             return [{"group_id": int(ALLOWED_GROUP_ID), "group_name": "可获准群", "member_count": 1}]
         if api == "send_group_msg":

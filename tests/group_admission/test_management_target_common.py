@@ -6,21 +6,17 @@
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.plugins.komari_memory.api import API_PREFIX as MEMORY_PREFIX
-from komari_bot.plugins.komari_memory.api import create_memory_router
 from komari_bot.plugins.komari_management.reply_fulfillment_api import (
     API_PREFIX as FF_PREFIX,
 )
 from komari_bot.plugins.komari_management.reply_fulfillment_api import (
     create_reply_fulfillment_router,
 )
-
+from komari_bot.plugins.komari_memory.api import API_PREFIX as MEMORY_PREFIX
+from komari_bot.plugins.komari_memory.api import create_memory_router
 from tests.group_admission.chat_admission_support import ScriptedAdjudicate
 from tests.group_admission.management_admission_support import (
     ALLOWED_GROUP_ID,
@@ -44,14 +40,14 @@ def _memory_app(service: FakeMemoryService) -> "FastAPI":
     app.include_router(
         create_memory_router(
             api_token=MANAGEMENT_CREDENTIALS,
-            service_getter=lambda: service,
+            service_getter=lambda: service,  # type: ignore[arg-type] -- 测试用 fake 注入
             redis_getter=lambda: None,
         )
     )
     return app
 
 
-async def test_superuser_credential_does_not_bypass_admission(monkeypatch) -> None:
+async def test_superuser_credential_does_not_bypass_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC5: SUPERUSER 只负责认证，受限目标仍被 403（无准入 bypass）。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -102,7 +98,7 @@ def _build_all(service: FakeMemoryService) -> "FastAPI":
     app.include_router(
         create_memory_router(
             api_token=MANAGEMENT_CREDENTIALS,
-            service_getter=lambda: service,
+            service_getter=lambda: service,  # type: ignore[arg-type] -- 测试用 fake 注入
             redis_getter=lambda: None,
         )
     )

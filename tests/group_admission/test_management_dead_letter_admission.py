@@ -10,13 +10,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 from fastapi import FastAPI
 
 from komari_bot.plugins.komari_memory.api import API_PREFIX, create_memory_router
-
 from tests.group_admission.chat_admission_support import ScriptedAdjudicate
 from tests.group_admission.management_admission_support import (
     ALLOWED_GROUP_ID,
@@ -46,11 +43,11 @@ def _build_app(manager: FakeDeadLetterManager) -> "FastAPI":
     return app
 
 
-def _admitted_intents(scripted):
+def _admitted_intents(scripted: ScriptedAdjudicate) -> list[object]:
     return [intent for (_g, intent) in scripted.calls]
 
 
-async def test_dead_letter_list_restricted_not_leaked(monkeypatch) -> None:
+async def test_dead_letter_list_restricted_not_leaked(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3: 摘要读取为 BUSINESS 且受限群不进入列表/计数。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -73,7 +70,7 @@ async def test_dead_letter_list_restricted_not_leaked(monkeypatch) -> None:
     assert scripted.calls, "dead-letter 读取前未裁决"
 
 
-async def test_dead_letter_list_consults_business_intent(monkeypatch) -> None:
+async def test_dead_letter_list_consults_business_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC5: dead-letter 读取正文为 BUSINESS 分类。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
@@ -89,7 +86,7 @@ async def test_dead_letter_list_consults_business_intent(monkeypatch) -> None:
     assert "business" in intents, "dead-letter 读取未按 BUSINESS 裁决"
 
 
-async def test_dead_letter_requeue_restricted_forbidden(monkeypatch) -> None:
+async def test_dead_letter_requeue_restricted_forbidden(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC5 single-restricted: requeue 受限群 -> 403，不清除/重放快照。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -98,7 +95,7 @@ async def test_dead_letter_requeue_restricted_forbidden(monkeypatch) -> None:
         resp = await client.post(
             f"{API_PREFIX}/conversation-dead-letters/"
             f"{RESTRICTED_GROUP_ID}/snap-10002/requeue",
-            headers=auth_headers(MEMORY_READER),
+            headers=auth_headers(MEMORY_WRITE),
         )
     assert resp.status_code in (403, 404), "受限群 requeue 必须被拒绝或视为不可达"
     assert manager.requeue_calls == [], "受限群仍触发了 requeue 重放"

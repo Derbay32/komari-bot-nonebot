@@ -12,17 +12,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fastapi import FastAPI
 
-from komari_bot.management.management_audit import ManagementAuditEvent
 from komari_bot.plugins.komari_management.reply_fulfillment_api import (
     API_PREFIX,
     create_reply_fulfillment_router,
 )
-
 from tests.group_admission.chat_admission_support import ScriptedAdjudicate
 from tests.group_admission.management_admission_support import (
     ALLOWED_GROUP_ID,
@@ -34,6 +32,9 @@ from tests.group_admission.management_admission_support import (
     install_scripted,
 )
 
+if TYPE_CHECKING:
+    from komari_bot.management.management_audit import ManagementAuditEvent
+
 pytestmark = pytest.mark.group_admission_acceptance
 
 FULFILLMENT_MANAGE_TOKEN = "fulfillment-manage-token-00"
@@ -41,7 +42,7 @@ HDR_MANAGE = auth_headers(FULFILLMENT_MANAGE_TOKEN, request_id="ff-req-tsk231")
 HDR_READ = auth_headers(FULFILLMENT_MANAGE_TOKEN)
 
 
-def _admitted_intents(scripted):
+def _admitted_intents(scripted: ScriptedAdjudicate) -> list[object]:
     return [intent for (_groups, intent) in scripted.calls]
 
 
@@ -60,7 +61,7 @@ def _build_app(service: FakeOpsService, audit: list[Any]) -> "FastAPI":
     return app
 
 
-async def test_confirm_delivered_restricted_does_not_execute(monkeypatch) -> None:
+async def test_confirm_delivered_restricted_does_not_execute(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1 restricted: confirm-delivered 整条拒绝，下游不执行、不被授权。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -75,10 +76,12 @@ async def test_confirm_delivered_restricted_does_not_execute(monkeypatch) -> Non
     assert resp.status_code == 403, "restricted 群应拒绝送达确认"
     assert service.delivered_calls == [], "restricted 下仍调用了 confirm_delivered"
     assert scripted.calls, "confirm-delivered 前未裁决"
-    assert _admitted_intents(scripted) == [], "受限态不应被授权 fact_finalization"
+    assert _admitted_intents(scripted) == ["fact_finalization"], (
+        "受限送达确认必须恰好按 FACT_FINALIZATION 裁决一次并被拒绝"
+    )
 
 
-async def test_confirm_delivered_admitted_consults_fact_finalization(monkeypatch) -> None:
+async def test_confirm_delivered_admitted_consults_fact_finalization(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC2: confirm-delivered 以 FACT_FINALIZATION 对账，交付后终止不重发。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
@@ -95,7 +98,7 @@ async def test_confirm_delivered_admitted_consults_fact_finalization(monkeypatch
     assert service.delivered_calls == [("reply-target-0001", "platform-1")]
 
 
-async def test_confirm_not_delivered_resource_release_is_technical_cleanup(monkeypatch) -> None:
+async def test_confirm_not_delivered_resource_release_is_technical_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC2: 未送达/资源释放只做 TECHNICAL_CLEANUP，从不重发回复正文。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
@@ -113,7 +116,7 @@ async def test_confirm_not_delivered_resource_release_is_technical_cleanup(monke
     assert service.not_delivered_calls == ["reply-target-0001"]
 
 
-async def test_resume_commitment_consults_fact_finalization(monkeypatch) -> None:
+async def test_resume_commitment_consults_fact_finalization(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC2: 承诺续跑按 FACT_FINALIZATION，只续承诺不重发回复。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)
@@ -130,7 +133,7 @@ async def test_resume_commitment_consults_fact_finalization(monkeypatch) -> None
     assert service.resume_calls == [("reply-target-0001", "favorability_adjustment")]
 
 
-async def test_list_restricted_group_not_leaked(monkeypatch) -> None:
+async def test_list_restricted_group_not_leaked(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3: 列表在正文读取前按最小化归属投影过滤，不泄漏受限群存在性/计数。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted(monkeypatch, scripted)
@@ -150,7 +153,7 @@ async def test_list_restricted_group_not_leaked(monkeypatch) -> None:
     assert scripted.calls, "列表归属过滤前未逐项裁决"
 
 
-async def test_confirm_delivered_group_id_not_in_audit(monkeypatch) -> None:
+async def test_confirm_delivered_group_id_not_in_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC5: 调用方提交的 group ID 只回显在批准响应字段，不进入审计/告警。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted(monkeypatch, scripted)

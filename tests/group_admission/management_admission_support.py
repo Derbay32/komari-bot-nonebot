@@ -11,7 +11,6 @@ komari_memory）装配为可测 FastAPI 应用所需的确定性依赖与 fake�
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +20,8 @@ from komari_bot.plugins.komari_memory.services.conversation_processing import (
 from tests.group_admission.chat_admission_support import install_scripted_adjudicate
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from httpx import AsyncClient
     from pytest import MonkeyPatch
 
@@ -134,12 +135,15 @@ class FakeOpsService:
         self.get_calls: list[str] = []
 
     def _summary(self) -> dict[str, Any]:
+        assert self.detail is not None
         summary = deepcopy(self.detail)
         summary.pop("reply_target_message_id", None)
         summary.pop("reply_content", None)
         return summary
 
-    async def list_fulfillments(self, *, status, limit, offset):
+    async def list_fulfillments(
+        self, *, status: str | None, limit: int, offset: int
+    ) -> dict[str, Any]:
         self.list_calls.append({"status": status, "limit": limit, "offset": offset})
         return {
             "items": [self._summary()],
@@ -152,7 +156,9 @@ class FakeOpsService:
         self.get_calls.append(fulfillment_id)
         return deepcopy(self.detail)
 
-    async def confirm_delivered(self, fulfillment_id, *, platform_message_id):
+    async def confirm_delivered(
+        self, fulfillment_id: str, *, platform_message_id: str | None
+    ) -> dict[str, Any]:
         self.delivered_calls.append((fulfillment_id, platform_message_id))
         return {
             "fulfillment_id": fulfillment_id,
@@ -161,7 +167,7 @@ class FakeOpsService:
             "platform_message_id": platform_message_id,
         }
 
-    async def confirm_not_delivered(self, fulfillment_id):
+    async def confirm_not_delivered(self, fulfillment_id: str) -> dict[str, Any]:
         self.not_delivered_calls.append(fulfillment_id)
         return {
             "fulfillment_id": fulfillment_id,
@@ -170,7 +176,9 @@ class FakeOpsService:
             "reservation_released": True,
         }
 
-    async def resume_commitment(self, fulfillment_id, *, commitment_type):
+    async def resume_commitment(
+        self, fulfillment_id: str, *, commitment_type: str
+    ) -> dict[str, Any]:
         self.resume_calls.append((fulfillment_id, commitment_type))
         return {
             "fulfillment_id": fulfillment_id,
@@ -245,21 +253,29 @@ class FakeMemoryService:
         self.delete_calls: list[int] = []
         self.list_calls: int = 0
 
-    async def list_conversations(self, **kwargs):
+    async def list_conversations(
+        self, **kwargs: object
+    ) -> tuple[list[dict[str, Any]], int]:
+        del kwargs
         self.list_calls += 1
         return list(self.rows.values()), len(self.rows)
 
-    async def get_conversation_entry(self, conversation_id: int):
+    async def get_conversation_entry(
+        self, conversation_id: int
+    ) -> dict[str, Any] | None:
         return self.rows.get(conversation_id)
 
-    async def create_conversation_entry(self, **kwargs):
+    async def create_conversation_entry(self, **kwargs: object) -> dict[str, Any]:
         self.create_calls.append(kwargs)
         new_id = max(self.rows, default=0) + 1
         entry = conversation_entry(conversation_id=new_id, group_id=str(kwargs.get("group_id") or ALLOWED_GROUP_ID))
         self.rows[new_id] = entry
         return entry
 
-    async def update_conversation_entry(self, conversation_id, **kwargs):
+    async def update_conversation_entry(
+        self, conversation_id: int, **kwargs: object
+    ) -> dict[str, Any] | None:
+        del kwargs
         return self.rows.get(conversation_id)
 
     async def delete_conversation_entry(self, conversation_id: int) -> bool:
