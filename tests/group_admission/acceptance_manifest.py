@@ -865,3 +865,64 @@ ADMISSION_EFFECT_CASES += (
         ),
     ),
 )
+
+
+# TSK-230 komari_memory 群工作休眠与归属传播的逐效果准入登记。每条受治理业务
+# 效果带独立 effect_id（前缀 ``group_admission.effect.memory.*``），owner_module
+# 均为 komari_memory，intent 覆盖 business；归属来自群对话/互动快照与 job
+# 的 group_id lineage。anchor 指向本票真实 pytest node（红基线测试驱动真实
+# worker/repository/manager 入口）。
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.memory.conversation_claim",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="ConversationProcessingLifecycle.process_conversation_snapshot",
+        sink_kind="conversation_buffer_claim_lease",
+        intent="business",
+        attribution_source="conversation_processing_snapshot.group_id",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_memory_dormancy_admission.py"
+            "::test_ac2_restricted_no_business_lease_no_failure_budget_no_dead_letter"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.memory.conversation_body_read",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="ConversationProcessingLifecycle._run_processing_attempt",
+        sink_kind="conversation_buffer_body_reader",
+        intent="business",
+        attribution_source="conversation_processing_snapshot.group_id",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_memory_dormancy_admission.py"
+            "::test_ac1_restricted_conversation_reader_fail_if_called"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.memory.interaction_global_commit",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="InteractionEventRepository.insert_interaction_event",
+        sink_kind="interaction_history_global_commit",
+        intent="business",
+        attribution_source="interaction_v2_associated_group_ids",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_interaction_v2_admission.py"
+            "::test_ac6_global_commit_adjudicates_full_associated_group_set"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.memory.forgetting_decay",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="ForgettingService.decay_and_cleanup",
+        sink_kind="conversation_importance_decay",
+        intent="business",
+        attribution_source="forgetting_job_associated_group_ids",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_forgetting_admission.py"
+            "::test_ac7_forgetting_restricted_day_skips_and_no_backfill"
+        ),
+    ),
+)

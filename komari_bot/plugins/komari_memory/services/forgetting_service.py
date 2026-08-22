@@ -30,6 +30,7 @@ from ..repositories.forgetting_job_repository import (
     ForgettingJobRepository,
     ForgettingJobStage,
 )
+from .admission import memory_batch_business_admitted
 from .config_interface import get_config
 
 if TYPE_CHECKING:
@@ -223,6 +224,38 @@ class ForgettingService:
         """获取当前动态配置，避免服务长期持有启动快照。"""
         return self._config_provider()
 
+    async def _collect_decay_associated_groups(self) -> tuple[int, ...]:
+        """最小归属投影：取对话与互动两张记忆表涉及的关联群集合。
+
+        只读取群归属（不读正文/摘要），供衰减前的关联群裁决；存储不可用时
+        返回空（由裁决层按归属缺失故障关闭）。Repository/Redis Adapter 策略
+        无感，归属投影由编排层（本服务）负责。
+        """
+        pool = self.pg_pool
+        if pool is None:
+            return ()
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT group_id FROM komari_memory_conversations
+                    WHERE group_id IS NOT NULL
+                    """
+                )
+        except Exception:
+            logger.exception(
+                "[KomariMemory] 收集忘却关联群归属投影失败，按归属失败持有处理"
+            )
+            return ()
+        groups: set[int] = set()
+        for row in rows:
+            value = row["group_id"]
+            try:
+                groups.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return tuple(sorted(groups))
+
     async def decay_and_cleanup(self, *, run_date: date | None = None) -> bool:
         """执行死神脚本（每天凌晨4点）。
 
@@ -235,6 +268,17 @@ class ForgettingService:
         config = self.config
         if not config.forgetting_enabled:
             logger.debug("[KomariMemory] 忘却功能未启用，跳过")
+            return False
+
+        # 衰减作用前按最小归属投影裁决（AC7/ADR-0012）：受限日跳过整批，
+        # 恢复后不补算休眠天数；归属缺失进入持有态。
+        if not memory_batch_business_admitted(
+            group_ids=await self._collect_decay_associated_groups()
+        ):
+            logger.info(
+                "[KomariMemory] 当日忘却衰减因群准入受限而休眠跳过: run_date={}",
+                run_date,
+            )
             return False
 
         effective_run_date = run_date or datetime.now().astimezone().date()

@@ -80,6 +80,10 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.fulfillment.reconcile",
     "group_admission.effect.fulfillment.commitment",
     "group_admission.effect.fulfillment.cleanup",
+    "group_admission.effect.memory.conversation_claim",
+    "group_admission.effect.memory.conversation_body_read",
+    "group_admission.effect.memory.interaction_global_commit",
+    "group_admission.effect.memory.forgetting_decay",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {
@@ -285,6 +289,20 @@ def test_fulfillment_effect_case_rows_are_attributed() -> None:
             "technical_cleanup",
         }, case.effect_id
         assert case.attribution_source == "reply_fulfillment.group_id", case.effect_id
+
+
+def test_memory_effect_case_rows_are_attributed() -> None:
+    """TSK-230 记忆 dormancy 效果行归属 komari_memory，intent 受控。"""
+    memory_prefix = "group_admission.effect.memory."
+    memory_cases = [
+        case
+        for case in ADMISSION_EFFECT_CASES
+        if case.effect_id.startswith(memory_prefix)
+    ]
+    assert len(memory_cases) >= 4, "TSK-230 必须登记 memory 效果行"
+    for case in memory_cases:
+        assert case.owner_module == "komari_bot.plugins.komari_memory", case.effect_id
+        assert case.intent == "business", case.effect_id
 
 
 def test_management_cases_register_exactly_the_phase_a_control_plane() -> None:
