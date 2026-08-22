@@ -267,3 +267,39 @@ async def test_ac5_in_flight_work_may_finish_but_write_before_is_discarded_on_re
 
     assert scripted.calls, "写结果前必须重新裁决（撤销点）"
     assert provider.committed == [], "撤销后写结果必须丢弃，不得持久化"
+
+
+class _NonEmptyStorage(DormantProcessingStorage):
+    """供 AC5 正例：返回非空缓冲正文，驱动真实 processing 步骤执行并持久化。"""
+
+    async def get_processing_conversation_buffer(
+        self,
+        group_id: str,
+        processing_key: str,
+        owner_token: str,
+    ) -> list[object]:
+        del processing_key, owner_token
+        self.get_calls.append({"group_id": group_id})
+        return [{"user_id": "u1", "group_id": group_id}]
+
+
+async def test_ac5_in_flight_completes_and_persists_when_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """补项3（AC5 正例）：已获准入开始 in-flight 工作可完成并正常持久化。
+
+    与 test_ac5_in_flight_..._discarded_on_revoke 互为对照：获准群贡献不因准入
+    门控被误丢弃，正文处理产物随完成门控持久化（advance/ack），而非休眠。
+    """
+    scripted = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    storage = _NonEmptyStorage()
+    lifecycle = _make_lifecycle(storage)
+    provider = _CommitAwareProcessor()
+
+    done = await lifecycle.process_conversation_snapshot("g1", provider)
+
+    assert scripted.calls, "获准处理也必须先裁决"
+    assert done is True, "获准组必须走完生命周期"
+    assert provider.pending, "获准组 in-flight 工作应真正执行（有非空正文）"
+    assert provider.committed != [], "获准入开始的工作完成后应正常持久化产物"

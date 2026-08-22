@@ -21,6 +21,23 @@ _RESOURCE_ID = "komari_memory_summary"
 
 
 @pytest.fixture(autouse=True)
+def _admit_all_memory_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """为既有 memory 服务测试装载统一准入替身：恒 admit。
+
+    TSK-230 起生产在持久群工作各效果前接入统一群准入（ADR-0012）。既有服务
+    测试（lifecycle / summary_worker / forgetting / interaction worker 等）不
+    关心准入语义，统一注入 ``admitted`` 判定替身使真实准入 seam 不阻断既有
+    行为断言；准入语义本身由 tests/group_admission/*admission.py 专项验收。
+    """
+    from tests.group_admission.chat_admission_support import (
+        ScriptedAdjudicate,
+        install_scripted_adjudicate,
+    )
+
+    install_scripted_adjudicate(monkeypatch, ScriptedAdjudicate("admitted"))
+
+
+@pytest.fixture(autouse=True)
 def _inject_marker_prompt_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     """为依赖总结 Prompt 的服务测试注入完整 marker 快照。"""
     import komari_bot.plugins.komari_memory.agent.profile_agent_service as profile_module
