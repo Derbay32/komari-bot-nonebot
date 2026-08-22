@@ -993,7 +993,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         retention_days INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1018,7 +1018,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         rerank_top_n INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1054,7 +1054,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         layout_params JSONB NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1071,7 +1071,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         redis_db INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1112,7 +1112,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         scene_keep_versions INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1134,7 +1134,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         max_content_preview_length INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1150,7 +1150,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         total_limit INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1167,7 +1167,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         announce_request_cooldown_seconds FLOAT NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1253,7 +1253,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         error_notify_enabled BOOLEAN NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1280,7 +1280,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         circuit_breaker_recovery_seconds FLOAT NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1305,7 +1305,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         event_level VARCHAR NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1334,7 +1334,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         vision_reasoning_effort VARCHAR NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1348,7 +1348,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         redis_db INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1361,7 +1361,7 @@ _TABLE_STATEMENTS: tuple[str, ...] = (
         max_favorability_delta_per_reply INTEGER NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
 )
 
@@ -1381,7 +1381,7 @@ _PROMPT_TABLE_STATEMENTS: tuple[str, ...] = (
         cot_prefix_role TEXT NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1395,7 +1395,7 @@ _PROMPT_TABLE_STATEMENTS: tuple[str, ...] = (
         json_response_example TEXT NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
     """
 
@@ -1412,7 +1412,7 @@ _PROMPT_TABLE_STATEMENTS: tuple[str, ...] = (
         cot_prefix_role TEXT NOT NULL,
         PRIMARY KEY (id)
     )
-    
+
     """,
 )
 

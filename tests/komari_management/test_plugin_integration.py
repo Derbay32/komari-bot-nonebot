@@ -10,6 +10,7 @@ import pytest
 from pydantic import BaseModel
 
 from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
+from komari_bot.plugins.group_admission import register_group_admission_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
@@ -67,6 +68,7 @@ class _DummyConfigManager:
 
 def _build_components() -> ManagementApiComponents:
     return ManagementApiComponents(
+        register_group_admission_api=register_group_admission_api,
         register_knowledge_api=register_knowledge_api,
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,

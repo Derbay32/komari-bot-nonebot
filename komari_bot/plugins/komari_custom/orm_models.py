@@ -5,7 +5,7 @@ NoneBot 与任何业务插件，因此 Alembic 迁移环境可以直接以源文
 （见 ``komari_bot/config/typed_config.load_all_plugin_orm_models``），
 模型注册进 ``SQLModel.metadata`` 供 autogenerate/check 使用。
 
-列定义与 ``migrations/versions/0001_baseline_full_schema.py`` 中
+列定义与 ``migrations/versions/0002_typed_schema.py`` 中
 ``_custom_proposal_statements()`` 的既有 DDL 精确对齐（列名/类型/可空/
 默认/约束/索引），目标是 ``orm_bootstrap check`` 零 diff：
 

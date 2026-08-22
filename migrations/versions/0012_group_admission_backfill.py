@@ -7,11 +7,15 @@ pre-admission schema、无策略数据）继续升级时中止在 head 之前，
 生成缺省策略或合并旧 JSONB 名单。downgrade 明确拒绝回退。
 """
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
+
 from alembic import op
 from sqlalchemy import text
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
     from sqlalchemy import Connection
 
 revision: str = "0012"

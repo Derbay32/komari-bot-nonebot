@@ -184,9 +184,7 @@ def test_forward_only_barrier_downgrades_are_irreversible() -> None:
                 f"{revision} downgrade 的 RuntimeError 必须含 forward-only 标记 {marker}"
             )
         else:
-            raise AssertionError(
-                f"{revision} 作为 forward-only barrier，downgrade() 必须抛 RuntimeError"
-            )
+            raise AssertionError(f"{revision} downgrade 必须抛 RuntimeError")  # noqa: TRY003
 
 
 def test_no_legacy_jsonb_list_loader_seam_in_chain() -> None:

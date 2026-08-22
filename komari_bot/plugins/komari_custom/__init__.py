@@ -176,6 +176,7 @@ async def handle_custom_help(
     args: Message = CommandArg(),
 ) -> None:
     """显示 .custom 帮助。"""
+    del bot
     if not await _admission_gate(event):
         return
     arg_text = args.extract_plain_text().strip()

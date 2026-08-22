@@ -92,7 +92,7 @@ def test_management_runtime_registers_group_admission() -> None:
         "register_management_api_for_driver 必须挂载 group-admission 路由"
     )
     # 路由前缀（ADR 专属三路由）
-    assert '/api/v2/group-admission/policy' in source or 'group-admission' in source
+    assert "/api/v2/group-admission/policy" in source or "group-admission" in source
 
 
 def test_management_loader_requires_group_admission() -> None:

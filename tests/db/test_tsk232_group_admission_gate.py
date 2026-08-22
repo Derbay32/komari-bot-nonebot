@@ -18,6 +18,7 @@ finally DROP；共享门控库始终保持 head。无 ``KOMARI_TEST_POSTGRES_URL
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import asyncpg
@@ -96,7 +97,9 @@ async def test_fresh_upgrade_head_creates_group_admission_config() -> None:
                 f"SELECT policy FROM {GROUP_ADMISSION_TABLE} WHERE id = 1"
             )
             assert policy_row is not None, "fresh marker 库必须播种缺省策略行"
-            assert policy_row["policy"] == {"mode": "blacklist", "group_ids": []}, (
+            # asyncpg 对 JSONB 列原样返回字符串，解析后断言结构。
+            seeded = json.loads(policy_row["policy"])
+            assert seeded == {"mode": "blacklist", "group_ids": []}, (
                 "空库缺省策略必须为 blacklist + 空群名单"
             )
         finally:

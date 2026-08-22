@@ -221,13 +221,13 @@ async def handle_group_history_summary(
 ) -> None:
     """处理群聊历史总结请求。"""
     config = cast("DynamicConfigSchema", config_manager.get())
-    if not config.plugin_enable:
-        return
-
     group_id = getattr(event, "group_id", None)
-    if not isinstance(group_id, int) or group_id <= 0:
-        return
-    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
+    if (
+        not config.plugin_enable
+        or not isinstance(group_id, int)
+        or group_id <= 0
+        or adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS
+    ):
         return
 
     if not await check_group_history_supported(bot):

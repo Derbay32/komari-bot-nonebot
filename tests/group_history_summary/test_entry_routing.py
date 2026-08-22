@@ -108,7 +108,7 @@ def _install_permission(
         qualification = (
             summary_module.AdmissionQualification.BUSINESS
             if allowed
-            else summary_module.AdmissionQualification.RESTRICTED
+            else summary_module.AdmissionQualification.REJECTED
         )
         return SimpleNamespace(qualification=qualification)
 

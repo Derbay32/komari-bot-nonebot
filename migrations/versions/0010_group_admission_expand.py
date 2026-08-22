@@ -54,21 +54,32 @@ CREATE TABLE komari_group_admission_config (
 _DEFAULT_POLICY = '{"mode": "blacklist", "group_ids": []}'
 
 
+#: 会话级 fresh 安装标记（由 0001 fresh_marker 在同一次 upgrade 的同一
+#: 连接上设置；分步升级/既有库续升的新会话不携带，见 0001 注释）。
+_FRESH_GUC = "komari_tsk232.fresh_install"
+
+
 def upgrade(name: str = "") -> None:
     if name:
         return
 
     op.execute(_CREATE_TABLE_SQL)
 
-    # 幂等播种缺省策略（fresh 空库；id=1 已存在则不动，避免覆盖既有策略）。
-    op.execute(
-        text(
-            f"INSERT INTO {_TABLE} (id, revision, updated_at, policy) "
-            "VALUES (1, 1, NOW(), CAST(:policy AS JSONB)) "
-            "ON CONFLICT (id) DO NOTHING"
-        ),
-        {"policy": _DEFAULT_POLICY},
-    )
+    # 仅 fresh 全新安装（同一次 upgrade 运行、0001 已设会话标记）幂等播种
+    # 缺省策略；分步升级或既有库续升不得静默播种——统一策略必须由 operator
+    # 显式提交并经 0012 backfill barrier 检验（缺策略时 0012 拒绝升级）。
+    fresh_install = op.get_bind().execute(
+        text(f"SELECT current_setting('{_FRESH_GUC}', true)")
+    ).scalar_one_or_none()
+    if fresh_install == "1":
+        op.get_bind().execute(
+            text(
+                f"INSERT INTO {_TABLE} (id, revision, updated_at, policy) "
+                "VALUES (1, 1, NOW(), CAST(:policy AS JSONB)) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"policy": _DEFAULT_POLICY},
+        )
 
 
 def downgrade(name: str = "") -> None:

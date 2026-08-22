@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
+from komari_bot.plugins.group_admission import register_group_admission_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
@@ -107,6 +108,7 @@ def _credentials(
 
 def _build_components() -> ManagementApiComponents:
     return ManagementApiComponents(
+        register_group_admission_api=register_group_admission_api,
         register_knowledge_api=register_knowledge_api,
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
@@ -203,7 +205,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "/api/v2/agent-run-logs, /api/v2/komari-search, "
         "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
         "/api/v2/komari-announce, /api/v2/komari-decision-scenes, "
-        "/api/v2/komari-user-bans, /api/v2/reply-fulfillments"
+        "/api/v2/komari-user-bans, /api/v2/group-admission, /api/v2/reply-fulfillments"
     )
     assert logger.info_messages[-1] == (
         "[Komari Management] 管理文档入口: "

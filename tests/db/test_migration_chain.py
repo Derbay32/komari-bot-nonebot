@@ -143,7 +143,7 @@ def test_typed_prompt_tables_revision_exists() -> None:
         None,
     )
     assert typed_revision is not None
-    
+
     revision_sql = Path(typed_revision.path).read_text(encoding="utf-8")
     missing_tables = {
         table

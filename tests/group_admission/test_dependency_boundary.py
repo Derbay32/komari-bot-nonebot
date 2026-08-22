@@ -48,6 +48,15 @@ FORBIDDEN_IMPORT_ROOTS = {
 #: 唯一允许的跨 komari_bot 绝对 import（必须恰好是顶层模块，禁止深 import）。
 ALLOWED_KOMARI_ABSOLUTE_MODULES = {
     "komari_bot.plugins.config_manager",
+    # TSK-232：config_schema.py 与其余 15 个插件同地位，经 TypedConfigModel
+    # 基类定义强类型单行表（结构真源），非存储访问。
+    "komari_bot.config.typed_config",
+}
+
+#: TSK-232：强类型配置表的 JSONB 列类型声明（sqlalchemy.dialects）。
+#: 仅允许类型声明用途，连接/会话/DDL 仍被禁止。
+ALLOWED_ABSOLUTE_MODULES = {
+    "sqlalchemy.dialects.postgresql",
 }
 
 #: TSK-223：共享管理包允许任意子模块（鉴权/审计工具面，与 user_ban 等既有
@@ -115,9 +124,10 @@ def test_group_admission_has_no_forbidden_storage_or_business_imports() -> None:
         for lineno, target in _absolute_import_targets(module_file):
             root = target.split(".")[0]
             if root in FORBIDDEN_IMPORT_ROOTS:
-                violations.append(
-                    f"{module_file.name}:{lineno}: 禁用存储依赖 {target}"
-                )
+                if target not in ALLOWED_ABSOLUTE_MODULES:
+                    violations.append(
+                        f"{module_file.name}:{lineno}: 禁用存储依赖 {target}"
+                    )
                 continue
             if target.startswith("komari_bot."):
                 if target in ALLOWED_KOMARI_ABSOLUTE_MODULES:
@@ -193,31 +203,38 @@ def test_core_komari_bot_has_no_group_admission_deep_imports() -> None:
 
 
 def test_phase_a_does_not_introduce_config_schema_or_migration() -> None:
-    """本票不创建 config_schema.py，也不新增任何群准入迁移。"""
-    assert not (PACKAGE_DIR / "config_schema.py").exists(), (
-        "阶段 A 不得创建 group_admission config_schema.py"
+    """TSK-232 已正式解除阶段 A 限制：config_schema 与群准入迁移就位。
+
+    阶段 A 曾要求 group_admission 不建 config_schema.py / 不引入群准入迁移；
+    TSK-232 破坏性 cutover 后两者均为正式契约（强类型单行表 + 0010-0013
+    admission 迁移锚点），本用例改为断言它们确实存在并注册。
+    """
+    assert (PACKAGE_DIR / "config_schema.py").exists(), (
+        "TSK-232 后 group_admission 必须持有强类型 config_schema"
     )
     migrations_dir = PROJECT_ROOT / "migrations" / "versions"
     assert migrations_dir.is_dir(), "迁移版本目录缺失"
-    offenders: list[str] = []
-    for migration_file in sorted(migrations_dir.glob("*.py")):
-        text = migration_file.read_text(encoding="utf-8")
-        if "group_admission" in text:
-            offenders.append(migration_file.name)
-    assert offenders == [], f"阶段 A 不得引入群准入迁移: {offenders}"
+    anchors = [
+        "0010_group_admission_expand.py",
+        "0012_group_admission_backfill.py",
+        "0013_group_admission_cutover.py",
+    ]
+    for anchor in anchors:
+        assert (migrations_dir / anchor).exists(), f"缺少 admission 迁移锚点 {anchor}"
 
 
 def test_phase_a_komari_management_plugin_does_not_mount_group_admission() -> None:
-    """本票不修改 komari_management 最终挂载，也不在其引入 require/import。"""
-    management_plugin_dir = PLUGINS_DIR / "komari_management"
-    assert management_plugin_dir.is_dir(), "komari_management 插件目录缺失"
-    offenders: list[str] = []
-    for module_file in sorted(management_plugin_dir.rglob("*.py")):
-        text = module_file.read_text(encoding="utf-8")
-        if "group_admission" in text:
-            offenders.append(module_file.name)
-    assert offenders == [], (
-        f"阶段 A 不得在 komari_management 挂载/引用 group_admission: {offenders}"
+    """TSK-232 已正式解除阶段 A 禁挂载限制：komari_management 装配准入 Router。
+
+    阶段 A 曾禁止 komari_management 引用 group_admission；TSK-232 把
+    ``register_group_admission_api`` 纳入生产装配（ManagementApiComponents +
+    register_management_api_for_driver），本用例改为断言装配确实存在。
+    """
+    api_runtime = PLUGINS_DIR / "komari_management" / "api_runtime.py"
+    assert api_runtime.exists(), "api_runtime.py 缺失"
+    text = api_runtime.read_text(encoding="utf-8")
+    assert "register_group_admission_api" in text, (
+        "komari_management 生产装配必须挂载 group_admission Router"
     )
 
 

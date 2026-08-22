@@ -60,8 +60,8 @@ def test_permission_plugin_entirely_removed() -> None:
                 continue
             text = file.read_text(encoding="utf-8", errors="ignore")
             if "permission_manager" in text or "check_runtime_permission" in text:
-                raise AssertionError(f"旧 permission 引用仍存于生产/测试: {file}")
-    assets = [p for p in (KOMARI_BOT / "plugins").rglob("*permission_manager*")]
+                raise AssertionError(f"旧 permission 引用残留: {file}")  # noqa: TRY003
+    assets = list((KOMARI_BOT / "plugins").rglob("*permission_manager*"))
     assert assets == [], f"插件目录仍存在 permission_manager 文件: {assets}"
 
 
@@ -74,8 +74,8 @@ def test_retired_artifacts_paths_do_not_exist() -> None:
 def test_eight_config_schema_removed_whitelist_fields() -> None:
     """八个 config_schema.py 不得再有 user_whitelist / group_whitelist 字段。"""
     pattern = re.compile(
-        r"^\s*(?:(?i)" + "|".join(re.escape(f) for f in RETIRED_FIELDS) + r")\s*[:=]",
-        re.MULTILINE,
+        r"^\s*(?:" + "|".join(re.escape(f) for f in RETIRED_FIELDS) + r")\s*[:=]",
+        re.IGNORECASE | re.MULTILINE,
     )
     for plugin in EIGHT_WHITELISTED_SCHEMAS:
         path = KOMARI_BOT / "plugins" / plugin / "config_schema.py"
