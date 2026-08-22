@@ -13,7 +13,10 @@
   与逐方法错误注入 / 调用计数 / 全断裂开关，承载管理控制面 PUT 契约；
 - ``start_runtime`` / ``install_singleton``：用真实 ``ConfigManager`` 与真实
   ``_AdmissionRuntime`` 拉起运行时，并把实例 monkeypatch 成
-  ``komari_bot.plugins.group_admission.runtime._runtime`` module singleton。
+  ``komari_bot.plugins.group_admission.runtime._runtime`` module singleton；
+  TSK-223 阶段 B 起 ``build_runtime`` / ``start_runtime`` 接受可选
+  ``runtime_kwargs``，原样透传给 ``_AdmissionRuntime`` 构造器（可控 UTC 时钟
+  / 在线 Bot 提供者 / SUPERUSERS 提供者三个可选内部 DI 关键字）。
 
 生产包尚不存在时，helper 内部的惰性 import 会抛出
 ``ModuleNotFoundError``，使依赖它的用例以缺失生产符号的原因失败（red）。
@@ -33,7 +36,7 @@ from komari_bot.plugins.config_manager.storage import StoredConfig
 
 if TYPE_CHECKING:
     import asyncio
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     import pytest
 
@@ -122,7 +125,13 @@ class AdmissionStorageFake:
         self._race_snapshots.extend(snapshots)
 
     def deliver(self, stored: StoredConfig) -> None:
-        """以真实 ConfigManager watcher 身份投递一条存储快照。"""
+        """以真实 ConfigManager watcher 身份投递一条存储快照。
+
+        watcher 因存储行已变更而触发，因此先更新存储当前状态再回调，
+        与真实存储「先提交、后通知」的顺序一致；后续 fetch/CAS 必须能观察
+        到该 revision。
+        """
+        self._initial = stored
         for callback in tuple(self.watcher_callbacks):
             callback(stored)
 
@@ -281,25 +290,48 @@ def import_admission_package() -> Any:
 def build_runtime(
     monkeypatch: pytest.MonkeyPatch,
     storage: AdmissionStorageFake,
+    *,
+    runtime_kwargs: Mapping[str, object] | None = None,
 ) -> tuple[Any, ConfigManager]:
-    """构造真实 ConfigManager 与真实 ``_AdmissionRuntime``（未启动）。"""
+    """构造真实 ConfigManager 与真实 ``_AdmissionRuntime``（未启动）。
+
+    TSK-223 阶段 B：``runtime_kwargs`` 原样传入 ``_AdmissionRuntime`` 构
+    造器。冻结的生产内部 DI 接缝（全部可选关键字，不是测试 hook，缺省时生
+    产使用真实默认值）：
+
+    - ``clock``：可控 UTC 时钟 callable（返回带时区 UTC datetime），驱动窗口/
+      提醒/稳定恢复与全部状态时间戳；
+    - ``online_bots_provider``：在线 Bot 枚举提供者（返回 Mapping 或
+      Iterable），仅用于 SUPERUSER 通知投递；
+    - ``superusers_provider``：SUPERUSER 群号提供者（返回 Iterable，仅合法
+      正整数生效），仅用于通知收件人解析。
+    """
     monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+    # ``ConfigManager`` 自身经 ``manager`` 模块绑定 ``get_config_storage``
+    # （``manager.py`` 直接 ``from .storage import get_config_storage``），故
+    # 只需 patch ``manager_module``；包级 ``get_config_storage`` 绑定依赖包
+    # ``__init__`` 顶层 ``require('nonebot_plugin_orm')``，在测试导入期 NoneBot
+    # 未就绪时会中断导入，不能依赖，故不 patch 包级绑定。
     runtime_module = import_runtime_module()
     manager = ConfigManager(PLUGIN_NAME, AdmissionValueSchema)
-    runtime = runtime_module._AdmissionRuntime()
+    runtime = runtime_module._AdmissionRuntime(**(runtime_kwargs or {}))
     return runtime, manager
 
 
 async def start_runtime(
     monkeypatch: pytest.MonkeyPatch,
     storage: AdmissionStorageFake,
+    *,
+    runtime_kwargs: Mapping[str, object] | None = None,
 ) -> tuple[Any, ConfigManager]:
     """用真实 ConfigManager 构造并启动真实 ``_AdmissionRuntime``。
 
     返回 ``(runtime, manager)``；不触碰 module singleton，调用方按需经
-    ``install_singleton`` 显式安装。
+    ``install_singleton`` 显式安装。``runtime_kwargs`` 语义见 ``build_runtime``。
     """
-    runtime, manager = build_runtime(monkeypatch, storage)
+    runtime, manager = build_runtime(
+        monkeypatch, storage, runtime_kwargs=runtime_kwargs
+    )
     await runtime.start(manager)
     return runtime, manager
 

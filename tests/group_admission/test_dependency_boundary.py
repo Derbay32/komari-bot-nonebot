@@ -243,3 +243,65 @@ def test_phase_a_has_no_telemetry_or_side_persistence_channels() -> None:
                     f"{module_file.name}:{lineno}: 禁止的 AgentRun import {target}"
                 )
     assert offenders == [], f"阶段 A 出现越界遥测/第二持久面: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# TSK-223 阶段 B：可观测性保持封闭运维诊断预算（不引入指标基础设施、
+# 不显式接 Sentry、不注册 driver hooks / scheduler）
+# ---------------------------------------------------------------------------
+
+#: 阶段 B 额外禁止的遥测/诊断库 import 根（与阶段 A 互补）。
+FORBIDDEN_PHASE_B_IMPORT_ROOTS = {
+    "prometheus_client",
+    "opentelemetry",
+    "sentry_sdk",
+    "statsd",
+    "datadog",
+}
+
+#: 阶段 B 禁止的标识符（AST 级别扫描，docstring 提及不会误报）：
+#: 显式 Sentry 异常捕获、全局指标注册表、NoneBot driver hooks 与 scheduler
+#: 作业注册（阶段 B 只提供 ``process_observability``，scheduler 归后续票）。
+FORBIDDEN_PHASE_B_IDENTIFIERS = {
+    "capture_exception",
+    "add_event_processor",
+    "CollectorRegistry",
+    "on_startup",
+    "on_shutdown",
+    "add_job",
+}
+
+
+def _identifier_occurrences(path: Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    occurrences: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_PHASE_B_IDENTIFIERS:
+            occurrences.append((node.lineno, node.id))
+        elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_PHASE_B_IDENTIFIERS:
+            occurrences.append((node.lineno, node.attr))
+    return occurrences
+
+
+def test_phase_b_observability_keeps_operational_diagnostic_boundaries() -> None:
+    """阶段 B 不引入指标基础设施/显式 Sentry 接口，也不注册 driver hooks。
+
+    可观测性只由低基数内存计数 + 现有应用日志 + 内存通知构成：不引入
+    Prometheus/OTel/全局指标注册表与 ``/metrics``（阶段 A 标记扫描互补），
+    不显式调用 ``capture_exception`` / 不向日志挂原始异常对象，不注册
+    ``on_startup`` / ``on_shutdown`` / scheduler 作业（``process_observability``
+    由后续 scheduler 票驱动）。内容泄漏由金丝雀用例在运行时验收。
+    """
+    offenders: list[str] = []
+    for module_file in _package_modules():
+        for lineno, target in _absolute_import_targets(module_file):
+            root = target.split(".")[0]
+            if root in FORBIDDEN_PHASE_B_IMPORT_ROOTS:
+                offenders.append(
+                    f"{module_file.name}:{lineno}: 禁止的诊断/指标库 import {target}"
+                )
+        for lineno, name in _identifier_occurrences(module_file):
+            offenders.append(
+                f"{module_file.name}:{lineno}: 禁止的标识符 {name}"
+            )
+    assert offenders == [], f"阶段 B 出现越界诊断/装配面: {offenders}"

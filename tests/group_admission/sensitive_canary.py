@@ -187,3 +187,49 @@ def build_standard_canary_bundle() -> SensitiveCanaryBundle:
             ),
         )
     )
+
+
+def build_extended_canary_bundle() -> SensitiveCanaryBundle:
+    """TSK-223 阶段 B 扩展探针集：标准集 + 身份/正文/诊断特征探针。
+
+    在标准集之上覆盖：群/用户/消息/请求/履约/提案 ID、prompt/reasoning/
+    工具参数正文、API Key、恶意 trace 与异常/traceback 特征。阶段 B 的递归泄
+    漏扫描（日志 message+extra、status、HTTP 错误体、审计、私聊卡、Sentry
+    handoff 模拟记录）一律使用本 bundle。
+    """
+    return SensitiveCanaryBundle(
+        (
+            *build_standard_canary_bundle().tokens,
+            SensitiveCanaryToken(label="group-id", value=779001),
+            SensitiveCanaryToken(label="user-id", value=889002),
+            SensitiveCanaryToken(
+                label="message-id", value="msg-CANARY-9f2e77"
+            ),
+            SensitiveCanaryToken(
+                label="request-id", value="req-CANARY-41d0aa"
+            ),
+            SensitiveCanaryToken(
+                label="fulfillment-id", value="fulfill-CANARY-77b3e9"
+            ),
+            SensitiveCanaryToken(
+                label="proposal-id", value="proposal-CANARY-c9d144"
+            ),
+            SensitiveCanaryToken(
+                label="prompt-body",
+                value="CANARY-PROMPT-5d9a 系统提示词正文",
+            ),
+            SensitiveCanaryToken(
+                label="reasoning-body", value="CANARY-REASONING-b21c"
+            ),
+            SensitiveCanaryToken(
+                label="tool-args", value='{"canary_arg": "CANARY-TOOL-88fe"}'
+            ),
+            SensitiveCanaryToken(
+                label="api-key", value="sk-canary-9f8e7d6c5b4a3210"
+            ),
+            SensitiveCanaryToken(
+                label="exception-trace",
+                value="Traceback (most recent call last): CANARY-TB-1a2b",
+            ),
+        )
+    )

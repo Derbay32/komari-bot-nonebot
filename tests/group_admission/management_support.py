@@ -235,6 +235,7 @@ async def prepare_control_plane(
     audit_recorder: Any | None = None,
     allowed_origins: Sequence[str] = (),
     credentials: Sequence[Mapping[str, object]] | None = None,
+    runtime_kwargs: Mapping[str, object] | None = None,
 ) -> tuple[FastAPI, Any, ConfigManager]:
     """装配控制面验收环境并返回 ``(app, runtime, manager)``。
 
@@ -246,6 +247,10 @@ async def prepare_control_plane(
     3. 安装真实 ``_AdmissionRuntime`` 为 module singleton；
     4. 经公开 ``register_group_admission_api`` 装配 FastAPI 应用。
 
+    TSK-223 阶段 B：``runtime_kwargs`` 原样透传给 ``_AdmissionRuntime`` 构
+    造器（可控 UTC 时钟 / 在线 Bot 提供者 / SUPERUSERS 提供者），观测类用例
+    经此注入确定性时钟与通知投递环境。
+
     返回的 ``manager`` 仅供测试侧既有接缝使用（如摘除快照 listener 模拟
     持久化未发布），不暗示控制面从测试取得管理器。
     """
@@ -256,7 +261,7 @@ async def prepare_control_plane(
     manager = ConfigManager(PLUGIN_NAME, AdmissionValueSchema)
 
     runtime_module = import_runtime_module()
-    runtime = runtime_module._AdmissionRuntime()
+    runtime = runtime_module._AdmissionRuntime(**(runtime_kwargs or {}))
     await runtime.start(manager)
     install_singleton(monkeypatch, runtime)
 

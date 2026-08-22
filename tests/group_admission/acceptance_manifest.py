@@ -16,6 +16,10 @@ management case）：
   务效果：不进入 ``ADMISSION_EFFECT_CASES``，不与 ``adjudicate`` 的
   BUSINESS 语义混淆；独立的行类型保证未来 governed effects 仍可按原
   ``AdmissionEffectCase`` 形态无歧义表达；
+- ``AdmissionObservabilityCase``：TSK-223 阶段 B 登记的无内容可观测性契约行。
+  计数、窗口、故障期与通知属运维诊断分类（``operational_diagnostic``，
+  TSK-217）：它们是封闭的运维观测/告警面，不是需要群裁决的受治理业务效果，
+  因此同样不进入 ``ADMISSION_EFFECT_CASES``；
 - manifest ID 只存在于本测试真源，不进入生产 ``contracts.py``，也不替
   未来插件发明 effect row。
 """
@@ -77,6 +81,26 @@ class AdmissionManagementCase:
     acceptance_anchor: str
 
 
+@dataclass(frozen=True, slots=True)
+class AdmissionObservabilityCase:
+    """一条无内容可观测性契约登记行（TSK-223 阶段 B）。
+
+    可观测性不是受治理业务效果：``work_category`` 固定为
+    ``operational_diagnostic``（TSK-217：计数/窗口/故障期/通知属运维诊断，
+    不冒充 governed BUSINESS effect）；``surface`` 描述该行的观察面（状态投
+    影 / 结构化日志 / SUPERUSER 卡 / 内存遥测），``sink_kind`` 描述契约类
+    别。ID 前缀 ``group_admission.observability.``。
+    """
+
+    observability_case_id: str
+    owner_module: str
+    source_symbol: str
+    surface: str
+    sink_kind: str
+    work_category: str
+    acceptance_anchor: str
+
+
 #: 核心模块四项契约：裁决入口、运行时状态、快照发布、生命周期。
 #: 本票不登记控制面 / 观测 / 入口门禁契约，它们由后续票各自登记。
 ADMISSION_CONTRACT_CASES: tuple[AdmissionContractCase, ...] = (
@@ -122,6 +146,11 @@ ADMISSION_CONTRACT_CASES: tuple[AdmissionContractCase, ...] = (
 #: 不执行平台输出、持久写入、LLM/工具调用或平台读取。效果行由 TSK-224+
 #: 的效果所有者票（入口门禁、聊天、履约、记忆、提案、总结、管理）登记，
 #: 本票不替未来插件发明 effect row。
+#:
+#: 阶段 B 补充冻结：管理控制面 CAS 写入属 ``system_control_plane``（登记在
+#: ``ADMISSION_MANAGEMENT_CASES``）；计数/窗口/故障期与 SUPERUSER 通知属
+#: ``operational_diagnostic`` 运维诊断（登记在 ``ADMISSION_OBSERVABILITY_CASES``）。
+#: 两者都不冒充需要逐群裁决的 governed BUSINESS effect，因此本 tuple 保持空。
 ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = ()
 
 #: TSK-223 阶段 A 管理控制面契约行：经顶层 ``register_group_admission_api``
@@ -206,6 +235,113 @@ ADMISSION_MANAGEMENT_CASES: tuple[AdmissionManagementCase, ...] = (
         acceptance_anchor=(
             "tests/group_admission/test_management_registration.py"
             "::test_registration_is_idempotent_with_exactly_three_routes"
+        ),
+    ),
+)
+
+#: TSK-223 阶段 B 无内容可观测性契约行：完整状态投影、低基数遥测、正常拒
+#: 绝静默、归属 5 分钟窗口、故障期生命周期、通知 fallback / 离线合并与内容安
+#: 全。全部属 ``operational_diagnostic`` 分类（不冒充 governed BUSINESS
+#: effect）。
+ADMISSION_OBSERVABILITY_CASES: tuple[AdmissionObservabilityCase, ...] = (
+    AdmissionObservabilityCase(
+        observability_case_id="group_admission.observability.status_full_projection",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="register_group_admission_api",
+        surface="GET /api/v2/group-admission/status",
+        sink_kind="in_memory_state_projection",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_status.py"
+            "::test_status_projects_exact_full_field_set_when_ready"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id=(
+            "group_admission.observability.telemetry_closed_low_cardinality"
+        ),
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="register_group_admission_api",
+        surface="GET /api/v2/group-admission/status.telemetry",
+        sink_kind="low_cardinality_telemetry",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_telemetry.py"
+            "::test_telemetry_maps_are_preinitialized_with_closed_keys"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id="group_admission.observability.normal_denial_silence",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_AdmissionRuntime",
+        surface="adjudicate/record_private_input_rejected",
+        sink_kind="normal_denial_silence",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_telemetry.py"
+            "::test_normal_denials_only_count_and_stay_silent"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id="group_admission.observability.attribution_window",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_AdmissionRuntime",
+        surface="structured-log+superuser-card",
+        sink_kind="throttled_attribution_window",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_attribution.py"
+            "::test_first_attribution_failure_logs_and_queues_exactly_one_card"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id="group_admission.observability.fault_episode",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_AdmissionRuntime",
+        surface="structured-log+status",
+        sink_kind="fault_episode_lifecycle",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_fault_episode.py"
+            "::test_cold_start_failure_starts_failed_episode_exactly_once"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id="group_admission.observability.notification_fallback",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_AdmissionRuntime",
+        surface="superuser-card",
+        sink_kind="superuser_notification_delivery",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_notification.py"
+            "::test_per_recipient_bot_fallback_delivers_exactly_once"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id=(
+            "group_admission.observability.notification_offline_combine"
+        ),
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_AdmissionRuntime",
+        surface="superuser-card",
+        sink_kind="offline_combined_notification",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_notification.py"
+            "::test_offline_fault_then_recovery_sends_single_combined_card"
+        ),
+    ),
+    AdmissionObservabilityCase(
+        observability_case_id="group_admission.observability.content_safety",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="_AdmissionRuntime",
+        surface="all-diagnostic-surfaces",
+        sink_kind="content_safety_canary",
+        work_category="operational_diagnostic",
+        acceptance_anchor=(
+            "tests/group_admission/test_observability_content_safety.py"
+            "::test_extended_canary_bundle_self_check_and_report_shape"
         ),
     ),
 )

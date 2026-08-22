@@ -34,6 +34,10 @@ from tests.group_admission.management_support import (
     management_credentials,
     prepare_control_plane,
 )
+from tests.group_admission.observability_support import (
+    assert_status_exact_shape,
+    assert_telemetry_closed_maps,
+)
 from tests.group_admission.runtime_support import (
     AdmissionStorageFake,
     import_admission_package,
@@ -209,6 +213,18 @@ async def test_endpoints_fail_closed_when_runtime_not_started(
     assert_whitelist_detail(get_response, 503, "storage_unavailable")
     assert_whitelist_detail(put_response, 503, "storage_unavailable")
     assert status_response.status_code == 200
-    assert status_response.json()["status"] == "failed"
+    status_body = status_response.json()
+    assert_status_exact_shape(status_body)
+    assert status_body["status"] == "failed"
+    # 未启动：快照时间与问题时间全部为 null，遥测预初始化全零
+    for field_name in (
+        "configured_updated_at",
+        "effective_loaded_at",
+        "last_refresh_attempt_at",
+        "last_storage_success_at",
+        "problem_since",
+    ):
+        assert status_body[field_name] is None, field_name
+    assert_telemetry_closed_maps(status_body["telemetry"], total=0)
     assert storage.fetch_calls == 0, "故障关闭路径不得读取存储"
     assert storage.cas_calls == [], "故障关闭路径不得写入存储"

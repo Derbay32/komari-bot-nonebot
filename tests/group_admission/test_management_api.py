@@ -24,7 +24,8 @@
   None/None）；
 - GET status（config:read）从 module singleton 内存读取、零隐藏 I/O，
   ready/degraded/failed 恒 200，不出现 mode/group_ids/policy/fingerprint/
-  异常；阶段 A 只冻结 TSK-222 五字段，时间/telemetry 字段留阶段 B；
+  异常；阶段 B 升级为 TSK-217 完整固定投影（精确键集 + UTC RFC 3339 时间 +
+  封闭低基数 telemetry，详见 test_observability_status.py）；
 - 管理凭据只影响 API auth，不形成裁决 bypass；审计 started/final 安全
   metadata 精确（旧/新 revision、规范化 SHA-256 指纹、persisted/published、
   closed result code），绝不含策略正文/群号，且 publication success 在
@@ -61,6 +62,11 @@ from tests.group_admission.management_support import (
     normalized_policy,
     prepare_control_plane,
     put_headers,
+)
+from tests.group_admission.observability_support import (
+    assert_rfc3339_utc,
+    assert_status_exact_shape,
+    assert_telemetry_closed_maps,
 )
 from tests.group_admission.runtime_support import (
     AdmissionStorageFake,
@@ -107,7 +113,8 @@ INVALID_POLICY_BODIES: list[tuple[dict[str, object], str]] = [
     ({"mode": "blacklist", "group_ids": [None]}, "element-null"),
 ]
 
-#: status 响应中绝不出现的敏感/越界键（阶段 A 冻结）。
+#: status 响应中绝不出现的敏感/越界键（阶段 B 起由精确键集断言承接，此处保留
+#: 作为双重防线：即使未来新增字段也不得引入这些键）。
 _STATUS_FORBIDDEN_KEYS = frozenset(
     {
         "mode",
@@ -800,8 +807,9 @@ async def test_status_ready_projects_singleton_state_with_zero_storage_io(
 ) -> None:
     """ready 状态 200；存储全断裂仍 200，证明零隐藏 I/O。
 
-    响应只投影 TSK-222 五个状态字段（阶段 A），不得出现
-    mode/group_ids/policy/fingerprint/异常。
+    响应投影 TSK-217 完整固定字段集（阶段 B 升级）：5 个运行时字段 +
+    5 个 UTC RFC 3339 时间（未发生为 null）+ telemetry（封闭低基数键集）；
+    精确键集排除 mode/group_ids/policy/fingerprint/异常/重试计划。
     """
     storage = AdmissionStorageFake(stored_policy(1, atomic_policy("blacklist", [200])))
     app, runtime, _manager = await prepare_control_plane(monkeypatch, storage)
@@ -819,22 +827,32 @@ async def test_status_ready_projects_singleton_state_with_zero_storage_io(
     assert len(storage.cas_calls) == cas_before, "status 触发存储写入"
 
     body = response.json()
-    required = {
-        "status",
-        "problem_code",
-        "configured_revision",
-        "effective_revision",
-        "using_last_known_good",
-    }
-    assert required <= set(body), f"status 缺少五个冻结字段: {body}"
+    assert_status_exact_shape(body)
+    leaked_keys = _STATUS_FORBIDDEN_KEYS & set(body)
+    assert leaked_keys == set(), f"status 出现越界键: {leaked_keys}"
     assert body["status"] == expected.status.value == "ready"
     assert body["problem_code"] == expected.problem_code is None
     assert body["configured_revision"] == expected.configured_revision == 1
     assert body["effective_revision"] == expected.effective_revision == 1
     assert body["using_last_known_good"] == expected.using_last_known_good is False
 
-    leaked_keys = _STATUS_FORBIDDEN_KEYS & set(body)
-    assert leaked_keys == set(), f"status 出现越界键: {leaked_keys}"
+    # ready：全部时间锚点已有值，问题时间为 null
+    assert_rfc3339_utc(
+        body["configured_updated_at"], field_name="configured_updated_at"
+    )
+    assert_rfc3339_utc(body["effective_loaded_at"], field_name="effective_loaded_at")
+    assert_rfc3339_utc(
+        body["last_refresh_attempt_at"], field_name="last_refresh_attempt_at"
+    )
+    assert_rfc3339_utc(
+        body["last_storage_success_at"], field_name="last_storage_success_at"
+    )
+    assert body["problem_since"] is None
+
+    telemetry = body["telemetry"]
+    assert_rfc3339_utc(telemetry["started_at"], field_name="telemetry.started_at")
+    assert_telemetry_closed_maps(telemetry, total=0)
+
     build_standard_canary_bundle().assert_no_leaks(
         body, context="status 响应体"
     )
@@ -845,7 +863,7 @@ async def test_status_degraded_and_failed_still_return_200(
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
 ) -> None:
-    """degraded/failed 同样恒 200，投影运行时真实状态。"""
+    """degraded/failed 同样恒 200，投影运行时真实状态与完整时间锚点。"""
     if scenario == "degraded":
         storage = AdmissionStorageFake(
             stored_policy(1, atomic_policy("blacklist", [200]))
@@ -864,6 +882,7 @@ async def test_status_degraded_and_failed_still_return_200(
 
     assert response.status_code == 200, response.text
     body = response.json()
+    assert_status_exact_shape(body)
     assert body["status"] == expected.status.value == scenario
     assert body["problem_code"] == expected.problem_code
     assert body["configured_revision"] == expected.configured_revision
@@ -874,10 +893,37 @@ async def test_status_degraded_and_failed_still_return_200(
         assert body["configured_revision"] == 2
         assert body["effective_revision"] == 1
         assert body["using_last_known_good"] is True
+        # LKG 建立后降级：时间锚点全部保留，problem_since 置位
+        assert_rfc3339_utc(
+            body["configured_updated_at"], field_name="configured_updated_at"
+        )
+        assert_rfc3339_utc(
+            body["effective_loaded_at"], field_name="effective_loaded_at"
+        )
+        assert_rfc3339_utc(
+            body["last_refresh_attempt_at"], field_name="last_refresh_attempt_at"
+        )
+        assert_rfc3339_utc(
+            body["last_storage_success_at"], field_name="last_storage_success_at"
+        )
+        assert_rfc3339_utc(body["problem_since"], field_name="problem_since")
+        telemetry = body["telemetry"]
+        assert telemetry["runtime_problem_occurrences"]["stored_policy_invalid"] == 1
     else:
         assert body["problem_code"] == "storage_unavailable"
         assert body["configured_revision"] is None
         assert body["effective_revision"] is None
+        # 冷启动失败：尝试过读取但从未成功，无快照时间；problem_since 置位
+        assert_rfc3339_utc(
+            body["last_refresh_attempt_at"], field_name="last_refresh_attempt_at"
+        )
+        assert body["last_storage_success_at"] is None
+        assert body["effective_loaded_at"] is None
+        assert body["configured_updated_at"] is None
+        assert_rfc3339_utc(body["problem_since"], field_name="problem_since")
+        telemetry = body["telemetry"]
+        assert telemetry["runtime_problem_occurrences"]["storage_unavailable"] == 1
+    assert_telemetry_closed_maps(body["telemetry"])
 
 
 # ---------------------------------------------------------------------------
