@@ -82,51 +82,21 @@ def test_fetch_availability_missing_api_key(
     assert search_module.is_fetch_available() is False
 
 
-def test_fetch_availability_superuser_bypass(
+def test_fetch_availability_gating_free_depends_on_switch_and_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SUPERUSER 始终可用。"""
+    """ADR-0012 / TSK-225：is_fetch_available 不再按调用者/群白名单裁决。
+
+    白名单（user_whitelist/group_whitelist）字段虽仍可配置，但不再影响可用
+    性（策略无感，不猜群/调用方）；可用性只取决于 fetch_enabled 与
+    search_api_key 是否就绪。
+    """
     _patch_fetch_dependencies(
         monkeypatch,
-        user_whitelist=["9999"],
-        group_whitelist=["9999"],
+        user_whitelist=["1001"],
+        group_whitelist=["2001"],
     )
-    assert search_module.is_fetch_available(caller_is_superuser=True) is True
-
-
-@pytest.mark.parametrize(
-    (
-        "user_whitelist",
-        "group_whitelist",
-        "caller_user_id",
-        "caller_group_id",
-        "expected",
-    ),
-    [
-        ([], [], "1001", "2001", True),
-        (["1001"], [], "1002", "2001", False),
-        ([], ["2001"], "1001", "2002", False),
-    ],
-)
-def test_fetch_availability_whitelist_matrix(
-    monkeypatch: pytest.MonkeyPatch,
-    user_whitelist: list[str],
-    group_whitelist: list[str],
-    caller_user_id: str,
-    caller_group_id: str,
-    *,
-    expected: bool,
-) -> None:
-    """抓取可用性白名单矩阵（简化版）。"""
-    _patch_fetch_dependencies(
-        monkeypatch,
-        user_whitelist=user_whitelist,
-        group_whitelist=group_whitelist,
-    )
-    assert search_module.is_fetch_available(
-        caller_user_id=caller_user_id,
-        caller_group_id=caller_group_id,
-    ) is expected
+    assert search_module.is_fetch_available() is True
 
 
 # ─── URL 校验 ──────────────────────────────────────────────────────
@@ -359,20 +329,21 @@ async def test_fetch_page_upstream_error(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_fetch_page_permission_denied(monkeypatch: pytest.MonkeyPatch) -> None:
-    """白名单不匹配返回 PERMISSION_DENIED。"""
+async def test_fetch_page_is_gating_free_for_any_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0012 / TSK-225：fetch_page 不再受调用者身份/名单门禁。
+
+    权限拒绝分支已随白名单门控移除；配置就绪时任意调用者都可正常抓取。
+    """
     _patch_fetch_dependencies(
         monkeypatch,
         user_whitelist=["9999"],
         group_whitelist=["9999"],
     )
 
-    result = await search_module.fetch_page(
-        ["https://a.test"],
-        caller_user_id="1001",
-        caller_group_id="2001",
-    )
-    assert result == "[抓取失败：PERMISSION_DENIED]"
+    result = await search_module.fetch_page(["https://a.test"])
+    assert "[抓取失败" not in result
 
 
 # ─── 内容截断 ──────────────────────────────────────────────────────
