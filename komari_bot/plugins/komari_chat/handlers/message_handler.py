@@ -35,13 +35,13 @@ from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..reply_fulfillment_domain import build_reply_fulfillment_id
+from ..services.admission_gate import effect_business_admitted
 from ..services.agent_budget import AgentExecutionBudget
 from ..services.config_interface import get_config, get_memory_config
 from ..services.image_downloader import (
     download_images_as_base64_aligned,
     extract_image_sources,
 )
-from ..services.admission_gate import effect_business_admitted
 from ..services.image_reading_session import (
     ImageFailureSummary,
     ImageReadingSession,
@@ -464,7 +464,9 @@ class MessageHandler:
             return ResolvedReplyContext(context=context, refetched=False)
 
         refetched_reply = await self._refetch_reply(
-            bot=bot, reply=event.reply, group_id=str(event.group_id)
+            bot=bot,
+            reply=event.reply,
+            group_id=getattr(event, "group_id", None),
         )
         if refetched_reply is None:
             return ResolvedReplyContext(context=context, refetched=True)
@@ -1147,18 +1149,10 @@ class MessageHandler:
 
         if _image_failure_summary is None:
             use_search_tool = bool(
-                komari_search_plugin.is_search_available(
-                    caller_user_id=message.user_id,
-                    caller_group_id=message.group_id,
-                    caller_is_superuser=caller_is_superuser,
-                )
+                komari_search_plugin.is_search_available()
             )
             use_fetch_tool = bool(
-                komari_search_plugin.is_fetch_available(
-                    caller_user_id=message.user_id,
-                    caller_group_id=message.group_id,
-                    caller_is_superuser=caller_is_superuser,
-                )
+                komari_search_plugin.is_fetch_available()
             )
             allowed_profile_user_ids = {message.user_id}
             allowed_profile_user_ids.update(

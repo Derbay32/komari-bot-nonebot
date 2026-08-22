@@ -22,9 +22,9 @@ from .reply_fulfillment_ops_errors import (
     ReplyFulfillmentOpsNotFoundError,
     ReplyFulfillmentOpsValidationError,
 )
+from .services.admission_gate import effect_business_admitted
 from .services.proactive_reservation import ProactiveReservationService
 from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
-from .services.admission_gate import effect_business_admitted
 from .services.reply_fulfillment_ops import (
     ReplyFulfillmentOpsService,
     build_reply_fulfillment_ops_service,

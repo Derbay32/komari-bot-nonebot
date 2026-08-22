@@ -35,7 +35,7 @@ def effect_business_admitted(*, group_id: str | int | None) -> bool:
     ``business`` 资格——既成事实收尾或技术清理资格不能扩张解释为可开展
     普通业务。
     """
-    import komari_bot.plugins.group_admission as admission_pkg  # noqa: PLC0415
+    import komari_bot.plugins.group_admission as admission_pkg
 
     result = admission_pkg.adjudicate(_normalized_group_id(group_id))
     return result.qualification.value == "business"

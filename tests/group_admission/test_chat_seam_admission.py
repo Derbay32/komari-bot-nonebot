@@ -17,7 +17,6 @@ from typing import Any, cast
 import pytest
 
 import komari_bot.plugins as plugins_package
-
 from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,

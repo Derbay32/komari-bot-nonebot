@@ -736,22 +736,18 @@ async def _build_search_tool_result(
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
     request_trace_id: str | None = None,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
 ) -> str:
-    """执行 search_web 工具并返回工具消息内容。"""
+    """执行 search_web 工具并返回工具消息内容。
+
+    调用者级名单门控已随 ADR-0012 / TSK-225 从 komari_search 移除；本边界
+    只转发查询与 trace，不再携带 caller 参数。
+    """
     query = _parse_search_query(parsed_arguments, raw_arguments)
     if query is None:
         return "[搜索失败：query 参数缺失或格式错误]"
-    search_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
-    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
-        search_kwargs.update(
-            caller_user_id=caller_user_id,
-            caller_group_id=caller_group_id,
-            caller_is_superuser=caller_is_superuser,
-        )
-    return await komari_search.search_web(query, **search_kwargs)
+    return await komari_search.search_web(
+        query, request_trace_id=request_trace_id
+    )
 
 
 def _parse_fetch_urls(
@@ -783,22 +779,16 @@ async def _build_fetch_tool_result(
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
     request_trace_id: str | None = None,
-    caller_user_id: str | None = None,
-    caller_group_id: str | None = None,
-    caller_is_superuser: bool = False,
 ) -> str:
-    """执行 fetch_page 工具并返回工具消息内容。"""
+    """执行 fetch_page 工具并返回工具消息内容。
+
+    调用者级名单门控已随 ADR-0012 / TSK-225 从 komari_search 移除；本边界
+    只转发 URL 与 trace，不再携带 caller 参数。
+    """
     urls = _parse_fetch_urls(parsed_arguments, raw_arguments)
     if urls is None:
         return "[抓取失败：urls 参数缺失或格式错误]"
-    fetch_kwargs: dict[str, Any] = {"request_trace_id": request_trace_id}
-    if caller_user_id is not None or caller_group_id is not None or caller_is_superuser:
-        fetch_kwargs.update(
-            caller_user_id=caller_user_id,
-            caller_group_id=caller_group_id,
-            caller_is_superuser=caller_is_superuser,
-        )
-    return await komari_search.fetch_page(urls, **fetch_kwargs)
+    return await komari_search.fetch_page(urls, request_trace_id=request_trace_id)
 
 
 def _append_bare_text_correction(
@@ -1063,6 +1053,10 @@ async def _execute_business_tool(
     status = "success"
     result_summary: str | None = None
     error_summary: str | None = None
+    # ADR-0012 / TSK-225：caller 名单门控从搜索/抓取边界移除后，本函数不再
+    # 使用 caller_group_id / caller_is_superuser（read_profile 仍用
+    # caller_user_id 判定本人画像）；显式消费以免误报未用参数。
+    del caller_group_id, caller_is_superuser
 
     # TSK-225：每个工具 body 前准入裁决（chat.tool_dispatch / tool_search /
     # tool_fetch_page）。受限/故障关闭时安静丢弃该工具，不执行工具体、不向
@@ -1099,9 +1093,6 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
                 request_trace_id=request_trace_id,
-                caller_user_id=caller_user_id,
-                caller_group_id=caller_group_id,
-                caller_is_superuser=caller_is_superuser,
             )
             if content.startswith("[搜索失败"):
                 status = "error"
@@ -1113,9 +1104,6 @@ async def _execute_business_tool(
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
                 request_trace_id=request_trace_id,
-                caller_user_id=caller_user_id,
-                caller_group_id=caller_group_id,
-                caller_is_superuser=caller_is_superuser,
             )
             if content.startswith("[抓取失败"):
                 status = "error"
