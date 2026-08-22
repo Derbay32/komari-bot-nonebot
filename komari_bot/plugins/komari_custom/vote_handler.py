@@ -112,7 +112,11 @@ async def fetch_and_update_votes(
     """主动拉取表情回应用户并覆盖本地投票计数。
 
     表情回应读取前先对目标群做业务裁决：受限群不触达平台读取（独立治理效果），
-    返回 ``None`` 并保持静默。
+    并记下休眠标记（供恢复后换届），返回 ``None`` 保持静默。
+
+    恢复准入后的首次业务效果（本读取）会触发换届轮换：休眠期平台累积的票整批
+    记为旧轮 baseline，拉取照常发生、全量刷入；后续达标判定按「新轮有效票 =
+    当前票 - baseline」执行。
     """
     if state.repository is None or state.config_manager is None:
         return None
@@ -121,7 +125,11 @@ async def fetch_and_update_votes(
         return None
     # 平台读取：消费具体群业务内容，读取前按该群裁决。
     if not business_admitted(proposal.group_id):
+        # 受限（休眠）：保存安全进度标记，不触达平台、不刷新投票。
+        await state.repository.mark_dormant(proposal.id)
         return None
+
+    was_dormant = bool(getattr(proposal, "dormant_seen", False))
     config = state.config_manager.get()
     try:
         result = await bot.call_api(
@@ -138,7 +146,12 @@ async def fetch_and_update_votes(
     valid_users = sorted(
         {user_id for user_id in user_ids if user_id not in excluded_user_ids}
     )
-    return await state.repository.replace_votes(proposal_id, valid_users)
+    updated = await state.repository.replace_votes(proposal_id, valid_users)
+    if was_dormant and updated is not None:
+        # 换届：旧轮票（休眠期攒）整批记入 baseline，轮次 +1 后达标只看新轮票。
+        await state.repository.rotate_vote_epoch(proposal_id, valid_users)
+        updated = await state.repository.get_by_id(proposal_id) or updated
+    return updated
 
 
 async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
@@ -161,9 +174,11 @@ async def approve_if_ready(bot: Bot, proposal_id: int) -> None:
     if not business_admitted(proposal.group_id) or proposal.status == "approving":
         return
 
-    # 沉眠/预活跃轮次（vote_epoch==0）：恢复准入后的首次业务处理按换届式轮换，
-    # 上一 epoch 累计票不具跨 epoch 达标效力，须经新轮 fetch 刷新后才可采纳。
-    if getattr(proposal, "vote_epoch", 0) <= 0:
+    # 沉眠/预活跃轮次（vote_epoch==0）须经新轮 fetch 刷新；换届后只按新轮有效票
+    # 判达标（休眠期平台累积旧票已整批计入 baseline，不计入达标）。
+    if getattr(proposal, "vote_epoch", 0) <= 0 or _effective_vote_count(
+        proposal
+    ) < getattr(proposal, "required_votes", 0):
         return
 
     approval_token = uuid4().hex
@@ -259,6 +274,19 @@ def _became_approved(before: Proposal | None, after: Proposal | None) -> bool:
         and after is not None
         and after.status == "approved"
     )
+
+
+def _effective_vote_count(proposal: Proposal) -> int:
+    """换届后的新轮有效票数 = 当前投票者 - baseline。
+
+    无 baseline（未经历休眠轮换）时直接采用原始 ``vote_count``；有 baseline 时
+    减去旧轮投票者快照，保证休眠期平台累积旧票不计入新轮达标。
+    """
+    baseline = set(getattr(proposal, "vote_baseline_voters", None) or [])
+    if baseline:
+        voted = set(getattr(proposal, "voted_users", None) or [])
+        return len(voted - baseline)
+    return int(getattr(proposal, "vote_count", 0) or 0)
 
 
 def extract_keywords(title: str) -> list[str]:

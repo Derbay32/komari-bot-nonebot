@@ -43,6 +43,12 @@ class Proposal(BaseModel):
     #:（沉眠期累计票不具跨 epoch 达标效力）；恢复准入后首次业务处理按换届式轮
     #: 换，上一轮计票不参与新轮采纳。
     vote_epoch: int = 0
+    #: 换届轮换时记录的旧轮投票者快照（baseline）。恢复准入后首次业务处理会把
+    #: 休眠期平台累积的票整批写入本快照，新轮有效票 = 当前投票者 - baseline。
+    vote_baseline_voters: list[str] = Field(default_factory=list)
+    #: 休眠标记：受限（休眠）期内业务处理时置真，恢复获准后首个业务效果清除并
+    #: 触发换届轮换。
+    dormant_seen: bool = False
     created_at: datetime
     updated_at: datetime
     approved_at: datetime | None = None
