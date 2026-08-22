@@ -292,6 +292,30 @@ class _VoteRepository:
         )
         return self.proposal
 
+    async def mark_dormant(self, proposal_id: int) -> None:
+        """镜像生产休眠标记：受限期记录，供恢复换届识别。"""
+        p = self.proposal
+        if p is not None and p.id == proposal_id:
+            self.proposal = p.model_copy(update={"dormant_seen": True})
+
+    async def rotate_vote_epoch(
+        self,
+        proposal_id: int,
+        baseline_voters: list[str],
+    ) -> Proposal | None:
+        """镜像生产换届：旧轮票整批记入 baseline，轮次 +1，清除休眠标记。"""
+        p = self.proposal
+        if p is None or p.id != proposal_id:
+            return None
+        self.proposal = p.model_copy(
+            update={
+                "vote_epoch": (p.vote_epoch or 0) + 1,
+                "vote_baseline_voters": baseline_voters,
+                "dormant_seen": False,
+            }
+        )
+        return self.proposal
+
     async def claim_for_approval(
         self,
         proposal_id: int,
