@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from importlib import import_module
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast, get_type_hints
 
 import pytest
-from nonebot.adapters.onebot.v11 import Adapter, Bot, Message, PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
 
 from komari_bot.onebot.onebot_messages import plain_text_message
@@ -15,6 +16,7 @@ from komari_bot.plugins.character_binding.manager import (
     CharacterBindingManager,
     CharacterNameValidationError,
 )
+from komari_bot.plugins.group_admission import AdmissionQualification
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -30,6 +32,21 @@ def commands_module(app: App) -> Any:
 def manager_module(app: App) -> Any:
     del app
     return import_module("komari_bot.plugins.character_binding.manager")
+
+
+@pytest.fixture(autouse=True)
+def _admit_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    commands_module: Any,
+) -> None:
+    """放行统一准入复查，命令单测专注既有领域逻辑。"""
+
+    def _adjudicate(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            qualification=AdmissionQualification.BUSINESS,
+        )
+
+    monkeypatch.setattr(commands_module, "adjudicate", _adjudicate)
 
 
 class _StubManager(CharacterBindingManager):
@@ -68,15 +85,15 @@ def _build_private_event(
     *,
     user_id: int = 42,
     message_id: int = 1,
-) -> PrivateMessageEvent:
+) -> GroupMessageEvent:
     message = Message(plain_text)
-    return PrivateMessageEvent.model_construct(
+    return GroupMessageEvent.model_construct(
         time=1,
         self_id=669293859,
         post_type="message",
-        sub_type="friend",
+        sub_type="normal",
         user_id=user_id,
-        message_type="private",
+        message_type="group",
         message_id=message_id,
         message=message,
         original_message=message,
@@ -85,6 +102,8 @@ def _build_private_event(
         sender=Sender.model_construct(user_id=user_id, nickname="tester", card=""),
         to_me=True,
         reply=None,
+        group_id=114514,
+        anonymous=None,
     )
 
 
