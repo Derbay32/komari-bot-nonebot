@@ -734,27 +734,45 @@ async def test_publish_no_reclaim_same_revision_and_re_adjudicates_on_change(
 async def test_restore_rotates_vote_epoch_so_stale_dormant_votes_no_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """恢复后轮换 vote_epoch：上一 epoch 达标票不得跨入新 epoch 自动触达采纳。"""
+    """恢复后轮换 vote_epoch：休眠期平台累积旧票不得跨入新 epoch 触达采纳。
+
+    已激活轮次（vote_epoch=1）的 voting 提案受限期休眠；恢复准入后全量拉取
+    （脚本化 bot 返回休眠期间攒的票）直接覆盖计数。当前生产无轮换触发点，旧票
+    直接刷进同一 epoch 并达标采纳 → 红：恢复后旧轮票不得成为新轮达标依据。
+    """
     probe = AdmissionProbe(admitted=True)
     install_admission_probe(monkeypatch, probe)
     proposal = _published_proposal(
         status="voting",
         required_votes=2,
-        vote_count=5,
-        voted_users=["201", "202", "203"],
+        vote_count=1,
+        voted_users=["201"],
+        vote_epoch=1,
     )
     repository = _VoteRepository(proposal)
     knowledge = _KnowledgePlugin()
-    bot = _install_vote_state(
-        monkeypatch, repository=repository, knowledge=knowledge
-    )
+    # 注入状态；bot 每次按相位单独构造（脚本化平台回应）。
+    _install_vote_state(monkeypatch, repository=repository, knowledge=knowledge)
 
-    await vote_handler.approve_if_ready(cast("Any", bot), proposal.id)
+    # 休眠（受限）期一次业务处理：不触达平台、不刷新投票。
+    probe.set_admitted(admitted=False)
+    dormant_bot = _Bot(fetch_users=["201", "202", "203"])
+    await vote_handler.fetch_and_update_votes(cast("Any", dormant_bot), message_id=1, proposal_id=1)
+    assert dormant_bot.fetch_calls == 0, "休眠期不得读取表情回应"
+
+    # 恢复准入：全量拉取会把休眠期间平台累积的旧票刷进同一 epoch（当前即红点）。
+    probe.set_admitted(admitted=True)
+    restored_bot = _Bot(fetch_users=["201", "202", "203"])
+    await vote_handler.fetch_and_update_votes(cast("Any", restored_bot), message_id=1, proposal_id=1)
+    assert restored_bot.fetch_calls == 1
+    assert repository.proposal.vote_count == 3
+
+    await vote_handler.approve_if_ready(cast("Any", restored_bot), proposal.id)
 
     assert repository.proposal.status != "approved", (
-        "旧 epoch 沉眠期累计达标票不得跨入新 epoch 自动触达采纳"
+        "恢复轮换后，休眠期累积旧票不得成为新轮达标依据自动触发采纳"
     )
-    assert knowledge.add_calls == [], "旧 epoch 达标票不得触发重复 add_knowledge"
+    assert knowledge.add_calls == [], "休眠期累积旧票不得触发重复 add_knowledge"
 
 
 async def test_dormancy_epoch_skips_platform_fetch(
