@@ -84,6 +84,17 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.memory.conversation_body_read",
     "group_admission.effect.memory.interaction_global_commit",
     "group_admission.effect.memory.forgetting_decay",
+    # TSK-231 管理面群目标治理效果
+    "group_admission.effect.management.reply_fulfillment_list",
+    "group_admission.effect.management.reply_fulfillment_confirm_delivered",
+    "group_admission.effect.management.reply_fulfillment_confirm_not_delivered",
+    "group_admission.effect.management.reply_fulfillment_resume_commitment",
+    "group_admission.effect.management.reply_fulfillment_reservation_release",
+    "group_admission.effect.management.announcement_send",
+    "group_admission.effect.management.announcement_replay",
+    "group_admission.effect.management.dead_letter_list",
+    "group_admission.effect.management.dead_letter_requeue",
+    "group_admission.effect.management.memory_conversation_write",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {
@@ -303,6 +314,35 @@ def test_memory_effect_case_rows_are_attributed() -> None:
     for case in memory_cases:
         assert case.owner_module == "komari_bot.plugins.komari_memory", case.effect_id
         assert case.intent == "business", case.effect_id
+
+
+def test_management_effect_case_rows_are_attributed() -> None:
+    """TSK-231 管理面效果行:owner 闭集 + intent 闭集 + 归属非空。"""
+    prefix = "group_admission.effect.management."
+    rows = [
+        case
+        for case in ADMISSION_EFFECT_CASES
+        if case.effect_id.startswith(prefix)
+    ]
+    assert len(rows) >= 5, "TSK-231 必须登记管理面治理效果行"
+    for case in rows:
+        assert case.owner_module in {
+            "komari_bot.plugins.komari_management",
+            "komari_bot.plugins.komari_memory",
+        }, case.effect_id
+        assert case.intent in {
+            "business",
+            "fact_finalization",
+            "technical_cleanup",
+        }, case.effect_id
+        assert case.work_category in {
+            "transient_interaction",
+            "persistent_group_work",
+            "factual_group_work",
+            "fact_finalization",
+            "technical_cleanup",
+        }, case.effect_id
+        assert case.attribution_source.strip() and case.sink_kind.strip()
 
 
 def test_management_cases_register_exactly_the_phase_a_control_plane() -> None:
