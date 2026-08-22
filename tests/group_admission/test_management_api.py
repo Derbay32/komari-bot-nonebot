@@ -1053,6 +1053,72 @@ async def test_put_audit_final_result_codes(
     assert "whitelist" not in serialized, "审计不得记录策略正文"
 
 
+async def test_put_old_cached_policy_invalid_keeps_safe_empty_fingerprint_and_enters_audit_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧缓存策略非法：PUT 不泄露非白名单 500，仍进入审计 span（PhaseA F1）。
+
+    PUT 计算 old cached policy fingerprint 时若旧策略非法，``_normalize_policy``
+    会抛 ``PolicyCompilationError``。修复前该异常在审计 span 之前逃逸，成为
+    泄露原异常的非白名单 500，且审计 span 根本不被进入。修复后：
+
+    - ``old_policy_fingerprint`` 保持安全空值，不写入旧策略正文；
+    - 请求仍正常推进（新合法策略经严格 CAS 写入并本地发布，返回 200），不泄露
+      原始异常为非白名单 500；
+    - 审计 span 被正常进入，记录 old_revision / 安全空值旧指纹 / 新指纹。
+    """
+    recorder = RecordingAuditRecorder()
+    # 初始持久化一条非法策略（mode 非法），rev 1。
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "graylist", "group_ids": [200]})
+    )
+    app, _runtime, _manager = await prepare_control_plane(
+        monkeypatch, storage, audit_recorder=recorder
+    )
+
+    async with asgi_client(app) as client:
+        response = await client.put(
+            POLICY_PATH,
+            headers=put_headers(WRITER_TOKEN, if_match='"1"'),
+            json=atomic_policy("whitelist", [77011]),
+        )
+
+    # 修复后请求正常推进：新合法策略经严格 CAS 写入并本地发布，返回 200，
+    # 绝不泄露原始 PolicyCompilationError 为非白名单 500。
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"policy", "revision", "updated_at"}
+    assert body["policy"] == normalized_policy("whitelist", [77011])
+    assert body["revision"] == 2
+
+    # 审计 span 必须被进入；旧指纹为安全空值，新指纹为合法新策略指纹。
+    final_events = recorder.final_events()
+    assert len(final_events) == 1, "旧策略非法时也必须进入审计 span"
+    final = final_events[0]
+    assert set(final.metadata) == EXPECTED_AUDIT_METADATA_KEYS
+    assert final.metadata["old_revision"] == 1
+    assert final.metadata["old_policy_fingerprint"] == "", (
+        "旧策略非法时 old_policy_fingerprint 必须保持安全空值"
+    )
+    assert final.metadata["new_policy_fingerprint"] == canonical_policy_fingerprint(
+        normalized_policy("whitelist", [77011])
+    )
+    assert final.metadata["result_code"] == RESULT_CODE_SUCCESS
+    assert final.metadata["persisted"] is True
+    assert final.metadata["published"] is True
+    assert final.metadata["new_revision"] == 2
+
+    # canary：非法旧策略的 mode（graylist）与群号（200）绝不回显。响应体只含
+    # 新合法策略（whitelist/77011），审计只记录 revision 与安全规范化指纹
+    # （old_policy_fingerprint 为空、new_policy_fingerprint 为哈希），不泄露
+    # 旧策略正文；审计同样不回显新策略正文（只记指纹）。
+    assert "graylist" not in response.text, "响应不得回显旧非法策略 mode"
+    assert "200" not in response.text, "响应不得回显旧非法群号"
+    serialized = str([event.to_dict() for event in recorder.events])
+    assert "graylist" not in serialized, "审计不得记录旧非法策略正文"
+    assert "whitelist" not in serialized, "审计不得记录新策略正文（仅指纹）"
+
+
 # ---------------------------------------------------------------------------
 # 错误 message 固定性（不拼异常/策略/revision/ID）
 # ---------------------------------------------------------------------------
