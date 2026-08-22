@@ -369,6 +369,7 @@ def _install_vote_state(
     *,
     repository: _VoteRepository,
     knowledge: _KnowledgePlugin,
+    fetch_users: list[object] | None = None,
 ) -> _Bot:
     """把投票处理依赖注入真实 ``vote_handler.state`` 并返回新的 Bot 替身。"""
 
@@ -377,7 +378,7 @@ def _install_vote_state(
         def get() -> SimpleNamespace:
             return SimpleNamespace(plugin_enable=True, vote_emoji_id="128077")
 
-    bot = _Bot()
+    bot = _Bot(fetch_users=fetch_users)
     monkeypatch.setattr(vote_handler.state, "repository", repository)
     monkeypatch.setattr(vote_handler.state, "knowledge_plugin", knowledge)
     monkeypatch.setattr(vote_handler.state, "config_manager", _ConfigManager())
@@ -721,3 +722,96 @@ async def test_publish_no_reclaim_same_revision_and_re_adjudicates_on_change(
     assert len(repository.claimed_ids) == first_claims, (
         "受限新 revision 不得认领业务租约"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC5 — vote_epoch 生产路径红基线（真实 vote_handler，非自证）
+# ---------------------------------------------------------------------------
+
+
+async def test_restore_rotates_vote_epoch_so_stale_dormant_votes_no_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """恢复后轮换 vote_epoch：上一 epoch 达标票不得跨入新 epoch 自动触达采纳。"""
+    probe = AdmissionProbe(admitted=True)
+    install_admission_probe(monkeypatch, probe)
+    proposal = _published_proposal(
+        status="voting",
+        required_votes=2,
+        vote_count=5,
+        voted_users=["201", "202", "203"],
+    )
+    repository = _VoteRepository(proposal)
+    knowledge = _KnowledgePlugin()
+    bot = _install_vote_state(
+        monkeypatch, repository=repository, knowledge=knowledge
+    )
+
+    await vote_handler.approve_if_ready(cast("Any", bot), proposal.id)
+
+    assert repository.proposal.status != "approved", (
+        "旧 epoch 沉眠期累计达标票不得跨入新 epoch 自动触达采纳"
+    )
+    assert knowledge.add_calls == [], "旧 epoch 达标票不得触发重复 add_knowledge"
+
+
+async def test_dormancy_epoch_skips_platform_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """休眠（受限）期间表情读取不触达平台、不刷新投票。"""
+    probe = AdmissionProbe(admitted=False)
+    install_admission_probe(monkeypatch, probe)
+    repository = _VoteRepository(_published_proposal())
+    knowledge = _KnowledgePlugin()
+    bot = _install_vote_state(
+        monkeypatch, repository=repository, knowledge=knowledge
+    )
+
+    await vote_handler.fetch_and_update_votes(cast("Any", bot), message_id=1, proposal_id=1)
+
+    assert bot.fetch_calls == 0, "受限（休眠）不得读取表情回应"
+    assert repository.replace_votes_calls == []
+
+
+async def test_same_epoch_voter_dedup_through_production_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 voter 在同一 epoch 重复回应只计一票（经真实 fetch_and_update_votes）。"""
+    probe = AdmissionProbe(admitted=True)
+    install_admission_probe(monkeypatch, probe)
+    repository = _VoteRepository(_published_proposal())
+    knowledge = _KnowledgePlugin()
+    bot = _install_vote_state(
+        monkeypatch,
+        repository=repository,
+        knowledge=knowledge,
+        fetch_users=["101", "101", "102"],
+    )
+
+    await vote_handler.fetch_and_update_votes(cast("Any", bot), message_id=1, proposal_id=1)
+
+    assert repository.replace_votes_calls == [["101", "102"]]
+    assert repository.proposal.vote_count == 2
+
+
+async def test_cross_epoch_voter_reeligible_through_production_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """上次用 epoch 投过票的 voter，新的 epoch 仍可重新计入（去重按 epoch 作用域）。"""
+    probe = AdmissionProbe(admitted=True)
+    install_admission_probe(monkeypatch, probe)
+    repository = _VoteRepository(
+        _published_proposal(voted_users=["201"], vote_count=1)
+    )
+    knowledge = _KnowledgePlugin()
+    bot = _install_vote_state(
+        monkeypatch,
+        repository=repository,
+        knowledge=knowledge,
+        fetch_users=["201", "202"],
+    )
+
+    await vote_handler.fetch_and_update_votes(cast("Any", bot), message_id=1, proposal_id=1)
+
+    assert repository.replace_votes_calls == [["201", "202"]]
+    assert repository.proposal.vote_count == 2
