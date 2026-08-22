@@ -342,6 +342,27 @@ class _VoteRepository:
         )
         return self.proposal
 
+    async def mark_hold(
+        self,
+        proposal_id: int,
+        approval_token: str,
+        hold_code: str,
+    ) -> Proposal | None:
+        """镜像生产 ``mark_hold``：把认领中提案收敛为运维 closed hold。"""
+        del hold_code
+        p = self.proposal
+        if (
+            p is None
+            or p.id != proposal_id
+            or p.status != "approving"
+            or p.approval_token != approval_token
+        ):
+            return None
+        self.proposal = p.model_copy(
+            update={"status": "hold", "approval_token": None}
+        )
+        return self.proposal
+
 
 def _install_vote_state(
     monkeypatch: pytest.MonkeyPatch,

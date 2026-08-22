@@ -173,7 +173,7 @@ async def _ignore_message_id(_message_id: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_definitive_send_rejection_can_retry_same_proposal() -> None:
+async def test_definitive_send_rejection_blocks_same_revision_reclaim() -> None:
     repository = _MemoryPublicationRepository()
     service = ProposalPublicationService(repository)
     send_calls = 0
@@ -182,10 +182,8 @@ async def test_definitive_send_rejection_can_retry_same_proposal() -> None:
     async def _send(_proposal: Proposal) -> object:
         nonlocal send_calls
         send_calls += 1
-        if send_calls == 1:
-            msg = "模拟 QQ 发送失败"
-            raise RuntimeError(msg)
-        return {"message_id": 7788}
+        msg = "模拟 QQ 发送失败"
+        raise RuntimeError(msg)
 
     async def _remember(message_id: int) -> None:
         remembered_ids.append(message_id)
@@ -204,20 +202,23 @@ async def test_definitive_send_rejection_can_retry_same_proposal() -> None:
     assert repository.proposal.status == "failed"
     assert repository.proposal.publication_error_code == "send_rejected"
     first_proposal_id = repository.proposal.id
+    first_send_calls = send_calls
 
-    published = await service.publish(
-        _draft(),
-        remembered_message_id=None,
-        send_message=_send,
-        remember_message_id=_remember,
-        is_definitive_send_failure=lambda _exc: True,
-    )
+    # 同 effective revision 重复 publish：绝不重复领取业务租约、不重复投递。
+    with pytest.raises(ProposalPublicationError) as retry_exc:
+        await service.publish(
+            _draft(),
+            remembered_message_id=None,
+            send_message=_send,
+            remember_message_id=_remember,
+            is_definitive_send_failure=lambda _exc: True,
+        )
 
-    assert published.id == first_proposal_id
-    assert published.status == "voting"
-    assert published.publication_attempts == 2
-    assert repository.claimed_ids == [first_proposal_id, first_proposal_id]
-    assert remembered_ids == [7788]
+    assert retry_exc.value.error_code == "send_rejected"
+    assert repository.claimed_ids == [first_proposal_id]
+    assert send_calls == first_send_calls
+    assert remembered_ids == []
+    assert repository.proposal.publication_attempts == 1
 
 
 @pytest.mark.asyncio
@@ -311,6 +312,7 @@ async def test_retry_recovers_remembered_message_without_sending_again() -> None
         remember_message_id=_remember,
     )
 
+    assert recovered is not None
     assert recovered.status == "voting"
     assert recovered.vote_message_id == 8899
     assert send_calls == 1
@@ -352,6 +354,7 @@ async def test_concurrent_confirm_only_allows_one_platform_send() -> None:
     allow_send_to_finish.set()
     published = await first_task
 
+    assert published is not None
     assert published.status == "voting"
     assert send_calls == 1
 
@@ -381,6 +384,8 @@ async def test_already_published_retry_is_side_effect_free() -> None:
         remember_message_id=_ignore_message_id,
     )
 
+    assert first is not None
+    assert second is not None
     assert second.id == first.id
     assert repository.claimed_ids == [first.id]
 

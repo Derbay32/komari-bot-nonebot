@@ -43,6 +43,7 @@ class _Repository:
             proposer_id=10001,
             vote_count=1,
             required_votes=3,
+            group_id=456,
         )
 
     async def initialize(self) -> None:
