@@ -1,9 +1,11 @@
-"""TSK-222：group_admission 顶层公开面契约测试。
+"""TSK-222/TSK-223：group_admission 顶层公开面契约测试。
 
 验收目标：
 
-- 顶层 ``__all__`` 精确等于 7 个冻结符号，不暴露名单、快照、Service、
-  bool helper、``force_reload``、effect wrapper、Fake/Protocol 或测试 hook；
+- 顶层 ``__all__`` 精确等于 8 个冻结符号（TSK-223 新增且仅新增装配入口
+  ``register_group_admission_api``），不暴露名单、快照、Service、bool
+  helper、``create_router``、``force_reload``、effect wrapper、
+  Fake/Protocol 或测试 hook；
 - 三个枚举的 wire values 与成员集合冻结；
 - ``AdmissionResult`` / ``AdmissionRuntimeState`` 为 frozen/slots/keyword-only
   契约类型，字段精确，不提前固定 TSK-223 才拥有的时间/遥测/API 字段；
@@ -42,6 +44,7 @@ pytestmark = pytest.mark.group_admission_acceptance
 EXPECTED_TOP_LEVEL_SYMBOLS = {
     "adjudicate",
     "get_runtime_state",
+    "register_group_admission_api",
     "AdmissionIntent",
     "AdmissionQualification",
     "AdmissionResult",
@@ -74,6 +77,17 @@ FORBIDDEN_PUBLIC_HELPERS = {
     "force_reload",
     "get_policy",
     "get_snapshot",
+    # TSK-223：装配层只得到注册函数；router/manager/config/service/遥测/
+    # 通知器与测试 hook 均不得进入顶层暴露面。
+    "create_router",
+    "create_group_admission_router",
+    "get_manager",
+    "get_config",
+    "get_service",
+    "telemetry",
+    "notifier",
+    "install_for_testing",
+    "reset_for_testing",
 }
 
 
@@ -102,13 +116,19 @@ def _assert_frozen_slots_dataclass(cls: object, expected_fields: list[str]) -> N
     assert names == expected_fields, f"契约字段不精确: {names}"
 
 
-def test_top_level_all_is_exactly_the_seven_frozen_symbols() -> None:
+def test_top_level_all_is_exactly_the_eight_frozen_symbols() -> None:
     admission = _import_package()
     assert set(admission.__all__) == EXPECTED_TOP_LEVEL_SYMBOLS
     assert sorted(admission.__all__) == sorted(EXPECTED_TOP_LEVEL_SYMBOLS)
 
+    # 禁止名单采用模块感知判定：包内子模块（``policy`` / ``runtime`` 等）
+    # 以属性形式出现在 dir() 中属正常，不算暴露面泄漏。
     namespace = set(dir(admission))
-    leaked = FORBIDDEN_PUBLIC_HELPERS & namespace
+    leaked = {
+        name
+        for name in FORBIDDEN_PUBLIC_HELPERS & namespace
+        if not inspect.ismodule(getattr(admission, name, None))
+    }
     assert not leaked, f"顶层暴露面出现禁止的公开符号: {sorted(leaked)}"
 
 
@@ -263,6 +283,63 @@ def test_get_runtime_state_is_a_sync_no_argument_callable() -> None:
     )
     parameters = inspect.signature(get_runtime_state).parameters
     assert list(parameters) == [], "get_runtime_state 不接受任何参数"
+
+
+def test_register_group_admission_api_is_a_sync_assembly_entrypoint() -> None:
+    """注册函数签名冻结：仅供装配层，manager/runtime 不进入 public 签名。
+
+    ``(app, *, api_token, allowed_origins, audit_recorder=None)``；同步、
+    返回 ``None``；``audit_recorder`` 可空且默认 ``None``。
+    """
+    admission = _import_package()
+    register = admission.register_group_admission_api
+
+    assert not inspect.iscoroutinefunction(register), "注册函数必须同步"
+    parameters = inspect.signature(register).parameters
+    assert list(parameters) == [
+        "app",
+        "api_token",
+        "allowed_origins",
+        "audit_recorder",
+    ]
+    assert parameters["app"].kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_ONLY,
+    )
+    for name in ("api_token", "allowed_origins", "audit_recorder"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+    assert parameters["allowed_origins"].default is inspect.Parameter.empty
+    assert parameters["audit_recorder"].default is None
+
+
+def test_register_group_admission_api_type_hints_resolve_at_runtime() -> None:
+    """注册函数签名注解运行时真实：``get_type_hints`` 不得抛 NameError。
+
+    共享管理包类型（``ManagementTokenSource`` /
+    ``ManagementAuditRecorder``）与 FastAPI 类型必须在模块 globals 可解析；
+    返回注解为 ``None``。
+    """
+    from fastapi import FastAPI
+
+    admission = _import_package()
+
+    hints = typing.get_type_hints(admission.register_group_admission_api)
+
+    assert hints["app"] is FastAPI
+    assert hints["return"] is types.NoneType
+    # 只断言可解析性与基本形态：api_token 允许静态序列或惰性 callable 源；
+    # audit_recorder 可为空（可选）。
+    assert "api_token" in hints
+    assert "allowed_origins" in hints
+    audit_hint = hints["audit_recorder"]
+    audit_members = (
+        typing.get_args(audit_hint)
+        if typing.get_origin(audit_hint) in (typing.Union, types.UnionType)
+        else (audit_hint,)
+    )
+    assert types.NoneType in audit_members, (
+        f"audit_recorder 必须可空（默认 None）: {audit_hint!r}"
+    )
 
 
 def test_adjudicate_type_hints_resolve_at_runtime() -> None:

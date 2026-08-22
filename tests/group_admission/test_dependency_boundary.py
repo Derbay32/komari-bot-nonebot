@@ -1,4 +1,4 @@
-"""TSK-222：group_admission 依赖方向与第二持久真源静态边界验收。
+"""TSK-222/TSK-223：group_admission 依赖方向与第二持久真源静态边界验收。
 
 验收目标（AST 静态扫描，不 import 生产代码）：
 
@@ -7,9 +7,15 @@
   配置表（经 config_manager）是唯一持久真源，LKG 只驻留进程内存；
 - ``group_admission`` 不得 import 任何业务插件；跨 ``komari_bot`` 绝对
   import 仅允许 ``komari_bot.plugins.config_manager`` 顶层暴露面
-  （ADR-0006），其余一律走包内 relative import 或 NoneBot 装配；
+  （ADR-0006）与 ``komari_bot.management`` 共享管理包（TSK-223 控制面
+  鉴权/审计，其子模块导入形态与 user_ban 等既有消费方一致），其余一律走
+  包内 relative import 或 NoneBot 装配；
 - 其他生产代码不得 deep import ``group_admission`` 内部子模块（测试代码
-  的 module-owned 深 import 属已约定 seam，不在限制范围）。
+  的 module-owned 深 import 属已约定 seam，不在限制范围）；
+- TSK-223 阶段 A 静态断言：不引入 config_schema/migration、
+  komari_management 挂载/require、Prometheus/OTel/全局指标、拒绝表/
+  Redis 明细/独立 JSONL/AgentRun（共享 management audit 导入不算新增独
+  立 JSONL）。
 
 生产包目录缺失时以断言失败（red）报告，而非跳过。
 """
@@ -44,7 +50,34 @@ ALLOWED_KOMARI_ABSOLUTE_MODULES = {
     "komari_bot.plugins.config_manager",
 }
 
+#: TSK-223：共享管理包允许任意子模块（鉴权/审计工具面，与 user_ban 等既有
+#: 消费方的导入形态一致）；komari_management **插件** 仍被禁止。
+ALLOWED_KOMARI_PREFIXES = ("komari_bot.management.",)
+
 DDL_MARKERS = ("CREATE TABLE", "CREATE INDEX", "ALTER TABLE", "DROP TABLE")
+
+#: TSK-223 阶段 A 包内禁止出现的遥测/第二持久面文本标记（共享 management
+#: audit 导入本身不在此列，它不算新增独立 JSONL）。
+#: TSK-223 阶段 A 包内禁止出现的第二持久面文本标记（共享 management
+#: audit 导入本身不在此列，它不算新增独立 JSONL）。库级禁用依赖走
+#: import 目标扫描，避免 docstring 提及禁令本身时误报。
+FORBIDDEN_PHASE_A_MARKERS = (
+    ".jsonl",
+    "/metrics",
+)
+
+#: 阶段 A 控制面也不得引入遥测库、AgentRun 或 Redis 明细面（与头部存储
+#: 禁用根互补，单独列出以便归因）。
+FORBIDDEN_PHASE_A_IMPORT_ROOTS = {
+    "redis",
+    "aioredis",
+    "prometheus_client",
+    "opentelemetry",
+}
+
+FORBIDDEN_PHASE_A_IMPORT_TARGET_PREFIXES = (
+    "komari_bot.plugins.agent_run_logger",
+)
 
 
 def _package_modules() -> list[Path]:
@@ -86,15 +119,18 @@ def test_group_admission_has_no_forbidden_storage_or_business_imports() -> None:
                     f"{module_file.name}:{lineno}: 禁用存储依赖 {target}"
                 )
                 continue
-            if target.startswith("komari_bot.") and (
-                target not in ALLOWED_KOMARI_ABSOLUTE_MODULES
-            ):
+            if target.startswith("komari_bot."):
+                if target in ALLOWED_KOMARI_ABSOLUTE_MODULES:
+                    continue
+                if target.startswith(ALLOWED_KOMARI_PREFIXES):
+                    continue
                 violations.append(
                     f"{module_file.name}:{lineno}: 越界 komari_bot import {target}"
                 )
     assert violations == [], (
-        "group_admission 依赖方向违规（只允许 config_manager 顶层、NoneBot "
-        f"装配、标准库与第三方非存储依赖）: {violations}"
+        "group_admission 依赖方向违规（只允许 config_manager 顶层、共享 "
+        "management 包、NoneBot 装配、标准库与第三方非存储依赖）: "
+        f"{violations}"
     )
 
 
@@ -149,3 +185,123 @@ def test_core_komari_bot_has_no_group_admission_deep_imports() -> None:
     assert offenders == [], (
         f"发现 komari_bot 内部对 group_admission 的 deep import: {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TSK-223 阶段 A：控制面落地但不引入越界生产工件（静态白盒断言）
+# ---------------------------------------------------------------------------
+
+
+def test_phase_a_does_not_introduce_config_schema_or_migration() -> None:
+    """本票不创建 config_schema.py，也不新增任何群准入迁移。"""
+    assert not (PACKAGE_DIR / "config_schema.py").exists(), (
+        "阶段 A 不得创建 group_admission config_schema.py"
+    )
+    migrations_dir = PROJECT_ROOT / "migrations" / "versions"
+    assert migrations_dir.is_dir(), "迁移版本目录缺失"
+    offenders: list[str] = []
+    for migration_file in sorted(migrations_dir.glob("*.py")):
+        text = migration_file.read_text(encoding="utf-8")
+        if "group_admission" in text:
+            offenders.append(migration_file.name)
+    assert offenders == [], f"阶段 A 不得引入群准入迁移: {offenders}"
+
+
+def test_phase_a_komari_management_plugin_does_not_mount_group_admission() -> None:
+    """本票不修改 komari_management 最终挂载，也不在其引入 require/import。"""
+    management_plugin_dir = PLUGINS_DIR / "komari_management"
+    assert management_plugin_dir.is_dir(), "komari_management 插件目录缺失"
+    offenders: list[str] = []
+    for module_file in sorted(management_plugin_dir.rglob("*.py")):
+        text = module_file.read_text(encoding="utf-8")
+        if "group_admission" in text:
+            offenders.append(module_file.name)
+    assert offenders == [], (
+        f"阶段 A 不得在 komari_management 挂载/引用 group_admission: {offenders}"
+    )
+
+
+def test_phase_a_has_no_telemetry_or_side_persistence_channels() -> None:
+    """阶段 A 不引入 Prometheus/OTel/全局指标、拒绝表/Redis 明细/独立
+    JSONL/AgentRun；共享 management audit 导入不算新增独立 JSONL。"""
+    offenders: list[str] = []
+    for module_file in _package_modules():
+        lowered = module_file.read_text(encoding="utf-8").lower()
+        offenders.extend(
+            f"{module_file.name}: {marker}"
+            for marker in FORBIDDEN_PHASE_A_MARKERS
+            if marker in lowered
+        )
+        for lineno, target in _absolute_import_targets(module_file):
+            root = target.split(".")[0]
+            if root in FORBIDDEN_PHASE_A_IMPORT_ROOTS:
+                offenders.append(
+                    f"{module_file.name}:{lineno}: 禁止的遥测/存储 import {target}"
+                )
+            elif target.startswith(FORBIDDEN_PHASE_A_IMPORT_TARGET_PREFIXES):
+                offenders.append(
+                    f"{module_file.name}:{lineno}: 禁止的 AgentRun import {target}"
+                )
+    assert offenders == [], f"阶段 A 出现越界遥测/第二持久面: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# TSK-223 阶段 B：可观测性保持封闭运维诊断预算（不引入指标基础设施、
+# 不显式接 Sentry、不注册 driver hooks / scheduler）
+# ---------------------------------------------------------------------------
+
+#: 阶段 B 额外禁止的遥测/诊断库 import 根（与阶段 A 互补）。
+FORBIDDEN_PHASE_B_IMPORT_ROOTS = {
+    "prometheus_client",
+    "opentelemetry",
+    "sentry_sdk",
+    "statsd",
+    "datadog",
+}
+
+#: 阶段 B 禁止的标识符（AST 级别扫描，docstring 提及不会误报）：
+#: 显式 Sentry 异常捕获、全局指标注册表、NoneBot driver hooks 与 scheduler
+#: 作业注册（阶段 B 只提供 ``process_observability``，scheduler 归后续票）。
+FORBIDDEN_PHASE_B_IDENTIFIERS = {
+    "capture_exception",
+    "add_event_processor",
+    "CollectorRegistry",
+    "on_startup",
+    "on_shutdown",
+    "add_job",
+}
+
+
+def _identifier_occurrences(path: Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    occurrences: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_PHASE_B_IDENTIFIERS:
+            occurrences.append((node.lineno, node.id))
+        elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_PHASE_B_IDENTIFIERS:
+            occurrences.append((node.lineno, node.attr))
+    return occurrences
+
+
+def test_phase_b_observability_keeps_operational_diagnostic_boundaries() -> None:
+    """阶段 B 不引入指标基础设施/显式 Sentry 接口，也不注册 driver hooks。
+
+    可观测性只由低基数内存计数 + 现有应用日志 + 内存通知构成：不引入
+    Prometheus/OTel/全局指标注册表与 ``/metrics``（阶段 A 标记扫描互补），
+    不显式调用 ``capture_exception`` / 不向日志挂原始异常对象，不注册
+    ``on_startup`` / ``on_shutdown`` / scheduler 作业（``process_observability``
+    由后续 scheduler 票驱动）。内容泄漏由金丝雀用例在运行时验收。
+    """
+    offenders: list[str] = []
+    for module_file in _package_modules():
+        for lineno, target in _absolute_import_targets(module_file):
+            root = target.split(".")[0]
+            if root in FORBIDDEN_PHASE_B_IMPORT_ROOTS:
+                offenders.append(
+                    f"{module_file.name}:{lineno}: 禁止的诊断/指标库 import {target}"
+                )
+        for lineno, name in _identifier_occurrences(module_file):
+            offenders.append(
+                f"{module_file.name}:{lineno}: 禁止的标识符 {name}"
+            )
+    assert offenders == [], f"阶段 B 出现越界诊断/装配面: {offenders}"
