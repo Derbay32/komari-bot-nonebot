@@ -21,6 +21,7 @@ from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_to_me_rule
 from komari_bot.plugins.komari_decision import classify_summary_request
 
+from .admission_gate import effect_business_admitted
 from .config_schema import DynamicConfigSchema
 from .execution_service import (
     CapabilityNotSupportedError,
@@ -38,6 +39,7 @@ from .history_service import check_group_history_supported
 require("config_manager")
 from komari_bot.plugins import config_manager as config_manager_plugin
 
+require("group_admission")
 require("agent_run_logger")
 require("permission_manager")
 from komari_bot.plugins import permission_manager as permission_manager_plugin
@@ -274,12 +276,38 @@ async def handle_group_history_summary(
         logger.exception("[GroupHistorySummary] 处理总结请求失败")
         return
 
+    await _send_group_summary_outputs(bot, event, result)
+
+
+async def _send_group_summary_outputs(
+    bot: Bot,
+    event: GroupMessageEvent,
+    result: SummaryExecutionResult,
+) -> None:
+    """向目标群逐条发布总结正文/图片分段，每条输出前按目标群裁决。
+
+    TSK-229：每条群输出都是独立的不可分瞬时效果（摘要.group_output），在
+    bot.send 之前按目标群 BUSINESS 裁决；受限时正常丢弃该条输出，不发送、
+    不通知、不复活，不影响其余已获准分段。用于（1）无图时正文文本发布，
+    （2）有图时逐张图片发布。
+    """
     if not result.image_base64:
-        await summary_matcher.finish(plain_text_message(result.summary_text))
+        if effect_business_admitted(group_id=int(event.group_id)):
+            await bot.send(
+                event,
+                plain_text_message(result.summary_text),
+            )
+        return
 
     image_pages = getattr(result, "image_pages_base64", ()) or (result.image_base64,)
     for image_page in image_pages:
-        await bot.send(
-            event,
-            MessageSegment.image(file=f"base64://{image_page}"),
-        )
+        if effect_business_admitted(group_id=int(event.group_id)):
+            await bot.send(
+                event,
+                MessageSegment.image(file=f"base64://{image_page}"),
+            )
+        else:
+            logger.info(
+                "[GroupHistorySummary] 群输出准入受限，丢弃该条分段: group_id={}",
+                event.group_id,
+            )
