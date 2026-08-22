@@ -115,6 +115,56 @@ class ReplyFulfillmentRepository:
             )
         return True
 
+    async def prepare_minimal_identity(
+        self,
+        fulfillment_id: str,
+        *,
+        group_id: str,
+        request_trace_id: str,
+        trigger_message_id: str,
+        trigger_user_id: str,
+        bot_self_id: str,
+        adapter_name: str,
+        reply_target_message_id: str,
+        payload_hash: str,
+    ) -> None:
+        """受限准备：只落无正文、无承诺载荷的最小未送达身份。
+
+        复用 ``prepare`` 的单事务父子插入骨架，但只插父身份、不插任何子
+        承诺（``reply_content`` 保持空串、不冻结 payload），用于准备前
+        受限时阻断同一触发事件再次发送；同一履约身份已存在时幂等
+        （ON CONFLICT DO NOTHING）。空正文不产生任何送达后承诺。
+        """
+        async with self.pg_pool.acquire() as connection, connection.transaction():
+            await connection.execute(
+                """
+                INSERT INTO komari_chat_reply_fulfillments (
+                    fulfillment_id,
+                    payload_hash,
+                    request_trace_id,
+                    trigger_message_id,
+                    trigger_user_id,
+                    group_id,
+                    bot_self_id,
+                    adapter_name,
+                    reply_target_message_id,
+                    reply_content,
+                    delivery_state
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', 'NOT_STARTED')
+                ON CONFLICT (fulfillment_id) DO NOTHING
+                """,
+                fulfillment_id,
+                payload_hash,
+                request_trace_id,
+                trigger_message_id,
+                trigger_user_id,
+                group_id,
+                bot_self_id,
+                adapter_name,
+                reply_target_message_id,
+            )
+
     async def mark_send_started(self, fulfillment_id: str) -> bool:
         """把回复从未发送推进到待确认送达。"""
         async with self.pg_pool.acquire() as connection:
@@ -408,6 +458,27 @@ class ReplyFulfillmentRepository:
                 fulfillment_id,
                 owner_token,
                 max(1, lease_seconds),
+            )
+        return dict(row) if row is not None else None
+
+    async def load_parent_attribution(
+        self,
+        fulfillment_id: str,
+    ) -> dict[str, Any] | None:
+        """读取父记录的最小群归属投影，供承诺执行前复核归属。
+
+        只返回父身份与 ``group_id``；父记录不存在返回 None。父归属是
+        送达后承诺的关联群唯一来源，父群缺失（None/空串）即准入归属
+        不可用，承诺执行前必须安全持有而不猜测。
+        """
+        async with self.pg_pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT fulfillment_id, group_id
+                FROM komari_chat_reply_fulfillments
+                WHERE fulfillment_id = $1
+                """,
+                fulfillment_id,
             )
         return dict(row) if row is not None else None
 

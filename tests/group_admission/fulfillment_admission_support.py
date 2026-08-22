@@ -238,6 +238,44 @@ class ParentChildRepository:
             for commitment in draft.commitments
         }
         return True
+
+    async def prepare_minimal_identity(
+        self,
+        fulfillment_id: str,
+        *,
+        group_id: str,
+        request_trace_id: str,
+        trigger_message_id: str,
+        trigger_user_id: str,
+        bot_self_id: str,
+        adapter_name: str,
+        reply_target_message_id: str,
+        payload_hash: str,
+    ) -> None:
+        """受限准备：只落父身份、不冻结任何承诺（与真实仓库同形）。"""
+        if fulfillment_id in self.records:
+            return
+        self.records[fulfillment_id] = {
+            "fulfillment_id": fulfillment_id,
+            "payload_hash": payload_hash,
+            "request_trace_id": request_trace_id,
+            "trigger_message_id": trigger_message_id,
+            "trigger_user_id": trigger_user_id,
+            "group_id": group_id,
+            "bot_self_id": bot_self_id,
+            "adapter_name": adapter_name,
+            "reply_target_message_id": reply_target_message_id,
+            "reply_content": "",
+            "delivery_state": "NOT_STARTED",
+            "platform_message_id": None,
+            "proactive_group_id": None,
+            "proactive_reservation_id": None,
+            "prepared_at": self.now,
+            "send_started_at": None,
+            "delivered_at": None,
+            "not_delivered_at": None,
+            "completed_at": None,
+        }
 class ReservationHandoff:
     """移交凭据：冻结身份快照 + 幂等 release() 记录。"""
 
@@ -485,6 +523,17 @@ class CommitmentRepo:
             for fid, parent in self.parents.items()
             if not parent["completed"]
         ]
+
+    async def load_parent_attribution(
+        self, fulfillment_id: str
+    ) -> dict[str, Any] | None:
+        parent = self.parents.get(fulfillment_id)
+        if parent is None:
+            return None
+        return {
+            "fulfillment_id": fulfillment_id,
+            "group_id": parent.get("group_id"),
+        }
 
     async def mark_idempotency_evidence_cleared(
         self, fulfillment_id: str, *, owner_token: str
