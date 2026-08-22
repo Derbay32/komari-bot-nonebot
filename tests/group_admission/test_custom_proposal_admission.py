@@ -621,6 +621,7 @@ async def test_approved_fact_finalization_no_duplicate_commit(
         vote_count=3,
         required_votes=3,
         group_id=100,
+        vote_epoch=1,
     )
     repository = _VoteRepository(proposal, mark_approval_fails_first=1)
     knowledge = _KnowledgePlugin()
@@ -647,6 +648,7 @@ async def test_knowledge_source_conflict_enters_closed_hold(
         vote_count=3,
         required_votes=3,
         group_id=100,
+        vote_epoch=1,
     )
     repository = _VoteRepository(proposal)
     knowledge = _KnowledgePlugin(conflict=True)
