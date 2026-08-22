@@ -468,3 +468,112 @@ async def test_debug_public_restricted_blocks_group_keeps_private(
         "完整私聊诊断仍须投递给 SUPERUSER(运维类别不受群限制)"
     )
     assert scripted.calls != [], "debug 群公开结果前未调用 adjudicate"
+
+
+# ---------------------------------------------------------------------------
+# 强制补项 AC-1: handler 层 per-send 群输出门控（摘要.group_output）
+# ---------------------------------------------------------------------------
+
+
+class _GroupSendingBot:
+    """记录型群发送 bot：仅实现 ``send(event, message)``。"""
+
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    async def send(self, event: Any, message: Any) -> None:
+        del event
+        self.sent.append(message)
+
+
+def _build_output_result(
+    *,
+    image_base64: str,
+    image_pages: tuple[str, ...],
+) -> Any:
+    """构造一个真实 SummaryExecutionResult（供 handler 输出 seam 使用）。"""
+    from komari_bot.plugins.group_history_summary.execution_service import (
+        SummaryExecutionResult,
+    )
+    from komari_bot.plugins.group_history_summary.planner_service import (
+        SummaryPlanResult,
+    )
+
+    return SummaryExecutionResult(
+        summary_text="今天的总结文字",
+        filtered_message_count=5,
+        plan_result=SummaryPlanResult(
+            messages=[],
+            tool_result=None,
+            planner_note="",
+            rounds_used=1,
+        ),
+        image_base64=image_base64,
+        image_pages_base64=image_pages,
+        image_truncated=False,
+        filter_label="最近消息",
+        time_range="08-01 00:00 - 08-02 00:00",
+        history_fetch=None,
+    )
+
+
+async def test_handler_group_output_restricted_blocks_per_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handler 逐条群输出门控：第一条获准发送，第二条受限即丢弃（摘要.group_output）。"""
+    from komari_bot.plugins.group_history_summary.__init__ import (
+        _send_group_summary_outputs,
+    )
+
+    scripted = ScriptedAdjudicate("admitted")
+    # 两条图片分段：第一条获准、第二条受限 -> 只发送第一条。
+    scripted.set_sequence("admitted", "restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+
+    bot = _GroupSendingBot()
+    event = SimpleNamespace(group_id=int(GROUP_ID))
+    result = _build_output_result(
+        image_base64="page-a",
+        image_pages=("page-a", "page-b"),
+    )
+
+    await _send_group_summary_outputs(bot=cast("Any", bot), event=cast("Any", event), result=result)
+
+    assert len(bot.sent) == 1, "per-send 门控应只放行获准的那一条分段"
+    assert "page-a" in str(bot.sent[0]), "获准分段应被发送"
+    assert "page-b" not in "".join(str(m) for m in bot.sent), (
+        "受限分段不得发送（不复活、不退出其余获准分段）"
+    )
+    assert len(scripted.calls) == 2, "per-send 门控应在每条分段前各裁决一次"
+    _, intent_a = scripted.calls[0]
+    assert getattr(intent_a, "value", "business") == "business"
+
+
+async def test_summary_denial_does_not_trigger_failure_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5: 准入拒绝不进入 GroupTaskFailureNotifier/总结失败通知与 retry。"""
+    from komari_bot.onebot.group_failure_notify import GroupTaskFailureNotifier
+
+    scripted = ScriptedAdjudicate("restricted")
+    ns = _setup_harness(monkeypatch, scripted)
+
+    async def _fail_notify(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError(  # noqa: TRY003
+            "准入拒绝不得进入 GroupTaskFailureNotifier/总结失败通知"
+        )
+
+    monkeypatch.setattr(
+        GroupTaskFailureNotifier,
+        "notify",
+        _fail_notify,
+    )
+    # 若失败通知/异常进入 handler 的失败收口，会以 retry 重发；denial 是
+    # 正常控制流，不得抛出、不得通知、不得记录失败。
+    result, ns_exc = await _execute(ns.bot, ns.config, collector=ns.collector)
+    assert ns_exc is None, "准入拒绝是正常控制流: 不得以异常/失败通知收口"
+    assert result is not None and not result.image_base64, "受限时不得产出图片"
+    assert ns.collector.errors == [], "准入拒绝不得记录为失败"
+    assert ns.provider.calls == [], "受限时 provider 不得被调用"
+    _ = ns_exc

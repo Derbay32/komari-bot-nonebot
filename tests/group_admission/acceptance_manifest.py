@@ -760,7 +760,7 @@ ADMISSION_EFFECT_CASES += (
         work_category="transient_interaction",
         acceptance_anchor=(
             "tests/group_admission/test_summary_admission.py"
-            "::test_debug_public_restricted_blocks_group_keeps_private"
+            "::test_handler_group_output_restricted_blocks_per_send"
         ),
     ),
     AdmissionEffectCase(
