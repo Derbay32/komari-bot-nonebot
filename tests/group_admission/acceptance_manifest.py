@@ -926,3 +926,143 @@ ADMISSION_EFFECT_CASES += (
         ),
     ),
 )
+
+
+# TSK-231 管理面群目标治理业务效果登记（owner 为各管理插件；effect_id 前缀
+# ``group_admission.effect.management.*``）。这些是管理 HTTP 效果在准入接入后
+# 受治理的业务效果行：owner 分别为 komari_management（履约/公告）与
+# komari_memory（记忆/dead-letter），intent 按 ADR-0012 精确分类——列表/发送/
+# 编辑写为 business，对账/续跑/幂等回放为 fact_finalization，资源释放/终态
+# 清理为 technical_cleanup。anchor 指向本票真实 pytest node（红基线）。
+ADMISSION_EFFECT_CASES += (
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.reply_fulfillment_list",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_reply_fulfillment_router.list_fulfillments",
+        sink_kind="reply_fulfillment_management_projection",
+        intent="business",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_reply_fulfillment_admission.py"
+            "::test_list_restricted_group_not_leaked"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.reply_fulfillment_confirm_delivered",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_reply_fulfillment_router.confirm_delivered",
+        sink_kind="delivery_confirm",
+        intent="fact_finalization",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_reply_fulfillment_admission.py"
+            "::test_confirm_delivered_admitted_consults_fact_finalization"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.reply_fulfillment_confirm_not_delivered",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_reply_fulfillment_router.confirm_not_delivered",
+        sink_kind="delivery_failure_tombstone",
+        intent="fact_finalization",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_reply_fulfillment_admission.py"
+            "::test_confirm_not_delivered_resource_release_is_technical_cleanup"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.reply_fulfillment_resume_commitment",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_reply_fulfillment_router.resume_commitment",
+        sink_kind="commitment_resume",
+        intent="fact_finalization",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_reply_fulfillment_admission.py"
+            "::test_resume_commitment_consults_fact_finalization"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.reply_fulfillment_reservation_release",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_reply_fulfillment_router.confirm_not_delivered",
+        sink_kind="reservation_release",
+        intent="technical_cleanup",
+        attribution_source="reply_fulfillment.group_id",
+        work_category="technical_cleanup",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_reply_fulfillment_admission.py"
+            "::test_confirm_not_delivered_resource_release_is_technical_cleanup"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.announcement_send",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_announce_router.send_maintenance_announce",
+        sink_kind="onebot_send_group_msg",
+        intent="business",
+        attribution_source="announce.payload.group_ids",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_announce_admission.py"
+            "::test_announce_single_restricted_forbidden"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.announcement_replay",
+        owner_module="komari_bot.plugins.komari_management",
+        source_symbol="create_announce_router.send_maintenance_announce",
+        sink_kind="announcement_idempotent_replay",
+        intent="fact_finalization",
+        attribution_source="announce.payload.group_ids",
+        work_category="fact_finalization",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_announce_admission.py"
+            "::test_announce_replay_same_payload_never_resends"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.dead_letter_list",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="create_memory_router.list_conversation_dead_letters",
+        sink_kind="dead_letter_http_read",
+        intent="business",
+        attribution_source="dead_letter.group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_dead_letter_admission.py"
+            "::test_dead_letter_list_consults_business_intent"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.dead_letter_requeue",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="create_memory_router.requeue_conversation_dead_letter",
+        sink_kind="dead_letter_requeue",
+        intent="business",
+        attribution_source="dead_letter.group_id",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_dead_letter_admission.py"
+            "::test_dead_letter_requeue_restricted_forbidden"
+        ),
+    ),
+    AdmissionEffectCase(
+        effect_id="group_admission.effect.management.memory_conversation_write",
+        owner_module="komari_bot.plugins.komari_memory",
+        source_symbol="create_memory_router.create_conversation",
+        sink_kind="memory_persist_cas",
+        intent="business",
+        attribution_source="conversation.group_id",
+        work_category="persistent_group_work",
+        acceptance_anchor=(
+            "tests/group_admission/test_management_memory_group_admission.py"
+            "::test_create_conversation_admitted_executes"
+        ),
+    ),
+)

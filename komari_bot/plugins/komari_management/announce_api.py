@@ -22,6 +22,10 @@ from komari_bot.llm.content_budget import (
     normalize_required_text,
     validate_text_budget,
 )
+from komari_bot.management.admission_gate import (
+    gate_single,
+    resolve_admission_intent,
+)
 from komari_bot.management.management_api import (
     ManagementPrincipal,
     create_bearer_auth_dependency,
@@ -569,10 +573,31 @@ def create_announce_router(
                     )
                 raise HTTPException(status_code=503, detail="Bot 不在线，无法发送消息")
 
+            snapshot = await _discover_bot_group_routes(bots)
+            intent = resolve_admission_intent("business")
+            allowed_group_ids: list[int] = []
+            for group_id in payload.group_ids:
+                granted, gate_status = gate_single(
+                    group_id=group_id,
+                    intent=intent,
+                )
+                if not granted:
+                    if gate_status == 503:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="群准入运行时不可用",
+                        )
+                else:
+                    allowed_group_ids.append(group_id)
+            if not allowed_group_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="全部目标群处于受限状态",
+                )
+
             try:
-                snapshot = await _discover_bot_group_routes(bots)
                 results: list[AnnounceResult] = []
-                for index, group_id in enumerate(payload.group_ids):
+                for index, group_id in enumerate(allowed_group_ids):
                     candidates = snapshot.routes.get(group_id, ())
                     if not candidates:
                         results.append(
@@ -594,7 +619,7 @@ def create_announce_router(
                         )
                     if (
                         announce_send_interval_seconds > 0
-                        and index < len(payload.group_ids) - 1
+                        and index < len(allowed_group_ids) - 1
                     ):
                         await asyncio.sleep(announce_send_interval_seconds)
 
