@@ -85,9 +85,7 @@ async def _connect(params: dict[str, Any]) -> Any:
 async def _fetch_version(params: dict[str, Any]) -> str:
     connection = await _connect(params)
     try:
-        value = await connection.fetchval(
-            "SELECT version_num FROM alembic_version"
-        )
+        value = await connection.fetchval("SELECT version_num FROM alembic_version")
     finally:
         await connection.close()
     return str(value)
@@ -135,25 +133,52 @@ async def _seed_proposal_matrix(
                 )
             )
         matrix: list[tuple[str, int, str, str | None, str | None]] = [
-            ("restricted_publishing", CANARY_GROUP_A, "publishing",
-             "pub-token-restricted", None),
-            ("restricted_voting", CANARY_GROUP_A, "voting",
-             "approval-token-voting", None),
-            ("admitted_voting", CANARY_GROUP_C, "voting",
-             "approval-token-admitted", None),
-            ("approving_consistent", CANARY_GROUP_A, "approving", None,
-             str(knowledge_ids["consistent"])),
-            ("approving_conflict", CANARY_GROUP_C, "approving", None,
-             str(knowledge_ids["conflict"])),
-            ("approving_missing_source", CANARY_GROUP_A, "approving", None,
-             "999999"),
-            ("terminal_approved", CANARY_GROUP_A, "approved", None,
-             str(knowledge_ids["consistent"])),
+            (
+                "restricted_publishing",
+                CANARY_GROUP_A,
+                "publishing",
+                "pub-token-restricted",
+                None,
+            ),
+            (
+                "restricted_voting",
+                CANARY_GROUP_A,
+                "voting",
+                "approval-token-voting",
+                None,
+            ),
+            (
+                "admitted_voting",
+                CANARY_GROUP_C,
+                "voting",
+                "approval-token-admitted",
+                None,
+            ),
+            (
+                "approving_consistent",
+                CANARY_GROUP_A,
+                "approving",
+                None,
+                str(knowledge_ids["consistent"]),
+            ),
+            (
+                "approving_conflict",
+                CANARY_GROUP_C,
+                "approving",
+                None,
+                str(knowledge_ids["conflict"]),
+            ),
+            ("approving_missing_source", CANARY_GROUP_A, "approving", None, "999999"),
+            (
+                "terminal_approved",
+                CANARY_GROUP_A,
+                "approved",
+                None,
+                str(knowledge_ids["consistent"]),
+            ),
             ("terminal_failed", CANARY_GROUP_C, "failed", None, None),
         ]
-        for index, (key, group_id, status, approval_token, kid) in enumerate(
-            matrix, 1
-        ):
+        for index, (key, group_id, status, approval_token, kid) in enumerate(matrix, 1):
             body = (
                 "knowledge-canary-consistent-body"
                 if key == "approving_consistent"
@@ -176,9 +201,7 @@ async def _seed_proposal_matrix(
                     f"pub-key-b1mod-{index}",
                     f"pub-token-{index}" if status == "publishing" else None,
                     approval_token,
-                    datetime(2026, 8, 1, tzinfo=UTC)
-                    if status == "approved"
-                    else None,
+                    datetime(2026, 8, 1, tzinfo=UTC) if status == "approved" else None,
                     int(kid) if kid is not None else None,
                 )
             )
@@ -314,9 +337,7 @@ def test_0012_proposal_matrix_defers_and_finalizes() -> None:
         assert admitted["approval_token"] == "approval-token-admitted"
 
         # approving + 知识源一致：fact finalization 直接收敛为 approved
-        consistent = asyncio.run(
-            _fetch_proposal(params, ids["approving_consistent"])
-        )
+        consistent = asyncio.run(_fetch_proposal(params, ids["approving_consistent"]))
         assert consistent["status"] == "approved"
         assert consistent["approved_at"] is not None
 
@@ -325,9 +346,7 @@ def test_0012_proposal_matrix_defers_and_finalizes() -> None:
         assert conflict["execution_hold_code"] == "KNOWLEDGE_SOURCE_CONFLICT"
 
         # approving + 源缺失且受限：DEFERRED 休眠
-        missing = asyncio.run(
-            _fetch_proposal(params, ids["approving_missing_source"])
-        )
+        missing = asyncio.run(_fetch_proposal(params, ids["approving_missing_source"]))
         assert missing["status"] == "approving"
         assert missing["admission_state"] == "DEFERRED"
         assert missing["publication_token"] is None
@@ -360,8 +379,7 @@ def test_0012_memory_job_and_announcement_sentinels() -> None:
         assert result.returncode == 0, result.stderr
 
         jobs = {
-            str(row["job_name"]): row
-            for row in asyncio.run(_fetch_memory_jobs(params))
+            str(row["job_name"]): row for row in asyncio.run(_fetch_memory_jobs(params))
         }
         open_job = jobs["forgetting_canary_open"]
         assert open_job["stage"] == "claimed"
@@ -473,7 +491,10 @@ def test_empty_database_upgrade_advances_gate_to_postgres_backfilled() -> None:
 
 def test_full_head_upgrade_on_empty_database_succeeds() -> None:
     """全新空库一次 upgrade head 必须成功收敛到 0017（fresh 自动放行链）。"""
-    with cutover_scratch_database("mod") as (params, _database_url):
+    with cutover_scratch_database("mod", revision="head") as (
+        params,
+        _database_url,
+    ):
         assert asyncio.run(_fetch_version(params)) == "0017"
 
 

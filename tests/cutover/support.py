@@ -29,6 +29,7 @@ import importlib
 import json
 import os
 from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -232,13 +233,24 @@ def require_same_gate_database() -> None:
 
 
 @contextlib.contextmanager
-def cutover_scratch_database(tag: str) -> Iterator[tuple[dict[str, Any], str]]:
-    """重建 ``_tsk232b1<tag>`` 一次性隔离库并 upgrade head，结束时 DROP。"""
+def cutover_scratch_database(
+    tag: str,
+    revision: str = "0010",
+) -> Iterator[tuple[dict[str, Any], str]]:
+    """重建 ``_tsk232b1<tag>`` 一次性隔离库并 upgrade 到指定 revision。
+
+    骨架面 CLI 命令（prepare-policy/capture-evidence/abort/status 等）只存在于
+    0010→0013 的停机窗口内：0013 coordinated contract 会按契约物理删除
+    migration-only 的 gate 表，因此 head 库上这些命令只能观察到 GATE_MISSING。
+    默认停链在 0010（gate 表与准入配置表就位、0013 未执行），与生产
+    runbook 中 CLI 的真实操作窗口一致；fresh 直通守卫等需要完整链的用例
+    显式传 ``revision="head"``。
+    """
     require_same_gate_database()
     params = asyncio.run(recreate_scratch_database(f"_tsk232b1{tag}"))
     database_url = scratch_url(str(params["database"]))
     try:
-        result = run_bootstrap(database_url, "upgrade", "head")
+        result = run_bootstrap(database_url, "upgrade", revision)
         assert result.returncode == 0, result.stderr
         yield params, database_url
     finally:
@@ -424,14 +436,26 @@ async def _seed_reply_fulfillments(params: dict[str, Any]) -> None:
         for delivery_state, count in DELIVERY_STATE_ROWS:
             for _ in range(count):
                 serial += 1
+                # 原始 CHECK（0005 起）要求非 NOT_STARTED 行携带对应计时事实
+                send_started_at = (
+                    datetime.now(UTC) if delivery_state != "NOT_STARTED" else None
+                )
+                delivered_at = (
+                    datetime.now(UTC) if delivery_state == "DELIVERED" else None
+                )
+                not_delivered_at = (
+                    datetime.now(UTC) if delivery_state == "NOT_DELIVERED" else None
+                )
                 await connection.execute(
                     """
                     INSERT INTO komari_chat_reply_fulfillments (
                         fulfillment_id, payload_hash, request_trace_id,
                         trigger_message_id, trigger_user_id, group_id,
                         bot_self_id, adapter_name, reply_target_message_id,
-                        reply_content, delivery_state
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                        reply_content, delivery_state,
+                        send_started_at, delivered_at, not_delivered_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                              $12, $13, $14)
                     """,
                     f"fulfill-canary-seed-{serial}",
                     f"canary-payload-hash-{serial}",
@@ -444,6 +468,9 @@ async def _seed_reply_fulfillments(params: dict[str, Any]) -> None:
                     f"target-canary-{serial}",
                     f"{CANARY_BODY_TOKEN}-{serial}",
                     delivery_state,
+                    send_started_at,
+                    delivered_at,
+                    not_delivered_at,
                 )
     finally:
         await connection.close()

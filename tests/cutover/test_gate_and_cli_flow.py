@@ -657,8 +657,6 @@ def test_status_snapshot_on_fresh_database(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """fresh 库 status：gate 全量快照 + alembic_version + 全部聚合计数。"""
-    from tests.db.tsk197_gate_support import HEAD_REVISION
-
     with cutover_scratch_database("flow") as (_params, database_url):
         exit_code, payload = run_cli(
             capsys,
@@ -670,7 +668,8 @@ def test_status_snapshot_on_fresh_database(
         assert payload is not None
         assert payload["command"] == "status"
         assert payload["status"] == "ok"
-        assert find_key(payload, "alembic_version") == HEAD_REVISION
+        # fixture 停链在 0010（cutover CLI 生命周期窗口，0013 会删 gate 表）
+        assert find_key(payload, "alembic_version") == "0010"
         assert find_key(payload, "phase") == "EXPANDED"
         assert find_key(payload, "is_fresh") is True
         # gate 全量快照字段名完备性：可空字段值可为 null，但键必须存在。
