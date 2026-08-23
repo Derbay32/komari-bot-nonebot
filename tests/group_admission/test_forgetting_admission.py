@@ -11,8 +11,9 @@ Fake 只做依赖注入与记录，不替代生产对象。
 
 from __future__ import annotations
 
-import pytest
 from types import SimpleNamespace
+
+import pytest
 
 from komari_bot.plugins.komari_memory.repositories.forgetting_job_repository import (
     ForgettingJobClaim,
