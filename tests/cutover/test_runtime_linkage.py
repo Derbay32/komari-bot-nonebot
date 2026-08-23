@@ -150,6 +150,11 @@ def main() -> None:
     nonebot.init()
     nonebot.load_plugin("nonebot_plugin_orm")
 
+    # 裸子进程缺少 nb-cli 启动流程，本地插件无法被 require 解析；这里按
+    # 生产同款方式装载本地插件目录，使后续 require(短名) 走正规插件注册
+    # （与 tests/conftest.py 的假 require 预挂是同一目的）。
+    nonebot.load_plugins("komari_bot/plugins")
+
     from komari_bot.plugins.komari_custom.proposal_repository import (
         ProposalRepository,
     )
