@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Never
 
 #: mode 闭集（blacklist / whitelist）。
 _POLICY_MODES = ("blacklist", "whitelist")
@@ -37,7 +37,7 @@ class PolicyCanonicalizationError(ValueError):
     """策略载荷 canonical 化失败；异常消息不含策略正文或群号。"""
 
 
-def _reject(reason: str) -> None:
+def _reject(reason: str) -> Never:
     """以统一 closed code 抛错；reason 为固定文案，不携带动态输入。"""
     msg = f"{POLICY_FILE_INVALID}: {reason}"
     raise PolicyCanonicalizationError(msg)
