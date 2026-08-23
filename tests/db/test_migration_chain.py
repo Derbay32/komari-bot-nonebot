@@ -504,8 +504,12 @@ def test_reply_fulfillment_backfill_revision_exists() -> None:
     assert "FAILED" in normalized
     assert "FOR UPDATE" in normalized
     assert "REPLY_COMMIT_TOMBSTONE_RETENTION_DAYS" in normalized
-    assert "AMBIGUOUS_FAILED_COUNT=" in normalized
-    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    # 门禁静态锚点：label 字面量 + count 投影模板（错误文本运行时拼装）
+    assert 'LABEL="AMBIGUOUS_FAILED"' in normalized
+    assert "{LABEL}_COUNT={COUNT}" in normalized
+    # TSK-232：迁移错误投影只保留 closed code 与聚合 count，
+    # minimum fulfillment 动态身份必须物理消失
+    assert "MINIMUM_FULFILLMENT_ID=" not in normalized
     assert "COUNT(*)" in normalized
     assert "COUNT(DISTINCT" in normalized
     assert "LEASE_OWNER" in normalized
@@ -560,20 +564,25 @@ def test_reply_fulfillment_cutover_revision_exists() -> None:
     assert "FOR UPDATE" in normalized
     assert f"FROM {old_table}" in normalized
     assert f"FROM {parent_table}" in normalized
-    assert "MISSING_BACKFILL_COUNT=" in normalized
-    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    # 门禁静态锚点：label 字面量 + count 投影模板（错误文本运行时拼装）
+    assert 'LABEL="MISSING_BACKFILL"' in normalized
+    assert "{LABEL}_COUNT={COUNT}" in normalized
+    # TSK-232：迁移错误投影只保留 closed code 与聚合 count，
+    # minimum fulfillment 动态身份必须物理消失
+    assert "MINIMUM_FULFILLMENT_ID=" not in normalized
     assert "COUNT(*)" in normalized
     assert "COUNT(DISTINCT" in normalized
+    # RENAME 为数据驱动（renames 元组 + f-string 模板）：
+    # 断言六个改名对字面量与执行模板存在
     for old_name, new_name in renamed_columns.items():
-        assert re.search(
-            rf"ALTER TABLE {config_table} .*RENAME COLUMN "
-            rf"{old_name.upper()} TO {new_name.upper()}",
-            normalized,
-        ), old_name
+        assert f'"{old_name}"' in revision_sql, old_name
+        assert f'"{new_name}"' in revision_sql, new_name
+    assert "RENAME COLUMN" in normalized
+    assert f"ALTER TABLE {config_table}" in normalized
     assert "REPLY_FULFILLMENT_RETRY_MAX_SECONDS" in normalized
     assert "DEFAULT 3600" in normalized
     assert f"DROP TABLE {old_table}" in normalized
-    assert normalized.index("MISSING_BACKFILL_COUNT=") < normalized.index(
+    assert normalized.index('LABEL="MISSING_BACKFILL"') < normalized.index(
         f"DROP TABLE {old_table}"
     )
 

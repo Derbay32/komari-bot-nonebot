@@ -85,7 +85,8 @@ def _load_gate_row(connection: Connection) -> dict[str, object] | None:
     row = connection.execute(
         text(
             f"SELECT phase, is_fresh, policy_fingerprint,"
-            f" redis_finalizer_digest FROM {_GATE_TABLE} WHERE id = 1"
+            f" redis_evidence_digest, redis_finalizer_digest"
+            f" FROM {_GATE_TABLE} WHERE id = 1"
         )
     ).first()
     if row is None:
@@ -94,7 +95,8 @@ def _load_gate_row(connection: Connection) -> dict[str, object] | None:
         "phase": row[0],
         "is_fresh": bool(row[1]),
         "policy_fingerprint": row[2],
-        "redis_finalizer_digest": row[3],
+        "redis_evidence_digest": row[3],
+        "redis_finalizer_digest": row[4],
     }
 
 
@@ -133,13 +135,61 @@ def _quarantine_attestation(connection: Connection) -> tuple[str, int]:
     return hasher.hexdigest(), len(rows)
 
 
+def _business_residual_count(connection: Connection) -> int:
+    """聚合四族业务存量的未收敛行数（与 0012 同口径，两侧同步维护）。
+
+    0013 执行时 0012 已完成转换：operator 库的 DEFERRED 提案 status 仍为
+    非终态、计数非零；只有从未携带在途业务的库（fresh 或分步升级的
+    空业务库）才可能全零。
+    """
+    total = 0
+    total += int(
+        connection.execute(
+            text(
+                "SELECT count(*) FROM komari_chat_reply_fulfillments"
+                " WHERE delivery_state = 'NOT_STARTED'"
+            )
+        ).scalar_one()
+    )
+    total += int(
+        connection.execute(
+            text(
+                "SELECT count(*) FROM komari_custom_proposals"
+                " WHERE status IN ('publishing', 'voting', 'approving')"
+            )
+        ).scalar_one()
+    )
+    total += int(
+        connection.execute(
+            text(
+                "SELECT count(*) FROM komari_announcement_dispatches"
+                " WHERE status = 'processing'"
+            )
+        ).scalar_one()
+    )
+    total += int(
+        connection.execute(
+            text(
+                "SELECT count(*) FROM komari_memory_jobs"
+                " WHERE stage <> 'completed'"
+            )
+        ).scalar_one()
+    )
+    return total
+
+
 def _require_phase_reachable(
     connection: Connection,
     gate: dict[str, object],
 ) -> bool:
-    """相位必须为 REDIS_FINALIZED，或满足 fresh 豁免。
+    """相位必须为 REDIS_FINALIZED，或满足无存量豁免。
 
-    返回是否走了 fresh 豁免直通路径；豁免时调用方跳过其余全部验证。
+    豁免覆盖两类库：fresh 安装（is_fresh），以及从未进入 operator 流程
+    且四族业务存量全零、双 ledger 与 evidence/finalizer 摘要全空的
+    分步升级空业务库（0012 同口径直通后的镜像豁免；operator 路径必经
+    capture-evidence，其 evidence 摘要非空，不可能落入本豁免）。
+
+    返回是否走了豁免直通路径；豁免时调用方跳过其余全部验证。
     """
     if str(gate["phase"]) == _PHASE_FINALIZED:
         return False
@@ -153,7 +203,15 @@ def _require_phase_reachable(
         and quarantine_total == 0
         and gate["redis_finalizer_digest"] is None
     )
-    if not fresh_exempt:
+    empty_exempt = (
+        not fresh_exempt
+        and gate["redis_evidence_digest"] is None
+        and gate["redis_finalizer_digest"] is None
+        and cleanup_total == 0
+        and quarantine_total == 0
+        and _business_residual_count(connection) == 0
+    )
+    if not (fresh_exempt or empty_exempt):
         _fail("GATE_PHASE_INVALID", 1)
     return True
 
