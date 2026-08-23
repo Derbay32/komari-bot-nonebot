@@ -163,6 +163,9 @@ def _arrange_evidence_phase(params: dict[str, Any]) -> None:
         phase="REDIS_EVIDENCE_CAPTURED",
         policy_revision=1,
         policy_fingerprint=VALID_POLICY_FINGERPRINT,
+        # 真实 capture-evidence 必落 evidence 摘要；operator 路径的库
+        # 因此不可能落入 0013 的"从未进入 operator 流程"无存量豁免
+        redis_evidence_digest="e" * 64,
     )
 
 
