@@ -179,6 +179,25 @@ class ProposalRow(_ProposalModelBase, table=True):
         default=None,
         sa_column=Column(DateTime(timezone=True)),
     )
+    #: 统一准入状态（0012 backfill 起由 cutover/运行时联动维护）。
+    admission_state: str = Field(
+        default="ACTIVE",
+        sa_column=Column(
+            Text,
+            nullable=False,
+            server_default=text("'ACTIVE'"),
+        ),
+    )
+    execution_hold_code: str | None = Field(
+        default=None, sa_column=Column(Text)
+    )
+    admission_deferred_revision: int | None = Field(
+        default=None, sa_column=Column(Integer)
+    )
+    admission_deferred_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True)),
+    )
 
     __table_args__ = (
         Index("idx_custom_proposals_status", "status"),

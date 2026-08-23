@@ -75,6 +75,10 @@ class AnnouncementDispatchRow(_AnnouncementModelBase, table=True):
     response_payload: Any | None = Field(
         default=None, sa_column=Column(JSONB)
     )
+    #: 0012 backfill 起：processing 行转 reconciliation 时的 closed code 凭证。
+    reconciliation_code: str | None = Field(
+        default=None, sa_column=Column(Text)
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(

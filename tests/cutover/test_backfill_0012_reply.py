@@ -91,7 +91,9 @@ async def _seed_mirrored_families(params: dict[str, Any]) -> dict[str, str]:
     - ``ns_restricted`` / ``ns_admitted``：受限/获准群的 NOT_STARTED 行
       （含正文与承诺 payload；受限行带共享 reservation 身份）；
     - ``ns_dup``：复用同一 reservation 身份的第三条 NOT_STARTED；
-    - ``ctl_pending`` / ``ctl_delivered`` / ``ctl_cancelled``：控制行。
+    - ``ctl_pending`` / ``ctl_delivered`` / ``ctl_cancelled``：控制行
+      （ctl_delivered 同样携带共享 reservation 的 proactive 子承诺，
+      用于验证 DELIVERED 行 payload 原样保留且不进 ledger）。
     """
     connection = await _connect(params)
     try:
@@ -107,7 +109,7 @@ async def _seed_mirrored_families(params: dict[str, Any]) -> dict[str, str]:
         for key, state, group_id, index in rows:
             fid = f"fulfill-b1reply-{index:02d}-{key}"
             ids[key] = fid
-            has_reservation = key in {"ns_restricted", "ns_dup"}
+            has_reservation = key in {"ns_restricted", "ns_dup", "ctl_delivered"}
             await connection.execute(
                 """
                 INSERT INTO komari_chat_reply_fulfillments (
@@ -177,6 +179,17 @@ def _delivered_expr(state: str) -> object:
 def _not_delivered_expr(state: str) -> object:
     """NOT_DELIVERED 行必须带未送达时间戳（父表 CHECK）。"""
     return datetime.now(UTC) if state == "NOT_DELIVERED" else None
+
+
+def _as_json_object(payload: object) -> Any:
+    """"JSONB wire 形态归一：asyncpg 默认 codec 对 jsonb 返回文本。
+
+    基线断言以内容等值为准（dict 相等）；裸 asyncpg 连接取回 JSONB
+    是字符串，故先统一解码再比较（规格缺陷最小对齐，见 TSK-232 报告）。
+    """
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return payload
 
 
 async def _connect(params: dict[str, Any]) -> Any:
@@ -336,11 +349,13 @@ def test_0012_preserves_pending_delivered_and_existing_not_delivered() -> None:
         payloads = {
             str(row["commitment_type"]): row["payload"] for row in children
         }
-        assert payloads["favorability_adjustment"] == {
+        assert _as_json_object(payloads["favorability_adjustment"]) == {
             "user_id": "888777666",
             "delta": 3,
         }
-        proactive_payload = payloads["proactive_reply_confirmation"]
+        proactive_payload = _as_json_object(
+            payloads["proactive_reply_confirmation"]
+        )
         assert proactive_payload is not None
         assert json.loads(json.dumps(proactive_payload))["reservation_id"] == (
             _SHARED_RESERVATION_ID

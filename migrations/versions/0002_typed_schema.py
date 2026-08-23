@@ -871,7 +871,7 @@ def _reply_commit_statements() -> tuple[str, ...]:
             favorability_reason TEXT,
             interaction_history JSONB,
             proactive_reservation_id TEXT,
-            proactive_cooldown_seconds INT NOT NULL CHECK (
+            proactive_cooldown_seconds INT CHECK (
                 proactive_cooldown_seconds >= 0
             ),
             global_interaction_enabled BOOLEAN NOT NULL,

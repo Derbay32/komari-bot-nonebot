@@ -213,44 +213,6 @@ def _add_retry_max_column(connection: Connection) -> None:
     )
 
 
-def _relax_delivery_timestamp_check(connection: Connection) -> None:
-    """放宽父表送达时间戳 CHECK：允许无计时事实的履约行。
-
-    cutover 完成后履约行的计时事实（send_started_at / delivered_at /
-    not_delivered_at）允许缺席；仅保留"事实只归属其状态"的互斥语义：
-    ``delivered_at`` 只能出现在 DELIVERED，``not_delivered_at`` 只能
-    出现在 NOT_DELIVERED，NOT_STARTED 行保持三项全空。
-    """
-    connection.execute(
-        text(
-            """
-            ALTER TABLE komari_chat_reply_fulfillments
-            DROP CONSTRAINT ck_reply_fulfillment_delivery_timestamps
-            """
-        )
-    )
-    connection.execute(
-        text(
-            """
-            ALTER TABLE komari_chat_reply_fulfillments
-            ADD CONSTRAINT ck_reply_fulfillment_delivery_timestamps CHECK (
-                (delivery_state = 'NOT_STARTED'
-                    AND send_started_at IS NULL
-                    AND delivered_at IS NULL
-                    AND not_delivered_at IS NULL)
-                OR (delivery_state = 'PENDING_CONFIRMATION'
-                    AND delivered_at IS NULL
-                    AND not_delivered_at IS NULL)
-                OR (delivery_state = 'DELIVERED'
-                    AND not_delivered_at IS NULL)
-                OR (delivery_state = 'NOT_DELIVERED'
-                    AND delivered_at IS NULL)
-            )
-            """
-        )
-    )
-
-
 def upgrade(name: str = "") -> None:
     if name:
         return
@@ -260,7 +222,6 @@ def upgrade(name: str = "") -> None:
     _verify_backfill_complete(connection)
     _rename_config_columns(connection)
     _add_retry_max_column(connection)
-    _relax_delivery_timestamp_check(connection)
     # 门禁通过后旧宽表物理删除；新父子表与配置表保留
     connection.execute(text("DROP TABLE komari_chat_reply_commit_outbox"))
     # TSK-232：清 legacy JSONB 名单存储（旧 komari_plugin_configs 表），
