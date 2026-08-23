@@ -201,11 +201,11 @@ def test_command_effect_manifest_anchors_collectable() -> None:
     )
 
 
-def test_command_handlers_do_not_depend_on_permission_manager() -> None:
-    """AC2/AC7（红基线）：命令模块不得 import permission_manager 或用其运行时检查收窄。
+def test_command_handlers_use_unified_admission_gate() -> None:
+    """AC2/AC7（红基线）：命令模块统一接入 group_admission 裁决（sr 模式）。
 
-    目标：收敛后各业务插件直接拥有 plugin_enable，调用方移除对
-    permission_manager 的运行时检查依赖，为最终物理删除做准备。
+    目标：收敛后各业务插件直接拥有 plugin_enable 并走统一准入裁决，
+    不再依赖旧运行时权限检查容器（已物理删除）。
     """
     target_files = [
         "komari_help/commands.py",
@@ -213,19 +213,14 @@ def test_command_handlers_do_not_depend_on_permission_manager() -> None:
         "character_binding/commands.py",
         "user_ban/commands.py",
     ]
-    markers = ("permission_manager", "check_runtime_permission")
-    offenders: list[str] = []
+    missing: list[str] = []
     for rel in target_files:
         py_file = PROJECT_ROOT / "komari_bot" / "plugins" / rel
         text = py_file.read_text("utf-8")
-        offenders.extend(
-            f"{rel}: 仍引用 {marker}"
-            for marker in markers
-            if marker in text
-        )
-    assert offenders == [], (
-        "命令模块仍依赖 permission_manager 运行时检查（AC2/AC7 迁移未完成）: "
-        f"{offenders}"
+        if "adjudicate" not in text and "group_admission" not in text:
+            missing.append(rel)
+    assert missing == [], (
+        f"命令模块未统一接入统一准入裁决（AC2/AC7 迁移未完成）: {missing}"
     )
 
 

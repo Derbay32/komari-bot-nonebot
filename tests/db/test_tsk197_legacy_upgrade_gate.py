@@ -59,7 +59,7 @@ from tests.db.tsk197_gate_support import (
 
 pytestmark = [SKIP_NO_POSTGRES, pytest.mark.asyncio]
 
-LEGACY_REVISION = "0011"
+LEGACY_REVISION = "0008"
 CHAT_TABLE = "komari_chat_config"
 MEMORY_TABLE = "komari_memory_config"
 PROMPT_TABLE = "komari_prompt_komari_chat"
@@ -195,6 +195,23 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
         finally:
             await connection.close()
 
+        # TSK-232：分步升级跨 0012 backfill barrier 前必须按 operator 语义
+        # 显式提交准入策略（barrier 拒绝静默缺省）。先升 0010 建准入表，
+        # 注入策略后才能继续 head。
+        result = run_bootstrap(db_url, "upgrade", "0010")
+        assert result.returncode == 0, result.stderr
+        connection = await asyncpg.connect(**scratch)
+        try:
+            await connection.execute(
+                "INSERT INTO komari_group_admission_config"
+                " (id, revision, updated_at, policy)"
+                " VALUES (1, 1, NOW(),"
+                ' \'{"mode": "blacklist", "group_ids": []}\'::jsonb)'
+                " ON CONFLICT (id) DO NOTHING"
+            )
+        finally:
+            await connection.close()
+
         # 升级到 head
         result = run_bootstrap(db_url, "upgrade", "head")
         assert result.returncode == 0, result.stderr
@@ -203,7 +220,7 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
         try:
             assert await connection.fetchval(
                 "SELECT version_num FROM alembic_version"
-            ) == HEAD_REVISION, "升级后必须停留在单一 head 0015"
+            ) == HEAD_REVISION, "升级后必须停留在单一 head"
 
             # 旧聊天 Prompt 列删除 + 新行为列就位
             prompt_columns = await _column_names(connection, PROMPT_TABLE)

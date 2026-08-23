@@ -91,6 +91,8 @@ def _load_management_components() -> ManagementApiComponents:
     from komari_bot.plugins import user_ban as user_ban_plugin
     require("komari_chat")
     from komari_bot.plugins import komari_chat as chat_plugin
+    require("group_admission")
+    from komari_bot.plugins import group_admission as group_admission_plugin
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
@@ -105,6 +107,7 @@ def _load_management_components() -> ManagementApiComponents:
         register_search_api=search_plugin.register_search_api,
         register_user_ban_api=user_ban_plugin.register_user_ban_api,
         user_ban_service_getter=user_ban_plugin.get_service,
+        register_group_admission_api=group_admission_plugin.register_group_admission_api,
         reply_fulfillment_service_getter=chat_plugin.get_reply_fulfillment_ops_service,
         config_resources=(
             ManagedConfigResource(

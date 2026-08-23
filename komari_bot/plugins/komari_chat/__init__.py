@@ -37,16 +37,19 @@ from .services.reply_fulfillment_workflow import (
 
 # 依赖插件
 require("embedding_provider")
-require("permission_manager")
 require("user_ban")
 require("komari_memory")
 require("komari_decision")
 require("user_data")
+require("group_admission")
 
 from komari_bot.plugins import komari_memory as memory_plugin
-from komari_bot.plugins import permission_manager as permission_manager_plugin
 from komari_bot.plugins import user_ban as user_ban_plugin
 from komari_bot.plugins import user_data as user_data_plugin
+from komari_bot.plugins.group_admission import (
+    AdmissionQualification,
+    adjudicate,
+)
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
 
@@ -375,10 +378,10 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         logger.debug("[KomariChat] KomariMemory 未就绪，跳过消息处理")
         return
 
-    can_use, _ = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config
-    )
-    if not can_use:
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return
 
     try:

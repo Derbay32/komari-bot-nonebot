@@ -34,8 +34,8 @@ from alembic import op
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-revision: str = "0013"
-down_revision: str | Sequence[str] | None = "0012"
+revision: str = "0014"
+down_revision: str | Sequence[str] | None = "0013"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -69,6 +69,12 @@ def upgrade(name: str = "") -> None:
         "AND agent_max_total_tool_calls <= agent_max_rounds * agent_max_tool_calls_per_round"
         ")"
     )
+    # TSK-193: 工具调用约束模式列（原 0014 合并）
+    op.execute(
+        "ALTER TABLE komari_chat_config "
+        "ADD COLUMN agent_tool_call_mode VARCHAR(32) "
+        "NOT NULL DEFAULT 'required'"
+    )
 
 
 def downgrade(name: str = "") -> None:
@@ -76,5 +82,7 @@ def downgrade(name: str = "") -> None:
         return
 
     op.execute(f"ALTER TABLE {_TABLE} DROP CONSTRAINT {_CHECK_NAME}")
+    op.execute(f"ALTER TABLE {_TABLE} DROP COLUMN agent_tool_call_mode")
+
     for column, _default in _AGENT_BUDGET_COLUMNS:
         op.execute(f"ALTER TABLE {_TABLE} DROP COLUMN {column}")

@@ -41,7 +41,6 @@
 ```json
 {
   "plugin_enable": true,
-  "group_whitelist": ["123456789"],
   "redis_host": "localhost",
   "redis_port": 6379
 }
@@ -156,8 +155,7 @@ nonebot-plugin-orm `get_session` 访问；embedding 生成仍依赖
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `plugin_enable` | `false` | 插件总开关 |
-| `user_whitelist` | `[]` | 用户白名单 |
-| `group_whitelist` | `[]` | 群白名单 |
+| `plugin_enable` 由本插件自持开启
 | `redis_host` | `localhost` | Redis 主机 |
 | `redis_port` | `6379` | Redis 端口 |
 | `redis_db` | `1` | Redis DB |
@@ -244,7 +242,7 @@ PNG、GIF 和 WebP。
 检查：
 
 - `plugin_enable` 是否为 `true`
-- `group_whitelist` 是否配置了目标群
+- 统一准入策略是否放行目标群
 - `SQLALCHEMY_DATABASE_URL` 是否已正确配置（旧 `pg_user` / `pg_password` 已随 v2.0.0 下线）
 
 ### 向量维度不匹配

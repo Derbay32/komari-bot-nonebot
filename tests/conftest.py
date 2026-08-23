@@ -241,44 +241,6 @@ class _DummyUserDataPlugin:
         return 0
 
 
-class _DummyPermissionManagerPlugin:
-    @staticmethod
-    def check_context_permission(
-        config: object,
-        *,
-        user_id: str,
-        group_id: str | None,
-        is_superuser: bool = False,
-    ) -> tuple[bool, str]:
-        if not bool(getattr(config, "plugin_enable", True)):
-            return False, "插件当前已禁用"
-        if is_superuser:
-            return True, ""
-        user_whitelist = getattr(config, "user_whitelist", [])
-        group_whitelist = getattr(config, "group_whitelist", [])
-        if user_whitelist and user_id not in user_whitelist:
-            return False, "用户不在白名单"
-        if group_id is not None and group_whitelist and group_id not in group_whitelist:
-            return False, "群组不在白名单"
-        return True, ""
-
-    @staticmethod
-    async def check_runtime_permission(
-        _bot: object,
-        _event: object,
-        _config: object,
-    ) -> tuple[bool, str]:
-        return True, ""
-
-    @staticmethod
-    async def check_plugin_status(_config: object) -> tuple[bool, str]:
-        return True, "🟢 正常"
-
-    @staticmethod
-    def format_permission_info(_config: object) -> str:
-        return "权限正常"
-
-
 class _DummyUserBanPlugin:
     class BanServiceUnavailableError(RuntimeError):
         pass
@@ -432,7 +394,6 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "agent_run_logger": _DummyAgentRunLoggerPlugin(),
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
-    "permission_manager": _DummyPermissionManagerPlugin(),
     "user_ban": _DummyUserBanPlugin(),
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),

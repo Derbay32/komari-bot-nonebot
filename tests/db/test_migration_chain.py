@@ -38,8 +38,6 @@ EXPECTED_BASELINE_TABLES = {
     "komari_memory_scene_runtime",
     "komari_memory_scene_set",
     "komari_memory_user_profile",
-    "komari_plugin_configs",
-    "komari_prompt_configs",
     "komari_search_index_versions",
     "komari_user_ban_cache_state",
     "komari_user_ban_notification_outbox",
@@ -81,12 +79,18 @@ def test_baseline_revision_covers_current_schema() -> None:
     revisions = list(script.walk_revisions())
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1
-    baseline_sql = Path(baselines[0].path).read_text(encoding="utf-8")
+    assert baselines[0].revision == "0001"
+    # TSK-232：0001 折为 fresh marker（空迁移），全部基础表由 0002 起逐链
+    # 建出；这里扫描全链 CREATE TABLE 以校验覆盖既有 PostgreSQL 表。
+    combined_sql = "\n".join(
+        filename.read_text(encoding="utf-8")
+        for filename in sorted((MIGRATIONS_DIR / "versions").glob("*.py"))
+    )
     missing_tables = {
         table
         for table in EXPECTED_BASELINE_TABLES
-        if f"CREATE TABLE {table}" not in baseline_sql
-        and f"CREATE UNLOGGED TABLE {table}" not in baseline_sql
+        if f"CREATE TABLE {table}" not in combined_sql
+        and f"CREATE UNLOGGED TABLE {table}" not in combined_sql
     }
 
     assert missing_tables == set()
@@ -100,7 +104,7 @@ def test_typed_config_tables_revision_exists() -> None:
         (
             rev
             for rev in revisions
-            if "typed_plugin_config_tables" in Path(rev.path).name
+            if "typed_schema" in Path(rev.path).name
         ),
         None,
     )
@@ -135,11 +139,11 @@ def test_typed_prompt_tables_revision_exists() -> None:
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     typed_revision = next(
-        (rev for rev in revisions if "typed_prompt_tables" in Path(rev.path).name),
+        (rev for rev in revisions if "typed_schema" in Path(rev.path).name),
         None,
     )
     assert typed_revision is not None
-    assert typed_revision.down_revision == "0002"
+
     revision_sql = Path(typed_revision.path).read_text(encoding="utf-8")
     missing_tables = {
         table
@@ -170,7 +174,7 @@ def test_komari_chat_config_revision_exists() -> None:
         None,
     )
     assert chat_revision is not None
-    assert chat_revision.down_revision == "0003"
+    assert chat_revision.down_revision == "0002"
     revision_sql = Path(chat_revision.path).read_text(encoding="utf-8")
 
     assert "CREATE TABLE komari_chat_config" in revision_sql
@@ -213,7 +217,7 @@ def test_komari_decision_summary_config_revision_exists() -> None:
         None,
     )
     assert summary_revision is not None
-    assert summary_revision.down_revision == "0004"
+    assert summary_revision.down_revision == "0003"
 
     revision_sql = Path(summary_revision.path).read_text(encoding="utf-8")
     columns = {
@@ -249,8 +253,8 @@ def test_reply_fulfillment_parent_child_revision_exists() -> None:
         None,
     )
     assert fulfillment_revision is not None
-    assert fulfillment_revision.revision == "0006"
-    assert fulfillment_revision.down_revision == "0005"
+    assert fulfillment_revision.revision == "0005"
+    assert fulfillment_revision.down_revision == "0004"
 
     revision_sql = Path(fulfillment_revision.path).read_text(encoding="utf-8")
     normalized = re.sub(r"\s+", " ", revision_sql).upper()
@@ -329,7 +333,7 @@ def test_reply_fulfillment_parent_child_revision_exists() -> None:
 def test_reply_fulfillment_revision_is_self_contained() -> None:
     """父子表迁移不得加载应用运行时，也不得删除旧 outbox。"""
     revision_path = (
-        MIGRATIONS_DIR / "versions" / "0006_reply_fulfillment_parent_child.py"
+        MIGRATIONS_DIR / "versions" / "0005_reply_fulfillment_parent_child.py"
     )
     revision_sql = revision_path.read_text(encoding="utf-8")
 
@@ -347,8 +351,8 @@ def test_reply_delivery_recovery_revision_exists() -> None:
         None,
     )
     assert delivery_revision is not None
-    assert delivery_revision.revision == "0007"
-    assert delivery_revision.down_revision == "0006"
+    assert delivery_revision.revision == "0006"
+    assert delivery_revision.down_revision == "0005"
 
     revision_sql = Path(delivery_revision.path).read_text(encoding="utf-8")
     normalized = re.sub(r"\s+", " ", revision_sql).upper()
@@ -413,8 +417,8 @@ def test_reply_fulfillment_lifecycle_revision_exists() -> None:
         None,
     )
     assert lifecycle_revision is not None
-    assert lifecycle_revision.revision == "0008"
-    assert lifecycle_revision.down_revision == "0007"
+    assert lifecycle_revision.revision == "0007"
+    assert lifecycle_revision.down_revision == "0006"
 
     revision_sql = Path(lifecycle_revision.path).read_text(encoding="utf-8")
     normalized = re.sub(r"\s+", " ", revision_sql).upper()
@@ -450,8 +454,8 @@ def test_reply_fulfillment_alert_revision_exists() -> None:
         None,
     )
     assert alert_revision is not None
-    assert alert_revision.revision == "0009"
-    assert alert_revision.down_revision == "0008"
+    assert alert_revision.revision == "0008"
+    assert alert_revision.down_revision == "0007"
 
     revision_sql = Path(alert_revision.path).read_text(encoding="utf-8")
     normalized = re.sub(r"\s+", " ", revision_sql).upper()
@@ -477,13 +481,13 @@ def test_reply_fulfillment_backfill_revision_exists() -> None:
         (
             rev
             for rev in revisions
-            if "reply_fulfillment_backfill" in Path(rev.path).name
+            if "reply_fulfillment_mirror" in Path(rev.path).name
         ),
         None,
     )
     assert backfill_revision is not None
-    assert backfill_revision.revision == "0010"
-    assert backfill_revision.down_revision == "0009"
+    assert backfill_revision.revision == "0011"
+    assert backfill_revision.down_revision == "0010"
 
     revision_sql = Path(backfill_revision.path).read_text(encoding="utf-8")
     normalized = re.sub(r"\s+", " ", revision_sql).upper()
@@ -500,8 +504,12 @@ def test_reply_fulfillment_backfill_revision_exists() -> None:
     assert "FAILED" in normalized
     assert "FOR UPDATE" in normalized
     assert "REPLY_COMMIT_TOMBSTONE_RETENTION_DAYS" in normalized
-    assert "AMBIGUOUS_FAILED_COUNT=" in normalized
-    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    # 门禁静态锚点：label 字面量 + count 投影模板（错误文本运行时拼装）
+    assert 'LABEL="AMBIGUOUS_FAILED"' in normalized
+    assert "{LABEL}_COUNT={COUNT}" in normalized
+    # TSK-232：迁移错误投影只保留 closed code 与聚合 count，
+    # minimum fulfillment 动态身份必须物理消失
+    assert "MINIMUM_FULFILLMENT_ID=" not in normalized
     assert "COUNT(*)" in normalized
     assert "COUNT(DISTINCT" in normalized
     assert "LEASE_OWNER" in normalized
@@ -526,13 +534,13 @@ def test_reply_fulfillment_cutover_revision_exists() -> None:
         (
             rev
             for rev in revisions
-            if "reply_fulfillment_cutover" in Path(rev.path).name
+            if "group_admission_cutover" in Path(rev.path).name
         ),
         None,
     )
     assert cutover_revision is not None
-    assert cutover_revision.revision == "0011"
-    assert cutover_revision.down_revision == "0010"
+    assert cutover_revision.revision == "0013"
+    assert cutover_revision.down_revision == "0012"
 
     revision_sql = Path(cutover_revision.path).read_text(encoding="utf-8")
     normalized = re.sub(r"\s+", " ", revision_sql).upper()
@@ -556,20 +564,25 @@ def test_reply_fulfillment_cutover_revision_exists() -> None:
     assert "FOR UPDATE" in normalized
     assert f"FROM {old_table}" in normalized
     assert f"FROM {parent_table}" in normalized
-    assert "MISSING_BACKFILL_COUNT=" in normalized
-    assert "MINIMUM_FULFILLMENT_ID=" in normalized
+    # 门禁静态锚点：label 字面量 + count 投影模板（错误文本运行时拼装）
+    assert 'LABEL="MISSING_BACKFILL"' in normalized
+    assert "{LABEL}_COUNT={COUNT}" in normalized
+    # TSK-232：迁移错误投影只保留 closed code 与聚合 count，
+    # minimum fulfillment 动态身份必须物理消失
+    assert "MINIMUM_FULFILLMENT_ID=" not in normalized
     assert "COUNT(*)" in normalized
     assert "COUNT(DISTINCT" in normalized
+    # RENAME 为数据驱动（renames 元组 + f-string 模板）：
+    # 断言六个改名对字面量与执行模板存在
     for old_name, new_name in renamed_columns.items():
-        assert re.search(
-            rf"ALTER TABLE {config_table} .*RENAME COLUMN "
-            rf"{old_name.upper()} TO {new_name.upper()}",
-            normalized,
-        ), old_name
+        assert f'"{old_name}"' in revision_sql, old_name
+        assert f'"{new_name}"' in revision_sql, new_name
+    assert "RENAME COLUMN" in normalized
+    assert f"ALTER TABLE {config_table}" in normalized
     assert "REPLY_FULFILLMENT_RETRY_MAX_SECONDS" in normalized
     assert "DEFAULT 3600" in normalized
     assert f"DROP TABLE {old_table}" in normalized
-    assert normalized.index("MISSING_BACKFILL_COUNT=") < normalized.index(
+    assert normalized.index('LABEL="MISSING_BACKFILL"') < normalized.index(
         f"DROP TABLE {old_table}"
     )
 
@@ -578,7 +591,7 @@ def test_reply_fulfillment_cutover_revision_exists() -> None:
     assert f"DROP TABLE {config_table}" not in normalized
     assert "FROM KOMARI_BOT" not in normalized
     assert "IMPORT KOMARI_BOT" not in normalized
-    assert "0011_REPLY_FULFILLMENT_CUTOVER_IS_IRREVERSIBLE" in normalized
+    assert "0013_TSK232_IS_IRREVERSIBLE" in normalized
 
 
 def test_migration_cli_can_inspect_chain_without_loading_application(
@@ -633,7 +646,7 @@ def test_chat_prompt_behavior_columns_revision_exists() -> None:
 
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
-    children = [rev for rev in revisions if rev.down_revision == "0011"]
+    children = [rev for rev in revisions if rev.down_revision == "0008"]
     assert len(children) == 1, f"0011 的直接后继 revision 必须唯一: {children}"
 
     revision_sql = Path(children[0].path).read_text(encoding="utf-8")
@@ -665,15 +678,15 @@ def test_chat_prompt_behavior_columns_downgrade_is_irreversible() -> None:
     migration_path = next(
         rev
         for rev in sorted((MIGRATIONS_DIR / "versions").glob("*.py"))
-        if "0012_chat_prompt_behavior_columns" in rev.name
+        if "0009_komari_chat_prompt_behavior" in rev.name
     )
-    spec = importlib.util.spec_from_file_location("mig_0012_guard", migration_path)
+    spec = importlib.util.spec_from_file_location("mig_0009_guard", migration_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    assert module.revision == "0012"
-    with pytest.raises(RuntimeError, match="0012_CHAT_PROMPT_BEHAVIOR_COLUMNS_IS_IRREVERSIBLE"):
+    assert module.revision == "0009"
+    with pytest.raises(RuntimeError, match="0009_TSK232_IS_IRREVERSIBLE"):
         module.downgrade()
 
 
@@ -690,7 +703,7 @@ def test_agent_budget_config_revision_exists() -> None:
     """
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
-    children = [rev for rev in revisions if rev.down_revision == "0012"]
+    children = [rev for rev in revisions if rev.down_revision == "0013"]
     assert len(children) == 1, f"0012 的直接后继 revision 必须唯一: {children}"
 
     revision_sql = Path(children[0].path).read_text(encoding="utf-8")

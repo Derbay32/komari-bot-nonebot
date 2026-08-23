@@ -150,9 +150,6 @@ async def test_reply_send_restricted_blocks_outbound(
     s.set_sequence("admitted", "restricted")  # provider admitted, send restricted
     install_scripted_adjudicate(monkeypatch, s)
     mod = _fresh_chat_module(monkeypatch)
-    monkeypatch.setattr(mod, "permission_manager_plugin",
-                        SimpleNamespace(check_runtime_permission=_perm_ok),
-                        raising=False)
     monkeypatch.setattr(mod, "user_ban_plugin",
                         SimpleNamespace(is_event_banned=_not_banned),
                         raising=False)
@@ -426,7 +423,7 @@ def _fresh_chat_module(monkeypatch: pytest.MonkeyPatch) -> Any:
     original_require = np.require
 
     def _require(name: str) -> object:
-        if name in {"komari_memory", "komari_decision", "permission_manager",
+        if name in {"komari_memory", "komari_decision",
                     "user_ban", "user_data"}:
             return SimpleNamespace(get_plugin_manager=lambda: None)
         return original_require(name)

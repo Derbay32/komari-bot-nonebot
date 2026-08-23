@@ -346,24 +346,26 @@ async def test_cutover_aborts_and_rolls_back_when_backfill_is_missing() -> None:
 
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0010")
+    result = _run_bootstrap(scratch_url, "upgrade", "0011")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**scratch)
     fulfillment_id = "tsk87-missing-parent"
     try:
         await _insert_legacy_prepared(connection, fulfillment_id)
 
-        result = _run_bootstrap(scratch_url, "upgrade", "0011")
+        result = _run_bootstrap(scratch_url, "upgrade", "0013")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
+        # TSK-232 对齐：错误面收敛为 closed 聚合 count，不再携带
+        # minimum_fulfillment_id 动态身份。
         assert "missing_backfill_count=1" in output
-        assert f"minimum_fulfillment_id={fulfillment_id}" in output
+        assert "minimum_fulfillment_id" not in output
         assert "不得泄露的旧回复正文" not in output
         assert "不得泄露昵称" not in output
 
         assert (
             await connection.fetchval("SELECT version_num FROM alembic_version")
-            == "0010"
+            == "0011"
         )
         assert await _table_exists(connection, "komari_chat_reply_commit_outbox")
         columns = await _column_names(connection, "komari_chat_config")
@@ -388,7 +390,7 @@ async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
 
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0010")
+    result = _run_bootstrap(scratch_url, "upgrade", "0011")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**scratch)
     fulfillment_id = "tsk87-missing-children"
@@ -396,16 +398,18 @@ async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
         await _insert_legacy_prepared(connection, fulfillment_id)
         await _insert_parent_for_legacy(connection, fulfillment_id)
 
-        result = _run_bootstrap(scratch_url, "upgrade", "0011")
+        result = _run_bootstrap(scratch_url, "upgrade", "0013")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
+        # TSK-232 对齐：错误面收敛为 closed 聚合 count，不再携带
+        # minimum_fulfillment_id 动态身份。
         assert "commitment_mismatch_count=1" in output
-        assert f"minimum_fulfillment_id={fulfillment_id}" in output
+        assert "minimum_fulfillment_id" not in output
         assert "不得泄露的旧回复正文" not in output
 
         assert (
             await connection.fetchval("SELECT version_num FROM alembic_version")
-            == "0010"
+            == "0011"
         )
         assert await _table_exists(connection, "komari_chat_reply_commit_outbox")
     finally:
@@ -424,7 +428,7 @@ async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -
 
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0010")
+    result = _run_bootstrap(scratch_url, "upgrade", "0011")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**scratch)
     fulfillment_id = "tsk87-complete-cutover"
@@ -441,7 +445,7 @@ async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -
         await _insert_legacy_prepared(connection, fulfillment_id)
         await _insert_parent_children_for_legacy(connection, fulfillment_id)
 
-        result = _run_bootstrap(scratch_url, "upgrade", "0011")
+        result = _run_bootstrap(scratch_url, "upgrade", "0013")
         assert result.returncode == 0, result.stderr
 
         assert not await _table_exists(connection, "komari_chat_reply_commit_outbox")
@@ -469,7 +473,7 @@ async def test_cutover_preserves_config_and_drops_only_complete_legacy_table() -
         assert tuple(row) == (*DISTINCTIVE_VALUES[:5], 3600, DISTINCTIVE_VALUES[5])
         assert (
             await connection.fetchval("SELECT version_num FROM alembic_version")
-            == "0011"
+            == "0013"
         )
         assert (
             await connection.fetchval(

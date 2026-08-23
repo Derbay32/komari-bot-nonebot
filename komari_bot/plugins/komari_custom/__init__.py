@@ -68,14 +68,17 @@ __plugin_meta__ = PluginMetadata(
 )
 
 require("config_manager")
-require("permission_manager")
 require("komari_knowledge")
 require("character_binding")
+require("group_admission")
 
 from komari_bot.plugins import character_binding
 from komari_bot.plugins import config_manager as config_manager_plugin
 from komari_bot.plugins import komari_knowledge as knowledge_plugin
-from komari_bot.plugins import permission_manager as permission_manager_plugin
+from komari_bot.plugins.group_admission import (
+    AdmissionQualification,
+    adjudicate,
+)
 
 config_manager = config_manager_plugin.get_config_manager(
     "komari_custom", DynamicConfigSchema
@@ -150,6 +153,22 @@ async def on_shutdown() -> None:
     await custom_sessions.close()
 
 
+async def _admission_gate(event: GroupMessageEvent) -> bool:
+    """统一准入复查与本插件自有开关的前置门。
+
+    先由 ``group_admission`` 裁决关联群（命令只在群内触发）：获准后读取本
+    插件自身 ``plugin_enable`` 进一步收窄；任一环节不满足都静默跳过。
+    ``plugin_enable`` 只收窄不扩张：准入资格始终由裁决决定。
+    """
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return False
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
+        return False
+    config = cast("DynamicConfigSchema", config_manager.get())
+    return bool(getattr(config, "plugin_enable", True))
+
+
 @custom.handle()
 async def handle_custom_help(
     bot: Bot,
@@ -157,11 +176,9 @@ async def handle_custom_help(
     args: Message = CommandArg(),
 ) -> None:
     """显示 .custom 帮助。"""
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config_manager.get()
-    )
-    if not can_use:
-        await custom.finish(plain_text_message(f"❌ {reason}"))
+    del bot
+    if not await _admission_gate(event):
+        return
     arg_text = args.extract_plain_text().strip()
     if arg_text:
         await custom.finish(
@@ -179,11 +196,8 @@ async def handle_custom_action(
 ) -> None:
     """分发 .custom 子命令。"""
     _, action = cmd
-    can_use, reason = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config_manager.get()
-    )
-    if not can_use:
-        await custom_action.finish(plain_text_message(f"❌ {reason}"))
+    if not await _admission_gate(event):
+        return
 
     try:
         await repository.initialize()

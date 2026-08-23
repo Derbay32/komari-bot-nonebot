@@ -1,6 +1,6 @@
 """聊天 Prompt 行为字段迁移：删除 output_instruction 并新增独立行为列
 
-迁移 ID: 0012
+迁移 ID: 0009
 父迁移: 0011
 
 TSK-188 决策 26/36 与 TSK-190 验收标准 3：聊天 Prompt 的最终输出协议
@@ -35,8 +35,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-revision: str = "0012"
-down_revision: str | Sequence[str] | None = "0011"
+revision: str = "0009"
+down_revision: str | Sequence[str] | None = "0008"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -80,7 +80,7 @@ def downgrade(name: str = "") -> None:
     # 已按 TSK-190 契约永久丢弃，无法承诺还原；新行为列正文由 seed 拥有，
     # 回退需要重建旧列并重跑 seed 流程，明确拒绝在此处提供。
     msg = (
-        "0012_CHAT_PROMPT_BEHAVIOR_COLUMNS_IS_IRREVERSIBLE: "
+        "0009_TSK232_IS_IRREVERSIBLE: "
         "output_instruction 列已删除且自定义内容永久丢弃，"
         "不允许回退"
     )

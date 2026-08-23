@@ -28,13 +28,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
     )
 
     # 白名单配置
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单，为空则允许所有用户", sa_type=JSONB
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单，为空则允许所有群聊", sa_type=JSONB
-    )
-
     # Redis 配置
     redis_db: int = Field(
         default=1,
@@ -325,7 +318,7 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         description="回复生成失败时是否向 SUPERUSER 私聊发送极简诊断通知（群内错误提示不受此开关影响）",
     )
 
-    @field_validator("user_whitelist", "group_whitelist", "bot_aliases", mode="before")
+    @field_validator("bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
         """处理从 .env 格式解析列表。

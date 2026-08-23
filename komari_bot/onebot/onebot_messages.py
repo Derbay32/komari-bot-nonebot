@@ -14,8 +14,7 @@ def get_user_nickname(event: MessageEvent) -> str:
     """获取用户昵称。
 
     优先使用群昵称（card），其次使用用户昵称，最后使用「用户（ID）」占位。
-    逻辑自 ``permission_manager.utils.get_user_nickname`` 迁移，作为 OneBot
-    层共享 utility，避免业务插件重复复制权限辅助函数。
+    该逻辑收敛到 OneBot 层共享 utility，避免业务插件重复复制昵称辅助函数。
 
     Args:
         event: OneBot 消息事件

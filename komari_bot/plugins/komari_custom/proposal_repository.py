@@ -320,6 +320,9 @@ class ProposalRepository:
             .where(
                 _P.c.publication_key == publication_key,
                 _P.c.status.in_(["publishing", "failed"]),
+                # TSK-232 联动：DEFERRED 与运维 hold 行不得被普通恢复触碰
+                _P.c.admission_state == "ACTIVE",
+                _P.c.execution_hold_code.is_(None),
                 or_(
                     _P.c.vote_message_id.is_(None),
                     _P.c.vote_message_id == message_id,
@@ -595,6 +598,9 @@ class ProposalRepository:
             .where(
                 _P.c.id == proposal_id,
                 _P.c.vote_count >= _P.c.required_votes,
+                # TSK-232 联动：DEFERRED 与运维 hold 行不得被普通认领取走
+                _P.c.admission_state == "ACTIVE",
+                _P.c.execution_hold_code.is_(None),
                 or_(
                     and_(
                         _P.c.status == "voting",
@@ -625,6 +631,43 @@ class ProposalRepository:
         finally:
             await session.close()
         return self._row_to_proposal(row) if row is not None else None
+
+    async def wake_deferred(
+        self,
+        proposal_id: int,
+        *,
+        policy_revision: int,
+    ) -> Proposal | None:
+        """admitted 裁决后的幂等唤醒：CAS DEFERRED→ACTIVE。
+
+        仅当行仍处 DEFERRED 时翻转并记录触发 revision（同 revision 只
+        翻转一次）；已 ACTIVE 的重复唤醒幂等返回现值，不重置 revision。
+        翻转后普通认领路径即可正常取走该提案。
+        """
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(
+                _P.c.id == proposal_id,
+                _P.c.admission_state == "DEFERRED",
+            )
+            .values(
+                admission_state="ACTIVE",
+                admission_deferred_revision=policy_revision,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        if row is not None:
+            return self._row_to_proposal(row)
+        # 幂等回退：行不存在或已翻转，返回现值（缺失则为 None）。
+        return await self.get_by_id(proposal_id)
 
     async def list_approval_candidates(
         self,

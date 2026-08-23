@@ -27,15 +27,13 @@ _PROVIDER_PREFIXES = {
     "tavily": "tavily_",
     "exa": "exa_",
 }
-_METADATA_FIELDS = {
-    # 强类型表存储专用字段（单行主键 / CAS 修订号 / 写入时间）不进入
-    # 管理描述符；白名单与插件开关同样不属于搜索字段描述面。
+_STORAGE_ONLY_FIELDS = {
+    # 强类型表存储专用字段（单行主键 / CAS 修订号 / 写入时间）与插件开关
+    # 不进入搜索字段描述面。
     "id",
     "revision",
     "updated_at",
     "plugin_enable",
-    "user_whitelist",
-    "group_whitelist",
 }
 
 
@@ -98,7 +96,7 @@ def _build_provider_descriptors() -> ProviderDescriptorsResponse:
     }
 
     for field_name, field in DynamicConfigSchema.model_fields.items():
-        if field_name in _METADATA_FIELDS:
+        if field_name in _STORAGE_ONLY_FIELDS:
             continue
         schema_extra = field.json_schema_extra
         secret = False

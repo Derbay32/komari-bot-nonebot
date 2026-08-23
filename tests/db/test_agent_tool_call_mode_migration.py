@@ -45,8 +45,8 @@ pytestmark = [
     pytest.mark.asyncio,
 ]
 
-#: 0012 时刻 komari_chat_config 的存量业务列（不含 0013 预算列 / 0014
-#: agent_tool_call_mode / 0015 图片列）。固定为 0012 历史 schema 的字面
+#: 新链 0013（cutover 改名后、0014 预算/模式前）时刻 komari_chat_config
+#: 的存量业务列。固定为该历史 schema 的字面
 #: 清单，不随 head 的 `_NON_BUDGET_COLUMN_DEFAULTS` 字典演进——后续 head
 #: 新增列（如 TSK-194 图片字段）不得污染历史列集合 oracle。
 _EXPECTED_0012_VALUE_COLUMNS: tuple[str, ...] = (
@@ -155,11 +155,12 @@ async def _insert_legacy_row(connection: asyncpg.Connection) -> None:
 async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly() -> None:
     """AC1：0014 新增非空默认 required 列；升级保留存量行，downgrade 显式回退。
 
-    完整链路：upgrade 0012 → 在 0012 时代表结构写入存量行（仅非预算列）
-    → upgrade 0013（预算列以默认值补齐存量行）→ upgrade head
-    （agent_tool_call_mode 以默认值补齐存量行）→ downgrade 0013
-    （列被删除且存量行仍在）→ upgrade head 后 ``orm_bootstrap check``
-    零漂移。
+    完整链路（TSK-232 新链编号）：upgrade 0010 后显式提交准入策略（operator
+    语义，分步升级不播种缺省）→ upgrade 0013 过 backfill barrier 并完成
+    cutover 改名（reply_commit→reply_fulfillment）→ 写入存量行（仅非预算列）
+    → upgrade 0014（预算列 + agent_tool_call_mode 以默认值补齐存量行）
+    → upgrade head → downgrade 0013（0014 整体回退：列被删除且存量行仍在）
+    → upgrade head 后 ``orm_bootstrap check`` 零漂移。
     """
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
@@ -167,16 +168,23 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
     try:
-        # 先停在 0012：按历史 schema 写入存量行
-        result = _run_bootstrap(scratch_url, "upgrade", "0012")
+        # 停在 0010：admission 表已建但分步升级不播种缺省，按 operator 语义
+        # 显式提交准入策略后才能越过 0012 backfill barrier。
+        result = _run_bootstrap(scratch_url, "upgrade", "0010")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
         try:
-            await _insert_legacy_row(conn)
+            await conn.execute(
+                "INSERT INTO komari_group_admission_config"
+                " (id, revision, updated_at, policy)"
+                " VALUES (1, 1, NOW(),"
+                " '{\"mode\": \"blacklist\", \"group_ids\": []}'::jsonb)"
+                " ON CONFLICT (id) DO NOTHING"
+            )
         finally:
             await conn.close()
 
-        # upgrade 0013：预算列以数据库默认值补齐存量行
+        # upgrade 0013：barrier 放行 + cutover 改名完成，预算/模式列均未加入
         result = _run_bootstrap(scratch_url, "upgrade", "0013")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
@@ -189,13 +197,34 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
                 )
             }
             assert "agent_tool_call_mode" not in columns, "0013 阶段不应存在新列"
-            assert set(AGENT_BUDGET_COLUMNS) <= columns, "0013 必须已新增预算列"
+            assert not set(AGENT_BUDGET_COLUMNS) & columns, "0013 阶段不应存在预算列"
+            value_columns = sorted(columns - {"id", "revision", "updated_at"})
+            assert value_columns == list(_EXPECTED_0012_VALUE_COLUMNS), (
+                f"0013 表列集合与预期不一致: {value_columns}"
+            )
+            await _insert_legacy_row(conn)
+        finally:
+            await conn.close()
+
+        # upgrade 0014：预算列 + agent_tool_call_mode 以数据库默认值补齐存量行
+        result = _run_bootstrap(scratch_url, "upgrade", "0014")
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        conn = await asyncpg.connect(**scratch)
+        try:
+            columns = {
+                str(row["column_name"])
+                for row in await conn.fetch(
+                    "SELECT column_name FROM information_schema.columns"
+                    " WHERE table_name = 'komari_chat_config'"
+                )
+            }
+            assert set(AGENT_BUDGET_COLUMNS) <= columns, "0014 必须已新增预算列"
             budget_row = await conn.fetchrow(
                 "SELECT agent_max_rounds, agent_max_tool_calls_per_round,"
                 " agent_max_total_tool_calls FROM komari_chat_config WHERE id = 1"
             )
             assert tuple(budget_row) == AGENT_BUDGET_DEFAULTS, (
-                "0013 升级必须以默认值补齐存量行"
+                "0014 升级必须以默认值补齐存量行"
             )
             assert await conn.fetchval(
                 "SELECT revision FROM komari_chat_config WHERE id = 1"
@@ -203,7 +232,7 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
         finally:
             await conn.close()
 
-        # upgrade head：0014 新增列，存量行由数据库默认补齐
+        # upgrade head：后续迁移（图片列等）完成后仍保留 0014 默认语义
         result = _run_bootstrap(scratch_url, "upgrade", "head")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
@@ -255,7 +284,7 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
         finally:
             await conn.close()
 
-        # downgrade 0013：列显式回退，存量行保留
+        # downgrade 0013：0014（预算+模式合并迁移）整体回退，存量行保留
         result = _run_bootstrap(scratch_url, "downgrade", "0013")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
@@ -268,6 +297,9 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
                 )
             }
             assert "agent_tool_call_mode" not in columns, "downgrade 必须删除新列"
+            assert not set(AGENT_BUDGET_COLUMNS) & columns, (
+                "downgrade 必须删除 0014 预算列"
+            )
             still_there = await conn.fetchval(
                 "SELECT revision FROM komari_chat_config WHERE id = 1"
             )
