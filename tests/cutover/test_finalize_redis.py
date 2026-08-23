@@ -352,7 +352,7 @@ def test_resume_skips_already_finished_entries(
 # ---------------------------------------------------------------------------
 
 
-def _seed_legacy_family(client: Any) -> dict[str, str]:
+async def _seed_legacy_family(client: Any) -> dict[str, str]:
     """播种 legacy global_interaction 族键，返回字符串键 {key: value}。"""
     string_entries = {
         "komari_memory:global_interaction:user-canary-1": (
@@ -363,17 +363,17 @@ def _seed_legacy_family(client: Any) -> dict[str, str]:
         ),
     }
     for key, value in string_entries.items():
-        client.set(key, value)
-    client.sadd("komari_memory:global_interaction:pending", "user-canary-1")
-    client.hset(
+        await client.set(key, value)
+    await client.sadd("komari_memory:global_interaction:pending", "user-canary-1")
+    await client.hset(
         "komari_memory:global_interaction:leases", "user-canary-1", "lease-1"
     )
-    client.hset(
+    await client.hset(
         "komari_memory:global_interaction:lease_owners",
         "user-canary-1",
         "own-1",
     )
-    client.hset(
+    await client.hset(
         "komari_memory:global_interaction:snapshots", "user-canary-1", '{"a":1}'
     )
     return string_entries
@@ -387,7 +387,7 @@ def test_legacy_global_interaction_family_quarantined(
     seeded: dict[str, str] = {}
 
     async def _flow(client: Any) -> None:
-        seeded.update(_seed_legacy_family(client))
+        seeded.update(await _seed_legacy_family(client))
 
     async def _assert(client: Any) -> None:
         # 原 key 全部消失；quarantine 镜像保留原字节且无 TTL
