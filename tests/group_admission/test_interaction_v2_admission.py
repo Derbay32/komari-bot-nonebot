@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 from komari_bot.plugins.komari_memory.handlers import (
     interaction_event_worker as worker_module,
@@ -26,6 +24,8 @@ from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,
 )
+
+pytestmark = pytest.mark.group_admission_acceptance
 
 
 def _record(group_id: str) -> dict[str, object]:

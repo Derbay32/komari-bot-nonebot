@@ -11,11 +11,8 @@ Fake 只做依赖注入与记录，不替代生产对象。
 
 from __future__ import annotations
 
+import pytest
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import pytest
 
 from komari_bot.plugins.komari_memory.repositories.forgetting_job_repository import (
     ForgettingJobClaim,
@@ -27,6 +24,8 @@ from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,
 )
+
+pytestmark = pytest.mark.group_admission_acceptance
 
 
 class _FakeForgettingJobRepo:

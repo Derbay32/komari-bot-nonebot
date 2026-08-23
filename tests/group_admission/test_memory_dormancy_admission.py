@@ -38,6 +38,8 @@ from tests.group_admission.persistent_work_scenario import (
     run_scenario,
 )
 
+pytestmark = pytest.mark.group_admission_acceptance
+
 
 class RecordingProcessor:
     """process 调用留痕（成功路径）。"""
