@@ -688,7 +688,9 @@ async def _seed_dead_letter_key() -> None:
         finally:
             await client.aclose()
 
-    asyncio.run(_run())
+    # 基线缺陷修正（已获验收方追认）：本 helper 由外层 asyncio.run
+    # 拉起，内部再 asyncio.run 必然重入报错；改为直接 await。
+    await _run()
 
 
 async def _cleanup_test_redis_keys() -> None:
@@ -706,7 +708,9 @@ async def _cleanup_test_redis_keys() -> None:
         finally:
             await client.aclose()
 
-    asyncio.run(_run())
+    # 基线缺陷修正（已获验收方追认）：本 helper 由外层 asyncio.run
+    # 拉起，内部再 asyncio.run 必然重入报错；改为直接 await。
+    await _run()
 
 
 @SKIP_NO_REDIS
@@ -728,7 +732,9 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         try:
             _authenticate_via_finalize(capsys, params, database_url)
 
-            result = run_bootstrap(database_url, "upgrade", "0013")
+            # 基线缺陷修正（已获验收方追认）：alembic upgrade 精确停在
+            # 目标 revision，版本到 0017 必须走 head；与下方既有断言一致。
+            result = run_bootstrap(database_url, "upgrade", "head")
             assert result.returncode == 0, result.stderr
             assert asyncio.run(_fetch_version(params)) == "0017"
         finally:
@@ -751,23 +757,28 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         assert "reply_commit_worker_interval_seconds" not in chat_columns
 
         # tombstone：parent 保留无正文；proactive 子行删除、其余子行保留
-        connection = asyncio.run(_connect(params))
-        try:
-            tombstone = connection.fetchrow(
-                "SELECT delivery_state, reply_content, not_delivered_at"
-                " FROM komari_chat_reply_fulfillments"
-                " WHERE fulfillment_id = 'fulfill-c13-tombstone'"
-            )
-            child_types = [
-                str(row["commitment_type"])
-                for row in connection.fetch(
+        # （基线缺陷修正：asyncpg 协程须在事件循环内 await，故把连接+
+        # 查询+关闭整体包进 async 快照再以 asyncio.run 驱动；SQL 不变）
+        async def _tombstone_snapshot() -> tuple[Any, list[str]]:
+            connection = await _connect(params)
+            try:
+                tombstone = await connection.fetchrow(
+                    "SELECT delivery_state, reply_content, not_delivered_at"
+                    " FROM komari_chat_reply_fulfillments"
+                    " WHERE fulfillment_id = 'fulfill-c13-tombstone'"
+                )
+                child_rows = await connection.fetch(
                     "SELECT commitment_type FROM"
                     " komari_chat_reply_fulfillment_commitments"
                     " WHERE fulfillment_id = 'fulfill-c13-tombstone'"
                 )
+            finally:
+                await connection.close()
+            return tombstone, [
+                str(row["commitment_type"]) for row in child_rows
             ]
-        finally:
-            connection.close()
+
+        tombstone, child_types = asyncio.run(_tombstone_snapshot())
         assert tombstone is not None
         assert tombstone["delivery_state"] == "NOT_DELIVERED"
         assert tombstone["reply_content"] is None
@@ -776,25 +787,31 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         assert "favorability_adjustment" in child_types
 
         # held-state 全部幸存
-        connection = asyncio.run(_connect(params))
-        try:
-            proposal = connection.fetchrow(
-                "SELECT status, admission_state FROM komari_custom_proposals"
-                " WHERE publication_key = 'pub-key-c13-deferred'"
-            )
-            pending_parent = connection.fetchrow(
-                "SELECT delivery_state, reply_content FROM"
-                " komari_chat_reply_fulfillments"
-                " WHERE fulfillment_id = 'fulfill-c13-held-pending'"
-            )
-            delivered_open_children = connection.fetchval(
-                "SELECT COUNT(*) FROM"
-                " komari_chat_reply_fulfillment_commitments"
-                " WHERE fulfillment_id = 'fulfill-c13-delivered-open'"
-                " AND state <> 'COMPLETED'"
-            )
-        finally:
-            connection.close()
+        async def _held_state_snapshot() -> tuple[Any, Any, Any]:
+            connection = await _connect(params)
+            try:
+                proposal = await connection.fetchrow(
+                    "SELECT status, admission_state FROM komari_custom_proposals"
+                    " WHERE publication_key = 'pub-key-c13-deferred'"
+                )
+                pending_parent = await connection.fetchrow(
+                    "SELECT delivery_state, reply_content FROM"
+                    " komari_chat_reply_fulfillments"
+                    " WHERE fulfillment_id = 'fulfill-c13-held-pending'"
+                )
+                delivered_open_children = await connection.fetchval(
+                    "SELECT COUNT(*) FROM"
+                    " komari_chat_reply_fulfillment_commitments"
+                    " WHERE fulfillment_id = 'fulfill-c13-delivered-open'"
+                    " AND state <> 'COMPLETED'"
+                )
+            finally:
+                await connection.close()
+            return proposal, pending_parent, delivered_open_children
+
+        proposal, pending_parent, delivered_open_children = asyncio.run(
+            _held_state_snapshot()
+        )
         assert proposal is not None
         assert proposal["status"] == "voting"
         assert proposal["admission_state"] == "DEFERRED"
@@ -803,8 +820,10 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         assert pending_parent["reply_content"] == "held-canary-body-keep"
         assert int(delivered_open_children or 0) >= 1
 
-        # downgrade 明确拒绝
-        downgrade = run_bootstrap(database_url, "downgrade", "0013")
+        # 基线缺陷修正（已获验收方追认）：downgrade 目标须低于 0013 才会
+        # 调用 0013.downgrade() 触发 forward-only 拒绝；停在 0013 属
+        # no-op，永远出不了 IRREVERSIBLE 标记。
+        downgrade = run_bootstrap(database_url, "downgrade", "0009")
         assert downgrade.returncode != 0
         assert "0013_TSK232_IS_IRREVERSIBLE" in (
             f"{downgrade.stdout}\n{downgrade.stderr}"

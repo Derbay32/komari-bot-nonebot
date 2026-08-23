@@ -91,33 +91,21 @@ def _require_no_conflict(
     where: str,
     label: str,
 ) -> None:
-    """旧表条件命中即失败：只报告数量与最小 fulfillment 身份。
+    """旧表条件命中即失败：只报告聚合 count，绝不携带动态身份。
 
     ``where`` 拼接到旧表的 WHERE 条件；任何命中都表示迁移无法确定
     映射或目标已冲突，必须在任何写入前中止（事务整体回滚）。错误
-    正文只含 ``{label}_count=`` 与 ``minimum_fulfillment_id=`` 两个
-    最小投影，绝不携带回复正文、互动载荷或异常原文。
+    正文只含 ``{label}_count=`` 聚合投影，绝不携带 fulfillment 身份、
+    回复正文、互动载荷或异常原文。
     """
-    row = connection.execute(
-        text(
-            "SELECT COUNT(*), MIN(operation_id) "
-            "FROM komari_chat_reply_commit_outbox "
-            f"WHERE {where}"
-        )
-    ).first()
-    if row is None:
-        return
-    count = int(row[0] or 0)
-    minimum_id = row[1]
+    count = int(
+        connection.execute(
+            text(f"SELECT COUNT(*) FROM komari_chat_reply_commit_outbox WHERE {where}")
+        ).scalar_one()
+    )
     if not count:
         return
-    if label == "ambiguous_failed":
-        # 字面量固定消息：版本链守卫测试要求文件内保留
-        # ``ambiguous_failed_count=`` 与 ``minimum_fulfillment_id=``
-        # 两个最小投影 token，此分支不是冗余分支。
-        msg = f"ambiguous_failed_count={count} minimum_fulfillment_id={minimum_id}"
-    else:
-        msg = f"{label}_count={count} minimum_fulfillment_id={minimum_id}"
+    msg = f"{label}_count={count}"
     raise RuntimeError(msg)
 
 

@@ -356,8 +356,10 @@ async def test_cutover_aborts_and_rolls_back_when_backfill_is_missing() -> None:
         result = _run_bootstrap(scratch_url, "upgrade", "0013")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
+        # TSK-232 对齐：错误面收敛为 closed 聚合 count，不再携带
+        # minimum_fulfillment_id 动态身份。
         assert "missing_backfill_count=1" in output
-        assert f"minimum_fulfillment_id={fulfillment_id}" in output
+        assert "minimum_fulfillment_id" not in output
         assert "不得泄露的旧回复正文" not in output
         assert "不得泄露昵称" not in output
 
@@ -399,8 +401,10 @@ async def test_cutover_aborts_when_parent_child_mirror_is_incomplete() -> None:
         result = _run_bootstrap(scratch_url, "upgrade", "0013")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
+        # TSK-232 对齐：错误面收敛为 closed 聚合 count，不再携带
+        # minimum_fulfillment_id 动态身份。
         assert "commitment_mismatch_count=1" in output
-        assert f"minimum_fulfillment_id={fulfillment_id}" in output
+        assert "minimum_fulfillment_id" not in output
         assert "不得泄露的旧回复正文" not in output
 
         assert (

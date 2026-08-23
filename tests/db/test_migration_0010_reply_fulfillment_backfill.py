@@ -544,8 +544,10 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
         result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
+        # TSK-232 对齐：错误面收敛为 closed 聚合 count，不再携带
+        # minimum_fulfillment_id 动态身份。
         assert "ambiguous_failed_count=1" in output
-        assert f"minimum_fulfillment_id={operation_ids[1]}" in output
+        assert "minimum_fulfillment_id" not in output
         assert sensitive_reply not in output
 
         assert (
