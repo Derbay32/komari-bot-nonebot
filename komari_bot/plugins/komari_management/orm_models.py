@@ -98,7 +98,7 @@ class AnnouncementDispatchRow(_AnnouncementModelBase, table=True):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('processing', 'completed', 'reconciliation_required')",
+            "status IN ('processing', 'completed', 'reconciliation_required', 'done')",
             name="komari_announcement_dispatches_status_check",
         ),
         Index(

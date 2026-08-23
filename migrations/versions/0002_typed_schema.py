@@ -327,7 +327,7 @@ def _announcement_statements() -> tuple[str, ...]:
             payload_hash TEXT NOT NULL,
             status TEXT NOT NULL
                 CHECK (status IN (
-                    'processing', 'completed', 'reconciliation_required'
+                    'processing', 'completed', 'reconciliation_required', 'done'
                 )),
             owner_token TEXT,
             lease_expires_at TIMESTAMPTZ,
