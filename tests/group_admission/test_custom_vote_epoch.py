@@ -12,7 +12,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.group_admission.custom_acceptance_support import AdmissionProbe
+
+pytestmark = pytest.mark.group_admission_acceptance
 
 
 class EpochLedger:

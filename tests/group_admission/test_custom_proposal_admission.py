@@ -36,6 +36,8 @@ from tests.group_admission.custom_acceptance_support import (
     install_admission_probe,
 )
 
+pytestmark = pytest.mark.group_admission_acceptance
+
 # ---------------------------------------------------------------------------
 # 测试替身
 # ---------------------------------------------------------------------------
