@@ -279,7 +279,16 @@ async def event_gate_context() -> AsyncIterator[None]:
 
     测试失败：门禁未注册时消息不被拦截，流经完整五阶段而非零阶段。
     ``finally`` 块仍精确恢复注册表。
+
+    TSK-248：生产在包 import 期还会注册 driver lifespan startup/shutdown
+    钩子，本上下文同时快照并恢复 lifespan 钩子集合，避免跨用例累积残留
+    （AC6「无 listener/task/reference 残留」的测试环境侧保证）。
     """
+    from nonebot import get_driver
+
+    driver = get_driver()
+    startup_snapshot = list(driver._lifespan._startup_funcs)
+    shutdown_snapshot = list(driver._lifespan._shutdown_funcs)
     snapshot = snapshot_event_registries()
     _clear_registries()
 
@@ -297,4 +306,6 @@ async def event_gate_context() -> AsyncIterator[None]:
 
         yield
     finally:
+        driver._lifespan._startup_funcs[:] = startup_snapshot
+        driver._lifespan._shutdown_funcs[:] = shutdown_snapshot
         _restore_registries(snapshot)

@@ -387,9 +387,20 @@ class _DummyGroupAdmissionPlugin:
     """
 
 
+class _DummyApschedulerPlugin:
+    """require("nonebot_plugin_apscheduler") 只作加载声明。
+
+    TSK-248 起 group_admission 作为首个未 shim 的真实插件在包入口声明该硬
+    依赖；实际 scheduler 对象由本文件顶部 ``sys.modules`` 的
+    ``nonebot_plugin_apscheduler`` shim（``_DummyScheduler``）提供，
+    ``lifecycle_context`` 会把它替换为可记录 fake。
+    """
+
+
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "group_admission": _DummyGroupAdmissionPlugin(),
+    "nonebot_plugin_apscheduler": _DummyApschedulerPlugin(),
     "llm_provider": _DummyLLMProvider(),
     "agent_run_logger": _DummyAgentRunLoggerPlugin(),
     "embedding_provider": _DummyEmbeddingPlugin(),

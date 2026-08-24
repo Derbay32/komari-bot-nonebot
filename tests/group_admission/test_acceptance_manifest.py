@@ -4,7 +4,8 @@
 
 - contract/effect/management/observability 稳定 ID 唯一且前缀形态受控；
 - 每行全部字段非空；
-- 本票恰好登记核心四项契约，anchor 指向本票实际可收集的 pytest node；
+- 本票恰好登记核心五项契约（TSK-248 新增 ``driver_lifecycle``），anchor
+  指向本票实际可收集的 pytest node；
 - 核心模块不拥有受治理业务效果，effect 登记保持单条（控制面 CAS 属
   ``system_control_plane``，可观测性/通知属 ``operational_diagnostic``，都不冒
   充 governed BUSINESS effect）；TSK-224 已登记一条入口门禁效果，不替代下游；
@@ -45,6 +46,7 @@ EXPECTED_CORE_CONTRACT_IDS = {
     "group_admission.contract.runtime_state",
     "group_admission.contract.snapshot_publish",
     "group_admission.contract.lifecycle",
+    "group_admission.contract.driver_lifecycle",
 }
 
 EXPECTED_EFFECT_CASE_IDS = {
@@ -167,7 +169,8 @@ def test_contract_case_ids_are_unique_and_well_formed() -> None:
     assert len(_all_case_ids()) == len(set(_all_case_ids())), "跨行类型 ID 重复"
 
 
-def test_contract_cases_register_exactly_the_four_core_contracts() -> None:
+def test_contract_cases_register_exactly_the_five_core_contracts() -> None:
+    """本票恰好登记五项核心契约（TSK-248 新增 driver_lifecycle 行）。"""
     assert {case.contract_id for case in ADMISSION_CONTRACT_CASES} == (
         EXPECTED_CORE_CONTRACT_IDS
     )

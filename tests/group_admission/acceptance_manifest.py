@@ -105,7 +105,8 @@ class AdmissionObservabilityCase:
     acceptance_anchor: str
 
 
-#: 核心模块四项契约：裁决入口、运行时状态、快照发布、生命周期。
+#: 核心模块五项契约：裁决入口、运行时状态、快照发布、运行时生命周期、
+#: 生产 driver 生命周期（TSK-248）。
 #: 本票不登记控制面 / 观测 / 入口门禁契约，它们由后续票各自登记。
 ADMISSION_CONTRACT_CASES: tuple[AdmissionContractCase, ...] = (
     AdmissionContractCase(
@@ -142,6 +143,19 @@ ADMISSION_CONTRACT_CASES: tuple[AdmissionContractCase, ...] = (
         acceptance_anchor=(
             "tests/group_admission/test_runtime_lifecycle.py"
             "::test_close_clears_snapshot_and_ignores_later_deliveries"
+        ),
+    ),
+    #: TSK-248：生产生命周期装配契约。真实 driver startup/shutdown hook 经
+    #: nonebot-plugin-apscheduler 周期 job 驱动 ``process_observability``，
+    #: startup 恰一次获取 manager 并启动 runtime，shutdown 恰一次停任务并
+    #: close；行为验证见 test_lifecycle_driver.py / test_lifecycle_scheduler.py。
+    AdmissionContractCase(
+        contract_id="group_admission.contract.driver_lifecycle",
+        owner_module="komari_bot.plugins.group_admission",
+        source_symbol="driver.on_startup",
+        acceptance_anchor=(
+            "tests/group_admission/test_lifecycle_driver.py"
+            "::test_startup_via_driver_hook_reaches_ready_and_single_flight"
         ),
     ),
 )
