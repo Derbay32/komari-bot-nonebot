@@ -142,11 +142,33 @@ CANARY_BODY_TOKEN = "canary-body-leak-probe-7d21"
 CANARY_LEAK_MARKER = "canary-invalid-policy-marker-9f4e"
 
 #: 验收基线合法策略（canonical 形态：升序去重正整数）。
+#: 真实 canonical 存储形态（AC5）：prepare-policy 落库前经
+#: ``canonicalize_policy`` 升序去重，fixture 不得再用非 canonical 顺序掩盖
+#: operator 路径上的指纹漂移。
 VALID_POLICY: dict[str, Any] = {
     "mode": "blacklist",
-    "group_ids": [CANARY_GROUP_B, CANARY_GROUP_A],
+    "group_ids": [CANARY_GROUP_A, CANARY_GROUP_B],
 }
 VALID_POLICY_FINGERPRINT = ""
+
+#: 多群号乱序/重复输入（operator 真实文件形态，未规范化）。
+MULTIGROUP_RAW_POLICY: dict[str, Any] = {
+    "mode": "blacklist",
+    "group_ids": [
+        CANARY_GROUP_C,
+        CANARY_GROUP_A,
+        CANARY_GROUP_B,
+        CANARY_GROUP_C,
+        CANARY_GROUP_A,
+    ],
+}
+
+#: 上述输入经 ``canonicalize_policy`` 规范化后的真实存储形态（升序去重）。
+MULTIGROUP_CANONICAL_POLICY: dict[str, Any] = {
+    "mode": "blacklist",
+    "group_ids": sorted(set(MULTIGROUP_RAW_POLICY["group_ids"])),
+}
+MULTIGROUP_POLICY_FINGERPRINT = ""
 
 #: fresh 隔离库经 0010 播种的缺省策略（与迁移链一致）。
 DEFAULT_SEEDED_POLICY: dict[str, Any] = {"mode": "blacklist", "group_ids": []}
@@ -170,6 +192,7 @@ def oracle_list_fingerprint(group_ids: list[int]) -> str:
 
 
 VALID_POLICY_FINGERPRINT = oracle_fingerprint(VALID_POLICY)
+MULTIGROUP_POLICY_FINGERPRINT = oracle_fingerprint(MULTIGROUP_CANONICAL_POLICY)
 DEFAULT_SEEDED_POLICY_FINGERPRINT = oracle_fingerprint(DEFAULT_SEEDED_POLICY)
 
 
