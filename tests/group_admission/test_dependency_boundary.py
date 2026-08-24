@@ -292,8 +292,9 @@ def test_phase_a_has_no_telemetry_or_side_persistence_channels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TSK-223 阶段 B：可观测性保持封闭运维诊断预算（不引入指标基础设施、
-# 不显式接 Sentry、不注册 driver hooks / scheduler）
+# TSK-223 阶段 B / TSK-248 收尾：可观测性保持封闭运维诊断预算（不引入指标
+# 基础设施、不显式接 Sentry）；TSK-248 起允许 driver lifecycle / scheduler
+# 装配（startup/shutdown 钩子与周期 job），但仍保持存储边界 / 无第二持久真源。
 # ---------------------------------------------------------------------------
 
 #: 阶段 B 额外禁止的遥测/诊断库 import 根（与阶段 A 互补）。
@@ -306,15 +307,15 @@ FORBIDDEN_PHASE_B_IMPORT_ROOTS = {
 }
 
 #: 阶段 B 禁止的标识符（AST 级别扫描，docstring 提及不会误报）：
-#: 显式 Sentry 异常捕获、全局指标注册表、NoneBot driver hooks 与 scheduler
-#: 作业注册（阶段 B 只提供 ``process_observability``，scheduler 归后续票）。
+#: 显式 Sentry 异常捕获、全局指标注册表。
+#: TSK-248 起 **允许** driver lifecycle 装配：``on_startup`` / ``on_shutdown``
+#: 钩子与 ``add_job`` 周期任务由生产生命周期票落地（见
+#: test_lifecycle_driver.py / test_lifecycle_scheduler.py），因此从本禁集合中
+#: 移除；生命周期行为的真实验证由那些用例承担，不以本静态扫描代替。
 FORBIDDEN_PHASE_B_IDENTIFIERS = {
     "capture_exception",
     "add_event_processor",
     "CollectorRegistry",
-    "on_startup",
-    "on_shutdown",
-    "add_job",
 }
 
 
@@ -330,13 +331,17 @@ def _identifier_occurrences(path: Path) -> list[tuple[int, str]]:
 
 
 def test_phase_b_observability_keeps_operational_diagnostic_boundaries() -> None:
-    """阶段 B 不引入指标基础设施/显式 Sentry 接口，也不注册 driver hooks。
+    """阶段 B 不引入指标基础设施/显式 Sentry 接口；TSK-248 起允许生命周期装配。
 
     可观测性只由低基数内存计数 + 现有应用日志 + 内存通知构成：不引入
     Prometheus/OTel/全局指标注册表与 ``/metrics``（阶段 A 标记扫描互补），
-    不显式调用 ``capture_exception`` / 不向日志挂原始异常对象，不注册
-    ``on_startup`` / ``on_shutdown`` / scheduler 作业（``process_observability``
-    由后续 scheduler 票驱动）。内容泄漏由金丝雀用例在运行时验收。
+    不显式调用 ``capture_exception`` / 不向日志挂原始异常对象。
+
+    TSK-248 变更：阶段 B 曾禁止注册 ``on_startup`` / ``on_shutdown`` /
+    scheduler 作业（当时 ``process_observability`` 由后续 scheduler 票驱
+    动）；本票落地生产生命周期装配后解除该禁止，但**存储边界与无第二持久
+    真源约束由本文件其余静态用例继续守护**（不因解除钩子禁止而放开
+    redis / sqlalchemy / DDL 等禁用面）。内容泄漏由金丝雀用例在运行时验收。
     """
     offenders: list[str] = []
     for module_file in _package_modules():
