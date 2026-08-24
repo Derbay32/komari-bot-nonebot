@@ -1,6 +1,6 @@
-"""TSK-222/TSK-223：group_admission 依赖方向与第二持久真源静态边界验收。
+"""TSK-222/TSK-223/TSK-246：group_admission 依赖方向与消费方硬依赖声明验收。
 
-验收目标（AST 静态扫描，不 import 生产代码）：
+验收目标（主要 AST 静态扫描；TSK-246 追加 NoneBot 装载器 runtime seam）：
 
 - 生产 ``group_admission`` 包不得 import Redis / 文件存储 / SQLAlchemy /
   asyncpg / nonebot-plugin-orm，也不得出现 DDL 字面量——PostgreSQL 强类型
@@ -16,6 +16,10 @@
   komari_management 挂载/require、Prometheus/OTel/全局指标、拒绝表/
   Redis 明细/独立 JSONL/AgentRun（共享 management audit 导入不算新增独
   立 JSONL）。
+- TSK-246 消费方硬依赖声明：从生产代码识别 ``group_admission`` 顶层消费
+  者，断言其所属插件入口（``__init__.py``）显式 ``require("group_admission")``；
+  三插件（komari_memory / user_ban / character_binding）经 NoneBot 装载器
+  runtime seam 逐入口装载验证声明，消费 import 只落在顶层 ``__all__`` 内。
 
 生产包目录缺失时以断言失败（red）报告，而非跳过。
 """
@@ -23,9 +27,17 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+from tests.group_admission.entry_gate_support import snapshot_event_registries
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytestmark = pytest.mark.group_admission_acceptance
 
@@ -322,3 +334,285 @@ def test_phase_b_observability_keeps_operational_diagnostic_boundaries() -> None
                 f"{module_file.name}:{lineno}: 禁止的标识符 {name}"
             )
     assert offenders == [], f"阶段 B 出现越界诊断/装配面: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# TSK-246：group_admission 消费方硬依赖声明（consumer dependency census）
+#
+# 验收目标：
+#
+# - AST census：从生产代码识别全部 ``group_admission`` 顶层消费者，断言其
+#   所属插件入口（``__init__.py``）显式 ``require("group_admission")``，未
+#   来新增消费者漏声明时精确失败；兼容既有 komari_help 约定——消费模块与
+#   ``require`` 同文件声明且该模块在插件装载期被入口 import（NoneBot 加载
+#   期即完成声明）。
+# - NoneBot 装载器 runtime seam：recording require 逐插件装载三插件
+#   （komari_memory / user_ban / character_binding）生产入口，断言装载期间
+#   记录到 ``group_admission`` 声明；装载副作用（matcher / preprocessor /
+#   driver 生命周期钩子）精确恢复。
+# - 消费 import 只落在 ``group_admission`` 顶层 ``__all__`` 内（ADR-0006 只
+#   消费顶层暴露面），不引入 deep import（既有用例覆盖）。
+#
+# 本票不新增 public bool helper、不改群号解析/准入资格/命令回复——由既有
+# user_ban / character_binding / komari_memory 公共行为测试守住零行为变化
+# （见测试命令中对应目录）。
+# ---------------------------------------------------------------------------
+
+GROUP_ADMISSION_PLUGIN = "group_admission"
+GROUP_ADMISSION_MODULE = "komari_bot.plugins.group_admission"
+
+#: TSK-246 明确要求补齐硬依赖声明的三个消费者。
+CONSUMER_PLUGINS = ("user_ban", "character_binding", "komari_memory")
+
+
+def _module_require_names(path: Path) -> set[str]:
+    """AST 提取模块顶层 ``require("...")`` 调用的字符串参数集合。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "require"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            names.add(node.args[0].value)
+    return names
+
+
+def _group_admission_import_targets(
+    path: Path,
+) -> list[tuple[int, str, list[str]]]:
+    """提取模块对 ``group_admission`` 的全部绝对 import 形态。
+
+    返回 ``(lineno, target, imported_names)``：
+
+    - ``import komari_bot.plugins.group_admission`` /
+      ``import komari_bot.plugins.group_admission as g`` → target 为该模块名，
+      imported_names 为空；
+    - ``from komari_bot.plugins.group_admission import X, Y`` → target 为该模块
+      名，imported_names 为 ``["X", "Y"]``；
+    - ``from komari_bot.plugins import group_admission`` /
+      ``from komari_bot.plugins import group_admission as g`` → target 归一为
+      ``komari_bot.plugins.group_admission``。
+
+    只匹配 ``level == 0`` 的绝对 import；包内 relative import 属组内实现不受限。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: list[tuple[int, str, list[str]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend(
+                (node.lineno, alias.name, [])
+                for alias in node.names
+                if alias.name == GROUP_ADMISSION_MODULE
+                or alias.name.startswith(f"{GROUP_ADMISSION_MODULE}.")
+            )
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            if node.module == GROUP_ADMISSION_MODULE:
+                found.append(
+                    (node.lineno, node.module, [a.name for a in node.names])
+                )
+            elif node.module == "komari_bot.plugins":
+                found.extend(
+                    (node.lineno, GROUP_ADMISSION_MODULE, [])
+                    for alias in node.names
+                    if alias.name == "group_admission"
+                )
+    return found
+
+
+def _iter_group_admission_consumers() -> list[tuple[str, Path]]:
+    """遍历生产插件包，返回消费 ``group_admission`` 顶层面的
+    ``(plugin_name, module_path)`` 列表。"""
+    consumers: list[tuple[str, Path]] = []
+    for plugin_dir in sorted(PLUGINS_DIR.iterdir()):
+        if not plugin_dir.is_dir() or plugin_dir.name == GROUP_ADMISSION_PLUGIN:
+            continue
+        consumers.extend(
+            (plugin_dir.name, module_file)
+            for module_file in sorted(plugin_dir.rglob("*.py"))
+            if _group_admission_import_targets(module_file)
+        )
+    return consumers
+
+
+def _top_level_all(path: Path) -> set[str]:
+    """AST 提取模块顶层 ``__all__ = [...]`` 字符串集合。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "__all__"
+            and isinstance(node.value, ast.List)
+        ):
+            return {
+                elt.value
+                for elt in node.value.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            }
+    return set()
+
+
+def test_group_admission_consumer_plugin_entry_declares_require() -> None:
+    """consumer dependency census：消费者所属插件入口必须显式声明硬依赖。
+
+    从生产代码识别全部 ``group_admission`` 顶层消费者，断言其所属插件入口
+    （``__init__.py``）包含 ``require("group_admission")``；兼容既有
+    komari_help 约定（消费模块与 ``require`` 同文件声明且该模块在插件装载期
+    被入口 import）。未来新增消费者漏声明时本用例精确失败。
+    """
+    missing: list[str] = []
+    for plugin_name, module_file in _iter_group_admission_consumers():
+        entry = PLUGINS_DIR / plugin_name / "__init__.py"
+        declared = GROUP_ADMISSION_PLUGIN in _module_require_names(entry)
+        if not declared:
+            declared = GROUP_ADMISSION_PLUGIN in _module_require_names(module_file)
+        if not declared:
+            missing.append(
+                f"{plugin_name} ({module_file.relative_to(PLUGINS_DIR)})"
+            )
+    assert missing == [], (
+        "以下插件消费 group_admission 顶层面但未在插件入口显式声明硬依赖 "
+        f'require("{GROUP_ADMISSION_PLUGIN}"): {missing}'
+    )
+
+
+def test_group_admission_consumer_imports_stay_within_top_level_all() -> None:
+    """消费方 import 的符号必须全部落在 ``group_admission`` 顶层 ``__all__`` 内。
+
+    ADR-0006 只消费顶层暴露面：``from komari_bot.plugins.group_admission
+    import X`` 的 ``X`` 必须是顶层 ``__all__`` 成员；``import ... as pkg``
+    整模块形态不在名单校验范围（运行时属性访问）。
+    """
+    all_symbols = _top_level_all(PACKAGE_DIR / "__init__.py")
+    assert all_symbols, "group_admission 顶层 __all__ 缺失，无法校验消费面"
+    violations: list[str] = []
+    for plugin_name, module_file in _iter_group_admission_consumers():
+        for lineno, _target, names in _group_admission_import_targets(module_file):
+            violations.extend(
+                f"{plugin_name}/{module_file.name}:{lineno}: {name}"
+                for name in names
+                if name == "*" or name not in all_symbols
+            )
+    assert violations == [], (
+        f"消费方 import 了 group_admission 顶层未导出的符号: {violations}"
+    )
+
+
+def _snapshot_lifespan() -> dict[str, list[object]]:
+    """快照 driver 生命周期钩子，避免装载插件入口残留 startup/shutdown 回调。"""
+    from nonebot import get_driver
+
+    lifespan = get_driver()._lifespan
+    return {
+        "startup": list(lifespan._startup_funcs),
+        "ready": list(lifespan._ready_funcs),
+        "shutdown": list(lifespan._shutdown_funcs),
+    }
+
+
+def _restore_lifespan(snapshot: dict[str, list[object]]) -> None:
+    from nonebot import get_driver
+
+    lifespan = get_driver()._lifespan
+    lifespan._startup_funcs = list(snapshot["startup"])
+    lifespan._ready_funcs = list(snapshot["ready"])
+    lifespan._shutdown_funcs = list(snapshot["shutdown"])
+
+
+def _restore_event_registries(snapshot: dict[str, Any]) -> None:
+    """恢复 matcher 与四组 message 注册表（与 entry_gate_support 语义一致）。"""
+    import nonebot.matcher as _matcher_mod
+    import nonebot.message as _msg_mod
+
+    _matcher_mod.matchers.clear()
+    _matcher_mod.matchers.update(snapshot["matchers"])
+    _msg_mod._run_preprocessors.clear()
+    _msg_mod._run_preprocessors.update(snapshot["run_pre"])
+    _msg_mod._run_postprocessors.clear()
+    _msg_mod._run_postprocessors.update(snapshot["run_post"])
+    _msg_mod._event_postprocessors.clear()
+    _msg_mod._event_postprocessors.update(snapshot["event_post"])
+    _msg_mod._event_preprocessors.clear()
+    _msg_mod._event_preprocessors.update(snapshot["event_pre"])
+
+
+@pytest.fixture
+def _recorded_requires(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """TSK-246 runtime seam：以 recording require 包裹 conftest 桩。
+
+    ``nonebot_plugin_apscheduler`` 返回 ``sys.modules`` 中的 dummy 模块
+    （三个插件入口都在装载期 require 它）；其余委托 conftest
+    ``_fake_require``（registry 内插件返回桩、未声明抛错）。
+    """
+    import nonebot.plugin as np
+
+    original = np.require
+    recorded: list[str] = []
+
+    def _recording_require(name: str) -> object:
+        recorded.append(name)
+        if name == "nonebot_plugin_apscheduler":
+            return sys.modules["nonebot_plugin_apscheduler"]
+        return original(name)
+
+    monkeypatch.setattr(np, "require", _recording_require)
+    yield recorded
+
+
+def _load_plugin_entry_isolated(plugin_name: str) -> str:
+    """以唯一模块名装载插件生产入口（不触碰 conftest 包 shim），返回模块名。
+
+    ``spec_from_file_location`` 对点号模块名会把 ``__package__`` 设成完整
+    模块名，导致入口内的相对 import 把已加载的强类型子模块（如
+    ``config_schema``）当作新模块重新执行，触发 SQLModel 表重复定义；显式
+    把 spec 标记为普通模块（``submodule_search_locations=None``），使
+    ``__package__`` 与 ``__spec__.parent`` 都落在插件包名上，相对 import 复用
+    ``sys.modules`` 中的真实子模块。
+    """
+    module_name = f"komari_bot.plugins.{plugin_name}._tsk246_entry"
+    sys.modules.pop(module_name, None)
+    module_path = PLUGINS_DIR / plugin_name / "__init__.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        msg = f"无法装载 {plugin_name} 插件入口"
+        raise RuntimeError(msg)
+    spec.submodule_search_locations = None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module_name
+
+
+@pytest.mark.parametrize("plugin_name", CONSUMER_PLUGINS)
+def test_plugin_entry_declares_group_admission_require_on_load(
+    plugin_name: str,
+    _recorded_requires: list[str],
+) -> None:
+    """NoneBot 装载器 seam：三插件生产入口装载期必须声明
+    ``require("group_admission")``。
+
+    recording require 逐插件装载真实生产入口（spec_from_file_location 唯一
+    模块名，避开 conftest 包 shim），断言装载期间记录到 group_admission
+    声明；装载副作用（matcher / preprocessor / driver 生命周期钩子）在
+    ``finally`` 中精确恢复。
+    """
+    module_name = f"komari_bot.plugins.{plugin_name}._tsk246_entry"
+    snapshot = snapshot_event_registries()
+    lifespan_snapshot = _snapshot_lifespan()
+    try:
+        _load_plugin_entry_isolated(plugin_name)
+        recorded = list(_recorded_requires)
+        assert GROUP_ADMISSION_PLUGIN in recorded, (
+            f"{plugin_name} 插件入口装载期未调用 "
+            f'require("{GROUP_ADMISSION_PLUGIN}")，记录到: {recorded}'
+        )
+    finally:
+        sys.modules.pop(module_name, None)
+        _restore_lifespan(lifespan_snapshot)
+        _restore_event_registries(snapshot)
