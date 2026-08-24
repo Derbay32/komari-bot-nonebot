@@ -124,6 +124,39 @@ async def test_policy_published_logs_startup_watcher_management_with_fingerprint
     )
 
 
+async def test_policy_published_fingerprint_matches_shared_canonical_for_multigroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3：多群号策略的 policy_published 指纹必须与 CLI 共享 canonical 指纹一致。
+
+    当前运行时 ``_canonical_policy_fingerprint`` 取升序形态摘要，而 CLI 共享
+    ``policy_fingerprint`` 取去重降序形态摘要 → 多群号分叉（红）。
+    """
+    from komari_bot.admission_policy import policy_fingerprint as shared_fingerprint
+
+    raw = {"mode": "whitelist", "group_ids": [900, 800, 900, 700]}
+    clock = FakeUtcClock()
+    storage = AdmissionStorageFake(stored_policy(1, atomic_policy("blacklist", [200])))
+    _app, _runtime, _manager = await prepare_control_plane(
+        monkeypatch,
+        storage,
+        runtime_kwargs=build_runtime_kwargs(clock=clock),
+    )
+
+    with capture_admission_logs() as capture:
+        storage.deliver(
+            stored_policy(2, atomic_policy("whitelist", [900, 800, 900, 700]))
+        )
+
+    records = capture.by_event(EVENT_POLICY_PUBLISHED)
+    assert len(records) == 1, capture.event_names()
+    record = records[0]
+    assert record["extra"]["source"] == "watcher"
+    assert record["extra"]["policy_fingerprint"] == shared_fingerprint(raw), (
+        "policy_published 指纹必须与 CLI 共享 canonical 指纹一致"
+    )
+
+
 async def test_policy_published_startup_source_on_successful_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

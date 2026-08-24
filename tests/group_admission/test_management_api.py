@@ -359,6 +359,42 @@ async def test_put_success_persists_exactly_one_strict_cas_and_publishes_before_
     assert final.metadata["result_code"] == RESULT_CODE_SUCCESS
 
 
+async def test_put_audit_fingerprint_matches_shared_canonical_for_multigroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3：多群号策略的管理审计指纹必须与 CLI 共享 canonical 指纹一致。
+
+    当前管理 ``_policy_fingerprint`` 取规范化（升序）形态摘要，而 CLI 共享
+    ``policy_fingerprint`` 取去重降序形态摘要 → 多群号分叉（红）。
+    """
+    from komari_bot.admission_policy import policy_fingerprint as shared_fingerprint
+
+    recorder = RecordingAuditRecorder()
+    storage = AdmissionStorageFake(stored_policy(1, atomic_policy("blacklist", [200])))
+    app, _runtime, _manager = await prepare_control_plane(
+        monkeypatch,
+        storage,
+        audit_recorder=recorder,
+    )
+    raw = {"mode": "whitelist", "group_ids": [900, 800, 900, 700]}
+
+    async with asgi_client(app) as client:
+        response = await client.put(
+            POLICY_PATH,
+            headers=put_headers(WRITER_TOKEN, if_match='"1"'),
+            json=raw,
+        )
+        assert response.status_code == 200, response.text
+
+    final_events = recorder.final_events()
+    assert len(final_events) == 1
+    final = final_events[0]
+    assert final.outcome == "succeeded"
+    assert final.metadata["new_policy_fingerprint"] == shared_fingerprint(raw), (
+        "审计 new_policy_fingerprint 必须与 CLI 共享 canonical 指纹一致"
+    )
+
+
 # ---------------------------------------------------------------------------
 # PUT policy：If-Match 与 body 校验矩阵（422，不触存储）
 # ---------------------------------------------------------------------------

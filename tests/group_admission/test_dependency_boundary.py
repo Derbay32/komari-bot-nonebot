@@ -63,6 +63,10 @@ ALLOWED_KOMARI_ABSOLUTE_MODULES = {
     # TSK-232：config_schema.py 与其余 15 个插件同地位，经 TypedConfigModel
     # 基类定义强类型单行表（结构真源），非存储访问。
     "komari_bot.config.typed_config",
+    # TSK-247：统一策略指纹契约的共享 canonical 真值——运行时 compile_policy
+    # 与 CLI canonical 校验的单一验证真源（纯函数，无 I/O、无插件依赖）。
+    # 只允许顶层模块本身，禁止其任何子模块前缀（admission_policy.*）。
+    "komari_bot.admission_policy",
 }
 
 #: TSK-232：强类型配置表的 JSONB 列类型声明（sqlalchemy.dialects）。
@@ -154,6 +158,19 @@ def test_group_admission_has_no_forbidden_storage_or_business_imports() -> None:
         "management 包、NoneBot 装配、标准库与第三方非存储依赖）: "
         f"{violations}"
     )
+
+
+def test_komari_absolute_import_allowlist_is_exact() -> None:
+    """跨 komari_bot 绝对 import 白名单必须恰好是既有项加本票新增模块。
+
+    防止后续票顺带放宽架构边界（业务插件、存储、遥测、DDL 或 deep import
+    前缀）；只锁定集合内容，不引用任何实现行号。
+    """
+    assert {
+        "komari_bot.plugins.config_manager",
+        "komari_bot.config.typed_config",
+        "komari_bot.admission_policy",
+    } == ALLOWED_KOMARI_ABSOLUTE_MODULES
 
 
 def test_group_admission_declares_no_sql_ddl_second_source() -> None:

@@ -29,8 +29,6 @@ published 与结果码，绝不含策略正文 / 群号。
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from collections.abc import Sequence  # noqa: TC003
 from datetime import UTC, datetime
@@ -40,6 +38,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette import status
 
+from komari_bot.admission_policy import policy_fingerprint
 from komari_bot.management.management_api import (
     ManagementPrincipal,
     ManagementTokenSource,
@@ -109,16 +108,10 @@ async def _noop_recorder(event: ManagementAuditEvent) -> None:
 def _policy_fingerprint(policy: Mapping[str, object]) -> str:
     """规范化策略的 SHA-256 指纹（审计安全字段；不含群号明文）。
 
-    与测试参照真源一致：键排序、紧凑分隔符、保留非 ASCII 的规范化序列化，
-    只含规范化后的策略对象（group_ids 已去重排序）。
+    TSK-247 起复用共享 ``admission_policy.policy_fingerprint`` 真源：对
+    canonical 升序存储形态取摘要，与 CLI / 0013 迁移 / 运行时日志逐字一致。
     """
-    canonical = json.dumps(
-        dict(policy),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return policy_fingerprint(dict(policy))
 
 
 def _normalize_policy(payload: object) -> dict[str, object]:
