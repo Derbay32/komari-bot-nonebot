@@ -9,6 +9,7 @@ from nonebot.message import run_preprocessor
 from nonebot.plugin import PluginMetadata, require
 
 require("nonebot_plugin_apscheduler")
+require("group_admission")
 
 if TYPE_CHECKING:
     from datetime import datetime
