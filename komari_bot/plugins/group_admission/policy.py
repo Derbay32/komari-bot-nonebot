@@ -18,9 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-type PolicyMode = Literal["blacklist", "whitelist"]
+from komari_bot.admission_policy import (
+    POLICY_FILE_INVALID,
+    PolicyCanonicalizationError,
+    canonicalize_policy,
+)
 
-_POLICY_KEYS = frozenset(("mode", "group_ids"))
+type PolicyMode = Literal["blacklist", "whitelist"]
 
 
 class PolicyCompilationError(ValueError):
@@ -38,40 +42,20 @@ class _CompiledPolicy:
 def compile_policy(payload: object) -> _CompiledPolicy:
     """把策略载荷编译为不可变产物。
 
-    严格要求载荷恰好包含 ``mode`` 与 ``group_ids``：``mode`` 仅接受
-    ``blacklist`` / ``whitelist``；``group_ids`` 必须是 list，元素必须是
-    正整数 OneBot 群号（拒绝 bool、零、负数与非整数），编译时确定性去
-    重。任何非法输入都抛 ``PolicyCompilationError``，绝不携带正文。
+    TSK-247 起复用 ``komari_bot.admission_policy.canonicalize_policy`` 作为
+    唯一校验真源（与 CLI / 0013 迁移 / 管理审计同一 canonical 规则），把
+    共享校验异常安全映射到本模块既有的 ``PolicyCompilationError`` 契约：
+    映射只剥离 cutover closed code 前缀，不携带任何策略正文或群号。
     """
-    if not isinstance(payload, dict):
-        msg = "策略载荷必须是对象"
-        raise PolicyCompilationError(msg)
-    if set(payload) != _POLICY_KEYS:
-        msg = "策略载荷必须恰好包含 mode 与 group_ids"
-        raise PolicyCompilationError(msg)
-
-    raw_mode = payload["mode"]
-    if raw_mode == "blacklist":
-        mode: PolicyMode = "blacklist"
-    elif raw_mode == "whitelist":
-        mode = "whitelist"
-    else:
-        msg = "策略 mode 必须是 blacklist 或 whitelist"
-        raise PolicyCompilationError(msg)
-
-    raw_group_ids = payload["group_ids"]
-    if not isinstance(raw_group_ids, list):
-        msg = "策略 group_ids 必须是 list"
-        raise PolicyCompilationError(msg)
-
-    group_ids: set[int] = set()
-    for element in raw_group_ids:
-        if type(element) is not int or element <= 0:
-            msg = "策略 group_ids 必须全部是正整数群号"
-            raise PolicyCompilationError(msg)
-        group_ids.add(element)
-
-    return _CompiledPolicy(mode=mode, group_ids=frozenset(group_ids))
+    try:
+        canonical = canonicalize_policy(payload)
+    except PolicyCanonicalizationError as error:
+        message = str(error).removeprefix(f"{POLICY_FILE_INVALID}: ")
+        raise PolicyCompilationError(message) from None
+    return _CompiledPolicy(
+        mode=canonical["mode"],
+        group_ids=frozenset(canonical["group_ids"]),
+    )
 
 
 def policy_admits(policy: _CompiledPolicy, associated_group_ids: frozenset[int]) -> bool:

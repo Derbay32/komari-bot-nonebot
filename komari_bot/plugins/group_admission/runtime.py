@@ -35,8 +35,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -44,6 +42,8 @@ from threading import RLock
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from nonebot import logger
+
+from komari_bot.admission_policy import policy_fingerprint
 
 from .contracts import (
     AdmissionIntent,
@@ -133,16 +133,10 @@ _POLICY_SOURCE_MANAGEMENT = "management"
 def _canonical_policy_fingerprint(mode: str, group_ids: frozenset[int]) -> str:
     """规范化策略的 SHA-256 指纹（审计安全字段，只含摘要不含群号明文）。
 
-    规范化序列化对齐管理参照真源：键排序、紧凑分隔符、保留非 ASCII；
-    ``group_ids`` 已由编译去重，此处确定性排序后参与哈希。
+    TSK-247 起复用共享 ``admission_policy.policy_fingerprint`` 真源：对
+    canonical 升序存储形态取摘要，与 CLI / 0013 迁移 / 管理审计逐字一致。
     """
-    canonical = json.dumps(
-        {"mode": mode, "group_ids": sorted(group_ids)},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return policy_fingerprint({"mode": mode, "group_ids": sorted(group_ids)})
 
 
 def _default_online_bots_provider() -> Mapping[str, object] | Iterable[object]:

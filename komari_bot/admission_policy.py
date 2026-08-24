@@ -13,9 +13,10 @@ re-export/薄封装复用）对同一载荷必须产出一致的 canonical 形�
 
 非法输入抛出 :class:`PolicyCanonicalizationError`；异常消息携带 closed
 code ``POLICY_FILE_INVALID`` 且绝不回显任何输入值。canonical 形态要求
-group_ids 升序去重；策略指纹对去重降序数组形态取紧凑 JSON
-（``sort_keys`` + ``separators=(",", ":")``）的 SHA-256 hex（序列约定
-由验收基线锁定，详见 :func:`policy_fingerprint`）。
+group_ids 升序去重；策略指纹直接对 canonical 升序存储形态取紧凑 JSON
+（``sort_keys`` + ``separators=(",", ":")``）的 SHA-256 hex，与 0013 迁移
+对存储 JSONB 文本重算 digest 的字节面逐字一致（序列约定由验收基线
+锁定，详见 :func:`policy_fingerprint`）。
 """
 
 from __future__ import annotations
@@ -75,19 +76,16 @@ def canonicalize_policy(payload: object) -> dict[str, Any]:
 
 
 def policy_fingerprint(payload: object) -> str:
-    """先过 canonical 关，再对指纹形态取 SHA-256（64-hex）。
+    """先过 canonical 关，再对 canonical 存储形态取 SHA-256（64-hex）。
 
-    指纹序列约定（验收基线字节级锁定）：``group_ids`` 以去重后降序数组、
-    对象键 ``sort_keys`` + 紧凑分隔符参与序列化。该约定对群号顺序与重复
-    不敏感（同一策略唯一指纹），并与验收支持层
-    ``oracle_fingerprint`` 对基准策略的取值逐字节一致。
+    指纹序列约定（验收基线字节级锁定）：直接对 canonical 升序去重的存储
+    形态（``sort_keys`` + 紧凑分隔符）取摘要，与 0013 迁移对存储 JSONB
+    文本重算 digest 的字节面逐字一致。该约定对群号顺序与重复不敏感
+    （同一策略唯一指纹），并与验收支持层 ``oracle_fingerprint`` 对基准
+    策略的取值逐字节一致。
     """
     canonical = canonicalize_policy(payload)
-    fingerprint_form = {
-        "mode": canonical["mode"],
-        "group_ids": sorted(canonical["group_ids"], reverse=True),
-    }
-    serialized = json.dumps(fingerprint_form, sort_keys=True, separators=(",", ":"))
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
