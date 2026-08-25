@@ -1,16 +1,13 @@
 """TSK-224 事件门控测试共享基础设施（测试专用，不承载生产语义）。
 
-提供 ``event_gate_context`` 异步上下文管理器，它在进入时：
+提供 ``event_gate_context`` 异步上下文管理器：registry 与 lifespan 容器的
+快照、清空与恢复统一委托 ``registry_isolation_context()``（TSK-253 唯一真
+源），本上下文只保留领域编排——
 
-1. 快照 ``nonebot.matcher.matchers``（MatcherManager 的全部条目）、
-   ``nonebot.message._run_preprocessors``、``_run_postprocessors``、
-   ``_event_postprocessors``、``_event_preprocessors`` 五组注册表；
-2. 清空上述注册表；
-3. 从 ``sys.modules`` 与 ``komari_bot.plugins.group_admission`` 包
-   属性中弹出 ``event_gate`` 模块引用；
-4. 重新加载 ``group_admission`` 包，触发底层 import 自动注册一个
+1. 弹出 ``event_gate`` 模块引用（``sys.modules`` 与包属性）；
+2. 重新加载 ``group_admission`` 包，触发底层 import 自动注册一个
    生产事件前置处理器（``event_preprocessor``）；
-5. 在 ``finally`` 块中精确恢复全部注册表。
+3. 退出时（正常 / 异常）经唯一真源精确恢复全部被管理容器。
 
 不提供 ``install_event_gate`` 测试接缝。
 
@@ -51,6 +48,9 @@ from tests.group_admission.management_support import (
     STATUS_PATH,
     asgi_client,
     auth_headers,
+)
+from tests.group_admission.registry_isolation_support import (
+    registry_isolation_context,
 )
 
 _GATE_MODULE = "komari_bot.plugins.group_admission.event_gate"
@@ -250,49 +250,20 @@ def snapshot_event_registries() -> dict[str, Any]:
     }
 
 
-def _clear_registries() -> None:
-    """清空五组注册表。"""
-    _matcher_mod.matchers.clear()
-    _msg_mod._run_preprocessors.clear()
-    _msg_mod._run_postprocessors.clear()
-    _msg_mod._event_postprocessors.clear()
-    _msg_mod._event_preprocessors.clear()
-
-
-def _restore_registries(snapshot: dict[str, Any]) -> None:
-    """精确恢复五组注册表至快照状态。"""
-    _matcher_mod.matchers.clear()
-    _matcher_mod.matchers.update(snapshot["matchers"])
-    _msg_mod._run_preprocessors.clear()
-    _msg_mod._run_preprocessors.update(snapshot["run_pre"])
-    _msg_mod._run_postprocessors.clear()
-    _msg_mod._run_postprocessors.update(snapshot["run_post"])
-    _msg_mod._event_postprocessors.clear()
-    _msg_mod._event_postprocessors.update(snapshot["event_post"])
-    _msg_mod._event_preprocessors.clear()
-    _msg_mod._event_preprocessors.update(snapshot["event_pre"])
-
-
 @asynccontextmanager
 async def event_gate_context() -> AsyncIterator[None]:
-    """异步上下文管理器：快照、清空、加载事件门控、恢复注册表。
+    """异步上下文管理器：加载事件门控，注册表与 lifespan 由唯一真源隔离。
 
-    测试失败：门禁未注册时消息不被拦截，流经完整五阶段而非零阶段。
-    ``finally`` 块仍精确恢复注册表。
+    TSK-253：registry/lifespan 的保存、清空与恢复统一委托
+    ``registry_isolation_context()``（快照 + 清空进入、精确恢复退出）；本函
+    数只保留领域编排——弹出 ``event_gate`` 模块引用并重载包，触发底层
+    import 自动注册一个生产事件前置处理器（``event_preprocessor``）。
 
-    TSK-248：生产在包 import 期还会注册 driver lifespan startup/shutdown
-    钩子，本上下文同时快照并恢复 lifespan 钩子集合，避免跨用例累积残留
+    测试失败：门禁未注册时消息不被拦截，流经完整五阶段而非零阶段。context
+    退出时（正常 / 异常）仍精确恢复全部被管理容器，避免跨用例累积残留
     （AC6「无 listener/task/reference 残留」的测试环境侧保证）。
     """
-    from nonebot import get_driver
-
-    driver = get_driver()
-    startup_snapshot = list(driver._lifespan._startup_funcs)
-    shutdown_snapshot = list(driver._lifespan._shutdown_funcs)
-    snapshot = snapshot_event_registries()
-    _clear_registries()
-
-    try:
+    with registry_isolation_context():
         # 从 sys.modules 与包属性中弹出 event_gate 模块引用
         sys.modules.pop(_GATE_MODULE, None)
         pkg = sys.modules.get(_PACKAGE)
@@ -305,7 +276,3 @@ async def event_gate_context() -> AsyncIterator[None]:
         importlib.reload(sys.modules[_PACKAGE])
 
         yield
-    finally:
-        driver._lifespan._startup_funcs[:] = startup_snapshot
-        driver._lifespan._shutdown_funcs[:] = shutdown_snapshot
-        _restore_registries(snapshot)

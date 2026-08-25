@@ -30,11 +30,13 @@ import ast
 import importlib.util
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.group_admission.entry_gate_support import snapshot_event_registries
+from tests.group_admission.registry_isolation_support import (
+    registry_isolation_context,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -526,44 +528,6 @@ def test_group_admission_consumer_imports_stay_within_top_level_all() -> None:
     )
 
 
-def _snapshot_lifespan() -> dict[str, list[object]]:
-    """快照 driver 生命周期钩子，避免装载插件入口残留 startup/shutdown 回调。"""
-    from nonebot import get_driver
-
-    lifespan = get_driver()._lifespan
-    return {
-        "startup": list(lifespan._startup_funcs),
-        "ready": list(lifespan._ready_funcs),
-        "shutdown": list(lifespan._shutdown_funcs),
-    }
-
-
-def _restore_lifespan(snapshot: dict[str, list[object]]) -> None:
-    from nonebot import get_driver
-
-    lifespan = get_driver()._lifespan
-    lifespan._startup_funcs = list(snapshot["startup"])
-    lifespan._ready_funcs = list(snapshot["ready"])
-    lifespan._shutdown_funcs = list(snapshot["shutdown"])
-
-
-def _restore_event_registries(snapshot: dict[str, Any]) -> None:
-    """恢复 matcher 与四组 message 注册表（与 entry_gate_support 语义一致）。"""
-    import nonebot.matcher as _matcher_mod
-    import nonebot.message as _msg_mod
-
-    _matcher_mod.matchers.clear()
-    _matcher_mod.matchers.update(snapshot["matchers"])
-    _msg_mod._run_preprocessors.clear()
-    _msg_mod._run_preprocessors.update(snapshot["run_pre"])
-    _msg_mod._run_postprocessors.clear()
-    _msg_mod._run_postprocessors.update(snapshot["run_post"])
-    _msg_mod._event_postprocessors.clear()
-    _msg_mod._event_postprocessors.update(snapshot["event_post"])
-    _msg_mod._event_preprocessors.clear()
-    _msg_mod._event_preprocessors.update(snapshot["event_pre"])
-
-
 @pytest.fixture
 def _recorded_requires(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     """TSK-246 runtime seam：以 recording require 包裹 conftest 桩。
@@ -621,23 +585,20 @@ def test_plugin_entry_declares_group_admission_require_on_load(
 
     recording require 逐插件装载真实生产入口（spec_from_file_location 唯一
     模块名，避开 conftest 包 shim），断言装载期间记录到 group_admission
-    声明；装载副作用（matcher / preprocessor / driver 生命周期钩子）在
-    ``finally`` 中精确恢复。
+    声明；装载副作用（matcher / preprocessor / driver 生命周期钩子）由
+    ``registry_isolation_context`` 唯一真源在 context 退出时精确恢复。
     """
     module_name = f"komari_bot.plugins.{plugin_name}._tsk246_entry"
-    snapshot = snapshot_event_registries()
-    lifespan_snapshot = _snapshot_lifespan()
-    try:
-        _load_plugin_entry_isolated(plugin_name)
-        recorded = list(_recorded_requires)
-        assert GROUP_ADMISSION_PLUGIN in recorded, (
-            f"{plugin_name} 插件入口装载期未调用 "
-            f'require("{GROUP_ADMISSION_PLUGIN}")，记录到: {recorded}'
-        )
-    finally:
-        sys.modules.pop(module_name, None)
-        _restore_lifespan(lifespan_snapshot)
-        _restore_event_registries(snapshot)
+    with registry_isolation_context():
+        try:
+            _load_plugin_entry_isolated(plugin_name)
+            recorded = list(_recorded_requires)
+            assert GROUP_ADMISSION_PLUGIN in recorded, (
+                f"{plugin_name} 插件入口装载期未调用 "
+                f'require("{GROUP_ADMISSION_PLUGIN}")，记录到: {recorded}'
+            )
+        finally:
+            sys.modules.pop(module_name, None)
 
 
 # ---------------------------------------------------------------------------
