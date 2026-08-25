@@ -638,3 +638,205 @@ def test_plugin_entry_declares_group_admission_require_on_load(
         sys.modules.pop(module_name, None)
         _restore_lifespan(lifespan_snapshot)
         _restore_event_registries(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# TSK-253：registry/lifespan 恢复唯一真源边界（AST census）
+#
+# 验收目标：
+#
+# - 中立 ``registry_isolation_support.py`` 是 tests/group_admission/ 内
+#   registry/lifespan 恢复的唯一真源；其他文件不得重新实现恢复写操作
+#   （lifespan list 原地切片 / 属性重绑、registry ``clear`` / ``update``）。
+#   census 只基于受管容器的**真实恢复写操作**判定，不用 ``_restore_*`` /
+#   ``_clear_*`` 名称前缀、也不用任何旧函数名白名单豁免——存量三处恢复
+#   路径（``test_dependency_boundary`` / ``entry_gate_support`` /
+#   ``lifecycle_support``）正是本票要求迁移/删除的第二恢复真源，census 绝
+#   不保护它们；名称与 registry/lifespan 无关的恢复/清理 helper 不含这些
+#   写操作，自然放行。
+# - 只读访问（``list`` / ``set`` / ``dict`` / ``items`` / ``in``）与新增
+#   hooks 的差分比较（``func not in snapshot``）仍允许，不在此禁集合内。
+# - 扫描基于 AST，docstring / 注释不会误报。
+# - 中立 helper 不接管 ``sys.modules``、不 reload、不注入 scheduler /
+#   runtime fake：不得 import ``importlib`` / ``nonebot_plugin_apscheduler`` /
+#   ``pytest``，不得访问 ``sys.modules``，不得使用 ``monkeypatch``。
+#
+# 红基线：helper 尚未创建时，行为用例以 ``ModuleNotFoundError``、census 用
+# 例以「唯一真源缺失」失败（red）；临时放入最小/正确 helper 后，census 仍
+# 因上述三处既有旧恢复写操作而红（red）。只有实现代理迁移三个调用方并删除
+# 这些写操作才允许转绿。
+# ---------------------------------------------------------------------------
+
+GROUP_ADMISSION_TESTS_DIR = PROJECT_ROOT / "tests" / "group_admission"
+
+#: 被管理的 lifespan list 槽位（原地切片恢复，禁止属性重绑）。
+_LIFESPAN_LIST_NAMES = frozenset(
+    {"_startup_funcs", "_ready_funcs", "_shutdown_funcs"}
+)
+
+#: 被管理的 registry 容器槽位（set/dict-like，clear + update 恢复）。
+_REGISTRY_CONTAINER_NAMES = frozenset(
+    {
+        "matchers",
+        "_run_preprocessors",
+        "_run_postprocessors",
+        "_event_preprocessors",
+        "_event_postprocessors",
+    }
+)
+
+#: 恢复写操作只识别**受管容器的真实写操作**，不按 ``_restore_*`` /
+#: ``_clear_*`` 名称前缀、也不按任何旧函数名判断：名称与 registry/lifespan
+#: 无关的恢复/清理 helper（如 ``_restore_unrelated_state`` /
+#: ``_clear_other_cache``）因不含这些写操作而自然放行。本票要求迁移并删除
+#: 存量三处恢复路径（``test_dependency_boundary`` 的 ``_restore_lifespan`` /
+#: ``_restore_event_registries``、``entry_gate_support`` 的
+#: ``_clear_registries`` / ``_restore_registries`` / ``event_gate_context``、
+#: ``lifecycle_support`` 的 ``lifecycle_context``），census 绝不豁免它们：
+#: 收敛完成前它们体内的 lifespan 赋值/切片与 registry ``clear`` /
+#: ``update`` 一律计为第二恢复真源（red）。
+def _registry_isolation_helper_path() -> Path:
+    """返回中立恢复唯一真源的模块路径。"""
+    return GROUP_ADMISSION_TESTS_DIR / "registry_isolation_support.py"
+
+
+def _last_attr(node: ast.expr) -> str | None:
+    """属性链最后一环属性名：``a.b.c`` → ``"c"``（顶层 Attribute 的 attr）。"""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _scan_registry_restore_writes(paths: list[Path]) -> list[str]:
+    """AST 扫描给定文件中的 registry/lifespan 恢复写操作。
+
+    只识别**写操作**（docstring / 注释不进入 AST，不会误报；只读访问与
+    hook 差分比较不在扫描范围）：
+
+    - lifespan list 恢复：``driver._lifespan._startup_funcs[:] = X`` 的原地
+      切片赋值，与 ``lifespan._startup_funcs = X`` 的属性重绑；
+    - registry 清空 / 整表回填：对 ``matchers`` / ``_run_preprocessors`` /
+      ``_run_postprocessors`` / ``_event_preprocessors`` /
+      ``_event_postprocessors`` 调用 ``.clear()`` / ``.update(...)``。
+
+    只按上述真实写操作判定，**不做任何函数名豁免**：不按 ``_restore_*`` /
+    ``_clear_*`` 名称前缀、也不按旧函数名白名单放行。存量三处恢复路径
+    （``test_dependency_boundary`` / ``entry_gate_support`` /
+    ``lifecycle_support``）体内的写操作就是本票要求删除的第二恢复真源，
+    收敛完成前一律计为违规；名称与受管容器无关的恢复/清理 helper（如
+    ``_restore_unrelated_state`` / ``_clear_other_cache``）因不含这些写操作
+    而自然放行。
+    """
+    violations: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.Call)):
+                continue
+            where = f"{path.name}:{node.lineno}"
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript) and isinstance(
+                        target.slice, ast.Slice
+                    ):
+                        last = _last_attr(target.value)
+                        if last in _LIFESPAN_LIST_NAMES:
+                            violations.append(
+                                f"{where}: lifespan 列表原地切片恢复 {last}"
+                            )
+                    elif isinstance(target, ast.Attribute):
+                        last = _last_attr(target)
+                        if last in _LIFESPAN_LIST_NAMES:
+                            violations.append(
+                                f"{where}: lifespan 列表属性重绑 {last}"
+                            )
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute) and func.attr in {
+                    "clear",
+                    "update",
+                }:
+                    last = _last_attr(func.value)
+                    if last in _REGISTRY_CONTAINER_NAMES:
+                        violations.append(
+                            f"{where}: registry {last}.{func.attr}()"
+                        )
+    return violations
+
+
+def test_registry_isolation_helper_is_the_single_restore_source() -> None:
+    """TSK-253：中立 ``registry_isolation_support`` 是恢复的唯一真源。
+
+    其他 ``tests/group_admission/`` 文件不得重新实现 registry/lifespan 恢复
+    写操作（AST 只扫描真实写操作，只读访问与 hook 差分比较仍允许；不按函数
+    名或前缀豁免，存量三处恢复路径收敛前一律计为第二真源）。helper 缺失时
+    以「唯一真源缺失」失败；helper 就位后若 ``test_dependency_boundary`` /
+    ``entry_gate_support`` / ``lifecycle_support`` 仍保留旧恢复写操作，则继续
+    以「发现第二恢复真源」失败（red）。
+    """
+    helper = _registry_isolation_helper_path()
+    assert helper.is_file(), (
+        "registry_isolation_support.py 尚不存在（中立恢复唯一真源缺失，"
+        "TSK-253 红基线）"
+    )
+    scan_paths = [
+        path
+        for path in sorted(GROUP_ADMISSION_TESTS_DIR.glob("*.py"))
+        if path.name != helper.name
+    ]
+    violations = _scan_registry_restore_writes(scan_paths)
+    assert violations == [], (
+        "发现第二 registry/lifespan 恢复真源（必须统一走 "
+        f"registry_isolation_support 的 context manager）: {violations}"
+    )
+
+
+def test_registry_isolation_helper_keeps_scope_narrow() -> None:
+    """TSK-253：中立 helper 不接管 sys.modules / reload / scheduler / fake。
+
+    只允许保存与恢复 registry/lifespan 容器；模块弹出、插件 reload、
+    scheduler 替换与 runtime 单例注入等编排职责必须留在既有调用方
+    （``entry_gate_support`` / ``lifecycle_support``）。AST 扫描避免
+    docstring 误报。
+    """
+    helper = _registry_isolation_helper_path()
+    assert helper.is_file(), (
+        "registry_isolation_support.py 尚不存在（中立恢复唯一真源缺失，"
+        "TSK-253 红基线）"
+    )
+    tree = ast.parse(helper.read_text(encoding="utf-8"), filename=str(helper))
+
+    forbidden_import_roots = {"importlib", "nonebot_plugin_apscheduler", "pytest"}
+    imported_roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(
+                alias.name.split(".")[0] for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_roots.add(node.module.split(".")[0])
+    offenders = sorted(imported_roots & forbidden_import_roots)
+    assert offenders == [], (
+        f"helper 不得导入 reload/fake 注入载体: {offenders}"
+    )
+
+    sys_modules_touched = [
+        f"line {node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "modules"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "sys"
+    ]
+    assert sys_modules_touched == [], (
+        f"helper 不得访问 sys.modules（模块接管）: {sys_modules_touched}"
+    )
+
+    monkeypatch_refs = [
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "monkeypatch"
+    ]
+    assert monkeypatch_refs == [], (
+        f"helper 不得使用 monkeypatch（fake 注入）: {monkeypatch_refs}"
+    )
