@@ -9,8 +9,9 @@
   全程无真实 sleep；
 - ``lifecycle_context``：以真实 NoneBot Driver 生命周期为装配源：
 
-  1. 快照 driver lifespan startup/shutdown hook 集合、五组事件注册表与
-     scheduler 引用；
+  1. registry/lifespan 容器的保存、清空与恢复统一委托
+     ``registry_isolation_context()``（TSK-253 唯一真源）；本上下文只读
+     差分快照 startup/shutdown hook 集合供新增钩子判定；
   2. 替换 scheduler 为记录 fake，patch 共享 ``get_config_storage`` 存储工
      厂，并安装公开 ``get_config_manager`` getter fake（registry 语义、记录
      调用，可选注入获取抛错）；
@@ -21,7 +22,8 @@
   4. 把测试构造的真实 ``_AdmissionRuntime``（可选时钟 / 在线 Bot / SUPERUSER
      DI）安装为 module singleton，再经**真实 driver startup hook** 启动
      （AC7：本 support 绝不调用 ``runtime.start()`` 冒充生产生命周期）；
-  5. ``finally`` 精确恢复 lifespan、事件注册表、scheduler 与单例注入。
+  5. 退出时（正常 / 异常）经唯一真源精确恢复 lifespan / 事件注册表，并恢
+     复 scheduler 与单例注入。
 
 冻结的生产 seam 语义（生产实现必须满足，否则用例红）：
 
@@ -60,10 +62,8 @@ if TYPE_CHECKING:
 from nonebot import get_driver
 
 from komari_bot.plugins.config_manager import manager as manager_module
-from tests.group_admission.entry_gate_support import (
-    _clear_registries,
-    _restore_registries,
-    snapshot_event_registries,
+from tests.group_admission.registry_isolation_support import (
+    registry_isolation_context,
 )
 from tests.group_admission.runtime_support import (
     import_admission_package,
@@ -299,74 +299,73 @@ async def lifecycle_context(
 
     绝不调用 ``runtime.start()``：运行时生命周期完全由 driver hooks 驱动。
     """
-    # 1. 确保包已导入（生产可能在 import 期注册 hooks；快照在导入后取）。
+    # 1. 确保包已导入（生产可能在 import 期注册 hooks；差分快照在导入后取）。
     import_admission_package()
 
     driver = get_driver()
+    # 只读差分快照：供 reload 后识别新增的 startup/shutdown 钩子（census 允
+    # 许的只读访问 + 差分比较）。registry/lifespan 的保存、清空与恢复统一由
+    # ``registry_isolation_context`` 负责，本函数不再保留任何恢复写操作。
     startup_snapshot = list(driver._lifespan._startup_funcs)
     shutdown_snapshot = list(driver._lifespan._shutdown_funcs)
-    event_snapshot = snapshot_event_registries()
-    _clear_registries()
 
-    # 2. 替换 scheduler 为可记录 fake（生产 import 期绑定它）。
-    apscheduler_mod: Any = sys.modules.get("nonebot_plugin_apscheduler")
-    prev_scheduler = getattr(apscheduler_mod, "scheduler", None)
-    fake_scheduler = FakeScheduler()
-    if apscheduler_mod is not None:
-        apscheduler_mod.scheduler = fake_scheduler
-
-    # 3. 把存储工厂替换为可控 fake：fake getter 返回的真实 ConfigManager 经
-    #    共享 ``get_config_storage`` 调用该 fake，承载持久配置行为。
-    monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
-
-    # 4. 安装公开 get_config_manager fake：生产验收 seam 是 config_manager
-    #    顶层唯一注册表 getter（禁止生产直接构造 ConfigManager）。fake 为
-    #    registry 语义（同 plugin_name 复用同一真实 ConfigManager），记录调
-    #    用供「恰一次获取 + 精确资源名/Schema」断言；manager_acquisition_error
-    #    注入获取抛错路径。
-    config_manager_calls = _install_config_manager_getter_fake(
-        monkeypatch,
-        acquisition_error=manager_acquisition_error,
-    )
-
-    # 5. 注入 DI runtime 到（未弹出的）runtime 模块 singleton：生产 startup
-    #    钩子经 ``runtime._runtime`` 解析并启动它。
-    runtime_module = import_runtime_module()
-    runtime = runtime_module._AdmissionRuntime(**(runtime_kwargs or {}))
-    install_singleton(monkeypatch, runtime)
-
-    # 6. 弹出可重载子模块并 reload 包，触发生产装配（hooks + scheduler job）。
-    _pop_group_admission_submodules()
-    try:
-        importlib.reload(sys.modules[_PACKAGE])
-
-        new_startup = [
-            func
-            for func in driver._lifespan._startup_funcs
-            if func not in startup_snapshot
-        ]
-        new_shutdown = [
-            func
-            for func in driver._lifespan._shutdown_funcs
-            if func not in shutdown_snapshot
-        ]
-
-        yield SimpleNamespace(
-            runtime=runtime,
-            startup_hooks=new_startup,
-            shutdown_hooks=new_shutdown,
-            scheduler=fake_scheduler,
-            jobs=list(fake_scheduler.jobs),
-            config_manager_calls=config_manager_calls,
-        )
-    finally:
-        # 6. 精确恢复 lifespan、事件注册表与 scheduler（并恢复单例注入由
-        #    monkeypatch 在测试结束时完成）。
-        driver._lifespan._startup_funcs[:] = startup_snapshot
-        driver._lifespan._shutdown_funcs[:] = shutdown_snapshot
-        _restore_registries(event_snapshot)
+    with registry_isolation_context():
+        # 2. 替换 scheduler 为可记录 fake（生产 import 期绑定它）。
+        apscheduler_mod: Any = sys.modules.get("nonebot_plugin_apscheduler")
+        prev_scheduler = getattr(apscheduler_mod, "scheduler", None)
+        fake_scheduler = FakeScheduler()
         if apscheduler_mod is not None:
-            apscheduler_mod.scheduler = prev_scheduler
+            apscheduler_mod.scheduler = fake_scheduler
+
+        # 3. 把存储工厂替换为可控 fake：fake getter 返回的真实 ConfigManager 经
+        #    共享 ``get_config_storage`` 调用该 fake，承载持久配置行为。
+        monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+
+        # 4. 安装公开 get_config_manager fake：生产验收 seam 是 config_manager
+        #    顶层唯一注册表 getter（禁止生产直接构造 ConfigManager）。fake 为
+        #    registry 语义（同 plugin_name 复用同一真实 ConfigManager），记录调
+        #    用供「恰一次获取 + 精确资源名/Schema」断言；manager_acquisition_error
+        #    注入获取抛错路径。
+        config_manager_calls = _install_config_manager_getter_fake(
+            monkeypatch,
+            acquisition_error=manager_acquisition_error,
+        )
+
+        # 5. 注入 DI runtime 到（未弹出的）runtime 模块 singleton：生产 startup
+        #    钩子经 ``runtime._runtime`` 解析并启动它。
+        runtime_module = import_runtime_module()
+        runtime = runtime_module._AdmissionRuntime(**(runtime_kwargs or {}))
+        install_singleton(monkeypatch, runtime)
+
+        # 6. 弹出可重载子模块并 reload 包，触发生产装配（hooks + scheduler job）。
+        _pop_group_admission_submodules()
+        try:
+            importlib.reload(sys.modules[_PACKAGE])
+
+            new_startup = [
+                func
+                for func in driver._lifespan._startup_funcs
+                if func not in startup_snapshot
+            ]
+            new_shutdown = [
+                func
+                for func in driver._lifespan._shutdown_funcs
+                if func not in shutdown_snapshot
+            ]
+
+            yield SimpleNamespace(
+                runtime=runtime,
+                startup_hooks=new_startup,
+                shutdown_hooks=new_shutdown,
+                scheduler=fake_scheduler,
+                jobs=list(fake_scheduler.jobs),
+                config_manager_calls=config_manager_calls,
+            )
+        finally:
+            # 恢复 scheduler（lifespan / 事件注册表由唯一真源在 context 退出
+            # 时恢复；单例注入由 monkeypatch 在测试结束时完成）。
+            if apscheduler_mod is not None:
+                apscheduler_mod.scheduler = prev_scheduler
 
 
 async def invoke_hook(hook: Callable[..., Any]) -> None:
