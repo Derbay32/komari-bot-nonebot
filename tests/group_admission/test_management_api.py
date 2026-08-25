@@ -364,8 +364,9 @@ async def test_put_audit_fingerprint_matches_shared_canonical_for_multigroup(
 ) -> None:
     """AC3：多群号策略的管理审计指纹必须与 CLI 共享 canonical 指纹一致。
 
-    当前管理 ``_policy_fingerprint`` 取规范化（升序）形态摘要，而 CLI 共享
-    ``policy_fingerprint`` 取去重降序形态摘要 → 多群号分叉（红）。
+    修复前红基线：旧实现管理 ``_policy_fingerprint`` 取规范化（升序）形态摘
+    要，而 CLI 共享 ``policy_fingerprint`` 取去重降序形态摘要 → 多群号分叉
+    （红）；当前测试用于防止该缺陷回归。
     """
     from komari_bot.admission_policy import policy_fingerprint as shared_fingerprint
 

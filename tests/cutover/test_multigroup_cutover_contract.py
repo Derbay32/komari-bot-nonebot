@@ -4,9 +4,10 @@
 
 - AC1：至少两个不同群号的乱序/重复输入经 ``prepare-policy`` 规范化存储
   后可通过 0013 coordinated contract 终检（单事务内对存储 canonical 字节
-  重算 digest 与 gate 指纹一致）。当前 CLI 共享指纹取去重降序形态，与存储
-  升序 canonical 形态分叉 → 0013 以 ``POLICY_FINGERPRINT_DRIFT`` 阻断合法
-  多群号升级（红）；
+  重算 digest 与 gate 指纹一致）。修复前红基线：旧实现 CLI 共享指纹取去重
+  降序形态，与存储升序 canonical 形态分叉 → 0013 以
+  ``POLICY_FINGERPRINT_DRIFT`` 阻断合法多群号升级（红）；当前测试用于防止
+  该缺陷回归；
 - AC4：真实持久策略或 gate 指纹篡改仍以 ``POLICY_FINGERPRINT_DRIFT``
   closed code 阻断，错误面无群号/正文（回归锁定，修复后仍必须阻断）。
 
@@ -230,8 +231,9 @@ def test_0013_succeeds_with_multigroup_policy_via_real_prepare_policy(
 ) -> None:
     """真实 prepare-policy 规范化存储多群号策略后，0013 终检必须放行。
 
-    当前 CLI 共享指纹对去重降序形态取摘要，而 0013 对存储升序 canonical
-    字节重算 digest → 合法升级被 ``POLICY_FINGERPRINT_DRIFT`` 阻断（红）。
+    修复前红基线：旧实现 CLI 共享指纹对去重降序形态取摘要，而 0013 对存储
+    升序 canonical 字节重算 digest → 合法升级被 ``POLICY_FINGERPRINT_DRIFT``
+    阻断（红）；当前测试用于防止该缺陷回归。
     """
     with _prepared_multigroup_cutover(capsys, tmp_path, "a1") as (params, database_url):
         result = run_bootstrap(database_url, "upgrade", "head")

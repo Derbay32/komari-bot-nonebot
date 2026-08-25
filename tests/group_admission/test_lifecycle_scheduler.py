@@ -13,8 +13,8 @@ scheduler 接缝。经**确定性调用**注册的周期 job 函数验证
 全程假时钟 / 假 Bot / 假 SUPERUSER，无真实 sleep；运行时只经真实 driver
 startup hook 启动，周期 job 只经 scheduler 接缝注册并确定性调用。
 
-红基线：当前生产代码尚未装配 scheduler job，``ctx.scheduler.jobs`` 为空，
-本文件用例因无 job 可调用而失败（red）。
+修复前红基线：旧实现生产代码尚未装配 scheduler job，``ctx.scheduler.jobs``
+为空，本文件用例因无 job 可调用而失败（red）；当前测试用于防止该缺陷回归。
 """
 
 from __future__ import annotations
