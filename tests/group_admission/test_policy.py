@@ -7,7 +7,8 @@
 - AC7（字节级）：指纹必须与「真实 canonical 存储形态」逐字节一致——
   ``policy_fingerprint`` 的序列化输入 == ``canonicalize_policy`` 输出
   （升序去重）的紧凑 JSON 字节，即 0013 迁移对存储 JSONB 文本重算
-  digest 的同一字节面；多群号下 CLI 与迁移 digest 当前分叉（红）；
+  digest 的同一字节面；修复前红基线：旧实现多群号下 CLI 与迁移 digest
+  分叉（红），当前测试用于防止该缺陷回归；
 - AC6（架构/AST 合同）：运行时 ``compile_policy`` 与 CLI canonical 校验
   不得维护两套独立验证真源——运行时 policy 模块必须 import
   ``komari_bot.admission_policy.canonicalize_policy`` 并在 ``compile_policy``
@@ -15,8 +16,8 @@
 - AC7（自包含/AST 合同）：0013 迁移必须自包含，不得 import 任何
   ``komari_bot`` 可变应用模块（只断言依赖边界）。
 
-本文件无 DB、无 NoneBot 运行时依赖，是可无服务打红、准确证明当前多群号
-分叉的测试面之一。
+本文件无 DB、无 NoneBot 运行时依赖，是可无服务打红、准确证明多群号分叉
+的测试面之一；当前测试用于防止该缺陷回归。
 """
 
 from __future__ import annotations
@@ -111,7 +112,8 @@ def test_fingerprint_distinguishes_distinct_policies() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC7：指纹与真实 canonical 存储形态逐字节一致（多群号当前分叉 → 红）
+# AC7：指纹与真实 canonical 存储形态逐字节一致（修复前红基线：旧实现多群号分叉 → 红；
+# 当前测试用于防止该缺陷回归）
 # ---------------------------------------------------------------------------
 
 
@@ -119,8 +121,9 @@ def test_fingerprint_byte_matches_canonical_storage_form_for_multigroup() -> Non
     """多群号乱序/重复输入的指纹必须等于 canonical 存储字节的 SHA-256。
 
     0013 迁移对存储 JSONB 文本（canonical 形态）重算 digest；CLI 共享指纹
-    必须与它逐字节一致。当前 ``policy_fingerprint`` 对去重降序形态取摘要，
-    与存储升序形态分叉 → 红（AC3/AC7 违约）。
+    必须与它逐字节一致。修复前红基线：旧实现 ``policy_fingerprint`` 对去重
+    降序形态取摘要，与存储升序形态分叉（AC3/AC7 违约）；当前测试用于防止
+    该缺陷回归。
     """
     canonical = canonicalize_policy(MULTIGROUP_RAW_POLICY)
     assert canonical == MULTIGROUP_CANONICAL_POLICY
@@ -147,10 +150,10 @@ def test_fingerprint_byte_matches_canonical_storage_form_for_single_and_empty() 
 def test_runtime_compile_reuses_shared_canonical_truth() -> None:
     """运行时 policy 模块必须复用 ``komari_bot.admission_policy`` 真源。
 
-    当前 ``compile_policy`` 自带一套内联校验（不 import 共享包），形成两套
-    独立验证真源 → 红（AC6 违约）。本测试只断言依赖边界：模块 import 共享
-    包，且 ``compile_policy`` 函数体引用 ``canonicalize_policy``，不锁具体
-    实现行号。
+    修复前红基线：旧实现 ``compile_policy`` 自带一套内联校验（不 import 共
+    享包），形成两套独立验证真源（AC6 违约）；当前测试用于防止该缺陷回归。
+    本测试只断言依赖边界：模块 import 共享包，且 ``compile_policy`` 函数体
+    引用 ``canonicalize_policy``，不锁具体实现行号。
     """
     source = _module_source("komari_bot/plugins/group_admission/policy.py")
     tree = ast.parse(source)

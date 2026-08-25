@@ -11,8 +11,9 @@
 - AC4 policy GET/PUT 访问真实持久配置，status 对三态返回安全投影；
 - AC9 Router 仍只装配一次。
 
-红基线：生产未装配 driver startup hook 时，``lifecycle_context`` 捕获不到
-钩子，本文件用例在调用 startup 钩子处失败（red）。
+修复前红基线：旧实现生产代码未装配 driver startup hook，
+``lifecycle_context`` 捕获不到钩子，本文件用例在调用 startup 钩子处失败
+（red）；当前测试用于防止该缺陷回归。
 """
 
 from __future__ import annotations

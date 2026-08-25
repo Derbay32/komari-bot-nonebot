@@ -11,9 +11,10 @@
 - AC7 真实 driver lifecycle 证明生产 runtime 启动（本文件全部用例只经
   driver hooks 驱动启动）。
 
-红基线：当前生产代码尚未装配 driver lifespan hooks 与 scheduler job，本文件
-用例因 ``lifecycle_context`` 捕获到的 ``startup_hooks`` / ``shutdown_hooks``
-为空、scheduler 零注册而失败（red）。
+修复前红基线：旧实现生产代码尚未装配 driver lifespan hooks 与 scheduler
+job，本文件用例因 ``lifecycle_context`` 捕获到的 ``startup_hooks`` /
+``shutdown_hooks`` 为空、scheduler 零注册而失败（red）；当前测试用于防止
+该缺陷回归。
 """
 
 from __future__ import annotations
