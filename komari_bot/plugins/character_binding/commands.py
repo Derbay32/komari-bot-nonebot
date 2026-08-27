@@ -11,6 +11,7 @@ from nonebot.adapters.onebot.v11 import Message, MessageEvent  # noqa: TC002
 from nonebot.params import CommandArg, Depends
 
 from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification, adjudicate
 
 from .manager import (
     BindingPersistenceError,
@@ -18,6 +19,18 @@ from .manager import (
     CharacterNameValidationError,
     get_manager,
 )
+
+
+def _group_admitted(event: MessageEvent) -> bool:
+    """对事件的关联群执行统一准入复查。
+
+    命令只会在群内触发：无合法群号（私聊/归属缺失）或策略受限时返回
+    ``False``，由调用方静默跳过，不提示、不响应。
+    """
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return False
+    return adjudicate([group_id]).qualification is AdmissionQualification.BUSINESS
 
 
 @dataclass(slots=True)
@@ -82,6 +95,10 @@ async def handle_bind_help(event: MessageEvent) -> None:
     Args:
         event: 消息事件
     """
+    # 统一准入复查：不通过则静默跳过
+    if not _group_admitted(event):
+        return
+
     user_id = str(event.user_id)
     manager = get_manager()
 
@@ -114,10 +131,15 @@ bind_set = on_command(("bind", "set"), priority=10, block=True)
 
 @bind_set.handle()
 async def handle_set(
+    event: MessageEvent,
     request: BindSetRequest = Depends(parse_self_bind_set_request),
     manager: CharacterBindingManager = Depends(get_manager),
 ) -> None:
     """处理普通用户设置绑定命令。"""
+    # 统一准入复查：不通过则静默跳过
+    if not _group_admitted(event):
+        return
+
     if not request.character_name:
         await bind_set.finish("❌ 请提供角色名\n用法: .bind set <角色名>")
 
@@ -138,10 +160,15 @@ bind_del = on_command(("bind", "del"), priority=10, block=True)
 
 @bind_del.handle()
 async def handle_del(
+    event: MessageEvent,
     request: BindDeleteRequest = Depends(parse_self_bind_delete_request),
     manager: CharacterBindingManager = Depends(get_manager),
 ) -> None:
     """处理普通用户删除绑定命令。"""
+    # 统一准入复查：不通过则静默跳过
+    if not _group_admitted(event):
+        return
+
     try:
         success = await manager.remove_character_name(request.target_user_id)
     except BindingPersistenceError:
@@ -158,10 +185,15 @@ bind_list = on_command(("bind", "list"), priority=10, block=True)
 
 @bind_list.handle()
 async def handle_list(
+    event: MessageEvent,
     user_id: str = Depends(get_event_user_id),
     manager: CharacterBindingManager = Depends(get_manager),
 ) -> None:
     """处理普通用户查看绑定列表命令。"""
+    # 统一准入复查：不通过则静默跳过
+    if not _group_admitted(event):
+        return
+
     bindings = manager.list_bindings()
 
     if not bindings:

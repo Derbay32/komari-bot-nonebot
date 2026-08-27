@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from nonebot import logger
 from nonebot.plugin import require
 
+from .admission_gate import SummaryAdmissionDeniedError, ensure_effect_admitted
 from .group_lock import GroupSummaryLockLostError, group_summary_lock_manager
 from .history_service import (
     HistoryFetchMetadata,
@@ -175,6 +176,7 @@ async def _execute_group_summary_core(
         model=config.summary_model,
         temperature=config.summary_temperature,
         max_tokens=config.summary_max_tokens,
+        group_id=group_id,
         assistant_prefill_enabled=config.assistant_prefill_enabled,
         dsv4_roleplay_instruct_mode=config.dsv4_roleplay_instruct_mode,
         thinking_mode=config.summary_thinking_mode,
@@ -197,6 +199,9 @@ async def _execute_group_summary_core(
         filtered_messages[-1].timestamp,
     )
     subtitle = f"{filter_label} {len(filtered_messages)} 条 | {time_range}"
+    # TSK-229：图片渲染为不可分瞬时效果；渲染前按目标群 BUSINESS 裁决，
+    # 受限即抛 SummaryAdmissionDeniedError 终止本任务（正常控制流）。
+    ensure_effect_admitted(group_id=group_id)
     image_render = await asyncio.to_thread(
         render_summary_image_pages_base64,
         title=SUMMARY_TITLE,
@@ -304,6 +309,25 @@ async def execute_group_summary(
                     collector=collector,
                     history_capability_confirmed=history_capability_confirmed,
                 )
+            )
+        except SummaryAdmissionDeniedError:
+            # 准入拒绝为正常控制流：不记错误、不发正常失败通知/retry，瞬时
+            # 任务终止且恢复后不复活；仍释放群锁（由 finally 统一收口）。
+            return SummaryExecutionResult(
+                summary_text="",
+                filtered_message_count=0,
+                plan_result=SummaryPlanResult(
+                    messages=[],
+                    tool_result=None,
+                    planner_note="",
+                    rounds_used=0,
+                ),
+                image_base64="",
+                image_pages_base64=(),
+                image_truncated=False,
+                filter_label="无",
+                time_range="无",
+                history_fetch=None,
             )
         except GroupSummaryLockLostError as exc:
             error = SummaryServiceUnavailableError(

@@ -1,7 +1,10 @@
 """角色绑定插件 - 提供跨插件的角色名管理功能。"""
 
 from nonebot import get_driver
-from nonebot.plugin import PluginMetadata
+from nonebot.plugin import PluginMetadata, require
+
+# 依赖统一群聊准入插件
+require("group_admission")
 
 from .manager import CharacterBindingManager, get_manager
 

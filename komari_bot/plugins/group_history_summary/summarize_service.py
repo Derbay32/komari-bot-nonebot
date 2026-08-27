@@ -13,6 +13,7 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 
+from .admission_gate import ensure_effect_admitted
 from .history_service import HistoryMessage, format_message_for_prompt
 from .prompt_template import get_template
 
@@ -62,6 +63,7 @@ async def _summarize_history_internal(
     temperature: float,
     max_tokens: int,
     *,
+    group_id: str | None = None,
     assistant_prefill_enabled: bool = False,
     dsv4_roleplay_instruct_mode: str = "auto",
     thinking_mode: bool = False,
@@ -124,6 +126,9 @@ async def _summarize_history_internal(
             "request_api": request_api,
             "stream_enabled": stream_enabled,
         }
+        # TSK-229：summary LLM 为不可分瞬时效果；调用前按目标群 BUSINESS
+        # 裁决，受限即抛 SummaryAdmissionDeniedError 终止本任务（正常控制流）。
+        ensure_effect_admitted(group_id=group_id)
         try:
             completion = await llm_provider.generate_messages_completion(
                 **request_data,
@@ -160,6 +165,8 @@ async def _summarize_history_internal(
 
         return summary_text, completion
 
+    # TSK-229：非 collector 便捷路径同样在 summary LLM 前按目标群裁决。
+    ensure_effect_admitted(group_id=group_id)
     raw_result = await llm_provider.generate_text_with_messages(
         messages=messages,  # type: ignore[arg-type]
         model=model,
@@ -185,6 +192,7 @@ async def summarize_history_messages(
     temperature: float,
     max_tokens: int,
     *,
+    group_id: str | None = None,
     assistant_prefill_enabled: bool = False,
     dsv4_roleplay_instruct_mode: str = "auto",
     thinking_mode: bool = False,
@@ -200,6 +208,7 @@ async def summarize_history_messages(
         model,
         temperature,
         max_tokens,
+        group_id=group_id,
         assistant_prefill_enabled=assistant_prefill_enabled,
         dsv4_roleplay_instruct_mode=dsv4_roleplay_instruct_mode,
         thinking_mode=thinking_mode,

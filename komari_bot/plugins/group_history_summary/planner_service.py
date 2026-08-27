@@ -15,6 +15,7 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 
+from .admission_gate import ensure_effect_admitted
 from .history_service import (
     HistoryFetchMetadata,
     HistoryFetchResult,
@@ -262,6 +263,9 @@ async def _fetch_history_window(
 ) -> HistoryFetchResult:
     from .history_service import fetch_group_history_messages
 
+    # TSK-229：具体群平台读取为不可分瞬时效果；调用 get_group_msg_history
+    # 前按目标群 BUSINESS 裁决，受限即抛 SummaryAdmissionDeniedError 终止。
+    ensure_effect_admitted(group_id=group_id)
     return await fetch_group_history_messages(
         bot=bot,
         group_id=group_id,
@@ -617,6 +621,9 @@ async def plan_summary_request(
         # 行为），非思考模式保留 auto 选择。
         if not planning_thinking_mode:
             request_data["tool_choice"] = "auto"
+        # TSK-229：planning LLM 为不可分瞬时效果；调用前按目标群 BUSINESS
+        # 裁决，受限即抛 SummaryAdmissionDeniedError 终止本任务（正常控制流）。
+        ensure_effect_admitted(group_id=group_id)
         try:
             completion = cast(
                 "LLMCompletionResultSchema",

@@ -10,6 +10,7 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
 from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification, adjudicate
 
 from .event_support import is_superuser_id
 from .models import (
@@ -63,6 +64,18 @@ def _parse_list_scope(value: str) -> tuple[bool, BanScope | None]:
             return True, None
         case _:
             return False, None
+
+
+def _group_admitted(event: MessageEvent) -> bool:
+    """对事件的关联群执行统一准入复查。
+
+    SUPERUSER 身份鉴权不构成准入 bypass：受限群即使由 SUPERUSER 触发也静默
+    拒绝，不部署封禁/解封效果。
+    """
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return False
+    return adjudicate([group_id]).qualification is AdmissionQualification.BUSINESS
 
 
 def _scope_label(scope: BanTargetScope) -> str:
@@ -238,6 +251,9 @@ async def handle_ban(
     """处理封禁、状态查询和列表命令。"""
     if not await SUPERUSER(bot, event):
         await ban_matcher.finish("❌ 仅限 SUPERUSER 使用")
+    # 统一准入复查：受限群即使 SUPERUSER 也静默跳过
+    if not _group_admitted(event):
+        return
     tokens = args.extract_plain_text().strip().split()
     if not tokens:
         await ban_matcher.finish(USAGE)
@@ -296,6 +312,9 @@ async def handle_unban(
     """处理解封命令。"""
     if not await SUPERUSER(bot, event):
         await unban_matcher.finish("❌ 仅限 SUPERUSER 使用")
+    # 统一准入复查：受限群即使 SUPERUSER 也静默跳过
+    if not _group_admitted(event):
+        return
     tokens = args.extract_plain_text().strip().split()
     if len(tokens) != 2:
         await unban_matcher.finish("❌ 解封参数无效\n" + USAGE)

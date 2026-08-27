@@ -78,8 +78,15 @@ async def _read_single_image(
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
+    group_id: str | None = None,
 ) -> str:
     """调用视觉模型读取单张图片。"""
+    # TSK-225：视觉 LLM 效果准入——入口与效果启动前各裁决一次（阶段屏障）。
+    # 受限/故障关闭时安静丢弃，视觉 provider 恒不被调用、不插入无关 await。
+    from .admission_gate import effect_business_admitted
+
+    if not effect_business_admitted(group_id=group_id):
+        return "[图片读取失败: 准入拒绝]"
     config = cast("DynamicConfigSchema", llm_provider_config_manager.get())
     if not config.api_token:
         return "[图片读取失败: 未配置 api_token]"
@@ -116,6 +123,10 @@ async def _read_single_image(
             len(image_data_uri),
         )
         async with _VISION_READ_SEMAPHORE:
+            # TSK-225 阶段屏障：视觉效果启动前最后同步裁决；期间策略翻转受限
+            # 后效果不得启动。
+            if not effect_business_admitted(group_id=group_id):
+                return "[图片读取失败: 准入拒绝]"
             completion = await llm_provider.generate_messages_completion(
                 **request_data,
                 request_trace_id=request_trace_id or "",
@@ -198,6 +209,7 @@ async def read_images(
     request_trace_id: str | None = None,
     parent_call_id: str | None = None,
     collector: "LLMDiagnosticCollector | None" = None,
+    group_id: str | None = None,
 ) -> list[str]:
     """调用多模态 AI 读取图片，返回图片描述列表。"""
     if not base64_images:
@@ -221,6 +233,7 @@ async def read_images(
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,
+                group_id=group_id,
             )
             for index, image_data_uri in enumerate(base64_images)
         )

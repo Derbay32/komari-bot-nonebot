@@ -1,10 +1,8 @@
 """Komari Search 动态配置 Schema（v2.0：双提供者 + 网页抓取）。"""
 
-from typing import Any, ClassVar, Literal
+from typing import ClassVar, Literal
 
-from pydantic import field_validator
 from sqlalchemy import Column, String
-from sqlalchemy.dialects.postgresql import JSONB
 
 from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 
@@ -18,13 +16,6 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     model_config = typed_model_config(json_schema_extra={"default_apply_mode": "immediate"})
 
     plugin_enable: bool = Field(default=False, description="插件启用状态")
-    user_whitelist: list[str] = Field(
-        default_factory=list, description="用户白名单", sa_type=JSONB
-    )
-    group_whitelist: list[str] = Field(
-        default_factory=list, description="群聊白名单", sa_type=JSONB
-    )
-
     search_provider: Literal["tavily", "exa"] = Field(
         default="tavily",
         sa_column=Column(String(16), nullable=False, default="tavily"),
@@ -109,17 +100,3 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         le=300.0,
         description="服务熔断后的探测等待时间（秒）",
     )
-
-    @field_validator("user_whitelist", "group_whitelist", mode="before")
-    @classmethod
-    def parse_list_string(cls, v: Any) -> Any:
-        """兼容 JSON 字符串与逗号分隔白名单配置。"""
-        if isinstance(v, str):
-            import json
-
-            try:
-                parsed = json.loads(v)
-                return [str(item) for item in parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [item.strip() for item in v.split(",") if item.strip()]
-        return v

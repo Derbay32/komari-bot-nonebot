@@ -241,7 +241,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
 
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0010")
+    result = _run_bootstrap(scratch_url, "upgrade", "0011")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**scratch)
     operation_ids = [
@@ -254,7 +254,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
     ]
     now = datetime.now(UTC)
     try:
-        result = _run_bootstrap(scratch_url, "downgrade", "0009")
+        result = _run_bootstrap(scratch_url, "downgrade", "0010")
         assert result.returncode == 0, result.stderr
 
         await _insert_legacy_row(
@@ -340,7 +340,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
             not_delivered_at=now - timedelta(minutes=1),
         )
 
-        result = _run_bootstrap(scratch_url, "upgrade", "0010")
+        result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode == 0, result.stderr
 
         parents = await connection.fetch(
@@ -462,7 +462,7 @@ async def test_backfill_maps_six_legacy_states_and_is_repeatable() -> None:
         )
 
         before_repeat = [dict(row) for row in parents] + [dict(row) for row in children]
-        result = _run_bootstrap(scratch_url, "upgrade", "0010")
+        result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode == 0, result.stderr
         repeated_parents = await connection.fetch(
             """
@@ -501,14 +501,14 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
 
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0010")
+    result = _run_bootstrap(scratch_url, "upgrade", "0011")
     assert result.returncode == 0, result.stderr
     connection = await asyncpg.connect(**scratch)
     operation_ids = ["tsk86-safe-prepared", "tsk86-ambiguous-failed"]
     now = datetime.now(UTC)
     sensitive_reply = "不得出现在迁移错误里的正文"
     try:
-        result = _run_bootstrap(scratch_url, "downgrade", "0009")
+        result = _run_bootstrap(scratch_url, "downgrade", "0010")
         assert result.returncode == 0, result.stderr
         await _insert_legacy_row(
             connection,
@@ -541,16 +541,18 @@ async def test_ambiguous_failed_history_aborts_before_any_backfill() -> None:
             sensitive_reply,
         )
 
-        result = _run_bootstrap(scratch_url, "upgrade", "0010")
+        result = _run_bootstrap(scratch_url, "upgrade", "0011")
         assert result.returncode != 0
         output = f"{result.stdout}\n{result.stderr}"
+        # TSK-232 对齐：错误面收敛为 closed 聚合 count，不再携带
+        # minimum_fulfillment_id 动态身份。
         assert "ambiguous_failed_count=1" in output
-        assert f"minimum_fulfillment_id={operation_ids[1]}" in output
+        assert "minimum_fulfillment_id" not in output
         assert sensitive_reply not in output
 
         assert (
             await connection.fetchval("SELECT version_num FROM alembic_version")
-            == "0009"
+            == "0010"
         )
         assert (
             await connection.fetchval(

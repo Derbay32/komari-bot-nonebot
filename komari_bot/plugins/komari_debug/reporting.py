@@ -35,6 +35,21 @@ MAX_NODES_PER_BATCH = 50
 _ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
+def _group_business_admitted(group_id: int | None) -> bool:
+    """对群公开诊断结果执行一次 BUSINESS 裁决（TSK-229 / 摘要.debug_public）。
+
+    同步、无 I/O；只认 ``business`` 资格。缺值视为不可靠归属，故障关闭拒绝。
+    调用面读取顶层 ``adjudicate``（包级运行时属性解析，可被测试替身替换拦截），
+    只在被调用时惰性 import，避免测试 / 插件装载期触发 ``require``。
+    """
+    if group_id is None:
+        return False
+    import komari_bot.plugins.group_admission as admission_pkg
+
+    result = admission_pkg.adjudicate((int(group_id),))
+    return result.qualification.value == "business"
+
+
 @dataclass(frozen=True, slots=True)
 class DiagnosticDeliveryResult:
     """完整私聊报告与可选公开脱敏报告的投递结果。"""
@@ -455,6 +470,14 @@ async def build_and_send_diagnostic_report(
 
     public_delivered: bool | None = None
     if public_group_id is not None:
+        # TSK-229：群公开结果为不可分瞬时效果，投递前按目标群 BUSINESS 裁决；
+        # 受限则正常丢弃该群公开结果，不发送、不通知。完整私聊诊断
+        # （SUPERUSER 运维类别）不受群限制，已在上面投递完毕。
+        if not _group_business_admitted(public_group_id):
+            return DiagnosticDeliveryResult(
+                private_delivered=private_delivered,
+                public_delivered=None,
+            )
         public_chapters = _build_chapters(
             collector,
             result_type,

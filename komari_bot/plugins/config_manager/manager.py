@@ -7,6 +7,7 @@ NoneBot dotenv 或进程环境变量提供，不进入本管理器。
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from threading import RLock
@@ -43,6 +44,23 @@ class _ConfigSyncResult:
     changed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigSnapshot:
+    """进程内不可变的版本化配置快照。
+
+    原子包含 ``value / revision / updated_at`` 三元组：整体为 frozen/slots
+    值对象，manager 以单次引用替换方式发布，并发读取只能观察到完整旧快照
+    或完整新快照，不会撕裂。
+
+    ``value`` 运行时始终是 config_schema 校验通过的 BaseModel 实例，绝不暴露
+    存储 dict；静态类型标注为 Any 以兼容不同插件 Schema。
+    """
+
+    value: Any
+    revision: int
+    updated_at: datetime
+
+
 class ConfigManager:
     """通用配置管理器。
 
@@ -75,6 +93,8 @@ class ConfigManager:
             else _DEFAULT_CONFIG_MAX_STALENESS_SECONDS
         )
         self._watcher_registered = False
+        self._snapshot: ConfigSnapshot | None = None
+        self._snapshot_listeners: list[Callable[[ConfigSnapshot], None]] = []
         self._state_lock = RLock()
         self._sync_lock = RLock()
         self._async_lock = asyncio.Lock()
@@ -191,19 +211,78 @@ class ConfigManager:
 
     def _cache_stored_config(self, stored: StoredConfig) -> BaseModel:
         """用数据库返回值刷新当前进程缓存。"""
+        return self._accept_stored_snapshot(stored).value
+
+    def _accept_stored_snapshot(self, stored: StoredConfig) -> ConfigSnapshot:
+        """接纳本地写入或 watcher 发现的存储快照。
+
+        只有严格更高的 revision 才会替换当前快照；相同、较低或乱序 revision
+        一律拒绝，不回退也不重复发布。当前引用替换与 listener 发布在同一把
+        状态锁边界内完成，调用方不得分别读取可撕裂的字段。
+        """
         config = self._config_schema(**stored.config_data)
         with self._state_lock:
             self._last_revision_checked_at = monotonic()
-            if (
-                self._revision is not None
-                and stored.revision < self._revision
-                and self._dynamic_config is not None
-            ):
-                return self._dynamic_config
+            current = self._snapshot
+            if current is not None and stored.revision <= current.revision:
+                return current
+            snapshot = ConfigSnapshot(
+                value=config,
+                revision=stored.revision,
+                updated_at=stored.updated_at,
+            )
+            self._snapshot = snapshot
             self._dynamic_config = config
             self._last_loaded_at = stored.updated_at
             self._revision = stored.revision
-            return config
+            self._publish_snapshot_locked(snapshot)
+            return snapshot
+
+    def _publish_snapshot_locked(self, snapshot: ConfigSnapshot) -> None:
+        """在状态锁内同步通知全部 listener；单个回调异常不影响其他 listener。"""
+        for listener in tuple(self._snapshot_listeners):
+            try:
+                listener(snapshot)
+            except Exception as exc:
+                logger.warning(
+                    f"[{self._plugin_name}] 配置快照 listener 回调失败: "
+                    f"revision={snapshot.revision}, error={type(exc).__name__}"
+                )
+
+    def get_cached_versioned_snapshot(self) -> ConfigSnapshot:
+        """读取进程内不可变版本化配置快照。
+
+        原子包含 ``value / revision / updated_at``，只读进程内缓存、不做任何
+        存储 I/O；配置未初始化时通过 RuntimeError fail-fast。
+        """
+        snapshot = self._snapshot
+        if snapshot is None:
+            msg = (
+                f"[{self._plugin_name}] 配置尚未初始化，无法读取版本化快照，"
+                "请先调用 initialize() 或 initialize_async()"
+            )
+            raise RuntimeError(msg)
+        return snapshot
+
+    def register_snapshot_listener(
+        self,
+        callback: Callable[[ConfigSnapshot], None],
+    ) -> None:
+        """注册快照 listener，在接纳严格更高 revision 后同步调用。
+
+        listener 只在新快照已被 manager 完整接纳并替换当前引用后调用，
+        回调内读取 ``get_cached_versioned_snapshot()`` 必然得到同一快照。
+        """
+        with self._state_lock:
+            self._snapshot_listeners.append(callback)
+
+    def unregister_snapshot_listener(
+        self,
+        callback: Callable[[ConfigSnapshot], None],
+    ) -> None:
+        """注销快照 listener；未注册时静默忽略，注销仅停止后续回调。"""
+        with self._state_lock, suppress(ValueError):
+            self._snapshot_listeners.remove(callback)
 
     def _build_sync_result(
         self,
@@ -504,6 +583,49 @@ class ConfigManager:
                 )
 
             return self._raise_update_conflict(field_name)
+
+    async def update_field_if_revision_async(
+        self,
+        field_name: str,
+        value: Any,
+        *,
+        expected_revision: int,
+    ) -> ConfigSnapshot | None:
+        """异步执行单次 strict CAS 字段更新。
+
+        仅按给定 ``expected_revision`` 发出一次底层 CAS：成功时接纳新修订、
+        同步发布快照并在发布后返回新快照；冲突时明确返回 ``None``，不读取
+        数据库最新值、不自动重试、不重放覆盖、不发布任何快照。与
+        ``update_field_async`` / ``mutate_field_async`` 的冲突重试语义相互独立。
+        """
+        async with self._async_lock:
+            base_snapshot = self._snapshot
+            if base_snapshot is None:
+                msg = (
+                    f"[{self._plugin_name}] 配置尚未初始化，无法执行 strict CAS 更新"
+                )
+                raise RuntimeError(msg)
+            if field_name not in self._config_schema.model_fields:
+                msg = f"未知的配置字段: {field_name}"
+                raise ValueError(msg)
+
+            current_dict = base_snapshot.value.model_dump()
+            current_dict[field_name] = value
+            new_config = self._config_schema(**current_dict)
+
+            updated = await get_config_storage().update_fields_if_revision_async(
+                plugin_name=self._plugin_name,
+                config=new_config,
+                field_names={field_name},
+                expected_revision=expected_revision,
+            )
+            if updated is None:
+                logger.info(
+                    f"[{self._plugin_name}] strict CAS 修订冲突，未更新配置: "
+                    f"field={field_name}, expected_revision={expected_revision}"
+                )
+                return None
+            return self._accept_stored_snapshot(updated)
 
     async def mutate_field_async(
         self,

@@ -11,6 +11,7 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import require
 
 from komari_bot.onebot.onebot_messages import plain_text_message
+from komari_bot.plugins.group_admission import AdmissionQualification, adjudicate
 
 from .config_schema import DynamicConfigSchema
 from .engine import get_engine
@@ -23,10 +24,9 @@ from .rendering import (
 from .scanner import HelpScanAlreadyRunningError, scan_and_sync
 
 require("config_manager")
-require("permission_manager")
+require("group_admission")
 
 from komari_bot.plugins import config_manager as config_manager_plugin
-from komari_bot.plugins import permission_manager as permission_manager_plugin
 
 config_manager = config_manager_plugin.get_config_manager(
     "komari_help",
@@ -42,13 +42,20 @@ help_refresh_cmd = on_command(
 )
 
 
-async def _check_runtime_permission(
-    bot: Bot,
-    event: MessageEvent,
-) -> tuple[bool, str]:
-    """读取当前配置并执行统一权限检查。"""
+async def _admission_gate(event: MessageEvent) -> bool:
+    """统一准入复查与本插件自有开关的前置门。
+
+    先由 ``group_admission`` 裁决关联群，获准后读取本插件自身
+    ``plugin_enable`` 进一步收窄；任一环节不满足都静默跳过。``plugin_enable``
+    只收窄不扩张：准入资格始终由裁决决定。
+    """
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return False
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
+        return False
     config = await config_manager.get_async()
-    return await permission_manager_plugin.check_runtime_permission(bot, event, config)
+    return bool(getattr(config, "plugin_enable", True))
 
 
 async def _build_overview() -> str:
@@ -73,13 +80,12 @@ async def _build_overview() -> str:
 
 @help_cmd.handle()
 async def handle_help(
-    bot: Bot,
     event: MessageEvent,
     args: Message = CommandArg(),
 ) -> None:
-    can_use, reason = await _check_runtime_permission(bot, event)
-    if not can_use:
-        await help_cmd.finish(plain_text_message(f"❌ {reason}"))
+    # 统一准入复查与插件开关前置门：不通过则静默跳过
+    if not await _admission_gate(event):
+        return
 
     query = args.extract_plain_text().strip()
     engine = get_engine()
@@ -98,13 +104,12 @@ async def handle_help(
 
 @help_list_cmd.handle()
 async def handle_help_list(
-    bot: Bot,
     event: MessageEvent,
     args: Message = CommandArg(),
 ) -> None:
-    can_use, reason = await _check_runtime_permission(bot, event)
-    if not can_use:
-        await help_list_cmd.finish(plain_text_message(f"❌ {reason}"))
+    # 统一准入复查与前置开关门：不通过则静默跳过
+    if not await _admission_gate(event):
+        return
 
     engine = get_engine()
     if engine is None:
@@ -142,9 +147,9 @@ async def handle_help_refresh(bot: Bot, event: MessageEvent) -> None:
     if not await SUPERUSER(bot, event):
         await help_refresh_cmd.finish("❌ 仅限 SUPERUSER 使用")
 
-    can_use, reason = await _check_runtime_permission(bot, event)
-    if not can_use:
-        await help_refresh_cmd.finish(plain_text_message(f"❌ {reason}"))
+    # 统一准入复查与前置开关门：不通过则静默跳过
+    if not await _admission_gate(event):
+        return
 
     engine = get_engine()
     if engine is None:

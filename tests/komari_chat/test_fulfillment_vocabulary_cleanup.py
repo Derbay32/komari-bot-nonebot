@@ -1,8 +1,9 @@
 """TSK-121: 履约链路日志与租约方法名词汇收尾验收测试。
 
 验收对象（红线基线，实现落地前预期全红，防漂移锚点除外）：
-- ``reply_fulfillment_workflow`` 内 9 处 ``operation={}`` 日志标签改为
-  ``fulfillment={}``，中文正文里的「operation」措辞对齐为「履约」；
+- ``reply_fulfillment_workflow`` 内日志标签统一为 ``fulfillment={}``；
+  中文正文里的「operation」措辞对齐为「履约」（TSK-228 新增受限准备与
+  受限恢复终止两条履约日志，计数从 9 增至 11）；
 - ``ReplyFulfillmentRepository`` 方法改名：``has_active_operation`` ->
   ``has_fulfillment``、``claim_operation`` -> ``claim_lease``（并入既有
   ``renew_lease`` / ``release_lease`` 租约家族）；两处 Protocol 声明
@@ -27,7 +28,7 @@ from komari_bot.plugins.komari_chat.services import (
     reply_fulfillment_workflow,
 )
 
-WORKFLOW_LOG_TAG_COUNT = 9
+WORKFLOW_LOG_TAG_COUNT = 11
 
 
 def _workflow_source() -> str:
@@ -67,7 +68,7 @@ def _commitment_executor_protocol() -> object:
 
 
 def test_workflow_log_tags_use_fulfillment_label() -> None:
-    """验收标准 1a：9 处 operation={} 日志标签全部改为 fulfillment={}。
+    """验收标准 1a：日志标签全部统一为 fulfillment={}。
 
     插值参数本就是 fulfillment_id，标签与措辞不得再保留 operation 争议名。
     """

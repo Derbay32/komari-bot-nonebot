@@ -103,15 +103,16 @@ def _install_permission(
     allowed: bool,
     calls: list[str],
 ) -> None:
-    async def _check_permission(*_args: object) -> tuple[bool, str]:
+    def _adjudicate(_groups: object) -> object:
         calls.append("permission")
-        return allowed, "无权限"
+        qualification = (
+            summary_module.AdmissionQualification.BUSINESS
+            if allowed
+            else summary_module.AdmissionQualification.REJECTED
+        )
+        return SimpleNamespace(qualification=qualification)
 
-    monkeypatch.setattr(
-        summary_module,
-        "permission_manager_plugin",
-        SimpleNamespace(check_runtime_permission=_check_permission),
-    )
+    monkeypatch.setattr(summary_module, "adjudicate", _adjudicate)
 
 
 def _tracked_async_result(

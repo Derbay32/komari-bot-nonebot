@@ -146,6 +146,10 @@ typeCheckingMode = "standard"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
+markers = [
+    "group_admission_acceptance: 统一群聊准入验收测试（TSK-218 冻结 marker）",
+    "group_admission_service: 统一群聊准入需真实 PostgreSQL/Redis 服务的验收测试（TSK-218 冻结 marker）",
+]
 filterwarnings = [
     "error:Failing to pass a value to the 'type_params'.*:DeprecationWarning:nonebot\\.typing",
 ]

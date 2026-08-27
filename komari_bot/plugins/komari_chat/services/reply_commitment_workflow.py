@@ -34,6 +34,10 @@ from ..reply_fulfillment_domain import (
     COMMITMENT_ORDER,
     ReplyFulfillmentConflictError,
 )
+from .admission_gate import (
+    reply_fulfillment_cleanup_authorized,
+    reply_fulfillment_finalization_granted,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -130,6 +134,11 @@ class _CommitmentExecutorRepository(Protocol):
         owner_token: str,
     ) -> bool: ...
 
+    async def load_parent_attribution(
+        self,
+        fulfillment_id: str,
+    ) -> dict[str, Any] | None: ...
+
 
 def _build_payload(commitment_type: str, raw: object) -> Any:
     """把持久载荷构造成冻结领域值对象（invalid_payload 的分类点）。
@@ -195,6 +204,8 @@ class ReplyCommitmentWorkflow:
         self.user_data = user_data
         self.config_getter = config_getter
         self._owner_token = f"commit-{uuid.uuid4().hex}"
+        # 父归属缺失的安全持有告警去重（单 worker 部署，进程内即可）。
+        self._held_warnings: set[str] = set()
 
     async def recover_pending(self) -> int:
         """领取 DELIVERED 父项并兑现其当前到期承诺，返回完成父项数。
@@ -282,6 +293,7 @@ class ReplyCommitmentWorkflow:
         不可反转，任一步失败由调用方隔离并归还租约。
         """
         fulfillment_id = str(record["fulfillment_id"])
+        reply_fulfillment_cleanup_authorized(group_id=record.get("group_id"))
         evidence_cleared = record.get("idempotency_evidence_cleared_at") is not None
         if not evidence_cleared:
             await self.redis.delete_chat_commit_evidence(fulfillment_id)
@@ -360,13 +372,18 @@ class ReplyCommitmentWorkflow:
         if rows is None:
             # 父租约已不属于自己（丢失或被回收），立即中止本轮。
             return False
+        parent = await self.repository.load_parent_attribution(fulfillment_id)
         for row in sorted(
             rows,
             key=lambda item: COMMITMENT_ORDER.get(
                 str(item["commitment_type"]), len(COMMITMENT_ORDER)
             ),
         ):
-            if lease_lost.is_set() or not await self._process_commitment_row(
+            if lease_lost.is_set():
+                return False
+            if not await self._commitment_gate(fulfillment_id, parent):
+                return False
+            if not await self._process_commitment_row(
                 fulfillment_id,
                 row,
                 lease_lost,
@@ -380,6 +397,31 @@ class ReplyCommitmentWorkflow:
                 owner_token=self._owner_token,
             )
         )
+
+    async def _commitment_gate(
+        self,
+        fulfillment_id: str,
+        parent: dict[str, Any] | None,
+    ) -> bool:
+        """每项冻结承诺执行前的独立准入裁决（FACT_FINALIZATION）。
+
+        按父记录最小群归属复核：父归属缺失（无记录 / group_id 为空或
+        缺失）进入安全持有态并告警一次，不执行、不删除、不自动重试、
+        不随策略修订唤醒；归属可解析时按 FACT_FINALIZATION 重裁决，受限
+        （REJECTED）即被拦截中止本轮（释放父租约休眠）。一次裁决只授
+        权紧随其后的那一个不可分承诺效果，不跨项缓存。
+        """
+        group_id = parent.get("group_id") if parent else None
+        granted = reply_fulfillment_finalization_granted(group_id=group_id)
+        if group_id is None or str(group_id).strip() == "":
+            if fulfillment_id not in self._held_warnings:
+                self._held_warnings.add(fulfillment_id)
+                logger.warning(
+                    "[KomariChat] 送达承诺父归属缺失，进入安全持有: fulfillment={}",
+                    fulfillment_id,
+                )
+            return False
+        return granted
 
     async def _process_commitment_row(
         self,

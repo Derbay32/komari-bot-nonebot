@@ -6,9 +6,13 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import nonebot.plugin
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -237,44 +241,6 @@ class _DummyUserDataPlugin:
         return 0
 
 
-class _DummyPermissionManagerPlugin:
-    @staticmethod
-    def check_context_permission(
-        config: object,
-        *,
-        user_id: str,
-        group_id: str | None,
-        is_superuser: bool = False,
-    ) -> tuple[bool, str]:
-        if not bool(getattr(config, "plugin_enable", True)):
-            return False, "插件当前已禁用"
-        if is_superuser:
-            return True, ""
-        user_whitelist = getattr(config, "user_whitelist", [])
-        group_whitelist = getattr(config, "group_whitelist", [])
-        if user_whitelist and user_id not in user_whitelist:
-            return False, "用户不在白名单"
-        if group_id is not None and group_whitelist and group_id not in group_whitelist:
-            return False, "群组不在白名单"
-        return True, ""
-
-    @staticmethod
-    async def check_runtime_permission(
-        _bot: object,
-        _event: object,
-        _config: object,
-    ) -> tuple[bool, str]:
-        return True, ""
-
-    @staticmethod
-    async def check_plugin_status(_config: object) -> tuple[bool, str]:
-        return True, "🟢 正常"
-
-    @staticmethod
-    def format_permission_info(_config: object) -> str:
-        return "权限正常"
-
-
 class _DummyUserBanPlugin:
     class BanServiceUnavailableError(RuntimeError):
         pass
@@ -413,13 +379,32 @@ class _DummyDecisionPlugin:
     pass
 
 
+class _DummyGroupAdmissionPlugin:
+    """require("group_admission") 只作加载声明，返回值不承载业务符号。
+
+    业务裁决/状态符号一律由真实顶层包暴露面提供（ADR-0006），本票不对
+    该包注入 shim，保证测试能验证真实顶层 ``__all__``。
+    """
+
+
+class _DummyApschedulerPlugin:
+    """require("nonebot_plugin_apscheduler") 只作加载声明。
+
+    TSK-248 起 group_admission 作为首个未 shim 的真实插件在包入口声明该硬
+    依赖；实际 scheduler 对象由本文件顶部 ``sys.modules`` 的
+    ``nonebot_plugin_apscheduler`` shim（``_DummyScheduler``）提供，
+    ``lifecycle_context`` 会把它替换为可记录 fake。
+    """
+
+
 _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
+    "group_admission": _DummyGroupAdmissionPlugin(),
+    "nonebot_plugin_apscheduler": _DummyApschedulerPlugin(),
     "llm_provider": _DummyLLMProvider(),
     "agent_run_logger": _DummyAgentRunLoggerPlugin(),
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
-    "permission_manager": _DummyPermissionManagerPlugin(),
     "user_ban": _DummyUserBanPlugin(),
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
@@ -443,10 +428,26 @@ def _fake_require(name: str) -> object:
 nonebot.plugin.require = _fake_require
 
 
-# 为 komari_debug 测试注入包级导出到 shim
+# 为 komari_debug 测试注入包级导出到 shim；group_admission 按 ADR-0006 从
+# config_manager 顶层 import 版本化快照类型，因此注入真实类型身份（来自 .manager
+# 子模块），dummy get_config_manager 保留且不获得新业务行为。
+from komari_bot.plugins.config_manager.manager import (
+    ConfigManager as _RealConfigManager,
+)
+from komari_bot.plugins.config_manager.manager import (
+    ConfigSnapshot as _RealConfigSnapshot,
+)
+
 _inject_package_exports(
     "config_manager",
     {"get_config_manager": _DummyConfigManagerPlugin.get_config_manager},
+)
+_inject_package_exports(
+    "config_manager",
+    {
+        "ConfigManager": _RealConfigManager,
+        "ConfigSnapshot": _RealConfigSnapshot,
+    },
 )
 _inject_package_exports(
     "character_binding",
@@ -538,3 +539,44 @@ _inject_package_exports(
         "generate_completion": _DummyLLMProvider.generate_completion,
     },
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_event_gate_preprocessor(request: pytest.FixtureRequest) -> Iterator[None]:
+    """隔离 ``group_admission`` 全局事件门禁前置处理器。
+
+    默认（无 ``group_admission_acceptance`` 标记）移除
+    ``_admission_event_gate`` 前置处理器，使现有 matcher 单元测试保持
+    隔离运行。标记为 ``group_admission_acceptance`` 的测试保留真实
+    全局门禁，由 ``event_gate_context`` 管理生命周期。
+
+    TSK-224 引入的全局事件门禁在 ``event_gate`` 模块 import 时自动注册
+    到 ``nonebot.message._event_preprocessors``。单跑特定测试文件时不受
+    影响，但全量测试套件中该门禁会拦截 komari_debug / komari_help / sr /
+    user_ban 等插件的 matcher 测试事件，导致 63 个假阳性失败。
+    """
+    # 延迟 import 避免模块加载副作用
+    from nonebot.message import _event_preprocessors
+
+    # 收集门禁条目：call.__module__ 匹配 event_gate 模块的 Dependent 对象
+    gate_entries = {
+        dep
+        for dep in _event_preprocessors
+        if getattr(dep, "call", None) is not None
+        and getattr(dep.call, "__module__", None)
+        == "komari_bot.plugins.group_admission.event_gate"
+    }
+
+    # 判断当前测试是否属于门禁验收套件
+    has_marker = (
+        request.node.get_closest_marker("group_admission_acceptance") is not None
+    )
+
+    if not has_marker and gate_entries:
+        _event_preprocessors.difference_update(gate_entries)
+
+    try:
+        yield
+    finally:
+        if not has_marker and gate_entries:
+            _event_preprocessors.update(gate_entries)

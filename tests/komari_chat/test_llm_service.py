@@ -389,19 +389,16 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     ]
     searched_queries: list[str] = []
     searched_trace_ids: list[str | None] = []
-    searched_contexts: list[tuple[str | None, str | None, bool]] = []
 
     async def _fake_search_web(
         query: str,
         *,
         request_trace_id: str | None = None,
-        caller_user_id: str | None = None,
-        caller_group_id: str | None = None,
-        caller_is_superuser: bool = False,
     ) -> str:
+        # ADR-0012 / TSK-225：komari_search.search_web 已移除 caller 名单门控，
+        # 工具边界不再携带调用者身份，只转发查询与 trace（策略无感）。
         searched_queries.append(query)
         searched_trace_ids.append(request_trace_id)
-        searched_contexts.append((caller_user_id, caller_group_id, caller_is_superuser))
         return "搜索结果：今天有一条新闻"
 
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
@@ -426,7 +423,8 @@ def test_generate_reply_with_tools_executes_search_tool_loop(monkeypatch: Any) -
     assert result.content == "根据搜索结果回答"
     assert searched_queries == ["今日新闻"]
     assert searched_trace_ids == ["chat-search-1"]
-    assert searched_contexts == [("user-1", "group-1", True)]
+    # ADR-0012 / TSK-225：工具边界不再向 search_web 转发调用者名单上下文
+    # （无 gating），故不再断言 caller_user_id/caller_group_id/caller_is_superuser。
     assert fake_provider.completion_calls[0]["tools"] == [
         llm_service_module.SEARCH_WEB_TOOL,
         llm_service_module.FINAL_RESPONSE_TOOL,

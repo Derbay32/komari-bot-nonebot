@@ -121,6 +121,11 @@ class ProposalRepository:
             vote_count=int(row.vote_count),
             required_votes=int(row.required_votes),
             voted_users=[str(item) for item in row.voted_users],
+            vote_epoch=int(row.vote_epoch),
+            vote_baseline_voters=[
+                str(item) for item in row.vote_baseline_voters
+            ],
+            dormant_seen=bool(row.dormant_seen),
             created_at=row.created_at,
             updated_at=row.updated_at,
             approved_at=row.approved_at,
@@ -315,6 +320,9 @@ class ProposalRepository:
             .where(
                 _P.c.publication_key == publication_key,
                 _P.c.status.in_(["publishing", "failed"]),
+                # TSK-232 联动：DEFERRED 与运维 hold 行不得被普通恢复触碰
+                _P.c.admission_state == "ACTIVE",
+                _P.c.execution_hold_code.is_(None),
                 or_(
                     _P.c.vote_message_id.is_(None),
                     _P.c.vote_message_id == message_id,
@@ -533,6 +541,49 @@ class ProposalRepository:
             await session.close()
         return self._row_to_proposal(row) if row is not None else None
 
+    async def mark_dormant(self, proposal_id: int) -> None:
+        """受限（休眠）期内记下休眠标记，供恢复获准后识别换届轮换。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(_P.c.id == proposal_id)
+            .values(dormant_seen=True, updated_at=func.now())
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                await session.execute(statement)
+        finally:
+            await session.close()
+
+    async def rotate_vote_epoch(
+        self,
+        proposal_id: int,
+        baseline_voters: list[str],
+    ) -> Proposal | None:
+        """恢复轮换：把沉睡期平台累积票整批记录为旧轮 baseline，轮次 +1。
+
+        轮次 +1 后新轮有效票 = 当前投票者 - baseline；并清除休眠标记。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(_P.c.id == proposal_id)
+            .values(
+                vote_epoch=_P.c.vote_epoch + 1,
+                vote_baseline_voters=baseline_voters,
+                dormant_seen=False,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        return self._row_to_proposal(row) if row is not None else None
+
     async def claim_for_approval(
         self,
         proposal_id: int,
@@ -547,6 +598,9 @@ class ProposalRepository:
             .where(
                 _P.c.id == proposal_id,
                 _P.c.vote_count >= _P.c.required_votes,
+                # TSK-232 联动：DEFERRED 与运维 hold 行不得被普通认领取走
+                _P.c.admission_state == "ACTIVE",
+                _P.c.execution_hold_code.is_(None),
                 or_(
                     and_(
                         _P.c.status == "voting",
@@ -577,6 +631,43 @@ class ProposalRepository:
         finally:
             await session.close()
         return self._row_to_proposal(row) if row is not None else None
+
+    async def wake_deferred(
+        self,
+        proposal_id: int,
+        *,
+        policy_revision: int,
+    ) -> Proposal | None:
+        """admitted 裁决后的幂等唤醒：CAS DEFERRED→ACTIVE。
+
+        仅当行仍处 DEFERRED 时翻转并记录触发 revision（同 revision 只
+        翻转一次）；已 ACTIVE 的重复唤醒幂等返回现值，不重置 revision。
+        翻转后普通认领路径即可正常取走该提案。
+        """
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(
+                _P.c.id == proposal_id,
+                _P.c.admission_state == "DEFERRED",
+            )
+            .values(
+                admission_state="ACTIVE",
+                admission_deferred_revision=policy_revision,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        if row is not None:
+            return self._row_to_proposal(row)
+        # 幂等回退：行不存在或已翻转，返回现值（缺失则为 None）。
+        return await self.get_by_id(proposal_id)
 
     async def list_approval_candidates(
         self,
@@ -643,6 +734,41 @@ class ProposalRepository:
                 await session.execute(statement)
         finally:
             await session.close()
+
+    async def mark_hold(
+        self,
+        proposal_id: int,
+        approval_token: str,
+        hold_code: str,
+    ) -> Proposal | None:
+        """把认领中的提案收敛为运维 hold（closed hold）。
+
+        知识写入 / 发布等出现不可自动恢复的冲突时，把提案移出可重试的投票 / 认
+        领流程并终止，阻断后续认领与采纳通知，等待另行鉴权的数据修复。"""
+        self._require_ready()
+        statement = (
+            update(ProposalRow)
+            .where(
+                _P.c.id == proposal_id,
+                _P.c.status == "approving",
+                _P.c.approval_token == approval_token,
+            )
+            .values(
+                status="hold",
+                approval_token=None,
+                approval_started_at=None,
+                publication_error_code=hold_code,
+                updated_at=func.now(),
+            )
+            .returning(ProposalRow)
+        )
+        session = _open_session()
+        try:
+            async with session.begin():
+                row = (await session.execute(statement)).scalars().one_or_none()
+        finally:
+            await session.close()
+        return self._row_to_proposal(row) if row is not None else None
 
     async def mark_approved(
         self,

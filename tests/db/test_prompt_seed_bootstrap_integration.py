@@ -387,7 +387,7 @@ async def test_old_db_migration_drops_output_instruction_and_keeps_custom_fields
 
     scratch = await _recreate_scratch_database("_promptmig")
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0011")
+    result = _run_bootstrap(scratch_url, "upgrade", "0008")
     assert result.returncode == 0, result.stderr
 
     connection = await asyncpg.connect(**scratch)
@@ -410,13 +410,25 @@ async def test_old_db_migration_drops_output_instruction_and_keeps_custom_fields
             "system",
         )
         old_columns = await _column_names(connection, "komari_prompt_komari_chat")
-        assert old_columns >= LEGACY_CHAT_COLUMNS, "0011 版本应具备旧 Prompt 列"
+        assert old_columns >= LEGACY_CHAT_COLUMNS, "0008 版本应具备旧 Prompt 列"
+
+        # TSK-232：分步升级跨 0012 backfill barrier 前按 operator 语义显式
+        # 提交准入策略（先升 0010 建表，注入后再继续 head）。
+        result = _run_bootstrap(scratch_url, "upgrade", "0010")
+        assert result.returncode == 0, result.stderr
+        await connection.execute(
+            "INSERT INTO komari_group_admission_config"
+            " (id, revision, updated_at, policy)"
+            " VALUES (1, 1, NOW(),"
+            ' \'{"mode": "blacklist", "group_ids": []}\'::jsonb)'
+            " ON CONFLICT (id) DO NOTHING"
+        )
 
         result = _run_bootstrap(scratch_url, "upgrade", "head")
         assert result.returncode == 0, result.stderr
         assert (
             await connection.fetchval("SELECT version_num FROM alembic_version")
-            != "0011"
+            != "0008"
         ), "迁移必须离开旧 revision"
 
         columns = await _column_names(connection, "komari_prompt_komari_chat")

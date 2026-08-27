@@ -242,6 +242,12 @@ return 1
 
 _GLOBAL_INTERACTION_SNAPSHOT_TTL_SECONDS = 7 * 24 * 60 * 60
 
+#: 对话 processing 快照的休眠安全 TTIL 下限（秒）：受限群休眠窗口内不得因
+#: 临时快照 TTL 清零而丢失安全进度（ADR-0012 "若现有 TTL 会让安全进度在休眠
+#: 中消失，实现必须调整以保留进度"）。实际生效 TTL = max(配置值, 本下限)，
+#: 恢复后仍复用剩余 TTL，不重新满额（补项2）。
+_PROCESSING_SNAPSHOT_DORMANCY_TTL_SECONDS = 7 * 24 * 60 * 60
+
 
 @dataclass(frozen=True)
 class MessageSchema:
@@ -334,6 +340,13 @@ class RedisManager:
             msg = "Redis 未初始化，请先调用 initialize()"
             raise RuntimeError(msg)
         return self._redis
+
+    def _processing_snapshot_ttl(self) -> int:
+        """生效的对话 processing 快照 TTL：不低于休眠安全下限（冻结跨休眠窗）。"""
+        return max(
+            int(self.config.conversation_snapshot_ttl_seconds),
+            _PROCESSING_SNAPSHOT_DORMANCY_TTL_SECONDS,
+        )
 
     async def push_message(
         self,
@@ -454,7 +467,7 @@ class RedisManager:
             meta_session_start_key,
             owner_token,
             self.config.conversation_processing_lease_seconds * 1000,
-            self.config.conversation_snapshot_ttl_seconds,
+            self._processing_snapshot_ttl(),
         )
         return self._parse_conversation_claim(result)
 
@@ -474,7 +487,7 @@ class RedisManager:
             RedisKeys.buffer_processing_lock(group_id),
             owner_token,
             self.config.conversation_processing_lease_seconds * 1000,
-            self.config.conversation_snapshot_ttl_seconds,
+            self._processing_snapshot_ttl(),
         )
         return self._parse_conversation_claim(result)
 
@@ -526,7 +539,7 @@ class RedisManager:
             RedisKeys.buffer_processing_lock(group_id),
             owner_token,
             self.config.conversation_processing_lease_seconds * 1000,
-            self.config.conversation_snapshot_ttl_seconds,
+            self._processing_snapshot_ttl(),
         )
         return int(cast("int", result)) == 1
 
@@ -660,7 +673,7 @@ class RedisManager:
             operation,
             field,
             value,
-            self.config.conversation_snapshot_ttl_seconds,
+            self._processing_snapshot_ttl(),
         )
         raw_result = list(cast("list[Any]", result or []))
         if not raw_result or int(raw_result[0]) != 1:

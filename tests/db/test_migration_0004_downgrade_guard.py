@@ -27,7 +27,7 @@ import asyncpg
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MIGRATION_PATH = PROJECT_ROOT / "migrations" / "versions" / "0004_komari_chat_config.py"
+MIGRATION_PATH = PROJECT_ROOT / "migrations" / "versions" / "0003_komari_chat_config.py"
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
@@ -208,7 +208,7 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
 
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
-    result = _run_bootstrap(scratch_url, "upgrade", "0004")
+    result = _run_bootstrap(scratch_url, "upgrade", "0003")
     assert result.returncode == 0, result.stderr
 
     conn = await asyncpg.connect(**scratch)
@@ -217,7 +217,7 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
 
         # === 场景一：komari_chat_config 无行 ===
         await conn.execute("DELETE FROM komari_chat_config WHERE id = 1")
-        result = _run_bootstrap(scratch_url, "downgrade", "0003")
+        result = _run_bootstrap(scratch_url, "downgrade", "0002")
         assert result.returncode == 0, f"空行场景 downgrade 失败: {result.stderr}"
 
         chat_table_exists = await conn.fetchval(
@@ -240,7 +240,7 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
             )
 
         # === 场景二：komari_chat_config 有行，活字段原样回填 ===
-        result = _run_bootstrap(scratch_url, "upgrade", "0004")
+        result = _run_bootstrap(scratch_url, "upgrade", "0003")
         assert result.returncode == 0, result.stderr
 
         # 隔离库无运行时播种，先按 schema 默认值补插单行再写特色值
@@ -257,7 +257,7 @@ async def test_downgrade_empty_row_and_populated_row_scenarios() -> None:
             *distinctive.values(),
         )
 
-        result = _run_bootstrap(scratch_url, "downgrade", "0003")
+        result = _run_bootstrap(scratch_url, "downgrade", "0002")
         assert result.returncode == 0, f"有行场景 downgrade 失败: {result.stderr}"
 
         memory_row = await conn.fetchrow(

@@ -26,6 +26,7 @@ from uuid import uuid4
 from nonebot import logger
 
 from ..core.retry import get_retry_attempts, retry_async
+from .admission import memory_conversation_business_admitted
 from .conversation_processing import (
     ConversationLeaseLostError,
     ConversationSnapshotClaim,
@@ -361,6 +362,11 @@ class ConversationProcessingLifecycle:
         """
         storage = self._storage
         owner_token = f"summary-{uuid4().hex}"
+        # 效果前最后同步步骤：裁决关联群归属（ADR-0012 / AC1/AC2/AC3/AC8）。
+        # 受限或归属失败的候选不领租约、不读正文、不耗 failure/retry、不进
+        # dead-letter，直接休眠返回 False。
+        if not memory_conversation_business_admitted(group_id=group_id):
+            return False
         if existing_processing_key is None:
             claim = await storage.claim_conversation_buffer(
                 group_id,

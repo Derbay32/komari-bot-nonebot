@@ -8,6 +8,7 @@ from .group_failure_notify import (
     RedisFailureNotificationCooldown,
     image_failure_reason_code,
 )
+from .onebot_messages import get_user_nickname
 
 __all__ = [
     "GroupTaskFailureNotification",
@@ -15,5 +16,6 @@ __all__ = [
     "ImageFailureDiagnostic",
     "InMemoryFailureNotificationCooldown",
     "RedisFailureNotificationCooldown",
+    "get_user_nickname",
     "image_failure_reason_code",
 ]

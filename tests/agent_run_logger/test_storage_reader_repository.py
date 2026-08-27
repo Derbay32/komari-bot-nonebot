@@ -214,7 +214,7 @@ def test_cleanup_retains_current_log_day_and_removes_legacy_sqlite(
 def test_pg_schema_contains_only_rebuildable_metadata() -> None:
     migration_path = (
         Path(__file__).resolve().parents[2]
-        / "migrations/versions/0001_baseline_full_schema.py"
+        / "migrations/versions/0002_typed_schema.py"
     )
     ddl = migration_path.read_text(encoding="utf-8").lower()
     assert "komari_agent_run_log_index" in ddl

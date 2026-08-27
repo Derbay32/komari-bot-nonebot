@@ -63,7 +63,7 @@ jobs:
 
       - name: 无服务全量测试
         if: ${{ !cancelled() && steps.dependency-sync.outcome == 'success' }}
-        run: poetry run pytest tests/ -q
+        run: poetry run pytest tests/ -q -m "not group_admission_service"
 
   service-and-migration:
     # main/dev ruleset 依赖该检查名；重命名时必须同步更新 required checks。
@@ -138,7 +138,7 @@ jobs:
 
       - name: 真实服务全量测试
         if: ${{ !cancelled() && steps.migration-upgrade.outcome == 'success' }}
-        run: poetry run pytest tests/ -q
+        run: poetry run pytest tests/ -q -m "group_admission_service or not group_admission_service"
 
       - name: autogenerate 空 diff 校验
         if: ${{ !cancelled() && steps.migration-upgrade.outcome == 'success' }}

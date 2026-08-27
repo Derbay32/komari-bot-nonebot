@@ -22,6 +22,7 @@ from .reply_fulfillment_ops_errors import (
     ReplyFulfillmentOpsNotFoundError,
     ReplyFulfillmentOpsValidationError,
 )
+from .services.admission_gate import effect_business_admitted
 from .services.proactive_reservation import ProactiveReservationService
 from .services.reply_delivery_onebot import DeliveryRequest, OneBotReplySender
 from .services.reply_fulfillment_ops import (
@@ -36,16 +37,19 @@ from .services.reply_fulfillment_workflow import (
 
 # 依赖插件
 require("embedding_provider")
-require("permission_manager")
 require("user_ban")
 require("komari_memory")
 require("komari_decision")
 require("user_data")
+require("group_admission")
 
 from komari_bot.plugins import komari_memory as memory_plugin
-from komari_bot.plugins import permission_manager as permission_manager_plugin
 from komari_bot.plugins import user_ban as user_ban_plugin
 from komari_bot.plugins import user_data as user_data_plugin
+from komari_bot.plugins.group_admission import (
+    AdmissionQualification,
+    adjudicate,
+)
 
 get_memory_plugin_manager = memory_plugin.get_plugin_manager
 
@@ -332,6 +336,17 @@ async def generate_debug_reply(
     Raises:
         RuntimeError: 底层服务（Redis / Memory）未初始化
     """
+    # TSK-225：chat.debug_public——debug 干跑的群公开输出（--public 摘要送达）
+    # 前按该群裁决；受限时安静丢弃，不生成、不进入 LLM、不发生群公开输出。
+    if not effect_business_admitted(group_id=group_id):
+        return DebugReplyResult(
+            reply="",
+            reply_to_message_id=None,
+            favorability_delta=None,
+            favorability_reason=None,
+            interaction_history=None,
+            collector=collector,
+        )
     handler = _get_or_build_handler()
     if handler is None:
         raise RuntimeError(  # noqa: TRY003
@@ -363,10 +378,10 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         logger.debug("[KomariChat] KomariMemory 未就绪，跳过消息处理")
         return
 
-    can_use, _ = await permission_manager_plugin.check_runtime_permission(
-        bot, event, config
-    )
-    if not can_use:
+    group_id = getattr(event, "group_id", None)
+    if not isinstance(group_id, int) or group_id <= 0:
+        return
+    if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return
 
     try:
@@ -396,7 +411,13 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
             发送载荷投影自履约冻结的群与引用目标，不依赖 matcher 的
             隐式事件上下文；平台异常细节由边界翻译，不在此旁路。
+            TSK-225：chat.reply_send——群回复送达前按该群裁决；受限时安静
+            丢弃已准备回复（未送达身份/预占终止），不发送、不复活。
             """
+            if not effect_business_admitted(
+                group_id=actual_pending_reply.message.group_id
+            ):
+                return None
             request = cast(
                 "DeliveryRequest",
                 SimpleNamespace(
@@ -405,6 +426,12 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
                     reply_to_message_id=actual_pending_reply.reply_to_message_id,
                 ),
             )
+            # 送达前一瞬再次按当前策略裁决（阶段屏障）；已准备载荷允许解码，
+            # 但受限时绝不真正发出不可逆群消息。
+            if not effect_business_admitted(
+                group_id=actual_pending_reply.message.group_id
+            ):
+                return None
             return await OneBotReplySender(bot)(request)
 
         fulfilled = await workflow.fulfill(

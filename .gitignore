@@ -162,6 +162,7 @@ test_multimodal.py
 logs
 !tools/
 tools/*
+!tools/acceptance_evidence.py
 data/character_binding/.bindings.json.lock
 
 # Playwright MCP

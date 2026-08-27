@@ -1,8 +1,8 @@
 """Komari Management v1 权限名提示。
 
-旧版单 Token / ``llm_logs:read`` 权限只存在于遗留 ``komari_plugin_configs``
-JSONB 表中；强类型配置表不含这些列，运行时不再做旧 KV 清理，这里只保留
-对仍在用旧权限名的凭据提示。
+旧版单 Token / ``llm_logs:read`` 权限只存在于已物理删除的遗留 JSONB 配置
+中；强类型配置表不含这些列，运行时不再做旧 KV 清理，这里只保留对仍在用
+旧权限名的凭据提示。
 """
 
 from __future__ import annotations

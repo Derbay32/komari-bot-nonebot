@@ -34,6 +34,10 @@ from ..reply_fulfillment_domain import (
     build_reply_fulfillment_payload_hash,
 )
 from ..repositories.reply_fulfillment_repository import ReplyFulfillmentRepository
+from .admission_gate import (
+    reply_fulfillment_business_admitted,
+    reply_fulfillment_finalization_granted,
+)
 from .reply_commitment_workflow import ReplyCommitmentWorkflow
 from .reply_delivery_onebot import ReplyDeliveryResult
 from .reply_fulfillment_alert import (
@@ -126,6 +130,20 @@ class _ReplyFulfillmentRepository(Protocol):
     async def has_fulfillment(self, fulfillment_id: str) -> bool: ...
 
     async def prepare(self, draft: ReplyFulfillmentDraft) -> bool: ...
+
+    async def prepare_minimal_identity(
+        self,
+        fulfillment_id: str,
+        *,
+        group_id: str,
+        request_trace_id: str,
+        trigger_message_id: str,
+        trigger_user_id: str,
+        bot_self_id: str,
+        adapter_name: str,
+        reply_target_message_id: str,
+        payload_hash: str,
+    ) -> None: ...
 
     async def mark_send_started(self, fulfillment_id: str) -> bool: ...
 
@@ -356,6 +374,39 @@ class ReplyFulfillmentWorkflow:
                 pending_reply.message.group_id,
             )
 
+    async def _persist_minimal_identity(
+        self,
+        pending_reply: _PendingReply,
+    ) -> None:
+        """受限准备：只落无正文、无承诺载荷的最小未送达身份。
+
+        以空正文与最小身份字段插入，阻断同一触发事件再次发送；绝不落
+        全量 Draft（不携带正文、不冻结承诺），也不进入发送。仓库已存在
+        同一履约身份时保持幂等（ON CONFLICT DO NOTHING）。
+        """
+        payload_hash = build_reply_fulfillment_payload_hash(
+            fulfillment_id=pending_reply.fulfillment_id,
+            trigger_message_id=pending_reply.message.message_id,
+            trigger_user_id=pending_reply.message.user_id,
+            group_id=pending_reply.message.group_id,
+            bot_self_id=pending_reply.bot_self_id,
+            adapter_name=pending_reply.adapter_name,
+            reply_target_message_id=pending_reply.reply_to_message_id,
+            reply_content="",
+            commitments=(),
+        )
+        await self.repository.prepare_minimal_identity(
+            pending_reply.fulfillment_id,
+            group_id=pending_reply.message.group_id,
+            request_trace_id=pending_reply.request_trace_id,
+            trigger_message_id=pending_reply.message.message_id,
+            trigger_user_id=pending_reply.message.user_id,
+            bot_self_id=pending_reply.bot_self_id,
+            adapter_name=pending_reply.adapter_name,
+            reply_target_message_id=pending_reply.reply_to_message_id,
+            payload_hash=payload_hash,
+        )
+
     async def fulfill(
         self,
         pending_reply: _PendingReply,
@@ -376,6 +427,20 @@ class ReplyFulfillmentWorkflow:
         # 发送起始阶段持进程内锁：prepare 与 mark_send_started 之间不被
         # 本进程恢复 worker 领取；锁不跨平台发送。
         async with self._send_start_lock:
+            if not reply_fulfillment_business_admitted(
+                group_id=pending_reply.message.group_id
+            ):
+                # 准备前受限：只保留最小未送达身份并释放预占，绝不落全量
+                # Draft、绝不触发发送；结果不复活（准入恢复不补发）。
+                await self._persist_minimal_identity(pending_reply)
+                await self._release_reservation(pending_reply)
+                logger.info(
+                    "[KomariChat] 准备前受限，只保留最小未送达身份: "
+                    "group={} fulfillment={}",
+                    pending_reply.message.group_id,
+                    pending_reply.fulfillment_id,
+                )
+                return False
             try:
                 prepared = await self._prepare(pending_reply)
             except asyncio.CancelledError:
@@ -420,6 +485,9 @@ class ReplyFulfillmentWorkflow:
                 platform_message_id=delivery_result.platform_message_id,
             )
         if delivery_result.state == "not_delivered":
+            reply_fulfillment_finalization_granted(
+                group_id=pending_reply.message.group_id
+            )
             await self.repository.mark_not_delivered(pending_reply.fulfillment_id)
             await self._release_reservation(pending_reply)
             logger.info(
@@ -428,6 +496,9 @@ class ReplyFulfillmentWorkflow:
                 pending_reply.fulfillment_id,
             )
             return False
+        reply_fulfillment_finalization_granted(
+            group_id=pending_reply.message.group_id
+        )
         logger.info(
             "[KomariChat] 发送结果未知，回复进入待确认对账: fulfillment={}",
             pending_reply.fulfillment_id,
@@ -442,6 +513,9 @@ class ReplyFulfillmentWorkflow:
         platform_message_id: str | None,
     ) -> bool:
         """已送达回复：持久化送达事实，立即推进承诺并恢复告警。"""
+        reply_fulfillment_finalization_granted(
+            group_id=pending_reply.message.group_id
+        )
         delivered = await self.repository.mark_delivered(
             pending_reply.fulfillment_id,
             platform_message_id=platform_message_id,
@@ -523,6 +597,19 @@ class ReplyFulfillmentWorkflow:
         待确认。
         """
         fulfillment_id = str(record["fulfillment_id"])
+        if not reply_fulfillment_business_admitted(
+            group_id=record.get("group_id")
+        ):
+            # NOT_STARTED 受限后终止为持久终态（未送达），不进入休眠、
+            # 不补发；恢复准入后也不复活。
+            await self.repository.mark_not_delivered(fulfillment_id)
+            await self._release_recovered_reservation(record)
+            logger.info(
+                "[KomariChat] 恢复发送受限，NOT_STARTED 终止为未送达: "
+                "fulfillment={}",
+                fulfillment_id,
+            )
+            return False
         recovered_reply = self._recovered_reply(record)
         try:
             delivery_result = await sender(recovered_reply)

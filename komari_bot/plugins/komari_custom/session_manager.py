@@ -15,6 +15,7 @@ from komari_bot.llm.content_budget import (
     normalize_required_text,
 )
 
+from .admission import business_admitted
 from .models import SessionData, UndoRecord
 
 if TYPE_CHECKING:
@@ -182,8 +183,14 @@ class CustomSessionManager:
         user_id: str,
         *,
         title: str = "",
-    ) -> SessionData:
-        """创建新会话。"""
+    ) -> SessionData | None:
+        """创建新会话。
+
+        受限群不写入 Redis、不启动业务存活时钟（PTTL 不续期），返回 ``None``：
+        编辑会话属于持久群归属数据，恢复准入后按换届式恢复，只恢复剩余时间。
+        """
+        if not business_admitted(group_id):
+            return None
         normalized_title = (
             self._validate_field_text("title", title) if title.strip() else ""
         )

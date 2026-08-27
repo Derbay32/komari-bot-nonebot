@@ -52,7 +52,7 @@ SKIP_NO_POSTGRES = pytest.mark.skipif(
     reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试",
 )
 
-HEAD_REVISION = "0015"
+HEAD_REVISION = "0017"
 
 #: 0013 引入的三项回复 Agent 预算列（仅让这些列走数据库默认值）。
 AGENT_BUDGET_COLUMNS = (
@@ -289,9 +289,18 @@ async def insert_row_without_budget_columns(
     value_columns = sorted(
         columns - {"id", "revision", "updated_at"} - set(AGENT_BUDGET_COLUMNS)
     )
-    missing = [
-        column for column in value_columns if column not in NON_BUDGET_COLUMN_DEFAULTS
-    ]
+
+    def _default_for(column: str) -> object:
+        if column in NON_BUDGET_COLUMN_DEFAULTS:
+            return NON_BUDGET_COLUMN_DEFAULTS[column]
+        # 0008 时代 chat 配置仍持有 reply_commit_*（0013 才改名
+        # reply_fulfillment_*）；两代列默认值一致，这里按前缀映射。
+        if column.startswith("reply_commit_"):
+            renamed = "reply_fulfillment_" + column[len("reply_commit_") :]
+            return NON_BUDGET_COLUMN_DEFAULTS[renamed]
+        raise KeyError(column)
+
+    missing = [column for column in value_columns if _default_for(column) is None]
     assert not missing, f"测试默认值字典缺少列: {missing}"
     columns_sql = ", ".join(["id", "revision", "updated_at", *value_columns])
     placeholders = ", ".join(f"${index}" for index in range(1, 4 + len(value_columns)))
@@ -300,7 +309,7 @@ async def insert_row_without_budget_columns(
         1,
         revision,
         datetime.now(UTC),
-        *[NON_BUDGET_COLUMN_DEFAULTS[column] for column in value_columns],
+        *[_default_for(column) for column in value_columns],
     )
 
 

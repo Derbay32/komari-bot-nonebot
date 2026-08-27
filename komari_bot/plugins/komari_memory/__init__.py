@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 # 依赖插件
 require("nonebot_plugin_apscheduler")
 require("agent_run_logger")
+require("group_admission")
 
 from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema
