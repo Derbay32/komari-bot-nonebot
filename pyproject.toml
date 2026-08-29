@@ -22,6 +22,7 @@ dependencies = [
     # v2.0.0 数据库基础设施：engine/会话生命周期与 Alembic 迁移由该插件托管
     "nonebot-plugin-orm[asyncpg] (>=0.8.3,<0.9.0)",
     "sqlmodel (>=0.0.39,<0.1.0)",
+    "nonebot-adapter-qq>=1.7.2",
 ]
 
 [tool.nonebot]
@@ -33,6 +34,7 @@ nonebot-adapter-onebot = [
     { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" },
 ]
 "@local" = []
+nonebot-adapter-qq = [{name = "QQ", module_name = "nonebot.adapters.qq"}]
 
 [tool.nonebot.plugins]
 "@local" = []
