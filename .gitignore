@@ -145,7 +145,7 @@ dmypy.json
 !/docs/adr/
 !/docs/adr/**
 /.ruff_cache
-/.kilo
+/.agents
 
 # config files
 config/config_manager/*.json
@@ -167,6 +167,3 @@ data/character_binding/.bindings.json.lock
 
 # Playwright MCP
 .playwright-mcp/
-
-# Pi Agent
-.pi/
