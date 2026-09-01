@@ -167,3 +167,6 @@ data/character_binding/.bindings.json.lock
 
 # Playwright MCP
 .playwright-mcp/
+
+# Pi Agent
+.pi/
