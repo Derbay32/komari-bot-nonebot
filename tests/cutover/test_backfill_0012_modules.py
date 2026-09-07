@@ -490,12 +490,12 @@ def test_empty_database_upgrade_advances_gate_to_postgres_backfilled() -> None:
 
 
 def test_full_head_upgrade_on_empty_database_succeeds() -> None:
-    """全新空库一次 upgrade head 必须成功收敛到 0018（fresh 自动放行链）。"""
+    """全新空库一次 upgrade head 必须成功收敛到 0019（fresh 自动放行链）。"""
     with cutover_scratch_database("mod", revision="head") as (
         params,
         _database_url,
     ):
-        assert asyncio.run(_fetch_version(params)) == "0018"
+        assert asyncio.run(_fetch_version(params)) == "0019"
 
 
 def test_policy_missing_failure_keeps_0011_then_repairs() -> None:
