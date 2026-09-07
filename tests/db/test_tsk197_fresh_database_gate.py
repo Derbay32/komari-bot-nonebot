@@ -6,7 +6,7 @@
 检查」，而不是把升级、播种、校验拆散到互不相关的测试里。
 
 覆盖（对应验收标准）：
-- AC1：从基线重建的全新数据库可依次完成 Alembic 升级（head = 0015）、
+- AC1：从基线重建的全新数据库可依次完成 Alembic 升级（head = 0018）、
   初始数据播种与冷启动完整性验证（三个 Prompt 资源单行 + 判定场景）；
 - AC3：迁移链单一 head 且 ``orm_bootstrap check`` 零漂移（升级后与
   播种后各一次）；
@@ -65,7 +65,7 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
         try:
             assert await connection.fetchval(
                 "SELECT version_num FROM alembic_version"
-            ) == HEAD_REVISION, "全新库升级后必须停留在单一 head 0015"
+            ) == HEAD_REVISION, "全新库升级后必须停留在单一 head 0018"
         finally:
             await connection.close()
 
