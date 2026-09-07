@@ -1,18 +1,19 @@
 """角色绑定插件 - 提供跨插件的角色名管理功能。"""
 
-from __future__ import annotations
-
-from importlib import import_module
-from typing import TYPE_CHECKING, Any
-
 from nonebot import get_driver
 from nonebot.plugin import PluginMetadata, require
-from sqlmodel import SQLModel
 
 # 依赖统一群聊准入插件
 require("group_admission")
 
 from . import reply_evidence as _reply_evidence  # noqa: F401
+from .manager import (
+    BindingConflictError,
+    BindingPersistenceError,
+    CharacterBindingManager,
+    CharacterNameValidationError,
+    get_manager,
+)
 from .reply_evidence import (
     ReplyEvidence,
     ReplyEvidenceCollector,
@@ -21,14 +22,6 @@ from .reply_evidence import (
     get_runtime_collectors,
     set_runtime_collectors,
 )
-
-if TYPE_CHECKING:
-    from .manager import (
-        BindingConflictError,
-        BindingPersistenceError,
-        CharacterBindingManager,
-        CharacterNameValidationError,
-    )
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
@@ -43,13 +36,12 @@ __plugin_meta__ = PluginMetadata(
 
 async def init_plugin() -> None:
     """插件启动时初始化管理器。"""
-    manager = import_module(f"{__name__}.manager").get_manager()
-    await manager.initialize()
+    await get_manager().initialize()
 
 
 async def close_plugin() -> None:
     """插件关闭时释放数据库连接池租约。"""
-    manager = import_module(f"{__name__}.manager").get_manager()
+    manager = get_manager()
     await manager.close()
 
 
@@ -59,7 +51,7 @@ def get_binding_manager() -> CharacterBindingManager:
     Returns:
         管理器实例
     """
-    return import_module(f"{__name__}.manager").get_manager()
+    return get_manager()
 
 
 def get_character_name(
@@ -69,7 +61,7 @@ def get_character_name(
     fallback_nickname: str | None = None,
 ) -> str:
     """OneBot 群事件的最小群作用域桥接查询。"""
-    return get_binding_manager().get_character_name(
+    return get_manager().get_character_name(
         group_id=group_id,
         user_id=user_id,
         fallback_nickname=fallback_nickname,
@@ -84,7 +76,7 @@ def get_qq_character_name(
     fallback_nickname: str | None = None,
 ) -> str | None:
     """QQ 官方群事件的 canonical 角色名查询。"""
-    return get_binding_manager().get_qq_character_name(
+    return get_manager().get_qq_character_name(
         app_id=app_id,
         group_openid=group_openid,
         member_openid=member_openid,
@@ -94,19 +86,7 @@ def get_qq_character_name(
 
 async def get_legacy_character_name(user_id: str) -> str | None:
     """读取旧全局角色名作为主动绑定流程的迁移候选。"""
-    return await get_binding_manager().get_legacy_character_name(user_id)
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve manager types lazily so evidence import stays side-effect narrow."""
-    if name in {
-        "BindingConflictError",
-        "BindingPersistenceError",
-        "CharacterBindingManager",
-        "CharacterNameValidationError",
-    }:
-        return getattr(import_module(f"{__name__}.manager"), name)
-    raise AttributeError(name)
+    return await get_manager().get_legacy_character_name(user_id)
 
 
 __all__ = [
@@ -131,8 +111,8 @@ try:
 except ValueError:
     driver = None
 
-if driver is not None and "komari_character_bindings" not in SQLModel.metadata.tables:
-    # 导入命令模块以注册命令处理器；commands 自己导入 manager。
+if driver is not None:
+    # 导入命令模块以注册命令处理器（必须在 manager 之后导入以避免循环导入）
     from . import commands  # noqa: F401
 
     driver.on_startup(init_plugin)
