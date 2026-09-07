@@ -20,7 +20,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import ClassVar
 
-from sqlalchemy import Column, DateTime, Table, Text, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKeyConstraint,
+    Table,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlmodel import Field, SQLModel
 
 
@@ -67,4 +75,109 @@ class CharacterBindingRow(_CharacterBindingModelBase, table=True):
     )
 
 
-__all__ = ["CharacterBindingRow"]
+class CharacterBindingGroupRow(_CharacterBindingModelBase, table=True):
+    """已验证的 QQ 应用群映射。
+
+    ``group_id`` 是 OneBot 侧群号，``group_openid`` 是 QQ 官方协议的群
+    身份。两者只在同一个 ``app_id`` 内互相唯一；OneBot 的 ``self_id``
+    是连接属性，不进入这个关系，因此更换连接不会拆分同一个群。
+    """
+
+    __tablename__ = "komari_character_binding_groups"
+
+    app_id: str = Field(sa_column=Column(Text, primary_key=True, nullable=False))
+    group_openid: str = Field(
+        sa_column=Column(Text, primary_key=True, nullable=False)
+    )
+    group_id: str = Field(sa_column=Column(Text, nullable=False))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        ),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        ),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "app_id",
+            "group_id",
+            name="uq_komari_character_binding_groups_app_group_id",
+        ),
+    )
+
+
+class CharacterBindingMemberRow(_CharacterBindingModelBase, table=True):
+    """已验证群成员的双协议身份及当前群角色名。"""
+
+    __tablename__ = "komari_character_binding_members"
+
+    app_id: str = Field(sa_column=Column(Text, primary_key=True, nullable=False))
+    group_openid: str = Field(
+        sa_column=Column(Text, primary_key=True, nullable=False)
+    )
+    member_openid: str = Field(
+        sa_column=Column(Text, primary_key=True, nullable=False)
+    )
+    member_qq: str = Field(sa_column=Column(Text, nullable=False))
+    character_name: str | None = Field(default=None, sa_column=Column(Text))
+    character_name_key: str | None = Field(
+        default=None,
+        sa_column=Column(Text),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        ),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        ),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["app_id", "group_openid"],
+            [
+                "komari_character_binding_groups.app_id",
+                "komari_character_binding_groups.group_openid",
+            ],
+            ondelete="CASCADE",
+            name="fk_komari_character_binding_members_group",
+        ),
+        UniqueConstraint(
+            "app_id",
+            "group_openid",
+            "member_qq",
+            name="uq_komari_character_binding_members_qq",
+        ),
+        UniqueConstraint(
+            "app_id",
+            "group_openid",
+            "character_name_key",
+            name="uq_komari_character_binding_members_name",
+        ),
+    )
+
+
+__all__ = [
+    "CharacterBindingGroupRow",
+    "CharacterBindingMemberRow",
+    "CharacterBindingRow",
+]

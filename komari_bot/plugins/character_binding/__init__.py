@@ -6,7 +6,13 @@ from nonebot.plugin import PluginMetadata, require
 # 依赖统一群聊准入插件
 require("group_admission")
 
-from .manager import CharacterBindingManager, get_manager
+from .manager import (
+    BindingConflictError,
+    BindingPersistenceError,
+    CharacterBindingManager,
+    CharacterNameValidationError,
+    get_manager,
+)
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
@@ -40,25 +46,49 @@ def get_binding_manager() -> CharacterBindingManager:
 
 
 def get_character_name(
+    *,
+    group_id: str,
     user_id: str,
     fallback_nickname: str | None = None,
 ) -> str:
-    """便捷函数：获取用户的角色名。
+    """OneBot 群事件的最小群作用域桥接查询。"""
+    return get_manager().get_character_name(
+        group_id=group_id,
+        user_id=user_id,
+        fallback_nickname=fallback_nickname,
+    )
 
-    Args:
-        user_id: 用户ID
-        fallback_nickname: 备用昵称
 
-    Returns:
-        角色名称
-    """
-    return get_manager().get_character_name(user_id, fallback_nickname)
+def get_qq_character_name(
+    *,
+    app_id: str,
+    group_openid: str,
+    member_openid: str,
+    fallback_nickname: str | None = None,
+) -> str | None:
+    """QQ 官方群事件的 canonical 角色名查询。"""
+    return get_manager().get_qq_character_name(
+        app_id=app_id,
+        group_openid=group_openid,
+        member_openid=member_openid,
+        fallback_nickname=fallback_nickname,
+    )
+
+
+async def get_legacy_character_name(user_id: str) -> str | None:
+    """读取旧全局角色名作为主动绑定流程的迁移候选。"""
+    return await get_manager().get_legacy_character_name(user_id)
 
 
 __all__ = [
+    "BindingConflictError",
+    "BindingPersistenceError",
     "CharacterBindingManager",
+    "CharacterNameValidationError",
     "get_binding_manager",
     "get_character_name",
+    "get_legacy_character_name",
+    "get_qq_character_name",
 ]
 
 try:

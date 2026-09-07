@@ -62,6 +62,17 @@ def get_command_text(args: Message = CommandArg()) -> str:
     return args.extract_plain_text().strip()
 
 
+def get_event_fallback_nickname(event: MessageEvent) -> str:
+    """读取当前群事件的展示昵称，仅作为未绑定时的普通回退。"""
+    sender = getattr(event, "sender", None)
+    if sender is not None:
+        card = str(getattr(sender, "card", "") or "").strip()
+        nickname = str(getattr(sender, "nickname", "") or "").strip()
+        if card or nickname:
+            return card or nickname
+    return event.get_user_id()
+
+
 def parse_self_bind_set_request(
     user_id: str = Depends(get_event_user_id),
     arg_text: str = Depends(get_command_text),
@@ -101,13 +112,16 @@ async def handle_bind_help(event: MessageEvent) -> None:
 
     user_id = str(event.user_id)
     manager = get_manager()
-
-    # 检查用户是否有绑定
-    has_binding = manager.has_binding(user_id)
+    group_id = str(getattr(event, "group_id", ""))
+    fallback_name = get_event_fallback_nickname(event)
+    character_name = manager.get_character_name(
+        group_id=group_id,
+        user_id=user_id,
+        fallback_nickname=fallback_name,
+    )
     binding_info = ""
-    if has_binding:
-        character_name = manager.get_character_name(user_id)
-        binding_info = f"\n📋 您当前的角色绑定: {character_name}"
+    if character_name not in (fallback_name, user_id):
+        binding_info = f"\n📋 您当前的本群角色名: {character_name}"
 
     help_text = (
         "🎭 角色绑定命令说明：\n"
@@ -144,7 +158,11 @@ async def handle_set(
         await bind_set.finish("❌ 请提供角色名\n用法: .bind set <角色名>")
 
     try:
-        await manager.set_character_name(request.target_user_id, request.character_name)
+        await manager.set_group_character_name(
+            str(getattr(event, "group_id", "")),
+            request.target_user_id,
+            request.character_name,
+        )
     except CharacterNameValidationError as exc:
         await bind_set.finish(plain_text_message(f"❌ {exc}"))
     except BindingPersistenceError:
@@ -152,7 +170,6 @@ async def handle_set(
     await bind_set.finish(
         plain_text_message(f"✅ 已设置您的角色名为 {request.character_name}")
     )
-
 
 # /bind del
 bind_del = on_command(("bind", "del"), priority=10, block=True)
@@ -170,7 +187,10 @@ async def handle_del(
         return
 
     try:
-        success = await manager.remove_character_name(request.target_user_id)
+        success = await manager.clear_group_character_name(
+            str(getattr(event, "group_id", "")),
+            request.target_user_id,
+        )
     except BindingPersistenceError:
         await bind_del.finish("❌ 角色绑定删除失败，请稍后重试")
     if success:
@@ -194,14 +214,15 @@ async def handle_list(
     if not _group_admitted(event):
         return
 
-    bindings = manager.list_bindings()
-
-    if not bindings:
-        await bind_list.finish("📋 当前没有任何角色绑定")
-
-    if user_id in bindings:
+    fallback_name = get_event_fallback_nickname(event)
+    character_name = manager.get_character_name(
+        group_id=str(getattr(event, "group_id", "")),
+        user_id=user_id,
+        fallback_nickname=fallback_name,
+    )
+    if character_name not in (fallback_name, user_id):
         await bind_list.finish(
-            plain_text_message(f"📋 您的角色绑定: {bindings[user_id]}")
+            plain_text_message(f"📋 您的本群角色名: {character_name}")
         )
 
-    await bind_list.finish("❌ 您还没有设置角色绑定")
+    await bind_list.finish("❌ 您还没有设置本群角色名")
