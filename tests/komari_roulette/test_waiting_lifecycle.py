@@ -93,7 +93,7 @@ def test_transfer_rejects_stale_join_seq_after_member_rejoins() -> None:
     assert _seat_seqs(state) == [1, 3]
 
     stale = dispatch(state, Action.transfer(player(1), target_seq=2))
-    assert_rejected(stale, "invalid_transfer_target", "stale_join_seq")
+    assert_rejected(stale, "player_seq_not_found")
     assert stale.state == state
 
     current = dispatch(state, Action.transfer(player(1), target_seq=3))

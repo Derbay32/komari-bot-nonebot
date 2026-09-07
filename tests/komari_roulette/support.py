@@ -272,7 +272,7 @@ def public_facts(state: GameState) -> tuple[Any, ...]:
             seat.member_openid,
             seat.display_name,
             seat.alive,
-            deepcopy(seat.inventory),
+            dict(seat.inventory),
         )
         for seat in state.players
     )

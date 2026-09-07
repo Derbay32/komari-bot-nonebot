@@ -44,7 +44,7 @@ Action.open_item_panel(player)
 Action.expire()
 ```
 
-`Action.start` 接收纯值 `item_weights` 并在 waiting→active 成功时冻结副本；调用方随后修改原映射不能改变进行中对局的抽样权重。`choose_item` 的 `decision` 为 `discard` 或 `replace`；失败选择返回失败结果且不续期。锁目标不存在、已淘汰或已被待锁占用时分别返回稳定的 `invalid_item_target/not_found`、`invalid_item_target/not_alive` 或 `item_precondition_failed/target_already_locked`，并且不消耗锁。
+`Action.start` 接收纯值 `item_weights` 并在 waiting→active 成功时冻结副本；调用方随后修改原映射不能改变进行中对局的抽样权重。`choose_item` 的 `decision` 为 `discard` 或 `replace`；失败选择返回失败结果且不续期。合法数字在当前阵容中不存在（包括失效旧 `join_seq`）返回 `player_seq_not_found`；已淘汰目标返回 `invalid_item_target/eliminated`；自己返回 `invalid_item_target/self`；已被待锁占用返回 `item_effect_conflict/target_already_locked`，并且这些失败均不消耗锁。
 
 `PlayerRef` 必须携带已验证的应用/群/成员协议身份和非空冻结显示名；测试不把裸 QQ 号、昵称或 `character_binding` 内部记录当作身份。`GroupRef` 至少区分 `app_id` 与 `group_openid`。
 

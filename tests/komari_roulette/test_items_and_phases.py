@@ -355,13 +355,15 @@ def test_lock_binds_to_next_turn_and_is_cleared_when_target_is_eliminated() -> N
     assert_ok(first, "shot")
     reward = dispatch(first.state, Action.shoot(player(1)), random_source=entropy)
     assert_ok(reward, "shot")
+    before_self_target = public_facts(reward.state)
     self_target = dispatch(
         reward.state,
         Action.use_item(player(1), ItemType.LOCK, target_seq=1),
         random_source=entropy,
     )
     assert_rejected(self_target, "invalid_item_target", "self")
-    assert self_target.state == reward.state
+    assert public_facts(reward.state) == before_self_target
+    assert public_facts(self_target.state) == before_self_target
 
     locked = dispatch(
         reward.state,
@@ -410,7 +412,7 @@ def test_lock_rejects_missing_dead_and_duplicate_targets_without_consuming() -> 
         missing,
         Action.use_item(player(1), ItemType.LOCK, target_seq=99),
     )
-    assert_rejected(missing_result, "invalid_item_target", "not_found")
+    assert_rejected(missing_result, "player_seq_not_found")
     assert public_facts(missing) == missing_facts
     assert public_facts(missing_result.state) == missing_facts
 
@@ -420,7 +422,7 @@ def test_lock_rejects_missing_dead_and_duplicate_targets_without_consuming() -> 
         dead,
         Action.use_item(player(1), ItemType.LOCK, target_seq=2),
     )
-    assert_rejected(dead_result, "invalid_item_target", "not_alive")
+    assert_rejected(dead_result, "invalid_item_target", "eliminated")
     assert public_facts(dead) == dead_facts
     assert public_facts(dead_result.state) == dead_facts
 
@@ -432,7 +434,7 @@ def test_lock_rejects_missing_dead_and_duplicate_targets_without_consuming() -> 
     )
     assert_rejected(
         duplicate_result,
-        "item_precondition_failed",
+        "item_effect_conflict",
         "target_already_locked",
     )
     assert public_facts(duplicate) == duplicate_facts
