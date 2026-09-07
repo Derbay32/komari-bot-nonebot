@@ -85,32 +85,21 @@ class PostgresRouletteStorage:
 
         if for_update:
             await self._lock_scope(group)
-        statement = (
-            select(RouletteGameRow, RoulettePlayerRow)
-            .outerjoin(
-                _P,
-                _P.c.game_id == _G.c.game_id,
-            )
-            .where(
-                _G.c.app_id == group.app_id,
-                _G.c.group_openid == group.group_openid,
-                _G.c.lifecycle.in_(("waiting", "active")),
-            )
-            .order_by(_G.c.created_at, _P.c.join_seq)
-            .execution_options(populate_existing=True)
-        )
-        if for_update:
-            statement = statement.with_for_update(of=RouletteGameRow)
-        result = await self._execute(statement)
-        pairs = list(result.all())
-        roots = list({pair[0].game_id: pair[0] for pair in pairs}.values())
-        if len(roots) > 1:
-            raise AggregateCorruptError("multiple current games share one group slot")
-        if not roots:
+        root, players = await self._load_current_rows(group, for_update=for_update)
+        if root is None:
             return None
-        root = roots[0]
-        players = [pair[1] for pair in pairs if pair[1] is not None]
         return self._snapshot_from_rows(root, players)
+
+    async def fail_corrupt_current(
+        self,
+        group: GroupRef,
+        *,
+        ended_at: datetime,
+    ) -> RouletteResult | None:
+        """Safely terminate a confirmed-corrupt current aggregate."""
+
+        await self._lock_scope(group)
+        return await self._fail_corrupt_current_locked(group, ended_at=ended_at)
 
     async def create_waiting(self, snapshot: GameSnapshot) -> GameSnapshot:
         """Insert a new waiting root and its initial frozen player seat."""
@@ -182,7 +171,11 @@ class PostgresRouletteStorage:
 
         await self._lock_scope(before.group)
         root = await self._load_root(before.game_id, for_update=True)
-        if root is None or root.state_revision != expected_revision:
+        if root is None:
+            raise RevisionConflictError("stored game revision is stale")
+        if type(root.state_revision) is not int or root.state_revision < 1:
+            raise AggregateCorruptError("persisted state revision is invalid")
+        if root.state_revision != expected_revision:
             raise RevisionConflictError("stored game revision is stale")
         if root.lifecycle != before.lifecycle:
             raise RevisionConflictError("stored game lifecycle is stale")
@@ -264,6 +257,21 @@ class PostgresRouletteStorage:
                     "terminal projection group does not match immutable result"
                 )
             return
+        if projection.lifecycle == "failed":
+            if projection.reason != "aggregate_corrupt":
+                raise TerminalProjectionRejectedError(
+                    "failed projection reason is not aggregate_corrupt"
+                )
+            failed = await self._fail_corrupt_current_locked(
+                projection.group,
+                ended_at=projection.ended_at,
+                expected_game_id=projection.game_id,
+            )
+            if failed is None:
+                raise TerminalProjectionRejectedError(
+                    "failed projection has no current game"
+                )
+            return
         root = await self._load_root(projection.game_id, for_update=True)
         if root is None or (root.app_id, root.group_openid) != (
             projection.group.app_id,
@@ -272,6 +280,8 @@ class PostgresRouletteStorage:
             raise TerminalProjectionRejectedError(
                 "terminal projection has no game root"
             )
+        if type(root.state_revision) is not int or root.state_revision < 1:
+            raise AggregateCorruptError("persisted state revision is invalid")
         if (
             projection.lifecycle in {"completed", "cancelled", "expired"}
             and root.lifecycle != projection.lifecycle
@@ -279,16 +289,6 @@ class PostgresRouletteStorage:
             raise TerminalProjectionRejectedError(
                 "root is not in the projected terminal state"
             )
-        if projection.lifecycle == "failed" and root.lifecycle not in {
-            "waiting",
-            "active",
-            "failed",
-        }:
-            raise TerminalProjectionRejectedError(
-                "failed projection has invalid root state"
-            )
-        if projection.lifecycle == "failed" and projection.reason not in FAILED_REASONS:
-            raise TerminalProjectionRejectedError("failed reason is not whitelisted")
 
         players = await self._load_players(projection.game_id, for_update=True)
         try:
@@ -376,9 +376,20 @@ class PostgresRouletteStorage:
     ) -> RouletteResult | None:
         """Read one immutable result in the requested group scope."""
 
-        result_row = await self._load_result_row(game_id)
-        if result_row is None:
+        result = await self._execute(
+            select(RouletteResultRow, RouletteResultPlayerRow)
+            .outerjoin(
+                _RP,
+                _RP.c.game_id == _R.c.game_id,
+            )
+            .where(_R.c.game_id == game_id)
+            .order_by(_RP.c.join_seq)
+            .execution_options(populate_existing=True)
+        )
+        pairs = list(result.all())
+        if not pairs:
             return None
+        result_row = pairs[0][0]
         if (result_row.app_id, result_row.group_openid) != (
             group.app_id,
             group.group_openid,
@@ -386,13 +397,7 @@ class PostgresRouletteStorage:
             return None
         try:
             _validate_result_header(result_row)
-            player_result = await self._execute(
-                select(RouletteResultPlayerRow)
-                .where(_RP.c.game_id == game_id)
-                .order_by(_RP.c.join_seq)
-                .execution_options(populate_existing=True)
-            )
-            result_players = list(player_result.scalars().all())
+            result_players = [pair[1] for pair in pairs if pair[1] is not None]
             _validate_result_players(result_row, result_players)
             players = tuple(
                 ResultPlayer(
@@ -521,6 +526,40 @@ class PostgresRouletteStorage:
                 )
             )
         await self._flush()
+
+    async def _load_current_rows(
+        self,
+        group: GroupRef,
+        *,
+        for_update: bool,
+    ) -> tuple[RouletteGameRow | None, list[RoulettePlayerRow]]:
+        statement = (
+            select(RouletteGameRow, RoulettePlayerRow)
+            .outerjoin(
+                _P,
+                _P.c.game_id == _G.c.game_id,
+            )
+            .where(
+                _G.c.app_id == group.app_id,
+                _G.c.group_openid == group.group_openid,
+                _G.c.lifecycle.in_(("waiting", "active")),
+            )
+            .order_by(_G.c.created_at, _P.c.join_seq)
+            .execution_options(populate_existing=True)
+        )
+        if for_update:
+            statement = statement.with_for_update(of=RouletteGameRow)
+        result = await self._execute(statement)
+        pairs = list(result.all())
+        roots = list({pair[0].game_id: pair[0] for pair in pairs}.values())
+        if len(roots) > 1:
+            raise AggregateCorruptError("multiple current games share one group slot")
+        if not roots:
+            return None, []
+        root = roots[0]
+        if for_update:
+            return root, await self._load_players(root.game_id, for_update=True)
+        return root, [pair[1] for pair in pairs if pair[1] is not None]
 
     async def _load_root(
         self,
@@ -667,11 +706,101 @@ class PostgresRouletteStorage:
             {"scope_key": f"komari-roulette:{group.app_id}:{group.group_openid}"},
         )
 
+    async def _fail_corrupt_current_locked(
+        self,
+        group: GroupRef,
+        *,
+        ended_at: datetime,
+        expected_game_id: str | None = None,
+    ) -> RouletteResult | None:
+        root, players = await self._load_current_rows(group, for_update=True)
+        if root is None:
+            return None
+        if expected_game_id is not None and root.game_id != expected_game_id:
+            raise TerminalProjectionRejectedError(
+                "failed projection game does not match current game"
+            )
+        if await self._load_result_row(root.game_id) is not None:
+            raise TerminalProjectionRejectedError(
+                "current game already has an immutable result"
+            )
+        try:
+            self._snapshot_from_rows(root, players)
+        except AggregateCorruptError:
+            pass
+        else:
+            raise TerminalProjectionRejectedError(
+                "current aggregate is valid and cannot be failed"
+            )
+        return await self._project_failed_locked(root, players, ended_at)
+
+    async def _project_failed_locked(
+        self,
+        root: RouletteGameRow,
+        players: Sequence[RoulettePlayerRow],
+        ended_at: datetime,
+    ) -> RouletteResult:
+        _validate_failed_projection_time(root, ended_at)
+        if type(root.state_revision) is not int or root.state_revision < 0:
+            raise AggregateCorruptError("persisted state revision is invalid")
+        terminal_revision = root.state_revision + 1
+        result = RouletteResultRow(
+            game_id=root.game_id,
+            app_id=root.app_id,
+            group_openid=root.group_openid,
+            lifecycle="failed",
+            reason="aggregate_corrupt",
+            created_at=root.created_at,
+            started_at=root.started_at,
+            ended_at=ended_at,
+            terminal_revision=terminal_revision,
+            winner_seq=None,
+            winner_member_openid=None,
+            winner_display_name=None,
+        )
+        self._session.add(result)
+        await self._flush()
+        for player in _safe_failed_result_players(root.game_id, players):
+            self._session.add(player)
+        await self._flush()
+        await self._execute(
+            update(RouletteGameRow)
+            .where(_G.c.game_id == root.game_id)
+            .values(
+                lifecycle="failed",
+                host_seq=None,
+                current_player_seq=None,
+                phase=None,
+                waiting_expires_at=None,
+                turn_deadline_at=None,
+                ordered_chamber=[],
+                pending_rewards=[],
+                pending_burst=False,
+                pending_locks=[],
+                ended_at=ended_at,
+                state_revision=terminal_revision,
+                updated_at=ended_at,
+            )
+        )
+        await self._execute(
+            delete(RoulettePlayerRow).where(_P.c.game_id == root.game_id)
+        )
+        await self._flush()
+        stored = await self.get_result(
+            GroupRef(root.app_id, root.group_openid),
+            root.game_id,
+        )
+        if stored is None:
+            raise StorageUnavailableError("failed result disappeared before readback")
+        return stored
+
     def _snapshot_from_rows(
         self,
         root: RouletteGameRow,
         players: Sequence[RoulettePlayerRow],
     ) -> GameSnapshot:
+        if type(root.state_revision) is not int or root.state_revision < 1:
+            raise AggregateCorruptError("persisted state revision is invalid")
         if root.lifecycle == "waiting" and not players:
             raise AggregateCorruptError("waiting game has no runtime players")
         try:
@@ -928,17 +1057,18 @@ def _validate_result_header(row: RouletteResultRow) -> None:
             or not row.winner_display_name.strip()
         ):
             raise ValueError("completed result has no complete winner proof")
-    elif row.lifecycle == "failed" and row.reason not in FAILED_REASONS:
-        raise ValueError("failed result reason is not whitelisted")
-    elif any(
-        value is not None
-        for value in (
-            row.winner_seq,
-            row.winner_member_openid,
-            row.winner_display_name,
-        )
-    ):
-        raise ValueError("non-completed result has a winner proof")
+    else:
+        if row.lifecycle == "failed" and row.reason not in FAILED_REASONS:
+            raise ValueError("failed result reason is not whitelisted")
+        if any(
+            value is not None
+            for value in (
+                row.winner_seq,
+                row.winner_member_openid,
+                row.winner_display_name,
+            )
+        ):
+            raise ValueError("non-completed result has a winner proof")
 
 
 def _validate_leaderboard_row(row: RouletteLeaderboardRow) -> None:
@@ -959,10 +1089,112 @@ def _validate_leaderboard_row(row: RouletteLeaderboardRow) -> None:
     _validate_db_timestamp(row.last_won_at)
 
 
+def _validate_failed_projection_time(
+    root: RouletteGameRow,
+    ended_at: datetime,
+) -> None:
+    try:
+        _validate_db_timestamp(ended_at)
+    except ValueError as exc:
+        raise TerminalProjectionRejectedError(
+            "failed projection time is not timezone-aware"
+        ) from exc
+    try:
+        _validate_db_timestamp(root.created_at)
+        _validate_db_timestamp(root.started_at)
+    except ValueError as exc:
+        raise AggregateCorruptError(
+            "failed projection root timestamps are invalid"
+        ) from exc
+    if root.created_at is None:
+        raise AggregateCorruptError("failed projection root has no creation time")
+    if ended_at < root.created_at:
+        raise TerminalProjectionRejectedError(
+            "failed projection time precedes game creation"
+        )
+    if root.started_at is not None and ended_at < root.started_at:
+        raise TerminalProjectionRejectedError(
+            "failed projection time precedes game start"
+        )
+
+
+def _safe_failed_result_players(
+    game_id: str,
+    players: Sequence[RoulettePlayerRow],
+) -> list[RouletteResultPlayerRow]:
+    candidates = [
+        row
+        for row in players
+        if (
+            type(row.join_seq) is int
+            and row.join_seq > 0
+            and type(row.member_openid) is str
+            and bool(row.member_openid.strip())
+            and type(row.display_name) is str
+            and bool(row.display_name.strip())
+            and type(row.alive) is bool
+        )
+    ]
+    invalid_indexes: set[int] = set()
+    first_by_sequence: dict[int, int] = {}
+    first_by_member: dict[str, int] = {}
+    for index, row in enumerate(candidates):
+        sequence = row.join_seq
+        member_openid = row.member_openid
+        if type(sequence) is not int or type(member_openid) is not str:
+            continue
+        previous_sequence = first_by_sequence.get(sequence)
+        if previous_sequence is None:
+            first_by_sequence[sequence] = index
+        else:
+            invalid_indexes.update((previous_sequence, index))
+        previous_member = first_by_member.get(member_openid)
+        if previous_member is None:
+            first_by_member[member_openid] = index
+        else:
+            invalid_indexes.update((previous_member, index))
+
+    safe: list[RouletteResultPlayerRow] = []
+    for index, row in enumerate(candidates):
+        if index in invalid_indexes:
+            continue
+        eliminated_order = (
+            row.eliminated_order
+            if type(row.eliminated_order) is int and row.eliminated_order > 0
+            else None
+        )
+        eliminated_reason = (
+            row.eliminated_reason
+            if type(row.eliminated_reason) is str
+            else None
+        )
+        eliminated_at = row.eliminated_at
+        try:
+            _validate_db_timestamp(eliminated_at)
+        except ValueError:
+            eliminated_at = None
+        safe.append(
+            RouletteResultPlayerRow(
+                game_id=game_id,
+                join_seq=row.join_seq,
+                member_openid=row.member_openid,
+                display_name=row.display_name,
+                alive=row.alive,
+                eliminated_order=eliminated_order,
+                eliminated_reason=eliminated_reason,
+                eliminated_at=eliminated_at,
+            )
+        )
+    return safe
+
+
 def _validate_result_players(
     result: RouletteResultRow,
     players: Sequence[RouletteResultPlayerRow],
 ) -> None:
+    if result.lifecycle == "failed":
+        _validate_failed_result_players(result, players)
+        return
     if not players:
         raise ValueError("terminal result has no result players")
     seen_sequences: set[int] = set()
@@ -1031,6 +1263,44 @@ def _validate_result_players(
             or result.winner_display_name != winner.display_name
         ):
             raise ValueError("completed result winner does not match seats")
+
+
+def _validate_failed_result_players(
+    result: RouletteResultRow,
+    players: Sequence[RouletteResultPlayerRow],
+) -> None:
+    """Validate only the representable facts retained for a failed result."""
+
+    seen_sequences: set[int] = set()
+    seen_members: set[str] = set()
+    for row in players:
+        if row.game_id != result.game_id:
+            raise ValueError("result player references a different game")
+        if (
+            type(row.join_seq) is not int
+            or row.join_seq <= 0
+            or row.join_seq in seen_sequences
+        ):
+            raise ValueError("failed result player sequence is invalid")
+        seen_sequences.add(row.join_seq)
+        if (
+            type(row.member_openid) is not str
+            or not row.member_openid.strip()
+            or row.member_openid in seen_members
+            or type(row.display_name) is not str
+            or not row.display_name.strip()
+        ):
+            raise ValueError("failed result player identity is invalid")
+        seen_members.add(row.member_openid)
+        if type(row.alive) is not bool:
+            raise TypeError("failed result player alive flag is invalid")
+        if row.eliminated_order is not None and (
+            type(row.eliminated_order) is not int or row.eliminated_order <= 0
+        ):
+            raise ValueError("failed result elimination order is invalid")
+        if row.eliminated_reason is not None and type(row.eliminated_reason) is not str:
+            raise TypeError("failed result elimination reason is invalid")
+        _validate_db_timestamp(row.eliminated_at)
 
 
 def _validate_db_timestamp(value: object) -> None:
