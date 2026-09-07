@@ -609,7 +609,17 @@ async def test_missing_native_reply_does_not_call_get_msg() -> None:
     fetcher = MessageFetcher({})
     collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
     _open(collector, code=code)
-    event = _group_event(message_id=46001, user_id=MEMBER_QQ, text=COMMAND)
+    challenge_text = f"正在确认你的本群身份。会话码：{code}"
+    event = _group_event(
+        message_id=46001,
+        user_id=int(OFFICIAL_BOT_QQ),
+        text=challenge_text,
+        self_id=ONEBOT_SELF_ID,
+        to_me=False,
+        message=Message(challenge_text),
+        original_message=Message(challenge_text),
+        sender_id=OFFICIAL_BOT_QQ,
+    )
 
     assert await collector.handle_event(event) is None
     assert fetcher.calls == []
@@ -632,6 +642,7 @@ async def test_get_msg_failure_is_silent_and_does_not_create_evidence() -> None:
     fetcher.fail_ids.add(original_id)
     collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
     _open(collector, code=code)
+    await collector.handle_event(_original_event(message_id=original_id))
     challenge = _challenge_event(
         message_id=challenge_id,
         session_code=code,
