@@ -656,7 +656,12 @@ async def test_bind_list_empty(
 ) -> None:
     """无绑定时显示提示。"""
     manager_stub = SimpleNamespace()
-    manager_stub.list_onebot_group_bindings = lambda *, _group_id: {}
+
+    def _empty_list(*, group_id: str) -> dict[str, str]:
+        del group_id
+        return {}
+
+    manager_stub.list_onebot_group_bindings = _empty_list
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
 
     async def _fake_private_message(
@@ -700,9 +705,12 @@ async def test_bind_list_exception_shows_error(
 ) -> None:
     """list_onebot_group_bindings 抛异常时显示失败消息。"""
     manager_stub = SimpleNamespace()
-    manager_stub.list_onebot_group_bindings = lambda *, _group_id: (
-        _ for _ in ()
-    ).throw(RuntimeError("存储失败"))
+
+    def _raise_list_error(*, group_id: str) -> dict[str, str]:
+        del group_id
+        raise RuntimeError("存储失败")
+
+    manager_stub.list_onebot_group_bindings = _raise_list_error
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
     private_messages: list[str] = []
 
@@ -767,9 +775,12 @@ async def test_group_bind_list_sends_full_details_only_to_superuser_private_chat
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bindings = {"42": "binding-canary-konata", "10086": "binding-canary-kagami"}
-    manager_stub = SimpleNamespace(
-        list_onebot_group_bindings=lambda *, _group_id: bindings
-    )
+
+    def _list_bindings(*, group_id: str) -> dict[str, str]:
+        del group_id
+        return bindings
+
+    manager_stub = SimpleNamespace(list_onebot_group_bindings=_list_bindings)
     private_messages: list[tuple[int, str]] = []
 
     async def _fake_private_message(
@@ -818,9 +829,12 @@ async def test_group_bind_list_public_mode_shows_only_redacted_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bindings = {"42": "binding-public-canary"}
-    manager_stub = SimpleNamespace(
-        list_onebot_group_bindings=lambda *, _group_id: bindings
-    )
+
+    def _list_bindings(*, group_id: str) -> dict[str, str]:
+        del group_id
+        return bindings
+
+    manager_stub = SimpleNamespace(list_onebot_group_bindings=_list_bindings)
 
     async def _fake_private_message(
         _bot: object,
@@ -866,11 +880,12 @@ async def test_group_bind_list_error_reason_is_private(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     error_canary = "binding-storage-error-canary"
-    manager_stub = SimpleNamespace(
-        list_onebot_group_bindings=lambda *, _group_id: (_ for _ in ()).throw(
-            RuntimeError(error_canary)
-        )
-    )
+
+    def _raise_list_error(*, group_id: str) -> dict[str, str]:
+        del group_id
+        raise RuntimeError(error_canary)
+
+    manager_stub = SimpleNamespace(list_onebot_group_bindings=_raise_list_error)
     private_messages: list[str] = []
 
     async def _fake_private_message(

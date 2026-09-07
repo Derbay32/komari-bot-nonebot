@@ -225,9 +225,13 @@ async def test_bind_list_rejects_non_superuser(
     """非 SUPERUSER 访问 bind list 应被拒绝。"""
     called = SimpleNamespace(list_onebot_group_bindings=False)
     manager_stub = SimpleNamespace()
-    manager_stub.list_onebot_group_bindings = (
-        lambda *, _group_id: setattr(called, "list_onebot_group_bindings", True) or {}
-    )
+
+    def _list_onebot_group_bindings(*, group_id: str) -> dict[str, str]:
+        del group_id
+        called.list_onebot_group_bindings = True
+        return {}
+
+    manager_stub.list_onebot_group_bindings = _list_onebot_group_bindings
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
 
     async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
