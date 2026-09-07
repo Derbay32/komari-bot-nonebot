@@ -13,9 +13,9 @@ from nonebot.adapters.onebot.v11.event import Sender
 from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.plugins.character_binding.manager import (
     BindingPersistenceError,
+    CharacterBindingManager,
     CharacterNameValidationError,
 )
-from komari_bot.plugins.group_admission import AdmissionQualification
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -39,16 +39,19 @@ def _admit_admission(
     commands_module: Any,
 ) -> None:
     """放行统一准入复查，命令单测专注既有领域逻辑。"""
-
     def _adjudicate(*_args: object, **_kwargs: object) -> object:
         return SimpleNamespace(
-            qualification=AdmissionQualification.BUSINESS,
+            # Resolve the enum from the command module that owns the patched
+            # adjudicator.  This keeps ``is AdmissionQualification.BUSINESS``
+            # valid when the admission package was reloaded during NoneBug
+            # startup.
+            qualification=commands_module.AdmissionQualification.BUSINESS,
         )
 
     monkeypatch.setattr(commands_module, "adjudicate", _adjudicate)
 
 
-class _StubManager:
+class _StubManager(CharacterBindingManager):
     def __init__(self, bindings: dict[str, str] | None = None) -> None:
         self.bindings = {
             ("114514", user_id): character_name
@@ -245,7 +248,7 @@ async def test_handle_list_only_returns_current_user_binding_with_nonebug(
         ctx.should_pass_rule(matcher=commands_module.bind_list)
         ctx.should_call_send(
             event,
-            plain_text_message("📋 您的角色绑定: 泉此方"),
+            plain_text_message("📋 您的本群角色名: 泉此方"),
             bot=bot,
         )
         ctx.should_finished()
@@ -269,7 +272,7 @@ async def test_handle_list_treats_stored_cq_code_as_plain_text(
         ctx.should_pass_rule(matcher=commands_module.bind_list)
         ctx.should_call_send(
             event,
-            plain_text_message("📋 您的角色绑定: [CQ:at,qq=all]"),
+            plain_text_message("📋 您的本群角色名: [CQ:at,qq=all]"),
             bot=bot,
         )
         ctx.should_finished()

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from contextlib import suppress
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import event
@@ -16,6 +18,7 @@ from komari_bot.plugins.character_binding.manager import (
     BindingPersistenceError,
 )
 from tests.character_binding.conftest import (
+    POSTGRES_URL,
     bind_member,
     list_group_bindings,
     lookup_name,
@@ -23,6 +26,8 @@ from tests.character_binding.conftest import (
 )
 
 if TYPE_CHECKING:
+    import asyncpg
+
     from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 
 
@@ -78,6 +83,121 @@ def _member_openids(rows: object) -> set[str]:
     for row in rows:
         result.update(_member_openids(row))
     return result
+
+
+def _sql_literal(value: str) -> str:
+    """Quote a test-generated literal for the temporary trigger DDL."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _asyncpg_url() -> str:
+    return POSTGRES_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+async def _open_control_connection() -> "asyncpg.Connection":
+    import asyncpg
+
+    return await asyncpg.connect(_asyncpg_url())
+
+
+async def _install_cross_group_pause_trigger(
+    *,
+    app_id: str,
+    group_id: str,
+    group_openid: str,
+) -> tuple[str, str, tuple[int, int], tuple[int, int]]:
+    """Pause only the cross-mapped INSERT at PostgreSQL's trigger boundary.
+
+    The trigger is deliberately test-local.  It proves that the X transaction
+    has reached the public write's group INSERT before the two valid mappings
+    commit, without depending on manager internals or a timing race.
+    """
+    suffix = uuid4().hex[:20]
+    trigger_name = f"tsk271_pause_{suffix}"
+    function_name = f"tsk271_pause_fn_{suffix}"
+    signal_key = (uuid4().int % 2_000_000_000 + 1, uuid4().int % 2_000_000_000 + 1)
+    gate_key = (uuid4().int % 2_000_000_000 + 1, uuid4().int % 2_000_000_000 + 1)
+    function_sql = f"""
+        CREATE FUNCTION "{function_name}"() RETURNS trigger
+        LANGUAGE plpgsql AS $func$
+        BEGIN
+            IF NEW.app_id = TG_ARGV[0]
+               AND NEW.group_id = TG_ARGV[1]
+               AND NEW.group_openid = TG_ARGV[2] THEN
+                PERFORM pg_advisory_xact_lock(
+                    TG_ARGV[3]::integer, TG_ARGV[4]::integer
+                );
+                PERFORM pg_advisory_xact_lock(
+                    TG_ARGV[5]::integer, TG_ARGV[6]::integer
+                );
+            END IF;
+            RETURN NEW;
+        END;
+        $func$
+    """
+    trigger_sql = f"""
+        CREATE TRIGGER "{trigger_name}"
+        BEFORE INSERT ON komari_character_binding_groups
+        FOR EACH ROW
+        EXECUTE FUNCTION "{function_name}"(
+            {_sql_literal(app_id)},
+            {_sql_literal(group_id)},
+            {_sql_literal(group_openid)},
+            {_sql_literal(str(signal_key[0]))},
+            {_sql_literal(str(signal_key[1]))},
+            {_sql_literal(str(gate_key[0]))},
+            {_sql_literal(str(gate_key[1]))}
+        )
+    """
+    connection = await _open_control_connection()
+    try:
+        await connection.execute(function_sql)
+        await connection.execute(trigger_sql)
+    finally:
+        await connection.close()
+    return trigger_name, function_name, signal_key, gate_key
+
+
+async def _drop_cross_group_pause_trigger(
+    *,
+    trigger_name: str,
+    function_name: str,
+) -> None:
+    connection = await _open_control_connection()
+    try:
+        await connection.execute(
+            f'DROP TRIGGER IF EXISTS "{trigger_name}" '
+            "ON komari_character_binding_groups"
+        )
+        await connection.execute(f'DROP FUNCTION IF EXISTS "{function_name}"()')
+    finally:
+        await connection.close()
+
+
+async def _wait_for_advisory_signal(key: tuple[int, int]) -> None:
+    """Wait for the trigger's SQL-side signal, yielding through DB I/O."""
+    statement = """
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND granted
+              AND classid = :class_id
+              AND objid = :object_id
+        )
+        """.replace(":class_id", "$1").replace(":object_id", "$2")
+
+    connection = await _open_control_connection()
+    async def poll() -> None:
+        while True:
+            reached = bool(await connection.fetchval(statement, key[0], key[1]))
+            if reached:
+                return
+
+    try:
+        await asyncio.wait_for(poll(), timeout=10)
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -333,6 +453,162 @@ async def test_same_group_name_race_has_one_conflict_and_one_committed_row(
         assert _member_openids(rows) == {f"openid-race-{successful_indices[0]}"}
     finally:
         await verifier.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
+    app: object,
+    app_id: str,
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """Crossed ``(group_id, group_openid)`` races fail closed atomically.
+
+    X starts with ``(G1, O2)`` and is paused at its group INSERT.  S1 commits
+    ``(G1, O1)`` and S2 commits ``(G2, O2)`` while X is waiting.  The public
+    write must reject X after its conflict recheck rather than attaching X's
+    member to S2's canonical group.
+    """
+    del app
+    require_postgres()
+    from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+
+    numeric_seed = int(app_id.removeprefix("tsk271-")[:12], 16)
+    group_one_id = str(100_000_000 + numeric_seed % 800_000_000)
+    group_one_openid = f"{app_id}-group-one"
+    group_two_id = str(int(group_one_id) + 1)
+    group_two_openid = f"{app_id}-group-two"
+    member_one_qq = str(int(group_one_id) + 11)
+    member_two_qq = str(int(group_one_id) + 12)
+    cross_member_qq = str(int(group_one_id) + 13)
+    cross_member_openid = f"{app_id}-member-cross"
+    trigger_names: tuple[str, str] | None = None
+    gate_connection = await _open_control_connection()
+    gate_held = False
+    cross_task: asyncio.Task[object] | None = None
+    managers = [
+        binding_manager,
+        CharacterBindingManager(),
+        CharacterBindingManager(),
+    ]
+    await asyncio.gather(*(manager.initialize() for manager in managers[1:]))
+
+    try:
+        trigger_names_data = await _install_cross_group_pause_trigger(
+            app_id=app_id,
+            group_id=group_one_id,
+            group_openid=group_two_openid,
+        )
+        trigger_names = trigger_names_data[:2]
+        _trigger_name, _function_name, signal_key, gate_key = trigger_names_data
+
+        await gate_connection.execute("BEGIN")
+        await gate_connection.fetchval(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            gate_key[0],
+            gate_key[1],
+        )
+        gate_held = True
+
+        cross_task = asyncio.create_task(
+            bind_member(
+                managers[0],
+                app_id=app_id,
+                group_id=group_one_id,
+                group_openid=group_two_openid,
+                member_qq=cross_member_qq,
+                member_openid=cross_member_openid,
+                character_name="错误交叉",
+            )
+        )
+        await _wait_for_advisory_signal(signal_key)
+
+        await bind_member(
+            managers[1],
+            app_id=app_id,
+            group_id=group_one_id,
+            group_openid=group_one_openid,
+            member_qq=member_one_qq,
+            member_openid=f"{app_id}-member-one",
+            character_name="群一成员",
+        )
+        await bind_member(
+            managers[2],
+            app_id=app_id,
+            group_id=group_two_id,
+            group_openid=group_two_openid,
+            member_qq=member_two_qq,
+            member_openid=f"{app_id}-member-two",
+            character_name="群二成员",
+        )
+
+        # The gate is transaction-scoped.  Rolling back this controller
+        # session releases it even if the cross task is later cancelled.
+        await gate_connection.execute("ROLLBACK")
+        gate_held = False
+
+        with pytest.raises(BindingConflictError):
+            await asyncio.wait_for(cross_task, timeout=10)
+
+        verifier = CharacterBindingManager()
+        await verifier.initialize()
+        try:
+            group_one_rows = list_group_bindings(
+                verifier,
+                app_id=app_id,
+                group_openid=group_one_openid,
+            )
+            group_two_rows = list_group_bindings(
+                verifier,
+                app_id=app_id,
+                group_openid=group_two_openid,
+            )
+            assert _member_openids(group_one_rows) == {
+                f"{app_id}-member-one"
+            }
+            assert _member_openids(group_two_rows) == {
+                f"{app_id}-member-two"
+            }
+            assert (
+                verifier.get_character_name(
+                    group_id=group_one_id,
+                    user_id=member_one_qq,
+                    fallback_nickname="群一昵称",
+                )
+                == "群一成员"
+            )
+            assert (
+                verifier.get_character_name(
+                    group_id=group_two_id,
+                    user_id=cross_member_qq,
+                    fallback_nickname="交叉昵称",
+                )
+                == "交叉昵称"
+            )
+            assert (
+                verifier.get_qq_character_name(
+                    app_id=app_id,
+                    group_openid=group_two_openid,
+                    member_openid=cross_member_openid,
+                    fallback_nickname="交叉昵称",
+                )
+                == "交叉昵称"
+            )
+        finally:
+            await verifier.close()
+    finally:
+        if gate_held:
+            with suppress(Exception):
+                await gate_connection.execute("ROLLBACK")
+        if cross_task is not None and not cross_task.done():
+            with suppress(Exception):
+                await asyncio.wait_for(cross_task, timeout=10)
+        if trigger_names is not None:
+            await _drop_cross_group_pause_trigger(
+                trigger_name=trigger_names[0],
+                function_name=trigger_names[1],
+            )
+        await gate_connection.close()
+        await asyncio.gather(*(manager.close() for manager in managers[1:]))
 
 
 @pytest.mark.asyncio

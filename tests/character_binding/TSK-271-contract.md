@@ -109,6 +109,7 @@ SUPERUSER、群内只发安全回执”的调试投影规则。对于没有已�
 | 名字 trim/空白折叠、长度、控制类别 | test_manager.py 名字校验参数组 |
 | NFKC+casefold 同群唯一、跨群同名 | test_same_group_name_uses_nfkc_casefold_and_cross_group_allows_same_name |
 | 真实 PG 并发同名仅一胜 | test_same_group_name_race_has_one_conflict_and_one_committed_row |
+| 交叉群映射并发不把成员挂到错误群 | test_cross_group_mapping_race_never_attaches_member_to_wrong_group |
 | 群/成员/名字原子失败无孤立记录；失败 manager 不发布快照 | test_same_group_name_race_has_one_conflict_and_one_committed_row、test_conflicting_name_rolls_back_group_member_and_name_atomically、test_new_group_write_failure_rolls_back_and_keeps_snapshot_unchanged |
 | 清当前群名但保留身份关联 | test_clear_name_retains_verified_group_and_member_identity |
 | 旧全局值不作为默认群查询 | test_legacy_global_value_is_not_a_default_group_lookup |

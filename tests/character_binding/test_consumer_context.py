@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
+from nonebot.exception import FinishedException
 
 
 class _StrictScopedBinding:
@@ -269,7 +270,6 @@ async def test_debug_bind_set_uses_current_group_context(
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    del app
     debug_commands = importlib.import_module("komari_bot.plugins.komari_debug.commands")
     calls: list[dict[str, object]] = []
 
@@ -302,23 +302,35 @@ async def test_debug_bind_set_uses_current_group_context(
         _fake_basic_result,
     )
 
-    sent: list[str] = []
-
-    async def _finish(message: object) -> None:
-        sent.append(str(message))
-
-    monkeypatch.setattr(debug_commands.debug_bind_set, "finish", _finish)
     event = _build_group_event(
         ".debug bind set 42 群内角色",
         user_id=42,
         group_id=12345,
         self_id=1001,
     )
-    await debug_commands.handle_debug_bind_set(
-        bot=cast("Any", SimpleNamespace(self_id="1001")),
-        event=event,
-        arg_text="42 群内角色",
-    )
+
+    sent: list[str] = []
+
+    async def _authorized_superuser(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def _finish(message: object) -> None:
+        sent.append(str(message))
+        raise FinishedException
+
+    # Use a real NoneBug Bot and make authorization an explicit test seam.  The
+    # consumer assertion is about forwarding the current group context; the
+    # independent komari_debug tests cover the production SUPERUSER rule.
+    monkeypatch.setattr(debug_commands, "SUPERUSER", _authorized_superuser)
+    monkeypatch.setattr(debug_commands.debug_bind_set, "finish", _finish)
+    async with app.test_matcher() as ctx:
+        bot = _create_bot(ctx, self_id="1001")
+        with pytest.raises(FinishedException):
+            await debug_commands.handle_debug_bind_set(
+                bot=bot,
+                event=event,
+                arg_text="42 群内角色",
+            )
 
     assert calls == [
         {
