@@ -23,7 +23,9 @@
 临时会话从 `open_session` 起有效 600 秒，恰好到期时拒绝；取消、新连接代次和新的
 collector 实例都会使旧缓存/证据失效。273 不生成 `app_id` 或官方数字 QQ 配置；274
 或启动装配层负责构造已配置 collectors 后调用 `set_runtime_collectors()`。未注入时
-listener 必须静默跳过。
+listener 必须静默跳过。`ReplyEvidenceSession` 是不可变的公开快照；会话 TTL 从
+`open_session` 计时，原始 OneBot 缓存按自身首次观察时间计时。缓存可以先于仍有效的
+会话淘汰；已形成的 evidence 在所属会话仍有效时不因正常缓存淘汰撤销。
 
 ## 事件与证据边界
 

@@ -12,7 +12,7 @@ import asyncio
 import importlib
 import sys
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -21,14 +21,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
 import pytest
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
+from nonebot.adapters.onebot.v11.event import Reply, Sender
+
 from komari_bot.plugins.character_binding.reply_evidence import (
     ReplyEvidence,
     ReplyEvidenceCollector,
     SessionCodeCollisionError,
 )
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
-from nonebot.adapters.onebot.v11.event import Reply, Sender
-
 from tests.group_admission.entry_gate_support import (
     ProbeBot,
     dispatch,
@@ -47,6 +47,18 @@ PACKAGE_PATH = (
     / "komari_bot"
     / "plugins"
     / "character_binding"
+)
+# NoneBot test startup may already import these ORM-backed modules while
+# registering the shared SQLModel metadata.  Reusing those module objects keeps
+# a real package reload from defining the same tables twice.  Registration
+# bearing modules remain reloadable below so this helper still observes the
+# production commands and evidence listener.
+_PRESERVE_REAL_PACKAGE_MODULES = frozenset(
+    {
+        f"{PACKAGE_NAME}.orm_models",
+        f"{PACKAGE_NAME}.database",
+        f"{PACKAGE_NAME}.manager",
+    }
 )
 
 APP_ID = "app-tsk273"
@@ -105,6 +117,27 @@ class BlockingMessageFetcher(MessageFetcher):
         await self.release.wait()
         if message_id in self.fail_ids:
             raise RuntimeError("simulated get_msg failure")  # noqa: TRY003
+        return self.payloads[message_id]
+
+
+class PerMessageBlockingFetcher(MessageFetcher):
+    """Block one target while allowing a second target to finish immediately."""
+
+    def __init__(
+        self,
+        payloads: Mapping[int, Mapping[str, object]],
+        blocked_message_id: int,
+    ) -> None:
+        super().__init__(payloads)
+        self.blocked_message_id = blocked_message_id
+        self.blocked_started = asyncio.Event()
+        self.release_blocked = asyncio.Event()
+
+    async def __call__(self, message_id: int) -> Mapping[str, object]:
+        self.calls.append(message_id)
+        if message_id == self.blocked_message_id:
+            self.blocked_started.set()
+            await self.release_blocked.wait()
         return self.payloads[message_id]
 
 
@@ -188,6 +221,7 @@ def _challenge_event(
     group_id: int = GROUP_ID,
     official_sender: str = OFFICIAL_BOT_QQ,
     quoted_sender: int = MEMBER_QQ,
+    quoted_real_id: int | None = None,
     quoted_has_mention: bool = True,
     to_me: bool = False,
 ) -> GroupMessageEvent:
@@ -204,7 +238,11 @@ def _challenge_event(
         time=int(BASE_TIME.timestamp()),
         message_type="group",
         message_id=quoted_message_id,
-        real_id=quoted_message_id,
+        real_id=(
+            quoted_message_id
+            if quoted_real_id is None
+            else quoted_real_id
+        ),
         sender=_sender(quoted_sender, "member"),
         message=quoted_message,
         group_id=group_id,
@@ -232,6 +270,7 @@ def _get_msg_payload(
     sender_id: int | str = MEMBER_QQ,
     mention_official: bool = True,
     returned_message_id: int | None = None,
+    returned_real_id: int | None = None,
     raw_message: str | None = None,
     message_text: str | None = None,
 ) -> dict[str, object]:
@@ -240,7 +279,7 @@ def _get_msg_payload(
     payload: dict[str, object] = {
         "time": int(BASE_TIME.timestamp()),
         "message_id": message_id if returned_message_id is None else returned_message_id,
-        "real_id": message_id,
+        "real_id": message_id if returned_real_id is None else returned_real_id,
         "message_type": message_type,
         "sender": {"user_id": int(sender_id), "nickname": "member"},
         "message": [
@@ -466,6 +505,146 @@ async def test_interleaved_same_text_sessions_use_native_reply_identity() -> Non
 
 
 @pytest.mark.asyncio
+async def test_different_sessions_progress_while_one_get_msg_is_blocked() -> None:
+    """一个成员的慢 get_msg 不得阻塞另一成员的独立会话。"""
+    first_original_id = 32101
+    second_original_id = 32102
+    first_challenge_id = 42101
+    second_challenge_id = 42102
+    fetcher = PerMessageBlockingFetcher(
+        {
+            first_original_id: _get_msg_payload(
+                message_id=first_original_id,
+                original_text=COMMAND,
+                sender_id=21001,
+            ),
+            second_original_id: _get_msg_payload(
+                message_id=second_original_id,
+                original_text=COMMAND,
+                sender_id=21002,
+            ),
+        },
+        blocked_message_id=first_original_id,
+    )
+    collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
+    await collector.handle_event(
+        _original_event(message_id=first_original_id, member_qq=21001)
+    )
+    await collector.handle_event(
+        _original_event(message_id=second_original_id, member_qq=21002)
+    )
+    _open(
+        collector,
+        code="TSK273-CONCURRENT-ONE",
+        member_openid="member-one",
+        qq_message_id="qq-one",
+    )
+    _open(
+        collector,
+        code="TSK273-CONCURRENT-TWO",
+        member_openid="member-two",
+        qq_message_id="qq-two",
+    )
+    first_task = asyncio.create_task(
+        collector.handle_event(
+            _challenge_event(
+                message_id=first_challenge_id,
+                session_code="TSK273-CONCURRENT-ONE",
+                quoted_message_id=first_original_id,
+                quoted_text=COMMAND,
+                quoted_sender=21001,
+            )
+        )
+    )
+    await asyncio.wait_for(fetcher.blocked_started.wait(), timeout=1)
+    second_task = asyncio.create_task(
+        collector.handle_event(
+            _challenge_event(
+                message_id=second_challenge_id,
+                session_code="TSK273-CONCURRENT-TWO",
+                quoted_message_id=second_original_id,
+                quoted_text=COMMAND,
+                quoted_sender=21002,
+            )
+        )
+    )
+
+    try:
+        second_evidence = await asyncio.wait_for(second_task, timeout=1)
+        assert second_evidence is not None
+        _assert_evidence(
+            second_evidence,
+            code="TSK273-CONCURRENT-TWO",
+            member_qq=21002,
+            member_openid="member-two",
+            onebot_original_message_id=second_original_id,
+            challenge_message_id=second_challenge_id,
+            qq_message_id="qq-two",
+        )
+        assert not first_task.done()
+    finally:
+        fetcher.release_blocked.set()
+        first_evidence = await first_task
+        if not second_task.done():
+            second_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await second_task
+
+    assert first_evidence is not None
+    _assert_evidence(
+        first_evidence,
+        code="TSK273-CONCURRENT-ONE",
+        member_qq=21001,
+        member_openid="member-one",
+        onebot_original_message_id=first_original_id,
+        challenge_message_id=first_challenge_id,
+        qq_message_id="qq-one",
+    )
+    assert fetcher.calls == [first_original_id, second_original_id]
+
+
+@pytest.mark.asyncio
+async def test_signed_message_id_and_independent_real_id_are_valid() -> None:
+    """OneBot message_id 可带符号，real_id 是独立事实。"""
+    code = "TSK273-SIGNED-ID"
+    original_id = -38101
+    challenge_id = 48101
+    real_id = 712345
+    fetcher = MessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                returned_real_id=real_id,
+                original_text=COMMAND,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
+    _open(collector, code=code)
+
+    evidence = await _prime_and_capture(
+        collector,
+        original=_original_event(message_id=original_id),
+        challenge=_challenge_event(
+            message_id=challenge_id,
+            session_code=code,
+            quoted_message_id=original_id,
+            quoted_real_id=real_id,
+            quoted_text=COMMAND,
+        ),
+    )
+
+    assert evidence is not None
+    _assert_evidence(
+        evidence,
+        code=code,
+        onebot_original_message_id=original_id,
+        challenge_message_id=challenge_id,
+    )
+    assert fetcher.calls == [original_id]
+
+
+@pytest.mark.asyncio
 async def test_duplicate_legal_challenge_is_idempotent() -> None:
     code = "TSK273-IDEMPOTENT"
     original_id = 33001
@@ -499,6 +678,140 @@ async def test_duplicate_legal_challenge_is_idempotent() -> None:
     assert first is not None
     assert second == first
     assert fetcher.calls == [original_id]
+
+
+@pytest.mark.asyncio
+async def test_session_original_command_must_match_cached_original() -> None:
+    code = "TSK273-COMMAND-MISMATCH"
+    original_id = 33101
+    challenge_id = 43101
+    fetcher = MessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                original_text=COMMAND,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
+    _open(collector, code=code, original_command="/bind --qq-side-mismatch")
+
+    await collector.handle_event(_original_event(message_id=original_id))
+    challenge = _challenge_event(
+        message_id=challenge_id,
+        session_code=code,
+        quoted_message_id=original_id,
+        quoted_text=COMMAND,
+    )
+
+    assert await collector.handle_event(challenge) is None
+    assert collector.get_evidence(code) is None
+
+
+def test_open_session_returns_an_immutable_public_snapshot() -> None:
+    code = "TSK273-IMMUTABLE-SESSION"
+    collector = _collector(
+        fetcher=MessageFetcher({}),
+        clock=FrozenClock(BASE_TIME),
+    )
+
+    session = collector.open_session(
+        session_code=code,
+        group_openid=GROUP_OPENID,
+        member_openid=MEMBER_OPENID,
+        original_command=COMMAND,
+        qq_message_id=QQ_ORIGINAL_MESSAGE_ID,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        session.original_command = "/tampered"  # pyright: ignore[reportAttributeAccessIssue]
+    current = collector.get_session(code)
+    assert current is not None
+    assert current is session
+    assert current.original_command == COMMAND
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["outer_group", "reply_member"])
+async def test_existing_evidence_rejects_late_outer_or_reply_conflict(
+    conflict: str,
+) -> None:
+    code = f"TSK273-LATE-CONFLICT-{conflict}"
+    original_id = 33201
+    challenge_id = 43201
+    fetcher = MessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                original_text=COMMAND,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
+    _open(collector, code=code)
+    first = await _prime_and_capture(
+        collector,
+        original=_original_event(message_id=original_id),
+        challenge=_challenge_event(
+            message_id=challenge_id,
+            session_code=code,
+            quoted_message_id=original_id,
+            quoted_text=COMMAND,
+        ),
+    )
+    assert first is not None
+
+    late = _challenge_event(
+        message_id=challenge_id,
+        session_code=code,
+        quoted_message_id=original_id,
+        quoted_text=COMMAND,
+        group_id=GROUP_ID + 1 if conflict == "outer_group" else GROUP_ID,
+        quoted_sender=MEMBER_QQ + 1 if conflict == "reply_member" else MEMBER_QQ,
+    )
+
+    assert await collector.handle_event(late) is None
+    assert collector.get_evidence(code) == first
+    assert fetcher.calls == [original_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["none", "sender", "segment"])
+async def test_representative_malformed_get_msg_payload_fails_closed(
+    malformed: str,
+) -> None:
+    code = f"TSK273-MALFORMED-{malformed}"
+    original_id = 33301
+    challenge_id = 43301
+    valid_payload = _get_msg_payload(
+        message_id=original_id,
+        original_text=COMMAND,
+    )
+    if malformed == "none":
+        payload: object = None
+    else:
+        payload = dict(valid_payload)
+        if malformed == "sender":
+            payload["sender"] = ["not-a-sender-mapping"]
+        else:
+            payload["message"] = [{"type": "at", "data": "not-a-mapping"}]
+    fetcher = MessageFetcher(cast("Any", {original_id: payload}))
+    collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
+    _open(collector, code=code)
+    await collector.handle_event(_original_event(message_id=original_id))
+
+    assert (
+        await collector.handle_event(
+            _challenge_event(
+                message_id=challenge_id,
+                session_code=code,
+                quoted_message_id=original_id,
+                quoted_text=COMMAND,
+            )
+        )
+        is None
+    )
+    assert collector.get_evidence(code) is None
 
 
 @pytest.mark.asyncio
@@ -730,6 +1043,76 @@ async def test_inflight_get_msg_cannot_resurrect_invalidated_session(
 
 
 @pytest.mark.asyncio
+async def test_inflight_get_msg_rejects_when_original_cache_expires_first() -> None:
+    """原消息缓存可先于仍有效的会话到期，释放旧读取也不得成功。"""
+    code = "TSK273-INFLIGHT-CACHE-EXPIRED"
+    original_id = 37602
+    challenge_id = 47602
+    clock = FrozenClock(BASE_TIME)
+    fetcher = BlockingMessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                original_text=COMMAND,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=clock)
+    await collector.handle_event(_original_event(message_id=original_id))
+    clock.advance(timedelta(minutes=9))
+    _open(collector, code=code)
+    challenge = _challenge_event(
+        message_id=challenge_id,
+        session_code=code,
+        quoted_message_id=original_id,
+        quoted_text=COMMAND,
+    )
+
+    pending = asyncio.create_task(collector.handle_event(challenge))
+    await asyncio.wait_for(fetcher.started.wait(), timeout=1)
+    clock.advance(timedelta(minutes=1))
+    assert collector.get_session(code) is not None
+    fetcher.release.set()
+
+    assert await pending is None
+    assert collector.get_evidence(code) is None
+
+
+@pytest.mark.asyncio
+async def test_cache_eviction_does_not_revoke_still_valid_evidence() -> None:
+    """正常清理原消息缓存不得撤销尚未到期的已验 evidence。"""
+    code = "TSK273-CACHE-EVICTION-AFTER-EVIDENCE"
+    original_id = 37603
+    challenge_id = 47603
+    clock = FrozenClock(BASE_TIME)
+    fetcher = MessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                original_text=COMMAND,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=clock)
+    await collector.handle_event(_original_event(message_id=original_id))
+    clock.advance(timedelta(minutes=9))
+    _open(collector, code=code)
+    evidence = await collector.handle_event(
+        _challenge_event(
+            message_id=challenge_id,
+            session_code=code,
+            quoted_message_id=original_id,
+            quoted_text=COMMAND,
+        )
+    )
+    assert evidence is not None
+
+    clock.advance(timedelta(minutes=1, microseconds=1))
+    assert collector.get_session(code) is not None
+    assert collector.get_evidence(code) == evidence
+
+
+@pytest.mark.asyncio
 async def test_cached_original_message_must_match_complete_get_msg() -> None:
     code = "TSK273-CACHE-MATCH"
     original_id = 38001
@@ -922,6 +1305,8 @@ def _real_character_binding_package() -> Iterator[object]:
         if name == PACKAGE_NAME or name.startswith(f"{PACKAGE_NAME}.")
     }
     for name in saved_modules:
+        if name in _PRESERVE_REAL_PACKAGE_MODULES:
+            continue
         sys.modules.pop(name, None)
 
     parent = sys.modules.get("komari_bot.plugins")
