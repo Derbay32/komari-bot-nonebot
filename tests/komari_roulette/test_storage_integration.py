@@ -3,27 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import suppress
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
-from komari_bot.plugins.komari_roulette.mapper import (
-    GameSnapshot,
-    TerminalProjection,
-    game_state_from_snapshot,
-    game_state_to_snapshot,
-    transition_from_action_result,
-)
-from komari_bot.plugins.komari_roulette.storage import (
-    AggregateCorruptError,
-    PostgresRouletteStorage,
-    RevisionConflictError,
-    StorageUnavailableError,
-    TerminalProjectionRejectedError,
-)
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -31,6 +18,24 @@ from komari_bot.plugins.komari_roulette.domain import (
     Action,
     ChamberKind,
     apply_action,
+)
+from komari_bot.plugins.komari_roulette.mapper import (
+    GameSnapshot,
+    TerminalProjection,
+    game_state_from_snapshot,
+    game_state_to_snapshot,
+    transition_from_action_result,
+)
+from komari_bot.plugins.komari_roulette.orm_models import (
+    RouletteGameRow,
+    RoulettePlayerRow,
+)
+from komari_bot.plugins.komari_roulette.storage import (
+    AggregateCorruptError,
+    PostgresRouletteStorage,
+    RevisionConflictError,
+    StorageUnavailableError,
+    TerminalProjectionRejectedError,
 )
 from tests.komari_roulette.storage_support import (
     POSTGRES_URL,
@@ -89,6 +94,38 @@ async def _pg_now(session: AsyncSession) -> datetime:
     value = (await session.execute(text("SELECT CURRENT_TIMESTAMP"))).scalar_one()
     assert isinstance(value, datetime)
     return value
+
+
+async def _backend_pid(session: AsyncSession) -> int:
+    value = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+    assert isinstance(value, int)
+    return value
+
+
+async def _blocking_pids(session: AsyncSession, pid: int) -> tuple[int, ...]:
+    value = (
+        await session.execute(
+            text("SELECT pg_blocking_pids(:pid)"),
+            {"pid": pid},
+        )
+    ).scalar_one()
+    assert isinstance(value, list)
+    return tuple(int(blocker) for blocker in value)
+
+
+async def _wait_until_blocked(
+    observer: AsyncSession,
+    pid: int,
+    *,
+    wait_seconds: float = 5.0,
+) -> tuple[int, ...]:
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        blockers = await _blocking_pids(observer, pid)
+        if blockers:
+            return blockers
+        await asyncio.sleep(0.02)
+    pytest.fail(f"backend {pid} did not become blocked")
 
 
 async def _create_waiting(
@@ -419,6 +456,193 @@ async def test_cross_row_stage_invariant_is_checked_when_active_roster_is_too_sm
         await session.close()
 
 
+@pytest.mark.parametrize(
+    "malformed_weight",
+    (True, 1.5, "3"),
+    ids=("bool", "float", "numeric-string"),
+)
+async def test_json_weight_types_are_not_silently_coerced(
+    db_scope: tuple[str, str, GroupRef],
+    malformed_weight: object,
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    session = open_session()
+    try:
+        created = await _create_waiting(group)
+        baseline = await PostgresRouletteStorage(session).load_current(group)
+        assert baseline is not None
+        weights: dict[str, object] = {
+            item.value: value for item, value in baseline.item_weights.items()
+        }
+        weights["beer"] = malformed_weight
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games "
+                "SET item_weights = CAST(:weights AS json) "
+                "WHERE game_id = :game_id"
+            ),
+            {"weights": json.dumps(weights), "game_id": created.game_id},
+        )
+        await session.commit()
+    finally:
+        await session.close()
+
+    read_session = open_session()
+    try:
+        with pytest.raises(AggregateCorruptError):
+            await PostgresRouletteStorage(read_session).load_current(group)
+        assert (
+            await PostgresRouletteStorage(read_session).get_result(
+                group, created.game_id
+            )
+            is None
+        )
+    finally:
+        await read_session.close()
+
+
+async def test_persisted_zero_revision_is_not_a_valid_current_game(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    session = open_session()
+    try:
+        created = await _create_waiting(group)
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games SET state_revision = 0 "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": created.game_id},
+        )
+        await session.commit()
+    finally:
+        await session.close()
+
+    read_session = open_session()
+    try:
+        with pytest.raises(AggregateCorruptError):
+            await PostgresRouletteStorage(read_session).load_current(group)
+    finally:
+        await read_session.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "empty_chamber",
+        "chamber_without_live",
+        "zero_chamber_revision",
+        "zero_turn_seq",
+        "pending_reward_wrong_phase",
+        "item_choice_not_full",
+        "duplicate_pending_locks",
+        "duplicate_frozen_name",
+        "lock_targets_eliminated_player",
+    ),
+)
+async def test_active_row_and_phase_invariants_fail_closed(
+    db_scope: tuple[str, str, GroupRef],
+    corruption: str,
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    session = open_session()
+    try:
+        names = (
+            ("合法一", "合法二", "合法三")
+            if corruption == "lock_targets_eliminated_player"
+            else ("合法一", "合法二")
+        )
+        active = await _persist_active(session, group, names=names)
+        baseline = await PostgresRouletteStorage(session).load_current(group)
+        assert baseline is not None
+        game_id = active.game_id
+        if corruption == "duplicate_frozen_name":
+            await session.execute(
+                text(
+                    "UPDATE komari_roulette_players AS duplicate "
+                    "SET display_name = original.display_name "
+                    "FROM komari_roulette_players AS original "
+                    "WHERE duplicate.game_id = :game_id "
+                    "AND original.game_id = :game_id "
+                    "AND duplicate.join_seq = 2 "
+                    "AND original.join_seq = 1"
+                ),
+                {"game_id": game_id},
+            )
+        elif corruption == "lock_targets_eliminated_player":
+            await session.execute(
+                text(
+                    "UPDATE komari_roulette_players SET alive = false, "
+                    "eliminated_order = 1, eliminated_reason = 'shot', "
+                    "eliminated_at = CURRENT_TIMESTAMP "
+                    "WHERE game_id = :game_id AND join_seq = 1"
+                ),
+                {"game_id": game_id},
+            )
+            await session.execute(
+                text(
+                    "UPDATE komari_roulette_games SET current_player_seq = 2, "
+                    "phase = 'locked_turn', "
+                    "pending_locks = ARRAY[1]::integer[] "
+                    "WHERE game_id = :game_id"
+                ),
+                {"game_id": game_id},
+            )
+        else:
+            statements = {
+                "empty_chamber": (
+                    "UPDATE komari_roulette_games SET ordered_chamber = "
+                    "ARRAY[]::text[] WHERE game_id = :game_id"
+                ),
+                "chamber_without_live": (
+                    "UPDATE komari_roulette_games SET ordered_chamber = "
+                    "ARRAY['blank','blank','blank','blank','blank','blank']::text[] "
+                    "WHERE game_id = :game_id"
+                ),
+                "zero_chamber_revision": (
+                    "UPDATE komari_roulette_games SET chamber_revision = 0 "
+                    "WHERE game_id = :game_id"
+                ),
+                "zero_turn_seq": (
+                    "UPDATE komari_roulette_games SET turn_seq = 0 "
+                    "WHERE game_id = :game_id"
+                ),
+                "pending_reward_wrong_phase": (
+                    "UPDATE komari_roulette_games SET pending_rewards = "
+                    "ARRAY['beer']::text[] WHERE game_id = :game_id"
+                ),
+                "item_choice_not_full": (
+                    "UPDATE komari_roulette_games SET phase = 'item_choice', "
+                    "pending_rewards = ARRAY['beer']::text[] "
+                    "WHERE game_id = :game_id"
+                ),
+                "duplicate_pending_locks": (
+                    "UPDATE komari_roulette_games SET pending_locks = "
+                    "ARRAY[2,2]::integer[] WHERE game_id = :game_id"
+                ),
+            }
+            await session.execute(text(statements[corruption]), {"game_id": game_id})
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            restored = await PostgresRouletteStorage(session).load_current(group)
+            assert restored is not None
+            assert restored.state_revision == baseline.state_revision
+            assert restored.players == baseline.players
+            return
+    finally:
+        await session.close()
+
+    read_session = open_session()
+    try:
+        with pytest.raises(AggregateCorruptError):
+            await PostgresRouletteStorage(read_session).load_current(group)
+    finally:
+        await read_session.close()
+
+
 async def test_controlled_failed_projection_after_corruption_has_no_winner(
     db_scope: tuple[str, str, GroupRef],
 ) -> None:
@@ -447,12 +671,234 @@ async def test_controlled_failed_projection_after_corruption_has_no_winner(
         await storage.project_terminal(projection)
         await corrupt_session.commit()
         result = await storage.get_result(group, created.game_id)
+        assert result is not None
         assert result.lifecycle == "failed"
         assert result.winner_member_openid is None
         assert await storage.list_leaderboard(group) == ()
         assert result.reason == "aggregate_corrupt"
+        assert result.terminal_revision == created.state_revision + 1
+        root = (
+            await corrupt_session.execute(
+                text(
+                    "SELECT lifecycle, state_revision "
+                    "FROM komari_roulette_games WHERE game_id = :game_id"
+                ),
+                {"game_id": created.game_id},
+            )
+        ).mappings().one()
+        assert root["lifecycle"] == "failed"
+        assert root["state_revision"] == result.terminal_revision
     finally:
         await corrupt_session.close()
+
+
+async def test_fail_corrupt_current_projects_safe_history_and_releases_slot(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    setup = open_session()
+    try:
+        active = await _persist_active(
+            setup,
+            group,
+            names=("原始甲", "原始乙"),
+        )
+    finally:
+        await setup.close()
+
+    corrupt = open_session()
+    try:
+        await corrupt.execute(
+            text(
+                "UPDATE komari_roulette_players AS duplicate "
+                "SET display_name = original.display_name "
+                "FROM komari_roulette_players AS original "
+                "WHERE duplicate.game_id = :game_id "
+                "AND original.game_id = :game_id "
+                "AND duplicate.join_seq = 2 "
+                "AND original.join_seq = 1"
+            ),
+            {"game_id": active.game_id},
+        )
+        await corrupt.commit()
+    finally:
+        await corrupt.close()
+
+    read_session = open_session()
+    try:
+        with pytest.raises(AggregateCorruptError):
+            await PostgresRouletteStorage(read_session).load_current(group)
+    finally:
+        await read_session.close()
+
+    failed_session = open_session()
+    try:
+        storage = PostgresRouletteStorage(failed_session)
+        failed = await storage.fail_corrupt_current(
+            group,
+            ended_at=await _pg_now(failed_session),
+        )
+        assert failed is not None
+        assert failed.lifecycle == "failed"
+        assert failed.reason == "aggregate_corrupt"
+        assert failed.winner_seq is None
+        assert failed.winner_member_openid is None
+        assert failed.players
+        assert failed.players[0].join_seq == 1
+        await failed_session.commit()
+
+        stored = await storage.get_result(group, active.game_id)
+        assert stored is not None
+        assert stored.lifecycle == "failed"
+        assert stored.winner_seq is None
+        assert stored.players
+        assert stored.players[0].member_openid == active.players[0].member_openid
+        assert stored.terminal_revision == active.state_revision + 1
+        root = (
+            await failed_session.execute(
+                text(
+                    "SELECT lifecycle, state_revision, ordered_chamber, "
+                    "pending_rewards, pending_burst, pending_locks "
+                    "FROM komari_roulette_games WHERE game_id = :game_id"
+                ),
+                {"game_id": active.game_id},
+            )
+        ).mappings().one()
+        assert root["lifecycle"] == "failed"
+        assert root["state_revision"] == stored.terminal_revision
+        assert list(root["ordered_chamber"] or ()) == []
+        assert list(root["pending_rewards"] or ()) == []
+        assert root["pending_burst"] is False
+        assert list(root["pending_locks"] or ()) == []
+    finally:
+        await failed_session.close()
+
+    assert (await count_scope_rows(group.app_id, group.group_openid))["komari_roulette_players"] == 0
+    replacement = await _create_waiting(group)
+    assert replacement.lifecycle == "waiting"
+
+
+async def test_fail_corrupt_current_allows_empty_failed_history(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    setup = open_session()
+    try:
+        active = await _persist_active(setup, group)
+    finally:
+        await setup.close()
+
+    corrupt = open_session()
+    try:
+        await corrupt.execute(
+            text(
+                "DELETE FROM komari_roulette_players "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": active.game_id},
+        )
+        await corrupt.commit()
+    finally:
+        await corrupt.close()
+
+    read_session = open_session()
+    try:
+        with pytest.raises(AggregateCorruptError):
+            await PostgresRouletteStorage(read_session).load_current(group)
+    finally:
+        await read_session.close()
+
+    failed_session = open_session()
+    try:
+        storage = PostgresRouletteStorage(failed_session)
+        failed = await storage.fail_corrupt_current(
+            group,
+            ended_at=await _pg_now(failed_session),
+        )
+        assert failed is not None
+        assert failed.lifecycle == "failed"
+        assert failed.players == ()
+        await failed_session.commit()
+        stored = await storage.get_result(group, active.game_id)
+        assert stored is not None
+        assert stored.lifecycle == "failed"
+        assert stored.players == ()
+        assert stored.winner_member_openid is None
+        assert await storage.list_leaderboard(group) == ()
+    finally:
+        await failed_session.close()
+
+    counts = await count_scope_rows(group.app_id, group.group_openid)
+    assert counts["komari_roulette_players"] == 0
+    assert counts["komari_roulette_results"] == 1
+    assert counts["komari_roulette_result_players"] == 0
+
+
+async def test_fail_corrupt_current_rejects_a_valid_active_game_without_changes(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    setup = open_session()
+    try:
+        active = await _persist_active(setup, group)
+    finally:
+        await setup.close()
+
+    session = open_session()
+    try:
+        storage = PostgresRouletteStorage(session)
+        before = await storage.load_current(group)
+        assert before is not None
+        with pytest.raises(TerminalProjectionRejectedError):
+            await storage.fail_corrupt_current(
+                group,
+                ended_at=await _pg_now(session),
+            )
+        await session.rollback()
+        restored = await storage.load_current(group)
+        assert restored == before
+        assert await storage.get_result(group, active.game_id) is None
+        assert await storage.list_leaderboard(group) == ()
+    finally:
+        await session.close()
+
+
+async def test_infrastructure_failure_never_creates_a_failed_result(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    setup = open_session()
+    try:
+        active = await _persist_active(setup, group)
+    finally:
+        await setup.close()
+
+    broken_engine = create_async_engine(
+        "postgresql+asyncpg://komari_test@127.0.0.1:1/does_not_exist",
+        pool_pre_ping=True,
+    )
+    broken_factory = async_sessionmaker(broken_engine, expire_on_commit=False)
+    try:
+        async with broken_factory() as broken_session:
+            with pytest.raises(StorageUnavailableError):
+                await PostgresRouletteStorage(broken_session).fail_corrupt_current(
+                    group,
+                    ended_at=START + timedelta(minutes=15),
+                )
+    finally:
+        await broken_engine.dispose()
+
+    verify = open_session()
+    try:
+        storage = PostgresRouletteStorage(verify)
+        current = await storage.load_current(group)
+        assert current is not None
+        assert current.game_id == active.game_id
+        assert current.lifecycle == "active"
+        assert await storage.get_result(group, active.game_id) is None
+        assert await storage.list_leaderboard(group) == ()
+    finally:
+        await verify.close()
 
 
 async def test_terminal_projection_rejects_an_absent_game(
@@ -546,6 +992,343 @@ async def test_same_group_concurrent_create_has_one_winner_without_in_process_lo
         assert current is not None
     finally:
         await session.close()
+
+
+async def test_nonlocking_load_returns_one_complete_snapshot_during_join_commit(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    created = await _create_waiting(group)
+    reader = open_session()
+    writer = open_session()
+    observer = open_session()
+    writer_task: asyncio.Task[None] | None = None
+    writer_was_blocked = False
+    try:
+        reader_storage = PostgresRouletteStorage(reader)
+        writer_storage = PostgresRouletteStorage(writer)
+        writer_pid = await _backend_pid(writer)
+        original_execute = reader.execute
+        hook_used = False
+
+        async def join_and_commit() -> None:
+            before = await writer_storage.load_current(group)
+            assert before is not None
+            before_state = game_state_from_snapshot(before)
+            actor = player_for(
+                group,
+                2,
+                name="钩子加入者",
+                member_openid="snapshot-hook-member",
+            )
+            joined = apply_action(
+                before_state,
+                Action.join(actor),
+                now=START,
+                random_source=DeterministicRandom(),
+            )
+            assert joined.ok and joined.code == "joined"
+            transition = transition_from_action_result(
+                before,
+                joined,
+                action_kind="join",
+                occurred_at=await _pg_now(writer),
+            )
+            await writer_storage.save_transition(
+                transition,
+                expected_revision=before.state_revision,
+            )
+            await writer.commit()
+
+        async def execute_with_join_hook(
+            statement: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            nonlocal hook_used, writer_task, writer_was_blocked
+            result = await original_execute(statement, *args, **kwargs)
+            if not hook_used:
+                hook_used = True
+                writer_task = asyncio.create_task(join_and_commit())
+                try:
+                    await asyncio.wait_for(asyncio.shield(writer_task), timeout=1)
+                except TimeoutError:
+                    blockers = await _blocking_pids(observer, writer_pid)
+                    if blockers:
+                        writer_was_blocked = True
+                    else:
+                        await asyncio.wait_for(writer_task, timeout=5)
+            return result
+
+        object.__setattr__(reader, "execute", execute_with_join_hook)
+        loaded = await reader_storage.load_current(group, for_update=False)
+        assert loaded is not None
+        assert hook_used
+        # The reader may observe the statement's old snapshot or a fully new
+        # one, but it must never combine root revision 1 with two player rows.
+        assert (loaded.state_revision, len(loaded.players)) in {(1, 1), (2, 2)}
+        assert not (
+            loaded.state_revision == created.state_revision and len(loaded.players) == 2
+        )
+
+        await reader.rollback()
+        if writer_task is not None and not writer_task.done():
+            await asyncio.wait_for(writer_task, timeout=5)
+        latest = await reader_storage.load_current(group, for_update=False)
+        assert latest is not None
+        assert latest.state_revision == created.state_revision + 1
+        assert len(latest.players) == 2
+    finally:
+        if writer_task is not None and not writer_task.done():
+            writer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await writer_task
+        with suppress(Exception):
+            await reader.rollback()
+        with suppress(Exception):
+            await writer.rollback()
+        await observer.close()
+        await reader.close()
+        await writer.close()
+
+
+async def test_terminal_save_and_projection_share_one_scope_lock_order(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    saver = open_session()
+    projector = open_session()
+    observer = open_session()
+    projector_task: asyncio.Task[None] | None = None
+    try:
+        saver_pid = await _backend_pid(saver)
+        _final_snapshot, projection, _active_before_terminal = await _persist_completed(
+            saver,
+            group,
+            project=False,
+        )
+        projector_pid = await _backend_pid(projector)
+        projector_task = asyncio.create_task(
+            PostgresRouletteStorage(projector).project_terminal(projection)
+        )
+        blockers = await _wait_until_blocked(observer, projector_pid)
+        assert saver_pid in blockers
+
+        await asyncio.wait_for(
+            PostgresRouletteStorage(saver).project_terminal(projection),
+            timeout=5,
+        )
+        await asyncio.wait_for(saver.commit(), timeout=5)
+        await asyncio.wait_for(projector_task, timeout=5)
+        await projector.commit()
+    finally:
+        if projector_task is not None and not projector_task.done():
+            projector_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await projector_task
+        with suppress(Exception):
+            await saver.rollback()
+        with suppress(Exception):
+            await projector.rollback()
+        await observer.close()
+        await saver.close()
+        await projector.close()
+
+    verify = open_session()
+    try:
+        storage = PostgresRouletteStorage(verify)
+        result = await storage.get_result(group, projection.game_id)
+        assert result is not None
+        assert result.lifecycle == "completed"
+        assert result.winner_seq == 3
+        rows = await storage.list_leaderboard(group)
+        assert len(rows) == 1
+        assert rows[0].wins == 1
+    finally:
+        await verify.close()
+
+
+async def test_blocked_transition_preserves_domain_deadline(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    setup = open_session()
+    blocker = open_session()
+    writer = open_session()
+    observer = open_session()
+    writer_task: asyncio.Task[GameSnapshot] | None = None
+    try:
+        await _persist_active(
+            setup,
+            group,
+            chamber=(
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+            ),
+        )
+        await setup.close()
+
+        before = await PostgresRouletteStorage(writer).load_current(group)
+        assert before is not None
+        await writer.rollback()
+        state = game_state_from_snapshot(before)
+        actor = next(
+            seat.player
+            for seat in state.players
+            if seat.join_seq == state.current_player_seq
+        )
+        changed = apply_action(
+            state,
+            Action.shoot(actor),
+            now=START + timedelta(minutes=10),
+            random_source=DeterministicRandom(),
+        )
+        assert changed.ok
+        transition = transition_from_action_result(
+            before,
+            changed,
+            action_kind="shoot",
+            occurred_at=await _pg_now(writer),
+        )
+        expected_deadline = transition.after.deadline
+        assert expected_deadline is not None
+
+        locked = await PostgresRouletteStorage(blocker).load_current(
+            group,
+            for_update=True,
+        )
+        assert locked is not None
+        writer_pid = await _backend_pid(writer)
+        writer_task = asyncio.create_task(
+            PostgresRouletteStorage(writer).save_transition(
+                transition,
+                expected_revision=before.state_revision,
+            )
+        )
+        await _wait_until_blocked(observer, writer_pid)
+        await blocker.rollback()
+        saved = await asyncio.wait_for(writer_task, timeout=5)
+        await writer.commit()
+        assert saved.deadline == expected_deadline
+    finally:
+        if writer_task is not None and not writer_task.done():
+            writer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await writer_task
+        with suppress(Exception):
+            await blocker.rollback()
+        with suppress(Exception):
+            await writer.rollback()
+        with suppress(Exception):
+            await setup.close()
+        await observer.close()
+        await blocker.close()
+        await writer.close()
+
+    verify = open_session()
+    try:
+        restored = await PostgresRouletteStorage(verify).load_current(group)
+        assert restored is not None
+        assert restored.deadline == expected_deadline
+    finally:
+        await verify.close()
+
+
+async def test_public_load_refreshes_a_caller_session_identity_map_and_cas(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _app_id, _group_openid, group = db_scope
+    created = await _create_waiting(group)
+    reader = open_session()
+    writer = open_session()
+    try:
+        reader_storage = PostgresRouletteStorage(reader)
+        writer_storage = PostgresRouletteStorage(writer)
+        old = await reader_storage.load_current(group)
+        assert old is not None
+        held_root = (
+            await reader.execute(
+                select(RouletteGameRow).where(
+                    RouletteGameRow.__table__.c.game_id == old.game_id
+                )
+            )
+        ).scalar_one()
+        held_players = list(
+            (
+                await reader.execute(
+                    select(RoulettePlayerRow)
+                    .where(RoulettePlayerRow.__table__.c.game_id == old.game_id)
+                    .order_by(RoulettePlayerRow.__table__.c.join_seq)
+                )
+            ).scalars()
+        )
+        assert held_root.state_revision == old.state_revision
+        assert [row.join_seq for row in held_players] == [1]
+        old_state = game_state_from_snapshot(old)
+        actor = player_for(
+            group,
+            2,
+            name="外部新版本",
+            member_openid="identity-map-fresh-member",
+        )
+        stale_result = apply_action(
+            old_state,
+            Action.join(actor),
+            now=START,
+            random_source=DeterministicRandom(),
+        )
+        assert stale_result.ok and stale_result.code == "joined"
+        stale_transition = transition_from_action_result(
+            old,
+            stale_result,
+            action_kind="join",
+            occurred_at=await _pg_now(reader),
+        )
+
+        current = await writer_storage.load_current(group)
+        assert current is not None
+        joined = apply_action(
+            game_state_from_snapshot(current),
+            Action.join(actor),
+            now=START,
+            random_source=DeterministicRandom(),
+        )
+        assert joined.ok and joined.code == "joined"
+        external_transition = transition_from_action_result(
+            current,
+            joined,
+            action_kind="join",
+            occurred_at=await _pg_now(writer),
+        )
+        await writer_storage.save_transition(
+            external_transition,
+            expected_revision=current.state_revision,
+        )
+        await writer.commit()
+
+        refreshed = await reader_storage.load_current(group)
+        assert refreshed is not None
+        assert refreshed.state_revision == created.state_revision + 1
+        assert [seat.join_seq for seat in refreshed.players] == [1, 2]
+        assert held_root.state_revision == refreshed.state_revision
+        assert held_players[0].join_seq == 1
+        with pytest.raises(RevisionConflictError):
+            await reader_storage.save_transition(
+                stale_transition,
+                expected_revision=old.state_revision,
+            )
+        await reader.rollback()
+        latest = await reader_storage.load_current(group)
+        assert latest is not None
+        assert latest.state_revision == refreshed.state_revision
+        assert [seat.join_seq for seat in latest.players] == [1, 2]
+    finally:
+        await reader.close()
+        await writer.close()
 
 
 async def test_activity_slot_isolated_by_app_and_group(

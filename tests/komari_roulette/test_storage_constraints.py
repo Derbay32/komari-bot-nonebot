@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
-from komari_bot.plugins.komari_roulette.mapper import game_state_to_snapshot
-from komari_bot.plugins.komari_roulette.storage import PostgresRouletteStorage
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from komari_bot.plugins.komari_roulette.mapper import game_state_to_snapshot
+from komari_bot.plugins.komari_roulette.storage import PostgresRouletteStorage
 from tests.komari_roulette.storage_support import (
     POSTGRES_URL,
     SQLALCHEMY_URL,
@@ -87,7 +87,10 @@ async def _constraints(table: str) -> list[str]:
         await session.close()
 
 
-async def test_relationized_schema_has_closed_core_tables_and_types() -> None:
+async def test_relationized_schema_has_closed_core_tables_and_types(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _ = db_scope
     expected = {
         "komari_roulette_games",
         "komari_roulette_players",
@@ -139,7 +142,10 @@ async def test_relationized_schema_has_closed_core_tables_and_types() -> None:
     assert game_columns["pending_rewards"]["data_type"] == "ARRAY"
 
 
-async def test_schema_constraints_cover_lifecycle_arrays_inventory_and_fk() -> None:
+async def test_schema_constraints_cover_lifecycle_arrays_inventory_and_fk(
+    db_scope: tuple[str, str, GroupRef],
+) -> None:
+    _ = db_scope
     game_constraints = await _constraints("komari_roulette_games")
     player_constraints = await _constraints("komari_roulette_players")
     result_constraints = await _constraints("komari_roulette_results")
@@ -198,6 +204,8 @@ async def test_database_rejects_invalid_closed_arrays_and_inventory(
         await storage.create_waiting(snapshot)
         await session.commit()
         game_id = snapshot.game_id
+        baseline = await storage.load_current(group)
+        assert baseline is not None
 
         invalid_updates = (
             "UPDATE komari_roulette_games SET lifecycle = 'unknown' WHERE game_id = :game_id",
@@ -212,5 +220,10 @@ async def test_database_rejects_invalid_closed_arrays_and_inventory(
             with pytest.raises(IntegrityError):
                 await session.execute(text(statement), {"game_id": game_id})
             await session.rollback()
+            restored = await storage.load_current(group)
+            assert restored is not None
+            assert restored.game_id == baseline.game_id
+            assert restored.state_revision == baseline.state_revision
+            assert restored.players == baseline.players
     finally:
         await session.close()
