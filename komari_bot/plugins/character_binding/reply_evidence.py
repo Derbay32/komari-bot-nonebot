@@ -78,6 +78,7 @@ class ReplyEvidenceSession:
     connection_generation: int
     evidence: ReplyEvidence | None = None
 
+
 @dataclass(frozen=True, slots=True)
 class _OriginalMessage:
     message_id: int
@@ -226,7 +227,6 @@ class ReplyEvidenceCollector:
 
     def __init__(
         self,
-        *,
         app_id: str,
         official_bot_qq: str,
         message_fetcher: MessageFetcher,
@@ -393,7 +393,8 @@ class ReplyEvidenceCollector:
                 self._sessions.pop(challenge.session_code, None)
                 return None
             if session.evidence is not None:
-                if self._matches_existing_evidence(session.evidence, challenge):
+                cached = self._original_messages.get(challenge.target_message_id)
+                if self._matches_existing_evidence(session.evidence, challenge, cached):
                     return session.evidence
                 return None
             cached = self._original_messages.get(challenge.target_message_id)
@@ -434,6 +435,19 @@ class ReplyEvidenceCollector:
             self._sessions.get(session.session_code) is session
             and session.connection_generation == self._connection_generation
             and session.expires_at > now
+        )
+
+    def _original_current(self, cached: _OriginalMessage, now: datetime) -> bool:
+        return (
+            self._original_messages.get(cached.message_id) is cached
+            and cached.generation == self._connection_generation
+            and cached.observed_at + SESSION_TTL > now
+        )
+
+    def _challenge_current(self, challenge: _Challenge, now: datetime) -> bool:
+        return (
+            challenge.generation == self._connection_generation
+            and challenge.observed_at + SESSION_TTL > now
         )
 
     def _cache_original(
@@ -575,9 +589,11 @@ class ReplyEvidenceCollector:
         cached: _OriginalMessage,
     ) -> ReplyEvidence | None:
         now = self._now()
-        if not self._session_current(session, now):
-            return None
-        if cached.generation != self._connection_generation:
+        if (
+            not self._session_current(session, now)
+            or not self._challenge_current(challenge, now)
+            or not self._original_current(cached, now)
+        ):
             return None
         if cached.group_id != challenge.group_id:
             return None
@@ -586,7 +602,11 @@ class ReplyEvidenceCollector:
         except Exception:
             return None
         now = self._now()
-        if not self._session_current(session, now):
+        if (
+            not self._session_current(session, now)
+            or not self._challenge_current(challenge, now)
+            or not self._original_current(cached, now)
+        ):
             return None
         if not isinstance(payload, Mapping):
             return None
@@ -616,18 +636,21 @@ class ReplyEvidenceCollector:
     def _matches_existing_evidence(
         evidence: ReplyEvidence,
         challenge: _Challenge,
+        cached: _OriginalMessage | None,
     ) -> bool:
-        if evidence.onebot_original_message_id != challenge.target_message_id:
-            return False
-        if evidence.challenge_message_id != challenge.challenge_message_id:
-            return False
-        if evidence.group_id != challenge.group_id:
-            return False
-        if challenge.reply_message_type is not None and challenge.reply_message_type != "group":
-            return False
-        if challenge.reply_member_qq is not None and challenge.reply_member_qq != evidence.member_qq:
-            return False
-        return challenge.reply_group_id in (None, evidence.group_id)
+        return all(
+            (
+                evidence.onebot_original_message_id == challenge.target_message_id,
+                evidence.challenge_message_id == challenge.challenge_message_id,
+                evidence.group_id == challenge.group_id,
+                challenge.reply_message_type in (None, "group"),
+                challenge.reply_member_qq in (None, evidence.member_qq),
+                cached is None
+                or challenge.reply_signature is None
+                or challenge.reply_signature == cached.signature,
+                challenge.reply_group_id in (None, evidence.group_id),
+            )
+        )
 
     def _verify_payload(  # noqa: PLR0911
         self,
