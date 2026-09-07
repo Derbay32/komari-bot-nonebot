@@ -15,6 +15,7 @@ from tests.komari_roulette.support import (
     assert_rejected,
     dispatch,
     player,
+    public_facts,
     restore_trusted_state,
     start_active,
 )
@@ -92,6 +93,37 @@ def test_follow_up_all_blank_draws_one_reward_per_blank_in_order() -> None:
     ]
     assert third.reply["reward_count"] == 1
     assert third.reply["rewards"] == [ItemType.MAGNIFIER.value]
+
+
+def test_start_freezes_item_weights_before_later_reward_draws() -> None:
+    weights = {
+        ItemType.MAGNIFIER: 1,
+        ItemType.BEER: 2,
+        ItemType.BURST: 3,
+        ItemType.LOCK: 4,
+    }
+    entropy = ScriptedRandomSource(
+        chambers=(
+            (
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+            ),
+        ),
+        items=(ItemType.BEER,),
+    )
+    active, _ = start_active(random_source=entropy, item_weights=weights)
+    expected = dict(weights)
+    weights[ItemType.BEER] = 99
+
+    first = dispatch(active, Action.shoot(player(1)), random_source=entropy)
+    assert_ok(first, "shot")
+    second = dispatch(first.state, Action.shoot(player(1)), random_source=entropy)
+    assert_ok(second, "shot")
+    assert entropy.item_calls == [expected]
 
 
 def test_magnifier_consumes_inventory_and_renews_without_chamber_mutation() -> None:
@@ -356,6 +388,55 @@ def test_lock_binds_to_next_turn_and_is_cleared_when_target_is_eliminated() -> N
     assert target_dies.state.players[1].alive is False
     assert not target_dies.state.pending_locks
     assert target_dies.state.current_player_seq == 3
+
+
+def test_lock_rejects_missing_dead_and_duplicate_targets_without_consuming() -> None:
+    common = {
+        "phase": "follow_up",
+        "ordered_chamber": (
+            ChamberKind.BLANK,
+            ChamberKind.LIVE,
+            ChamberKind.BLANK,
+            ChamberKind.BLANK,
+            ChamberKind.LIVE,
+            ChamberKind.BLANK,
+        ),
+        "inventory": {ItemType.LOCK: 1},
+        "player_numbers": (1, 2, 3),
+    }
+    missing = restore_trusted_state(**common)
+    missing_facts = public_facts(missing)
+    missing_result = dispatch(
+        missing,
+        Action.use_item(player(1), ItemType.LOCK, target_seq=99),
+    )
+    assert_rejected(missing_result, "invalid_item_target", "not_found")
+    assert public_facts(missing) == missing_facts
+    assert public_facts(missing_result.state) == missing_facts
+
+    dead = restore_trusted_state(**common, dead_player_numbers=(2,))
+    dead_facts = public_facts(dead)
+    dead_result = dispatch(
+        dead,
+        Action.use_item(player(1), ItemType.LOCK, target_seq=2),
+    )
+    assert_rejected(dead_result, "invalid_item_target", "not_alive")
+    assert public_facts(dead) == dead_facts
+    assert public_facts(dead_result.state) == dead_facts
+
+    duplicate = restore_trusted_state(**common, pending_locks=(2,))
+    duplicate_facts = public_facts(duplicate)
+    duplicate_result = dispatch(
+        duplicate,
+        Action.use_item(player(1), ItemType.LOCK, target_seq=2),
+    )
+    assert_rejected(
+        duplicate_result,
+        "item_precondition_failed",
+        "target_already_locked",
+    )
+    assert public_facts(duplicate) == duplicate_facts
+    assert public_facts(duplicate_result.state) == duplicate_facts
 
 
 def test_burst_survives_handoff_and_first_live_stops_the_second_consumption() -> None:
@@ -705,6 +786,60 @@ def test_item_choice_safe_reply_hides_future_reward_types() -> None:
     assert_no_secret_chamber_or_reward_fields(second_result)
 
 
+def test_item_choice_discards_multiple_rewards_one_at_a_time_and_renews_each() -> None:
+    before = restore_trusted_state(
+        phase="follow_up",
+        ordered_chamber=(
+            ChamberKind.BLANK,
+            ChamberKind.BLANK,
+            ChamberKind.LIVE,
+            ChamberKind.LIVE,
+            ChamberKind.BLANK,
+            ChamberKind.BLANK,
+        ),
+        pending_burst=True,
+    )
+    original_inventory = _inventory(before, 1)
+    entropy = ScriptedRandomSource(items=(ItemType.BEER, ItemType.MAGNIFIER))
+    pending = dispatch(before, Action.shoot(player(1)), random_source=entropy)
+    assert_ok(pending, "item_choice_pending")
+    assert pending.state.phase == "item_choice"
+    assert pending.state.pending_rewards == (ItemType.BEER, ItemType.MAGNIFIER)
+
+    failed = dispatch(
+        pending.state,
+        Action.choose_item(player(1), decision="replace"),
+        now=START + timedelta(minutes=3),
+    )
+    assert not failed.ok
+    assert public_facts(failed.state) == public_facts(pending.state)
+    assert failed.state.deadline == pending.state.deadline
+
+    first_discard = dispatch(
+        pending.state,
+        Action.choose_item(player(1), decision="discard"),
+        now=START + timedelta(minutes=1),
+    )
+    assert_ok(first_discard)
+    assert first_discard.state.phase == "item_choice"
+    assert first_discard.state.pending_rewards == (ItemType.MAGNIFIER,)
+    assert _inventory(first_discard.state, 1) == original_inventory
+    assert first_discard.state.deadline == START + timedelta(minutes=16)
+    assert first_discard.state.state_revision == pending.state.state_revision + 1
+
+    second_discard = dispatch(
+        first_discard.state,
+        Action.choose_item(player(1), decision="discard"),
+        now=START + timedelta(minutes=2),
+    )
+    assert_ok(second_discard)
+    assert second_discard.state.phase == "follow_up"
+    assert second_discard.state.pending_rewards == ()
+    assert _inventory(second_discard.state, 1) == original_inventory
+    assert second_discard.state.deadline == START + timedelta(minutes=17)
+    assert second_discard.state.state_revision == first_discard.state.state_revision + 1
+
+
 def test_item_choice_timeout_drops_unprocessed_rewards_before_rotation() -> None:
     before = restore_trusted_state(
         phase="item_choice",
@@ -750,6 +885,7 @@ def test_second_reward_draw_failure_rolls_back_the_whole_pre_draw() -> None:
     )
     entropy = ScriptedRandomSource(items=(ItemType.BEER,))
     entropy.fail_on_item_call = 2
+    before_facts = public_facts(before)
 
     failed = dispatch(
         before,
@@ -759,7 +895,5 @@ def test_second_reward_draw_failure_rolls_back_the_whole_pre_draw() -> None:
 
     assert_rejected(failed, "random_source_failed")
     assert len(entropy.item_calls) == 2
-    assert failed.state == before
-    assert failed.state.state_revision == before.state_revision
-    assert failed.state.chamber_revision == before.chamber_revision
-    assert failed.state.pending_rewards == before.pending_rewards
+    assert public_facts(before) == before_facts
+    assert public_facts(failed.state) == before_facts

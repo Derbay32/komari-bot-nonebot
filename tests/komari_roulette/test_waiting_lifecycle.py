@@ -81,6 +81,26 @@ def test_host_leave_and_explicit_transfer_keep_waiting_order() -> None:
     assert _seat_seqs(state) == [1]
 
 
+def test_transfer_rejects_stale_join_seq_after_member_rejoins() -> None:
+    state = create_waiting()
+    joined = join(state, 2)
+    assert_ok(joined, "joined")
+    left = dispatch(joined.state, Action.leave(player(2)))
+    assert_ok(left, "left")
+    rejoined = join(left.state, 2)
+    assert_ok(rejoined, "joined")
+    state = rejoined.state
+    assert _seat_seqs(state) == [1, 3]
+
+    stale = dispatch(state, Action.transfer(player(1), target_seq=2))
+    assert_rejected(stale, "invalid_transfer_target", "stale_join_seq")
+    assert stale.state == state
+
+    current = dispatch(state, Action.transfer(player(1), target_seq=3))
+    assert_ok(current, "host_transferred")
+    assert current.state.host_seq == 3
+
+
 def test_waiting_actions_have_stable_failures_and_random_start_is_atomic() -> None:
     state = create_waiting()
     duplicate = join(state, 1)

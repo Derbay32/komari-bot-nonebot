@@ -22,7 +22,7 @@ from komari_bot.plugins.komari_roulette.domain import (
 
 `initial_state(group)` 创建一个没有进行中游戏的 `GameState`。`apply_action(state, action, *, now, random_source)` 是唯一的领域变更入口：它接收完整可信 `GameState`，返回 `ActionResult`，不在测试中调用 repository、ORM 或 matcher。
 
-仓储恢复测试可以使用 `GameState.from_trusted_snapshot(snapshot)` 构造合法的可信领域输入。`snapshot` 至少包含上面列出的生命周期/回合/修订/席位字段、`ordered_chamber`、`pending_rewards`、已冻结的 `item_weights` 与道具效果状态；该入口只接收可信持久化适配器输入，不把普通用户结果或不受信任消息直接反序列化为状态。
+仓储恢复测试可以使用 `GameState.from_trusted_snapshot(snapshot)` 构造合法的可信领域输入。`snapshot` 至少包含上面列出的生命周期/回合/修订/席位字段、`ordered_chamber`、`pending_rewards`、已冻结的 `item_weights` 与道具效果状态（包括 `pending_burst`、`pending_locks`）；`pending_locks` 的目标使用冻结 `join_seq` 表示。该入口只接收可信持久化适配器输入，不把普通用户结果或不受信任消息直接反序列化为状态。
 
 `Action` 是不可变的命令值对象，至少提供以下构造器：
 
@@ -31,7 +31,7 @@ Action.create(player)
 Action.join(player)
 Action.leave(player)
 Action.cancel(player)
-Action.start(player)
+Action.start(player, item_weights=None)
 Action.shoot(player)
 Action.forfeit(player)
 Action.end_turn(player)
@@ -44,7 +44,11 @@ Action.open_item_panel(player)
 Action.expire()
 ```
 
+`Action.start` 接收纯值 `item_weights` 并在 waiting→active 成功时冻结副本；调用方随后修改原映射不能改变进行中对局的抽样权重。`choose_item` 的 `decision` 为 `discard` 或 `replace`；失败选择返回失败结果且不续期。锁目标不存在、已淘汰或已被待锁占用时分别返回稳定的 `invalid_item_target/not_found`、`invalid_item_target/not_alive` 或 `item_precondition_failed/target_already_locked`，并且不消耗锁。
+
 `PlayerRef` 必须携带已验证的应用/群/成员协议身份和非空冻结显示名；测试不把裸 QQ 号、昵称或 `character_binding` 内部记录当作身份。`GroupRef` 至少区分 `app_id` 与 `group_openid`。
+
+玩家资格比较完整的 `(app_id, group_openid, member_openid)`，同一 `member_openid` 在其他应用或群中不能操作本局。
 
 随机与时间均在边界注入。测试 fake 提供 `chamber_order(live_count, blank_count)` 和 `weighted_item(weights)`；实现可以采用兼容的结构化协议，但不能从全局随机源、系统时钟或数据库读取。随机源抛出异常或返回非法结果时，动作必须返回 `random_source_failed` 并保持输入状态不变。
 

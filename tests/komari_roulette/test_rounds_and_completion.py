@@ -15,7 +15,9 @@ from tests.komari_roulette.support import (
     assert_rejected,
     dispatch,
     player,
+    public_facts,
     restore_trusted_state,
+    scoped_player,
     start_active,
 )
 
@@ -29,6 +31,25 @@ def test_only_current_surviving_participant_can_act() -> None:
     outsider = dispatch(active, Action.shoot(player(3)), random_source=entropy)
     assert_rejected(outsider, "not_participant")
     assert outsider.state == active
+
+
+def test_same_member_openid_in_another_application_or_group_is_not_a_player() -> None:
+    active, entropy = start_active()
+    before_facts = public_facts(active)
+    foreign_players = (
+        scoped_player(1, app_id="other-app", group_openid="group-1"),
+        scoped_player(1, app_id="qq", group_openid="other-group"),
+    )
+
+    for foreign in foreign_players:
+        rejected = dispatch(
+            active,
+            Action.shoot(foreign),
+            random_source=entropy,
+        )
+        assert_rejected(rejected, "not_participant")
+        assert public_facts(active) == before_facts
+        assert public_facts(rejected.state) == before_facts
 
 
 def test_expired_current_request_returns_turn_expired_after_atomic_rotation() -> None:

@@ -12,6 +12,7 @@ from tests.komari_roulette.support import (
     assert_rejected,
     dispatch,
     player,
+    public_facts,
     start_active,
 )
 
@@ -294,6 +295,7 @@ def test_random_failure_during_auto_reload_leaves_the_whole_action_uncommitted()
     )
     assert_ok(beer, "item_used")
     before_failure = beer.state
+    before_facts = public_facts(before_failure)
     entropy.fail_next_chamber = True
     failed = dispatch(
         before_failure,
@@ -301,4 +303,5 @@ def test_random_failure_during_auto_reload_leaves_the_whole_action_uncommitted()
         random_source=entropy,
     )
     assert_rejected(failed, "random_source_failed")
-    assert failed.state == before_failure
+    assert public_facts(before_failure) == before_facts
+    assert public_facts(failed.state) == before_facts

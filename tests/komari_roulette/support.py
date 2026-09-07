@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,9 +35,26 @@ TURN = timedelta(minutes=15)
 def player(number: int, *, name: str | None = None) -> PlayerRef:
     """Build a protocol-scoped participant with a frozen display name."""
 
-    return PlayerRef(
+    return scoped_player(
+        number,
         app_id=APP_ID,
         group_openid=GROUP_OPENID,
+        name=name,
+    )
+
+
+def scoped_player(
+    number: int,
+    *,
+    app_id: str,
+    group_openid: str,
+    name: str | None = None,
+) -> PlayerRef:
+    """Build a participant whose application/group scope is explicit."""
+
+    return PlayerRef(
+        app_id=app_id,
+        group_openid=group_openid,
         member_openid=f"member-{number}",
         display_name=name or f"Player {number}",
     )
@@ -153,6 +171,7 @@ def start_active(
     player_numbers: Sequence[int] = (1, 2),
     chamber: Sequence[ChamberKind] | None = None,
     random_source: ScriptedRandomSource | None = None,
+    item_weights: Mapping[ItemType, int] | None = None,
 ) -> tuple[GameState, ScriptedRandomSource]:
     entropy = random_source or ScriptedRandomSource(
         chambers=(
@@ -172,11 +191,12 @@ def start_active(
         joined = join(state, number, random_source=entropy)
         assert_ok(joined, "joined")
         state = joined.state
-    started = dispatch(
-        state,
-        Action.start(player(player_numbers[0])),
-        random_source=entropy,
+    start_action = (
+        Action.start(player(player_numbers[0]), item_weights=item_weights)
+        if item_weights is not None
+        else Action.start(player(player_numbers[0]))
     )
+    started = dispatch(state, start_action, random_source=entropy)
     assert_ok(started, "started")
     return started.state, entropy
 
@@ -189,6 +209,8 @@ def restore_trusted_state(
     pending_burst: bool = False,
     inventory: Mapping[ItemType, int] | None = None,
     player_numbers: Sequence[int] = (1, 2),
+    dead_player_numbers: Sequence[int] = (),
+    pending_locks: Sequence[int] = (),
 ) -> GameState:
     """Build a valid storage-recovery snapshot through the public domain seam.
 
@@ -210,7 +232,7 @@ def restore_trusted_state(
         {
             "player": player(number),
             "join_seq": join_seq,
-            "alive": True,
+            "alive": number not in dead_player_numbers,
             "inventory": player_inventory if join_seq == 1 else {},
         }
         for join_seq, number in enumerate(player_numbers, start=1)
@@ -230,7 +252,7 @@ def restore_trusted_state(
             "ordered_chamber": tuple(ordered_chamber),
             "pending_rewards": tuple(pending_rewards),
             "pending_burst": pending_burst,
-            "pending_locks": (),
+            "pending_locks": tuple(pending_locks),
             "item_weights": {
                 ItemType.MAGNIFIER: 1,
                 ItemType.BEER: 1,
@@ -238,6 +260,36 @@ def restore_trusted_state(
                 ItemType.LOCK: 1,
             },
         }
+    )
+
+
+def public_facts(state: GameState) -> tuple[Any, ...]:
+    """Snapshot public durable facts without relying on object identity."""
+
+    players = tuple(
+        (
+            seat.join_seq,
+            seat.member_openid,
+            seat.display_name,
+            seat.alive,
+            deepcopy(seat.inventory),
+        )
+        for seat in state.players
+    )
+    return (
+        state.lifecycle,
+        state.phase,
+        state.state_revision,
+        state.chamber_revision,
+        state.turn_seq,
+        state.current_player_seq,
+        state.deadline,
+        state.host_seq,
+        deepcopy(state.ordered_chamber),
+        deepcopy(state.pending_rewards),
+        deepcopy(state.pending_burst),
+        deepcopy(state.pending_locks),
+        players,
     )
 
 
