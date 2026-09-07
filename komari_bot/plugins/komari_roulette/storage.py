@@ -672,6 +672,8 @@ class PostgresRouletteStorage:
         root: RouletteGameRow,
         players: Sequence[RoulettePlayerRow],
     ) -> GameSnapshot:
+        if root.lifecycle == "waiting" and not players:
+            raise AggregateCorruptError("waiting game has no runtime players")
         try:
             _validate_runtime_players(players)
             state = _state_from_rows(root, players)
