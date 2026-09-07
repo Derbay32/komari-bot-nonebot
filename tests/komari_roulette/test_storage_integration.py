@@ -849,6 +849,18 @@ async def test_fail_corrupt_current_rejects_a_valid_active_game_without_changes(
         storage = PostgresRouletteStorage(session)
         before = await storage.load_current(group)
         assert before is not None
+        healthy_failed_projection = TerminalProjection.from_state(
+            before,
+            lifecycle="failed",
+            reason="aggregate_corrupt",
+            ended_at=await _pg_now(session),
+            winner_seq=None,
+        )
+        with pytest.raises(TerminalProjectionRejectedError):
+            await storage.project_terminal(healthy_failed_projection)
+        await session.rollback()
+        before = await storage.load_current(group)
+        assert before is not None
         with pytest.raises(TerminalProjectionRejectedError):
             await storage.fail_corrupt_current(
                 group,
