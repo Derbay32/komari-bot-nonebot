@@ -389,7 +389,9 @@ def test_lock_binds_to_next_turn_and_is_cleared_when_target_is_eliminated() -> N
     assert_ok(target_dies, "shot")
     assert target_dies.state.players[1].alive is False
     assert not target_dies.state.pending_locks
-    assert target_dies.state.current_player_seq == 3
+    assert target_dies.state.lifecycle == "completed"
+    assert target_dies.state.current_player_seq is None
+    assert target_dies.reply["winner_seq"] == 3
 
 
 def test_lock_rejects_missing_dead_and_duplicate_targets_without_consuming() -> None:
@@ -455,7 +457,10 @@ def test_burst_survives_handoff_and_first_live_stops_the_second_consumption() ->
         ),
         items=(ItemType.BEER, ItemType.BURST),
     )
-    active, _ = start_active(random_source=entropy)
+    active, _ = start_active(
+        player_numbers=(1, 2, 3),
+        random_source=entropy,
+    )
     first = dispatch(active, Action.shoot(player(1)), random_source=entropy)
     assert_ok(first, "shot")
     beer_reward = dispatch(first.state, Action.shoot(player(1)), random_source=entropy)
@@ -494,7 +499,7 @@ def test_burst_survives_handoff_and_first_live_stops_the_second_consumption() ->
     assert burst.state.pending_burst is False
     assert burst.state.players[1].alive is False
     assert burst.state.lifecycle == "active"
-    assert burst.state.current_player_seq == 1
+    assert burst.state.current_player_seq == 3
 
 
 def test_burst_survives_reload_forfeit_and_timeout() -> None:
@@ -503,6 +508,7 @@ def test_burst_survives_reload_forfeit_and_timeout() -> None:
         ordered_chamber=(ChamberKind.LIVE, ChamberKind.BLANK),
         pending_burst=True,
         inventory={},
+        player_numbers=(1, 2, 3),
     )
 
     reloaded = dispatch(
@@ -752,8 +758,8 @@ def test_item_choice_safe_reply_hides_future_reward_types() -> None:
         ordered_chamber=first.ordered_chamber,
         pending_burst=True,
     )
-    first_entropy = ScriptedRandomSource(items=(ItemType.BEER, ItemType.MAGNIFIER))
-    second_entropy = ScriptedRandomSource(items=(ItemType.BEER, ItemType.LOCK))
+    first_entropy = ScriptedRandomSource(items=(ItemType.BEER, ItemType.BEER))
+    second_entropy = ScriptedRandomSource(items=(ItemType.BEER, ItemType.MAGNIFIER))
 
     first_result = dispatch(
         first,
@@ -778,12 +784,18 @@ def test_item_choice_safe_reply_hides_future_reward_types() -> None:
     assert (
         first_result.state.pending_rewards[1] != second_result.state.pending_rewards[1]
     )
+    assert first_result.state.pending_rewards == (
+        ItemType.BEER,
+        ItemType.BEER,
+    )
+    assert second_result.state.pending_rewards == (
+        ItemType.BEER,
+        ItemType.MAGNIFIER,
+    )
     assert first_result.reply == second_result.reply
     assert first_result.reply["pending_item"] == ItemType.BEER.value
-    assert (
-        first_result.reply["pending_item_count"]
-        == second_result.reply["pending_item_count"]
-    )
+    assert first_result.reply["pending_item_count"] == 1
+    assert second_result.reply["pending_item_count"] == 1
     assert_no_secret_chamber_or_reward_fields(first_result)
     assert_no_secret_chamber_or_reward_fields(second_result)
 

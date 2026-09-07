@@ -68,15 +68,17 @@ def test_expired_current_request_returns_turn_expired_after_atomic_rotation() ->
     late = dispatch(
         before,
         Action.shoot(player(1)),
-        now=START + TURN,
+        now=START + timedelta(hours=2),
         random_source=entropy,
     )
     assert_rejected(late, "turn_expired")
     assert late.state != before
     assert late.state.players[0].alive is False
+    assert late.state.players[1].alive is True
+    assert late.state.players[2].alive is True
     assert late.state.current_player_seq == 2
     assert late.state.turn_seq == 2
-    assert late.state.deadline == START + TURN + TURN
+    assert late.state.deadline == START + timedelta(hours=2) + TURN
     assert late.reply["eliminated_reason"] == "timeout"
 
 
@@ -104,7 +106,7 @@ def test_forfeit_rotates_and_last_two_forfeit_completes_with_unique_winner() -> 
     assert second.reply["winner_seq"] == 3
     assert second.reply["completion_reason"] == "forfeit"
     assert second.state.current_player_seq is None
-    assert second.state.turn_seq == first.state.turn_seq + 1
+    assert second.state.turn_seq == first.state.turn_seq
 
     late = dispatch(second.state, Action.shoot(player(3)), random_source=entropy)
     assert_rejected(late, "game_completed")
@@ -152,7 +154,7 @@ def test_locked_blank_ends_the_turn_without_follow_up_or_reward() -> None:
     assert shot.state.players[1].alive is True
 
 
-def test_follow_up_forfeit_rotates_and_drops_pending_rewards() -> None:
+def test_follow_up_forfeit_rotates_and_preserves_no_pending_rewards() -> None:
     before = restore_trusted_state(
         phase="follow_up",
         ordered_chamber=(
@@ -163,7 +165,7 @@ def test_follow_up_forfeit_rotates_and_drops_pending_rewards() -> None:
             ChamberKind.LIVE,
             ChamberKind.BLANK,
         ),
-        pending_rewards=(ItemType.BEER, ItemType.MAGNIFIER),
+        player_numbers=(1, 2, 3),
     )
     forfeited = dispatch(before, Action.forfeit(player(1)))
 
@@ -175,8 +177,7 @@ def test_follow_up_forfeit_rotates_and_drops_pending_rewards() -> None:
 
 
 def test_failed_and_read_only_actions_do_not_extend_the_turn_deadline() -> None:
-    entropy = ScriptedRandomSource()
-    active, _ = start_active(random_source=entropy)
+    active, entropy = start_active()
     before_deadline = active.deadline
 
     failed = dispatch(

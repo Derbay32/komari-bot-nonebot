@@ -13,6 +13,7 @@ from tests.komari_roulette.support import (
     dispatch,
     player,
     public_facts,
+    restore_trusted_state,
     start_active,
 )
 
@@ -79,6 +80,166 @@ def test_live_shot_still_consumes_before_elimination_and_stops_the_action() -> N
     assert live.state.chamber_revision == 3
     assert live.state.lifecycle == "completed"
     assert_no_secret_chamber_or_reward_fields(live)
+
+
+def test_last_live_with_remaining_blank_is_normalized_before_rotation() -> None:
+    before = restore_trusted_state(
+        phase="first_shot",
+        ordered_chamber=(ChamberKind.LIVE, ChamberKind.BLANK),
+        player_numbers=(1, 2, 3),
+    )
+    entropy = ScriptedRandomSource(
+        chambers=(
+            (
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+            ),
+        )
+    )
+
+    result = dispatch(
+        before,
+        Action.shoot(player(1)),
+        random_source=entropy,
+    )
+
+    assert_ok(result, "shot")
+    assert result.reply["consumptions"] == ["live"]
+    assert result.reply["auto_reloaded"] is True
+    assert result.reply["reload_reason"] == "no_live"
+    assert result.reply["remaining_live"] == 2
+    assert result.reply["remaining_blank"] == 4
+    assert result.state.chamber_revision == before.chamber_revision + 2
+    assert result.state.lifecycle == "active"
+    assert result.state.current_player_seq == 2
+    assert result.state.players[0].alive is False
+    assert entropy.chamber_calls == [(2, 4)]
+
+
+def test_terminal_last_live_is_normalized_before_completion() -> None:
+    before = restore_trusted_state(
+        phase="first_shot",
+        ordered_chamber=(ChamberKind.LIVE,),
+        player_numbers=(1, 2),
+    )
+    entropy = ScriptedRandomSource(
+        chambers=(
+            (
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+            ),
+        )
+    )
+
+    result = dispatch(
+        before,
+        Action.shoot(player(1)),
+        random_source=entropy,
+    )
+
+    assert_ok(result, "shot")
+    assert result.state.lifecycle == "completed"
+    assert result.state.turn_seq == before.turn_seq
+    assert result.reply["consumptions"] == ["live"]
+    assert result.reply["auto_reloaded"] is True
+    assert result.reply["reload_reason"] == "empty"
+    assert result.reply["remaining_live"] == 2
+    assert result.reply["remaining_blank"] == 4
+    assert result.state.chamber_revision == before.chamber_revision + 2
+    assert result.reply["winner_seq"] == 2
+    assert entropy.chamber_calls == [(2, 4)]
+
+
+def test_last_live_normalization_failure_rolls_back_the_whole_shot() -> None:
+    before = restore_trusted_state(
+        phase="first_shot",
+        ordered_chamber=(ChamberKind.LIVE, ChamberKind.BLANK),
+        player_numbers=(1, 2, 3),
+    )
+    before_facts = public_facts(before)
+    entropy = ScriptedRandomSource()
+    entropy.fail_next_chamber = True
+
+    failed = dispatch(
+        before,
+        Action.shoot(player(1)),
+        random_source=entropy,
+    )
+
+    assert_rejected(failed, "random_source_failed")
+    assert entropy.chamber_calls == [(2, 4)]
+    assert public_facts(before) == before_facts
+    assert public_facts(failed.state) == before_facts
+
+
+def test_burst_first_live_stops_and_normalizes_before_second_consumption() -> None:
+    before = restore_trusted_state(
+        phase="follow_up",
+        ordered_chamber=(ChamberKind.LIVE, ChamberKind.BLANK),
+        pending_burst=True,
+        player_numbers=(1, 2, 3),
+    )
+    entropy = ScriptedRandomSource(
+        chambers=(
+            (
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+            ),
+        )
+    )
+
+    result = dispatch(
+        before,
+        Action.shoot(player(1)),
+        random_source=entropy,
+    )
+
+    assert_ok(result, "shot")
+    assert result.reply["consumptions"] == ["live"]
+    assert result.reply["auto_reloaded"] is True
+    assert result.reply["reload_reason"] == "no_live"
+    assert result.reply["reward_count"] == 0
+    assert result.state.pending_burst is False
+    assert result.state.players[0].alive is False
+    assert result.state.lifecycle == "active"
+    assert result.state.current_player_seq == 2
+    assert result.state.chamber_revision == before.chamber_revision + 2
+    assert entropy.chamber_calls == [(2, 4)]
+
+
+def test_burst_last_live_normalization_failure_rolls_back_both_consumptions() -> None:
+    before = restore_trusted_state(
+        phase="follow_up",
+        ordered_chamber=(ChamberKind.LIVE, ChamberKind.BLANK),
+        pending_burst=True,
+        player_numbers=(1, 2, 3),
+    )
+    before_facts = public_facts(before)
+    entropy = ScriptedRandomSource()
+    entropy.fail_next_chamber = True
+
+    failed = dispatch(
+        before,
+        Action.shoot(player(1)),
+        random_source=entropy,
+    )
+
+    assert_rejected(failed, "random_source_failed")
+    assert entropy.chamber_calls == [(2, 4)]
+    assert public_facts(before) == before_facts
+    assert public_facts(failed.state) == before_facts
 
 
 def test_no_live_normalizes_after_consumption_and_increments_chamber_revision_twice() -> (
@@ -250,7 +411,7 @@ def test_manual_reload_preserves_remaining_live_and_adds_exactly_one_live() -> N
     assert reload.state.phase == "first_shot"
     assert reload.state.ordered_chamber == (
         ChamberKind.LIVE,
-        ChamberKind.BLANK,
+        ChamberKind.LIVE,
         ChamberKind.LIVE,
         ChamberKind.BLANK,
         ChamberKind.BLANK,
