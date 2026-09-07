@@ -39,6 +39,7 @@ load_current(group: GroupRef, *, for_update: bool = False) -> GameSnapshot | Non
 create_waiting(snapshot: GameSnapshot) -> GameSnapshot
 save_transition(transition: StateTransition, *, expected_revision: int) -> GameSnapshot
 project_terminal(projection: TerminalProjection)
+fail_corrupt_current(group: GroupRef, *, ended_at: datetime) -> RouletteResult | None
 get_result(group: GroupRef, game_id: str)
 list_leaderboard(group: GroupRef)
 rebuild_leaderboard(group: GroupRef)
@@ -82,7 +83,18 @@ existing proof and never increments wins again.  `cancelled`, `expired`, and
 Storage failures raise `StorageUnavailableError` and do not change lifecycle
 or fabricate an empty game.  A successfully read aggregate that violates a
 cross-row invariant raises `AggregateCorruptError` (the caller may perform a
-controlled safe `failed` projection with a whitelist reason code).  Stale
+controlled safe `failed` projection with a whitelist reason code).  The
+controlled path is the narrow `fail_corrupt_current()` operation: it accepts
+only the group and a PostgreSQL-time terminal timestamp, never a caller-built
+snapshot or winner.  It locks and rechecks the persisted current rows itself;
+an intact waiting/active aggregate is rejected with
+`TerminalProjectionRejectedError`, an absent current game returns `None`, and
+an infrastructure error remains `StorageUnavailableError`.  A confirmed
+corrupt aggregate becomes `failed` with the fixed safe reason
+`aggregate_corrupt`, a terminal revision one greater than the root revision,
+no winner or win, and immediate runtime cleanup.  The result contains only
+the result header and safe historical player rows; that set may be empty when
+no player row can be safely projected.  Stale
 `state_revision` writes raise `RevisionConflictError` and leave all rows
 unchanged.  A terminal projection for an absent game, a non-terminal game, or
 one without exactly one eligible winner raises
