@@ -344,6 +344,14 @@ def test_lock_binds_to_next_turn_and_is_cleared_when_target_is_eliminated() -> N
                 ChamberKind.BLANK,
                 ChamberKind.BLANK,
             ),
+            (
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+                ChamberKind.BLANK,
+                ChamberKind.LIVE,
+                ChamberKind.BLANK,
+            ),
         ),
         items=(ItemType.LOCK,),
     )
@@ -392,6 +400,12 @@ def test_lock_binds_to_next_turn_and_is_cleared_when_target_is_eliminated() -> N
     assert target_dies.state.lifecycle == "completed"
     assert target_dies.state.current_player_seq is None
     assert target_dies.reply["winner_seq"] == 3
+    assert target_dies.reply["auto_reloaded"] is True
+    assert target_dies.reply["reload_reason"] == "no_live"
+    assert target_dies.reply["remaining_live"] == 2
+    assert target_dies.reply["remaining_blank"] == 4
+    assert target_dies.state.chamber_revision == issuer_dies.state.chamber_revision + 2
+    assert entropy.chamber_calls == [(2, 4), (2, 4)]
 
 
 def test_lock_rejects_missing_dead_and_duplicate_targets_without_consuming() -> None:
@@ -664,7 +678,11 @@ def test_item_choice_is_the_only_action_allowed_after_full_inventory_reward() ->
     assert_ok(item_choice, "item_choice_pending")
     assert item_choice.state.phase == "item_choice"
     assert item_choice.reply["pending_item"] == ItemType.BEER.value
-    assert item_choice.reply["pending_item_count"] == 1
+    assert len(item_choice.state.pending_rewards) == 1
+    assert (
+        item_choice.reply["pending_item_count"]
+        == len(item_choice.state.pending_rewards) - 1
+    )
     assert_no_secret_chamber_or_reward_fields(item_choice)
 
     forfeited = dispatch(
