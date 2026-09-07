@@ -118,7 +118,7 @@ def upgrade(name: str = "") -> None:
     op.execute(
         """
         CREATE TABLE komari_roulette_results (
-            game_id TEXT PRIMARY KEY,
+            game_id TEXT NOT NULL,
             app_id TEXT NOT NULL,
             group_openid TEXT NOT NULL,
             lifecycle TEXT NOT NULL,
@@ -130,12 +130,14 @@ def upgrade(name: str = "") -> None:
             winner_seq INTEGER,
             winner_member_openid TEXT,
             winner_display_name TEXT,
+            CONSTRAINT pk_komari_roulette_results
+                PRIMARY KEY (game_id),
             CONSTRAINT fk_komari_roulette_results_game
                 FOREIGN KEY (game_id)
                 REFERENCES komari_roulette_games (game_id)
                 ON DELETE RESTRICT,
-            CONSTRAINT uq_komari_roulette_results_game
-                UNIQUE (game_id),
+            CONSTRAINT uq_komari_roulette_results_scope
+                UNIQUE (game_id, app_id, group_openid),
             CONSTRAINT ck_komari_roulette_results_lifecycle
                 CHECK (lifecycle IN ('completed', 'cancelled', 'expired',
                                      'failed'))
@@ -158,7 +160,7 @@ def upgrade(name: str = "") -> None:
             CONSTRAINT fk_komari_roulette_result_players_result
                 FOREIGN KEY (game_id)
                 REFERENCES komari_roulette_results (game_id)
-                ON DELETE CASCADE,
+                ON DELETE RESTRICT,
             CONSTRAINT uq_komari_roulette_result_players_member
                 UNIQUE (game_id, member_openid),
             CONSTRAINT ck_komari_roulette_result_players_join_seq_positive

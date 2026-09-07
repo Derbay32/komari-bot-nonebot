@@ -7,8 +7,7 @@ the only owner of the physical schema.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from sqlalchemy import (
     ARRAY,
@@ -28,11 +27,8 @@ from sqlalchemy import (
 )
 from sqlmodel import Field, SQLModel
 
-
-def _utcnow() -> datetime:
-    """Provide a value for direct ORM construction in tests."""
-
-    return datetime.now(UTC)
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class _RouletteModelBase(SQLModel):
@@ -60,7 +56,6 @@ class RouletteGameRow(_RouletteModelBase, table=True):
     )
     host_seq: int | None = Field(default=None, sa_column=Column(Integer))
     created_at: datetime = Field(
-        default_factory=_utcnow,
         sa_column=Column(
             DateTime(timezone=True),
             nullable=False,
@@ -141,7 +136,6 @@ class RouletteGameRow(_RouletteModelBase, table=True):
         sa_column=Column(Integer, nullable=False, server_default=text("1")),
     )
     updated_at: datetime = Field(
-        default_factory=_utcnow,
         sa_column=Column(
             DateTime(timezone=True),
             nullable=False,
@@ -274,7 +268,6 @@ class RouletteResultRow(_RouletteModelBase, table=True):
                 ondelete="RESTRICT",
                 name="fk_komari_roulette_results_game",
             ),
-            primary_key=True,
             nullable=False,
         )
     )
@@ -304,7 +297,13 @@ class RouletteResultRow(_RouletteModelBase, table=True):
     )
 
     __table_args__ = (
-        UniqueConstraint("game_id", name="uq_komari_roulette_results_game"),
+        PrimaryKeyConstraint("game_id", name="pk_komari_roulette_results"),
+        UniqueConstraint(
+            "game_id",
+            "app_id",
+            "group_openid",
+            name="uq_komari_roulette_results_scope",
+        ),
         CheckConstraint(
             "lifecycle IN ('completed', 'cancelled', 'expired', 'failed')",
             name="ck_komari_roulette_results_lifecycle",
@@ -322,7 +321,7 @@ class RouletteResultPlayerRow(_RouletteModelBase, table=True):
             Text,
             ForeignKey(
                 "komari_roulette_results.game_id",
-                ondelete="CASCADE",
+                ondelete="RESTRICT",
                 name="fk_komari_roulette_result_players_result",
             ),
             nullable=False,
