@@ -204,7 +204,11 @@ async def sr_function(
     # 获取用户信息
     user_id = event.get_user_id()
     user_nickname = get_user_nickname(event)
-    username = character_binding.get_character_name(user_id, user_nickname)
+    username = character_binding.get_character_name(
+        group_id=str(getattr(event, "group_id", "")),
+        user_id=user_id,
+        fallback_nickname=user_nickname,
+    )
 
     try:
         # 如果有额外参数，作为自定义消息加入最终回复

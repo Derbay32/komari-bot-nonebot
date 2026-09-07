@@ -545,7 +545,11 @@ def _resolve_proposer_name(event: GroupMessageEvent) -> str:
     username = event.sender.nickname.strip() if event.sender.nickname else ""
     group_card = event.sender.card.strip() if event.sender.card else ""
     fallback_name = username or group_card or user_id
-    return character_binding.get_character_name(user_id, fallback_name)
+    return character_binding.get_character_name(
+        group_id=str(event.group_id),
+        user_id=user_id,
+        fallback_nickname=fallback_name,
+    )
 
 
 def _format_proposer(proposal: Proposal) -> str:

@@ -309,7 +309,11 @@ async def fetch_group_history_messages(
                 fallback_nickname = (
                     str(sender.get("nickname", "")).strip() or fallback_nickname
                 )
-            nickname = name_resolver(user_id, fallback_nickname)
+            nickname = name_resolver(
+                group_id=str(group_id),
+                user_id=user_id,
+                fallback_nickname=fallback_nickname,
+            )
 
             content = _extract_content(item)
             if not content:

@@ -38,6 +38,16 @@ class _HistoryBot:
         return response
 
 
+def _identity_name(
+    *,
+    group_id: str,
+    user_id: str,
+    fallback_nickname: str,
+) -> str:
+    del group_id, user_id
+    return fallback_nickname
+
+
 @pytest.mark.asyncio
 async def test_fetch_history_marks_partial_and_failed_batch() -> None:
     bot = _HistoryBot(
@@ -52,7 +62,7 @@ async def test_fetch_history_marks_partial_and_failed_batch() -> None:
         group_id="10000",
         count=4,
         batch_size=2,
-        name_resolver=lambda _user_id, nickname: nickname,
+        name_resolver=_identity_name,
     )
 
     assert [message.message_seq for message in result.messages] == [3, 4]
@@ -79,7 +89,7 @@ async def test_fetch_history_natural_end_is_complete() -> None:
         group_id="10000",
         count=4,
         batch_size=2,
-        name_resolver=lambda _user_id, nickname: nickname,
+        name_resolver=_identity_name,
     )
 
     assert result.metadata.status == "complete"
@@ -98,7 +108,7 @@ async def test_fetch_history_marks_repeated_page_as_partial() -> None:
         group_id="10000",
         count=4,
         batch_size=2,
-        name_resolver=lambda _user_id, nickname: nickname,
+        name_resolver=_identity_name,
     )
 
     assert result.metadata.status == "partial"

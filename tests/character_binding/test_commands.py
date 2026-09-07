@@ -16,7 +16,6 @@ from komari_bot.plugins.character_binding.manager import (
     CharacterBindingManager,
     CharacterNameValidationError,
 )
-from komari_bot.plugins.group_admission import AdmissionQualification
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -40,10 +39,13 @@ def _admit_admission(
     commands_module: Any,
 ) -> None:
     """放行统一准入复查，命令单测专注既有领域逻辑。"""
-
     def _adjudicate(*_args: object, **_kwargs: object) -> object:
         return SimpleNamespace(
-            qualification=AdmissionQualification.BUSINESS,
+            # Resolve the enum from the command module that owns the patched
+            # adjudicator.  This keeps ``is AdmissionQualification.BUSINESS``
+            # valid when the admission package was reloaded during NoneBug
+            # startup.
+            qualification=commands_module.AdmissionQualification.BUSINESS,
         )
 
     monkeypatch.setattr(commands_module, "adjudicate", _adjudicate)
@@ -51,39 +53,44 @@ def _admit_admission(
 
 class _StubManager(CharacterBindingManager):
     def __init__(self, bindings: dict[str, str] | None = None) -> None:
-        self.bindings = dict(bindings or {})
-
-    def has_binding(self, user_id: str) -> bool:
-        return user_id in self.bindings
+        self.bindings = {
+            ("114514", user_id): character_name
+            for user_id, character_name in (bindings or {}).items()
+        }
 
     def get_character_name(
         self,
+        *,
+        group_id: str,
         user_id: str,
         fallback_nickname: str | None = None,
     ) -> str:
-        if user_id in self.bindings:
-            return self.bindings[user_id]
+        if (group_id, user_id) in self.bindings:
+            return self.bindings[(group_id, user_id)]
         if fallback_nickname:
             return fallback_nickname
         return user_id
 
-    async def set_character_name(self, user_id: str, character_name: str) -> None:
-        self.bindings[user_id] = character_name
+    async def set_group_character_name(
+        self,
+        group_id: str,
+        user_id: str,
+        character_name: str,
+    ) -> None:
+        self.bindings[(group_id, user_id)] = character_name
 
-    async def remove_character_name(self, user_id: str) -> bool:
-        if user_id not in self.bindings:
+    async def clear_group_character_name(self, group_id: str, user_id: str) -> bool:
+        if (group_id, user_id) not in self.bindings:
             return False
-        del self.bindings[user_id]
+        del self.bindings[(group_id, user_id)]
         return True
 
-    def list_bindings(self) -> dict[str, str]:
-        return self.bindings.copy()
 
-
-def _build_private_event(
+def _build_group_event(
     plain_text: str,
     *,
     user_id: int = 42,
+    group_id: int = 114514,
     message_id: int = 1,
 ) -> GroupMessageEvent:
     message = Message(plain_text)
@@ -102,7 +109,7 @@ def _build_private_event(
         sender=Sender.model_construct(user_id=user_id, nickname="tester", card=""),
         to_me=True,
         reply=None,
-        group_id=114514,
+        group_id=group_id,
         anonymous=None,
     )
 
@@ -145,15 +152,19 @@ async def test_handle_set_reports_validation_failure(
 ) -> None:
     manager = _StubManager()
 
-    async def reject_name(_user_id: str, _character_name: str) -> None:
+    async def reject_name(
+        _group_id: str,
+        _user_id: str,
+        _character_name: str,
+    ) -> None:
         raise CharacterNameValidationError("角色名不能包含换行或控制字符")
 
-    monkeypatch.setattr(manager, "set_character_name", reject_name)
+    monkeypatch.setattr(manager, "set_group_character_name", reject_name)
     monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind set 角色名")
+        event = _build_group_event(".bind set 角色名")
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_set)
         ctx.should_pass_rule(matcher=commands_module.bind_set)
@@ -174,15 +185,19 @@ async def test_handle_set_reports_persistence_failure(
 ) -> None:
     manager = _StubManager()
 
-    async def fail_to_save(_user_id: str, _character_name: str) -> None:
+    async def fail_to_save(
+        _group_id: str,
+        _user_id: str,
+        _character_name: str,
+    ) -> None:
         raise BindingPersistenceError("角色绑定保存失败")
 
-    monkeypatch.setattr(manager, "set_character_name", fail_to_save)
+    monkeypatch.setattr(manager, "set_group_character_name", fail_to_save)
     monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind set 泉此方")
+        event = _build_group_event(".bind set 泉此方")
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_set)
         ctx.should_pass_rule(matcher=commands_module.bind_set)
@@ -199,15 +214,15 @@ async def test_handle_delete_reports_persistence_failure(
 ) -> None:
     manager = _StubManager({"42": "泉此方"})
 
-    async def fail_to_delete(_user_id: str) -> bool:
+    async def fail_to_delete(_group_id: str, _user_id: str) -> bool:
         raise BindingPersistenceError("角色绑定保存失败")
 
-    monkeypatch.setattr(manager, "remove_character_name", fail_to_delete)
+    monkeypatch.setattr(manager, "clear_group_character_name", fail_to_delete)
     monkeypatch.setattr(manager_module.state, "manager", manager)
 
     async with app.test_matcher(commands_module.bind_del) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind del")
+        event = _build_group_event(".bind del")
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_del)
         ctx.should_pass_rule(matcher=commands_module.bind_del)
@@ -227,13 +242,13 @@ async def test_handle_list_only_returns_current_user_binding_with_nonebug(
 
     async with app.test_matcher(commands_module.bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind list")
+        event = _build_group_event(".bind list")
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_list)
         ctx.should_pass_rule(matcher=commands_module.bind_list)
         ctx.should_call_send(
             event,
-            plain_text_message("📋 您的角色绑定: 泉此方"),
+            plain_text_message("📋 您的本群角色名: 泉此方"),
             bot=bot,
         )
         ctx.should_finished()
@@ -251,13 +266,13 @@ async def test_handle_list_treats_stored_cq_code_as_plain_text(
 
     async with app.test_matcher(commands_module.bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".bind list")
+        event = _build_group_event(".bind list")
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=commands_module.bind_list)
         ctx.should_pass_rule(matcher=commands_module.bind_list)
         ctx.should_call_send(
             event,
-            plain_text_message("📋 您的角色绑定: [CQ:at,qq=all]"),
+            plain_text_message("📋 您的本群角色名: [CQ:at,qq=all]"),
             bot=bot,
         )
         ctx.should_finished()

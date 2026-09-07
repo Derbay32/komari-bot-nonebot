@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -35,7 +36,7 @@ class _PytestConfigWithStash(Protocol):
 def pytest_configure(config: object) -> None:
     """在 NoneBug 初始化前写入 NoneBot 启动参数。"""
     pytest_config = cast("_PytestConfigWithStash", config)
-    pytest_config.stash[NONEBOT_INIT_KWARGS] = {
+    init_kwargs: dict[str, object] = {
         "driver": "~fastapi",
         "command_start": ["。", "."],
         "command_sep": [" "],
@@ -45,6 +46,10 @@ def pytest_configure(config: object) -> None:
         "fastapi_redoc_url": None,
         "fastapi_include_adapter_schema": False,
     }
+    test_database_url = os.environ.get("SQLALCHEMY_DATABASE_URL")
+    if test_database_url:
+        init_kwargs["sqlalchemy_database_url"] = test_database_url
+    pytest_config.stash[NONEBOT_INIT_KWARGS] = init_kwargs
 
 
 class _DummyScheduler:
@@ -195,6 +200,7 @@ class _DummyAgentRunLoggerPlugin:
     def register_agent_run_log_api(*_args: object, **_kwargs: object) -> None:
         return None
 
+
 class _DummyUserDataPlugin:
     @staticmethod
     def get_config() -> object:
@@ -272,8 +278,25 @@ class _DummyKnowledgePlugin:
 
 class _DummyCharacterBindingPlugin:
     @staticmethod
-    def get_character_name(user_id: str, fallback_nickname: str = "") -> str:
+    def get_character_name(
+        *,
+        group_id: str,
+        user_id: str,
+        fallback_nickname: str | None = None,
+    ) -> str:
+        del group_id
         return fallback_nickname or user_id
+
+    @staticmethod
+    def get_qq_character_name(
+        *,
+        app_id: str,
+        group_openid: str,
+        member_openid: str,
+        fallback_nickname: str | None = None,
+    ) -> str:
+        del app_id, group_openid
+        return fallback_nickname or member_openid
 
     @staticmethod
     def get_binding_manager() -> object:
@@ -282,31 +305,41 @@ class _DummyCharacterBindingPlugin:
 
 class _DummyBindingManager:
     def __init__(self) -> None:
-        self._bindings: dict[str, str] = {}
-
-    def has_binding(self, user_id: str) -> bool:
-        return user_id in self._bindings
+        self._bindings: dict[tuple[str, str], str] = {}
 
     def get_character_name(
-        self, user_id: str, fallback_nickname: str | None = None
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        fallback_nickname: str | None = None,
     ) -> str:
-        if user_id in self._bindings:
-            return self._bindings[user_id]
+        if (group_id, user_id) in self._bindings:
+            return self._bindings[(group_id, user_id)]
         if fallback_nickname:
             return fallback_nickname
         return user_id
 
-    async def set_character_name(self, user_id: str, character_name: str) -> None:
-        self._bindings[user_id] = character_name
+    async def set_group_character_name(
+        self,
+        group_id: str,
+        user_id: str,
+        character_name: str,
+    ) -> None:
+        self._bindings[(group_id, user_id)] = character_name
 
-    async def remove_character_name(self, user_id: str) -> bool:
-        if user_id not in self._bindings:
+    async def clear_group_character_name(self, group_id: str, user_id: str) -> bool:
+        if (group_id, user_id) not in self._bindings:
             return False
-        del self._bindings[user_id]
+        del self._bindings[(group_id, user_id)]
         return True
 
-    def list_bindings(self) -> dict[str, str]:
-        return self._bindings.copy()
+    def list_onebot_group_bindings(self, *, group_id: str) -> dict[str, str]:
+        return {
+            user_id: name
+            for (stored_group_id, user_id), name in self._bindings.items()
+            if stored_group_id == group_id
+        }
 
 
 class _DummyChatPlugin:
@@ -454,6 +487,7 @@ _inject_package_exports(
     {
         "get_binding_manager": _DummyCharacterBindingPlugin.get_binding_manager,
         "get_character_name": _DummyCharacterBindingPlugin.get_character_name,
+        "get_qq_character_name": _DummyCharacterBindingPlugin.get_qq_character_name,
     },
 )
 _inject_package_exports(

@@ -271,6 +271,7 @@ async def build_prompt(
     """
     template = await get_template()
     messages: list[dict[str, Any]] = []
+    lookup_group_id = str(group_id or "")
 
     # TSK-195：delegated 模式不在主 prompt 出现任何图片 URL/base64，只用
     # 任务级会话的稳定计数表述可读图片（引用在前、当前在后）；原生模式
@@ -348,6 +349,7 @@ async def build_prompt(
                 )
             else:
                 character_name = character_binding.get_character_name(
+                    group_id=lookup_group_id,
                     user_id=msg.user_id,
                     fallback_nickname=msg.user_nickname,
                 )
@@ -453,12 +455,14 @@ async def build_prompt(
             if not msg.is_bot:
                 all_user_ids.add(msg.user_id)
                 visible_users[msg.user_id] = character_binding.get_character_name(
+                    group_id=lookup_group_id,
                     user_id=msg.user_id,
                     fallback_nickname=msg.user_nickname,
                 )
     if current_user_id:
         all_user_ids.add(current_user_id)
         visible_users[current_user_id] = character_binding.get_character_name(
+            group_id=lookup_group_id,
             user_id=current_user_id,
             fallback_nickname=current_user_nickname,
         )
@@ -469,6 +473,7 @@ async def build_prompt(
     ):
         all_user_ids.add(reply_context.user_id)
         visible_users[reply_context.user_id] = character_binding.get_character_name(
+            group_id=lookup_group_id,
             user_id=reply_context.user_id,
             fallback_nickname=reply_context.user_nickname or reply_context.user_id,
         )
@@ -527,11 +532,12 @@ async def build_prompt(
             f"<recent_interaction_history>\n{recent_interaction_text}\n</recent_interaction_history>"
         )
 
-    del memory_service, group_id
+    del memory_service
 
     if favorability is not None:
         favor_display_name = (
             character_binding.get_character_name(
+                group_id=lookup_group_id,
                 user_id=favorability.user_id,
                 fallback_nickname=current_user_nickname,
             )
@@ -555,6 +561,7 @@ async def build_prompt(
     # 当前用户消息（使用 <user_input> 标签防止提示词注入）
     current_character_name = (
         character_binding.get_character_name(
+            group_id=lookup_group_id,
             user_id=current_user_id,
             fallback_nickname=current_user_nickname,
         )
@@ -568,6 +575,7 @@ async def build_prompt(
         if reply_context.source_side == "user":
             reply_name = (
                 character_binding.get_character_name(
+                    group_id=lookup_group_id,
                     user_id=reply_context.user_id,
                     fallback_nickname=reply_context.user_nickname or "被回复用户",
                 )

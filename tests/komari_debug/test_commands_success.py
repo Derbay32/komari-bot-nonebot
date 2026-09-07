@@ -369,7 +369,9 @@ async def test_favor_set_strict_extra_args_ignored_by_split(
         bot = _create_onebot_bot(ctx)
         # "42 200 extra stuff" → parts[0]="42", parts[1]="200 extra stuff"
         # _parse_favor_value("200 extra stuff") 会失败
-        event = _build_private_event(".debug favor set 42 200 extra stuff", user_id=SU_ID)
+        event = _build_private_event(
+            ".debug favor set 42 200 extra stuff", user_id=SU_ID
+        )
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_set)
@@ -388,19 +390,24 @@ async def test_favor_set_strict_extra_args_ignored_by_split(
 async def test_bind_set_success(
     app: App,
     debug_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 .debug bind set 成功输出。"""
+    """验证 .debug bind set 在群上下文中成功输出。"""
+
+    async def _fake_basic_result(**_kwargs: object) -> str:
+        return "binding-result"
+
+    monkeypatch.setattr(
+        debug_commands, "_build_basic_command_result", _fake_basic_result
+    )
+
     async with app.test_matcher(debug_commands.debug_bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind set 42 泉此方", user_id=SU_ID)
+        event = _build_group_event(".debug bind set 42 泉此方", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
-        ctx.should_call_send(
-            event,
-            plain_text_message("✅ 已为用户 42 设置角色绑定: 泉此方"),
-            bot=bot,
-        )
+        ctx.should_call_send(event, "binding-result", bot=bot)
         ctx.should_finished()
 
 
@@ -412,7 +419,7 @@ async def test_bind_set_rejects_missing_character_name(
     """角色名为空时拒绝。"""
     async with app.test_matcher(debug_commands.debug_bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind set 42", user_id=SU_ID)
+        event = _build_group_event(".debug bind set 42", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
@@ -432,7 +439,7 @@ async def test_bind_set_rejects_empty_character_name(
     """角色名为空白时拒绝。"""
     async with app.test_matcher(debug_commands.debug_bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind set 42    ", user_id=SU_ID)
+        event = _build_group_event(".debug bind set 42    ", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
@@ -450,22 +457,25 @@ async def test_bind_set_exception_shows_error(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """set_character_name 抛异常时显示失败消息。"""
+    """群级 set_group_character_name 抛异常时显示失败消息。"""
     manager_stub = SimpleNamespace()
-    manager_stub.set_character_name = _make_async_raise(RuntimeError("存储失败"))
+    manager_stub.set_group_character_name = _make_async_raise(RuntimeError("存储失败"))
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+
+    async def _fake_basic_result(**_kwargs: object) -> str:
+        return "binding-error-result"
+
+    monkeypatch.setattr(
+        debug_commands, "_build_basic_command_result", _fake_basic_result
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind set 42 泉此方", user_id=SU_ID)
+        event = _build_group_event(".debug bind set 42 泉此方", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
-        ctx.should_call_send(
-            event,
-            plain_text_message("❌ 设置绑定失败\n错误码: bind_set_failed"),
-            bot=bot,
-        )
+        ctx.should_call_send(event, "binding-error-result", bot=bot)
         ctx.should_finished()
 
 
@@ -478,22 +488,25 @@ async def test_bind_del_success(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """remove_character_name 返回 True 时显示已删除。"""
+    """clear_group_character_name 返回 True 时显示已删除。"""
     manager_stub = SimpleNamespace()
-    manager_stub.remove_character_name = _make_async_return(return_value=True)
+    manager_stub.clear_group_character_name = _make_async_return(return_value=True)
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+
+    async def _fake_basic_result(**_kwargs: object) -> str:
+        return "binding-delete-result"
+
+    monkeypatch.setattr(
+        debug_commands, "_build_basic_command_result", _fake_basic_result
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_del) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind del 42", user_id=SU_ID)
+        event = _build_group_event(".debug bind del 42", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(
-            event,
-            plain_text_message("✅ 已删除用户 42 的角色绑定"),
-            bot=bot,
-        )
+        ctx.should_call_send(event, "binding-delete-result", bot=bot)
         ctx.should_finished()
 
 
@@ -503,22 +516,25 @@ async def test_bind_del_not_found(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """remove_character_name 返回 False 时显示不存在。"""
+    """clear_group_character_name 返回 False 时显示不存在。"""
     manager_stub = SimpleNamespace()
-    manager_stub.remove_character_name = _make_async_return(return_value=False)
+    manager_stub.clear_group_character_name = _make_async_return(return_value=False)
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+
+    async def _fake_basic_result(**_kwargs: object) -> str:
+        return "binding-delete-missing-result"
+
+    monkeypatch.setattr(
+        debug_commands, "_build_basic_command_result", _fake_basic_result
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_del) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind del 999", user_id=SU_ID)
+        event = _build_group_event(".debug bind del 999", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(
-            event,
-            plain_text_message("⚠️ 用户 999 没有角色绑定"),
-            bot=bot,
-        )
+        ctx.should_call_send(event, "binding-delete-missing-result", bot=bot)
         ctx.should_finished()
 
 
@@ -530,7 +546,7 @@ async def test_bind_del_rejects_missing_user_id(
     """缺少用户 ID 时提示用法。"""
     async with app.test_matcher(debug_commands.debug_bind_del) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind del", user_id=SU_ID)
+        event = _build_group_event(".debug bind del", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
@@ -548,22 +564,27 @@ async def test_bind_del_exception_shows_error(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """remove_character_name 抛异常时显示失败消息。"""
+    """clear_group_character_name 抛异常时显示失败消息。"""
     manager_stub = SimpleNamespace()
-    manager_stub.remove_character_name = _make_async_raise(RuntimeError("JSON 解析失败"))
+    manager_stub.clear_group_character_name = _make_async_raise(
+        RuntimeError("存储失败")
+    )
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+
+    async def _fake_basic_result(**_kwargs: object) -> str:
+        return "binding-delete-error-result"
+
+    monkeypatch.setattr(
+        debug_commands, "_build_basic_command_result", _fake_basic_result
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_del) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind del 42", user_id=SU_ID)
+        event = _build_group_event(".debug bind del 42", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_del)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_del)
-        ctx.should_call_send(
-            event,
-            plain_text_message("❌ 删除绑定失败\n错误码: bind_delete_failed"),
-            bot=bot,
-        )
+        ctx.should_call_send(event, "binding-delete-error-result", bot=bot)
         ctx.should_finished()
 
 
@@ -576,21 +597,55 @@ async def test_bind_list_with_bindings(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """有绑定时列出所有绑定。"""
+    """群内列表只返回安全回执，并把明细交给独立私聊投影。"""
     bindings = {"42": "泉此方", "10086": "柊镜"}
-    manager_stub = SimpleNamespace()
-    manager_stub.list_bindings = lambda: bindings
+    list_calls: list[str] = []
+
+    def _list_onebot_group_bindings(*, group_id: str) -> dict[str, str]:
+        list_calls.append(group_id)
+        return bindings
+
+    manager_stub = SimpleNamespace(
+        list_onebot_group_bindings=_list_onebot_group_bindings
+    )
+    private_messages: list[str] = []
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        message: object,
+    ) -> bool:
+        private_messages.append(str(message))
+        return True
+
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="e" * 32),
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind list", user_id=SU_ID)
+        event = _build_group_event(".debug bind list", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
-        expected = "📋 全部角色绑定:\n  10086: 柊镜\n  42: 泉此方"
-        ctx.should_call_send(event, plain_text_message(expected), bot=bot)
+        ctx.should_call_send(
+            event,
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-eeeeeeeeeeee\n"
+                "执行状态: 成功\n"
+                "完整结果: 已私聊"
+            ),
+            bot=bot,
+        )
         ctx.should_finished()
+
+    assert list_calls == ["12345"]
+    assert len(private_messages) == 1
 
 
 @pytest.mark.asyncio
@@ -601,18 +656,42 @@ async def test_bind_list_empty(
 ) -> None:
     """无绑定时显示提示。"""
     manager_stub = SimpleNamespace()
-    manager_stub.list_bindings = dict
+
+    def _empty_list(*, group_id: str) -> dict[str, str]:
+        del group_id
+        return {}
+
+    manager_stub.list_onebot_group_bindings = _empty_list
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        _message: object,
+    ) -> bool:
+        return True
+
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="f" * 32),
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind list", user_id=SU_ID)
+        event = _build_group_event(".debug bind list", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         ctx.should_call_send(
             event,
-            plain_text_message("📋 当前没有任何角色绑定"),
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-ffffffffffff\n"
+                "执行状态: 成功\n"
+                "完整结果: 已私聊"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -624,20 +703,46 @@ async def test_bind_list_exception_shows_error(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """list_bindings 抛异常时显示失败消息。"""
+    """list_onebot_group_bindings 抛异常时显示失败消息。"""
     manager_stub = SimpleNamespace()
-    manager_stub.list_bindings = lambda: (_ for _ in ()).throw(RuntimeError("JSON 文件损坏"))
+
+    def _raise_list_error(*, group_id: str) -> dict[str, str]:
+        del group_id
+        raise RuntimeError("存储失败")
+
+    manager_stub.list_onebot_group_bindings = _raise_list_error
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
+    private_messages: list[str] = []
+
+    async def _fake_private_message(
+        _bot: object,
+        _user_id: int,
+        message: object,
+    ) -> bool:
+        private_messages.append(str(message))
+        return True
+
+    monkeypatch.setattr(debug_commands, "send_private_message", _fake_private_message)
+    monkeypatch.setattr(
+        debug_commands.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="g" * 32),
+    )
 
     async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind list", user_id=SU_ID)
+        event = _build_group_event(".debug bind list", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
         ctx.should_call_send(
             event,
-            plain_text_message("❌ 查询绑定列表失败\n错误码: bind_list_failed"),
+            plain_text_message(
+                "🔒 调试请求已处理\n"
+                "请求 ID: debug-bind-list-gggggggggggg\n"
+                "执行状态: 失败\n"
+                "完整结果: 已私聊"
+            ),
             bot=bot,
         )
         ctx.should_finished()
@@ -651,7 +756,7 @@ async def test_bind_list_rejects_extra_arguments(
     """bind list 不接受任何额外参数。"""
     async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(".debug bind list extra", user_id=SU_ID)
+        event = _build_group_event(".debug bind list extra", user_id=SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_list)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_list)
@@ -670,7 +775,12 @@ async def test_group_bind_list_sends_full_details_only_to_superuser_private_chat
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bindings = {"42": "binding-canary-konata", "10086": "binding-canary-kagami"}
-    manager_stub = SimpleNamespace(list_bindings=lambda: bindings)
+
+    def _list_bindings(*, group_id: str) -> dict[str, str]:
+        del group_id
+        return bindings
+
+    manager_stub = SimpleNamespace(list_onebot_group_bindings=_list_bindings)
     private_messages: list[tuple[int, str]] = []
 
     async def _fake_private_message(
@@ -719,7 +829,12 @@ async def test_group_bind_list_public_mode_shows_only_redacted_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bindings = {"42": "binding-public-canary"}
-    manager_stub = SimpleNamespace(list_bindings=lambda: bindings)
+
+    def _list_bindings(*, group_id: str) -> dict[str, str]:
+        del group_id
+        return bindings
+
+    manager_stub = SimpleNamespace(list_onebot_group_bindings=_list_bindings)
 
     async def _fake_private_message(
         _bot: object,
@@ -765,9 +880,12 @@ async def test_group_bind_list_error_reason_is_private(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     error_canary = "binding-storage-error-canary"
-    manager_stub = SimpleNamespace(
-        list_bindings=lambda: (_ for _ in ()).throw(RuntimeError(error_canary))
-    )
+
+    def _raise_list_error(*, group_id: str) -> dict[str, str]:
+        del group_id
+        raise RuntimeError(error_canary)
+
+    manager_stub = SimpleNamespace(list_onebot_group_bindings=_raise_list_error)
     private_messages: list[str] = []
 
     async def _fake_private_message(
@@ -878,7 +996,9 @@ async def test_reply_success_calls_generate_debug_reply_and_sends_report(
         spy.build_report_called = True
         spy.report_kwargs = kwargs
 
-    monkeypatch.setattr(debug_commands, "generate_debug_reply", _fake_generate_debug_reply)
+    monkeypatch.setattr(
+        debug_commands, "generate_debug_reply", _fake_generate_debug_reply
+    )
     monkeypatch.setattr(debug_commands, "_deliver_debug_report", _fake_deliver_report)
 
     async with app.test_matcher(debug_commands.debug_reply) as ctx:
@@ -973,7 +1093,9 @@ async def test_reply_exception_sends_error_report(
         spy.build_report_called = True
         spy.report_kwargs = kwargs
 
-    monkeypatch.setattr(debug_commands, "generate_debug_reply", _fake_generate_debug_reply)
+    monkeypatch.setattr(
+        debug_commands, "generate_debug_reply", _fake_generate_debug_reply
+    )
     monkeypatch.setattr(debug_commands, "_deliver_debug_report", _fake_deliver_report)
 
     async with app.test_matcher(debug_commands.debug_reply) as ctx:
@@ -1004,9 +1126,7 @@ async def test_summary_rejects_private_chat_detailed(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_summary)
         ctx.should_pass_rule(matcher=debug_commands.debug_summary)
-        ctx.should_call_send(
-            event, "❌ .debug summary 仅支持群聊", bot=bot
-        )
+        ctx.should_call_send(event, "❌ .debug summary 仅支持群聊", bot=bot)
         ctx.should_finished()
 
 
@@ -1185,10 +1305,12 @@ async def test_favor_get_strict_no_extra_params() -> None:
 def _make_async_return(return_value: object) -> Any:
     async def _fn(*_args: object, **_kwargs: object) -> object:
         return return_value
+
     return _fn
 
 
 def _make_async_raise(exception: Exception) -> Any:
     async def _fn(*_args: object, **_kwargs: object) -> object:
         raise exception
+
     return _fn

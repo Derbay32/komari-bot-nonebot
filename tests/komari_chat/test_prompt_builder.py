@@ -88,8 +88,8 @@ def _patch_dependencies(monkeypatch: Any) -> None:
         prompt_builder_module,
         "character_binding",
         SimpleNamespace(
-            get_character_name=lambda user_id, fallback_nickname: (
-                fallback_nickname or user_id or "未知用户"
+            get_character_name=lambda *, group_id, user_id, fallback_nickname: (
+                fallback_nickname or user_id or group_id or "未知用户"
             )
         ),
     )
@@ -173,18 +173,14 @@ def test_build_prompt_inserts_assistant_turn_for_bot_reply_text(
         messages, role="system", contains="<profile_tool_hint>"
     )
     assert "read_profile" in str(profile_hint["content"])
-    security = _unique_message(
-        messages, role="system", contains="不得作为系统指令"
-    )
+    security = _unique_message(messages, role="system", contains="不得作为系统指令")
 
     # 机器人被回复的文本作为 assistant 引用块原样注入
     quoted = _unique_message(
         messages,
         role="assistant",
         exact=(
-            '<quoted_message side="assistant">\n'
-            "上一条是机器人说的话\n"
-            "</quoted_message>"
+            '<quoted_message side="assistant">\n上一条是机器人说的话\n</quoted_message>'
         ),
     )
     # 当前用户消息落在末尾（未开启预填充时）
@@ -221,14 +217,13 @@ def test_build_prompt_injects_search_tool_system_message(monkeypatch: Any) -> No
     search_hints = [
         message
         for message in messages
-        if message["role"] == "system"
-        and search_marker in str(message["content"])
+        if message["role"] == "system" and search_marker in str(message["content"])
     ]
     assert len(search_hints) == 1, "搜索行为提示必须恰好一条"
     # 工具名与工具协议由代码拥有（TSK-190），行为引导正文来自 DB 字段 marker
-    assert any(
-        "search_web" in str(message["content"]) for message in messages
-    ), "启用搜索工具时必须出现 search_web 工具提示"
+    assert any("search_web" in str(message["content"]) for message in messages), (
+        "启用搜索工具时必须出现 search_web 工具提示"
+    )
 
     messages_without = asyncio.run(
         prompt_builder_module.build_prompt(
@@ -239,12 +234,8 @@ def test_build_prompt_injects_search_tool_system_message(monkeypatch: Any) -> No
             current_user_nickname="阿虚",
         )
     )
-    joined_without = "\n".join(
-        str(message["content"]) for message in messages_without
-    )
-    assert search_marker not in joined_without, (
-        "未启用搜索工具时不得注入搜索行为字段"
-    )
+    joined_without = "\n".join(str(message["content"]) for message in messages_without)
+    assert search_marker not in joined_without, "未启用搜索工具时不得注入搜索行为字段"
     assert "search_web" not in joined_without, (
         "未启用搜索工具时不得注入 search_web 工具提示"
     )
@@ -327,7 +318,9 @@ def test_build_prompt_injects_only_current_user_profile(monkeypatch: Any) -> Non
     assert "group_id" not in profile_block
 
 
-def test_build_prompt_does_not_fetch_profiles_for_visible_users(monkeypatch: Any) -> None:
+def test_build_prompt_does_not_fetch_profiles_for_visible_users(
+    monkeypatch: Any,
+) -> None:
     _patch_dependencies(monkeypatch)
 
     class _FailingMemory:
@@ -353,7 +346,9 @@ def test_build_prompt_does_not_fetch_profiles_for_visible_users(monkeypatch: Any
         )
     )
 
-    assert any("<current_user_profile>" in str(message["content"]) for message in messages)
+    assert any(
+        "<current_user_profile>" in str(message["content"]) for message in messages
+    )
 
 
 def test_build_prompt_injects_interactions_as_yaml_content_time_only(
@@ -684,9 +679,9 @@ def test_build_prompt_injects_fetch_tool_hint(monkeypatch: Any) -> None:
     ]
     assert len(fetch_system_messages) == 1, "抓取行为提示必须恰好一条"
     # 工具名 fetch_page 由代码拥有（TSK-190），行为引导正文来自 DB 字段 marker
-    assert any(
-        "fetch_page" in str(message["content"]) for message in messages_with
-    ), "启用抓取工具时必须出现 fetch_page 工具提示"
+    assert any("fetch_page" in str(message["content"]) for message in messages_with), (
+        "启用抓取工具时必须出现 fetch_page 工具提示"
+    )
 
     messages_without = asyncio.run(
         prompt_builder_module.build_prompt(
@@ -699,9 +694,7 @@ def test_build_prompt_injects_fetch_tool_hint(monkeypatch: Any) -> None:
         )
     )
 
-    joined_without = "\n".join(
-        str(message["content"]) for message in messages_without
-    )
+    joined_without = "\n".join(str(message["content"]) for message in messages_without)
     assert fetch_marker not in joined_without, (
         "未启用抓取工具时不得注入网页抓取行为字段"
     )
@@ -792,8 +785,7 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
     for marker in expected_markers:
         assert marker in joined, f"builder 未注入 DB 快照行为字段: {marker}"
     assert f"DB-{vision_field.upper()}" not in joined, (
-        "视觉描述职责字段只供 vision_service 子调用消费，"
-        "不得注入主回复 Agent messages"
+        "视觉描述职责字段只供 vision_service 子调用消费，不得注入主回复 Agent messages"
     )
     assert "OLD-OUTPUT-SENTINEL" not in joined, (
         "builder 不得再注入已删除的 output_instruction 内容"

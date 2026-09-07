@@ -1,7 +1,7 @@
 """TSK-232 —— 迁移链重排的结构面静态守卫（无需真实数据库）。
 
 本轮（结构面）红基线刷新 ``migrations/versions`` 版本链的验收契约。目标链
-（单主干、head=0017）按 ADR-0012 「破坏性迁移后果」重排为：
+（单主干、head=0018）按 ADR-0012 「破坏性迁移后果」重排为：
 
 - ``0001`` ``0001_fresh_marker``　fresh marker，不再是一次性全量基线
   （仅空库身份，不含任何 legacy 大表/扩展）；
@@ -26,10 +26,12 @@
 - ``0015`` ``0015_image_understanding_mode``　图片理解模式（原 0015）；
 - ``0016`` ``0016_custom_proposal_vote_epoch``　提案投票纪元（原 0016）；
 - ``0017`` ``0017_custom_proposal_dormancy_rotation``　提案休眠轮换
-  （原 0017，head）。
+  （原 0017）；
+- ``0018`` ``0018_character_binding_groups``　按应用隔离的群成员角色绑定
+  关系（TSK-271，head）。
 
 编号映射理由（每行附于映射常量）：先按 ADR 把四个准入/履约锚点固定到
-0010-0013，再向上/向下保持原内容相对次序折叠填充，头保持 0017；禁止复用
+0010-0013，再向上/向下保持原内容相对次序折叠填充，头保持 0018；禁止复用
 旧 revision 字符串、禁止 branch/merge revision，故链内无 alias，也不为
 数字命名做兼容别名。本文件只解析版本目录与迁移源文本，不要求真实数据库。
 """
@@ -83,8 +85,10 @@ NEW_CHAIN = (
     ("0015", "image_understanding_mode", "image_understanding_mode"),
     # 0016 提案投票纪元（原 0016）
     ("0016", "custom_proposal_vote_epoch", "vote_epoch"),
-    # 0017 提案休眠轮换（原 0017，head）
+    # 0017 提案休眠轮换（原 0017）
     ("0017", "custom_proposal_dormancy_rotation", "dormancy"),
+    # 0018 TSK-271 群成员角色绑定（追加于原链 head）
+    ("0018", "character_binding_groups", "komari_character_binding_groups"),
 )
 
 #: 标注 forward-only / IRREVERSIBLE 的 revision（实现源文本必须含该标记）。
@@ -106,13 +110,13 @@ def _migration_file(revision: str) -> Path:
     return match[0]
 
 
-def test_chain_is_single_trunk_head_0017() -> None:
-    """新链单主干、无 alias、head=0017。"""
+def test_chain_is_single_trunk_head_0018() -> None:
+    """新链单主干、无 alias、head=0018。"""
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0017"
+    assert heads[0] == "0018"
 
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1
@@ -154,7 +158,7 @@ def test_semantic_anchors_present() -> None:
 
 
 def test_numbering_map_redistributes_original_content() -> None:
-    """原 0002-0017 内容依映射归位到新 0002-0017，关键 SQL 文本特征逐项断言。"""
+    """原 0002-0017 内容依映射归位，追加 0018 关键 SQL 特征逐项断言。"""
     for revision, _stem, marker in NEW_CHAIN:
         if marker is None:
             continue

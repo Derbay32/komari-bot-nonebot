@@ -61,9 +61,9 @@ HELP_TEXT = """🔧 Komari Debug 子命令：
 
 .debug favor get <用户ID> — 查询好感度
 .debug favor set <用户ID> <0-400> — 设置好感度
-.debug bind set <用户ID> <角色名> — 设置角色绑定
-.debug bind del <用户ID> — 删除角色绑定
-.debug bind list [--public] — 查看全部绑定（明细默认私聊）
+.debug bind set <用户ID> <角色名> — 设置当前群角色绑定
+.debug bind del <用户ID> — 删除当前群角色名
+.debug bind list [--public] — 查看当前群绑定（明细默认私聊）
 .debug reply [--public] <测试文本> — 群聊干跑回复（完整报告默认私聊）
 .debug summary [--public] <总结要求> — 群聊诊断总结（完整报告默认私聊）
 .debug notify on|off — 切换回复失败 SUPERUSER 通知
@@ -432,6 +432,8 @@ async def handle_debug_bind_set(
 ) -> None:
     if not await SUPERUSER(bot, event):
         await debug_bind_set.finish("❌ 仅限 SUPERUSER 使用")
+    if not isinstance(event, GroupMessageEvent):
+        await debug_bind_set.finish("❌ .debug bind set 仅支持群聊")
 
     parts = arg_text.split(maxsplit=1)
     if len(parts) < 2:
@@ -454,7 +456,11 @@ async def handle_debug_bind_set(
     request_id = f"debug-bind-set-{uuid.uuid4().hex[:12]}"
     try:
         manager = get_binding_manager()
-        await manager.set_character_name(user_id, character_name)
+        await manager.set_group_character_name(
+            str(event.group_id),
+            user_id,
+            character_name,
+        )
     except Exception as exc:
         logger.error(
             "[KomariDebug] bind set 失败: request_id={} error_type={}",
@@ -490,6 +496,8 @@ async def handle_debug_bind_del(
 ) -> None:
     if not await SUPERUSER(bot, event):
         await debug_bind_del.finish("❌ 仅限 SUPERUSER 使用")
+    if not isinstance(event, GroupMessageEvent):
+        await debug_bind_del.finish("❌ .debug bind del 仅支持群聊")
 
     user_id = _parse_user_id(arg_text)
     if user_id is None:
@@ -500,7 +508,10 @@ async def handle_debug_bind_del(
     request_id = f"debug-bind-del-{uuid.uuid4().hex[:12]}"
     try:
         manager = get_binding_manager()
-        success = await manager.remove_character_name(user_id)
+        success = await manager.clear_group_character_name(
+            str(event.group_id),
+            user_id,
+        )
     except Exception as exc:
         logger.error(
             "[KomariDebug] bind del 失败: request_id={} error_type={}",
@@ -540,6 +551,8 @@ async def handle_debug_bind_list(
 ) -> None:
     if not await SUPERUSER(bot, event):
         await debug_bind_list.finish("❌ 仅限 SUPERUSER 使用")
+    if not isinstance(event, GroupMessageEvent):
+        await debug_bind_list.finish("❌ .debug bind list 仅支持群聊")
 
     public_requested, remaining = _extract_public_flag(arg_text)
     if remaining:
@@ -553,7 +566,7 @@ async def handle_debug_bind_list(
 
     try:
         manager = get_binding_manager()
-        bindings = manager.list_bindings()
+        bindings = manager.list_onebot_group_bindings(group_id=str(event.group_id))
     except Exception as exc:
         logger.error(
             "[KomariDebug] bind list 失败: request_id={} error_type={}",
@@ -586,9 +599,6 @@ async def handle_debug_bind_list(
         private_text = "\n".join(lines)
     else:
         private_text = "📋 当前没有任何角色绑定"
-
-    if not isinstance(event, GroupMessageEvent):
-        await debug_bind_list.finish(plain_text_message(private_text))
 
     private_delivered = await send_private_message(
         bot,
