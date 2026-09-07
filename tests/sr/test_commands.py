@@ -48,7 +48,13 @@ class _AtomicListConfigManager:
 
 class _StubCharacterBinding:
     @staticmethod
-    def get_character_name(_user_id: str, fallback_nickname: str = "") -> str:
+    def get_character_name(
+        *,
+        group_id: str,
+        user_id: str,
+        fallback_nickname: str = "",
+    ) -> str:
+        del group_id, user_id
         return fallback_nickname
 
 
@@ -249,8 +255,7 @@ def test_sr_list_rejects_excessive_count_and_item_size(sr_module: Any) -> None:
     with pytest.raises(ValidationError, match="最多允许 500 项"):
         config_module.DynamicConfigSchema(
             sr_list=[
-                f"项目 {index}"
-                for index in range(config_module.MAX_SR_LIST_ITEMS + 1)
+                f"项目 {index}" for index in range(config_module.MAX_SR_LIST_ITEMS + 1)
             ]
         )
 

@@ -128,9 +128,7 @@ async def test_favor_get_rejects_non_superuser(
 
     async with app.test_matcher(debug_commands.debug_favor_get) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(
-            f".debug favor get {NON_SU_ID}", user_id=NON_SU_ID
-        )
+        event = _build_private_event(f".debug favor get {NON_SU_ID}", user_id=NON_SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_get)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_get)
@@ -156,9 +154,7 @@ async def test_favor_set_rejects_non_superuser(
 
     async with app.test_matcher(debug_commands.debug_favor_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(
-            ".debug favor set 12345 200", user_id=NON_SU_ID
-        )
+        event = _build_private_event(".debug favor set 12345 200", user_id=NON_SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_favor_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_favor_set)
@@ -175,25 +171,23 @@ async def test_bind_set_rejects_non_superuser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """非 SUPERUSER 访问 bind set 应被拒绝。"""
-    called = SimpleNamespace(set_character_name=False)
+    called = SimpleNamespace(set_group_character_name=False)
     manager_stub = SimpleNamespace()
-    manager_stub.set_character_name = _make_async_spy(
-        called, "set_character_name", return_value=None
+    manager_stub.set_group_character_name = _make_async_spy(
+        called, "set_group_character_name", return_value=None
     )
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
 
     async with app.test_matcher(debug_commands.debug_bind_set) as ctx:
         bot = _create_onebot_bot(ctx)
-        event = _build_private_event(
-            ".debug bind set 12345 泉此方", user_id=NON_SU_ID
-        )
+        event = _build_private_event(".debug bind set 12345 泉此方", user_id=NON_SU_ID)
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_bind_set)
         ctx.should_pass_rule(matcher=debug_commands.debug_bind_set)
         ctx.should_call_send(event, REJECT_MSG, bot=bot)
         ctx.should_finished()
 
-    assert not called.set_character_name
+    assert not called.set_group_character_name
 
 
 @pytest.mark.asyncio
@@ -203,10 +197,10 @@ async def test_bind_del_rejects_non_superuser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """非 SUPERUSER 访问 bind del 应被拒绝。"""
-    called = SimpleNamespace(remove_character_name=False)
+    called = SimpleNamespace(clear_group_character_name=False)
     manager_stub = SimpleNamespace()
-    manager_stub.remove_character_name = _make_async_spy(
-        called, "remove_character_name", return_value=False
+    manager_stub.clear_group_character_name = _make_async_spy(
+        called, "clear_group_character_name", return_value=False
     )
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
 
@@ -219,7 +213,7 @@ async def test_bind_del_rejects_non_superuser(
         ctx.should_call_send(event, REJECT_MSG, bot=bot)
         ctx.should_finished()
 
-    assert not called.remove_character_name
+    assert not called.clear_group_character_name
 
 
 @pytest.mark.asyncio
@@ -229,9 +223,11 @@ async def test_bind_list_rejects_non_superuser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """非 SUPERUSER 访问 bind list 应被拒绝。"""
-    called = SimpleNamespace(list_bindings=False)
+    called = SimpleNamespace(list_onebot_group_bindings=False)
     manager_stub = SimpleNamespace()
-    manager_stub.list_bindings = lambda: setattr(called, "list_bindings", True) or {}
+    manager_stub.list_onebot_group_bindings = (
+        lambda *, _group_id: setattr(called, "list_onebot_group_bindings", True) or {}
+    )
     monkeypatch.setattr(debug_commands, "get_binding_manager", lambda: manager_stub)
 
     async with app.test_matcher(debug_commands.debug_bind_list) as ctx:
@@ -243,7 +239,7 @@ async def test_bind_list_rejects_non_superuser(
         ctx.should_call_send(event, REJECT_MSG, bot=bot)
         ctx.should_finished()
 
-    assert not called.list_bindings
+    assert not called.list_onebot_group_bindings
 
 
 @pytest.mark.asyncio
@@ -342,9 +338,7 @@ async def test_reply_rejects_private_chat(app: App, debug_commands: Any) -> None
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_reply)
         ctx.should_pass_rule(matcher=debug_commands.debug_reply)
-        ctx.should_call_send(
-            event, "❌ .debug reply 仅支持群聊", bot=bot
-        )
+        ctx.should_call_send(event, "❌ .debug reply 仅支持群聊", bot=bot)
         ctx.should_finished()
 
 
@@ -357,9 +351,7 @@ async def test_summary_rejects_private_chat(app: App, debug_commands: Any) -> No
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_summary)
         ctx.should_pass_rule(matcher=debug_commands.debug_summary)
-        ctx.should_call_send(
-            event, "❌ .debug summary 仅支持群聊", bot=bot
-        )
+        ctx.should_call_send(event, "❌ .debug summary 仅支持群聊", bot=bot)
         ctx.should_finished()
 
 
@@ -766,9 +758,7 @@ async def test_notify_on_success(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_notify)
         ctx.should_pass_rule(matcher=debug_commands.debug_notify)
-        ctx.should_call_send(
-            event, "✅ 回复失败 SUPERUSER 通知已开启", bot=bot
-        )
+        ctx.should_call_send(event, "✅ 回复失败 SUPERUSER 通知已开启", bot=bot)
         ctx.should_finished()
 
 
@@ -796,9 +786,7 @@ async def test_notify_off_success(
         ctx.receive_event(bot, event)
         ctx.should_pass_permission(matcher=debug_commands.debug_notify)
         ctx.should_pass_rule(matcher=debug_commands.debug_notify)
-        ctx.should_call_send(
-            event, "✅ 回复失败 SUPERUSER 通知已关闭", bot=bot
-        )
+        ctx.should_call_send(event, "✅ 回复失败 SUPERUSER 通知已关闭", bot=bot)
         ctx.should_finished()
 
 
@@ -809,6 +797,7 @@ async def test_notify_toggle_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """.debug notify 切换失败时回复错误提示。"""
+
     async def _fail_update_field_async(*_args: object, **_kwargs: object) -> object:
         msg = "数据库连接断开"
         raise RuntimeError(msg)
