@@ -641,8 +641,6 @@ def _shoot(  # noqa: PLR0911
             kind = chamber.pop(0)
             consumptions.append(kind)
             chamber_revision += 1
-            if kind is ChamberKind.LIVE:
-                break
             reason = _normalization_reason(chamber)
             if reason is not None:
                 order = _random_chamber(random_source, INITIAL_LIVE, INITIAL_BLANK)
@@ -652,6 +650,8 @@ def _shoot(  # noqa: PLR0911
                 chamber_revision += 1
                 reload_reason = reason
                 auto_reloaded = True
+            if kind is ChamberKind.LIVE:
+                break
     except Exception:
         return _failure(state, "random_source_failed")
 
@@ -950,6 +950,7 @@ def _reload(
             "after_blank": blank_count,
             "turn_ends": True,
             "information_invalidated": True,
+            "previous_chamber_revision": state.chamber_revision,
             "chamber_revision": new_state.chamber_revision,
         },
         code="reloaded",
@@ -1026,9 +1027,7 @@ def _expire_active(state: GameState, now: datetime) -> ActionResult:
         state,
         pending_rewards=(),
         state_revision=state.state_revision + 1,
-        deadline=state.deadline + TURN_DURATION
-        if state.deadline is not None
-        else now + TURN_DURATION,
+        deadline=now + TURN_DURATION,
     )
     return _eliminate_current(
         new_state,
@@ -1071,7 +1070,6 @@ def _eliminate_current(
             pending_rewards=(),
             pending_burst=False,
             pending_locks=(),
-            turn_seq=state.turn_seq + 1,
         )
         terminal_reply = dict(reply)
         terminal_reply.update(
@@ -1187,12 +1185,10 @@ def _item_choice_reply(state: GameState) -> dict[str, Any]:
     if not state.pending_rewards:
         return {"pending_item": None, "pending_item_count": 0}
     first = state.pending_rewards[0]
-    count = 0
-    for item in state.pending_rewards:
-        if item is not first:
-            break
-        count += 1
-    return {"pending_item": first.value, "pending_item_count": count}
+    return {
+        "pending_item": first.value,
+        "pending_item_count": len(state.pending_rewards) - 1,
+    }
 
 
 def _is_expired(state: GameState, now: datetime) -> bool:
