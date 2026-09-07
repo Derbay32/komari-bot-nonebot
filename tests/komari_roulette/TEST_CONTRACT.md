@@ -1,0 +1,77 @@
+# TSK-272 纯领域测试契约
+
+本目录只测试 `komari_bot.plugins.komari_roulette.domain` 的公开领域边界。测试不导入 NoneBot、OneBot、SQL、character_binding ORM 或发送器；平台身份由测试构造的 `PlayerRef` 值对象传入。
+
+## 最小公开入口
+
+实现需要提供以下窄入口（模块可以拆分，但这些符号必须由插件顶层或 `domain` 模块稳定导出）：
+
+```python
+from komari_bot.plugins.komari_roulette.domain import (
+    Action,
+    ActionResult,
+    ChamberKind,
+    GameState,
+    ItemType,
+    PlayerRef,
+    GroupRef,
+    apply_action,
+    initial_state,
+)
+```
+
+`initial_state(group)` 创建一个没有进行中游戏的 `GameState`。`apply_action(state, action, *, now, random_source)` 是唯一的领域变更入口：它接收完整可信 `GameState`，返回 `ActionResult`，不在测试中调用 repository、ORM 或 matcher。
+
+仓储恢复测试可以使用 `GameState.from_trusted_snapshot(snapshot)` 构造合法的可信领域输入。`snapshot` 至少包含上面列出的生命周期/回合/修订/席位字段、`ordered_chamber`、`pending_rewards`、已冻结的 `item_weights` 与道具效果状态；该入口只接收可信持久化适配器输入，不把普通用户结果或不受信任消息直接反序列化为状态。
+
+`Action` 是不可变的命令值对象，至少提供以下构造器：
+
+```python
+Action.create(player)
+Action.join(player)
+Action.leave(player)
+Action.cancel(player)
+Action.start(player)
+Action.shoot(player)
+Action.forfeit(player)
+Action.end_turn(player)
+Action.reload(player)
+Action.use_item(player, item, target_seq=None)
+Action.discard_item(player, item)
+Action.choose_item(player, decision, replace_item=None)
+Action.transfer(player, target_seq)
+Action.open_item_panel(player)
+Action.expire()
+```
+
+`PlayerRef` 必须携带已验证的应用/群/成员协议身份和非空冻结显示名；测试不把裸 QQ 号、昵称或 `character_binding` 内部记录当作身份。`GroupRef` 至少区分 `app_id` 与 `group_openid`。
+
+随机与时间均在边界注入。测试 fake 提供 `chamber_order(live_count, blank_count)` 和 `weighted_item(weights)`；实现可以采用兼容的结构化协议，但不能从全局随机源、系统时钟或数据库读取。随机源抛出异常或返回非法结果时，动作必须返回 `random_source_failed` 并保持输入状态不变。
+
+## 结果与可信状态的分层
+
+`ActionResult` 至少提供：
+
+- `ok: bool`、`code: str`、`reason: str | None`；
+- `state: GameState`，供下一次领域动作和持久化恢复使用；
+- `reply`，只含可安全给上层投影的结构化结果。
+
+成功 `code` 可以区分动作完成与终局原因；终局语义以 `state.lifecycle` 和 `reply.completion_reason` 为准，测试不要求“射击终局”和“弃权终局”共享某个动作码。
+
+`GameState` 可保留完整有序弹仓、当前首项、尚未处理的预抽奖励（`pending_rewards`）、库存、待连发与待锁等可信耐久事实；它不能被当作普通用户结果直接序列化。`reply` 不得包含完整弹仓、当前消费后首项、未处理奖励类型、随机种子、异常正文或任何内部 ORM 对象。item_choice 只公开当前待选奖励和剩余件数，后续预抽类型必须保密。
+
+为便于恢复和领域续跑，`GameState` 的公开可信字段包含 `lifecycle`、`phase`、`state_revision`、`chamber_revision`、`turn_seq`、`current_player_seq`、`deadline`、`host_seq`、`players` 与 `ordered_chamber`；`players` 是按冻结顺序排列的不可变席位快照，每席至少有 `join_seq`、`member_openid`、`display_name`、`alive`、`inventory`。这些字段属于可信输入状态，不是普通消息结果。
+
+顶层生命周期是 `waiting | active | completed | cancelled | expired | failed`；`first_shot | follow_up | locked_turn | item_choice` 是 active 内阶段/覆盖态。可信状态始终独立携带 `state_revision` 和 `chamber_revision`：创建的 state revision 为 1，成功外层动作恰增 1；开始建立 chamber revision 1，每次消费/重建/手动装填按弹仓契约递增。只读道具面板不递增任一修订号；成功使用放大镜会消耗库存并续期，因此递增 `state_revision`，但放大镜观察本身不递增 `chamber_revision`。
+
+## 行为覆盖
+
+测试固定并可追溯到 TSK-260～263、TSK-266 与 TSK-268：
+
+1. 等候阶段支持创建、加入、重复加入、满员、退出、局主转让、取消、超时和开始；人数 2–6，`join_seq` 严格递增且退出重入不复用（编号可大于 6），开始冻结顺序/名字并拒绝迟到入席。
+2. 开始建立有序 6 发弹仓，初始 2 实 4 空；射击与啤酒逐发消费，`empty` 优先于 `no_live` 归一化为新 2 实 4 空；手动装填保留剩余实弹并添加恰好 1 发实弹、补空至 6、轮转。
+3. `first_shot`、`follow_up`、`locked_turn` 和 `item_choice` 分别验证合法/非法动作。首发实弹立即停止连发；待连发随手枪跨回合保留；啤酒与待连发冲突；普通主动丢弃只在 first_shot/follow_up 合法；锁在下一次实际获得回合时触发，淘汰/终局清理。
+4. follow_up 全空射击按发预抽奖励；权重可注入且开始时冻结；满仓从首个满槽开始进入 item_choice，逐件支持丢弃新物或按类型替换旧物，包括同类替换；超时/弃权只丢弃未处理队列。
+5. 成功和失败动作的 15 分钟续期语义、过期先结算、唯一胜者终局、随机失败无提交、`state_revision` 与 `chamber_revision` 独立均由可观察状态断言。
+
+测试不验证随机频率、不锁定实现类层级、不访问私有 collaborator；常数仅使用已决议的 2 实 4 空、最大 6 人/发、15 分钟绝对期限与四类道具。
