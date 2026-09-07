@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+
 from komari_bot.plugins.komari_roulette.domain import (
     Action,
     ActionResult,
