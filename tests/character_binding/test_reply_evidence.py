@@ -8,6 +8,7 @@ V11 事件提供两端消息与 reply 结构，``message_fetcher`` 提供可替�
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from contextlib import contextmanager, suppress
@@ -32,7 +33,6 @@ from tests.group_admission.entry_gate_support import (
     ProbeBot,
     dispatch,
     event_gate_context,
-    make_v11_event,
 )
 from tests.group_admission.management_support import prepare_control_plane
 from tests.group_admission.registry_isolation_support import (
@@ -50,13 +50,15 @@ PACKAGE_PATH = (
 )
 
 APP_ID = "app-tsk273"
+SECOND_APP_ID = "app-tsk273-secondary"
 GROUP_OPENID = "group-openid-tsk273"
 MEMBER_OPENID = "member-openid-tsk273"
 OFFICIAL_BOT_QQ = "9001001"
+SECOND_OFFICIAL_BOT_QQ = "9001002"
 ONEBOT_SELF_ID = 7777001
 GROUP_ID = 10001
 MEMBER_QQ = 20001
-COMMAND = "继续绑定"
+COMMAND = "/bind"
 QQ_ORIGINAL_MESSAGE_ID = "qq-msg-1001"
 BASE_TIME = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
 
@@ -89,8 +91,34 @@ class MessageFetcher:
         return self.payloads[message_id]
 
 
+class BlockingMessageFetcher(MessageFetcher):
+    """让 get_msg 在校验中途挂起，以验证会话失效后的二次检查。"""
+
+    def __init__(self, payloads: Mapping[int, Mapping[str, object]]) -> None:
+        super().__init__(payloads)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, message_id: int) -> Mapping[str, object]:
+        self.calls.append(message_id)
+        self.started.set()
+        await self.release.wait()
+        if message_id in self.fail_ids:
+            raise RuntimeError("simulated get_msg failure")  # noqa: TRY003
+        return self.payloads[message_id]
+
+
 def _sender(user_id: int | str, nickname: str) -> Sender:
     return Sender.model_construct(user_id=int(user_id), nickname=nickname)
+
+
+def _bind_message(text: str = COMMAND) -> Message:
+    return Message(
+        [
+            MessageSegment.at(OFFICIAL_BOT_QQ),
+            MessageSegment.text(text),
+        ]
+    )
 
 
 def _group_event(
@@ -104,6 +132,7 @@ def _group_event(
     message: Message | None = None,
     original_message: Message | None = None,
     reply: Reply | None = None,
+    raw_message: str | None = None,
     sender_id: int | str | None = None,
 ) -> GroupMessageEvent:
     current_message = message or Message(text)
@@ -119,7 +148,7 @@ def _group_event(
         message_id=message_id,
         message=current_message,
         original_message=source_message,
-        raw_message=text,
+        raw_message=text if raw_message is None else raw_message,
         font=14,
         sender=_sender(resolved_sender, "sender"),
         to_me=to_me,
@@ -135,12 +164,17 @@ def _original_event(
     group_id: int = GROUP_ID,
     member_qq: int = MEMBER_QQ,
     text: str = COMMAND,
+    mention_official: bool = True,
 ) -> GroupMessageEvent:
+    message = _bind_message(text) if mention_official else Message(text)
     return _group_event(
         message_id=message_id,
         user_id=member_qq,
         group_id=group_id,
         text=text,
+        message=message,
+        original_message=message,
+        raw_message=str(message),
         sender_id=member_qq,
     )
 
@@ -154,11 +188,17 @@ def _challenge_event(
     group_id: int = GROUP_ID,
     official_sender: str = OFFICIAL_BOT_QQ,
     quoted_sender: int = MEMBER_QQ,
+    quoted_has_mention: bool = True,
     to_me: bool = False,
 ) -> GroupMessageEvent:
     challenge_text = f"正在确认你的本群身份。会话码：{session_code}"
     original = Message(
         [MessageSegment.reply(quoted_message_id), MessageSegment.text(challenge_text)]
+    )
+    quoted_message = (
+        _bind_message(quoted_text)
+        if quoted_has_mention
+        else Message(quoted_text)
     )
     reply = Reply.model_construct(
         time=int(BASE_TIME.timestamp()),
@@ -166,7 +206,7 @@ def _challenge_event(
         message_id=quoted_message_id,
         real_id=quoted_message_id,
         sender=_sender(quoted_sender, "member"),
-        message=Message(quoted_text),
+        message=quoted_message,
         group_id=group_id,
     )
     return _group_event(
@@ -190,22 +230,28 @@ def _get_msg_payload(
     group_id: int | None = GROUP_ID,
     message_type: str = "group",
     sender_id: int | str = MEMBER_QQ,
+    mention_official: bool = True,
+    returned_message_id: int | None = None,
     raw_message: str | None = None,
     message_text: str | None = None,
 ) -> dict[str, object]:
+    resolved_text = message_text or original_text
+    payload_message = _bind_message(resolved_text) if mention_official else Message(resolved_text)
     payload: dict[str, object] = {
         "time": int(BASE_TIME.timestamp()),
-        "message_id": message_id,
+        "message_id": message_id if returned_message_id is None else returned_message_id,
         "real_id": message_id,
         "message_type": message_type,
         "sender": {"user_id": int(sender_id), "nickname": "member"},
         "message": [
-            {
-                "type": "text",
-                "data": {"text": message_text or original_text},
-            }
+            {"type": segment.type, "data": dict(segment.data)}
+            for segment in payload_message
         ],
-        "raw_message": raw_message or message_text or original_text,
+        "raw_message": (
+            str(payload_message)
+            if raw_message is None
+            else raw_message
+        ),
     }
     if group_id is not None:
         payload["group_id"] = group_id
@@ -352,19 +398,6 @@ async def test_interleaved_same_text_sessions_use_native_reply_identity() -> Non
         }
     )
     collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
-    _open(
-        collector,
-        code=code_one,
-        member_openid="member-one",
-        qq_message_id="qq-one",
-    )
-    _open(
-        collector,
-        code=code_two,
-        member_openid="member-two",
-        qq_message_id="qq-two",
-    )
-
     challenge_two = _challenge_event(
         message_id=challenge_two_id,
         session_code=code_two,
@@ -382,14 +415,30 @@ async def test_interleaved_same_text_sessions_use_native_reply_identity() -> Non
     original_one = _original_event(message_id=original_one_id, member_qq=21001)
     original_two = _original_event(message_id=original_two_id, member_qq=21002)
 
-    # The two protocol sides arrive in crossed order; each original is cached
-    # before its matching official challenge, and get_msg is still required.
+    # OneBot sees both valid /bind originals before QQ creates the sessions;
+    # the later challenges then arrive in the opposite order.
     results = [
         await collector.handle_event(original_two),
         await collector.handle_event(original_one),
-        await collector.handle_event(challenge_two),
-        await collector.handle_event(challenge_one),
     ]
+    _open(
+        collector,
+        code=code_one,
+        member_openid="member-one",
+        qq_message_id="qq-one",
+    )
+    _open(
+        collector,
+        code=code_two,
+        member_openid="member-two",
+        qq_message_id="qq-two",
+    )
+    results.extend(
+        [
+            await collector.handle_event(challenge_two),
+            await collector.handle_event(challenge_one),
+        ]
+    )
 
     assert results[0] is None
     assert results[1] is None
@@ -462,10 +511,16 @@ async def test_duplicate_legal_challenge_is_idempotent() -> None:
         ("missing_group_id", {}, {"group_id": None}),
         ("wrong_original_sender", {}, {"sender_id": MEMBER_QQ + 99}),
         (
+            "original_sender_is_official_bot",
+            {},
+            {"sender_id": int(OFFICIAL_BOT_QQ)},
+        ),
+        (
             "body_mismatch",
             {},
             {"message_text": "正文已被替换", "raw_message": "正文已被替换"},
         ),
+        ("message_id_mismatch", {}, {"returned_message_id": 34099}),
     ],
 )
 async def test_invalid_sender_type_group_or_body_fails_closed(
@@ -589,6 +644,81 @@ async def test_get_msg_failure_is_silent_and_does_not_create_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unmentioned_bind_is_not_cached_as_original_evidence() -> None:
+    """普通群聊即使正文为 /bind，也必须缺少官 Bot 原生 @ 才拒绝。"""
+    code = "TSK273-NO-MENTION"
+    original_id = 37501
+    challenge_id = 47501
+    fetcher = MessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                original_text=COMMAND,
+                mention_official=False,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=FrozenClock(BASE_TIME))
+    _open(collector, code=code)
+    await collector.handle_event(
+        _original_event(
+            message_id=original_id,
+            text=COMMAND,
+            mention_official=False,
+        )
+    )
+    challenge = _challenge_event(
+        message_id=challenge_id,
+        session_code=code,
+        quoted_message_id=original_id,
+        quoted_text=COMMAND,
+        quoted_has_mention=False,
+    )
+
+    assert await collector.handle_event(challenge) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidation", ["cancel", "reset", "expire"])
+async def test_inflight_get_msg_cannot_resurrect_invalidated_session(
+    invalidation: str,
+) -> None:
+    code = f"TSK273-INFLIGHT-{invalidation}"
+    original_id = 37601
+    challenge_id = 47601
+    clock = FrozenClock(BASE_TIME)
+    fetcher = BlockingMessageFetcher(
+        {
+            original_id: _get_msg_payload(
+                message_id=original_id,
+                original_text=COMMAND,
+            )
+        }
+    )
+    collector = _collector(fetcher=fetcher, clock=clock)
+    _open(collector, code=code)
+    await collector.handle_event(_original_event(message_id=original_id))
+    challenge = _challenge_event(
+        message_id=challenge_id,
+        session_code=code,
+        quoted_message_id=original_id,
+        quoted_text=COMMAND,
+    )
+
+    pending = asyncio.create_task(collector.handle_event(challenge))
+    await fetcher.started.wait()
+    if invalidation == "cancel":
+        collector.cancel_session(code)
+    elif invalidation == "reset":
+        collector.reset_connection()
+    else:
+        clock.advance(timedelta(minutes=10))
+    fetcher.release.set()
+
+    assert await pending is None
+
+
+@pytest.mark.asyncio
 async def test_cached_original_message_must_match_complete_get_msg() -> None:
     code = "TSK273-CACHE-MATCH"
     original_id = 38001
@@ -705,7 +835,7 @@ async def test_cancel_restart_and_reconnect_invalidate_old_evidence() -> None:
     new_original_id = 41002
     new_challenge_id = 51002
     old_text = COMMAND
-    new_text = "重新绑定"
+    new_text = COMMAND
     fetcher = MessageFetcher(
         {
             old_original_id: _get_msg_payload(
@@ -736,11 +866,7 @@ async def test_cancel_restart_and_reconnect_invalidate_old_evidence() -> None:
     restarted = _collector(fetcher=fetcher, clock=clock)
     assert await restarted.handle_event(old_challenge) is None
 
-    _open(collector, code=old_code)
     collector.reset_connection()
-    # Re-open the same session data after reconnect without re-caching the old
-    # original: a stale cache must not become evidence for the new generation.
-    _open(collector, code=old_code)
     assert await collector.handle_event(old_challenge) is None
 
     _open(
@@ -824,6 +950,20 @@ def _registered_evidence_matchers() -> list[Any]:
     ]
 
 
+@contextmanager
+def _runtime_collectors_context(
+    module: Any,
+    collectors: tuple[ReplyEvidenceCollector, ...],
+) -> Iterator[None]:
+    """只通过公开运行时注入口临时提供已配置 collectors。"""
+    previous = module.get_runtime_collectors()
+    module.set_runtime_collectors(collectors)
+    try:
+        yield
+    finally:
+        module.set_runtime_collectors(previous)
+
+
 def test_real_character_binding_package_registers_nonblocking_evidence_matcher() -> None:
     """真实包导入必须注册监听器，不能由测试 shim 冒充。"""
     with registry_isolation_context(), _real_character_binding_package():
@@ -833,11 +973,62 @@ def test_real_character_binding_package_registers_nonblocking_evidence_matcher()
         assert matchers[0].block is False
 
 
+def test_runtime_collectors_keep_multiple_app_configurations() -> None:
+    """运行时注册表按 app 保留多个配置，不以单例覆盖。"""
+    with registry_isolation_context(), _real_character_binding_package():
+        reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+        first = reply_evidence.ReplyEvidenceCollector(
+            app_id=APP_ID,
+            official_bot_qq=OFFICIAL_BOT_QQ,
+            message_fetcher=MessageFetcher({}),
+            clock=FrozenClock(BASE_TIME),
+        )
+        second = reply_evidence.ReplyEvidenceCollector(
+            app_id=SECOND_APP_ID,
+            official_bot_qq=SECOND_OFFICIAL_BOT_QQ,
+            message_fetcher=MessageFetcher({}),
+            clock=FrozenClock(BASE_TIME),
+        )
+
+        with _runtime_collectors_context(reply_evidence, (first, second)):
+            assert reply_evidence.get_runtime_collectors() == (first, second)
+
+
 @pytest.mark.asyncio
-async def test_restricted_group_event_never_reaches_evidence_listener(
+async def test_unconfigured_runtime_listener_silently_skips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """准入拒绝发生在 matcher 前，监听器不应缓存或读取证据。"""
+    """273 不生成配置；274 未注入 collector 时监听器静默跳过。"""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": [GROUP_ID]})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    async with event_gate_context():
+        with _real_character_binding_package():
+            reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+            bot = ProbeBot()
+            with _runtime_collectors_context(reply_evidence, ()):
+                await dispatch(
+                    bot,
+                    _challenge_event(
+                        message_id=61001,
+                        session_code="TSK273-NO-RUNTIME",
+                        quoted_message_id=61002,
+                        quoted_text=COMMAND,
+                        group_id=GROUP_ID + 1,
+                    ),
+                )
+                assert reply_evidence.get_runtime_collectors() == ()
+
+    assert bot.calls == []
+
+
+@pytest.mark.asyncio
+async def test_admitted_event_reaches_explicitly_injected_collector_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """准入通过后只调用显式注入的已配置实例，拒绝群不进入 collector。"""
     storage = AdmissionStorageFake(
         stored_policy(1, {"mode": "blacklist", "group_ids": [GROUP_ID]})
     )
@@ -847,27 +1038,36 @@ async def test_restricted_group_event_never_reaches_evidence_listener(
     async with event_gate_context():
         with _real_character_binding_package():
             reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+            collector = reply_evidence.ReplyEvidenceCollector(
+                app_id=APP_ID,
+                official_bot_qq=OFFICIAL_BOT_QQ,
+                message_fetcher=MessageFetcher({}),
+                clock=FrozenClock(BASE_TIME),
+            )
 
-            async def _spy(self: object, *args: object, **kwargs: object) -> None:
-                del self, kwargs
-                event = args[-1]
+            async def _spy(event: object) -> None:
                 assert isinstance(event, GroupMessageEvent)
                 calls.append(event)
 
-            monkeypatch.setattr(
-                reply_evidence.ReplyEvidenceCollector,
-                "handle_event",
-                _spy,
-            )
+            monkeypatch.setattr(collector, "handle_event", _spy)
             bot = ProbeBot()
-            await dispatch(
-                bot,
-                make_v11_event(GroupMessageEvent, group_id=GROUP_ID + 1),
-            )
-            await dispatch(
-                bot,
-                make_v11_event(GroupMessageEvent, group_id=GROUP_ID),
-            )
+            with _runtime_collectors_context(reply_evidence, (collector,)):
+                admitted = _challenge_event(
+                    message_id=62001,
+                    session_code="TSK273-LISTENER",
+                    quoted_message_id=62002,
+                    quoted_text=COMMAND,
+                    group_id=GROUP_ID + 1,
+                )
+                rejected = _challenge_event(
+                    message_id=62003,
+                    session_code="TSK273-LISTENER",
+                    quoted_message_id=62004,
+                    quoted_text=COMMAND,
+                    group_id=GROUP_ID,
+                )
+                await dispatch(bot, admitted)
+                await dispatch(bot, rejected)
 
-    assert [event.group_id for event in calls] == [GROUP_ID + 1]
+    assert calls == [admitted]
     assert bot.calls == []
