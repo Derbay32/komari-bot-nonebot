@@ -12,6 +12,8 @@ from .manager import (
     BindingPersistenceError,
     CharacterBindingManager,
     CharacterNameValidationError,
+    GroupBindingRecord,
+    character_name_key,
     get_manager,
 )
 from .reply_evidence import (
@@ -22,6 +24,7 @@ from .reply_evidence import (
     get_runtime_collectors,
     set_runtime_collectors,
 )
+from .transaction import BindingTransaction, GroupBindingGroup
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
@@ -92,12 +95,16 @@ async def get_legacy_character_name(user_id: str) -> str | None:
 __all__ = [
     "BindingConflictError",
     "BindingPersistenceError",
+    "BindingTransaction",
     "CharacterBindingManager",
     "CharacterNameValidationError",
+    "GroupBindingGroup",
+    "GroupBindingRecord",
     "ReplyEvidence",
     "ReplyEvidenceCollector",
     "ReplyEvidenceSession",
     "SessionCodeCollisionError",
+    "character_name_key",
     "get_binding_manager",
     "get_character_name",
     "get_legacy_character_name",

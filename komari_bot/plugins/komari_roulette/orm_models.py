@@ -25,6 +25,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
 if TYPE_CHECKING:
@@ -390,7 +391,104 @@ class RouletteLeaderboardRow(_RouletteModelBase, table=True):
     )
 
 
+class RouletteCommandReceiptRow(_RouletteModelBase, table=True):
+    """Immutable command outcome and frozen reply projection."""
+
+    __tablename__ = "komari_roulette_command_receipts"
+
+    receipt_id: str = Field(sa_column=Column(Text, primary_key=True, nullable=False))
+    app_id: str = Field(sa_column=Column(Text, nullable=False))
+    group_openid: str = Field(sa_column=Column(Text, nullable=False))
+    inbound_msg_id: str = Field(sa_column=Column(Text, nullable=False))
+    fingerprint: dict[str, object] = Field(
+        sa_column=Column(JSONB, nullable=False)
+    )
+    result_code: str = Field(sa_column=Column(Text, nullable=False))
+    game_id: str | None = Field(default=None, sa_column=Column(Text))
+    state_revision: int | None = Field(default=None, sa_column=Column(Integer))
+    turn_seq: int | None = Field(default=None, sa_column=Column(Integer))
+    reply_projection: dict[str, object] = Field(
+        sa_column=Column(JSONB, nullable=False)
+    )
+    created_at: datetime = Field(
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        )
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "app_id",
+            "group_openid",
+            "inbound_msg_id",
+            name="uq_komari_roulette_command_receipts_message",
+        ),
+        CheckConstraint(
+            "state_revision IS NULL OR state_revision >= 0",
+            name="ck_komari_roulette_command_receipts_revision",
+        ),
+        CheckConstraint(
+            "turn_seq IS NULL OR turn_seq >= 0",
+            name="ck_komari_roulette_command_receipts_turn",
+        ),
+    )
+
+
+class RouletteFulfillmentRow(_RouletteModelBase, table=True):
+    """One-to-one durable delivery state for a command receipt."""
+
+    __tablename__ = "komari_roulette_fulfillments"
+
+    receipt_id: str = Field(
+        sa_column=Column(
+            Text,
+            ForeignKey(
+                "komari_roulette_command_receipts.receipt_id",
+                ondelete="CASCADE",
+                name="fk_komari_roulette_fulfillments_receipt",
+            ),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    state: str = Field(
+        default="NOT_STARTED",
+        sa_column=Column(
+            Text,
+            nullable=False,
+            server_default=text("'NOT_STARTED'"),
+        ),
+    )
+    platform_message_id: str | None = Field(
+        default=None,
+        sa_column=Column(Text),
+    )
+    updated_at: datetime = Field(
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        )
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('NOT_STARTED', 'PENDING_CONFIRMATION', 'DELIVERED', "
+            "'NOT_DELIVERED')",
+            name="ck_komari_roulette_fulfillments_state",
+        ),
+        CheckConstraint(
+            "state <> 'DELIVERED' OR platform_message_id IS NOT NULL",
+            name="ck_komari_roulette_fulfillments_platform_id",
+        ),
+    )
+
+
 __all__ = [
+    "RouletteCommandReceiptRow",
+    "RouletteFulfillmentRow",
     "RouletteGameRow",
     "RouletteLeaderboardRow",
     "RoulettePlayerRow",

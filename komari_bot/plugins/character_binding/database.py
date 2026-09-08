@@ -10,8 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select, text, update
-from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy import select, text
 
 from .orm_models import CharacterBindingGroupRow, CharacterBindingMemberRow
 
@@ -28,6 +27,9 @@ class DatabaseBindingConflictError(RuntimeError):
 
 def _open_session() -> "AsyncSession":
     """打开 nonebot-plugin-orm 管理的共享会话。"""
+    from nonebot import require
+
+    require("nonebot_plugin_orm")
     from nonebot_plugin_orm import get_session
 
     return get_session(expire_on_commit=False)
@@ -99,125 +101,27 @@ class CharacterBindingDB:
         member_qq: str,
         member_openid: str,
         character_name: str,
-        character_name_key: str,
+        character_name_key: str,  # noqa: ARG002 retained for legacy callers
     ) -> None:
         """原子建立/复用群和成员身份，并写入角色名。"""
         self._require_ready()
+        from .manager import BindingConflictError
+        from .transaction import BindingTransaction
+
         session = _open_session()
         try:
             async with session.begin():
-                group_by_id = await self._load_group_for_update(
-                    session,
-                    app_id=app_id,
-                    group_id=group_id,
-                )
-                group_by_openid = await self._load_group_for_update(
-                    session,
-                    app_id=app_id,
-                    group_openid=group_openid,
-                )
-
-                if group_by_id is not None and group_by_id["group_openid"] != group_openid:
-                    raise DatabaseBindingConflictError("group_id 已关联其他官方群身份")  # noqa: TRY003
-                if group_by_openid is not None and group_by_openid["group_id"] != group_id:
-                    raise DatabaseBindingConflictError("group_openid 已关联其他 OneBot 群")  # noqa: TRY003
-
-                if group_by_id is None and group_by_openid is None:
-                    await session.execute(
-                        postgres_insert(CharacterBindingGroupRow)
-                        .values(
-                            app_id=app_id,
-                            group_openid=group_openid,
-                            group_id=group_id,
-                        )
-                        .on_conflict_do_nothing()
-                    )
-                    group_by_id = await self._load_group_for_update(
-                        session,
+                try:
+                    await BindingTransaction(session).bind(
                         app_id=app_id,
                         group_id=group_id,
-                    )
-                    group_by_openid = await self._load_group_for_update(
-                        session,
-                        app_id=app_id,
                         group_openid=group_openid,
+                        member_qq=member_qq,
+                        member_openid=member_openid,
+                        character_name=character_name,
                     )
-                    if (
-                        group_by_id is None
-                        or group_by_openid is None
-                        or group_by_id["group_openid"] != group_openid
-                        or group_by_openid["group_id"] != group_id
-                    ):
-                        raise DatabaseBindingConflictError("群身份关联不完整")
-                elif group_by_id is None or group_by_openid is None:
-                    raise DatabaseBindingConflictError("群身份关联不完整")
-
-                existing_by_qq = await self._load_member_for_update(
-                    session,
-                    app_id=app_id,
-                    group_openid=group_openid,
-                    member_qq=member_qq,
-                )
-                existing_by_openid = await self._load_member_for_update(
-                    session,
-                    app_id=app_id,
-                    group_openid=group_openid,
-                    member_openid=member_openid,
-                )
-
-                if (
-                    existing_by_qq is not None
-                    and existing_by_qq["member_openid"] != member_openid
-                ):
-                    raise DatabaseBindingConflictError("member_qq 已关联其他官方群成员")  # noqa: TRY003
-                if (
-                    existing_by_openid is not None
-                    and existing_by_openid["member_qq"] != member_qq
-                ):
-                    raise DatabaseBindingConflictError("member_openid 已关联其他 QQ")  # noqa: TRY003
-                if (
-                    existing_by_qq is not None
-                    and existing_by_openid is not None
-                    and existing_by_qq["member_openid"] != existing_by_openid["member_openid"]
-                ):
-                    raise DatabaseBindingConflictError("成员双向身份关联不一致")
-
-                existing = existing_by_qq or existing_by_openid
-                name_conflict = await self._name_conflicts(
-                    session,
-                    app_id=app_id,
-                    group_openid=group_openid,
-                    character_name_key=character_name_key,
-                    member_openid=member_openid,
-                )
-                if name_conflict:
-                    raise DatabaseBindingConflictError("同群角色名已被使用")
-
-                if existing is None:
-                    await session.execute(
-                        postgres_insert(CharacterBindingMemberRow).values(
-                            app_id=app_id,
-                            group_openid=group_openid,
-                            member_openid=member_openid,
-                            member_qq=member_qq,
-                            character_name=character_name,
-                            character_name_key=character_name_key,
-                        )
-                    )
-                else:
-                    await session.execute(
-                        update(_MEMBERS)
-                        .where(
-                            (_MEMBERS.c.app_id == app_id)
-                            & (_MEMBERS.c.group_openid == group_openid)
-                            & (_MEMBERS.c.member_openid == member_openid)
-                        )
-                        .values(
-                            character_name=character_name,
-                            character_name_key=character_name_key,
-                            updated_at=func.now(),
-                        )
-                    )
+                except BindingConflictError as error:
+                    raise DatabaseBindingConflictError(str(error)) from error
         finally:
             await session.close()
 
@@ -230,24 +134,20 @@ class CharacterBindingDB:
     ) -> bool:
         """清除角色名但保留群与成员身份关联。"""
         self._require_ready()
+        from .manager import BindingConflictError
+        from .transaction import BindingTransaction
+
         session = _open_session()
         try:
             async with session.begin():
-                result = await session.execute(
-                    update(_MEMBERS)
-                    .where(
-                        (_MEMBERS.c.app_id == app_id)
-                        & (_MEMBERS.c.group_openid == group_openid)
-                        & (_MEMBERS.c.member_openid == member_openid)
-                        & _MEMBERS.c.character_name.is_not(None)
+                try:
+                    return await BindingTransaction(session).clear(
+                        app_id=app_id,
+                        group_openid=group_openid,
+                        member_openid=member_openid,
                     )
-                    .values(
-                        character_name=None,
-                        character_name_key=None,
-                        updated_at=func.now(),
-                    )
-                )
-                return int(getattr(result, "rowcount", 0)) > 0
+                except BindingConflictError as error:
+                    raise DatabaseBindingConflictError(str(error)) from error
         finally:
             await session.close()
 
