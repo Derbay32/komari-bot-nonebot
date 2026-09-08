@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import types
@@ -489,6 +490,37 @@ _inject_package_exports(
         "get_character_name": _DummyCharacterBindingPlugin.get_character_name,
         "get_qq_character_name": _DummyCharacterBindingPlugin.get_qq_character_name,
     },
+)
+
+
+def _load_character_binding_transaction_exports() -> dict[str, object]:
+    """Load the caller-owned facade without executing package startup hooks."""
+
+    package = "komari_bot.plugins.character_binding"
+    for module_name in ("transaction", "binding_transaction", "facade"):
+        qualified_name = f"{package}.{module_name}"
+        try:
+            module = importlib.import_module(qualified_name)
+        except ModuleNotFoundError as error:
+            if error.name == qualified_name:
+                continue
+            raise
+        exports = {
+            name: getattr(module, name)
+            for name in (
+                "BindingTransaction",
+                "BindingConflictError",
+                "BindingPersistenceError",
+            )
+            if hasattr(module, name)
+        }
+        if "BindingTransaction" in exports:
+            return exports
+    return {}
+
+
+_inject_package_exports(
+    "character_binding", _load_character_binding_transaction_exports()
 )
 _inject_package_exports(
     "user_data",

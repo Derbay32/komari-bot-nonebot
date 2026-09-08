@@ -6,6 +6,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -77,16 +78,18 @@ async def harness() -> AsyncIterator[Harness]:
 class CountingProjector:
     """Deterministic projector that exposes only the public reply context."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, metadata: Mapping[str, str | int | bool] | None = None) -> None:
         self.calls = 0
         self.contexts: list[str] = []
+        self.metadata = dict(metadata or {})
 
     def __call__(self, context: ReplyProjectionContext) -> ReplyProjection:
         self.calls += 1
         self.contexts.append(repr(context))
+        metadata = {"projector_call": self.calls, **self.metadata}
         return ReplyProjection(
             body="冻结安全回复",
-            metadata={"projector_call": self.calls},
+            metadata=metadata,
         )
 
 
@@ -351,8 +354,8 @@ async def test_waiting_join_race_assigns_last_seat_and_never_reuses_join_seq(
         )
     )
     assert sorted(receipt.result_code for receipt in last_race) == [
-        "joined",
         "game_full",
+        "joined",
     ]
 
     leave = await service.execute_group_command(
@@ -366,6 +369,18 @@ async def test_waiting_join_race_assigns_last_seat_and_never_reuses_join_seq(
     assert leave.result_code == "left"
     rejoined = await join_player(service, current, member_openids[1], "rejoin-2")
     assert rejoined.result_code == "joined"
+
+    started = await start_game(service, current, member_openids[0], "start-after-rejoin")
+    assert started.result_code == "started"
+    stale_target = await service.execute_group_command(
+        request(
+            current,
+            "transfer-stale-target",
+            command_factory("transfer", target_player_seq=2),
+            member_openid=member_openids[0],
+        )
+    )
+    assert stale_target.result_code == "player_seq_not_found"
 
     async with harness.session_factory() as session:
         rows = (
@@ -441,6 +456,54 @@ async def test_waiting_start_cancel_race_commits_one_latest_decision(
     await delete_scope(harness.engine, current)
 
 
+async def test_waiting_join_start_competition_is_ordered_by_group_lock(
+    harness: Harness,
+) -> None:
+    async def race(first_operation: str) -> tuple[CommandReceipt, CommandReceipt, Scope]:
+        current = scope(f"waiting-{first_operation}-race")
+        members = await seed_players(harness.binding_manager, current, 3)
+        service = service_for(harness, random_source=CountingRandom())
+        await create_waiting(service, current, member_openid=members[0])
+        assert (await join_player(service, current, members[1], "join-2")).result_code == "joined"
+        async with harness.session_factory() as blocker:
+            await blocker.begin()
+            blocker_pid = await backend_pid(blocker)
+            await hold_group_lock(blocker, current)
+            join_started = asyncio.Event()
+            start_started = asyncio.Event()
+
+            async def join() -> CommandReceipt:
+                join_started.set()
+                return await join_player(service, current, members[2], "race-join")
+
+            async def start() -> CommandReceipt:
+                start_started.set()
+                return await start_game(service, current, members[0], "race-start")
+
+            runners = [join, start] if first_operation == "join" else [start, join]
+            tasks = [asyncio.create_task(runner()) for runner in runners]
+            await join_started.wait()
+            await start_started.wait()
+            await wait_for_blocked(harness.session_factory, blocker_pid)
+            await blocker.commit()
+            first, second = await asyncio.gather(*tasks)
+        results = (first, second) if first_operation == "join" else (second, first)
+        return results[0], results[1], current
+
+    join_result, start_result, join_first_scope = await race("join")
+    assert join_result.result_code == "joined"
+    assert start_result.result_code == "started"
+    start_result_first, join_result_second, start_first_scope = await race("start")
+    assert start_result_first.result_code == "started"
+    assert join_result_second.result_code in {
+        "game_not_waiting",
+        "not_waiting",
+        "game_started",
+    }
+    await delete_scope(harness.engine, join_first_scope)
+    await delete_scope(harness.engine, start_first_scope)
+
+
 async def test_binding_name_is_required_for_join_and_frozen_after_seating(
     harness: Harness,
 ) -> None:
@@ -448,10 +511,32 @@ async def test_binding_name_is_required_for_join_and_frozen_after_seating(
     first = await seed_binding(harness.binding_manager, current, 1, name="甲")
     second = await seed_binding(harness.binding_manager, current, 2, name="乙")
     third = await seed_binding(harness.binding_manager, current, 3, name="丙")
+    fourth = await seed_binding(harness.binding_manager, current, 4, name="丁")
     service = service_for(harness, random_source=CountingRandom())
     await create_waiting(service, current, member_openid=first)
     joined = await join_player(service, current, second, "join-2")
     assert joined.result_code == "joined"
+
+    await harness.binding_manager.clear_character_name(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=first,
+    )
+
+    await harness.binding_manager.bind_group_member(
+        app_id=current.app_id,
+        group_id=f"qq-group-{current.group_openid}",
+        group_openid=current.group_openid,
+        member_qq=f"qq-{fourth}",
+        member_openid=fourth,
+        character_name="甲",
+    )
+    normalized_collision = await join_player(service, current, fourth, "join-name-collision")
+    assert normalized_collision.result_code in {
+        "character_name_taken",
+        "name_conflict",
+        "binding_name_conflict",
+    }
 
     await harness.binding_manager.clear_character_name(
         app_id=current.app_id,
@@ -474,9 +559,9 @@ async def test_binding_name_is_required_for_join_and_frozen_after_seating(
     )
     await harness.binding_manager.bind_group_member(
         app_id=current.app_id,
-        group_id=f"qq-{current.group_openid}",
+        group_id=f"qq-group-{current.group_openid}",
         group_openid=current.group_openid,
-        member_qq="qq-member-2",
+        member_qq=f"qq-{second}",
         member_openid=second,
         character_name="乙改名",
     )
@@ -573,6 +658,82 @@ async def test_active_same_observation_only_first_action_can_commit(
     await delete_scope(harness.engine, current)
 
 
+async def test_item_choice_same_observation_consumes_once_and_renews_once(
+    harness: Harness,
+) -> None:
+    current = scope("item-choice-race")
+    members = await seed_players(harness.binding_manager, current, 3)
+    entropy = CountingRandom()
+    service = service_for(harness, random_source=entropy)
+    await create_waiting(service, current)
+    await join_player(service, current, members[1], "join-2")
+    await join_player(service, current, members[2], "join-3")
+    started = await start_game(service, current, members[0])
+    assert started.result_code == "started"
+    before = await current_game_row(harness.session_factory, current)
+    assert before is not None
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games "
+                "SET phase = 'item_choice', "
+                "pending_rewards = ARRAY['beer', 'lock']::text[] "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": before["game_id"]},
+        )
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_players "
+                "SET magnifier_count = 1, beer_count = 1, "
+                "burst_count = 1, lock_count = 1 "
+                "WHERE game_id = :game_id AND join_seq = 1"
+            ),
+            {"game_id": before["game_id"]},
+        )
+        await session.commit()
+    item_observation = observation(
+        game_id=str(before["game_id"]),
+        state_revision=int(before["state_revision"]),
+        turn_seq=int(before["turn_seq"]),
+    )
+    async with harness.session_factory() as blocker:
+        await blocker.begin()
+        blocker_pid = await backend_pid(blocker)
+        await hold_group_lock(blocker, current)
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def choose(message_id: str, started_event: asyncio.Event) -> CommandReceipt:
+            started_event.set()
+            return await service.execute_group_command(
+                request(
+                    current,
+                    message_id,
+                    command_factory("choose_item", decision="discard"),
+                    member_openid=members[0],
+                ),
+                observation=item_observation,
+            )
+
+        first_task = asyncio.create_task(choose("item-choice-a", first_started))
+        second_task = asyncio.create_task(choose("item-choice-b", second_started))
+        await first_started.wait()
+        await second_started.wait()
+        await wait_for_blocked(harness.session_factory, blocker_pid)
+        await blocker.commit()
+        results = await asyncio.gather(first_task, second_task)
+    assert [result.result_code for result in results].count("item_choice_updated") == 1
+    assert [result.result_code for result in results].count("state_conflict") == 1
+    assert entropy.chamber_calls == 1
+    assert entropy.item_calls == 1
+    after = await current_game_row(harness.session_factory, current)
+    assert after is not None
+    assert int(after["state_revision"]) == int(before["state_revision"]) + 1
+    assert after["pending_rewards"] == ["lock"]
+    await delete_scope(harness.engine, current)
+
+
 async def test_read_only_panel_and_leaderboard_ignore_stale_observation(
     harness: Harness,
 ) -> None:
@@ -646,12 +807,21 @@ async def test_expiry_worker_and_action_share_pg_deadline_boundary(
         await session.execute(
             text(
                 "UPDATE komari_roulette_games "
-                "SET turn_deadline_at = clock_timestamp() - interval '1 second' "
+                "SET turn_deadline_at = clock_timestamp() + interval '1 second' "
                 "WHERE game_id = :game_id"
             ),
             {"game_id": before["game_id"]},
         )
         await session.commit()
+    async with harness.session_factory() as session:
+        deadline = await session.scalar(
+            text(
+                "SELECT turn_deadline_at FROM komari_roulette_games "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": before["game_id"]},
+        )
+    assert deadline is not None
     async with harness.session_factory() as session:
         receipt_count_before = await count_rows(
             session, "komari_roulette_command_receipts", current
@@ -688,26 +858,62 @@ async def test_expiry_worker_and_action_share_pg_deadline_boundary(
 
         expiry_task = asyncio.create_task(run_expiry())
         action_task = asyncio.create_task(run_action())
-        await expiry_started.wait()
-        await action_started.wait()
-        await wait_for_blocked(harness.session_factory, blocker_pid)
-        await blocker.commit()
-        expiry, action = await asyncio.gather(expiry_task, action_task)
+        try:
+            await expiry_started.wait()
+            await action_started.wait()
+            await wait_for_blocked(harness.session_factory, blocker_pid)
+            async with harness.session_factory() as probe:
+                waiting_xacts = (
+                    await probe.execute(
+                        text(
+                            "SELECT xact_start FROM pg_stat_activity "
+                            "WHERE :blocker = ANY(pg_blocking_pids(pid)) "
+                            "AND xact_start IS NOT NULL"
+                        ),
+                        {"blocker": blocker_pid},
+                    )
+                ).scalars().all()
+            assert waiting_xacts
+            assert all(xact_start < deadline for xact_start in waiting_xacts)
+            await asyncio.sleep(
+                max(0.25, (deadline - datetime.now(UTC)).total_seconds() + 0.25)
+            )
+            await blocker.commit()
+            expiry, action = await asyncio.gather(expiry_task, action_task)
+        finally:
+            if blocker.in_transaction():
+                await blocker.rollback()
+            for task in (expiry_task, action_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(expiry_task, action_task, return_exceptions=True)
     assert expiry.receipt_id is None
     assert action.result_code in {"turn_expired", "state_conflict"}
     async with harness.session_factory() as session:
         assert await count_rows(
             session, "komari_roulette_command_receipts", current
         ) == receipt_count_before + 1
-        deadline = await session.scalar(
+        deadline_in_full_window = await session.scalar(
             text(
-                "SELECT turn_deadline_at >= clock_timestamp() + interval '14 minutes' "
+                "SELECT turn_deadline_at BETWEEN "
+                "clock_timestamp() + interval '14 minutes 30 seconds' AND "
+                "clock_timestamp() + interval '15 minutes 30 seconds' "
                 "FROM komari_roulette_games "
                 "WHERE app_id = :app_id AND group_openid = :group_openid"
             ),
             {"app_id": current.app_id, "group_openid": current.group_openid},
         )
-    assert deadline is True
+        eliminated = await session.scalar(
+            text(
+                "SELECT count(*) FROM komari_roulette_players "
+                "WHERE game_id = (SELECT game_id FROM komari_roulette_games "
+                "WHERE app_id = :app_id AND group_openid = :group_openid) "
+                "AND alive = false"
+            ),
+            {"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+    assert deadline_in_full_window is True
+    assert eliminated == 1
     async with harness.session_factory() as session:
         assert await session.scalar(
             text(
@@ -777,6 +983,46 @@ async def test_same_key_replay_uses_first_receipt_and_different_payload_raises(
         )
     async with harness.session_factory() as session:
         assert await count_rows(session, "komari_roulette_command_receipts", current) == 3
+    await delete_scope(harness.engine, current)
+
+
+async def test_same_key_first_receipt_competition_has_one_effect_and_projection(
+    harness: Harness,
+) -> None:
+    current = scope("same-key-first-race")
+    await seed_binding(harness.binding_manager, current, 1)
+    projector = CountingProjector()
+    service = service_for(harness, projector=projector)
+    command_request = request(
+        current,
+        "same-key-first",
+        command_factory("create"),
+    )
+    async with harness.session_factory() as blocker:
+        await blocker.begin()
+        blocker_pid = await backend_pid(blocker)
+        await hold_group_lock(blocker, current)
+        started = [asyncio.Event(), asyncio.Event()]
+
+        async def run(index: int) -> CommandReceipt:
+            started[index].set()
+            return await service.execute_group_command(command_request)
+
+        tasks = [asyncio.create_task(run(index)) for index in range(2)]
+        for event in started:
+            await event.wait()
+        await wait_for_blocked(harness.session_factory, blocker_pid)
+        await blocker.commit()
+        first, second = await asyncio.gather(*tasks)
+    assert first.receipt_id == second.receipt_id
+    assert first.fingerprint == second.fingerprint
+    assert first.result_code == second.result_code == "created"
+    assert projector.calls == 1
+    async with harness.session_factory() as session:
+        assert await count_rows(session, "komari_roulette_games", current) == 1
+        assert await count_rows(
+            session, "komari_roulette_command_receipts", current
+        ) == 1
     await delete_scope(harness.engine, current)
 
 
@@ -870,13 +1116,23 @@ async def test_commit_failure_rolls_back_terminal_result_wins_and_receipt(
             observation=action_observation,
         )
     monkeypatch.setattr(AsyncSession, "commit", original_commit)
+    retried = await service.execute_group_command(
+        request(
+            current,
+            "forfeit-failure",
+            command_factory("forfeit"),
+            member_openid=members[0],
+        ),
+        observation=action_observation,
+    )
+    assert retried.result_code in {"forfeited", "completed"}
     row = await current_game_row(harness.session_factory, current)
     assert row is not None
-    assert row["lifecycle"] == "active"
+    assert row["lifecycle"] == "completed"
     async with harness.session_factory() as session:
-        assert await count_rows(session, "komari_roulette_results", current) == 0
-        assert await count_rows(session, "komari_roulette_leaderboard", current) == 0
-        assert await count_rows(session, "komari_roulette_command_receipts", current) == 3
+        assert await count_rows(session, "komari_roulette_results", current) == 1
+        assert await count_rows(session, "komari_roulette_leaderboard", current) == 1
+        assert await count_rows(session, "komari_roulette_command_receipts", current) == 4
     await delete_scope(harness.engine, current)
 
 
@@ -936,13 +1192,23 @@ async def test_receipt_or_fulfillment_insert_failure_rolls_back_terminal_and_win
                 text(f"DROP TRIGGER {trigger_name} ON {failure_table}")
             )
             await connection.execute(text(f"DROP FUNCTION {function_name}()"))
+    retried = await service.execute_group_command(
+        request(
+            current,
+            f"trigger-{suffix}",
+            command_factory("forfeit"),
+            member_openid=members[0],
+        ),
+        observation=action_observation,
+    )
+    assert retried.result_code in {"forfeited", "completed"}
     row = await current_game_row(harness.session_factory, current)
     assert row is not None
-    assert row["lifecycle"] == "active"
+    assert row["lifecycle"] == "completed"
     async with harness.session_factory() as session:
-        assert await count_rows(session, "komari_roulette_results", current) == 0
-        assert await count_rows(session, "komari_roulette_leaderboard", current) == 0
-        assert await count_rows(session, "komari_roulette_command_receipts", current) == 3
+        assert await count_rows(session, "komari_roulette_results", current) == 1
+        assert await count_rows(session, "komari_roulette_leaderboard", current) == 1
+        assert await count_rows(session, "komari_roulette_command_receipts", current) == 4
     await delete_scope(harness.engine, current)
 
 
@@ -955,7 +1221,8 @@ async def test_commit_outcome_unknown_retries_only_with_original_key(
 ) -> None:
     current = scope(f"commit-unknown-{commit_after_pg_write}")
     await seed_binding(harness.binding_manager, current, 1)
-    service = service_for(harness)
+    projector = CountingProjector()
+    service = service_for(harness, projector=projector)
     original_commit = AsyncSession.commit
     calls = 0
 
@@ -978,6 +1245,7 @@ async def test_commit_outcome_unknown_retries_only_with_original_key(
     )
     assert calls == 1
     assert retried.result_code == "created"
+    assert projector.calls == (1 if commit_after_pg_write else 2)
     async with harness.session_factory() as session:
         assert await count_rows(session, "komari_roulette_games", current) == 1
         assert await count_rows(session, "komari_roulette_command_receipts", current) == 1
@@ -1012,6 +1280,53 @@ async def test_projected_reply_is_frozen_and_contains_no_private_runtime_state(
     await delete_scope(harness.engine, current)
 
 
+async def test_active_projection_reveals_one_item_without_secret_queue(
+    harness: Harness,
+) -> None:
+    current = scope("projection-active")
+    members = await seed_players(harness.binding_manager, current, 3)
+    projector = CountingProjector(metadata={"target_member_openid": members[0]})
+    service = service_for(harness, projector=projector)
+    await create_waiting(service, current)
+    await join_player(service, current, members[1], "join-2")
+    await join_player(service, current, members[2], "join-3")
+    assert (await start_game(service, current, members[0])).result_code == "started"
+    before = await current_game_row(harness.session_factory, current)
+    assert before is not None
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games SET "
+                "ordered_chamber = ARRAY['live', 'blank', 'live', 'blank']::text[], "
+                "phase = 'item_choice', "
+                "pending_rewards = ARRAY['beer', 'lock']::text[] "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": before["game_id"]},
+        )
+        await session.commit()
+    result = await service.execute_group_command(
+        request(
+            current,
+            "projection-active-choice",
+            command_factory("choose_item", decision="discard"),
+            member_openid=members[0],
+        ),
+        observation=observation(
+            game_id=str(before["game_id"]),
+            state_revision=int(before["state_revision"]),
+            turn_seq=int(before["turn_seq"]),
+        ),
+    )
+    assert result.result_code == "item_choice_updated"
+    contexts = "\n".join(projector.contexts)
+    assert "live', 'blank', 'live', 'blank" not in contexts
+    assert "beer', 'lock" not in contexts
+    assert "beer" in repr(result.reply)
+    assert members[0] in repr(result.reply)
+    await delete_scope(harness.engine, current)
+
+
 async def test_storage_failure_does_not_turn_into_no_game_or_failed_receipt(
     harness: Harness,
 ) -> None:
@@ -1028,6 +1343,50 @@ async def test_storage_failure_does_not_turn_into_no_game_or_failed_receipt(
     async with harness.session_factory() as session:
         assert await count_rows(session, "komari_roulette_games", current) == 0
         assert await count_rows(session, "komari_roulette_command_receipts", current) == 0
+    await delete_scope(harness.engine, current)
+
+
+async def test_actual_pg_disconnect_fails_closed_without_no_game_or_fake_receipt(
+    harness: Harness,
+) -> None:
+    current = scope("pg-disconnect")
+    await seed_binding(harness.binding_manager, current, 1)
+
+    @asynccontextmanager
+    async def disconnecting_session_factory() -> AsyncIterator[AsyncSession]:
+        async with harness.session_factory() as session:
+            service_pid = await backend_pid(session)
+            original_execute = session.execute
+            terminated = False
+
+            async def execute_and_disconnect(*args: Any, **kwargs: Any) -> Any:
+                nonlocal terminated
+                result = await original_execute(*args, **kwargs)
+                if not terminated:
+                    terminated = True
+                    async with harness.engine.connect() as killer:
+                        await killer.execute(
+                            text("SELECT pg_terminate_backend(:pid)"),
+                            {"pid": service_pid},
+                        )
+                return result
+
+            session.execute = execute_and_disconnect  # type: ignore[method-assign]
+            yield session
+
+    service = RouletteCommandService(
+        session_factory=disconnecting_session_factory,
+        reply_projector=CountingProjector(),
+    )
+    with pytest.raises((StorageUnavailableError, ConnectionError)):
+        await service.execute_group_command(
+            request(current, "actual-pg-disconnect", command_factory("create"))
+        )
+    async with harness.session_factory() as session:
+        assert await count_rows(session, "komari_roulette_games", current) == 0
+        assert await count_rows(
+            session, "komari_roulette_command_receipts", current
+        ) == 0
     await delete_scope(harness.engine, current)
 
 

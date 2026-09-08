@@ -26,10 +26,12 @@ if TYPE_CHECKING:
 from .command_support import (
     PG_REQUIRED,
     Scope,
+    backend_pid,
     create_engine_and_factory,
     delete_scope,
     scope,
     seed_binding,
+    wait_for_blocked,
 )
 from .test_command_service import CountingProjector, create_waiting
 
@@ -97,13 +99,31 @@ async def test_only_one_worker_claims_one_receipt(
         reply_projector=CountingProjector(),
     )
     receipt_id = receipt.receipt_id
-    claims = await asyncio.gather(
-        service.claim_fulfillment(receipt_id),
-        service.claim_fulfillment(receipt_id),
-    )
+    async with harness.session_factory() as blocker:
+        await blocker.begin()
+        blocker_pid = await backend_pid(blocker)
+        await blocker.execute(
+            text(
+                "SELECT receipt_id FROM komari_roulette_fulfillments "
+                "WHERE receipt_id = :receipt_id FOR UPDATE"
+            ),
+            {"receipt_id": receipt_id},
+        )
+        started = [asyncio.Event(), asyncio.Event()]
+
+        async def claim(index: int):
+            started[index].set()
+            return await service.claim_fulfillment(receipt_id)
+
+        tasks = [asyncio.create_task(claim(index)) for index in range(2)]
+        for event in started:
+            await event.wait()
+        await wait_for_blocked(harness.session_factory, blocker_pid)
+        await blocker.commit()
+        claims = await asyncio.gather(*tasks)
     assert sum(claim is not None for claim in claims) == 1
     claim = next(claim for claim in claims if claim is not None)
-    assert claim.state == FulfillmentState.PENDING_CONFIRMATION
+    assert getattr(claim, "state", None) == FulfillmentState.PENDING_CONFIRMATION
     row = await fulfillment_row(harness.session_factory, receipt_id)
     assert row["state"] == "PENDING_CONFIRMATION"
     await delete_scope(harness.engine, current)

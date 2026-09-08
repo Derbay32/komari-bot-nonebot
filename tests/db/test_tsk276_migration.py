@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -39,14 +42,6 @@ def script_directory() -> ScriptDirectory:
     return ScriptDirectory.from_config(config)
 
 
-def test_0020_is_the_single_head_after_0019() -> None:
-    script = script_directory()
-    assert script.get_heads() == [HEAD]
-    revision = script.get_revision(HEAD)
-    assert revision is not None
-    assert revision.down_revision == "0019"
-
-
 def test_0020_does_not_reuse_chat_reply_outbox() -> None:
     revision = script_directory().get_revision(HEAD)
     assert revision is not None
@@ -54,6 +49,184 @@ def test_0020_does_not_reuse_chat_reply_outbox() -> None:
     assert "komari_chat_reply_outbox" not in text
     assert RECEIPT_TABLE in text
     assert FULFILLMENT_TABLE in text
+
+
+async def _table_columns(connection: asyncpg.Connection, table: str) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in await connection.fetch(
+            "SELECT column_name, data_type, udt_name, is_nullable, "
+            "column_default, is_identity, is_generated "
+            "FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = $1 "
+            "ORDER BY ordinal_position",
+            table,
+        )
+    ]
+
+
+def _coerce_value(value: object, column: dict[str, Any]) -> object:  # noqa: PLR0911
+    udt_name = str(column["udt_name"])
+    data_type = str(column["data_type"])
+    if udt_name == "uuid":
+        return value if isinstance(value, UUID) else UUID(str(value))
+    if data_type in {"json", "jsonb"}:
+        return value if isinstance(value, str) else json.dumps(value)
+    if udt_name in {"bool", "boolean"}:
+        return bool(value)
+    if udt_name in {"int2", "int4", "int8", "numeric"}:
+        return int(str(value))
+    if udt_name in {"float4", "float8"}:
+        return float(str(value))
+    if udt_name in {"timestamp", "timestamptz", "date"}:
+        return value if isinstance(value, datetime) else datetime.now(UTC)
+    if udt_name.startswith("_"):
+        return value if isinstance(value, list) else [value]
+    return str(value)
+
+
+def _default_required_value(column: dict[str, Any]) -> object:  # noqa: PLR0911
+    name = str(column["column_name"])
+    udt_name = str(column["udt_name"])
+    data_type = str(column["data_type"])
+    if name.endswith("_id") or name == "receipt_id":
+        return uuid4() if udt_name == "uuid" else f"tsk276-{name}-{uuid4().hex}"
+    if name in {"app_id", "group_openid", "member_openid", "inbound_msg_id"}:
+        return f"tsk276-{name}"
+    if name == "fingerprint":
+        return {"command": "create", "params": {}}
+    if name in {"canonical_command", "reply_projection", "metadata"}:
+        return {"body": "safe", "metadata": {}}
+    if name in {"state", "status"}:
+        return "NOT_STARTED"
+    if name == "result_code":
+        return "created"
+    if name in {"created_at", "updated_at", "claimed_at"}:
+        return datetime.now(UTC)
+    if data_type in {"jsonb", "json"}:
+        return {}
+    if udt_name.startswith("_"):
+        return []
+    if udt_name in {"bool", "boolean"}:
+        return True
+    if udt_name in {"int2", "int4", "int8", "numeric"}:
+        return 1
+    if udt_name in {"float4", "float8"}:
+        return 1.0
+    return f"tsk276-{name}"
+
+
+async def _insert_complete_row(
+    connection: asyncpg.Connection,
+    table: str,
+    *,
+    overrides: dict[str, object],
+) -> object:
+    columns = await _table_columns(connection, table)
+    values: dict[str, object] = {}
+    for column in columns:
+        name = str(column["column_name"])
+        has_default = column["column_default"] is not None
+        generated = str(column["is_generated"]) != "NEVER"
+        identity = str(column["is_identity"]) == "YES"
+        if generated or identity:
+            continue
+        if name in overrides:
+            values[name] = _coerce_value(overrides[name], column)
+        elif str(column["is_nullable"]) == "NO" and not has_default:
+            values[name] = _coerce_value(_default_required_value(column), column)
+    assert values, table
+    quoted_columns = ", ".join(f'"{name}"' for name in values)
+    placeholders = ", ".join(f"${index}" for index in range(1, len(values) + 1))
+    await connection.execute(
+        f'INSERT INTO "{table}" ({quoted_columns}) VALUES ({placeholders})',
+        *values.values(),
+    )
+    return values.get("receipt_id")
+
+
+async def _has_exact_unique(
+    connection: asyncpg.Connection,
+    table: str,
+    expected: tuple[str, ...],
+) -> bool:
+    rows = await connection.fetch(
+        "SELECT tc.constraint_name, kcu.column_name, kcu.ordinal_position "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "ON tc.constraint_name = kcu.constraint_name "
+        "AND tc.table_schema = kcu.table_schema "
+        "WHERE tc.table_schema = 'public' AND tc.table_name = $1 "
+        "AND tc.constraint_type = 'UNIQUE' "
+        "ORDER BY tc.constraint_name, kcu.ordinal_position",
+        table,
+    )
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["constraint_name"]), []).append(
+            str(row["column_name"])
+        )
+    if any(tuple(columns) == expected for columns in grouped.values()):
+        return True
+    rows = await connection.fetch(
+        "SELECT array_agg(attribute.attname ORDER BY key_column.ordinality) "
+        "AS columns "
+        "FROM pg_class table_ref "
+        "JOIN pg_namespace namespace_ref ON namespace_ref.oid = table_ref.relnamespace "
+        "JOIN pg_index index_ref ON index_ref.indrelid = table_ref.oid "
+        "CROSS JOIN LATERAL unnest(index_ref.indkey) WITH ORDINALITY "
+        "AS key_column(attnum, ordinality) "
+        "JOIN pg_attribute attribute ON attribute.attrelid = table_ref.oid "
+        "AND attribute.attnum = key_column.attnum "
+        "WHERE namespace_ref.nspname = 'public' AND table_ref.relname = $1 "
+        "AND index_ref.indisunique AND NOT index_ref.indisprimary "
+        "AND key_column.ordinality <= index_ref.indnkeyatts "
+        "GROUP BY index_ref.indexrelid",
+        table,
+    )
+    return any(tuple(row["columns"]) == expected for row in rows)
+
+
+async def _has_exact_key(
+    connection: asyncpg.Connection,
+    table: str,
+    expected: tuple[str, ...],
+) -> bool:
+    rows = await connection.fetch(
+        "SELECT tc.constraint_name, kcu.column_name, kcu.ordinal_position "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "ON tc.constraint_name = kcu.constraint_name "
+        "AND tc.table_schema = kcu.table_schema "
+        "WHERE tc.table_schema = 'public' AND tc.table_name = $1 "
+        "AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE') "
+        "ORDER BY tc.constraint_name, kcu.ordinal_position",
+        table,
+    )
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["constraint_name"]), []).append(
+            str(row["column_name"])
+        )
+    if any(tuple(columns) == expected for columns in grouped.values()):
+        return True
+    rows = await connection.fetch(
+        "SELECT array_agg(attribute.attname ORDER BY key_column.ordinality) "
+        "AS columns "
+        "FROM pg_class table_ref "
+        "JOIN pg_namespace namespace_ref ON namespace_ref.oid = table_ref.relnamespace "
+        "JOIN pg_index index_ref ON index_ref.indrelid = table_ref.oid "
+        "CROSS JOIN LATERAL unnest(index_ref.indkey) WITH ORDINALITY "
+        "AS key_column(attnum, ordinality) "
+        "JOIN pg_attribute attribute ON attribute.attrelid = table_ref.oid "
+        "AND attribute.attnum = key_column.attnum "
+        "WHERE namespace_ref.nspname = 'public' AND table_ref.relname = $1 "
+        "AND index_ref.indisunique "
+        "AND key_column.ordinality <= index_ref.indnkeyatts "
+        "GROUP BY index_ref.indexrelid",
+        table,
+    )
+    return any(tuple(row["columns"]) == expected for row in rows)
 
 
 @PG_REQUIRED
@@ -108,51 +281,73 @@ async def test_fresh_database_upgrade_head_creates_receipt_and_fulfillment_schem
                 "state",
                 "platform_message_id",
             } <= fulfillment_columns
-            unique_key_columns = {
-                str(row["column_name"])
-                for row in await connection.fetch(
-                    "SELECT kcu.column_name "
-                    "FROM information_schema.table_constraints tc "
-                    "JOIN information_schema.key_column_usage kcu "
-                    "ON tc.constraint_name = kcu.constraint_name "
-                    "AND tc.table_schema = kcu.table_schema "
-                    "WHERE tc.table_schema = 'public' AND tc.table_name = $1 "
-                    "AND tc.constraint_type = 'UNIQUE'",
-                    RECEIPT_TABLE,
-                )
-            }
-            assert {
-                "app_id",
-                "group_openid",
-                "inbound_msg_id",
-            } <= unique_key_columns
+            assert await _has_exact_unique(
+                connection,
+                RECEIPT_TABLE,
+                ("app_id", "group_openid", "inbound_msg_id"),
+            )
 
-            await connection.execute(
-                f"INSERT INTO {RECEIPT_TABLE} "
-                "(receipt_id, app_id, group_openid, inbound_msg_id, "
-                "fingerprint, result_code, reply_projection) "
-                "VALUES ('receipt-1', 'app', 'group', 'msg', '{}', 'created', '{}')"
+            first_receipt_id = uuid4()
+            receipt_key = await _insert_complete_row(
+                connection,
+                RECEIPT_TABLE,
+                overrides={
+                    "receipt_id": first_receipt_id,
+                    "app_id": "tsk276-migration-app",
+                    "group_openid": "tsk276-migration-group",
+                    "inbound_msg_id": "tsk276-migration-message",
+                    "fingerprint": {"command": "create", "params": {}},
+                    "result_code": "created",
+                    "reply_projection": {
+                        "body": "safe",
+                        "metadata": {"revealed": 1},
+                    },
+                },
             )
+            assert receipt_key is not None
             with pytest.raises(asyncpg.UniqueViolationError):
-                await connection.execute(
-                    f"INSERT INTO {RECEIPT_TABLE} "
-                    "(receipt_id, app_id, group_openid, inbound_msg_id, "
-                    "fingerprint, result_code, reply_projection) "
-                    "VALUES ('receipt-2', 'app', 'group', 'msg', '{}', 'created', '{}')"
+                await _insert_complete_row(
+                    connection,
+                    RECEIPT_TABLE,
+                    overrides={
+                        "receipt_id": uuid4(),
+                        "app_id": "tsk276-migration-app",
+                        "group_openid": "tsk276-migration-group",
+                        "inbound_msg_id": "tsk276-migration-message",
+                        "fingerprint": {"command": "different", "params": {}},
+                        "result_code": "created",
+                        "reply_projection": {"body": "safe-2"},
+                    },
                 )
-            await connection.execute(
-                f"INSERT INTO {FULFILLMENT_TABLE} "
-                "(receipt_id, state) VALUES ('receipt-1', 'NOT_STARTED')"
+            assert await _has_exact_key(connection, FULFILLMENT_TABLE, ("receipt_id",))
+            await _insert_complete_row(
+                connection,
+                FULFILLMENT_TABLE,
+                overrides={
+                    "receipt_id": receipt_key,
+                    "state": "NOT_STARTED",
+                    "platform_message_id": "tsk276-platform-message",
+                },
             )
             with pytest.raises(asyncpg.UniqueViolationError):
-                await connection.execute(
-                    f"INSERT INTO {FULFILLMENT_TABLE} "
-                    "(receipt_id, state) VALUES ('receipt-1', 'NOT_STARTED')"
+                await _insert_complete_row(
+                    connection,
+                    FULFILLMENT_TABLE,
+                    overrides={
+                        "receipt_id": receipt_key,
+                        "state": "NOT_STARTED",
+                        "platform_message_id": "tsk276-platform-message-2",
+                    },
                 )
             with pytest.raises(asyncpg.ForeignKeyViolationError):
-                await connection.execute(
-                    f"INSERT INTO {FULFILLMENT_TABLE} "
-                    "(receipt_id, state) VALUES ('missing-receipt', 'NOT_STARTED')"
+                await _insert_complete_row(
+                    connection,
+                    FULFILLMENT_TABLE,
+                    overrides={
+                        "receipt_id": uuid4(),
+                        "state": "NOT_STARTED",
+                        "platform_message_id": "tsk276-platform-missing",
+                    },
                 )
         finally:
             await connection.close()

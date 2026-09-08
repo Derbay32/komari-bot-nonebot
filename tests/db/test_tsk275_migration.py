@@ -1,4 +1,4 @@
-"""TSK-275 Alembic 0019 chain and real PostgreSQL migration gate."""
+"""TSK-275/276 Alembic chain and real PostgreSQL migration gate."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0019"
+HEAD = "0020"
 ROULETTE_TABLES = {
     "komari_roulette_games",
     "komari_roulette_players",
@@ -45,12 +45,13 @@ def _script_directory() -> ScriptDirectory:
     return ScriptDirectory.from_config(config)
 
 
-def test_0019_is_the_single_head_after_character_binding_0018() -> None:
+def test_0020_is_the_single_head_after_roulette_storage_0019() -> None:
     script = _script_directory()
     assert script.get_heads() == [HEAD]
     revision = script.get_revision(HEAD)
     assert revision is not None
-    assert revision.down_revision == "0018"
+    assert revision.down_revision == "0019"
+    assert script.get_revision("0019").down_revision == "0018"  # type: ignore[union-attr]
 
 
 def test_roulette_orm_module_is_importable_without_runtime_ddl() -> None:
@@ -109,7 +110,7 @@ async def test_fresh_database_upgrade_head_and_check_include_roulette_schema() -
 
 @PG_REQUIRED
 @pytest.mark.asyncio
-async def test_upgrade_from_0018_preserves_binding_schema_and_converges_to_0019() -> (
+async def test_upgrade_from_0018_preserves_binding_schema_and_converges_to_0020() -> (
     None
 ):
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):

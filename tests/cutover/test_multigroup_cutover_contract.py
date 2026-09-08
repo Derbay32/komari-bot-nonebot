@@ -240,7 +240,7 @@ def test_0013_succeeds_with_multigroup_policy_via_real_prepare_policy(
         assert result.returncode == 0, (
             f"多群号合法升级必须通过 0013 终检:\n{result.stdout}\n{result.stderr}"
         )
-        assert asyncio.run(_fetch_version(params)) == "0019"
+        assert asyncio.run(_fetch_version(params)) == "0020"
 
 
 # ---------------------------------------------------------------------------

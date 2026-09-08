@@ -2,13 +2,13 @@
 
 覆盖工单 B 区：
 
-- fresh 空库 ``upgrade head`` 成功、停留在单一 head 0019，最终 schema 含
+- fresh 空库 ``upgrade head`` 成功、停留在单一 head 0020，最终 schema 含
   ``komari_group_admission_config`` 强类型单行表并与 SQLModel metadata
   零漂移（orm_bootstrap check），且仅 fresh marker 空库自动初始化缺省策略
   ``{"mode": "blacklist", "group_ids": []}``；
 - 非 fresh（先升到前置 legacy schema、无准入策略数据）的库不得被静默当作
   fresh 放行：继续 ``upgrade head`` 必须在 policy/backfill barrier 处拒绝
-  并要求 operator 显式提交统一策略，alembic_version 不得直接落在 0019；
+  并要求 operator 显式提交统一策略，alembic_version 不得直接落在 0020；
 - 不设任何 alias/双读/fallback/开发数据库兼容链。
 
 隔离纪律与 tsk197 一致：用例在门控库派生的一次性隔离库（后缀唯一）内执行，
@@ -112,7 +112,7 @@ async def test_legacy_without_policy_is_not_silently_fresh() -> None:
     """非 fresh 库（已有 pre-admission schema、无 policy）不得静默当 fresh 直升 head。
 
     要求：继续 ``upgrade head`` 必须在 policy/backfill barrier 处拒绝并停在
-    head 之前的 revision，绝不自动生成缺省策略；alembic_version 不得为 0019。
+    head 之前的 revision，绝不自动生成缺省策略；alembic_version 不得为 0020。
     """
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
