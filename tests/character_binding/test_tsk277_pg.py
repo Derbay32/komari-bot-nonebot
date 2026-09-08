@@ -2594,3 +2594,180 @@ async def test_init_plugin_installs_and_close_plugin_removes_wizard() -> None:
         await package.close_plugin()
         assert module.get_binding_wizard() is None, "close_plugin 必须移除 wizard"
     await _reset_shared_orm_engine()
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["cancel", "close", "recheck_denied", "ttl"],
+)
+async def test_apply_pause_then_invalidation_rolls_back_and_returns_no_reply(
+    action: str,
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9/AC10：_apply 已 bind/flush 但未 commit 期间失效，必须回滚且不返回成功。"""
+    current = scope(f"apply-pause-{action}")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    ban_state = {"banned": False}
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    staged = asyncio.Event()
+    release = asyncio.Event()
+
+    async def staged_bind(self: Any, **kwargs: Any) -> None:
+        await self._original_bind(**kwargs)  # type: ignore[attr-defined]
+        staged.set()
+        await release.wait()
+
+    async for engine, factory in create_engine_and_factory():
+        task: asyncio.Task[Any] | None = None
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    transaction_module = importlib.import_module(
+                        "komari_bot.plugins.character_binding.transaction"
+                    )
+                    freeze_qq_now(monkeypatch, clock)
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+                        return None
+
+                    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+                        return ban_state["banned"]
+
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=ban_checker,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    try:
+                        claim = await coordinator.claim_initial_bind(
+                            QQInitialBindRequest(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                qq_message_id="pause-1",
+                                command="/bind",
+                            )
+                        )
+                        assert claim is not None
+                        token = await coordinator.accept_reply_evidence(
+                            ReplyEvidence(
+                                app_id=current.app_id,
+                                session_code=claim.session_code,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                group_id=str(current.group_id),
+                                member_qq=str(current.member_qq),
+                                original_command="/bind",
+                                qq_message_id="pause-1",
+                                onebot_original_message_id=94001,
+                                challenge_message_id=94002,
+                                connection_generation=claim.connection_generation,
+                            )
+                        )
+                        assert token is not None
+                        name = await wizard.handle_event(
+                            make_event(
+                                content="/bind",
+                                message_id="pause-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert name is not None
+                        assert name.body == NAME_INPUT
+                        session_code = await _session_code(wizard, module, current)
+                        preview = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="pause-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert preview is not None
+                        assert preview.body == BINDING_CONFIRM.format(name="阿明")
+
+                        monkeypatch.setattr(
+                            transaction_module.BindingTransaction,
+                            "_original_bind",
+                            transaction_module.BindingTransaction.bind,
+                            raising=False,
+                        )
+                        monkeypatch.setattr(
+                            transaction_module.BindingTransaction,
+                            "bind",
+                            staged_bind,
+                        )
+                        task = asyncio.create_task(
+                            wizard.handle_event(
+                                make_event(
+                                    content=f"/bind confirm {session_code}",
+                                    message_id="pause-4",
+                                    group_openid=current.group_openid,
+                                    member_openid=current.member_openid,
+                                ),
+                                token,
+                            )
+                        )
+                        await asyncio.wait_for(staged.wait(), timeout=5)
+
+                        match action:
+                            case "cancel":
+                                assert await wizard.cancel(session_code) is True
+                            case "close":
+                                await wizard.close()
+                            case "recheck_denied":
+                                ban_state["banned"] = True
+                            case "ttl":
+                                clock.advance(timedelta(minutes=11))
+
+                        release.set()
+                        result = await task
+
+                        assert result is None, f"{action} 后不得返回成功 reply"
+                        assert (
+                            await _count_rows(
+                                factory, "komari_character_binding_members", current
+                            )
+                            == 0
+                        ), f"{action} 后暂存事务必须回滚"
+                        assert (
+                            await _count_rows(
+                                factory, "komari_character_binding_groups", current
+                            )
+                            == 0
+                        ), f"{action} 后不得留下群映射"
+                    finally:
+                        release.set()
+                        if task is not None and not task.done():
+                            task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await task
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
