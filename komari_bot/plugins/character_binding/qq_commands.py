@@ -25,7 +25,7 @@ from nonebot.typing import T_State  # noqa: TC002 - NoneBot 运行时解析 DI �
 
 from komari_bot.plugins.group_admission import get_qq_admission_token
 
-from .wizard import WizardReply, get_binding_wizard
+from .wizard import WizardReply, bind_command_text, get_binding_wizard
 
 bind_qq = on_message(priority=2, block=False)
 
@@ -67,7 +67,7 @@ async def handle_bind_qq(
     if type(event) is not GroupAtMessageCreateEvent:
         return
     content = event.content if isinstance(event.content, str) else ""
-    if not content.startswith("/bind"):
+    if bind_command_text(content) is None:
         return
     token = get_qq_admission_token(state)
     if token is None:

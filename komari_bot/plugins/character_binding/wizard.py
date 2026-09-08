@@ -48,6 +48,7 @@ SESSION_TTL: timedelta = timedelta(minutes=10)
 _MAX_SEEN_MESSAGES: int = 1024
 _MAX_COMPLETED_REPLIES: int = 32
 _MAX_SESSIONS: int = 512
+_COMMAND_PREFIX: str = "/bind"
 
 WizardStep = Literal[
     "challenge_pending",
@@ -211,6 +212,20 @@ def _escape_name(name: str) -> str:
     for marker in ("*", "_", "`", "~", "|"):
         escaped = escaped.replace(marker, f"\\{marker}")
     return escaped.replace("<", "&lt;").replace(">", "&gt;")
+
+
+def bind_command_text(content: str) -> str | None:
+    """按词法返回去掉前导空白后的 ``/bind`` 命令文本。
+
+    命令边界以空白分隔：``/bind``、``/bind <子命令>`` 与 ``" /bind "`` 是命令；
+    ``/bindfoo`` 不是命令，必须静默。只去除命令前的空白，不改动子命令正文。
+    """
+    text = content.lstrip()
+    if not text.startswith(_COMMAND_PREFIX):
+        return None
+    if len(text) > len(_COMMAND_PREFIX) and not text[len(_COMMAND_PREFIX)].isspace():
+        return None
+    return text
 
 
 def _conflict_text(error: BindingConflictError) -> str:
@@ -432,13 +447,18 @@ class BindingWizard:
         token: QQAdmissionToken,
         reply: WizardReply,
     ) -> bool:
-        """发送前最后一道复核：先重审，canonical 只作通过后的补充校验。"""
+        """发送前最后一道复核：重审必须是最后一步。
+
+        任何 canonical 读取（await）都发生在重审之前，重审之后的 active/
+        generation 为同步检查，确保读取或重审等待期间的封禁/撤销/close 不漏检。
+        """
+        generation = self._generation
+        completed = self._completed_reply_for(reply)
+        if completed is not None and not await self._canonical_matches(completed):
+            return False
         if not await self._recheck(token):
             return False
-        completed = self._completed_reply_for(reply)
-        if completed is None:
-            return True
-        return await self._canonical_matches(completed)
+        return self._active and generation == self._generation
 
     def _completed_reply_for(self, reply: WizardReply) -> _CompletedReply | None:
         for candidate, completed in self._completed_replies:
@@ -521,8 +541,10 @@ class BindingWizard:
             not isinstance(content, str)
             or not isinstance(message_id, str)
             or not message_id
-            or not content.startswith("/bind")
         ):
+            return None
+        command_text = bind_command_text(content)
+        if command_text is None:
             return None
         await self._prune()
         seen_key = (
@@ -539,7 +561,7 @@ class BindingWizard:
             group_openid=token.group_openid,
             member_openid=token.member_openid,
         )
-        verb, remainder = self._split_command(content)
+        verb, remainder = self._split_command(command_text)
         if verb == "":
             return await self._handle_bind(token, event, scope)
         if verb == "name":
@@ -1329,6 +1351,7 @@ __all__ = [
     "WizardScope",
     "WizardSessionView",
     "WizardStep",
+    "bind_command_text",
     "get_binding_wizard",
     "set_binding_wizard",
 ]
