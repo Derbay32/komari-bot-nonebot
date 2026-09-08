@@ -1001,6 +1001,10 @@ class BindingWizard:
                 return (False, IDENTITY_UNCONFIRMED)
             if not outcome[0]:
                 return outcome
+            if not await self._final_commit_gate(snapshot, token, generation):
+                with suppress(Exception):
+                    await session_db.rollback()
+                return (False, None)
             try:
                 await session_db.commit()
             except Exception as commit_error:
@@ -1011,6 +1015,27 @@ class BindingWizard:
         finally:
             with suppress(Exception):
                 await session_db.close()
+
+    async def _final_commit_gate(
+        self,
+        snapshot: _ConfirmSnapshot,
+        token: QQAdmissionToken,
+        generation: int,
+    ) -> bool:
+        """写入后、commit 前的最终闸门。
+
+        先 await 最新准入重审（policy/user_ban 与正式身份），再同步复核
+        active/generation/会话当前与 TTL，确保重审等待期间发生的
+        cancel/close 不会被漏掉；任一步失败都必须回滚暂存事务。
+        """
+        if not await self._recheck(token):
+            return False
+        return (
+            self._active
+            and generation == self._generation
+            and self._session_still_current(snapshot)
+            and snapshot.expires_at > self._now()
+        )
 
     async def _apply(  # noqa: PLR0911
         self,
