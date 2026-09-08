@@ -6,13 +6,13 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
+
+from komari_bot.plugins.komari_roulette.domain import ItemType
 from komari_bot.plugins.komari_roulette.mapper import (
     GameSnapshot,
     game_state_from_snapshot,
     game_state_to_snapshot,
 )
-
-from komari_bot.plugins.komari_roulette.domain import ItemType
 from tests.komari_roulette.storage_support import (
     START,
     active_state,
