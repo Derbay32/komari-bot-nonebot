@@ -2917,3 +2917,213 @@ async def test_authorize_send_rechecks_after_canonical_read(
                         reply_evidence.set_runtime_collectors(())
         finally:
             await _cleanup(engine, current)
+
+
+async def _terminate_advisory_waiters(engine: AsyncEngine) -> None:
+    """有界清理：终止仍等待组 advisory lock 的后端，避免用例失败后挂住后续测试。"""
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE wait_event_type = 'Lock' "
+                "AND query ILIKE '%pg_advisory_xact_lock%' "
+                "AND pid <> pg_backend_pid()"
+            )
+        )
+
+
+async def _database_name(engine: AsyncEngine) -> str:
+    async with engine.connect() as connection:
+        return str(await connection.scalar(text("SELECT current_database()")))
+
+
+async def _set_database_timeouts(
+    engine: AsyncEngine,
+    db_name: str,
+    *,
+    reset: bool,
+) -> None:
+    """有界兜底：给该测试库的新连接设置/复位 lock_timeout 与 statement_timeout。"""
+    async with engine.begin() as connection:
+        if reset:
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" RESET lock_timeout')
+            )
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" RESET statement_timeout')
+            )
+        else:
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" SET lock_timeout = \'2s\'')
+            )
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" SET statement_timeout = \'15s\'')
+            )
+
+
+async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC8/AC9：真实 init_plugin 安装的生产 resolver 不得与持锁 confirm 自锁。"""
+    from nonebot import get_driver
+    from nonebot.adapters.qq.config import BotInfo, Intents
+    from nonebot.config import Config as NoneBotConfig
+
+    from komari_bot.plugins import user_ban as user_ban_module
+
+    require_postgres()
+    current = scope("real-init-resolvers")
+    driver = get_driver()
+    config_values = driver.config.model_dump()
+    config_values.update(
+        {
+            "qq_is_sandbox": True,
+            "qq_bots": [
+                BotInfo(
+                    id=current.app_id,
+                    token="tsk277-init-token",
+                    secret="tsk277-init-secret",
+                    intent=Intents(c2c_group_at_messages=True),
+                    use_websocket=False,
+                ).model_dump()
+            ],
+            "qq_official_bot_qq_by_app": {current.app_id: OFFICIAL_BOT_QQ},
+        }
+    )
+
+    async def _is_user_banned(_user_id: str, _scope: object) -> bool:
+        return False
+
+    monkeypatch.setattr(driver, "config", NoneBotConfig.model_validate(config_values))
+    monkeypatch.setattr(
+        user_ban_module,
+        "is_configured_superuser_id",
+        lambda _user_id: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        user_ban_module,
+        "is_user_banned",
+        _is_user_banned,
+        raising=False,
+    )
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    async for engine, _factory in create_engine_and_factory():
+        db_name = await _database_name(engine)
+        await _set_database_timeouts(engine, db_name, reset=False)
+        await _reset_shared_orm_engine()
+        await prepare_control_plane(monkeypatch, storage)
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package() as binding:
+                    package = cast("Any", binding)
+                    await package.init_plugin()
+                    try:
+                        module = require_wizard_contract()
+                        wizard = module.get_binding_wizard()
+                        assert wizard is not None, "init_plugin 必须安装 wizard"
+                        coordinator = wizard._coordinator
+                        bot = QQProbeBot(current.app_id)
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="real-init-1",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 1
+                        challenge = markdown_content(bot.calls[0][1])
+                        session_code = challenge.split("会话码：", 1)[1].split(
+                            "\n", 1
+                        )[0]
+                        evidence = ReplyEvidence(
+                            app_id=current.app_id,
+                            session_code=session_code,
+                            group_openid=current.group_openid,
+                            member_openid=current.member_openid,
+                            group_id=str(current.group_id),
+                            member_qq=str(current.member_qq),
+                            original_command="/bind",
+                            qq_message_id="real-init-1",
+                            onebot_original_message_id=96001,
+                            challenge_message_id=96002,
+                            connection_generation=0,
+                        )
+                        assert (
+                            await coordinator.accept_reply_evidence(evidence)
+                            is not None
+                        )
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="real-init-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 2
+                        assert markdown_content(bot.calls[1][1]) == NAME_INPUT
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="real-init-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 3
+                        assert markdown_content(bot.calls[2][1]) == BINDING_CONFIRM.format(
+                            name="阿明"
+                        )
+
+                        confirm_task = asyncio.create_task(
+                            dispatch_qq(
+                                bot,
+                                make_group_at(
+                                    content=f"/bind confirm {session_code}",
+                                    message_id="real-init-4",
+                                    group_openid=current.group_openid,
+                                    member_openid=current.member_openid,
+                                ),
+                            )
+                        )
+                        done, _pending = await asyncio.wait(
+                            {confirm_task},
+                            timeout=10,
+                        )
+                        if not done:
+                            await _terminate_advisory_waiters(engine)
+                            with suppress(Exception):
+                                await asyncio.wait_for(confirm_task, timeout=5)
+                            pytest.fail(
+                                "真实 confirm 在 10s 内未完成：生产 resolver 在持组锁后自锁"
+                            )
+
+                        assert len(bot.calls) == 4, (
+                            f"生产 resolver 下成功文案必须实际发送: {bot.calls}"
+                        )
+                        assert markdown_content(bot.calls[3][1]) == BIND_SUCCESS.format(
+                            name="阿明"
+                        )
+                        manager = package.get_binding_manager()
+                        assert (
+                            manager.get_qq_character_name(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            )
+                            == "阿明"
+                        )
+                    finally:
+                        await package.close_plugin()
+        finally:
+            await _terminate_advisory_waiters(engine)
+            await _cleanup(engine, current)
+            await _set_database_timeouts(engine, db_name, reset=True)
+            await _reset_shared_orm_engine()
