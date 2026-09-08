@@ -200,6 +200,41 @@ async def _wait_for_advisory_signal(key: tuple[int, int]) -> None:
         await connection.close()
 
 
+async def _wait_for_group_scope_blocked(
+    *,
+    app_id: str,
+    group_openid: str,
+) -> None:
+    """Prove a writer is waiting on the shared group scope advisory lock."""
+    scope_key = f"komari-roulette:{app_id}:{group_openid}"
+    statement = """
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND NOT granted
+              AND classid = (
+                  (hashtextextended($1, 0) >> 32) & 4294967295
+              )::oid
+              AND objid = (
+                  hashtextextended($1, 0) & 4294967295
+              )::oid
+        )
+    """
+    connection = await _open_control_connection()
+
+    async def poll() -> None:
+        while True:
+            if await connection.fetchval(statement, scope_key):
+                return
+            await asyncio.sleep(0.02)
+
+    try:
+        await asyncio.wait_for(poll(), timeout=10)
+    finally:
+        await connection.close()
+
+
 @pytest.mark.asyncio
 async def test_group_id_and_openid_are_bidirectionally_unique_and_ignore_self_id(
     binding_manager: CharacterBindingManager,
@@ -485,6 +520,7 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
     gate_connection = await _open_control_connection()
     gate_held = False
     cross_task: asyncio.Task[object] | None = None
+    second_scope_task: asyncio.Task[object] | None = None
     managers = [
         binding_manager,
         CharacterBindingManager(),
@@ -522,6 +558,27 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
         )
         await _wait_for_advisory_signal(signal_key)
 
+        second_scope_started = asyncio.Event()
+
+        async def bind_second_scope() -> object:
+            second_scope_started.set()
+            return await bind_member(
+                managers[2],
+                app_id=app_id,
+                group_id=group_two_id,
+                group_openid=group_two_openid,
+                member_qq=member_two_qq,
+                member_openid=f"{app_id}-member-two",
+                character_name="群二成员",
+            )
+
+        second_scope_task = asyncio.create_task(bind_second_scope())
+        await second_scope_started.wait()
+        await _wait_for_group_scope_blocked(
+            app_id=app_id,
+            group_openid=group_two_openid,
+        )
+
         await bind_member(
             managers[1],
             app_id=app_id,
@@ -531,15 +588,6 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
             member_openid=f"{app_id}-member-one",
             character_name="群一成员",
         )
-        await bind_member(
-            managers[2],
-            app_id=app_id,
-            group_id=group_two_id,
-            group_openid=group_two_openid,
-            member_qq=member_two_qq,
-            member_openid=f"{app_id}-member-two",
-            character_name="群二成员",
-        )
 
         # The gate is transaction-scoped.  Rolling back this controller
         # session releases it even if the cross task is later cancelled.
@@ -548,6 +596,7 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
 
         with pytest.raises(BindingConflictError):
             await asyncio.wait_for(cross_task, timeout=10)
+        await asyncio.wait_for(second_scope_task, timeout=10)
 
         verifier = CharacterBindingManager()
         await verifier.initialize()
@@ -599,9 +648,12 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
         if gate_held:
             with suppress(Exception):
                 await gate_connection.execute("ROLLBACK")
-        if cross_task is not None and not cross_task.done():
+        if cross_task is not None:
             with suppress(Exception):
                 await asyncio.wait_for(cross_task, timeout=10)
+        if second_scope_task is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(second_scope_task, timeout=10)
         if trigger_names is not None:
             await _drop_cross_group_pause_trigger(
                 trigger_name=trigger_names[0],
