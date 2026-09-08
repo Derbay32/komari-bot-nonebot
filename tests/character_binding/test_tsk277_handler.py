@@ -28,6 +28,7 @@ from tests.character_binding.tsk277_support import (
     OFFICIAL_BOT_QQ,
     FakeCoordinator,
     FrozenClock,
+    freeze_qq_now,
     make_claim,
     markdown_content,
     payload_buttons,
@@ -93,6 +94,7 @@ async def _real_coordinator_env(
             reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
             coordinator_module = importlib.import_module(COORDINATOR_MODULE)
             clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+            freeze_qq_now(monkeypatch, clock)
             collector = reply_evidence.ReplyEvidenceCollector(
                 app_id=APP_ID,
                 official_bot_qq=OFFICIAL_BOT_QQ,
@@ -159,6 +161,7 @@ async def _fake_coordinator_env(
             module = require_wizard_contract()
             reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
             clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+            freeze_qq_now(monkeypatch, clock)
             wizard = module.BindingWizard(
                 coordinator=coordinator,
                 session_factory=_unused_factory,
@@ -200,7 +203,12 @@ async def test_real_handler_sends_markdown_challenge_with_quote_and_no_second_cl
         bot = QQProbeBot(APP_ID)
         await dispatch_qq(
             bot,
-            make_group_at(content="/bind", message_id="qq-handler-1"),
+            make_group_at(
+                content="/bind",
+                message_id="qq-handler-1",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
         )
 
         assert len(env["claim_calls"]) == 1, "handler 不得重复初始 claim"
@@ -232,7 +240,12 @@ async def test_real_handler_does_not_send_twice_for_duplicate_inbound(
         group_resolver=resolve_group,
     ) as env:
         bot = QQProbeBot(APP_ID)
-        event = make_group_at(content="/bind", message_id="qq-handler-dup")
+        event = make_group_at(
+            content="/bind",
+            message_id="qq-handler-dup",
+            group_openid=GROUP_OPENID,
+            member_openid=MEMBER_OPENID,
+        )
         await dispatch_qq(bot, event)
         await dispatch_qq(bot, event)
 
@@ -259,11 +272,21 @@ async def test_real_handler_ignores_non_bind_and_non_native_events(
         bot = QQProbeBot(APP_ID)
         await dispatch_qq(
             bot,
-            make_group_at(content="/轮盘 开枪", message_id="qq-handler-game"),
+            make_group_at(
+                content="/轮盘 开枪",
+                message_id="qq-handler-game",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
         )
         await dispatch_qq(
             bot,
-            make_group_at(content="普通聊天", message_id="qq-handler-chat"),
+            make_group_at(
+                content="普通聊天",
+                message_id="qq-handler-chat",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
         )
         await dispatch_qq(
             bot,
@@ -290,7 +313,12 @@ async def test_real_handler_send_failure_does_not_append_fallback(
         with suppress(Exception):
             await dispatch_qq(
                 bot,
-                make_group_at(content="/bind", message_id="qq-handler-fail"),
+                make_group_at(
+                    content="/bind",
+                    message_id="qq-handler-fail",
+                    group_openid=GROUP_OPENID,
+                    member_openid=MEMBER_OPENID,
+                ),
             )
 
         assert len(bot.calls) == 1, f"no fallback allowed: {bot.calls}"
@@ -317,7 +345,12 @@ async def test_restricted_group_stays_silent_even_for_configured_superuser(
         bot = QQProbeBot(APP_ID)
         await dispatch_qq(
             bot,
-            make_group_at(content="/bind", message_id="qq-handler-restricted"),
+            make_group_at(
+                content="/bind",
+                message_id="qq-handler-restricted",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
         )
 
         assert bot.calls == []
@@ -357,7 +390,12 @@ async def test_send_time_recheck_suppresses_reply_in_wait_window(
         bot = QQProbeBot(APP_ID)
         await dispatch_qq(
             bot,
-            make_group_at(content="/bind", message_id="qq-handler-window"),
+            make_group_at(
+                content="/bind",
+                message_id="qq-handler-window",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
         )
 
         assert bot.calls == [], "等待窗口内失格后不得发送"
@@ -393,12 +431,67 @@ async def test_positive_control_send_performs_send_time_recheck(
         bot = QQProbeBot(APP_ID)
         await dispatch_qq(
             bot,
-            make_group_at(content="/bind", message_id="qq-handler-window-ok"),
+            make_group_at(
+                content="/bind",
+                message_id="qq-handler-window-ok",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
         )
 
         assert len(bot.calls) == 1
         assert len(coordinator.recheck_calls) >= 2
         assert coordinator.recheck_calls[-1][1] == "business"
+
+
+async def test_real_handler_ignores_changed_content_for_same_inbound_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3/AC8：重复入站按 scope+message_id 判定，content 变化也不得执行。"""
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    async def resolve_member(_app_id: str, _group_openid: str, _openid: str) -> None:
+        return None
+
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    claim = make_claim(
+        clock=clock,
+        session_code="qq-dup-content",
+        qq_message_id="qq-handler-dup-content",
+    )
+    coordinator = FakeCoordinator(claim=claim)
+    async with _fake_coordinator_env(
+        monkeypatch,
+        group_resolver=resolve_group,
+        member_resolver=resolve_member,
+        coordinator=coordinator,
+    ):
+        bot = QQProbeBot(APP_ID)
+        await dispatch_qq(
+            bot,
+            make_group_at(
+                content="/bind",
+                message_id="qq-handler-dup-content",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
+        )
+        assert len(bot.calls) == 1
+
+        # 同一 scope+message_id、不同 content：不得再次执行或发送。
+        await dispatch_qq(
+            bot,
+            make_group_at(
+                content="/bind rename",
+                message_id="qq-handler-dup-content",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
+        )
+
+        assert len(bot.calls) == 1, f"changed content with same id must be ignored: {bot.calls}"
 
 
 async def test_handler_contract_is_registered_as_census_matcher() -> None:

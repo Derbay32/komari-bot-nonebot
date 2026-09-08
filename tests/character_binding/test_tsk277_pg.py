@@ -44,6 +44,7 @@ from tests.character_binding.tsk277_support import (
     FakeCoordinator,
     FrozenClock,
     buttons_of,
+    freeze_qq_now,
     make_event,
     make_token,
     make_verified,
@@ -1254,7 +1255,7 @@ async def test_commit_outcome_unknown_after_commit_does_not_report_and_converges
                 await wizard.handle_event(
                     make_event(
                         content=f"/bind confirm {session_code}",
-                        message_id="unknown-2",
+                        message_id="unknown-3",
                         group_openid=current.group_openid,
                         member_openid=current.member_openid,
                     ),
@@ -1277,7 +1278,7 @@ async def test_commit_outcome_unknown_after_commit_does_not_report_and_converges
             repeat = await wizard.handle_event(
                 make_event(
                     content=f"/bind confirm {session_code}",
-                    message_id="unknown-3",
+                    message_id="unknown-4",
                     group_openid=current.group_openid,
                     member_openid=current.member_openid,
                 ),
@@ -1338,7 +1339,7 @@ async def test_commit_outcome_unknown_before_commit_leaves_no_record_and_repeat_
                 await wizard.handle_event(
                     make_event(
                         content=f"/bind confirm {session_code}",
-                        message_id="before-2",
+                        message_id="before-3",
                         group_openid=current.group_openid,
                         member_openid=current.member_openid,
                     ),
@@ -1364,7 +1365,7 @@ async def test_commit_outcome_unknown_before_commit_leaves_no_record_and_repeat_
             repeat = await wizard.handle_event(
                 make_event(
                     content=f"/bind confirm {session_code}",
-                    message_id="before-3",
+                    message_id="before-4",
                     group_openid=current.group_openid,
                     member_openid=current.member_openid,
                 ),
@@ -1586,6 +1587,7 @@ async def test_real_handler_evidence_progression_and_success_send_survive_cancel
                     module = require_wizard_contract()
                     reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
                     coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    freeze_qq_now(monkeypatch, clock)
                     collector = reply_evidence.ReplyEvidenceCollector(
                         app_id=current.app_id,
                         official_bot_qq=OFFICIAL_BOT_QQ,

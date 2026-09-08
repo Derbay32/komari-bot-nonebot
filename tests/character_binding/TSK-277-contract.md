@@ -152,7 +152,9 @@ WizardReply(body, keyboard, reply_to_message_id)
 - 会话身份 = `(app_id, group_openid, member_openid)`；命令携带的 session 码
   必须匹配。成员或应用不匹配 → 他人流程文案；同应用同成员但群不匹配 → 错误群
   文案；码不存在/已取消/已过期 → 失效文案。
-- 同一入站消息 ID 重复投递只处理一次（不重复写库、不重复发送）。
+- 同一入站消息 ID 重复投递只处理一次（不重复写库、不重复发送）。重复入站键是
+  `(app_id, group_openid, member_openid, message_id)`：content 变化不影响去重，
+  不同 scope 的相同 message_id 必须各自处理。
 - 旧按钮/旧确认/迟到证据只作用于原会话；新会话不被影响。
 - 取消在发送准入拒绝时仍丢弃本地草稿，但静默；取消不主动通知他人。
 
@@ -211,7 +213,7 @@ WizardReply(body, keyboard, reply_to_message_id)
 | --- | --- |
 | 1 命令/按钮/纯文本可达/无 fallback | `test_tsk277_handler.py::test_real_handler_sends_markdown_challenge_with_quote_and_no_second_claim`、`test_tsk277_handler.py::test_real_handler_ignores_non_bind_and_non_native_events`、`test_tsk277_handler.py::test_real_handler_send_failure_does_not_append_fallback`、`test_tsk277_wizard.py::test_first_unmapped_bind_sends_one_challenge_and_repeat_is_silent`、`test_tsk277_wizard.py::test_legacy_candidate_only_after_verified_active_bind`、`test_commands.py::test_character_binding_has_no_onebot_bind_command_matchers` |
 | 2 名字规范器与注入防护 | `test_tsk277_wizard.py::test_name_command_uses_full_remaining_text_and_normalizes`、`test_tsk277_wizard.py::test_name_validation_rejects_and_keeps_current_step`、`test_tsk277_wizard.py::test_name_rendering_does_not_inject_markdown_or_real_mention`、`test_tsk277_pg.py::test_same_group_concurrent_name_has_one_winner_and_loser_can_rename` |
-| 3 每作用域一草稿/绝对 TTL/重复不重建 | `test_tsk277_wizard.py::test_ttl_is_absolute_ten_minutes_and_repeat_does_not_extend`、`test_tsk277_wizard.py::test_mapped_unbound_member_requests_single_claim_then_not_ready`、`test_tsk277_wizard.py::test_sessions_are_isolated_per_member_and_cancel_keeps_other`、`test_tsk277_wizard.py::test_duplicate_inbound_message_is_not_processed_twice`、`test_tsk277_handler.py::test_real_handler_does_not_send_twice_for_duplicate_inbound` |
+| 3 每作用域一草稿/绝对 TTL/重复不重建 | `test_tsk277_wizard.py::test_ttl_is_absolute_ten_minutes_and_repeat_does_not_extend`、`test_tsk277_wizard.py::test_mapped_unbound_member_requests_single_claim_then_not_ready`、`test_tsk277_wizard.py::test_sessions_are_isolated_per_member_and_cancel_keeps_other`、`test_tsk277_wizard.py::test_duplicate_inbound_message_is_not_processed_twice`、`test_tsk277_wizard.py::test_duplicate_inbound_with_changed_content_is_not_processed`、`test_tsk277_wizard.py::test_same_message_id_in_different_scope_is_processed`、`test_tsk277_handler.py::test_real_handler_does_not_send_twice_for_duplicate_inbound`、`test_tsk277_handler.py::test_real_handler_ignores_changed_content_for_same_inbound_id` |
 | 4 首次挑战/静默取证/再次 /bind 消费 | `test_tsk277_wizard.py::test_first_unmapped_bind_sends_one_challenge_and_repeat_is_silent`、`test_tsk277_wizard.py::test_unknown_group_pending_evidence_advances_on_next_bind_without_rebuild`、`test_tsk277_wizard.py::test_mapped_pending_evidence_advances_to_legacy_without_reclaim`、`test_tsk277_handler.py::test_real_handler_sends_markdown_challenge_with_quote_and_no_second_claim`、`test_tsk277_pg.py::test_real_handler_evidence_progression_and_success_send_survive_cancel` |
 | 5 会话/作用域/阶段核验与迟到失效 | `test_tsk277_wizard.py::test_cross_member_group_and_app_commands_are_rejected`、`test_tsk277_wizard.py::test_cancelled_session_code_is_stale_for_new_session`、`test_tsk277_wizard.py::test_cancel_drops_draft_even_when_send_admission_denies`、`test_tsk277_wizard.py::test_wrong_step_and_unknown_command_use_authoritative_texts`、`test_tsk277_wizard.py::test_active_draft_blocks_rename_and_unbind_switch` |
 | 6 改名/解绑 preview→confirm | `test_tsk277_pg.py::test_rename_preview_confirm_conflict_and_cancel`、`test_tsk277_pg.py::test_rename_or_unbind_without_character_name_prompts_binding`、`test_tsk277_pg.py::test_unbind_clears_only_name_and_identity_stays_reusable`、`test_tsk277_wizard.py::test_active_draft_blocks_rename_and_unbind_switch` |

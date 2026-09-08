@@ -23,6 +23,8 @@ from komari_bot.plugins.group_admission import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
 
 WIZARD_MODULE = "komari_bot.plugins.character_binding.wizard"
@@ -126,6 +128,19 @@ def require_wizard_contract(*names: str) -> Any:
     if missing:
         pytest.fail(f"TSK-277 wizard 公共契约缺失：{missing}")
     return module
+
+
+def freeze_qq_now(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Callable[[], datetime],
+) -> None:
+    """把 group_admission.qq 的时间源与测试时钟统一。
+
+    生产 qq.py 用真实墙钟判定 challenge/verified session TTL；测试若只冻结
+    coordinator 时钟会让 claim 立即过期。统一到同一可控时钟，夹具才确定。
+    """
+    qq_module = importlib.import_module("komari_bot.plugins.group_admission.qq")
+    monkeypatch.setattr(qq_module, "_now", clock)
 
 
 def make_claim(
@@ -380,6 +395,7 @@ __all__ = [
     "FakeCoordinator",
     "FrozenClock",
     "buttons_of",
+    "freeze_qq_now",
     "make_claim",
     "make_event",
     "make_token",

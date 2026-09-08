@@ -906,3 +906,94 @@ async def test_duplicate_inbound_message_is_not_processed_twice() -> None:
     assert view is not None
     assert view.character_name == "阿明"
     assert view.step == "binding_confirm"
+
+
+async def test_duplicate_inbound_with_changed_content_is_not_processed() -> None:
+    """AC3/AC8：重复入站键是 scope+message_id；content 变化也不得执行。"""
+    module = require_wizard_contract()
+    clock = FrozenClock()
+    verified = make_verified(clock=clock, session_code=SESSION)
+    coordinator = FakeCoordinator(verified=verified)
+    wizard = _wizard(module, clock=clock, coordinator=coordinator)
+    token = make_token(
+        scope="binding",
+        group_id=277001,
+        member_qq=MEMBER_QQ,
+        verified_session=verified,
+        qq_message_id="qq-msg-42",
+    )
+    await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-42"),
+        token,
+    )
+    first = await wizard.handle_event(
+        make_event(content=f"/bind name {SESSION} 阿明", message_id="qq-msg-43"),
+        token,
+    )
+    assert first is not None
+    assert first.body == BINDING_CONFIRM.format(name="阿明")
+
+    # 相同 scope+message_id、不同 content：不得执行（否则会提交绑定）。
+    changed = await wizard.handle_event(
+        make_event(content=f"/bind confirm {SESSION}", message_id="qq-msg-43"),
+        token,
+    )
+
+    assert changed is None
+    view = await wizard.get_session(_scope(module))
+    assert view is not None
+    assert view.step == "binding_confirm"
+    assert view.character_name == "阿明"
+
+
+async def test_same_message_id_in_different_scope_is_processed() -> None:
+    """AC3/AC8：重复入站键包含 scope；不同成员同 message_id 必须各自处理。"""
+    module = require_wizard_contract()
+    clock = FrozenClock()
+    first_verified = make_verified(clock=clock, session_code="scope-a")
+    second_verified = make_verified(
+        clock=clock,
+        session_code="scope-b",
+        member_openid=SECOND_MEMBER_OPENID,
+        member_qq=277003,
+    )
+    coordinator = FakeCoordinator(verified=first_verified)
+    wizard = _wizard(module, clock=clock, coordinator=coordinator)
+    first_token = make_token(
+        scope="binding",
+        group_id=277001,
+        member_qq=MEMBER_QQ,
+        verified_session=first_verified,
+        qq_message_id="shared-id",
+    )
+    second_token = make_token(
+        scope="binding",
+        group_id=277001,
+        member_openid=SECOND_MEMBER_OPENID,
+        member_qq=277003,
+        verified_session=second_verified,
+        qq_message_id="shared-id",
+    )
+
+    first = await wizard.handle_event(
+        make_event(content="/bind", message_id="shared-id"),
+        first_token,
+    )
+    second = await wizard.handle_event(
+        make_event(
+            content="/bind",
+            message_id="shared-id",
+            member_openid=SECOND_MEMBER_OPENID,
+        ),
+        second_token,
+    )
+
+    assert first is not None
+    assert first.body == NAME_INPUT
+    assert second is not None, "不同 scope 的相同 message_id 不得被去重"
+    assert second.body == NAME_INPUT
+    assert await wizard.get_session(_scope(module)) is not None
+    assert (
+        await wizard.get_session(_scope(module, member_openid=SECOND_MEMBER_OPENID))
+        is not None
+    )
