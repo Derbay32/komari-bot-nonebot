@@ -435,3 +435,210 @@ async def test_binding_challenge_recheck_rejects_when_group_becomes_restricted(
     assert isinstance(decision, package.QQEffectDecision)
     assert decision.allowed is False
     assert decision.effect == "binding_challenge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entrypoint", "invalidation"),
+    (
+        ("coordinator", "cancel"),
+        ("coordinator", "reset"),
+        ("coordinator", "close"),
+        ("public", "cancel"),
+        ("public", "reset"),
+        ("public", "close"),
+    ),
+    ids=(
+        "coordinator-cancel",
+        "coordinator-reset",
+        "coordinator-close",
+        "public-cancel",
+        "public-reset",
+        "public-close",
+    ),
+)
+async def test_binding_recheck_rejects_after_lifecycle_invalidation_during_ban_await(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    invalidation: str,
+) -> None:
+    """A token cannot survive coordinator invalidation during ban authority."""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int | None:
+        return None
+
+    async def fetch_message(_message_id: int) -> dict[str, object]:
+        return {}
+
+    ban_calls = 0
+    ban_started = asyncio.Event()
+    release_ban = asyncio.Event()
+
+    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+        nonlocal ban_calls
+        ban_calls += 1
+        if ban_calls == 1:
+            return False
+        ban_started.set()
+        await release_ban.wait()
+        return False
+
+    with registry_isolation_context(), _real_character_binding_package() as binding:
+        package = require_qq_contract(
+            "QQAdmissionToken",
+            "QQEffectDecision",
+            "QQInitialBindRequest",
+        )
+        from komari_bot.plugins.character_binding.reply_evidence import (
+            ReplyEvidence,
+            ReplyEvidenceCollector,
+        )
+
+        def clock() -> datetime:
+            return datetime.now(UTC)
+
+        binding_public = cast("Any", binding)
+        coordinator = binding_public.QQBindingCoordinator(
+            collectors=(
+                ReplyEvidenceCollector(
+                    app_id=APP_ID,
+                    official_bot_qq="9274001",
+                    message_fetcher=fetch_message,
+                    clock=clock,
+                ),
+            ),
+            group_resolver=resolve_group,
+            clock=clock,
+            ban_checker=ban_checker,
+        )
+        await coordinator.start()
+        task: asyncio.Task[Any] | None = None
+        decision: Any = None
+        try:
+            claim = await coordinator.claim_initial_bind(
+                package.QQInitialBindRequest(
+                    app_id=APP_ID,
+                    group_openid=GROUP_OPENID,
+                    member_openid=MEMBER_OPENID,
+                    qq_message_id=QQ_MESSAGE_ID,
+                    command="/bind",
+                )
+            )
+            assert claim is not None
+            evidence = ReplyEvidence(
+                app_id=APP_ID,
+                session_code=claim.session_code,
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+                group_id=str(GROUP_ID),
+                member_qq=str(MEMBER_QQ),
+                original_command="/bind",
+                qq_message_id=QQ_MESSAGE_ID,
+                onebot_original_message_id=91001,
+                challenge_message_id=91002,
+                connection_generation=claim.connection_generation,
+            )
+            token = await coordinator.accept_reply_evidence(evidence)
+            assert token is not None
+            assert token.verified_session is not None
+
+            if entrypoint == "coordinator":
+                task = asyncio.create_task(
+                    coordinator.recheck(token, effect="binding")
+                )
+            else:
+                task = asyncio.create_task(
+                    package.recheck_qq_effect(token, effect="binding")
+                )
+            await asyncio.wait_for(ban_started.wait(), timeout=1)
+
+            if invalidation == "cancel":
+                await coordinator.cancel(token.verified_session.session_code)
+            elif invalidation == "reset":
+                coordinator.reset_generation()
+            else:
+                await coordinator.close()
+
+            release_ban.set()
+            decision = await asyncio.wait_for(task, timeout=1)
+        finally:
+            release_ban.set()
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            await coordinator.close()
+
+    assert isinstance(decision, package.QQEffectDecision)
+    assert decision.allowed is False
+    assert decision.effect == "binding"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mapping",
+    (
+        "none",
+        "same",
+        "different",
+        "error",
+    ),
+    ids=("unmapped", "same-mapping", "different-mapping", "mapping-error"),
+)
+async def test_binding_recheck_applies_current_formal_group_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    mapping: str,
+) -> None:
+    """Binding continuation accepts unknown/same mapping and rejects conflicts."""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    package = require_qq_contract(
+        "QQEffectDecision",
+        "register_qq_ban_checker",
+        "register_qq_binding_session_resolver",
+        "register_qq_group_resolver",
+        "recheck_qq_effect",
+    )
+    token = _binding_token(package)
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int | None:
+        if mapping == "none":
+            return None
+        if mapping == "same":
+            return GROUP_ID
+        if mapping == "different":
+            return GROUP_ID + 1
+        raise RuntimeError("formal mapping unavailable")  # noqa: TRY003
+
+    async def resolve_session(
+        _app_id: str,
+        _group_openid: str,
+        _member_openid: str,
+    ) -> Any:
+        return token.verified_session
+
+    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+        return False
+
+    with registry_isolation_context():
+        package.register_qq_group_resolver(resolve_group)
+        package.register_qq_binding_session_resolver(resolve_session)
+        package.register_qq_ban_checker(ban_checker)
+        try:
+            decision = await package.recheck_qq_effect(token, effect="binding")
+        finally:
+            package.register_qq_group_resolver(None)
+            package.register_qq_binding_session_resolver(None)
+            package.register_qq_ban_checker(None)
+
+    assert isinstance(decision, package.QQEffectDecision)
+    assert decision.allowed is (mapping in {"none", "same"})
+    assert decision.effect == "binding"

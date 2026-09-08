@@ -145,7 +145,7 @@ QQBindingSessionResolver = Callable[
 ```
 
 该 resolver 查询当前 generation 的已核验临时会话。它独立于正式 group
-resolver，供未正式映射但 evidence 已通过的 `/bind continue` 等后续步骤使用。
+resolver，供未正式映射但 evidence 已通过的再次 `/bind` 等后续步骤使用。
 返回 `None` 或过期/旧 generation 都不能放行；不能只凭客户端重新构造同字段
 dataclass 获得资格。
 
@@ -171,8 +171,8 @@ dataclass 获得资格。
 ## coordinator 生命周期与证据
 
 character_binding 顶层导出 `QQBindingCoordinator`。构造器只接收启动装配提供的
-每 app collector/fetcher、caller-owned ORM session factory 和 clock，不创建或
-销毁共享 ORM engine：
+每 app collector、group/member resolver、ban checker 和 clock；不接收、创建或
+销毁 ORM session factory 或 nonebot-plugin-orm 共享 engine：
 
 ```python
 class QQBindingCoordinator:
