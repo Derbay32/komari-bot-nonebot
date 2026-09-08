@@ -67,7 +67,11 @@ async def _unavailable_message_fetcher(
 
 
 async def _resolve_qq_group(app_id: str, group_openid: str) -> int | None:
-    """Resolve one canonical QQ group through a caller-owned transaction."""
+    """Resolve one canonical QQ group for admission via a lock-free committed read.
+
+    该解析器会被持组锁的 confirm 重审调用；若另开 session 再取同一 advisory
+    lock 会形成跨 session 自锁，因此这里只读取已提交 canonical 行。
+    """
     from .database import _open_session
 
     session = _open_session()
@@ -76,6 +80,7 @@ async def _resolve_qq_group(app_id: str, group_openid: str) -> int | None:
             group = await BindingTransaction(session).resolve_group(
                 app_id=app_id,
                 group_openid=group_openid,
+                lock=False,
             )
             if group is None:
                 return None
@@ -95,7 +100,10 @@ async def _resolve_qq_member(
     group_openid: str,
     member_openid: str,
 ) -> int | None:
-    """Resolve the current trusted numeric member identity, if bound."""
+    """Resolve the current trusted numeric member identity, if bound.
+
+    与 group resolver 相同：准入只读，不加组锁，只读取已提交 canonical 行。
+    """
     from .database import _open_session
 
     session = _open_session()
@@ -105,6 +113,7 @@ async def _resolve_qq_member(
                 app_id=app_id,
                 group_openid=group_openid,
                 member_openid=member_openid,
+                lock=False,
             )
             if member is None:
                 return None

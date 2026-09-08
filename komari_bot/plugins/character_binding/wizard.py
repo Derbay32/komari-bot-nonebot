@@ -373,6 +373,7 @@ class BindingWizard:
                 app_id=scope.app_id,
                 group_openid=scope.group_openid,
                 member_openid=scope.member_openid,
+                lock=False,
             )
         except Exception:
             return None
