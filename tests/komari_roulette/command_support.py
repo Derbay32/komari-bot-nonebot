@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
-from komari_bot.db.group_transaction_locks import lock_group_scope
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
 
+from komari_bot.db.group_transaction_locks import lock_group_scope
 from komari_bot.plugins.komari_roulette import (
     CanonicalCommand,
     CommandRequest,

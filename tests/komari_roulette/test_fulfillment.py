@@ -111,11 +111,11 @@ async def test_only_one_worker_claims_one_receipt(
         )
         started = [asyncio.Event(), asyncio.Event()]
 
-        async def claim(index: int):
+        async def run_claim(index: int):
             started[index].set()
             return await service.claim_fulfillment(receipt_id)
 
-        tasks = [asyncio.create_task(claim(index)) for index in range(2)]
+        tasks = [asyncio.create_task(run_claim(index)) for index in range(2)]
         for event in started:
             await event.wait()
         await wait_for_blocked(harness.session_factory, blocker_pid)
