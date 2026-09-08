@@ -22,7 +22,6 @@ from komari_bot.plugins.group_admission import QQInitialBindRequest
 
 from .manager import (
     CharacterNameValidationError,
-    character_name_key,
     validate_character_name,
 )
 from .transaction import (
@@ -48,6 +47,7 @@ if TYPE_CHECKING:
 SESSION_TTL: timedelta = timedelta(minutes=10)
 _MAX_SEEN_MESSAGES: int = 1024
 _MAX_COMPLETED_REPLIES: int = 32
+_MAX_SESSIONS: int = 512
 
 WizardStep = Literal[
     "challenge_pending",
@@ -181,16 +181,35 @@ class _Session:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ConfirmSnapshot:
+    """confirm 进入 await 前冻结的不可变草稿快照。"""
+
+    scope: WizardScope
+    session_code: str
+    operation: WizardOperation
+    character_name: str | None
+    previous_name: str | None
+    expected_group_id: int | None
+    expected_member_qq: int | None
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedReply:
+    """已完成回复的 canonical 校验信息，不随草稿后续变化。"""
+
+    scope: WizardScope
+    operation: WizardOperation
+    character_name: str | None
+
+
 def _escape_name(name: str) -> str:
     """把名字渲染为普通文本，避免注入 Markdown 排版或真实 mention。"""
     escaped = name.replace("\\", "\\\\")
     for marker in ("*", "_", "`", "~", "|"):
         escaped = escaped.replace(marker, f"\\{marker}")
     return escaped.replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _same_name(left: str, right: str) -> bool:
-    return character_name_key(left) == character_name_key(right)
 
 
 def _conflict_text(error: BindingConflictError) -> str:
@@ -251,9 +270,11 @@ class BindingWizard:
         self._seen_messages: OrderedDict[tuple[str, str, str, str], None] = (
             OrderedDict()
         )
-        self._completed_replies: deque[tuple[WizardReply, _Session]] = deque(
+        self._completed_replies: deque[tuple[WizardReply, _CompletedReply]] = deque(
             maxlen=_MAX_COMPLETED_REPLIES
         )
+        self._active = True
+        self._generation = 0
 
     # ---- 基础设施 ----
 
@@ -410,35 +431,69 @@ class BindingWizard:
         token: QQAdmissionToken,
         reply: WizardReply,
     ) -> bool:
-        completed = self._completed_session_for(reply)
-        if await self._recheck(token):
-            return True
-        if completed is None:
+        """发送前最后一道复核：先重审，canonical 只作通过后的补充校验。"""
+        if not await self._recheck(token):
             return False
+        completed = self._completed_reply_for(reply)
+        if completed is None:
+            return True
         return await self._canonical_matches(completed)
 
-    def _completed_session_for(self, reply: WizardReply) -> _Session | None:
-        for candidate, session in self._completed_replies:
+    def _completed_reply_for(self, reply: WizardReply) -> _CompletedReply | None:
+        for candidate, completed in self._completed_replies:
             if candidate is reply:
-                return session
+                return completed
         return None
 
-    async def _canonical_matches(self, session: _Session) -> bool:
-        canonical = await self._read_canonical(session.scope)
-        if session.operation == "unbind":
+    async def _canonical_matches(self, completed: _CompletedReply) -> bool:
+        canonical = await self._read_canonical(completed.scope)
+        if completed.operation == "unbind":
             return canonical is None
-        if session.character_name is None:
+        if completed.character_name is None:
             return False
-        return canonical is not None and _same_name(
-            canonical,
-            session.character_name,
-        )
+        return canonical == completed.character_name
+
+    def reset(self) -> None:
+        """撤销当前向导代次：在途旧调用不得继续写库。"""
+        self._generation += 1
+        self._active = False
+        self._sessions.clear()
+        self._by_code.clear()
+        self._completed_replies.clear()
+        self._seen_messages.clear()
+
+    async def close(self) -> None:
+        """关闭向导并撤销所有在途代次。"""
+        self.reset()
+
+    async def _prune(self) -> None:
+        """有界清理过期草稿，避免临时状态无限保留。"""
+        now = self._now()
+        for session in list(self._sessions.values()):
+            if session.expires_at <= now:
+                await self._drop(session)
+        while len(self._sessions) > _MAX_SESSIONS:
+            oldest = min(
+                self._sessions.values(),
+                key=lambda item: item.created_at,
+            )
+            await self._drop(oldest)
+
+    def _session_still_current(self, snapshot: _ConfirmSnapshot) -> bool:
+        session = self._sessions.get(snapshot.scope)
+        if session is None or session.session_code != snapshot.session_code:
+            return False
+        if session.completed:
+            return False
+        return session.expires_at > self._now()
 
     async def handle_event(  # noqa: PLR0911
         self,
         event: GroupAtMessageCreateEvent,
         token: QQAdmissionToken,
     ) -> WizardReply | None:
+        if not self._active:
+            return None
         if type(event) is not GroupAtMessageCreateEvent:
             return None
         content = getattr(event, "content", None)
@@ -450,6 +505,7 @@ class BindingWizard:
             or not content.startswith("/bind")
         ):
             return None
+        await self._prune()
         seen_key = (
             token.app_id,
             token.group_openid,
@@ -833,7 +889,7 @@ class BindingWizard:
 
     # ---- /bind confirm ----
 
-    async def _handle_confirm(
+    async def _handle_confirm(  # noqa: PLR0911
         self,
         token: QQAdmissionToken,
         event: GroupAtMessageCreateEvent,
@@ -849,32 +905,76 @@ class BindingWizard:
             return await self._reply(token, event, WRONG_STEP)
         if not await self._recheck(token):
             return None
-        committed, text = await self._commit(session, token)
+        snapshot = _ConfirmSnapshot(
+            scope=session.scope,
+            session_code=session.session_code,
+            operation=session.operation,
+            character_name=session.character_name,
+            previous_name=session.previous_name,
+            expected_group_id=session.expected_group_id,
+            expected_member_qq=session.expected_member_qq,
+            expires_at=session.expires_at,
+        )
+        generation = self._generation
+        committed, text = await self._commit(snapshot, token, generation)
         if not committed:
+            if text is None:
+                return None
             return self._build(event, text, self._step_keyboard(session))
-        session.completed = True
-        session.step = "completed"
+        if (
+            self._active
+            and generation == self._generation
+            and self._sessions.get(snapshot.scope) is session
+        ):
+            session.character_name = snapshot.character_name
+            session.previous_name = snapshot.previous_name
+            session.completed = True
+            session.step = "completed"
         with suppress(Exception):
-            await self._coordinator.cancel(session.session_code)
+            await self._coordinator.cancel(snapshot.session_code)
         await self._publish()
-        reply = self._build(event, self._success_body(session))
-        self._completed_replies.append((reply, session))
+        reply = self._build(
+            event,
+            self._success_body_for(snapshot.operation, snapshot.character_name),
+        )
+        self._completed_replies.append(
+            (
+                reply,
+                _CompletedReply(
+                    scope=snapshot.scope,
+                    operation=snapshot.operation,
+                    character_name=snapshot.character_name,
+                ),
+            )
+        )
         return reply
 
-    async def _commit(
+    async def _commit(  # noqa: PLR0911
         self,
-        session: _Session,
+        snapshot: _ConfirmSnapshot,
         token: QQAdmissionToken,
-    ) -> tuple[bool, str]:
+        generation: int,
+    ) -> tuple[bool, str | None]:
         session_db = self._session_factory()
         try:
             try:
                 await lock_group_scope(
                     session_db,
-                    app_id=session.scope.app_id,
-                    group_openid=session.scope.group_openid,
+                    app_id=snapshot.scope.app_id,
+                    group_openid=snapshot.scope.group_openid,
                 )
-                outcome = await self._apply(session_db, session, token)
+            except BindingPersistenceError:
+                return (False, IDENTITY_UNCONFIRMED)
+            except Exception:
+                return (False, IDENTITY_UNCONFIRMED)
+            if not self._active or generation != self._generation:
+                return (False, None)
+            if not await self._recheck(token):
+                return (False, None)
+            if not self._session_still_current(snapshot):
+                return (False, None)
+            try:
+                outcome = await self._apply(session_db, snapshot, token)
             except BindingConflictError as conflict:
                 return (False, _conflict_text(conflict))
             except BindingPersistenceError:
@@ -897,19 +997,19 @@ class BindingWizard:
     async def _apply(  # noqa: PLR0911
         self,
         session_db: AsyncSession,
-        session: _Session,
+        snapshot: _ConfirmSnapshot,
         token: QQAdmissionToken,
-    ) -> tuple[bool, str]:
-        scope = session.scope
+    ) -> tuple[bool, str | None]:
+        scope = snapshot.scope
         transaction = BindingTransaction(session_db)
         expected_group = (
-            session.expected_group_id
-            if session.expected_group_id is not None
+            snapshot.expected_group_id
+            if snapshot.expected_group_id is not None
             else token.group_id
         )
         expected_member = (
-            session.expected_member_qq
-            if session.expected_member_qq is not None
+            snapshot.expected_member_qq
+            if snapshot.expected_member_qq is not None
             else token.member_qq
         )
         group = await transaction.resolve_group(
@@ -942,12 +1042,12 @@ class BindingWizard:
             if by_qq is not None and by_qq.member_openid != scope.member_openid:
                 return (False, MEMBER_CONFLICT)
         canonical = row.character_name if row is not None else None
-        target = session.character_name
-        if session.operation == "bind":
+        target = snapshot.character_name
+        if snapshot.operation == "bind":
             if target is None:
                 return (False, EXPIRED)
             if canonical is not None:
-                if _same_name(canonical, target):
+                if canonical == target:
                     return (True, "")
                 return (False, EXPIRED)
             if expected_group is None or expected_member is None:
@@ -961,12 +1061,12 @@ class BindingWizard:
                 character_name=target,
             )
             return (True, "")
-        if session.operation == "rename":
-            if target is None or session.previous_name is None or canonical is None:
+        if snapshot.operation == "rename":
+            if target is None or snapshot.previous_name is None or canonical is None:
                 return (False, EXPIRED)
-            if _same_name(canonical, target):
+            if canonical == target:
                 return (True, "")
-            if _same_name(canonical, session.previous_name):
+            if canonical == snapshot.previous_name:
                 await transaction.rename(
                     app_id=scope.app_id,
                     group_openid=scope.group_openid,
@@ -977,10 +1077,7 @@ class BindingWizard:
             return (False, EXPIRED)
         if canonical is None:
             return (True, "")
-        if session.previous_name is not None and _same_name(
-            canonical,
-            session.previous_name,
-        ):
+        if snapshot.previous_name is not None and canonical == snapshot.previous_name:
             await transaction.clear(
                 app_id=scope.app_id,
                 group_openid=scope.group_openid,
@@ -1079,14 +1176,19 @@ class BindingWizard:
     # ---- 视图渲染 ----
 
     @staticmethod
-    def _success_body(session: _Session) -> str:
-        if session.operation == "bind":
-            return BIND_SUCCESS.format(name=_escape_name(session.character_name or ""))
-        if session.operation == "rename":
-            return RENAME_SUCCESS.format(
-                name=_escape_name(session.character_name or "")
-            )
+    def _success_body_for(
+        operation: WizardOperation,
+        character_name: str | None,
+    ) -> str:
+        if operation == "bind":
+            return BIND_SUCCESS.format(name=_escape_name(character_name or ""))
+        if operation == "rename":
+            return RENAME_SUCCESS.format(name=_escape_name(character_name or ""))
         return UNBIND_SUCCESS
+
+    @classmethod
+    def _success_body(cls, session: _Session) -> str:
+        return cls._success_body_for(session.operation, session.character_name)
 
     def _step_body(self, session: _Session) -> str:  # noqa: PLR0911
         if session.step == "challenge_pending":

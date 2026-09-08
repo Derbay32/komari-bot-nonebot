@@ -32,7 +32,7 @@ from .reply_evidence import (
     set_runtime_collectors,
 )
 from .transaction import BindingTransaction, GroupBindingGroup
-from .wizard import BindingWizard, set_binding_wizard
+from .wizard import BindingWizard, get_binding_wizard, set_binding_wizard
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
@@ -185,6 +185,10 @@ async def init_plugin() -> None:
     await manager.initialize()
     if not manager._initialized:
         return
+    previous_wizard = get_binding_wizard()
+    if previous_wizard is not None:
+        await previous_wizard.close()
+        set_binding_wizard(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
     coordinator = QQBindingCoordinator(
@@ -209,7 +213,10 @@ async def init_plugin() -> None:
 
 
 async def close_plugin() -> None:
-    """先撤销 QQ 准入接缝与向导，再释放绑定数据库租约。"""
+    """先撤销向导与 QQ 准入接缝，再释放绑定数据库租约。"""
+    wizard = get_binding_wizard()
+    if wizard is not None:
+        await wizard.close()
     set_binding_wizard(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
