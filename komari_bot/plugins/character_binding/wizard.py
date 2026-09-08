@@ -197,8 +197,9 @@ class _ConfirmSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _CompletedReply:
-    """已完成回复的 canonical 校验信息，不随草稿后续变化。"""
+    """已完成回复的 canonical 校验与待清理信息。"""
 
+    session_code: str
     scope: WizardScope
     operation: WizardOperation
     character_name: str | None
@@ -453,6 +454,21 @@ class BindingWizard:
             return False
         return canonical == completed.character_name
 
+    async def finish_send(self, reply: WizardReply) -> None:
+        """发送尝试结束后清理已完成会话；普通回复为 no-op。
+
+        handler 在真正发送的 ``finally`` 中调用：无论发送成功、失败还是发送前
+        重审拒绝，都在发送尝试结束后才撤销临时会话，避免提前清理使成功回复
+        的重审失效，也不把撤销权限扩大到未发送的回复。
+        """
+        for index, (candidate, completed) in enumerate(self._completed_replies):
+            if candidate is not reply:
+                continue
+            del self._completed_replies[index]
+            with suppress(Exception):
+                await self._coordinator.cancel(completed.session_code)
+            return
+
     def reset(self) -> None:
         """撤销当前向导代次：在途旧调用不得继续写库。"""
         self._generation += 1
@@ -463,7 +479,10 @@ class BindingWizard:
         self._seen_messages.clear()
 
     async def close(self) -> None:
-        """关闭向导并撤销所有在途代次。"""
+        """撤销待清理的已完成会话，再关闭并废弃当前代次。"""
+        for _candidate, completed in list(self._completed_replies):
+            with suppress(Exception):
+                await self._coordinator.cancel(completed.session_code)
         self.reset()
 
     async def _prune(self) -> None:
@@ -930,8 +949,6 @@ class BindingWizard:
             session.previous_name = snapshot.previous_name
             session.completed = True
             session.step = "completed"
-        with suppress(Exception):
-            await self._coordinator.cancel(snapshot.session_code)
         await self._publish()
         reply = self._build(
             event,
@@ -941,6 +958,7 @@ class BindingWizard:
             (
                 reply,
                 _CompletedReply(
+                    session_code=snapshot.session_code,
                     scope=snapshot.scope,
                     operation=snapshot.operation,
                     character_name=snapshot.character_name,

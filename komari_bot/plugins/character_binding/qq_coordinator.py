@@ -40,8 +40,6 @@ GroupResolver = Callable[[str, str], Awaitable[int | None]]
 MemberResolver = Callable[[str, str, str], Awaitable[int | None]]
 Clock = Callable[[], datetime]
 
-_MAX_COMPLETED_SENDS: int = 512
-
 
 @dataclass(slots=True)
 class _BindingRecord:
@@ -50,15 +48,6 @@ class _BindingRecord:
     collector: ReplyEvidenceCollector
     verified: QQVerifiedBindingSession | None = None
     evidence: ReplyEvidence | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _CompletedSend:
-    """清理临时会话后，供成功回复做最后一次正式身份重审的凭据。"""
-
-    session: QQVerifiedBindingSession
-    generation: int
-    expires_at: datetime
 
 
 class QQBindingCoordinator:
@@ -88,7 +77,6 @@ class QQBindingCoordinator:
         self._counter = 0
         self._records: dict[tuple[str, str, str], _BindingRecord] = {}
         self._claims: dict[str, _BindingRecord] = {}
-        self._completed_sends: dict[str, _CompletedSend] = {}
         self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
 
     def _now(self) -> datetime:
@@ -184,12 +172,7 @@ class QQBindingCoordinator:
         register_evidence_receiver(self.accept_reply_evidence)
 
     async def close(self) -> None:
-        should_reset = (
-            self._active
-            or bool(self._records)
-            or bool(self._claims)
-            or bool(self._completed_sends)
-        )
+        should_reset = self._active or bool(self._records) or bool(self._claims)
         self._active = False
         if should_reset:
             self.reset_generation()
@@ -204,7 +187,6 @@ class QQBindingCoordinator:
         self._generation += 1
         self._records.clear()
         self._claims.clear()
-        self._completed_sends.clear()
         for collector in self._collectors:
             collector.reset_connection()
 
@@ -214,29 +196,6 @@ class QQBindingCoordinator:
             return
         self._records.pop(self._key(record.request), None)
         record.collector.cancel_session(record.claim.session_code)
-        verified = record.verified
-        if verified is not None and verified.expires_at > self._now():
-            self._completed_sends[verified.session_code] = _CompletedSend(
-                session=verified,
-                generation=self._generation,
-                expires_at=verified.expires_at,
-            )
-            self._prune_completed_sends()
-
-    def _prune_completed_sends(self) -> None:
-        now = self._now()
-        for code in [
-            code
-            for code, completed in self._completed_sends.items()
-            if completed.expires_at <= now
-        ]:
-            self._completed_sends.pop(code, None)
-        while len(self._completed_sends) > _MAX_COMPLETED_SENDS:
-            oldest = min(
-                self._completed_sends,
-                key=lambda code: self._completed_sends[code].expires_at,
-            )
-            self._completed_sends.pop(oldest, None)
 
     async def claim_initial_bind(
         self,
@@ -497,79 +456,17 @@ class QQBindingCoordinator:
                 )
             record = self._claims.get(session.session_code)
             if (
-                record is not None
-                and record.verified is session
-                and self._record_current(record)
+                record is None
+                or record.verified is not session
+                or not self._record_current(record)
             ):
-                return await recheck_qq_effect(token, effect=scope)
-            return await self._recheck_completed_send(token, session)
+                return QQEffectDecision(
+                    allowed=False,
+                    effect="binding",
+                    reason_code="binding_unavailable",
+                    effective_policy_revision=None,
+                )
         return await recheck_qq_effect(token, effect=scope)
-
-    async def _recheck_completed_send(  # noqa: PLR0911
-        self,
-        token: QQAdmissionToken,
-        session: QQVerifiedBindingSession,
-    ) -> QQEffectDecision:
-        """已清理会话的成功回复：用正式 canonical 身份重新资格。
-
-        临时 claim/evidence 已移除，但成功文案仍需在发送前按最新策略与
-        user_ban 复核；这里只信任已验证会话里的正式身份，不复活临时记录。
-        """
-
-        def reject(reason: str) -> QQEffectDecision:
-            return QQEffectDecision(
-                allowed=False,
-                effect="binding",
-                reason_code=reason,
-                effective_policy_revision=None,
-            )
-
-        completed = self._completed_sends.get(session.session_code)
-        if (
-            not self._active
-            or completed is None
-            or completed.session is not session
-            or completed.generation != self._generation
-            or completed.expires_at <= self._now()
-            or session.connection_generation != self._generation
-        ):
-            return reject("binding_unavailable")
-        group_id, resolver_ok = await self._resolve_group(
-            token.app_id,
-            token.group_openid,
-        )
-        if (
-            not resolver_ok
-            or (group_id is not None and group_id != session.group_id)
-            or token.group_id != session.group_id
-            or token.member_qq != session.member_qq
-        ):
-            return reject("scope_mismatch")
-        decision = adjudicate([session.group_id])
-        if (
-            decision.qualification.value != "business"
-            or decision.effective_revision is None
-        ):
-            return reject("policy_restricted")
-        banned = await self._is_banned(session.member_qq)
-        if banned is None:
-            return reject("ban_unavailable")
-        if banned:
-            return reject("user_banned")
-        decision = adjudicate([session.group_id])
-        if (
-            not self._active
-            or completed.generation != self._generation
-            or decision.qualification.value != "business"
-            or decision.effective_revision is None
-        ):
-            return reject("policy_restricted")
-        return QQEffectDecision(
-            allowed=True,
-            effect="binding",
-            reason_code="completed_send_allowed",
-            effective_policy_revision=decision.effective_revision,
-        )
 
 
 __all__ = ["QQBindingCoordinator"]

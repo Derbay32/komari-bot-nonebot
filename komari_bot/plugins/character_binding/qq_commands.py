@@ -78,15 +78,18 @@ async def handle_bind_qq(
     reply = await wizard.handle_event(event, token)
     if reply is None:
         return
-    if not await wizard.authorize_send(token, reply):
-        return
     try:
+        if not await wizard.authorize_send(token, reply):
+            return
         await bind_qq.send(_qq_message(reply))
     except Exception as error:
         logger.warning(
             "[CharacterBinding] QQ 绑定回复发送结果不确定，不补发: error_type={}",
             type(error).__name__,
         )
+    finally:
+        # 发送尝试结束后才撤销临时会话，避免提前清理使成功回复的重审失效。
+        await wizard.finish_send(reply)
 
 
 __all__ = ["bind_qq"]
