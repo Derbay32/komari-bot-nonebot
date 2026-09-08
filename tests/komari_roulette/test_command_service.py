@@ -6,7 +6,6 @@ import asyncio
 import json
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -81,11 +80,13 @@ class CountingProjector:
     def __init__(self, *, metadata: Mapping[str, str | int | bool] | None = None) -> None:
         self.calls = 0
         self.contexts: list[str] = []
+        self.context_objects: list[ReplyProjectionContext] = []
         self.metadata = dict(metadata or {})
 
     def __call__(self, context: ReplyProjectionContext) -> ReplyProjection:
         self.calls += 1
         self.contexts.append(repr(context))
+        self.context_objects.append(context)
         metadata = {"projector_call": self.calls, **self.metadata}
         return ReplyProjection(
             body="冻结安全回复",
@@ -481,25 +482,26 @@ async def test_waiting_join_start_competition_is_ordered_by_group_lock(
                 return await start_game(service, current, members[0], "race-start")
 
             runners = [join, start] if first_operation == "join" else [start, join]
-            tasks = [asyncio.create_task(runner()) for runner in runners]
-            await join_started.wait()
-            await start_started.wait()
+            first_task = asyncio.create_task(runners[0]())
+            first_event = join_started if first_operation == "join" else start_started
+            second_event = start_started if first_operation == "join" else join_started
+            await first_event.wait()
+            await wait_for_blocked(harness.session_factory, blocker_pid)
+            second_task = asyncio.create_task(runners[1]())
+            await second_event.wait()
             await wait_for_blocked(harness.session_factory, blocker_pid)
             await blocker.commit()
-            first, second = await asyncio.gather(*tasks)
-        results = (first, second) if first_operation == "join" else (second, first)
-        return results[0], results[1], current
+            first, second = await asyncio.gather(first_task, second_task)
+        if first_operation == "join":
+            return first, second, current
+        return second, first, current
 
     join_result, start_result, join_first_scope = await race("join")
     assert join_result.result_code == "joined"
     assert start_result.result_code == "started"
-    start_result_first, join_result_second, start_first_scope = await race("start")
+    join_result_second, start_result_first, start_first_scope = await race("start")
     assert start_result_first.result_code == "started"
-    assert join_result_second.result_code in {
-        "game_not_waiting",
-        "not_waiting",
-        "game_started",
-    }
+    assert join_result_second.result_code == "game_already_started"
     await delete_scope(harness.engine, join_first_scope)
     await delete_scope(harness.engine, start_first_scope)
 
@@ -726,7 +728,7 @@ async def test_item_choice_same_observation_consumes_once_and_renews_once(
     assert [result.result_code for result in results].count("item_choice_updated") == 1
     assert [result.result_code for result in results].count("state_conflict") == 1
     assert entropy.chamber_calls == 1
-    assert entropy.item_calls == 1
+    assert entropy.item_calls == 0
     after = await current_game_row(harness.session_factory, current)
     assert after is not None
     assert int(after["state_revision"]) == int(before["state_revision"]) + 1
@@ -862,22 +864,32 @@ async def test_expiry_worker_and_action_share_pg_deadline_boundary(
             await expiry_started.wait()
             await action_started.wait()
             await wait_for_blocked(harness.session_factory, blocker_pid)
-            async with harness.session_factory() as probe:
-                waiting_xacts = (
-                    await probe.execute(
-                        text(
-                            "SELECT xact_start FROM pg_stat_activity "
-                            "WHERE :blocker = ANY(pg_blocking_pids(pid)) "
-                            "AND xact_start IS NOT NULL"
-                        ),
-                        {"blocker": blocker_pid},
-                    )
-                ).scalars().all()
-            assert waiting_xacts
+            async with asyncio.timeout(5):
+                while True:
+                    async with harness.session_factory() as probe:
+                        waiting_xacts = (
+                            await probe.execute(
+                                text(
+                                    "SELECT xact_start FROM pg_stat_activity "
+                                    "WHERE :blocker = ANY(pg_blocking_pids(pid)) "
+                                    "AND xact_start IS NOT NULL"
+                                ),
+                                {"blocker": blocker_pid},
+                            )
+                        ).scalars().all()
+                    if len(waiting_xacts) >= 2:
+                        break
+                    await asyncio.sleep(0.02)
             assert all(xact_start < deadline for xact_start in waiting_xacts)
-            await asyncio.sleep(
-                max(0.25, (deadline - datetime.now(UTC)).total_seconds() + 0.25)
-            )
+            async with asyncio.timeout(5):
+                while True:
+                    async with harness.session_factory() as clock_probe:
+                        pg_now = await clock_probe.scalar(
+                            text("SELECT clock_timestamp()")
+                        )
+                    if pg_now >= deadline:
+                        break
+                    await asyncio.sleep(0.02)
             await blocker.commit()
             expiry, action = await asyncio.gather(expiry_task, action_task)
         finally:
@@ -1304,6 +1316,15 @@ async def test_active_projection_reveals_one_item_without_secret_queue(
             ),
             {"game_id": before["game_id"]},
         )
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_players "
+                "SET magnifier_count = 1, beer_count = 1, "
+                "burst_count = 1, lock_count = 1 "
+                "WHERE game_id = :game_id AND join_seq = 1"
+            ),
+            {"game_id": before["game_id"]},
+        )
         await session.commit()
     result = await service.execute_group_command(
         request(
@@ -1319,10 +1340,11 @@ async def test_active_projection_reveals_one_item_without_secret_queue(
         ),
     )
     assert result.result_code == "item_choice_updated"
-    contexts = "\n".join(projector.contexts)
-    assert "live', 'blank', 'live', 'blank" not in contexts
-    assert "beer', 'lock" not in contexts
-    assert "beer" in repr(result.reply)
+    public_context = projector.context_objects[-1]
+    context_repr = repr(public_context)
+    assert "live', 'blank', 'live', 'blank" not in context_repr
+    assert "beer', 'lock" not in context_repr
+    assert "lock" in context_repr
     assert members[0] in repr(result.reply)
     await delete_scope(harness.engine, current)
 

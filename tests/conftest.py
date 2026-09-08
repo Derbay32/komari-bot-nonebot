@@ -497,26 +497,22 @@ def _load_character_binding_transaction_exports() -> dict[str, object]:
     """Load the caller-owned facade without executing package startup hooks."""
 
     package = "komari_bot.plugins.character_binding"
-    for module_name in ("transaction", "binding_transaction", "facade"):
-        qualified_name = f"{package}.{module_name}"
-        try:
-            module = importlib.import_module(qualified_name)
-        except ModuleNotFoundError as error:
-            if error.name == qualified_name:
-                continue
-            raise
-        exports = {
-            name: getattr(module, name)
-            for name in (
-                "BindingTransaction",
-                "BindingConflictError",
-                "BindingPersistenceError",
-            )
-            if hasattr(module, name)
-        }
-        if "BindingTransaction" in exports:
-            return exports
-    return {}
+    qualified_name = f"{package}.transaction"
+    try:
+        module = importlib.import_module(qualified_name)
+    except ModuleNotFoundError as error:
+        if error.name == qualified_name:
+            return {}
+        raise
+    return {
+        name: getattr(module, name)
+        for name in (
+            "BindingTransaction",
+            "BindingConflictError",
+            "BindingPersistenceError",
+        )
+        if hasattr(module, name)
+    }
 
 
 _inject_package_exports(

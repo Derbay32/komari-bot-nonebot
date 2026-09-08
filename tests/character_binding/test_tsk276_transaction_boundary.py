@@ -397,9 +397,12 @@ async def test_binding_write_and_join_share_scope_lock_for_both_commit_orders(
             else (join_binding, mutate_binding)
         )
         first_task = asyncio.create_task(first())
+        first_event = clear_started if operation_first else join_started
+        second_event = join_started if operation_first else clear_started
+        await first_event.wait()
+        await wait_for_blocked(factory, blocker_pid)
         second_task = asyncio.create_task(second())
-        await clear_started.wait()
-        await join_started.wait()
+        await second_event.wait()
         await wait_for_blocked(factory, blocker_pid)
         await blocker.commit()
         results = await asyncio.gather(first_task, second_task)

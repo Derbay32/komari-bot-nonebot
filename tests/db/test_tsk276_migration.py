@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -34,6 +32,9 @@ PG_REQUIRED = pytest.mark.skipif(
     reason="未设置 KOMARI_TEST_POSTGRES_URL，不能执行 TSK-276 迁移验收",
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 
 def script_directory() -> ScriptDirectory:
     config = Config()
@@ -51,98 +52,64 @@ def test_0020_does_not_reuse_chat_reply_outbox() -> None:
     assert FULFILLMENT_TABLE in text
 
 
-async def _table_columns(connection: asyncpg.Connection, table: str) -> list[dict[str, Any]]:
-    return [
-        dict(row)
-        for row in await connection.fetch(
-            "SELECT column_name, data_type, udt_name, is_nullable, "
-            "column_default, is_identity, is_generated "
-            "FROM information_schema.columns "
-            "WHERE table_schema = 'public' AND table_name = $1 "
-            "ORDER BY ordinal_position",
-            table,
-        )
-    ]
+async def _insertable_columns(
+    connection: asyncpg.Connection,
+    table: str,
+) -> list[str]:
+    """Return columns used to copy a row without inventing required values."""
+
+    rows = await connection.fetch(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = $1 "
+        "AND is_generated = 'NEVER' AND is_identity = 'NO' "
+        "ORDER BY ordinal_position",
+        table,
+    )
+    return [str(row["column_name"]) for row in rows]
 
 
-def _coerce_value(value: object, column: dict[str, Any]) -> object:  # noqa: PLR0911
-    udt_name = str(column["udt_name"])
-    data_type = str(column["data_type"])
-    if udt_name == "uuid":
-        return value if isinstance(value, UUID) else UUID(str(value))
-    if data_type in {"json", "jsonb"}:
-        return value if isinstance(value, str) else json.dumps(value)
-    if udt_name in {"bool", "boolean"}:
-        return bool(value)
-    if udt_name in {"int2", "int4", "int8", "numeric"}:
-        return int(str(value))
-    if udt_name in {"float4", "float8"}:
-        return float(str(value))
-    if udt_name in {"timestamp", "timestamptz", "date"}:
-        return value if isinstance(value, datetime) else datetime.now(UTC)
-    if udt_name.startswith("_"):
-        return value if isinstance(value, list) else [value]
-    return str(value)
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
 
 
-def _default_required_value(column: dict[str, Any]) -> object:  # noqa: PLR0911
-    name = str(column["column_name"])
-    udt_name = str(column["udt_name"])
-    data_type = str(column["data_type"])
-    if name.endswith("_id") or name == "receipt_id":
-        return uuid4() if udt_name == "uuid" else f"tsk276-{name}-{uuid4().hex}"
-    if name in {"app_id", "group_openid", "member_openid", "inbound_msg_id"}:
-        return f"tsk276-{name}"
-    if name == "fingerprint":
-        return {"command": "create", "params": {}}
-    if name in {"canonical_command", "reply_projection", "metadata"}:
-        return {"body": "safe", "metadata": {}}
-    if name in {"state", "status"}:
-        return "NOT_STARTED"
-    if name == "result_code":
-        return "created"
-    if name in {"created_at", "updated_at", "claimed_at"}:
-        return datetime.now(UTC)
-    if data_type in {"jsonb", "json"}:
-        return {}
-    if udt_name.startswith("_"):
-        return []
-    if udt_name in {"bool", "boolean"}:
-        return True
-    if udt_name in {"int2", "int4", "int8", "numeric"}:
-        return 1
-    if udt_name in {"float4", "float8"}:
-        return 1.0
-    return f"tsk276-{name}"
+def _fresh_identifier(value: object) -> object:
+    """Keep the database's identifier type while making a new key."""
+
+    if isinstance(value, UUID):
+        return uuid4()
+    return f"tsk276-{uuid4().hex}"
 
 
-async def _insert_complete_row(
+async def _copy_row_with_overrides(
     connection: asyncpg.Connection,
     table: str,
     *,
-    overrides: dict[str, object],
-) -> object:
-    columns = await _table_columns(connection, table)
-    values: dict[str, object] = {}
+    source_column: str,
+    source_value: object,
+    overrides: Mapping[str, object],
+) -> None:
+    """Copy a known-valid row, changing only explicit key columns."""
+
+    columns = await _insertable_columns(connection, table)
+    assert source_column in columns
+    assert set(overrides) <= set(columns)
+    parameters: list[object] = []
+    select_expressions: list[str] = []
     for column in columns:
-        name = str(column["column_name"])
-        has_default = column["column_default"] is not None
-        generated = str(column["is_generated"]) != "NEVER"
-        identity = str(column["is_identity"]) == "YES"
-        if generated or identity:
-            continue
-        if name in overrides:
-            values[name] = _coerce_value(overrides[name], column)
-        elif str(column["is_nullable"]) == "NO" and not has_default:
-            values[name] = _coerce_value(_default_required_value(column), column)
-    assert values, table
-    quoted_columns = ", ".join(f'"{name}"' for name in values)
-    placeholders = ", ".join(f"${index}" for index in range(1, len(values) + 1))
+        if column in overrides:
+            parameters.append(overrides[column])
+            select_expressions.append(f"${len(parameters)} AS {_quote_identifier(column)}")
+        else:
+            select_expressions.append(_quote_identifier(column))
+    parameters.append(source_value)
     await connection.execute(
-        f'INSERT INTO "{table}" ({quoted_columns}) VALUES ({placeholders})',
-        *values.values(),
+        f"INSERT INTO {_quote_identifier(table)} "
+        f"({', '.join(_quote_identifier(column) for column in columns)}) "
+        f"SELECT {', '.join(select_expressions)} "
+        f"FROM {_quote_identifier(table)} "
+        f"WHERE {_quote_identifier(source_column)} = ${len(parameters)}",
+        *parameters,
     )
-    return values.get("receipt_id")
 
 
 async def _has_exact_unique(
@@ -287,67 +254,124 @@ async def test_fresh_database_upgrade_head_creates_receipt_and_fulfillment_schem
                 ("app_id", "group_openid", "inbound_msg_id"),
             )
 
-            first_receipt_id = uuid4()
-            receipt_key = await _insert_complete_row(
-                connection,
-                RECEIPT_TABLE,
-                overrides={
-                    "receipt_id": first_receipt_id,
-                    "app_id": "tsk276-migration-app",
-                    "group_openid": "tsk276-migration-group",
-                    "inbound_msg_id": "tsk276-migration-message",
-                    "fingerprint": {"command": "create", "params": {}},
-                    "result_code": "created",
-                    "reply_projection": {
-                        "body": "safe",
-                        "metadata": {"revealed": 1},
-                    },
-                },
+            # The service creates a complete, binding-qualified receipt and its
+            # initial NOT_STARTED fulfillment.  Constraint checks below copy
+            # this valid row instead of guessing values for required columns.
+            from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+            from komari_bot.plugins.character_binding import BindingTransaction
+            from komari_bot.plugins.komari_roulette import (
+                ReplyProjection,
+                RouletteCommandService,
             )
-            assert receipt_key is not None
+            from tests.komari_roulette.command_support import (
+                command_factory,
+                request,
+                scope,
+            )
+
+            current = scope("migration-schema")
+            scratch_engine = create_async_engine(database_url, pool_pre_ping=True)
+            scratch_factory = async_sessionmaker(
+                scratch_engine,
+                expire_on_commit=False,
+            )
+            try:
+                async with scratch_factory() as setup_session:
+                    binding = BindingTransaction(setup_session)
+                    await binding.bind(
+                        app_id=current.app_id,
+                        group_id=f"qq-{current.group_openid}",
+                        group_openid=current.group_openid,
+                        member_qq=f"qq-{current.member_openid}",
+                        member_openid=current.member_openid,
+                        character_name="迁移夹具",
+                    )
+                    await setup_session.commit()
+                service = RouletteCommandService(
+                    session_factory=scratch_factory,
+                    reply_projector=lambda _context: ReplyProjection(
+                        body="safe",
+                        metadata={"test": True},
+                    ),
+                )
+                created = await service.execute_group_command(
+                    request(
+                        current,
+                        "migration-create",
+                        command_factory("create"),
+                        member_openid=current.member_openid,
+                    )
+                )
+                assert created.receipt_id is not None
+            finally:
+                await scratch_engine.dispose()
+
+            receipt_row = await connection.fetchrow(
+                f"SELECT * FROM {_quote_identifier(RECEIPT_TABLE)} "
+                "WHERE app_id = $1 AND group_openid = $2 AND inbound_msg_id = $3",
+                current.app_id,
+                current.group_openid,
+                "migration-create",
+            )
+            assert receipt_row is not None
+            receipt_key = receipt_row["receipt_id"]
+            fulfillment_row = await connection.fetchrow(
+                f"SELECT * FROM {_quote_identifier(FULFILLMENT_TABLE)} "
+                "WHERE receipt_id = $1",
+                receipt_key,
+            )
+            assert fulfillment_row is not None
+            assert str(fulfillment_row["state"]) == "NOT_STARTED"
+            assert fulfillment_row["platform_message_id"] is None
+
+            duplicate_receipt_id = _fresh_identifier(receipt_key)
             with pytest.raises(asyncpg.UniqueViolationError):
-                await _insert_complete_row(
+                await _copy_row_with_overrides(
                     connection,
                     RECEIPT_TABLE,
+                    source_column="receipt_id",
+                    source_value=receipt_key,
                     overrides={
-                        "receipt_id": uuid4(),
-                        "app_id": "tsk276-migration-app",
-                        "group_openid": "tsk276-migration-group",
-                        "inbound_msg_id": "tsk276-migration-message",
-                        "fingerprint": {"command": "different", "params": {}},
-                        "result_code": "created",
-                        "reply_projection": {"body": "safe-2"},
+                        "receipt_id": duplicate_receipt_id,
                     },
                 )
-            assert await _has_exact_key(connection, FULFILLMENT_TABLE, ("receipt_id",))
-            await _insert_complete_row(
+
+            second_receipt_id = _fresh_identifier(receipt_key)
+            second_message_id = "migration-create-copy"
+            await _copy_row_with_overrides(
                 connection,
-                FULFILLMENT_TABLE,
+                RECEIPT_TABLE,
+                source_column="receipt_id",
+                source_value=receipt_key,
                 overrides={
-                    "receipt_id": receipt_key,
-                    "state": "NOT_STARTED",
-                    "platform_message_id": "tsk276-platform-message",
+                    "receipt_id": second_receipt_id,
+                    "inbound_msg_id": second_message_id,
                 },
             )
+            assert await _has_exact_key(connection, FULFILLMENT_TABLE, ("receipt_id",))
+            await _copy_row_with_overrides(
+                connection,
+                FULFILLMENT_TABLE,
+                source_column="receipt_id",
+                source_value=receipt_key,
+                overrides={"receipt_id": second_receipt_id},
+            )
             with pytest.raises(asyncpg.UniqueViolationError):
-                await _insert_complete_row(
+                await _copy_row_with_overrides(
                     connection,
                     FULFILLMENT_TABLE,
-                    overrides={
-                        "receipt_id": receipt_key,
-                        "state": "NOT_STARTED",
-                        "platform_message_id": "tsk276-platform-message-2",
-                    },
+                    source_column="receipt_id",
+                    source_value=receipt_key,
+                    overrides={"receipt_id": receipt_key},
                 )
             with pytest.raises(asyncpg.ForeignKeyViolationError):
-                await _insert_complete_row(
+                await _copy_row_with_overrides(
                     connection,
                     FULFILLMENT_TABLE,
-                    overrides={
-                        "receipt_id": uuid4(),
-                        "state": "NOT_STARTED",
-                        "platform_message_id": "tsk276-platform-missing",
-                    },
+                    source_column="receipt_id",
+                    source_value=receipt_key,
+                    overrides={"receipt_id": _fresh_identifier(receipt_key)},
                 )
         finally:
             await connection.close()
