@@ -13,7 +13,7 @@
 
 还提供：
 
-- ``ProbeBot``：最小 Bot duck 类型，记录 ``call_api`` 调用；
+- ``ProbeBot``：真实 OneBot V11 Bot 测试身份，记录 ``call_api`` 调用；
 - ``dispatch(bot, event)``：调用 ``nonebot.message.handle_event``
   分发事件。
 - ``make_v11_event(event_cls, *, group_id=100, **overrides)``：构造
@@ -40,6 +40,8 @@ import nonebot
 import nonebot.adapters
 import nonebot.matcher as _matcher_mod
 import nonebot.message as _msg_mod
+from nonebot.adapters.onebot.v11 import Adapter as OneBotAdapter
+from nonebot.adapters.onebot.v11 import Bot as OneBotBot
 from nonebot.adapters.onebot.v11 import Message
 from nonebot.adapters.onebot.v11.event import Event, Sender
 
@@ -191,36 +193,13 @@ async def read_status(app: FastAPI) -> dict[str, Any]:
         return response.json()
 
 
-class _AdapterDuck:
-    """最小 adapter duck：只提供 ``get_name`` 供 Bot ``type`` property 使用。"""
-
-    def __init__(self, name: str) -> None:
-        self._name = name
-
-    def get_name(self) -> str:
-        return self._name
-
-    @property
-    def config(self) -> object:
-        return None
-
-
-class ProbeBot:
-    """最小 Bot duck 类型：记录 ``call_api`` 调用，可 ``cast`` 为 ``nonebot.adapters.Bot``。
-
-    提供 ``self_id``、``type``、``adapter`` 三个标准 Bot 属性。``call_api``
-    将调用记录追加到 ``self.calls`` 列表，返回 ``None``。
-    """
+class ProbeBot(OneBotBot):
+    """真实 OneBot V11 Bot 身份，记录 ``call_api`` 调用并返回 ``None``。"""
 
     def __init__(self, self_id: str = "12345") -> None:
-        self.self_id: str = self_id
+        adapter = cast("OneBotAdapter", OneBotAdapter.__new__(OneBotAdapter))
+        super().__init__(adapter, self_id)
         self.calls: list[tuple[str, dict[str, object]]] = []
-        self._type: str = "OneBot V11"
-        self.adapter = _AdapterDuck(self._type)
-
-    @property
-    def type(self) -> str:
-        return self._type
 
     async def call_api(self, api: str, **data: object) -> None:
         self.calls.append((api, data))
