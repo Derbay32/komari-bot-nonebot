@@ -2771,3 +2771,149 @@ async def test_apply_pause_then_invalidation_rolls_back_and_returns_no_reply(
                         reply_evidence.set_runtime_collectors(())
         finally:
             await _cleanup(engine, current)
+
+
+async def test_authorize_send_rechecks_after_canonical_read(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9：canonical 读取期间发生封禁变更，authorize_send 必须拒绝（重审最后一步）。"""
+    current = scope("authz-canonical-window")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    ban_state = {"banned": False}
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    staged = asyncio.Event()
+    release = asyncio.Event()
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    freeze_qq_now(monkeypatch, clock)
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+                        return None
+
+                    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+                        return ban_state["banned"]
+
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=ban_checker,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    try:
+                        claim = await coordinator.claim_initial_bind(
+                            QQInitialBindRequest(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                qq_message_id="canon-1",
+                                command="/bind",
+                            )
+                        )
+                        assert claim is not None
+                        token = await coordinator.accept_reply_evidence(
+                            ReplyEvidence(
+                                app_id=current.app_id,
+                                session_code=claim.session_code,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                group_id=str(current.group_id),
+                                member_qq=str(current.member_qq),
+                                original_command="/bind",
+                                qq_message_id="canon-1",
+                                onebot_original_message_id=95001,
+                                challenge_message_id=95002,
+                                connection_generation=claim.connection_generation,
+                            )
+                        )
+                        assert token is not None
+                        name = await wizard.handle_event(
+                            make_event(
+                                content="/bind",
+                                message_id="canon-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert name is not None
+                        assert name.body == NAME_INPUT
+                        session_code = await _session_code(wizard, module, current)
+                        preview = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="canon-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert preview is not None
+                        assert preview.body == BINDING_CONFIRM.format(name="阿明")
+                        success = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind confirm {session_code}",
+                                message_id="canon-4",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert success is not None
+                        assert success.body == BIND_SUCCESS.format(name="阿明")
+                        assert await wizard.authorize_send(token, success) is True
+
+                        original_read = wizard._read_canonical
+
+                        async def staged_read(
+                            read_scope: Any,
+                            _original: Any = original_read,
+                        ) -> Any:
+                            staged.set()
+                            await release.wait()
+                            return await _original(read_scope)
+
+                        monkeypatch.setattr(
+                            wizard,
+                            "_read_canonical",
+                            staged_read,
+                            raising=False,
+                        )
+                        task = asyncio.create_task(
+                            wizard.authorize_send(token, success)
+                        )
+                        await asyncio.wait_for(staged.wait(), timeout=5)
+                        ban_state["banned"] = True
+                        release.set()
+
+                        assert await task is False, (
+                            "canonical 读取期间撤销后必须拒绝，重审应是最后一步"
+                        )
+                    finally:
+                        release.set()
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)

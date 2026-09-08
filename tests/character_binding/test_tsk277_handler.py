@@ -19,6 +19,7 @@ from tests.character_binding.test_reply_evidence import (
 )
 from tests.character_binding.tsk277_support import (
     APP_ID,
+    BAD_COMMAND,
     CANCEL_BUTTON,
     CHALLENGE_BODY,
     CONTINUE_BUTTON,
@@ -517,3 +518,78 @@ async def test_handler_contract_is_registered_as_census_matcher() -> None:
             assert len(registered) == 1, (
                 f"expected exactly one QQ handler matcher: {registered}"
             )
+
+
+async def test_real_handler_accepts_trimmed_initial_bind_without_losing_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1/AC4：门禁按 strip 后精确 /bind 消耗 claim，handler 必须同样发挑战。"""
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int | None:
+        return None
+
+    async with _real_coordinator_env(
+        monkeypatch,
+        group_resolver=resolve_group,
+    ) as env:
+        bot = QQProbeBot(APP_ID)
+        await dispatch_qq(
+            bot,
+            make_group_at(
+                content=" /bind ",
+                message_id="qq-handler-trimmed",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
+        )
+
+        assert len(env["claim_calls"]) == 1, "门禁已按 strip 后的 /bind 消耗初始 claim"
+        data = _only_call(bot)
+        body = markdown_content(data)
+        assert body.startswith("正在确认你的本群身份。\n会话码："), (
+            "trimmed /bind 不得只消耗 claim 而不发挑战"
+        )
+        assert data["group_openid"] == GROUP_OPENID
+
+
+async def test_real_handler_ignores_bind_prefixed_non_command_but_reports_unknown_subcommand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1/AC11：/bindfoo 不是命令必须静默；/bind bogus 仍是未知子命令。"""
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    async def resolve_member(_app_id: str, _group_openid: str, _openid: str) -> None:
+        return None
+
+    coordinator = FakeCoordinator()
+    async with _fake_coordinator_env(
+        monkeypatch,
+        group_resolver=resolve_group,
+        member_resolver=resolve_member,
+        coordinator=coordinator,
+    ):
+        bot = QQProbeBot(APP_ID)
+        await dispatch_qq(
+            bot,
+            make_group_at(
+                content="/bindfoo",
+                message_id="qq-handler-prefix",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
+        )
+        assert bot.calls == [], f"/bindfoo 不是命令，必须静默: {bot.calls}"
+
+        await dispatch_qq(
+            bot,
+            make_group_at(
+                content="/bind bogus",
+                message_id="qq-handler-unknown",
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+            ),
+        )
+        assert len(bot.calls) == 1
+        assert markdown_content(bot.calls[0][1]) == BAD_COMMAND
