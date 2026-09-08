@@ -26,6 +26,7 @@ from nonebot.adapters.qq.event import (
 )
 from nonebot.adapters.qq.models.guild import User
 from nonebot.adapters.qq.models.qq import FriendAuthor, GroupMemberAuthor
+from nonebot.typing import T_State  # noqa: TC002
 
 from tests.group_admission.entry_gate_support import event_gate_context
 from tests.group_admission.registry_isolation_support import (
@@ -266,7 +267,7 @@ def register_state_probe(captured: list[dict[object, object]]) -> object:
     matcher = nonebot.on_message(priority=1, block=False)
 
     @matcher.handle()
-    async def _handle(state: dict[object, object]) -> None:
+    async def _handle(state: T_State) -> None:
         captured.append(dict(state))
 
     return matcher

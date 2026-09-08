@@ -21,8 +21,16 @@ class QQEffectDecision: ...
 async def qualify_qq_event(bot, event) -> QQAdmissionToken | None: ...
 def get_qq_admission_token(state) -> QQAdmissionToken | None: ...
 
-def register_qq_group_resolver(resolver | None) -> None: ...
-def register_qq_initial_bind_claimer(claimer | None) -> None: ...
+def register_qq_group_resolver(
+    resolver | None,
+    *,
+    member_resolver | None = None,
+) -> None: ...
+def register_qq_initial_bind_claimer(
+    claimer | None,
+    *,
+    validator | None = None,
+) -> None: ...
 def register_qq_binding_session_resolver(resolver | None) -> None: ...
 def register_qq_ban_checker(checker | None) -> None: ...
 async def recheck_qq_effect(token, *, effect) -> QQEffectDecision: ...
@@ -106,6 +114,13 @@ QQGroupResolver = Callable[[str, str], Awaitable[int | None]]
 返回的 `GroupBindingGroup.group_id` 由 character_binding 装配层规范化为正整数
 后再交给此接缝；群映射没有成员也必须成功解析。
 
+`register_qq_group_resolver` 的可选 `member_resolver` 形状为
+`Callable[[str, str, str], Awaitable[int | None]]`，参数依次是 `app_id`、
+`group_openid`、`member_openid`。它只返回数据库确认的 canonical numeric QQ；
+返回 `None` 表示没有可靠成员映射，异常必须拒绝当前资格。已映射且 admitted
+群的 BUSINESS 资格不能因此强制要求成员已绑定，但有 canonical QQ 时必须把它
+传给封禁 facade；即便 OpenID 恰好全是数字也不能代替该值。
+
 ```python
 QQInitialBindClaimer = Callable[
     [QQInitialBindRequest],
@@ -116,6 +131,11 @@ QQInitialBindClaimer = Callable[
 一次性与 10 分钟绝对 TTL 由 character_binding 的真实临时会话协调器负责。
 重复事件可以返回同一个 session 的 `is_new=False` claim，但成功 claim 数量
 至多一次；不可用当前 claim 续期或创建第二个挑战。
+
+`register_qq_initial_bind_claimer` 的可选 `validator` 接收待重审的
+`QQAdmissionToken` 并返回 awaitable bool。它只验证协调器仍持有的原始 claim；
+不能通过客户端重构相同字段的 token。validator 与当前有效策略、TTL、generation
+共同决定 challenge 是否仍可产生效果。
 
 ```python
 QQBindingSessionResolver = Callable[

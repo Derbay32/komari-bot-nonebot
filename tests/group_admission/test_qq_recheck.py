@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from tests.character_binding.test_reply_evidence import _real_character_binding_package
 from tests.group_admission.management_support import prepare_control_plane
 from tests.group_admission.qq_admission_support import (
     APP_ID,
@@ -27,7 +28,7 @@ from tests.group_admission.runtime_support import AdmissionStorageFake, stored_p
 pytestmark = pytest.mark.group_admission_acceptance
 
 
-def _business_token(package: Any) -> Any:
+def _business_token(package: Any, *, member_qq: int | None = None) -> Any:
     return package.QQAdmissionToken(
         scope="business",
         app_id=APP_ID,
@@ -35,7 +36,7 @@ def _business_token(package: Any) -> Any:
         member_openid=MEMBER_OPENID,
         qq_message_id=QQ_MESSAGE_ID,
         group_id=GROUP_ID,
-        member_qq=None,
+        member_qq=member_qq,
         effective_policy_revision=1,
         connection_generation=0,
         claim=None,
@@ -174,3 +175,263 @@ async def test_binding_recheck_rejects_policy_revocation_during_await(
     assert isinstance(decision, package.QQEffectDecision)
     assert decision.allowed is False
     assert decision.effect == "binding"
+
+
+@pytest.mark.asyncio
+async def test_business_recheck_rechecks_authoritative_member_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale token cannot keep using a member QQ after its authority changes."""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    package = require_qq_contract(
+        "QQEffectDecision",
+        "register_qq_group_resolver",
+        "register_qq_ban_checker",
+        "recheck_qq_effect",
+    )
+    token = _business_token(package, member_qq=MEMBER_QQ)
+    observed_members: list[str] = []
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    async def resolve_member(
+        _app_id: str,
+        _group_openid: str,
+        _member_openid: str,
+    ) -> int:
+        replacement = MEMBER_QQ + 1
+        observed_members.append(str(replacement))
+        return replacement
+
+    async def ban_checker(member_qq: int, _scope: str) -> bool:
+        return member_qq == MEMBER_QQ + 1
+
+    with registry_isolation_context():
+        package.register_qq_group_resolver(
+            resolve_group,
+            member_resolver=resolve_member,
+        )
+        package.register_qq_ban_checker(ban_checker)
+        try:
+            decision = await package.recheck_qq_effect(token, effect="business")
+        finally:
+            package.register_qq_group_resolver(None)
+            package.register_qq_ban_checker(None)
+
+    assert isinstance(decision, package.QQEffectDecision)
+    assert decision.allowed is False
+    assert observed_members == [str(MEMBER_QQ + 1)]
+
+
+@pytest.mark.asyncio
+async def test_business_recheck_rejects_policy_revocation_during_ban_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final business policy check runs after the ban authority await."""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    package = require_qq_contract(
+        "QQEffectDecision",
+        "register_qq_group_resolver",
+        "register_qq_ban_checker",
+        "recheck_qq_effect",
+    )
+    ban_started = asyncio.Event()
+    release_ban = asyncio.Event()
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+        ban_started.set()
+        await release_ban.wait()
+        return False
+
+    task: asyncio.Task[Any] | None = None
+    with registry_isolation_context():
+        package.register_qq_group_resolver(resolve_group)
+        package.register_qq_ban_checker(ban_checker)
+        try:
+            task = asyncio.create_task(
+                package.recheck_qq_effect(
+                    _business_token(package, member_qq=MEMBER_QQ),
+                    effect="business",
+                )
+            )
+            await asyncio.wait_for(ban_started.wait(), timeout=1)
+            storage.deliver(
+                stored_policy(2, {"mode": "blacklist", "group_ids": [GROUP_ID]})
+            )
+            release_ban.set()
+            decision = await asyncio.wait_for(task, timeout=1)
+        finally:
+            release_ban.set()
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            package.register_qq_group_resolver(None)
+            package.register_qq_ban_checker(None)
+
+    assert isinstance(decision, package.QQEffectDecision)
+    assert decision.allowed is False
+    assert decision.effect == "business"
+
+
+@pytest.mark.asyncio
+async def test_binding_recheck_rejects_policy_revocation_during_ban_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final binding policy check runs after the ban authority await."""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    package = require_qq_contract(
+        "QQEffectDecision",
+        "QQVerifiedBindingSession",
+        "register_qq_binding_session_resolver",
+        "register_qq_ban_checker",
+        "recheck_qq_effect",
+    )
+    token = _binding_token(package)
+    ban_started = asyncio.Event()
+    release_ban = asyncio.Event()
+
+    async def resolve_session(
+        _app_id: str,
+        _group_openid: str,
+        _member_openid: str,
+    ) -> Any:
+        return token.verified_session
+
+    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+        ban_started.set()
+        await release_ban.wait()
+        return False
+
+    task: asyncio.Task[Any] | None = None
+    with registry_isolation_context():
+        package.register_qq_binding_session_resolver(resolve_session)
+        package.register_qq_ban_checker(ban_checker)
+        try:
+            task = asyncio.create_task(
+                package.recheck_qq_effect(token, effect="binding")
+            )
+            await asyncio.wait_for(ban_started.wait(), timeout=1)
+            storage.deliver(
+                stored_policy(2, {"mode": "blacklist", "group_ids": [GROUP_ID]})
+            )
+            release_ban.set()
+            decision = await asyncio.wait_for(task, timeout=1)
+        finally:
+            release_ban.set()
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            package.register_qq_binding_session_resolver(None)
+            package.register_qq_ban_checker(None)
+
+    assert isinstance(decision, package.QQEffectDecision)
+    assert decision.allowed is False
+    assert decision.effect == "binding"
+
+
+@pytest.mark.asyncio
+async def test_binding_challenge_recheck_rejects_when_group_becomes_restricted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real unknown-group claim cannot send after its group becomes restricted."""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    group_mapped = False
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int | None:
+        return GROUP_ID if group_mapped else None
+
+    async def fetch_message(_message_id: int) -> dict[str, object]:
+        return {}
+
+    with registry_isolation_context(), _real_character_binding_package() as binding:
+        package = require_qq_contract(
+            "QQAdmissionToken",
+            "QQEffectDecision",
+            "QQInitialBindRequest",
+            "recheck_qq_effect",
+        )
+        from komari_bot.plugins.character_binding.reply_evidence import (
+            ReplyEvidenceCollector,
+        )
+
+        def clock() -> datetime:
+            return datetime.now(UTC)
+
+        binding_public = cast("Any", binding)
+        coordinator = binding_public.QQBindingCoordinator(
+            collectors=(
+                ReplyEvidenceCollector(
+                    app_id=APP_ID,
+                    official_bot_qq="9274001",
+                    message_fetcher=fetch_message,
+                    clock=clock,
+                ),
+            ),
+            group_resolver=resolve_group,
+            clock=clock,
+        )
+        await coordinator.start()
+        try:
+            claim = await coordinator.claim_initial_bind(
+                package.QQInitialBindRequest(
+                    app_id=APP_ID,
+                    group_openid=GROUP_OPENID,
+                    member_openid=MEMBER_OPENID,
+                    qq_message_id=QQ_MESSAGE_ID,
+                    command="/bind",
+                )
+            )
+            assert claim is not None
+            token = package.QQAdmissionToken(
+                scope="binding_challenge",
+                app_id=APP_ID,
+                group_openid=GROUP_OPENID,
+                member_openid=MEMBER_OPENID,
+                qq_message_id=QQ_MESSAGE_ID,
+                group_id=None,
+                member_qq=None,
+                effective_policy_revision=1,
+                connection_generation=claim.connection_generation,
+                claim=claim,
+                verified_session=None,
+            )
+            allowed = await coordinator.recheck(
+                token,
+                effect="binding_challenge",
+            )
+            assert allowed.allowed is True
+
+            group_mapped = True
+            storage.deliver(
+                stored_policy(2, {"mode": "blacklist", "group_ids": [GROUP_ID]})
+            )
+            decision = await coordinator.recheck(
+                token,
+                effect="binding_challenge",
+            )
+        finally:
+            await coordinator.close()
+
+    assert isinstance(decision, package.QQEffectDecision)
+    assert decision.allowed is False
+    assert decision.effect == "binding_challenge"

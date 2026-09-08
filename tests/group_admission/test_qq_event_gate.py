@@ -16,6 +16,7 @@ from tests.group_admission.qq_admission_support import (
     MEMBER_OPENID,
     MEMBER_QQ,
     OFFICIAL_BOT_QQ,
+    QQ_MESSAGE_ID,
     ForgedGroupAtMessageCreateEvent,
     QQProbeBot,
     dispatch_qq,
@@ -47,11 +48,15 @@ def _registered_qq_contract(
     package: Any,
     *,
     group_resolver: Callable[[str, str], Awaitable[int | None]],
+    member_resolver: Callable[[str, str, str], Awaitable[int | None]] | None = None,
     claimer: Callable[[Any], Awaitable[Any]] | None = None,
     session_resolver: Callable[[str, str, str], Awaitable[Any]] | None = None,
     ban_checker: Callable[[int, str], Awaitable[bool]] | None = None,
 ) -> Iterator[None]:
-    package.register_qq_group_resolver(group_resolver)
+    package.register_qq_group_resolver(
+        group_resolver,
+        member_resolver=member_resolver,
+    )
     package.register_qq_initial_bind_claimer(claimer)
     package.register_qq_binding_session_resolver(session_resolver)
     package.register_qq_ban_checker(ban_checker)
@@ -78,13 +83,19 @@ async def _prepare_runtime(
     return storage
 
 
-def _claim(package: Any, *, is_new: bool, session_code: str = "claim-tsk274") -> Any:
+def _claim(
+    package: Any,
+    *,
+    is_new: bool,
+    session_code: str = "claim-tsk274",
+    qq_message_id: str = QQ_MESSAGE_ID,
+) -> Any:
     return package.QQBindClaim(
         session_code=session_code,
         app_id=APP_ID,
         group_openid=GROUP_OPENID,
         member_openid=MEMBER_OPENID,
-        qq_message_id="qq-bind-tsk274",
+        qq_message_id=qq_message_id,
         connection_generation=0,
         # Gate smoke cases must not depend on the wall clock matching the
         # frozen timestamp used by the event model.  Exact expiry is covered
@@ -136,6 +147,59 @@ async def test_mapped_admitted_group_is_business_without_member_binding(
     assert token.member_qq is None
     assert token.claim is None
     assert claimer_calls == []
+
+
+@pytest.mark.asyncio
+async def test_mapped_admitted_group_uses_canonical_member_qq_for_ban_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A numeric-shaped OpenID cannot replace a canonical member QQ identity."""
+    await _prepare_runtime(
+        monkeypatch,
+        policy={"mode": "blacklist", "group_ids": []},
+    )
+    package = require_qq_contract("qualify_qq_event", "register_qq_group_resolver")
+    ban_calls: list[tuple[int, str]] = []
+    member_openid = "123456789"
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    async def resolve_member(
+        app_id: str,
+        group_openid: str,
+        observed_member_openid: str,
+    ) -> int:
+        assert (app_id, group_openid, observed_member_openid) == (
+            APP_ID,
+            GROUP_OPENID,
+            member_openid,
+        )
+        return MEMBER_QQ
+
+    async def ban_checker(member_qq: int, scope: str) -> bool:
+        ban_calls.append((member_qq, scope))
+        return False
+
+    async with event_gate_context():
+        with _registered_qq_contract(
+            package,
+            group_resolver=resolve_group,
+            member_resolver=resolve_member,
+            ban_checker=ban_checker,
+        ):
+            token = await package.qualify_qq_event(
+                QQProbeBot(APP_ID),
+                make_group_at(
+                    content="/轮盘 开枪",
+                    member_openid=member_openid,
+                ),
+            )
+
+    assert token is not None
+    assert token.scope == "business"
+    assert token.member_qq == MEMBER_QQ
+    assert ban_calls == [(MEMBER_QQ, "command")]
 
 
 @pytest.mark.asyncio

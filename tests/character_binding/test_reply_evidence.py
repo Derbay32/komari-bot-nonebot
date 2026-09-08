@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
 import pytest
+from nonebot.adapters.onebot.v11 import Adapter as OneBotAdapter
+from nonebot.adapters.onebot.v11 import Bot as OneBotBot
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
@@ -101,6 +103,19 @@ class MessageFetcher:
         if message_id in self.fail_ids:
             raise RuntimeError("simulated get_msg failure")  # noqa: TRY003
         return self.payloads[message_id]
+
+
+class _OneBotListenerBot(OneBotBot):
+    """真实 OneBot 身份，网络调用仅记录并返回空载荷。"""
+
+    def __init__(self) -> None:
+        adapter = cast("OneBotAdapter", OneBotAdapter.__new__(OneBotAdapter))
+        super().__init__(adapter, "onebot-tsk273")
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def call_api(self, api: str, **data: object) -> Mapping[str, object]:
+        self.calls.append((api, data))
+        return {}
 
 
 class BlockingMessageFetcher(MessageFetcher):
@@ -1441,12 +1456,13 @@ async def test_admitted_event_reaches_explicitly_injected_collector_only(
                 clock=FrozenClock(BASE_TIME),
             )
 
-            async def _spy(event: object) -> None:
+            async def _spy(event: object, *, bot: object | None = None) -> None:
                 assert isinstance(event, GroupMessageEvent)
+                assert isinstance(bot, OneBotBot)
                 calls.append(event)
 
             monkeypatch.setattr(collector, "handle_event", _spy)
-            bot = ProbeBot()
+            bot = _OneBotListenerBot()
             with _runtime_collectors_context(reply_evidence, (collector,)):
                 admitted = _challenge_event(
                     message_id=62001,

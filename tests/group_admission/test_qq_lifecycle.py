@@ -32,15 +32,19 @@ from tests.character_binding.test_reply_evidence import (
     _original_event,
     _real_character_binding_package,
 )
+from tests.character_binding.test_reply_evidence import (
+    MEMBER_OPENID as ONEBOT_MEMBER_OPENID,
+)
+from tests.character_binding.test_reply_evidence import (
+    MEMBER_QQ as ONEBOT_MEMBER_QQ,
+)
 from tests.group_admission.entry_gate_support import (
-    ProbeBot,
     dispatch,
     event_gate_context,
 )
 from tests.group_admission.management_support import prepare_control_plane
 from tests.group_admission.qq_admission_support import (
     APP_ID,
-    MEMBER_QQ,
     SECOND_APP_ID,
     QQProbeBot,
     make_group_at,
@@ -168,7 +172,7 @@ async def test_real_listener_passes_received_onebot_to_each_collector(
                 calls.append((event, bot))
 
             monkeypatch.setattr(collector, "handle_event", spy)
-            onebot = ProbeBot(self_id="onebot-tsk274")
+            onebot = _OneBotFetchBot({})
             qq = QQProbeBot()
             admitted = _challenge_event(
                 message_id=274111,
@@ -265,7 +269,7 @@ async def test_real_listener_delivers_accepted_evidence_to_coordinator(
                 )
                 assert active is not None
                 assert active.group_id == _GROUP_ID
-                assert active.member_qq == MEMBER_QQ
+                assert active.member_qq == ONEBOT_MEMBER_QQ
                 assert onebot.calls == [("get_msg", {"message_id": original_id})]
                 assert qq.calls == []
             finally:
@@ -286,6 +290,7 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
     require_postgres()
     from nonebot import get_driver
 
+    from komari_bot.plugins import user_ban as user_ban_module
     from tests.character_binding.test_reply_evidence import (
         _real_character_binding_package,
     )
@@ -326,6 +331,30 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
         stored_policy(1, {"mode": "blacklist", "group_ids": []})
     )
     await prepare_control_plane(monkeypatch, storage)
+
+    superuser_calls: list[str] = []
+    ban_calls: list[tuple[str, str]] = []
+
+    def is_configured_superuser_id(user_id: str) -> bool:
+        superuser_calls.append(user_id)
+        return False
+
+    async def is_user_banned(user_id: str, scope: object) -> bool:
+        ban_calls.append((user_id, str(scope)))
+        return False
+
+    monkeypatch.setattr(
+        user_ban_module,
+        "is_configured_superuser_id",
+        is_configured_superuser_id,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        user_ban_module,
+        "is_user_banned",
+        is_user_banned,
+        raising=False,
+    )
 
     await _reset_shared_orm_engine()
     dispose_calls: list[AsyncEngine] = []
@@ -473,3 +502,6 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
         "official-qq-is-invalid",
     ):
         assert secret not in captured_logs
+    assert str(ONEBOT_MEMBER_QQ) in superuser_calls
+    assert (str(ONEBOT_MEMBER_QQ), "command") in ban_calls
+    assert all(user_id != ONEBOT_MEMBER_OPENID for user_id, _scope in ban_calls)

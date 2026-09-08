@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -37,12 +37,9 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.group_admission_acceptance
 
-_BASE_TIME = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
-
-
 class FrozenClock:
-    def __init__(self) -> None:
-        self.current = _BASE_TIME
+    def __init__(self, current: datetime | None = None) -> None:
+        self.current = current or datetime.now(UTC)
 
     def __call__(self) -> datetime:
         return self.current
@@ -65,6 +62,14 @@ async def _prepare_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     storage = AdmissionStorageFake(
         stored_policy(1, {"mode": "blacklist", "group_ids": []})
     )
+    await prepare_control_plane(monkeypatch, storage)
+
+
+async def _prepare_policy_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: dict[str, object],
+) -> None:
+    storage = AdmissionStorageFake(stored_policy(1, policy))
     await prepare_control_plane(monkeypatch, storage)
 
 
@@ -174,6 +179,113 @@ async def test_real_coordinator_claim_is_one_shot_and_generation_bound(
             fromlist=["get_runtime_collectors"],
         )
         assert reply_evidence.get_runtime_collectors() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidation", ["reset", "close"])
+async def test_inflight_old_generation_claim_cannot_survive_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+    invalidation: str,
+) -> None:
+    """close/reset during authority I/O must not mint an old-generation claim."""
+    await _prepare_runtime(monkeypatch)
+    resolver_started = asyncio.Event()
+    release_resolver = asyncio.Event()
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+        resolver_started.set()
+        await release_resolver.wait()
+
+    with _real_binding_package() as binding:
+        admission = require_qq_contract("QQInitialBindRequest")
+        clock = FrozenClock()
+        coordinator = _build_coordinator(
+            binding,
+            clock=clock,
+            resolve_group=resolve_group,
+        )
+        await coordinator.start()
+        task: asyncio.Task[Any] | None = None
+        result: Any = None
+        try:
+            task = asyncio.create_task(
+                coordinator.claim_initial_bind(_request(admission))
+            )
+            await asyncio.wait_for(resolver_started.wait(), timeout=1)
+            if invalidation == "reset":
+                coordinator.reset_generation()
+            else:
+                await coordinator.close()
+            release_resolver.set()
+            result = await asyncio.wait_for(task, timeout=1)
+        finally:
+            release_resolver.set()
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            if invalidation == "reset":
+                await coordinator.close()
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_mapped_admitted_group_can_claim_without_member_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mapped admitted group does not require a pre-existing member binding."""
+    await _prepare_runtime(monkeypatch)
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    with _real_binding_package() as binding:
+        admission = require_qq_contract("QQInitialBindRequest")
+        coordinator = _build_coordinator(
+            binding,
+            clock=FrozenClock(),
+            resolve_group=resolve_group,
+        )
+        await coordinator.start()
+        claim: Any = None
+        try:
+            claim = await coordinator.claim_initial_bind(_request(admission))
+        finally:
+            await coordinator.close()
+
+    assert claim is not None
+    assert claim.is_new is True
+
+
+@pytest.mark.asyncio
+async def test_mapped_restricted_group_cannot_claim_binding_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _prepare_policy_runtime(
+        monkeypatch,
+        {"mode": "blacklist", "group_ids": [GROUP_ID]},
+    )
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+        return GROUP_ID
+
+    with _real_binding_package() as binding:
+        admission = require_qq_contract("QQInitialBindRequest")
+        coordinator = _build_coordinator(
+            binding,
+            clock=FrozenClock(),
+            resolve_group=resolve_group,
+        )
+        await coordinator.start()
+        claim: Any = None
+        try:
+            claim = await coordinator.claim_initial_bind(_request(admission))
+        finally:
+            await coordinator.close()
+
+    assert claim is None
 
 
 @pytest.mark.asyncio
