@@ -499,9 +499,9 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
     """Crossed ``(group_id, group_openid)`` races fail closed atomically.
 
     X starts with ``(G1, O2)`` and is paused at its group INSERT.  S1 commits
-    ``(G1, O1)`` and S2 commits ``(G2, O2)`` while X is waiting.  The public
-    write must reject X after its conflict recheck rather than attaching X's
-    member to S2's canonical group.
+    ``(G1, O1)`` while X and S2 wait; releasing X lets its conflict recheck
+    fail, after which S2 commits ``(G2, O2)``.  The public write must reject
+    X rather than attaching its member to S2's canonical group.
     """
     del app
     require_postgres()
@@ -573,20 +573,23 @@ async def test_cross_group_mapping_race_never_attaches_member_to_wrong_group(
             )
 
         second_scope_task = asyncio.create_task(bind_second_scope())
-        await second_scope_started.wait()
+        await asyncio.wait_for(second_scope_started.wait(), timeout=10)
         await _wait_for_group_scope_blocked(
             app_id=app_id,
             group_openid=group_two_openid,
         )
 
-        await bind_member(
-            managers[1],
-            app_id=app_id,
-            group_id=group_one_id,
-            group_openid=group_one_openid,
-            member_qq=member_one_qq,
-            member_openid=f"{app_id}-member-one",
-            character_name="群一成员",
+        await asyncio.wait_for(
+            bind_member(
+                managers[1],
+                app_id=app_id,
+                group_id=group_one_id,
+                group_openid=group_one_openid,
+                member_qq=member_one_qq,
+                member_openid=f"{app_id}-member-one",
+                character_name="群一成员",
+            ),
+            timeout=10,
         )
 
         # The gate is transaction-scoped.  Rolling back this controller
