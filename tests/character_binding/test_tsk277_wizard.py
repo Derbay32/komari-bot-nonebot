@@ -22,6 +22,7 @@ from tests.character_binding.tsk277_support import (
     CONTINUE_BUTTON,
     EXPIRED,
     FILL_NAME_BUTTON,
+    GROUP_ID,
     GROUP_OPENID,
     LEGACY_CHOICE,
     MEMBER_OPENID,
@@ -197,6 +198,113 @@ async def test_mapped_unbound_member_requests_single_claim_then_not_ready() -> N
     assert view is not None
     assert view.session_code == SESSION
     assert view.expires_at == claim.expires_at
+
+
+async def test_unknown_group_pending_evidence_advances_on_next_bind_without_rebuild() -> None:
+    """AC4/AC3：未映射群 pending 会话在证据到达后由再次 /bind 推进，不重建不续期。"""
+    module = require_wizard_contract()
+    clock = FrozenClock()
+    claim = make_claim(clock=clock, session_code=SESSION, qq_message_id="qq-msg-50")
+    coordinator = FakeCoordinator(claim=claim)
+    wizard = _wizard(module, clock=clock, coordinator=coordinator)
+    challenge_token = make_token(
+        scope="binding_challenge",
+        claim=claim,
+        qq_message_id="qq-msg-50",
+    )
+
+    first = await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-50"),
+        challenge_token,
+    )
+    assert first is not None
+    assert first.body == CHALLENGE_BODY.format(session=SESSION)
+    pending = await wizard.get_session(_scope(module))
+    assert pending is not None
+    assert pending.step == "challenge_pending"
+    assert pending.expires_at == claim.expires_at
+
+    # 273/274 静默取证只更新协调器；wizard 不主动发送任何 QQ 消息。
+    verified = make_verified(
+        clock=clock,
+        session_code=SESSION,
+        qq_message_id="qq-msg-50",
+    )
+    coordinator.verified = verified
+    still_pending = await wizard.get_session(_scope(module))
+    assert still_pending is not None
+    assert still_pending.step == "challenge_pending"
+
+    clock.advance(timedelta(minutes=1))
+    binding_token = make_token(
+        scope="binding",
+        group_id=GROUP_ID,
+        member_qq=MEMBER_QQ,
+        verified_session=verified,
+        qq_message_id="qq-msg-51",
+    )
+    advanced = await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-51"),
+        binding_token,
+    )
+
+    assert advanced is not None
+    assert advanced.body == NAME_INPUT
+    view = await wizard.get_session(_scope(module))
+    assert view is not None
+    assert view.session_code == SESSION, "证据推进不得重建会话"
+    assert view.expires_at == claim.expires_at, "证据推进不得续期"
+    assert view.step == "name_input"
+    assert coordinator.claim_calls == []
+
+
+async def test_mapped_pending_evidence_advances_to_legacy_without_reclaim() -> None:
+    """AC4/AC7/AC9：已映射未绑定 pending 会话在证据到达后推进旧名选择，不重复取证。"""
+    module = require_wizard_contract()
+    clock = FrozenClock()
+    claim = make_claim(clock=clock, session_code=SESSION, qq_message_id="qq-msg-52")
+    coordinator = FakeCoordinator(claim=claim)
+    wizard = _wizard(module, clock=clock, coordinator=coordinator, legacy="小明")
+    business = make_token(
+        scope="business",
+        group_id=GROUP_ID,
+        member_qq=None,
+        qq_message_id="qq-msg-52",
+    )
+
+    first = await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-52"),
+        business,
+    )
+    assert first is not None
+    assert first.body == CHALLENGE_BODY.format(session=SESSION)
+    assert len(coordinator.claim_calls) == 1
+
+    verified = make_verified(
+        clock=clock,
+        session_code=SESSION,
+        qq_message_id="qq-msg-52",
+    )
+    coordinator.verified = verified
+    clock.advance(timedelta(minutes=1))
+    advanced = await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-53"),
+        make_token(
+            scope="business",
+            group_id=GROUP_ID,
+            member_qq=None,
+            qq_message_id="qq-msg-53",
+        ),
+    )
+
+    assert advanced is not None
+    assert advanced.body == LEGACY_CHOICE.format(name="小明")
+    view = await wizard.get_session(_scope(module))
+    assert view is not None
+    assert view.step == "legacy_choice"
+    assert view.session_code == SESSION
+    assert view.expires_at == claim.expires_at
+    assert len(coordinator.claim_calls) == 1, "证据推进不得重复初始取证"
 
 
 async def test_verified_identity_skips_challenge_and_shows_name_input() -> None:

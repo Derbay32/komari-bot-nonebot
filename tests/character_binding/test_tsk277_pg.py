@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -17,17 +18,23 @@ from sqlalchemy import text
 
 from komari_bot.db.group_transaction_locks import lock_group_scope
 from komari_bot.plugins.character_binding import BindingTransaction
+from komari_bot.plugins.character_binding.reply_evidence import ReplyEvidence
+from tests.character_binding.test_reply_evidence import (
+    _real_character_binding_package,
+)
 from tests.character_binding.tsk277_support import (
     BIND_SUCCESS,
     BINDING_CONFIRM,
     CANCELLED,
     EXISTING_BINDING,
+    EXPIRED,
     GROUP_CONFLICT,
     LEGACY_CHOICE,
     MEMBER_CONFLICT,
     NAME_DUPLICATE_ERROR,
     NAME_INPUT,
     NO_CHARACTER_NAME,
+    OFFICIAL_BOT_QQ,
     RENAME_BUTTON,
     RENAME_CONFIRM,
     RENAME_SUCCESS,
@@ -40,8 +47,17 @@ from tests.character_binding.tsk277_support import (
     make_event,
     make_token,
     make_verified,
+    markdown_content,
     require_wizard_contract,
 )
+from tests.group_admission.management_support import prepare_control_plane
+from tests.group_admission.qq_admission_support import (
+    QQProbeBot,
+    dispatch_qq,
+    event_gate_context,
+    make_group_at,
+)
+from tests.group_admission.runtime_support import AdmissionStorageFake, stored_policy
 from tests.komari_roulette.command_support import (
     PG_REQUIRED,
     backend_pid,
@@ -57,6 +73,13 @@ if TYPE_CHECKING:
     from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 
 pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
+
+REPLY_EVIDENCE_MODULE = "komari_bot.plugins.character_binding.reply_evidence"
+COORDINATOR_MODULE = "komari_bot.plugins.character_binding.qq_coordinator"
+
+
+async def _empty_fetcher(_message_id: int) -> dict[str, object]:
+    return {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1363,5 +1386,307 @@ async def test_commit_outcome_unknown_before_commit_leaves_no_record_and_repeat_
                 )
                 == "阿明"
             )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_commit_unknown_after_commit_never_overwrites_later_maintenance_rename(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：after-commit 不确定后另一合法维护流程改名，重复旧 confirm 绝不覆写。"""
+    module = require_wizard_contract()
+    current = scope("unknown-overwrite")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    failed = {"once": False}
+
+    async def commit_then_lose(inner: AsyncSession) -> None:
+        await inner.commit()
+        if not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("commit outcome unknown")  # noqa: TRY003
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=_hook_factory(factory, commit_then_lose),
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="ow-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="ow",
+            )
+            with pytest.raises(module.BindingCommitOutcomeUnknownError):
+                await wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="ow-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "阿明"
+
+            # 另一合法维护流程（共享 271 facade）把同一成员改名为“小暗”。
+            async with factory() as session:
+                await BindingTransaction(session).rename(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    character_name="小暗",
+                )
+                await session.commit()
+
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="ow-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+
+            assert repeat is not None
+            assert repeat.body == EXPIRED, "不确定提交后的旧 confirm 不得虚报成功"
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "小暗", "绝不覆写后续合法正式值"
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    fallback_nickname="FALLBACK",
+                )
+                != "阿明"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_commit_unknown_before_commit_never_overwrites_existing_new_formal_state(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：before-commit 不确定后已有新正式状态，重复旧 confirm 不得盲目覆盖。"""
+    module = require_wizard_contract()
+    current = scope("unknown-before-overwrite")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    failed = {"once": False}
+
+    async def lose_before_commit(inner: AsyncSession) -> None:
+        if not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("commit outcome unknown")  # noqa: TRY003
+        await inner.commit()
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=_hook_factory(factory, lose_before_commit),
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="bo-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="bo",
+            )
+            with pytest.raises(module.BindingCommitOutcomeUnknownError):
+                await wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="bo-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 0
+            )
+
+            # 另一合法维护流程为同一成员建立正式绑定“小暗”。
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                name="小暗",
+            )
+
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="bo-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+
+            assert repeat is not None
+            assert repeat.body == EXPIRED, "不确定提交后的旧 confirm 不得虚报成功"
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] == "小暗", "绝不盲目覆盖已有新正式状态"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 1
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+@pytest.mark.group_admission_acceptance
+async def test_real_handler_evidence_progression_and_success_send_survive_cancel(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC4/AC9/AC10：真实 binding token 链证据推进→成功发送不被 coordinator.cancel 破坏。"""
+    current = scope("chain")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int | None:
+        return None
+
+    async def never_banned(_member_qq: int, _scope: str) -> bool:
+        return False
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=never_banned,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    module.set_binding_wizard(wizard)
+                    try:
+                        bot = QQProbeBot(current.app_id)
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="chain-1",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 1
+                        challenge = markdown_content(bot.calls[0][1])
+                        assert challenge.startswith("正在确认你的本群身份。\n会话码：")
+                        session_code = challenge.split("会话码：", 1)[1].split("\n", 1)[0]
+
+                        evidence = ReplyEvidence(
+                            app_id=current.app_id,
+                            session_code=session_code,
+                            group_openid=current.group_openid,
+                            member_openid=current.member_openid,
+                            group_id=str(current.group_id),
+                            member_qq=str(current.member_qq),
+                            original_command="/bind",
+                            qq_message_id="chain-1",
+                            onebot_original_message_id=91001,
+                            challenge_message_id=91002,
+                            connection_generation=0,
+                        )
+                        token = await coordinator.accept_reply_evidence(evidence)
+                        assert token is not None
+                        assert token.scope == "binding"
+                        assert len(bot.calls) == 1, "证据到达不得自动追加 QQ 消息"
+
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="chain-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 2
+                        assert markdown_content(bot.calls[1][1]) == NAME_INPUT
+
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="chain-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 3
+                        assert markdown_content(bot.calls[2][1]) == BINDING_CONFIRM.format(
+                            name="阿明"
+                        )
+
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content=f"/bind confirm {session_code}",
+                                message_id="chain-4",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 4, (
+                            f"提交成功后成功文案必须实际发送: {bot.calls}"
+                        )
+                        assert markdown_content(bot.calls[3][1]) == BIND_SUCCESS.format(
+                            name="阿明"
+                        )
+                        assert (
+                            await _member_row(factory, current, current.member_openid)
+                        )["character_name"] == "阿明"
+                    finally:
+                        module.set_binding_wizard(None)
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
         finally:
             await _cleanup(engine, current)
