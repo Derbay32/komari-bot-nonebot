@@ -14,9 +14,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
+
+from komari_bot.db.group_transaction_locks import lock_group_scope
 
 from .domain import ChamberKind, GameState, GroupRef, ItemType, PlayerRef, PlayerSeat
 from .mapper import (
@@ -246,6 +248,22 @@ class PostgresRouletteStorage:
     async def project_terminal(self, projection: TerminalProjection) -> None:
         """Write an immutable result, update wins, and clear runtime state."""
 
+        await self._project_terminal_with_wins(projection)
+
+    async def project_terminal_with_wins(
+        self,
+        projection: TerminalProjection,
+    ) -> int | None:
+        """Project a terminal result and return the winner's new win count."""
+
+        return await self._project_terminal_with_wins(projection)
+
+    async def _project_terminal_with_wins(
+        self,
+        projection: TerminalProjection,
+    ) -> int | None:
+        """Write an immutable result, update wins, and clear runtime state."""
+
         await self._lock_scope(projection.group)
         existing_result = await self._load_result_row(projection.game_id)
         if existing_result is not None:
@@ -256,7 +274,7 @@ class PostgresRouletteStorage:
                 raise TerminalProjectionRejectedError(
                     "terminal projection group does not match immutable result"
                 )
-            return
+            return None
         if projection.lifecycle == "failed":
             if projection.reason != "aggregate_corrupt":
                 raise TerminalProjectionRejectedError(
@@ -271,7 +289,7 @@ class PostgresRouletteStorage:
                 raise TerminalProjectionRejectedError(
                     "failed projection has no current game"
                 )
-            return
+            return None
         root = await self._load_root(projection.game_id, for_update=True)
         if root is None or (root.app_id, root.group_openid) != (
             projection.group.app_id,
@@ -338,8 +356,9 @@ class PostgresRouletteStorage:
                 )
             )
         await self._flush()
+        winner_group_wins: int | None = None
         if winner is not None:
-            await self._increment_leaderboard(
+            winner_group_wins = await self._increment_leaderboard(
                 root.app_id,
                 root.group_openid,
                 winner,
@@ -368,6 +387,7 @@ class PostgresRouletteStorage:
             delete(RoulettePlayerRow).where(_P.c.game_id == projection.game_id)
         )
         await self._flush()
+        return winner_group_wins
 
     async def get_result(
         self,
@@ -677,7 +697,7 @@ class PostgresRouletteStorage:
         group_openid: str,
         winner: RoulettePlayerRow,
         ended_at: Any,
-    ) -> None:
+    ) -> int:
         statement = pg_insert(RouletteLeaderboardRow).values(
             app_id=app_id,
             group_openid=group_openid,
@@ -698,13 +718,27 @@ class PostgresRouletteStorage:
                 "last_won_at": ended_at,
             },
         )
-        await self._execute(statement)
+        result = await self._execute(statement.returning(_L.c.wins))
+        wins = result.scalar_one()
+        if isinstance(wins, bool) or not isinstance(wins, int):
+            raise AggregateCorruptError("leaderboard wins is invalid")
+        return wins
 
     async def _lock_scope(self, group: GroupRef) -> None:
-        await self._execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:scope_key, 0))"),
-            {"scope_key": f"komari-roulette:{group.app_id}:{group.group_openid}"},
-        )
+        try:
+            await lock_group_scope(
+                self._session,
+                app_id=group.app_id,
+                group_openid=group.group_openid,
+            )
+        except (
+            DBAPIError,
+            SQLAlchemyError,
+            ConnectionError,
+            OSError,
+            TimeoutError,
+        ) as exc:
+            raise StorageUnavailableError("roulette storage is unavailable") from exc
 
     async def _fail_corrupt_current_locked(
         self,

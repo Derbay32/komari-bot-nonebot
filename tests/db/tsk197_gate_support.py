@@ -52,7 +52,7 @@ SKIP_NO_POSTGRES = pytest.mark.skipif(
     reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试",
 )
 
-HEAD_REVISION = "0019"
+HEAD_REVISION = "0020"
 
 #: 0013 引入的三项回复 Agent 预算列（仅让这些列走数据库默认值）。
 AGENT_BUDGET_COLUMNS = (

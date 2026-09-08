@@ -4,6 +4,28 @@ The persistence imports register SQLModel metadata only; they do not open a
 connection or execute DDL.  Database/session ownership remains with callers.
 """
 
+from nonebot.plugin import require
+
+require("character_binding")
+
+from .command_service import (
+    CanonicalCommand,
+    CommandReceipt,
+    CommandRequest,
+    CommitOutcomeUnknownError,
+    ExpiryAdvance,
+    FulfillmentClaim,
+    FulfillmentConflictError,
+    FulfillmentState,
+    IdempotencyKeyConflictError,
+    Observation,
+    ReplyGameView,
+    ReplyPlayer,
+    ReplyProjection,
+    ReplyProjectionContext,
+    RouletteCommandService,
+    StateConflictError,
+)
 from .domain import (
     Action,
     ActionResult,
@@ -39,18 +61,34 @@ __all__ = [
     "Action",
     "ActionResult",
     "AggregateCorruptError",
+    "CanonicalCommand",
     "ChamberKind",
+    "CommandReceipt",
+    "CommandRequest",
+    "CommitOutcomeUnknownError",
     "EliminationRecord",
+    "ExpiryAdvance",
+    "FulfillmentClaim",
+    "FulfillmentConflictError",
+    "FulfillmentState",
     "GameSnapshot",
     "GameState",
     "GroupRef",
+    "IdempotencyKeyConflictError",
     "ItemType",
     "LeaderboardEntry",
+    "Observation",
     "PlayerRef",
     "PostgresRouletteStorage",
+    "ReplyGameView",
+    "ReplyPlayer",
+    "ReplyProjection",
+    "ReplyProjectionContext",
     "ResultPlayer",
     "RevisionConflictError",
+    "RouletteCommandService",
     "RouletteResult",
+    "StateConflictError",
     "StateTransition",
     "StorageUnavailableError",
     "TerminalProjection",

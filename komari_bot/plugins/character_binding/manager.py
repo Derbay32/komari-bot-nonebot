@@ -15,7 +15,7 @@ from typing import Any
 from nonebot import logger
 from sqlalchemy.exc import IntegrityError
 
-from .database import CharacterBindingDB, DatabaseBindingConflictError
+from .database import CharacterBindingDB, _open_session
 
 MAX_CHARACTER_NAME_LENGTH = 64
 _EMPTY_NAME_ERROR = "角色名不能为空"
@@ -47,6 +47,19 @@ class GroupBindingRecord:
     member_openid: str
     character_name: str | None
     character_name_key: str | None
+
+
+def _require_current_onebot_identity(
+    current: GroupBindingRecord | None,
+    cached: GroupBindingRecord,
+) -> GroupBindingRecord:
+    if (
+        current is None
+        or current.group_id != cached.group_id
+        or current.member_openid != cached.member_openid
+    ):
+        raise BindingPersistenceError("暂时无法确认本群身份")
+    return current
 
 
 def validate_character_name(character_name: str) -> str:
@@ -177,20 +190,29 @@ class CharacterBindingManager:
         """原子绑定群成员角色名；``bot_self_id`` 仅为审计兼容参数。"""
         del bot_self_id
         normalized_name = validate_character_name(character_name)
-        name_key = character_name_key(normalized_name)
         async with self._lock:
-            try:
-                await self._database.bind_group_member(
-                    app_id=str(app_id),
-                    group_id=str(group_id),
-                    group_openid=str(group_openid),
-                    member_qq=str(member_qq),
-                    member_openid=str(member_openid),
-                    character_name=normalized_name,
-                    character_name_key=name_key,
+            if not self._initialized:
+                raise BindingPersistenceError(  # noqa: TRY003
+                    "character_binding 数据库尚未初始化"
                 )
-            except DatabaseBindingConflictError as error:
-                raise BindingConflictError(str(error)) from error
+            from .transaction import BindingTransaction
+
+            session = _open_session()
+            try:
+                async with session.begin():
+                    transaction = BindingTransaction(session)
+                    await transaction.bind(
+                        app_id=str(app_id),
+                        group_id=str(group_id),
+                        group_openid=str(group_openid),
+                        member_qq=str(member_qq),
+                        member_openid=str(member_openid),
+                        character_name=normalized_name,
+                    )
+            except BindingConflictError:
+                raise
+            except BindingPersistenceError:
+                raise
             except IntegrityError as error:
                 raise BindingConflictError("群、成员或角色名已被其他绑定占用") from error
             except Exception as error:
@@ -199,6 +221,8 @@ class CharacterBindingManager:
                     type(error).__name__,
                 )
                 raise BindingPersistenceError("角色绑定保存失败") from error
+            finally:
+                await session.close()
 
             try:
                 await self._refresh_snapshot_locked()
@@ -210,11 +234,76 @@ class CharacterBindingManager:
                 raise BindingPersistenceError("角色绑定保存结果无法确认") from error
 
         logger.info(
-            "[CharacterBinding] 绑定群成员角色: app_id={} group_openid={} name_length={}",
-            app_id,
-            group_openid,
+            "[CharacterBinding] 绑定群成员角色: name_length={}",
             len(normalized_name),
         )
+
+    async def _mutate_onebot_cached_member(
+        self,
+        record: GroupBindingRecord,
+        *,
+        character_name: str | None,
+    ) -> bool:
+        """Revalidate a cached OneBot identity before a rename or clear."""
+
+        normalized_name = (
+            validate_character_name(character_name)
+            if character_name is not None
+            else None
+        )
+        async with self._lock:
+            if not self._initialized:
+                raise BindingPersistenceError(  # noqa: TRY003
+                    "character_binding 数据库尚未初始化"
+                )
+            from .transaction import BindingTransaction
+
+            session = _open_session()
+            try:
+                async with session.begin():
+                    transaction = BindingTransaction(session)
+                    current = await transaction.resolve_member_by_qq(
+                        app_id=record.app_id,
+                        group_openid=record.group_openid,
+                        member_qq=record.member_qq,
+                    )
+                    current = _require_current_onebot_identity(current, record)
+                    if normalized_name is None:
+                        changed = await transaction.clear(
+                            app_id=current.app_id,
+                            group_openid=current.group_openid,
+                            member_openid=current.member_openid,
+                        )
+                    else:
+                        await transaction.rename(
+                            app_id=current.app_id,
+                            group_openid=current.group_openid,
+                            member_openid=current.member_openid,
+                            character_name=normalized_name,
+                        )
+                        changed = True
+            except (BindingConflictError, BindingPersistenceError):
+                raise
+            except Exception as error:
+                logger.error(
+                    "[CharacterBinding] OneBot 群成员角色写入失败: error_type={}",
+                    type(error).__name__,
+                )
+                raise BindingPersistenceError("角色绑定保存失败") from error
+            finally:
+                await session.close()
+
+            if not changed:
+                return False
+            try:
+                await self._refresh_snapshot_locked()
+            except Exception as error:
+                logger.error(
+                    "[CharacterBinding] 群成员角色提交后刷新快照失败: error_type={}",
+                    type(error).__name__,
+                )
+                raise BindingPersistenceError("角色绑定保存结果无法确认") from error
+            return True
 
     async def clear_character_name(
         self,
@@ -225,18 +314,29 @@ class CharacterBindingManager:
     ) -> bool:
         """只清除当前群角色名，保留已验证的身份关系。"""
         async with self._lock:
-            try:
-                cleared = await self._database.clear_character_name(
-                    app_id=str(app_id),
-                    group_openid=str(group_openid),
-                    member_openid=str(member_openid),
+            if not self._initialized:
+                raise BindingPersistenceError(  # noqa: TRY003
+                    "character_binding 数据库尚未初始化"
                 )
+            from .transaction import BindingTransaction
+
+            session = _open_session()
+            try:
+                async with session.begin():
+                    transaction = BindingTransaction(session)
+                    cleared = await transaction.clear(
+                        app_id=str(app_id),
+                        group_openid=str(group_openid),
+                        member_openid=str(member_openid),
+                    )
             except Exception as error:
                 logger.error(
                     "[CharacterBinding] 清除群成员角色失败: error_type={}",
                     type(error).__name__,
                 )
                 raise BindingPersistenceError("角色绑定保存失败") from error
+            finally:
+                await session.close()
             if not cleared:
                 return False
             try:
@@ -339,22 +439,17 @@ class CharacterBindingManager:
     ) -> None:
         """通过已验证 OneBot 桥接设置当前群角色名。"""
         record = self._resolve_onebot_member(group_id=group_id, user_id=user_id)
-        await self.bind_group_member(
-            app_id=record.app_id,
-            group_id=record.group_id,
-            group_openid=record.group_openid,
-            member_qq=record.member_qq,
-            member_openid=record.member_openid,
+        await self._mutate_onebot_cached_member(
+            record,
             character_name=character_name,
         )
 
     async def clear_group_character_name(self, group_id: str, user_id: str) -> bool:
         """通过已验证 OneBot 桥接清除当前群角色名。"""
         record = self._resolve_onebot_member(group_id=group_id, user_id=user_id)
-        return await self.clear_character_name(
-            app_id=record.app_id,
-            group_openid=record.group_openid,
-            member_openid=record.member_openid,
+        return await self._mutate_onebot_cached_member(
+            record,
+            character_name=None,
         )
 
     async def get_legacy_character_name(self, user_id: str) -> str | None:
