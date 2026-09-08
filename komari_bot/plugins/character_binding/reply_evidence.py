@@ -17,7 +17,17 @@ from datetime import datetime, timedelta
 from typing import Any, Final
 
 from nonebot import on_message
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
+
+# NoneBot reflects these annotations at runtime to inject matcher dependencies.
+from nonebot.adapters import Bot, Event  # noqa: TC002
+from nonebot.adapters.onebot.v11 import (
+    Bot as OneBotBot,
+)
+from nonebot.adapters.onebot.v11 import (
+    GroupMessageEvent,
+    Message,
+    MessageSegment,
+)
 from nonebot.adapters.onebot.v11.event import Reply
 
 SESSION_TTL: Final[timedelta] = timedelta(seconds=600)
@@ -30,6 +40,7 @@ _MAX_PENDING_CHALLENGES: Final[int] = 1024
 
 MessageFetcher = Callable[[int], Awaitable[Mapping[str, object]]]
 Clock = Callable[[], datetime]
+EvidenceReceiver = Callable[["ReplyEvidence"], Awaitable[object | None]]
 
 
 class SessionCodeCollisionError(ValueError):
@@ -359,7 +370,12 @@ class ReplyEvidenceCollector:
                 if session is None:
                     return
 
-    async def handle_event(self, event: object) -> ReplyEvidence | None:  # noqa: PLR0911
+    async def handle_event(
+        self,
+        event: object,
+        *,
+        bot: OneBotBot | None = None,
+    ) -> ReplyEvidence | None:
         """Consume one admitted OneBot group event without sending anything."""
         if not isinstance(event, GroupMessageEvent):
             return None
@@ -370,7 +386,7 @@ class ReplyEvidenceCollector:
         except (AttributeError, TypeError, ValueError):
             return None
         if original is not None:
-            return await self._resolve_pending(original)
+            return await self._resolve_pending(original, bot=bot)
 
         try:
             challenge = self._build_challenge(event, now)
@@ -378,6 +394,14 @@ class ReplyEvidenceCollector:
             return None
         if challenge is None:
             return None
+        return await self._handle_challenge(challenge, bot=bot)
+
+    async def _handle_challenge(
+        self,
+        challenge: _Challenge,
+        *,
+        bot: OneBotBot | None,
+    ) -> ReplyEvidence | None:
         session = self._sessions.get(challenge.session_code)
         if session is None:
             self._remember_challenge(challenge)
@@ -393,15 +417,26 @@ class ReplyEvidenceCollector:
                 self._sessions.pop(challenge.session_code, None)
                 return None
             if session.evidence is not None:
-                cached = self._original_messages.get(challenge.target_message_id)
-                if self._matches_existing_evidence(session.evidence, challenge, cached):
-                    return session.evidence
-                return None
+                return self._existing_challenge_evidence(session, challenge)
             cached = self._original_messages.get(challenge.target_message_id)
             if cached is None:
                 self._remember_challenge(challenge)
                 return None
-            return await self._resolve(session, challenge, cached)
+            return await self._resolve(session, challenge, cached, bot=bot)
+
+    def _existing_challenge_evidence(
+        self,
+        session: ReplyEvidenceSession,
+        challenge: _Challenge,
+    ) -> ReplyEvidence | None:
+        cached = self._original_messages.get(challenge.target_message_id)
+        if session.evidence is not None and self._matches_existing_evidence(
+            session.evidence,
+            challenge,
+            cached,
+        ):
+            return session.evidence
+        return None
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -559,7 +594,12 @@ class ReplyEvidenceCollector:
         self._pending_challenges[key] = challenge
         self._trim(self._pending_challenges, _MAX_PENDING_CHALLENGES)
 
-    async def _resolve_pending(self, original: _OriginalMessage) -> ReplyEvidence | None:
+    async def _resolve_pending(
+        self,
+        original: _OriginalMessage,
+        *,
+        bot: OneBotBot | None = None,
+    ) -> ReplyEvidence | None:
         result: ReplyEvidence | None = None
         for key, challenge in tuple(self._pending_challenges.items()):
             if challenge.target_message_id != original.message_id:
@@ -576,7 +616,12 @@ class ReplyEvidenceCollector:
                     if result is None:
                         result = session.evidence
                     continue
-                resolved = await self._resolve(session, challenge, original)
+                resolved = await self._resolve(
+                    session,
+                    challenge,
+                    original,
+                    bot=bot,
+                )
                 self._pending_challenges.pop(key, None)
                 if resolved is not None and result is None:
                     result = resolved
@@ -587,6 +632,8 @@ class ReplyEvidenceCollector:
         session: ReplyEvidenceSession,
         challenge: _Challenge,
         cached: _OriginalMessage,
+        *,
+        bot: OneBotBot | None = None,
     ) -> ReplyEvidence | None:
         now = self._now()
         if (
@@ -598,7 +645,7 @@ class ReplyEvidenceCollector:
         if cached.group_id != challenge.group_id:
             return None
         try:
-            payload = await self._message_fetcher(challenge.target_message_id)
+            payload = await self._fetch_message(challenge.target_message_id, bot=bot)
         except Exception:
             return None
         now = self._now()
@@ -695,10 +742,27 @@ class ReplyEvidenceCollector:
             return False
         return challenge.reply_signature == _message_signature(payload_message)
 
+    async def _fetch_message(
+        self,
+        message_id: int,
+        *,
+        bot: OneBotBot | None,
+    ) -> Mapping[str, object]:
+        """Fetch through the receiving OneBot bot when one is available."""
+        if bot is not None:
+            if not isinstance(bot, OneBotBot):
+                raise RuntimeError("receiving OneBot bot is required")  # noqa: TRY003
+            payload = await bot.call_api("get_msg", message_id=message_id)
+            if not isinstance(payload, Mapping):
+                raise TypeError("message payload is not a mapping")  # noqa: TRY003
+            return payload
+        return await self._message_fetcher(message_id)
+
 
 class _RuntimeCollectors:
     def __init__(self) -> None:
         self.values: tuple[ReplyEvidenceCollector, ...] = ()
+        self.receiver: EvidenceReceiver | None = None
 
 
 _runtime_collectors = _RuntimeCollectors()
@@ -716,14 +780,27 @@ def set_runtime_collectors(
     _runtime_collectors.values = tuple(collectors)
 
 
+def register_evidence_receiver(receiver: EvidenceReceiver | None) -> None:
+    """Install the one current evidence receiver for runtime assembly."""
+    _runtime_collectors.receiver = receiver
+
+
 reply_evidence_matcher = on_message(priority=1, block=False)
 
 
 @reply_evidence_matcher.handle()
-async def _consume_reply_evidence(event: GroupMessageEvent) -> None:
+async def _consume_reply_evidence(
+    bot: Bot,
+    event: Event,
+) -> None:
     """Consume evidence only after the global group admission gate."""
+    if not isinstance(bot, OneBotBot) or not isinstance(event, GroupMessageEvent):
+        return
+    receiver = _runtime_collectors.receiver
     for collector in get_runtime_collectors():
-        await collector.handle_event(event)
+        evidence = await collector.handle_event(event, bot=bot)
+        if evidence is not None and receiver is not None:
+            await receiver(evidence)
 
 
 __all__ = [
@@ -732,6 +809,7 @@ __all__ = [
     "ReplyEvidenceSession",
     "SessionCodeCollisionError",
     "get_runtime_collectors",
+    "register_evidence_receiver",
     "reply_evidence_matcher",
     "set_runtime_collectors",
 ]

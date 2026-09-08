@@ -20,6 +20,7 @@ import pytest
 from tests.group_admission.entry_gate_census import (
     MATCHER_ENTRY_CENSUS,
     ONEBOT_EVENT_CENSUS,
+    QQ_EVENT_CENSUS,
 )
 
 pytestmark = pytest.mark.group_admission_acceptance
@@ -164,6 +165,39 @@ def test_event_census_unique_rows() -> None:
 
 def test_event_census_exact_count() -> None:
     assert len(ONEBOT_EVENT_CENSUS) == 22
+
+
+def test_qq_event_census_has_one_exact_allowed_event() -> None:
+    """QQ gate has one native @ entry; callback and other protocols stay closed."""
+    from nonebot.adapters.qq import event as qq_event
+
+    actual_names = {
+        row.event_class
+        for row in QQ_EVENT_CENSUS
+        if row.event_class != "ForgedGroupAtMessageCreateEvent"
+    }
+    adapter_names = {
+        "GroupAtMessageCreateEvent",
+        "GroupMessageCreateEvent",
+        "C2CMessageCreateEvent",
+        "MessageCreateEvent",
+        "DirectMessageCreateEvent",
+        "InteractionCreateEvent",
+    }
+    assert actual_names == adapter_names
+
+    allowed = {
+        row.event_class for row in QQ_EVENT_CENSUS if row.qualification == "allowed"
+    }
+    assert allowed == {"GroupAtMessageCreateEvent"}
+    assert isinstance(qq_event.GroupAtMessageCreateEvent, type)
+
+    rejected = {
+        row.event_class
+        for row in QQ_EVENT_CENSUS
+        if row.qualification == "rejected"
+    }
+    assert rejected == adapter_names - allowed | {"ForgedGroupAtMessageCreateEvent"}
 
 
 def test_event_census_category_counts() -> None:

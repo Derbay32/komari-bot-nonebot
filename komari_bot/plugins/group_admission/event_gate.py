@@ -20,8 +20,9 @@
 
 from __future__ import annotations
 
+# NoneBot reflects these annotations at runtime to inject matcher dependencies.
+from nonebot.adapters import Bot, Event  # noqa: TC002
 from nonebot.adapters.onebot.v11.event import (
-    Event,
     GroupAdminNoticeEvent,
     GroupBanNoticeEvent,
     GroupDecreaseNoticeEvent,
@@ -44,9 +45,11 @@ from nonebot.adapters.onebot.v11.event import (
 )
 from nonebot.exception import IgnoredException
 from nonebot.message import event_preprocessor
+from nonebot.typing import T_State  # noqa: TC002
 
 from . import runtime as _runtime_module
 from .contracts import AdmissionIntent, AdmissionQualification
+from .qq import QQ_ADMISSION_STATE_KEY, qualify_qq_event
 
 # 3 类系统元事件闭集：精确运行时类身份（不接纳子类）。
 _SYSTEM_META_CLASSES: frozenset[type[Event]] = frozenset({
@@ -89,7 +92,11 @@ def _event_family(event: Event) -> str:
 
 
 @event_preprocessor
-async def _admission_event_gate(event: Event) -> None:
+async def _admission_event_gate(
+    bot: Bot,
+    event: Event,
+    state: T_State,
+) -> None:
     """全局事件前置处理器：按群聊准入策略进行粗门禁裁决。
 
     1. system_meta → 直接放行；
@@ -99,6 +106,17 @@ async def _admission_event_gate(event: Event) -> None:
     """
     # 运行时精确类身份：一次捕获，用于所有闭集检查（禁止 isinstance 泛化吸纳新子类）
     event_class = type(event)
+
+    # QQ 只接受原生精确 GroupAtMessageCreateEvent；成功资格写入共享 state，
+    # 后续 matcher 只读取该 token，不会再次消费一次性 binding claim。
+    from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
+
+    if event_class is GroupAtMessageCreateEvent:
+        token = await qualify_qq_event(bot, event)
+        if token is None:
+            raise IgnoredException("group_admission_rejected") from None
+        state[QQ_ADMISSION_STATE_KEY] = token
+        return
 
     # 1. system_meta：精确运行时类身份匹配三种 MetaEvent，直接放行
     if event_class in _SYSTEM_META_CLASSES:

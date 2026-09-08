@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from nonebot import get_driver
+from nonebot.adapters.qq.event import QQMessageEvent
 
 from .models import BanScope, normalize_qq_user_id
 from .service import get_service
@@ -15,6 +16,11 @@ if TYPE_CHECKING:
 
 def get_event_user_id(event: Event) -> str | None:
     """尽力从消息或通知事件中提取可靠 QQ 号。"""
+    # QQ OpenID occupies the same adapter event surface as a user id but is not
+    # a numeric OneBot QQ identity.  Keep it out of the generic ban lookup even
+    # when an OpenID happens to contain only digits.
+    if isinstance(event, QQMessageEvent):
+        return None
     try:
         user_id = normalize_qq_user_id(event.get_user_id())
     except (AttributeError, NotImplementedError, TypeError, ValueError):

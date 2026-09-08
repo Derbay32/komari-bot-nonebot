@@ -2,8 +2,8 @@
 
 验收目标：
 
-- 顶层 ``__all__`` 精确等于 8 个冻结符号（TSK-223 新增且仅新增装配入口
-  ``register_group_admission_api``），不暴露名单、快照、Service、bool
+- 顶层 ``__all__`` 精确等于既有准入符号与 TSK-274 QQ 合同符号，不暴露名单、
+  快照、Service、bool
   helper、``create_router``、``force_reload``、effect wrapper、
   Fake/Protocol 或测试 hook；
 - 三个枚举的 wire values 与成员集合冻结；
@@ -50,6 +50,19 @@ EXPECTED_TOP_LEVEL_SYMBOLS = {
     "AdmissionResult",
     "AdmissionRuntimeState",
     "AdmissionRuntimeStatus",
+    "QQ_ADMISSION_STATE_KEY",
+    "QQAdmissionToken",
+    "QQBindClaim",
+    "QQInitialBindRequest",
+    "QQVerifiedBindingSession",
+    "QQEffectDecision",
+    "qualify_qq_event",
+    "get_qq_admission_token",
+    "register_qq_group_resolver",
+    "register_qq_initial_bind_claimer",
+    "register_qq_binding_session_resolver",
+    "register_qq_ban_checker",
+    "recheck_qq_effect",
 }
 
 FROZEN_REASON_CODES = {
@@ -116,7 +129,7 @@ def _assert_frozen_slots_dataclass(cls: object, expected_fields: list[str]) -> N
     assert names == expected_fields, f"契约字段不精确: {names}"
 
 
-def test_top_level_all_is_exactly_the_eight_frozen_symbols() -> None:
+def test_top_level_all_is_exactly_the_group_and_qq_contract() -> None:
     admission = _import_package()
     assert set(admission.__all__) == EXPECTED_TOP_LEVEL_SYMBOLS
     assert sorted(admission.__all__) == sorted(EXPECTED_TOP_LEVEL_SYMBOLS)

@@ -50,6 +50,21 @@ from .contracts import (
     AdmissionRuntimeStatus,
 )
 from .management_api import register_group_admission_api
+from .qq import (
+    QQ_ADMISSION_STATE_KEY,
+    QQAdmissionToken,
+    QQBindClaim,
+    QQEffectDecision,
+    QQInitialBindRequest,
+    QQVerifiedBindingSession,
+    get_qq_admission_token,
+    qualify_qq_event,
+    recheck_qq_effect,
+    register_qq_ban_checker,
+    register_qq_binding_session_resolver,
+    register_qq_group_resolver,
+    register_qq_initial_bind_claimer,
+)
 
 __plugin_meta__ = PluginMetadata(
     name="group_admission",
@@ -58,14 +73,27 @@ __plugin_meta__ = PluginMetadata(
 )
 
 __all__ = [
+    "QQ_ADMISSION_STATE_KEY",
     "AdmissionIntent",
     "AdmissionQualification",
     "AdmissionResult",
     "AdmissionRuntimeState",
     "AdmissionRuntimeStatus",
+    "QQAdmissionToken",
+    "QQBindClaim",
+    "QQEffectDecision",
+    "QQInitialBindRequest",
+    "QQVerifiedBindingSession",
     "adjudicate",
+    "get_qq_admission_token",
     "get_runtime_state",
+    "qualify_qq_event",
+    "recheck_qq_effect",
     "register_group_admission_api",
+    "register_qq_ban_checker",
+    "register_qq_binding_session_resolver",
+    "register_qq_group_resolver",
+    "register_qq_initial_bind_claimer",
 ]
 
 
