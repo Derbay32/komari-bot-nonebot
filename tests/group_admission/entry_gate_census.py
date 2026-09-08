@@ -7,7 +7,7 @@ MatcherEntryRow: entry_id, source_path, source_symbol, factory, event_family, ef
 新增 V11 事件子类或 matcher 注册行必须一并更新本 census，否则对应测试失败。
 
 ``ONEBOT_EVENT_CENSUS``: 22 个 OneBot V11 事件子类。
-``MATCHER_ENTRY_CENSUS``: 26 个 matcher 注册项。
+``MATCHER_ENTRY_CENSUS``: 27 个 matcher 注册项。
 """
 
 from __future__ import annotations
@@ -72,8 +72,9 @@ ONEBOT_EVENT_CENSUS: tuple[EventCensusRow, ...] = (
 )
 
 MATCHER_ENTRY_CENSUS: tuple[MatcherEntryRow, ...] = (
-    # on_message (1)
+    # on_message (2)
     _M("matcher.komari_chat.__init__.matcher", "komari_bot/plugins/komari_chat/__init__.py", "matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.character_binding.reply_evidence.reply_evidence_matcher", "komari_bot/plugins/character_binding/reply_evidence.py", "reply_evidence_matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     # on_regex (1)
     _M("matcher.group_history_summary.__init__.summary_matcher", "komari_bot/plugins/group_history_summary/__init__.py", "summary_matcher", "on_regex", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     # on_notice (1)
