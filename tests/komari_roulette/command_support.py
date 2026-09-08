@@ -40,6 +40,22 @@ PG_REQUIRED = pytest.mark.skipif(
 )
 
 
+async def reset_shared_orm_engine() -> None:
+    """Dispose nonebot-plugin-orm engines before crossing pytest event loops."""
+
+    from nonebot import require
+
+    require("nonebot_plugin_orm")
+    import nonebot_plugin_orm as orm_module
+
+    engines = getattr(orm_module, "_engines", None)
+    if not engines:
+        return
+    for engine in list(engines.values()):
+        with suppress(Exception):
+            await engine.dispose()
+
+
 @dataclass(frozen=True, slots=True)
 class Scope:
     """A unique app/group/member scope for one test."""

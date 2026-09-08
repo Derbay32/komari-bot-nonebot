@@ -29,6 +29,7 @@ from .command_support import (
     backend_pid,
     create_engine_and_factory,
     delete_scope,
+    reset_shared_orm_engine,
     scope,
     seed_binding,
     wait_for_blocked,
@@ -48,6 +49,7 @@ class Harness:
 @pytest.fixture
 async def harness() -> AsyncIterator[Harness]:
     async for engine, session_factory in create_engine_and_factory():
+        await reset_shared_orm_engine()
         manager = CharacterBindingManager()
         await manager.initialize()
         current = scope("fulfillment-fixture")
@@ -56,6 +58,7 @@ async def harness() -> AsyncIterator[Harness]:
         finally:
             with suppress(Exception):
                 await manager.close()
+            await reset_shared_orm_engine()
             await delete_scope(engine, current)
 
 

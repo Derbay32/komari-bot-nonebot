@@ -328,6 +328,104 @@ async def test_manager_cache_cannot_authorize_a_cleared_member(
     )
 
 
+@pytest.mark.parametrize("operation", ["clear", "set"])
+async def test_onebot_bridge_rechecks_cached_member_identity_under_lock(
+    database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    binding_manager: CharacterBindingManager,
+    operation: str,
+) -> None:
+    engine, factory = database
+    current = scope("binding-clear-identity")
+    group_id = f"qq-group-{current.group_openid}"
+    old_member_qq = f"qq-{current.member_openid}"
+    await binding_manager.bind_group_member(
+        app_id=current.app_id,
+        group_id=group_id,
+        group_openid=current.group_openid,
+        member_qq=old_member_qq,
+        member_openid=current.member_openid,
+        character_name="身份复核名",
+    )
+    assert (
+        binding_manager.get_character_name(
+            group_id=group_id,
+            user_id=old_member_qq,
+        )
+        == "身份复核名"
+    )
+
+    # Keep the manager's old OneBot snapshot while another committed transaction
+    # changes the canonical identity underneath it.
+    async with factory() as session:
+        if operation == "clear":
+            await session.execute(
+                text(
+                    "UPDATE komari_character_binding_members "
+                    "SET member_qq = :new_member_qq "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid "
+                    "AND member_openid = :member_openid"
+                ),
+                {
+                    "new_member_qq": f"{old_member_qq}-changed",
+                    "app_id": current.app_id,
+                    "group_openid": current.group_openid,
+                    "member_openid": current.member_openid,
+                },
+            )
+        else:
+            await session.execute(
+                text(
+                    "DELETE FROM komari_character_binding_members "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid "
+                    "AND member_openid = :member_openid"
+                ),
+                {
+                    "app_id": current.app_id,
+                    "group_openid": current.group_openid,
+                    "member_openid": current.member_openid,
+                },
+            )
+        await session.commit()
+
+    with pytest.raises(BindingPersistenceError):
+        if operation == "clear":
+            await binding_manager.clear_group_character_name(group_id, old_member_qq)
+        else:
+            await binding_manager.set_group_character_name(
+                group_id,
+                old_member_qq,
+                "缓存不应重建",
+            )
+
+    async with factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT member_qq, character_name "
+                    "FROM komari_character_binding_members "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid "
+                    "AND member_openid = :member_openid"
+                ),
+                {
+                    "app_id": current.app_id,
+                    "group_openid": current.group_openid,
+                    "member_openid": current.member_openid,
+                },
+            )
+        ).mappings().one_or_none()
+    if operation == "clear":
+        assert row is not None
+        assert row["member_qq"] == f"{old_member_qq}-changed"
+        assert row["character_name"] == "身份复核名"
+    else:
+        assert row is None
+    await clear_binding_scope(
+        engine,
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+    )
+
+
 @pytest.mark.parametrize("operation", ["clear", "rename"])
 @pytest.mark.parametrize("operation_first", [True, False])
 async def test_binding_write_and_join_share_scope_lock_for_both_commit_orders(

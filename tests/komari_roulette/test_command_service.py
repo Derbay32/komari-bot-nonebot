@@ -37,6 +37,7 @@ from .command_support import (
     hold_group_lock,
     observation,
     request,
+    reset_shared_orm_engine,
     scope,
     seed_binding,
     wait_for_blocked,
@@ -63,6 +64,7 @@ class Harness:
 @pytest.fixture
 async def harness() -> AsyncIterator[Harness]:
     async for engine, session_factory in create_engine_and_factory():
+        await reset_shared_orm_engine()
         manager = CharacterBindingManager()
         await manager.initialize()
         current = scope("fixture")
@@ -71,6 +73,7 @@ async def harness() -> AsyncIterator[Harness]:
         finally:
             with suppress(Exception):
                 await manager.close()
+            await reset_shared_orm_engine()
             await delete_scope(engine, current)
 
 
@@ -1099,7 +1102,8 @@ async def test_commit_failure_rolls_back_terminal_result_wins_and_receipt(
 ) -> None:
     current = scope("rollback")
     members = await seed_players(harness.binding_manager, current, 2)
-    service = service_for(harness)
+    projector = CountingProjector()
+    service = service_for(harness, projector=projector)
     await create_waiting(service, current)
     await join_player(service, current, members[1], "join-2")
     await start_game(service, current, members[0])
@@ -1138,6 +1142,7 @@ async def test_commit_failure_rolls_back_terminal_result_wins_and_receipt(
         observation=action_observation,
     )
     assert retried.result_code in {"forfeited", "completed"}
+    assert getattr(projector.context_objects[-1], "winner_group_wins", None) == 1
     row = await current_game_row(harness.session_factory, current)
     assert row is not None
     assert row["lifecycle"] == "completed"
