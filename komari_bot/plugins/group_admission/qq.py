@@ -477,6 +477,14 @@ async def _recheck_authorized_effect(
     ban_error = "ban_unavailable" if banned is None else "user_banned" if banned else None
     if ban_error is not None:
         return reject(ban_error)
+    if effect == "binding":
+        binding_error = await _recheck_binding_authority(
+            token,
+            group_id,
+            member_qq,
+        )
+        if binding_error is not None:
+            return reject(binding_error)
     admitted, revision = _policy_result(group_id)
     if not admitted:
         return QQEffectDecision(
@@ -578,11 +586,47 @@ async def _resolve_binding_identity(
         member_openid=token.member_openid,
     ):
         return None, None, "binding_expired"
-    if token.verified_session is not session:
-        return None, None, "scope_mismatch"
-    if token.group_id != session.group_id or token.member_qq != session.member_qq:
+    if (
+        token.verified_session is not session
+        or session.connection_generation != token.connection_generation
+        or token.group_id != session.group_id
+        or token.member_qq != session.member_qq
+    ):
         return None, None, "scope_mismatch"
     return session.group_id, session.member_qq, None
+
+
+async def _recheck_binding_authority(
+    token: QQAdmissionToken,
+    group_id: int,
+    member_qq: int | None,
+) -> str | None:
+    formal_error = await _check_binding_formal_group(token, group_id)
+    if formal_error is not None:
+        return formal_error
+    latest_group_id, latest_member_qq, latest_error = (
+        await _resolve_binding_identity(token)
+    )
+    if latest_error is not None:
+        return latest_error
+    if latest_group_id != group_id or latest_member_qq != member_qq:
+        return "scope_mismatch"
+    return None
+
+
+async def _check_binding_formal_group(
+    token: QQAdmissionToken,
+    group_id: int,
+) -> str | None:
+    formal_group_id, resolver_ok = await _current_group(
+        token.app_id,
+        token.group_openid,
+    )
+    if not resolver_ok:
+        return "group_unavailable"
+    if formal_group_id is not None and formal_group_id != group_id:
+        return "scope_mismatch"
+    return None
 
 
 __all__ = [
