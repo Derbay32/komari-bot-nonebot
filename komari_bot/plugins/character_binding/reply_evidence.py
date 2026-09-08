@@ -14,9 +14,12 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 from nonebot import on_message
+
+# NoneBot reflects these annotations at runtime to inject matcher dependencies.
+from nonebot.adapters import Bot, Event  # noqa: TC002
 from nonebot.adapters.onebot.v11 import (
     Bot as OneBotBot,
 )
@@ -26,9 +29,6 @@ from nonebot.adapters.onebot.v11 import (
     MessageSegment,
 )
 from nonebot.adapters.onebot.v11.event import Reply
-
-if TYPE_CHECKING:
-    from nonebot.adapters import Bot, Event
 
 SESSION_TTL: Final[timedelta] = timedelta(seconds=600)
 """Absolute lifetime of a pending bridge session and its evidence."""

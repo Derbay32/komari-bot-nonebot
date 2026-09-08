@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+# NoneBot reflects these annotations at runtime to inject matcher dependencies.
+from nonebot.adapters import Bot, Event  # noqa: TC002
 from nonebot.adapters.onebot.v11.event import (
     GroupAdminNoticeEvent,
     GroupBanNoticeEvent,
@@ -45,10 +45,7 @@ from nonebot.adapters.onebot.v11.event import (
 )
 from nonebot.exception import IgnoredException
 from nonebot.message import event_preprocessor
-
-if TYPE_CHECKING:
-    from nonebot.adapters import Bot, Event
-    from nonebot.typing import T_State
+from nonebot.typing import T_State  # noqa: TC002
 
 from . import runtime as _runtime_module
 from .contracts import AdmissionIntent, AdmissionQualification
