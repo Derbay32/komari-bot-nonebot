@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import nonebot
+import nonebot.plugin as nonebot_plugin
 import pytest
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 from nonebot.adapters.qq import Bot as QQBot
@@ -185,7 +186,7 @@ def _run_entrypoint(
     driver: _StartupDriver,
     qq_config: QQConfig,
     *,
-    observed_configs: list[object] | None = None,
+    observed_reads: list[tuple[type[BaseModel], BaseModel]] | None = None,
     official_map: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Run only startup registration with NoneBot lifecycle/network replaced."""
@@ -204,19 +205,25 @@ def _run_entrypoint(
     )
     monkeypatch.setattr(nonebot, "init", lambda: None)
     monkeypatch.setattr(nonebot, "get_driver", lambda: driver)
+    # ``nonebot.plugin`` captured its own ``get_driver`` import at module load
+    # time.  Patching only ``nonebot.get_driver`` therefore leaves the real
+    # get_plugin_config() reading the process-global driver instead of this
+    # test driver.
+    monkeypatch.setattr(nonebot_plugin, "get_driver", lambda: driver)
     monkeypatch.setattr(nonebot, "load_builtin_plugins", lambda *_args: None)
     monkeypatch.setattr(nonebot, "load_from_toml", lambda *_args: None)
     monkeypatch.setattr(nonebot, "run", lambda: None)
 
-    real_get_plugin_config = nonebot.get_plugin_config
+    real_get_plugin_config = nonebot_plugin.get_plugin_config
 
     def observe_config(config_type: type[_ConfigT]) -> _ConfigT:
         config = real_get_plugin_config(config_type)
-        if observed_configs is not None:
-            observed_configs.append(config)
+        if observed_reads is not None:
+            observed_reads.append((config_type, config))
         return config
 
     monkeypatch.setattr(nonebot, "get_plugin_config", observe_config)
+    monkeypatch.setattr(nonebot_plugin, "get_plugin_config", observe_config)
     monkeypatch.setattr(qq_adapter_module, "get_plugin_config", observe_config)
     return cast(
         "dict[str, object]",
@@ -251,16 +258,18 @@ def test_entrypoint_runtime_skips_qq_adapter_when_user_has_no_qq_bots(
 
 def test_entrypoint_runtime_registers_qq_and_normalizes_user_intents(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Registration must exercise the real adapter with the final BotInfo."""
     driver = _StartupDriver()
     raw_config = _raw_config_with_default_intents()
-    observed_configs: list[object] = []
+    observed_reads: list[tuple[type[BaseModel], BaseModel]] = []
     _run_entrypoint(
         monkeypatch,
         driver,
         raw_config,
-        observed_configs=observed_configs,
+        observed_reads=observed_reads,
     )
 
     assert driver.registered == [OneBotV11Adapter, QQAdapter]
@@ -274,11 +283,30 @@ def test_entrypoint_runtime_registers_qq_and_normalizes_user_intents(
     assert info.secret == "test-secret"
     assert info.use_websocket is False
     assert info.intent.model_dump() == _minimal_intents().model_dump()
+    qq_reads = [
+        config
+        for _config_type, config in observed_reads
+        if hasattr(config, "qq_bots")
+    ]
+    assert len(qq_reads) >= 2
+    assert qq_reads[0] is not qq_reads[1]
+    assert all(cast("Any", config).qq_bots[0].id == APP_ID for config in qq_reads)
+    official_map_reads = [
+        config
+        for _config_type, config in observed_reads
+        if getattr(config, "qq_official_bot_qq_by_app", None) is not None
+    ]
+    assert official_map_reads
     assert any(
-        getattr(config, "qq_official_bot_qq_by_app", None)
+        cast("Any", config).qq_official_bot_qq_by_app
         == {APP_ID: str(OFFICIAL_BOT_QQ)}
-        for config in observed_configs
+        for config in official_map_reads
     )
+
+    captured_output = capsys.readouterr()
+    captured_logs = "\n".join((caplog.text, captured_output.out, captured_output.err))
+    for secret in ("test-token", "test-secret", APP_ID, str(OFFICIAL_BOT_QQ)):
+        assert secret not in captured_logs
 
 
 @pytest.mark.parametrize(

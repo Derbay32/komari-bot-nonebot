@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -94,6 +95,7 @@ async def test_business_recheck_rejects_policy_revocation_during_await(
 
     with registry_isolation_context():
         package.register_qq_group_resolver(resolve_group)
+        task: asyncio.Task[Any] | None = None
         try:
             task = asyncio.create_task(
                 package.recheck_qq_effect(_business_token(package), effect="business")
@@ -105,6 +107,12 @@ async def test_business_recheck_rejects_policy_revocation_during_await(
             release_resolver.set()
             decision = await asyncio.wait_for(task, timeout=1)
         finally:
+            release_resolver.set()
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
             package.register_qq_group_resolver(None)
 
     assert isinstance(decision, package.QQEffectDecision)
@@ -143,6 +151,7 @@ async def test_binding_recheck_rejects_policy_revocation_during_await(
 
     with registry_isolation_context():
         package.register_qq_binding_session_resolver(resolve_session)
+        task: asyncio.Task[Any] | None = None
         try:
             task = asyncio.create_task(
                 package.recheck_qq_effect(token, effect="binding")
@@ -154,6 +163,12 @@ async def test_binding_recheck_rejects_policy_revocation_during_await(
             release_resolver.set()
             decision = await asyncio.wait_for(task, timeout=1)
         finally:
+            release_resolver.set()
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
             package.register_qq_binding_session_resolver(None)
 
     assert isinstance(decision, package.QQEffectDecision)

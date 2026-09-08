@@ -229,11 +229,11 @@ OneBot 始终注册。QQ 只在 `qq_bots` 非空时注册；QQ 账号为空时�
 
 | AC | 测试 | 观察点 |
 |---|---|---|
-| 双协议启动、最小 Intent、零 QQ 不影响 OneBot | `test_qq_startup.py`、`test_qq_coordinator.py` | 条件 QQ 注册、真实 adapter setup 能力、真实 driver 配置解析、显式 Intent、transport 保留、secret/身份不泄漏；未配置 app 无初始 claim |
+| 双协议启动、最小 Intent、零 QQ 不影响 OneBot | `test_qq_startup.py`、`test_qq_coordinator.py`、`test_qq_lifecycle.py::test_real_character_binding_startup_installs_and_closes_qq_admission` | 条件 QQ 注册、真实 adapter setup 能力、真实 driver 配置解析、显式 Intent、transport 保留、合法/非法 app collector 与初始 challenge、关闭后撤销资格、secret/身份不泄漏；未配置 app 无初始 claim |
 | 精确 QQ @ 闭集与 mapped 策略矩阵 | `test_qq_event_gate.py` | mapped admitted 即 business（member_qq 可 None）、restricted/error 静默、其他事件拒绝 |
 | 未映射一次挑战与 state 交接 | `test_qq_event_gate.py`、`test_qq_coordinator.py` | claim 至多一次、`is_new`、state token 不被消费 |
 | 已核验未正式映射会话继续绑定 | `test_qq_coordinator.py` | session resolver 返回 binding，continue 不重新 challenge |
 | evidence、效果前重审与策略撤销 | `test_qq_recheck.py` | business/binding_challenge/binding 分流、generation/TTL/LKG、无陈旧许可 |
 | trusted QQ 封禁分流 | `test_qq_identity.py` | 数字形 OpenID 不冒充 QQ，真实 QQ 才查封禁，异常故障关闭 |
-| 启停、真实 listener/collector 接线 | `test_qq_lifecycle.py` | start/close/reset、拒绝 OneBot 不进 collector、真实 evidence receiver、OneBot get_msg 路由、不 dispose ORM |
+| 启停、真实 listener/collector 接线 | `test_qq_lifecycle.py`、`test_qq_lifecycle.py::test_real_character_binding_startup_installs_and_closes_qq_admission` | start/close/reset、真实插件 init/close hook、拒绝 OneBot 不进 collector、真实 evidence receiver、OneBot get_msg 路由、旧 token 关闭后拒绝、不 dispose ORM |
 | OneBot 22 类闭集与 QQ 独立闭集 | `entry_gate_census.py`、`test_entry_gate_census.py` | 保持现有 OneBot census，不新增 matcher/事件旁路 |

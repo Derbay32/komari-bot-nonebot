@@ -10,7 +10,14 @@ import pytest
 from nonebot.adapters.onebot.v11 import Adapter as OneBotAdapter
 from nonebot.adapters.onebot.v11 import Bot as OneBotBot
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from nonebot.adapters.qq.config import BotInfo, Intents
+from nonebot.config import Config as NoneBotConfig
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.character_binding.conftest import (
+    _reset_shared_orm_engine,
+    require_postgres,
+)
 from tests.character_binding.test_reply_evidence import (
     APP_ID as ONEBOT_APP_ID,
 )
@@ -34,7 +41,9 @@ from tests.group_admission.management_support import prepare_control_plane
 from tests.group_admission.qq_admission_support import (
     APP_ID,
     MEMBER_QQ,
+    SECOND_APP_ID,
     QQProbeBot,
+    make_group_at,
 )
 from tests.group_admission.runtime_support import AdmissionStorageFake, stored_policy
 
@@ -265,3 +274,202 @@ async def test_real_listener_delivers_accepted_evidence_to_coordinator(
 
 async def forbidden_fetcher() -> Mapping[str, object]:
     raise AssertionError("collector used an unbound fallback fetcher")  # noqa: TRY003
+
+
+@pytest.mark.asyncio
+async def test_real_character_binding_startup_installs_and_closes_qq_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """生产插件 hook 必须装配有效 app，并在 close 后撤销全部资格。"""
+    require_postgres()
+    from nonebot import get_driver
+
+    from tests.character_binding.test_reply_evidence import (
+        _real_character_binding_package,
+    )
+
+    driver = get_driver()
+    valid_info = BotInfo(
+        id=APP_ID,
+        token="lifecycle-test-token",
+        secret="lifecycle-test-secret",
+        intent=Intents(c2c_group_at_messages=True),
+        use_websocket=False,
+    )
+    invalid_info = BotInfo(
+        id=SECOND_APP_ID,
+        token="invalid-app-test-token",
+        secret="invalid-app-test-secret",
+        intent=Intents(c2c_group_at_messages=True),
+        use_websocket=False,
+    )
+    config_values = driver.config.model_dump()
+    config_values.update(
+        {
+            "qq_is_sandbox": True,
+            "qq_bots": [valid_info.model_dump(), invalid_info.model_dump()],
+            "qq_official_bot_qq_by_app": {
+                APP_ID: str(OFFICIAL_BOT_QQ),
+                SECOND_APP_ID: "official-qq-is-invalid",
+            },
+        }
+    )
+    monkeypatch.setattr(
+        driver,
+        "config",
+        NoneBotConfig.model_validate(config_values),
+    )
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    await _reset_shared_orm_engine()
+    dispose_calls: list[AsyncEngine] = []
+    original_dispose = AsyncEngine.dispose
+
+    async def observe_dispose(
+        self: AsyncEngine,
+        *,
+        close: bool = True,
+    ) -> None:
+        dispose_calls.append(self)
+        await original_dispose(self, close=close)
+
+    monkeypatch.setattr(AsyncEngine, "dispose", observe_dispose)
+
+    try:
+        async with event_gate_context():
+            with _real_character_binding_package() as binding:
+                binding_public = cast("Any", binding)
+                admission = importlib.import_module(
+                    "komari_bot.plugins.group_admission"
+                )
+                reply_evidence = importlib.import_module(
+                    "komari_bot.plugins.character_binding.reply_evidence"
+                )
+                reply_evidence.set_runtime_collectors(())
+                for register_name in (
+                    "register_qq_group_resolver",
+                    "register_qq_initial_bind_claimer",
+                    "register_qq_binding_session_resolver",
+                    "register_qq_ban_checker",
+                ):
+                    getattr(admission, register_name)(None)
+
+                unknown_group = "group-openid-tsk274-lifecycle-unknown"
+                valid_event = make_group_at(
+                    group_openid=unknown_group,
+                    message_id="qq-lifecycle-valid",
+                )
+                invalid_event = make_group_at(
+                    group_openid=unknown_group,
+                    message_id="qq-lifecycle-invalid",
+                )
+                valid_bot = QQProbeBot(APP_ID)
+                invalid_bot = QQProbeBot(SECOND_APP_ID)
+
+                assert await admission.qualify_qq_event(valid_bot, valid_event) is None
+                assert reply_evidence.get_runtime_collectors() == ()
+
+                driver_lifespan = driver._lifespan
+                assert binding_public.init_plugin in driver_lifespan._startup_funcs
+                assert binding_public.close_plugin in driver_lifespan._shutdown_funcs
+
+                started = False
+                valid_token: Any = None
+                try:
+                    started = True
+                    await binding_public.init_plugin()
+                    collectors = reply_evidence.get_runtime_collectors()
+                    assert tuple(collector.app_id for collector in collectors) == (APP_ID,)
+                    assert collectors[0].official_bot_qq == str(OFFICIAL_BOT_QQ)
+
+                    valid_token = await admission.qualify_qq_event(
+                        valid_bot,
+                        valid_event,
+                    )
+                    assert valid_token is not None
+                    assert valid_token.scope == "binding_challenge"
+                    assert valid_token.claim is not None
+
+                    original_id = 274131
+                    challenge_id = 274132
+                    onebot = _OneBotFetchBot(
+                        _get_msg_payload(
+                            message_id=original_id,
+                            original_text=COMMAND,
+                            group_id=_GROUP_ID,
+                        )
+                    )
+                    qq = QQProbeBot(APP_ID)
+                    with _runtime_collectors_context(
+                        reply_evidence,
+                        reply_evidence.get_runtime_collectors(),
+                    ):
+                        await dispatch(
+                            onebot,
+                            _original_event(
+                                message_id=original_id,
+                                group_id=_GROUP_ID,
+                                text=COMMAND,
+                            ),
+                        )
+                        await dispatch(
+                            onebot,
+                            _challenge_event(
+                                message_id=challenge_id,
+                                session_code=valid_token.claim.session_code,
+                                quoted_message_id=original_id,
+                                quoted_text=COMMAND,
+                                group_id=_GROUP_ID,
+                            ),
+                        )
+                    continued = await admission.qualify_qq_event(
+                        valid_bot,
+                        make_group_at(
+                            content="/bind continue",
+                            group_openid=unknown_group,
+                            message_id="qq-lifecycle-continue",
+                        ),
+                    )
+                    assert continued is not None
+                    assert continued.scope == "binding"
+                    assert onebot.calls == [("get_msg", {"message_id": original_id})]
+                    assert qq.calls == []
+                    assert (
+                        await admission.qualify_qq_event(invalid_bot, invalid_event)
+                    ) is None
+                finally:
+                    if started:
+                        await binding_public.close_plugin()
+
+                assert reply_evidence.get_runtime_collectors() == ()
+                assert await admission.qualify_qq_event(valid_bot, valid_event) is None
+                closed_decision = await admission.recheck_qq_effect(
+                    valid_token,
+                    effect="binding_challenge",
+                )
+                assert closed_decision.allowed is False
+                assert closed_decision.effect == "binding_challenge"
+        assert dispose_calls == []
+    finally:
+        monkeypatch.setattr(AsyncEngine, "dispose", original_dispose)
+        await _reset_shared_orm_engine()
+
+    captured_output = capsys.readouterr()
+    captured_logs = "\n".join((caplog.text, captured_output.out, captured_output.err))
+    for secret in (
+        "lifecycle-test-token",
+        "lifecycle-test-secret",
+        "invalid-app-test-token",
+        "invalid-app-test-secret",
+        APP_ID,
+        SECOND_APP_ID,
+        str(OFFICIAL_BOT_QQ),
+        "official-qq-is-invalid",
+    ):
+        assert secret not in captured_logs
