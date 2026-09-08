@@ -160,6 +160,17 @@ class CharacterBindingManager:
         rows = await self._database.load_all()
         self._records = self._build_snapshot(rows)
 
+    async def refresh_snapshot(self) -> None:
+        """重新发布已提交的正式绑定快照。
+
+        只允许在调用方确认提交成功后发布；提交失败或结果不确定时不得调用，
+        以免读取路径观察到未提交或不确定的正式值。
+        """
+        async with self._lock:
+            if not self._initialized:
+                return
+            await self._refresh_snapshot_locked()
+
     async def _close_database_after_failure(self) -> None:
         try:
             await self._database.close()

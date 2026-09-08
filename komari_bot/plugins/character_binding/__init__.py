@@ -32,14 +32,19 @@ from .reply_evidence import (
     set_runtime_collectors,
 )
 from .transaction import BindingTransaction, GroupBindingGroup
+from .wizard import BindingWizard, set_binding_wizard
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
     description="提供跨插件的角色名绑定管理功能",
     usage="""
-    .bind set <角色名> - 设置绑定
-    .bind del - 删除绑定
-    .bind list - 查看绑定列表
+    /bind - 开始或继续本群绑定向导
+    /bind rename - 修改本群角色名
+    /bind unbind - 解除本群角色名绑定
+    /bind name <会话码> <角色名> - 提交或修改角色名
+    /bind reuse <会话码> - 沿用旧角色名
+    /bind confirm <会话码> - 确认当前操作
+    /bind cancel <会话码> - 取消当前操作
     """,
 )
 
@@ -175,25 +180,37 @@ def _configured_qq_collectors() -> tuple[ReplyEvidenceCollector, ...]:
 
 
 async def init_plugin() -> None:
-    """初始化管理器后再安装 QQ 准入与 OneBot 证据接线。"""
+    """初始化管理器后安装 QQ 准入、证据接线与绑定向导。"""
     manager = get_manager()
     await manager.initialize()
     if not manager._initialized:
         return
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
-    _qq_plugin_state.coordinator = QQBindingCoordinator(
+    coordinator = QQBindingCoordinator(
         collectors=_configured_qq_collectors(),
         group_resolver=_resolve_qq_group,
         clock=lambda: datetime.now(UTC),
         member_resolver=_resolve_qq_member,
         ban_checker=_qq_ban_checker,
     )
-    await _qq_plugin_state.coordinator.start()
+    _qq_plugin_state.coordinator = coordinator
+    await coordinator.start()
+    from .database import _open_session
+
+    set_binding_wizard(
+        BindingWizard(
+            coordinator=coordinator,
+            session_factory=_open_session,
+            clock=lambda: datetime.now(UTC),
+            manager=manager,
+        )
+    )
 
 
 async def close_plugin() -> None:
-    """先撤销 QQ 准入接缝，再释放绑定数据库租约。"""
+    """先撤销 QQ 准入接缝与向导，再释放绑定数据库租约。"""
+    set_binding_wizard(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
         _qq_plugin_state.coordinator = None
@@ -272,8 +289,8 @@ except ValueError:
     driver = None
 
 if driver is not None:
-    # 导入命令模块以注册命令处理器（必须在 manager 之后导入以避免循环导入）
-    from . import commands  # noqa: F401
+    # 导入 QQ handler 以注册唯一 matcher（必须在 manager 之后导入以避免循环导入）
+    from . import qq_commands  # noqa: F401
 
     driver.on_startup(init_plugin)
     driver.on_shutdown(close_plugin)
