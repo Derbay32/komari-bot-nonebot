@@ -9,7 +9,8 @@ MatcherEntryRow: entry_id, source_path, source_symbol, factory, event_family, ef
 
 ``ONEBOT_EVENT_CENSUS``: 22 个 OneBot V11 事件子类。
 ``QQ_EVENT_CENSUS``: QQ 入口允许的精确事件与显式拒绝事件闭集。
-``MATCHER_ENTRY_CENSUS``: 27 个 matcher 注册项。
+``MATCHER_ENTRY_CENSUS``: 24 个 matcher 注册项（TSK-277 退役旧
+character_binding 四个 on_command，新增一个 QQ handler on_message）。
 """
 
 from __future__ import annotations
@@ -93,14 +94,15 @@ QQ_EVENT_CENSUS: tuple[QQEventCensusRow, ...] = (
 )
 
 MATCHER_ENTRY_CENSUS: tuple[MatcherEntryRow, ...] = (
-    # on_message (2)
+    # on_message (3)
     _M("matcher.komari_chat.__init__.matcher", "komari_bot/plugins/komari_chat/__init__.py", "matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.character_binding.reply_evidence.reply_evidence_matcher", "komari_bot/plugins/character_binding/reply_evidence.py", "reply_evidence_matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.character_binding.qq_commands.bind_qq", "komari_bot/plugins/character_binding/qq_commands.py", "bind_qq", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     # on_regex (1)
     _M("matcher.group_history_summary.__init__.summary_matcher", "komari_bot/plugins/group_history_summary/__init__.py", "summary_matcher", "on_regex", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     # on_notice (1)
     _M("matcher.komari_custom.vote_handler.vote_notice", "komari_bot/plugins/komari_custom/vote_handler.py", "vote_notice", "on_notice", "notice", (_EFFECT_ID,), _MATCHER_ANCHOR),
-    # on_command (23)
+    # on_command (19)
     _M("matcher.komari_custom.__init__.custom", "komari_bot/plugins/komari_custom/__init__.py", "custom", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.komari_custom.__init__.custom_action", "komari_bot/plugins/komari_custom/__init__.py", "custom_action", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.komari_debug.commands.debug_root", "komari_bot/plugins/komari_debug/commands.py", "debug_root", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
@@ -117,10 +119,6 @@ MATCHER_ENTRY_CENSUS: tuple[MatcherEntryRow, ...] = (
     _M("matcher.komari_help.commands.help_refresh_cmd", "komari_bot/plugins/komari_help/commands.py", "help_refresh_cmd", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.user_ban.commands.ban_matcher", "komari_bot/plugins/user_ban/commands.py", "ban_matcher", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.user_ban.commands.unban_matcher", "komari_bot/plugins/user_ban/commands.py", "unban_matcher", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
-    _M("matcher.character_binding.commands.bind", "komari_bot/plugins/character_binding/commands.py", "bind", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
-    _M("matcher.character_binding.commands.bind_set", "komari_bot/plugins/character_binding/commands.py", "bind_set", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
-    _M("matcher.character_binding.commands.bind_del", "komari_bot/plugins/character_binding/commands.py", "bind_del", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
-    _M("matcher.character_binding.commands.bind_list", "komari_bot/plugins/character_binding/commands.py", "bind_list", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.sr.__init__.sr", "komari_bot/plugins/sr/__init__.py", "sr", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.sr.__init__.sr_custom", "komari_bot/plugins/sr/__init__.py", "sr_custom", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.sr.__init__.sr_manage", "komari_bot/plugins/sr/__init__.py", "sr_manage", "on_command", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),

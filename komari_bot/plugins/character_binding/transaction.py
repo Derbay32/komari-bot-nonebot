@@ -231,16 +231,22 @@ class BindingTransaction:
         *,
         app_id: str,
         group_openid: str,
+        lock: bool = True,
     ) -> GroupBindingGroup | None:
-        """Resolve a group mapping; ``None`` means it truly is unmapped."""
+        """Resolve a group mapping; ``None`` means it truly is unmapped.
+
+        ``lock=False`` 仅供准入只读解析使用：不加组锁，只读取已提交行，因此
+        不会与持锁写事务形成跨 session 自锁。
+        """
 
         _, BindingPersistenceError = _binding_errors()
         try:
-            await lock_group_scope(
-                self._session,
-                app_id=str(app_id),
-                group_openid=str(group_openid),
-            )
+            if lock:
+                await lock_group_scope(
+                    self._session,
+                    app_id=str(app_id),
+                    group_openid=str(group_openid),
+                )
             row = (
                 await self._session.execute(
                     select(_GROUPS).where(
@@ -265,16 +271,21 @@ class BindingTransaction:
         app_id: str,
         group_openid: str,
         member_openid: str,
+        lock: bool = True,
     ) -> GroupBindingRecord | None:
-        """Read the current canonical member row from PostgreSQL."""
+        """Read the current canonical member row from PostgreSQL.
+
+        ``lock=False`` 仅供准入只读解析使用：不加组锁，只读取已提交行。
+        """
 
         _, BindingPersistenceError = _binding_errors()
         try:
-            await lock_group_scope(
-                self._session,
-                app_id=str(app_id),
-                group_openid=str(group_openid),
-            )
+            if lock:
+                await lock_group_scope(
+                    self._session,
+                    app_id=str(app_id),
+                    group_openid=str(group_openid),
+                )
             result = await self._session.execute(
                 select(
                     _MEMBERS,
@@ -306,16 +317,21 @@ class BindingTransaction:
         app_id: str,
         group_openid: str,
         member_qq: str,
+        lock: bool = True,
     ) -> GroupBindingRecord | None:
-        """Resolve a member by its OneBot QQ identity under the group lock."""
+        """Resolve a member by its OneBot QQ identity.
+
+        ``lock=False`` 仅供准入只读解析使用：不加组锁，只读取已提交行。
+        """
 
         _, BindingPersistenceError = _binding_errors()
         try:
-            await lock_group_scope(
-                self._session,
-                app_id=str(app_id),
-                group_openid=str(group_openid),
-            )
+            if lock:
+                await lock_group_scope(
+                    self._session,
+                    app_id=str(app_id),
+                    group_openid=str(group_openid),
+                )
             result = await self._session.execute(
                 select(
                     _MEMBERS,

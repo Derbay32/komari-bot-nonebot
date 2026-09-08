@@ -1,0 +1,3129 @@
+"""TSK-277 真实 PostgreSQL：原子提交、并发、冲突、提交结果不确定与缓存发布。
+
+只使用真实 engine/session factory 与真实 `CharacterBindingManager`；wizard 的
+协调器端口按用例注入，事务与并发全部落在真实 PostgreSQL 上。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import text
+
+from komari_bot.db.group_transaction_locks import lock_group_scope
+from komari_bot.plugins.character_binding import BindingTransaction
+from komari_bot.plugins.character_binding.reply_evidence import ReplyEvidence
+from komari_bot.plugins.group_admission import (
+    QQEffectDecision,
+    QQInitialBindRequest,
+)
+from tests.character_binding.conftest import (
+    _reset_shared_orm_engine,
+    require_postgres,
+)
+from tests.character_binding.test_reply_evidence import (
+    _real_character_binding_package,
+)
+from tests.character_binding.tsk277_support import (
+    BIND_SUCCESS,
+    BINDING_CONFIRM,
+    CANCELLED,
+    EXISTING_BINDING,
+    EXPIRED,
+    GROUP_CONFLICT,
+    LEGACY_CHOICE,
+    MEMBER_CONFLICT,
+    NAME_DUPLICATE_ERROR,
+    NAME_INPUT,
+    NO_CHARACTER_NAME,
+    OFFICIAL_BOT_QQ,
+    RENAME_BUTTON,
+    RENAME_CONFIRM,
+    RENAME_SUCCESS,
+    UNBIND_BUTTON,
+    UNBIND_CONFIRM,
+    UNBIND_SUCCESS,
+    FakeCoordinator,
+    FrozenClock,
+    buttons_of,
+    freeze_qq_now,
+    make_claim,
+    make_event,
+    make_token,
+    make_verified,
+    markdown_content,
+    require_wizard_contract,
+)
+from tests.group_admission.management_support import prepare_control_plane
+from tests.group_admission.qq_admission_support import (
+    QQProbeBot,
+    dispatch_qq,
+    event_gate_context,
+    make_group_at,
+)
+from tests.group_admission.registry_isolation_support import registry_isolation_context
+from tests.group_admission.runtime_support import AdmissionStorageFake, stored_policy
+from tests.komari_roulette.command_support import (
+    PG_REQUIRED,
+    backend_pid,
+    create_engine_and_factory,
+    wait_for_blocked,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable
+
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+    from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+
+pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
+
+REPLY_EVIDENCE_MODULE = "komari_bot.plugins.character_binding.reply_evidence"
+COORDINATOR_MODULE = "komari_bot.plugins.character_binding.qq_coordinator"
+
+
+async def _empty_fetcher(_message_id: int) -> dict[str, object]:
+    return {}
+
+
+@dataclass(frozen=True, slots=True)
+class Scope:
+    app_id: str
+    group_openid: str
+    group_id: int
+    member_openid: str
+    member_qq: int
+    session_code: str
+
+
+def scope(tag: str) -> Scope:
+    suffix = uuid4().hex[:10]
+    return Scope(
+        app_id=f"tsk277-app-{tag}-{suffix}",
+        group_openid=f"tsk277-group-{tag}-{suffix}",
+        group_id=277000 + (int(suffix[:4], 16) % 900),
+        member_openid=f"tsk277-member-{tag}-{suffix}",
+        member_qq=700000 + (int(suffix[4:8], 16) % 90000),
+        session_code=f"tsk277-session-{tag}-{suffix}",
+    )
+
+
+def second_member(current: Scope) -> tuple[str, int, str]:
+    return (
+        f"{current.member_openid}-b",
+        current.member_qq + 1,
+        f"{current.session_code}-b",
+    )
+
+
+async def _cleanup(engine: AsyncEngine, current: Scope) -> None:
+    params = {"app_id": current.app_id, "group_openid": current.group_openid}
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "DELETE FROM komari_character_binding_members "
+                "WHERE app_id = :app_id AND group_openid = :group_openid"
+            ),
+            params,
+        )
+        await connection.execute(
+            text(
+                "DELETE FROM komari_character_binding_groups "
+                "WHERE app_id = :app_id AND group_openid = :group_openid"
+            ),
+            params,
+        )
+        await connection.execute(
+            text("DELETE FROM komari_character_bindings WHERE user_id = :member_qq"),
+            {"member_qq": str(current.member_qq)},
+        )
+
+
+def _wizard(
+    module: Any,
+    *,
+    factory: Any,
+    clock: FrozenClock,
+    coordinator: FakeCoordinator,
+    manager: CharacterBindingManager | None,
+) -> Any:
+    return module.BindingWizard(
+        coordinator=coordinator,
+        session_factory=factory,
+        clock=clock,
+        manager=manager,
+    )
+
+
+def _binding_token(
+    current: Scope,
+    *,
+    clock: FrozenClock,
+    session_code: str | None = None,
+    member_openid: str | None = None,
+    member_qq: int | None = None,
+    qq_message_id: str,
+) -> Any:
+    code = session_code or current.session_code
+    verified = make_verified(
+        clock=clock,
+        session_code=code,
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=member_openid or current.member_openid,
+        qq_message_id=qq_message_id,
+        group_id=current.group_id,
+        member_qq=member_qq or current.member_qq,
+    )
+    return make_token(
+        scope="binding",
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=member_openid or current.member_openid,
+        qq_message_id=qq_message_id,
+        group_id=current.group_id,
+        member_qq=member_qq or current.member_qq,
+        verified_session=verified,
+    )
+
+
+def _business_token(
+    current: Scope,
+    *,
+    member_openid: str,
+    member_qq: int,
+    qq_message_id: str,
+) -> Any:
+    return make_token(
+        scope="business",
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=member_openid,
+        qq_message_id=qq_message_id,
+        group_id=current.group_id,
+        member_qq=member_qq,
+    )
+
+
+async def _seed_binding(
+    factory: async_sessionmaker[AsyncSession],
+    current: Scope,
+    *,
+    member_openid: str,
+    member_qq: int,
+    name: str | None,
+) -> None:
+    async with factory() as session:
+        transaction = BindingTransaction(session)
+        await transaction.bind(
+            app_id=current.app_id,
+            group_id=str(current.group_id),
+            group_openid=current.group_openid,
+            member_qq=str(member_qq),
+            member_openid=member_openid,
+            character_name=name or "占位名",
+        )
+        if name is None:
+            await transaction.clear(
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+                member_openid=member_openid,
+            )
+        await session.commit()
+
+
+async def _member_row(
+    factory: async_sessionmaker[AsyncSession],
+    current: Scope,
+    member_openid: str,
+) -> dict[str, Any]:
+    async with factory() as session:
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT member_qq, character_name, character_name_key, updated_at "
+                        "FROM komari_character_binding_members "
+                        "WHERE app_id = :app_id AND group_openid = :group_openid "
+                        "AND member_openid = :member_openid"
+                    ),
+                    {
+                        "app_id": current.app_id,
+                        "group_openid": current.group_openid,
+                        "member_openid": member_openid,
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    return dict(row) if row is not None else {}
+
+
+async def _count_rows(
+    factory: async_sessionmaker[AsyncSession],
+    table: str,
+    current: Scope,
+) -> int:
+    assert table in {
+        "komari_character_binding_members",
+        "komari_character_binding_groups",
+    }
+    async with factory() as session:
+        return int(
+            await session.scalar(
+                text(
+                    f"SELECT count(*) FROM {table} "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid"
+                ),
+                {
+                    "app_id": current.app_id,
+                    "group_openid": current.group_openid,
+                },
+            )
+            or 0
+        )
+
+
+async def _session_code(
+    wizard: Any,
+    module: Any,
+    current: Scope,
+    *,
+    member_openid: str | None = None,
+) -> str:
+    view = await wizard.get_session(
+        module.WizardScope(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=member_openid or current.member_openid,
+        )
+    )
+    assert view is not None, "flow must expose its current session"
+    return str(view.session_code)
+
+
+async def _drive_to_confirm(
+    wizard: Any,
+    module: Any,
+    current: Scope,
+    *,
+    token: Any,
+    name: str,
+    prefix: str,
+) -> str:
+    member_openid = token.member_openid
+    reply = await wizard.handle_event(
+        make_event(
+            content="/bind",
+            message_id=f"{prefix}-1",
+            group_openid=current.group_openid,
+            member_openid=member_openid,
+        ),
+        token,
+    )
+    assert reply is not None
+    assert reply.body == NAME_INPUT
+    session_code = await _session_code(
+        wizard, module, current, member_openid=member_openid
+    )
+    confirm = await wizard.handle_event(
+        make_event(
+            content=f"/bind name {session_code} {name}",
+            message_id=f"{prefix}-2",
+            group_openid=current.group_openid,
+            member_openid=member_openid,
+        ),
+        token,
+    )
+    assert confirm is not None
+    assert confirm.body == BINDING_CONFIRM.format(name=name)
+    return session_code
+
+
+class _CommitHookSession:
+    """在唯一 commit 边界注入提交结果不确定；其余调用委托真实 session。"""
+
+    def __init__(self, inner: AsyncSession, hook: Callable[[AsyncSession], Awaitable[None]]) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_hook", hook)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def commit(self) -> None:
+        await self._hook(self._inner)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+    async def rollback(self) -> None:
+        await self._inner.rollback()
+
+
+def _hook_factory(
+    base: async_sessionmaker[AsyncSession],
+    hook: Callable[[AsyncSession], Awaitable[None]],
+) -> Any:
+    def factory() -> Any:
+        return _CommitHookSession(base(), hook)
+
+    return cast("Any", factory)
+
+
+async def test_confirm_commits_atomically_and_publishes_cache_only_after_commit(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：群映射+成员+名字单事务；双协议查询一致；提交后才发布缓存。"""
+    module = require_wizard_contract()
+    current = scope("confirm")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(
+                current,
+                clock=clock,
+                qq_message_id="confirm-1",
+            )
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="confirm",
+            )
+
+            reply = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="confirm-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+
+            assert reply is not None
+            assert reply.body == BIND_SUCCESS.format(name="阿明")
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] == "阿明"
+            assert row["character_name_key"] == "阿明"
+            assert await _count_rows(
+                factory, "komari_character_binding_groups", current
+            ) == 1
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    fallback_nickname="FALLBACK",
+                )
+                == "阿明"
+            )
+            assert (
+                binding_manager.get_character_name(
+                    group_id=str(current.group_id),
+                    user_id=str(current.member_qq),
+                    fallback_nickname="FALLBACK",
+                )
+                == "阿明"
+            )
+            # 274 cancel 语义：handle_event 返回成功 reply 时尚未清理临时会话。
+            assert coordinator.cancelled == []
+            assert await wizard.authorize_send(token, reply) is True
+            await wizard.finish_send(reply)
+            assert coordinator.cancelled == [session_code], (
+                "finish_send 必须恰好清理一次临时会话"
+            )
+            await wizard.finish_send(reply)
+            assert coordinator.cancelled == [session_code], "finish_send 必须幂等"
+            view = await wizard.get_session(
+                module.WizardScope(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+            )
+            assert view is not None
+            assert view.completed is True
+            assert view.step == "completed"
+
+            updated_before = row["updated_at"]
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="confirm-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert repeat is not None
+            assert repeat.body == BIND_SUCCESS.format(name="阿明")
+            row_after = await _member_row(factory, current, current.member_openid)
+            assert row_after["updated_at"] == updated_before, "重复 confirm 不得二次写入"
+            assert await _count_rows(
+                factory, "komari_character_binding_members", current
+            ) == 1
+
+            existing = await wizard.handle_event(
+                make_event(
+                    content="/bind",
+                    message_id="confirm-5",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert existing is not None
+            assert existing.body == EXISTING_BINDING.format(name="阿明")
+            assert buttons_of(existing) == [
+                (RENAME_BUTTON, "/bind rename", 2),
+                (UNBIND_BUTTON, "/bind unbind", 2),
+            ]
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_group_and_member_conflicts_preserve_original_records(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：双向群/成员 identity 冲突保留原记录，且不写名字。"""
+    module = require_wizard_contract()
+    current = scope("conflict")
+    member_scope = scope("member-conflict")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with factory() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO komari_character_binding_groups "
+                        "(app_id, group_openid, group_id) VALUES (:a, :g, :other)"
+                    ),
+                    {
+                        "a": current.app_id,
+                        "g": current.group_openid,
+                        "other": str(current.group_id + 1),
+                    },
+                )
+                await session.commit()
+
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="conflict-1")
+            conflict_session = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="conflict",
+            )
+            reply = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {conflict_session}",
+                    message_id="conflict-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert reply is not None
+            assert reply.body == GROUP_CONFLICT
+            assert await _count_rows(
+                factory, "komari_character_binding_members", current
+            ) == 0
+            async with factory() as session:
+                group_id = await session.scalar(
+                    text(
+                        "SELECT group_id FROM komari_character_binding_groups "
+                        "WHERE app_id = :a AND group_openid = :g"
+                    ),
+                    {"a": current.app_id, "g": current.group_openid},
+                )
+            assert group_id == str(current.group_id + 1)
+
+            # 成员 identity 冲突：member_qq 已关联另一 OpenID。
+            async with factory() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO komari_character_binding_groups "
+                        "(app_id, group_openid, group_id) VALUES (:a, :g, :gid)"
+                    ),
+                    {
+                        "a": member_scope.app_id,
+                        "g": member_scope.group_openid,
+                        "gid": str(member_scope.group_id),
+                    },
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO komari_character_binding_members "
+                        "(app_id, group_openid, member_openid, member_qq, "
+                        "character_name, character_name_key) "
+                        "VALUES (:a, :g, :other, :qq, '旧名', '旧名')"
+                    ),
+                    {
+                        "a": member_scope.app_id,
+                        "g": member_scope.group_openid,
+                        "other": f"{member_scope.member_openid}-other",
+                        "qq": str(member_scope.member_qq),
+                    },
+                )
+                await session.commit()
+
+            member_token = _binding_token(
+                member_scope,
+                clock=clock,
+                qq_message_id="member-conflict-1",
+            )
+            member_session = await _drive_to_confirm(
+                wizard,
+                module,
+                member_scope,
+                token=member_token,
+                name="阿明",
+                prefix="member-conflict",
+            )
+            member_reply = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {member_session}",
+                    message_id="member-conflict-3",
+                    group_openid=member_scope.group_openid,
+                    member_openid=member_scope.member_openid,
+                ),
+                member_token,
+            )
+            assert member_reply is not None
+            assert member_reply.body == MEMBER_CONFLICT
+            original = await _member_row(
+                factory, member_scope, f"{member_scope.member_openid}-other"
+            )
+            assert original["character_name"] == "旧名"
+        finally:
+            await _cleanup(engine, current)
+            await _cleanup(engine, member_scope)
+
+
+async def test_same_group_concurrent_name_has_one_winner_and_loser_can_rename(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：真实 PG 并发同名仅一方成功；失败方仍可改名。"""
+    module = require_wizard_contract()
+    current = scope("race")
+    other_openid, other_qq, other_session = second_member(current)
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token_a = _binding_token(current, clock=clock, qq_message_id="race-a-1")
+            token_b = _binding_token(
+                current,
+                clock=clock,
+                session_code=other_session,
+                member_openid=other_openid,
+                member_qq=other_qq,
+                qq_message_id="race-b-1",
+            )
+            session_a = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token_a,
+                name="同名",
+                prefix="race-a",
+            )
+            session_b = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token_b,
+                name="同名",
+                prefix="race-b",
+            )
+
+            blocker = factory()
+            await lock_group_scope(
+                blocker,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
+            blocker_pid = await backend_pid(blocker)
+            task_a = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_a}",
+                        message_id="race-a-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token_a,
+                )
+            )
+            task_b = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_b}",
+                        message_id="race-b-3",
+                        group_openid=current.group_openid,
+                        member_openid=other_openid,
+                    ),
+                    token_b,
+                )
+            )
+            await wait_for_blocked(factory, blocker_pid)
+            await blocker.rollback()
+            await blocker.close()
+            reply_a, reply_b = await asyncio.gather(task_a, task_b)
+
+            bodies = {reply_a.body if reply_a else None, reply_b.body if reply_b else None}
+            assert bodies == {BIND_SUCCESS.format(name="同名"), NAME_DUPLICATE_ERROR}
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 1
+            )
+
+            loser_token = token_a if reply_a and reply_a.body == NAME_DUPLICATE_ERROR else token_b
+            loser_openid = (
+                current.member_openid
+                if loser_token is token_a
+                else other_openid
+            )
+            loser_session = session_a if loser_token is token_a else session_b
+            renamed = await wizard.handle_event(
+                make_event(
+                    content=f"/bind name {loser_session} 另一个名",
+                    message_id="race-loser-4",
+                    group_openid=current.group_openid,
+                    member_openid=loser_openid,
+                ),
+                loser_token,
+            )
+            assert renamed is not None
+            assert renamed.body == BINDING_CONFIRM.format(name="另一个名")
+            confirmed = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {loser_session}",
+                    message_id="race-loser-5",
+                    group_openid=current.group_openid,
+                    member_openid=loser_openid,
+                ),
+                loser_token,
+            )
+            assert confirmed is not None
+            assert confirmed.body == BIND_SUCCESS.format(name="另一个名")
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 2
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_rename_preview_confirm_conflict_and_cancel(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC6/AC11：rename preview→confirm，冲突/取消保留原名，旧名释放。"""
+    module = require_wizard_contract()
+    current = scope("rename")
+    other_openid, other_qq, _ = second_member(current)
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                name="阿明",
+            )
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=other_openid,
+                member_qq=other_qq,
+                name="小明",
+            )
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="rename-1")
+            existing = await wizard.handle_event(
+                make_event(
+                    content="/bind",
+                    message_id="rename-1",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert existing is not None
+            assert existing.body == EXISTING_BINDING.format(name="阿明")
+            assert coordinator.claim_calls == []
+            assert coordinator.session_resolver_calls == []
+
+            rename = await wizard.handle_event(
+                make_event(
+                    content="/bind rename",
+                    message_id="rename-2",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert rename is not None
+            assert rename.body == NAME_INPUT
+            view = await wizard.get_session(
+                module.WizardScope(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+            )
+            assert view is not None
+            assert view.operation == "rename"
+            assert view.step == "name_input"
+            assert coordinator.claim_calls == []
+            rename_session = str(view.session_code)
+
+            preview = await wizard.handle_event(
+                make_event(
+                    content=f"/bind name {rename_session} 小明",
+                    message_id="rename-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert preview is not None
+            assert preview.body == RENAME_CONFIRM.format(old="阿明", new="小明")
+            conflict = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {rename_session}",
+                    message_id="rename-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert conflict is not None
+            assert conflict.body == NAME_DUPLICATE_ERROR
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "阿明"
+
+            cancel = await wizard.handle_event(
+                make_event(
+                    content=f"/bind cancel {rename_session}",
+                    message_id="rename-5",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert cancel is not None
+            assert cancel.body == CANCELLED
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "阿明"
+
+            await wizard.handle_event(
+                make_event(
+                    content="/bind rename",
+                    message_id="rename-6",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            second_session = await _session_code(wizard, module, current)
+            await wizard.handle_event(
+                make_event(
+                    content=f"/bind name {second_session} 小暗",
+                    message_id="rename-7",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            success = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {second_session}",
+                    message_id="rename-8",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert success is not None
+            assert success.body == RENAME_SUCCESS.format(name="小暗")
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "小暗"
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+                == "小暗"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_rename_or_unbind_without_character_name_prompts_binding(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC6：无角色名时 rename/unbind 不写入并给出定稿提示。"""
+    module = require_wizard_contract()
+    current = scope("noname")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                name=None,
+            )
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="noname-1")
+            for index, command in enumerate(("/bind rename", "/bind unbind")):
+                reply = await wizard.handle_event(
+                    make_event(
+                        content=command,
+                        message_id=f"noname-{index + 1}",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+                assert reply is not None
+                assert reply.body == NO_CHARACTER_NAME
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] is None
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_unbind_clears_only_name_and_identity_stays_reusable(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC6：解绑只清名字，保留 group/member identity；可复用同一身份重新绑定。"""
+    module = require_wizard_contract()
+    current = scope("unbind")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                name="阿明",
+            )
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="unbind-1")
+            preview = await wizard.handle_event(
+                make_event(
+                    content="/bind unbind",
+                    message_id="unbind-1",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert preview is not None
+            assert preview.body == UNBIND_CONFIRM.format(name="阿明")
+            view = await wizard.get_session(
+                module.WizardScope(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+            )
+            assert view is not None
+            assert view.operation == "unbind"
+            assert view.step == "unbind_confirm"
+            unbind_session = str(view.session_code)
+
+            success = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {unbind_session}",
+                    message_id="unbind-2",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert success is not None
+            assert success.body == UNBIND_SUCCESS
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] is None
+            assert str(row["member_qq"]) == str(current.member_qq)
+            assert await _count_rows(
+                factory, "komari_character_binding_groups", current
+            ) == 1
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    fallback_nickname="FALLBACK",
+                )
+                == "FALLBACK"
+            )
+
+            business = _business_token(
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                qq_message_id="unbind-3",
+            )
+            rebind = await wizard.handle_event(
+                make_event(
+                    content="/bind",
+                    message_id="unbind-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                business,
+            )
+            assert rebind is not None
+            assert rebind.body == NAME_INPUT
+            assert coordinator.claim_calls == [], "已有身份关联不得重新取证"
+            rebind_session = await _session_code(wizard, module, current)
+            await wizard.handle_event(
+                make_event(
+                    content=f"/bind name {rebind_session} 新名",
+                    message_id="unbind-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                business,
+            )
+            rebound = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {rebind_session}",
+                    message_id="unbind-5",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                business,
+            )
+            assert rebound is not None
+            assert rebound.body == BIND_SUCCESS.format(name="新名")
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 1
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_legacy_candidate_reuse_and_conflict(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC7：旧名只在主动 /bind + 已验证身份 + 当前群未绑定时候选；reuse 重新校验。"""
+    module = require_wizard_contract()
+    current = scope("legacy")
+    conflict_scope = scope("legacy-conflict")
+    other_openid, other_qq, _ = second_member(current)
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with factory() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO komari_character_bindings "
+                        "(user_id, character_name) VALUES (:user_id, '小明')"
+                    ),
+                    {"user_id": str(current.member_qq)},
+                )
+                await session.commit()
+
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            assert (
+                binding_manager.get_character_name(
+                    group_id=str(current.group_id),
+                    user_id=str(current.member_qq),
+                    fallback_nickname="FALLBACK",
+                )
+                == "FALLBACK"
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="legacy-1")
+            candidate = await wizard.handle_event(
+                make_event(
+                    content="/bind",
+                    message_id="legacy-1",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert candidate is not None
+            assert candidate.body == LEGACY_CHOICE.format(name="小明")
+            legacy_session = await _session_code(wizard, module, current)
+            reuse = await wizard.handle_event(
+                make_event(
+                    content=f"/bind reuse {legacy_session}",
+                    message_id="legacy-2",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert reuse is not None
+            assert reuse.body == BINDING_CONFIRM.format(name="小明")
+            committed = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {legacy_session}",
+                    message_id="legacy-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert committed is not None
+            assert committed.body == BIND_SUCCESS.format(name="小明")
+            async with factory() as session:
+                legacy = await session.scalar(
+                    text(
+                        "SELECT character_name FROM komari_character_bindings "
+                        "WHERE user_id = :user_id"
+                    ),
+                    {"user_id": str(current.member_qq)},
+                )
+            assert legacy == "小明", "迁移不得改写旧全局表"
+
+            # 旧名与群内现有名字冲突：reuse 必须在最终提交重新校验。
+            await _seed_binding(
+                factory,
+                conflict_scope,
+                member_openid=other_openid,
+                member_qq=other_qq,
+                name="小明",
+            )
+            async with factory() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO komari_character_bindings "
+                        "(user_id, character_name) VALUES (:user_id, '小明')"
+                    ),
+                    {"user_id": str(conflict_scope.member_qq)},
+                )
+                await session.commit()
+            conflict_token = _binding_token(
+                conflict_scope,
+                clock=clock,
+                qq_message_id="legacy-conflict-1",
+            )
+            conflict_candidate = await wizard.handle_event(
+                make_event(
+                    content="/bind",
+                    message_id="legacy-conflict-1",
+                    group_openid=conflict_scope.group_openid,
+                    member_openid=conflict_scope.member_openid,
+                ),
+                conflict_token,
+            )
+            assert conflict_candidate is not None
+            assert conflict_candidate.body == LEGACY_CHOICE.format(name="小明")
+            conflict_session = await _session_code(
+                wizard, module, conflict_scope
+            )
+            await wizard.handle_event(
+                make_event(
+                    content=f"/bind reuse {conflict_session}",
+                    message_id="legacy-conflict-2",
+                    group_openid=conflict_scope.group_openid,
+                    member_openid=conflict_scope.member_openid,
+                ),
+                conflict_token,
+            )
+            conflict = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {conflict_session}",
+                    message_id="legacy-conflict-3",
+                    group_openid=conflict_scope.group_openid,
+                    member_openid=conflict_scope.member_openid,
+                ),
+                conflict_token,
+            )
+            assert conflict is not None
+            assert conflict.body == NAME_DUPLICATE_ERROR
+            assert (
+                await _member_row(
+                    factory, conflict_scope, conflict_scope.member_openid
+                )
+            ) == {}
+        finally:
+            await _cleanup(engine, current)
+            await _cleanup(engine, conflict_scope)
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "DELETE FROM komari_character_bindings "
+                        "WHERE user_id = :user_id"
+                    ),
+                    {"user_id": str(other_qq)},
+                )
+
+
+async def test_commit_outcome_unknown_after_commit_does_not_report_and_converges(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8/AC10：已提交但响应丢失不虚报；重复 confirm 依据 canonical 记录收敛。"""
+    module = require_wizard_contract()
+    current = scope("unknown-after")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    failed = {"once": False}
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+
+            async def commit_then_lose(inner: AsyncSession) -> None:
+                await inner.commit()
+                if not failed["once"]:
+                    failed["once"] = True
+                    raise RuntimeError("commit outcome unknown")  # noqa: TRY003
+
+            wizard = _wizard(
+                module,
+                factory=_hook_factory(factory, commit_then_lose),
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="unknown-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="unknown",
+            )
+
+            with pytest.raises(module.BindingCommitOutcomeUnknownError):
+                await wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="unknown-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] == "阿明", "提交已发生"
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    fallback_nickname="FALLBACK",
+                )
+                == "FALLBACK"
+            ), "无法确认提交时不得发布缓存"
+            updated_before = row["updated_at"]
+
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="unknown-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert repeat is not None
+            assert repeat.body == BIND_SUCCESS.format(name="阿明")
+            row_after = await _member_row(factory, current, current.member_openid)
+            assert row_after["updated_at"] == updated_before, "收敛不得改写已提交记录"
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+                == "阿明"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_commit_outcome_unknown_before_commit_leaves_no_record_and_repeat_writes_once(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：未提交的不确定结果不虚报；重复 confirm 只补写一次。"""
+    module = require_wizard_contract()
+    current = scope("unknown-before")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    failed = {"once": False}
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+
+            async def lose_before_commit(inner: AsyncSession) -> None:
+                if not failed["once"]:
+                    failed["once"] = True
+                    raise RuntimeError("commit outcome unknown")  # noqa: TRY003
+                await inner.commit()
+
+            wizard = _wizard(
+                module,
+                factory=_hook_factory(factory, lose_before_commit),
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="before-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="before",
+            )
+
+            with pytest.raises(module.BindingCommitOutcomeUnknownError):
+                await wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="before-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 0
+            )
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    fallback_nickname="FALLBACK",
+                )
+                == "FALLBACK"
+            )
+
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="before-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert repeat is not None
+            assert repeat.body == BIND_SUCCESS.format(name="阿明")
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 1
+            )
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+                == "阿明"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_commit_unknown_after_commit_never_overwrites_later_maintenance_rename(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：after-commit 不确定后另一合法维护流程改名，重复旧 confirm 绝不覆写。"""
+    module = require_wizard_contract()
+    current = scope("unknown-overwrite")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    failed = {"once": False}
+
+    async def commit_then_lose(inner: AsyncSession) -> None:
+        await inner.commit()
+        if not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("commit outcome unknown")  # noqa: TRY003
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=_hook_factory(factory, commit_then_lose),
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="ow-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="ow",
+            )
+            with pytest.raises(module.BindingCommitOutcomeUnknownError):
+                await wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="ow-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "阿明"
+
+            # 另一合法维护流程（共享 271 facade）把同一成员改名为“小暗”。
+            async with factory() as session:
+                await BindingTransaction(session).rename(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    character_name="小暗",
+                )
+                await session.commit()
+
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="ow-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+
+            assert repeat is not None
+            assert repeat.body == EXPIRED, "不确定提交后的旧 confirm 不得虚报成功"
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "小暗", "绝不覆写后续合法正式值"
+            assert (
+                binding_manager.get_qq_character_name(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    fallback_nickname="FALLBACK",
+                )
+                != "阿明"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_commit_unknown_before_commit_never_overwrites_existing_new_formal_state(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8：before-commit 不确定后已有新正式状态，重复旧 confirm 不得盲目覆盖。"""
+    module = require_wizard_contract()
+    current = scope("unknown-before-overwrite")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    failed = {"once": False}
+
+    async def lose_before_commit(inner: AsyncSession) -> None:
+        if not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("commit outcome unknown")  # noqa: TRY003
+        await inner.commit()
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=_hook_factory(factory, lose_before_commit),
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="bo-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="bo",
+            )
+            with pytest.raises(module.BindingCommitOutcomeUnknownError):
+                await wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="bo-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 0
+            )
+
+            # 另一合法维护流程为同一成员建立正式绑定“小暗”。
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                name="小暗",
+            )
+
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="bo-4",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+
+            assert repeat is not None
+            assert repeat.body == EXPIRED, "不确定提交后的旧 confirm 不得虚报成功"
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] == "小暗", "绝不盲目覆盖已有新正式状态"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 1
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+@pytest.mark.group_admission_acceptance
+async def test_real_handler_evidence_progression_and_success_send_survive_cancel(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC4/AC9/AC10：真实链证据推进→成功发送，发送后 finally 才清理临时会话。"""
+    current = scope("chain")
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with _real_pg_handler_env(
+                current,
+                factory=factory,
+                manager=binding_manager,
+                monkeypatch=monkeypatch,
+            ) as env:
+                bot = QQProbeBot(current.app_id)
+                session_code = await _run_real_chain_until_confirm(bot, current, env)
+
+                await dispatch_qq(
+                    bot,
+                    make_group_at(
+                        content=f"/bind confirm {session_code}",
+                        message_id="chain-4",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                )
+
+                assert len(bot.calls) == 4, (
+                    f"提交成功后成功文案必须实际发送: {bot.calls}"
+                )
+                assert markdown_content(bot.calls[3][1]) == BIND_SUCCESS.format(
+                    name="阿明"
+                )
+                assert (
+                    await _member_row(factory, current, current.member_openid)
+                )["character_name"] == "阿明"
+                assert env["cancel_calls"] == [session_code], (
+                    "成功发送后 finally 必须恰好清理一次临时会话"
+                )
+                coordinator = env["coordinator"]
+                assert (
+                    await coordinator.resolve_verified_binding_session(
+                        current.app_id,
+                        current.group_openid,
+                        current.member_openid,
+                    )
+                    is None
+                )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def _wait_for_draft_name(
+    wizard: Any,
+    module: Any,
+    current: Scope,
+    expected: str,
+) -> None:
+    """等待同 scope 草稿变为 expected；串行实现下会超时，由调用方吞掉。"""
+    async with asyncio.timeout(1.0):
+        while True:
+            view = await wizard.get_session(
+                module.WizardScope(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+            )
+            if view is not None and view.character_name == expected:
+                return
+            await asyncio.sleep(0.01)
+
+
+async def test_authorize_send_denies_completed_reply_after_recheck_revocation(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC9：成功回复生成后撤销准入/封禁，authorize_send 必须拒绝，即使 canonical 一致。"""
+    module = require_wizard_contract()
+    current = scope("authz-revoked")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="authz-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="authz",
+            )
+            success = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="authz-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert success is not None
+            assert success.body == BIND_SUCCESS.format(name="阿明")
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "阿明"
+
+            # 阳性：准入仍允许时，已完成回复可以发送。
+            assert await wizard.authorize_send(token, success) is True
+
+            # 撤销准入/封禁后：canonical 仍等于目标，也不得放行。
+            coordinator.recheck_allowed = False
+            assert await wizard.authorize_send(token, success) is False, (
+                "completed canonical 一致不得绕过发送前重审"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_confirm_rechecks_after_group_lock_and_writes_nothing_when_revoked(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC9：confirm 等待组锁期间撤销准入，获锁后必须重审且零写入。"""
+    module = require_wizard_contract()
+    current = scope("lock-recheck")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="lock-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="lock",
+            )
+
+            blocker = factory()
+            await lock_group_scope(
+                blocker,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
+            blocker_pid = await backend_pid(blocker)
+            task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="lock-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            await wait_for_blocked(factory, blocker_pid)
+
+            # 确认已停在组锁等待上；此刻撤销准入，再放锁。
+            coordinator.recheck_allowed = False
+            await blocker.rollback()
+            await blocker.close()
+            result = await task
+
+            assert result is None, "获锁后重审失败必须静默"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 0
+            ), "获锁后重审失败不得写入成员/名字"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_groups", current
+                )
+                == 0
+            ), "获锁后重审失败不得写入群映射"
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_concurrent_name_change_during_confirm_never_writes_unconfirmed_name(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8/AC10：同 scope confirm 等待期间改草稿，不得写入未确认的新名。"""
+    module = require_wizard_contract()
+    current = scope("draft-race")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="draft-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="draft",
+            )
+
+            blocker = factory()
+            await lock_group_scope(
+                blocker,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
+            blocker_pid = await backend_pid(blocker)
+            confirm_task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="draft-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            await wait_for_blocked(factory, blocker_pid)
+
+            name_task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind name {session_code} 小暗",
+                        message_id="draft-4",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            # 无串行/快照时草稿会被改成“小暗”；合理实现下这里会超时。
+            with suppress(TimeoutError):
+                await _wait_for_draft_name(wizard, module, current, "小暗")
+
+            await blocker.rollback()
+            await blocker.close()
+            await asyncio.gather(confirm_task, name_task, return_exceptions=True)
+
+            row = await _member_row(factory, current, current.member_openid)
+            assert row.get("character_name") == "阿明", (
+                f"不得写入未确认的新名: {row}"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+class _FailOnCallBot(QQProbeBot):
+    """在第 N 次 call_api 抛错，用于验证发送失败的 finally 清理。"""
+
+    def __init__(self, self_id: str, *, fail_on: int) -> None:
+        super().__init__(self_id)
+        self.fail_on = fail_on
+
+    async def call_api(self, api: str, **data: object) -> Any:
+        self.calls.append((api, data))
+        if len(self.calls) == self.fail_on:
+            raise RuntimeError("simulated send outcome unknown")  # noqa: TRY003
+        return None
+
+
+class _CommitAwareCoordinator(FakeCoordinator):
+    """commit 完成后拒绝任何重审，用于发送前准入撤销的 finally 清理。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.committed = False
+
+    async def recheck(self, token: Any, *, effect: str) -> QQEffectDecision:
+        if self.committed:
+            self.recheck_calls.append((token, effect))
+            return QQEffectDecision(
+                allowed=False,
+                effect=cast("Any", effect),
+                reason_code="policy_restricted",
+                effective_policy_revision=1,
+            )
+        return await super().recheck(token, effect=effect)
+
+
+@asynccontextmanager
+async def _real_pg_handler_env(
+    current: Scope,
+    *,
+    factory: async_sessionmaker[AsyncSession],
+    manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[dict[str, Any]]:
+    """真实包 + 真实 preprocessor + 真实协调器 + 真实 PG wizard。"""
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    async def resolve_group(_app_id: str, _group_openid: str) -> int | None:
+        return None
+
+    async def never_banned(_member_qq: int, _scope: str) -> bool:
+        return False
+
+    async with event_gate_context():
+        with _real_character_binding_package():
+            module = require_wizard_contract()
+            reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+            coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+            clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+            freeze_qq_now(monkeypatch, clock)
+            collector = reply_evidence.ReplyEvidenceCollector(
+                app_id=current.app_id,
+                official_bot_qq=OFFICIAL_BOT_QQ,
+                message_fetcher=_empty_fetcher,
+                clock=clock,
+            )
+            coordinator = coordinator_module.QQBindingCoordinator(
+                collectors=(collector,),
+                group_resolver=resolve_group,
+                ban_checker=never_banned,
+                clock=clock,
+            )
+            cancel_calls: list[str] = []
+            original_cancel = coordinator.cancel
+
+            async def counting_cancel(session_code: str) -> None:
+                cancel_calls.append(session_code)
+                await original_cancel(session_code)
+
+            monkeypatch.setattr(
+                coordinator,
+                "cancel",
+                counting_cancel,
+                raising=False,
+            )
+            await coordinator.start()
+            wizard = module.BindingWizard(
+                coordinator=coordinator,
+                session_factory=factory,
+                clock=clock,
+                manager=manager,
+            )
+            module.set_binding_wizard(wizard)
+            try:
+                yield {
+                    "module": module,
+                    "coordinator": coordinator,
+                    "wizard": wizard,
+                    "clock": clock,
+                    "cancel_calls": cancel_calls,
+                }
+            finally:
+                module.set_binding_wizard(None)
+                await coordinator.close()
+                reply_evidence.set_runtime_collectors(())
+
+
+async def _run_real_chain_until_confirm(
+    bot: QQProbeBot,
+    current: Scope,
+    env: dict[str, Any],
+    *,
+    name: str = "阿明",
+) -> str:
+    """真实 handler 链：挑战 → 证据推进 → 名字输入 → 最终确认预览。"""
+    coordinator = env["coordinator"]
+    await dispatch_qq(
+        bot,
+        make_group_at(
+            content="/bind",
+            message_id="chain-1",
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+        ),
+    )
+    assert len(bot.calls) == 1
+    challenge = markdown_content(bot.calls[0][1])
+    assert challenge.startswith("正在确认你的本群身份。\n会话码：")
+    session_code = challenge.split("会话码：", 1)[1].split("\n", 1)[0]
+
+    evidence = ReplyEvidence(
+        app_id=current.app_id,
+        session_code=session_code,
+        group_openid=current.group_openid,
+        member_openid=current.member_openid,
+        group_id=str(current.group_id),
+        member_qq=str(current.member_qq),
+        original_command="/bind",
+        qq_message_id="chain-1",
+        onebot_original_message_id=91001,
+        challenge_message_id=91002,
+        connection_generation=0,
+    )
+    token = await coordinator.accept_reply_evidence(evidence)
+    assert token is not None
+    assert token.scope == "binding"
+    assert len(bot.calls) == 1, "证据到达不得自动追加 QQ 消息"
+
+    await dispatch_qq(
+        bot,
+        make_group_at(
+            content="/bind",
+            message_id="chain-2",
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+        ),
+    )
+    assert len(bot.calls) == 2
+    assert markdown_content(bot.calls[1][1]) == NAME_INPUT
+
+    await dispatch_qq(
+        bot,
+        make_group_at(
+            content=f"/bind name {session_code} {name}",
+            message_id="chain-3",
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+        ),
+    )
+    assert len(bot.calls) == 3
+    assert markdown_content(bot.calls[2][1]) == BINDING_CONFIRM.format(name=name)
+    return session_code
+
+
+@pytest.mark.group_admission_acceptance
+async def test_real_handler_send_failure_finally_revokes_completed_session(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC10：发送失败（结果不确定）时 finally 也必须清理临时会话且不补发。"""
+    current = scope("chain-fail")
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with _real_pg_handler_env(
+                current,
+                factory=factory,
+                manager=binding_manager,
+                monkeypatch=monkeypatch,
+            ) as env:
+                bot = _FailOnCallBot(current.app_id, fail_on=4)
+                session_code = await _run_real_chain_until_confirm(bot, current, env)
+
+                await dispatch_qq(
+                    bot,
+                    make_group_at(
+                        content=f"/bind confirm {session_code}",
+                        message_id="chain-4",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                )
+
+                assert len(bot.calls) == 4, "发送失败只尝试一次、不补发"
+                assert (
+                    await _member_row(factory, current, current.member_openid)
+                )["character_name"] == "阿明"
+                assert env["cancel_calls"] == [session_code], (
+                    "发送失败 finally 必须清理临时会话"
+                )
+        finally:
+            await _cleanup(engine, current)
+
+
+@pytest.mark.group_admission_acceptance
+async def test_real_handler_denied_send_finally_revokes_completed_session(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9/AC10：发送前重审拒绝时不发送，但 finally 仍清理临时会话。"""
+    current = scope("chain-deny")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    coordinator = _CommitAwareCoordinator(
+        claim=make_claim(
+            clock=clock,
+            session_code="deny-session",
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            qq_message_id="deny-1",
+        )
+    )
+
+    async def commit_then_flag(inner: AsyncSession) -> None:
+        await inner.commit()
+        coordinator.committed = True
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    freeze_qq_now(monkeypatch, clock)
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=_hook_factory(factory, commit_then_flag),
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    module.set_binding_wizard(wizard)
+                    admission = importlib.import_module(
+                        "komari_bot.plugins.group_admission"
+                    )
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> int:
+                        return current.group_id
+
+                    admission.register_qq_group_resolver(resolve_group)
+                    try:
+                        bot = QQProbeBot(current.app_id)
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="deny-1",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 1
+                        coordinator.verified = make_verified(
+                            clock=clock,
+                            session_code="deny-session",
+                            app_id=current.app_id,
+                            group_openid=current.group_openid,
+                            member_openid=current.member_openid,
+                            qq_message_id="deny-1",
+                            group_id=current.group_id,
+                            member_qq=current.member_qq,
+                        )
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="deny-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 2
+                        assert markdown_content(bot.calls[1][1]) == NAME_INPUT
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind name deny-session 阿明",
+                                message_id="deny-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 3
+
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind confirm deny-session",
+                                message_id="deny-4",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+
+                        assert len(bot.calls) == 3, "授权拒绝不得发送成功文案"
+                        assert (
+                            await _member_row(factory, current, current.member_openid)
+                        )["character_name"] == "阿明"
+                        assert coordinator.cancelled == ["deny-session"], (
+                            "拒绝发送 finally 仍必须清理临时会话"
+                        )
+                    finally:
+                        module.set_binding_wizard(None)
+                        admission.register_qq_group_resolver(None)
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_real_coordinator_denies_send_after_post_commit_ban_change(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9：真实协调器在提交后发生封禁变更时必须拒绝发送。"""
+    current = scope("post-commit-ban")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    ban_state = {"banned": False}
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    freeze_qq_now(monkeypatch, clock)
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+                        return None
+
+                    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+                        return ban_state["banned"]
+
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=ban_checker,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    try:
+                        claim = await coordinator.claim_initial_bind(
+                            QQInitialBindRequest(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                qq_message_id="ban-1",
+                                command="/bind",
+                            )
+                        )
+                        assert claim is not None
+                        token = await coordinator.accept_reply_evidence(
+                            ReplyEvidence(
+                                app_id=current.app_id,
+                                session_code=claim.session_code,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                group_id=str(current.group_id),
+                                member_qq=str(current.member_qq),
+                                original_command="/bind",
+                                qq_message_id="ban-1",
+                                onebot_original_message_id=92001,
+                                challenge_message_id=92002,
+                                connection_generation=claim.connection_generation,
+                            )
+                        )
+                        assert token is not None
+                        name = await wizard.handle_event(
+                            make_event(
+                                content="/bind",
+                                message_id="ban-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert name is not None
+                        assert name.body == NAME_INPUT
+                        session_code = await _session_code(wizard, module, current)
+                        preview = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="ban-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert preview is not None
+                        assert preview.body == BINDING_CONFIRM.format(name="阿明")
+                        success = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind confirm {session_code}",
+                                message_id="ban-4",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert success is not None
+                        assert success.body == BIND_SUCCESS.format(name="阿明")
+
+                        assert await wizard.authorize_send(token, success) is True
+                        ban_state["banned"] = True
+                        assert await wizard.authorize_send(token, success) is False, (
+                            "真实协调器必须在提交后封禁变更时拒发"
+                        )
+                    finally:
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_confirm_lock_wait_ttl_expiry_writes_nothing(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9：confirm 等待组锁期间 TTL 到期，获锁后必须重审且零写入。"""
+    current = scope("lock-ttl")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    freeze_qq_now(monkeypatch, clock)
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+                        return None
+
+                    async def never_banned(_member_qq: int, _scope: str) -> bool:
+                        return False
+
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=never_banned,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    try:
+                        claim = await coordinator.claim_initial_bind(
+                            QQInitialBindRequest(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                qq_message_id="ttl-1",
+                                command="/bind",
+                            )
+                        )
+                        assert claim is not None
+                        token = await coordinator.accept_reply_evidence(
+                            ReplyEvidence(
+                                app_id=current.app_id,
+                                session_code=claim.session_code,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                group_id=str(current.group_id),
+                                member_qq=str(current.member_qq),
+                                original_command="/bind",
+                                qq_message_id="ttl-1",
+                                onebot_original_message_id=93001,
+                                challenge_message_id=93002,
+                                connection_generation=claim.connection_generation,
+                            )
+                        )
+                        assert token is not None
+                        name = await wizard.handle_event(
+                            make_event(
+                                content="/bind",
+                                message_id="ttl-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert name is not None
+                        assert name.body == NAME_INPUT
+                        session_code = await _session_code(wizard, module, current)
+                        preview = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="ttl-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert preview is not None
+                        assert preview.body == BINDING_CONFIRM.format(name="阿明")
+
+                        blocker = factory()
+                        await lock_group_scope(
+                            blocker,
+                            app_id=current.app_id,
+                            group_openid=current.group_openid,
+                        )
+                        blocker_pid = await backend_pid(blocker)
+                        task = asyncio.create_task(
+                            wizard.handle_event(
+                                make_event(
+                                    content=f"/bind confirm {session_code}",
+                                    message_id="ttl-4",
+                                    group_openid=current.group_openid,
+                                    member_openid=current.member_openid,
+                                ),
+                                token,
+                            )
+                        )
+                        await wait_for_blocked(factory, blocker_pid)
+
+                        clock.advance(timedelta(minutes=11))
+                        await blocker.rollback()
+                        await blocker.close()
+                        result = await task
+
+                        assert result is None, "TTL 到期后重审失败必须静默"
+                        assert (
+                            await _count_rows(
+                                factory, "komari_character_binding_members", current
+                            )
+                            == 0
+                        ), "TTL 到期后不得写入"
+                    finally:
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
+
+
+@pytest.mark.parametrize("action", ["cancel", "close", "reset"])
+async def test_cancel_close_reset_during_lock_wait_writes_nothing(
+    action: str,
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC10：confirm 等待组锁期间 cancel/close/reset 后不得再写入。"""
+    module = require_wizard_contract()
+    current = scope(f"abort-{action}")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id=f"{action}-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix=action,
+            )
+
+            blocker = factory()
+            await lock_group_scope(
+                blocker,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
+            blocker_pid = await backend_pid(blocker)
+            task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id=f"{action}-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            await wait_for_blocked(factory, blocker_pid)
+
+            match action:
+                case "cancel":
+                    assert await wizard.cancel(session_code) is True
+                case "close":
+                    await wizard.close()
+                case "reset":
+                    wizard.reset()
+
+            await blocker.rollback()
+            await blocker.close()
+            result = await task
+
+            assert result is None, f"{action} 后确认不得继续执行"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 0
+            ), f"{action} 后不得写入成员"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_groups", current
+                )
+                == 0
+            ), f"{action} 后不得写入群映射"
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_rename_case_only_change_updates_display(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC6：ABC→abc 仅大小写变化也必须真正更新展示名与比较键。"""
+    module = require_wizard_contract()
+    current = scope("rename-case")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            await _seed_binding(
+                factory,
+                current,
+                member_openid=current.member_openid,
+                member_qq=current.member_qq,
+                name="ABC",
+            )
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="case-1")
+            rename = await wizard.handle_event(
+                make_event(
+                    content="/bind rename",
+                    message_id="case-1",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert rename is not None
+            assert rename.body == NAME_INPUT
+            session_code = await _session_code(wizard, module, current)
+            preview = await wizard.handle_event(
+                make_event(
+                    content=f"/bind name {session_code} abc",
+                    message_id="case-2",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert preview is not None
+            assert preview.body == RENAME_CONFIRM.format(old="ABC", new="abc")
+            success = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="case-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert success is not None
+            assert success.body == RENAME_SUCCESS.format(name="abc")
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] == "abc", "仅大小写变化也必须更新展示名"
+            assert row["character_name_key"] == "abc"
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_init_plugin_installs_and_close_plugin_removes_wizard() -> None:
+    """AC10：真实 init_plugin/close_plugin 必须安装与关闭 wizard。"""
+    require_postgres()
+    await _reset_shared_orm_engine()
+    with registry_isolation_context(), _real_character_binding_package() as binding:
+        package = cast("Any", binding)
+        module = require_wizard_contract()
+        await package.close_plugin()
+        await package.init_plugin()
+        assert module.get_binding_wizard() is not None, "init_plugin 必须安装 wizard"
+        await package.close_plugin()
+        assert module.get_binding_wizard() is None, "close_plugin 必须移除 wizard"
+    await _reset_shared_orm_engine()
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["cancel", "close", "recheck_denied", "ttl"],
+)
+async def test_apply_pause_then_invalidation_rolls_back_and_returns_no_reply(
+    action: str,
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9/AC10：_apply 已 bind/flush 但未 commit 期间失效，必须回滚且不返回成功。"""
+    current = scope(f"apply-pause-{action}")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    ban_state = {"banned": False}
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    staged = asyncio.Event()
+    release = asyncio.Event()
+
+    async def staged_bind(self: Any, **kwargs: Any) -> None:
+        await self._original_bind(**kwargs)  # type: ignore[attr-defined]
+        staged.set()
+        await release.wait()
+
+    async for engine, factory in create_engine_and_factory():
+        task: asyncio.Task[Any] | None = None
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    transaction_module = importlib.import_module(
+                        "komari_bot.plugins.character_binding.transaction"
+                    )
+                    freeze_qq_now(monkeypatch, clock)
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+                        return None
+
+                    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+                        return ban_state["banned"]
+
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=ban_checker,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    try:
+                        claim = await coordinator.claim_initial_bind(
+                            QQInitialBindRequest(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                qq_message_id="pause-1",
+                                command="/bind",
+                            )
+                        )
+                        assert claim is not None
+                        token = await coordinator.accept_reply_evidence(
+                            ReplyEvidence(
+                                app_id=current.app_id,
+                                session_code=claim.session_code,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                group_id=str(current.group_id),
+                                member_qq=str(current.member_qq),
+                                original_command="/bind",
+                                qq_message_id="pause-1",
+                                onebot_original_message_id=94001,
+                                challenge_message_id=94002,
+                                connection_generation=claim.connection_generation,
+                            )
+                        )
+                        assert token is not None
+                        name = await wizard.handle_event(
+                            make_event(
+                                content="/bind",
+                                message_id="pause-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert name is not None
+                        assert name.body == NAME_INPUT
+                        session_code = await _session_code(wizard, module, current)
+                        preview = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="pause-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert preview is not None
+                        assert preview.body == BINDING_CONFIRM.format(name="阿明")
+
+                        monkeypatch.setattr(
+                            transaction_module.BindingTransaction,
+                            "_original_bind",
+                            transaction_module.BindingTransaction.bind,
+                            raising=False,
+                        )
+                        monkeypatch.setattr(
+                            transaction_module.BindingTransaction,
+                            "bind",
+                            staged_bind,
+                        )
+                        task = asyncio.create_task(
+                            wizard.handle_event(
+                                make_event(
+                                    content=f"/bind confirm {session_code}",
+                                    message_id="pause-4",
+                                    group_openid=current.group_openid,
+                                    member_openid=current.member_openid,
+                                ),
+                                token,
+                            )
+                        )
+                        await asyncio.wait_for(staged.wait(), timeout=5)
+
+                        match action:
+                            case "cancel":
+                                assert await wizard.cancel(session_code) is True
+                            case "close":
+                                await wizard.close()
+                            case "recheck_denied":
+                                ban_state["banned"] = True
+                            case "ttl":
+                                clock.advance(timedelta(minutes=11))
+
+                        release.set()
+                        result = await task
+
+                        assert result is None, f"{action} 后不得返回成功 reply"
+                        assert (
+                            await _count_rows(
+                                factory, "komari_character_binding_members", current
+                            )
+                            == 0
+                        ), f"{action} 后暂存事务必须回滚"
+                        assert (
+                            await _count_rows(
+                                factory, "komari_character_binding_groups", current
+                            )
+                            == 0
+                        ), f"{action} 后不得留下群映射"
+                    finally:
+                        release.set()
+                        if task is not None and not task.done():
+                            task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await task
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_authorize_send_rechecks_after_canonical_read(
+    binding_manager: CharacterBindingManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC9：canonical 读取期间发生封禁变更，authorize_send 必须拒绝（重审最后一步）。"""
+    current = scope("authz-canonical-window")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    ban_state = {"banned": False}
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    staged = asyncio.Event()
+    release = asyncio.Event()
+
+    async for engine, factory in create_engine_and_factory():
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package():
+                    module = require_wizard_contract()
+                    reply_evidence = importlib.import_module(REPLY_EVIDENCE_MODULE)
+                    coordinator_module = importlib.import_module(COORDINATOR_MODULE)
+                    freeze_qq_now(monkeypatch, clock)
+
+                    async def resolve_group(_app_id: str, _group_openid: str) -> None:
+                        return None
+
+                    async def ban_checker(_member_qq: int, _scope: str) -> bool:
+                        return ban_state["banned"]
+
+                    collector = reply_evidence.ReplyEvidenceCollector(
+                        app_id=current.app_id,
+                        official_bot_qq=OFFICIAL_BOT_QQ,
+                        message_fetcher=_empty_fetcher,
+                        clock=clock,
+                    )
+                    coordinator = coordinator_module.QQBindingCoordinator(
+                        collectors=(collector,),
+                        group_resolver=resolve_group,
+                        ban_checker=ban_checker,
+                        clock=clock,
+                    )
+                    await coordinator.start()
+                    wizard = module.BindingWizard(
+                        coordinator=coordinator,
+                        session_factory=factory,
+                        clock=clock,
+                        manager=binding_manager,
+                    )
+                    try:
+                        claim = await coordinator.claim_initial_bind(
+                            QQInitialBindRequest(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                qq_message_id="canon-1",
+                                command="/bind",
+                            )
+                        )
+                        assert claim is not None
+                        token = await coordinator.accept_reply_evidence(
+                            ReplyEvidence(
+                                app_id=current.app_id,
+                                session_code=claim.session_code,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                                group_id=str(current.group_id),
+                                member_qq=str(current.member_qq),
+                                original_command="/bind",
+                                qq_message_id="canon-1",
+                                onebot_original_message_id=95001,
+                                challenge_message_id=95002,
+                                connection_generation=claim.connection_generation,
+                            )
+                        )
+                        assert token is not None
+                        name = await wizard.handle_event(
+                            make_event(
+                                content="/bind",
+                                message_id="canon-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert name is not None
+                        assert name.body == NAME_INPUT
+                        session_code = await _session_code(wizard, module, current)
+                        preview = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="canon-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert preview is not None
+                        assert preview.body == BINDING_CONFIRM.format(name="阿明")
+                        success = await wizard.handle_event(
+                            make_event(
+                                content=f"/bind confirm {session_code}",
+                                message_id="canon-4",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                            token,
+                        )
+                        assert success is not None
+                        assert success.body == BIND_SUCCESS.format(name="阿明")
+                        assert await wizard.authorize_send(token, success) is True
+
+                        original_read = wizard._read_canonical
+
+                        async def staged_read(
+                            read_scope: Any,
+                            _original: Any = original_read,
+                        ) -> Any:
+                            staged.set()
+                            await release.wait()
+                            return await _original(read_scope)
+
+                        monkeypatch.setattr(
+                            wizard,
+                            "_read_canonical",
+                            staged_read,
+                            raising=False,
+                        )
+                        task = asyncio.create_task(
+                            wizard.authorize_send(token, success)
+                        )
+                        await asyncio.wait_for(staged.wait(), timeout=5)
+                        ban_state["banned"] = True
+                        release.set()
+
+                        assert await task is False, (
+                            "canonical 读取期间撤销后必须拒绝，重审应是最后一步"
+                        )
+                    finally:
+                        release.set()
+                        await coordinator.close()
+                        reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
+
+
+async def _terminate_advisory_waiters(engine: AsyncEngine) -> None:
+    """有界清理：终止仍等待组 advisory lock 的后端，避免用例失败后挂住后续测试。"""
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE wait_event_type = 'Lock' "
+                "AND query ILIKE '%pg_advisory_xact_lock%' "
+                "AND pid <> pg_backend_pid()"
+            )
+        )
+
+
+async def _database_name(engine: AsyncEngine) -> str:
+    async with engine.connect() as connection:
+        return str(await connection.scalar(text("SELECT current_database()")))
+
+
+async def _set_database_timeouts(
+    engine: AsyncEngine,
+    db_name: str,
+    *,
+    reset: bool,
+) -> None:
+    """有界兜底：给该测试库的新连接设置/复位 lock_timeout 与 statement_timeout。"""
+    async with engine.begin() as connection:
+        if reset:
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" RESET lock_timeout')
+            )
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" RESET statement_timeout')
+            )
+        else:
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" SET lock_timeout = \'2s\'')
+            )
+            await connection.execute(
+                text(f'ALTER DATABASE "{db_name}" SET statement_timeout = \'15s\'')
+            )
+
+
+async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC8/AC9：真实 init_plugin 安装的生产 resolver 不得与持锁 confirm 自锁。"""
+    from nonebot import get_driver
+    from nonebot.adapters.qq.config import BotInfo, Intents
+    from nonebot.config import Config as NoneBotConfig
+
+    from komari_bot.plugins import user_ban as user_ban_module
+
+    require_postgres()
+    current = scope("real-init-resolvers")
+    driver = get_driver()
+    config_values = driver.config.model_dump()
+    config_values.update(
+        {
+            "qq_is_sandbox": True,
+            "qq_bots": [
+                BotInfo(
+                    id=current.app_id,
+                    token="tsk277-init-token",
+                    secret="tsk277-init-secret",
+                    intent=Intents(c2c_group_at_messages=True),
+                    use_websocket=False,
+                ).model_dump()
+            ],
+            "qq_official_bot_qq_by_app": {current.app_id: OFFICIAL_BOT_QQ},
+        }
+    )
+
+    async def _is_user_banned(_user_id: str, _scope: object) -> bool:
+        return False
+
+    monkeypatch.setattr(driver, "config", NoneBotConfig.model_validate(config_values))
+    monkeypatch.setattr(
+        user_ban_module,
+        "is_configured_superuser_id",
+        lambda _user_id: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        user_ban_module,
+        "is_user_banned",
+        _is_user_banned,
+        raising=False,
+    )
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    async for engine, _factory in create_engine_and_factory():
+        db_name = await _database_name(engine)
+        await _set_database_timeouts(engine, db_name, reset=False)
+        await _reset_shared_orm_engine()
+        await prepare_control_plane(monkeypatch, storage)
+        try:
+            async with event_gate_context():
+                with _real_character_binding_package() as binding:
+                    package = cast("Any", binding)
+                    await package.init_plugin()
+                    try:
+                        module = require_wizard_contract()
+                        wizard = module.get_binding_wizard()
+                        assert wizard is not None, "init_plugin 必须安装 wizard"
+                        coordinator = wizard._coordinator
+                        bot = QQProbeBot(current.app_id)
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="real-init-1",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 1
+                        challenge = markdown_content(bot.calls[0][1])
+                        session_code = challenge.split("会话码：", 1)[1].split(
+                            "\n", 1
+                        )[0]
+                        evidence = ReplyEvidence(
+                            app_id=current.app_id,
+                            session_code=session_code,
+                            group_openid=current.group_openid,
+                            member_openid=current.member_openid,
+                            group_id=str(current.group_id),
+                            member_qq=str(current.member_qq),
+                            original_command="/bind",
+                            qq_message_id="real-init-1",
+                            onebot_original_message_id=96001,
+                            challenge_message_id=96002,
+                            connection_generation=0,
+                        )
+                        assert (
+                            await coordinator.accept_reply_evidence(evidence)
+                            is not None
+                        )
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content="/bind",
+                                message_id="real-init-2",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 2
+                        assert markdown_content(bot.calls[1][1]) == NAME_INPUT
+                        await dispatch_qq(
+                            bot,
+                            make_group_at(
+                                content=f"/bind name {session_code} 阿明",
+                                message_id="real-init-3",
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            ),
+                        )
+                        assert len(bot.calls) == 3
+                        assert markdown_content(bot.calls[2][1]) == BINDING_CONFIRM.format(
+                            name="阿明"
+                        )
+
+                        confirm_task = asyncio.create_task(
+                            dispatch_qq(
+                                bot,
+                                make_group_at(
+                                    content=f"/bind confirm {session_code}",
+                                    message_id="real-init-4",
+                                    group_openid=current.group_openid,
+                                    member_openid=current.member_openid,
+                                ),
+                            )
+                        )
+                        done, _pending = await asyncio.wait(
+                            {confirm_task},
+                            timeout=10,
+                        )
+                        if not done:
+                            await _terminate_advisory_waiters(engine)
+                            with suppress(Exception):
+                                await asyncio.wait_for(confirm_task, timeout=5)
+                            pytest.fail(
+                                "真实 confirm 在 10s 内未完成：生产 resolver 在持组锁后自锁"
+                            )
+
+                        assert len(bot.calls) == 4, (
+                            f"生产 resolver 下成功文案必须实际发送: {bot.calls}"
+                        )
+                        assert markdown_content(bot.calls[3][1]) == BIND_SUCCESS.format(
+                            name="阿明"
+                        )
+                        manager = package.get_binding_manager()
+                        assert (
+                            manager.get_qq_character_name(
+                                app_id=current.app_id,
+                                group_openid=current.group_openid,
+                                member_openid=current.member_openid,
+                            )
+                            == "阿明"
+                        )
+                    finally:
+                        await package.close_plugin()
+        finally:
+            await _terminate_advisory_waiters(engine)
+            await _cleanup(engine, current)
+            await _set_database_timeouts(engine, db_name, reset=True)
+            await _reset_shared_orm_engine()

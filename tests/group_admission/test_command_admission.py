@@ -57,11 +57,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _target_command_paths() -> list[Path]:
-    """TSK-227 被收敛命令的四个源模块。"""
+    """TSK-227 被收敛命令的源模块（TSK-277 起 character_binding 旧命令退役）。"""
     paths = [
         "komari_help/commands.py",
         "sr/__init__.py",
-        "character_binding/commands.py",
         "user_ban/commands.py",
     ]
     return [PROJECT_ROOT / "komari_bot" / "plugins" / p for p in paths]
@@ -170,7 +169,7 @@ def test_no_orphan_command_matchers_in_target_modules() -> None:
     census = {row.entry_id for row in COMMAND_EFFECT_SINK_CENSUS}
     extra = set(scanned) - census
     assert extra == set(), f"存在未登记的 on_command matcher: {extra}"
-    assert len(census) == 12, f"command census 应为 12 条，实际 {len(census)}"
+    assert len(census) == 8, f"command census 应为 8 条，实际 {len(census)}"
 
 
 def test_command_effect_manifest_anchors_collectable() -> None:
@@ -210,7 +209,6 @@ def test_command_handlers_use_unified_admission_gate() -> None:
     target_files = [
         "komari_help/commands.py",
         "sr/__init__.py",
-        "character_binding/commands.py",
         "user_ban/commands.py",
     ]
     missing: list[str] = []
@@ -233,7 +231,6 @@ def test_command_handlers_gate_effects_through_group_admission() -> None:
     target_files = [
         "komari_help/commands.py",
         "sr/__init__.py",
-        "character_binding/commands.py",
         "user_ban/commands.py",
     ]
     unguarded: list[str] = []

@@ -32,14 +32,19 @@ from .reply_evidence import (
     set_runtime_collectors,
 )
 from .transaction import BindingTransaction, GroupBindingGroup
+from .wizard import BindingWizard, get_binding_wizard, set_binding_wizard
 
 __plugin_meta__ = PluginMetadata(
     name="character_binding",
     description="提供跨插件的角色名绑定管理功能",
     usage="""
-    .bind set <角色名> - 设置绑定
-    .bind del - 删除绑定
-    .bind list - 查看绑定列表
+    /bind - 开始或继续本群绑定向导
+    /bind rename - 修改本群角色名
+    /bind unbind - 解除本群角色名绑定
+    /bind name <会话码> <角色名> - 提交或修改角色名
+    /bind reuse <会话码> - 沿用旧角色名
+    /bind confirm <会话码> - 确认当前操作
+    /bind cancel <会话码> - 取消当前操作
     """,
 )
 
@@ -62,7 +67,11 @@ async def _unavailable_message_fetcher(
 
 
 async def _resolve_qq_group(app_id: str, group_openid: str) -> int | None:
-    """Resolve one canonical QQ group through a caller-owned transaction."""
+    """Resolve one canonical QQ group for admission via a lock-free committed read.
+
+    该解析器会被持组锁的 confirm 重审调用；若另开 session 再取同一 advisory
+    lock 会形成跨 session 自锁，因此这里只读取已提交 canonical 行。
+    """
     from .database import _open_session
 
     session = _open_session()
@@ -71,6 +80,7 @@ async def _resolve_qq_group(app_id: str, group_openid: str) -> int | None:
             group = await BindingTransaction(session).resolve_group(
                 app_id=app_id,
                 group_openid=group_openid,
+                lock=False,
             )
             if group is None:
                 return None
@@ -90,7 +100,10 @@ async def _resolve_qq_member(
     group_openid: str,
     member_openid: str,
 ) -> int | None:
-    """Resolve the current trusted numeric member identity, if bound."""
+    """Resolve the current trusted numeric member identity, if bound.
+
+    与 group resolver 相同：准入只读，不加组锁，只读取已提交 canonical 行。
+    """
     from .database import _open_session
 
     session = _open_session()
@@ -100,6 +113,7 @@ async def _resolve_qq_member(
                 app_id=app_id,
                 group_openid=group_openid,
                 member_openid=member_openid,
+                lock=False,
             )
             if member is None:
                 return None
@@ -175,25 +189,44 @@ def _configured_qq_collectors() -> tuple[ReplyEvidenceCollector, ...]:
 
 
 async def init_plugin() -> None:
-    """初始化管理器后再安装 QQ 准入与 OneBot 证据接线。"""
+    """初始化管理器后安装 QQ 准入、证据接线与绑定向导。"""
     manager = get_manager()
     await manager.initialize()
     if not manager._initialized:
         return
+    previous_wizard = get_binding_wizard()
+    if previous_wizard is not None:
+        await previous_wizard.close()
+        set_binding_wizard(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
-    _qq_plugin_state.coordinator = QQBindingCoordinator(
+    coordinator = QQBindingCoordinator(
         collectors=_configured_qq_collectors(),
         group_resolver=_resolve_qq_group,
         clock=lambda: datetime.now(UTC),
         member_resolver=_resolve_qq_member,
         ban_checker=_qq_ban_checker,
     )
-    await _qq_plugin_state.coordinator.start()
+    _qq_plugin_state.coordinator = coordinator
+    await coordinator.start()
+    from .database import _open_session
+
+    set_binding_wizard(
+        BindingWizard(
+            coordinator=coordinator,
+            session_factory=_open_session,
+            clock=lambda: datetime.now(UTC),
+            manager=manager,
+        )
+    )
 
 
 async def close_plugin() -> None:
-    """先撤销 QQ 准入接缝，再释放绑定数据库租约。"""
+    """先撤销向导与 QQ 准入接缝，再释放绑定数据库租约。"""
+    wizard = get_binding_wizard()
+    if wizard is not None:
+        await wizard.close()
+    set_binding_wizard(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
         _qq_plugin_state.coordinator = None
@@ -272,8 +305,8 @@ except ValueError:
     driver = None
 
 if driver is not None:
-    # 导入命令模块以注册命令处理器（必须在 manager 之后导入以避免循环导入）
-    from . import commands  # noqa: F401
+    # 导入 QQ handler 以注册唯一 matcher（必须在 manager 之后导入以避免循环导入）
+    from . import qq_commands  # noqa: F401
 
     driver.on_startup(init_plugin)
     driver.on_shutdown(close_plugin)

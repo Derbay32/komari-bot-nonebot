@@ -42,10 +42,6 @@ _RAW: tuple[tuple[str, str, str, tuple[str, str]], ...] = (
     ("sr", "__init__", "sr", _REPLY),
     ("sr", "__init__", "sr_custom", _WRITE_GROUP),
     ("sr", "__init__", "sr_manage", _WRITE_GROUP),
-    ("character_binding", "commands", "bind", _REPLY),
-    ("character_binding", "commands", "bind_set", _WRITE_GROUP),
-    ("character_binding", "commands", "bind_del", _WRITE_GROUP),
-    ("character_binding", "commands", "bind_list", _REPLY),
     ("user_ban", "commands", "ban_matcher", _WRITE_GROUP),
     ("user_ban", "commands", "unban_matcher", _WRITE_GROUP),
 )
