@@ -1,6 +1,7 @@
 """TSK-224 slice4: event gate dependency & registration boundary.
 
-1. event_gate.py module must exist, __init__ must import it via AST, __all__ exact 8 symbols, no install_hook.
+1. event_gate.py module must exist, __init__ must import it via AST, __all__ exact
+   public group/QQ contract, no install_hook.
 2. Gate exactly one @event_preprocessor async _admission_event_gate; forbidden: run_preprocessor, on_*, Matcher, cancel/create_task, AgentRun, cross-plugin imports. IgnoredException required.
 3. Runtime registry: event_gate_context loads exactly one preprocessor whose .call.__module__ is gate module.
 """
@@ -104,15 +105,25 @@ def test_package_init_imports_event_gate() -> None:
     assert found, "package must import event_gate"
 
 
-def test_package_all_exact_eight_symbols() -> None:
+def test_package_all_exact_group_and_qq_symbols() -> None:
     assert INIT.is_file()
     tree = ast.parse(INIT.read_text("utf-8"), filename=str(INIT))
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets):
             assert isinstance(node.value, ast.List)
             all_syms = {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}
-            expected = {"AdmissionIntent", "AdmissionQualification", "AdmissionResult", "AdmissionRuntimeState",
-                        "AdmissionRuntimeStatus", "adjudicate", "get_runtime_state", "register_group_admission_api"}
+            expected = {
+                "AdmissionIntent", "AdmissionQualification", "AdmissionResult",
+                "AdmissionRuntimeState", "AdmissionRuntimeStatus", "adjudicate",
+                "get_runtime_state", "register_group_admission_api",
+                "QQ_ADMISSION_STATE_KEY", "QQAdmissionToken", "QQBindClaim",
+                "QQInitialBindRequest", "QQVerifiedBindingSession",
+                "QQEffectDecision", "qualify_qq_event", "get_qq_admission_token",
+                "register_qq_group_resolver",
+                "register_qq_initial_bind_claimer",
+                "register_qq_binding_session_resolver", "register_qq_ban_checker",
+                "recheck_qq_effect",
+            }
             assert all_syms == expected, f"extra={all_syms - expected}, missing={expected - all_syms}"
             assert "install_event_gate" not in all_syms
             return

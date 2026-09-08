@@ -1,12 +1,14 @@
 """TSK-224 event gate frozen census (test truth source, not test module).
 
 EventCensusRow: event_class, category, family, attribution_source, acceptance_anchor.
+QQEventCensusRow: event_class, qualification, acceptance_anchor.
 MatcherEntryRow: entry_id, source_path, source_symbol, factory, event_family, effect_ids, acceptance_anchor.
 
 ``ONEBOT_EVENT_CENSUS`` / ``MATCHER_ENTRY_CENSUS`` 是严格的确定性枚举：
 新增 V11 事件子类或 matcher 注册行必须一并更新本 census，否则对应测试失败。
 
 ``ONEBOT_EVENT_CENSUS``: 22 个 OneBot V11 事件子类。
+``QQ_EVENT_CENSUS``: QQ 入口允许的精确事件与显式拒绝事件闭集。
 ``MATCHER_ENTRY_CENSUS``: 27 个 matcher 注册项。
 """
 
@@ -25,6 +27,13 @@ class EventCensusRow:
 
 
 @dataclass(frozen=True, slots=True)
+class QQEventCensusRow:
+    event_class: str
+    qualification: str
+    acceptance_anchor: str
+
+
+@dataclass(frozen=True, slots=True)
 class MatcherEntryRow:
     entry_id: str
     source_path: str
@@ -36,10 +45,12 @@ class MatcherEntryRow:
 
 
 _CENSUS_ANCHOR = "tests/group_admission/test_entry_gate_census.py::test_event_census_exact_descendants"
+_QQ_CENSUS_ANCHOR = "tests/group_admission/test_qq_event_gate.py::test_qq_event_closed_set"
 _MATCHER_ANCHOR = "tests/group_admission/test_entry_gate_census.py::test_matcher_census_exact_registrations"
 _EFFECT_ID = "group_admission.effect.inbound_matcher_dispatch"
 
 _E = EventCensusRow
+_Q = QQEventCensusRow
 _M = MatcherEntryRow
 
 ONEBOT_EVENT_CENSUS: tuple[EventCensusRow, ...] = (
@@ -69,6 +80,16 @@ ONEBOT_EVENT_CENSUS: tuple[EventCensusRow, ...] = (
     _E("MessageEvent", "unsupported_business_fail_closed", "message", "none", _CENSUS_ANCHOR),
     _E("NoticeEvent", "unsupported_business_fail_closed", "notice", "none", _CENSUS_ANCHOR),
     _E("RequestEvent", "unsupported_business_fail_closed", "request", "none", _CENSUS_ANCHOR),
+)
+
+QQ_EVENT_CENSUS: tuple[QQEventCensusRow, ...] = (
+    _Q("GroupAtMessageCreateEvent", "allowed", _QQ_CENSUS_ANCHOR),
+    _Q("GroupMessageCreateEvent", "rejected", _QQ_CENSUS_ANCHOR),
+    _Q("C2CMessageCreateEvent", "rejected", _QQ_CENSUS_ANCHOR),
+    _Q("MessageCreateEvent", "rejected", _QQ_CENSUS_ANCHOR),
+    _Q("DirectMessageCreateEvent", "rejected", _QQ_CENSUS_ANCHOR),
+    _Q("InteractionCreateEvent", "rejected", _QQ_CENSUS_ANCHOR),
+    _Q("ForgedGroupAtMessageCreateEvent", "rejected", _QQ_CENSUS_ANCHOR),
 )
 
 MATCHER_ENTRY_CENSUS: tuple[MatcherEntryRow, ...] = (
