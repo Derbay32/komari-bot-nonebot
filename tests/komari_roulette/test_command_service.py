@@ -333,13 +333,12 @@ async def test_waiting_join_race_assigns_last_seat_and_never_reuses_join_seq(
                     service, current, member_openid, message_id
                 )
 
-            tasks = [
-                asyncio.create_task(run_one(index, member, message))
-                for index, (member, message) in enumerate(members_to_join)
-            ]
-            for event in started:
-                await event.wait()
-            await wait_for_blocked(harness.session_factory, blocker_pid)
+            tasks: list[asyncio.Task[CommandReceipt]] = []
+            for index, (member, message) in enumerate(members_to_join):
+                task = asyncio.create_task(run_one(index, member, message))
+                tasks.append(task)
+                await started[index].wait()
+                await wait_for_blocked(harness.session_factory, blocker_pid)
             await blocker.commit()
             return list(await asyncio.gather(*tasks))
 
@@ -362,6 +361,22 @@ async def test_waiting_join_race_assigns_last_seat_and_never_reuses_join_seq(
         "joined",
     ]
 
+    async with harness.session_factory() as session:
+        stale_target_seq = await session.scalar(
+            text(
+                "SELECT join_seq FROM komari_roulette_players "
+                "WHERE game_id = (SELECT game_id FROM komari_roulette_games "
+                "WHERE app_id = :app_id AND group_openid = :group_openid) "
+                "AND member_openid = :member_openid"
+            ),
+            {
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "member_openid": member_openids[1],
+            },
+        )
+    assert stale_target_seq is not None
+
     leave = await service.execute_group_command(
         request(
             current,
@@ -374,13 +389,11 @@ async def test_waiting_join_race_assigns_last_seat_and_never_reuses_join_seq(
     rejoined = await join_player(service, current, member_openids[1], "rejoin-2")
     assert rejoined.result_code == "joined"
 
-    started = await start_game(service, current, member_openids[0], "start-after-rejoin")
-    assert started.result_code == "started"
     stale_target = await service.execute_group_command(
         request(
             current,
             "transfer-stale-target",
-            command_factory("transfer", target_player_seq=2),
+            command_factory("transfer", target_player_seq=int(stale_target_seq)),
             member_openid=member_openids[0],
         )
     )
@@ -403,6 +416,8 @@ async def test_waiting_join_race_assigns_last_seat_and_never_reuses_join_seq(
         ).all()
     assert [row[0] for row in rows] == [1, 3, 4, 5, 6, 7]
     assert rows[-1][1] == member_openids[1]
+    started = await start_game(service, current, member_openids[0], "start-after-rejoin")
+    assert started.result_code == "started"
     await delete_scope(harness.engine, current)
 
 
