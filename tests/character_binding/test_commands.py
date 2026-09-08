@@ -1,297 +1,121 @@
-"""character_binding 命令测试。"""
+"""TSK-277 AC12：OneBot 旧 /bind 命令入口退役，保留静默证据监听并更新帮助。
+
+旧 `bind` / `bind_set` / `bind_del` / `bind_list` 四个 on_command matcher 必须
+物理退役；QQ 绑定向导由 `qq_commands.bind_qq`（on_message）承接，证据监听
+`reply_evidence_matcher` 保持注册。帮助条目同步新语法。
+"""
 
 from __future__ import annotations
 
-from importlib import import_module
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast, get_type_hints
+import ast
+from pathlib import Path
 
 import pytest
-from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
-from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.onebot.onebot_messages import plain_text_message
-from komari_bot.plugins.character_binding.manager import (
-    BindingPersistenceError,
-    CharacterBindingManager,
-    CharacterNameValidationError,
+from tests.character_binding.test_reply_evidence import (
+    _real_character_binding_package,
+)
+from tests.group_admission.entry_gate_census import MATCHER_ENTRY_CENSUS
+from tests.group_admission.registry_isolation_support import (
+    registry_isolation_context,
 )
 
-if TYPE_CHECKING:
-    from nonebug import App
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_DIR = PROJECT_ROOT / "komari_bot" / "plugins" / "character_binding"
+LEGACY_SYMBOLS = ("bind", "bind_set", "bind_del", "bind_list")
+EVIDENCE_MATCHER_ENTRY = (
+    "matcher.character_binding.reply_evidence.reply_evidence_matcher"
+)
+QQ_HANDLER_ENTRY = "matcher.character_binding.qq_commands.bind_qq"
 
 
-@pytest.fixture
-def commands_module(app: App) -> Any:
-    del app
-    return import_module("komari_bot.plugins.character_binding.commands")
+def _on_command_assignments() -> dict[str, str]:
+    """AST 扫描 character_binding 目录里的 on_command matcher 赋值。"""
+    result: dict[str, str] = {}
+    for py_file in sorted(PLUGIN_DIR.glob("*.py")):
+        tree = ast.parse(py_file.read_text("utf-8"), filename=str(py_file))
+        aliases: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "nonebot":
+                aliases.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "on_command"
+                )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in {"on_command", *aliases}
+            ):
+                result[node.targets[0].id] = py_file.name
+    return result
 
 
-@pytest.fixture
-def manager_module(app: App) -> Any:
-    del app
-    return import_module("komari_bot.plugins.character_binding.manager")
+def test_character_binding_has_no_onebot_bind_command_matchers() -> None:
+    """AC12：旧四个 on_command 入口退役，禁止换 on_type 或别名逃逸。"""
+    assignments = _on_command_assignments()
+    assert assignments == {}, f"旧 OneBot 命令入口必须退役: {assignments}"
 
 
-@pytest.fixture(autouse=True)
-def _admit_admission(
-    monkeypatch: pytest.MonkeyPatch,
-    commands_module: Any,
-) -> None:
-    """放行统一准入复查，命令单测专注既有领域逻辑。"""
-    def _adjudicate(*_args: object, **_kwargs: object) -> object:
-        return SimpleNamespace(
-            # Resolve the enum from the command module that owns the patched
-            # adjudicator.  This keeps ``is AdmissionQualification.BUSINESS``
-            # valid when the admission package was reloaded during NoneBug
-            # startup.
-            qualification=commands_module.AdmissionQualification.BUSINESS,
-        )
-
-    monkeypatch.setattr(commands_module, "adjudicate", _adjudicate)
+def test_census_retires_legacy_matchers_and_registers_qq_handler() -> None:
+    """AC12：census 27→24、on_command 23→19，新增 QQ handler 明确登记。"""
+    entry_ids = {row.entry_id for row in MATCHER_ENTRY_CENSUS}
+    for symbol in LEGACY_SYMBOLS:
+        legacy_entry = f"matcher.character_binding.commands.{symbol}"
+        assert legacy_entry not in entry_ids, f"{legacy_entry} 必须从 census 移除"
+    assert EVIDENCE_MATCHER_ENTRY in entry_ids, "静默证据监听必须保留"
+    assert QQ_HANDLER_ENTRY in entry_ids, "QQ handler 必须显式登记"
+    qq_row = next(row for row in MATCHER_ENTRY_CENSUS if row.entry_id == QQ_HANDLER_ENTRY)
+    assert qq_row.factory == "on_message", "禁止换 on_type 逃扫描"
+    assert qq_row.source_path.endswith("qq_commands.py")
 
 
-class _StubManager(CharacterBindingManager):
-    def __init__(self, bindings: dict[str, str] | None = None) -> None:
-        self.bindings = {
-            ("114514", user_id): character_name
-            for user_id, character_name in (bindings or {}).items()
+def test_binding_help_metadata_documents_new_wizard_syntax() -> None:
+    """AC12：帮助条目同步新 /bind 语法，不再宣传旧 set/del/list。"""
+    with registry_isolation_context(), _real_character_binding_package() as package:
+        metadata = getattr(package, "__plugin_meta__", None)
+        assert metadata is not None
+        usage = str(getattr(metadata, "usage", "") or "")
+        for command in (
+            "/bind rename",
+            "/bind unbind",
+            "/bind confirm",
+            "/bind cancel",
+        ):
+            assert command in usage, f"帮助缺少 {command}: {usage!r}"
+        for legacy in (".bind set", ".bind del", ".bind list"):
+            assert legacy not in usage, f"帮助仍宣传旧语法 {legacy}: {usage!r}"
+
+
+@pytest.mark.asyncio
+async def test_real_package_keeps_silent_evidence_listener_only() -> None:
+    """AC12：真实包导入只保留静默证据监听与 QQ handler，无旧命令 matcher。"""
+    import nonebot.matcher as matcher_module
+
+    with registry_isolation_context(), _real_character_binding_package():
+        matchers = [
+            matcher
+            for matchers in matcher_module.matchers.values()
+            for matcher in matchers
+            if getattr(getattr(matcher, "_source", None), "module_name", "").startswith(
+                "komari_bot.plugins.character_binding"
+            )
+        ]
+        by_module = {
+            getattr(getattr(matcher, "_source", None), "module_name", ""): matcher
+            for matcher in matchers
         }
-
-    def get_character_name(
-        self,
-        *,
-        group_id: str,
-        user_id: str,
-        fallback_nickname: str | None = None,
-    ) -> str:
-        if (group_id, user_id) in self.bindings:
-            return self.bindings[(group_id, user_id)]
-        if fallback_nickname:
-            return fallback_nickname
-        return user_id
-
-    async def set_group_character_name(
-        self,
-        group_id: str,
-        user_id: str,
-        character_name: str,
-    ) -> None:
-        self.bindings[(group_id, user_id)] = character_name
-
-    async def clear_group_character_name(self, group_id: str, user_id: str) -> bool:
-        if (group_id, user_id) not in self.bindings:
-            return False
-        del self.bindings[(group_id, user_id)]
-        return True
-
-
-def _build_group_event(
-    plain_text: str,
-    *,
-    user_id: int = 42,
-    group_id: int = 114514,
-    message_id: int = 1,
-) -> GroupMessageEvent:
-    message = Message(plain_text)
-    return GroupMessageEvent.model_construct(
-        time=1,
-        self_id=669293859,
-        post_type="message",
-        sub_type="normal",
-        user_id=user_id,
-        message_type="group",
-        message_id=message_id,
-        message=message,
-        original_message=message,
-        raw_message=plain_text,
-        font=14,
-        sender=Sender.model_construct(user_id=user_id, nickname="tester", card=""),
-        to_me=True,
-        reply=None,
-        group_id=group_id,
-        anonymous=None,
-    )
-
-
-def _create_onebot_bot(ctx: Any) -> Bot:
-    adapter = ctx.create_adapter(base=Adapter)
-    return cast("Bot", ctx.create_bot(base=Bot, adapter=adapter, self_id="669293859"))
-
-
-def test_runtime_type_hints_can_resolve_onebot_message_types(
-    commands_module: Any,
-) -> None:
-    event_hints = get_type_hints(commands_module.get_event_user_id)
-    message_hints = get_type_hints(commands_module.get_command_text)
-
-    assert event_hints["event"].__name__ == "MessageEvent"
-    assert message_hints["args"].__name__ == "Message"
-
-
-def test_parse_self_bind_set_request_always_targets_self(
-    commands_module: Any,
-) -> None:
-    request = commands_module.parse_self_bind_set_request(
-        user_id="42",
-        arg_text="泉此方",
-    )
-
-    assert request.operator_user_id == "42"
-    assert request.target_user_id == "42"
-    assert request.character_name == "泉此方"
-    assert request.specified_target is False
-
-
-@pytest.mark.asyncio
-async def test_handle_set_reports_validation_failure(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager()
-
-    async def reject_name(
-        _group_id: str,
-        _user_id: str,
-        _character_name: str,
-    ) -> None:
-        raise CharacterNameValidationError("角色名不能包含换行或控制字符")
-
-    monkeypatch.setattr(manager, "set_group_character_name", reject_name)
-    monkeypatch.setattr(manager_module.state, "manager", manager)
-
-    async with app.test_matcher(commands_module.bind_set) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_group_event(".bind set 角色名")
-        ctx.receive_event(bot, event)
-        ctx.should_pass_permission(matcher=commands_module.bind_set)
-        ctx.should_pass_rule(matcher=commands_module.bind_set)
-        ctx.should_call_send(
-            event,
-            plain_text_message("❌ 角色名不能包含换行或控制字符"),
-            bot=bot,
-        )
-        ctx.should_finished()
-
-
-@pytest.mark.asyncio
-async def test_handle_set_reports_persistence_failure(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager()
-
-    async def fail_to_save(
-        _group_id: str,
-        _user_id: str,
-        _character_name: str,
-    ) -> None:
-        raise BindingPersistenceError("角色绑定保存失败")
-
-    monkeypatch.setattr(manager, "set_group_character_name", fail_to_save)
-    monkeypatch.setattr(manager_module.state, "manager", manager)
-
-    async with app.test_matcher(commands_module.bind_set) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_group_event(".bind set 泉此方")
-        ctx.receive_event(bot, event)
-        ctx.should_pass_permission(matcher=commands_module.bind_set)
-        ctx.should_pass_rule(matcher=commands_module.bind_set)
-        ctx.should_call_send(event, "❌ 角色绑定保存失败，请稍后重试", bot=bot)
-        ctx.should_finished()
-
-
-@pytest.mark.asyncio
-async def test_handle_delete_reports_persistence_failure(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager({"42": "泉此方"})
-
-    async def fail_to_delete(_group_id: str, _user_id: str) -> bool:
-        raise BindingPersistenceError("角色绑定保存失败")
-
-    monkeypatch.setattr(manager, "clear_group_character_name", fail_to_delete)
-    monkeypatch.setattr(manager_module.state, "manager", manager)
-
-    async with app.test_matcher(commands_module.bind_del) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_group_event(".bind del")
-        ctx.receive_event(bot, event)
-        ctx.should_pass_permission(matcher=commands_module.bind_del)
-        ctx.should_pass_rule(matcher=commands_module.bind_del)
-        ctx.should_call_send(event, "❌ 角色绑定删除失败，请稍后重试", bot=bot)
-        ctx.should_finished()
-
-
-@pytest.mark.asyncio
-async def test_handle_list_only_returns_current_user_binding_with_nonebug(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager({"42": "泉此方", "10086": "柊镜"})
-    monkeypatch.setattr(manager_module.state, "manager", manager)
-
-    async with app.test_matcher(commands_module.bind_list) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_group_event(".bind list")
-        ctx.receive_event(bot, event)
-        ctx.should_pass_permission(matcher=commands_module.bind_list)
-        ctx.should_pass_rule(matcher=commands_module.bind_list)
-        ctx.should_call_send(
-            event,
-            plain_text_message("📋 您的本群角色名: 泉此方"),
-            bot=bot,
-        )
-        ctx.should_finished()
-
-
-@pytest.mark.asyncio
-async def test_handle_list_treats_stored_cq_code_as_plain_text(
-    app: App,
-    commands_module: Any,
-    manager_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _StubManager({"42": "[CQ:at,qq=all]"})
-    monkeypatch.setattr(manager_module.state, "manager", manager)
-
-    async with app.test_matcher(commands_module.bind_list) as ctx:
-        bot = _create_onebot_bot(ctx)
-        event = _build_group_event(".bind list")
-        ctx.receive_event(bot, event)
-        ctx.should_pass_permission(matcher=commands_module.bind_list)
-        ctx.should_pass_rule(matcher=commands_module.bind_list)
-        ctx.should_call_send(
-            event,
-            plain_text_message("📋 您的本群角色名: [CQ:at,qq=all]"),
-            bot=bot,
-        )
-        ctx.should_finished()
-
-
-def test_no_superuser_import_in_commands(commands_module: Any) -> None:
-    """验证 commands 模块不再导入 SUPERUSER。"""
-    assert not hasattr(commands_module, "SUPERUSER")
-    assert "SUPERUSER" not in dir(commands_module)
-
-
-def test_no_superuser_matchers_in_commands(commands_module: Any) -> None:
-    """验证 commands 模块不再包含 SUPERUSER matcher。"""
-    assert not hasattr(commands_module, "bind_set_superuser")
-    assert not hasattr(commands_module, "bind_del_superuser")
-    assert not hasattr(commands_module, "bind_list_superuser")
-
-
-def test_no_superuser_parsers_in_commands(commands_module: Any) -> None:
-    """验证 commands 模块不再包含 SUPERUSER 解析器。"""
-    assert not hasattr(commands_module, "parse_superuser_bind_set_request")
-    assert not hasattr(commands_module, "parse_superuser_bind_delete_request")
+        assert (
+            "komari_bot.plugins.character_binding.commands" not in by_module
+        ), "旧 commands 模块不得再注册 matcher"
+        evidence = by_module.get("komari_bot.plugins.character_binding.reply_evidence")
+        assert evidence is not None
+        assert evidence.type == "message"
+        assert evidence.block is False
+        qq_handler = by_module.get("komari_bot.plugins.character_binding.qq_commands")
+        assert qq_handler is not None
+        assert qq_handler.type == "message"
