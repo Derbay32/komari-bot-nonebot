@@ -997,3 +997,52 @@ async def test_same_message_id_in_different_scope_is_processed() -> None:
         await wizard.get_session(_scope(module, member_openid=SECOND_MEMBER_OPENID))
         is not None
     )
+
+
+async def test_finish_send_is_noop_for_non_completed_replies() -> None:
+    """AC10：非 completed 回复 finish_send 不得取消草稿或临时会话。"""
+    module = require_wizard_contract()
+    clock = FrozenClock()
+    claim = make_claim(clock=clock, session_code=SESSION, qq_message_id="qq-msg-70")
+    coordinator = FakeCoordinator(claim=claim)
+    wizard = _wizard(module, clock=clock, coordinator=coordinator)
+    challenge_token = make_token(
+        scope="binding_challenge",
+        claim=claim,
+        qq_message_id="qq-msg-70",
+    )
+    challenge = await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-70"),
+        challenge_token,
+    )
+    assert challenge is not None
+    await wizard.finish_send(challenge)
+    assert coordinator.cancelled == []
+    pending = await wizard.get_session(_scope(module))
+    assert pending is not None
+    assert pending.step == "challenge_pending"
+
+    verified = make_verified(
+        clock=clock,
+        session_code=SESSION,
+        qq_message_id="qq-msg-70",
+    )
+    coordinator.verified = verified
+    name_token = make_token(
+        scope="binding",
+        group_id=277001,
+        member_qq=MEMBER_QQ,
+        verified_session=verified,
+        qq_message_id="qq-msg-71",
+    )
+    name_reply = await wizard.handle_event(
+        make_event(content="/bind", message_id="qq-msg-71"),
+        name_token,
+    )
+    assert name_reply is not None
+    assert name_reply.body == NAME_INPUT
+    await wizard.finish_send(name_reply)
+    assert coordinator.cancelled == []
+    still = await wizard.get_session(_scope(module))
+    assert still is not None
+    assert still.step == "name_input"

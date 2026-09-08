@@ -35,6 +35,8 @@ class BindingWizard:
         reply: WizardReply,
     ) -> bool: ...
 
+    async def finish_send(self, reply: WizardReply) -> None: ...
+
     async def get_session(self, scope: WizardScope) -> WizardSessionView | None: ...
 
     async def cancel(self, session_code: str) -> bool: ...
@@ -73,6 +75,11 @@ WizardReply(body, keyboard, reply_to_message_id)
   effect=token.scope)` 复核；`allowed=False` 时不得产生可见效果。
 - `authorize_send` 是 handler 在真正调用 `bot.send` 之前的最后一道同步复核
   （覆盖 handle_event 返回后到发送之间的等待窗口）。
+- `finish_send(reply)` 由 handler 在发送尝试的 `finally` 中调用：确认成功的
+  `handle_event` 只登记 completed 回复、**不**清理临时会话；发送尝试结束后
+  （成功、发送失败、发送前重审拒绝）才恰好调用一次 `coordinator.cancel`。
+  `finish_send` 幂等，对非 completed 回复是 no-op；`close()` 会清理尚未
+  finish 的 completed 回复。
 - `session_factory()` 返回的 `AsyncSession` 由 wizard 自己打开、关闭，且只在
   一个明确边界调用一次 `await session.commit()`（不得用 `async with
   session.begin()` 把 commit 藏进上下文），以便测试注入提交结果不确定。
@@ -91,6 +98,8 @@ WizardReply(body, keyboard, reply_to_message_id)
   不得再次 `qualify_qq_event` 或重复初始 claim；
 - `reply = await wizard.handle_event(event, token)`；`reply is None` 直接返回；
 - `await wizard.authorize_send(token, reply)` 为假则不发送；
+- 发送尝试包在 `try/finally` 中，`finally` 无条件调用 `wizard.finish_send(reply)`：
+  成功、发送失败与发送前重审拒绝三种路径都清理一次临时会话；
 - 发送载荷必须是真实 QQ Markdown：`post_group_messages` 的
   `markdown.content` 等于 `reply.body` 原文，`msg_type == 2`，按钮进入
   `keyboard`（每按钮 `action.type == 2`、`action.data` 为命令），普通
@@ -202,10 +211,11 @@ WizardReply(body, keyboard, reply_to_message_id)
   已被其他合法流程改为不同值则拒绝（失效文案）且不覆写。
 - 两协议公开查询（`get_qq_character_name` 与 `get_character_name`）读取同一
   canonical 记录；缓存只在 commit 成功后发布。
-- **成功发送与临时会话清理的次序**：提交成功后 wizard 清理临时 claim/evidence
-  （`coordinator.cancel(session_code)`）不得使成功回复的发送前重审失效；成功
-  文案必须实际发送。实现可推迟清理到发送授权之后，或对已确认完成的会话用
-  canonical 状态授权发送。
+- **成功发送与临时会话清理的次序**：确认成功的 `handle_event` 不得清理临时会话
+  （`coordinator.cancel` 不在其中），否则成功回复的发送前重审会因 token 失效而
+  失败。handler 在发送尝试的 `finally` 调用 `finish_send(reply)`，成功、发送失败
+  与发送前重审拒绝三种路径都恰好清理一次；`finish_send` 幂等且对非 completed
+  回复 no-op。274 的 cancel 语义保持即时撤销（不做“保留权限”的变体）。
 - **completed 回复不得绕过重审**：`authorize_send` 先执行 `coordinator.recheck`；
   重审拒绝时必须返回 False，即使 canonical 已等于目标（新封禁/群撤销在回复
   生成后生效也不得放行）。canonical 回退只允许在重审通过之后作为发送授权的
@@ -226,10 +236,10 @@ WizardReply(body, keyboard, reply_to_message_id)
 | 3 每作用域一草稿/绝对 TTL/重复不重建 | `test_tsk277_wizard.py::test_ttl_is_absolute_ten_minutes_and_repeat_does_not_extend`、`test_tsk277_wizard.py::test_mapped_unbound_member_requests_single_claim_then_not_ready`、`test_tsk277_wizard.py::test_sessions_are_isolated_per_member_and_cancel_keeps_other`、`test_tsk277_wizard.py::test_duplicate_inbound_message_is_not_processed_twice`、`test_tsk277_wizard.py::test_duplicate_inbound_with_changed_content_is_not_processed`、`test_tsk277_wizard.py::test_same_message_id_in_different_scope_is_processed`、`test_tsk277_handler.py::test_real_handler_does_not_send_twice_for_duplicate_inbound`、`test_tsk277_handler.py::test_real_handler_ignores_changed_content_for_same_inbound_id` |
 | 4 首次挑战/静默取证/再次 /bind 消费 | `test_tsk277_wizard.py::test_first_unmapped_bind_sends_one_challenge_and_repeat_is_silent`、`test_tsk277_wizard.py::test_unknown_group_pending_evidence_advances_on_next_bind_without_rebuild`、`test_tsk277_wizard.py::test_mapped_pending_evidence_advances_to_legacy_without_reclaim`、`test_tsk277_handler.py::test_real_handler_sends_markdown_challenge_with_quote_and_no_second_claim`、`test_tsk277_pg.py::test_real_handler_evidence_progression_and_success_send_survive_cancel` |
 | 5 会话/作用域/阶段核验与迟到失效 | `test_tsk277_wizard.py::test_cross_member_group_and_app_commands_are_rejected`、`test_tsk277_wizard.py::test_cancelled_session_code_is_stale_for_new_session`、`test_tsk277_wizard.py::test_cancel_drops_draft_even_when_send_admission_denies`、`test_tsk277_wizard.py::test_wrong_step_and_unknown_command_use_authoritative_texts`、`test_tsk277_wizard.py::test_active_draft_blocks_rename_and_unbind_switch` |
-| 6 改名/解绑 preview→confirm | `test_tsk277_pg.py::test_rename_preview_confirm_conflict_and_cancel`、`test_tsk277_pg.py::test_rename_or_unbind_without_character_name_prompts_binding`、`test_tsk277_pg.py::test_unbind_clears_only_name_and_identity_stays_reusable`、`test_tsk277_wizard.py::test_active_draft_blocks_rename_and_unbind_switch` |
+| 6 改名/解绑 preview→confirm | `test_tsk277_pg.py::test_rename_preview_confirm_conflict_and_cancel`、`test_tsk277_pg.py::test_rename_or_unbind_without_character_name_prompts_binding`、`test_tsk277_pg.py::test_unbind_clears_only_name_and_identity_stays_reusable`、`test_tsk277_pg.py::test_rename_case_only_change_updates_display`、`test_tsk277_wizard.py::test_active_draft_blocks_rename_and_unbind_switch` |
 | 7 旧名候选与 reuse | `test_tsk277_wizard.py::test_legacy_candidate_only_after_verified_active_bind`、`test_tsk277_wizard.py::test_unverified_identity_never_reads_legacy_candidate`、`test_tsk277_wizard.py::test_reuse_without_legacy_name_reports_missing_candidate`、`test_tsk277_pg.py::test_legacy_candidate_reuse_and_conflict` |
 | 8 原子事务/并发/不确定提交/覆写保护/缓存 | `test_tsk277_pg.py::test_confirm_commits_atomically_and_publishes_cache_only_after_commit`、`test_tsk277_pg.py::test_group_and_member_conflicts_preserve_original_records`、`test_tsk277_pg.py::test_same_group_concurrent_name_has_one_winner_and_loser_can_rename`、`test_tsk277_pg.py::test_commit_outcome_unknown_after_commit_does_not_report_and_converges`、`test_tsk277_pg.py::test_commit_outcome_unknown_before_commit_leaves_no_record_and_repeat_writes_once`、`test_tsk277_pg.py::test_commit_unknown_after_commit_never_overwrites_later_maintenance_rename`、`test_tsk277_pg.py::test_commit_unknown_before_commit_never_overwrites_existing_new_formal_state`、`test_tsk277_pg.py::test_concurrent_name_change_during_confirm_never_writes_unconfirmed_name` |
-| 9 效果前重审/state token/映射≠白名单 | `test_tsk277_handler.py::test_send_time_recheck_suppresses_reply_in_wait_window`、`test_tsk277_handler.py::test_positive_control_send_performs_send_time_recheck`、`test_tsk277_handler.py::test_restricted_group_stays_silent_even_for_configured_superuser`、`test_tsk277_handler.py::test_real_handler_sends_markdown_challenge_with_quote_and_no_second_claim`、`test_tsk277_wizard.py::test_denied_recheck_suppresses_visible_reply_and_draft_effect`、`test_tsk277_wizard.py::test_mapped_pending_evidence_advances_to_legacy_without_reclaim`、`test_tsk277_pg.py::test_real_handler_evidence_progression_and_success_send_survive_cancel`、`test_tsk277_pg.py::test_authorize_send_denies_completed_reply_after_recheck_revocation`、`test_tsk277_pg.py::test_confirm_rechecks_after_group_lock_and_writes_nothing_when_revoked` |
-| 10 wizard 拥有事务与幂等完成态 | `test_tsk277_pg.py::test_confirm_commits_atomically_and_publishes_cache_only_after_commit`、`test_tsk277_pg.py::test_real_handler_evidence_progression_and_success_send_survive_cancel` |
+| 9 效果前重审/state token/映射≠白名单 | `test_tsk277_handler.py::test_send_time_recheck_suppresses_reply_in_wait_window`、`test_tsk277_handler.py::test_positive_control_send_performs_send_time_recheck`、`test_tsk277_handler.py::test_restricted_group_stays_silent_even_for_configured_superuser`、`test_tsk277_handler.py::test_real_handler_sends_markdown_challenge_with_quote_and_no_second_claim`、`test_tsk277_wizard.py::test_denied_recheck_suppresses_visible_reply_and_draft_effect`、`test_tsk277_wizard.py::test_mapped_pending_evidence_advances_to_legacy_without_reclaim`、`test_tsk277_pg.py::test_real_handler_evidence_progression_and_success_send_survive_cancel`、`test_tsk277_pg.py::test_authorize_send_denies_completed_reply_after_recheck_revocation`、`test_tsk277_pg.py::test_confirm_rechecks_after_group_lock_and_writes_nothing_when_revoked`、`test_tsk277_pg.py::test_real_coordinator_denies_send_after_post_commit_ban_change`、`test_tsk277_pg.py::test_confirm_lock_wait_ttl_expiry_writes_nothing`、`test_tsk277_pg.py::test_real_handler_denied_send_finally_revokes_completed_session` |
+| 10 wizard 拥有事务与幂等完成态 | `test_tsk277_pg.py::test_confirm_commits_atomically_and_publishes_cache_only_after_commit`、`test_tsk277_pg.py::test_real_handler_evidence_progression_and_success_send_survive_cancel`、`test_tsk277_pg.py::test_real_handler_send_failure_finally_revokes_completed_session`、`test_tsk277_pg.py::test_real_handler_denied_send_finally_revokes_completed_session`、`test_tsk277_wizard.py::test_finish_send_is_noop_for_non_completed_replies`、`test_tsk277_pg.py::test_cancel_close_reset_during_lock_wait_writes_nothing`、`test_tsk277_pg.py::test_init_plugin_installs_and_close_plugin_removes_wizard` |
 | 11 权威文案 | 全量断言（上表文案常量），节点见 AC1–AC10 各用例 |
 | 12 旧入口退役/census/help | `test_commands.py::test_census_retires_legacy_matchers_and_registers_qq_handler`、`test_commands.py::test_binding_help_metadata_documents_new_wizard_syntax`、`test_commands.py::test_real_package_keeps_silent_evidence_listener_only`、`tests/group_admission/test_entry_gate_census.py::test_matcher_census_exact_count`、`tests/group_admission/test_entry_gate_census.py::test_matcher_census_factory_totals`、`tests/group_admission/test_entry_gate_census.py::test_matcher_census_exact_registrations`、`tests/group_admission/test_entry_gate_census.py::test_matcher_census_source_paths_match_ast_scan`、`tests/group_admission/test_command_admission.py::test_no_orphan_command_matchers_in_target_modules` |
