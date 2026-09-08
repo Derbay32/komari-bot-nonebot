@@ -2,6 +2,122 @@
 
 本目录只测试 `komari_bot.plugins.komari_roulette.domain` 的公开领域边界。测试不导入 NoneBot、OneBot、SQL、character_binding ORM 或发送器；平台身份由测试构造的 `PlayerRef` 值对象传入。
 
+## TSK-275 PostgreSQL storage seam
+
+TSK-275 adds a separate persistence seam.  The tests in this directory use the
+following public names; an implementation may split modules internally, but it
+must keep these imports stable (the top-level plugin package may re-export
+them):
+
+```python
+from komari_bot.plugins.komari_roulette.mapper import (
+    GameSnapshot,
+    StateTransition,
+    TerminalProjection,
+    game_state_from_snapshot,
+    game_state_to_snapshot,
+    transition_from_action_result,
+)
+from komari_bot.plugins.komari_roulette.storage import (
+    AggregateCorruptError,
+    PostgresRouletteStorage,
+    RevisionConflictError,
+    StorageUnavailableError,
+    TerminalProjectionRejectedError,
+)
+```
+
+`PostgresRouletteStorage(session)` receives an already opened SQLAlchemy
+`AsyncSession`.  It never commits, rolls back, or opens a second transaction;
+the caller owns one unit of work and can combine a state transition, terminal
+projection, and leaderboard update atomically.  `GameSnapshot` carries the
+storage generated `game_id` alongside the trusted `GameState` fields.  Public
+operations are:
+
+```python
+load_current(group: GroupRef, *, for_update: bool = False) -> GameSnapshot | None
+create_waiting(snapshot: GameSnapshot) -> GameSnapshot
+save_transition(transition: StateTransition, *, expected_revision: int) -> GameSnapshot
+project_terminal(projection: TerminalProjection)
+fail_corrupt_current(group: GroupRef, *, ended_at: datetime) -> RouletteResult | None
+get_result(group: GroupRef, game_id: str)
+list_leaderboard(group: GroupRef)
+rebuild_leaderboard(group: GroupRef)
+```
+
+The test construction helper is `GameSnapshot.from_state(state,
+game_id=...)`; the mapper functions must round-trip that value without losing
+any trusted field.
+
+`transition_from_action_result(before, result, action_kind=..., occurred_at=...)`
+is the only test construction seam for a state change.  It carries both the
+previous trusted snapshot and the domain result, so the adapter can record
+elimination order/reason/time even though the pure `GameState` intentionally
+does not contain that history.  `TerminalProjection.from_state(snapshot,
+lifecycle=..., reason=..., ended_at=..., winner_seq=...)` is only used after
+the corresponding waiting/join/start/action transitions have been persisted;
+the adapter must verify the current root and runtime history before projecting
+an immutable result.  Callers never provide raw SQL rows or an arbitrary
+winner for a game that was not stored.
+
+The return values are structured DTOs or `GameState` snapshots, never ORM
+objects.  `game_state_to_snapshot()` preserves the trusted fields needed to
+resume a game: `next_join_seq`, ordered chamber, pending reward queue,
+`pending_locks`, frozen player names and item weights.  The inverse mapper
+returns an immutable `GameState` and validates the persisted aggregate.
+
+`TerminalProjection` contains the complete immutable result proof (group key,
+game id, lifecycle/reason, creation/start/end times, terminal revision,
+ordered frozen seats, final player status/elimination metadata, and winner).
+`get_result()` returns a structured result whose player entries expose the
+frozen `join_seq`, identity, display name, final alive flag, elimination order,
+elimination reason, and PostgreSQL timestamps; `list_leaderboard()` exposes
+safe display fields, `wins`, and `last_won_at`, and never includes an openid in
+a user-facing field.
+The storage adapter writes the result and winner projection in the caller's
+transaction, then removes every consumable runtime row/secret.  `completed`
+is the only lifecycle that can add a win; a duplicate result is a read of the
+existing proof and never increments wins again.  `cancelled`, `expired`, and
+`failed` have no winner.
+
+Storage failures raise `StorageUnavailableError` and do not change lifecycle
+or fabricate an empty game.  A successfully read aggregate that violates a
+cross-row invariant raises `AggregateCorruptError` (the caller may perform a
+controlled safe `failed` projection with a whitelist reason code).  The
+controlled path is the narrow `fail_corrupt_current()` operation: it accepts
+only the group and a PostgreSQL-time terminal timestamp, never a caller-built
+snapshot or winner.  It locks and rechecks the persisted current rows itself;
+an intact waiting/active aggregate is rejected with
+`TerminalProjectionRejectedError`, an absent current game returns `None`, and
+an infrastructure error remains `StorageUnavailableError`.  A confirmed
+corrupt aggregate becomes `failed` with the fixed safe reason
+`aggregate_corrupt`, a terminal revision one greater than the root revision,
+no winner or win, and immediate runtime cleanup.  The result contains only
+the result header and safe historical player rows; that set may be empty when
+no player row can be safely projected.  Stale
+`state_revision` writes raise `RevisionConflictError` and leave all rows
+unchanged.  A terminal projection for an absent game, a non-terminal game, or
+one without exactly one eligible winner raises
+`TerminalProjectionRejectedError` and leaves the current game/result rows
+unchanged.
+
+The model/migration tests lock these relation names and database-local
+constraints:
+
+* `komari_roulette_games`, `komari_roulette_players`,
+  `komari_roulette_results`, `komari_roulette_result_players`, and
+  `komari_roulette_leaderboard`;
+* `waiting`/`active` partial uniqueness on `(app_id, group_openid)`;
+* constrained `TEXT[]` chamber/reward arrays and closed lifecycle/item
+  elements;
+* non-negative four-item inventory with a total of at most four;
+* player/result foreign keys and one result per `game_id`;
+* leaderboard scope `(app_id, group_openid, member_openid)` and wins ≥ 1.
+
+The mapper/storage tests are intentionally red until these production seams
+and Alembic revision `0019` exist.  They do not treat a missing PostgreSQL or
+Redis service as a passing result.
+
 ## 最小公开入口
 
 实现需要提供以下窄入口（模块可以拆分，但这些符号必须由插件顶层或 `domain` 模块稳定导出）：

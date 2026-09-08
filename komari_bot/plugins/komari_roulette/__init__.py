@@ -1,8 +1,7 @@
-"""Pure domain primitives for the QQ Russian roulette game.
+"""Public domain and PostgreSQL seams for the QQ Russian roulette game.
 
-The command and persistence adapters are deliberately kept outside this
-package.  Importing the package therefore has no NoneBot or database side
-effects.
+The persistence imports register SQLModel metadata only; they do not open a
+connection or execute DDL.  Database/session ownership remains with callers.
 """
 
 from .domain import (
@@ -16,15 +15,49 @@ from .domain import (
     apply_action,
     initial_state,
 )
+from .mapper import (
+    EliminationRecord,
+    GameSnapshot,
+    LeaderboardEntry,
+    ResultPlayer,
+    RouletteResult,
+    StateTransition,
+    TerminalProjection,
+    game_state_from_snapshot,
+    game_state_to_snapshot,
+    transition_from_action_result,
+)
+from .storage import (
+    AggregateCorruptError,
+    PostgresRouletteStorage,
+    RevisionConflictError,
+    StorageUnavailableError,
+    TerminalProjectionRejectedError,
+)
 
 __all__ = [
     "Action",
     "ActionResult",
+    "AggregateCorruptError",
     "ChamberKind",
+    "EliminationRecord",
+    "GameSnapshot",
     "GameState",
     "GroupRef",
     "ItemType",
+    "LeaderboardEntry",
     "PlayerRef",
+    "PostgresRouletteStorage",
+    "ResultPlayer",
+    "RevisionConflictError",
+    "RouletteResult",
+    "StateTransition",
+    "StorageUnavailableError",
+    "TerminalProjection",
+    "TerminalProjectionRejectedError",
     "apply_action",
+    "game_state_from_snapshot",
+    "game_state_to_snapshot",
     "initial_state",
+    "transition_from_action_result",
 ]
