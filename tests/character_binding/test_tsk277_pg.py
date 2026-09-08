@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -1690,5 +1691,223 @@ async def test_real_handler_evidence_progression_and_success_send_survive_cancel
                         module.set_binding_wizard(None)
                         await coordinator.close()
                         reply_evidence.set_runtime_collectors(())
+        finally:
+            await _cleanup(engine, current)
+
+
+async def _wait_for_draft_name(
+    wizard: Any,
+    module: Any,
+    current: Scope,
+    expected: str,
+) -> None:
+    """等待同 scope 草稿变为 expected；串行实现下会超时，由调用方吞掉。"""
+    async with asyncio.timeout(1.0):
+        while True:
+            view = await wizard.get_session(
+                module.WizardScope(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                )
+            )
+            if view is not None and view.character_name == expected:
+                return
+            await asyncio.sleep(0.01)
+
+
+async def test_authorize_send_denies_completed_reply_after_recheck_revocation(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC9：成功回复生成后撤销准入/封禁，authorize_send 必须拒绝，即使 canonical 一致。"""
+    module = require_wizard_contract()
+    current = scope("authz-revoked")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="authz-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="authz",
+            )
+            success = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {session_code}",
+                    message_id="authz-3",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert success is not None
+            assert success.body == BIND_SUCCESS.format(name="阿明")
+            assert (
+                await _member_row(factory, current, current.member_openid)
+            )["character_name"] == "阿明"
+
+            # 阳性：准入仍允许时，已完成回复可以发送。
+            assert await wizard.authorize_send(token, success) is True
+
+            # 撤销准入/封禁后：canonical 仍等于目标，也不得放行。
+            coordinator.recheck_allowed = False
+            assert await wizard.authorize_send(token, success) is False, (
+                "completed canonical 一致不得绕过发送前重审"
+            )
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_confirm_rechecks_after_group_lock_and_writes_nothing_when_revoked(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC9：confirm 等待组锁期间撤销准入，获锁后必须重审且零写入。"""
+    module = require_wizard_contract()
+    current = scope("lock-recheck")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="lock-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="lock",
+            )
+
+            blocker = factory()
+            await lock_group_scope(
+                blocker,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
+            blocker_pid = await backend_pid(blocker)
+            task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="lock-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            await wait_for_blocked(factory, blocker_pid)
+
+            # 确认已停在组锁等待上；此刻撤销准入，再放锁。
+            coordinator.recheck_allowed = False
+            await blocker.rollback()
+            await blocker.close()
+            result = await task
+
+            assert result is None, "获锁后重审失败必须静默"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_members", current
+                )
+                == 0
+            ), "获锁后重审失败不得写入成员/名字"
+            assert (
+                await _count_rows(
+                    factory, "komari_character_binding_groups", current
+                )
+                == 0
+            ), "获锁后重审失败不得写入群映射"
+        finally:
+            await _cleanup(engine, current)
+
+
+async def test_concurrent_name_change_during_confirm_never_writes_unconfirmed_name(
+    binding_manager: CharacterBindingManager,
+) -> None:
+    """AC8/AC10：同 scope confirm 等待期间改草稿，不得写入未确认的新名。"""
+    module = require_wizard_contract()
+    current = scope("draft-race")
+    clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    async for engine, factory in create_engine_and_factory():
+        try:
+            coordinator = FakeCoordinator()
+            wizard = _wizard(
+                module,
+                factory=factory,
+                clock=clock,
+                coordinator=coordinator,
+                manager=binding_manager,
+            )
+            token = _binding_token(current, clock=clock, qq_message_id="draft-1")
+            session_code = await _drive_to_confirm(
+                wizard,
+                module,
+                current,
+                token=token,
+                name="阿明",
+                prefix="draft",
+            )
+
+            blocker = factory()
+            await lock_group_scope(
+                blocker,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
+            blocker_pid = await backend_pid(blocker)
+            confirm_task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind confirm {session_code}",
+                        message_id="draft-3",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            await wait_for_blocked(factory, blocker_pid)
+
+            name_task = asyncio.create_task(
+                wizard.handle_event(
+                    make_event(
+                        content=f"/bind name {session_code} 小暗",
+                        message_id="draft-4",
+                        group_openid=current.group_openid,
+                        member_openid=current.member_openid,
+                    ),
+                    token,
+                )
+            )
+            # 无串行/快照时草稿会被改成“小暗”；合理实现下这里会超时。
+            with suppress(TimeoutError):
+                await _wait_for_draft_name(wizard, module, current, "小暗")
+
+            await blocker.rollback()
+            await blocker.close()
+            await asyncio.gather(confirm_task, name_task, return_exceptions=True)
+
+            row = await _member_row(factory, current, current.member_openid)
+            assert row.get("character_name") == "阿明", (
+                f"不得写入未确认的新名: {row}"
+            )
         finally:
             await _cleanup(engine, current)
