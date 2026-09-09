@@ -114,16 +114,19 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
     （`***` 前后空行；提及 tag 紧跟当前玩家行内的冻结名之后）。
   - 奖励选择：`> 结果句 — 道具列表已满，选择一项来替换。 — 当前新道具 — 已有道具 —
     后续待处理奖励 — *** — 当前局面 — *** — 玩家列表`（两条 `***`）。
-  - 终局：**单个普通段落**，无 `>`、无 `**`、无 `***`、无列表、无按钮；只表达唯一胜者
-    与结算后本群累计胜场（`{冻结名} {<qqbot-at-user>} 获胜，累计胜场 {n}。`，TSK-266
-    真实提及验收定稿，无块引用）。
+  - 终局：**单个普通段落**，无 `>`、无 `**`、无 `***`、无列表、无按钮；必须表达
+    **导致终局的事件**（由 `details` 的 `completion_reason`/`eliminated_reason` 等
+    事实驱动，如谁被淘汰/弃权/超时）、唯一胜者与本群累计胜场（`winner_group_wins`）。
+    终局文案遵循 TSK-266 1F/269 文案池；`{冻结名} {<qqbot-at-user>} 获胜，累计胜场
+    {n}。` 只是 md-mention 实机验收样例，**不是无事件精确定稿**，测试不得钉死单句。
 - **单次真实提及与位置**：
   - `context.mention_target` 非空时，`body` 恰好嵌入一个
     `<qqbot-at-user id="{mention_target.member_openid}" />`（QQ 官方 Markdown 原生提及，
     原型 `codex/tsk-266-md-mention-acceptance` 实机验收格式）。位置按
     `context.mention_reason`：
     - `turn` / `reward`：`**当前：{冻结名}** {tag}`（紧跟当前玩家行内的冻结名之后）；
-    - `winner`：`{冻结名} {tag} 获胜，累计胜场 {n}。`；
+    - `winner`：提及紧跟胜者冻结名之后（样例 `{冻结名} {tag} 获胜，累计胜场 {n}。`
+      只示意提及位置；终局正文还须表达终局事件，见上）；
     - `lock_target`：`{冻结名}（{tag}）`（上锁结果句内、冻结名后的括号中）。
   - `metadata` 同时携带 `mention_member_openid` 与 `mention_display_name` 一对（供日志/
     校验），但**真实发送载荷的提及断言必须以 `MessageSegment.markdown` 正文中的
@@ -141,8 +144,9 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
     编号式玩家标识按**行锚定**判定：`(?m)^- {N}｜`（`- 2｜小红` 形式）；弹仓计数
     （`弹仓 **4/6**`）、`道具 N` 数量、排行榜名次行（`1. 玩家｜N 胜`）都不是玩家编号。
     **玩家阵容行格式**：`- {冻结名}｜{状态}｜道具 {N}｜待锁`（当前玩家加粗，状态
-    `当前`/`存活`/`出局`）；**`道具 N` 是道具种类数**（不同道具类型计数，非总件数）：
-    啤酒×2＋锁×1 显示 `道具 2`；待锁标记仅在目标玩家 `pending_lock` 时出现。
+    `当前`/`存活`/`出局`）；**`道具 N` 是道具总数**（TSK-266 1B：每名玩家持有的道具
+    总数，各类型数量求和）：啤酒×2＋锁×1 显示 `道具 3`；待锁标记仅在目标玩家
+    `pending_lock` 时出现。
   - 编号只出现在两个专用区域：道具面板"可上锁的玩家"（`- 2｜小红`）与等候"可转让给"
     （`- 2｜小红`）；按稳定编号升序、保留缺口、不重排、不 @。
 - **排行榜渲染**（TSK-266 10.2 定稿）：
@@ -151,8 +155,11 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
   - 有记录时：`**本群俄罗斯轮盘排行榜｜前 10 名**` ＋ 有序列表
     `1. {冻结名}｜{N} 胜`，**最多显示前 10 名**（不足 10 显示全部）；末行
     `共有 {M} 名玩家取得过胜利。`，`M` 统计本群**所有**至少一次胜场的玩家（含未进
-    前 10 者），不是仅显示行数。`details["leaderboard"]` 条目为
-    `"{冻结名}"`（1 胜）或 `"{冻结名}:{N}"` 形式（`N` 为胜场数）。
+    前 10 者），不是仅显示行数。`details["leaderboard"]` 条目**恒为**
+    `"{冻结名}:{N}"`（TSK-276 `_leaderboard_values` 实际编码：1 胜也是 `":1"`，
+    不存在裸名字条目）。冻结名本身可含冒号：渲染必须按**最后一个冒号**拆分
+    （`rsplit(":", 1)`），绝不能把玩家名当胜场数或拆错名字（`"小红:小明:5"` →
+    冻结名 `小红:小明`、胜场 5）。
   - 行首数字是排行榜名次，不是玩家稳定编号；名字是最近一次获胜对局保存的**冻结显示名**
     （改名不刷新）；不 mention、不展示 openid/QQ 号。
   - 排行榜无按钮；不延长行动时间（到期推进由 TSK-276 服务完成）。
@@ -233,15 +240,15 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
   - 等候：`加入 / 开始 / 退出 / 取消` ＋ 通用 `🔄转让`（填入 `/轮盘 转让 `，末尾保留
     参数分隔空格）；仅局主一人时省略转让按钮。
   - 终局、排行榜与固定错误：**无按钮**（`metadata["keyboard"]` 为规范空对象
-    `'{"rows": []}'`）。规范 spec 恒为 JSON 对象 `{"rows": [...]}`；辅助函数
-    `keyboard_from_spec`/`build_real_keyboard` 对历史裸 `[]`（无按钮）也宽容接受，但
-    `render_reply` 输出恒为对象形式。
+    `'{"rows": []}'`）。规范 spec 恒为 JSON 对象 `{"rows": [...]}`；本票无历史数据/
+    兼容要求，`keyboard_from_spec`/`build_real_keyboard` **不接受裸 `[]` 形式**（无
+    历史宽容回退），`render_reply` 输出恒为对象形式。
   - 按钮标签不截断昵称、不把冻结姓名/编号塞进短标签。
 - 覆盖评论按 `6a9e6ce3`（等候转让）、`6a9bc5dd`（1H 尺寸）、`6a9c5988`（排行榜）定稿。
 
 ## 6. RouletteDelivery 契约
 
-`RouletteDelivery(service, *, runtime_check: Callable[[], bool] | None = None)`；
+`RouletteDelivery(service, *, runtime_check: Callable[[], bool | Awaitable[bool]] | None = None)`；
 `async deliver(receipt: CommandReceipt, sender) -> DeliveryOutcome`。`DeliveryOutcome`
 是真实枚举 `DELIVERED | NOT_DELIVERED | UNKNOWN | NO_CLAIM`；`SendNotAcceptedError`
 是 sender 明确"发送前/未被接受"失败的型别异常。**顺序固定（TSK-267 6）**：
@@ -252,8 +259,10 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
    （0 网络）。
 2. `service.claim_fulfillment(receipt.receipt_id)`：返回 `None` → `NO_CLAIM`，0 网络
    （重复事件/已领取）；抛异常 → 原样上抛，0 网络。
-3. **发送前 runtime 最后重核**：`runtime_check()`（轮盘开关、群准入、5 分钟凭证过期等
-   实时核查）；返回 False → `service.mark_not_delivered(claim)` → `NOT_DELIVERED`，
+3. **发送前 runtime 最后重核**：`await runtime_check()`（轮盘开关、群准入、5 分钟凭证
+   过期等实时核查；同步返回 bool 或返回 Awaitable[bool] 均可，真实准入重核是异步
+   可调用，不得强制仅同步）；结果 False → `service.mark_not_delivered(claim)` →
+   `NOT_DELIVERED`，
    0 网络。**276 没有 `mark_not_started_failed` 方法（已核查实际接口）；预发送失败经真实
    `claim_fulfillment`（NOT_STARTED→PENDING）＋ `mark_not_delivered`
    （PENDING→NOT_DELIVERED）完成，0 网络调用平台。**
@@ -272,7 +281,7 @@ send 先于 mark_delivered（无服务模式下用记录型 builder/runtime_chec
 
 ## 7. RouletteQQHandler 契约
 
-`RouletteQQHandler(service, delivery, *, send_gate: Callable[[], bool] | None = None)`；
+`RouletteQQHandler(service, delivery, *, send_gate: Callable[[], bool | Awaitable[bool]] | None = None)`；
 `async handle(bot, event, *, state=None) -> None`：
 
 1. 严格事件资格：仅 `GroupAtMessageCreateEvent`；`event.id`、`event.group_openid`、
@@ -285,7 +294,8 @@ send 先于 mark_delivered（无服务模式下用记录型 builder/runtime_chec
    `execute_group_command`；等候动作（create/join/leave/cancel/start/open_item_panel/
    leaderboard）不 observe。
 5. 恰好一次 `execute_group_command(request, observation=...)`。
-6. **发送门（TSK-278 评论 6a9ed97d）**：`send_gate()` 为 False（轮盘开关关闭/群准入受限）
+6. **发送门（TSK-278 评论 6a9ed97d）**：`await send_gate()`（同步或异步）为 False
+   （轮盘开关关闭/群准入受限）
    → **不启动新发送**：不调用 `deliver`、不重渲染、不补发；收据保持 NOT_STARTED 由后台
    过期收敛。为 True 或未注入时才恰好一次 `deliver(receipt, sender)`。
 7. `request = CommandRequest(app_id=bot.self_id, group_openid, inbound_msg_id=event.id,

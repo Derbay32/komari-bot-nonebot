@@ -306,6 +306,28 @@ async def test_send_gate_runs_before_delivery_and_gates_it() -> None:
     assert len(delivery.deliver_calls) == 1
 
 
+async def test_async_send_gate_is_awaited() -> None:
+    """真实准入实时门可为异步可调用：await 结果再决定是否启动发送。"""
+    calls: list[str] = []
+
+    async def async_send_gate() -> bool:
+        calls.append("gate")
+        return False
+
+    handler, service, delivery = _handler(send_gate=async_send_gate)
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+
+    assert calls == ["gate"]
+    assert len(service.execute_calls) == 1
+    assert delivery.deliver_calls == []
+
+
 async def test_default_send_gate_allows_delivery() -> None:
     handler, service, delivery = _handler()
     _execute_success(service)

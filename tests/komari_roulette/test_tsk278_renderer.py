@@ -80,7 +80,7 @@ def test_follow_up_is_complete_markdown() -> None:
     assert "弹仓：**4/6**｜实弹 **1**｜空弹 **3**｜中弹概率 **25%**" in body
 
     # 玩家阵容行：当前加粗、状态与道具数、待锁标记。
-    assert "- 小红｜存活｜道具 2｜待锁" in body
+    assert "- 小红｜存活｜道具 3｜待锁" in body
     assert "- **小明**｜当前｜道具 1" in body
     assert "- 小白｜出局｜道具 0" in body
 
@@ -107,7 +107,7 @@ def test_follow_up_mentions_current_player_once_in_body() -> None:
     assert between == " ", body
     # 分割线定稿：弹仓行之后一条 ``***``，名单在末尾。
     assert body.index("***") > body.index("弹仓：")
-    assert body.index("- 小红｜存活｜道具 2｜待锁") > body.index("***")
+    assert body.index("- 小红｜存活｜道具 3｜待锁") > body.index("***")
 
 
 def test_follow_up_keyboard_spec_is_frozen_json() -> None:
@@ -161,7 +161,7 @@ def test_reward_choice_has_two_dividers() -> None:
     assert "后续待处理奖励：**1 件**" in body
     assert "**当前：小明**" in body
     assert "弹仓：**4/6**｜实弹 **1**｜空弹 **3**｜中弹概率 **25%**" in body
-    assert "- 小红｜存活｜道具 2｜待锁" in body
+    assert "- 小红｜存活｜道具 3｜待锁" in body
     assert_no_player_numbers(body, 1, 2, 3)
     assert_no_member_openid(body, "member-1", "member-2", "member-3")
 
@@ -202,7 +202,7 @@ def test_lock_success_mentions_lock_target() -> None:
     assert "小红对小明（" in body and "）使用了锁。" in body
     assert "**当前：小红**" in body
     assert "- **小红**｜当前｜道具 1" in body
-    assert "- 小明｜存活｜道具 2｜待锁" in body
+    assert "- 小明｜存活｜道具 3｜待锁" in body
 
     # 锁目标提及：位于 ``小明（`` 之后、``）`` 之前。
     assert_single_mention_tag(body, "member-1")
@@ -245,7 +245,7 @@ def test_continue_in_place_does_not_mention() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 终局：普通单段 + 胜者提及
+# 终局：普通单段 + 终局事件/胜者/累计胜场事实 + 胜者提及
 # ---------------------------------------------------------------------------
 
 
@@ -254,8 +254,13 @@ def test_final_is_single_plain_paragraph() -> None:
         result_code="shot",
         lifecycle="completed",
         phase=None,
+        details={
+            "completion_reason": "shot",
+            "winner_seq": 1,
+            "eliminated_reason": "shot",
+        },
         winner=player(1, name="小明"),
-        winner_group_wins=1,
+        winner_group_wins=3,
         mention_target=player(1, name="小明"),
         mention_reason="winner",
         players=(player(1, name="小明"), player(3, name="小白", alive=False)),
@@ -271,9 +276,18 @@ def test_final_is_single_plain_paragraph() -> None:
     assert_no_player_numbers(body, 1, 3)
     assert_no_member_openid(body, "member-1", "member-2", "member-3")
 
-    # 终局 = ``{冻结名} {tag} 获胜，累计胜场 {n}。``（TSK-266 真实提及验收定稿）。
+    # 终局正文必须表达终局事件事实（谁被淘汰）、唯一胜者与本群累计胜场。
+    # 不钉死单句：`{名} 获胜，累计胜场 N。` 只是实机提及样例，终局文案以
+    # TSK-266 1F/269 文案池为准（TSK-278-contract.md 第 4 节）。
     assert_single_mention_tag(body, "member-1")
-    assert body == '小明 <qqbot-at-user id="member-1" /> 获胜，累计胜场 1。'
+    tag_at = mention_tag_position(body, "member-1")
+    winner_at = body.index("小明")
+    assert winner_at <= tag_at, "mention must follow the winner's frozen name"
+    between = body[winner_at + len("小明") : tag_at]
+    assert between in (" ", ""), body
+    assert "小白" in body  # 终局原因事实：被淘汰玩家出现
+    assert "累计胜场" in body
+    assert "3" in body  # 本群累计胜场数
 
 
 def test_final_mentions_winner_once_with_metadata_pair() -> None:
@@ -356,11 +370,27 @@ def test_leaderboard_rank_is_not_player_seq() -> None:
 def test_leaderboard_uses_frozen_latest_win_name() -> None:
     # 最近一次获胜对局保存的冻结显示名（改名不刷新）直接来自
     # storage.list_leaderboard 的 display_name，渲染层不得自行替换/拼接。
-    entries = ("小鞠旧名", "另一人:3")
+    # 真实 276 ``_leaderboard_values`` 编码恒为 ``{冻结名}:{N}``（1 胜也是 ":1"），
+    # 因此测试用真实编码形式。
+    entries = ("小鞠旧名:1", "另一人:3")
     rendered = render_reply(_leaderboard_context(entries))
     body = rendered.body
     assert "1. 小鞠旧名｜1 胜" in body
+    assert "2. 另一人｜3 胜" in body
     assert "小鞠旧名" in body
+
+
+def test_leaderboard_frozen_name_with_colon_rsplits_last_colon() -> None:
+    # 冻结名本身可含冒号：真实编码仍是 ``{冻结名}:{N}``。渲染必须按最后一个
+    # 冒号拆分，绝不能把玩家名当胜场数或把名字拆错。
+    entries = ("小红:小明:5", "阿:雪:2")
+    rendered = render_reply(_leaderboard_context(entries))
+    body = rendered.body
+    assert "1. 小红:小明｜5 胜" in body
+    assert "2. 阿:雪｜2 胜" in body
+    assert "共有 2 名玩家取得过胜利。" in body
+    assert "1. 小红｜小明:5 胜" not in body
+    assert "1. 小红:小明:5 胜" not in body
 
 
 def test_leaderboard_timeout_result_suppresses_leaderboard() -> None:

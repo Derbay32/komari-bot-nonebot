@@ -112,7 +112,7 @@ async def test_deliver_sends_real_qq_message_payload() -> None:
     text = message_markdown_content(message)
     assert text == frozen.reply.body
     assert_single_mention_tag(text, "member-1")
-    # 冻结 keyboard spec 还原为真实键盘段：默认 spec "[]" → 无按钮。
+    # 冻结 keyboard spec 还原为真实键盘段：默认 spec '{"rows": []}' → 无按钮。
     assert message_keyboard_rows(message) == []
     # 送达只读冻结收据：不 observe、不重读当前状态。
     assert service.observe_calls == []
@@ -267,6 +267,31 @@ async def test_deliver_runtime_recheck_runs_after_claim() -> None:
     )
     assert seen == ["runtime"]
     assert len(sender.calls) == 1
+
+
+async def test_deliver_async_runtime_recheck_is_awaited() -> None:
+    """真实准入重核可为异步可调用（返回 Awaitable[bool]）；合同不强制仅同步 bool。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender()
+    seen: list[str] = []
+
+    async def async_runtime() -> bool:
+        seen.append("runtime")
+        return False
+
+    outcome = await _delivery(
+        service=service,
+        runtime_check=async_runtime,
+    ).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert seen == ["runtime"]
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.claim_calls == ["receipt-1"]
+    assert service.mark_not_delivered_calls == [claim("receipt-1")]
+    assert service.mark_delivered_calls == []
 
 
 async def test_deliver_build_failure_is_zero_network() -> None:

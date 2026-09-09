@@ -279,6 +279,50 @@ async def test_real_leaderboard_frozen_latest_win_name(
     assert after[0]["wins"] == 1
 
 
+async def test_real_leaderboard_details_encoding_with_colon_name(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """真实 276 details 的 leaderboard 条目编码恒为 ``{冻结名}:{N}``：
+    冻结名含冒号时仍保留完整名字，只有最后一个冒号后是胜场数。"""
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-probe-leaderboard-colon")
+    members = await seed_players(manager, current, 2)
+    await seed_binding(manager, current, 2, name="小红:小明")
+    projector = CountingProjector(metadata={"keyboard": '{"rows": []}'})
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=projector,
+    )
+    await create_waiting(service, current)
+    await join_player(service, current, members[1], "probe-colon-join-2")
+    await start_game(service, current, members[0])
+    forfeited = await service.execute_group_command(
+        request(
+            current,
+            "probe-colon-forfeit",
+            command_factory("forfeit"),
+            member_openid=members[0],
+        )
+    )
+    assert forfeited.result_code in {"forfeited", "completed"}
+
+    listed = await service.execute_group_command(
+        request(
+            current,
+            "probe-colon-leaderboard",
+            command_factory("leaderboard"),
+            member_openid=members[1],
+        )
+    )
+    assert listed.result_code == "leaderboard"
+    ctx = projector.context_objects[-1]
+    assert ctx.details.get("leaderboard") == ("小红:小明:1",)
+
+
 # ---------------------------------------------------------------------------
 # 4. Real service contexts: mention priority 轮转→奖励→胜者→锁 and 原地不@
 # ---------------------------------------------------------------------------

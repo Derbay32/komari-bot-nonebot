@@ -182,7 +182,7 @@ async def test_real_delivery_payload_is_real_qq_message(
     message = sender.calls[0]["message"]
     # 真实 QQ MessageSegment.markdown 正文来自冻结收据投影。
     assert message_markdown_content(message) == real_receipt.reply.body
-    # 冻结 keyboard spec "[]" 还原为空键盘。
+    # 冻结 keyboard spec '{"rows": []}' 还原为空键盘。
     assert message_keyboard_rows(message) == []
 
 
@@ -425,6 +425,54 @@ async def test_real_runtime_recheck_failure_is_zero_network(
     ).deliver(real_receipt, sender)
 
     assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert sender.calls == []
+    assert sender.network_calls == []
+    async with session_factory() as session:
+        state = await session.scalar(
+            text(
+                "SELECT state FROM komari_roulette_fulfillments "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+    assert state == "NOT_DELIVERED"
+
+
+async def test_real_async_runtime_recheck_is_awaited(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """真实准入重核为异步可调用时同样被 await 并拦截发送（0 网络）。"""
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-delivery-async-runtime")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+    seen: list[str] = []
+
+    async def async_runtime() -> bool:
+        seen.append("runtime")
+        return False
+
+    sender = FakeSender()
+    outcome = await RouletteDelivery(
+        service=service,
+        runtime_check=async_runtime,
+    ).deliver(real_receipt, sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert seen == ["runtime"]
     assert sender.calls == []
     assert sender.network_calls == []
     async with session_factory() as session:

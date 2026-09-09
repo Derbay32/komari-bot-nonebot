@@ -434,8 +434,9 @@ def build_real_keyboard(spec: str) -> Any:
 
     This mirrors what TSK-278 ``keyboard_from_spec`` must do; it lets the
     delivery tests assert on the *real* adapter payload without importing the
-    missing seam.  Both ``{"rows": [...]}`` and a bare ``[]`` (no buttons)
-    are accepted.
+    missing seam.  Only the canonical object form ``{"rows": [...]}`` is
+    accepted — there is no historical bare-``[]`` fallback (see
+    TSK-278-contract.md section 5).
     """
     from nonebot.adapters.qq.models import (
         InlineKeyboard,
@@ -444,8 +445,6 @@ def build_real_keyboard(spec: str) -> Any:
     )
 
     parsed = json.loads(spec)
-    if isinstance(parsed, list):
-        return MessageKeyboard(content=InlineKeyboard(rows=[]))
     rows = []
     for row_spec in parsed["rows"]:
         button_specs = (
@@ -459,7 +458,7 @@ def build_real_keyboard(spec: str) -> Any:
     return MessageKeyboard(content=InlineKeyboard(rows=rows))
 
 
-def build_real_message(body: str, keyboard_spec: str = "[]") -> Message:
+def build_real_message(body: str, keyboard_spec: str = '{"rows": []}') -> Message:
     """Real QQ ``Message``: one markdown segment + one keyboard segment."""
     from nonebot.adapters.qq.message import MessageSegment
 
