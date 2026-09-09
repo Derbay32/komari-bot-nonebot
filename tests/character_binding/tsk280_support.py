@@ -317,7 +317,7 @@ async def health_check_commit_failure_switch(
 
 
 class SessionCloseCounter:
-    """统计进程中 AsyncSession 的关闭次数（``after_close`` 事件）。"""
+    """统计进程中 AsyncSession 的关闭次数（monkeypatch ``close``）。"""
 
     def __init__(self) -> None:
         self.closed = 0
@@ -325,17 +325,25 @@ class SessionCloseCounter:
 
 @contextmanager
 def track_session_closes() -> Iterator[SessionCloseCounter]:
-    """统计提交失败期间被关闭的 session（防 session 泄漏回归）。"""
+    """统计提交失败期间被关闭的 session（防 session 泄漏回归）。
+
+    SQLAlchemy 2.0 没有 ``after_close`` 事件，改用对 ``AsyncSession.close``
+    的计数 monkeypatch（测试辅助，不影响生产代码）。
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     counter = SessionCloseCounter()
+    original_close = AsyncSession.close
 
-    def _after_close(_session: _SyncSession) -> None:
+    async def _counting_close(self: AsyncSession) -> None:
         counter.closed += 1
+        await original_close(self)
 
-    event.listen(_SyncSession, "after_close", _after_close)
+    AsyncSession.close = _counting_close  # type: ignore[assignment]
     try:
         yield counter
     finally:
-        event.remove(_SyncSession, "after_close", _after_close)
+        AsyncSession.close = original_close  # type: ignore[assignment]
 
 
 # ─── 绑定/轮盘数据辅助（全部对照真实表结构） ─────────────────────────

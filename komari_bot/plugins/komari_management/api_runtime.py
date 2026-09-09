@@ -37,6 +37,14 @@ if TYPE_CHECKING:
     from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
 
+def _noop_register_api(*args: object, **kwargs: object) -> None:
+    """测试装配缺省：不注册任何路由。"""
+
+
+def _noop_service_getter() -> None:
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ManagementApiComponents:
     """统一管理 API 注册所需组件。"""
@@ -57,6 +65,10 @@ class ManagementApiComponents:
     reply_fulfillment_service_getter: Callable[[], object | None]
     config_resources: tuple[ManagedConfigResource, ...]
     prompt_resources: tuple[ManagedPromptResource, ...]
+    register_character_binding_repair_api: Callable[..., None] = _noop_register_api
+    character_binding_repair_service_getter: Callable[[], object | None] = (
+        _noop_service_getter
+    )
 
 
 def register_management_api_for_driver(
@@ -130,6 +142,12 @@ def register_management_api_for_driver(
         server_app,
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
+    )
+    components.register_character_binding_repair_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+        service_getter=components.character_binding_repair_service_getter,
     )
     register_reply_fulfillment_api(
         server_app,

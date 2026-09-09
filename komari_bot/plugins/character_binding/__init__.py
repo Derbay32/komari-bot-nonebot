@@ -13,6 +13,7 @@ require("group_admission")
 require("user_ban")
 
 from . import reply_evidence as _reply_evidence  # noqa: F401
+from .management_api import register_character_binding_repair_api
 from .manager import (
     BindingConflictError,
     BindingPersistenceError,
@@ -23,6 +24,11 @@ from .manager import (
     get_manager,
 )
 from .qq_coordinator import QQBindingCoordinator
+from .repair import (
+    BindingRepairService,
+    get_binding_repair_service,
+    set_binding_repair_service,
+)
 from .reply_evidence import (
     ReplyEvidence,
     ReplyEvidenceCollector,
@@ -211,6 +217,13 @@ async def init_plugin() -> None:
     await coordinator.start()
     from .database import _open_session
 
+    set_binding_repair_service(
+        BindingRepairService(
+            session_factory=_open_session,
+            clock=lambda: datetime.now(UTC),
+            manager=manager,
+        )
+    )
     set_binding_wizard(
         BindingWizard(
             coordinator=coordinator,
@@ -227,6 +240,7 @@ async def close_plugin() -> None:
     if wizard is not None:
         await wizard.close()
     set_binding_wizard(None)
+    set_binding_repair_service(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
         _qq_plugin_state.coordinator = None
@@ -280,6 +294,7 @@ async def get_legacy_character_name(user_id: str) -> str | None:
 __all__ = [
     "BindingConflictError",
     "BindingPersistenceError",
+    "BindingRepairService",
     "BindingTransaction",
     "CharacterBindingManager",
     "CharacterNameValidationError",
@@ -292,10 +307,13 @@ __all__ = [
     "SessionCodeCollisionError",
     "character_name_key",
     "get_binding_manager",
+    "get_binding_repair_service",
     "get_character_name",
     "get_legacy_character_name",
     "get_qq_character_name",
     "get_runtime_collectors",
+    "register_character_binding_repair_api",
+    "set_binding_repair_service",
     "set_runtime_collectors",
 ]
 
