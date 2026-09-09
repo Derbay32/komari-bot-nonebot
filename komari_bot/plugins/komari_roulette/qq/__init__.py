@@ -4,6 +4,7 @@ This phase ships the parser, keyboard, renderer and help-copy seams; the
 handler and delivery seams land in the following delivery phase.
 """
 
+from .keyboard import build_keyboard, keyboard_from_spec
 from .parser import parse_command
 
-__all__ = ["parse_command"]
+__all__ = ["build_keyboard", "keyboard_from_spec", "parse_command"]
