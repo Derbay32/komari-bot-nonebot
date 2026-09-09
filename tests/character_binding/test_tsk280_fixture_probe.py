@@ -22,6 +22,7 @@ from tests.character_binding.tsk280_support import (
     PG_REQUIRED,
     CommitFailureSwitch,
     backend_pid,
+    clear_binding_scope,
     clear_roulette_scope,
     create_engine_and_factory,
     health_check_commit_failure_switch,
@@ -100,6 +101,7 @@ async def test_roulette_completed_game_fixture_and_counts(
     await clear_roulette_scope(harness.engine, current)
     after = await roulette_counts(harness.engine, current)
     assert after == {"games": 0, "results": 0, "players": 0, "wins": 0}
+    await clear_binding_scope(harness.engine, current)
 
 
 async def test_commit_failure_switch_health_check(harness: Harness) -> None:

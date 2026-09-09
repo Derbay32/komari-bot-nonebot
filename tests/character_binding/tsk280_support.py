@@ -264,41 +264,56 @@ async def health_check_commit_failure_switch(
     switch: CommitFailureSwitch,
 ) -> None:
     """健康验证失败注入：未武装可提交、武装后必失败且不落库、可恢复。"""
-    table = f"tsk280_failure_probe_{uuid4().hex}"
+    with install_commit_failure_switch(switch):
+        def _table() -> str:
+            # TEMP TABLE 按连接会话存活（非 ON COMMIT DROP），池化连接复用会
+            # 保留上一段探针的表；每段探针必须用独立表名，避免同连接 duplicate。
+            return f"tsk280_failure_probe_{uuid4().hex}"
 
-    async def _probe_insert(value: int) -> int:
-        async with session_factory() as session:
-            await session.execute(text(f"CREATE TEMP TABLE {table} (id integer)"))
-            await session.execute(
-                text(f"INSERT INTO {table} (id) VALUES ({value})")
-            )
-            await session.commit()
-            return int(
-                await session.scalar(text(f"SELECT count(*) FROM {table}"))
-            )
-
-    # 1) 未武装：提交成功并可见。
-    assert await _probe_insert(1) == 1
-    # 2) 武装：提交在真正 COMMIT 前失败，数据未落库。
-    async with session_factory() as session:
-        await session.execute(text(f"CREATE TEMP TABLE {table} (id integer)"))
-        await session.execute(text(f"INSERT INTO {table} (id) VALUES (2)"))
-        switch.arm()
-        try:
-            with pytest.raises(OperationalError):
+        async def _probe_insert(value: int) -> int:
+            table = _table()
+            async with session_factory() as session:
+                await session.execute(text(f"CREATE TEMP TABLE {table} (id integer)"))
+                await session.execute(
+                    text(f"INSERT INTO {table} (id) VALUES ({value})")
+                )
                 await session.commit()
-        finally:
-            switch.disarm()
-        await session.rollback()
-        await session.close()
-    async with session_factory() as session:
-        await session.execute(text(f"CREATE TEMP TABLE {table} (id integer)"))
-        assert int(
-            await session.scalar(text(f"SELECT count(*) FROM {table}"))
-        ) == 0
-    # 3) 已解除：可继续正常提交。
-    assert await _probe_insert(3) == 1
-    assert switch.raised == 1
+                return int(
+                    await session.scalar(text(f"SELECT count(*) FROM {table}"))
+                )
+
+        # 1) 未武装：提交成功并可见。
+        assert await _probe_insert(1) == 1
+        # 2) 武装：提交在真正 COMMIT 前失败，数据未落库。
+        armed_table = _table()
+        async with session_factory() as session:
+            await session.execute(
+                text(f"CREATE TEMP TABLE {armed_table} (id integer)")
+            )
+            await session.execute(
+                text(f"INSERT INTO {armed_table} (id) VALUES (2)")
+            )
+            switch.arm()
+            try:
+                with pytest.raises(OperationalError):
+                    await session.commit()
+            finally:
+                switch.disarm()
+            await session.rollback()
+            await session.close()
+        post_failure_table = _table()
+        async with session_factory() as session:
+            await session.execute(
+                text(f"CREATE TEMP TABLE {post_failure_table} (id integer)")
+            )
+            assert int(
+                await session.scalar(
+                    text(f"SELECT count(*) FROM {post_failure_table}")
+                )
+            ) == 0
+        # 3) 已解除：可继续正常提交。
+        assert await _probe_insert(3) == 1
+        assert switch.raised == 1
 
 
 class SessionCloseCounter:
@@ -475,11 +490,14 @@ async def roulette_counts(
     engine: AsyncEngine,
     current: Scope,
 ) -> dict[str, int]:
-    """本作用域轮盘四表行数。
+    """本作用域轮盘表行数。
 
     对照真实表结构：``komari_roulette_players`` / ``result_players`` 没有
     ``app_id``/``group_openid`` 列，必须经 ``komari_roulette_games`` 关联；
     ``results``/``leaderboard``/``games`` 有作用域列，按 app+group 过滤。
+    ``players`` 同时统计运行期座位与终局不可变快照：终局投影会把运行期
+    玩家行搬入 ``komari_roulette_result_players`` 并清空
+    ``komari_roulette_players``，两种状态互斥，行数相加不会重复计数。
     """
     async with engine.begin() as connection:
         rows = await connection.execute(
@@ -494,11 +512,21 @@ async def roulette_counts(
                  WHERE app_id = :app_id AND group_openid = :group_openid
                 UNION ALL
                 SELECT 'players', count(*)
-                  FROM komari_roulette_players
-                 WHERE game_id IN (
-                       SELECT game_id FROM komari_roulette_games
-                        WHERE app_id = :app_id AND group_openid = :group_openid
-                 )
+                  FROM (
+                        SELECT game_id FROM komari_roulette_players
+                         WHERE game_id IN (
+                               SELECT game_id FROM komari_roulette_games
+                                WHERE app_id = :app_id
+                                      AND group_openid = :group_openid
+                         )
+                        UNION ALL
+                        SELECT game_id FROM komari_roulette_result_players
+                         WHERE game_id IN (
+                               SELECT game_id FROM komari_roulette_games
+                                WHERE app_id = :app_id
+                                      AND group_openid = :group_openid
+                         )
+                  ) AS scoped_participants
                 UNION ALL
                 SELECT 'wins', coalesce(sum(wins), 0)
                   FROM komari_roulette_leaderboard
