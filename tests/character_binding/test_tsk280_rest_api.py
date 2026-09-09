@@ -25,6 +25,7 @@ from komari_bot.plugins.character_binding import management_api
 from tests.character_binding.tsk280_support import (
     MANAGE_CREDENTIALS,
     READ_CREDENTIALS,
+    REVOKED_MANAGE_CREDENTIALS,
     WILDCARD_CREDENTIALS,
     Scope,
     StubBindingRepairService,
@@ -43,7 +44,10 @@ from tests.character_binding.tsk280_support import (
 if TYPE_CHECKING:
     from nonebug import App
 
-    from komari_bot.management.management_audit import ManagementAuditEvent
+    from komari_bot.management.management_audit import (
+        ManagementAuditEvent,
+        ManagementAuditRecorder,
+    )
 
 
 def _build_app(
@@ -52,17 +56,28 @@ def _build_app(
     *,
     api_token: list[dict[str, object]] = WILDCARD_CREDENTIALS,
 ) -> FastAPI:
-    async def _record_audit(event: ManagementAuditEvent) -> None:
-        if audit_events is not None:
-            audit_events.append(event)
+    if audit_events is None:
+        return _build_app_with_recorder(service, None, api_token=api_token)
 
+    async def _record_audit(event: ManagementAuditEvent) -> None:
+        audit_events.append(event)
+
+    return _build_app_with_recorder(service, _record_audit, api_token=api_token)
+
+
+def _build_app_with_recorder(
+    service: StubBindingRepairService,
+    recorder: ManagementAuditRecorder | None,
+    *,
+    api_token: list[dict[str, object]] = WILDCARD_CREDENTIALS,
+) -> FastAPI:
     app = FastAPI()
     management_api.register_character_binding_repair_api(
         app,
         api_token=api_token,
         allowed_origins=[],
         service_getter=lambda: service,
-        audit_recorder=_record_audit if audit_events is not None else None,
+        audit_recorder=recorder,
     )
     return app
 
@@ -398,6 +413,135 @@ async def test_audit_records_safe_fields_only(app: App) -> None:
     assert current.member_openid not in rendered
     assert current.member_qq not in rendered
     assert "花火" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_revoked_manage_credential_cannot_access_repair(app: App) -> None:
+    """AC：已撤销凭据即使带 manage 权限也不能读写身份关系。"""
+    service = StubBindingRepairService()
+    current = make_scope("rest-revoked")
+    service.diagnosis = diagnosis_payload(current, members=[member_view(current)])
+    service.preview_result = preview_payload(current)
+    service.confirm_result = confirm_result_payload(current)
+    headers = write_headers(
+        request_id="revoked-write", token="revoked-token-000000"
+    )
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app(service, api_token=REVOKED_MANAGE_CREDENTIALS))
+    ) as ctx:
+        client = ctx.get_client()
+        diagnose = await client.get(
+            _diagnose_url(current), headers=read_headers("revoked-token-000000")
+        )
+        preview = await client.post(
+            f"{management_api.API_PREFIX}/preview",
+            headers=headers,
+            json={"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+        confirm = await client.post(
+            f"{management_api.API_PREFIX}/confirm",
+            headers=headers,
+            json={
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "token": "preview-token-1",
+            },
+        )
+
+    assert diagnose.status_code == 401
+    assert preview.status_code == 401
+    assert confirm.status_code == 401
+    assert service.diagnose_calls == []
+    assert service.preview_calls == []
+    assert service.confirm_calls == []
+
+
+class _SelectiveRaisingAuditRecorder:
+    """在指定调用序号抛出的审计 recorder（started=1，final=2）。"""
+
+    def __init__(self, raise_on_calls: set[int]) -> None:
+        self.raise_on_calls = raise_on_calls
+        self.calls = 0
+        self.events: list[ManagementAuditEvent] = []
+
+    async def __call__(self, event: ManagementAuditEvent) -> None:
+        self.calls += 1
+        if self.calls in self.raise_on_calls:
+            msg = "audit sink CANARY-unavailable"
+            raise RuntimeError(msg)
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_audit_start_failure_aborts_without_operation(app: App) -> None:
+    """审计启动事件失败 → 请求失败且业务不执行（不签发令牌/不删除）。"""
+    service = StubBindingRepairService()
+    current = make_scope("rest-audit-start-fail")
+    service.preview_result = preview_payload(current)
+    service.confirm_result = confirm_result_payload(current)
+    recorder = _SelectiveRaisingAuditRecorder({1})
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app_with_recorder(service, recorder))
+    ) as ctx:
+        client = ctx.get_client()
+        preview = await client.post(
+            f"{management_api.API_PREFIX}/preview",
+            headers=write_headers(request_id="audit-start-preview"),
+            json={"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+        confirm = await client.post(
+            f"{management_api.API_PREFIX}/confirm",
+            headers=write_headers(request_id="audit-start-confirm"),
+            json={
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "token": "preview-token-1",
+            },
+        )
+
+    assert preview.status_code == 500
+    assert confirm.status_code == 500
+    assert service.preview_calls == []
+    assert service.confirm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_audit_final_failure_does_not_break_operation(app: App) -> None:
+    """审计结果事件失败被共享 span 吞掉：操作成功、结果正确、业务各执行一次。"""
+    service = StubBindingRepairService()
+    current = make_scope("rest-audit-final-fail")
+    service.preview_result = preview_payload(current)
+    service.confirm_result = confirm_result_payload(current)
+    recorder = _SelectiveRaisingAuditRecorder({2, 4})
+
+    async with app.test_server(
+        asgi=cast("Any", _build_app_with_recorder(service, recorder))
+    ) as ctx:
+        client = ctx.get_client()
+        preview = await client.post(
+            f"{management_api.API_PREFIX}/preview",
+            headers=write_headers(request_id="audit-final-preview"),
+            json={"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+        confirm = await client.post(
+            f"{management_api.API_PREFIX}/confirm",
+            headers=write_headers(request_id="audit-final-confirm"),
+            json={
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "token": "preview-token-1",
+            },
+        )
+
+    assert preview.status_code == 200
+    assert confirm.status_code == 200
+    assert preview.json()["token"] == "preview-token-1"
+    assert confirm.json()["cleared_count"] == 1
+    assert len(service.preview_calls) == 1
+    assert len(service.confirm_calls) == 1
+    assert [event.outcome for event in recorder.events] == ["started", "started"]
 
 
 def test_route_set_is_fixed_without_identity_repoint() -> None:

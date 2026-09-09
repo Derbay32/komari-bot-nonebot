@@ -2,9 +2,14 @@
 
 无服务阶段：本文件顶层 import 缺失业务模块即 RED（服务层）；门控未满足时
 skip。实现落地后由 root 提供隔离库运行，验证：诊断直读 PG、成员/群范围
-预览与确认、对局阻断与锁等待后槽位复核、依赖变化重预览、令牌单次/操作者/
-10 分钟 TTL/重启失效、提交失败原子保留、终局历史与胜场不受修复影响、以及
-与 bind/轮盘开局的并发锁串行化（复用 TSK-276 ``lock_group_scope``）。
+预览与确认（群级同时清除群映射，TSK-269 第六节）、对局阻断与锁等待后槽位
+复核、依赖增删/改名/解绑变化、令牌绑定目标/单次/操作者/10 分钟 TTL/重启
+失效、锁等待跨 TTL 后失效、同令牌并发仅一次清除、提交失败原子保留（同一
+实例 + 真实 before_commit 事件注入）、终局历史与胜场不受修复影响、普通用户
+解绑保留身份关系，以及与 bind/轮盘开局的并发锁串行化。
+
+夹具正确性由 ``test_tsk280_fixture_probe.py`` 独立验证（不依赖本模块缺失
+的 repair 模块）。
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
@@ -24,7 +29,6 @@ from komari_bot.plugins.character_binding.repair import (
     RepairTokenError,
 )
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 
 from komari_bot.plugins.character_binding.manager import (
     BindingPersistenceError,
@@ -32,33 +36,42 @@ from komari_bot.plugins.character_binding.manager import (
 )
 from komari_bot.plugins.komari_roulette import (
     CanonicalCommand,
-    CommandRequest,
     GroupRef,
     PostgresRouletteStorage,
-    ReplyProjection,
-    RouletteCommandService,
 )
 from tests.character_binding.tsk280_support import (
     PG_REQUIRED,
+    CommitFailureSwitch,
     Scope,
     backend_pid,
+    bind_member,
     clear_roulette_scope,
+    create_active,
     create_engine_and_factory,
+    create_waiting,
+    create_waiting_in_session,
+    group_binding_rows,
+    group_mapping_rows,
+    health_check_commit_failure_switch,
     hold_group_lock,
+    install_commit_failure_switch,
+    make_roulette,
+    member_rows,
+    persist_completed_game,
+    request,
     reset_shared_orm_engine,
+    roulette_counts,
     seed_binding,
+    track_session_closes,
     wait_for_blocked,
+    wait_for_blocked_count,
 )
-from tests.character_binding.tsk280_support import (
-    scope as make_scope,
-)
+from tests.character_binding.tsk280_support import scope as make_scope
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
-
-    from komari_bot.plugins.komari_roulette.domain import RandomSource
 
 pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
 
@@ -107,236 +120,6 @@ def make_service(
     manager: CharacterBindingManager | None = None,
 ) -> BindingRepairService:
     return BindingRepairService(session_factory=factory, clock=clock, manager=manager)
-
-
-def make_roulette(
-    factory: async_sessionmaker[AsyncSession],
-    random_source: RandomSource | None = None,
-) -> RouletteCommandService:
-    return RouletteCommandService(
-        session_factory=factory,
-        reply_projector=lambda _context: ReplyProjection(
-            body="safe", metadata={"test": True}
-        ),
-        random_source=random_source,
-    )
-
-
-def request(
-    current: Scope,
-    message_id: str,
-    command: CanonicalCommand,
-    *,
-    member_openid: str,
-) -> CommandRequest:
-    return CommandRequest(
-        app_id=current.app_id,
-        group_openid=current.group_openid,
-        inbound_msg_id=message_id,
-        member_openid=member_openid,
-        command=command,
-        target_mention_count=1,
-    )
-
-
-async def bind_member(
-    manager: CharacterBindingManager,
-    current: Scope,
-    index: int,
-    *,
-    name: str | None = None,
-) -> None:
-    await seed_binding(
-        manager,
-        current,
-        index,
-        name=name or f"角色{index}",
-    )
-
-
-async def create_waiting(
-    service: RouletteCommandService,
-    current: Scope,
-    member_openid: str,
-    *,
-    message_id: str | None = None,
-) -> None:
-    await service.execute_group_command(
-        request(
-            current,
-            message_id or f"create-{uuid4().hex}",
-            CanonicalCommand.create(),
-            member_openid=member_openid,
-        )
-    )
-
-
-async def create_active(
-    service: RouletteCommandService,
-    current: Scope,
-    member_openids: tuple[str, str],
-) -> None:
-    await create_waiting(
-        service, current, member_openids[0], message_id=f"create-{uuid4().hex}"
-    )
-    await service.execute_group_command(
-        request(
-            current,
-            f"join-{uuid4().hex}",
-            CanonicalCommand.join(),
-            member_openid=member_openids[1],
-        )
-    )
-    await service.execute_group_command(
-        request(
-            current,
-            f"start-{uuid4().hex}",
-            CanonicalCommand.start(),
-            member_openid=member_openids[0],
-        )
-    )
-
-
-async def persist_completed_game(
-    factory: async_sessionmaker[AsyncSession],
-    current: Scope,
-) -> str:
-    """用公开命令 seam 走完一局（2 名玩家、首发即命中终局），返回 game_id。"""
-    from komari_bot.plugins.komari_roulette.domain import ChamberKind
-    from tests.komari_roulette.storage_support import DeterministicRandom
-
-    service = make_roulette(
-        factory,
-        random_source=DeterministicRandom(
-            chambers=(
-                (
-                    ChamberKind.LIVE,
-                    ChamberKind.LIVE,
-                    ChamberKind.BLANK,
-                    ChamberKind.BLANK,
-                    ChamberKind.BLANK,
-                    ChamberKind.BLANK,
-                ),
-            )
-        ),
-    )
-    first = current.with_member(1)
-    second = current.with_member(2)
-    await create_waiting(
-        service, current, first.member_openid, message_id="game-create"
-    )
-    await service.execute_group_command(
-        request(
-            current,
-            "game-join",
-            CanonicalCommand.join(),
-            member_openid=second.member_openid,
-        )
-    )
-    await service.execute_group_command(
-        request(
-            current,
-            "game-start",
-            CanonicalCommand.start(),
-            member_openid=first.member_openid,
-        )
-    )
-    shot = await service.execute_group_command(
-        request(
-            current,
-            "game-shoot",
-            CanonicalCommand.shoot(),
-            member_openid=first.member_openid,
-        )
-    )
-    assert shot.result_code == "shot"
-    assert shot.game_id is not None
-    return shot.game_id
-
-
-async def roulette_counts(
-    engine: AsyncEngine,
-    current: Scope,
-) -> dict[str, int]:
-    """本作用域轮盘四表行数（终局历史/玩家/胜场/游戏）。"""
-    group = current.group_openid
-    async with engine.begin() as connection:
-        rows = await connection.execute(
-            text(
-                """
-                SELECT 'games', count(*) FROM komari_roulette_games
-                 WHERE group_openid = :group
-                UNION ALL
-                SELECT 'results', count(*) FROM komari_roulette_results
-                 WHERE group_openid = :group
-                UNION ALL
-                SELECT 'players', count(*) FROM komari_roulette_players
-                 WHERE group_openid = :group
-                UNION ALL
-                SELECT 'wins', coalesce(sum(wins), 0) FROM komari_roulette_leaderboard
-                 WHERE group_openid = :group
-                """
-            ),
-            {"group": group},
-        )
-        return {name: int(value) for name, value in rows.all()}
-
-
-async def group_binding_rows(
-    engine: AsyncEngine,
-    current: Scope,
-) -> int:
-    async with engine.begin() as connection:
-        rows = await connection.execute(
-            text(
-                """
-                SELECT count(*) FROM komari_character_binding_members
-                 WHERE app_id = :app_id AND group_openid = :group_openid
-                """
-            ),
-            {"app_id": current.app_id, "group_openid": current.group_openid},
-        )
-        return int(rows.scalar_one())
-
-
-class _FailingCommitSession:
-    """把 commit 替换为确定性存储失败的窄代理（其余属性转发）。
-
-    无论实现采用 ``async with session:``、显式 ``commit()`` 还是
-    ``async with session.begin():``，代理都在成功提交路径抛出
-    ``OperationalError``（DBAPIError 子类），保证失败确定性。
-    """
-
-    def __init__(self, inner: AsyncSession) -> None:
-        self._inner = inner
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._inner, name)
-
-    async def __aenter__(self) -> Self:
-        await self._inner.__aenter__()
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        if len(args) < 2 or args[1] is None:
-            raise OperationalError("injected commit failure", {}, RuntimeError("boom"))  # noqa: TRY003
-        await self._inner.__aexit__(*args)
-
-    async def commit(self) -> None:
-        raise OperationalError("injected commit failure", {}, RuntimeError("boom"))  # noqa: TRY003
-
-
-class _FailingSessionFactory:
-    """产出确定性 commit 失败 session 的 session_factory 注入点。"""
-
-    def __init__(self, inner: async_sessionmaker[AsyncSession]) -> None:
-        self._inner = inner
-
-    def __call__(self) -> _FailingCommitSession:
-        return _FailingCommitSession(self._inner())
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._inner, name)
 
 
 async def _blocking_confirm(
@@ -423,10 +206,14 @@ async def test_diagnose_reads_postgres_not_manager_cache(
 async def test_member_scope_preview_and_confirm_with_isolation(
     harness: Harness,
 ) -> None:
-    """成员范围只清除目标成员；同 scope 其他成员与群行不受影响。"""
+    """成员范围只清除目标成员；跨应用同 openid 与同应用其他群完全不变。"""
     current = make_scope("pg-member-isolation")
     await bind_member(harness.binding_manager, current, 1, name="甲")
     await bind_member(harness.binding_manager, current, 2, name="乙")
+    cross_app = current.sibling(other_app=True)
+    cross_group = current.sibling(other_group=True)
+    await seed_binding(harness.binding_manager, cross_app, 1, name="跨应用甲")
+    await seed_binding(harness.binding_manager, cross_group, 1, name="跨群甲")
     service = make_service(harness.session_factory, _Clock(START))
     member = current.with_member(1)
 
@@ -456,28 +243,33 @@ async def test_member_scope_preview_and_confirm_with_isolation(
     assert result.cleared_names == ("甲",)
 
     async with harness.session_factory() as session:
-        rows = await session.execute(
-            text(
-                """
-                SELECT member_openid, character_name
-                  FROM komari_character_binding_members
-                 WHERE app_id = :app_id AND group_openid = :group_openid
-                 ORDER BY member_openid
-                """
-            ),
-            {"app_id": current.app_id, "group_openid": current.group_openid},
-        )
-        remaining = rows.all()
-    assert remaining == [(current.with_member(2).member_openid, "乙")]
+        assert await member_rows(session, current) == [
+            (current.with_member(2).member_openid, "乙")
+        ]
+        # 跨应用同 openid、同应用其他群：成员行与群映射原样保留。
+        assert await member_rows(session, cross_app) == [
+            (member.member_openid, "跨应用甲")
+        ]
+        assert await member_rows(session, cross_group) == [
+            (member.member_openid, "跨群甲")
+        ]
+    assert await group_mapping_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, cross_app) == 1
+    assert await group_mapping_rows(harness.engine, cross_group) == 1
 
 
 async def test_group_scope_preview_and_confirm_clear_all(
     harness: Harness,
 ) -> None:
-    """群范围预览/确认清除全部成员并保留群行。"""
+    """群范围清除所选应用/群映射及全部成员；其他应用/群完全不变（TSK-269）。"""
     current = make_scope("pg-group-clear")
     await bind_member(harness.binding_manager, current, 1, name="甲")
     await bind_member(harness.binding_manager, current, 2, name="乙")
+    cross_app = current.sibling(other_app=True)
+    cross_group = current.sibling(other_group=True)
+    await seed_binding(harness.binding_manager, cross_app, 1, name="跨应用甲")
+    await seed_binding(harness.binding_manager, cross_app, 2, name="跨应用乙")
+    await seed_binding(harness.binding_manager, cross_group, 1, name="跨群甲")
     service = make_service(harness.session_factory, _Clock(START))
 
     preview = await service.preview(
@@ -503,21 +295,21 @@ async def test_group_scope_preview_and_confirm_clear_all(
     assert result.cleared_count == 2
     assert set(result.cleared_names) == {"甲", "乙"}
 
+    # TSK-269 第六节：群级清除该群映射及依赖它的全部成员关联。
+    assert await group_mapping_rows(harness.engine, current) == 0
+    assert await group_binding_rows(harness.engine, current) == 0
+
+    # 独立验证：同 openid 的其他应用、同应用的其他群完全不变。
     async with harness.session_factory() as session:
-        group_rows = (
-            await session.execute(
-                text(
-                    """
-                    SELECT count(*) FROM komari_character_binding_groups
-                     WHERE app_id = :app_id AND group_openid = :group_openid
-                    """
-                ),
-                {"app_id": current.app_id, "group_openid": current.group_openid},
-            )
-        ).scalar_one()
-        member_count = await group_binding_rows(harness.engine, current)
-    assert int(group_rows) == 1  # 群行保留（空绑定），成员全部清除
-    assert member_count == 0
+        assert await member_rows(session, cross_app) == [
+            (current.with_member(1).member_openid, "跨应用甲"),
+            (current.with_member(2).member_openid, "跨应用乙"),
+        ]
+        assert await member_rows(session, cross_group) == [
+            (current.with_member(1).member_openid, "跨群甲"),
+        ]
+    assert await group_mapping_rows(harness.engine, cross_app) == 1
+    assert await group_mapping_rows(harness.engine, cross_group) == 1
 
 
 async def test_repair_does_not_rebind_notify_or_change_admission(
@@ -584,6 +376,57 @@ async def test_repair_does_not_rebind_notify_or_change_admission(
 # ---------------------------------------------------------------- 对局阻断
 
 
+async def test_preview_refused_while_waiting_game_exists(
+    harness: Harness,
+) -> None:
+    """waiting 对局已存在时预览即被拒（无需先签令牌）。"""
+    current = make_scope("pg-preview-refuse-waiting")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    await bind_member(harness.binding_manager, current, 2, name="乙")
+    service = make_service(harness.session_factory, _Clock(START))
+    roulette = make_roulette(harness.session_factory)
+
+    await create_waiting(
+        roulette, current, current.with_member(1).member_openid
+    )
+    with pytest.raises(RepairBlockedByGameError):
+        await service.preview(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            operator_id="tsk280-operator",
+            reason=CHANGE_REASON,
+        )
+    assert await group_binding_rows(harness.engine, current) == 2
+
+
+async def test_preview_refused_while_active_game_exists(
+    harness: Harness,
+) -> None:
+    """active 对局已存在时预览即被拒。"""
+    current = make_scope("pg-preview-refuse-active")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    await bind_member(harness.binding_manager, current, 2, name="乙")
+    service = make_service(harness.session_factory, _Clock(START))
+    roulette = make_roulette(harness.session_factory)
+
+    await create_active(
+        roulette,
+        current,
+        (
+            current.with_member(1).member_openid,
+            current.with_member(2).member_openid,
+        ),
+    )
+    with pytest.raises(RepairBlockedByGameError):
+        await service.preview(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            operator_id="tsk280-operator",
+            reason=CHANGE_REASON,
+        )
+    assert await group_binding_rows(harness.engine, current) == 2
+
+
 async def test_confirm_refused_while_waiting_game_exists(
     harness: Harness,
 ) -> None:
@@ -646,7 +489,6 @@ async def test_confirm_refused_while_active_game_exists(
         operator_id="tsk280-operator",
         reason=CHANGE_REASON,
     )
-    assert preview.game_present is False
 
     await create_active(
         roulette,
@@ -690,28 +532,20 @@ async def test_confirm_rechecks_slot_after_lock_wait(
         confirm_task = asyncio.create_task(
             _blocking_confirm(service, current, preview.token)
         )
-        await wait_for_blocked(harness.session_factory, blocker_pid)
+        try:
+            await wait_for_blocked(harness.session_factory, blocker_pid)
 
-        # 阻塞期间（同锁会话内）真实创建一个 waiting 对局
-        from komari_bot.plugins.komari_roulette import game_state_to_snapshot
-        from tests.komari_roulette.storage_support import group_for, waiting_state
+            # 阻塞期间（同锁会话内）真实创建一个 waiting 对局
+            await create_waiting_in_session(
+                blocker,
+                current,
+                current.with_member(1).member_openid,
+                name="甲",
+            )
+        finally:
+            await blocker.commit()
 
-        group = group_for(current.app_id, current.group_openid)
-        member = current.with_member(1)
-        snapshot = game_state_to_snapshot(
-            waiting_state(
-                group,
-                player_count=1,
-                names=("甲",),
-                member_openids=(member.member_openid,),
-            ),
-            game_id=f"game-{uuid4().hex}",
-        )
-        storage = PostgresRouletteStorage(blocker)
-        await storage.create_waiting(snapshot)
-        await blocker.commit()
-
-    ok, error = await confirm_task
+    ok, error = await asyncio.wait_for(confirm_task, timeout=10)
     assert ok is False
     assert isinstance(error, RepairBlockedByGameError)
     assert await group_binding_rows(harness.engine, current) == 1
@@ -796,7 +630,190 @@ async def test_confirm_rejects_when_dependency_changed_between_preview_and_confi
     assert result.cleared_count == 1
 
 
+async def test_confirm_rejects_when_member_added_after_preview(
+    harness: Harness,
+) -> None:
+    """群范围预览后新增成员 → 依赖集合变化，确认被拒且不误删。"""
+    current = make_scope("pg-dep-add")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    await bind_member(harness.binding_manager, current, 2, name="乙")
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    assert preview.affected_count == 2
+
+    await bind_member(harness.binding_manager, current, 3, name="丙")
+
+    with pytest.raises(RepairDependencyChangedError):
+        await service.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=preview.token,
+            operator_id="tsk280-operator",
+            request_id="req-dep-add",
+            reason=CHANGE_REASON,
+        )
+    assert await group_binding_rows(harness.engine, current) == 3
+
+    # 重新预览后才可清除全部 3 名成员
+    fresh = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    assert fresh.affected_count == 3
+    result = await service.confirm(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        token=fresh.token,
+        operator_id="tsk280-operator",
+        request_id="req-dep-add-repreview",
+        reason=CHANGE_REASON,
+    )
+    assert result.cleared_count == 3
+    assert await group_binding_rows(harness.engine, current) == 0
+
+
+async def test_confirm_rejects_when_member_deleted_after_preview(
+    harness: Harness,
+) -> None:
+    """群范围预览后成员被删除 → 依赖集合变化，确认被拒且不误删。"""
+    current = make_scope("pg-dep-delete")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    await bind_member(harness.binding_manager, current, 2, name="乙")
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    assert preview.affected_count == 2
+
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                """
+                DELETE FROM komari_character_binding_members
+                 WHERE app_id = :app_id AND group_openid = :group_openid
+                   AND member_openid = :member_openid
+                """
+            ),
+            {
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "member_openid": current.with_member(2).member_openid,
+            },
+        )
+        await session.commit()
+
+    with pytest.raises(RepairDependencyChangedError):
+        await service.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=preview.token,
+            operator_id="tsk280-operator",
+            request_id="req-dep-delete",
+            reason=CHANGE_REASON,
+        )
+    assert await group_binding_rows(harness.engine, current) == 1
+
+
+async def test_confirm_rejects_when_target_unbound_after_preview(
+    harness: Harness,
+) -> None:
+    """成员范围预览后目标被普通解绑（清角色名）→ 依赖变化，关系保留。"""
+    current = make_scope("pg-dep-unbind")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+    member = current.with_member(1)
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        member_openid=member.member_openid,
+        reason=CHANGE_REASON,
+    )
+    assert preview.affected_count == 1
+
+    await harness.binding_manager.clear_character_name(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=member.member_openid,
+    )
+
+    with pytest.raises(RepairDependencyChangedError):
+        await service.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=preview.token,
+            operator_id="tsk280-operator",
+            request_id="req-dep-unbind",
+            reason=CHANGE_REASON,
+        )
+    # 普通解绑不清除身份关系：成员行仍在、角色名被清空。
+    async with harness.session_factory() as session:
+        assert await member_rows(session, current) == [(member.member_openid, None)]
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+
 # ---------------------------------------------------------------- 令牌语义
+
+
+async def test_confirm_rejects_tampered_app_or_group_target(
+    harness: Harness,
+) -> None:
+    """令牌绑定预览时的 app/group 目标：篡改任一目标都不能清除任何行。"""
+    current = make_scope("pg-token-tamper")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+
+    other_app = f"{current.app_id}-other"
+    other_group = f"{current.group_openid}-other"
+    for tampered_app, tampered_group in (
+        (other_app, current.group_openid),
+        (current.app_id, other_group),
+    ):
+        with pytest.raises(RepairTokenError):
+            await service.confirm(
+                app_id=tampered_app,
+                group_openid=tampered_group,
+                token=preview.token,
+                operator_id="tsk280-operator",
+                request_id="req-tamper",
+                reason=CHANGE_REASON,
+            )
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+    # 真实目标重新预览后仍可正常清除。
+    fresh = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    result = await service.confirm(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        token=fresh.token,
+        operator_id="tsk280-operator",
+        request_id="req-tamper-fresh",
+        reason=CHANGE_REASON,
+    )
+    assert result.cleared_count == 1
+    assert await group_binding_rows(harness.engine, current) == 0
 
 
 async def test_confirm_rejects_operator_mismatch(
@@ -855,6 +872,45 @@ async def test_token_is_single_use(
             request_id="req-single-use-2",
             reason=CHANGE_REASON,
         )
+
+
+async def test_same_token_concurrent_confirm_clears_exactly_once(
+    harness: Harness,
+) -> None:
+    """同一令牌并发确认：有界并发下恰好一次清除，数据库不变量成立。"""
+    current = make_scope("pg-token-concurrent")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    await bind_member(harness.binding_manager, current, 2, name="乙")
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    assert preview.scope == "group"
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            _blocking_confirm(
+                service, current, preview.token, request_id="race-a"
+            ),
+            _blocking_confirm(
+                service, current, preview.token, request_id="race-b"
+            ),
+        ),
+        timeout=10,
+    )
+    ok_flags = [ok for ok, _ in results]
+    errors = [error for _, error in results]
+    assert ok_flags.count(True) == 1  # 恰好一次清除
+    assert sum(isinstance(error, RepairTokenError) for error in errors) == 1
+
+    # 数据库不变量：群映射与成员关联都只被清除一次。
+    assert await group_mapping_rows(harness.engine, current) == 0
+    assert await group_binding_rows(harness.engine, current) == 0
+    async with harness.session_factory() as session:
+        assert await member_rows(session, current) == []
 
 
 async def test_token_ttl_boundary_at_nine_minutes_fifty_nine(
@@ -943,8 +999,79 @@ async def test_token_store_is_in_memory_and_restart_invalidates(
 async def test_confirm_commit_failure_preserves_original_rows(
     harness: Harness,
 ) -> None:
-    """提交失败 → BindingPersistenceError，删除不落库，原记录完整。"""
+    """提交失败 → BindingPersistenceError，删除不落库，原记录完整。
+
+    使用与 preview **同一实例** 的会话工厂：先健康验证提交失败注入，再
+    武装开关执行确认。失败必须发生在真正 COMMIT 之前（``before_commit``
+    事件），不能等 ``__aexit__`` 已提交后抛，也不能漏掉 session 关闭。
+    """
     current = make_scope("pg-commit-failure")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    await bind_member(harness.binding_manager, current, 2, name="乙")
+
+    switch = CommitFailureSwitch()
+    await health_check_commit_failure_switch(harness.session_factory, switch)
+
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    assert preview.affected_count == 2
+
+    with install_commit_failure_switch(switch):
+        raised_before = switch.raised
+        switch.arm()
+        try:
+            with pytest.raises(BindingPersistenceError):
+                await service.confirm(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    token=preview.token,
+                    operator_id="tsk280-operator",
+                    request_id="req-commit-failure",
+                    reason=CHANGE_REASON,
+                )
+        finally:
+            switch.disarm()
+
+    # 注入确实在真正 COMMIT 前拦截了一次提交。
+    assert switch.raised == raised_before + 1
+    # 原数据未提交：群行与全部成员行完整保留。
+    assert await group_mapping_rows(harness.engine, current) == 1
+    assert await group_binding_rows(harness.engine, current) == 2
+    async with harness.session_factory() as session:
+        assert await member_rows(session, current) == [
+            (current.with_member(1).member_openid, "甲"),
+            (current.with_member(2).member_openid, "乙"),
+        ]
+
+    # 失败后服务仍可用：重新预览并成功清除（证明没有卡死/半提交状态）。
+    fresh = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    result = await service.confirm(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        token=fresh.token,
+        operator_id="tsk280-operator",
+        request_id="req-commit-failure-after",
+        reason=CHANGE_REASON,
+    )
+    assert result.cleared_count == 2
+    assert await group_binding_rows(harness.engine, current) == 0
+
+
+async def test_confirm_commit_failure_closes_failed_session(
+    harness: Harness,
+) -> None:
+    """提交失败路径不能泄漏 session：after_close 计数必须覆盖失败确认。"""
+    current = make_scope("pg-commit-failure-close")
     await bind_member(harness.binding_manager, current, 1, name="甲")
     service = make_service(harness.session_factory, _Clock(START))
     preview = await service.preview(
@@ -954,19 +1081,24 @@ async def test_confirm_commit_failure_preserves_original_rows(
         reason=CHANGE_REASON,
     )
 
-    failing_service = make_service(
-        cast("Any", _FailingSessionFactory(harness.session_factory)), _Clock(START)
-    )
-    with pytest.raises(BindingPersistenceError):
-        await failing_service.confirm(
-            app_id=current.app_id,
-            group_openid=current.group_openid,
-            token=preview.token,
-            operator_id="tsk280-operator",
-            request_id="req-commit-failure",
-            reason=CHANGE_REASON,
-        )
-
+    switch = CommitFailureSwitch()
+    await health_check_commit_failure_switch(harness.session_factory, switch)
+    with install_commit_failure_switch(switch), track_session_closes() as closes:
+        before = closes.closed
+        switch.arm()
+        try:
+            with pytest.raises(BindingPersistenceError):
+                await service.confirm(
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    token=preview.token,
+                    operator_id="tsk280-operator",
+                    request_id="req-commit-failure-close",
+                    reason=CHANGE_REASON,
+                )
+        finally:
+            switch.disarm()
+        assert closes.closed > before  # 失败确认的 session 已被关闭
     assert await group_binding_rows(harness.engine, current) == 1
 
 
@@ -984,13 +1116,14 @@ async def test_completed_game_history_and_wins_preserved_after_repair(
     assert before["results"] >= 1
     assert before["wins"] >= 1
 
+    # 终局（completed）不阻断修复：预览与确认都正常完成。
     preview = await service.preview(
         app_id=current.app_id,
         group_openid=current.group_openid,
         operator_id="tsk280-operator",
         reason=CHANGE_REASON,
     )
-    assert preview.game_present is False  # 终局不阻断修复
+    assert preview.affected_count == 2
     result = await service.confirm(
         app_id=current.app_id,
         group_openid=current.group_openid,
@@ -1014,6 +1147,60 @@ async def test_completed_game_history_and_wins_preserved_after_repair(
             {"group": current.group_openid, "game_id": game_id},
         )
         assert winner.scalar_one() is not None
+    assert await group_binding_rows(harness.engine, current) == 0
+
+
+# ---------------------------------------------------------------- 普通用户解绑
+
+
+async def test_normal_user_unbind_keeps_identity_relationship(
+    harness: Harness,
+) -> None:
+    """普通解绑只清角色名、保留身份关系；修复才是删除关系的唯一入口。"""
+    current = make_scope("pg-unbind-keeps")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    member = current.with_member(1)
+
+    cleared = await harness.binding_manager.clear_character_name(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=member.member_openid,
+    )
+    assert cleared is True
+
+    # 身份关系保留：成员行仍在（角色名清空）、群映射仍在。
+    async with harness.session_factory() as session:
+        assert await member_rows(session, current) == [(member.member_openid, None)]
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+    # 诊断仍列出该成员（关系未被删除）。
+    service = make_service(harness.session_factory, _Clock(START))
+    diagnosis = await service.diagnose(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+    )
+    assert len(diagnosis.members) == 1
+    assert diagnosis.members[0].member_openid == member.member_openid
+    assert diagnosis.members[0].character_name is None
+
+    # 成员级修复可清除该关联（仅修复入口删除身份关系）。
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        member_openid=member.member_openid,
+        reason=CHANGE_REASON,
+    )
+    assert preview.affected_count == 1
+    result = await service.confirm(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        token=preview.token,
+        operator_id="tsk280-operator",
+        request_id="req-unbind-repair",
+        reason=CHANGE_REASON,
+    )
+    assert result.cleared_count == 1
     assert await group_binding_rows(harness.engine, current) == 0
 
 
@@ -1044,44 +1231,44 @@ async def test_concurrent_confirm_and_bind_share_group_lock(
         bind_task = asyncio.create_task(
             _blocking_bind(harness.binding_manager, current, 3, name="并发绑定")
         )
-        await wait_for_blocked(harness.session_factory, blocker_pid)
-        await asyncio.sleep(0.5)
-        async with harness.engine.connect() as probe:
-            blocked = (
-                await probe.execute(
-                    text(
-                        """
-                        SELECT count(*) FROM pg_stat_activity
-                         WHERE :blocker = ANY(pg_blocking_pids(pid))
-                        """
-                    ),
-                    {"blocker": blocker_pid},
-                )
-            ).scalar_one()
-        assert int(blocked) >= 2  # 确认与 bind 两条会话都阻塞在同一把锁
-        await blocker.commit()
+        try:
+            await wait_for_blocked_count(
+                harness.session_factory, blocker_pid, min_count=2
+            )
+            async with harness.engine.connect() as probe:
+                blocked = (
+                    await probe.execute(
+                        text(
+                            """
+                            SELECT count(*) FROM pg_stat_activity
+                             WHERE :blocker = ANY(pg_blocking_pids(pid))
+                            """
+                        ),
+                        {"blocker": blocker_pid},
+                    )
+                ).scalar_one()
+            assert int(blocked) >= 2  # 确认与 bind 两条会话都阻塞在同一把锁
+        finally:
+            await blocker.rollback()
+            if not confirm_task.done():
+                confirm_task.cancel()
+            if not bind_task.done():
+                bind_task.cancel()
 
-    confirm_ok, confirm_error = await confirm_task
-    bind_ok, bind_error = await bind_task
+    confirm_ok, confirm_error = await asyncio.wait_for(confirm_task, timeout=10)
+    bind_ok, bind_error = await asyncio.wait_for(bind_task, timeout=10)
     assert confirm_error is None
     assert bind_error is None
     assert confirm_ok is True
     assert bind_ok is True
 
-    # 两种合法时序都产生一致终态：确认清掉旧成员，bind 后新增成员
+    # 两种合法时序都产生一致终态：确认清掉旧成员，bind 后新增成员。
     assert await group_binding_rows(harness.engine, current) == 1
     async with harness.session_factory() as session:
-        rows = await session.execute(
-            text(
-                """
-                SELECT member_openid, character_name
-                  FROM komari_character_binding_members
-                 WHERE app_id = :app_id AND group_openid = :group_openid
-                """
-            ),
-            {"app_id": current.app_id, "group_openid": current.group_openid},
-        )
-        assert rows.all() == [(current.with_member(3).member_openid, "并发绑定")]
+        assert await member_rows(session, current) == [
+            (current.with_member(3).member_openid, "并发绑定")
+        ]
+    assert await group_mapping_rows(harness.engine, current) == 1
 
 
 async def test_concurrent_confirm_and_roulette_open_share_group_lock(
@@ -1092,7 +1279,6 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
     await bind_member(harness.binding_manager, current, 1, name="甲")
     await bind_member(harness.binding_manager, current, 2, name="乙")
     service = make_service(harness.session_factory, _Clock(START))
-    roulette = make_roulette(harness.session_factory)
     preview = await service.preview(
         app_id=current.app_id,
         group_openid=current.group_openid,
@@ -1100,15 +1286,20 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
         reason=CHANGE_REASON,
     )
 
-    async def _blocking_open() -> tuple[bool, BaseException | None]:
+    async def _blocking_open() -> tuple[str | None, BaseException | None]:
         try:
-            await create_waiting(
-                roulette, current, current.with_member(1).member_openid
+            receipt = await service.execute_group_command(
+                request(
+                    current,
+                    f"open-{uuid4().hex}",
+                    CanonicalCommand.create(),
+                    member_openid=current.with_member(1).member_openid,
+                )
             )
         except BaseException as error:
-            return False, error
+            return None, error
         else:
-            return True, None
+            return receipt.result_code, None
 
     async with harness.session_factory() as blocker:
         await blocker.begin()
@@ -1118,25 +1309,32 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
             _blocking_confirm(service, current, preview.token)
         )
         open_task = asyncio.create_task(_blocking_open())
-        await wait_for_blocked(harness.session_factory, blocker_pid)
-        await asyncio.sleep(0.5)
-        async with harness.engine.connect() as probe:
-            blocked = (
-                await probe.execute(
-                    text(
-                        """
-                        SELECT count(*) FROM pg_stat_activity
-                         WHERE :blocker = ANY(pg_blocking_pids(pid))
-                        """
-                    ),
-                    {"blocker": blocker_pid},
-                )
-            ).scalar_one()
-        assert int(blocked) >= 2
-        await blocker.commit()
+        try:
+            await wait_for_blocked_count(
+                harness.session_factory, blocker_pid, min_count=2
+            )
+            async with harness.engine.connect() as probe:
+                blocked = (
+                    await probe.execute(
+                        text(
+                            """
+                            SELECT count(*) FROM pg_stat_activity
+                             WHERE :blocker = ANY(pg_blocking_pids(pid))
+                            """
+                        ),
+                        {"blocker": blocker_pid},
+                    )
+                ).scalar_one()
+            assert int(blocked) >= 2
+        finally:
+            await blocker.rollback()
+            if not confirm_task.done():
+                confirm_task.cancel()
+            if not open_task.done():
+                open_task.cancel()
 
-    confirm_ok, confirm_error = await confirm_task
-    open_ok, open_error = await open_task
+    confirm_ok, confirm_error = await asyncio.wait_for(confirm_task, timeout=10)
+    open_code, open_error = await asyncio.wait_for(open_task, timeout=10)
     assert confirm_task.done() and open_task.done()  # 无死锁
 
     async with harness.session_factory() as session:
@@ -1148,13 +1346,55 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
 
     group_present = (await group_binding_rows(harness.engine, current)) > 0
     # 开局的先拿到锁 → 对局存在且确认被拒（绑定保留）；
-    # 确认先拿到锁 → 群清空且开局因无绑定失败（无对局）。
+    # 确认先拿到锁 → 群清空且开局因无绑定返回 binding_required（无对局）。
     assert (game_present, group_present) in {(True, True), (False, False)}
     if game_present:
         assert confirm_ok is False
         assert isinstance(confirm_error, RepairBlockedByGameError)
-        assert open_ok is True
+        assert open_code == "created"
+        assert open_error is None
     else:
         assert confirm_ok is True
-        assert open_ok is False
-        assert open_error is not None
+        assert open_code == "binding_required"
+        assert open_error is None
+
+
+# ---------------------------------------------------------------- 锁等待跨 TTL
+
+
+async def test_confirm_rechecks_token_expiry_after_lock_wait(
+    harness: Harness,
+) -> None:
+    """锁等待期间令牌过期：提交前必须复核，过期则拒绝且不写库。"""
+    current = make_scope("pg-ttl-lock-wait")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    clock = _Clock(START)
+    service = make_service(harness.session_factory, clock)
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+
+    async with harness.session_factory() as blocker:
+        await blocker.begin()
+        blocker_pid = await backend_pid(blocker)
+        await hold_group_lock(blocker, current)
+        confirm_task = asyncio.create_task(
+            _blocking_confirm(service, current, preview.token)
+        )
+        try:
+            await wait_for_blocked(harness.session_factory, blocker_pid)
+            # 确认已通过初始令牌校验并阻塞在群锁上；等待期间令牌绝对过期。
+            clock.advance(timedelta(minutes=10, seconds=1))
+        finally:
+            await blocker.rollback()
+            if not confirm_task.done():
+                confirm_task.cancel()
+
+    ok, error = await asyncio.wait_for(confirm_task, timeout=10)
+    assert ok is False
+    assert isinstance(error, RepairTokenError)
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
