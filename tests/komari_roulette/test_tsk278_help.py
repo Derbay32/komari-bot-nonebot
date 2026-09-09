@@ -49,7 +49,7 @@ def test_roulette_plugin_declares_help_in_metadata_usage() -> None:
 
 def test_parser_rejects_qq_help_command() -> None:
     # RED: /轮盘 帮助 已删除；按未知命令解析，绝不成为轮盘命令入口。
-    from komari_bot.plugins.komari_roulette import parse_command
+    from komari_bot.plugins.komari_roulette.qq.parser import parse_command
 
     command = parse_command("/轮盘 帮助")
     assert command is not None

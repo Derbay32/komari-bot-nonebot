@@ -1,29 +1,34 @@
 # ruff: noqa: RUF001
 """TSK-278 RED baseline: full-Markdown reply renderer seam.
 
-The red root for this file is the missing top-level ``render_reply`` symbol.
-Assertions follow ``TSK-278-contract.md`` section 4 and the TSK-266 12.2 /
-11.1-11.5 confirmed layouts.
+The red root for this file is the missing ``render_reply`` symbol in
+``komari_bot.plugins.komari_roulette.qq.renderer``.  Assertions follow
+``TSK-278-contract.md`` section 4 and the TSK-266 12.2 / 11.1-11.5 confirmed
+layouts, plus the leaderboard spec (10.2) and the real-mention acceptance.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
+from komari_bot.plugins.komari_roulette.qq.renderer import render_reply
 
 from komari_bot.plugins.komari_roulette import (
     ReplyProjection,
     ReplyProjectionContext,
-    render_reply,
 )
 
 from .tsk278_support import (
     assert_body_has_markdown_structure,
     assert_no_member_openid,
+    assert_no_mention_tag,
     assert_no_player_numbers,
+    assert_single_mention_tag,
     context,
     game_view,
+    mention_tag_position,
     player,
 )
 
@@ -79,21 +84,44 @@ def test_follow_up_is_complete_markdown() -> None:
     assert "- **小明**｜当前｜道具 1" in body
     assert "- 小白｜出局｜道具 0" in body
 
-    # 普通正文不带玩家编号与内部身份。
+    # 普通正文不带玩家编号与内部身份（平台提及 tag 除外）。
     assert_no_player_numbers(body, 1, 2, 3)
     assert_no_member_openid(body, "member-1", "member-2", "member-3")
 
 
-def test_follow_up_mention_is_exactly_one() -> None:
+def test_follow_up_mentions_current_player_once_in_body() -> None:
     rendered = render_reply(_follow_up_context())
     metadata = dict(rendered.metadata)
     assert metadata.get("mention_member_openid") == "member-1"
     assert metadata.get("mention_display_name") == "小明"
     assert len([k for k in metadata if k.startswith("mention_")]) == 2
 
+    # 真实发送载荷以 markdown 正文中的原生提及为准：恰好一个 tag，紧跟
+    # ``**当前：小明**``（轮转/奖励位置），不是全文末尾。
+    body = rendered.body
+    assert_single_mention_tag(body, "member-1")
+    tag_at = mention_tag_position(body, "member-1")
+    current_line_at = body.index("**当前：小明**")
+    assert tag_at > current_line_at
+    between = body[current_line_at + len("**当前：小明**") : tag_at]
+    assert between == " ", body
+    # 分割线定稿：弹仓行之后一条 ``***``，名单在末尾。
+    assert body.index("***") > body.index("弹仓：")
+    assert body.index("- 小红｜存活｜道具 2｜待锁") > body.index("***")
+
+
+def test_follow_up_keyboard_spec_is_frozen_json() -> None:
+    rendered = render_reply(_follow_up_context())
+    spec = rendered.metadata.get("keyboard")
+    assert isinstance(spec, str)
+    parsed = json.loads(spec)
+    assert "rows" in parsed
+    assert isinstance(parsed["rows"], list)
+    assert parsed["rows"], "follow_up must offer buttons"
+
 
 # ---------------------------------------------------------------------------
-# 奖励选择：两条分割线
+# 奖励选择：两条分割线 + 提及位置
 # ---------------------------------------------------------------------------
 
 
@@ -137,9 +165,16 @@ def test_reward_choice_has_two_dividers() -> None:
     assert_no_player_numbers(body, 1, 2, 3)
     assert_no_member_openid(body, "member-1", "member-2", "member-3")
 
+    # 奖励选择：提及在 ``**当前：小明**`` 之后。
+    assert_single_mention_tag(body, "member-1")
+    tag_at = mention_tag_position(body, "member-1")
+    current_line_at = body.index("**当前：小明**")
+    assert tag_at > current_line_at
+    assert body[current_line_at + len("**当前：小明**") : tag_at] == " "
+
 
 # ---------------------------------------------------------------------------
-# 成功上锁：@锁目标 + 弹仓—分割线—名单
+# 成功上锁：@锁目标（括号内位置）
 # ---------------------------------------------------------------------------
 
 
@@ -150,8 +185,8 @@ def test_lock_success_mentions_lock_target() -> None:
         phase="follow_up",
         details={"item": "lock", "target_player_seq": 2},
         players=(
-            player(2, name="小红", inventory=(("magnifier", 1),), pending_lock=True),
-            player(1, name="小明", inventory=(("beer", 2), ("lock", 1))),
+            player(2, name="小红", inventory=(("magnifier", 1),)),
+            player(1, name="小明", inventory=(("beer", 2), ("lock", 1)), pending_lock=True),
             player(3, name="小白", alive=False),
         ),
         current_player=player(2, name="小红"),
@@ -169,6 +204,13 @@ def test_lock_success_mentions_lock_target() -> None:
     assert "- **小红**｜当前｜道具 1" in body
     assert "- 小明｜存活｜道具 2｜待锁" in body
 
+    # 锁目标提及：位于 ``小明（`` 之后、``）`` 之前。
+    assert_single_mention_tag(body, "member-1")
+    tag_at = mention_tag_position(body, "member-1")
+    open_paren_at = body.index("小红对小明（") + len("小红对小明（")
+    close_paren_at = body.index("）使用了锁。")
+    assert open_paren_at <= tag_at < close_paren_at
+
     metadata = dict(rendered.metadata)
     assert metadata.get("mention_member_openid") == "member-1"
     assert metadata.get("mention_display_name") == "小明"
@@ -177,7 +219,33 @@ def test_lock_success_mentions_lock_target() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 终局：普通单段，无引用/粗体/列表/编号/按钮数据
+# 原地继续（原地不@）：actor 就是当前玩家 → 无提及
+# ---------------------------------------------------------------------------
+
+
+def test_continue_in_place_does_not_mention() -> None:
+    base = context(
+        result_code="shot",
+        lifecycle="active",
+        phase="follow_up",
+        details={"consumed_kind": "blank"},
+        players=_roster(),
+        current_player=player(1, name="小明"),
+        mention_target=None,
+        mention_reason=None,
+        view=game_view(remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
+    )
+    rendered = render_reply(base)
+    body = rendered.body
+    assert_no_mention_tag(body)
+    metadata = dict(rendered.metadata)
+    assert "mention_member_openid" not in metadata
+    assert "mention_display_name" not in metadata
+    assert "**当前：小明**" in body
+
+
+# ---------------------------------------------------------------------------
+# 终局：普通单段 + 胜者提及
 # ---------------------------------------------------------------------------
 
 
@@ -200,14 +268,15 @@ def test_final_is_single_plain_paragraph() -> None:
         body, dividers=0, blockquote=False, bold=False, roster=False
     )
     assert "\n\n" not in body.strip("\n"), "final must be a single paragraph"
-    assert "小明" in body
-    assert "累计胜场 1" in body
-    assert "6 场" not in body  # 唯一胜者累计胜场 = 1，不是固定示例 6
     assert_no_player_numbers(body, 1, 3)
     assert_no_member_openid(body, "member-1", "member-2", "member-3")
 
+    # 终局 = ``{冻结名} {tag} 获胜，累计胜场 {n}。``（TSK-266 真实提及验收定稿）。
+    assert_single_mention_tag(body, "member-1")
+    assert body == '小明 <qqbot-at-user id="member-1" /> 获胜，累计胜场 1。'
 
-def test_final_mentions_winner_once() -> None:
+
+def test_final_mentions_winner_once_with_metadata_pair() -> None:
     base = context(
         result_code="shot",
         lifecycle="completed",
@@ -218,10 +287,102 @@ def test_final_mentions_winner_once() -> None:
         mention_reason="winner",
     )
     rendered = render_reply(base)
+    body = rendered.body
+    assert_single_mention_tag(body, "member-1")
     metadata = dict(rendered.metadata)
     assert metadata.get("mention_member_openid") == "member-1"
     assert metadata.get("mention_display_name") == "小明"
     assert len([k for k in metadata if k.startswith("mention_")]) == 2
+    # 终局无按钮。
+    assert json.loads(metadata["keyboard"])["rows"] == []
+
+
+# ---------------------------------------------------------------------------
+# 排行榜（TSK-266 10.2）
+# ---------------------------------------------------------------------------
+
+
+def _leaderboard_context(entries: tuple[str, ...]) -> ReplyProjectionContext:
+    return context(
+        result_code="leaderboard",
+        lifecycle="active",
+        phase=None,
+        details={"leaderboard": entries},
+        players=(),
+        current_player=None,
+        mention_target=None,
+        mention_reason=None,
+        view=None,
+    )
+
+
+def test_leaderboard_no_winners_copy() -> None:
+    rendered = render_reply(_leaderboard_context(()))
+    body = rendered.body
+    assert body == "本群还没有俄罗斯轮盘胜者。"
+    assert_no_mention_tag(body)
+    assert json.loads(rendered.metadata["keyboard"])["rows"] == []
+
+
+def test_leaderboard_shows_top_10_and_total_all_winners() -> None:
+    entries = tuple(f"玩家{i}:{i}" for i in range(12, 0, -1))
+    rendered = render_reply(_leaderboard_context(entries))
+    body = rendered.body
+
+    assert body.startswith("**本群俄罗斯轮盘排行榜｜前 10 名**")
+    # 排行榜行首是名次，不是玩家编号；每行 ``名次. 冻结名|N 胜``。
+    for rank in range(1, 11):
+        assert f"{rank}. 玩家{13 - rank}｜{13 - rank} 胜" in body, body
+    assert "11. 玩家2｜2 胜" not in body  # 只显示前 10
+    assert "12. 玩家1｜1 胜" not in body
+    # 总数统计所有胜者（含未进前 10 者）。
+    assert "共有 12 名玩家取得过胜利。" in body
+    assert_no_mention_tag(body)
+    assert_no_member_openid(body, "member-1", "member-2", "member-3")
+
+
+def test_leaderboard_rank_is_not_player_seq() -> None:
+    entries = ("小红:8", "小明:5", "小白:5")
+    rendered = render_reply(_leaderboard_context(entries))
+    body = rendered.body
+    assert "1. 小红｜8 胜" in body
+    assert "2. 小明｜5 胜" in body
+    assert "3. 小白｜5 胜" in body
+    assert "共有 3 名玩家取得过胜利。" in body
+    assert_no_mention_tag(body)
+    assert_no_member_openid(body, "member-1", "member-2", "member-3")
+
+
+def test_leaderboard_uses_frozen_latest_win_name() -> None:
+    # 最近一次获胜对局保存的冻结显示名（改名不刷新）直接来自
+    # storage.list_leaderboard 的 display_name，渲染层不得自行替换/拼接。
+    entries = ("小鞠旧名", "另一人:3")
+    rendered = render_reply(_leaderboard_context(entries))
+    body = rendered.body
+    assert "1. 小鞠旧名｜1 胜" in body
+    assert "小鞠旧名" in body
+
+
+def test_leaderboard_timeout_result_suppresses_leaderboard() -> None:
+    # TSK-266 10.2：排行榜查询推进查询者自己到期 → 返回超时结果而非排行榜。
+    # 服务层（真实 PG 测试）保证该场景 result_code=turn_expired；渲染层此时
+    # 必须输出固定超时文案，不得渲染排行榜。
+    base = context(
+        result_code="turn_expired",
+        lifecycle="active",
+        phase="follow_up",
+        details={"eliminated_reason": "timeout"},
+        players=_roster(),
+        current_player=player(2, name="小红"),
+        mention_target=None,
+        mention_reason=None,
+        view=game_view(remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
+    )
+    rendered = render_reply(base)
+    body = rendered.body
+    assert body == "你的行动时间已经结束，本次命令未执行。"
+    assert "排行榜" not in body
+    assert_no_mention_tag(body)
 
 
 # ---------------------------------------------------------------------------
@@ -335,20 +496,20 @@ def test_waiting_shows_transfer_area_with_numbers() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 名单转义：名字不得注入 Markdown
+# 名单转义：名字不得注入 Markdown / XML / 伪造第二个提及
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("name", "visible", "forbidden"),
     [
-        ("[恶意](http://evil.example)", "恶意", "]("),
-        ("小明**加粗**", "小明", "**"),
-        ("[小红](https://x)", "小红", "]("),
-        ("小明 `code`", "小明", "`code`"),
+        ("[恶意](http://evil.example)", "恶意", "[恶意](http://evil.example)"),
+        ("小明**加粗**", "小明", "小明**加粗**"),
+        ("[小红](https://x)", "小红", "[小红](https://x)"),
+        ("小明 `code`", "小明", "小明 `code`"),
     ],
 )
-def test_render_escapes_unsafe_display_names(
+def test_render_escapes_unsafe_markdown_names(
     name: str,
     visible: str,
     forbidden: str,
@@ -366,6 +527,28 @@ def test_render_escapes_unsafe_display_names(
     body = rendered.body
     assert visible in body  # 名字内容可见
     assert forbidden not in body, f"unsafe markdown leaked through: {forbidden!r}"
+
+
+def test_render_escapes_xml_injection_in_frozen_name() -> None:
+    name = '<qqbot-at-user id="member-9" /><b>粗</b>&amp;'
+    base = context(
+        result_code="shot",
+        lifecycle="completed",
+        phase=None,
+        winner=player(1, name=name, member_openid="member-1"),
+        winner_group_wins=1,
+        mention_target=player(1, name=name, member_openid="member-1"),
+        mention_reason="winner",
+    )
+    rendered = render_reply(base)
+    body = rendered.body
+    # 冻结名中的 XML 必须转义：不伪造第二个提及、不出现原始 <b> 结构。
+    assert_single_mention_tag(body, "member-1")
+    assert '<qqbot-at-user id="member-9"' not in body
+    assert "<b>" not in body
+    # 名字内容仍可见（&amp; 已实体化，但字符不会消失）。
+    assert "粗" in body
+    assert_no_member_openid(body, "member-1")
 
 
 # ---------------------------------------------------------------------------
@@ -476,10 +659,11 @@ def test_error_reply_is_fixed_text_without_state(
     assert "***" not in body
     assert "**" not in body
     assert "- " not in body
-    assert ">" not in body
+    assert not any(line.startswith("> ") for line in body.splitlines())
     assert_no_member_openid(body, "member-1", "member-2", "member-3", "member-9")
     metadata = dict(rendered.metadata)
     assert not [k for k in metadata if k.startswith("mention_")], metadata
+    assert json.loads(metadata["keyboard"])["rows"] == []
 
 
 def test_error_never_echoes_raw_input() -> None:

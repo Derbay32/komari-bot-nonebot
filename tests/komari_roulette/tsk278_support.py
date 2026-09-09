@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF002, RUF003  # ｜ 是玩家行列分隔符（规范字符，非代码符号）
 """Self-contained, service-free helpers for the TSK-278 test baseline.
 
 Everything here runs without a NoneBot driver, without a real PostgreSQL,
@@ -7,13 +8,15 @@ of the handler/delivery under test is a recording fake.
 
 No TSK-278 production symbol is imported at module import time on purpose:
 the RED baseline must fail on the specific missing seam, not on this helper
-module.  Tests that need a TSK-278 symbol import it from the plugin top
-level inside the test function / module they own.
+module.  Tests that need a TSK-278 symbol import it inside the test function
+/ module they own.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -26,8 +29,14 @@ from nonebot.adapters.qq.event import (
     GroupAtMessageCreateEvent,
     GroupMessageCreateEvent,
 )
+from nonebot.adapters.qq.message import Message
+from nonebot.adapters.qq.models import Action, Button, Permission, RenderData
 from nonebot.adapters.qq.models.qq import GroupMemberAuthor
 
+from komari_bot.plugins.group_admission.qq import (
+    QQ_ADMISSION_STATE_KEY,
+    QQAdmissionToken,
+)
 from komari_bot.plugins.komari_roulette import (
     CommandReceipt,
     FulfillmentClaim,
@@ -41,6 +50,48 @@ from komari_bot.plugins.komari_roulette import (
 
 APP_ID = "tsk278-app"
 GROUP_OPENID = "group-1"
+
+
+# ---------------------------------------------------------------------------
+# Real admission handoff (TSK-274 gate token; not faked)
+# ---------------------------------------------------------------------------
+
+
+def business_token(
+    *,
+    scope: str = "business",
+    member_openid: str = "member-1",
+    qq_message_id: str = "msg-1",
+) -> QQAdmissionToken:
+    """A real ``QQAdmissionToken`` as the TSK-274 preprocessor would leave in
+    ``event.state`` for an admitted group-@ message."""
+    return QQAdmissionToken(
+        scope=cast("Any", scope),
+        app_id=APP_ID,
+        group_openid=GROUP_OPENID,
+        member_openid=member_openid,
+        qq_message_id=qq_message_id,
+        group_id=None,
+        member_qq=None,
+        effective_policy_revision=1,
+        connection_generation=0,
+        claim=None,
+        verified_session=None,
+    )
+
+
+def admission_state(
+    *,
+    token: QQAdmissionToken | None = None,
+) -> dict[str, Any]:
+    """The ``state`` dict a handler receives for an admitted group-@ message.
+
+    Defaults to a real admitted token; pass ``token=None`` explicitly only if
+    a test wants a handoff carrying no token (not used by the suite).
+    """
+    if token is None:
+        token = business_token()
+    return {QQ_ADMISSION_STATE_KEY: token}
 
 
 # ---------------------------------------------------------------------------
@@ -302,8 +353,15 @@ def projection(
     *,
     mention_member_openid: str | None = None,
     mention_display_name: str | None = None,
+    keyboard_spec: str | None = '{"rows": []}',
 ) -> ReplyProjection:
-    metadata: dict[str, Any] = {}
+    """Frozen projection carrying the scalar metadata TSK-276 stores.
+
+    ``keyboard`` is the JSON object spec string produced by ``build_keyboard``
+    and consumed by ``keyboard_from_spec`` (see TSK-278-contract.md section 5);
+    it is always present, the empty object meaning no buttons.
+    """
+    metadata: dict[str, Any] = {"keyboard": keyboard_spec}
     if mention_member_openid is not None:
         metadata["mention_member_openid"] = mention_member_openid
     if mention_display_name is not None:
@@ -346,6 +404,170 @@ def claim(
 
 
 # ---------------------------------------------------------------------------
+# Real QQ payload builders (no TSK-278 import; adapter classes only)
+# ---------------------------------------------------------------------------
+
+
+def make_button(
+    label: str,
+    data: str,
+    *,
+    action_type: int = 2,
+    permission_type: int = 2,
+    reply: bool = False,
+    enter: bool = False,
+) -> Button:
+    return Button(
+        render_data=RenderData(label=label),
+        action=Action(
+            type=action_type,
+            permission=Permission(type=permission_type),
+            data=data,
+            reply=reply,
+            enter=enter,
+        ),
+    )
+
+
+def build_real_keyboard(spec: str) -> Any:
+    """Materialize a real QQ MessageKeyboard from a JSON spec.
+
+    This mirrors what TSK-278 ``keyboard_from_spec`` must do; it lets the
+    delivery tests assert on the *real* adapter payload without importing the
+    missing seam.  Both ``{"rows": [...]}`` and a bare ``[]`` (no buttons)
+    are accepted.
+    """
+    from nonebot.adapters.qq.models import (
+        InlineKeyboard,
+        InlineKeyboardRow,
+        MessageKeyboard,
+    )
+
+    parsed = json.loads(spec)
+    if isinstance(parsed, list):
+        return MessageKeyboard(content=InlineKeyboard(rows=[]))
+    rows = []
+    for row_spec in parsed["rows"]:
+        button_specs = (
+            row_spec["buttons"] if isinstance(row_spec, dict) else row_spec
+        )
+        rows.append(
+            InlineKeyboardRow(
+                buttons=[make_button(b["label"], b["data"]) for b in button_specs]
+            )
+        )
+    return MessageKeyboard(content=InlineKeyboard(rows=rows))
+
+
+def build_real_message(body: str, keyboard_spec: str = "[]") -> Message:
+    """Real QQ ``Message``: one markdown segment + one keyboard segment."""
+    from nonebot.adapters.qq.message import MessageSegment
+
+    message = Message()
+    message += MessageSegment.markdown(body)
+    message += MessageSegment.keyboard(build_real_keyboard(keyboard_spec))
+    return message
+
+
+def message_markdown_content(message: Any) -> str:
+    """Extract the markdown text from a real QQ Message payload."""
+    if isinstance(message, Message):
+        for segment in message:
+            if segment.type == "markdown":
+                markdown = segment.data.get("markdown", {})
+                content = getattr(markdown, "content", None)
+                if content is None and isinstance(markdown, dict):
+                    content = markdown.get("content")
+                return str(content)
+        raise AssertionError("no markdown segment in message")  # noqa: TRY003
+    return str(getattr(message, "content", message))
+
+
+def message_keyboard_rows(message: Any) -> list[list["ButtonSpec"]]:
+    """Extract flattened keyboard rows from a real QQ Message payload."""
+    if isinstance(message, Message):
+        for segment in message:
+            if segment.type == "keyboard":
+                return flatten_keyboard(segment.data["keyboard"])
+        raise AssertionError("no keyboard segment in message")  # noqa: TRY003
+    return flatten_keyboard(message)
+
+
+# ---------------------------------------------------------------------------
+# Mention-tag inspection helpers
+# ---------------------------------------------------------------------------
+
+MENTION_TAG_RE = re.compile(r"<qqbot-at-user id=\"([^\"]*)\"\s*/>")
+
+
+def mention_tags(body: str) -> list[str]:
+    """Every ``<qqbot-at-user id="..." />`` tag (openid, in body order)."""
+    return MENTION_TAG_RE.findall(body)
+
+
+def assert_single_mention_tag(body: str, openid: str) -> None:
+    """Exactly one native mention tag for ``openid``, in the body."""
+    tags = mention_tags(body)
+    assert tags == [openid], f"expected single {openid!r} tag, got {tags!r} in {body!r}"
+
+
+def assert_no_mention_tag(body: str) -> None:
+    assert MENTION_TAG_RE.search(body) is None, f"unexpected mention tag in {body!r}"
+
+
+def mention_tag_position(body: str, openid: str) -> int:
+    """Index of the mention tag for ``openid`` (requires it to exist)."""
+    match = re.search(
+        rf'<qqbot-at-user id="{re.escape(openid)}"\s*/>',
+        body,
+    )
+    assert match is not None, f"no mention tag for {openid!r} in {body!r}"
+    return match.start()
+
+
+def assert_no_member_openid(body: str, *openids: str) -> None:
+    """Openids may appear only inside the platform mention tag."""
+    stripped = MENTION_TAG_RE.sub("", body)
+    for openid in openids:
+        assert openid not in stripped, (
+            f"member_openid leaked outside a mention tag: {openid!r} in {body!r}"
+        )
+
+
+def assert_no_player_numbers(body: str, *numbers: int) -> None:
+    """普通正文不得出现编号式玩家标识行（``- N｜名字`` 形式）。
+
+    编号标识符只允许出现在专用区域（可上锁/可转让）；弹仓计数、
+    “道具 N”等数量不是玩家编号，一律放行。
+    """
+    for number in numbers:
+        pattern = rf"(?m)^- {number}｜"
+        assert re.search(pattern, body) is None, (
+            f"player number {number} leaked into ordinary body: {body!r}"
+        )
+
+
+def assert_body_has_markdown_structure(
+    body: str,
+    *,
+    dividers: int,
+    blockquote: bool,
+    bold: bool,
+    roster: bool,
+) -> None:
+    lines = body.splitlines()
+    if dividers:
+        divider_lines = [line for line in lines if line.strip() == "***"]
+        assert len(divider_lines) == dividers, f"expected {dividers} '***', got {divider_lines}"
+    else:
+        assert "***" not in body
+    assert (any(line.startswith("> ") for line in lines)) is blockquote
+    assert ("**" in body) is bold
+    roster_lines = [line for line in lines if line.startswith("- ")]
+    assert bool(roster_lines) is roster
+
+
+# ---------------------------------------------------------------------------
 # Recording fakes
 # ---------------------------------------------------------------------------
 
@@ -353,10 +575,11 @@ def claim(
 class FakeCommandService:
     """Recording stand-in for RouletteCommandService.
 
-    Implements the five calls used by the handler and the delivery:
+    Implements the calls used by the handler and the delivery:
     observe_current / execute_group_command / claim_fulfillment /
     mark_delivered / mark_not_delivered.  Behavior is configured per test;
-    everything is recorded for assertions.
+    everything is recorded for assertions.  PG-backed tests use the real
+    service instead.
     """
 
     def __init__(self) -> None:
@@ -461,20 +684,18 @@ class FakeSender:
 
 
 class FakeDelivery:
-    """Recording stand-in for RouletteDelivery.
+    """Recording stand-in for RouletteDelivery (injected seam).
 
-    Outcomes are passed as plain strings ("DELIVERED" / "NOT_DELIVERED" /
-    "UNKNOWN" / "NO_CLAIM") so this helper does not depend on the TSK-278
-    production enum at import time.
+    Outcomes are not asserted in handler tests — only that deliver was or was
+    not called — so this stub returns a plain marker and records calls.
     """
 
-    def __init__(self, outcomes: list[str] | None = None) -> None:
-        self.outcomes = outcomes or ["NO_CLAIM"]
+    def __init__(self) -> None:
         self.deliver_calls: list[tuple[Any, Any]] = []
 
-    async def deliver(self, receipt: Any, sender: Any) -> str:
+    async def deliver(self, receipt: Any, sender: Any) -> Any:
         self.deliver_calls.append((receipt, sender))
-        return self.outcomes[min(len(self.deliver_calls), len(self.outcomes)) - 1]
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -493,59 +714,26 @@ class ButtonSpec:
 
 
 def flatten_keyboard(keyboard: Any) -> list[list[ButtonSpec]]:
-    """Flatten an InlineKeyboard (or any object with rows of buttons)."""
-    rows: list[list[ButtonSpec]] = []
-    for row in keyboard.rows:
+    """Flatten an InlineKeyboard (or a MessageKeyboard wrapping one)."""
+    content = getattr(keyboard, "content", None)
+    if content is not None and getattr(content, "rows", None) is not None:
+        rows = content.rows
+    else:
+        rows = keyboard.rows
+    flattened: list[list[ButtonSpec]] = []
+    for row in rows:
         buttons: list[ButtonSpec] = []
         for button in row.buttons:
             action = button.action
-            permission = button.permission
             buttons.append(
                 ButtonSpec(
-                    label=str(button.label),
+                    label=str(button.render_data.label),
                     data=str(action.data),
                     action_type=int(action.type),
-                    permission_type=int(permission.type),
+                    permission_type=int(action.permission.type),
                     reply=bool(action.reply),
                     enter=bool(action.enter),
                 )
             )
-        rows.append(buttons)
-    return rows
-
-
-def assert_no_player_numbers(body: str, *numbers: int) -> None:
-    """普通正文不得出现独立玩家编号（1-3 位数字片段）。"""
-    import re
-
-    # 普通正文不带玩家编号（编号只出现在专用目标区）。
-    for number in numbers:
-        pattern = rf"(?<![\d]){number}(?![\d])"
-        assert re.search(pattern, body) is None, (
-            f"player number {number} leaked into ordinary body: {body!r}"
-        )
-
-
-def assert_no_member_openid(body: str, *openids: str) -> None:
-    for openid in openids:
-        assert openid not in body, f"member_openid leaked into body: {openid!r}"
-
-
-def assert_body_has_markdown_structure(
-    body: str,
-    *,
-    dividers: int,
-    blockquote: bool,
-    bold: bool,
-    roster: bool,
-) -> None:
-    lines = body.splitlines()
-    if dividers:
-        divider_lines = [line for line in lines if line.strip() == "***"]
-        assert len(divider_lines) == dividers, f"expected {dividers} '***', got {divider_lines}"
-    else:
-        assert "***" not in body
-    assert ("> " in body) is blockquote
-    assert ("**" in body) is bold
-    roster_lines = [line for line in lines if line.startswith("- ")]
-    assert bool(roster_lines) is roster
+        flattened.append(buttons)
+    return flattened

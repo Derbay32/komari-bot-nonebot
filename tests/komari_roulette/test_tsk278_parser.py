@@ -1,16 +1,17 @@
 # ruff: noqa: RUF001
 """TSK-278 RED baseline: QQ roulette command parser seam.
 
-The single red root for this file is the missing top-level ``parse_command``
-symbol.  All cases below describe the observable parsing contract recorded in
-``TSK-278-contract.md`` section 3.
+The single red root for this file is the missing ``parse_command`` symbol in
+``komari_bot.plugins.komari_roulette.qq.parser``.  All cases below describe
+the observable parsing contract recorded in ``TSK-278-contract.md`` section 3.
 """
 
 from __future__ import annotations
 
 import pytest
+from komari_bot.plugins.komari_roulette.qq.parser import parse_command
 
-from komari_bot.plugins.komari_roulette import CanonicalCommand, parse_command
+from komari_bot.plugins.komari_roulette import CanonicalCommand
 
 SYNTAX = "syntax_failure"
 
@@ -75,10 +76,16 @@ def test_parse_collapses_internal_whitespace() -> None:
         ("/轮盘 结束", "end_turn"),
         ("/轮盘 装填", "reload"),
         ("/轮盘 道具", "open_item_panel"),
+        ("/轮盘 排行榜", "leaderboard"),
     ],
 )
 def test_parse_bare_subcommands(text: str, intent: str) -> None:
     assert _ok(text).intent == intent
+
+
+def test_parse_leaderboard_accepts_no_arguments() -> None:
+    command = _syntax("/轮盘 排行榜 x")
+    assert _code(command) == "invalid_args:排行榜"
 
 
 @pytest.mark.parametrize(
