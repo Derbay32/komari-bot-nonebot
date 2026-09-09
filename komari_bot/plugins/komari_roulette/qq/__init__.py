@@ -6,5 +6,6 @@ handler and delivery seams land in the following delivery phase.
 
 from .keyboard import build_keyboard, keyboard_from_spec
 from .parser import parse_command
+from .renderer import render_reply
 
-__all__ = ["build_keyboard", "keyboard_from_spec", "parse_command"]
+__all__ = ["build_keyboard", "keyboard_from_spec", "parse_command", "render_reply"]
