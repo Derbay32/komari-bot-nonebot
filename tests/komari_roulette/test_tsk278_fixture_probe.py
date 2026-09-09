@@ -22,6 +22,7 @@ from sqlalchemy import text
 from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 from komari_bot.plugins.komari_roulette import (
     FulfillmentState,
+    Observation,
     RouletteCommandService,
 )
 
@@ -229,13 +230,20 @@ async def test_real_leaderboard_frozen_latest_win_name(
     assert started.result_code == "started"
 
     # 局主弃权 → 另一名玩家获胜；排行榜写入冻结显示名。
+    forfeit_row = await current_game_row(session_factory, current)
+    assert forfeit_row is not None
     forfeited = await service.execute_group_command(
         request(
             current,
             "probe-forfeit",
             command_factory("forfeit"),
             member_openid=members[0],
-        )
+        ),
+        observation=observation(
+            game_id=str(forfeit_row["game_id"]),
+            state_revision=int(forfeit_row["state_revision"]),
+            turn_seq=int(forfeit_row["turn_seq"]),
+        ),
     )
     assert forfeited.result_code in {"forfeited", "completed"}
     assert projector.context_objects[-1].winner_group_wins == 1
@@ -300,13 +308,20 @@ async def test_real_leaderboard_details_encoding_with_colon_name(
     await create_waiting(service, current)
     await join_player(service, current, members[1], "probe-colon-join-2")
     await start_game(service, current, members[0])
+    forfeit_row = await current_game_row(session_factory, current)
+    assert forfeit_row is not None
     forfeited = await service.execute_group_command(
         request(
             current,
             "probe-colon-forfeit",
             command_factory("forfeit"),
             member_openid=members[0],
-        )
+        ),
+        observation=observation(
+            game_id=str(forfeit_row["game_id"]),
+            state_revision=int(forfeit_row["state_revision"]),
+            turn_seq=int(forfeit_row["turn_seq"]),
+        ),
     )
     assert forfeited.result_code in {"forfeited", "completed"}
 
@@ -352,6 +367,15 @@ async def test_real_context_mention_priority_and_continue_in_place(
     def last_context() -> Any:
         return projector.context_objects[-1]
 
+    async def game_observation() -> Observation:
+        row = await current_game_row(session_factory, current)
+        assert row is not None
+        return observation(
+            game_id=str(row["game_id"]),
+            state_revision=int(row["state_revision"]),
+            turn_seq=int(row["turn_seq"]),
+        )
+
     # 原地不@：actor == current，空弹继续行动 → 无提及。
     shot = await service.execute_group_command(
         request(
@@ -359,7 +383,8 @@ async def test_real_context_mention_priority_and_continue_in_place(
             "probe-shot-1",
             command_factory("shoot"),
             member_openid=members[0],
-        )
+        ),
+        observation=await game_observation(),
     )
     assert shot.result_code == "shot"
     ctx = last_context()
@@ -375,7 +400,8 @@ async def test_real_context_mention_priority_and_continue_in_place(
             "probe-end-turn",
             command_factory("end_turn"),
             member_openid=members[0],
-        )
+        ),
+        observation=await game_observation(),
     )
     assert ended.result_code == "turn_ended"
     ctx = last_context()
@@ -403,7 +429,12 @@ async def test_real_context_mention_priority_and_continue_in_place(
             "probe-lock",
             command_factory("use_item", item="lock", target_player_seq=1),
             member_openid=members[1],
-        )
+        ),
+        observation=observation(
+            game_id=str(before["game_id"]),
+            state_revision=int(before["state_revision"]),
+            turn_seq=int(before["turn_seq"]),
+        ),
     )
     assert locked.result_code == "item_used"
     ctx = last_context()
@@ -461,7 +492,8 @@ async def test_real_context_mention_priority_and_continue_in_place(
             "probe-forfeit",
             command_factory("forfeit"),
             member_openid=members[1],
-        )
+        ),
+        observation=await game_observation(),
     )
     assert won.result_code in {"forfeited", "completed"}
     ctx = last_context()

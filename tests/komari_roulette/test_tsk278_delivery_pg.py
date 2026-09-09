@@ -35,6 +35,7 @@ from .command_support import (
     command_factory,
     create_engine_and_factory,
     delete_scope,
+    observation,
     request,
     reset_shared_orm_engine,
     scope,
@@ -44,6 +45,7 @@ from .test_command_service import (
     CountingProjector,
     CountingRandom,
     create_waiting,
+    current_game_row,
     join_player,
     seed_players,
     start_game,
@@ -211,21 +213,35 @@ async def test_real_delivery_preserves_frozen_mention_body(
     await create_waiting(service, current)
     await join_player(service, current, members[1], "join-2")
     await start_game(service, current, members[0])
+    shot_row = await current_game_row(session_factory, current)
+    assert shot_row is not None
     await service.execute_group_command(
         request(
             current,
             "shot-1",
             command_factory("shoot"),
             member_openid=members[0],
-        )
+        ),
+        observation=observation(
+            game_id=str(shot_row["game_id"]),
+            state_revision=int(shot_row["state_revision"]),
+            turn_seq=int(shot_row["turn_seq"]),
+        ),
     )
+    end_row = await current_game_row(session_factory, current)
+    assert end_row is not None
     ended = await service.execute_group_command(
         request(
             current,
             "end-turn-1",
             command_factory("end_turn"),
             member_openid=members[0],
-        )
+        ),
+        observation=observation(
+            game_id=str(end_row["game_id"]),
+            state_revision=int(end_row["state_revision"]),
+            turn_seq=int(end_row["turn_seq"]),
+        ),
     )
     assert ended.result_code == "turn_ended"
     context_obj = projector.context_objects[-1]
