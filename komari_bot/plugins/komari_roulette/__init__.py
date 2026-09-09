@@ -4,9 +4,17 @@ The persistence imports register SQLModel metadata only; they do not open a
 connection or execute DDL.  Database/session ownership remains with callers.
 """
 
-from nonebot.plugin import require
+from nonebot.plugin import PluginMetadata, require
 
 require("character_binding")
+
+from .help_copy import help_usage
+
+__plugin_meta__ = PluginMetadata(
+    name="俄罗斯轮盘",
+    description="QQ 群俄罗斯轮盘小游戏",
+    usage=help_usage(),
+)
 
 from .command_service import (
     CanonicalCommand,
