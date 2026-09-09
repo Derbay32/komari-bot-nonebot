@@ -23,6 +23,7 @@ class BindingRepairService:
         *,
         session_factory: Callable[[], AsyncSession],
         clock: Callable[[], datetime],
+        game_state_reader: Callable[..., Awaitable[object | None]],
         manager: CharacterBindingManager | None = None,
     ) -> None: ...
 
@@ -51,9 +52,23 @@ class BindingRepairService:
         reason: str,
     ) -> RepairConfirmResult: ...
 
+    async def close(self) -> None: ...
+
 def set_binding_repair_service(service: BindingRepairService | None) -> None: ...
 def get_binding_repair_service() -> BindingRepairService | None: ...
 ```
+
+- `game_state_reader` 是**必填**依赖，签名
+  `game_state_reader(session, *, app_id, group_openid, for_update=False)`：读取
+  该作用域的轮盘当前对局快照（无对局返回 `None`）。由管理 composition root
+  注入真实 TSK-276 公共 seam `PostgresRouletteStorage.load_current`；测试
+  support 也注入真实 reader。**修复核心模块（`repair.py`）禁止直接反向
+  import 轮盘**，禁止用 `importlib` / 字符串拼接隐藏 import 绕架构。
+- `close()`：把服务置为已关闭并立即使全部令牌失效；close **不得等待**在途
+  任务（否则与群锁等待互相死锁）。已阻塞在群锁上的 confirm 在锁释放后必须
+  复核已关闭状态并失败（不得删除任何行）；已阻塞的 preview 不得签发令牌；
+  close 后旧引用拒绝一切操作（diagnose/preview 抛 `RuntimeError`，confirm
+  抛 `RepairTokenError` 或 `RuntimeError`）。
 
 值对象（keyword 构造，frozen dataclass）：
 
@@ -65,7 +80,7 @@ BindingDiagnosis(app_id, group_openid, group_id, members, game_present, game_lif
 RepairPreview(token, scope, app_id, group_openid, member_openid,
               affected_count, cleared_names, version, expires_at)
 RepairConfirmResult(scope, app_id, group_openid, member_openid,
-                    cleared_count, cleared_names)
+                    cleared_count, cleared_names, version, expected_count)
 ```
 
 DTO 字段集合以本清单为唯一真源；`RepairPreview` **没有** `game_present`
@@ -99,9 +114,13 @@ class RepairBlockedByGameError(RuntimeError)       # 群内存在 waiting/active
   member_openid 排序）并签发一次性令牌。
 - 令牌：绑定 `(operator_id, app_id, group_openid, member_openid|None,
   scope, version)`；`version` 是目标行（群行 + 受影响成员行）与当前游戏快照
-  （lifecycle/game_id/state_revision）的规范化 SHA-256 指纹；`expires_at =
-  clock() + 10 分钟`，绝对过期、不自动续期；令牌仅存进程内，重启即失效；
+  （lifecycle/game_id/state_revision）的规范化 SHA-256 指纹，**必须包含每行
+  的行版本时间（`updated_at`）或等价 generation（如 `xmin`）**：改名后改回
+  原值、删后重建同值（ABA）都必须改变指纹，旧令牌不得继续清除；`expires_at
+  = clock() + 10 分钟`，绝对过期、不自动续期；令牌仅存进程内，重启即失效；
   单次使用，重复/并发 confirm 不得重复清除。
+- `RepairConfirmResult` 额外携带 `version`（本次确认消耗的预览版本）与
+  `expected_count`（预览时的预期清除数量），供确认审计记录。
 - `confirm`：先校验令牌（存在、未过期、未使用、`operator_id` 相符、目标
   app/group 相符——篡改任一目标都只能得到 `RepairTokenError`），再在同一
   事务内获取 `lock_group_scope`；**持锁后必须同时复核**：槽位
@@ -156,9 +175,12 @@ def register_character_binding_repair_api(
   `character_binding.repair.preview` / `character_binding.repair.confirm`（每
   次尝试各记一条 started + 一条 succeeded/failed）；`target_hash =
   hash_management_target(app_id, group_openid, member_openid|"<group>")`；
-  metadata 记录 scope、version 指纹、预期/实际数量与结果码（preview 成功
-  `result_code="preview_issued"`，confirm 成功 `result_code="cleared"`，失败
-  由 span 记录异常）；绝不写入原始
+  **confirm 的目标哈希必须按实际范围计算：成员范围用成员哈希，不能固定为
+  群哈希**；metadata 记录 scope、version 指纹、预期/实际数量与结果码
+  （preview 成功 `result_code="preview_issued"`，confirm 成功
+  `result_code="cleared"`，失败由 span 记录异常）；**confirm 的 metadata
+  必须包含 preview version、预期数量（`expected_count`）与实删数量
+  （`cleared_count`），不能丢失 version**；绝不写入原始
   app_id/group_openid/member_openid/member_qq/角色名正文。
 - 审计失败安全性（与既有共享 span 语义一致）：**started 事件失败 → 请求
   失败且业务不执行**（不签发令牌/不删除）；**final 事件失败 → 操作照常成功**，
@@ -177,25 +199,33 @@ def register_character_binding_repair_api(
 diagnose → preview → confirm，并断言数据库不变量与真实审计事件。禁止仅注入
 FakeService 后宣称功能可用。
 
+### 生命周期归属
+
+修复服务的**创建与关闭由管理装配（`komari_management` composition root）
+负责**：装配构造 `BindingRepairService` 并注入真实 `game_state_reader`（经
+轮盘插件顶层公共 seam 取 `PostgresRouletteStorage.load_current`），并在关闭时
+`set_binding_repair_service(None)` / 调用 `close()`。`character_binding` 的旧
+生命周期（`init_plugin` / `close_plugin`）**不得**创建或关闭修复服务，避免
+绑定插件持有对轮盘的静态反向依赖。
+
 ### TSK-276 协作（复用真实接口，不新增抽象）
 
 服务在自持的同一 `AsyncSession` 内使用：
 
 ```python
 from komari_bot.db.group_transaction_locks import lock_group_scope
-from komari_bot.plugins.komari_roulette import (
-    GroupRef,
-    PostgresRouletteStorage,
-)
 
 await lock_group_scope(session, app_id=app_id, group_openid=group_openid)
-snapshot = await PostgresRouletteStorage(session).load_current(
-    GroupRef(app_id=app_id, group_openid=group_openid), for_update=True,
-)
+snapshot = await game_state_reader(session, app_id=app_id,
+                                   group_openid=group_openid,
+                                   for_update=True)
 ```
 
-锁序与绑定写入/轮盘命令一致（先取共享组锁再读行），持锁后必须重读目标行，
-禁止先查缓存再提交。诊断路径不取锁、只读已提交行。
+`game_state_reader` 由管理装配注入，内部即真实
+`PostgresRouletteStorage(session).load_current(GroupRef(...), for_update=...)`
+公共 seam；**`repair.py` 不 import 轮盘模块**（禁止 importlib/字符串拼接
+绕架构）。锁序与绑定写入/轮盘命令一致（先取共享组锁再读行），持锁后必须
+重读目标行，禁止先查缓存再提交。诊断路径不取锁、只读已提交行。
 
 ## AC → 测试映射
 
@@ -220,6 +250,13 @@ snapshot = await PostgresRouletteStorage(session).load_current(
 | 审计安全 ID、权限/理由/请求 ID/版本/数量/结果；审计失败安全性 | `test_tsk280_rest_api.py::test_audit_records_safe_fields_only`、`test_audit_start_failure_aborts_without_operation`、`test_audit_final_failure_does_not_break_operation` |
 | 受限群/轮盘关闭 REST 控制面仍可达 | `test_tsk280_rest_api.py::test_registration_does_not_require_group_admission_or_roulette_runtime` |
 | 真实装配：register → service get → 真实服务 → 真实 PG | `test_tsk280_assembly.py::test_register_to_service_get_real_assembly` |
+| 修复服务不得反向 import 轮盘 / 不得用 importlib 拼接绕架构 | `test_tsk276_transaction_boundary.py::test_character_binding_has_no_roulette_reverse_dependency`、`test_tsk280_surface_guards.py::test_repair_module_does_not_evade_roulette_dependency_with_dynamic_import` |
+| 修复服务不得拥有执行游戏命令入口；并发创建走真实 roulette service | `test_tsk280_repair_service.py::test_repair_service_has_no_game_command_execution_entry`、`test_tsk280_pg.py::test_concurrent_confirm_and_roulette_open_share_group_lock` |
+| 构造必填 game_state_reader（管理装配注入真实 276 seam） | `test_tsk280_repair_service.py::test_repair_service_constructor_requires_session_factory_clock_and_game_state_reader`、`test_repair_service_rejects_construction_without_game_state_reader`、`test_tsk280_assembly.py` |
+| 管理装配生命周期创建/关闭修复服务；绑定旧生命周期不持反向依赖 | `test_tsk280_surface_guards.py::test_repair_service_lifecycle_is_owned_by_management_assembly` |
+| close 期间等待群锁的 confirm 不删除 / preview 不发令牌；close 后旧引用拒绝、令牌失效 | `test_tsk280_pg.py::test_close_while_confirm_waits_on_group_lock_does_not_delete`、`test_close_while_preview_waits_on_group_lock_does_not_issue_token`、`test_closed_service_reference_refuses_operations_and_tokens_invalidated` |
+| 版本指纹含行版本（防 ABA：改名改回 / 删重建同值不得用旧令牌清除） | `test_tsk280_pg.py::test_rename_rename_back_does_not_clear_with_old_token`、`test_delete_recreate_same_value_does_not_clear_with_old_token` |
+| 成员 confirm 审计对应成员哈希且含版本/预期/实删数量 | `test_tsk280_rest_api.py::test_audit_records_safe_fields_only`、`test_tsk280_assembly.py::test_register_to_service_get_real_assembly` |
 | 夹具独立正确（不依赖缺失业务模块） | `test_tsk280_fixture_probe.py`（终局 seam/统计/清理 SQL/锁等待/提交失败注入） |
 
 ## 真实 PostgreSQL 门控

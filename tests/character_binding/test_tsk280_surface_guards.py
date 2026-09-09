@@ -1,9 +1,10 @@
-"""TSK-280 控制面约束守卫（不 import 未实现业务模块，当前即绿）。
+"""TSK-280 控制面约束守卫。
 
 本文件证明「缺失业务模块」RED 不是夹具/依赖问题：既有的 TSK-276 共享锁、
 BindingTransaction、轮盘 storage 与管理鉴权/审计 seam 在无服务、无新模块时
-全部可导入。守卫还固定 TSK-280 的负面约束：不新增 debug 修复入口、不新增
-matcher。
+全部可导入。守卫固定 TSK-280 的负面约束：不新增 debug 修复入口、不新增
+matcher、修复服务不得用 importlib 拼接隐藏对轮盘的依赖、生命周期归管理
+装配所有（后两条对当前生产为正确 RED）。
 """
 
 from __future__ import annotations
@@ -91,3 +92,45 @@ async def test_shared_seams_are_importable_without_repair_module() -> None:
     assert management_audit_span is not None
     assert REPAIR_API_PREFIX == "/api/v2/character-bindings/repair"
     await reset_shared_orm_engine()
+
+
+def test_repair_module_does_not_evade_roulette_dependency_with_dynamic_import() -> None:
+    """修复服务不得用 importlib 字符串拼接隐藏 import 绕架构：
+    对局状态必须经构造注入的 game_state_reader（真实 276 公共 seam）。"""
+    repair_path = (
+        PROJECT_ROOT / "komari_bot" / "plugins" / "character_binding" / "repair.py"
+    )
+    tree = ast.parse(repair_path.read_text(encoding="utf-8"))
+    dynamic_imports: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_dynamic_import = (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_module"
+        ) or (isinstance(node.func, ast.Name) and node.func.id == "__import__")
+        if is_dynamic_import:
+            dynamic_imports.append(ast.unparse(node))
+    assert not dynamic_imports, "\n".join(dynamic_imports)
+
+
+def test_repair_service_lifecycle_is_owned_by_management_assembly() -> None:
+    """修复服务生命周期由管理装配负责（创建注入真实 game_state_reader 并关闭）；
+    character_binding 旧生命周期不得持有这反向依赖。"""
+    binding_init = (
+        PROJECT_ROOT / "komari_bot" / "plugins" / "character_binding" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    management_root = PROJECT_ROOT / "komari_bot" / "plugins" / "komari_management"
+    management_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(management_root.rglob("*.py"))
+    )
+
+    # 绑定插件生命周期不再创建/关闭修复服务。
+    assert "BindingRepairService(" not in binding_init
+    assert "set_binding_repair_service" not in binding_init
+    # 管理装配创建修复服务并注入真实 game_state_reader。
+    assert "BindingRepairService(" in management_source
+    assert "game_state_reader=" in management_source
+    # 管理装配负责关闭（set_binding_repair_service(None) 或 service.close()）。
+    assert "set_binding_repair_service(" in management_source

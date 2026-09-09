@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
@@ -266,11 +267,44 @@ async def test_unmapped_group_is_none_but_storage_failure_is_explicit(
             )
 
 
+def _constant_string(node: ast.AST) -> str | None:
+    """常量折叠字符串字面量与相邻拼接（``"komari_" + "roulette"``）。"""
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
 def test_character_binding_has_no_roulette_reverse_dependency() -> None:
+    """binding 插件不得以任何形式反向依赖轮盘：字面 import、动态 importlib
+    拼接或 ``__import__`` 拼接都不允许（不得用字符串拼接逃避架构守卫）。"""
     package_root = Path(__file__).resolve().parents[2]
     binding_root = package_root / "komari_bot" / "plugins" / "character_binding"
-    source = "\n".join(path.read_text() for path in binding_root.rglob("*.py"))
-    assert "komari_roulette" not in source
+    violations: list[str] = []
+    for path in sorted(binding_root.rglob("*.py")):
+        relative = path.relative_to(package_root)
+        source = path.read_text(encoding="utf-8")
+        # 大小写不敏感的子串检查：任何 roulette 引用（含拼接片段）都违规。
+        if "roulette" in source.lower():
+            violations.append(f"{relative}: 出现 roulette 引用")
+            continue
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            is_dynamic_import = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "import_module"
+            ) or (isinstance(node.func, ast.Name) and node.func.id == "__import__")
+            if not is_dynamic_import:
+                continue
+            folded = _constant_string(node.args[0])
+            if folded is not None and "roulette" in folded.lower():
+                violations.append(
+                    f"{relative}: 动态 import 拼接引用 roulette"
+                )
+    assert not violations, "\n".join(violations)
 
 
 async def test_manager_cache_cannot_authorize_a_cleared_member(

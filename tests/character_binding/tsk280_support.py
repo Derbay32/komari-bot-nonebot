@@ -35,7 +35,7 @@ from komari_bot.plugins.komari_roulette import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -202,6 +202,30 @@ async def hold_group_lock(
         app_id=current.app_id,
         group_openid=current.group_openid,
     )
+
+
+def make_game_state_reader() -> Callable[..., Awaitable[object | None]]:
+    """真实 TSK-276 公共 seam 读取器（注入修复服务的 ``game_state_reader``）。
+
+    契约要求修复服务不得直接反向 import 轮盘；对局状态经构造注入读取器。
+    本辅助把真实 ``PostgresRouletteStorage.load_current`` 包成契约签名
+    ``(session, *, app_id, group_openid, for_update=False)``，测试与生产
+    装配共用同一公共 seam。
+    """
+
+    async def _read_game_state(
+        session: AsyncSession,
+        *,
+        app_id: str,
+        group_openid: str,
+        for_update: bool = False,
+    ) -> object | None:
+        return await PostgresRouletteStorage(session).load_current(
+            GroupRef(app_id=app_id, group_openid=group_openid),
+            for_update=for_update,
+        )
+
+    return _read_game_state
 
 
 # ─── 提交失败开关：真实 SQLAlchemy Session 事件包装 ─────────────────────
@@ -863,6 +887,8 @@ def confirm_result_payload(
     member_openid: str | None = None,
     cleared_count: int = 1,
     cleared_names: Sequence[str] = ("花火",),
+    version: str = "deadbeef",
+    expected_count: int = 1,
 ) -> dict[str, object]:
     return {
         "scope": scope,
@@ -871,6 +897,8 @@ def confirm_result_payload(
         "member_openid": member_openid or current.member_openid,
         "cleared_count": cleared_count,
         "cleared_names": list(cleared_names),
+        "version": version,
+        "expected_count": expected_count,
     }
 
 
@@ -931,6 +959,7 @@ __all__ = [
     "health_check_commit_failure_switch",
     "hold_group_lock",
     "install_commit_failure_switch",
+    "make_game_state_reader",
     "make_roulette",
     "member_rows",
     "member_view",

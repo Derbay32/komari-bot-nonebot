@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
+
+from komari_bot.plugins.character_binding import management_api
 from komari_bot.plugins.character_binding.repair import (
     RepairBlockedByGameError,
     RepairDependencyChangedError,
     RepairTargetNotFoundError,
     RepairTokenError,
 )
-
-from komari_bot.plugins.character_binding import management_api
 from tests.character_binding.tsk280_support import (
     MANAGE_CREDENTIALS,
     READ_CREDENTIALS,
@@ -350,15 +350,28 @@ async def test_repair_error_paths_map_to_fixed_status_codes(
 
 @pytest.mark.asyncio
 async def test_audit_records_safe_fields_only(app: App) -> None:
-    """审计记录操作者/理由/请求 ID/目标哈希/版本/数量/结果，绝不落原始身份。"""
+    """审计记录操作者/理由/请求 ID/目标哈希/版本/数量/结果，绝不落原始身份。
+
+    成员范围确认的审计必须对应**成员哈希**并携带预览 version、预期数量与
+    实删数量，不能固定为群哈希且丢失 version。
+    """
     service = StubBindingRepairService()
     current = make_scope("rest-audit")
+    member = current.with_member(1)
     service.preview_result = preview_payload(
         current,
         scope="member",
+        member_openid=member.member_openid,
         version="fingerprint-abc",
     )
-    service.confirm_result = confirm_result_payload(current)
+    service.confirm_result = confirm_result_payload(
+        current,
+        scope="member",
+        member_openid=member.member_openid,
+        version="fingerprint-abc",
+        expected_count=1,
+        cleared_count=1,
+    )
     audit_events: list[ManagementAuditEvent] = []
 
     async with app.test_server(
@@ -368,7 +381,11 @@ async def test_audit_records_safe_fields_only(app: App) -> None:
         await client.post(
             f"{management_api.API_PREFIX}/preview",
             headers=write_headers(request_id="audit-preview"),
-            json={"app_id": current.app_id, "group_openid": current.group_openid},
+            json={
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "member_openid": member.member_openid,
+            },
         )
         await client.post(
             f"{management_api.API_PREFIX}/confirm",
@@ -391,15 +408,23 @@ async def test_audit_records_safe_fields_only(app: App) -> None:
     assert preview_success.operator_id == "binding-wildcard"
     assert preview_success.reason == "运营核对错误关联"
     assert preview_success.request_id == "audit-preview"
-    assert preview_success.target_hash == safe_target_hash(current)
+    assert preview_success.target_hash == safe_target_hash(
+        current, member_openid=member.member_openid
+    )
     assert preview_success.metadata["scope"] == "member"
     assert preview_success.metadata["version"] == "fingerprint-abc"
     assert preview_success.metadata["affected_count"] == 1
     assert preview_success.metadata["result_code"] == "preview_issued"
     assert confirm_success.operator_id == "binding-wildcard"
     assert confirm_success.request_id == "audit-confirm"
-    assert confirm_success.target_hash == safe_target_hash(current)
+    # 成员范围确认：目标哈希必须是成员哈希，绝不能用群哈希代替。
+    assert confirm_success.target_hash == safe_target_hash(
+        current, member_openid=member.member_openid
+    )
     assert confirm_success.metadata["scope"] == "member"
+    # 确认审计必须携带预览 version、预期数量与实删数量。
+    assert confirm_success.metadata["version"] == "fingerprint-abc"
+    assert confirm_success.metadata["expected_count"] == 1
     assert confirm_success.metadata["cleared_count"] == 1
     assert confirm_success.metadata["result_code"] == "cleared"
 
@@ -458,16 +483,24 @@ async def test_revoked_manage_credential_cannot_access_repair(app: App) -> None:
 
 
 class _SelectiveRaisingAuditRecorder:
-    """在指定调用序号抛出的审计 recorder（started=1，final=2）。"""
+    """按事件阶段独立抛出的审计 recorder（每次请求各自独立判断）。
 
-    def __init__(self, raise_on_calls: set[int]) -> None:
-        self.raise_on_calls = raise_on_calls
-        self.calls = 0
+    累积调用序号的写法会让"只抛第 1 次"只让第一个请求失败、后续请求反而
+    成功；这里按 ``outcome`` 阶段判断，保证每个请求的 started（或 final）
+    都独立失败。
+    """
+
+    def __init__(self, *, raise_started: bool = False, raise_final: bool = False) -> None:
+        self.raise_started = raise_started
+        self.raise_final = raise_final
         self.events: list[ManagementAuditEvent] = []
 
     async def __call__(self, event: ManagementAuditEvent) -> None:
-        self.calls += 1
-        if self.calls in self.raise_on_calls:
+        if event.outcome == "started":
+            if self.raise_started:
+                msg = "audit sink CANARY-unavailable"
+                raise RuntimeError(msg)
+        elif self.raise_final:
             msg = "audit sink CANARY-unavailable"
             raise RuntimeError(msg)
         self.events.append(event)
@@ -480,7 +513,7 @@ async def test_audit_start_failure_aborts_without_operation(app: App) -> None:
     current = make_scope("rest-audit-start-fail")
     service.preview_result = preview_payload(current)
     service.confirm_result = confirm_result_payload(current)
-    recorder = _SelectiveRaisingAuditRecorder({1})
+    recorder = _SelectiveRaisingAuditRecorder(raise_started=True)
 
     async with app.test_server(
         asgi=cast("Any", _build_app_with_recorder(service, recorder))
@@ -514,7 +547,7 @@ async def test_audit_final_failure_does_not_break_operation(app: App) -> None:
     current = make_scope("rest-audit-final-fail")
     service.preview_result = preview_payload(current)
     service.confirm_result = confirm_result_payload(current)
-    recorder = _SelectiveRaisingAuditRecorder({2, 4})
+    recorder = _SelectiveRaisingAuditRecorder(raise_final=True)
 
     async with app.test_server(
         asgi=cast("Any", _build_app_with_recorder(service, recorder))
@@ -547,19 +580,21 @@ async def test_audit_final_failure_does_not_break_operation(app: App) -> None:
 def test_route_set_is_fixed_without_identity_repoint() -> None:
     """路由闭集恰好三个；不存在改指/重定向/直接写身份的路径。"""
     app = _build_app(StubBindingRepairService())
-    repair_routes = sorted(
+    repair_routes = {
         (
             ",".join(sorted(getattr(route, "methods", None) or [])),
             getattr(route, "path", ""),
         )
         for route in app.routes
         if str(getattr(route, "path", "")).startswith(management_api.API_PREFIX)
-    )
-    assert repair_routes == [
+    }
+    # 路由闭集与顺序无关：比较集合，避免把排序键（methods 优先）与
+    # 路径字母序混在一起产生的伪失败。
+    assert repair_routes == {
         ("POST", f"{management_api.API_PREFIX}/confirm"),
         ("GET", f"{management_api.API_PREFIX}/diagnose"),
         ("POST", f"{management_api.API_PREFIX}/preview"),
-    ]
+    }
 
 
 def test_registration_does_not_require_group_admission_or_roulette_runtime() -> None:

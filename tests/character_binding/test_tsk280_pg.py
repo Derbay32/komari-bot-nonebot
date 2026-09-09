@@ -8,6 +8,10 @@ skip。实现落地后由 root 提供隔离库运行，验证：诊断直读 PG�
 实例 + 真实 before_commit 事件注入）、终局历史与胜场不受修复影响、普通用户
 解绑保留身份关系，以及与 bind/轮盘开局的并发锁串行化。
 
+新增正确 RED（当前生产明确缺失）：close 生命周期（等待群锁的 confirm 不得
+删除 / preview 不得发令牌 / 旧引用拒绝操作）与版本指纹 ABA（改名改回、删重
+建同值不得用旧令牌清除）。
+
 夹具正确性由 ``test_tsk280_fixture_probe.py`` 独立验证（不依赖本模块缺失
 的 repair 模块）。
 """
@@ -22,18 +26,19 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
-from komari_bot.plugins.character_binding.repair import (
-    BindingRepairService,
-    RepairBlockedByGameError,
-    RepairDependencyChangedError,
-    RepairTokenError,
-)
 from sqlalchemy import text
 
 from komari_bot.plugins.character_binding.manager import (
     BindingPersistenceError,
     CharacterBindingManager,
 )
+from komari_bot.plugins.character_binding.repair import (
+    BindingRepairService,
+    RepairBlockedByGameError,
+    RepairDependencyChangedError,
+    RepairTokenError,
+)
+from komari_bot.plugins.character_binding.transaction import BindingTransaction
 from komari_bot.plugins.komari_roulette import (
     CanonicalCommand,
     GroupRef,
@@ -55,6 +60,7 @@ from tests.character_binding.tsk280_support import (
     health_check_commit_failure_switch,
     hold_group_lock,
     install_commit_failure_switch,
+    make_game_state_reader,
     make_roulette,
     member_rows,
     persist_completed_game,
@@ -119,7 +125,12 @@ def make_service(
     clock: _Clock,
     manager: CharacterBindingManager | None = None,
 ) -> BindingRepairService:
-    return BindingRepairService(session_factory=factory, clock=clock, manager=manager)
+    return BindingRepairService(
+        session_factory=factory,
+        clock=clock,
+        game_state_reader=make_game_state_reader(),
+        manager=manager,
+    )
 
 
 async def _blocking_confirm(
@@ -166,6 +177,26 @@ async def _blocking_bind(
         return False, error
     else:
         return True, None
+
+
+async def _blocking_preview(
+    service: BindingRepairService,
+    current: Scope,
+    *,
+    operator_id: str = "tsk280-operator",
+) -> tuple[object | None, BaseException | None]:
+    """在独立任务里执行预览，返回 (预览结果, 异常)。"""
+    try:
+        result = await service.preview(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            operator_id=operator_id,
+            reason=CHANGE_REASON,
+        )
+    except BaseException as error:
+        return None, error
+    else:
+        return result, None
 
 
 # ---------------------------------------------------------------- 诊断与范围
@@ -1250,23 +1281,38 @@ async def test_concurrent_confirm_and_bind_share_group_lock(
             assert int(blocked) >= 2  # 确认与 bind 两条会话都阻塞在同一把锁
         finally:
             await blocker.rollback()
-            if not confirm_task.done():
-                confirm_task.cancel()
-            if not bind_task.done():
-                bind_task.cancel()
 
-    confirm_ok, confirm_error = await asyncio.wait_for(confirm_task, timeout=10)
-    bind_ok, bind_error = await asyncio.wait_for(bind_task, timeout=10)
-    assert confirm_error is None
+    # 锁已释放：有界等待两个任务自然完成；finally 只兜底清理仍未完成的任务，
+    # 绝不在释放锁后立即 cancel 尚未完成任务（那会把正常完成变成 CancelledError）。
+    pending = (confirm_task, bind_task)
+    try:
+        confirm_ok, confirm_error = await asyncio.wait_for(confirm_task, timeout=10)
+        bind_ok, bind_error = await asyncio.wait_for(bind_task, timeout=10)
+    finally:
+        for task in pending:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
     assert bind_error is None
-    assert confirm_ok is True
     assert bind_ok is True
 
-    # 两种合法时序都产生一致终态：确认清掉旧成员，bind 后新增成员。
-    assert await group_binding_rows(harness.engine, current) == 1
+    # 两种合法时序都成立（共享同一把群锁、无死锁）：
+    # - 确认先拿到锁 → 清掉旧成员，bind 随后新增成员 → 只剩新成员；
+    # - bind 先拿到锁 → 依赖集合已变化（预览后新增成员），确认按契约被拒
+    #   （RepairDependencyChangedError）→ 原成员保留并新增成员。
     async with harness.session_factory() as session:
-        assert await member_rows(session, current) == [
+        final_members = await member_rows(session, current)
+    if confirm_ok:
+        assert confirm_error is None
+        assert final_members == [
             (current.with_member(3).member_openid, "并发绑定")
+        ]
+    else:
+        assert isinstance(confirm_error, RepairDependencyChangedError)
+        assert final_members == [
+            (current.with_member(1).member_openid, "甲"),
+            (current.with_member(3).member_openid, "并发绑定"),
         ]
     assert await group_mapping_rows(harness.engine, current) == 1
 
@@ -1285,10 +1331,13 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
         operator_id="tsk280-operator",
         reason=CHANGE_REASON,
     )
+    # 并发创建必须走真实轮盘命令服务；BindingRepairService 绝不是
+    # RouletteCommandService 的转发入口（严禁 execute_group_command 越界 API）。
+    roulette_service = make_roulette(harness.session_factory)
 
     async def _blocking_open() -> tuple[str | None, BaseException | None]:
         try:
-            receipt = await service.execute_group_command(
+            receipt = await roulette_service.execute_group_command(
                 request(
                     current,
                     f"open-{uuid4().hex}",
@@ -1328,13 +1377,18 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
             assert int(blocked) >= 2
         finally:
             await blocker.rollback()
-            if not confirm_task.done():
-                confirm_task.cancel()
-            if not open_task.done():
-                open_task.cancel()
 
-    confirm_ok, confirm_error = await asyncio.wait_for(confirm_task, timeout=10)
-    open_code, open_error = await asyncio.wait_for(open_task, timeout=10)
+    # 锁已释放：有界等待两个任务自然完成；finally 只兜底清理仍未完成的任务。
+    pending = (confirm_task, open_task)
+    try:
+        confirm_ok, confirm_error = await asyncio.wait_for(confirm_task, timeout=10)
+        open_code, open_error = await asyncio.wait_for(open_task, timeout=10)
+    finally:
+        for task in pending:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
     assert confirm_task.done() and open_task.done()  # 无死锁
 
     async with harness.session_factory() as session:
@@ -1390,11 +1444,262 @@ async def test_confirm_rechecks_token_expiry_after_lock_wait(
             clock.advance(timedelta(minutes=10, seconds=1))
         finally:
             await blocker.rollback()
-            if not confirm_task.done():
-                confirm_task.cancel()
 
-    ok, error = await asyncio.wait_for(confirm_task, timeout=10)
+    # 锁已释放：有界等待确认任务自然完成（锁释放后确认继续执行并复核 TTL）。
+    try:
+        ok, error = await asyncio.wait_for(confirm_task, timeout=10)
+    finally:
+        if not confirm_task.done():
+            confirm_task.cancel()
+            await asyncio.gather(confirm_task, return_exceptions=True)
     assert ok is False
     assert isinstance(error, RepairTokenError)
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+
+# ---------------------------------------------------------------- close 生命周期
+
+
+async def test_close_while_confirm_waits_on_group_lock_does_not_delete(
+    harness: Harness,
+) -> None:
+    """close 期间已阻塞在群锁上的 confirm 不得删除任何行。
+
+    close() 不得等待在途任务（会与锁等待死锁）；锁释放后 confirm 必须
+    复核已关闭状态（或令牌已失效）并失败，数据库不变量保持。
+    """
+    current = make_scope("pg-close-confirm")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+
+    async with harness.session_factory() as blocker:
+        await blocker.begin()
+        blocker_pid = await backend_pid(blocker)
+        await hold_group_lock(blocker, current)
+        confirm_task = asyncio.create_task(
+            _blocking_confirm(service, current, preview.token)
+        )
+        try:
+            await wait_for_blocked(harness.session_factory, blocker_pid)
+            # 确认已通过初始令牌校验并阻塞在群锁上；此时关闭服务。
+            # close 必须立即返回（不等待在途任务），否则与锁等待互相死锁。
+            await asyncio.wait_for(service.close(), timeout=5)
+        finally:
+            await blocker.rollback()
+
+    try:
+        ok, error = await asyncio.wait_for(confirm_task, timeout=10)
+    finally:
+        if not confirm_task.done():
+            confirm_task.cancel()
+            await asyncio.gather(confirm_task, return_exceptions=True)
+    assert ok is False
+    assert error is not None
+    # 业务不变量：close 期间等待锁的 confirm 不得清除任何行。
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+
+async def test_close_while_preview_waits_on_group_lock_does_not_issue_token(
+    harness: Harness,
+) -> None:
+    """close 期间已阻塞在群锁上的 preview 不得签发确认令牌。"""
+    current = make_scope("pg-close-preview")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+
+    async with harness.session_factory() as blocker:
+        await blocker.begin()
+        blocker_pid = await backend_pid(blocker)
+        await hold_group_lock(blocker, current)
+        preview_task = asyncio.create_task(_blocking_preview(service, current))
+        try:
+            await wait_for_blocked(harness.session_factory, blocker_pid)
+            await asyncio.wait_for(service.close(), timeout=5)
+        finally:
+            await blocker.rollback()
+
+    try:
+        result, error = await asyncio.wait_for(preview_task, timeout=10)
+    finally:
+        if not preview_task.done():
+            preview_task.cancel()
+            await asyncio.gather(preview_task, return_exceptions=True)
+    assert result is None
+    assert error is not None
+    # 未签发令牌：修复入口没有产生任何可用的确认凭证。
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+
+async def test_closed_service_reference_refuses_operations_and_tokens_invalidated(
+    harness: Harness,
+) -> None:
+    """close 后旧引用拒绝一切操作；close 使已签发令牌失效，重启亦不识别。"""
+    current = make_scope("pg-close-refuse")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        reason=CHANGE_REASON,
+    )
+    token = preview.token
+
+    await service.close()
+
+    # 旧引用拒绝诊断/预览（服务已关闭）。
+    with pytest.raises(RuntimeError):
+        await service.diagnose(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+        )
+    with pytest.raises(RuntimeError):
+        await service.preview(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            operator_id="tsk280-operator",
+            reason=CHANGE_REASON,
+        )
+    # 旧引用拒绝确认（令牌已被 close 失效或服务已关闭）。
+    with pytest.raises((RuntimeError, RepairTokenError)):
+        await service.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=token,
+            operator_id="tsk280-operator",
+            request_id="req-close-refuse",
+            reason=CHANGE_REASON,
+        )
+    # 重启后的新实例同样不认识旧令牌。
+    restarted = make_service(harness.session_factory, _Clock(START))
+    with pytest.raises(RepairTokenError):
+        await restarted.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=token,
+            operator_id="tsk280-operator",
+            request_id="req-close-restart",
+            reason=CHANGE_REASON,
+        )
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+
+# ---------------------------------------------------------------- 版本指纹 ABA
+
+
+async def test_rename_rename_back_does_not_clear_with_old_token(
+    harness: Harness,
+) -> None:
+    """指纹必须含行版本（updated_at 或等价 generation）：改名后改回原值（ABA）
+    不得让旧令牌继续清除。"""
+    current = make_scope("pg-aba-rename")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+    member = current.with_member(1)
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        member_openid=member.member_openid,
+        reason=CHANGE_REASON,
+    )
+
+    async with harness.session_factory() as session:
+        transaction = BindingTransaction(session)
+        await transaction.rename(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=member.member_openid,
+            character_name="乙",
+        )
+        await session.commit()
+    async with harness.session_factory() as session:
+        transaction = BindingTransaction(session)
+        await transaction.rename(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=member.member_openid,
+            character_name="甲",
+        )
+        await session.commit()
+
+    # 值已回到预览时状态，但行版本已前进：旧令牌必须失效，绝不能清除。
+    with pytest.raises(RepairDependencyChangedError):
+        await service.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=preview.token,
+            operator_id="tsk280-operator",
+            request_id="req-aba-rename",
+            reason=CHANGE_REASON,
+        )
+    assert await group_binding_rows(harness.engine, current) == 1
+    assert await group_mapping_rows(harness.engine, current) == 1
+
+
+async def test_delete_recreate_same_value_does_not_clear_with_old_token(
+    harness: Harness,
+) -> None:
+    """指纹必须含行版本：删后重建同值（ABA）不得让旧令牌继续清除。"""
+    current = make_scope("pg-aba-recreate")
+    await bind_member(harness.binding_manager, current, 1, name="甲")
+    service = make_service(harness.session_factory, _Clock(START))
+    member = current.with_member(1)
+    preview = await service.preview(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        operator_id="tsk280-operator",
+        member_openid=member.member_openid,
+        reason=CHANGE_REASON,
+    )
+
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                """
+                DELETE FROM komari_character_binding_members
+                 WHERE app_id = :app_id AND group_openid = :group_openid
+                   AND member_openid = :member_openid
+                """
+            ),
+            {
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "member_openid": member.member_openid,
+            },
+        )
+        await session.commit()
+    async with harness.session_factory() as session:
+        transaction = BindingTransaction(session)
+        await transaction.bind(
+            app_id=current.app_id,
+            group_id=current.group_id,
+            group_openid=current.group_openid,
+            member_qq=member.member_qq,
+            member_openid=member.member_openid,
+            character_name="甲",
+        )
+        await session.commit()
+
+    # 同值重建后行版本已变化：旧令牌必须失效，绝不能清除。
+    with pytest.raises(RepairDependencyChangedError):
+        await service.confirm(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token=preview.token,
+            operator_id="tsk280-operator",
+            request_id="req-aba-recreate",
+            reason=CHANGE_REASON,
+        )
     assert await group_binding_rows(harness.engine, current) == 1
     assert await group_mapping_rows(harness.engine, current) == 1

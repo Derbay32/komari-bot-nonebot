@@ -17,20 +17,21 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
+
+from komari_bot.plugins.character_binding import management_api
+from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 from komari_bot.plugins.character_binding.repair import (
     BindingRepairService,
     get_binding_repair_service,
     set_binding_repair_service,
 )
-
-from komari_bot.plugins.character_binding import management_api
-from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 from tests.character_binding.tsk280_support import (
     PG_REQUIRED,
     WILDCARD_CREDENTIALS,
     create_engine_and_factory,
     group_binding_rows,
     group_mapping_rows,
+    make_game_state_reader,
     read_headers,
     reset_shared_orm_engine,
     seed_binding,
@@ -86,6 +87,7 @@ async def test_register_to_service_get_real_assembly(
     service = BindingRepairService(
         session_factory=harness.session_factory,
         clock=lambda: datetime.now(UTC),
+        game_state_reader=make_game_state_reader(),
         manager=harness.binding_manager,
     )
     set_binding_repair_service(service)
@@ -153,6 +155,17 @@ async def test_register_to_service_get_real_assembly(
         assert actions.count("character_binding.repair.preview") == 2
         assert actions.count("character_binding.repair.confirm") == 2
         assert {event.outcome for event in audit_events} == {"started", "succeeded"}
+        confirm_audit = [
+            event
+            for event in audit_events
+            if event.action == "character_binding.repair.confirm"
+            and event.outcome == "succeeded"
+        ]
+        assert len(confirm_audit) == 1
+        # 真实确认审计必须携带预览 version 与预期/实删数量。
+        assert confirm_audit[0].metadata["version"] == preview.json()["version"]
+        assert confirm_audit[0].metadata["expected_count"] == 1
+        assert confirm_audit[0].metadata["cleared_count"] == 1
         rendered = json.dumps(
             [event.to_dict() for event in audit_events],
             ensure_ascii=False,
