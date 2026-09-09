@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001, RUF003  # ｜ ＝ × 是定稿文案字符；注释中的范围线非连字符
 """Full-Markdown reply renderer seam (TSK-278).
 
 ``render_reply`` projects a frozen ``ReplyProjectionContext`` into a
@@ -10,9 +11,9 @@ config-driven copy via ``set_sentence_pool``).
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any
 
-from ..command_service import ReplyPlayer, ReplyProjection, ReplyProjectionContext
+from ..command_service import ReplyProjection
 from .keyboard import (
     ITEM_CN,
     ITEM_LETTER,
@@ -21,6 +22,11 @@ from .keyboard import (
     build_keyboard,
     is_error_result_code,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from ..command_service import ReplyPlayer, ReplyProjectionContext
 
 # ---------------------------------------------------------------------------
 # Copy pool (TSK-266 / TSK-269 文案；TSK-279 注入配置化副本)
@@ -49,8 +55,8 @@ _sentence_pool: dict[str, str] = dict(DEFAULT_SENTENCE_POOL)
 
 def set_sentence_pool(pool: Mapping[str, str] | None) -> None:
     """Replace the result-sentence pool (TSK-279 copy injection seam)."""
-    global _sentence_pool
-    _sentence_pool = dict(pool) if pool is not None else dict(DEFAULT_SENTENCE_POOL)
+    _sentence_pool.clear()
+    _sentence_pool.update(pool if pool is not None else DEFAULT_SENTENCE_POOL)
 
 
 def get_sentence_pool() -> dict[str, str]:
@@ -208,7 +214,7 @@ def _current_line(context: ReplyProjectionContext) -> str:
     return line
 
 
-def _sentence(context: ReplyProjectionContext, key: str, **kwargs: object) -> str:
+def _sentence(key: str, **kwargs: object) -> str:
     template = _sentence_pool.get(key, DEFAULT_SENTENCE_POOL.get(key, ""))
     if not template:
         return ""
@@ -219,7 +225,6 @@ def _follow_up_body(context: ReplyProjectionContext) -> str:
     details = context.details
     kind = _KIND_CN.get(str(details.get("consumed_kind", "")), "空弹")
     sentence = _sentence(
-        context,
         context.result_code,
         name=_escape_name(context.current_player.display_name)
         if context.current_player
@@ -247,7 +252,7 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     reward_seq = reward_player.join_seq if reward_player is not None else None
     inventory = _roster_inventory(context, reward_seq) if reward_seq is not None else ()
     lines: list[str] = [
-        f"> {_sentence(context, 'item_choice_pending')}",
+        f"> {_sentence('item_choice_pending')}",
         "",
     ]
     if details.get("inventory_full"):
@@ -283,9 +288,12 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
 
 
 def _inventory_in_order(
-    inventory: tuple[tuple[str, int], ...],
+    inventory: tuple[Any, ...],
 ) -> list[tuple[str, int]]:
-    counts = dict(inventory)
+    counts: dict[str, int] = {}
+    for raw in inventory:
+        if isinstance(raw, tuple) and len(raw) == 2:
+            counts[str(raw[0])] = int(raw[1])
     return [(item, counts[item]) for item in ITEM_ORDER if item in counts]
 
 
@@ -298,7 +306,6 @@ def _lock_body(context: ReplyProjectionContext) -> str:
     if context.mention_target is not None and context.mention_reason == "lock_target":
         tag = _mention_tag(context.mention_target)
     sentence = _sentence(
-        context,
         "lock_used",
         actor=actor_name,
         target=target_name,
@@ -336,7 +343,6 @@ def _final_body(context: ReplyProjectionContext) -> str:
         eliminated_prefix = f"{_escape_name(eliminated.display_name)}{reason_text}，"
     wins = context.winner_group_wins
     return _sentence(
-        context,
         "final",
         eliminated_prefix=eliminated_prefix,
         winner=winner_name,
@@ -346,7 +352,9 @@ def _final_body(context: ReplyProjectionContext) -> str:
 
 
 def _leaderboard_body(context: ReplyProjectionContext) -> str:
-    entries = tuple(context.details.get("leaderboard") or ())
+    entries = context.details.get("leaderboard")
+    if not isinstance(entries, tuple):
+        entries = ()
     if not entries:
         return "本群还没有俄罗斯轮盘胜者。"
     parsed: list[tuple[str, int]] = []
@@ -364,7 +372,9 @@ def _panel_body(context: ReplyProjectionContext) -> str:
     current = context.current_player
     current_name = _escape_name(current.display_name) if current is not None else ""
     lines = [f"**{current_name}的道具**"]
-    inventory = tuple(context.details.get("inventory") or ())
+    inventory = context.details.get("inventory")
+    if not isinstance(inventory, tuple):
+        inventory = ()
     for item, count in _inventory_in_order(inventory):
         lines.append(f"- {ITEM_LETTER[item]}｜{ITEM_CN[item]} ×{count}")
     pending = context.game_view.pending_lock_players if context.game_view is not None else ()
@@ -379,7 +389,8 @@ def _panel_body(context: ReplyProjectionContext) -> str:
 def _waiting_body(context: ReplyProjectionContext) -> str:
     view = context.game_view
     host_seq = view.host_seq if view is not None else None
-    capacity = int(context.details.get("capacity", 6))
+    capacity_value = context.details.get("capacity", 6)
+    capacity = capacity_value if isinstance(capacity_value, int) else 6
     lines = [
         "**俄罗斯轮盘 · 等候中**",
         f"在席 {len(context.players)}/{capacity} 人",
@@ -404,7 +415,7 @@ def _waiting_body(context: ReplyProjectionContext) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_reply(context: ReplyProjectionContext) -> ReplyProjection:
+def render_reply(context: ReplyProjectionContext) -> ReplyProjection:  # noqa: PLR0911
     """Project a frozen context into the full Markdown reply projection."""
     if context.result_code == "leaderboard":
         body = _leaderboard_body(context)

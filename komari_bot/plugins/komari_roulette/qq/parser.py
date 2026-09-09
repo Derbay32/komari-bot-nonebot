@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001  # 命令用法模板使用的全角分隔符
 """QQ roulette command parser seam (TSK-278).
 
 ``parse_command`` is a pure function mapping a message text to a
@@ -9,9 +10,12 @@ fixed reply without ever echoing the raw input back.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from ..command_service import CanonicalCommand
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 PREFIX = "/轮盘"
 
@@ -113,7 +117,7 @@ def _parse_item(args: list[str]) -> CanonicalCommand:
     return _syntax("unknown_command")
 
 
-def _parse_reward(args: list[str]) -> CanonicalCommand:
+def _parse_reward(args: list[str]) -> CanonicalCommand:  # noqa: PLR0911
     if not args:
         return _invalid_args(REWARD_USAGE)
     verb, rest = args[0], args[1:]
@@ -140,7 +144,7 @@ def _parse_transfer(args: list[str]) -> CanonicalCommand:
     return CanonicalCommand.transfer(target_player_seq=seq)
 
 
-def parse_command(text: str) -> CanonicalCommand | None:
+def parse_command(text: str) -> CanonicalCommand | None:  # noqa: PLR0911
     """Parse one message text into a canonical command.
 
     Returns ``None`` for anything that is not a ``/轮盘`` command so the

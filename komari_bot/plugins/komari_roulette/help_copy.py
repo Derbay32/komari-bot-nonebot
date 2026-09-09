@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001  # 定稿文案使用的全角字符
 """Help copy for the QQ Russian roulette plugin (TSK-278).
 
 Four confirmed help sections (TSK-266 10.1 / 6a9bf92b) are concatenated into

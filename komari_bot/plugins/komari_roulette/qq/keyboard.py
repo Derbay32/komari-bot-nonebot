@@ -11,9 +11,9 @@ historical bare-list fallback.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from nonebot.adapters.qq.models.common import (
+from nonebot.adapters.qq.models import (
     Action,
     Button,
     InlineKeyboard,
@@ -23,7 +23,8 @@ from nonebot.adapters.qq.models.common import (
     RenderData,
 )
 
-from ..command_service import ReplyProjectionContext
+if TYPE_CHECKING:
+    from ..command_service import ReplyProjectionContext
 
 # Canonical item order A→B→C→D and their stable Chinese labels.
 ITEM_ORDER: tuple[str, ...] = ("magnifier", "beer", "burst", "lock")
@@ -109,13 +110,15 @@ def _item_choice_rows(context: ReplyProjectionContext) -> list[list[dict[str, An
                 break
     held_types = {raw_item for raw_item, _count in inventory}
     held = [item for item in ITEM_ORDER if item in held_types]
-    for chunk in _chunk(held, 3):
-        rows.append(
+    rows.extend(
+        [
             [
                 _button(f"🔄{ITEM_CN[item]}", f"/轮盘 奖励 替换 {ITEM_CN[item]}")
                 for item in chunk
             ]
-        )
+            for chunk in _chunk(held, 3)
+        ]
+    )
     return rows
 
 
@@ -129,7 +132,7 @@ def _waiting_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]
     return rows
 
 
-def _layout_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]:
+def _layout_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]:  # noqa: PLR0911
     if context.lifecycle in TERMINAL_LIFECYCLES:
         return []
     if context.lifecycle == "waiting":
