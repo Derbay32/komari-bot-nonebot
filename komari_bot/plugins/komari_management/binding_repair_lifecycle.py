@@ -47,9 +47,9 @@ def start_binding_repair_service() -> None:
     from nonebot import require
 
     require("komari_roulette")
-    from komari_bot.plugins.character_binding import get_binding_manager
-    from komari_bot.plugins.character_binding.repair import (
+    from komari_bot.plugins.character_binding import (
         BindingRepairService,
+        get_binding_manager,
         set_binding_repair_service,
     )
 
@@ -64,7 +64,7 @@ def start_binding_repair_service() -> None:
 
 async def stop_binding_repair_service() -> None:
     """关闭并移除修复服务；``close`` 立即生效且不等待在途任务。"""
-    from komari_bot.plugins.character_binding.repair import (
+    from komari_bot.plugins.character_binding import (
         get_binding_repair_service,
         set_binding_repair_service,
     )

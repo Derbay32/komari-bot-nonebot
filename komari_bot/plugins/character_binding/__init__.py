@@ -27,6 +27,7 @@ from .qq_coordinator import QQBindingCoordinator
 from .repair import (
     BindingRepairService,
     get_binding_repair_service,
+    set_binding_repair_service,
 )
 from .reply_evidence import (
     ReplyEvidence,
@@ -304,6 +305,7 @@ __all__ = [
     "get_qq_character_name",
     "get_runtime_collectors",
     "register_character_binding_repair_api",
+    "set_binding_repair_service",
     "set_runtime_collectors",
 ]
 
