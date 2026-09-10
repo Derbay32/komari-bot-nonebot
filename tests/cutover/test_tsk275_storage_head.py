@@ -1,4 +1,4 @@
-"""TSK-275/276 cutover guard: 0020 is the only migration head."""
+"""TSK-275/276 cutover guard: 0021 is the only migration head."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def test_tsk275_does_not_create_a_parallel_alembic_head() -> None:
     config.set_main_option("script_location", str(MIGRATIONS_DIR))
     config.set_main_option("version_path_separator", "os")
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0020"]
+    assert script.get_heads() == ["0021"]
     assert script.get_revision("0019").down_revision == "0018"  # type: ignore[union-attr]
     assert script.get_revision("0020").down_revision == "0019"  # type: ignore[union-attr]
 
@@ -59,7 +59,7 @@ async def test_tsk275_cutover_from_0018_keeps_prior_schema_and_reaches_one_head(
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == "0020"
+                == "0021"
             )
             tables = {
                 str(row["table_name"])
