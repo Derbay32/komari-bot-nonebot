@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import pytest
+
 from komari_bot.plugins.komari_roulette.qq.keyboard import (
     build_keyboard,
     keyboard_from_spec,
@@ -29,6 +31,8 @@ from .tsk278_support import (
 )
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from komari_bot.plugins.komari_roulette import ReplyProjectionContext
 
 
@@ -106,7 +110,7 @@ def test_locked_turn_buttons() -> None:
     base = context(
         result_code="shot",
         lifecycle="active",
-        phase="locked",
+        phase="locked_turn",
         players=(player(1, name="小明"), player(2, name="小红")),
         current_player=player(1, name="小明"),
         view=game_view(
@@ -121,6 +125,125 @@ def test_locked_turn_buttons() -> None:
     assert _labels(rows) == [["🔫开枪", "🏳️弃权"]]
     _assert_fill_only(rows)
     assert _data(rows)[0] == ["/轮盘 开枪", "/轮盘 弃权"]
+
+
+def test_locked_phase_alias_is_not_accepted() -> None:
+    """`locked` 不是 TSK-276 投影拼写；不得再被当锁定回合处理。"""
+    base = context(
+        result_code="shot",
+        lifecycle="active",
+        phase="locked",
+        players=(player(1, name="小明"), player(2, name="小红")),
+        current_player=player(1, name="小明", inventory=(("magnifier", 1),)),
+        view=game_view(
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+        ),
+    )
+    labels = [button.label for row in _materialize(base) for button in row]
+    # 应该是普通 follow_up 布局（含使用/丢弃），而不是只剩开枪/弃权。
+    assert "🧰使用" in labels
+    assert "⏹️结束" in labels
+
+
+# ---------------------------------------------------------------------------
+# 1H 动态布局：只展示提交后权威局面允许的动作
+# ---------------------------------------------------------------------------
+
+
+def _follow_up_context_with(
+    *,
+    inventory: tuple[tuple[str, int], ...],
+    others: tuple[Any, ...] = (),
+    remaining_total: int = 4,
+) -> ReplyProjectionContext:
+    current = player(1, name="小明", inventory=inventory)
+    roster = (current, *others)
+    return context(
+        result_code="shot",
+        lifecycle="active",
+        phase="follow_up",
+        players=roster,
+        current_player=current,
+        view=game_view(
+            remaining_total=remaining_total,
+            remaining_live=1,
+            remaining_blank=max(remaining_total - 1, 0),
+            hit_percent=25.0,
+        ),
+    )
+
+
+def test_follow_up_without_inventory_omits_use_and_discard() -> None:
+    """当前玩家道具 0 → 不出现 🧰使用 / 🗑️丢弃（1H 动态布局）。"""
+    base = _follow_up_context_with(
+        inventory=(), others=(player(2, name="小红"),)
+    )
+    labels = [button.label for row in _materialize(base) for button in row]
+    assert "🧰使用" not in labels
+    assert "🗑️丢弃" not in labels
+    assert "🔫开枪" in labels
+    assert "⏹️结束" in labels
+    assert "🏳️弃权" in labels
+
+
+def test_follow_up_on_full_chamber_omits_reload() -> None:
+    """弹仓 6/6 → 不出现 🔄装填。"""
+    base = _follow_up_context_with(
+        inventory=(("magnifier", 1),),
+        others=(player(2, name="小红"),),
+        remaining_total=6,
+    )
+    labels = [button.label for row in _materialize(base) for button in row]
+    assert "🔄装填" not in labels
+    assert "🔫开枪" in labels
+    assert "🧰使用" in labels
+
+
+def test_follow_up_lock_only_without_legal_target_omits_use() -> None:
+    """只有锁且无合法目标 → 不出现 🧰使用（仍可丢弃）。"""
+    base = _follow_up_context_with(
+        inventory=(("lock", 1),),
+        # 唯一在席对手已有待生效锁 → 不是合法目标。
+        others=(player(2, name="小红", pending_lock=True),),
+    )
+    labels = [button.label for row in _materialize(base) for button in row]
+    assert "🧰使用" not in labels
+    assert "🗑️丢弃" in labels
+
+
+def test_follow_up_lock_only_with_legal_target_keeps_use() -> None:
+    """只有锁但存在合法目标 → 🧰使用 仍出现。"""
+    base = _follow_up_context_with(
+        inventory=(("lock", 1),),
+        others=(player(2, name="小红"),),
+    )
+    labels = [button.label for row in _materialize(base) for button in row]
+    assert "🧰使用" in labels
+
+
+def test_follow_up_omits_item_buttons_when_all_counts_zero() -> None:
+    """只有 0 数量条目等价于无道具：不出现使用/丢弃。"""
+    base = _follow_up_context_with(
+        inventory=(("magnifier", 0), ("lock", 0)),
+        others=(player(2, name="小红"),),
+    )
+    labels = [button.label for row in _materialize(base) for button in row]
+    assert "🧰使用" not in labels
+    assert "🗑️丢弃" not in labels
+
+
+def test_keyboard_from_spec_rejects_bare_list() -> None:
+    with pytest.raises((TypeError, KeyError, ValueError)):
+        keyboard_from_spec("[]")
+
+
+def test_keyboard_from_spec_rejects_dict_rows() -> None:
+    """规范行恒为按钮对象列表；`{"buttons": [...]}` 不再兼容。"""
+    with pytest.raises((TypeError, KeyError, ValueError)):
+        keyboard_from_spec('{"rows": [{"buttons": []}]}')
 
 
 def test_item_choice_buttons_1d() -> None:

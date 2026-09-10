@@ -65,7 +65,7 @@ def _follow_up_context() -> ReplyProjectionContext:
         players=_roster(),
         current_player=player(1, name="小明"),
         mention_target=player(1, name="小明"),
-        mention_reason="current",
+        mention_reason="turn",
         view=game_view(remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
     )
 
@@ -149,6 +149,7 @@ def test_reward_choice_has_two_dividers() -> None:
             "pending_item": "magnifier",
             "pending_item_count": 1,
             "inventory_full": True,
+            "consumed_kind": "blank",
         },
         players=(
             player(2, name="小红", inventory=(("beer", 2), ("lock", 1)), pending_lock=True),
@@ -170,6 +171,9 @@ def test_reward_choice_has_two_dividers() -> None:
     rendered = render_reply(base)
     body = rendered.body
 
+    # 首行必须是本次空弹射击那份被冻结的空弹文案，而非通用的“你获得了新道具。”
+    assert body.splitlines()[0] == "> 小明打出一发空弹。", body
+    assert "你获得了新道具。" not in body
     assert_body_has_markdown_structure(body, dividers=2, blockquote=True, bold=True, roster=True)
     assert "当前新道具：**放大镜**" in body
     assert "已有道具：放大镜 ×1、啤酒 ×2、锁 ×1" in body
@@ -257,6 +261,96 @@ def test_continue_in_place_does_not_mention() -> None:
     assert "mention_member_openid" not in metadata
     assert "mention_display_name" not in metadata
     assert "**当前：小明**" in body
+
+
+# ---------------------------------------------------------------------------
+# 结果句命名动作发起者（而非轮转后的新当前玩家）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("result_code", "expected_sentence"),
+    [
+        ("turn_ended", "> 小明结束了回合。"),
+        ("forfeited", "> 小明选择弃权。"),
+    ],
+)
+def test_rotation_sentence_names_actor_not_next_current_player(
+    result_code: str, expected_sentence: str
+) -> None:
+    """end_turn / forfeit 轮转后，结果句仍是发起者，不是新当前玩家。"""
+    actor = player(1, name="小明")
+    next_player = player(2, name="小红")
+    base = context(
+        result_code=result_code,
+        lifecycle="active",
+        phase="follow_up",
+        details={},
+        players=(actor, next_player),
+        current_player=next_player,
+        actor_member_openid=actor.member_openid,
+        view=game_view(remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
+    )
+    body = render_reply(base).body
+    assert body.splitlines()[0] == expected_sentence, body
+    assert "小红结束了回合" not in body
+    assert "小红选择弃权" not in body
+    assert "**当前：小红**" in body
+
+
+# ---------------------------------------------------------------------------
+# 锁定回合面板：固定限制行（1E）与待连发提示（1B）
+# ---------------------------------------------------------------------------
+
+
+def test_locked_turn_board_shows_fixed_restriction_line() -> None:
+    base = context(
+        result_code="turn_ended",
+        lifecycle="active",
+        phase="locked_turn",
+        details={},
+        players=(player(1, name="小明"), player(2, name="小红")),
+        current_player=player(1, name="小明"),
+        actor_member_openid="member-1",
+        mention_target=None,
+        mention_reason=None,
+        view=game_view(
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+            active_lock_player=player(1, name="小明"),
+        ),
+    )
+    body = render_reply(base).body
+    assert "你本回合受到锁限制，只能执行一次开枪命令或弃权。" in body
+
+
+def test_pending_burst_hint_only_when_pending() -> None:
+    def _render(*, pending_burst: bool) -> str:
+        base = context(
+            result_code="shot",
+            lifecycle="active",
+            phase="follow_up",
+            details={"consumed_kind": "blank"},
+            players=(player(1, name="小明"), player(2, name="小红")),
+            current_player=player(1, name="小明"),
+            view=game_view(
+                remaining_total=4,
+                remaining_live=1,
+                remaining_blank=3,
+                hit_percent=25.0,
+                pending_burst=pending_burst,
+            ),
+        )
+        return render_reply(base).body
+
+    with_burst = _render(pending_burst=True)
+    without_burst = _render(pending_burst=False)
+    assert "手枪：下一次开枪连发" in with_burst
+    assert "手枪：下一次开枪连发" not in without_burst
+    assert "手枪：普通" not in with_burst
+    assert "手枪：普通" not in without_burst
 
 
 # ---------------------------------------------------------------------------
@@ -530,50 +624,106 @@ def test_turn_expired_completed_renders_fixed_notice_then_final() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_item_panel_lists_lock_target_numbers() -> None:
+def test_item_panel_lists_only_eligible_lock_targets() -> None:
+    """可上锁列表 = 存活 ∧ 非自己 ∧ 无已有待生效锁；`pending_lock_players` 是排除集合。"""
     base = context(
         result_code="panel_opened",
         lifecycle="active",
         phase="follow_up",
-        details={"inventory": (("magnifier", 1), ("beer", 1), ("burst", 1), ("lock", 1))},
+        details={"inventory": (("lock", 1),)},
         players=(
-            player(2, name="小红", inventory=(("lock", 1),)),
-            player(1, name="小明", inventory=(("magnifier", 1), ("beer", 1), ("burst", 1), ("lock", 1))),
-            player(5, name="小白", inventory=(("beer", 1),)),
+            player(1, name="小明", inventory=(("lock", 1),)),  # 自己
+            player(
+                2,
+                name="小红",
+                inventory=(("lock", 1),),
+                pending_lock=True,
+            ),  # 已有锁 → 排除
+            player(4, name="小白", inventory=(("beer", 1),)),  # 合法目标
+            player(5, name="小绿", alive=False),  # 出局 → 非目标
         ),
-        current_player=player(1, name="小明"),
+        current_player=player(1, name="小明", inventory=(("lock", 1),)),
         view=game_view(
             remaining_total=4,
             remaining_live=1,
             remaining_blank=3,
             hit_percent=25.0,
-            pending_lock_seqs=(2, 5),
+            pending_lock_seqs=(2,),
             pending_lock_players=(
-                player(2, name="小红", inventory=(("lock", 1),)),
-                player(5, name="小白", inventory=(("beer", 1),)),
+                player(2, name="小红", pending_lock=True),
             ),
         ),
     )
-    rendered = render_reply(base)
-    body = rendered.body
+    body = render_reply(base).body
 
-    # 标题不带编号。
     assert "**小明的道具**" in body
-    assert "- A｜放大镜 ×1" in body
-    assert "- B｜啤酒 ×1" in body
-    assert "- C｜连发器 ×1" in body
     assert "- D｜锁 ×1" in body
-
-    # 可上锁区域：稳定编号 + 冻结显示名，保留缺口。
     assert "**可上锁的玩家**" in body
-    assert "- 2｜小红" in body
-    assert "- 5｜小白" in body
+    # 只有玩家 4 合法；排除集合中的 2、自己 1、出局的 5 都不得出现。
+    assert "- 4｜小白" in body
+    assert "- 2｜小红" not in body
+    assert "- 1｜小明" not in body
+    assert "- 5｜小绿" not in body
     assert "使用锁时，在“使用”后补上 D 和目标编号。" in body
 
-    # 编号只出现在目标区，不出现在普通正文。
     ordinary = body.split("**可上锁的玩家**")[0]
-    assert_no_player_numbers(ordinary, 2, 5)
-    assert_no_member_openid(body, "member-1", "member-2", "member-5")
+    assert_no_player_numbers(ordinary, 2, 4, 5)
+    assert_no_member_openid(body, "member-1", "member-2", "member-4")
+
+
+def test_item_panel_lock_without_legal_target_shows_fixed_empty_copy() -> None:
+    """持锁但无合法目标：区域内只显示固定空文案，不列编号、不给输入提示。"""
+    base = context(
+        result_code="panel_opened",
+        lifecycle="active",
+        phase="follow_up",
+        details={"inventory": (("lock", 1),)},
+        players=(
+            player(1, name="小明", inventory=(("lock", 1),)),
+            player(2, name="小红", pending_lock=True),
+        ),
+        current_player=player(1, name="小明", inventory=(("lock", 1),)),
+        view=game_view(
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+            pending_lock_seqs=(2,),
+            pending_lock_players=(player(2, name="小红", pending_lock=True),),
+        ),
+    )
+    body = render_reply(base).body
+    assert "当前没有可上锁的玩家。" in body
+    assert "- 2｜小红" not in body
+    assert "使用锁时" not in body
+    assert_no_player_numbers(body, 1, 2)
+
+
+def test_item_panel_omits_lock_area_when_owner_has_no_lock() -> None:
+    """当前玩家没持有锁：即使别人有待锁，也不出现可上锁区域。"""
+    base = context(
+        result_code="panel_opened",
+        lifecycle="active",
+        phase="follow_up",
+        details={"inventory": (("magnifier", 1),)},
+        players=(
+            player(1, name="小明", inventory=(("magnifier", 1),)),
+            player(2, name="小红", pending_lock=True),
+        ),
+        current_player=player(1, name="小明", inventory=(("magnifier", 1),)),
+        view=game_view(
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+            pending_lock_seqs=(2,),
+            pending_lock_players=(player(2, name="小红", pending_lock=True),),
+        ),
+    )
+    body = render_reply(base).body
+    assert "可上锁的玩家" not in body
+    assert "当前没有可上锁的玩家。" not in body
+    assert "- 2｜" not in body
 
 
 def test_item_panel_hides_lock_area_without_lock() -> None:
@@ -590,6 +740,43 @@ def test_item_panel_hides_lock_area_without_lock() -> None:
     body = rendered.body
     assert "可上锁的玩家" not in body
     assert "2｜" not in body
+
+
+# ---------------------------------------------------------------------------
+# 防御性裸 invalid_args：用法文案，绝不是系统错误
+# ---------------------------------------------------------------------------
+
+
+def test_bare_invalid_args_renders_usage_not_system_error() -> None:
+    base = context(
+        result_code="invalid_args",
+        game_id=None,
+        lifecycle=None,
+        phase=None,
+        state_revision=None,
+        turn_seq=None,
+        actor_member_openid="member-1",
+        target_mention_count=0,
+        details={},
+    )
+    body = render_reply(base).body
+    assert "游戏状态异常" not in body
+    assert body.startswith("命令参数不正确。正确用法：@Bot /轮盘 "), body
+
+
+def test_invalid_args_with_subcommand_usage_is_exact() -> None:
+    base = context(
+        result_code="invalid_args:开局",
+        game_id=None,
+        lifecycle=None,
+        phase=None,
+        state_revision=None,
+        turn_seq=None,
+        actor_member_openid="member-1",
+        target_mention_count=0,
+        details={},
+    )
+    assert render_reply(base).body == "命令参数不正确。正确用法：@Bot /轮盘 开局"
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +975,7 @@ def test_error_reply_is_fixed_text_without_state(
         current_player=player(1, name="小明"),
         winner=player(1, name="小明"),
         mention_target=player(1, name="小明"),
-        mention_reason="current",
+        mention_reason="turn",
         view=game_view(remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
     )
     rendered = render_reply(base)

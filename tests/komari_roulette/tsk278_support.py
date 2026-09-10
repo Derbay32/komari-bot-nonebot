@@ -62,19 +62,27 @@ def business_token(
     scope: str = "business",
     member_openid: str = "member-1",
     qq_message_id: str = "msg-1",
+    app_id: str = APP_ID,
+    group_openid: str = GROUP_OPENID,
+    effective_policy_revision: int = 1,
+    connection_generation: int = 0,
 ) -> QQAdmissionToken:
-    """A real ``QQAdmissionToken`` as the TSK-274 preprocessor would leave in
-    ``event.state`` for an admitted group-@ message."""
+    """A real TSK-274 ``QQAdmissionToken`` as the preprocessor would leave in
+    ``event.state`` for an admitted group-@ message.
+
+    ``app_id`` / ``group_openid`` are overridable so tests can build a token
+    whose identity does **not** match the event (the handler must reject it).
+    """
     return QQAdmissionToken(
         scope=cast("Any", scope),
-        app_id=APP_ID,
-        group_openid=GROUP_OPENID,
+        app_id=app_id,
+        group_openid=group_openid,
         member_openid=member_openid,
         qq_message_id=qq_message_id,
         group_id=None,
         member_qq=None,
-        effective_policy_revision=1,
-        connection_generation=0,
+        effective_policy_revision=effective_policy_revision,
+        connection_generation=connection_generation,
         claim=None,
         verified_session=None,
     )
@@ -163,6 +171,58 @@ def make_group_at_event(
         author=_member(member_openid, username=author_name),
         group_id=f"qq-group-{group_openid}",
         group_openid=group_openid,
+    )
+
+
+def make_real_group_at_event(
+    content: str,
+    *,
+    message_id: str = "msg-1",
+    group_openid: str = GROUP_OPENID,
+    member_openid: str = "member-1",
+    author_name: str = "小明",
+    app_id: str = APP_ID,
+    timestamp: int = 1757300000,
+) -> GroupAtMessageCreateEvent:
+    """A strict QQ ``GROUP_AT_MESSAGE_CREATE`` event built the way the real
+    adapter builds it: from a *minimal real payload* via ``model_validate``.
+
+    The real model has **no** ``mentions`` field (``event.mentions is None``);
+    @s only exist as ``mention_user`` / ``mention_everyone`` segments parsed
+    out of ``content`` (``<@!openid>`` / ``<@!all>``).  ``content`` must be the
+    raw QQ content without the adapter's leading-space convention.
+    """
+    payload: dict[str, Any] = {
+        "id": message_id,
+        "time": timestamp,
+        "type": "group_at_message_create",
+        "detail_type": "group",
+        "self": {"platform": "qq", "user_id": app_id},
+        "content": content,
+        "timestamp": "2026-09-08T12:00:00+08:00",
+        "author": {
+            "id": f"author-{member_openid}",
+            "member_openid": member_openid,
+            "bot": False,
+            "member_role": "member",
+            "username": author_name,
+        },
+        "group_openid": group_openid,
+        "group_id": f"qq-group-{group_openid}",
+    }
+    return GroupAtMessageCreateEvent.model_validate(payload)
+
+
+def event_mention_count(event: Any) -> int:
+    """Number of real @ segments in a parsed QQ message.
+
+    The handler's ``target_mention_count`` fingerprint must count these, not
+    ``event.mentions`` (which the real model does not carry).
+    """
+    return sum(
+        1
+        for segment in event.get_message()
+        if segment.type in {"mention_user", "mention_everyone"}
     )
 
 
@@ -447,12 +507,15 @@ def build_real_keyboard(spec: str) -> Any:
     parsed = json.loads(spec)
     rows = []
     for row_spec in parsed["rows"]:
-        button_specs = (
-            row_spec["buttons"] if isinstance(row_spec, dict) else row_spec
-        )
+        if not isinstance(row_spec, list):
+            msg = (
+                "canonical keyboard spec rows are button-object lists, "
+                f"got {row_spec!r}"
+            )
+            raise TypeError(msg)
         rows.append(
             InlineKeyboardRow(
-                buttons=[make_button(b["label"], b["data"]) for b in button_specs]
+                buttons=[make_button(b["label"], b["data"]) for b in row_spec]
             )
         )
     return MessageKeyboard(content=InlineKeyboard(rows=rows))

@@ -101,6 +101,16 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
 `invalid_args:转让 <玩家编号>`、`invalid_args:奖励 丢弃｜替换 <道具名>`、
 `invalid_args:排行榜`（排行榜不接受参数）。
 
+**已识别裸子命令带多余参数必须携带该子命令的用法后缀**：`/轮盘 开局 额外` →
+`invalid_args:开局`、`/轮盘 开枪 1` → `invalid_args:开枪`。渲染层据此输出
+`命令参数不正确。正确用法：@Bot /轮盘 开局`，**绝不落入 `invalid_args` 裸码的通用系统
+错误文案**（TSK-266 11.1：参数缺失/多余/格式错误统一走用法文案）。
+
+**防御性裸码**：真正的裸 `/轮盘`（无子命令）仍解析为裸 `invalid_args`（无后缀）；
+渲染层对裸 `invalid_args` 也**必须**输出用法文案（静态模板占位），不得输出
+`游戏状态异常，本次操作未执行。请联系管理员。`。该分支只允许出现在无子命令时，
+任何已识别子命令的参数错误都必须带用法后缀。
+
 ## 4. render_reply 契约
 
 纯函数：`ReplyProjectionContext`（冻结投影）→ `ReplyProjection(body, metadata)`。不读
@@ -112,8 +122,22 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
     `**粗体**`；玩家阵容用无序列表 `- `；段落换行分隔。
   - 继续行动/成功上锁：`> 结果句 — **当前：{冻结名}** — 弹仓信息 — *** — 玩家列表`
     （`***` 前后空行；提及 tag 紧跟当前玩家行内的冻结名之后）。
+  - **结果句必须命名动作发起者（actor）**，不是轮转后的新当前玩家：`end_turn` 后当前玩家
+    自动轮转到下一人，但结果句恒为 `{actor}结束了回合。`；`forfeit` 同理为
+    `{actor}选择弃权。`。渲染层按 `context.actor_member_openid` 在 `context.players` 中解析
+    发起者的冻结显示名，绝不使用 `current_player.display_name`。
+  - **锁定回合（`phase == "locked_turn"`）精简投影**（1E `6a9aca9e`）：只展示 `开枪`、`弃权`
+    两个按钮；正文必须包含固定规则行 `你本回合受到锁限制，只能执行一次开枪命令或弃权。`
+    （即 `locked_turn_restriction` 定稿句），避免装饰性文案遗漏限制；只有
+    `game_view.pending_burst` 为真时才追加 `手枪：下一次开枪连发`，否则不出现该行
+    （1B `6a9ac89f`）。
+  - **待连发提示（1B `6a9ac89f`）**：普通 active 局面在 `game_view.pending_burst` 为真时
+    显示 `手枪：下一次开枪连发`；为假时整行省略（默认不显示 `手枪：普通`）。
   - 奖励选择：`> 结果句 — 道具列表已满，选择一项来替换。 — 当前新道具 — 已有道具 —
-    后续待处理奖励 — *** — 当前局面 — *** — 玩家列表`（两条 `***`）。
+    后续待处理奖励 — *** — 当前局面 — *** — 玩家列表`（两条 `***`）。奖励选择的
+    **首行结果句必须是本次空弹射击那份被冻结的空弹文案**（按 `details["consumed_kind"]
+    == "blank"` 用 `shot` 模板冻结），不得输出通用的 `你获得了新道具。`（TSK-266 1D / 1E：
+    奖励提示首行沿用同一次射击选中的文案）。
   - 终局：**单个普通段落**，无 `>`、无 `**`、无 `***`、无列表、无按钮；必须表达
     **导致终局的事件**（由 `details` 的 `completion_reason`/`eliminated_reason` 等
     事实驱动，如谁被淘汰/弃权/超时）、唯一胜者与本群累计胜场（`winner_group_wins`）。
@@ -128,6 +152,11 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
     - `winner`：提及紧跟胜者冻结名之后（样例 `{冻结名} {tag} 获胜，累计胜场 {n}。`
       只示意提及位置；终局正文还须表达终局事件，见上）；
     - `lock_target`：`{冻结名}（{tag}）`（上锁结果句内、冻结名后的括号中）。
+  - **超时（8.2 定稿 `6a9e5f0f`）**：进行中轮转的 `turn_expired` 必须对**刚取得行动权的
+    新当前玩家**产生恰好一次 `turn` 提及（原当前玩家被超时淘汰，服务层必须下发该目标）；
+    终局 `turn_expired` 对唯一胜者产生一次 `winner` 提及。原地继续行动仍不重复 @。
+    服务层 `_reply_mention_target/_reply_mention_reason` 必须把 `turn_expired` 与普通轮转
+    同列处理；渲染层只消费已冻结的 `mention_target`，绝不自行发明。
   - `metadata` 同时携带 `mention_member_openid` 与 `mention_display_name` 一对（供日志/
     校验），但**真实发送载荷的提及断言必须以 `MessageSegment.markdown` 正文中的
     `<qqbot-at-user>` 位置为准**，metadata 对不是充分证据。
@@ -149,6 +178,14 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
     `pending_lock` 时出现。
   - 编号只出现在两个专用区域：道具面板"可上锁的玩家"（`- 2｜小红`）与等候"可转让给"
     （`- 2｜小红`）；按稳定编号升序、保留缺口、不重排、不 @。
+  - **道具面板"可上锁的玩家"的合法目标集**（1H / 锁目标区 `6a9e5fd8`，覆盖候选
+    `6a9e5f8c`）：当前玩家持有 D=锁时才出现该区域；列出的是**合法上锁目标** = 存活、
+    不是自己、**没有已有待生效锁**。绝不能把 `ReplyGameView.pending_lock_players`
+    （＝已有待生效锁的玩家，恰恰是**排除集合**）直接当作可上锁列表渲染。冻结投影
+    语义：`pending_lock_player_seqs/_players` 是排除集合；渲染层按 `context.players` 的
+    `alive`/`pending_lock` 与 `context.current_player.join_seq` 重新计算合法目标集。
+    持锁但没有合法目标时，区域内只显示固定文案 `当前没有可上锁的玩家。`，不列编号、
+    不显示目标输入提示；没有锁时整个区域省略。
 - **排行榜渲染**（TSK-266 10.2 定稿）：
   - `context.result_code == "leaderboard"` 且 `details["leaderboard"]` 为空元组 →
     `本群还没有俄罗斯轮盘胜者。`（普通段落，无按钮、无 mention）。
@@ -247,17 +284,25 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
   - 普通 follow_up（按权威局面动态）：`🧰使用 / 🗑️丢弃`、`🔫开枪 / 🔄装填`、
     `⏹️结束 / 🏳️弃权`；`🧰使用` 填入 `/轮盘 道具 使用`、`🗑️丢弃` 填入
     `/轮盘 道具 丢弃`（1H 定稿：由用户补完道具字母后手动发送，**无尾随空格**；1D 奖励
-    替换与 6a9e6ce3 转让按钮仍按各自定稿保留参数分隔空格）。
-  - 锁定回合：`🔫开枪 / 🏳️弃权`。
+    替换与 6a9e6ce3 转让按钮仍按各自定稿保留参数分隔空格）。**只显示提交后权威局面允许的
+    动作**（1H `6a9bc5dd`）：
+    - 当前玩家无任何道具（阵容行 `道具 0`）→ **不出现** `🧰使用` 与 `🗑️丢弃`；
+    - `game_view.chamber_remaining_total == 6`（满膛）→ **不出现** `🔄装填`；
+    - 没有任一合法道具使用动作（含只有锁但无合法目标）→ 不出现 `🧰使用`；只有锁且存在
+      合法目标时`🧰使用`仍出现（不能沿用“只检查非锁道具”的旧条件）；
+    - `🔫开枪`、`⏹️结束`、`🏳️弃权` 恒在 follow_up 出现。
+  - 锁定回合：`phase == "locked_turn"` → `🔫开枪 / 🏳️弃权`。`locked_turn` 是 TSK-276
+    真实投影拼写，也是唯一接受的锁定阶段值；**不保留 `locked` 别名兼容**。
   - 奖励选择（1D）：`🗑️丢弃新道具 / 🏳️弃权` ＋ 各实际持有类型 `🔄<道具名>` 行
     （`🔄放大镜` / `🔄啤酒` / `🔄连发器` / `🔄锁`，填入 `/轮盘 奖励 替换 <名称>`，按
     A→B→C→D 顺序）。
   - 等候：`加入 / 开始 / 退出 / 取消` ＋ 通用 `🔄转让`（填入 `/轮盘 转让 `，末尾保留
     参数分隔空格）；仅局主一人时省略转让按钮。
   - 终局、排行榜与固定错误：**无按钮**（`metadata["keyboard"]` 为规范空对象
-    `'{"rows": []}'`）。规范 spec 恒为 JSON 对象 `{"rows": [...]}`；本票无历史数据/
-    兼容要求，`keyboard_from_spec`/`build_real_keyboard` **不接受裸 `[]` 形式**（无
-    历史宽容回退），`render_reply` 输出恒为对象形式。
+    `'{"rows": []}'`）。规范 spec 恒为 JSON 对象 `{"rows": [...]}`，其中每个 row 恒为
+    **按钮对象列表**（`[[{"label","data",…}, …], …]`）；本票无历史数据/兼容要求，
+    `keyboard_from_spec`/`build_real_keyboard` **不接受裸 `[]` 形式，也不接受 dict 行形式
+    `{"buttons": [...]}`**（无历史宽容回退），`render_reply` 输出恒为对象形式。
   - **零按钮 spec 不产生 keyboard 段**：spec 的 `rows` 为空时交付载荷只有
     `MessageSegment.markdown(...)`，绝不发送 `MessageSegment.keyboard(rows=[])`
     （无按钮 ≠ 空键盘字段；覆盖 TSK-266 评论 40/41 的“无键盘时…”与评论 81 验收
@@ -279,7 +324,19 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
    不重读服务状态、不 observe、不重渲染。构建失败 → 按第 3 步语义转 NOT_DELIVERED
    （0 网络）。
 2. `service.claim_fulfillment(receipt.receipt_id)`：返回 `None` → `NO_CLAIM`，0 网络
-   （重复事件/已领取）；抛异常 → 原样上抛，0 网络。
+   （重复事件/已领取）；抛异常 → 原样上抛，0 网络。**claim 是唯一允许发送的门**，因此
+   5 分钟凭证窗口必须在 claim 内以收据 `created_at` 对照数据库时钟原子判定
+   （TSK-267 §8 / TSK-278 评论 `6a9ed97d`）：`now - receipt.created_at >= 300s` → 原子
+   `NOT_STARTED → NOT_DELIVERED`，返回 claim 的 `state == NOT_DELIVERED`（不再是
+   `PENDING_CONFIRMATION`）。窗口内（`< 300s`）恰好一次正常领取
+   （`NOT_STARTED → PENDING_CONFIRMATION`）。“未开始且未调用过 QQ API”是过期原子的
+   前提；已 `PENDING_CONFIRMATION`/`DELIVERED`/`NOT_DELIVERED` 的行不变。不新增表/
+   列——直接复用 `komari_roulette_command_receipts.created_at`，下游 279 调度器同字段。
+2b. **非 `PENDING_CONFIRMATION` 的 claim 不得发送**：claim 返回的 `state` 不是
+   `PENDING_CONFIRMATION`（过期窗口已把它原子收敛为 `NOT_DELIVERED`）→ `deliver` 立即返回
+   `NOT_DELIVERED`，0 mark、0 网络、不重试。窗口在 **claim 时刻**用 DB 时钟重新求值：
+   步骤 1 的载荷构建（可能耗时）完成本身不授权发送；若构建期间跨过 300s 边界，claim
+   仍须拒绝（构建前/构建后都不预授权）。
 3. **发送前 runtime 最后重核**：`await runtime_check()`（轮盘开关、群准入、5 分钟凭证
    过期等实时核查；同步返回 bool 或返回 Awaitable[bool] 均可，真实准入重核是异步
    可调用，不得强制仅同步）；结果 False → `service.mark_not_delivered(claim)` →
@@ -308,25 +365,47 @@ send 先于 mark_delivered（无服务模式下用记录型 builder/runtime_chec
 
 ## 7. RouletteQQHandler 契约
 
-`RouletteQQHandler(service, delivery, *, send_gate: Callable[[], bool | Awaitable[bool]] | None = None)`；
+`RouletteQQHandler(service, delivery, *, business_gate, send_gate: Callable[[], bool | Awaitable[bool]] | None = None)`；
 `async handle(bot, event, *, state=None) -> None`：
 
 1. 严格事件资格：仅 `GroupAtMessageCreateEvent`；`event.id`、`event.group_openid`、
    `event.author.member_openid` 非空，否则静默返回。
 2. **准入 token（真实 helper）**：`get_qq_admission_token(state)`（group_admission 顶层
    现有导出）；`None` → 静默返回（0 execute/0 deliver）。
+2b. **token 作用域与身份绑定（TSK-278 评论 `6a9ed97d`）**：token 必须
+   `scope == "business"`，且其 `app_id`/`group_openid`/`member_openid`/`qq_message_id`
+   分别等于 `bot.self_id`/`event.group_openid`/`event.author.member_openid`/`event.id`。
+   作用域不符（`binding` / `binding_challenge`）或任一身份字段不匹配 → 静默返回
+   （0 observe/0 execute/0 deliver，绝不把绑定/绑定挑战 token 当成业务令牌）。该检查在
+   `parse_command` 之前，属于“请求与凭证同源”的静态绑定。
 3. `event.get_message().extract_plain_text()` → `parse_command`；`None` → 静默返回。
 4. active 状态变更动作（shoot/reload/end_turn/use_item/discard_item/choose_item/
    forfeit/transfer 之领域相关者）先 `observe_current(group)`，observation 传入
    `execute_group_command`；等候动作（create/join/leave/cancel/start/open_item_panel/
    leaderboard）不 observe。
+4b. **业务重授权 `business_gate(bot, event, token)`**：必填注入，可在 `handle` 中
+   同步或异步（返回值 `bool` 或 `Awaitable[bool]`）。在 observe 之后、**紧接
+   `execute_group_command` 之前**调用；结果为 False → 直接返回（0 execute/0 deliver）。
+   幂等：恢复重试会重新比对当前即时插件开关与群准入，因此“初诊通过但执行前被撤回”的
+   情况也计为 0 写入。gate 自身抛异常 → 故障关闭（0 execute/0 deliver），不向调用方
+   冒泡（gate 不执行 SQL，不代替领域代码）。`business_gate` 未注入（`None`）时构造期
+   即抛 `TypeError`——**本票不提供无 gate 的宽松兼容默认值**，也不允许由 presence-only
+   调用替代。
 5. 恰好一次 `execute_group_command(request, observation=...)`。
-6. **发送门（TSK-278 评论 6a9ed97d）**：`await send_gate()`（同步或异步）为 False
+6. **发送门（TSK-278 评论 `6a9ed97d`）**：`await send_gate()`（同步或异步）为 False
    （轮盘开关关闭/群准入受限）
    → **不启动新发送**：不调用 `deliver`、不重渲染、不补发；收据保持 NOT_STARTED 由后台
-   过期收敛。为 True 或未注入时才恰好一次 `deliver(receipt, sender)`。
+   过期收敛。为 True 或未注入时才恰好一次 `deliver(receipt, sender)`。**发送路径必须
+   独立于业务准入再次核查**：即使 `business_gate` 通过，`send_gate` 仍要按“发送时刻”的
+   实时开关/准入重判。
 7. `request = CommandRequest(app_id=bot.self_id, group_openid, inbound_msg_id=event.id,
-   member_openid=event.author.member_openid, command, target_mention_count=len(event.mentions or []))`。
+   member_openid=event.author.member_openid, command,
+   target_mention_count=<真实解析消息的 mention_user 段数>)`。**必须读
+   `event.get_message()` 中真实的 `mention_user`（及 `mention_everyone`）段计算数量，
+   严禁直接读 `event.mentions`**：`GroupAtMessageCreateEvent` 的真实模型
+   （`model_validate`）没有 `mentions` 字段，`event.mentions` 恒为 `None`；即使某实现里
+   存在，数组元素也不是 `MessageSegment`。QQ 内容里的 `<@!1234>` 会在
+   `get_message()` 中形成 `mention_user` 段。
 8. handler 自身**不执行 SQL、不写领域、不碰随机**；全部通过注入的 service/delivery 完成。
    错误由上层捕获/记录，handler 不自行重试领域动作或 QQ 发送。
 
@@ -335,8 +414,18 @@ send 先于 mark_delivered（无服务模式下用记录型 builder/runtime_chec
 - 测试文件：`tests/komari_roulette/test_tsk278_*.py`；独立 helpers 在 `tsk278_support.py`。
 - 夹具名固定：小明（member-1）/ 小红（member-2）/ 小白（member-3）；群 `group-1`；
   app `tsk278-app`。
-- 无服务模式：QQ 事件用 `model_construct` 构造，bot 用最小子类，服务/发送/履约用记录型
-  fake；真实 PG 用例按既有 `KOMARI_TEST_POSTGRES_URL` 门控编写（未配置时跳过）。
+- 无服务模式：QQ 事件用 `model_construct` 构造最小事件（允许），bot 用最小子类，
+  服务/发送/履约用记录型 fake；真实 PG 用例按既有 `KOMARI_TEST_POSTGRES_URL` 门控
+  编写（未配置时跳过）。**但凡断言 mention 数/token 身份绑定的事件都必须用真实
+  `GroupAtMessageCreateEvent.model_validate(<最小真实载荷>)` 构造，不得用
+  `model_construct` 手造 `mentions=[...]`**：真实模型没有 `mentions` 字段，@ 只会来自
+  内容里的 `<@!openid>` 解析出的 `mention_user` 段。
+- 群准入实时重核的**共享接缝**用例放在
+  `tests/group_admission/test_qq_roulette_gate.py`：把 handler 的 `business_gate` 接到真实
+  `recheck_qq_effect(..., effect="business")`（经 `prepare_control_plane` 真实策略存储），
+  证明 ingress 之后、执行前撤回群准入 → 0 领域写入 / 0 发送。本票**不**在 roulette 侧自造
+  恒真门；该文件必须声明 `pytestmark = pytest.mark.group_admission_acceptance`（TSK-233
+  marker 闭集），并且 `tests/group_admission/test_marker_closure.py` 保持通过。
 - `test_tsk278_fixture_probe.py` 是**独立夹具探针**：PG 门控、**不 import 任何 TSK-278
   符号**，只验证本票测试用到的真实 TSK-276 PG API/SQL/helper（`create_engine_and_factory`
   / `seed_binding` / `create_waiting` / `CountingProjector` / 收据与履约表结构 / claim 与

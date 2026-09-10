@@ -122,6 +122,41 @@ def test_parse_bare_prefix_with_space_is_invalid_args() -> None:
     assert command.syntax_code == "invalid_args"
 
 
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [
+        ("/轮盘 开局 额外", "invalid_args:开局"),
+        ("/轮盘 加入 额外", "invalid_args:加入"),
+        ("/轮盘 退出 额外", "invalid_args:退出"),
+        ("/轮盘 取消 额外", "invalid_args:取消"),
+        ("/轮盘 开始 额外", "invalid_args:开始"),
+        ("/轮盘 开枪 1", "invalid_args:开枪"),
+        ("/轮盘 弃权 额外", "invalid_args:弃权"),
+        ("/轮盘 结束 额外", "invalid_args:结束"),
+        ("/轮盘 装填 额外", "invalid_args:装填"),
+    ],
+)
+def test_parse_bare_subcommand_with_extra_args_carries_usage(
+    text: str, code: str
+) -> None:
+    """已识别裸子命令 + 多余参数必须携带该子命令的用法后缀。
+
+    TSK-266 11.1：参数多余与参数缺失/格式错误同属“用法文案”；裸 `invalid_args`
+    会让渲染层落入通用系统错误文案（见 renderer 的 `test_bare_invalid_args_*`）。
+    用法模板永不含原始输入，这里只断言后缀稳定且不回显额外参数。
+    """
+    command = _syntax(text)
+    assert _code(command) == code
+    assert "额外" not in _code(command)
+
+
+def test_parse_bare_subcommand_usage_suffix_is_static() -> None:
+    """同一子命令的不同多余参数必须产生相同用法后缀（不回显输入）。"""
+    first = _code(_syntax("/轮盘 开局 额外"))
+    second = _code(_syntax("/轮盘 开局 别的"))
+    assert first == second == "invalid_args:开局"
+
+
 # ---------------------------------------------------------------------------
 # Item letters (case-insensitive) and lock target numbers
 # ---------------------------------------------------------------------------

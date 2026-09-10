@@ -23,6 +23,7 @@ import pytest
 
 from komari_bot.plugins.komari_roulette import (
     CommandReceipt,
+    FulfillmentState,
     StorageUnavailableError,
 )
 from komari_bot.plugins.komari_roulette.qq.delivery import (
@@ -419,11 +420,15 @@ async def test_deliver_async_runtime_recheck_exception_fails_closed() -> None:
     assert sender.network_calls == []
     assert service.mark_not_delivered_calls == [claim("receipt-1")]
     assert service.mark_delivered_calls == []
-    """冻结载荷构建失败（如损坏的 keyboard spec）→ claim 后 mark_not_delivered。"""
+
+
+async def test_deliver_build_failure_after_claim_is_zero_send() -> None:
+    """冻结载荷构建失败（如损坏的 keyboard spec）→ 0 发送，收据转 NOT_DELIVERED。"""
     service = FakeCommandService()
     service.claim_result = claim("receipt-1")
     sender = FakeSender()
     broken = receipt(reply=projection("> 测试。", keyboard_spec="{not-json"))
+
     outcome = await _delivery(service=service).deliver(broken, sender)
 
     assert outcome is DeliveryOutcome.NOT_DELIVERED
@@ -505,6 +510,25 @@ async def test_deliver_claim_failure_no_network_call() -> None:
     with pytest.raises(StorageUnavailableError):
         await _delivery(service=service).deliver(_success_receipt(), sender)
 
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.mark_delivered_calls == []
+    assert service.mark_not_delivered_calls == []
+
+
+async def test_expired_claim_never_sends() -> None:
+    """claim 已把过期凭证原子收敛为 NOT_DELIVERED → 立即返回, 0 发送、0 mark。
+
+    TSK-267 §8 / TSK-278 评论 6a9ed97d：5 分钟窗口在 claim 内以收据
+    `created_at` 对照 DB 时钟判定；非 PENDING_CONFIRMATION 的 claim 不授权发送。
+    """
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1", state=FulfillmentState.NOT_DELIVERED)
+    sender = FakeSender()
+
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
     assert sender.calls == []
     assert sender.network_calls == []
     assert service.mark_delivered_calls == []

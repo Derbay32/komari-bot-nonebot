@@ -49,6 +49,7 @@ from .test_command_service import (
     seed_players,
     start_game,
 )
+from .tsk278_support import assert_single_mention_tag
 
 pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
 
@@ -202,6 +203,49 @@ async def test_real_active_timeout_appends_rotation_after_fixed_notice(
     assert "- Seat 1｜出局｜道具 0" in body
     assert "- **Seat 2**｜当前｜道具 0" in body
     assert "- Seat 3｜存活｜道具 0" in body
+    # 8.2 定稿 6a9e5f0f：进行中轮转必须对刚取得行动权的新当前玩家恰好一次提及。
+    assert_single_mention_tag(body, members[1])
+    assert (
+        f'**当前：Seat 2** <qqbot-at-user id="{members[1]}" />' in body
+    ), body
+
+    await delete_scope(harness.engine, current)
+
+
+async def test_real_completed_timeout_mentions_winner_once(
+    harness: Harness,
+) -> None:
+    """超时终局：唯一胜者恰好一次 winner 提及（8.2 定稿）。"""
+    current = scope("tsk278-renderer-timeout-final")
+    members = await seed_players(harness.binding_manager, current, 2)
+    service = await _started_game(harness, current, members)
+    row = await _row(harness, current)
+
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games "
+                "SET turn_deadline_at = NOW() - INTERVAL '1 minute' "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": str(row["game_id"])},
+        )
+        await session.commit()
+
+    receipt = await _execute(
+        service,
+        harness,
+        current,
+        "end-turn-1",
+        command_factory("end_turn"),
+        member_openid=members[0],
+    )
+
+    assert receipt.result_code == "turn_expired"
+    assert receipt.reply.body.startswith("你的行动时间已经结束，本次命令未执行。")
+    assert "超时出局" in receipt.reply.body
+    assert "累计胜场 1" in receipt.reply.body
+    assert_single_mention_tag(receipt.reply.body, members[1])
 
     await delete_scope(harness.engine, current)
 
@@ -288,6 +332,9 @@ async def test_real_reward_choice_body_matches_confirmed_copy(
 
     assert second.result_code == "item_choice_pending"
     body = second.reply.body
+    # 首行必须是同一次空弹射击冻结的空弹文案，而非通用“你获得了新道具。”
+    assert body.splitlines()[0] == "> Seat 1打出一发空弹。", body
+    assert "你获得了新道具。" not in body
     assert "道具列表已满，选择一项来替换。" in body
     assert "当前新道具：**啤酒**" in body
     assert "已有道具：放大镜 ×1、啤酒 ×1、连发器 ×1、锁 ×1" in body
@@ -372,5 +419,205 @@ async def test_real_leave_after_start_renders_phase_specific_copy(
     assert body.startswith("游戏已经开始，“退出”只用于等候阶段；"), body
     assert "/轮盘 弃权" in body
     assert "无法再改变等候阵容" not in body
+
+    await delete_scope(harness.engine, current)
+
+
+# ---------------------------------------------------------------------------
+# 道具面板：可上锁目标（a/b）——真实 domain → service → renderer
+# ---------------------------------------------------------------------------
+
+
+async def _grant_locks(
+    harness: Harness,
+    current: Scope,
+    *,
+    join_seq: int,
+    count: int,
+) -> None:
+    row = await _row(harness, current)
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_players SET lock_count = :count "
+                "WHERE game_id = :game_id AND join_seq = :join_seq"
+            ),
+            {
+                "count": count,
+                "game_id": str(row["game_id"]),
+                "join_seq": join_seq,
+            },
+        )
+        await session.commit()
+
+
+async def test_real_panel_lock_region_lists_only_eligible_targets(
+    harness: Harness,
+) -> None:
+    """面板可上锁区域 = 存活 ∧ 非自己 ∧ 无已有待生效锁。
+
+    真实局面：Seat 1 持锁并锁住 Seat 2；可上锁只剩 Seat 3，不得把带锁的
+    Seat 2（`pending_lock_players` 排除集合）当成可上锁目标。
+    """
+    current = scope("tsk278-renderer-panel-eligible")
+    members = await seed_players(harness.binding_manager, current, 3)
+    service = await _started_game(harness, current, members)
+    await _grant_locks(harness, current, join_seq=1, count=2)
+
+    locked = await _execute(
+        service,
+        harness,
+        current,
+        "lock-1",
+        command_factory("use_item", item=ItemType.LOCK, target_player_seq=2),
+        member_openid=members[0],
+    )
+    assert locked.result_code == "item_used"
+
+    panel = await _execute(
+        service,
+        harness,
+        current,
+        "panel-1",
+        command_factory("open_item_panel"),
+        member_openid=members[0],
+    )
+    assert panel.result_code == "panel_opened"
+    body = panel.reply.body
+    assert "**可上锁的玩家**" in body
+    assert "- 3｜Seat 3" in body
+    # Seat 2 已有待生效锁（排除集合），Seat 1 是自己。
+    assert "- 2｜Seat 2" not in body
+    assert "- 1｜Seat 1" not in body
+
+    await delete_scope(harness.engine, current)
+
+
+async def test_real_panel_lock_without_legal_target_shows_empty_copy(
+    harness: Harness,
+) -> None:
+    """持锁但没有合法目标：区域内只显示固定空文案，不列编号、不给输入提示。"""
+    current = scope("tsk278-renderer-panel-empty")
+    members = await seed_players(harness.binding_manager, current, 2)
+    service = await _started_game(harness, current, members)
+    await _grant_locks(harness, current, join_seq=1, count=2)
+
+    locked = await _execute(
+        service,
+        harness,
+        current,
+        "lock-1",
+        command_factory("use_item", item=ItemType.LOCK, target_player_seq=2),
+        member_openid=members[0],
+    )
+    assert locked.result_code == "item_used"
+
+    panel = await _execute(
+        service,
+        harness,
+        current,
+        "panel-1",
+        command_factory("open_item_panel"),
+        member_openid=members[0],
+    )
+    body = panel.reply.body
+    assert "**可上锁的玩家**" in body
+    assert "当前没有可上锁的玩家。" in body
+    assert "- 2｜Seat 2" not in body
+    assert "使用锁时" not in body
+
+    await delete_scope(harness.engine, current)
+
+
+# ---------------------------------------------------------------------------
+# 锁定回合面板：固定限制行（1E）+ 仅开枪/弃权
+# ---------------------------------------------------------------------------
+
+
+async def test_real_locked_turn_board_restriction_line_and_buttons(
+    harness: Harness,
+) -> None:
+    """Seat 1 锁住 Seat 2 → 回合轮到 Seat 2 时进入 locked_turn 精简面板。"""
+    import json as _json
+
+    current = scope("tsk278-renderer-locked-turn")
+    members = await seed_players(harness.binding_manager, current, 3)
+    service = await _started_game(harness, current, members)
+    await _grant_locks(harness, current, join_seq=1, count=2)
+
+    locked = await _execute(
+        service,
+        harness,
+        current,
+        "lock-1",
+        command_factory("use_item", item=ItemType.LOCK, target_player_seq=2),
+        member_openid=members[0],
+    )
+    assert locked.result_code == "item_used"
+
+    shot = await _execute(
+        service,
+        harness,
+        current,
+        "shoot-1",
+        command_factory("shoot"),
+        member_openid=members[0],
+    )
+    assert shot.result_code == "shot"
+
+    ended = await _execute(
+        service,
+        harness,
+        current,
+        "end-turn-1",
+        command_factory("end_turn"),
+        member_openid=members[0],
+    )
+    assert ended.result_code == "turn_ended"
+    body = ended.reply.body
+    assert "你本回合受到锁限制，只能执行一次开枪命令或弃权。" in body
+
+    spec = _json.loads(str(ended.reply.metadata["keyboard"]))
+    labels = [button["label"] for row in spec["rows"] for button in row]
+    assert labels == ["🔫开枪", "🏳️弃权"]
+
+    await delete_scope(harness.engine, current)
+
+
+# ---------------------------------------------------------------------------
+# end_turn 结果句命名发起者（而非轮转后的新当前玩家）
+# ---------------------------------------------------------------------------
+
+
+async def test_real_end_turn_sentence_names_actor(
+    harness: Harness,
+) -> None:
+    current = scope("tsk278-renderer-endturn-actor")
+    members = await seed_players(harness.binding_manager, current, 2)
+    service = await _started_game(harness, current, members)
+
+    shot = await _execute(
+        service,
+        harness,
+        current,
+        "shoot-1",
+        command_factory("shoot"),
+        member_openid=members[0],
+    )
+    assert shot.result_code == "shot"
+
+    ended = await _execute(
+        service,
+        harness,
+        current,
+        "end-turn-1",
+        command_factory("end_turn"),
+        member_openid=members[0],
+    )
+    assert ended.result_code == "turn_ended"
+    body = ended.reply.body
+    assert body.splitlines()[0] == "> Seat 1结束了回合。", body
+    assert "Seat 2结束了回合" not in body
+    assert "**当前：Seat 2**" in body
 
     await delete_scope(harness.engine, current)

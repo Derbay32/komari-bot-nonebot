@@ -13,6 +13,7 @@ gate is enabled.
 
 from __future__ import annotations
 
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
@@ -653,3 +654,178 @@ async def test_leaderboard_after_self_expiry_is_not_leaderboard(
     )
     assert shown.result_code == "leaderboard"
     assert projector.context_objects[-1].result_code == "leaderboard"
+
+
+# ---------------------------------------------------------------------------
+# 5 分钟凭证窗口：收据 created_at 对照 DB 时钟，在 claim 内原子判定
+# ---------------------------------------------------------------------------
+
+
+async def _receipt_age_seconds(
+    session_factory: async_sessionmaker[AsyncSession],
+    receipt_id: str,
+) -> float:
+    async with session_factory() as session:
+        age = await session.scalar(
+            text(
+                "SELECT EXTRACT(EPOCH FROM (clock_timestamp() - created_at)) "
+                "FROM komari_roulette_command_receipts "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": receipt_id},
+        )
+    assert age is not None
+    return float(age)
+
+
+async def test_real_receipt_aged_past_window_never_sends(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """收据 created_at 超过 300s → claim 原子收敛为 NOT_DELIVERED，0 网络。
+
+    TSK-267 §8 / TSK-278 评论 6a9ed97d：NOT_STARTED 且未调用过 QQ API 时，
+    凭证>5min 与构建失败/插件关闭/准入受限一样，原子转 NOT_DELIVERED，
+    绝不调用平台。
+    """
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-delivery-expired")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_command_receipts "
+                "SET created_at = NOW() - make_interval(secs => 301) "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+        await session.commit()
+    assert await _receipt_age_seconds(session_factory, real_receipt.receipt_id) >= 300
+
+    sender = FakeSender(result="qq-platform-expired")
+    outcome = await RouletteDelivery(service=service).deliver(real_receipt, sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert sender.calls == []
+    assert sender.network_calls == []
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT state, platform_message_id "
+                    "FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id"
+                ),
+                {"receipt_id": real_receipt.receipt_id},
+            )
+        ).mappings().first()
+    assert row is not None
+    assert row["state"] == "NOT_DELIVERED"
+    assert row["platform_message_id"] is None
+
+
+async def test_real_receipt_in_window_sends_once(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """窗口内（< 300s）仍恰好一次正常发送；边界不得误杀。"""
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-delivery-window-ok")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+    assert await _receipt_age_seconds(session_factory, real_receipt.receipt_id) < 300
+
+    sender = FakeSender(result="qq-platform-window-ok")
+    outcome = await RouletteDelivery(service=service).deliver(real_receipt, sender)
+
+    assert outcome is DeliveryOutcome.DELIVERED
+    assert len(sender.network_calls) == 1
+
+
+async def test_real_slow_build_crossing_window_never_sends(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """构建先于 claim；若构建期间跨过 300s 边界，claim 仍须拒发。
+
+    构建完成的时刻不预授权发送：窗口必须在 claim 时刻用 DB 时钟重新判定。
+    """
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+        build_qq_message,
+    )
+
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-delivery-crossing")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+
+    # 构建开始时仍在窗口内（~299s）。
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_command_receipts "
+                "SET created_at = NOW() - make_interval(secs => 299) "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+        await session.commit()
+
+    def slow_builder(receipt: Any) -> Any:
+        time.sleep(2.0)  # 阻塞事件循环：模拟构建耗时，claim 已跨过边界
+        return build_qq_message(receipt)
+
+    sender = FakeSender(result="qq-platform-crossing")
+    outcome = await RouletteDelivery(
+        service=service,
+        payload_builder=slow_builder,
+    ).deliver(real_receipt, sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert sender.calls == []
+    assert sender.network_calls == []
+    async with session_factory() as session:
+        state = await session.scalar(
+            text(
+                "SELECT state FROM komari_roulette_fulfillments "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+    assert state == "NOT_DELIVERED"

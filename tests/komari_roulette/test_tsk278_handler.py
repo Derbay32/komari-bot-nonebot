@@ -1,18 +1,25 @@
 """TSK-278 RED baseline: strict QQ group-@-message handler seam.
 
-The red root for this file is the missing ``RouletteQQHandler`` symbol in
-``komari_bot.plugins.komari_roulette.qq.handler``.  Assertions follow
+The red roots for this file are the missing/incorrect ``RouletteQQHandler``
+seam in ``komari_bot.plugins.komari_roulette.qq.handler``.  Assertions follow
 ``TSK-278-contract.md`` section 7: strict GroupAtMessageCreateEvent
 eligibility, real admission handoff (``get_qq_admission_token``, not faked),
-parse-driven dispatch, one execute + one deliver, observation pre-read for
-active commands only, send gate (plugin switch / group admission recheck)
-before starting any send, and no SQL/domain/random access (collaborators are
-injected).
+**token scope + identity binding** (a binding token or a token for another
+app/group/member/message never authorizes a business command), a mandatory
+business re-authorization gate placed *after* observe and *immediately before*
+execute (revocation between observe and execute means zero writes), parse-driven
+dispatch, one execute + one deliver, observation pre-read for active commands
+only, send gate (plugin switch / group admission recheck) re-checked separately
+before starting any send, ``target_mention_count`` read from the real parsed
+``mention_user`` segments (never ``event.mentions``), and no SQL/domain/random
+access (collaborators are injected).
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+import pytest
 
 from komari_bot.plugins.group_admission.qq import get_qq_admission_token
 from komari_bot.plugins.komari_roulette import (
@@ -30,13 +37,17 @@ from .tsk278_support import (
     FakeQQBot,
     admission_state,
     business_token,
+    event_mention_count,
     make_c2c_event,
     make_direct_event,
     make_group_at_event,
     make_plain_group_event,
+    make_real_group_at_event,
     projection,
     receipt,
 )
+
+_MISSING = object()
 
 
 def _handler(
@@ -44,15 +55,23 @@ def _handler(
     service: FakeCommandService | None = None,
     delivery: FakeDelivery | None = None,
     send_gate: Any = None,
+    business_gate: Any = _MISSING,
 ) -> tuple[RouletteQQHandler, FakeCommandService, FakeDelivery]:
     fake_service = service or FakeCommandService()
     fake_delivery = delivery or FakeDelivery()
+    if business_gate is _MISSING:
+        business_gate = _allow_gate
     handler = RouletteQQHandler(
         service=fake_service,
         delivery=fake_delivery,
+        business_gate=business_gate,  # type: ignore[call-arg]  # RED: 生产尚未接受该必填参数
         send_gate=send_gate,
     )
     return handler, fake_service, fake_delivery
+
+
+def _allow_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+    return True
 
 
 def _success_receipt() -> CommandReceipt:
@@ -164,6 +183,199 @@ async def test_admission_token_reads_real_state_key() -> None:
     )
     assert len(service.execute_calls) == 1
     assert len(delivery.deliver_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Token scope + identity binding (presence alone must never authorize)
+# ---------------------------------------------------------------------------
+
+
+async def test_binding_scope_token_never_authorizes_business_command() -> None:
+    """绑定/绑定挑战 token 不得当作业务令牌使用。"""
+    handler, service, delivery = _handler()
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(token=business_token(scope="binding")),
+    )
+    assert service.observe_calls == []
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
+
+
+async def test_binding_challenge_scope_token_never_authorizes_business_command() -> None:
+    handler, service, delivery = _handler()
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(token=business_token(scope="binding_challenge")),
+    )
+    assert service.observe_calls == []
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
+
+
+@pytest.mark.parametrize(
+    "token_kwargs",
+    [
+        pytest.param({"app_id": "other-app"}, id="wrong-app"),
+        pytest.param({"group_openid": "other-group"}, id="wrong-group"),
+        pytest.param({"member_openid": "member-9"}, id="wrong-member"),
+        pytest.param({"qq_message_id": "msg-9"}, id="wrong-message"),
+    ],
+)
+async def test_identity_mismatch_token_never_authorizes(
+    token_kwargs: dict[str, Any],
+) -> None:
+    """token 与事件必须同源：app/group/member/message 任一不符即静默拒绝。"""
+    handler, service, delivery = _handler()
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(token=business_token(**token_kwargs)),
+    )
+    assert service.observe_calls == []
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Business re-authorization gate (mandatory, after observe, before execute)
+# ---------------------------------------------------------------------------
+
+
+def test_business_gate_is_mandatory() -> None:
+    """没有业务重授权门即构造失败——本票不提供 presence-only 宽松默认值。"""
+    service = FakeCommandService()
+    delivery = FakeDelivery()
+    with pytest.raises(TypeError):
+        RouletteQQHandler(service=service, delivery=delivery)  # type: ignore[call-arg]
+
+
+async def test_business_gate_runs_after_observe_and_before_execute() -> None:
+    seen: list[tuple[str, int, int]] = []
+    service = FakeCommandService()
+    delivery = FakeDelivery()
+    _execute_success(service)
+    service.observation = Observation(game_id="game-1", state_revision=7, turn_seq=3)
+
+    def recording_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        seen.append(("gate", len(service.observe_calls), len(service.execute_calls)))
+        return True
+
+    handler, service, delivery = _handler(
+        service=service, delivery=delivery, business_gate=recording_gate
+    )
+
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+
+    assert seen == [("gate", 1, 0)], (
+        "business_gate 必须在 observe_current 之后、execute_group_command 之前调用"
+    )
+    assert len(service.execute_calls) == 1
+    assert len(delivery.deliver_calls) == 1
+
+
+async def test_business_gate_receives_bot_event_and_token() -> None:
+    received: list[tuple[Any, Any, Any]] = []
+
+    def gate(bot: Any, event: Any, token: Any) -> bool:
+        received.append((bot, event, token))
+        return True
+
+    handler, service, _delivery = _handler(business_gate=gate)
+    _execute_success(service)
+    event = make_group_at_event("/轮盘 开枪")
+    token = business_token()
+    await _run(handler, FakeQQBot(), event, state=admission_state(token=token))
+
+    assert len(received) == 1
+    passed_bot, passed_event, passed_token = received[0]
+    assert passed_bot.self_id == APP_ID
+    assert passed_event is event
+    assert passed_token is token
+
+
+async def test_business_gate_async_is_awaited() -> None:
+    calls: list[str] = []
+
+    async def async_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        calls.append("gate")
+        return True
+
+    handler, service, delivery = _handler(business_gate=async_gate)
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+    assert calls == ["gate"]
+    assert len(service.execute_calls) == 1
+    assert len(delivery.deliver_calls) == 1
+
+
+async def test_business_gate_false_blocks_execute_and_deliver() -> None:
+    """观察后、执行前准入被撤回 → 0 领域写入、0 发送。"""
+    handler, service, delivery = _handler(business_gate=lambda *_a: False)
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+    # observe 可以在 gate 之前发生（只读），但绝不 execute / deliver。
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
+
+
+async def test_business_gate_revocation_between_observe_and_execute_blocks_write() -> None:
+    """模拟群准入/插件开关在校验后、执行前被撤回：gate 重新裁决必须拦住写入。"""
+
+    def revoked_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        return False
+
+    handler, service, delivery = _handler(business_gate=revoked_gate)
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
+
+
+async def test_business_gate_exception_fails_closed() -> None:
+    """gate 自身异常（准入查询失败）→ 故障关闭，0 execute/0 deliver。"""
+
+    def broken_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        raise RuntimeError
+
+    handler, service, delivery = _handler(business_gate=broken_gate)
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +517,33 @@ async def test_send_gate_runs_before_delivery_and_gates_it() -> None:
     assert len(delivery.deliver_calls) == 1
 
 
+async def test_send_gate_is_independent_of_business_gate() -> None:
+    """业务重授权通过后，发送时刻仍要独立重核（门顺序不可合并）。"""
+    order: list[str] = []
+
+    def business_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        order.append("business")
+        return True
+
+    def send_gate() -> bool:
+        order.append("send")
+        return False
+
+    handler, service, delivery = _handler(
+        business_gate=business_gate, send_gate=send_gate
+    )
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+    assert order == ["business", "send"]
+    assert len(service.execute_calls) == 1
+    assert delivery.deliver_calls == []
+
+
 async def test_async_send_gate_is_awaited() -> None:
     """真实准入实时门可为异步可调用：await 结果再决定是否启动发送。"""
     calls: list[str] = []
@@ -356,7 +595,11 @@ async def test_request_fingerprint_uses_event_identity() -> None:
             member_openid="member-7",
             author_name="阿七",
         ),
-        state=admission_state(token=business_token(member_openid="member-7")),
+        state=admission_state(
+            token=business_token(
+                member_openid="member-7", qq_message_id="qq-msg-42"
+            )
+        ),
     )
 
     request, _observation = service.execute_calls[0]
@@ -366,17 +609,40 @@ async def test_request_fingerprint_uses_event_identity() -> None:
     assert request.member_openid == "member-7"
 
 
-async def test_request_mention_count_matches_event_mentions() -> None:
+async def test_request_mention_count_comes_from_real_parsed_segments() -> None:
+    """真实模型没有 `mentions` 字段；@ 必须来自解析出的 mention_user 段。"""
     handler, service, _delivery = _handler()
     _execute_success(service)
-    mentions = [{"id": "x", "type": "mention_user"}]
-    await _run(
-        handler,
-        FakeQQBot(),
-        make_group_at_event("/轮盘 开枪", mentions=mentions),
-        state=admission_state(),
-    )
+    event = make_real_group_at_event("/轮盘 开枪 <@!12345>")
+    # 真实 QQ 事件没有 mentions 数组；presence-only 读 event.mentions 只会得 None。
+    assert event.mentions is None
+    await _run(handler, FakeQQBot(), event, state=admission_state())
+
     request, _observation = service.execute_calls[0]
+    assert event_mention_count(event) == 1
+    assert request.target_mention_count == 1
+
+
+async def test_request_mention_count_is_zero_without_mention_segments() -> None:
+    handler, service, _delivery = _handler()
+    _execute_success(service)
+    event = make_real_group_at_event("/轮盘 开枪")
+    await _run(handler, FakeQQBot(), event, state=admission_state())
+
+    request, _observation = service.execute_calls[0]
+    assert event_mention_count(event) == 0
+    assert request.target_mention_count == 0
+
+
+async def test_request_mention_count_counts_everyone_segment() -> None:
+    handler, service, _delivery = _handler()
+    _execute_success(service)
+    event = make_real_group_at_event("<@!all> /轮盘 开枪")
+    assert event.mentions is None
+    await _run(handler, FakeQQBot(), event, state=admission_state())
+
+    request, _observation = service.execute_calls[0]
+    assert event_mention_count(event) == 1
     assert request.target_mention_count == 1
 
 
