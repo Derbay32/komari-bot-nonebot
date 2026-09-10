@@ -30,6 +30,7 @@ _PERMISSION_PATTERN = re.compile(
 )
 _READ_PERMISSION_IMPLICATIONS: Mapping[str, frozenset[str]] = {
     "announce:read": frozenset({"announce:send"}),
+    "character_binding:read": frozenset({"character_binding:manage"}),
     "config:read": frozenset({"config:write"}),
     "help:read": frozenset({"help:write"}),
     "knowledge:read": frozenset({"knowledge:write"}),

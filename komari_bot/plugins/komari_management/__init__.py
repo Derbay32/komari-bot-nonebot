@@ -48,6 +48,10 @@ from komari_bot.plugins.user_data.config_schema import (
 
 from .announcement_repository import close_announcement_dispatch_repository
 from .api_runtime import ManagementApiComponents, register_management_api_for_driver
+from .binding_repair_lifecycle import (
+    start_binding_repair_service,
+    stop_binding_repair_service,
+)
 from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
 from .startup_cleanup import cleanup_management_v1_config
@@ -93,6 +97,8 @@ def _load_management_components() -> ManagementApiComponents:
     from komari_bot.plugins import komari_chat as chat_plugin
     require("group_admission")
     from komari_bot.plugins import group_admission as group_admission_plugin
+    require("character_binding")
+    from komari_bot.plugins import character_binding as character_binding_plugin
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
@@ -109,6 +115,8 @@ def _load_management_components() -> ManagementApiComponents:
         user_ban_service_getter=user_ban_plugin.get_service,
         register_group_admission_api=group_admission_plugin.register_group_admission_api,
         reply_fulfillment_service_getter=chat_plugin.get_reply_fulfillment_ops_service,
+        register_character_binding_repair_api=character_binding_plugin.register_character_binding_repair_api,
+        character_binding_repair_service_getter=character_binding_plugin.get_binding_repair_service,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -252,6 +260,22 @@ state.api_registered = register_management_api_for_driver(
 async def _cleanup_management_v1_config() -> None:
     """清理 v1 管理配置残留并提示旧权限名。"""
     await cleanup_management_v1_config(logger=logger)
+
+
+@driver.on_startup
+async def _start_binding_repair_service() -> None:
+    """管理装配创建绑定修复服务（仅在管理 API 已注册时）。"""
+    if not state.api_registered:
+        return
+    start_binding_repair_service()
+
+
+@driver.on_shutdown
+async def _stop_binding_repair_service() -> None:
+    """管理装配关闭绑定修复服务（与创建对称，仅当曾注册 API）。"""
+    if not state.api_registered:
+        return
+    await stop_binding_repair_service()
 
 
 @driver.on_shutdown

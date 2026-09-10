@@ -75,10 +75,11 @@ type ManagementAuditRecorder = Callable[[ManagementAuditEvent], Awaitable[None]]
 
 @dataclass(slots=True)
 class ManagementAuditSpan:
-    """允许业务代码在结束前补充安全计数的审计上下文。"""
+    """允许业务代码在结束前补充安全计数与最终目标哈希的审计上下文。"""
 
     metadata: dict[str, AuditMetadataValue] = field(default_factory=dict)
     status_code: int = status.HTTP_200_OK
+    target_hash: str | None = None
 
 
 class JsonlManagementAuditRecorder:
@@ -227,9 +228,16 @@ async def management_audit_span(
     recorder: ManagementAuditRecorder,
     field_name: str | None = None,
     target_hash: str | None = None,
+    initial_metadata: Mapping[str, AuditMetadataValue] | None = None,
 ) -> AsyncIterator[ManagementAuditSpan]:
-    """写入 attempt/result 两阶段事件；attempt 失败时不执行变更。"""
+    """写入 attempt/result 两阶段事件；attempt 失败时不执行变更。
+
+    ``initial_metadata`` 显式声明 span 起始即可见的安全字段（如预览版本、
+    预期数量与范围），使 ``started`` 与后续 ``failed`` 都携带同一份真实
+    上下文；缺省为空，保持既有调用语义不变。
+    """
     started_at = time.monotonic()
+    initial = dict(initial_metadata or {})
     base_event = ManagementAuditEvent(
         timestamp=datetime.now(tz=UTC).isoformat(),
         request_id=request_id,
@@ -240,10 +248,11 @@ async def management_audit_span(
         target_hash=target_hash,
         reason=reason,
         outcome="started",
+        metadata=initial,
     )
     await recorder(base_event)
 
-    span = ManagementAuditSpan()
+    span = ManagementAuditSpan(metadata=dict(initial))
     try:
         yield span
     except BaseException as exc:
@@ -274,6 +283,11 @@ async def management_audit_span(
                 outcome="succeeded",
                 duration_ms=round((time.monotonic() - started_at) * 1000, 3),
                 status_code=span.status_code,
+                target_hash=(
+                    span.target_hash
+                    if span.target_hash is not None
+                    else base_event.target_hash
+                ),
                 metadata=dict(span.metadata),
             ),
         )

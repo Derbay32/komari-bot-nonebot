@@ -57,6 +57,8 @@ class ManagementApiComponents:
     reply_fulfillment_service_getter: Callable[[], object | None]
     config_resources: tuple[ManagedConfigResource, ...]
     prompt_resources: tuple[ManagedPromptResource, ...]
+    register_character_binding_repair_api: Callable[..., None]
+    character_binding_repair_service_getter: Callable[[], object | None]
 
 
 def register_management_api_for_driver(
@@ -130,6 +132,12 @@ def register_management_api_for_driver(
         server_app,
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
+    )
+    components.register_character_binding_repair_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+        service_getter=components.character_binding_repair_service_getter,
     )
     register_reply_fulfillment_api(
         server_app,

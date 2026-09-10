@@ -10,6 +10,9 @@ import pytest
 from pydantic import BaseModel
 
 from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
+from komari_bot.plugins.character_binding.management_api import (
+    register_character_binding_repair_api,
+)
 from komari_bot.plugins.group_admission import register_group_admission_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
@@ -82,6 +85,8 @@ def _build_components() -> ManagementApiComponents:
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
         reply_fulfillment_service_getter=lambda: None,
+        register_character_binding_repair_api=register_character_binding_repair_api,
+        character_binding_repair_service_getter=lambda: None,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -142,6 +147,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
     assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
+    assert "/api/v2/character-bindings/repair/diagnose" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" not in schema["paths"]
     tag_names = {
         tag
@@ -159,4 +165,5 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         "komari-management-prompt",
         "komari-user-bans",
         "reply-fulfillments",
+        "character-binding-repair",
     } <= tag_names
