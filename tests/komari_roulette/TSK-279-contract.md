@@ -335,3 +335,167 @@ PG/Redis 门控（PG 门控目标本轮未跑，仅改两条非 PG 纯投影 fix
 | `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python`（worktree 根，`filesAnalyzed`=690） | ✅ 0 errors, 0 warnings |
 
 Stage-B（runtime/worker/发送观测/REST/迁移面）未开始。
+
+## 9. Stage-B：runtime / 恢复扫描 / 清理 / 观测（本阶段）
+
+本阶段把 TSK-269 Resolution §2–§4 的生命周期、恢复、清理与观测面钉在**真实**
+PG + 真实 `RouletteCommandService.advance_expired` 深入口上；文件：
+`test_tsk279_runtime.py`、`test_tsk279_maintenance_pg.py`、
+`test_tsk279_observability.py`。生产模块 `komari_bot.plugins.komari_roulette.
+{runtime,maintenance,observability}` 尚不存在，RED 由 `load_symbol` 懒加载，失败为
+`ModuleNotFoundError` / `AttributeError`（“缺失接缝”桶）；对既有 no-arg 回调
+`send_gate` / `runtime_check` 的按调用演进用例失败为断言 / `TypeError`
+（“断言”桶）。两者都是设计内 RED，不是 fixture 造假。
+
+### 9.1 拟议最窄公共接缝
+
+```python
+# komari_bot/plugins/komari_roulette/runtime.py
+class RouletteRuntimeStatus(StrEnum): READY; DISABLED; FAILED
+RUNTIME_REASON_CODES: frozenset[str]      # 闭集：config_unavailable /
+                                          # admission_unavailable / storage_unavailable /
+                                          # recovery_failed / plugin_disabled / policy_restricted /
+                                          # policy_admitted / not_ready
+@dataclass(frozen=True) class RouletteRuntimeState:
+    status; reason_code; recovery_completed: bool; plugin_enable: bool
+@dataclass(frozen=True) class RouletteAuthority:
+    allowed: bool; reason_code: str; scope: str
+class RouletteRuntime:
+    def __init__(self, *, config_manager, recovery, admission) -> None
+    async def start(self) -> None          # config → recovery tick → READY/DISABLED/FAILED
+    async def close(self) -> None          # blocks dispatch；不 dispose 共享引擎
+    @property def accepting(self) -> bool
+    def get_state(self) -> RouletteRuntimeState
+    def authorize(self, *, scope: str, group_ids: Sequence[int], token=None) -> RouletteAuthority
+    async def run_recovery_tick(self) -> object
+
+# komari_bot/plugins/komari_roulette/maintenance.py
+RECOVERY_INTERVAL_SECONDS = 60
+RECOVERY_BATCH_SIZE = 100
+CLEANUP_HOUR = 4
+RECOVERY_JOB_ID; CLEANUP_JOB_ID
+@dataclass(frozen=True) class RecoveryTickResult:
+    scanned; advanced; skipped_restricted; failed; cursor
+@dataclass(frozen=True) class CleanupResult:
+    receipts_deleted; games_deleted; results_deleted; more_pending
+class RouletteMaintenance:
+    def __init__(self, *, session_factory, service, admission) -> None
+    async def advance_due(self, *, batch_size: int = 100) -> RecoveryTickResult
+    async def cleanup_retention(self, *, batch_size: int = 100) -> CleanupResult
+def register_maintenance_jobs(scheduler, maintenance) -> None
+def unregister_maintenance_jobs(scheduler) -> None
+
+# komari_bot/plugins/komari_roulette/observability.py
+OBSERVATION_REASON_CODES: frozenset[str]
+@dataclass(frozen=True) class RouletteObservation:
+    FIELDS: ClassVar[frozenset[str]]      # 固定键集合，随 as_dict() 一一对应
+    runtime_status; runtime_reason; latest_scan; latest_cleanup;
+    pending_receipts; fault_counts: tuple[tuple[str, int], ...]
+    def as_dict(self) -> dict[str, object]
+class RouletteObservability:
+    def __init__(self, *, session_factory=None, clock=None) -> None
+    async def refresh_pending(self) -> int
+    def note_scan(self, result: RecoveryTickResult) -> None
+    def note_cleanup(self, result: CleanupResult) -> None
+    def note_fault(self, error: BaseException) -> None
+    def snapshot(self) -> RouletteObservation
+def safe_fault_projection(error: BaseException) -> dict[str, str]  # 仅 error_type + reason_code
+def set_runtime_state(state: RouletteRuntimeState) -> None
+```
+
+`admission` 是**群级**门 `(app_id, group_openid) -> bool`，不携带成员身份；
+maintenance 经真实 `advance_expired` 推进（waiting 超时与 active 回合超时同一深入口），
+绝不发消息、绝不建收据/履约。
+
+### 9.2 AC → 用例 → 未来真实装配位置
+
+| AC（Resolution） | 用例（Stage-B） | 未来真实组合位置 |
+|---|---|---|
+| 启动顺序：ORM/配置/绑定准入/存储/恢复 | `runtime::test_start_reaches_ready_only_after_recovery_tick` | Stage-C：NoneBot `on_startup`，真实 `ConfigManager.initialize_async()` + `group_admission` + `RouletteCommandService` |
+| 恢复完成前拒绝业务/发送 | `runtime::test_runtime_rejects_business_before_recovery_completes` | Stage-C：handler `business_gate` / delivery `runtime_check` 接 `authorize()` |
+| `failed` ≠ 无对局 | `maintenance::test_completed_wins_project_once_and_recovery_does_not_resettle`（`no_active_game` 不改胜场） | Stage-C：`advance_expired` 结果码映射 |
+| 动态关停只停新业务，维护继续 | `runtime::test_plugin_disabled_states_disabled_but_recovery_still_runs` | Stage-C：`plugin_enable` 即时重读 |
+| 配置/DB 不可用 → FAILED；下一 tick → READY | `runtime::test_config_unavailable_reports_failed_without_running_recovery`、`::test_transient_recovery_failure_recovers_to_ready_next_tick` | Stage-C：真实异常分类，禁止静默 fallback |
+| 跨多个错过 15min 期限只淘汰旧当前一次、新当前自 PG now 获满 15min | `maintenance::test_advance_expired_eliminates_once_and_grants_full_window`（**绿探针**） | 已用真实深入口；Stage-C 只做调度接线 |
+| waiting 超时与回合超时共用深入口 | `maintenance::test_retention_fixture_has_real_terminal_lifecycles`（expired 分支）、`::test_recovery_skips_restricted_groups_and_creates_no_send` | Stage-C：`advance_due` 调 `advance_expired` |
+| 60s / batch100 / coalesce / max_instances=1 仅节流 | `maintenance::test_maintenance_jobs_registered_with_throttle_and_deploy_timezone` | Stage-C：注册到 `nonebot_plugin_apscheduler` 单例 |
+| 受限群不推进；再准入只推进旧当前一次 | `maintenance::test_recovery_skips_restricted_groups_and_creates_no_send` | Stage-C：`group_admission.adjudicate(intent=BUSINESS)` 按群 |
+| 有界分页 2–3 tick 不饿死后续 allowed 群 | `maintenance::test_recovery_paginates_past_a_restricted_batch` | Stage-C：真实游标持久化 |
+| 后台无合法 msgid：不建收据/履约、不发平台 | `maintenance::test_advance_expired_eliminates_once_and_grants_full_window`（计数不变）、`::test_recovery_skips_restricted_groups_and_creates_no_send` | Stage-C：maintenance 不持有 sender |
+| PENDING 仅计数，不重发/不猜/不调平台 | `observability::test_pending_count_reflects_real_receipts` | Stage-C：`refresh_pending` 用真实 status 视图，绝不 claim |
+| 超时终局发送失败不二次结算胜场 | 既有 TSK-278 delivery 用例 + `maintenance::test_completed_wins_project_once_and_recovery_does_not_resettle` | Stage-C：delivery `UNKNOWN` 保持 PENDING + 幂等终局 |
+| NoRedis 正确性 | `maintenance::test_maintenance_does_not_require_redis` | Stage-C：确认维护路径无 Redis import/调用 |
+| QQ 用户封禁保持真实群准入门 | `runtime::test_authority_is_per_call_isolated_between_groups` | Stage-C：真实 `user_ban` preprocessor 与群准入叠加 |
+| 维护只群级准入、不凭空给 member | `maintenance::test_recovery_skips_restricted_groups_and_creates_no_send`（gate 仅 app/group） | Stage-C：真实群→member 映射在 handler 侧，不在 maintenance |
+| 04:00 部署时区清理 | `maintenance::test_maintenance_jobs_registered_with_throttle_and_deploy_timezone`（`cleanup.trigger.timezone == 部署 tz`，不信 host TZ） | Stage-C：`nonebot_plugin_apscheduler` 默认 `Asia/Shanghai` |
+| PG UTC 账龄：收据+履约 7d；cancelled/expired/failed 30d；waiting/active 永不删；completed+结果+座位+胜场长期 | `maintenance::test_cleanup_deletes_aged_receipts_and_keeps_recent`、`::test_cleanup_deletes_nonwin_terminals_keeps_completed_and_wins`、`::test_retention_fixture_has_real_terminal_lifecycles`（**绿探针**，`clock_timestamp()` 账龄） | Stage-C：真实保留策略常量与分组删除 |
+| 真实表字段 + FK | `maintenance::test_retention_fixture_has_real_terminal_lifecycles`、`tsk279_support.seed_aged_receipt` / `insert_waiting_game` | Stage-C：迁移 0022+ 不得漂移 |
+| 合法终态闭集 | `maintenance::test_retention_fixture_has_real_terminal_lifecycles`（completed/cancelled/expired/failed 各一） | Stage-C：清理只删终态，绝不删 waiting/active |
+| 精确边界 7d/30d | `maintenance::test_cleanup_deletes_aged_receipts_and_keeps_recent`（7d+60s vs 6d）、`::test_cleanup_deletes_nonwin_terminals_keeps_completed_and_wins`（31d vs 40d completed） | Stage-C：边界常量 `> 7d` / `> 30d` |
+| 批界 + 可重入清理，不丢证据 | `maintenance::test_cleanup_is_batch_bounded_and_reentrant` | Stage-C：真实批删除 + 游标 |
+| protected 排首不饿死 eligible | `maintenance::test_cleanup_does_not_starve_eligible_behind_protected` | Stage-C：按表候选，不与 waiting/active 混队 |
+| 清理不重建/不改胜场 | `maintenance::test_cleanup_deletes_nonwin_terminals_keeps_completed_and_wins` | Stage-C：清理绝不调 `rebuild_leaderboard` |
+| shutdown：先停新派发/移除调度→有界 drain；不 dispose 共享 ORM 引擎；已发未确认保持 PENDING | `runtime::test_close_blocks_new_dispatch_and_never_disposes_shared_engine` | Stage-C：`on_shutdown` 按序；`nonebot_plugin_orm` 引擎共享 |
+| 按事件/令牌隔离准入与发送上下文 | `runtime::test_authority_is_per_call_isolated_between_groups` | Stage-C：真实多事件并发，A 撤销不影响 B |
+| 现网 no-arg `send_gate` / `runtime_check` 演进为按调用 | `runtime::test_handler_send_gate_receives_the_per_call_request`、`::test_delivery_runtime_check_receives_the_per_call_receipt` | Stage-C：`SendGate = Callable[[CommandRequest], bool]`、`RuntimeCheck = Callable[[CommandReceipt], bool]` |
+| 观测 ready/disabled/failed、最近扫描/清理、待确认计数、固定原因码、低基数计数 | `observability::test_observability_seam_exposes_fixed_projection`、`::test_pending_count_reflects_real_receipts` | Stage-C：真实 runtime 状态源 + status 视图计数 |
+| 恶意异常日志/投影不泄漏 identity/body/secret/chamber/future-reward | `observability::test_existing_reply_details_redaction_drops_hidden_and_secret_keys`（**绿探针**）、`::test_fault_projection_strips_a_malicious_exception` | Stage-C：真实 logger 输出走同一投影 |
+| 不新增 /metrics、不主动 QQ 通知 | `observability::test_fault_projection_collapses_multiline_payload_to_one_record`（固定键、无 channel 字段） | Stage-C：合同约束，无新端点/通知 |
+| 失败聚合不逐行重复 | `observability::test_fault_projection_collapses_multiline_payload_to_one_record` | Stage-C：按固定 reason 聚合并计次 |
+| 正常回调不得接 always-true 假生产接线 | 全部 runtime 用例显式传测试端口 `RecordingConfig` / `RecordingRecovery` / `_admission_by_group`，且注释声明它们**不是**生产 authority | Stage-C：真实装配必须替换这些端口 |
+
+### 9.3 Stage-B 绿探针（真实符号，无新模块）
+
+- `advance_expired` 单次淘汰 + 新窗口满 15min（读 `clock_timestamp()`）。
+- 终局 projection 幂等、胜场不二次结算、`no_active_game` 不碰胜场。
+- 作用域 advisory lock 经 `backend_pid` / `wait_for_blocked` 真实阻塞可观。
+- 四种真实终态 fixture（completed/cancelled/expired/failed）满足 CHECK/FK，
+  `result_players ≥ 2`、运行时座位清空。
+- 既有 `_safe_details` 允许清单丢弃 identity/body/secret/chamber/reward 键。
+
+### 9.4 Stage-C 待验证链（本阶段不宣称）
+
+真实 `on_startup`/`on_shutdown` 装配、真实 `group_admission` 群→member 解析、
+真实 `user_ban` 叠加、真实调度单例注册、真实保留策略常量、`SendGate`/
+`RuntimeCheck` 生产改签名、`nonebot_plugin_orm` 引擎共享断言的真实进程路径、
+REST/管理面、Alembic 迁移与 `check` 零 diff。
+
+### 9.5 Stage-B 执行记录（命令日志）
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+HEAD `78bb94b48005213fb733334401bb83ed6286d6f6`（提交后 `a314ec6`），
+root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）。
+PG/Redis 门控：
+
+```
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
+```
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/{tsk279_support.py,test_tsk279_runtime.py,test_tsk279_maintenance_pg.py,test_tsk279_observability.py}` | ✅ All checks passed |
+| `pytest tests/komari_roulette/test_tsk279_runtime.py tests/komari_roulette/test_tsk279_maintenance_pg.py tests/komari_roulette/test_tsk279_observability.py -q`（带门控） | 6 passed / 23 failed |
+| `pytest tests/komari_roulette/ -q`（带门控，全子套件） | ✅ 496 passed / 23 failed（失败全部为本阶段 RED） |
+
+RED 失败原因分类（`--tb=line`）：
+
+- `ModuleNotFoundError: ...komari_roulette.runtime` — 8 例
+- `ModuleNotFoundError: ...komari_roulette.maintenance` — 9 例
+- `ModuleNotFoundError: ...komari_roulette.observability` — 4 例
+- `AssertionError`（现网 no-arg `send_gate` / `runtime_check` 未按调用） — 2 例
+
+绿探针（全部真实符号，无 TSK-279 新模块）：
+
+- `advance_expired` 跨两个错过窗口只淘汰旧当前一次、新窗口自 PG now 满 15min，
+  且不新增收据/履约。
+- 终局 projection 幂等、胜场不二次结算、`no_active_game` 不碰胜场。
+- 作用域 advisory lock 经 `backend_pid`/`wait_for_blocked` 真实阻塞可观。
+- 原始 SQL waiting fixture 被真实深入口推进（`waiting_game_expired`）。
+- 四种真实终态（completed/cancelled/expired/failed）满足 CHECK/FK，
+  `result_players ≥ 2`、运行时座位清空。
+- 既有 `_safe_details` 允许清单丢弃 identity/body/secret/chamber/reward 键。
+
+清理核验：用例结束后按前缀 `tsk279-%` 统计轮盘四表与 character_binding 群/成员
+均为 0；门控库 `alembic_version` 仍为 `0021`，未降低 head。
