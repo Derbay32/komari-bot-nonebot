@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
@@ -106,6 +107,22 @@ class FulfillmentState(StrEnum):
 #: against the PostgreSQL clock; the TSK-279 scheduler reuses this same constant
 #: and the same ``komari_roulette_command_receipts.created_at`` column.
 FULFILLMENT_CREDENTIAL_WINDOW_SECONDS: int = 300
+
+
+def _age_seconds(value: object) -> float | None:
+    """Coerce a driver-reported credential age, or ``None`` when unusable.
+
+    ``EXTRACT(EPOCH FROM ...)`` is ``numeric`` so asyncpg hands back a
+    :class:`~decimal.Decimal`, but the value is validated before use so an
+    unexpected driver type fails closed instead of raising mid-claim.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,9 +709,9 @@ class RouletteCommandService:
                 if state is not FulfillmentState.NOT_STARTED:
                     await session.rollback()
                     return None
-                age_seconds = row["age_seconds"]
+                age_seconds = _age_seconds(row["age_seconds"])
                 if age_seconds is None or (
-                    float(age_seconds) >= FULFILLMENT_CREDENTIAL_WINDOW_SECONDS
+                    age_seconds >= FULFILLMENT_CREDENTIAL_WINDOW_SECONDS
                 ):
                     await session.execute(
                         text(
