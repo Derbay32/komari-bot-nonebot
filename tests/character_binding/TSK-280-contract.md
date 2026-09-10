@@ -97,6 +97,41 @@ class RepairBlockedByGameError(RuntimeError)       # 群内存在 waiting/active
 
 存储/基础设施失败继续使用既有 `BindingPersistenceError`，不得伪装成「无目标」。
 
+#### 确认前令牌审计上下文探针（最终缺陷修复）
+
+`confirm` 路由必须在打开审计 span（即写 `started` 事件）之前调用一个
+**同步**、只读、非消耗的探针，用真实目标与预览版本填充 `started`/`failed`：
+
+```python
+@dataclass(frozen=True, slots=True)
+class RepairConfirmAuditContext:
+    scope: RepairScope          # "member" | "group"
+    member_openid: str | None   # group 范围为 None
+    version: str                # 预览版本指纹
+    expected_count: int         # 预览时的预期清除数量
+
+class BindingRepairService:
+    def get_confirm_audit_context(
+        self,
+        *,
+        app_id: str,
+        group_openid: str,
+        token: str,
+        operator_id: str,
+    ) -> RepairConfirmAuditContext | None: ...
+```
+
+- **同步**（非 `async`）：调用方不得 `await`；返回冻结 dataclass（生产未落地
+  时测试用等价测试内结构协议，不 import 该类型以免整包 collect 崩溃）。
+- **只读、非消耗**：仅当令牌存在、未过期、未使用、`operator_id` 相符且目标
+  `app_id`/`group_openid` 相符时返回上下文；其余一律返回 `None`。
+- 返回 `None` 时**不消耗令牌、不访问数据库、不抛异常**；路由必须回退为请求
+  群安全哈希，`started`/`failed` 绝不泄露他人目标。
+- 探针的 `scope`/`member_openid`/`version`/`expected_count` 用于 `started`
+  与 `failed` 事件；`succeeded` 的 `target_hash`/metadata 仍以真实 `confirm`
+  结果为准，失败路径的 `version`/`expected_count` 必须来自探针而非调用结果。
+- `started` 审计失败时不得调用 `confirm`（令牌不消耗、正式行不删除）。
+
 ### 服务语义
 
 - `diagnose`：只读诊断；必须直接读取 PostgreSQL（`BindingTransaction.resolve_group`

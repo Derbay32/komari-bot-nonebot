@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -404,6 +406,7 @@ async def test_audit_records_safe_fields_only(app: App) -> None:
         "character_binding.repair.confirm",
     ]
     preview_success = audit_events[1]
+    confirm_started = audit_events[2]
     confirm_success = audit_events[3]
     assert preview_success.operator_id == "binding-wildcard"
     assert preview_success.reason == "运营核对错误关联"
@@ -427,6 +430,24 @@ async def test_audit_records_safe_fields_only(app: App) -> None:
     assert confirm_success.metadata["expected_count"] == 1
     assert confirm_success.metadata["cleared_count"] == 1
     assert confirm_success.metadata["result_code"] == "cleared"
+    # 确认 started 必须在业务调用前经同步只读探针解析真实目标：成员哈希、
+    # scope、预览 version 与预期数量都要在 started 上可见，不能只靠 succeeded
+    # 事后覆盖（否则依赖变动/审计失败路径会丢失真实目标）。
+    assert confirm_started.outcome == "started"
+    assert confirm_started.target_hash == safe_target_hash(
+        current, member_openid=member.member_openid
+    )
+    assert confirm_started.metadata["scope"] == "member"
+    assert confirm_started.metadata["version"] == "fingerprint-abc"
+    assert confirm_started.metadata["expected_count"] == 1
+    assert service.audit_context_calls == [
+        {
+            "app_id": current.app_id,
+            "group_openid": current.group_openid,
+            "token": "preview-token-1",
+            "operator_id": "binding-wildcard",
+        }
+    ]
 
     rendered = json.dumps(
         [event.to_dict() for event in audit_events],
@@ -575,6 +596,72 @@ async def test_audit_final_failure_does_not_break_operation(app: App) -> None:
     assert len(service.preview_calls) == 1
     assert len(service.confirm_calls) == 1
     assert [event.outcome for event in recorder.events] == ["started", "started"]
+
+
+def test_stub_repair_service_has_no_magic_fallback() -> None:
+    """桩纠错：未知方法不得被魔术回退吞掉，探针同步、同名、关键字闭集。
+
+    旧桩对任意公开未知方法返回可 await 的假值，会把路由的方法名拼写错误、
+    签名漂移或误 ``await`` 静默降级成「无有效上下文」，让既有 REST 契约
+    用例假通过。纠错后未知方法必须 ``AttributeError``，同步探针被误
+    ``await`` 必须 ``TypeError``，且配置了 ``confirm_result`` 时必须按真实
+    scope/version/expected_count 返回类型化上下文而不是恒 ``None``。
+    """
+    service = StubBindingRepairService()
+    assert not hasattr(service, "get_confirm_audit_ctx")
+    with pytest.raises(AttributeError):
+        service.get_confirm_audit_ctx(  # type: ignore[attr-defined]
+            app_id="a", group_openid="g", token="t", operator_id="o"
+        )
+    assert not inspect.iscoroutinefunction(service.get_confirm_audit_context)
+    with pytest.raises(TypeError):
+        # 关键字闭集：位置参数必须被签名拒绝（路由误传位参要立刻可见）。
+        inspect.signature(service.get_confirm_audit_context).bind(
+            "a", "g", "t", "o"
+        )
+    # 同步探针误 ``await``：返回类型不是可等待对象，必须立刻 TypeError，
+    # 而不是像旧 ``_FalsyAwaitable`` 那样被静默吞掉。
+    async def _await_probe() -> object:
+        probe_result: Any = service.get_confirm_audit_context(
+            app_id="a", group_openid="g", token="t", operator_id="o"
+        )
+        return await probe_result
+
+    with pytest.raises(TypeError):
+        asyncio.run(_await_probe())
+
+    current = make_scope("stub-probe")
+    member = current.with_member(1)
+    service.confirm_result = confirm_result_payload(
+        current,
+        scope="member",
+        member_openid=member.member_openid,
+        version="probe-version",
+        expected_count=1,
+    )
+    context = service.get_confirm_audit_context(
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        token="preview-token-1",
+        operator_id="binding-wildcard",
+    )
+    assert context is not None
+    assert (
+        context.scope,
+        context.member_openid,
+        context.version,
+        context.expected_count,
+    ) == ("member", member.member_openid, "probe-version", 1)
+    # 未配置 confirm_result：无效上下文返回 None，不消耗也不查库。
+    assert (
+        StubBindingRepairService().get_confirm_audit_context(
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            token="preview-token-1",
+            operator_id="binding-wildcard",
+        )
+        is None
+    )
 
 
 def test_route_set_is_fixed_without_identity_repoint() -> None:

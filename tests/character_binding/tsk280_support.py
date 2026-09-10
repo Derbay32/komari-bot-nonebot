@@ -780,59 +780,76 @@ REVOKED_MANAGE_CREDENTIALS = [
 ]
 
 
-class _FalsyAwaitable:
-    """容错探针返回：真值判定为假，可被 ``await``，未知属性返回 ``None``。
+@dataclass(frozen=True, slots=True)
+class StubRepairConfirmAuditContext:
+    """测试内结构协议：与生产 ``RepairConfirmAuditContext`` 同形。
 
-    TSK-280 最终缺陷修复在业务调用前新增只读、非消耗的令牌审计上下文探针；
-    桩服务无需复现其真实签名，但必须保证未知探针名不会因缺方法把既有 REST
-    契约用例变成夹具错误：无效/未知令牌语义（无有效上下文）下路由回退请求群
-    哈希，与当前 succeeded 事件按结果覆盖成员哈希的行为保持一致。
+    生产冻结 dataclass 尚未落地时，用它承载桩探针返回的真实
+    scope/member_openid/version/expected_count，避免在夹具里 import 尚未
+    实现的业务类型导致整包 collect 崩溃；路由只做属性访问，结构一致即可。
     """
 
-    def __await__(self) -> Any:
-        async def _settle() -> _FalsyAwaitable:
-            return self
-
-        return _settle().__await__()
-
-    def __bool__(self) -> bool:
-        return False
-
-    def __getattr__(self, name: str) -> None:
-        del name
+    scope: str
+    member_openid: str | None
+    version: str
+    expected_count: int
 
 
 class StubBindingRepairService:
     """REST 路由测试使用的桩服务端口实现。
 
-    桩服务只复现协议（diagnose/preview/confirm 三个关键字方法）与
-    预先配置的失败异常；返回值是普通 dict，由路由层的 response_model
-    负责定型，避免在夹具里 import 尚未实现的业务模块。
+    桩服务复现协议（diagnose/preview/confirm 与只读令牌审计上下文探针）与
+    预先配置的失败异常；返回值是普通 dict，由路由层的 response_model 负责
+    定型，避免在夹具里 import 尚未实现的业务模块。**没有**未知方法魔术
+    回退：任何方法名/签名偏差都必须以 ``AttributeError`` / ``TypeError``
+    显式暴露，绝不静默降级为「无有效上下文」。
     """
 
     def __init__(self) -> None:
         self.diagnose_calls: list[dict[str, str]] = []
         self.preview_calls: list[dict[str, object]] = []
         self.confirm_calls: list[dict[str, object]] = []
+        self.audit_context_calls: list[dict[str, str]] = []
         self.diagnosis: dict[str, object] | None = None
         self.preview_result: dict[str, object] | None = None
         self.confirm_result: dict[str, object] | None = None
         self.error: BaseException | None = None
 
-    def __getattr__(self, name: str) -> Any:
-        """未知探针方法容错：返回可直接判定/可 await 的无效上下文。
+    def get_confirm_audit_context(
+        self,
+        *,
+        app_id: str,
+        group_openid: str,
+        token: str,
+        operator_id: str,
+    ) -> StubRepairConfirmAuditContext | None:
+        """同步、只读、非消耗的确认前令牌审计上下文探针（与生产同名同签名）。
 
-        仅对下划线开头的私有/特殊名保持 ``AttributeError``，避免干扰框架
-        内省；业务侧公开探针名一律得到无效上下文（回退群哈希语义）。
+        仅当已配置 ``confirm_result`` 且未配置失败异常时返回真实
+        scope/version/预期数量；无效配置返回 ``None``（路由回退请求群哈希），
+        且绝不消耗令牌或执行任何 IO。该方法刻意不是协程：路由若误用
+        ``await`` 会立刻 ``TypeError``，而不是被魔术回退静默吞掉。
         """
-        if name.startswith("_"):
-            raise AttributeError(name)
-
-        def _probe(*args: object, **kwargs: object) -> _FalsyAwaitable:
-            del args, kwargs
-            return _FalsyAwaitable()
-
-        return _probe
+        self.audit_context_calls.append(
+            {
+                "app_id": app_id,
+                "group_openid": group_openid,
+                "token": token,
+                "operator_id": operator_id,
+            }
+        )
+        result = self.confirm_result
+        if self.error is not None or result is None:
+            return None
+        member_openid = result.get("member_openid")
+        return StubRepairConfirmAuditContext(
+            scope=str(result.get("scope", "member")),
+            member_openid=(
+                str(member_openid) if member_openid is not None else None
+            ),
+            version=str(result["version"]),
+            expected_count=int(str(result["expected_count"])),
+        )
 
     async def diagnose(self, **kwargs: object) -> dict[str, object]:
         self.diagnose_calls.append({key: str(value) for key, value in kwargs.items()})
@@ -981,6 +998,7 @@ __all__ = [
     "Scope",
     "SessionCloseCounter",
     "StubBindingRepairService",
+    "StubRepairConfirmAuditContext",
     "backend_pid",
     "bind_member",
     "clear_binding_scope",

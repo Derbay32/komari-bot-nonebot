@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import fields
+from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -168,6 +168,40 @@ def test_repair_value_objects_have_fixed_fields() -> None:
         "member_openid",
         "cleared_count",
         "cleared_names",
+        "version",
+        "expected_count",
+    ]
+
+
+def test_repair_service_exposes_synchronous_confirm_audit_probe() -> None:
+    """最终缺陷探针 ``get_confirm_audit_context`` 必须同步、同名、关键字闭集。
+
+    路由在业务调用前用它解析真实目标与预览 version/预期数量，使 ``started``
+    事件即携带成员哈希；同步契约可让误 ``await`` 立即 ``TypeError``，而不是
+    被整包依赖注入或静默降级掩盖。
+    """
+    probe: Any = getattr(BindingRepairService, "get_confirm_audit_context", None)
+    assert probe is not None, "缺少 BindingRepairService.get_confirm_audit_context"
+    assert not inspect.iscoroutinefunction(probe)
+    assert _keyword_only_names(probe) == {
+        "app_id",
+        "group_openid",
+        "token",
+        "operator_id",
+    }
+
+
+def test_repair_confirm_audit_context_is_frozen_dataclass_with_fixed_fields() -> None:
+    """探针值对象 ``RepairConfirmAuditContext``：冻结且字段集合固定。"""
+    from komari_bot.plugins.character_binding import repair
+
+    context_type: Any = getattr(repair, "RepairConfirmAuditContext", None)
+    assert context_type is not None, "缺少 RepairConfirmAuditContext"
+    assert is_dataclass(context_type)
+    assert getattr(context_type, "__dataclass_params__").frozen is True
+    assert [field.name for field in fields(context_type)] == [
+        "scope",
+        "member_openid",
         "version",
         "expected_count",
     ]
