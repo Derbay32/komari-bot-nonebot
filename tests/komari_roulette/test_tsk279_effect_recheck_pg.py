@@ -58,6 +58,7 @@ from .tsk278_support import (
 from .tsk279_support import (
     Tsk279Harness,
     harness_fixture_body,
+    scope_counts,
 )
 
 if TYPE_CHECKING:
@@ -1215,6 +1216,11 @@ async def test_installed_matcher_business_gate_reads_live_authority_for_same_tok
             assert await _receipt_count(
                 harness, current, "installed-policy-1"
             ) == 0
+            denied_counts = await scope_counts(harness.session_factory, current)
+            assert all(count == 0 for count in denied_counts.values()), (
+                "a before-domain rejection must leave zero receipt, game and "
+                f"fulfillment rows, got {denied_counts}"
+            )
         finally:
             clear_roulette_qq_runtime()
             group_admission.register_qq_group_resolver(None)
@@ -1354,5 +1360,110 @@ async def test_installed_handler_rechecks_authority_inside_the_group_lock(
                 await ban_service.unban_user(
                     user_id=str(member_qq), target_scope="command"
                 )
+            with suppress(Exception):
+                await ban_service.close()
+
+
+@PG_REQUIRED
+async def test_installed_matcher_never_borrows_a_token_across_groups(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two real groups: a token minted for one must never authorize the other."""
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.komari_roulette.qq import (
+        clear_roulette_qq_runtime,
+        handle_roulette_qq,
+        install_roulette_qq_runtime,
+    )
+    from komari_bot.plugins.user_ban.service import UserBanService
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    from .tsk279_lifecycle_support import RecordingQQBot
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    service = service_for(
+        harness,
+        projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+        random_source=CountingRandom(),
+    )
+    ban_service = UserBanService()
+
+    async def ban_checker(member_qq_value: int, scope: object) -> bool:
+        return await ban_service.is_user_banned(
+            str(member_qq_value), cast("Any", scope)
+        )
+
+    async def business_gate(_bot: Any, _event: Any, checked: Any) -> bool:
+        decision = await group_admission.recheck_qq_effect(
+            checked, effect="business"
+        )
+        return decision.allowed
+
+    async with harness.scope("iso-a") as group_a, harness.scope("iso-b") as group_b:
+        resolve_group, resolve_member = await _real_binding_resolvers(harness)
+        group_admission.register_qq_group_resolver(
+            resolve_group, member_resolver=resolve_member
+        )
+        group_admission.register_qq_ban_checker(ban_checker)
+        install_roulette_qq_runtime(
+            service=service,
+            business_gate=business_gate,
+            runtime_check=lambda _receipt: True,
+            send_gate=lambda _request: True,
+        )
+        try:
+            for offset, scope_value in enumerate((group_a, group_b)):
+                await harness.binding_manager.bind_group_member(
+                    app_id=scope_value.app_id,
+                    group_id=str(279400 + offset),
+                    group_openid=scope_value.group_openid,
+                    member_qq=str(5_000_000_000 + offset),
+                    member_openid=scope_value.member_openid,
+                    character_name="Seat 1",
+                    bot_self_id="tsk279-test-bot",
+                )
+            token_a, _mint_a, event_a = await _mint_business_token(
+                group_a, "iso-a-1"
+            )
+            token_b, _mint_b, event_b = await _mint_business_token(
+                group_b, "iso-b-1"
+            )
+
+            bot_a = RecordingQQBot(group_a.app_id)
+            bot_b = RecordingQQBot(group_b.app_id)
+            # A's token must not authorize B's event, even though both groups
+            # are admitted and A's token is valid in its own scope.
+            await handle_roulette_qq(
+                bot_b, event_b, admission_state(token=token_a)
+            )
+            assert await _receipt_count(harness, group_b, "iso-b-1") == 0
+            assert bot_b.calls == []
+
+            await handle_roulette_qq(
+                bot_a, event_a, admission_state(token=token_a)
+            )
+            assert await _receipt_count(harness, group_a, "iso-a-1") == 1
+            assert [api for api, _data in bot_a.calls] == ["post_group_messages"]
+            assert bot_a.calls[0][1]["msg_id"] == "iso-a-1"
+
+            await handle_roulette_qq(
+                bot_b, event_b, admission_state(token=token_b)
+            )
+            assert await _receipt_count(harness, group_b, "iso-b-1") == 1
+            assert [api for api, _data in bot_b.calls] == ["post_group_messages"]
+            assert bot_b.calls[0][1]["msg_id"] == "iso-b-1"
+        finally:
+            clear_roulette_qq_runtime()
+            group_admission.register_qq_group_resolver(None)
+            group_admission.register_qq_ban_checker(None)
             with suppress(Exception):
                 await ban_service.close()

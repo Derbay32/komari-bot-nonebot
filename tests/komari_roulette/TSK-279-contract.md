@@ -976,9 +976,10 @@ async def close(self) -> None
 | 已接受的 claim 后 `effect_check` 不得绕过 PG 窗口 | `effect::test_real_delivery_accepted_effect_check_still_honours_expired_window` | 缺签名 RED |
 | 已安装真实 handler/service 提交有效 token 并产出真实 SDK 载荷 | `effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload` | **GREEN 探针（不依赖 lifecycle）** |
 | 已安装真实 handler 的 business gate 对 ban/remap/policy 逐一拒绝同一 token | `effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token` | **GREEN 探针（不依赖 lifecycle）** |
+| 已安装真实 handler 在同一 runtime 下两组互不借 token（A token 不能授权 B 事件） | `effect::test_installed_matcher_never_borrows_a_token_across_groups` | **GREEN 探针（不依赖 lifecycle）** |
 | 已安装真实 handler 在组锁内复核撤权 → 零 receipt/零发送 | `effect::test_installed_handler_rechecks_authority_inside_the_group_lock` | **业务断言 RED（缺锁后 effect 复核）** |
 
-### 13.3 RED / GREEN 分类（Stage-C1 返工后实测：29 failed / 4 passed）
+### 13.3 RED / GREEN 分类（Stage-C1 返工后实测：29 failed / 5 passed）
 
 | 桶 | 用例 | 实测首错 |
 |---|---|---|
@@ -988,10 +989,10 @@ async def close(self) -> None
 | 业务断言（handler 未传 per-call closure） | `handler::…original_token_closure…`、`concurrent_handlers…` | `AssertionError: the handler must pass the per-call effect_check to the service / each handler call must pass its own post-lock closure` |
 | 业务断言（已安装 handler 缺锁后复核） | `installed::test_installed_handler_rechecks_authority_inside_the_group_lock` | `AssertionError: an authority revoked while the command queued must leave no domain receipt`（receipt 被提交） |
 | 业务断言（`maintenance.close` 立即返回） | `lifecycle_pg::test_maintenance_close_waits_for_the_in_flight_cleanup_round` | `AssertionError: maintenance.close() must wait for the in-flight cleanup round instead of returning immediately`（`assert not True`） |
-| **GREEN（不依赖 lifecycle 的真实旧 API 探针）** | `effect::test_old_api_authority_chain…`、`effect::test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends`、`effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload`、`effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token` | ✅ 4 passed（真实 `AdmissionRuntime` + 真实 `BindingTransaction` + 真实 `user_ban` + 真实 `RouletteCommandService`/`RouletteDelivery` + 真实 QQ adapter 传输录制） |
+| **GREEN（不依赖 lifecycle 的真实旧 API 探针）** | `effect::test_old_api_authority_chain…`、`effect::test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends`、`effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload`、`effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token`、`effect::test_installed_matcher_never_borrows_a_token_across_groups` | ✅ 5 passed（真实 `AdmissionRuntime` + 真实 `BindingTransaction` + 真实 `user_ban` + 真实 `RouletteCommandService`/`RouletteDelivery` + 真实 QQ adapter 传输录制） |
 
 未使用 `fakeSender`/import error 单独宣称任一 AC 通过；缺 seam 用例在被测符号存在
-后才会执行真实业务断言。四条 GREEN 均不依赖 `lifecycle` 模块，证明 C1 不是靠
+后才会执行真实业务断言。五条 GREEN 均不依赖 `lifecycle` 模块，证明 C1 不是靠
 「`QQruntime != None` + 全 true 门」才能通过。
 
 ### 13.4 本阶段未验证（保留给后续修复轮）
@@ -1025,7 +1026,7 @@ KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
 | `ruff check tests/komari_roulette/` | ✅ All checks passed |
 | `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控，C1 初版：baseline `8a4483b` + 当时**未提交**的 C1 测试 diff，后提交为 `9592c74`） | 1 passed / 24 failed（全部设计内 RED；1 passed 为后来删除的 tautological `test_lifecycle_module_path_is_frozen`） |
 | `pytest .../test_tsk279_runtime.py .../test_tsk279_maintenance_pg.py .../test_tsk279_observability.py -q`（带门控，改后回归） | ✅ 62 passed / 0 failed |
-| `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控，C1 返工后，HEAD `9592c74`） | 4 passed / 29 failed（4 GREEN 旧 API 探针；29 缺 seam/签名/符号/业务断言 RED，详见 §13.6） |
+| `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控，C1 返工后） | 5 passed / 29 failed（5 GREEN 旧 API 探针；29 缺 seam/签名/符号/业务断言 RED，详见 §13.6） |
 | `ruff check tests/komari_roulette/`（C1 返工后） | ✅ All checks passed |
 | `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python`（C1 初版） | 7 errors，全部为设计内 `effect_check`/`EffectCheckRejectedError` 缺签名 RED；lifecycle 文件 0 报错 |
 
@@ -1073,6 +1074,8 @@ KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
 4. **新增 1 条已安装路径 RED**：`test_installed_handler_rechecks_authority_inside_the_group_lock`
    ——真实 handler/service/admission/binding/ban，成员在命令排队等组锁时被封禁；
    要求组锁内复核后零 receipt、零发送。当前失败于 receipt 被提交（缺锁后复核）。
+   另新增 `test_installed_matcher_never_borrows_a_token_across_groups`：两组同一
+   runtime 下 A 的 token 不得授权 B 的事件（GREEN）。
 5. **旧 API＋PG 窗口 RED**：`test_real_delivery_accepted_effect_check_still_honours_expired_window`
    ——即使 claim 后 `effect_check` 接受，仍必须遵守 PG 窗口（缺 `effect_check` 签名即 RED）。
 6. **依赖获取/生命周期竞态 RED（lifecycle）**：
