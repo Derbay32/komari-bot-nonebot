@@ -7,7 +7,15 @@ connection or execute DDL.  Database/session ownership remains with callers.
 from nonebot.plugin import PluginMetadata, require
 
 require("character_binding")
+# The QQ adapter layer consumes the group-admission handoff token written into
+# the event state; declare the dependency explicitly and import its public
+# top-level surface only.
+require("group_admission")
 
+# Importing the QQ subpackage registers its group-@ matcher.  The matcher stays
+# inert until the composition root installs the runtime, so importing it has no
+# side effect on a deployment where the roulette plugin is disabled.
+from . import qq  # noqa: F401
 from .help_copy import help_usage
 
 __plugin_meta__ = PluginMetadata(
