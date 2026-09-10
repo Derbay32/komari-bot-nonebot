@@ -54,10 +54,6 @@ WAITING_CANCELLED_TEXT = "本局已取消。"
 #: ``{winner}`` 的位置唯一决定，配置既不能伪造也不能移动它。
 _MENTION_SLOT = "\x00"
 
-#: 无法解析终局原因时使用的终局槽位。三条终局模板都必须同时表达胜者、事件与
-#: 胜场，因此这只是文案选择，不是状态回退。
-DEFAULT_FINAL_COPY_KEY = "shot"
-
 
 class _ProjectionCopyPool:
     """A frozen copy snapshot bound to one isolated random source."""
@@ -523,25 +519,43 @@ def _final_outcome_player(context: ReplyProjectionContext) -> ReplyPlayer | None
     return next((player for player in context.players if not player.alive), None)
 
 
-def _final_copy_key(context: ReplyProjectionContext) -> str:
-    """Resolve the terminal copy key from the frozen receipt details.
+#: 终局 reason 缺失、越界或互相矛盾时的固定拒绝文案；绝不回显原始 details。
+_FINAL_REASON_REJECTED_TEXT = "终局回复缺少唯一有效的出局原因，无法生成终局文案。"
 
-    ``_eliminate_current`` always stamps the terminal reason into the reply, so
-    a committed game resolves one of the closed terminal keys.  A projection
-    built without one (direct unit projection) still renders the generic slot.
+
+def _final_copy_key(context: ReplyProjectionContext) -> str:
+    """Resolve the one closed terminal reason frozen into the receipt details.
+
+    ``_eliminate_current`` stamps the committed terminal reason into the reply,
+    so a real completed game always carries exactly one of the closed reasons:
+    ``shot`` only in ``completion_reason``, ``forfeit`` / ``timeout`` in both
+    fields set to the same value.  A projection that carries no reason, an
+    out-of-closure reason, or two different closed reasons is rejected with
+    ``ValueError`` **before** any copy is drawn: the renderer never guesses a
+    ``shot`` terminal and never fabricates an elimination event.  The refusal
+    message is fixed and never echoes the raw receipt details.
     """
 
+    reasons: set[str] = set()
     for field in ("eliminated_reason", "completion_reason"):
-        value = context.details.get(field)
-        if isinstance(value, str) and value in FINAL_COPY_KEYS:
-            return value
-    return DEFAULT_FINAL_COPY_KEY
+        if field not in context.details:
+            continue
+        value = context.details[field]
+        if not isinstance(value, str) or value not in FINAL_COPY_KEYS:
+            raise ValueError(_FINAL_REASON_REJECTED_TEXT)
+        reasons.add(value)
+    if len(reasons) != 1:
+        raise ValueError(_FINAL_REASON_REJECTED_TEXT)
+    return reasons.pop()
 
 
 def _final_body(
     context: ReplyProjectionContext,
     pool: _ProjectionCopyPool,
 ) -> str:
+    # Resolve the mandatory closed reason before drawing anything so a receipt
+    # without one is rejected instead of guessed into a ``shot`` terminal.
+    reason = _final_copy_key(context)
     winner = context.winner
     winner_name = _escape_name(winner.display_name) if winner is not None else ""
     tag = ""
@@ -550,14 +564,12 @@ def _final_body(
     event = ""
     eliminated = _final_outcome_player(context)
     if eliminated is not None:
-        reason = context.details.get("eliminated_reason")
-        if reason is None:
-            reason = context.details.get("completion_reason")
-        reason_text = _ELIMINATED_REASON_CN.get(str(reason), "出局")
-        event = f"{_escape_name(eliminated.display_name)}{reason_text}，"
+        # The verified reason indexes the closed copy map directly: no second
+        # fallback event text exists.
+        event = f"{_escape_name(eliminated.display_name)}{_ELIMINATED_REASON_CN[reason]}，"
     wins = context.winner_group_wins
     sentence = pool.final_sentence(
-        _final_copy_key(context),
+        reason,
         event=event,
         winner=f"{winner_name}{_MENTION_SLOT}",
         wins=wins if wins is not None else 0,
