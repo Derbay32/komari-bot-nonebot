@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import random
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -63,6 +63,10 @@ from .storage import (
 Scalar = str | int | bool | None
 PublicValue = Scalar | tuple[str, ...]
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+#: Caller gate re-evaluated while the group lock is held, before any write.
+#: ``None`` means the caller did *not* ask for a post-lock recheck; it is not an
+#: implicit always-true default, and no implementation may add one.
+EffectCheck = Callable[[], bool | Awaitable[bool]]
 #: Intents whose active-game writes are guarded by a caller observation.
 OBSERVED_ACTIVE_WRITES = frozenset(
     {
@@ -107,6 +111,10 @@ class FulfillmentState(StrEnum):
 #: against the PostgreSQL clock; the TSK-279 scheduler reuses this same constant
 #: and the same ``komari_roulette_command_receipts.created_at`` column.
 FULFILLMENT_CREDENTIAL_WINDOW_SECONDS: int = 300
+
+#: ``result_code`` returned by :meth:`RouletteCommandService.advance_expired`
+#: when the caller's post-lock gate declined the advance.  Nothing was written.
+EFFECT_CHECK_REJECTED = "effect_check_rejected"
 
 
 def _age_seconds(value: object) -> float | None:
@@ -635,8 +643,21 @@ class RouletteCommandService:
         group: GroupRef,
         *,
         observation: Observation | None = None,
+        effect_check: EffectCheck | None = None,
     ) -> ExpiryAdvance:
-        """Advance one expired game without creating a receipt or sending."""
+        """Advance one expired game without creating a receipt or sending.
+
+        ``effect_check`` is the caller's *internal* post-lock guard.  A worker
+        that only decided to advance *before* waiting on the group advisory lock
+        must re-confirm the decision after the wait: the gate is evaluated once
+        the lock is held and before any read that could write, so a group that
+        turned restricted (or a runtime that closed) while the worker queued
+        settles as a no-effect ``effect_check_rejected`` result instead of
+        advancing a turn nobody is allowed to see.
+
+        ``None`` means the caller explicitly supplied no gate; it is not an
+        always-true default and this method never substitutes one.
+        """
 
         del observation
         try:
@@ -647,6 +668,18 @@ class RouletteCommandService:
                     app_id=group.app_id,
                     group_openid=group.group_openid,
                 )
+                if effect_check is not None and not await _run_effect_check(
+                    effect_check
+                ):
+                    await session.rollback()
+                    return ExpiryAdvance(
+                        receipt_id=None,
+                        game_id=None,
+                        result_code=EFFECT_CHECK_REJECTED,
+                        changed=False,
+                        state_revision=None,
+                        turn_seq=None,
+                    )
                 try:
                     current = await storage.load_current(group, for_update=True)
                 except AggregateCorruptError:
@@ -1480,6 +1513,24 @@ class RouletteCommandService:
         return value
 
 
+async def _run_effect_check(effect_check: EffectCheck) -> bool:
+    """Evaluate a caller's post-lock gate, treating any failure as a refusal.
+
+    A gate that raises - or an awaitable gate that rejects - must never be read
+    as "the group is still allowed".  The caller asked for the admission or
+    runtime decision to be re-confirmed after the group lock; an unanswerable
+    question is a no-effect refusal, not a licence to write.
+    """
+
+    try:
+        outcome = effect_check()
+        if isinstance(outcome, Awaitable):
+            return bool(await outcome)
+        return bool(outcome)
+    except Exception:
+        return False
+
+
 def _receipt_from_row(row: Mapping[str, object]) -> CommandReceipt:
     raw_projection = row["reply_projection"]
     if isinstance(raw_projection, str):
@@ -1840,11 +1891,13 @@ def _member_for_seq(snapshot: GameSnapshot | None, join_seq: int | None) -> str 
 
 
 __all__ = [
+    "EFFECT_CHECK_REJECTED",
     "FULFILLMENT_CREDENTIAL_WINDOW_SECONDS",
     "CanonicalCommand",
     "CommandReceipt",
     "CommandRequest",
     "CommitOutcomeUnknownError",
+    "EffectCheck",
     "ExpiryAdvance",
     "FulfillmentClaim",
     "FulfillmentConflictError",
