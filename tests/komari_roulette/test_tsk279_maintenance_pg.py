@@ -22,6 +22,7 @@ with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -1101,6 +1102,224 @@ async def test_cleanup_does_not_starve_eligible_behind_protected(
 
 
 # ---------------------------------------------------------------------------
+# RED: cleanup fairness (a saturated first group must not starve later ones)
+# ---------------------------------------------------------------------------
+
+_DAY_SECONDS = int(_DAY.total_seconds())
+
+
+async def _scope_receipts(
+    session_factory: Any,
+    current: Scope,
+) -> int:
+    """Count this exact scope's receipts (aged or not); never a global count."""
+
+    async with session_factory() as session:
+        return int(
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM komari_roulette_command_receipts "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid"
+                ),
+                {
+                    "app_id": current.app_id,
+                    "group_openid": current.group_openid,
+                },
+            )
+            or 0
+        )
+
+
+async def _receipt_exists(session_factory: Any, receipt_id: str) -> bool:
+    async with session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT count(*) FROM komari_roulette_command_receipts "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": receipt_id},
+        )
+    return int(value or 0) > 0
+
+
+async def _game_exists(session_factory: Any, game_id: str) -> bool:
+    async with session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT count(*) FROM komari_roulette_games "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": game_id},
+        )
+    return int(value or 0) > 0
+
+
+async def _seed_raw_terminal(
+    harness: Tsk279Harness,
+    current: Scope,
+    *,
+    game_id: str,
+    lifecycle: str,
+    age_seconds: int,
+) -> None:
+    """Seed one real, schema-valid aged non-win terminal with no result row.
+
+    The cleanup path peels result players -> results -> the game root, and a
+    game with no result row is deleted by the game-root statement alone, so the
+    fairness fixture stays cheap while still exercising the real grouping SQL
+    (``ended_at``, terminal lifecycle set, PG clock age).
+    """
+
+    await insert_waiting_game(
+        harness.session_factory,
+        game_id=game_id,
+        app_id=current.app_id,
+        group_openid=current.group_openid,
+        member_openid=current.member_openid,
+        deadline_age_seconds=60,
+    )
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games SET lifecycle = :lifecycle, "
+                "ended_at = clock_timestamp() - make_interval(secs => :age) "
+                "WHERE game_id = :game_id"
+            ),
+            {"game_id": game_id, "lifecycle": lifecycle, "age": age_seconds},
+        )
+        await session.commit()
+
+
+@PG_REQUIRED
+async def test_cleanup_fairness_reaches_later_receipt_group(
+    harness: Tsk279Harness,
+) -> None:
+    """A saturated sorting-first group must not permanently starve the next.
+
+    Two real scopes share one app; the busy group sorts first and is re-filled
+    with fresh 7d-eligible receipts before every round, so an implementation
+    that hands the whole per-round budget to the first group never reaches the
+    later group.  Within a bound derived from the real candidate group count
+    the later group's single qualifying receipt must still be cleaned.
+    """
+
+    api = _maintenance_api()
+    batch_size = 100
+    async with harness.app("fair-receipts") as app_id:
+        busy = Scope(
+            app_id=app_id,
+            group_openid=f"{app_id}-grp-a-busy",
+            member_openid=f"{app_id}-m-busy",
+        )
+        later = Scope(
+            app_id=app_id,
+            group_openid=f"{app_id}-grp-z-later",
+            member_openid=f"{app_id}-m-later",
+        )
+        later_receipt = await seed_aged_receipt(
+            harness.session_factory,
+            later,
+            inbound_msg_id=f"fair-later-{uuid4().hex}",
+            age_seconds=_DAY_SECONDS * 8,
+        )
+        maintenance = api["RouletteMaintenance"](
+            session_factory=harness.session_factory,
+            service=service_for(harness, random_source=CountingRandom()),
+            admission=_allow_only(set()),
+        )
+        bound = await _cleanup_round_budget(harness, batch_size=batch_size)
+        assert bound >= 2
+        cleaned = False
+        for round_index in range(bound):
+            missing = batch_size + 20 - await _scope_receipts(
+                harness.session_factory, busy
+            )
+            for index in range(max(missing, 0)):
+                await seed_aged_receipt(
+                    harness.session_factory,
+                    busy,
+                    inbound_msg_id=(
+                        f"fair-busy-{round_index}-{index}-{uuid4().hex}"
+                    ),
+                    age_seconds=_DAY_SECONDS * 8,
+                )
+            await maintenance.cleanup_retention(batch_size=batch_size)
+            if not await _receipt_exists(harness.session_factory, later_receipt):
+                cleaned = True
+                break
+        assert cleaned, (
+            "the later group starved: every cleanup round handed the whole "
+            "budget to the sorting-first saturated group"
+        )
+
+
+@PG_REQUIRED
+async def test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed(
+    harness: Tsk279Harness,
+) -> None:
+    """The 30d terminal grouping must not starve the later group either, and
+    ``completed`` terminals stay as permanent win evidence."""
+
+    api = _maintenance_api()
+    batch_size = 3
+    age_seconds = _DAY_SECONDS * 31
+    async with harness.app("fair-terminals") as app_id:
+        busy = Scope(
+            app_id=app_id,
+            group_openid=f"{app_id}-grp-a-busy",
+            member_openid=f"{app_id}-m-busy",
+        )
+        later = Scope(
+            app_id=app_id,
+            group_openid=f"{app_id}-grp-z-later",
+            member_openid=f"{app_id}-m-later",
+        )
+        later_target = str(uuid4())
+        later_completed = str(uuid4())
+        await _seed_raw_terminal(
+            harness,
+            later,
+            game_id=later_target,
+            lifecycle="cancelled",
+            age_seconds=age_seconds,
+        )
+        await _seed_raw_terminal(
+            harness,
+            later,
+            game_id=later_completed,
+            lifecycle="completed",
+            age_seconds=age_seconds,
+        )
+        maintenance = api["RouletteMaintenance"](
+            session_factory=harness.session_factory,
+            service=service_for(harness, random_source=CountingRandom()),
+            admission=_allow_only(set()),
+        )
+        bound = await _cleanup_round_budget(harness, batch_size=batch_size)
+        cleaned = False
+        for _round_index in range(bound):
+            for _index in range(batch_size + 1):
+                await _seed_raw_terminal(
+                    harness,
+                    busy,
+                    game_id=str(uuid4()),
+                    lifecycle="cancelled",
+                    age_seconds=age_seconds,
+                )
+            await maintenance.cleanup_retention(batch_size=batch_size)
+            if not await _game_exists(harness.session_factory, later_target):
+                cleaned = True
+                break
+        assert cleaned, (
+            "the later terminal group starved behind the saturated first group"
+        )
+        assert await _game_exists(harness.session_factory, later_completed), (
+            "completed terminals are permanent win evidence and must never be "
+            "cleaned by the retention sweep"
+        )
+
+
+# ---------------------------------------------------------------------------
 # RED: scheduler wiring (fixed ids, throttle only) and no-Redis dependency
 # ---------------------------------------------------------------------------
 
@@ -1147,6 +1366,61 @@ async def test_maintenance_jobs_registered_with_throttle_and_deploy_timezone() -
     api["unregister_maintenance_jobs"](scheduler)
     assert scheduler.get_job(api["RECOVERY_JOB_ID"]) is None
     assert scheduler.get_job(api["CLEANUP_JOB_ID"]) is None
+
+
+@PG_REQUIRED
+async def test_daily_cleanup_callback_drains_backlog_beyond_one_batch(
+    harness: Tsk279Harness,
+) -> None:
+    """One real 04:00 callback run must drain more than a single batch.
+
+    The registered cron callable is fetched from the scheduler and *invoked*
+    (never asserted by name); a direct ``cleanup_retention(batch=100)`` stays
+    bounded to one batch, while one callback run consumes the multi-batch
+    backlog the daily sweep would otherwise leave behind.
+    """
+
+    api = _maintenance_api()
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    async with harness.scope("cron-drain") as current:
+        for index in range(201):
+            await seed_aged_receipt(
+                harness.session_factory,
+                current,
+                inbound_msg_id=f"cron-drain-{index}-{uuid4().hex}",
+                age_seconds=_DAY_SECONDS * 8,
+            )
+        maintenance = api["RouletteMaintenance"](
+            session_factory=harness.session_factory,
+            service=service_for(harness, random_source=CountingRandom()),
+            admission=_allow_only(set()),
+        )
+        # A single direct call stays a *bounded* page: more than one batch of
+        # eligible backlog is still present afterwards.
+        first = await maintenance.cleanup_retention(batch_size=100)
+        assert first.receipts_deleted <= 100
+        assert first.more_pending is True
+        remaining = await _scope_receipts(harness.session_factory, current)
+        assert remaining >= 101
+
+        scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+        api["register_maintenance_jobs"](scheduler, maintenance)
+        try:
+            job = scheduler.get_job(api["CLEANUP_JOB_ID"])
+            assert job is not None
+            callback = job.func
+            assert callable(callback)
+            outcome = callback()
+            if inspect.isawaitable(outcome):
+                await outcome
+        finally:
+            api["unregister_maintenance_jobs"](scheduler)
+
+        remaining_after = await _scope_receipts(harness.session_factory, current)
+        assert remaining_after == 0, (
+            "one 04:00 cron run must drain the aged backlog, not just one batch"
+        )
 
 
 async def test_maintenance_does_not_require_redis() -> None:

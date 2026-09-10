@@ -701,3 +701,87 @@ disable-doesn't-pause / close AC 不变。
 未实现，含本轮新增 `failed>0` 用例）+ 3 例既有按调用回调断言 RED（`SendGate` /
 `RuntimeCheck` 生产签名未演进）。维护侧（恢复分页、清理边界、双实例并发、锁后复核、
 期限优先定向编排、`effect_check`）**全绿**。
+
+## 11. Stage-B 最后一组审查 RED（B2 实现前的整合缺口）
+
+依据验收意见（observability F4/F5/F6 已证生产缺陷 + B1 单批函数正确但每日 cron
+无 drain 的实际整合缺口），本轮**只改 Stage-B 测试与合同**，新增 6 个以真实行为断言
+失败的 RED，把 B2 必须修的生产行为钉死；不实现任何生产接缝，不碰生产/其它分支。
+
+### 11.1 新增用例 → 义务
+
+| # | 义务 | 用例 | 性质 |
+|---|------|------|------|
+| 1 | `set_runtime_state` 的未知 `reason_code`（含身份/正文哨兵）必须归一为**固定闭集**成员，绝不原样进入 `runtime_reason`/`as_dict()`；合法 `ready/disabled/failed` 状态与 `plugin_disabled` / `policy_restricted` / `policy_admitted` / `not_ready` 原因保持有效语义且同属**共用**闭集（`OBSERVATION_REASON_CODES`），不新增会漂移的第二套定义 | `observability::test_runtime_reason_is_normalized_into_the_shared_closed_set` | RED（断言） |
+| 2 | `refresh_pending` 的真实 sessionFactory 读取异常：`pending_receipts` 保持**未知 None**（不是伪 `0`，也不是上次成功值），故障按 `pending_unavailable` 聚合，绝不误分类为 `recovery_failed`；原始 `RuntimeError` 正文/身份哨兵不得进入投影 | `observability::test_pending_read_failure_is_unknown_pending_unavailable_and_never_leaks` | RED（断言） |
+| 3 | `snapshot()` 的 `latest_scan` / `latest_cleanup` 与 `as_dict()` 不外泄内部可变字典：改返回投影或改传给 `note_*` 的记录都不能篡改后续 snapshot（只读 `TypeError` 或独立 copy 均可，不钉具体 mapping 类型） | `observability::test_snapshot_projection_isolates_internal_mutable_dicts` | RED（断言） |
+| 4a | 清理公平（7d 收据）：两个真实 scope、同一 app；排序靠前忙组每轮补满 ≥batch 的 7d 合格收据，后组一条合格；按真实候选组数有界轮次内后组必须被清理，预算不得每轮全给首组而永久饥饿 | `maintenance::test_cleanup_fairness_reaches_later_receipt_group` | RED（断言） |
+| 4b | 清理公平（30d 终局）同机制，且 `completed` 长期留存；`waiting`/`active` 与 completed 结果/座位/胜场绝不删 | `maintenance::test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed` | RED（断言） |
+| 5 | 真实每日 cron 回调**一次运行**消费 >1 个 batch 的积压（201 条合格收据），而单个 `cleanup_retention(batch=100)` 仍有界；从 `scheduler.get_job(CLEANUP_JOB_ID).func` 取真实回调并调用（黑盒行为，非函数名断言），业务上验证 7d 清理 | `maintenance::test_daily_cleanup_callback_drains_backlog_beyond_one_batch` | RED（断言） |
+
+### 11.2 B2 义务（本轮不实现）
+
+- **F4 归一**：observability 的共用闭集须同时容纳故障码与运行时原因码
+  （`plugin_disabled` / `policy_restricted` / `policy_admitted` / `not_ready`）；
+  未知 reason 归一到该闭集固定成员，禁止 raw passthrough。
+- **F5 故障归因**：`refresh_pending` 读失败置 `pending_receipts=None` 并聚合
+  `pending_unavailable`，不得落回 `RuntimeError → recovery_failed` 的通用映射。
+- **F6 不可变投影**：`snapshot()` 字段与 `as_dict()` 的嵌套计数 dict 必须拷贝或
+  只读；`as_dict()` 仍须 JSON-safe（既有 `json.dumps` 用例不得回归）。
+- **清理公平**：`cleanup_retention(batch=N)` 单轮有界，但不得让排序首组吃满全部
+  预算；多轮内必须推进到后续合格组（7d 与 30d 分组同机制）。
+- **每日 drain**：04:00 注册的回调必须在单次运行内循环消费 `more_pending` 的分批
+  积压（具体 drain 方法名由 B2 自定），且 `cleanup_retention(batch=N)` 保持单批有界。
+- **可取消 / close 停止**：drain 回调必须可被取消、runtime close 后停止；此生命周期
+  断言**复用 B2 runtime 生命周期用例**（见 §10.2 第 1/3 点），本阶段不重复。
+
+### 11.3 根裁决遵守
+
+- **F3（failed 计数吞异常）**：保留 maintenance 的 per-group 聚合与
+  “一个坏组不 abort 整页”；只要求 `failed>0` 的 tick 不得 READY（§10.5(e) 既有 RED）
+  且原因观测正确。不新增“worker 必须整页 abort”的义务。
+- 不新增无意义的 `batch_size<=0` 游标限制。
+- 根接受 service 锁后重读 PG 时间的既有深逻辑；不把未证的 stale observation 猜测
+  写成强制改动。
+
+### 11.4 失败证据（本轮实测，均为业务断言，非缺 module）
+
+| 用例 | 实测首断言失败 |
+|------|----------------|
+| `test_runtime_reason_is_normalized_into_the_shared_closed_set` | `AssertionError: assert 'plugin_disabled' in frozenset({'admission_unavailable', 'cleanup_failed', 'config_unavailable', 'pending_unavailable', 'recovery_failed', 'runtime_failed', ...})` |
+| `test_pending_read_failure_is_unknown_pending_unavailable_and_never_leaks` | `assert None == 1` where `{'recovery_failed': 1}.get('pending_unavailable')` |
+| `test_snapshot_projection_isolates_internal_mutable_dicts` | `{'scanned': 999, 'advanced': 999, ...} != {'scanned': 3, 'advanced': 1, ...}` |
+| `test_cleanup_fairness_reaches_later_receipt_group` | `AssertionError: the later group starved ...`（`cleaned is False`） |
+| `test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed` | `AssertionError: the later terminal group starved ...`（`cleaned is False`） |
+| `test_daily_cleanup_callback_drains_backlog_beyond_one_batch` | `assert 1 == 0`（cron 一次仅清一批，留 1 条） |
+
+新增 RED 全部为设计内生产行为缺口；无整文件 collection error，无用例自身 fixture
+造假。既有 `test_maintenance_rechecks_closed_runtime_after_group_lock_wait`（缺
+`runtime.py`）保持原 RED，不计入本轮。
+
+### 11.5 执行记录（命令日志）
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+branch `pi/TSK-279-runtime-recovery`，HEAD `254c4cb`（base `bc4b1cc`），root venv
+`/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）。PG/Redis 门控：
+
+```
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
+```
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `pytest .../test_tsk279_observability.py -q`（带门控，改前基线） | 5 passed |
+| `pytest .../test_tsk279_observability.py -q`（带门控，改后） | 5 passed / 3 failed（新增 RED） |
+| `pytest .../test_tsk279_maintenance_pg.py -q`（带门控，改前基线） | 25 passed / 1 failed |
+| `pytest .../test_tsk279_maintenance_pg.py -q`（带门控，改后） | 25 passed / 4 failed（3 新增 RED + 原 runtime 缺模块 RED） |
+| `pytest` 三文件合计（改前 → 改后） | 32 passed / 15 failed → 32 passed / 21 failed（+6 设计内 RED） |
+| `pytest tests/komari_roulette/ -q`（带门控） | 522 passed / 21 failed（既有 522 全绿无回归） |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python` | 4 errors，全部为既有 `SendGate`/`RuntimeCheck` 按调用签名 RED；新增用例 0 报错 |
+
+清理核验：用例结束后 `app_id like '%tsk279%'` 的收据/履约/对局均为 0，7d/30d 合格
+残渣计数均为 0；门控库 `alembic_version` 仍为 `0021`。库内其余 `tsk276`/`tsk280`
+行属其它套件既有残留，未手删、未被本票用例依赖为首屏。
