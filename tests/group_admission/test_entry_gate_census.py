@@ -1,7 +1,7 @@
 """TSK-224 event gate census verification.
 
 1. ONEBOT_EVENT_CENSUS == 22 V11 Event descendants (excl root Event), category counts exact, family/attribution_source match class defs; new adapter class fails.
-2. MATCHER_ENTRY_CENSUS == 24 matcher registrations (3 on_message, 1 on_regex, 1 on_notice, 19 on_command); AST scan; added/deleted fails.
+2. MATCHER_ENTRY_CENSUS == 25 matcher registrations (4 on_message, 1 on_regex, 1 on_notice, 19 on_command); AST scan; added/deleted fails.
 3. AST event_preprocessor scan: event_gate.py expected 1 entry.
 4. All census anchors collectable by pytest --collect-only.
 """
@@ -262,12 +262,12 @@ def test_matcher_census_unique_rows() -> None:
 
 
 def test_matcher_census_exact_count() -> None:
-    assert len(MATCHER_ENTRY_CENSUS) == 24
+    assert len(MATCHER_ENTRY_CENSUS) == 25
 
 
 def test_matcher_census_factory_totals() -> None:
     counts = Counter(row.factory for row in MATCHER_ENTRY_CENSUS)
-    assert counts == {"on_message": 3, "on_regex": 1, "on_notice": 1, "on_command": 19}
+    assert counts == {"on_message": 4, "on_regex": 1, "on_notice": 1, "on_command": 19}
 
 
 def test_matcher_census_effect_ids_always_singleton() -> None:

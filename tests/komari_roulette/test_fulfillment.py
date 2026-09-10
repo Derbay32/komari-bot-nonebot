@@ -195,3 +195,42 @@ async def test_pre_send_known_failure_is_not_delivered_and_unknown_stays_pending
     assert await service.claim_fulfillment(second_id) is None
     await delete_scope(harness.engine, current)
     await delete_scope(harness.engine, second_current)
+
+
+async def test_invalid_credential_age_converges_to_not_delivered(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不可用 age 不得被误判为窗口内：claim 原子收敛 NOT_DELIVERED（fail-closed）。
+
+    这是 claim 边界的行为断言，不锁定 ``_age_seconds`` 的具体 isinstance 编码。
+    """
+    current = scope("claim-invalid-age")
+    receipt = await receipt_for(harness, current)
+    service = RouletteCommandService(
+        session_factory=harness.session_factory,
+        reply_projector=CountingProjector(),
+    )
+    receipt_id = receipt.receipt_id
+
+    async def invalid_window_row(
+        _session: AsyncSession, receipt_id_arg: str
+    ) -> dict[str, object]:
+        return {
+            "receipt_id": receipt_id_arg,
+            "state": FulfillmentState.NOT_STARTED.value,
+            "age_seconds": "not-a-number",
+        }
+
+    monkeypatch.setattr(
+        RouletteCommandService,
+        "_fulfillment_window_row",
+        staticmethod(invalid_window_row),
+    )
+
+    claim = await service.claim_fulfillment(receipt_id)
+    assert claim is not None
+    assert claim.state is FulfillmentState.NOT_DELIVERED
+    row = await fulfillment_row(harness.session_factory, receipt_id)
+    assert row["state"] == "NOT_DELIVERED"
+    await delete_scope(harness.engine, current)

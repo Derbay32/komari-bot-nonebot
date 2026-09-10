@@ -565,6 +565,10 @@ def _transfer(state: GameState, action: Action, now: datetime) -> ActionResult:
     target = _seat_by_seq(state, action.target_seq)
     if target is None:
         return _failure(state, "player_seq_not_found")
+    if target.join_seq == state.host_seq:
+        # TSK-266 11.2: transferring the host to themselves is rejected and
+        # leaves the state untouched (same object, revision unchanged).
+        return _failure(state, "invalid_transfer_target", reason="self")
     new_state = replace(
         state,
         host_seq=target.join_seq,

@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
@@ -62,7 +63,8 @@ from .storage import (
 Scalar = str | int | bool | None
 PublicValue = Scalar | tuple[str, ...]
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
-_OBSERVED_ACTIVE_WRITES = frozenset(
+#: Intents whose active-game writes are guarded by a caller observation.
+OBSERVED_ACTIVE_WRITES = frozenset(
     {
         "shoot",
         "forfeit",
@@ -98,6 +100,29 @@ class FulfillmentState(StrEnum):
     PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
     DELIVERED = "DELIVERED"
     NOT_DELIVERED = "NOT_DELIVERED"
+
+
+#: Age after which a receipt's delivery credential is expired.  The window is
+#: enforced atomically inside :meth:`RouletteCommandService.claim_fulfillment`
+#: against the PostgreSQL clock; the TSK-279 scheduler reuses this same constant
+#: and the same ``komari_roulette_command_receipts.created_at`` column.
+FULFILLMENT_CREDENTIAL_WINDOW_SECONDS: int = 300
+
+
+def _age_seconds(value: object) -> float | None:
+    """Coerce a driver-reported credential age, or ``None`` when unusable.
+
+    ``EXTRACT(EPOCH FROM ...)`` is ``numeric`` so asyncpg hands back a
+    :class:`~decimal.Decimal`, but the value is validated before use so an
+    unexpected driver type fails closed instead of raising mid-claim.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +415,9 @@ class ReplyProjectionContext:
     mention_target: ReplyPlayer | None = None
     mention_reason: str | None = None
     game_view: ReplyGameView | None = None
+    #: Protocol intent of the command that produced this projection (for
+    #: phase-specific copy such as "leave" after a game has started).
+    intent: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
@@ -659,14 +687,46 @@ class RouletteCommandService:
             raise StorageUnavailableError("roulette expiry storage is unavailable") from error
 
     async def claim_fulfillment(self, receipt_id: str) -> FulfillmentClaim | None:
-        """Atomically claim the one allowed platform send attempt."""
+        """Atomically claim the one allowed platform send attempt.
+
+        The 5-minute credential window is enforced *inside* the claim while the
+        row lock is held, comparing the receipt's ``created_at`` against the
+        PostgreSQL ``clock_timestamp()`` (never a local wall clock).  An expired
+        ``NOT_STARTED`` row converges to ``NOT_DELIVERED`` and the returned
+        claim carries that state, so the sender never starts a network call; a
+        receipt still in the window transitions ``NOT_STARTED`` to
+        ``PENDING_CONFIRMATION``.  Any other state is left untouched and yields
+        no claim.
+        """
 
         try:
             async with self._session_factory() as session:
-                row = await self._fulfillment_row(session, receipt_id, for_update=True)
-                if row is None or row["state"] != FulfillmentState.NOT_STARTED.value:
+                row = await self._fulfillment_window_row(session, receipt_id)
+                if row is None:
                     await session.rollback()
                     return None
+                state = FulfillmentState(str(row["state"]))
+                if state is not FulfillmentState.NOT_STARTED:
+                    await session.rollback()
+                    return None
+                age_seconds = _age_seconds(row["age_seconds"])
+                if age_seconds is None or (
+                    age_seconds >= FULFILLMENT_CREDENTIAL_WINDOW_SECONDS
+                ):
+                    await session.execute(
+                        text(
+                            "UPDATE komari_roulette_fulfillments "
+                            "SET state = 'NOT_DELIVERED', "
+                            "updated_at = clock_timestamp() "
+                            "WHERE receipt_id = :receipt_id"
+                        ),
+                        {"receipt_id": receipt_id},
+                    )
+                    await session.commit()
+                    return FulfillmentClaim(
+                        receipt_id=receipt_id,
+                        state=FulfillmentState.NOT_DELIVERED,
+                    )
                 await session.execute(
                     text(
                         "UPDATE komari_roulette_fulfillments "
@@ -685,6 +745,33 @@ class RouletteCommandService:
             raise
         except (DBAPIError, SQLAlchemyError, ConnectionError, OSError, TimeoutError) as error:
             raise StorageUnavailableError("fulfillment storage is unavailable") from error
+
+    async def check_fulfillment_window(self, claim: FulfillmentClaim) -> bool:
+        """Re-read the credential window from the DB clock before the send.
+
+        The claim is a positive send authorization only for
+        ``PENDING_CONFIRMATION``; the receipt's ``created_at`` is compared to
+        the PostgreSQL ``clock_timestamp()`` so a slow pre-send recheck cannot
+        deliver on an expired credential.  Store errors propagate unfiltered so
+        the delivery boundary fails closed without a network call.
+        """
+
+        try:
+            async with self._session_factory() as session:
+                row = await self._fulfillment_window_row(session, claim.receipt_id)
+                await session.rollback()
+        except (DBAPIError, SQLAlchemyError, ConnectionError, OSError, TimeoutError) as error:
+            raise StorageUnavailableError("fulfillment storage is unavailable") from error
+        if row is None:
+            return False
+        state = FulfillmentState(str(row["state"]))
+        if state is not FulfillmentState.PENDING_CONFIRMATION:
+            return False
+        age_seconds = _age_seconds(row["age_seconds"])
+        return (
+            age_seconds is not None
+            and age_seconds < FULFILLMENT_CREDENTIAL_WINDOW_SECONDS
+        )
 
     async def mark_delivered(
         self,
@@ -887,7 +974,7 @@ class RouletteCommandService:
             current is not None
             and current.lifecycle == "active"
             and current.phase in {"first_shot", "follow_up", "locked_turn", "item_choice"}
-            and request.command.intent in _OBSERVED_ACTIVE_WRITES
+            and request.command.intent in OBSERVED_ACTIVE_WRITES
         )
         if requires_observation and not _observation_matches(current, observation):
             return await self._insert_failure_receipt(
@@ -902,6 +989,7 @@ class RouletteCommandService:
         winner_group_wins: int | None = None
         if request.command.intent == "leaderboard":
             if current is not None and current.deadline is not None and now >= current.deadline:
+                expiring_seq = current.current_player_seq
                 expiry_result = apply_action(
                     current.state,
                     Action.expire(),
@@ -916,6 +1004,19 @@ class RouletteCommandService:
                         expiry_result,
                         now=now,
                     )
+                    # TSK-266 10.2: a leaderboard query that lazily advanced the
+                    # deadline reports the timeout it caused to the very player
+                    # it eliminated; the leaderboard is never appended there.
+                    if _member_for_seq(current, expiring_seq) == request.member_openid:
+                        return await self._insert_failure_receipt(
+                            session,
+                            request,
+                            fingerprint=fingerprint,
+                            result_code=expiry_result.code,
+                            snapshot=current,
+                            details=expiry_result.reply,
+                            winner_group_wins=winner_group_wins,
+                        )
             entries = await storage.list_leaderboard(group)
             details = {"leaderboard": _leaderboard_values(entries)}
             return await self._insert_failure_receipt(
@@ -975,7 +1076,7 @@ class RouletteCommandService:
             request,
             result_code=result.code,
             snapshot=saved,
-            details=result.reply,
+            details=_waiting_end_details(result, request, current),
             winner_group_wins=winner_group_wins,
         )
         return await self._insert_receipt(
@@ -1132,6 +1233,7 @@ class RouletteCommandService:
                 lock_target_player=lock_target_player,
             ),
             game_view=_reply_game_view(snapshot, players),
+            intent=request.command.intent,
         )
         projection = self._reply_projector(context)
         if not isinstance(projection, ReplyProjection):
@@ -1211,6 +1313,57 @@ class RouletteCommandService:
             )
         ).mappings().one_or_none()
         return cast("Mapping[str, object] | None", row)
+
+    @staticmethod
+    async def _fulfillment_window_row(
+        session: AsyncSession,
+        receipt_id: str,
+    ) -> Mapping[str, object] | None:
+        """Lock the fulfillment row, then read its credential age from the DB clock.
+
+        The lock and the age read are deliberately *two* statements in one
+        transaction.  PostgreSQL evaluates a ``LockRows`` node's target list
+        below the lock, so computing ``clock_timestamp() - r.created_at`` in the
+        locking statement would freeze the age at statement start: a claim that
+        blocked for seconds on another connection's row lock would still see the
+        pre-wait age and could admit an already-expired credential (TSK-278).
+
+        The lock is taken by a statement whose target list only reads columns,
+        and the age is then read by a second statement that is sent strictly
+        after the lock is held, against the same
+        ``komari_roulette_command_receipts.created_at`` column.  A missing
+        fulfillment row returns ``None`` before any age is read, so callers
+        keep their existing missing-row handling.
+        """
+
+        locked = (
+            await session.execute(
+                text(
+                    "SELECT receipt_id, state "
+                    "FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id "
+                    "FOR UPDATE"
+                ),
+                {"receipt_id": receipt_id},
+            )
+        ).mappings().one_or_none()
+        if locked is None:
+            return None
+        age_seconds = await session.scalar(
+            text(
+                "SELECT EXTRACT(EPOCH FROM (clock_timestamp() - created_at)) "
+                "FROM komari_roulette_command_receipts "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": receipt_id},
+        )
+        if age_seconds is None:
+            return None
+        return {
+            "receipt_id": locked["receipt_id"],
+            "state": locked["state"],
+            "age_seconds": age_seconds,
+        }
 
     async def _insert_receipt(
         self,
@@ -1356,9 +1509,53 @@ def _name_key(name: str) -> str:
     return unicodedata.normalize("NFKC", name).casefold()
 
 
+def _projection_details(result: ActionResult) -> dict[str, object]:
+    """Forward the safe reply payload plus the fixed domain reason code.
+
+    TSK-278 renders reason-specific fixed errors (for example
+    ``item_precondition_failed`` + ``burst_requires_two_rounds``); the reason is
+    a closed domain identifier, never user input.
+    """
+
+    details: dict[str, object] = dict(result.reply)
+    if result.reason is not None:
+        details["reason"] = result.reason
+    return details
+
+
+def _waiting_end_details(
+    result: ActionResult,
+    request: CommandRequest,
+    current: GameSnapshot | None,
+) -> dict[str, object]:
+    """Add the TSK-266 1G waiting-end actor facts for a cancelled game.
+
+    A cancel commits an empty roster, so the post-transition snapshot can no
+    longer resolve who ended the game: the actor name is captured from the
+    pre-transition snapshot while it is still available.
+    """
+
+    details = _projection_details(result)
+    if result.code != "cancelled":
+        return details
+    if request.command.intent == "cancel":
+        details["waiting_end_reason"] = "host_cancelled"
+    elif request.command.intent == "leave":
+        details["waiting_end_reason"] = "last_player_left"
+    else:
+        return details
+    if current is not None:
+        for seat in current.players:
+            if seat.member_openid == request.member_openid:
+                details["waiting_end_actor_name"] = seat.display_name
+                break
+    return details
+
+
 def _safe_details(details: Mapping[str, object]) -> dict[str, PublicValue]:
     safe: dict[str, PublicValue] = {}
     allowed = {
+        "reason",
         "consumed_kind",
         "remaining_live",
         "remaining_blank",
@@ -1384,6 +1581,8 @@ def _safe_details(details: Mapping[str, object]) -> dict[str, PublicValue]:
         "winner_seq",
         "eliminated_reason",
         "leaderboard",
+        "waiting_end_reason",
+        "waiting_end_actor_name",
     }
     for key, value in details.items():
         if key not in allowed:
@@ -1518,6 +1717,14 @@ def _reply_lock_target(
     return _reply_player(players, target_seq)
 
 
+#: Rotation-family result codes: the reply names the *new* current player, so
+#: the outbound reminder follows the rotated seat (a timeout that eliminated the
+#: old current player triggers the same rotation mention).
+_ROTATION_MENTION_RESULT_CODES: frozenset[str] = frozenset(
+    {"started", "shot", "forfeited", "reloaded", "turn_ended", "turn_expired"}
+)
+
+
 def _reply_mention_target(
     request: CommandRequest,
     *,
@@ -1536,14 +1743,7 @@ def _reply_mention_target(
     if (
         current_player is not None
         and current_player.join_seq != actor_seq
-        and result_code
-        in {
-            "started",
-            "shot",
-            "forfeited",
-            "reloaded",
-            "turn_ended",
-        }
+        and result_code in _ROTATION_MENTION_RESULT_CODES
     ):
         return current_player
     if reward_player is not None:
@@ -1578,7 +1778,7 @@ def _reply_mention_reason(
     if (
         target is current_player
         and target.join_seq != actor_seq
-        and result_code in {"started", "shot", "forfeited", "reloaded", "turn_ended"}
+        and result_code in _ROTATION_MENTION_RESULT_CODES
     ):
         return "turn"
     if target is reward_player:
@@ -1609,6 +1809,7 @@ def _member_for_seq(snapshot: GameSnapshot | None, join_seq: int | None) -> str 
 
 
 __all__ = [
+    "FULFILLMENT_CREDENTIAL_WINDOW_SECONDS",
     "CanonicalCommand",
     "CommandReceipt",
     "CommandRequest",
