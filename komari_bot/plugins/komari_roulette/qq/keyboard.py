@@ -59,8 +59,15 @@ NON_ERROR_RESULT_CODES: frozenset[str] = frozenset(
         "item_choice_pending",
         "item_choice_updated",
         "leaderboard",
+        # A waiting host left and the earliest joiner took over: still a
+        # normal waiting-game reply with buttons, not a fixed error.
+        "host_transferred",
     }
 )
+
+#: Locked-turn phase spellings.  TSK-276 projects ``locked_turn``; the short
+#: ``locked`` is kept as an accepted projection alias.
+LOCKED_PHASES: frozenset[str] = frozenset({"locked", "locked_turn"})
 
 TERMINAL_LIFECYCLES: frozenset[str] = frozenset({"completed", "cancelled", "expired"})
 
@@ -143,7 +150,7 @@ def _layout_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]:
         return []
     if context.phase == "item_choice":
         return _item_choice_rows(context)
-    if context.phase == "locked":
+    if context.phase in LOCKED_PHASES:
         return _locked_rows()
     return _follow_up_rows()
 

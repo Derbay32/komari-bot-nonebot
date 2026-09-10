@@ -110,7 +110,10 @@ _ERROR_REASON_TEXTS: dict[tuple[str, str], str] = {
     ("invalid_item_target", "eliminated"): "目标玩家已经出局。",
     ("item_effect_conflict", "burst_already_pending"): "手枪已经带有连发效果，不能重复使用连发器。",
     ("item_effect_conflict", "target_already_locked"): "目标已经有一把待生效的锁。",
+    # TSK-266 11.5 pins ``insufficient_chamber_for_burst``; the real TSK-272
+    # domain reason string is ``burst_requires_two_rounds`` (same copy).
     ("item_precondition_failed", "insufficient_chamber_for_burst"): "弹仓至少需要剩余 2 发才能使用连发器。",
+    ("item_precondition_failed", "burst_requires_two_rounds"): "弹仓至少需要剩余 2 发才能使用连发器。",
     ("item_precondition_failed", "beer_blocked_by_burst"): "手枪处于待连发状态，不能使用啤酒。",
 }
 
@@ -251,11 +254,13 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     reward_player = context.reward_player or context.current_player
     reward_seq = reward_player.join_seq if reward_player is not None else None
     inventory = _roster_inventory(context, reward_seq) if reward_seq is not None else ()
+    # The reward phase only exists while the inventory is full (TSK-272 mapper
+    # invariant), and TSK-266 6a9bf4b7 always shows the replacement prompt.
     lines: list[str] = [
-        f"> {_sentence('item_choice_pending')}",
+        f"> {_sentence(context.result_code) or _sentence('item_choice_pending')}",
         "",
     ]
-    if details.get("inventory_full"):
+    if details.get("inventory_full", True):
         lines.append("道具列表已满，选择一项来替换。")
         lines.append("")
     pending_item = details.get("pending_item")
@@ -268,10 +273,9 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     ]
     if held:
         lines.append(f"已有道具：{'、'.join(held)}")
-    if context.game_view is not None and context.game_view.pending_reward_count:
-        lines.append(
-            f"后续待处理奖励：**{context.game_view.pending_reward_count} 件**"
-        )
+    pending_count = _pending_reward_count(context)
+    if pending_count > 0:
+        lines.append(f"后续待处理奖励：**{pending_count} 件**")
     lines += [
         "",
         "***",
@@ -290,11 +294,30 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
 def _inventory_in_order(
     inventory: tuple[Any, ...],
 ) -> list[tuple[str, int]]:
+    """Order inventory entries A→B→C→D, accepting both frozen encodings.
+
+    TSK-276 ``_safe_details`` freezes a mapping as ``"item:count"`` strings
+    (the real production shape); 2-tuples stay accepted for direct projections.
+    """
+
     counts: dict[str, int] = {}
     for raw in inventory:
         if isinstance(raw, tuple) and len(raw) == 2:
             counts[str(raw[0])] = int(raw[1])
+        elif isinstance(raw, str):
+            item, separator, count_text = raw.rpartition(":")
+            if separator and item and count_text.isdigit():
+                counts[item] = int(count_text)
     return [(item, counts[item]) for item in ITEM_ORDER if item in counts]
+
+
+def _pending_reward_count(context: ReplyProjectionContext) -> int:
+    """Rewards still queued *after* the current new item (TSK-272 semantics)."""
+
+    count = context.details.get("pending_item_count")
+    if isinstance(count, bool) or not isinstance(count, int):
+        return context.pending_reward_count
+    return count
 
 
 def _lock_body(context: ReplyProjectionContext) -> str:
@@ -326,6 +349,27 @@ def _lock_body(context: ReplyProjectionContext) -> str:
     )
 
 
+def _final_outcome_player(context: ReplyProjectionContext) -> ReplyPlayer | None:
+    """The seat the final reply is about: the eliminated actor when known.
+
+    A committed terminal elimination (live shot / forfeit / timeout) is always
+    commanded by the player who leaves the game, so the commanding member's
+    seat is the eliminated one.  Matching the internal sending id is not
+    interpolation: the id never reaches the body.
+    """
+
+    actor = context.actor_member_openid
+    if actor:
+        for player in context.players:
+            if (
+                player.member_openid
+                and player.member_openid == actor
+                and not player.alive
+            ):
+                return player
+    return next((player for player in context.players if not player.alive), None)
+
+
 def _final_body(context: ReplyProjectionContext) -> str:
     winner = context.winner
     winner_name = _escape_name(winner.display_name) if winner is not None else ""
@@ -334,7 +378,7 @@ def _final_body(context: ReplyProjectionContext) -> str:
         tag = _mention_tag(context.mention_target)
     winner_tag = f" {tag}" if tag else ""
     eliminated_prefix = ""
-    eliminated = next((p for p in context.players if not p.alive), None)
+    eliminated = _final_outcome_player(context)
     if eliminated is not None:
         reason = context.details.get("eliminated_reason")
         if reason is None:
@@ -420,6 +464,18 @@ def render_reply(context: ReplyProjectionContext) -> ReplyProjection:  # noqa: P
     if context.result_code == "leaderboard":
         body = _leaderboard_body(context)
         return _project(context, body, allow_mention=False)
+    if context.result_code == "turn_expired" and context.lifecycle == "completed":
+        # TSK-266 11.3: the timeout elimination is already committed, so one
+        # reply carries the fixed timeout notice followed by the final outcome.
+        fixed = _fixed_error_text(context)
+        return _project(
+            context,
+            f"{fixed}\n\n{_final_body(context)}",
+            allow_mention=True,
+        )
+    if context.lifecycle == "cancelled" and context.result_code == "cancelled":
+        # TSK-266 1G: the waiting game ended without a winner.
+        return _project(context, _sentence("cancelled"), allow_mention=False)
     if is_error_result_code(context.result_code):
         return _project(context, _fixed_error_text(context), allow_mention=False)
     if context.lifecycle == "completed":
