@@ -82,15 +82,26 @@ def build_qq_message(receipt: CommandReceipt) -> Message:
         raise TypeError("frozen keyboard spec is missing")  # noqa: TRY003
     message = Message()
     message += MessageSegment.markdown(receipt.reply.body)
-    message += MessageSegment.keyboard(keyboard_from_spec(spec))
+    keyboard = keyboard_from_spec(spec)
+    # TSK-266 1F: no buttons means no keyboard field at all.  An empty ``rows``
+    # list must not become an empty ``keyboard`` segment on the wire.
+    if keyboard.content is not None and keyboard.content.rows:
+        message += MessageSegment.keyboard(keyboard)
     return message
 
 
-def _platform_message_id(response: object) -> str:
-    """Extract the platform message id from a real QQ return or a test fake."""
+def _platform_message_id(response: object) -> str | None:
+    """Extract the platform message id, or ``None`` when it is unusable.
+
+    Real ``PostGroupMessagesReturn.id`` is ``str | None`` and test fakes may
+    return a bare id string; anything else (``None``, a dict, an object with
+    no ``id``) cannot confirm delivery and must never be stringified.
+    """
 
     value = getattr(response, "id", response)
-    return str(value)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 class RouletteDelivery:
@@ -125,8 +136,7 @@ class RouletteDelivery:
             )
             await self._service.mark_not_delivered(claim)
             return DeliveryOutcome.NOT_DELIVERED
-        if not await self._send_allowed():
-            await self._service.mark_not_delivered(claim)
+        if not await self._send_allowed(claim):
             return DeliveryOutcome.NOT_DELIVERED
         try:
             response = await sender.send_to_group(
@@ -149,9 +159,15 @@ class RouletteDelivery:
             )
             return DeliveryOutcome.UNKNOWN
         try:
+            platform_message_id = _platform_message_id(response)
+            if platform_message_id is None:
+                # TSK-278 6: the send happened but the platform gave no usable
+                # id; keep PENDING_CONFIRMATION and never fake an id.
+                logger.warning("[Roulette] 平台回执缺少可用消息 ID，保持待确认")
+                return DeliveryOutcome.UNKNOWN
             await self._service.mark_delivered(
                 claim,
-                platform_message_id=_platform_message_id(response),
+                platform_message_id=platform_message_id,
             )
         except Exception as error:
             logger.warning(
@@ -167,14 +183,35 @@ class RouletteDelivery:
         except Exception as error:  # 预发送阶段的显式失败：绝不发送、绝不重试
             return None, error
 
-    async def _send_allowed(self) -> bool:
+    async def _send_allowed(self, claim: FulfillmentClaim) -> bool:
+        """Live pre-send recheck; a failing check fails closed, never hangs.
+
+        The recheck runs after the claim and before any network call.  A check
+        that raises must not bubble out and leave the claim stuck in
+        ``PENDING_CONFIRMATION``: it is recorded as ``NOT_DELIVERED`` instead.
+        ``asyncio.CancelledError`` is a cancellation, not a rejected check.
+        """
+
         check = self._runtime_check
         if check is None:
             return True
-        result = check()
-        if inspect.isawaitable(result):
-            return bool(await cast("Awaitable[bool]", result))
-        return bool(result)
+        try:
+            result = check()
+            if inspect.isawaitable(result):
+                result = await cast("Awaitable[bool]", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "[Roulette] 发送前运行时重核失败，故障关闭: error_type={}",
+                type(error).__name__,
+            )
+            await self._service.mark_not_delivered(claim)
+            return False
+        if not bool(result):
+            await self._service.mark_not_delivered(claim)
+            return False
+        return True
 
 
 __all__ = [
