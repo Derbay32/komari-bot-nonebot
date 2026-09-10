@@ -261,7 +261,7 @@ config manager 上，避免用假单测上下文「猜终局」而假绿。
 `test_tsk279_terminal_key_fallback.py` 负责（**RED** 基线，见 §7）。禁止再用
 `DEFAULT_FINAL_COPY_KEY` 之类实现常量作为断言输入。
 
-### 278 遗留伪 context（本票不改，待各自拥有者补 facts）
+### 278 遗留伪 context（Stage-A 收尾已补真实 facts，见 §8）
 
 下述 TSK-278 用例直接构造 `lifecycle="completed"` 的投影 context 却未提供任何
 终局原因字段；`_final_copy_key` 收尾返工（缺失/未知/矛盾即拒绝）落地后，这些
@@ -270,9 +270,9 @@ config manager 上，避免用假单测上下文「猜终局」而假绿。
 
 | 文件:行 | 用例 | 现状 | 建议 |
 |---------|------|------|------|
-| `tests/komari_roulette/test_tsk278_renderer.py:402` | `test_final_mentions_winner_once_with_metadata_pair` | completed context 无 `details` | 补 `details={"completion_reason": "shot", "winner_seq": 1}`（真实实弹终局同形） |
-| `tests/komari_roulette/test_tsk278_renderer.py:859` | `test_render_escapes_xml_injection_in_frozen_name` | completed context 无 `details` | 同上，补 `completion_reason="shot"` |
-| `tests/komari_roulette/test_tsk278_keyboard.py:374` | `test_final_has_no_buttons` | completed context 无 `details`，仅调 `build_keyboard` | 仅当返工把校验上移到共享 context / `build_keyboard` 路径时受影响；否则保持不动 |
+| `tests/komari_roulette/test_tsk278_renderer.py:402` | `test_final_mentions_winner_once_with_metadata_pair` | ✅ 已补 `details={"completion_reason": "shot", "winner_seq": 1}` | 补 `details={"completion_reason": "shot", "winner_seq": 1}`（真实实弹终局同形） |
+| `tests/komari_roulette/test_tsk278_renderer.py:862` | `test_render_escapes_xml_injection_in_frozen_name` | ✅ 已补 `details={"completion_reason": "shot", "winner_seq": 1}` | 同上，补 `completion_reason="shot"` |
+| `tests/komari_roulette/test_tsk278_keyboard.py:374` | `test_final_has_no_buttons` | ✅ 未受影响：该用例不调投影，仅调 `build_keyboard`，未改且实测仍绿 | 仅当返工把校验上移到共享 context / `build_keyboard` 路径时受影响；否则保持不动 |
 
 ## 7. Stage-A 收尾返工记录（终局 reason 拒绝猜测，RED）
 
@@ -299,3 +299,39 @@ RED 失败原因（`--tb=line`）：`Failed: DID NOT RAISE ValueError` ×6，分
 
 真实三分支真证仍由 `test_tsk279_stage_a_pg.py`（三条真实终局）承担；本返工
 不得与其互相替代。
+
+## 8. Stage-A 收尾：278 遗留伪 context 补真实事实（已完成）
+
+§6 表列出的两条 TSK-278 投影用例是**用例自身的事实缺口**，按该表建议在各自文件
+补齐真实业务事实；**不改写任何断言、不放宽校验、不全局 helper 猜原因**。
+
+| 文件:行 | 用例 | 补入的 `details` |
+|---------|------|------------------|
+| `tests/komari_roulette/test_tsk278_renderer.py:402` | `test_final_mentions_winner_once_with_metadata_pair` | `{"completion_reason": "shot", "winner_seq": 1}` |
+| `tests/komari_roulette/test_tsk278_renderer.py:862` | `test_render_escapes_xml_injection_in_frozen_name` | 同上 |
+
+事实依据：`domain._eliminate_current(completion_reason="shot")` 对实弹终局只在
+`terminal_reply` 盖入 `completion_reason` 与 `winner_seq`（**不含**
+`eliminated_reason`；后者仅 `forfeit`/`timeout` 与 `completion_reason` 同键盖入），
+且 `winner_seq` 等于存活座位编号，与 fixture 的 `winner=player(1, ...)` 一致。两处
+只新增 `details`，原有唯一提及 / `mention_*` metadata 对 / 无按钮 / XML 逃逸 /
+不泄漏 openid 断言逐条保留。
+
+`test_tsk278_keyboard.py:374`（`test_final_has_no_buttons`）不调投影，未改，实测仍绿。
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+补 facts 前 HEAD `5aafd0c`，root venv
+`/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）；本 pane 无
+PG/Redis 门控（PG 门控目标本轮未跑，仅改两条非 PG 纯投影 fixture）。
+
+| 命令 | 结果 |
+|------|------|
+| `pytest .../test_tsk278_renderer.py::test_final_mentions_winner_once_with_metadata_pair ...::test_render_escapes_xml_injection_in_frozen_name -q`（补 facts 前） | 2 failed（`ValueError: 终局回复缺少唯一有效的出局原因`） |
+| 同上（补 facts 后） | ✅ 2 passed |
+| `pytest tests/komari_roulette/test_tsk278_renderer.py tests/komari_roulette/test_tsk279_terminal_key_fallback.py -q` | ✅ 81 passed（既有 renderer 72 + 新 9 契约） |
+| `pytest tests/komari_roulette/test_tsk278_renderer.py tests/komari_roulette/test_tsk278_keyboard.py tests/komari_roulette/test_tsk279_terminal_key_fallback.py -q` | ✅ 102 passed |
+| `pytest tests/komari_roulette/ -q`（无 PG/Redis 门控） | ✅ 369 passed, 121 skipped |
+| `ruff check tests/komari_roulette/test_tsk278_renderer.py` | ✅ All checks passed |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python`（worktree 根，`filesAnalyzed`=690） | ✅ 0 errors, 0 warnings |
+
+Stage-B（runtime/worker/发送观测/REST/迁移面）未开始。
