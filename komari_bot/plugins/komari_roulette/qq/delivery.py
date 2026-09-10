@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from nonebot import logger
 from nonebot.adapters.qq.message import Message, MessageSegment
 
-from ..command_service import FulfillmentState
+from ..command_service import EffectCheck, FulfillmentState
 from .keyboard import keyboard_from_spec
 
 if TYPE_CHECKING:
@@ -126,8 +126,18 @@ class RouletteDelivery:
         self,
         receipt: CommandReceipt,
         sender: QQMessageSender | QQBot,
+        *,
+        effect_check: EffectCheck | None = None,
     ) -> DeliveryOutcome:
-        """Build frozen payload → claim → recheck → window → send once → mark."""
+        """Build frozen payload → claim → recheck → window → send once → mark.
+
+        ``effect_check`` is the per-call post-claim authority recheck: it runs
+        after the atomic claim and before any network call, so an authority
+        revoked while the send queued blocks the network.  A ``False`` answer (or
+        a raising gate) converges the claim to ``NOT_DELIVERED``; a cancellation
+        is a cancellation.  The original ``runtime_check`` and the DB-clock
+        credential window remain mandatory.
+        """
 
         message, build_error = self._build(receipt)
         claim = await self._service.claim_fulfillment(receipt.receipt_id)
@@ -146,6 +156,8 @@ class RouletteDelivery:
             await self._service.mark_not_delivered(claim)
             return DeliveryOutcome.NOT_DELIVERED
         if not await self._send_allowed(receipt, claim):
+            return DeliveryOutcome.NOT_DELIVERED
+        if not await self._effect_allowed(effect_check, claim):
             return DeliveryOutcome.NOT_DELIVERED
         if not await self._window_allowed(claim):
             return DeliveryOutcome.NOT_DELIVERED
@@ -222,6 +234,40 @@ class RouletteDelivery:
         except Exception as error:
             logger.warning(
                 "[Roulette] 发送前运行时重核失败，故障关闭: error_type={}",
+                type(error).__name__,
+            )
+            await self._service.mark_not_delivered(claim)
+            return False
+        if not bool(result):
+            await self._service.mark_not_delivered(claim)
+            return False
+        return True
+
+    async def _effect_allowed(
+        self,
+        effect_check: EffectCheck | None,
+        claim: FulfillmentClaim,
+    ) -> bool:
+        """Final per-call authority recheck after the claim, before the network.
+
+        Resolved for *this* receipt (its closure captured the original token),
+        so two concurrent groups never share a decision.  A rejected or raising
+        gate records ``NOT_DELIVERED`` instead of leaving the claim stuck in
+        ``PENDING_CONFIRMATION``.  ``asyncio.CancelledError`` is a cancellation,
+        not a rejected check.
+        """
+
+        if effect_check is None:
+            return True
+        try:
+            result = effect_check()
+            if inspect.isawaitable(result):
+                result = await cast("Awaitable[bool]", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "[Roulette] 发送前最终裁决失败，故障关闭: error_type={}",
                 type(error).__name__,
             )
             await self._service.mark_not_delivered(claim)

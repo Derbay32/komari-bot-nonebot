@@ -20,7 +20,12 @@ from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
 
 from komari_bot.plugins import group_admission
 
-from ..command_service import OBSERVED_ACTIVE_WRITES, CommandRequest
+from ..command_service import (
+    OBSERVED_ACTIVE_WRITES,
+    CommandRequest,
+    EffectCheck,
+    EffectCheckRejectedError,
+)
 from .parser import parse_command
 
 if TYPE_CHECKING:
@@ -40,6 +45,32 @@ type BusinessGate = Callable[
 ]
 
 _MENTION_SEGMENT_TYPES = frozenset({"mention_user", "mention_everyone"})
+
+_EFFECT_CHECK_PARAMETER = "effect_check"
+
+
+def _supports_per_call_effect_check(target: object, member: str) -> bool:
+    """Whether ``target.member`` can receive the per-call ``effect_check`` keyword.
+
+    The production command service and delivery always advertise the seam (and
+    the TSK-279 probes do too).  A collaborator that cannot accept the keyword
+    cannot host the post-lock / post-claim recheck either; the handler must not
+    fabricate a closure for it, and for such a collaborator the mandatory
+    front-door business gate remains the only authority point.  Nothing here is
+    ever consulted to *relax* a check on a collaborator that does accept the
+    keyword.
+    """
+
+    try:
+        parameters = inspect.signature(getattr(target, member)).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if _EFFECT_CHECK_PARAMETER in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class _CommandService(Protocol):
@@ -80,6 +111,14 @@ class RouletteQQHandler:
         self._delivery = delivery
         self._business_gate = business_gate
         self._send_gate = send_gate
+        # Probed once: the per-call recheck is only handed to a collaborator
+        # that can actually host it (see ``_supports_per_call_effect_check``).
+        self._service_effect_check = _supports_per_call_effect_check(
+            service, "execute_group_command"
+        )
+        self._delivery_effect_check = _supports_per_call_effect_check(
+            delivery, "deliver"
+        )
 
     @staticmethod
     def _resolve_token(state: Mapping[str, Any] | None) -> QQAdmissionToken | None:
@@ -92,7 +131,7 @@ class RouletteQQHandler:
 
         return group_admission.get_qq_admission_token(state)
 
-    async def handle(
+    async def handle(  # noqa: PLR0911 — 一个守卫一个真实不处理分支
         self,
         bot: QQBot,
         event: object,
@@ -144,15 +183,81 @@ class RouletteQQHandler:
         observation: Observation | None = None
         if command.intent in OBSERVED_ACTIVE_WRITES:
             observation = await self._service.observe_current(request.group)
-        if not await self._business_allowed(bot, event, token):
+        # One closure for *this* call, capturing the original bot / event / token.
+        # It is the per-call authority recheck handed to the service (before the
+        # domain write, under the group lock) and to the delivery (after the
+        # claim, before the network): authority is never re-minted from the
+        # receipt and never shared across concurrent groups.
+        effect_check = self._effect_closure(bot, event, token)
+        if not self._service_effect_check and not await effect_check():
+            # A collaborator that cannot host the in-lock recheck keeps the
+            # mandatory front-door gate as its only authority point, so every
+            # command is gated exactly once, as late as the collaborator allows.
             return
-        receipt = await self._service.execute_group_command(
-            request,
-            observation=observation,
-        )
+        try:
+            receipt = await self._execute(request, observation, effect_check)
+        except EffectCheckRejectedError:
+            # The authority turned false while the command queued on the group
+            # lock: a silent no-effect control flow, never an error reply.
+            return
         if not await self._send_allowed(request):
             return
-        await self._delivery.deliver(receipt, bot)
+        await self._deliver(receipt, bot, effect_check)
+
+    async def _execute(
+        self,
+        request: CommandRequest,
+        observation: Observation | None,
+        effect_check: EffectCheck,
+    ) -> CommandReceipt:
+        """Run the single domain execution, rechecking authority under the lock.
+
+        The keyword is only passed to a collaborator that advertises it (see
+        ``_supports_per_call_effect_check``); the resulting argument-shape
+        narrowing is what the ``cast`` below records.
+        """
+
+        if not self._service_effect_check:
+            return await self._service.execute_group_command(
+                request, observation=observation
+            )
+        execute = cast(
+            "Callable[..., Awaitable[CommandReceipt]]",
+            self._service.execute_group_command,
+        )
+        return await execute(
+            request, observation=observation, effect_check=effect_check
+        )
+
+    async def _deliver(
+        self,
+        receipt: CommandReceipt,
+        sender: QQMessageSender,
+        effect_check: EffectCheck,
+    ) -> None:
+        """Run the single delivery, rechecking authority after the claim."""
+
+        if not self._delivery_effect_check:
+            await self._delivery.deliver(receipt, sender)
+            return
+        deliver = cast(
+            "Callable[..., Awaitable[object]]",
+            self._delivery.deliver,
+        )
+        await deliver(receipt, sender, effect_check=effect_check)
+
+    def _effect_closure(
+        self,
+        bot: QQBot,
+        event: GroupAtMessageCreateEvent,
+        token: QQAdmissionToken,
+    ) -> Callable[[], Awaitable[bool]]:
+        """Build the per-call post-lock / post-claim authority recheck."""
+
+        async def effect_check() -> bool:
+            return await self._business_allowed(bot, event, token)
+
+        return effect_check
 
     @staticmethod
     def _token_binds_to_event(

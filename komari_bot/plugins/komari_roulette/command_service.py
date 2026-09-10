@@ -97,6 +97,17 @@ class FulfillmentConflictError(RuntimeError):
     """A fulfillment claim was used with an incompatible terminal state."""
 
 
+class EffectCheckRejectedError(RuntimeError):
+    """The caller's post-lock gate declined the command.
+
+    A dedicated safe-rejection control flow, not a storage / state failure: the
+    group lock was already held, the idempotent replay was already excluded, and
+    the gate was evaluated before any write, so nothing was written (no receipt,
+    no state mutation, no fulfillment).  The QQ handler absorbs it silently; a
+    caller that does not expect it may still observe it as a ``RuntimeError``.
+    """
+
+
 class FulfillmentState(StrEnum):
     """Durable one-to-one reply fulfillment lifecycle."""
 
@@ -567,8 +578,18 @@ class RouletteCommandService:
         request: CommandRequest,
         *,
         observation: Observation | None = None,
+        effect_check: EffectCheck | None = None,
     ) -> CommandReceipt:
-        """Execute one parsed command and commit its receipt atomically."""
+        """Execute one parsed command and commit its receipt atomically.
+
+        ``effect_check`` mirrors :meth:`advance_expired`: the caller's internal
+        post-lock guard is evaluated once the group advisory lock is held and
+        before any read that could write.  A ``False`` answer (or a gate that
+        raises) settles as the dedicated :class:`EffectCheckRejectedError` with
+        zero effects; ordinary storage / domain errors still propagate.  ``None``
+        means the caller explicitly supplied no gate.  A gate that rejected the
+        command is never converted into an error receipt.
+        """
 
         try:
             async with self._session_factory() as session:
@@ -577,6 +598,7 @@ class RouletteCommandService:
                         session,
                         request,
                         observation=observation,
+                        effect_check=effect_check,
                     )
                     try:
                         await session.commit()
@@ -920,6 +942,7 @@ class RouletteCommandService:
         request: CommandRequest,
         *,
         observation: Observation | None,
+        effect_check: EffectCheck | None,
     ) -> CommandReceipt:
         """Run one command while retaining the caller's transaction."""
 
@@ -952,6 +975,13 @@ class RouletteCommandService:
         )
         if existing is not None:
             return self._replay_or_conflict(existing, fingerprint)
+
+        # The caller's authority was decided *before* this transaction waited on
+        # the group advisory lock; re-confirm it now that the lock is held and
+        # before any write.  A false / raising gate is a dedicated safe refusal
+        # with zero effects (never an error receipt).
+        if effect_check is not None and not await _run_effect_check(effect_check):
+            raise EffectCheckRejectedError("roulette command effect check rejected")
 
         if request.command.intent == "syntax_failure":
             code = request.command.syntax_code or "invalid_syntax"
@@ -1898,6 +1928,7 @@ __all__ = [
     "CommandRequest",
     "CommitOutcomeUnknownError",
     "EffectCheck",
+    "EffectCheckRejectedError",
     "ExpiryAdvance",
     "FulfillmentClaim",
     "FulfillmentConflictError",

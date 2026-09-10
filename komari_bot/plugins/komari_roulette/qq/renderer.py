@@ -126,6 +126,31 @@ def build_reply_projector(
     return projector
 
 
+def build_live_reply_projector(
+    *,
+    snapshot_provider: Callable[[], CopyPoolSnapshot],
+    random_source: CopyRandomSource,
+) -> Callable[[ReplyProjectionContext], ReplyProjection]:
+    """Bind a *live* snapshot provider into the projection seam.
+
+    Unlike :func:`build_reply_projector` (which freezes one snapshot at build
+    time), this factory consults ``snapshot_provider`` on every projection, so
+    the installed service always reads the current real configuration.  A fresh
+    isolated pool is constructed per projection, which means a committed receipt
+    freezes exactly the copy that was live at commit time and a later config
+    update can never rewrite it.
+    """
+
+    def projector(context: ReplyProjectionContext) -> ReplyProjection:
+        pool = _ProjectionCopyPool(
+            snapshot=snapshot_provider(),
+            random_source=random_source,
+        )
+        return render_reply(context, pool=pool)
+
+    return projector
+
+
 # ---------------------------------------------------------------------------
 # Fixed error copy (TSK-266 11.1–11.5; 逐字定稿)
 # ---------------------------------------------------------------------------

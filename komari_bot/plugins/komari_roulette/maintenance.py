@@ -24,6 +24,7 @@ The maintenance path imports no Redis client and holds no process lock.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -58,6 +59,10 @@ CLEANUP_MINUTE = 0
 #: Hard upper bound on one daily-drain run so a stuck ``more_pending`` can
 #: never busy-loop the scheduler.  Each round is still one bounded page.
 CLEANUP_DRAIN_MAX_ROUNDS = 1000
+
+#: Bounded wait for an in-flight dispatch round to release the round gate on
+#: ``close``.  A round that never settles cannot drag shutdown past the bound.
+CLOSE_ROUND_TIMEOUT_SECONDS = 5.0
 
 #: Retention boundaries, measured in PostgreSQL time (the storage is UTC).
 RECEIPT_RETENTION_DAYS = 7
@@ -281,6 +286,17 @@ async def _drain_cleanup(maintenance: RouletteMaintenance) -> CleanupResult:
     return total
 
 
+async def drain_cleanup(maintenance: RouletteMaintenance) -> CleanupResult:
+    """Consume the multi-batch retention backlog in one scheduled run.
+
+    Public entry point so the production composition root can register the same
+    bounded drain behaviour on its own scheduler without re-implementing the
+    loop; the semantics are exactly :func:`_drain_cleanup`.
+    """
+
+    return await _drain_cleanup(maintenance)
+
+
 def register_maintenance_jobs(
     scheduler: Any,
     maintenance: RouletteMaintenance,
@@ -296,7 +312,7 @@ def register_maintenance_jobs(
     """
 
     async def _daily_cleanup() -> CleanupResult:
-        return await _drain_cleanup(maintenance)
+        return await drain_cleanup(maintenance)
 
     scheduler.add_job(
         maintenance.advance_due,
@@ -349,6 +365,9 @@ class RouletteMaintenance:
         self._terminal_group_cursor: tuple[str, str] | None = None
         #: Set by :meth:`close`; stops dispatch and the daily drain.
         self._stopped = False
+        #: Serializes every dispatch round and lets :meth:`close` observe a
+        #: round boundary instead of returning mid-page.
+        self._round_gate = asyncio.Lock()
 
     @property
     def stopped(self) -> bool:
@@ -357,14 +376,27 @@ class RouletteMaintenance:
         return self._stopped
 
     async def close(self) -> None:
-        """Stop new dispatch; in-flight rounds finish their bounded page.
+        """Stop new dispatch; bounded-wait for the in-flight round to settle.
 
-        The maintenance path owns no shared ORM engine and no long-lived task,
-        so close only flips the stop flag: the recovery gate and the daily
-        drain both observe it on their next step.
+        Flipping the stop flag alone lets a bounded page keep deleting after
+        shutdown returned.  The round gate serializes every dispatch round, so
+        ``close`` marks ``_stopped`` first (the blocked round's post-lock gate
+        then observes it and abandons the effect) and then waits, bounded, for
+        that round to release the gate.  A round that never settles cannot drag
+        shutdown past the bound; maintenance owns no long-lived task and no
+        shared ORM engine.
         """
 
         self._stopped = True
+        try:
+            acquired = await asyncio.wait_for(
+                self._round_gate.acquire(),
+                timeout=CLOSE_ROUND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return
+        if acquired:
+            self._round_gate.release()
 
     async def advance_due(
         self,
@@ -383,6 +415,18 @@ class RouletteMaintenance:
 
         if self._stopped or batch_size <= 0:
             return RecoveryTickResult(0, 0, 0, 0, None)
+        async with self._round_gate:
+            if self._stopped:
+                return RecoveryTickResult(0, 0, 0, 0, None)
+            return await self._advance_due_locked(batch_size=batch_size)
+
+    async def _advance_due_locked(
+        self,
+        *,
+        batch_size: int,
+    ) -> RecoveryTickResult:
+        """Run one bounded recovery page while holding the round gate."""
+
         async with self._session_factory() as session:
             candidates = await self._load_due_candidates(session, batch_size)
         advanced = 0
@@ -443,6 +487,16 @@ class RouletteMaintenance:
         seats, the leaderboard and any ``waiting``/``active`` game are never
         touched, and the leaderboard is never rebuilt here.
         """
+
+        async with self._round_gate:
+            return await self._cleanup_retention_locked(batch_size=batch_size)
+
+    async def _cleanup_retention_locked(
+        self,
+        *,
+        batch_size: int,
+    ) -> CleanupResult:
+        """Run one bounded retention page while holding the round gate."""
 
         receipts_deleted = 0
         games_deleted = 0
@@ -768,6 +822,7 @@ __all__ = [
     "CleanupResult",
     "RecoveryTickResult",
     "RouletteMaintenance",
+    "drain_cleanup",
     "register_maintenance_jobs",
     "unregister_maintenance_jobs",
 ]
