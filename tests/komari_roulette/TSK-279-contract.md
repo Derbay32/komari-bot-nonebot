@@ -499,3 +499,115 @@ RED 失败原因分类（`--tb=line`）：
 
 清理核验：用例结束后按前缀 `tsk279-%` 统计轮盘四表与 character_binding 群/成员
 均为 0；门控库 `alembic_version` 仍为 `0021`，未降低 head。
+
+## 10. Stage-B 返工：动态生效 / 关闭不 dispose / 并发准入隔离 / worker 并发 / 锁后复核
+
+验收意见指出 Stage-B 的 6 绿 + 21 缺失接缝 RED + 2 无参回调断言 RED 虽成立，但若干
+契约 AC 缺少**行为证据**。本返工**只加强既有 5 个 Stage-B 文件**的行为断言，并补一批
+设计内 RED，把证据钉在真实 PG、真实 `RouletteCommandService.advance_expired`、真实
+共享 `nonebot_plugin_orm` 引擎与真实 `asyncio` 并发交错上；仍不实现生产接缝。
+
+### 10.1 新增/强化用例 → AC
+
+| AC（Resolution） | 用例 | 性质 | 观察到的行为 |
+|---|---|---|---|
+| 动态关停即时重读（§2） | `runtime::test_dynamic_disable_flips_live_without_restart_or_tick` | RED（缺失模块） | 同一 runtime 实例在 `plugin_enable` True→False 后**当期**拒绝 business/send，无需重启、无需等 60s tick；恢复失败期间再打开不得 READY，直到一次成功 tick |
+| 动态关停即时重读（真实 ConfigManager） | `runtime::test_real_config_manager_live_flip_denies_business_and_keeps_maintenance` | RED（缺失模块） | 经真实 `ConfigManager.update_field_async` 落库翻转后，下一次 `authorize` 立即 `plugin_disabled`；维护 tick 仍继续；既有 `waiting_expires_at` / `state_revision` 不变 |
+| 真实 ConfigManager 读 API 探针 | `runtime::test_real_config_manager_read_api_supports_live_flip` | **绿探针** | `ConfigManager("komari_roulette", DynamicConfigSchema)` 的 `initialize_async` / `update_field_async` / `get` / `get_async` 确实支持 live 翻转（保证上一条 RED 的 fixture 不是臆测） |
+| 关闭不 dispose 共享引擎（§2） | `runtime::test_close_blocks_new_dispatch_and_never_disposes_shared_engine` | RED（缺失模块） | 类级 `AsyncEngine.dispose` spy 证明首/次关闭都不 dispose 真实共享引擎（`orm.get_session()` 强制该引擎存在）；真实阻塞 recovery 被**有界取消**（`cancelled==1`、`finished==0`）；关闭后不再派发 |
+| 已发未确认取消保持 PENDING 且不撤胜场（§2、§4） | `runtime::test_delivery_cancel_keeps_pending_and_wins_but_unsent_is_rejected` | **绿探针** | 真实终局收据：发送中途 `CancelledError` → 履约保持 `PENDING_CONFIRMATION`、已提交胜场保持 1；未触网即被 `runtime_check` 拒绝 → `NOT_DELIVERED` 且 0 次网络调用 |
+| 按调用隔离准入与发送上下文（§5、§6） | `runtime::test_authority_is_per_call_isolated_between_concurrent_groups` | RED（缺失模块） | **同一实例**、`Barrier(2)` 交错的两组请求各自 101 允许 / 202 受限；撤销 101 只影响 101，无跨组 authority 泄漏 |
+| 现网 no-arg `send_gate` 演进为按调用 | `runtime::test_handler_send_gate_receives_the_per_call_request` | RED（断言） | 真实 `RouletteQQHandler` 的 `SendGate` 必须收到本调用 `CommandRequest` |
+| 同一实例并发 send gate 各自解析本请求 | `runtime::test_concurrent_send_gates_resolve_their_own_request` | RED（断言） | 真实 handler 两组并发经 `Barrier` 交错，一个撤销；gate 观测到各自 `request`，投递结果各归其组/msgid |
+| 现网 no-arg `runtime_check` 演进为按调用 | `runtime::test_delivery_runtime_check_receives_the_per_call_receipt` | RED（断言） | 真实 delivery 的 `RuntimeCheck` 收到本调用 `CommandReceipt`；`Barrier` 交错下 DELIVERED 载荷属允许组、`msg_id == receipt.inbound_msg_id`、`msg_seq == 1`、正文为冻结体 |
+| 两个 worker 竞争同一过期期限只推进一次（§2） | `maintenance::test_two_maintenance_instances_advance_one_turn_exactly_once` | RED（缺失模块） | 两个真实 `RouletteMaintenance` 实例经 `Barrier` 并发同一组；真实 PG 群锁下只淘汰旧当前一次、新当前自 PG now 满 15min、`advanced` 合计 1 |
+| 终局胜负只结算一次（§2、§3） | `maintenance::test_two_maintenance_instances_settle_terminal_wins_once` | RED（缺失模块） | 两个 worker 并发结算同一终局：`wins==1`、results==1、座位==2，不双加胜场 |
+| 临界 action 与 maintenance 锁竞争只提交一次效果（§2） | `maintenance::test_command_action_and_maintenance_locked_race_commits_one_effect` | RED（缺失模块） | 真实 `execute_group_command(forfeit)` 与真实 `advance_due` 并发抢同一群事务锁；无论谁先，恰好 1 个终局结果 + 1 个胜场，败者得 `state_conflict` / no-op |
+| 锁后复核准入：等待期间转受限即不推进（§2、§5） | `maintenance::test_maintenance_rechecks_admission_after_group_lock_wait` | RED（缺失模块） | 群锁被外部持有、worker 真实阻塞在锁上（`backend_pid`/`wait_for_blocked`）期间把该群转受限；放锁后不得推进，局保持 `waiting`、`advanced==0` |
+| 锁后复核运行时关闭：关闭后不得推进（§2） | `maintenance::test_maintenance_rechecks_closed_runtime_after_group_lock_wait` | RED（缺失模块） | 阻塞期间真实 `RouletteRuntime.close()`；放锁后不得推进；maintenance 用真实 `orm.get_session` 工厂 |
+| 两玩家超时终局确为胜场（fixture 探针） | `maintenance::test_two_player_expiry_settles_one_win` | **绿探针** | 真实 `advance_expired` 对两玩家过期回合 → `completed` + `wins==1`（保证并发结算用例的 fixture 成立） |
+
+### 10.2 拟议追加接缝（返工新增）
+
+```python
+# 1) 每个调用重新读取实时配置，不缓存启动快照
+class RouletteRuntime:
+    def authorize(self, *, scope: str, group_ids: Sequence[int], token=None) -> RouletteAuthority:
+        # 每次调用读取 ConfigManager.get()/get_async()（与真实 read API 同形）；
+        # plugin_enable=False → plugin_disabled，当期生效，不依赖 60s tick。
+        ...
+    def get_state(self) -> RouletteRuntimeState:
+        # 恢复失败期间即使 plugin_enable 翻回 True 也不得 READY；
+        # 只有一次成功 recovery tick 后才能 READY。
+        ...
+
+# 2) 深服务锁后效果复核 seam（不提供 always-true 默认）
+async def RouletteCommandService.advance_expired(
+    self,
+    group: GroupScope,
+    *,
+    observation: Observation | None = None,
+    effect_check: Callable[[], bool] | None = None,   # 在取得群 advisory 锁之后、提交之前求值
+) -> AdvanceResult: ...
+
+# 3) 维护每个到期群把「群准入 × 运行时 accepting」组合成锁后复核，而非只在扫描前判一次
+class RouletteMaintenance:
+    async def advance_due(self, *, batch_size: int = 100) -> RecoveryTickResult:
+        # 对每个候选群：先粗判 admission，进入真实 advance 后由 effect_check 在锁内再判；
+        # 期间转受限 / runtime 关闭都必须放弃推进。
+        ...
+
+# 4) 现网回调按调用签名（destructive change）
+SendGate = Callable[[CommandRequest], bool | Awaitable[bool]]
+RuntimeCheck = Callable[[CommandReceipt], bool | Awaitable[bool]]
+```
+
+约束：`effect_check` 为 `None` 表示调用方**未要求**锁后复核（不是 always-true）；
+需要准入的生产调用必须显式传入，实现不得内置「永远返回 True」的兜底。
+
+### 10.3 返工后 RED / 绿分类（本阶段同一命令测得）
+
+| 指标 | 修复前 | 返工后 |
+|------|--------|--------|
+| Stage-B 三文件合计 | 6 passed / 23 failed | **9 passed / 31 failed** |
+| 绿探针 | 5 maintenance + 1 observability | 6 maintenance（含两玩家终局）+ 2 runtime（真实 ConfigManager 读 API、delivery 取消 PENDING）+ 1 observability |
+| 缺失接缝 RED | 21（`ModuleNotFoundError`） | 28（runtime 10 / maintenance 14 / observability 4） |
+| 断言 RED（按调用回调） | 2 | 3（handler gate、并发 handler gate、delivery runtime_check） |
+
+新增的 8 个 RED 全部为设计内缺失接缝（`ModuleNotFoundError`），无「整文件 collection
+error」，无用例自身 fixture 造假的断言失败。
+
+### 10.4 返工执行记录（命令日志）
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+branch `pi/TSK-279-runtime-recovery`，基线 HEAD `61b91b8`（base `bc4b1cc`），root
+venv `/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）。PG/Redis 门控：
+
+```
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
+```
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `pytest .../test_tsk279_runtime.py -q`（带门控） | 2 passed / 13 failed |
+| `pytest .../test_tsk279_maintenance_pg.py -q`（带门控） | 6 passed / 14 failed |
+| `pytest .../test_tsk279_{runtime,maintenance_pg,observability}.py -q`（带门控） | 9 passed / 31 failed |
+
+RED 失败原因（`--tb=line`）：
+
+- `ModuleNotFoundError: ...komari_roulette.runtime` — 10 例
+- `ModuleNotFoundError: ...komari_roulette.maintenance` — 14 例
+- `ModuleNotFoundError: ...komari_roulette.observability` — 4 例
+- 按调用回调断言（`AssertionError` / `DeliveryOutcome`） — 3 例
+
+绿探针补充证据：真实 `ConfigManager` live 翻转读 API；真实终局发送中途取消 →
+`PENDING_CONFIRMATION` + `wins` 不撤、未触网 → `NOT_DELIVERED`；两玩家过期回合 →
+`completed` + `wins==1`。
+
+仍未覆盖（Stage-C 或本票后续）：真实 `on_startup`/`on_shutdown` 装配、真实
+`group_admission` 群→member 解析、真实 `user_ban` 叠加、真实调度单例注册、真实保留
+策略常量、`SendGate`/`RuntimeCheck` 生产改签名、REST/管理面、Alembic 迁移与 `check`
+零 diff。
