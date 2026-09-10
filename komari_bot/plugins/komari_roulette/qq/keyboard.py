@@ -24,7 +24,7 @@ from nonebot.adapters.qq.models import (
 )
 
 if TYPE_CHECKING:
-    from ..command_service import ReplyProjectionContext
+    from ..command_service import ReplyPlayer, ReplyProjectionContext
 
 # Canonical item order A→B→C→D and their stable Chinese labels.
 ITEM_ORDER: tuple[str, ...] = ("magnifier", "beer", "burst", "lock")
@@ -65,9 +65,9 @@ NON_ERROR_RESULT_CODES: frozenset[str] = frozenset(
     }
 )
 
-#: Locked-turn phase spellings.  TSK-276 projects ``locked_turn``; the short
-#: ``locked`` is kept as an accepted projection alias.
-LOCKED_PHASES: frozenset[str] = frozenset({"locked", "locked_turn"})
+#: The only accepted locked-phase spelling is TSK-276's ``locked_turn`` projection.
+#: There is no historical short ``locked`` alias.
+LOCKED_TURN_PHASE = "locked_turn"
 
 TERMINAL_LIFECYCLES: frozenset[str] = frozenset({"completed", "cancelled", "expired"})
 
@@ -88,12 +88,81 @@ def _button(label: str, data: str) -> dict[str, Any]:
     }
 
 
-def _follow_up_rows() -> list[list[dict[str, Any]]]:
-    return [
-        [_button("🧰使用", "/轮盘 道具 使用"), _button("🗑️丢弃", "/轮盘 道具 丢弃")],
-        [_button("🔫开枪", "/轮盘 开枪"), _button("🔄装填", "/轮盘 装填")],
-        [_button("⏹️结束", "/轮盘 结束"), _button("🏳️弃权", "/轮盘 弃权")],
-    ]
+def eligible_lock_targets(context: ReplyProjectionContext) -> tuple[ReplyPlayer, ...]:
+    """Legal lock targets: alive, not the actor, and not already pending a lock.
+
+    ``ReplyGameView.pending_lock_players`` is the *exclusion* set (players that
+    already carry a pending lock), never the eligible list.  The eligible set
+    is recomputed from the frozen roster so both the keyboard and the panel
+    renderer agree.
+    """
+
+    current_seq = (
+        context.current_player.join_seq if context.current_player is not None else None
+    )
+    return tuple(
+        sorted(
+            (
+                player
+                for player in context.players
+                if player.alive
+                and player.join_seq != current_seq
+                and not player.pending_lock
+            ),
+            key=lambda player: player.join_seq,
+        )
+    )
+
+
+def _current_inventory(context: ReplyProjectionContext) -> dict[str, int]:
+    """Positive item counts for the current player.
+
+    The frozen production context resolves ``current_player`` from the roster,
+    so the two copies carry identical inventories; taking the per-item maximum
+    reconciles lighter projections without double counting.
+    """
+
+    current = context.current_player
+    if current is None:
+        return {}
+    sources = [current]
+    sources.extend(
+        player for player in context.players if player.join_seq == current.join_seq
+    )
+    counts: dict[str, int] = {}
+    for source in sources:
+        for item, count in source.inventory_counts:
+            if count > 0:
+                counts[item] = max(counts.get(item, 0), count)
+    return counts
+
+
+def _has_usable_item(context: ReplyProjectionContext) -> bool:
+    """Whether the authoritative post-submit state allows any ``使用`` action."""
+
+    counts = _current_inventory(context)
+    if any(counts.get(item, 0) > 0 for item in ("magnifier", "beer", "burst")):
+        return True
+    # A held lock is only usable while a legal target exists.
+    return counts.get("lock", 0) > 0 and bool(eligible_lock_targets(context))
+
+
+def _follow_up_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]:
+    """Emit only the actions the post-submit authoritative state allows (1H)."""
+
+    rows: list[list[dict[str, Any]]] = []
+    if sum(_current_inventory(context).values()) > 0:
+        item_row: list[dict[str, Any]] = []
+        if _has_usable_item(context):
+            item_row.append(_button("🧰使用", "/轮盘 道具 使用"))
+        item_row.append(_button("🗑️丢弃", "/轮盘 道具 丢弃"))
+        rows.append(item_row)
+    action_row = [_button("🔫开枪", "/轮盘 开枪")]
+    if context.chamber_remaining_total != 6:
+        action_row.append(_button("🔄装填", "/轮盘 装填"))
+    rows.append(action_row)
+    rows.append([_button("⏹️结束", "/轮盘 结束"), _button("🏳️弃权", "/轮盘 弃权")])
+    return rows
 
 
 def _locked_rows() -> list[list[dict[str, Any]]]:
@@ -150,9 +219,9 @@ def _layout_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]:
         return []
     if context.phase == "item_choice":
         return _item_choice_rows(context)
-    if context.phase in LOCKED_PHASES:
+    if context.phase == LOCKED_TURN_PHASE:
         return _locked_rows()
-    return _follow_up_rows()
+    return _follow_up_rows(context)
 
 
 def build_keyboard(context: ReplyProjectionContext) -> str:
@@ -163,13 +232,17 @@ def build_keyboard(context: ReplyProjectionContext) -> str:
 def keyboard_from_spec(spec: str) -> MessageKeyboard:
     """Materialize a canonical JSON spec into a real QQ ``MessageKeyboard``.
 
-    Only the object form ``{"rows": [...]}`` is accepted; a bare list is
-    rejected exactly like the delivery seam's builder (no legacy fallback).
+    Only the object form ``{"rows": [[button, ...], ...]}`` is accepted: a bare
+    list and the historical dict-row form ``{"buttons": [...]}`` are rejected.
     """
+
     parsed = json.loads(spec)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("rows"), list):
+        raise TypeError("keyboard spec must be an object with a rows list")  # noqa: TRY003
     rows: list[InlineKeyboardRow] = []
     for row_spec in parsed["rows"]:
-        button_specs = row_spec["buttons"] if isinstance(row_spec, dict) else row_spec
+        if not isinstance(row_spec, list):
+            raise TypeError("each keyboard row must be a button list")  # noqa: TRY003
         buttons = [
             Button(
                 render_data=RenderData(label=str(button_spec["label"])),
@@ -181,7 +254,7 @@ def keyboard_from_spec(spec: str) -> MessageKeyboard:
                     enter=bool(button_spec.get("enter", False)),
                 ),
             )
-            for button_spec in button_specs
+            for button_spec in row_spec
         ]
         rows.append(InlineKeyboardRow(buttons=buttons))
     return MessageKeyboard(content=InlineKeyboard(rows=rows))
