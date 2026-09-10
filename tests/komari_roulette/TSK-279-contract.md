@@ -977,23 +977,30 @@ async def close(self) -> None
 | 已安装真实 handler/service 提交有效 token 并产出真实 SDK 载荷 | `effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload` | **GREEN 探针（不依赖 lifecycle）** |
 | 已安装真实 handler 的 business gate 对 ban/remap/policy 逐一拒绝同一 token | `effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token` | **GREEN 探针（不依赖 lifecycle）** |
 | 已安装真实 handler 在同一 runtime 下两组互不借 token（A token 不能授权 B 事件） | `effect::test_installed_matcher_never_borrows_a_token_across_groups` | **GREEN 探针（不依赖 lifecycle）** |
+| C1 装配次序 probe：`prepare` 后恢复真实 `get_config_storage` → 已启动 Admission 仍真工作 + 之后 RouletteManager 真实 PG | `lifecycle_pg::test_restoring_config_storage_factory_keeps_admission_fake_live_and_roulette_real_pg` | **GREEN 探针（不依赖 lifecycle）** |
 | 已安装真实 handler 在组锁内复核撤权 → 零 receipt/零发送 | `effect::test_installed_handler_rechecks_authority_inside_the_group_lock` | **业务断言 RED（缺锁后 effect 复核）** |
+| **真实 lifecycle 安装**（非手装 runtime）下有效 token 提交并录得真实 SDK 载荷 | `lifecycle_pg::test_lifecycle_installed_qq_handler_commits_valid_token_and_captures_real_sdk_payload` | 缺 seam RED（驱动真实 driver startup hook + 已安装 `handle_roulette_qq`） |
+| **真实 lifecycle 安装**状态、执行前 pluginFalse / ban / policy 撤销 → 至少拒绝（0 receipt/game/send） | `lifecycle_pg::test_lifecycle_installed_qq_handler_rejects_revoked_authority_before_execution[plugin_disabled\|user_banned\|policy_restricted]` | 缺 seam RED（参数化 3 例） |
+| **真实 lifecycle 安装**下发 claim 已提交后（Event 挂起，真实 PG pending）撤 ban / canonical 重映射再释放 → 0 网络 / `NOT_DELIVERED` 但已提交 domain/receipt 事实保留 | `lifecycle_pg::test_lifecycle_installed_delivery_post_claim_revocation_blocks_network_but_keeps_committed_facts[user_banned\|canonical_remapped]` | 缺 seam RED（参数化 2 例；屏障包裹真实 `app.service.claim_fulfillment`，不猜 resolver 调用） |
+| **真实 lifecycle 安装**下真实组锁等待后 pluginFalse → 至少一例零 receipt/game（不靠手装 gateway 闭包） | `lifecycle_pg::test_lifecycle_installed_qq_handler_group_lock_wait_then_plugin_false_leaves_zero_receipt_game` | 缺 seam RED（真实 advisory 锁 + 真实 `backend_pid`/`wait_for_blocked`） |
 
-### 13.3 RED / GREEN 分类（Stage-C1 返工后实测：29 failed / 5 passed）
+### 13.3 RED / GREEN 分类（Stage-C1 返工 + 装配次序修正后实测：36 failed / 6 passed）
 
 | 桶 | 用例 | 实测首错 |
 |---|---|---|
-| 缺 seam（lifecycle 模块不存在） | 11 个 `lifecycle::*` + 6 个 `lifecycle_pg::*` | `AssertionError: 生产未注册恰一个 komari_roulette driver startup hook，实际 0` / `ModuleNotFoundError`/`AttributeError` |
+| 缺 seam（lifecycle 模块不存在） | 11 个 `lifecycle::*` + **12** 个 `lifecycle_pg::*`（5 个结构 + 7 个 lifecycle→QQ 业务接线） | `AssertionError: 生产未注册恰一个 komari_roulette driver startup hook，实际 0` / `ModuleNotFoundError`/`AttributeError` |
 | 缺签名（`effect_check`） | `effect::…exposes_effect_check_keyword`、`…is_evaluated_only_after…`、`…propagates_storage_errors`、`delivery::…exposes…`、`delivery::…blocks_network…`、`delivery_variant…`、`installed::…accepted_effect_check_still_honours_expired_window` | `TypeError: … got an unexpected keyword argument 'effect_check'` / `AssertionError: 'effect_check' in mappingproxy(...)` |
 | 缺符号（`EffectCheckRejectedError`） | `…leaves_zero_effects`、`handler::…silently_absorbs…` | `ImportError: cannot import name 'EffectCheckRejectedError'` |
 | 业务断言（handler 未传 per-call closure） | `handler::…original_token_closure…`、`concurrent_handlers…` | `AssertionError: the handler must pass the per-call effect_check to the service / each handler call must pass its own post-lock closure` |
 | 业务断言（已安装 handler 缺锁后复核） | `installed::test_installed_handler_rechecks_authority_inside_the_group_lock` | `AssertionError: an authority revoked while the command queued must leave no domain receipt`（receipt 被提交） |
 | 业务断言（`maintenance.close` 立即返回） | `lifecycle_pg::test_maintenance_close_waits_for_the_in_flight_cleanup_round` | `AssertionError: maintenance.close() must wait for the in-flight cleanup round instead of returning immediately`（`assert not True`） |
-| **GREEN（不依赖 lifecycle 的真实旧 API 探针）** | `effect::test_old_api_authority_chain…`、`effect::test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends`、`effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload`、`effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token`、`effect::test_installed_matcher_never_borrows_a_token_across_groups` | ✅ 5 passed（真实 `AdmissionRuntime` + 真实 `BindingTransaction` + 真实 `user_ban` + 真实 `RouletteCommandService`/`RouletteDelivery` + 真实 QQ adapter 传输录制） |
+| **GREEN（不依赖 lifecycle 的真实旧 API 探针）** | `effect::test_old_api_authority_chain…`、`effect::test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends`、`effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload`、`effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token`、`effect::test_installed_matcher_never_borrows_a_token_across_groups`、`lifecycle_pg::test_restoring_config_storage_factory_keeps_admission_fake_live_and_roulette_real_pg` | ✅ 6 passed（前 5 条为真实 `AdmissionRuntime` / `BindingTransaction` / `user_ban` / `RouletteCommandService`/`RouletteDelivery`/真实 QQ adapter 传输录制；第 6 条为装配次序 fake/real 分界 probe） |
 
 未使用 `fakeSender`/import error 单独宣称任一 AC 通过；缺 seam 用例在被测符号存在
-后才会执行真实业务断言。五条 GREEN 均不依赖 `lifecycle` 模块，证明 C1 不是靠
-「`QQruntime != None` + 全 true 门」才能通过。
+后才会执行真实业务断言。六条 GREEN 均不依赖 `lifecycle` 模块，证明 C1 不是靠
+「`QQruntime != None` + 全 true 门」才能通过；新增的装配次序 probe 另行证明
+`prepare_control_plane` 之后恢复真实 `get_config_storage` 同时保持 fake watcher 下
+的 Admission 与真实 PG 的 RouletteManager。
 
 ### 13.4 本阶段未验证（保留给后续修复轮）
 
@@ -1101,3 +1108,132 @@ KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
 显式复位；`prepare_control_plane` 的 watcher 任务随 monkeypatch 撤销，测试内不做
 手动 `runtime.close()`（沿用既有 group_admission 测试约定）。维护准入用例仍以缺
 `lifecycle` seam 为首错，属“已冻结、待实现后真实运行”，本轮不宣称该 AC 通过。
+
+### 13.7 Stage-C1 补强：真实 lifecycle 安装 → QQ 业务接线（2026-09-11）
+
+触发：C1 的持久 GREEN（`effect::test_installed_matcher_*`）虽然使用真实
+`AdmissionRuntime` / `BindingTransaction` / `UserBanService`，但它们是**手动**调用
+`install_roulette_qq_runtime` 并传入测试自造的 `business_gate` / `runtime_check` /
+`send_gate`，因此**不能**证明未来的真实生命周期会安装“读取真实权威”的门。
+函数名里的 `installed` 不等于真实装配已完成。
+
+本轮**只改** C1 原始 5 文件中的 `test_tsk279_lifecycle_pg.py` 与本合同（不碰生产、
+不新建文件、不做临时探针），新增 7 个参数化 lifecycle→handler 用例；它们：
+**绝不调用 `install_roulette_qq_runtime`，也绝不替换已安装的三个门**——先跑真实
+`require_single_startup_hook` + `invoke_hook` 完成组合根装配，再直接驱动全局已安装的
+`handle_roulette_qq`。
+
+装配次序（`_installed_lifecycle_qq_authority`，dependency-first，模仿生产 fail-closed）：
+
+1. 删除 `komari_roulette_config` 单行；
+2. **先** `prepare_control_plane(monkeypatch, storage)`：真实 `_AdmissionRuntime` 以
+   可控 policy 存储（`AdmissionStorageFake`）`start` 至 READY，并在此时把 manager
+   快照 watcher 注册到 fake；
+3. **立即恢复** `manager_module.get_config_storage` 为真实工厂（`prepare_control_plane`
+   只 patch 了 `manager` 模块的全局工厂；已启动的 AdmissionRuntime 在 `start` 时已捕获
+   fake 的 watcher 回调，而之后创建的 RouletteManager 必须走真实 PG）；
+4. 注册真实 `BindingTransaction` 群/成员 resolver 与真实 `UserBanService` ban checker，
+   并绑定 canonical 数字群（全部在任何已安装门读取之前）；
+5. **再**进入真实 `lifecycle_context`（真实 Driver lifespan + 录制
+   `get_config_manager` 注册表）并 `invoke_hook` 真实 startup hook → 组合根用**真实**
+   `ConfigManager` 读真实 PG（默认值）；
+6. 经该真实 manager `update_field_async("plugin_enable", …)` 写入用例所需 live 开关，
+   pluginTrue 时 `app.runtime.run_recovery_tick()` 转 READY，并断言
+   `app.runtime.get_state().plugin_enable`；
+7. yield 后直接驱动全局已安装的 `handle_roulette_qq`。
+
+旧的「先 startup、后 prepare」次序已废弃：它让 startup 早于准入依赖 READY，逼迫
+实现忽略依赖 ready，因此不再作为契约。
+
+**装配次序分界 probe（不依赖 lifecycle，持久 GREEN）**：
+
+`lifecycle_pg::test_restoring_config_storage_factory_keeps_admission_fake_live_and_roulette_real_pg`
+独立证明第 2–3 步分界正确：(a) `prepare` 后恢复真实工厂，fake 捕获的 watcher 仍
+驱动已启动的 AdmissionRuntime（`storage.deliver` 撤销策略后 `adjudicate` 真的拒绝，
+再放行真的恢复，`effective_revision` 随 fake 快照前进）；(b) 恢复后新建的真实
+`ConfigManager("komari_roulette", DynamicConfigSchema)` `initialize_async` +
+`update_field_async("plugin_enable", …)` 落库到真实 PostgreSQL `komari_roulette_config`
+（raw SQL 复核），从不落入 admission fake。`finally` 显式复位全局
+`get_config_storage` 并删除 `komari_roulette_config` 单行，不泄露其它 suite。
+
+新增用例（全部为 **缺 seam RED**，首错
+`AssertionError: 生产未注册恰一个 komari_roulette driver startup hook，实际 0`）：
+
+| # | 用例 | 契约 |
+|---|------|------|
+| 1 | `test_lifecycle_installed_qq_handler_commits_valid_token_and_captures_real_sdk_payload` | 已安装 `get_roulette_qq_runtime() is not None`；有效 token → 恰一条 `post_group_messages`，`msg_id`/`msg_seq` 正确，且 SDK markdown 正文 == 落库冻结 `reply_projection.body` |
+| 2 | `…rejects_revoked_authority_before_execution[plugin_disabled / user_banned / policy_restricted]` | 执行前 live pluginFalse / 真实 ban / policy 撤销：0 发送、0 receipt、全部 `scope_counts` 为 0 |
+| 3 | `…delivery_post_claim_revocation_blocks_network_but_keeps_committed_facts[user_banned / canonical_remapped]` | 在真实 `app.service.claim_fulfillment` 提交后（`komari_roulette_fulfillments.state == PENDING_CONFIRMATION` 可见，非伪造）由 `_PostClaimClaimBarrier` 挂起，撤 ban / 改 canonical 映射再释放：0 网络、`NOT_DELIVERED`，但已提交 receipt（1 条）与 game（`lifecycle == waiting`）事实保留 |
+| 4 | `…group_lock_wait_then_plugin_false_leaves_zero_receipt_game` | 真实群 advisory 锁下 `backend_pid`/`wait_for_blocked` 证明 handler 真阻塞，期间 pluginFalse，放锁后：0 发送、0 receipt、全部 `scope_counts` 为 0（不靠手装 gateway 闭包） |
+
+post-claim 屏障语义：`_PostClaimClaimBarrier` 只在**真实**已安装 service 实例上包裹
+真实 `claim_fulfillment(receipt_id)`：`await` 原方法完成 → 确认该 receipt 的 PG
+fulfillment 为 `PENDING_CONFIRMATION` → `entered` 事件 + 等待 `release` → 返回原 claim。
+封禁/改 canonical 映射发生在该方法返回后、`RouletteDelivery` 的所有最终 authority
+读取之前，因此不再依赖/猜测实现是否调用群 resolver（合法 binding_session 读取路径
+可能不调用它），也不逼迫生产在 resolver 读旧值后做无意义双重读取。屏障只针对本
+用例 receipt_id，foreign 调用直通；它**不**替换任何已安装 QQ 门。真正的“claim 后
+复核”缺口由生产 lifecycle/`effect_check` 承担。
+
+**old-API green 与 lifecycle RED 分栏（不混淆函数名）**
+
+| 分栏 | 断言对象 | 依赖 lifecycle? | 本轮状态 |
+|---|---|---|---|
+| old-API green（5） | 真实 `AdmissionRuntime`+`BindingTransaction`+`user_ban`+`RouletteCommandService`/`RouletteDelivery`+真实 QQ adapter；**手动** `install_roulette_qq_runtime` + 测试自造门（另含纯旧 API 权威链、真实 delivery PG 窗口两条） | 否 | ✅ 5 passed |
+| 装配次序 probe（1） | `prepare_control_plane` + 真实工厂恢复：fake watcher 后的 AdmissionRuntime + 恢复后真实 PG RouletteManager（无 lifecycle） | 否 | ✅ 1 passed |
+| lifecycle RED（7） | 真实 driver startup hook 装配出的组合根 + 全局已安装 `handle_roulette_qq`；**不**手装 runtime、**不**替换三个门 | 是（模块缺失） | ❌ 7 failed（缺 seam，待实现） |
+
+因此 `installed_matcher` 的 GREEN **不**被当作“lifecycle 已完成接线”的证据；只有
+lifecycle RED 全绿才证明未来装配安装正确的门。
+
+**未覆盖内容（明确列出）**
+
+- 本轮只覆盖 startup → 安装 → handler 业务接线；真实 `on_startup`/`on_shutdown`
+  被完整 NoneBot Driver 调用的顺序（gunicorn 进程级）仍未覆盖（直接调用注册的真实
+  hook，同 §13.4）。
+- post-claim 分支本轮覆盖 ban 与 canonical 重映射；**pluginFalse 的 post-claim** 由
+  执行前（用例 2）与组锁等待（用例 4）覆盖，不在 post-claim 参数化内。
+- owner close 使在途请求 task 收到 `CancelledError` 的分支未纳入本轮：按既有协议允许
+  `PENDING`/`UNKNOWN` 保留且不重试，不机械要求 `NOT_DELIVERED`；既有模拟关闭用例
+  保持更窄范围，不作为本装配的替代。
+- 维护准入在已安装 lifecycle 上的“放行 → 到期推进”端到端闭环仍未验证（同 §13.4）。
+- `komari_roulette.lifecycle` 模块及其 hook body **仍不存在**：7 条 lifecycle→QQ
+  用例与 5 条结构用例的实测首错全部是 `AssertionError: 生产未注册恰一个
+  komari_roulette driver startup hook，实际 0`（缺 seam），因此装配后的真实
+  body（startup 次序、三个门的具体实现、post-claim 复核）**仍未验证**，不得
+  据本轮任何结果宣称这些 AC 通过。
+- REST/管理面与 OBS/get_status 公开面延后到 C2。
+
+**执行记录（命令日志）**
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+branch `pi/TSK-279-runtime-recovery`，本阶段基于 `debfb8a`（返工 diff 为本次提交），
+root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）；
+pyright 同用 `/Users/derbay32/project/komari-bot/.venv/bin/pyright --pythonpath
+/Users/derbay32/project/komari-bot/.venv/bin/python`。PG/Redis 门控（两 DSN 同库、
+head `0021`）：
+
+```
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
+```
+
+| 命令 | 结果 |
+|------|------|
+| `pytest tests/komari_roulette/test_tsk279_effect_recheck_pg.py -q -p no:cacheprovider`（带门控） | 5 passed / 12 failed（5 条 old-API green 不变） |
+| `pytest tests/komari_roulette/test_tsk279_lifecycle_pg.py -q -p no:cacheprovider`（带门控） | 1 passed / 13 failed（新增装配次序 probe green；5 结构 + 7 lifecycle→QQ 缺 seam RED，`maintenance.close` 业务断言 RED） |
+| `pytest tests/komari_roulette/test_tsk279_lifecycle_pg.py -q -k restoring_config_storage -p no:cacheprovider`（带门控） | ✅ 1 passed（装配次序 fake/real 分界 probe） |
+| `pytest tests/komari_roulette/test_tsk279_lifecycle_pg.py -q -k lifecycle_installed -p no:cacheprovider`（带门控） | 0 passed / 7 failed（全部缺 seam RED） |
+| `pytest tests/komari_roulette/test_tsk279_{effect_recheck_pg,lifecycle,lifecycle_pg}.py -q -p no:cacheprovider`（带门控，C1 全量） | 6 passed / **36** failed（5 旧 API green + 1 装配次序 probe green；36 缺 seam/签名/符号/业务断言 RED） |
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `ruff check .` | ✅ All checks passed |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python tests/komari_roulette/test_tsk279_lifecycle_pg.py` | ✅ 0 errors, 0 warnings, 0 informations |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python`（全仓） | 8 errors，全部为设计内 `effect_check`/`EffectCheckRejectedError` 缺接口 RED（`test_tsk279_effect_recheck_pg.py`） |
+
+清理核验：`_installed_lifecycle_qq_authority` 的 `finally` 显式恢复全局
+`manager.get_config_storage`、复位 `register_qq_group_resolver(None)` /
+`register_qq_ban_checker(None)`、`ban_service.close()`、`delete_roulette_config`；
+装配次序 probe 同样在 `finally` 恢复 `get_config_storage` 并删除
+`komari_roulette_config` 单行。C1 全量运行后实测：`komari_roulette_config` 0 行，
+本 scope 绑定行/轮盘 receipt/game/fulfillment 均为 0。

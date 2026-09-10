@@ -25,8 +25,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import pytest
@@ -41,10 +42,15 @@ from .command_support import (
 from .test_command_service import (
     CountingRandom,
     create_waiting,
+    current_game_row,
     join_player,
     seed_players,
     service_for,
     start_game,
+)
+from .test_tsk279_effect_recheck_pg import (
+    _mint_business_token,
+    _real_binding_resolvers,
 )
 from .tsk279_lifecycle_support import (
     application_api,
@@ -57,6 +63,7 @@ from .tsk279_support import (
     Tsk279Harness,
     harness_fixture_body,
     insert_waiting_game,
+    scope_counts,
     seed_aged_receipt,
 )
 
@@ -479,3 +486,569 @@ async def test_stop_after_start_leaves_no_roulette_jobs(
             assert ctx.scheduler.get_job(CLEANUP_JOB_ID) is None
     finally:
         await delete_roulette_config(harness.engine)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle → QQ business wiring: the *real* composition root, not a manual
+# ``install_roulette_qq_runtime``.
+#
+# C1 review gap: every persisted GREEN "installed" probe builds its own runtime
+# with ``install_roulette_qq_runtime`` and test-owned gates, so it cannot show
+# that the *real* lifecycle installs gates that read the real authority. These
+# cases never install a runtime and never replace its three gates: they drive the
+# real driver startup hook and then the globally installed ``handle_roulette_qq``
+# over real ``AdmissionRuntime`` / ``BindingTransaction`` / ``UserBanService``.
+# They are RED until ``komari_roulette.lifecycle`` exists.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _InstalledQQAuthority:
+    """Handles of one real lifecycle install plus real authority wiring."""
+
+    app: Any
+    manager: Any
+    current: Any
+    storage: Any
+    ban_service: Any
+    numeric_group: int
+    member_qq: int
+
+
+@asynccontextmanager
+async def _installed_lifecycle_qq_authority(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    plugin_enable: bool,
+    numeric_group: int,
+    member_qq: int,
+) -> AsyncIterator[_InstalledQQAuthority]:
+    """Install the real lifecycle and real authority; never install a QQ runtime.
+
+    Ordering is deliberately *dependency-first*, mirroring production fail-closed
+    startup: (1) the real admission control plane reaches READY with its fake
+    policy store, (2) the canonical binding/member/ban callbacks are registered,
+    (3) the real driver startup hook builds the composition root, (4) the live
+    switch is written through that root's real ``ConfigManager``, and only then
+    (5) the globally installed ``handle_roulette_qq`` is driven.  A startup that
+    ran before its authority dependencies were ready would have to ignore their
+    readiness, so this fixture never forces that shape.
+
+    ``prepare_control_plane`` monkeypatches the module-global
+    ``manager.get_config_storage`` factory; the fixture restores the real factory
+    immediately afterwards so every later ``ConfigManager`` (the roulette one)
+    reads real PostgreSQL.  The already-started admission runtime keeps working
+    because its ``ConfigManager`` captured the fake store's watcher callback
+    during ``start``.
+    """
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.config_manager import manager as manager_module
+    from komari_bot.plugins.user_ban.service import UserBanService
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await delete_roulette_config(harness.engine)
+    ban_service = UserBanService()
+    original_get_config_storage = manager_module.get_config_storage
+    try:
+        # 1. Real READY admission first: the runtime consumes the fake policy
+        #    store and registers its watcher before the seam is restored.
+        await prepare_control_plane(monkeypatch, storage)
+        # 2. Restore the real storage factory before the composition root starts:
+        #    the admission runtime keeps its captured fake watcher, while the
+        #    roulette ``ConfigManager`` must read real PostgreSQL.
+        manager_module.get_config_storage = original_get_config_storage
+
+        # 3. Register the real canonical binding/member/ban callbacks before any
+        #    installed gate can read them.
+        resolve_group, resolve_member = await _real_binding_resolvers(harness)
+
+        async def ban_checker(member_qq_value: int, scope: object) -> bool:
+            return await ban_service.is_user_banned(
+                str(member_qq_value), cast("Any", scope)
+            )
+
+        async with harness.scope("lifecycle-qq") as current:
+            await harness.binding_manager.bind_group_member(
+                app_id=current.app_id,
+                group_id=str(numeric_group),
+                group_openid=current.group_openid,
+                member_qq=str(member_qq),
+                member_openid=current.member_openid,
+                character_name="Seat 1",
+                bot_self_id="tsk279-test-bot",
+            )
+            group_admission.register_qq_group_resolver(
+                resolve_group, member_resolver=resolve_member
+            )
+            group_admission.register_qq_ban_checker(ban_checker)
+            try:
+                async with lifecycle_context(monkeypatch) as ctx:
+                    # 4. Real driver startup: the composition root reads the real
+                    #    PostgreSQL config through the restored factory.
+                    await invoke_hook(require_single_startup_hook(ctx))
+                    app = _application()
+                    manager = ctx.config_managers["komari_roulette"]
+                    # 5. Legal live switch through the real manager (real PG).
+                    await manager.update_field_async("plugin_enable", plugin_enable)
+                    if plugin_enable:
+                        await app.runtime.run_recovery_tick()
+                    assert app.runtime.get_state().plugin_enable is plugin_enable, (
+                        "the lifecycle config manager must carry the requested "
+                        "live switch"
+                    )
+                    yield _InstalledQQAuthority(
+                        app=app,
+                        manager=manager,
+                        current=current,
+                        storage=storage,
+                        ban_service=ban_service,
+                        numeric_group=numeric_group,
+                        member_qq=member_qq,
+                    )
+            finally:
+                group_admission.register_qq_group_resolver(None)
+                group_admission.register_qq_ban_checker(None)
+    finally:
+        manager_module.get_config_storage = original_get_config_storage
+        with suppress(Exception):
+            await ban_service.close()
+        await delete_roulette_config(harness.engine)
+
+
+async def _scope_latest_receipt_id(harness: Tsk279Harness, current: Any) -> str | None:
+    async with harness.session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT receipt_id FROM komari_roulette_command_receipts "
+                "WHERE app_id = :app_id AND group_openid = :group_openid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+    return None if value is None else str(value)
+
+
+async def _fulfillment_state(
+    harness: Tsk279Harness, current: Any, inbound_msg_id: str
+) -> str | None:
+    async with harness.session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT f.state FROM komari_roulette_fulfillments AS f "
+                "JOIN komari_roulette_command_receipts AS r "
+                "ON r.receipt_id = f.receipt_id "
+                "WHERE r.app_id = :app_id AND r.group_openid = :group_openid "
+                "AND r.inbound_msg_id = :inbound"
+            ),
+            {
+                "app_id": current.app_id,
+                "group_openid": current.group_openid,
+                "inbound": inbound_msg_id,
+            },
+        )
+    return None if value is None else str(value)
+
+
+@PG_REQUIRED
+async def test_restoring_config_storage_factory_keeps_admission_fake_live_and_roulette_real_pg(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old-API probe for the C1 fixture order: admission fake + real factory.
+
+    ``prepare_control_plane`` monkeypatches the module-global
+    ``manager.get_config_storage`` factory, so a ``ConfigManager`` built later
+    would silently read the admission fake.  The lifecycle fixture restores the
+    real factory *after* admission is READY and before the roulette composition
+    root starts.  This probe proves the restore is correct both ways without
+    depending on the still-missing ``lifecycle`` module:
+
+    * the already-started ``AdmissionRuntime`` still receives the fake's watcher
+      deliveries after the restore (a policy revocation really bites), because
+      its manager captured the fake watcher at ``start``;
+    * a real ``ConfigManager`` built after the restore reads and writes the real
+      PostgreSQL ``komari_roulette_config`` table, never the admission fake.
+    """
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.config_manager import manager as manager_module
+    from komari_bot.plugins.config_manager.manager import ConfigManager
+    from komari_bot.plugins.komari_roulette.config_schema import DynamicConfigSchema
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    numeric_group = 279540
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    original_get_config_storage = manager_module.get_config_storage
+    await delete_roulette_config(harness.engine)
+    try:
+        await prepare_control_plane(monkeypatch, storage)
+        admitted = group_admission.adjudicate([numeric_group])
+        assert (
+            admitted.qualification is group_admission.AdmissionQualification.BUSINESS
+        ), "the real admission runtime must be READY before the factory restore"
+
+        manager_module.get_config_storage = original_get_config_storage
+
+        # The fake's captured watcher keeps the *started* runtime live.
+        storage.deliver(
+            stored_policy(2, {"mode": "blacklist", "group_ids": [numeric_group]})
+        )
+        revoked = group_admission.adjudicate([numeric_group])
+        assert (
+            revoked.qualification
+            is group_admission.AdmissionQualification.REJECTED
+        ), "a fake-delivered revocation must still reach the started runtime"
+        assert revoked.reason_code == "policy_restricted"
+        assert group_admission.get_runtime_state().effective_revision == 2
+        storage.deliver(stored_policy(3, {"mode": "blacklist", "group_ids": []}))
+        assert (
+            group_admission.adjudicate([numeric_group]).qualification
+            is group_admission.AdmissionQualification.BUSINESS
+        ), "readmission through the same fake watcher must work"
+
+        # A real manager built after the restore uses real PostgreSQL.
+        roulette_manager = ConfigManager("komari_roulette", DynamicConfigSchema)
+        await roulette_manager.initialize_async()
+        await roulette_manager.update_field_async("plugin_enable", value=True)
+        async with harness.session_factory() as session:
+            stored = await session.scalar(
+                text("SELECT plugin_enable FROM komari_roulette_config WHERE id = 1")
+            )
+        assert stored is True, (
+            "a ConfigManager built after the factory restore must persist to the "
+            f"real PostgreSQL roulette config, got {stored!r}"
+        )
+    finally:
+        manager_module.get_config_storage = original_get_config_storage
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_lifecycle_installed_qq_handler_commits_valid_token_and_captures_real_sdk_payload(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .tsk278_support import admission_state
+    from .tsk279_lifecycle_support import QQ_MODULE, RecordingQQBot
+
+    async with _installed_lifecycle_qq_authority(
+        harness,
+        monkeypatch,
+        plugin_enable=True,
+        numeric_group=279501,
+        member_qq=8_500_000_001,
+    ) as authority:
+        qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
+        assert qq.get_roulette_qq_runtime() is not None, (
+            "the real startup hook must install the QQ runtime globally"
+        )
+        token, _mint_bot, event = await _mint_business_token(
+            authority.current, "lifecycle-allow-1"
+        )
+        bot = RecordingQQBot(authority.current.app_id)
+        await qq.handle_roulette_qq(bot, event, admission_state(token=token))
+
+        assert await _scope_receipts(harness, authority.current) == 1
+        apis = [api for api, _data in bot.calls]
+        assert apis == ["post_group_messages"], (
+            "the lifecycle-installed handler must produce exactly one real SDK "
+            f"payload, got {apis}"
+        )
+        payload = bot.calls[0][1]
+        assert payload["msg_id"] == "lifecycle-allow-1"
+        assert payload["msg_seq"] == 1
+        receipt_id = await _scope_latest_receipt_id(harness, authority.current)
+        assert receipt_id is not None
+        assert payload["markdown"].content == await _stored_reply_body(
+            harness, receipt_id
+        ), "the SDK payload must carry the frozen committed body"
+
+
+_REVOKE_CASES = ("plugin_disabled", "user_banned", "policy_restricted")
+
+
+@PG_REQUIRED
+@pytest.mark.parametrize("mutation", _REVOKE_CASES)
+async def test_lifecycle_installed_qq_handler_rejects_revoked_authority_before_execution(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    from tests.group_admission.runtime_support import stored_policy
+
+    from .tsk278_support import admission_state
+    from .tsk279_lifecycle_support import QQ_MODULE, RecordingQQBot
+
+    async with _installed_lifecycle_qq_authority(
+        harness,
+        monkeypatch,
+        plugin_enable=mutation != "plugin_disabled",
+        numeric_group=279510,
+        member_qq=8_500_000_010,
+    ) as authority:
+        qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
+        token, _mint_bot, event = await _mint_business_token(
+            authority.current, f"lifecycle-reject-{mutation}"
+        )
+        match mutation:
+            case "plugin_disabled":
+                pass  # installed with the live switch already off
+            case "user_banned":
+                await authority.ban_service.ban_user(
+                    user_id=str(authority.member_qq),
+                    target_scope="command",
+                    operator_id="tsk279-test",
+                )
+            case "policy_restricted":
+                authority.storage.deliver(
+                    stored_policy(
+                        2,
+                        {
+                            "mode": "blacklist",
+                            "group_ids": [authority.numeric_group],
+                        },
+                    )
+                )
+            case _:
+                message = f"unknown revocation case: {mutation}"
+                raise AssertionError(message)
+
+        bot = RecordingQQBot(authority.current.app_id)
+        await qq.handle_roulette_qq(bot, event, admission_state(token=token))
+
+        assert bot.calls == [], (
+            f"a {mutation} authority before execution must never send"
+        )
+        assert await _scope_receipts(harness, authority.current) == 0, (
+            f"a {mutation} authority before execution must leave no receipt"
+        )
+        counts = await scope_counts(harness.session_factory, authority.current)
+        assert all(count == 0 for count in counts.values()), (
+            f"a {mutation} authority before execution must leave zero effects, "
+            f"got {counts}"
+        )
+
+
+class _PostClaimClaimBarrier:
+    """Pause the *real* ``app.service.claim_fulfillment`` after the claim commits.
+
+    The committed ``PENDING_CONFIRMATION`` fulfillment row is the deterministic
+    post-claim marker: it cannot be observed before the real claim returned, and
+    the delivery only re-reads live authority *after* the claim.  Blocking inside
+    the real service method therefore lets this case revoke authority before any
+    final authority read begins, while still exercising the genuine claim and
+    delivery path.  It never guesses whether the installed implementation calls
+    a group resolver (a valid binding-session read path may not).
+
+    Only this case's receipt id is gated; foreign calls pass straight through.
+    ``RouletteCommandService`` is a plain (non-``slots``) class, so wrapping the
+    bound method on the installed instance is enough and leaves other objects
+    untouched.
+    """
+
+    def __init__(
+        self,
+        harness: Tsk279Harness,
+        *,
+        app_id: str,
+        inbound_msg_id: str,
+    ) -> None:
+        self._harness = harness
+        self._app_id = app_id
+        self._inbound = inbound_msg_id
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self._blocked = False
+
+    async def _this_case_receipt_id(self) -> str | None:
+        async with self._harness.session_factory() as session:
+            value = await session.scalar(
+                text(
+                    "SELECT receipt_id FROM komari_roulette_command_receipts "
+                    "WHERE app_id = :app_id AND inbound_msg_id = :inbound "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"app_id": self._app_id, "inbound": self._inbound},
+            )
+        return None if value is None else str(value)
+
+    async def _pending(self, receipt_id: str) -> bool:
+        async with self._harness.session_factory() as session:
+            state = await session.scalar(
+                text(
+                    "SELECT state FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id"
+                ),
+                {"receipt_id": receipt_id},
+            )
+        return str(state) == "PENDING_CONFIRMATION"
+
+    def install(self, service: Any) -> None:
+        """Wrap the real bound ``claim_fulfillment`` on the installed service."""
+
+        original = service.claim_fulfillment
+
+        async def gated(receipt_id: str) -> Any:
+            self.calls += 1
+            claim = await original(receipt_id)
+            if (
+                not self._blocked
+                and receipt_id == await self._this_case_receipt_id()
+                and await self._pending(receipt_id)
+            ):
+                self._blocked = True
+                self.entered.set()
+                await self.release.wait()
+            return claim
+
+        service.claim_fulfillment = gated
+
+
+_POST_CLAIM_CASES = ("user_banned", "canonical_remapped")
+
+
+@PG_REQUIRED
+@pytest.mark.parametrize("mutation", _POST_CLAIM_CASES)
+async def test_lifecycle_installed_delivery_post_claim_revocation_blocks_network_but_keeps_committed_facts(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    from .tsk278_support import admission_state
+    from .tsk279_lifecycle_support import QQ_MODULE, RecordingQQBot
+
+    inbound = f"lifecycle-postclaim-{mutation}"
+    async with _installed_lifecycle_qq_authority(
+        harness,
+        monkeypatch,
+        plugin_enable=True,
+        numeric_group=279520,
+        member_qq=8_500_000_020,
+    ) as authority:
+        qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
+        barrier = _PostClaimClaimBarrier(
+            harness, app_id=authority.current.app_id, inbound_msg_id=inbound
+        )
+        barrier.install(authority.app.service)
+        token, _mint_bot, event = await _mint_business_token(
+            authority.current, inbound
+        )
+        bot = RecordingQQBot(authority.current.app_id)
+        handler_task = asyncio.create_task(
+            qq.handle_roulette_qq(bot, event, admission_state(token=token))
+        )
+        try:
+            async with asyncio.timeout(10):
+                await barrier.entered.wait()
+            assert await _fulfillment_state(harness, authority.current, inbound) == (
+                "PENDING_CONFIRMATION"
+            ), "the real PG claim must be committed before authority is revoked"
+            match mutation:
+                case "user_banned":
+                    await authority.ban_service.ban_user(
+                        user_id=str(authority.member_qq),
+                        target_scope="command",
+                        operator_id="tsk279-test",
+                    )
+                case "canonical_remapped":
+                    async with harness.engine.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "UPDATE komari_character_binding_groups "
+                                "SET group_id = :moved "
+                                "WHERE app_id = :app_id AND group_openid = :group"
+                            ),
+                            {
+                                "moved": str(authority.numeric_group + 1),
+                                "app_id": authority.current.app_id,
+                                "group": authority.current.group_openid,
+                            },
+                        )
+                case _:
+                    message = f"unknown post-claim case: {mutation}"
+                    raise AssertionError(message)
+        finally:
+            barrier.release.set()
+        async with asyncio.timeout(10):
+            await handler_task
+
+        assert bot.calls == [], (
+            "an authority revoked after the claim must never reach the network"
+        )
+        assert await _fulfillment_state(harness, authority.current, inbound) == (
+            "NOT_DELIVERED"
+        )
+        assert await _scope_receipts(harness, authority.current) == 1, (
+            "the committed domain receipt must survive a post-claim rejection"
+        )
+        row = await current_game_row(harness.session_factory, authority.current)
+        assert row is not None, (
+            "the committed game fact must survive a post-claim rejection"
+        )
+        assert str(row["lifecycle"]) == "waiting"
+
+
+@PG_REQUIRED
+async def test_lifecycle_installed_qq_handler_group_lock_wait_then_plugin_false_leaves_zero_receipt_game(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .tsk278_support import admission_state
+    from .tsk279_lifecycle_support import QQ_MODULE, RecordingQQBot
+
+    async with _installed_lifecycle_qq_authority(
+        harness,
+        monkeypatch,
+        plugin_enable=True,
+        numeric_group=279530,
+        member_qq=8_500_000_030,
+    ) as authority:
+        qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
+        token, _mint_bot, event = await _mint_business_token(
+            authority.current, "lifecycle-lock-1"
+        )
+        bot = RecordingQQBot(authority.current.app_id)
+        async with harness.session_factory() as blocker:
+            await blocker.begin()
+            blocker_pid = await backend_pid(blocker)
+            await hold_group_lock(blocker, authority.current)
+            handler_task = asyncio.create_task(
+                qq.handle_roulette_qq(bot, event, admission_state(token=token))
+            )
+            try:
+                await wait_for_blocked(harness.session_factory, blocker_pid)
+                await authority.manager.update_field_async(
+                    "plugin_enable", value=False
+                )
+            finally:
+                await blocker.commit()
+            async with asyncio.timeout(10):
+                await handler_task
+
+        assert bot.calls == [], (
+            "a switch turned off while the command queued must never send"
+        )
+        assert await _scope_receipts(harness, authority.current) == 0, (
+            "a switch turned off while the command queued must leave no receipt"
+        )
+        counts = await scope_counts(harness.session_factory, authority.current)
+        assert all(count == 0 for count in counts.values()), (
+            "a switch turned off while the command queued must leave zero "
+            f"effects, got {counts}"
+        )
