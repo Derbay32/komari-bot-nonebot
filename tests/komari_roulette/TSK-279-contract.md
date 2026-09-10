@@ -785,3 +785,68 @@ KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
 清理核验：用例结束后 `app_id like '%tsk279%'` 的收据/履约/对局均为 0，7d/30d 合格
 残渣计数均为 0；门控库 `alembic_version` 仍为 `0021`。库内其余 `tsk276`/`tsk280`
 行属其它套件既有残留，未手删、未被本票用例依赖为首屏。
+
+## 12. Stage-B 验收卫生收尾：per-case scope 追踪 / 锁后准入门禁抗污染
+
+依据验收意见：Stage-B 维护锁用例的「自身污染」不是预存在问题，必须在本票内修掉；
+旧 TSK-278 两个 harness 的 `delete_scope(scope("fixture"))` 与实际用例 scope 不匹配，
+会让每例真实的 waiting/active/terminal 行残留到共享门控库。本轮**只改测试与
+fixture 清理**：不改业务断言、不给生产加 tests 专用 app 过滤、不删外来数据、
+不新增产品 AC。
+
+### 12.1 旧 TSK-278 harness：按真实用例 scope 逐个清理
+
+`test_tsk278_delivery_pg.py` / `test_tsk278_fixture_probe.py` 的 `harness` fixture
+不再删除一个从未被使用的共享 scope，而是以 fixture-scoped `monkeypatch` 替换本
+模块的 `scope` 函数：每次真实创建都记录返回值，`finally` 对每个记录到的 scope
+调用既有 `delete_scope`（本 case 轮盘行）与既有 `delete_binding_scope`（本 case
+的 character_binding 群/成员行）。只删本 case 记录到的 scope：不做「测试前全库
+清零」、不按前缀批量删除、不清其它用例数据；`harness` yield 的
+`(engine, session_factory, manager)` 业务接口与跨文件默认 `scope` 都不变。
+
+### 12.2 锁后准入用例：只授权 own scope + 持久 foreign due fixture
+
+`test_maintenance_rechecks_admission_after_group_lock_wait`：
+
+- `admission` 端口从「对所有 app/group 返回 True」改为
+  `gate["allowed"] and (app, group) == (own app, own group)`：外来 scope 一律明确
+  `False`，本用例只可能推进/撤销自己这一组，绝不推进外来 group。
+- 用 `harness.scope("post-lock-foreign")` 显式创建一个由本 case 最终删除的
+  foreign due scope（deadline 1 小时前，早于 own 的 60 秒前），作为**持久回归
+  fixture**：worker 必须经真实 keyset 分页跨过它才能到达被锁的 own 组。
+- 以 `batch_size=1` 真实分页（首页 foreign、次页 own），真实
+  `wait_for_blocked` 证明 worker 确已阻塞在 own 群锁上；阻塞期间撤销 own 门禁，
+  放锁后 own 仍 `waiting`、整局快照逐字段不变；foreign 快照逐字段不变；
+  `drive.advanced == 0`、`drive.skipped_restricted >= 1`、`drive.pages >= 2`。
+  不 sleep 15 分钟，直接以 PG 写入 past deadline。
+
+close-runtime 锁用例既有的 own scope 匹配保持不变。
+
+### 12.3 执行记录（命令日志）
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+branch `pi/TSK-279-runtime-recovery`，基线 HEAD `77045d2`，root venv
+`/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）。PG/Redis 门控：
+
+```
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
+```
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `ruff check .` | ✅ All checks passed |
+| `pytest .../test_tsk278_delivery_pg.py .../test_tsk278_fixture_probe.py -q`（带门控） | ✅ 23 passed |
+| `pytest .../test_tsk279_maintenance_pg.py -q`（带门控，连跑 3 次） | ✅ 29 passed ×3 |
+| `pytest tests/komari_roulette/ -q`（带门控，正常顺序、不 deselect） | ✅ 552 passed |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python` | ✅ 0 errors, 0 warnings, 0 informations |
+
+清理核验：先记录 UTC mark，再跑两个旧 file，随后按
+`created_at > mark` / `updated_at > mark` 统计本轮 `tsk276-app-tsk278-%`：轮盘
+games / command_receipts / fulfillments / results / leaderboard 与
+character_binding members / groups 全部为 0；`members_total` / `groups_total`
+前后不变（未动其它套件的历史残留）。全 roulette 套件结束后
+`lifecycle IN ('waiting','active')` 为 0，`tsk279-post-lock-foreign` /
+`post-lock-admission` 行均为 0；`alembic_version` 仍为 `0021`。

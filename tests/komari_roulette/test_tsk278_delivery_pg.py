@@ -14,6 +14,7 @@ gate is enabled.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -29,12 +30,13 @@ from komari_bot.plugins.komari_roulette import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .command_support import (
     PG_REQUIRED,
+    Scope,
     backend_pid,
     command_factory,
     create_engine_and_factory,
@@ -61,6 +63,7 @@ from .tsk278_support import (
     assert_single_mention_tag,
     message_markdown_content,
 )
+from .tsk279_support import delete_binding_scope
 
 pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
 
@@ -94,22 +97,48 @@ class MentionProjector(CountingProjector):
         return ReplyProjection(body=body, metadata=projection.metadata)
 
 
+def _tracking_scope_factory(
+    real_scope: Callable[[str], Scope],
+) -> tuple[list[Scope], Callable[[str], Scope]]:
+    """Record every scope a case creates so teardown deletes its own rows."""
+
+    created: list[Scope] = []
+
+    def tracking_scope(tag: str = "command") -> Scope:
+        current = real_scope(tag)
+        created.append(current)
+        return current
+
+    return created, tracking_scope
+
+
 @pytest.fixture
-async def harness() -> AsyncIterator[
+async def harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[
     tuple[AsyncEngine, async_sessionmaker[AsyncSession], CharacterBindingManager]
 ]:
     async for engine, session_factory in create_engine_and_factory():
         await reset_shared_orm_engine()
         manager = CharacterBindingManager()
         await manager.initialize()
-        current = scope("tsk278-delivery")
+        # Track the real per-case scopes so teardown deletes exactly the rows
+        # this case created.  The old fixture deleted one unused shared scope
+        # (``scope("tsk278-delivery")``) while each case leaked its own
+        # waiting/active/terminal rows into the shared test database.
+        created, tracking_scope = _tracking_scope_factory(scope)
+        monkeypatch.setattr(sys.modules[__name__], "scope", tracking_scope)
         try:
             yield engine, session_factory, manager
         finally:
             with suppress(Exception):
                 await manager.close()
             await reset_shared_orm_engine()
-            await delete_scope(engine, current)
+            for current_scope in created:
+                with suppress(Exception):
+                    await delete_scope(engine, current_scope)
+                with suppress(Exception):
+                    await delete_binding_scope(engine, current_scope)
 
 
 async def test_real_delivery_success_marks_delivered(

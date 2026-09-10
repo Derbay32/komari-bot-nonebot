@@ -1925,62 +1925,95 @@ async def test_maintenance_rechecks_admission_after_group_lock_wait(
     await probe.close()
     shared_factory = orm_module.get_session
 
-    async with harness.app("post-lock-admission") as app_id:
-        service = service_for(harness, random_source=CountingRandom())
-        group_openid = f"grp-postlock-{uuid4().hex}"
+    async with harness.scope("post-lock-foreign") as foreign:
+        # A real foreign due candidate owned by this case: created here and
+        # deleted by the tracked ``scope`` teardown.  Its earlier deadline
+        # makes it the first keyset page, so the worker must paginate past it
+        # before it can reach the locked own group.
         await insert_waiting_game(
             harness.session_factory,
             game_id=str(uuid4()),
-            app_id=app_id,
-            group_openid=group_openid,
-            member_openid=f"m-{group_openid}",
-            deadline_age_seconds=60,
+            app_id=foreign.app_id,
+            group_openid=foreign.group_openid,
+            member_openid=foreign.member_openid,
+            deadline_age_seconds=3600,
         )
-        current = Scope(
-            app_id=app_id,
-            group_openid=group_openid,
-            member_openid=f"m-{group_openid}",
-        )
-        gate = {"allowed": True}
+        foreign_before = await _game_snapshot(harness, foreign)
+        async with harness.app("post-lock-admission") as app_id:
+            service = service_for(harness, random_source=CountingRandom())
+            group_openid = f"grp-postlock-{uuid4().hex}"
+            await insert_waiting_game(
+                harness.session_factory,
+                game_id=str(uuid4()),
+                app_id=app_id,
+                group_openid=group_openid,
+                member_openid=f"m-{group_openid}",
+                deadline_age_seconds=60,
+            )
+            current = Scope(
+                app_id=app_id,
+                group_openid=group_openid,
+                member_openid=f"m-{group_openid}",
+            )
+            own_before = await _game_snapshot(harness, current)
+            gate = {"allowed": True}
 
-        def admission(_app_id: str, _group_openid: str) -> bool:
-            return gate["allowed"]
+            def admission(candidate_app: str, candidate_group: str) -> bool:
+                # Only this case's own group is revocable; every foreign scope
+                # is explicitly refused, so this case can neither advance nor
+                # depend on cleaning rows it does not own.
+                return gate["allowed"] and (
+                    candidate_app,
+                    candidate_group,
+                ) == (app_id, group_openid)
 
-        maintenance = api["RouletteMaintenance"](
-            session_factory=shared_factory,
-            service=service,
-            admission=admission,
-        )
-        async with harness.session_factory() as blocker:
-            await blocker.begin()
-            blocker_pid = await backend_pid(blocker)
-            await hold_group_lock(blocker, current)
-            tick_task = asyncio.create_task(
-                _drive_recovery_until_settled(
-                    maintenance,
-                    harness,
-                    app_id=app_id,
-                    group_openid=group_openid,
+            maintenance = api["RouletteMaintenance"](
+                session_factory=shared_factory,
+                service=service,
+                admission=admission,
+            )
+            async with harness.session_factory() as blocker:
+                await blocker.begin()
+                blocker_pid = await backend_pid(blocker)
+                await hold_group_lock(blocker, current)
+                tick_task = asyncio.create_task(
+                    _drive_recovery_until_settled(
+                        maintenance,
+                        harness,
+                        app_id=app_id,
+                        group_openid=group_openid,
+                        batch_size=1,
+                    )
                 )
-            )
-            try:
-                await wait_for_blocked(harness.session_factory, blocker_pid)
-                # The group turns restricted while the worker waits on the lock.
-                gate["allowed"] = False
-            finally:
-                await blocker.commit()
-            async with asyncio.timeout(10):
-                drive = await tick_task
-        async with harness.session_factory() as session:
-            lifecycle = await session.scalar(
-                text(
-                    "SELECT lifecycle FROM komari_roulette_games "
-                    "WHERE app_id = :app_id AND group_openid = :group_openid"
-                ),
-                {"app_id": app_id, "group_openid": group_openid},
-            )
-        assert lifecycle == "waiting"
-        assert drive.advanced == 0
+                try:
+                    await wait_for_blocked(harness.session_factory, blocker_pid)
+                    # The own group turns restricted while the worker waits on
+                    # the lock; the earlier foreign page is already skipped,
+                    # never advanced.
+                    gate["allowed"] = False
+                finally:
+                    await blocker.commit()
+                async with asyncio.timeout(10):
+                    drive = await tick_task
+            own_after = await _game_snapshot(harness, current)
+            foreign_after = await _game_snapshot(harness, foreign)
+            async with harness.session_factory() as session:
+                lifecycle = await session.scalar(
+                    text(
+                        "SELECT lifecycle FROM komari_roulette_games "
+                        "WHERE app_id = :app_id AND group_openid = :group_openid"
+                    ),
+                    {"app_id": app_id, "group_openid": group_openid},
+                )
+            assert lifecycle == "waiting"
+            assert own_after == own_before
+            assert foreign_after == foreign_before
+            assert drive.advanced == 0
+            assert drive.skipped_restricted >= 1
+            # The foreign page came first, so reaching the locked own group
+            # required a real keyset page advance (no private first-page
+            # assumption and no foreign cleanup).
+            assert drive.pages >= 2
 
 
 @PG_REQUIRED
