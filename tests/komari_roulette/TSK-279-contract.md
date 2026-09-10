@@ -522,7 +522,8 @@ RED 失败原因分类（`--tb=line`）：
 | 现网 no-arg `runtime_check` 演进为按调用 | `runtime::test_delivery_runtime_check_receives_the_per_call_receipt` | RED（断言） | 真实 delivery 的 `RuntimeCheck` 收到本调用 `CommandReceipt`；`Barrier` 交错下 DELIVERED 载荷属允许组、`msg_id == receipt.inbound_msg_id`、`msg_seq == 1`、正文为冻结体 |
 | 两个 worker 竞争同一过期期限只推进一次（§2） | `maintenance::test_two_maintenance_instances_advance_one_turn_exactly_once` | RED（缺失模块） | 两个真实 `RouletteMaintenance` 实例经 `Barrier` 并发同一组；真实 PG 群锁下只淘汰旧当前一次、新当前自 PG now 满 15min、`advanced` 合计 1 |
 | 终局胜负只结算一次（§2、§3） | `maintenance::test_two_maintenance_instances_settle_terminal_wins_once` | RED（缺失模块） | 两个 worker 并发结算同一终局：`wins==1`、results==1、座位==2，不双加胜场 |
-| 临界 action 与 maintenance 锁竞争只提交一次效果（§2） | `maintenance::test_command_action_and_maintenance_locked_race_commits_one_effect` | RED（缺失模块） | 真实 `execute_group_command(forfeit)` 与真实 `advance_due` 并发抢同一群事务锁；无论谁先，恰好 1 个终局结果 + 1 个胜场，败者得 `state_conflict` / no-op |
+| 期限优先：命令先持锁时过期的 forfeit 结算为 timeout（§2） | `maintenance::test_expired_deadline_beats_forfeit_when_command_runs_first` | **定向编排（非竞速）** | 已过期回合收到真实 `forfeit`：`turn_expired` + `reason=timeout`，绝不 `forfeited`；恰好 1 条 completed 结果、两座位、`wins==1` |
+| 维护先结算后迟到命令见 `no_active_game`（§2） | `maintenance::test_maintenance_first_settles_timeout_then_command_sees_no_active_game` | **定向编排（非竞速）** | 同一过期期限先由真实 `advance_due` 结算 `timeout`；迟到命令只观察到 `no_active_game`（或观测边界 `state_conflict`），终局不被改写成 `forfeited` |
 | 锁后复核准入：等待期间转受限即不推进（§2、§5） | `maintenance::test_maintenance_rechecks_admission_after_group_lock_wait` | RED（缺失模块） | 群锁被外部持有、worker 真实阻塞在锁上（`backend_pid`/`wait_for_blocked`）期间把该群转受限；放锁后不得推进，局保持 `waiting`、`advanced==0` |
 | 锁后复核运行时关闭：关闭后不得推进（§2） | `maintenance::test_maintenance_rechecks_closed_runtime_after_group_lock_wait` | RED（缺失模块） | 阻塞期间真实 `RouletteRuntime.close()`；放锁后不得推进；maintenance 用真实 `orm.get_session` 工厂 |
 | 两玩家超时终局确为胜场（fixture 探针） | `maintenance::test_two_player_expiry_settles_one_win` | **绿探针** | 真实 `advance_expired` 对两玩家过期回合 → `completed` + `wins==1`（保证并发结算用例的 fixture 成立） |
@@ -622,3 +623,81 @@ RED 失败原因（`--tb=line`）：
 `group_admission` 群→member 解析、真实 `user_ban` 叠加、真实调度单例注册、真实保留
 策略常量、`SendGate`/`RuntimeCheck` 生产改签名、REST/管理面、Alembic 迁移与 `check`
 零 diff。
+
+### 10.5 B1 独立返工：测试自错误修复 / 分页加固 / 期限优先定向编排 / 锁后 effect_check
+
+> §10.3 / §10.4 记录上一轮基线（当时 maintenance 接缝尚缺）。本轮基线 HEAD
+> `39bf7ea` 上 maintenance 接缝已存在，维护侧用例全部转绿；剩余红见 (f)。
+
+本轮只改 Stage-B 5 个文件中的测试（实际改动 `test_tsk279_maintenance_pg.py`、
+`test_tsk279_runtime.py` 与本合同），不碰生产代码。
+
+**（a）已证实的测试自错误（修复前必红，修复后转绿）**
+
+| 自错误 | 位置 | 真实契约 | 修复 |
+|---|---|---|---|
+| `str(cleanup.trigger.fields[5])` 被断言为 `"hour='4'"` | `test_maintenance_jobs_registered_with_throttle_and_deploy_timezone` | APScheduler `CronTrigger.fields[5]` 的 `str()` 是裸值 `"4"` | 断言 `fields[5] == "4"`、`fields[6] == "0"` + `get_next_fire_time` 落在部署时区 04:00 + `trigger.timezone` |
+| `ON r.result_id = rp.result_id` | `test_two_maintenance_instances_settle_terminal_wins_once` | 真实 ORM 结果表主键/FK 是 `game_id`（`komari_roulette_result_players(game_id, join_seq)`） | 改为 `r.game_id = rp.game_id` |
+| 结果列写作 `completion_reason` | 旧 `test_command_action_and_maintenance_locked_race_commits_one_effect` | 结果真实列是 `reason` 与 `lifecycle` | 用例重写为 (c) 的定向编排，统一经 `_terminal_projection_state` 读 `lifecycle` / `reason` |
+
+**（b）全表扫描用例的分页加固（TSK-278/280 残渣）**
+
+门控库实测残留 264 条 tsk276/tsk280 终局与 724 条收据（`due now: 0`、无过期残渣），
+因此 `test_recovery_*` / `test_cleanup_*` 不再假设本用例候选落在前 100 行：
+
+- `_recovery_page_budget` / `_cleanup_round_budget` 以**真实全局 due/aged 计数**推导
+  轮数上限（不删外部行、不把生产 SQL 收窄到本 scope）；
+- `_drive_recovery_until_settled` 由生产 `cursor` / `scanned` 驱动，允许跨过整页受限群
+  及无关行，直到本组 settle 或游标走空；
+- `_drive_cleanup_until` 同理按真实 aged 计数有界重入 `cleanup_retention`。
+
+**（c）期限优先：两个受控顺序，替代 Barrier 竞速**
+
+源确认 `advance_expired` 顶部对 `active and _is_expired` 先走 `_expire_active` →
+`_eliminate_current(completion_reason="timeout", code="turn_expired", ok=False)`；
+`_load_current_rows` 只认 `lifecycle IN ('waiting','active')`。故对同一过期期限：
+
+- 命令先持锁 → `turn_expired`、`reason=timeout`，**绝不** `forfeited`；
+- 维护先结算 → 迟到命令只得到 `no_active_game`（或观测边界 `state_conflict`）。
+
+两个用例各只跑一种真实顺序（无 `Barrier` 多次重跑），统一由
+`_assert_single_timeout_terminal` 断言：恰好 1 条 completed 结果、`reason=timeout`、
+`wins==1`、两座位、`game_lifecycle=completed`。
+
+**（d）锁后 `effect_check` 真实常驻服务用例**
+
+直接驱动真实 `RouletteCommandService.advance_expired(group, effect_check=...)`
+（真实 PG 群锁 + 真实 storage），断言零副作用：
+
+| 用例 | gate | 期望 |
+|---|---|---|
+| `test_advance_expired_rejects_sync_gate_with_zero_mutation` | `lambda: False` | `effect_check_rejected`、`changed=False`、`_game_snapshot` 前后逐字段相等 |
+| `test_advance_expired_rejects_async_gate_with_zero_mutation` | `async def gate() -> False` | 同上（awaitable 拒绝同样 fail-closed） |
+| `test_advance_expired_gate_exception_fails_closed_zero_mutation` | `def gate(): raise` | 同上（`_run_effect_check` 捕获后返回 False，绝不当作放行） |
+| `test_advance_expired_accepts_true_gate_and_advances` | `lambda: True` | gate 恰好调用 1 次、`changed=True`、`waiting_game_expired`、局转 `expired` |
+| `test_advance_expired_runs_gate_only_after_group_lock_is_held` | 真实阻塞在群锁上 | 外部持锁、worker 真阻塞（`backend_pid`/`wait_for_blocked`）期间 `gate_calls==0`；放锁后 `==1` 并成功推进——证明复核确在锁后 |
+
+**（e）runtime RED：`failed>0` 的 tick 不得 READY**
+
+`RecordingRecovery` / `BlockingRecovery`（runtime）与 `_NoopRecovery`（maintenance）
+现在返回真实 `RecoveryTickResult`（不再 `object` / 裸 `SimpleNamespace`），并新增
+`runtime::test_recovery_tick_with_failures_does_not_report_ready`：tick 返回 `failed=1`
+时 `status=FAILED`、`reason_code="recovery_failed"`、`recovery_completed=False`、
+`accepting=False`；紧随的失败-free tick 才恢复 READY。既有 init /
+disable-doesn't-pause / close AC 不变。
+
+**（f）本轮执行记录**
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `pytest .../test_tsk279_maintenance_pg.py -q`（带门控） | 25 passed / 1 failed |
+| `pytest .../test_tsk279_runtime.py -q`（带门控） | 2 passed / 14 failed |
+| `pytest .../test_tsk279_observability.py -q`（带门控） | 5 passed |
+| `pytest` 三文件合计 | 32 passed / 15 failed |
+| `pyright --pythonpath <root venv python>` | 4 errors（全部为既有按调用回调的签名不匹配 RED） |
+
+剩余 15 红：12 例 `ModuleNotFoundError: ...roulette.runtime`（Stage-C runtime 接缝
+未实现，含本轮新增 `failed>0` 用例）+ 3 例既有按调用回调断言 RED（`SendGate` /
+`RuntimeCheck` 生产签名未演进）。维护侧（恢复分页、清理边界、双实例并发、锁后复核、
+期限优先定向编排、`effect_check`）**全绿**。

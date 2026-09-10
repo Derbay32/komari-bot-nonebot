@@ -33,6 +33,7 @@ from komari_bot.plugins.group_admission import (
     AdmissionQualification,
     AdmissionResult,
 )
+from komari_bot.plugins.komari_roulette.maintenance import RecoveryTickResult
 
 from .command_support import (
     PG_REQUIRED,
@@ -91,18 +92,28 @@ class RecordingRecovery:
     driven.
     """
 
-    def __init__(self, *, fail_times: int = 0) -> None:
+    def __init__(self, *, fail_times: int = 0, failed_ticks: int = 0) -> None:
         self.calls = 0
         self.closed = False
         self.fail = False
         self._fail_times = fail_times
+        self._failed_ticks = failed_ticks
 
-    async def run_recovery_tick(self) -> object:
+    async def run_recovery_tick(self) -> RecoveryTickResult:
         self.calls += 1
         if self.fail or self.calls <= self._fail_times:
             message = "recovery tick failed (transient, TSK-279 test port)"
             raise RuntimeError(message)
-        return object()
+        # Return the real B1 tick result (not ``object``): ``failed`` is part of
+        # the port contract the runtime must honour, so a double must never hide
+        # a partial scan from it.
+        failed = 1 if self.calls <= self._failed_ticks else 0
+        return RecoveryTickResult(
+            scanned=1,
+            advanced=1 if failed == 0 else 0,
+            skipped_restricted=0,
+            failed=failed,
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -123,7 +134,7 @@ class BlockingRecovery:
         self.finished = 0
         self.closed = False
 
-    async def run_recovery_tick(self) -> object:
+    async def run_recovery_tick(self) -> RecoveryTickResult:
         self.calls += 1
         self.started.set()
         try:
@@ -132,7 +143,12 @@ class BlockingRecovery:
             self.cancelled += 1
             raise
         self.finished += 1
-        return object()
+        return RecoveryTickResult(
+            scanned=1,
+            advanced=1,
+            skipped_restricted=0,
+            failed=0,
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -348,6 +364,36 @@ async def test_transient_recovery_failure_recovers_to_ready_next_tick() -> None:
     # Not permanently failed and no silent fallback: the next tick converges.
     await runtime.run_recovery_tick()
     assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
+    assert runtime.accepting is True
+    await runtime.close()
+
+
+async def test_recovery_tick_with_failures_does_not_report_ready() -> None:
+    """A tick that counted per-group failures is not a clean recovery.
+
+    ``RecoveryTickResult.failed`` is part of the port contract: a scan that
+    walked groups but could not settle every one of them must not be reported
+    as READY.  Only a following failure-free tick may release business.
+    """
+
+    api = _runtime_api()
+    recovery = RecordingRecovery(failed_ticks=1)
+    runtime = api["RouletteRuntime"](
+        config_manager=RecordingConfig(),
+        recovery=recovery,
+        admission=_admission_by_group({1}),
+    )
+    await runtime.start()
+    state = runtime.get_state()
+    assert state.status is api["RouletteRuntimeStatus"].FAILED
+    assert state.reason_code == "recovery_failed"
+    assert state.recovery_completed is False
+    assert runtime.accepting is False
+
+    # The next tick has no failures and converges to READY.
+    await runtime.run_recovery_tick()
+    assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
+    assert runtime.get_state().recovery_completed is True
     assert runtime.accepting is True
     await runtime.close()
 
@@ -777,9 +823,15 @@ async def test_real_config_manager_live_flip_denies_business_and_keeps_maintenan
             dispatched: list[str] = []
 
             class RealRecovery:
-                async def run_recovery_tick(self) -> object:
+                async def run_recovery_tick(self) -> RecoveryTickResult:
                     dispatched.append("tick")
-                    return await service.advance_expired(current.group)
+                    outcome = await service.advance_expired(current.group)
+                    return RecoveryTickResult(
+                        scanned=1,
+                        advanced=1 if outcome.changed else 0,
+                        skipped_restricted=0,
+                        failed=0,
+                    )
 
                 async def close(self) -> None:
                     return None

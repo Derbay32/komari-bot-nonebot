@@ -12,10 +12,11 @@ storage/ORM to prove
 * a retention fixture built from real terminal lifecycles (completed /
   cancelled / expired / failed) is schema- and FK-valid.
 
-The remaining cases are **RED** for the still-missing
-``komari_bot.plugins.komari_roulette.maintenance`` seam (recovery pagination,
-retention boundaries, job registration, no-Redis dependency).  They fail with
-``ModuleNotFoundError`` — never with a wrong-fixture assertion.
+The remaining cases cover the real ``komari_bot.plugins.komari_roulette.maintenance``
+seam (recovery pagination, retention boundaries, job registration, no-Redis
+dependency) plus the two runtime-facing post-lock rechecks, which stay RED
+until ``komari_bot.plugins.komari_roulette.runtime`` is implemented and fail
+with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -108,6 +110,330 @@ async def _game_observation(harness: Tsk279Harness, current: Any) -> Any:
         state_revision=int(row["state_revision"]),
         turn_seq=int(row["turn_seq"]),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryDrive:
+    """Aggregated, bounded recovery walk toward this case's own candidate."""
+
+    scanned: int
+    advanced: int
+    skipped_restricted: int
+    failed: int
+    pages: int
+    settled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpiredTurn:
+    """A real two-player active game whose turn deadline is two hours past."""
+
+    service: Any
+    actor: str
+    observation: Any
+
+
+async def _group_lifecycle(
+    harness: Tsk279Harness,
+    *,
+    app_id: str,
+    group_openid: str,
+) -> str | None:
+    async with harness.session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT lifecycle FROM komari_roulette_games "
+                "WHERE app_id = :app_id AND group_openid = :group_openid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"app_id": app_id, "group_openid": group_openid},
+        )
+    return None if value is None else str(value)
+
+
+async def _recovery_page_budget(
+    harness: Tsk279Harness,
+    *,
+    batch_size: int,
+    margin: int = 4,
+) -> int:
+    """Bound the keyset walk by the *actual* number of due rows.
+
+    Other suites leave due rows behind, so this case's candidate can sit behind
+    several full pages.  The bound is derived from the real global due-row count
+    (the production query is never narrowed to this case's scope), so the walk
+    is bounded without deleting foreign rows or faking a private scan space.
+    """
+
+    async with harness.session_factory() as session:
+        total = await session.scalar(
+            text(
+                "SELECT count(*) FROM komari_roulette_games "
+                "WHERE lifecycle IN ('waiting', 'active') "
+                "AND COALESCE(waiting_expires_at, turn_deadline_at) "
+                "<= clock_timestamp()"
+            )
+        )
+    pages = (int(total or 0) + batch_size - 1) // batch_size
+    return pages + margin
+
+
+async def _drive_recovery_until_settled(
+    maintenance: Any,
+    harness: Tsk279Harness,
+    *,
+    app_id: str,
+    group_openid: str,
+    batch_size: int = 100,
+) -> _RecoveryDrive:
+    """Walk the real keyset scan until this case's group settles (or wraps).
+
+    The loop is driven by the *production* ``cursor``/``scanned`` values, so a
+    page full of foreign or restricted groups is walked past instead of being
+    deleted or filtered out.
+    """
+
+    budget = await _recovery_page_budget(harness, batch_size=batch_size)
+    scanned = advanced = skipped = failed = 0
+    pages = 0
+    settled = False
+    for _ in range(budget):
+        tick = await maintenance.advance_due(batch_size=batch_size)
+        pages += 1
+        scanned += int(getattr(tick, "scanned", 0))
+        advanced += int(getattr(tick, "advanced", 0))
+        skipped += int(getattr(tick, "skipped_restricted", 0))
+        failed += int(getattr(tick, "failed", 0))
+        lifecycle = await _group_lifecycle(
+            harness, app_id=app_id, group_openid=group_openid
+        )
+        if lifecycle not in {"waiting", "active"}:
+            settled = True
+            break
+        if getattr(tick, "cursor", None) is None:
+            # A partial page means the scan reached the end; the next call would
+            # restart from the same first rows, so stop instead of looping.
+            break
+    return _RecoveryDrive(scanned, advanced, skipped, failed, pages, settled)
+
+
+async def _cleanup_round_budget(
+    harness: Tsk279Harness,
+    *,
+    batch_size: int,
+    margin: int = 4,
+) -> int:
+    """Bound cleanup rounds by the *actual* aged-group count (no scope filter)."""
+
+    async with harness.session_factory() as session:
+        receipt_groups = int(
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM ("
+                    "SELECT app_id, group_openid FROM "
+                    "komari_roulette_command_receipts "
+                    "WHERE created_at < clock_timestamp() "
+                    "- make_interval(days => 7) "
+                    "GROUP BY app_id, group_openid) AS aged_receipt_groups"
+                )
+            )
+            or 0
+        )
+        terminal_groups = int(
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM ("
+                    "SELECT app_id, group_openid FROM komari_roulette_games "
+                    "WHERE lifecycle IN ('cancelled', 'expired', 'failed') "
+                    "AND ended_at IS NOT NULL "
+                    "AND ended_at < clock_timestamp() - make_interval(days => 30) "
+                    "GROUP BY app_id, group_openid) AS aged_terminal_groups"
+                )
+            )
+            or 0
+        )
+    groups = max(receipt_groups, terminal_groups)
+    return (groups + batch_size - 1) // batch_size + margin
+
+
+async def _drive_cleanup_until(
+    maintenance: Any,
+    harness: Tsk279Harness,
+    *,
+    done: Any,
+    batch_size: int = 100,
+) -> int:
+    """Run bounded, reentrant cleanup rounds until ``done()`` holds."""
+
+    budget = await _cleanup_round_budget(harness, batch_size=batch_size)
+    for round_index in range(1, budget + 1):
+        await maintenance.cleanup_retention(batch_size=batch_size)
+        if await done():
+            return round_index
+    message = "bounded cleanup rounds did not reach this case's rows"
+    raise AssertionError(message)
+
+
+async def _terminal_projection_state(
+    harness: Tsk279Harness,
+    current: Any,
+) -> dict[str, Any]:
+    """Read the real terminal projection for one exact scope (read-only)."""
+
+    params = {"app_id": current.app_id, "group_openid": current.group_openid}
+    async with harness.session_factory() as session:
+        results = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT lifecycle, reason FROM komari_roulette_results "
+                        "WHERE app_id = :app_id AND group_openid = :group_openid"
+                    ),
+                    params,
+                )
+            )
+            .all()
+        )
+        game_lifecycle = await session.scalar(
+            text(
+                "SELECT lifecycle FROM komari_roulette_games "
+                "WHERE app_id = :app_id AND group_openid = :group_openid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            params,
+        )
+        wins = await session.scalar(
+            text(
+                "SELECT wins FROM komari_roulette_leaderboard "
+                "WHERE app_id = :app_id AND group_openid = :group_openid"
+            ),
+            params,
+        )
+        result_players = await session.scalar(
+            text(
+                "SELECT count(*) FROM komari_roulette_result_players rp "
+                "JOIN komari_roulette_results r ON r.game_id = rp.game_id "
+                "WHERE r.app_id = :app_id AND r.group_openid = :group_openid"
+            ),
+            params,
+        )
+    return {
+        "results": [(str(row[0]), str(row[1])) for row in results],
+        "game_lifecycle": game_lifecycle,
+        "wins": int(wins or 0),
+        "result_players": int(result_players or 0),
+    }
+
+
+async def _assert_single_timeout_terminal(
+    harness: Tsk279Harness,
+    current: Any,
+) -> None:
+    """Exactly one completed result, reason ``timeout``, two seats, one win."""
+
+    state = await _terminal_projection_state(harness, current)
+    assert state["results"] == [("completed", "timeout")]
+    assert state["game_lifecycle"] == "completed"
+    assert state["wins"] == 1
+    assert state["result_players"] == 2
+
+
+async def _game_snapshot(harness: Tsk279Harness, current: Any) -> dict[str, Any]:
+    """Full mutation-relevant snapshot of one exact scope's current game."""
+
+    params = {"app_id": current.app_id, "group_openid": current.group_openid}
+    async with harness.session_factory() as session:
+        game = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT game_id, lifecycle, state_revision, "
+                        "chamber_revision, turn_seq, current_player_seq, "
+                        "waiting_expires_at, turn_deadline_at, pending_rewards, "
+                        "pending_burst, pending_locks, updated_at "
+                        "FROM komari_roulette_games "
+                        "WHERE app_id = :app_id AND group_openid = :group_openid "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    params,
+                )
+            )
+            .mappings()
+            .first()
+        )
+        assert game is not None
+        eliminated = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT join_seq FROM komari_roulette_players "
+                        "WHERE game_id = :game_id AND eliminated_at IS NOT NULL"
+                    ),
+                    {"game_id": game["game_id"]},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        receipts = int(
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM komari_roulette_command_receipts "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid"
+                ),
+                params,
+            )
+            or 0
+        )
+        results = int(
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM komari_roulette_results "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid"
+                ),
+                params,
+            )
+            or 0
+        )
+    return {
+        "game": dict(game),
+        "eliminated": [int(seq) for seq in eliminated],
+        "receipts": receipts,
+        "results": results,
+    }
+
+
+async def _seed_expired_active_turn(
+    harness: Tsk279Harness,
+    current: Any,
+    *,
+    message_prefix: str,
+) -> _ExpiredTurn:
+    """Seed a real two-player active game whose deadline already passed."""
+
+    members = await seed_players(harness.binding_manager, current, 2)
+    service = service_for(harness, random_source=CountingRandom())
+    await create_waiting(service, current, message_id=f"{message_prefix}-create")
+    await join_player(service, current, members[1], f"{message_prefix}-join-2")
+    await start_game(service, current, members[0], f"{message_prefix}-start")
+    row = await current_game_row(harness.session_factory, current)
+    assert row is not None
+    actor = members[int(row["current_player_seq"]) - 1]
+    observed = observation(
+        game_id=str(row["game_id"]),
+        state_revision=int(row["state_revision"]),
+        turn_seq=int(row["turn_seq"]),
+    )
+    async with harness.session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_games SET turn_deadline_at = "
+                "clock_timestamp() - interval '2 hours' WHERE game_id = :game_id"
+            ),
+            {"game_id": str(row["game_id"])},
+        )
+        await session.commit()
+    return _ExpiredTurn(service=service, actor=actor, observation=observed)
 
 
 @pytest.fixture
@@ -456,8 +782,14 @@ async def test_recovery_skips_restricted_groups_and_creates_no_send(
                 )
                 or 0
             )
-        tick = await maintenance.advance_due(batch_size=100)
-        assert tick.skipped_restricted >= 1
+        drive = await _drive_recovery_until_settled(
+            maintenance,
+            harness,
+            app_id=app_id,
+            group_openid=allowed,
+        )
+        assert drive.settled is True
+        assert drive.skipped_restricted >= 1
         async with harness.session_factory() as session:
             states = {
                 str(row[0]): str(row[1])
@@ -517,26 +849,21 @@ async def test_recovery_paginates_past_a_restricted_batch(
             service=service,
             admission=_allow_only({(app_id, allowed)}),
         )
-        lifecycle: object = None
-        ticks = 0
-        for _ in range(3):
-            ticks += 1
-            await maintenance.advance_due(batch_size=100)
-            async with harness.session_factory() as session:
-                lifecycle = await session.scalar(
-                    text(
-                        "SELECT lifecycle FROM komari_roulette_games "
-                        "WHERE app_id = :app_id AND group_openid = :group_openid"
-                    ),
-                    {"app_id": app_id, "group_openid": allowed},
-                )
-            if lifecycle == "expired":
-                break
-        assert lifecycle == "expired", (
-            "bounded pagination must reach an allowed group behind a full "
-            "batch of restricted groups within a few ticks"
+        drive = await _drive_recovery_until_settled(
+            maintenance,
+            harness,
+            app_id=app_id,
+            group_openid=allowed,
         )
-        assert ticks <= 3
+        assert drive.settled is True, (
+            "bounded pagination must reach an allowed group behind a full "
+            "batch of restricted groups"
+        )
+        assert drive.pages >= 2, (
+            "the allowed group must sit behind a full first page so the keyset "
+            "walk is what reaches it, not a private first-page assumption"
+        )
+        assert drive.skipped_restricted >= 100
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +894,20 @@ async def test_cleanup_deletes_aged_receipts_and_keeps_recent(
             service=service_for(harness, random_source=CountingRandom()),
             admission=_allow_only(set()),
         )
-        await maintenance.cleanup_retention(batch_size=100)
+        async def aged_gone() -> bool:
+            async with harness.session_factory() as session:
+                present = await session.scalar(
+                    text(
+                        "SELECT count(*) FROM komari_roulette_command_receipts "
+                        "WHERE receipt_id = :receipt_id"
+                    ),
+                    {"receipt_id": aged},
+                )
+            return int(present or 0) == 0
+
+        await _drive_cleanup_until(
+            maintenance, harness, done=aged_gone, batch_size=100
+        )
         async with harness.session_factory() as session:
             remaining = set(
                 (
@@ -616,7 +956,20 @@ async def test_cleanup_deletes_nonwin_terminals_keeps_completed_and_wins(
             service=service,
             admission=_allow_only(set()),
         )
-        await maintenance.cleanup_retention(batch_size=100)
+        async def nonwin_gone() -> bool:
+            async with harness.session_factory() as session:
+                present = await session.scalar(
+                    text(
+                        "SELECT count(*) FROM komari_roulette_games "
+                        "WHERE game_id = :cancelled OR game_id = :expired"
+                    ),
+                    {"cancelled": cancelled, "expired": expired},
+                )
+            return int(present or 0) == 0
+
+        await _drive_cleanup_until(
+            maintenance, harness, done=nonwin_gone, batch_size=100
+        )
         params = {"app_id": current.app_id, "grp": current.group_openid}
         async with harness.session_factory() as session:
             games = set(
@@ -663,8 +1016,22 @@ async def test_cleanup_is_batch_bounded_and_reentrant(
         )
         first = await maintenance.cleanup_retention(batch_size=2)
         assert isinstance(first.more_pending, bool)
-        for _ in range(3):
-            await maintenance.cleanup_retention(batch_size=2)
+        assert first.receipts_deleted <= 2
+
+        async def ours_gone() -> bool:
+            async with harness.session_factory() as session:
+                present = await session.scalar(
+                    text(
+                        "SELECT count(*) FROM komari_roulette_command_receipts "
+                        "WHERE app_id = :app_id AND group_openid = :grp"
+                    ),
+                    {"app_id": current.app_id, "grp": current.group_openid},
+                )
+            return int(present or 0) == 0
+
+        await _drive_cleanup_until(
+            maintenance, harness, done=ours_gone, batch_size=2
+        )
         async with harness.session_factory() as session:
             remaining = int(
                 await session.scalar(
@@ -708,7 +1075,20 @@ async def test_cleanup_does_not_starve_eligible_behind_protected(
             service=service_for(harness, random_source=CountingRandom()),
             admission=_allow_only(set()),
         )
-        await maintenance.cleanup_retention(batch_size=10)
+        async def aged_gone() -> bool:
+            async with harness.session_factory() as session:
+                present = await session.scalar(
+                    text(
+                        "SELECT count(*) FROM komari_roulette_command_receipts "
+                        "WHERE receipt_id = :receipt_id"
+                    ),
+                    {"receipt_id": aged},
+                )
+            return int(present or 0) == 0
+
+        await _drive_cleanup_until(
+            maintenance, harness, done=aged_gone, batch_size=10
+        )
         async with harness.session_factory() as session:
             still_there = await session.scalar(
                 text(
@@ -749,7 +1129,18 @@ async def test_maintenance_jobs_registered_with_throttle_and_deploy_timezone() -
     assert recovery.trigger.interval == timedelta(seconds=60)
     assert recovery.coalesce is True
     assert recovery.max_instances == 1
-    assert str(cleanup.trigger.fields[5]) == "hour='4'"
+    # APScheduler renders the cron field as the bare value (``4``), not a
+    # shell-like ``hour='4'`` repr.  Assert the 04:00 schedule directly on the
+    # trigger's own timezone (the deployment timezone), so the host clock/TZ is
+    # never involved.
+    assert str(cleanup.trigger.fields[5]) == "4"
+    assert str(cleanup.trigger.fields[6]) == "0"
+    from datetime import datetime as _datetime
+
+    at_noon = _datetime(2026, 1, 1, 12, 0, tzinfo=cleanup.trigger.timezone)
+    next_fire = cleanup.trigger.get_next_fire_time(None, at_noon)
+    assert next_fire is not None
+    assert (next_fire.hour, next_fire.minute) == (4, 0)
     assert str(cleanup.trigger.timezone) == deploy_timezone
     assert cleanup.coalesce is True
     assert cleanup.max_instances == 1
@@ -809,12 +1200,17 @@ async def test_two_maintenance_instances_advance_one_turn_exactly_once(
         )
         barrier = asyncio.Barrier(2)
 
-        async def run(maintenance: Any) -> Any:
+        async def run(maintenance: Any) -> _RecoveryDrive:
             await barrier.wait()
-            return await maintenance.advance_due(batch_size=100)
+            return await _drive_recovery_until_settled(
+                maintenance,
+                harness,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
 
-        ticks = await asyncio.gather(run(first), run(second))
-        advanced = sum(int(getattr(tick, "advanced", 0)) for tick in ticks)
+        drives = await asyncio.gather(run(first), run(second))
+        advanced = sum(drive.advanced for drive in drives)
         assert advanced == 1
 
         async with harness.session_factory() as session:
@@ -878,9 +1274,14 @@ async def test_two_maintenance_instances_settle_terminal_wins_once(
         )
         barrier = asyncio.Barrier(2)
 
-        async def run(maintenance: Any) -> Any:
+        async def run(maintenance: Any) -> _RecoveryDrive:
             await barrier.wait()
-            return await maintenance.advance_due(batch_size=100)
+            return await _drive_recovery_until_settled(
+                maintenance,
+                harness,
+                app_id=current.app_id,
+                group_openid=current.group_openid,
+            )
 
         await asyncio.gather(run(first), run(second))
 
@@ -908,7 +1309,7 @@ async def test_two_maintenance_instances_settle_terminal_wins_once(
             result_players = await session.scalar(
                 text(
                     "SELECT count(*) FROM komari_roulette_result_players rp "
-                    "JOIN komari_roulette_results r ON r.result_id = rp.result_id "
+                    "JOIN komari_roulette_results r ON r.game_id = rp.game_id "
                     "WHERE r.app_id = :app_id AND r.group_openid = :group_openid"
                 ),
                 {
@@ -922,98 +1323,261 @@ async def test_two_maintenance_instances_settle_terminal_wins_once(
 
 
 @PG_REQUIRED
-async def test_command_action_and_maintenance_locked_race_commits_one_effect(
+async def test_expired_deadline_beats_forfeit_when_command_runs_first(
     harness: Tsk279Harness,
 ) -> None:
-    api = _maintenance_api()
-    async with harness.scope("maint-race-action") as current:
-        members = await seed_players(harness.binding_manager, current, 2)
-        service = service_for(harness, random_source=CountingRandom())
-        await create_waiting(service, current)
-        await join_player(service, current, members[1], "mra-join-2")
-        await start_game(service, current, members[0], "mra-start")
-        row = await current_game_row(harness.session_factory, current)
-        assert row is not None
-        actor = members[int(row["current_player_seq"]) - 1]
-        observed = observation(
-            game_id=str(row["game_id"]),
-            state_revision=int(row["state_revision"]),
-            turn_seq=int(row["turn_seq"]),
-        )
-        async with harness.session_factory() as session:
-            await session.execute(
-                text(
-                    "UPDATE komari_roulette_games SET turn_deadline_at = "
-                    "clock_timestamp() - interval '2 hours' WHERE game_id = :gid"
-                ),
-                {"gid": str(row["game_id"])},
-            )
-            await session.commit()
+    """Controlled ordering #1: the real command holds the lock on a past deadline.
 
+    The two-hours-past deadline is the terminal fact.  Even though the actor
+    issues ``forfeit``, the real deep entry must settle ``turn_expired`` with
+    reason ``timeout`` - never ``forfeited`` - and must not double-settle the
+    win or the result seats.
+    """
+
+    async with harness.scope("deadline-command-first") as current:
+        seeded = await _seed_expired_active_turn(
+            harness, current, message_prefix="dcf"
+        )
+        receipt = await seeded.service.execute_group_command(
+            request(
+                current,
+                "dcf-forfeit",
+                command_factory("forfeit"),
+                member_openid=seeded.actor,
+            ),
+            observation=seeded.observation,
+        )
+        assert receipt.result_code == "turn_expired"
+        assert receipt.result_code != "forfeited"
+        await _assert_single_timeout_terminal(harness, current)
+
+
+@PG_REQUIRED
+async def test_maintenance_first_settles_timeout_then_command_sees_no_active_game(
+    harness: Tsk279Harness,
+) -> None:
+    """Controlled ordering #2: the worker settles first, the late command loses.
+
+    With the same past deadline, the recovery worker takes the lock first and
+    settles the timeout.  A command that arrives afterwards must observe
+    ``no_active_game`` (or a clean ``state_conflict`` at the observation
+    boundary) and must never overwrite the settled timeout with a forfeit.
+    """
+
+    api = _maintenance_api()
+    async with harness.scope("deadline-maintenance-first") as current:
+        seeded = await _seed_expired_active_turn(
+            harness, current, message_prefix="dmf"
+        )
         maintenance = api["RouletteMaintenance"](
             session_factory=harness.session_factory,
-            service=service,
+            service=seeded.service,
             admission=_allow_only({(current.app_id, current.group_openid)}),
         )
-        barrier = asyncio.Barrier(2)
+        drive = await _drive_recovery_until_settled(
+            maintenance,
+            harness,
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+        )
+        assert drive.settled is True
+        assert drive.advanced == 1
+        await _assert_single_timeout_terminal(harness, current)
 
-        async def run_action() -> Any:
-            await barrier.wait()
-            return await service.execute_group_command(
-                request(
-                    current,
-                    "mra-forfeit",
-                    command_factory("forfeit"),
-                    member_openid=actor,
-                ),
-                observation=observed,
-            )
+        late = await seeded.service.execute_group_command(
+            request(
+                current,
+                "dmf-forfeit",
+                command_factory("forfeit"),
+                member_openid=seeded.actor,
+            ),
+            observation=seeded.observation,
+        )
+        assert late.result_code in {"no_active_game", "state_conflict"}
+        assert late.result_code != "forfeited"
+        await _assert_single_timeout_terminal(harness, current)
 
-        async def run_maintenance() -> Any:
-            await barrier.wait()
-            return await maintenance.advance_due(batch_size=100)
 
-        receipt, tick = await asyncio.gather(run_action(), run_maintenance())
-        del tick
-        async with harness.session_factory() as session:
-            wins = await session.scalar(
-                text(
-                    "SELECT wins FROM komari_roulette_leaderboard "
-                    "WHERE app_id = :app_id AND group_openid = :group_openid"
-                ),
-                {
-                    "app_id": current.app_id,
-                    "group_openid": current.group_openid,
-                },
+# ---------------------------------------------------------------------------
+# Post-lock effect recheck on the real service (requirement 5 / TSK-279 10.2)
+# ---------------------------------------------------------------------------
+
+
+@PG_REQUIRED
+async def test_advance_expired_rejects_sync_gate_with_zero_mutation(
+    harness: Tsk279Harness,
+) -> None:
+    """A sync ``effect_check`` returning False is a no-effect refusal."""
+
+    from komari_bot.plugins.komari_roulette.command_service import EFFECT_CHECK_REJECTED
+
+    async with harness.scope("effect-reject-sync") as current:
+        service = service_for(harness, random_source=CountingRandom())
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        before = await _game_snapshot(harness, current)
+        advance = await service.advance_expired(
+            current.group,
+            effect_check=lambda: False,
+        )
+        assert advance.result_code == EFFECT_CHECK_REJECTED
+        assert advance.changed is False
+        assert advance.receipt_id is None
+        after = await _game_snapshot(harness, current)
+        assert after == before
+
+
+@PG_REQUIRED
+async def test_advance_expired_rejects_async_gate_with_zero_mutation(
+    harness: Tsk279Harness,
+) -> None:
+    """An awaitable ``effect_check`` resolving False is a no-effect refusal."""
+
+    from komari_bot.plugins.komari_roulette.command_service import EFFECT_CHECK_REJECTED
+
+    async def gate() -> bool:
+        return False
+
+    async with harness.scope("effect-reject-async") as current:
+        service = service_for(harness, random_source=CountingRandom())
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        before = await _game_snapshot(harness, current)
+        advance = await service.advance_expired(
+            current.group,
+            effect_check=gate,
+        )
+        assert advance.result_code == EFFECT_CHECK_REJECTED
+        assert advance.changed is False
+        after = await _game_snapshot(harness, current)
+        assert after == before
+
+
+@PG_REQUIRED
+async def test_advance_expired_gate_exception_fails_closed_zero_mutation(
+    harness: Tsk279Harness,
+) -> None:
+    """A gate that raises must fail closed, never licence a write."""
+
+    from komari_bot.plugins.komari_roulette.command_service import EFFECT_CHECK_REJECTED
+
+    def gate() -> bool:
+        message = "admission port exploded (TSK-279 test port)"
+        raise RuntimeError(message)
+
+    async with harness.scope("effect-reject-raise") as current:
+        service = service_for(harness, random_source=CountingRandom())
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        before = await _game_snapshot(harness, current)
+        advance = await service.advance_expired(
+            current.group,
+            effect_check=gate,
+        )
+        assert advance.result_code == EFFECT_CHECK_REJECTED
+        assert advance.changed is False
+        after = await _game_snapshot(harness, current)
+        assert after == before
+
+
+@PG_REQUIRED
+async def test_advance_expired_accepts_true_gate_and_advances(
+    harness: Tsk279Harness,
+) -> None:
+    """A gate resolving True lets the real expiry proceed exactly once."""
+
+    gate_calls = 0
+
+    def gate() -> bool:
+        nonlocal gate_calls
+        gate_calls += 1
+        return True
+
+    async with harness.scope("effect-accept") as current:
+        service = service_for(harness, random_source=CountingRandom())
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        advance = await service.advance_expired(
+            current.group,
+            effect_check=gate,
+        )
+        assert gate_calls == 1
+        assert advance.changed is True
+        assert advance.result_code == "waiting_game_expired"
+        lifecycle = await _group_lifecycle(
+            harness,
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+        )
+        assert lifecycle == "expired"
+
+
+@PG_REQUIRED
+async def test_advance_expired_runs_gate_only_after_group_lock_is_held(
+    harness: Tsk279Harness,
+) -> None:
+    """The post-lock gate really runs after the group advisory lock is held."""
+
+    gate_calls = 0
+
+    async def gate() -> bool:
+        nonlocal gate_calls
+        gate_calls += 1
+        return True
+
+    async with harness.scope("effect-lock-order") as current:
+        service = service_for(harness, random_source=CountingRandom())
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        async with harness.session_factory() as blocker:
+            await blocker.begin()
+            blocker_pid = await backend_pid(blocker)
+            await hold_group_lock(blocker, current)
+            advance_task = asyncio.create_task(
+                service.advance_expired(current.group, effect_check=gate)
             )
-            completed = await session.scalar(
-                text(
-                    "SELECT count(*) FROM komari_roulette_results "
-                    "WHERE app_id = :app_id AND group_openid = :group_openid "
-                    "AND completion_reason IS NOT NULL"
-                ),
-                {
-                    "app_id": current.app_id,
-                    "group_openid": current.group_openid,
-                },
-            )
-            result_players = await session.scalar(
-                text(
-                    "SELECT count(*) FROM komari_roulette_result_players rp "
-                    "JOIN komari_roulette_results r ON r.result_id = rp.result_id "
-                    "WHERE r.app_id = :app_id AND r.group_openid = :group_openid"
-                ),
-                {
-                    "app_id": current.app_id,
-                    "group_openid": current.group_openid,
-                },
-            )
-        # Whichever worker took the group lock first, exactly one terminal effect
-        # and exactly one win commits; the loser observes a clean conflict/no-op.
-        assert receipt.result_code in {"forfeited", "state_conflict"}
-        assert int(wins or 0) == 1
-        assert int(completed or 0) == 1
-        assert int(result_players or 0) == 2
+            try:
+                await wait_for_blocked(harness.session_factory, blocker_pid)
+                # While the worker is queued on the group lock the gate has not
+                # run yet: the recheck is genuinely *after* the lock, not before.
+                assert gate_calls == 0
+            finally:
+                await blocker.commit()
+            async with asyncio.timeout(10):
+                advance = await advance_task
+        assert gate_calls == 1
+        assert advance.changed is True
+        assert advance.result_code == "waiting_game_expired"
 
 
 # ---------------------------------------------------------------------------
@@ -1061,7 +1625,13 @@ class _EnabledConfig:
 
 class _NoopRecovery:
     async def run_recovery_tick(self) -> Any:
-        return SimpleNamespace(advanced=0)
+        result_cls = _maintenance_api()["RecoveryTickResult"]
+        return result_cls(
+            scanned=0,
+            advanced=0,
+            skipped_restricted=0,
+            failed=0,
+        )
 
     async def close(self) -> None:
         return None
@@ -1111,7 +1681,14 @@ async def test_maintenance_rechecks_admission_after_group_lock_wait(
             await blocker.begin()
             blocker_pid = await backend_pid(blocker)
             await hold_group_lock(blocker, current)
-            tick_task = asyncio.create_task(maintenance.advance_due(batch_size=100))
+            tick_task = asyncio.create_task(
+                _drive_recovery_until_settled(
+                    maintenance,
+                    harness,
+                    app_id=app_id,
+                    group_openid=group_openid,
+                )
+            )
             try:
                 await wait_for_blocked(harness.session_factory, blocker_pid)
                 # The group turns restricted while the worker waits on the lock.
@@ -1119,7 +1696,7 @@ async def test_maintenance_rechecks_admission_after_group_lock_wait(
             finally:
                 await blocker.commit()
             async with asyncio.timeout(10):
-                tick = await tick_task
+                drive = await tick_task
         async with harness.session_factory() as session:
             lifecycle = await session.scalar(
                 text(
@@ -1129,7 +1706,7 @@ async def test_maintenance_rechecks_admission_after_group_lock_wait(
                 {"app_id": app_id, "group_openid": group_openid},
             )
         assert lifecycle == "waiting"
-        assert int(getattr(tick, "advanced", 0)) == 0
+        assert drive.advanced == 0
 
 
 @PG_REQUIRED
@@ -1192,7 +1769,14 @@ async def test_maintenance_rechecks_closed_runtime_after_group_lock_wait(
             await blocker.begin()
             blocker_pid = await backend_pid(blocker)
             await hold_group_lock(blocker, current)
-            tick_task = asyncio.create_task(maintenance.advance_due(batch_size=100))
+            tick_task = asyncio.create_task(
+                _drive_recovery_until_settled(
+                    maintenance,
+                    harness,
+                    app_id=app_id,
+                    group_openid=group_openid,
+                )
+            )
             try:
                 await wait_for_blocked(harness.session_factory, blocker_pid)
                 # The real runtime closes while the worker waits on the lock.
@@ -1201,7 +1785,7 @@ async def test_maintenance_rechecks_closed_runtime_after_group_lock_wait(
             finally:
                 await blocker.commit()
             async with asyncio.timeout(10):
-                tick = await tick_task
+                drive = await tick_task
         async with harness.session_factory() as session:
             lifecycle = await session.scalar(
                 text(
@@ -1211,7 +1795,7 @@ async def test_maintenance_rechecks_closed_runtime_after_group_lock_wait(
                 {"app_id": app_id, "group_openid": group_openid},
             )
         assert lifecycle == "waiting"
-        assert int(getattr(tick, "advanced", 0)) == 0
+        assert drive.advanced == 0
 
 
 @PG_REQUIRED
