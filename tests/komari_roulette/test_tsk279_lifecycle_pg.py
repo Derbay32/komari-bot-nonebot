@@ -23,6 +23,7 @@ missing seam, never a fixture fabrication.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import json
 from contextlib import asynccontextmanager, suppress
@@ -53,6 +54,7 @@ from .test_tsk279_effect_recheck_pg import (
     _real_binding_resolvers,
 )
 from .tsk279_lifecycle_support import (
+    LIFECYCLE_MODULE,
     application_api,
     delete_roulette_config,
     invoke_hook,
@@ -511,6 +513,7 @@ class _InstalledQQAuthority:
     current: Any
     storage: Any
     ban_service: Any
+    business_gate: Any
     numeric_group: int
     member_qq: int
 
@@ -522,7 +525,6 @@ async def _installed_lifecycle_qq_authority(
     *,
     plugin_enable: bool,
     numeric_group: int,
-    member_qq: int,
 ) -> AsyncIterator[_InstalledQQAuthority]:
     """Install the real lifecycle and real authority; never install a QQ runtime.
 
@@ -558,6 +560,10 @@ async def _installed_lifecycle_qq_authority(
     await delete_roulette_config(harness.engine)
     ban_service = UserBanService()
     original_get_config_storage = manager_module.get_config_storage
+    # A fresh random member QQ per case: a ban left behind by an earlier run can
+    # never match it, so there is no foreign record to pre-clean and the
+    # ``finally`` unban only ever touches this case's own identity.
+    member_qq = 8_500_000_000 + int(uuid4().int % 1_000_000_000)
     try:
         # 1. Real READY admission first: the runtime consumes the fake policy
         #    store and registers its watcher before the seam is restored.
@@ -592,6 +598,23 @@ async def _installed_lifecycle_qq_authority(
             group_admission.register_qq_ban_checker(ban_checker)
             try:
                 async with lifecycle_context(monkeypatch) as ctx:
+                    # Capture the real installed business gate without replacing
+                    # it: the recording wrapper delegates to the production
+                    # install, so the gate under test is exactly the one the
+                    # composition root installs.
+                    lifecycle_module = importlib.import_module(LIFECYCLE_MODULE)
+                    real_install = lifecycle_module.install_roulette_qq_runtime
+                    captured_gate: dict[str, Any] = {}
+
+                    def _recording_install(**kwargs: Any) -> Any:
+                        captured_gate["business_gate"] = kwargs["business_gate"]
+                        return real_install(**kwargs)
+
+                    monkeypatch.setattr(
+                        lifecycle_module,
+                        "install_roulette_qq_runtime",
+                        _recording_install,
+                    )
                     # 4. Real driver startup: the composition root reads the real
                     #    PostgreSQL config through the restored factory.
                     await invoke_hook(require_single_startup_hook(ctx))
@@ -605,6 +628,10 @@ async def _installed_lifecycle_qq_authority(
                         "the lifecycle config manager must carry the requested "
                         "live switch"
                     )
+                    assert "business_gate" in captured_gate, (
+                        "the composition root must install the QQ runtime through "
+                        "the package install helper"
+                    )
                     yield _InstalledQQAuthority(
                         app=app,
                         manager=manager,
@@ -613,12 +640,19 @@ async def _installed_lifecycle_qq_authority(
                         ban_service=ban_service,
                         numeric_group=numeric_group,
                         member_qq=member_qq,
+                        business_gate=captured_gate["business_gate"],
                     )
             finally:
                 group_admission.register_qq_group_resolver(None)
                 group_admission.register_qq_ban_checker(None)
     finally:
         manager_module.get_config_storage = original_get_config_storage
+        with suppress(Exception):
+            # Case-owned hygiene: never leave this case's ban behind for a
+            # sibling parametrization (which may run later in the same session).
+            await ban_service.unban_user(
+                user_id=str(member_qq), target_scope="command"
+            )
         with suppress(Exception):
             await ban_service.close()
         await delete_roulette_config(harness.engine)
@@ -751,7 +785,6 @@ async def test_lifecycle_installed_qq_handler_commits_valid_token_and_captures_r
         monkeypatch,
         plugin_enable=True,
         numeric_group=279501,
-        member_qq=8_500_000_001,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
         assert qq.get_roulette_qq_runtime() is not None, (
@@ -799,7 +832,6 @@ async def test_lifecycle_installed_qq_handler_rejects_revoked_authority_before_e
         monkeypatch,
         plugin_enable=mutation != "plugin_disabled",
         numeric_group=279510,
-        member_qq=8_500_000_010,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
         token, _mint_bot, event = await _mint_business_token(
@@ -939,7 +971,6 @@ async def test_lifecycle_installed_delivery_post_claim_revocation_blocks_network
         monkeypatch,
         plugin_enable=True,
         numeric_group=279520,
-        member_qq=8_500_000_020,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
         barrier = _PostClaimClaimBarrier(
@@ -1017,7 +1048,6 @@ async def test_lifecycle_installed_qq_handler_group_lock_wait_then_plugin_false_
         monkeypatch,
         plugin_enable=True,
         numeric_group=279530,
-        member_qq=8_500_000_030,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
         token, _mint_bot, event = await _mint_business_token(
@@ -1050,5 +1080,210 @@ async def test_lifecycle_installed_qq_handler_group_lock_wait_then_plugin_false_
         counts = await scope_counts(harness.session_factory, authority.current)
         assert all(count == 0 for count in counts.values()), (
             "a switch turned off while the command queued must leave zero "
+            f"effects, got {counts}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# C1 review gap: the installed gate reads the *old* app state, so a stop that
+# begins (and even returns) can leave that gate accepting, and the registered
+# cleanup job is never cancelled.  These cases pin the local-state ordering.
+# ---------------------------------------------------------------------------
+
+
+@PG_REQUIRED
+async def test_lifecycle_stop_rejects_the_old_installed_gate_before_maintenance_drains(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop must close the old installed gate before maintenance drains.
+
+    ``stop_roulette_application`` clears QQ dispatch and then bounded-closes
+    maintenance *before* closing the runtime, so ``runtime.accepting`` only turns
+    false after the (up to ``CLOSE_ROUND_TIMEOUT_SECONDS``) maintenance close.  A
+    handler already holding the old installed gate must already be rejected when
+    stop begins - not only after the drain - and the released stop must not
+    resurrect any state.
+    """
+
+    from .tsk279_lifecycle_support import QQ_MODULE, RecordingQQBot
+
+    async with _installed_lifecycle_qq_authority(
+        harness,
+        monkeypatch,
+        plugin_enable=True,
+        numeric_group=279550,
+    ) as authority:
+        token, _mint_bot, event = await _mint_business_token(
+            authority.current, "lifecycle-stop-gate-1"
+        )
+        bot = RecordingQQBot(authority.current.app_id)
+
+        drain_entered = asyncio.Event()
+        drain_release = asyncio.Event()
+        real_close = authority.app.maintenance.close
+
+        async def gated_close() -> None:
+            drain_entered.set()
+            await drain_release.wait()
+            await real_close()
+
+        authority.app.maintenance.close = gated_close
+        stop_application = application_api()["stop_roulette_application"]
+
+        stop_task = asyncio.create_task(stop_application())
+        try:
+            async with asyncio.timeout(10):
+                await drain_entered.wait()
+            rejected = await authority.business_gate(bot, event, token)
+            assert rejected is False, (
+                "the old installed gate must reject as soon as stop begins, not "
+                "only after maintenance drains"
+            )
+        finally:
+            drain_release.set()
+            async with asyncio.timeout(10):
+                await stop_task
+
+        assert application_api()["get_roulette_application"]() is None, (
+            "a released stop must not resurrect the application"
+        )
+        qq = __import__(QQ_MODULE, fromlist=["get_roulette_qq_runtime"])
+        assert qq.get_roulette_qq_runtime() is None, (
+            "a released stop must not resurrect QQ dispatch"
+        )
+
+
+@PG_REQUIRED
+async def test_stop_bounded_joins_the_registered_cleanup_blocked_on_the_group_lock(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop must cancel/join the registered cleanup, not only time out.
+
+    The real registered cleanup callback waits on the group advisory lock while a
+    foreign transaction holds it past the shutdown bound.  ``maintenance.close``
+    only waits ``CLOSE_ROUND_TIMEOUT_SECONDS`` for a round boundary and then
+    returns, so a still-running job would resume and DELETE after shutdown
+    returned.  Shutdown must boundedly cancel/join the owned job, and the
+    released lock must not let the cleanup delete anything after stop returned.
+    """
+
+    from komari_bot.plugins.komari_roulette import maintenance as maintenance_module
+    from komari_bot.plugins.komari_roulette.maintenance import CLEANUP_JOB_ID
+
+    # Inject the real bound so the case does not wait the production five
+    # seconds; the semantics under test (never DELETE after stop returned) are
+    # unchanged, and a normal short round still drains (see the close test).
+    monkeypatch.setattr(maintenance_module, "CLOSE_ROUND_TIMEOUT_SECONDS", 0.5)
+
+    await delete_roulette_config(harness.engine)
+    try:
+        async with lifecycle_context(monkeypatch) as ctx:
+            await invoke_hook(require_single_startup_hook(ctx))
+            job = ctx.scheduler.get_job(CLEANUP_JOB_ID)
+            assert job is not None, "startup must register the cleanup job"
+            callback = job["func"]
+
+            async with harness.scope("stop-cleanup-inflight") as current:
+                await seed_aged_receipt(
+                    harness.session_factory,
+                    current,
+                    inbound_msg_id="stop-cleanup-inflight-1",
+                    age_seconds=_DAY_SECONDS * 8,
+                )
+                async with harness.session_factory() as blocker:
+                    await blocker.begin()
+                    blocker_pid = await backend_pid(blocker)
+                    await hold_group_lock(blocker, current)
+                    cleanup_task = asyncio.create_task(_maybe_await(callback()))
+                    try:
+                        await wait_for_blocked(
+                            harness.session_factory, blocker_pid
+                        )
+                        stop_task = asyncio.create_task(
+                            application_api()["stop_roulette_application"]()
+                        )
+                        async with asyncio.timeout(10):
+                            await stop_task
+                    finally:
+                        await blocker.commit()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await asyncio.wait_for(cleanup_task, timeout=10)
+
+                assert await _scope_receipts(harness, current) == 1, (
+                    "the registered cleanup must not DELETE after stop returned"
+                )
+    finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_lifecycle_business_gate_rechecks_local_switch_after_the_recheck(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed gate must re-read the local live switch after the recheck.
+
+    ``recheck_qq_effect`` is wrapped only to control timing (an ``Event``) and
+    still delegates to the real helper, so no remote verdict is fabricated.  The
+    live ``plugin_enable`` is flipped while the gate is suspended inside the
+    await; the gate must not release the effect (or the send) afterwards.
+    """
+
+    from komari_bot.plugins import group_admission
+
+    from .tsk278_support import admission_state
+    from .tsk279_lifecycle_support import QQ_MODULE, RecordingQQBot
+
+    async with _installed_lifecycle_qq_authority(
+        harness,
+        monkeypatch,
+        plugin_enable=True,
+        numeric_group=279560,
+    ) as authority:
+        qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
+        token, _mint_bot, event = await _mint_business_token(
+            authority.current, "lifecycle-local-1"
+        )
+
+        recheck_entered = asyncio.Event()
+        recheck_release = asyncio.Event()
+        real_recheck = group_admission.recheck_qq_effect
+
+        async def timing_recheck(checked: Any, *, effect: Any) -> Any:
+            recheck_entered.set()
+            await recheck_release.wait()
+            return await real_recheck(checked, effect=effect)
+
+        monkeypatch.setattr(
+            group_admission, "recheck_qq_effect", timing_recheck
+        )
+
+        bot = RecordingQQBot(authority.current.app_id)
+        handler_task = asyncio.create_task(
+            qq.handle_roulette_qq(bot, event, admission_state(token=token))
+        )
+        try:
+            async with asyncio.timeout(10):
+                await recheck_entered.wait()
+            # The live switch turns off while the gate waits on the authority.
+            await authority.manager.update_field_async(
+                "plugin_enable", value=False
+            )
+        finally:
+            recheck_release.set()
+        async with asyncio.timeout(10):
+            await handler_task
+
+        assert bot.calls == [], (
+            "a live switch turned off during the recheck must block the send"
+        )
+        assert await _scope_receipts(harness, authority.current) == 0, (
+            "a live switch turned off during the recheck must leave no receipt"
+        )
+        counts = await scope_counts(harness.session_factory, authority.current)
+        assert all(count == 0 for count in counts.values()), (
+            "a live switch turned off during the recheck must leave zero "
             f"effects, got {counts}"
         )

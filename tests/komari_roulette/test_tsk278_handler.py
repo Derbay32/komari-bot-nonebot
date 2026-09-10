@@ -330,8 +330,15 @@ async def test_business_gate_runs_after_observe_and_before_execute() -> None:
         state=admission_state(),
     )
 
-    assert seen == [("gate", 1, 0)], (
-        "business_gate 必须在 observe_current 之后、execute_group_command 之前调用"
+    assert seen, "business_gate must run"
+    assert seen[0] == ("gate", 1, 0), (
+        "the mandatory front-door business_gate must run after observe_current "
+        "and before execute_group_command"
+    )
+    # The *same* per-call closure is re-evaluated under the group lock; the
+    # total call count is not a product constraint, the phases are.
+    assert ("gate", 1, 1) in seen, (
+        "the per-call closure must re-check authority after the group lock"
     )
     assert len(service.execute_calls) == 1
     assert len(delivery.deliver_calls) == 1
@@ -350,11 +357,11 @@ async def test_business_gate_receives_bot_event_and_token() -> None:
     token = business_token()
     await _run(handler, FakeQQBot(), event, state=admission_state(token=token))
 
-    assert len(received) == 1
-    passed_bot, passed_event, passed_token = received[0]
-    assert passed_bot.self_id == APP_ID
-    assert passed_event is event
-    assert passed_token is token
+    assert received, "the business gate must run"
+    for passed_bot, passed_event, passed_token in received:
+        assert passed_bot.self_id == APP_ID
+        assert passed_event is event
+        assert passed_token is token
 
 
 async def test_business_gate_async_is_awaited() -> None:
@@ -372,7 +379,8 @@ async def test_business_gate_async_is_awaited() -> None:
         make_group_at_event("/轮盘 开枪"),
         state=admission_state(),
     )
-    assert calls == ["gate"]
+    assert calls, "the async business gate must be awaited"
+    assert all(call == "gate" for call in calls)
     assert len(service.execute_calls) == 1
     assert len(delivery.deliver_calls) == 1
 
@@ -426,6 +434,153 @@ async def test_business_gate_exception_fails_closed() -> None:
     )
     assert service.execute_calls == []
     assert delivery.deliver_calls == []
+
+
+class _LegacyServiceWithoutEffectCheck:
+    """A collaborator that cannot host the per-call post-lock recheck."""
+
+    def __init__(self) -> None:
+        self.execute_calls: list[Any] = []
+
+    async def observe_current(self, group: Any) -> None:
+        del group
+
+    async def execute_group_command(
+        self,
+        request: Any,
+        *,
+        observation: Observation | None = None,
+    ) -> CommandReceipt:
+        del observation
+        self.execute_calls.append(request)
+        return _success_receipt()
+
+
+class _LegacyDeliveryWithoutEffectCheck:
+    """A delivery that cannot host the per-call post-claim recheck."""
+
+    def __init__(self) -> None:
+        self.deliver_calls: list[tuple[Any, Any]] = []
+
+    async def deliver(self, receipt: Any, sender: Any) -> Any:
+        self.deliver_calls.append((receipt, sender))
+        return None
+
+
+async def test_handler_never_probes_service_effect_check_support() -> None:
+    """The handler must always pass ``effect_check`` - never probe support.
+
+    A collaborator without the keyword cannot host the in-lock recheck; the
+    handler must fail loudly (``TypeError``) instead of silently executing
+    without it.  Probing and skipping is the compat-authorization path this
+    case pins red.
+    """
+
+    service = _LegacyServiceWithoutEffectCheck()
+    delivery = FakeDelivery()
+    handler = RouletteQQHandler(
+        service=service,
+        delivery=delivery,
+        business_gate=_allow_gate,
+    )
+    with pytest.raises(TypeError):
+        await _run(
+            handler,
+            FakeQQBot(),
+            make_group_at_event("/轮盘 开枪"),
+            state=admission_state(),
+        )
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
+
+
+async def test_handler_never_probes_delivery_effect_check_support() -> None:
+    """A delivery that cannot accept the keyword must fail loudly."""
+
+    service = FakeCommandService()
+    _execute_success(service)
+    delivery = _LegacyDeliveryWithoutEffectCheck()
+    handler = RouletteQQHandler(
+        service=service,
+        delivery=delivery,
+        business_gate=_allow_gate,
+    )
+    with pytest.raises(TypeError):
+        await _run(
+            handler,
+            FakeQQBot(),
+            make_group_at_event("/轮盘 开枪"),
+            state=admission_state(),
+        )
+    assert len(service.execute_calls) == 1
+    assert delivery.deliver_calls == []
+
+
+async def test_front_door_true_then_in_lock_revocation_blocks_write() -> None:
+    """Start with a true gate so the handler really hands the closure over,
+    then flip it false to simulate revocation while the command is queued."""
+
+    calls: list[int] = []
+
+    def business_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        calls.append(len(calls) + 1)
+        return len(calls) == 1
+
+    service = FakeCommandService()
+    delivery = FakeDelivery()
+    _execute_success(service)
+    handler = RouletteQQHandler(
+        service=service,
+        delivery=delivery,
+        business_gate=business_gate,
+    )
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+
+    assert len(calls) >= 2, (
+        "the front-door gate must pass and the same closure must re-check in-lock"
+    )
+    assert len(service.effect_rejected_calls) == 1, (
+        "the in-lock recheck must reject the revocation"
+    )
+    assert delivery.deliver_calls == []
+    assert delivery.effect_rejections == 0
+
+
+async def test_front_and_lock_true_then_pre_send_revocation_blocks_send() -> None:
+    """The final pre-send recheck must block the network after the claim."""
+
+    calls: list[int] = []
+
+    def business_gate(_bot: Any, _event: Any, _token: Any) -> bool:
+        calls.append(len(calls) + 1)
+        return len(calls) <= 2
+
+    service = FakeCommandService()
+    delivery = FakeDelivery()
+    _execute_success(service)
+    handler = RouletteQQHandler(
+        service=service,
+        delivery=delivery,
+        business_gate=business_gate,
+    )
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=admission_state(),
+    )
+
+    assert len(calls) >= 3, (
+        "front-door + in-lock must pass before the pre-send recheck can reject"
+    )
+    assert service.effect_rejected_calls == []
+    assert delivery.deliver_calls == []
+    assert delivery.effect_rejections == 1
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +745,7 @@ async def test_send_gate_is_independent_of_business_gate() -> None:
 
     def send_gate(_request: CommandRequest) -> bool:
         order.append("send")
-        return False
+        return True
 
     handler, service, delivery = _handler(
         business_gate=business_gate, send_gate=send_gate
@@ -602,9 +757,17 @@ async def test_send_gate_is_independent_of_business_gate() -> None:
         make_group_at_event("/轮盘 开枪"),
         state=admission_state(),
     )
-    assert order == ["business", "send"]
+    # Phases, not a total-call constant: front-door + in-lock business, then the
+    # send gate, then the final pre-send business recheck (same closure).
+    assert order[0] == "business", "the front-door gate runs first"
+    assert "send" in order
+    assert order.index("send") > 0
+    assert order[-1] == "business", (
+        "the per-call closure must re-check authority after the send gate"
+    )
+    assert order.count("business") >= 2
     assert len(service.execute_calls) == 1
-    assert delivery.deliver_calls == []
+    assert len(delivery.deliver_calls) == 1
 
 
 async def test_async_send_gate_is_awaited() -> None:

@@ -36,8 +36,10 @@ from .tsk279_lifecycle_support import (
     QQ_MODULE,
     application_api,
     delete_roulette_config,
+    install_dependency_readiness,
     invoke_hook,
     lifecycle_context,
+    lifecycle_symbol,
     require_single_shutdown_hook,
     require_single_startup_hook,
 )
@@ -108,6 +110,28 @@ class BlockingConfig(TogglableConfig):
         self.entered.set()
         await self.release.wait()
         return await super().initialize_async(*args, **kwargs)
+
+
+class BlockingFailingConfig(TogglableConfig):
+    """Config port whose ``initialize_async`` blocks, then fails.
+
+    Used to prove a shutdown that completed first must also abort a *failed*
+    startup: the generation guard currently only covers the healthy branch, so a
+    dependency that fails after shutdown still installs the fail-closed bootstrap
+    graph and re-registers the owned jobs on top of a stopped process.
+    """
+
+    def __init__(self, *, plugin_enable: bool = True) -> None:
+        super().__init__(plugin_enable=plugin_enable)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def initialize_async(self, *args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        self.entered.set()
+        await self.release.wait()
+        message = "config dependency failed after shutdown (C1 test)"
+        raise RuntimeError(message)
 
 
 @pytest.fixture
@@ -461,15 +485,34 @@ async def test_start_config_acquisition_failure_is_safe_and_recovers(
                 "when config acquisition failed"
             )
 
-            # Controlled recovery: the dependency comes back and the periodic
-            # entry (not a manual re-install) turns the runtime ready.
+            # Controlled recovery: the dependency comes back.  The real default
+            # config disables business (plugin_enable=false), so the runtime must
+            # land DISABLED with recovery completed - never a fabricated READY.
             ctx.config_getter_state["error"] = None
             await job["func"]()
-            assert app.runtime.get_state().status.value == "ready"
+            disabled = app.runtime.get_state()
+            assert disabled.status.value == "disabled", (
+                "recovering with the real default config (plugin_enable=false) "
+                f"must be DISABLED, got {disabled.status.value}"
+            )
+            assert disabled.recovery_completed is True
+            assert app.runtime.accepting is False
             assert qq.get_roulette_qq_runtime() is not None, (
                 "recovery must install the QQ runtime once the dependency is "
                 "healthy"
             )
+
+            # A real live flip through the same registry manager (not a fake
+            # port mutation) must reach READY through the periodic entry.
+            manager = ctx.config_managers["komari_roulette"]
+            await manager.update_field_async("plugin_enable", value=True)
+            await job["func"]()
+            ready = app.runtime.get_state()
+            assert ready.status.value == "ready", (
+                f"an enabled live config must be READY, got {ready.status.value}"
+            )
+            assert ready.recovery_completed is True
+            assert app.runtime.accepting is True
     finally:
         await delete_roulette_config(harness.engine)
 
@@ -605,6 +648,7 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
 
     await delete_roulette_config(harness.engine)
     holder: dict[str, BlockingConfig] = {}
+    constructed = asyncio.Event()
 
     def factory(
         plugin_name: str,
@@ -614,6 +658,7 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
         del plugin_name, config_schema, env_config_schema
         port = BlockingConfig(plugin_enable=True)
         holder["port"] = port
+        constructed.set()
         return port
 
     try:
@@ -621,6 +666,10 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
             startup = require_single_startup_hook(ctx)
             shutdown = require_single_shutdown_hook(ctx)
             start_task = asyncio.create_task(invoke_hook(startup))
+            # The manager factory only runs once the startup task is scheduled;
+            # wait for the handshake before reading the port (never a KeyError).
+            async with asyncio.timeout(5):
+                await constructed.wait()
             port = holder["port"]
             async with asyncio.timeout(5):
                 await port.entered.wait()
@@ -639,5 +688,222 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
             )
             assert ctx.scheduler.get_job(RECOVERY_JOB_ID) is None
             assert ctx.scheduler.get_job(CLEANUP_JOB_ID) is None
+    finally:
+        await delete_roulette_config(harness.engine)
+
+
+# ---------------------------------------------------------------------------
+# Dependency readiness (binding / admission) + real job -> observation
+# ---------------------------------------------------------------------------
+
+
+async def test_character_binding_manager_is_ready_is_false_after_failed_initialize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public ``is_ready`` property must report a failed initialize as not
+    ready, without reading private state."""
+
+    from komari_bot.plugins.character_binding.database import CharacterBindingDB
+    from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+
+    manager = CharacterBindingManager()
+
+    async def _boom(self: object) -> None:
+        del self
+        raise RuntimeError("binding storage unavailable (C1 test)")  # noqa: TRY003
+
+    monkeypatch.setattr(CharacterBindingDB, "initialize", _boom)
+    await manager.initialize()
+    assert manager.is_ready is False
+
+
+_DEPENDENCY_RED_CASES = ("binding", "admission")
+
+
+@PG_REQUIRED
+@pytest.mark.parametrize("dependency", _DEPENDENCY_RED_CASES)
+async def test_start_fails_closed_when_dependency_not_ready_and_recovers(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    dependency: str,
+) -> None:
+    """A not-ready binding/admission dependency must fail closed, never pass as
+    an empty-scan success; the controlled periodic entry must recover it.
+    """
+
+    from komari_bot.plugins.komari_roulette.maintenance import RECOVERY_JOB_ID
+
+    toggles = install_dependency_readiness(
+        monkeypatch,
+        binding_ready=dependency != "binding",
+        admission_ready=dependency != "admission",
+    )
+    await delete_roulette_config(harness.engine)
+    try:
+        async with lifecycle_context(monkeypatch, ready_dependencies=False) as ctx:
+            await invoke_hook(require_single_startup_hook(ctx))
+            app = application_api()["get_roulette_application"]()
+            assert app is not None, (
+                "the fail-closed bootstrap graph must stay installed so the "
+                "periodic entry can recover the dependency"
+            )
+            state = app.runtime.get_state()
+            assert state.status.value == "failed", (
+                f"a not-ready {dependency} dependency must not pass as "
+                f"{state.status.value}: an empty scan is not a ready graph"
+            )
+            assert state.recovery_completed is False
+            assert app.runtime.accepting is False
+            qq = __import__(QQ_MODULE, fromlist=["get_roulette_qq_runtime"])
+            assert qq.get_roulette_qq_runtime() is None, (
+                "a not-ready dependency must never install QQ dispatch"
+            )
+
+            toggles.binding.ready = True
+            toggles.admission.ready = True
+            job = ctx.scheduler.get_job(RECOVERY_JOB_ID)
+            assert job is not None
+            await job["func"]()
+            recovered = app.runtime.get_state()
+            assert recovered.status.value in {"ready", "disabled"}, (
+                "the periodic entry must recover to ready/disabled once the "
+                f"dependency is healthy, got {recovered.status.value}"
+            )
+            assert qq.get_roulette_qq_runtime() is not None, (
+                "recovery must install QQ dispatch"
+            )
+    finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_registered_jobs_feed_the_owner_observability_snapshot(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real registered jobs must synchronise the owner's safe observation.
+
+    The snapshot must come from the jobs that actually ran (startup recovery +
+    registered recovery/cleanup callbacks), never be fabricated at read time,
+    and must never claim or resend a pending receipt.
+    """
+
+    from komari_bot.plugins.komari_roulette.maintenance import (
+        CLEANUP_JOB_ID,
+        RECOVERY_JOB_ID,
+    )
+
+    get_observation = lifecycle_symbol("get_roulette_observation")
+    await delete_roulette_config(harness.engine)
+    try:
+        async with lifecycle_context(monkeypatch) as ctx:
+            await invoke_hook(require_single_startup_hook(ctx))
+            app = application_api()["get_roulette_application"]()
+            assert app is not None
+
+            # The startup recovery tick really ran, so its safe record exists
+            # before any read-time fabrication could happen.
+            snapshot = get_observation()
+            assert snapshot is not None, (
+                "the composition root must expose a public observation snapshot"
+            )
+            assert snapshot.latest_scan is not None, (
+                "the real startup recovery tick must synchronise latest_scan"
+            )
+            assert snapshot.runtime_status == app.runtime.get_state().status.value, (
+                "the observation runtime status must track the live runtime"
+            )
+
+            await ctx.scheduler.get_job(RECOVERY_JOB_ID)["func"]()
+            after_recovery = get_observation()
+            assert (
+                after_recovery.runtime_status
+                == app.runtime.get_state().status.value
+            )
+            scan_after_recovery = after_recovery.latest_scan
+            assert scan_after_recovery is not None
+
+            await ctx.scheduler.get_job(CLEANUP_JOB_ID)["func"]()
+            after_cleanup = get_observation()
+            assert after_cleanup.latest_cleanup is not None, (
+                "the cleanup callback must synchronise latest_cleanup"
+            )
+            # A different job must not rewrite the already-run scan record.
+            assert after_cleanup.latest_scan == scan_after_recovery, (
+                "cleanup must not replace the recorded recovery scan"
+            )
+            assert after_cleanup.runtime_status == after_recovery.runtime_status
+    finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_stop_then_failed_config_initialize_never_installs_bootstrap(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A *failed* startup that lost the race with shutdown must not install.
+
+    The healthy branch guards late installs with the generation check; the
+    failure branch (which installs the fail-closed bootstrap graph and the owned
+    jobs) must apply the same guard.  Otherwise a dependency that fails after
+    shutdown completed resurrects an application and its scheduler jobs on a
+    stopped process.
+    """
+
+    from komari_bot.plugins.komari_roulette.maintenance import (
+        CLEANUP_JOB_ID,
+        RECOVERY_JOB_ID,
+    )
+
+    await delete_roulette_config(harness.engine)
+    holder: dict[str, BlockingFailingConfig] = {}
+    constructed = asyncio.Event()
+
+    def factory(
+        plugin_name: str,
+        config_schema: type[object],
+        env_config_schema: type[object] | None,
+    ) -> BlockingFailingConfig:
+        del plugin_name, config_schema, env_config_schema
+        port = BlockingFailingConfig(plugin_enable=True)
+        holder["port"] = port
+        constructed.set()
+        return port
+
+    try:
+        async with lifecycle_context(monkeypatch, manager_factory=factory) as ctx:
+            startup = require_single_startup_hook(ctx)
+            shutdown = require_single_shutdown_hook(ctx)
+            start_task = asyncio.create_task(invoke_hook(startup))
+            async with asyncio.timeout(5):
+                await constructed.wait()
+            port = holder["port"]
+            async with asyncio.timeout(5):
+                await port.entered.wait()
+
+            # Shutdown wins the race: the blocked initialize has not returned.
+            async with asyncio.timeout(10):
+                await invoke_hook(shutdown)
+
+            # The dependency then fails; the startup must not install anything.
+            port.release.set()
+            with suppress(Exception):
+                await asyncio.wait_for(start_task, timeout=10)
+
+            assert application_api()["get_roulette_application"]() is None, (
+                "a failed startup that raced a completed shutdown must not "
+                "install the fail-closed bootstrap application"
+            )
+            qq = __import__(QQ_MODULE, fromlist=["get_roulette_qq_runtime"])
+            assert qq.get_roulette_qq_runtime() is None
+            assert ctx.scheduler.get_job(RECOVERY_JOB_ID) is None, (
+                "a failed startup that raced a completed shutdown must not "
+                "re-register the recovery job"
+            )
+            assert ctx.scheduler.get_job(CLEANUP_JOB_ID) is None, (
+                "a failed startup that raced a completed shutdown must not "
+                "re-register the cleanup job"
+            )
     finally:
         await delete_roulette_config(harness.engine)

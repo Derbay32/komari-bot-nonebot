@@ -61,12 +61,16 @@ __all__ = [
     "LIFECYCLE_MODULE",
     "PACKAGE",
     "QQ_MODULE",
+    "AdmissionRuntimeToggle",
+    "BindingManagerToggle",
     "FakeScheduler",
     "RecordingQQBot",
     "application_api",
     "delete_roulette_config",
+    "install_dependency_readiness",
     "invoke_hook",
     "lifecycle_context",
+    "lifecycle_symbol",
     "require_single_shutdown_hook",
     "require_single_startup_hook",
 ]
@@ -296,12 +300,96 @@ def _pop_reloadable_roulette_modules() -> None:
                 delattr(pkg, top_level)
 
 
+def lifecycle_symbol(name: str) -> Any:
+    """Load a public lifecycle symbol lazily (missing → clear RED)."""
+
+    module = importlib.import_module(LIFECYCLE_MODULE)
+    if not hasattr(module, name):
+        message = (
+            f"{LIFECYCLE_MODULE} does not expose {name} yet (TSK-279 C1 RED)"
+        )
+        raise AttributeError(message)
+    return getattr(module, name)
+
+
+class BindingManagerToggle:
+    """Real-shaped binding manager double whose readiness can be flipped."""
+
+    def __init__(self, *, ready: bool) -> None:
+        self.ready = ready
+
+    @property
+    def is_ready(self) -> bool:
+        return self.ready
+
+
+class AdmissionRuntimeToggle:
+    """Callable ``get_runtime_state`` double returning a real typed state.
+
+    Flipping ``ready`` changes the *real* ``AdmissionRuntimeState`` returned by
+    every later call, so the composition root can be driven from not-ready to
+    ready without replacing the seam.
+    """
+
+    def __init__(self, *, ready: bool) -> None:
+        self.ready = ready
+
+    def __call__(self) -> Any:
+        from komari_bot.plugins.group_admission import (
+            AdmissionRuntimeState,
+            AdmissionRuntimeStatus,
+        )
+
+        if self.ready:
+            return AdmissionRuntimeState(
+                status=AdmissionRuntimeStatus.READY,
+                problem_code=None,
+                configured_revision=1,
+                effective_revision=1,
+                using_last_known_good=False,
+            )
+        return AdmissionRuntimeState(
+            status=AdmissionRuntimeStatus.FAILED,
+            problem_code="storage_unavailable",
+            configured_revision=None,
+            effective_revision=None,
+            using_last_known_good=False,
+        )
+
+
+def install_dependency_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    binding_ready: bool,
+    admission_ready: bool,
+) -> SimpleNamespace:
+    """Install readiness doubles on the public dependency seams.
+
+    The composition root must consult ``character_binding.get_binding_manager``
+    (``is_ready``) and ``group_admission.get_runtime_state`` (``is_ready``)
+    before claiming readiness.  Both the package-level accessor and the manager
+    submodule accessor are patched so an import-time binding is covered too.
+    Returns the toggles so a test can flip them for the recovery phase.
+    """
+
+    from komari_bot.plugins import character_binding, group_admission
+    from komari_bot.plugins.character_binding import manager as binding_manager
+
+    binding = BindingManagerToggle(ready=binding_ready)
+    admission = AdmissionRuntimeToggle(ready=admission_ready)
+    monkeypatch.setattr(character_binding, "get_binding_manager", lambda: binding)
+    monkeypatch.setattr(binding_manager, "get_manager", lambda: binding)
+    monkeypatch.setattr(group_admission, "get_runtime_state", admission)
+    return SimpleNamespace(binding=binding, admission=admission)
+
+
 @asynccontextmanager
 async def lifecycle_context(
     monkeypatch: pytest.MonkeyPatch,
     *,
     acquisition_error: Exception | None = None,
     manager_factory: Callable[..., Any] | None = None,
+    ready_dependencies: bool = True,
 ) -> AsyncIterator[SimpleNamespace]:
     """Assemble the roulette lifecycle from the real Driver + recording scheduler.
 
@@ -309,6 +397,11 @@ async def lifecycle_context(
     registered during the reload), ``scheduler`` (the recording fake),
     ``jobs``, ``config_manager_calls``, ``config_managers`` (the manager cache)
     and ``config_getter_state`` (flip ``state["error"]`` to recover).
+
+    By default it installs *ready* dependency seams (real-shaped binding manager
+    + real ``AdmissionRuntimeState``), so the healthy path is genuinely ready
+    rather than a production that skips readiness to satisfy old tests.  Pass
+    ``ready_dependencies=False`` to inject not-ready dependencies yourself.
     """
 
     importlib.import_module(PACKAGE)
@@ -329,6 +422,12 @@ async def lifecycle_context(
             acquisition_error=acquisition_error,
             manager_factory=manager_factory,
         )
+        if ready_dependencies:
+            install_dependency_readiness(
+                monkeypatch,
+                binding_ready=True,
+                admission_ready=True,
+            )
         _pop_reloadable_roulette_modules()
         try:
             importlib.reload(sys.modules[PACKAGE])

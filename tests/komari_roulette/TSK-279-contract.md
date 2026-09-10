@@ -1237,3 +1237,54 @@ KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
 装配次序 probe 同样在 `finally` 恢复 `get_config_storage` 并删除
 `komari_roulette_config` 单行。C1 全量运行后实测：`komari_roulette_config` 0 行，
 本 scope 绑定行/轮盘 receipt/game/fulfillment 均为 0。
+
+### 13.8 C1 测试收尾：真实脏工作区跑基线 → 提交（2026-09-11，独立审计响应）
+
+关系声明（base ↔ dirty → commit）：本轮不是在干净 base 上写测试，而是**先在实际
+工作区**（base `bc4b1cc`，HEAD `a2a3416`，7 个 C1 测试文件处于上一轮 dirty 状态）
+上跑出真实基线（11 failed / 101 passed），再补 4 条审计缺口 RED，最后把
+**base + dirty + 本轮新增**作为一次提交落盘（commit message 说明 what/why）。因此
+下表 15 failed / 101 passed 是“真实 base+dirty”的实测，而不是干净 base 的推测；
+提交后 `git status` 干净。
+
+独立审计给出的 3 个 shutdown 缺口 + 1 个根缺口，上一轮 11 RED 均未覆盖，本轮各加
+1 条最小 RED（不新增/不扩散文件，全部落在允许的 7 文件内）：
+
+| 缺口 | 新增用例（文件） | 冻结断言 | 实测首错（RED 证据） |
+|---|---|---|---|
+| A 失败启动越权安装 | `test_stop_then_failed_config_initialize_never_installs_bootstrap`（`test_tsk279_lifecycle.py`，新增 `BlockingFailingConfig`） | startup 阻塞在 `initialize_async` → stop 先完成 → 释放后 `initialize` 抛错：`get_roulette_application() is None`、`get_roulette_qq_runtime() is None`、`RECOVERY_JOB_ID`/`CLEANUP_JOB_ID` 均未注册 | `AssertionError: a failed startup that raced a completed shutdown must not install the fail-closed bootstrap application`（装上了 `_LazyConfigPort` bootstrap app） |
+| B stop 起点旧门仍放行 | `test_lifecycle_stop_rejects_the_old_installed_gate_before_maintenance_drains`（`_pg`，捕获真实 `business_gate`） | 用 Event 门控 `app.maintenance.close`，stop 进行中调用旧已安装 gate：必须 `False`；释放 stop 后 app/QQ 仍为 None | `AssertionError: the old installed gate must reject as soon as stop begins, not only after maintenance drains` |
+| C stop 不取消 owned job | `test_stop_bounded_joins_the_registered_cleanup_blocked_on_the_group_lock`（`_pg`） | monkeypatch 真实 `CLOSE_ROUND_TIMEOUT_SECONDS=0.5`，真实注册的 `CLEANUP_JOB_ID` 回调阻塞在真实群 advisory 锁上，stop 返回后放锁：aged receipt 必须保留（`== 1`），即 stop 返回后不得 DELETE | `AssertionError: the registered cleanup must not DELETE after stop returned`（`assert 0 == 1`） |
+| 根：门 await 后不复核本地 | `test_lifecycle_business_gate_rechecks_local_switch_after_the_recheck`（`_pg`，捕获真实 `business_gate`） | 只包 `group_admission.recheck_qq_effect` 计时（Event），仍委托真实 helper；await 期间经真实 manager 翻 `plugin_enable=False`：0 发送、0 receipt、全部 `scope_counts` 为 0 | `AssertionError: a live switch turned off during the recheck must leave no receipt`（`assert 1 == 0`） |
+
+根缺口语义：`_business_gate` 只在 await **前**读 `app.runtime.accepting`，await 后直接
+`return decision.allowed`，不重读本地 runtime/owner 状态。包装器只控制时序、仍委托真实
+`recheck_qq_effect`，因此不伪造远端裁决；证据是“本地动态开关不是实时的”。既有
+after-claim（用例 3）与 after-lock（用例 4）保持不动，不重复覆盖。
+
+装配门捕获（不改写生产门）：`_installed_lifecycle_qq_authority` 用 `monkeypatch.setattr`
+把 `lifecycle.install_roulette_qq_runtime` 换成记录包装器，**委托真实安装**并抄下
+`business_gate`，存进 `_InstalledQQAuthority.business_gate`；被测试的仍是组合根安装的
+那一个门，而非测试自造门。
+
+验收卫生：`_installed_lifecycle_qq_authority` 改为**每用例新随机 QQ**
+（`8_500_000_000 + uuid4() % 1e9`），并**删除**“用前先解封该身份”的 pre-clean；
+`finally` 只精确解封本用例自己创建的 `member_qq`。因此不再触碰任何 foreign ban，
+也不再需要 `_REVOKE_MEMBER_QQ` / `_POST_CLAIM_MEMBER_QQ` 每 mutation 一个固定号。
+根允许新增 readiness 属性；真实 manager 失败时 `is_ready is False` 的
+`test_character_binding_manager_is_ready_is_false_after_failed_initialize` 保留且仍
+GREEN（不在 15 RED 内）。
+
+实测（本工作区，base `bc4b1cc` + dirty，门控 DSN 同 §13.7，命令均带
+`-p no:cacheprovider`、不禁用 randomly）：
+
+| 命令 | 结果 |
+|------|------|
+| `pytest tests/komari_roulette/test_tsk278_handler.py test_tsk279_effect_recheck_pg.py test_tsk279_lifecycle.py test_tsk279_lifecycle_pg.py test_tsk279_runtime.py -q --tb=no`（带门控） | **15 failed / 101 passed**（11 上轮 RED + 4 本轮 RED；101 passed 与基线相同，无 GREEN 被破坏） |
+| `pytest` 仅本轮 4 条（`-q --tb=line`，带门控） | 4 failed，首错逐条为 A/B/C/根（同上表） |
+| `ruff check .` | ✅ All checks passed |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python`（全仓） | ✅ 0 errors, 0 warnings, 0 informations |
+
+未覆盖/风险：本轮只加 RED，不修生产；四个缺口在实现修复前必须保持 RED。Gap B/C
+用“在途/阻塞”制造窗口，未覆盖真实 gunicorn 进程级 on_shutdown 顺序（同 §13.4）；
+真实远端原子性未断言，只断言本地动态开关/owner 状态的实时性。

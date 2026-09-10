@@ -396,7 +396,14 @@ async def test_handler_passes_original_token_closure_to_service_and_delivery() -
     token = business_token()
     await handler.handle(bot, event, state=admission_state(token=token))
 
-    assert len(gate_calls) == 1, "the front-door business gate runs once"
+    assert gate_calls, "the business gate must run (front door at least)"
+    for recorded_bot, recorded_event, recorded_token in gate_calls:
+        assert recorded_bot is bot
+        assert recorded_event is event
+        assert recorded_token is token, (
+            "every gate invocation must re-check the ORIGINAL token, never a "
+            "receipt-derived re-mint"
+        )
     assert len(service.execute_effect_checks) == 1
     service_check = service.execute_effect_checks[0]
     assert service_check is not None, (
@@ -405,10 +412,7 @@ async def test_handler_passes_original_token_closure_to_service_and_delivery() -
     await _maybe_await(service_check())
     assert gate_calls[-1][0] is bot
     assert gate_calls[-1][1] is event
-    assert gate_calls[-1][2] is token, (
-        "the post-lock closure must re-check the ORIGINAL token, not a "
-        "receipt-derived re-mint"
-    )
+    assert gate_calls[-1][2] is token
 
     assert len(delivery.deliver_effect_checks) == 1
     delivery_check = delivery.deliver_effect_checks[0]

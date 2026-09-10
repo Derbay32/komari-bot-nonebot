@@ -357,11 +357,22 @@ class _PerRequestService:
         request: Any,
         *,
         observation: Any = None,
+        effect_check: Any = None,
     ) -> Any:
         del observation
         from .tsk278_support import projection, receipt
 
         self.requests.append(request)
+        if effect_check is not None:
+            outcome = effect_check()
+            if hasattr(outcome, "__await__"):
+                outcome = await outcome
+            if not outcome:
+                from komari_bot.plugins.komari_roulette.command_service import (
+                    EffectCheckRejectedError,
+                )
+
+                raise EffectCheckRejectedError
         return receipt(
             receipt_id=f"r-{request.inbound_msg_id}",
             app_id=request.app_id,
