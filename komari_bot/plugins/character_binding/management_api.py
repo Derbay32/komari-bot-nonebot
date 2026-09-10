@@ -40,7 +40,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from komari_bot.management.management_api import ManagementTokenSource
-    from komari_bot.management.management_audit import ManagementAuditRecorder
+    from komari_bot.management.management_audit import (
+        AuditMetadataValue,
+        ManagementAuditRecorder,
+    )
 
 API_PREFIX = "/api/v2/character-bindings/repair"
 _STORAGE_UNAVAILABLE = "绑定修复存储暂不可用"
@@ -271,12 +274,35 @@ def register_character_binding_repair_api(
     ) -> RepairConfirmResultResponse:
         """确认清除：令牌绑定操作者/对象/版本，复核通过才原子删除。"""
         service = _require_repair_service(getter)
-        target_hash = hash_management_target(
-            payload.app_id,
-            payload.group_openid,
-            "<group>",
-        )
         try:
+            # 开始审计 span 前先做同步只读、非消耗的令牌探针：合法令牌的真实
+            # 成员目标与预览版本/预期数量在 ``started`` 即可见，失败路径也不
+            # 依赖事后成功覆盖；无效令牌退化为请求群安全哈希。
+            context = service.get_confirm_audit_context(
+                app_id=payload.app_id,
+                group_openid=payload.group_openid,
+                token=payload.token,
+                operator_id=principal.operator_id,
+            )
+            initial_metadata: dict[str, AuditMetadataValue]
+            if context is None:
+                target_hash = hash_management_target(
+                    payload.app_id,
+                    payload.group_openid,
+                    "<group>",
+                )
+                initial_metadata = {}
+            else:
+                target_hash = hash_management_target(
+                    payload.app_id,
+                    payload.group_openid,
+                    context.member_openid or "<group>",
+                )
+                initial_metadata = {
+                    "scope": context.scope,
+                    "version": context.version,
+                    "expected_count": context.expected_count,
+                }
             async with management_audit_span(
                 principal=principal,
                 request_id=request_id,
@@ -284,6 +310,7 @@ def register_character_binding_repair_api(
                 action="character_binding.repair.confirm",
                 resource="character_binding",
                 target_hash=target_hash,
+                initial_metadata=initial_metadata,
                 recorder=recorder,
             ) as audit:
                 try:
@@ -308,13 +335,8 @@ def register_character_binding_repair_api(
                         status_code=503, detail=_STORAGE_UNAVAILABLE
                     ) from None
                 response = RepairConfirmResultResponse.model_validate(result)
-                # 目标哈希必须按实际范围计算：成员范围用成员哈希，绝不能
-                # 固定为群哈希。成员身份只在确认结果中可得，因此在此覆盖。
-                audit.target_hash = hash_management_target(
-                    payload.app_id,
-                    payload.group_openid,
-                    response.member_openid or "<group>",
-                )
+                # 目标哈希已在 span 打开前按探针真实范围确定，不再在成功后
+                # 动态覆盖，避免掩盖早期 started/failed 的错误目标。
                 audit.metadata.update(
                     {
                         "scope": response.scope,

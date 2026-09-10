@@ -171,6 +171,44 @@ class CharacterBindingManager:
                 return
             await self._refresh_snapshot_locked()
 
+    async def invalidate_repair_scope(
+        self,
+        *,
+        app_id: str,
+        group_openid: str,
+        member_openid: str | None = None,
+    ) -> None:
+        """定向移除已提交修复影响的快照条目（两种协议一致）。
+
+        只允许在确认正式删除已提交后调用：按 ``(app_id, group_openid)`` 移除
+        整组（``member_openid`` 为空）或单个成员关系，绝不触碰其他成员/群；
+        不重载全表、不新增 schema。持 ``_lock`` 与在途快照重建串行，使读+
+        发布原子，避免旧 ``load_all`` 读数回填已删身份。
+        """
+        target_app = str(app_id)
+        target_group = str(group_openid)
+        async with self._lock:
+            if member_openid is None:
+                self._records = tuple(
+                    record
+                    for record in self._records
+                    if not (
+                        record.app_id == target_app
+                        and record.group_openid == target_group
+                    )
+                )
+                return
+            target_member = str(member_openid)
+            self._records = tuple(
+                record
+                for record in self._records
+                if not (
+                    record.app_id == target_app
+                    and record.group_openid == target_group
+                    and record.member_openid == target_member
+                )
+            )
+
     async def _close_database_after_failure(self) -> None:
         try:
             await self._database.close()

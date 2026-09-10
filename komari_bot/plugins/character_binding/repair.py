@@ -117,6 +117,21 @@ class RepairConfirmResult:
     expected_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class RepairConfirmAuditContext:
+    """确认前同步探针解析出的真实目标审计上下文。
+
+    由 ``get_confirm_audit_context`` 只读、非消耗地返回，供 REST confirm 在
+    打开审计 span 之前填充 ``started``/``failed`` 的真实成员哈希与预览版本/
+    预期数量，避免用请求群哈希掩盖早期错误。
+    """
+
+    scope: RepairScope
+    member_openid: str | None
+    version: str
+    expected_count: int
+
+
 class RepairTokenError(RuntimeError):
     """确认令牌无效、已过期、已使用或与操作者/目标不符。"""
 
@@ -709,16 +724,8 @@ class BindingRepairService:
         finally:
             await session.close()
 
-        # 仅提交成功后刷新正式绑定快照，保证双协议查询一致。
-        if self._manager is not None:
-            try:
-                await self._manager.refresh_snapshot()
-            except Exception as error:
-                logger.error(
-                    "[BindingRepair] 修复确认后刷新快照失败: error_type={}",
-                    type(error).__name__,
-                )
-                raise BindingPersistenceError("绑定修复保存结果无法确认") from error
+        # 提交已确定：发布缓存；缓存失败绝不把已提交的删除改写为失败。
+        await self._publish_committed_repair_cache(entry)
 
         return RepairConfirmResult(
             scope=entry.scope,
@@ -727,6 +734,71 @@ class BindingRepairService:
             member_openid=entry.member_openid,
             cleared_count=len(cleared_names),
             cleared_names=cleared_names,
+            version=entry.version,
+            expected_count=entry.expected_count,
+        )
+
+    async def _publish_committed_repair_cache(self, entry: _TokenEntry) -> None:
+        """提交已确定后发布缓存：定向失效优先，整体刷新尽力而为。
+
+        正式删除已提交时，缓存刷新失败不能改写业务结果：先按真实作用域
+        定向移除受影响关系（纯内存、两协议一致、不受 DB 读路径故障影响），
+        再尝试整体刷新以拾取并发变更；刷新失败只记录。
+        """
+        manager = self._manager
+        if manager is None:
+            return
+        try:
+            await manager.invalidate_repair_scope(
+                app_id=entry.app_id,
+                group_openid=entry.group_openid,
+                member_openid=entry.member_openid,
+            )
+        except Exception as error:
+            logger.critical(
+                "[BindingRepair] 定向失效已提交修复缓存失败: error_type={}",
+                type(error).__name__,
+            )
+        try:
+            await manager.refresh_snapshot()
+        except Exception as error:
+            logger.error(
+                "[BindingRepair] 提交后刷新绑定快照失败: error_type={}",
+                type(error).__name__,
+            )
+
+    # ------------------------------------------------------------ 确认前探针
+
+    def get_confirm_audit_context(
+        self,
+        *,
+        app_id: str,
+        group_openid: str,
+        token: str,
+        operator_id: str,
+    ) -> RepairConfirmAuditContext | None:
+        """同步、只读、非消耗地解析有效令牌的真实审计上下文。
+
+        仅当令牌存在、未过期、未使用、``operator_id`` 相符且目标
+        ``app_id``/``group_openid`` 相符时返回上下文；其余一律返回 ``None``：
+        不消耗令牌、不访问数据库、不抛异常，路由据此回退为请求群安全哈希。
+        """
+        if self._closed:
+            return None
+        entry = self._tokens.get(token)
+        if (
+            entry is None
+            or entry.used
+            or self._clock() >= entry.expires_at
+            or entry.operator_id != str(operator_id)
+            or entry.app_id != str(app_id)
+            or entry.group_openid != str(group_openid)
+            or (entry.scope == "member" and entry.member_openid is None)
+        ):
+            return None
+        return RepairConfirmAuditContext(
+            scope=entry.scope,
+            member_openid=entry.member_openid,
             version=entry.version,
             expected_count=entry.expected_count,
         )
@@ -748,6 +820,7 @@ __all__ = [
     "BindingRepairService",
     "MemberBindingView",
     "RepairBlockedByGameError",
+    "RepairConfirmAuditContext",
     "RepairConfirmResult",
     "RepairDependencyChangedError",
     "RepairPreview",

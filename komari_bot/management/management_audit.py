@@ -228,9 +228,16 @@ async def management_audit_span(
     recorder: ManagementAuditRecorder,
     field_name: str | None = None,
     target_hash: str | None = None,
+    initial_metadata: Mapping[str, AuditMetadataValue] | None = None,
 ) -> AsyncIterator[ManagementAuditSpan]:
-    """写入 attempt/result 两阶段事件；attempt 失败时不执行变更。"""
+    """写入 attempt/result 两阶段事件；attempt 失败时不执行变更。
+
+    ``initial_metadata`` 显式声明 span 起始即可见的安全字段（如预览版本、
+    预期数量与范围），使 ``started`` 与后续 ``failed`` 都携带同一份真实
+    上下文；缺省为空，保持既有调用语义不变。
+    """
     started_at = time.monotonic()
+    initial = dict(initial_metadata or {})
     base_event = ManagementAuditEvent(
         timestamp=datetime.now(tz=UTC).isoformat(),
         request_id=request_id,
@@ -241,10 +248,11 @@ async def management_audit_span(
         target_hash=target_hash,
         reason=reason,
         outcome="started",
+        metadata=initial,
     )
     await recorder(base_event)
 
-    span = ManagementAuditSpan()
+    span = ManagementAuditSpan(metadata=dict(initial))
     try:
         yield span
     except BaseException as exc:
