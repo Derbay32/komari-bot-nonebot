@@ -22,6 +22,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEBUG_COMMANDS = (
     PROJECT_ROOT / "komari_bot" / "plugins" / "komari_debug" / "commands.py"
 )
+MANAGEMENT_ROOT = PROJECT_ROOT / "komari_bot" / "plugins" / "komari_management"
+BINDING_ROOT = PROJECT_ROOT / "komari_bot" / "plugins" / "character_binding"
 BINDING_MATCHER_ENTRIES = {
     "matcher.character_binding.reply_evidence.reply_evidence_matcher",
     "matcher.character_binding.qq_commands.bind_qq",
@@ -61,6 +63,66 @@ def _debug_bind_subcommands() -> set[str]:
 def test_debug_bind_subcommands_are_not_extended() -> None:
     """TSK-280 不新增 debug 修复入口：``.debug bind`` 保持 set/del/list 闭集。"""
     assert _debug_bind_subcommands() == {"set", "del", "list"}
+
+
+def _module_all_exports(init_path: Path) -> set[str]:
+    """AST 解析插件 ``__init__.__all__`` 字符串字面量集合。"""
+    tree = ast.parse(init_path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in node.targets
+        ):
+            continue
+        if isinstance(node.value, ast.List):
+            return {
+                element.value
+                for element in node.value.elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            }
+    return set()
+
+
+def test_management_lifecycle_cross_plugin_imports_are_top_level_only() -> None:
+    """管理装配绑定修复生命周期只允许跨插件顶层公开 ``__all__`` 引用。
+
+    ``komari_bot.plugins.<plugin>.<submodule>`` 直属深 import 与未被目标插件
+    顶层 ``__all__`` 暴露的符号引用都必须为 0：管理装配经既有顶层暴露面取
+    ``BindingRepairService`` / ``set_binding_repair_service`` / 轮盘公共 seam。
+    """
+    lifecycle = MANAGEMENT_ROOT / "binding_repair_lifecycle.py"
+    tree = ast.parse(lifecycle.read_text(encoding="utf-8"))
+    plugin_prefix = "komari_bot.plugins."
+    plugin_root = PROJECT_ROOT / "komari_bot" / "plugins"
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if not node.module.startswith(plugin_prefix):
+                continue
+            parts = node.module.split(".")
+            if len(parts) != 3:
+                violations.append(f"{node.module}: 跨插件深 import 子模块")
+                continue
+            exported = _module_all_exports(plugin_root / parts[2] / "__init__.py")
+            missing = sorted(
+                alias.name for alias in node.names if alias.name not in exported
+            )
+            if missing:
+                violations.append(f"{node.module}: 顶层 __all__ 未暴露 {missing}")
+        elif isinstance(node, ast.Import):
+            violations.extend(
+                f"{alias.name}: 跨插件深 import 模块"
+                for alias in node.names
+                if alias.name.startswith(plugin_prefix)
+                and len(alias.name.split(".")) != 3
+            )
+    assert not violations, "\n".join(violations)
+    # 生命周期依赖的修复服务符号必须是 character_binding 顶层公开面成员。
+    binding_exports = _module_all_exports(BINDING_ROOT / "__init__.py")
+    assert "BindingRepairService" in binding_exports
+    assert "set_binding_repair_service" in binding_exports
 
 
 def test_character_binding_matchers_stay_at_frozen_census() -> None:

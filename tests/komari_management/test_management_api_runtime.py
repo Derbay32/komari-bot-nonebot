@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -10,6 +11,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
+from komari_bot.plugins.character_binding.management_api import (
+    register_character_binding_repair_api,
+)
 from komari_bot.plugins.group_admission import register_group_admission_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
@@ -122,6 +126,8 @@ def _build_components() -> ManagementApiComponents:
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
         reply_fulfillment_service_getter=lambda: None,
+        register_character_binding_repair_api=register_character_binding_repair_api,
+        character_binding_repair_service_getter=lambda: None,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -136,6 +142,17 @@ def _build_components() -> ManagementApiComponents:
             ),
         ),
     )
+
+
+def test_management_components_require_binding_repair_fields() -> None:
+    """TSK-280 两个组件字段必填：不得用 _noop 注册默认兼容旧构造。"""
+    parameters = inspect.signature(ManagementApiComponents).parameters
+    for name in (
+        "register_character_binding_repair_api",
+        "character_binding_repair_service_getter",
+    ):
+        assert name in parameters, name
+        assert parameters[name].default is inspect.Parameter.empty, name
 
 
 @pytest.mark.asyncio
@@ -193,6 +210,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "/api/v2/reply-fulfillments/fulfillments/{fulfillment_id}/confirm-delivered"
         in schema["paths"]
     )
+    assert "/api/v2/character-bindings/repair/diagnose" in schema["paths"]
     assert "/api/llm-provider/v1/reply-logs" not in schema["paths"]
     security_schemes = schema["components"]["securitySchemes"]
     assert any(

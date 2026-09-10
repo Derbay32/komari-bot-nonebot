@@ -267,3 +267,23 @@ snapshot = await game_state_reader(session, app_id=app_id,
 无环境变量时跳过；TSK-280 与其它代理共享门控库期间不同时并跑，隔离库由根
 后续提供。当前基线运行阶段生产模块尚未实现，PG 测试与无服务测试同样以
 「缺失业务模块」为预期 RED；夹具探针在无 repair 模块时即可独立验证。
+
+## 最终缺口修复验收点（独立双轴 review，RED 优先）
+
+以下验收点由独立双轴 review 认定为「最后确定缺陷」，以真实 FastAPI 路由 +
+真实 `BindingRepairService` + 真实 PostgreSQL / 真实绑定管理器观察，禁止注入
+虚构服务接口；未实现前为真实 RED：
+
+| 新验收点 | 测试节点 | 现状 |
+| --- | --- | --- |
+| `confirm` 在业务调用前做纯只读、非消耗的令牌审计上下文探针；合法成员令牌的 `started` 与 `succeeded` 都携带真实成员哈希及 `version`/`expected_count` | `test_tsk280_final_gaps_pg.py::test_member_confirm_audit_has_member_hash_on_started_and_succeeded` | RED（`started.target_hash` 为群哈希） |
+| 合法成员令牌但依赖变动 409：`started` 与 `failed` 都携带真实成员哈希及 `version`/`expected_count` | `test_tsk280_final_gaps_pg.py::test_confirm_dependency_change_audit_has_member_hash_on_started_and_failed` | RED（`started.target_hash` 为群哈希） |
+| 无效令牌（含另一操作者的令牌）不得泄露目标：`started`/`failed` 退化为请求群安全哈希，且不消耗不删除 | `test_tsk280_final_gaps_pg.py::test_other_operator_token_audit_falls_back_to_request_group_hash` | 绿（探针必须保持群哈希回退） |
+| `started` 审计失败不消耗令牌、不删除正式行，且同一令牌可再次确认成功 | `test_tsk280_final_gaps_pg.py::test_confirm_started_audit_failure_keeps_token_and_rows_for_retry` | 绿（探针不得提前消耗令牌） |
+| 提交已确定后 `manager.refresh_snapshot()` 失败不得 503/failed、不得保留已删成员缓存；确认 200/succeeded，正式行删除，双协议快照移除受影响关系且未受影响成员/群保留，令牌重试不重复删除 | `test_tsk280_final_gaps_pg.py::test_committed_member_delete_survives_refresh_failure`、`test_committed_group_delete_survives_refresh_failure` | RED（确认回报 503 且缓存保留旧成员） |
+| 跨插件边界只允许顶层公开 `__all__`：管理修复生命周期不得深 import `character_binding.repair` | `test_tsk280_surface_guards.py::test_management_lifecycle_cross_plugin_imports_are_top_level_only` | RED（两处 `...character_binding.repair` 深 import） |
+| `ManagementApiComponents.register_character_binding_repair_api` 与 `character_binding_repair_service_getter` 必填、不得默认 `_noop`；真实装配路由可达、启动服务非 None、关闭后引用 None 且旧服务已关闭 | `tests/komari_management/test_management_api_runtime.py::test_management_components_require_binding_repair_fields`、`test_register_management_api_for_fastapi_driver`、`tests/komari_management/test_plugin_integration.py::test_nonebot_fastapi_driver_exposes_docs_and_management_routes`、`tests/komari_management/test_binding_repair_lifecycle.py::test_management_lifecycle_starts_with_real_manager_and_closes_service` | RED（两字段仍有 `_noop` 默认） |
+
+约束：`started`/`failed` 的 `version`/`expected_count` 必须来自探针上下文而非
+企业调用结果；不得新增持久化后台重试或 Schema；不得为通过测试而放宽审计
+哈希或吞掉真实存储失败。

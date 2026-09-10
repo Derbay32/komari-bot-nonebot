@@ -780,6 +780,28 @@ REVOKED_MANAGE_CREDENTIALS = [
 ]
 
 
+class _FalsyAwaitable:
+    """容错探针返回：真值判定为假，可被 ``await``，未知属性返回 ``None``。
+
+    TSK-280 最终缺陷修复在业务调用前新增只读、非消耗的令牌审计上下文探针；
+    桩服务无需复现其真实签名，但必须保证未知探针名不会因缺方法把既有 REST
+    契约用例变成夹具错误：无效/未知令牌语义（无有效上下文）下路由回退请求群
+    哈希，与当前 succeeded 事件按结果覆盖成员哈希的行为保持一致。
+    """
+
+    def __await__(self) -> Any:
+        async def _settle() -> _FalsyAwaitable:
+            return self
+
+        return _settle().__await__()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> None:
+        del name
+
+
 class StubBindingRepairService:
     """REST 路由测试使用的桩服务端口实现。
 
@@ -796,6 +818,21 @@ class StubBindingRepairService:
         self.preview_result: dict[str, object] | None = None
         self.confirm_result: dict[str, object] | None = None
         self.error: BaseException | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        """未知探针方法容错：返回可直接判定/可 await 的无效上下文。
+
+        仅对下划线开头的私有/特殊名保持 ``AttributeError``，避免干扰框架
+        内省；业务侧公开探针名一律得到无效上下文（回退群哈希语义）。
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def _probe(*args: object, **kwargs: object) -> _FalsyAwaitable:
+            del args, kwargs
+            return _FalsyAwaitable()
+
+        return _probe
 
     async def diagnose(self, **kwargs: object) -> dict[str, object]:
         self.diagnose_calls.append({key: str(value) for key, value in kwargs.items()})
