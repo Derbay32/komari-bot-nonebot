@@ -62,7 +62,8 @@ from .storage import (
 Scalar = str | int | bool | None
 PublicValue = Scalar | tuple[str, ...]
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
-_OBSERVED_ACTIVE_WRITES = frozenset(
+#: Intents whose active-game writes are guarded by a caller observation.
+OBSERVED_ACTIVE_WRITES = frozenset(
     {
         "shoot",
         "forfeit",
@@ -887,7 +888,7 @@ class RouletteCommandService:
             current is not None
             and current.lifecycle == "active"
             and current.phase in {"first_shot", "follow_up", "locked_turn", "item_choice"}
-            and request.command.intent in _OBSERVED_ACTIVE_WRITES
+            and request.command.intent in OBSERVED_ACTIVE_WRITES
         )
         if requires_observation and not _observation_matches(current, observation):
             return await self._insert_failure_receipt(
@@ -902,6 +903,7 @@ class RouletteCommandService:
         winner_group_wins: int | None = None
         if request.command.intent == "leaderboard":
             if current is not None and current.deadline is not None and now >= current.deadline:
+                expiring_seq = current.current_player_seq
                 expiry_result = apply_action(
                     current.state,
                     Action.expire(),
@@ -916,6 +918,19 @@ class RouletteCommandService:
                         expiry_result,
                         now=now,
                     )
+                    # TSK-266 10.2: a leaderboard query that lazily advanced the
+                    # deadline reports the timeout it caused to the very player
+                    # it eliminated; the leaderboard is never appended there.
+                    if _member_for_seq(current, expiring_seq) == request.member_openid:
+                        return await self._insert_failure_receipt(
+                            session,
+                            request,
+                            fingerprint=fingerprint,
+                            result_code=expiry_result.code,
+                            snapshot=current,
+                            details=expiry_result.reply,
+                            winner_group_wins=winner_group_wins,
+                        )
             entries = await storage.list_leaderboard(group)
             details = {"leaderboard": _leaderboard_values(entries)}
             return await self._insert_failure_receipt(
@@ -975,7 +990,7 @@ class RouletteCommandService:
             request,
             result_code=result.code,
             snapshot=saved,
-            details=result.reply,
+            details=_projection_details(result),
             winner_group_wins=winner_group_wins,
         )
         return await self._insert_receipt(
@@ -1356,9 +1371,24 @@ def _name_key(name: str) -> str:
     return unicodedata.normalize("NFKC", name).casefold()
 
 
+def _projection_details(result: ActionResult) -> dict[str, object]:
+    """Forward the safe reply payload plus the fixed domain reason code.
+
+    TSK-278 renders reason-specific fixed errors (for example
+    ``item_precondition_failed`` + ``burst_requires_two_rounds``); the reason is
+    a closed domain identifier, never user input.
+    """
+
+    details: dict[str, object] = dict(result.reply)
+    if result.reason is not None:
+        details["reason"] = result.reason
+    return details
+
+
 def _safe_details(details: Mapping[str, object]) -> dict[str, PublicValue]:
     safe: dict[str, PublicValue] = {}
     allowed = {
+        "reason",
         "consumed_kind",
         "remaining_live",
         "remaining_blank",
