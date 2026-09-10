@@ -1,9 +1,10 @@
 """Strict QQ group-@ command handler seam for the roulette plugin (TSK-278).
 
 ``RouletteQQHandler`` performs the ingress orchestration only: strict event
-eligibility, admission-token handoff, pure parse, optional observation
-pre-read for active writes, exactly one domain execution, the send gate, and
-at most one delivery.  It never executes SQL, writes domain state, or touches
+eligibility, real admission-token scope + identity binding, pure parse, optional
+observation pre-read for active writes, a mandatory business re-authorization
+gate immediately before the single domain execution, the send gate, and at most
+one delivery.  It never executes SQL, writes domain state, or touches
 randomness; every collaborator is injected by the caller.
 """
 
@@ -14,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from nonebot import logger
-from nonebot.adapters.qq import Bot as QQBot  # noqa: TC002 - NoneBot DI 与发送器
+from nonebot.adapters.qq import Bot as QQBot
 from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
 
 from komari_bot.plugins.group_admission import get_qq_admission_token
@@ -23,6 +24,8 @@ from ..command_service import OBSERVED_ACTIVE_WRITES, CommandRequest
 from .parser import parse_command
 
 if TYPE_CHECKING:
+    from komari_bot.plugins.group_admission import QQAdmissionToken
+
     from ..command_service import (
         CommandReceipt,
         GroupRef,
@@ -31,6 +34,12 @@ if TYPE_CHECKING:
     from .delivery import QQMessageSender
 
 type SendGate = Callable[[], bool | Awaitable[bool]]
+type BusinessGate = Callable[
+    [QQBot, GroupAtMessageCreateEvent, "QQAdmissionToken"],
+    bool | Awaitable[bool],
+]
+
+_MENTION_SEGMENT_TYPES = frozenset({"mention_user", "mention_everyone"})
 
 
 class _CommandService(Protocol):
@@ -64,10 +73,12 @@ class RouletteQQHandler:
         service: _CommandService,
         delivery: _Delivery,
         *,
+        business_gate: BusinessGate,
         send_gate: SendGate | None = None,
     ) -> None:
         self._service = service
         self._delivery = delivery
+        self._business_gate = business_gate
         self._send_gate = send_gate
 
     async def handle(
@@ -94,9 +105,17 @@ class RouletteQQHandler:
             and member_openid.strip()
         ):
             return
-        if get_qq_admission_token(state) is None:
+        token = get_qq_admission_token(state)
+        if token is None or not self._token_binds_to_event(
+            token,
+            bot=bot,
+            group_openid=group_openid,
+            member_openid=member_openid,
+            inbound_msg_id=inbound_msg_id,
+        ):
             return
-        command = parse_command(event.get_message().extract_plain_text())
+        message = event.get_message()
+        command = parse_command(message.extract_plain_text())
         if command is None:
             return
         request = CommandRequest(
@@ -105,11 +124,15 @@ class RouletteQQHandler:
             inbound_msg_id=inbound_msg_id,
             member_openid=member_openid,
             command=command,
-            target_mention_count=len(event.mentions or []),
+            target_mention_count=sum(
+                1 for segment in message if segment.type in _MENTION_SEGMENT_TYPES
+            ),
         )
         observation: Observation | None = None
         if command.intent in OBSERVED_ACTIVE_WRITES:
             observation = await self._service.observe_current(request.group)
+        if not await self._business_allowed(bot, event, token):
+            return
         receipt = await self._service.execute_group_command(
             request,
             observation=observation,
@@ -117,6 +140,49 @@ class RouletteQQHandler:
         if not await self._send_allowed():
             return
         await self._delivery.deliver(receipt, bot)
+
+    @staticmethod
+    def _token_binds_to_event(
+        token: QQAdmissionToken,
+        *,
+        bot: QQBot,
+        group_openid: str,
+        member_openid: str,
+        inbound_msg_id: str,
+    ) -> bool:
+        """Require a business-scoped token whose identity matches the event.
+
+        A binding / binding-challenge token (or any token minted for another
+        app, group, member or message) must never authorize a business command.
+        """
+
+        return (
+            token.scope == "business"
+            and token.app_id == bot.self_id
+            and token.group_openid == group_openid
+            and token.member_openid == member_openid
+            and token.qq_message_id == inbound_msg_id
+        )
+
+    async def _business_allowed(
+        self,
+        bot: QQBot,
+        event: GroupAtMessageCreateEvent,
+        token: QQAdmissionToken,
+    ) -> bool:
+        """Re-adjudicate business authority right before the domain write."""
+
+        try:
+            result = self._business_gate(bot, event, token)
+            if inspect.isawaitable(result):
+                result = await cast("Awaitable[bool]", result)
+        except Exception as error:  # 准入查询失败即故障关闭：绝不写入、绝不发送
+            logger.warning(
+                "[Roulette] 业务重授权门失败，本次不执行: error_type={}",
+                type(error).__name__,
+            )
+            return False
+        return bool(result)
 
     async def _send_allowed(self) -> bool:
         gate = self._send_gate
@@ -135,4 +201,4 @@ class RouletteQQHandler:
             return False
 
 
-__all__ = ["RouletteQQHandler"]
+__all__ = ["BusinessGate", "RouletteQQHandler", "SendGate"]
