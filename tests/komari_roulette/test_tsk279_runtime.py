@@ -54,7 +54,9 @@ from .test_command_service import (
 from .tsk279_support import (
     RUNTIME_MODULE,
     Tsk279Harness,
+    cancel_and_join,
     harness_fixture_body,
+    load_module,
     load_symbol,
 )
 
@@ -120,11 +122,13 @@ class RecordingRecovery:
 
 
 class BlockingRecovery:
-    """A recovery port whose tick blocks until it is cancelled.
+    """A recovery port whose *later* ticks block until they are cancelled.
 
-    Used to prove ``close()`` bounded-cancels an in-flight dispatch instead of
-    hanging the shutdown path, and records a *real* cancellation rather than a
-    boolean a test sets by hand.
+    The first tick returns cleanly so a runtime whose ``start`` really awaits
+    the first recovery can still reach READY; every subsequent tick blocks so
+    the close path can prove it bounded-cancels an in-flight dispatch instead
+    of hanging the shutdown path, recording a *real* cancellation rather than
+    a boolean a test sets by hand.
     """
 
     def __init__(self) -> None:
@@ -136,6 +140,13 @@ class BlockingRecovery:
 
     async def run_recovery_tick(self) -> RecoveryTickResult:
         self.calls += 1
+        if self.calls == 1:
+            return RecoveryTickResult(
+                scanned=1,
+                advanced=1,
+                skipped_restricted=0,
+                failed=0,
+            )
         self.started.set()
         try:
             await asyncio.Event().wait()
@@ -152,6 +163,112 @@ class BlockingRecovery:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class HandshakeRecovery:
+    """A recovery port whose tick really blocks until the test releases it.
+
+    ``started`` proves the startup recovery has begun; ``gate`` releases it.
+    The tick returns the real B1 result, so the runtime may not claim recovery
+    from a tick that was merely *dispatched*.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+        self.closed = False
+
+    async def run_recovery_tick(self) -> RecoveryTickResult:
+        self.calls += 1
+        self.started.set()
+        await self.gate.wait()
+        return RecoveryTickResult(
+            scanned=1,
+            advanced=1,
+            skipped_restricted=0,
+            failed=0,
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+        self.gate.set()
+
+
+class _MalformedRecovery:
+    """Return one injected malformed tick result (never the real B1 type).
+
+    ``RecordingRecovery`` keeps returning the real ``RecoveryTickResult``; the
+    malformed shapes are injected here so a runtime cannot silently coerce
+    them into a successful recovery.
+    """
+
+    def __init__(self, result: object) -> None:
+        self._result = result
+        self.calls = 0
+        self.closed = False
+
+    async def run_recovery_tick(self) -> object:
+        self.calls += 1
+        return self._result
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class StubbornRecovery:
+    """A tick that survives cancellation and reports a clean result late."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release_gate = asyncio.Event()
+        self.returned = asyncio.Event()
+        self.closed = False
+
+    async def run_recovery_tick(self) -> RecoveryTickResult:
+        self.calls += 1
+        self.started.set()
+        try:
+            await self.release_gate.wait()
+        except asyncio.CancelledError:
+            # A real worker may finish its DB transaction even after shutdown
+            # asked it to stop; the runtime must not apply that late result.
+            await self.release_gate.wait()
+        self.returned.set()
+        return RecoveryTickResult(
+            scanned=1,
+            advanced=1,
+            skipped_restricted=0,
+            failed=0,
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class HangingCloseRecovery:
+    """A recovery port whose ``close`` never returns without a release."""
+
+    def __init__(self) -> None:
+        self.tick_calls = 0
+        self.close_calls = 0
+        self.close_entered = asyncio.Event()
+        self.close_gate = asyncio.Event()
+
+    async def run_recovery_tick(self) -> RecoveryTickResult:
+        self.tick_calls += 1
+        return RecoveryTickResult(
+            scanned=1,
+            advanced=1,
+            skipped_restricted=0,
+            failed=0,
+        )
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.close_entered.set()
+        await self.close_gate.wait()
 
 
 class RecordingConfig:
@@ -294,7 +411,7 @@ async def test_start_reaches_ready_only_after_recovery_tick() -> None:
 
 async def test_runtime_rejects_business_before_recovery_completes() -> None:
     api = _runtime_api()
-    recovery = RecordingRecovery()
+    recovery = HandshakeRecovery()
     runtime = api["RouletteRuntime"](
         config_manager=RecordingConfig(),
         recovery=recovery,
@@ -305,9 +422,60 @@ async def test_runtime_rejects_business_before_recovery_completes() -> None:
     assert denied.allowed is False
     assert denied.reason_code in api["RUNTIME_REASON_CODES"]
     assert recovery.calls == 0
-    await runtime.start()
+
+    start_task = asyncio.create_task(runtime.start())
+    try:
+        # The startup recovery has really begun and is blocked inside the tick.
+        await asyncio.wait_for(recovery.started.wait(), timeout=2)
+        state = runtime.get_state()
+        assert state.recovery_completed is False
+        assert runtime.accepting is False
+        assert runtime.authorize(scope="business", group_ids=[1]).allowed is False
+        assert runtime.authorize(scope="send", group_ids=[1]).allowed is False
+        # ``await start()`` must not have completed while recovery is still in
+        # flight: a merely *scheduled* tick is not a completed recovery.
+        assert start_task.done() is False
+        recovery.gate.set()
+        await asyncio.wait_for(start_task, timeout=2)
+    finally:
+        recovery.gate.set()
+        await cancel_and_join([start_task])
+
+    state = runtime.get_state()
+    assert state.recovery_completed is True
+    assert state.status is api["RouletteRuntimeStatus"].READY
+    assert runtime.accepting is True
     allowed = runtime.authorize(scope="business", group_ids=[1])
     assert allowed.allowed is True
+    await runtime.close()
+
+
+async def test_concurrent_starts_share_one_startup_and_recovery() -> None:
+    """Two overlapping ``start`` calls must not queue a second recovery."""
+
+    api = _runtime_api()
+    config = RecordingConfig()
+    recovery = HandshakeRecovery()
+    runtime = api["RouletteRuntime"](
+        config_manager=config,
+        recovery=recovery,
+        admission=_admission_by_group({1}),
+    )
+    first = asyncio.create_task(runtime.start())
+    second = asyncio.create_task(runtime.start())
+    try:
+        await asyncio.wait_for(recovery.started.wait(), timeout=2)
+        recovery.gate.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+    finally:
+        recovery.gate.set()
+        await cancel_and_join([first, second])
+
+    # One config snapshot and exactly one recovery tick, not a serial repeat.
+    assert config.calls == 1
+    assert recovery.calls == 1
+    assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
+    assert runtime.accepting is True
     await runtime.close()
 
 
@@ -395,6 +563,82 @@ async def test_recovery_tick_with_failures_does_not_report_ready() -> None:
     assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
     assert runtime.get_state().recovery_completed is True
     assert runtime.accepting is True
+    await runtime.close()
+
+
+async def test_live_config_read_failure_never_keeps_stale_ready() -> None:
+    """A live read failure downgrades the state, and a readable config alone is
+    not enough to hand authority back without a clean recovery tick."""
+
+    api = _runtime_api()
+    config = RecordingConfig()
+    recovery = RecordingRecovery()
+    runtime = api["RouletteRuntime"](
+        config_manager=config,
+        recovery=recovery,
+        admission=_admission_by_group({1}),
+    )
+    await runtime.start()
+    assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
+
+    # The live read now fails: the published state must not keep claiming READY
+    # while ``plugin_enable`` cannot actually be read.
+    config.fails = True
+    state = runtime.get_state()
+    assert state.status is api["RouletteRuntimeStatus"].FAILED
+    assert state.reason_code == "config_unavailable"
+    assert state.recovery_completed is False
+    assert runtime.accepting is False
+    denied = runtime.authorize(scope="business", group_ids=[1])
+    assert denied.allowed is False
+    assert denied.reason_code == "config_unavailable"
+
+    # A readable config alone must not flip back to READY: only a clean
+    # recovery tick may release business again.
+    config.fails = False
+    assert runtime.get_state().status is api["RouletteRuntimeStatus"].FAILED
+    assert runtime.accepting is False
+    await runtime.run_recovery_tick()
+    assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
+    assert runtime.accepting is True
+    await runtime.close()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(SimpleNamespace(), id="missing-failed"),
+        pytest.param(SimpleNamespace(failed=True), id="bool-failed"),
+        pytest.param(SimpleNamespace(failed=-1), id="negative-failed"),
+        pytest.param(SimpleNamespace(failed=None), id="none-failed"),
+        pytest.param(SimpleNamespace(failed="0"), id="text-failed"),
+    ],
+)
+async def test_malformed_recovery_result_is_failed_not_success(
+    malformed: object,
+) -> None:
+    """A tick result without a usable non-negative ``failed`` is not success.
+
+    ``RecordingRecovery`` keeps returning the real ``RecoveryTickResult``; the
+    malformed shapes are injected here so a runtime cannot ``getattr`` or clamp
+    them into a clean recovery.
+    """
+
+    api = _runtime_api()
+    recovery = _MalformedRecovery(malformed)
+    runtime = api["RouletteRuntime"](
+        config_manager=RecordingConfig(),
+        recovery=recovery,
+        admission=_admission_by_group({1}),
+    )
+    await runtime.start()
+    state = runtime.get_state()
+    assert state.status is api["RouletteRuntimeStatus"].FAILED
+    assert state.recovery_completed is False
+    assert state.reason_code in api["RUNTIME_REASON_CODES"]
+    assert runtime.accepting is False
+    assert runtime.authorize(scope="business", group_ids=[1]).allowed is False
+    assert runtime.authorize(scope="send", group_ids=[1]).allowed is False
     await runtime.close()
 
 
@@ -509,6 +753,77 @@ async def test_close_blocks_new_dispatch_and_never_disposes_shared_engine() -> N
         blocked.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await blocked
+
+
+async def test_late_recovery_result_after_close_never_restores_ready() -> None:
+    """A tick that finishes *after* ``close`` must not restore authority.
+
+    Real workers can survive a cancellation request long enough to return a
+    clean result.  That late result must not write ``READY`` /
+    ``recovery_completed`` back onto a closed runtime.
+    """
+
+    api = _runtime_api()
+    runtime_module = load_module(RUNTIME_MODULE)
+    recovery = StubbornRecovery()
+    runtime = api["RouletteRuntime"](
+        config_manager=RecordingConfig(),
+        recovery=recovery,
+        admission=_admission_by_group({1}),
+    )
+    start_task = asyncio.create_task(runtime.start())
+    try:
+        await asyncio.wait_for(recovery.started.wait(), timeout=2)
+        # Inject a short bounded wait so the real close timeout is exercised fast.
+        with patch.object(runtime_module, "CLOSE_CANCEL_TIMEOUT_SECONDS", 0.05):
+            await asyncio.wait_for(runtime.close(), timeout=2)
+        assert runtime.accepting is False
+
+        # The stubborn tick now completes with a clean result after close().
+        recovery.release_gate.set()
+        await asyncio.wait_for(recovery.returned.wait(), timeout=2)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        state = runtime.get_state()
+        assert state.status is not api["RouletteRuntimeStatus"].READY
+        assert state.recovery_completed is False
+        assert runtime.accepting is False
+        assert runtime.authorize(scope="business", group_ids=[1]).allowed is False
+    finally:
+        recovery.release_gate.set()
+        await cancel_and_join([start_task])
+
+
+async def test_close_is_bounded_when_recovery_close_hangs() -> None:
+    """``close`` must stay bounded even when the recovery port's close hangs."""
+
+    api = _runtime_api()
+    runtime_module = load_module(RUNTIME_MODULE)
+    recovery = HangingCloseRecovery()
+    runtime = api["RouletteRuntime"](
+        config_manager=RecordingConfig(),
+        recovery=recovery,
+        admission=_admission_by_group({1}),
+    )
+    await runtime.start()
+    assert runtime.accepting is True
+
+    with patch.object(runtime_module, "CLOSE_CANCEL_TIMEOUT_SECONDS", 0.05):
+        close_task = asyncio.create_task(runtime.close())
+        try:
+            await asyncio.wait_for(recovery.close_entered.wait(), timeout=2)
+            # Bounded shutdown: a hanging port close must not hang the runtime.
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=2)
+        finally:
+            recovery.close_gate.set()
+            await cancel_and_join([close_task])
+
+    assert close_task.done()
+    assert close_task.exception() is None
+    assert recovery.close_calls == 1
+    assert runtime.accepting is False
+    await runtime.close()
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +1157,9 @@ async def test_real_config_manager_live_flip_denies_business_and_keeps_maintenan
                 admission=_admission_by_group({1}),
             )
             await runtime.start()
+            # ``await start()`` means the first recovery tick really completed —
+            # not merely that one was dispatched.
+            assert dispatched == ["tick"]
             assert runtime.authorize(scope="business", group_ids=[1]).allowed is True
 
             # Flip the *persisted* config through the real manager: authority must
@@ -853,9 +1171,9 @@ async def test_real_config_manager_live_flip_denies_business_and_keeps_maintenan
             assert runtime.authorize(scope="send", group_ids=[1]).allowed is False
 
             # Disabling business neither stops the absolute recovery sweep nor
-            # extends an existing deadline.
+            # extends an existing deadline: a fresh explicit tick still runs.
             await runtime.run_recovery_tick()
-            assert dispatched == ["tick"]
+            assert dispatched == ["tick", "tick"]
             after = await current_game_row(harness.session_factory, current)
             assert after is not None
             assert after["lifecycle"] == "waiting"

@@ -274,12 +274,15 @@ async def test_deliver_order_build_then_claim_then_send_then_mark() -> None:
 
     service = RecordingService()
     service.claim_result = claim("receipt-1")
+    delivered_receipt = _success_receipt()
 
     def recording_builder(_r: CommandReceipt) -> object:
         events.append("build")
         return object()
 
-    def recording_runtime() -> bool:
+    def recording_runtime(receipt: CommandReceipt) -> bool:
+        # 按调用：重核看到的必须是本次投递的收据，而非进程全局的“当前事件”。
+        assert receipt is delivered_receipt
         events.append("runtime_check")
         return True
 
@@ -287,7 +290,7 @@ async def test_deliver_order_build_then_claim_then_send_then_mark() -> None:
         service=service,
         runtime_check=recording_runtime,
         payload_builder=recording_builder,
-    ).deliver(_success_receipt(), RecordingSender())
+    ).deliver(delivered_receipt, RecordingSender())
 
     # 固定顺序：构建冻结载荷 → 原子领取 → runtime 重核 → 凭证窗口重核 →
     # 发送 → mark_delivered。
@@ -332,10 +335,16 @@ async def test_deliver_runtime_recheck_failure_is_zero_network() -> None:
     service = FakeCommandService()
     service.claim_result = claim("receipt-1")
     sender = FakeSender()
+    delivered_receipt = _success_receipt()
+
+    def deny_runtime(receipt: CommandReceipt) -> bool:
+        assert receipt is delivered_receipt
+        return False
+
     outcome = await _delivery(
         service=service,
-        runtime_check=lambda: False,
-    ).deliver(_success_receipt(), sender)
+        runtime_check=deny_runtime,
+    ).deliver(delivered_receipt, sender)
 
     assert outcome is DeliveryOutcome.NOT_DELIVERED
     assert sender.calls == []
@@ -352,7 +361,10 @@ async def test_deliver_runtime_recheck_runs_after_claim() -> None:
     sender = FakeSender()
     seen: list[str] = []
 
-    def recording_runtime() -> bool:
+    delivered_receipt = _success_receipt()
+
+    def recording_runtime(receipt: CommandReceipt) -> bool:
+        assert receipt is delivered_receipt
         seen.append("runtime")
         assert service.claim_calls == ["receipt-1"], (
             "runtime_check must run after claim"
@@ -360,7 +372,7 @@ async def test_deliver_runtime_recheck_runs_after_claim() -> None:
         return True
 
     await _delivery(service=service, runtime_check=recording_runtime).deliver(
-        _success_receipt(), sender
+        delivered_receipt, sender
     )
     assert seen == ["runtime"]
     assert len(sender.calls) == 1
@@ -373,14 +385,17 @@ async def test_deliver_async_runtime_recheck_is_awaited() -> None:
     sender = FakeSender()
     seen: list[str] = []
 
-    async def async_runtime() -> bool:
+    delivered_receipt = _success_receipt()
+
+    async def async_runtime(receipt: CommandReceipt) -> bool:
+        assert receipt is delivered_receipt
         seen.append("runtime")
         return False
 
     outcome = await _delivery(
         service=service,
         runtime_check=async_runtime,
-    ).deliver(_success_receipt(), sender)
+    ).deliver(delivered_receipt, sender)
 
     assert outcome is DeliveryOutcome.NOT_DELIVERED
     assert seen == ["runtime"]
@@ -397,13 +412,16 @@ async def test_deliver_sync_runtime_recheck_exception_fails_closed() -> None:
     service.claim_result = claim("receipt-1")
     sender = FakeSender()
 
-    def exploding_runtime() -> bool:
+    delivered_receipt = _success_receipt()
+
+    def exploding_runtime(receipt: CommandReceipt) -> bool:
+        assert receipt is delivered_receipt
         raise _RuntimeCheckError
 
     outcome = await _delivery(
         service=service,
         runtime_check=exploding_runtime,
-    ).deliver(_success_receipt(), sender)
+    ).deliver(delivered_receipt, sender)
 
     assert outcome is DeliveryOutcome.NOT_DELIVERED
     assert sender.calls == []
@@ -419,13 +437,16 @@ async def test_deliver_async_runtime_recheck_exception_fails_closed() -> None:
     service.claim_result = claim("receipt-1")
     sender = FakeSender()
 
-    async def exploding_runtime() -> bool:
+    delivered_receipt = _success_receipt()
+
+    async def exploding_runtime(receipt: CommandReceipt) -> bool:
+        assert receipt is delivered_receipt
         raise _RuntimeCheckError
 
     outcome = await _delivery(
         service=service,
         runtime_check=exploding_runtime,
-    ).deliver(_success_receipt(), sender)
+    ).deliver(delivered_receipt, sender)
 
     assert outcome is DeliveryOutcome.NOT_DELIVERED
     assert sender.calls == []

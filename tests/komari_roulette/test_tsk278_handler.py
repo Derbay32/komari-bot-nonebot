@@ -523,7 +523,13 @@ async def test_open_item_panel_does_not_pre_read_observation() -> None:
 
 
 async def test_send_gate_false_does_not_start_delivery() -> None:
-    handler, service, delivery = _handler(send_gate=lambda: False)
+    seen: list[CommandRequest] = []
+
+    def deny_gate(request: CommandRequest) -> bool:
+        seen.append(request)
+        return False
+
+    handler, service, delivery = _handler(send_gate=deny_gate)
     _execute_success(service)
     await _run(
         handler,
@@ -535,13 +541,19 @@ async def test_send_gate_false_does_not_start_delivery() -> None:
     # 领域仍执行并冻结收据，但发送门为 False → 不启动新发送、0 网络、不重渲染。
     assert len(service.execute_calls) == 1
     assert delivery.deliver_calls == []
+    # 按调用：门收到的必须是本调用的 CommandRequest，不得是无参全局事件。
+    assert len(seen) == 1
+    assert seen[0].inbound_msg_id == "msg-1"
+    assert seen[0].group_openid == GROUP_OPENID
 
 
 async def test_send_gate_runs_before_delivery_and_gates_it() -> None:
     calls: list[str] = []
     gated = {"value": False}
+    seen: list[CommandRequest] = []
 
-    def send_gate() -> bool:
+    def send_gate(request: CommandRequest) -> bool:
+        seen.append(request)
         calls.append("gate")
         return gated["value"]
 
@@ -554,6 +566,7 @@ async def test_send_gate_runs_before_delivery_and_gates_it() -> None:
         state=admission_state(),
     )
     assert calls == ["gate"]
+    assert [entry.inbound_msg_id for entry in seen] == ["msg-1"]
     assert delivery.deliver_calls == []
 
     # 轮盘开关恢复后同一事件再走一遍 → 恰好一次 deliver。
@@ -575,7 +588,7 @@ async def test_send_gate_is_independent_of_business_gate() -> None:
         order.append("business")
         return True
 
-    def send_gate() -> bool:
+    def send_gate(_request: CommandRequest) -> bool:
         order.append("send")
         return False
 
@@ -598,7 +611,7 @@ async def test_async_send_gate_is_awaited() -> None:
     """真实准入实时门可为异步可调用：await 结果再决定是否启动发送。"""
     calls: list[str] = []
 
-    async def async_send_gate() -> bool:
+    async def async_send_gate(_request: CommandRequest) -> bool:
         calls.append("gate")
         return False
 

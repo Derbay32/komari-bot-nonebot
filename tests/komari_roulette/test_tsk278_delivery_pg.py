@@ -489,11 +489,19 @@ async def test_real_runtime_recheck_failure_is_zero_network(
     real_receipt = await create_waiting(service, current)
 
     sender = FakeSender()
+    seen_receipts: list[Any] = []
+
+    def deny_runtime(receipt: Any) -> bool:
+        seen_receipts.append(receipt)
+        return False
+
     outcome = await RouletteDelivery(
         service=service,
-        runtime_check=lambda: False,
+        runtime_check=deny_runtime,
     ).deliver(real_receipt, sender)
 
+    # 按调用：重核看到的必须是本次投递的真实收据。
+    assert seen_receipts == [real_receipt]
     assert outcome is DeliveryOutcome.NOT_DELIVERED
     assert sender.calls == []
     assert sender.network_calls == []
@@ -531,7 +539,8 @@ async def test_real_async_runtime_recheck_is_awaited(
     real_receipt = await create_waiting(service, current)
     seen: list[str] = []
 
-    async def async_runtime() -> bool:
+    async def async_runtime(receipt: Any) -> bool:
+        assert receipt is real_receipt
         seen.append("runtime")
         return False
 
@@ -1047,7 +1056,8 @@ async def test_real_slow_runtime_crossing_window_never_sends(
     real_receipt = await create_waiting(service, current)
     assert await _receipt_age_seconds(session_factory, real_receipt.receipt_id) < 300
 
-    async def slow_runtime() -> bool:
+    async def slow_runtime(receipt: Any) -> bool:
+        assert receipt is real_receipt
         async with session_factory() as session:
             await session.execute(
                 text(
