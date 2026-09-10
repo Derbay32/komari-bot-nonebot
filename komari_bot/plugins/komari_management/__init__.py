@@ -35,6 +35,9 @@ from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSch
 from komari_bot.plugins.komari_memory.prompt_schema import (
     DISPLAY_NAME as KOMARI_MEMORY_SUMMARY_PROMPT_DISPLAY_NAME,
 )
+from komari_bot.plugins.komari_roulette.config_schema import (
+    DynamicConfigSchema as RouletteConfigSchema,
+)
 from komari_bot.plugins.komari_sentry.config_schema import KomariSentryConfigSchema
 from komari_bot.plugins.llm_provider.config_schema import (
     DynamicConfigSchema as LlmProviderConfigSchema,
@@ -209,6 +212,14 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "sr",
                     SrConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="komari_roulette",
+                display_name="Komari Roulette",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_roulette",
+                    RouletteConfigSchema,
                 ),
             ),
             ManagedConfigResource(
