@@ -48,6 +48,10 @@ from komari_bot.plugins.user_data.config_schema import (
 
 from .announcement_repository import close_announcement_dispatch_repository
 from .api_runtime import ManagementApiComponents, register_management_api_for_driver
+from .binding_repair_lifecycle import (
+    start_binding_repair_service,
+    stop_binding_repair_service,
+)
 from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
 from .startup_cleanup import cleanup_management_v1_config
@@ -256,6 +260,22 @@ state.api_registered = register_management_api_for_driver(
 async def _cleanup_management_v1_config() -> None:
     """清理 v1 管理配置残留并提示旧权限名。"""
     await cleanup_management_v1_config(logger=logger)
+
+
+@driver.on_startup
+async def _start_binding_repair_service() -> None:
+    """管理装配创建绑定修复服务（仅在管理 API 已注册时）。"""
+    if not state.api_registered:
+        return
+    start_binding_repair_service()
+
+
+@driver.on_shutdown
+async def _stop_binding_repair_service() -> None:
+    """管理装配关闭绑定修复服务（与创建对称，仅当曾注册 API）。"""
+    if not state.api_registered:
+        return
+    await stop_binding_repair_service()
 
 
 @driver.on_shutdown

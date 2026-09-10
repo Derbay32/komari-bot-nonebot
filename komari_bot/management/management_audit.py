@@ -75,10 +75,11 @@ type ManagementAuditRecorder = Callable[[ManagementAuditEvent], Awaitable[None]]
 
 @dataclass(slots=True)
 class ManagementAuditSpan:
-    """允许业务代码在结束前补充安全计数的审计上下文。"""
+    """允许业务代码在结束前补充安全计数与最终目标哈希的审计上下文。"""
 
     metadata: dict[str, AuditMetadataValue] = field(default_factory=dict)
     status_code: int = status.HTTP_200_OK
+    target_hash: str | None = None
 
 
 class JsonlManagementAuditRecorder:
@@ -274,6 +275,11 @@ async def management_audit_span(
                 outcome="succeeded",
                 duration_ms=round((time.monotonic() - started_at) * 1000, 3),
                 status_code=span.status_code,
+                target_hash=(
+                    span.target_hash
+                    if span.target_hash is not None
+                    else base_event.target_hash
+                ),
                 metadata=dict(span.metadata),
             ),
         )

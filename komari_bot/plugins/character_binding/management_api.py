@@ -98,6 +98,8 @@ class RepairConfirmResultResponse(BaseModel):
     member_openid: str | None
     cleared_count: int
     cleared_names: list[str | None]
+    version: str
+    expected_count: int
 
 
 class RepairPreviewRequest(BaseModel):
@@ -306,9 +308,18 @@ def register_character_binding_repair_api(
                         status_code=503, detail=_STORAGE_UNAVAILABLE
                     ) from None
                 response = RepairConfirmResultResponse.model_validate(result)
+                # 目标哈希必须按实际范围计算：成员范围用成员哈希，绝不能
+                # 固定为群哈希。成员身份只在确认结果中可得，因此在此覆盖。
+                audit.target_hash = hash_management_target(
+                    payload.app_id,
+                    payload.group_openid,
+                    response.member_openid or "<group>",
+                )
                 audit.metadata.update(
                     {
                         "scope": response.scope,
+                        "version": response.version,
+                        "expected_count": response.expected_count,
                         "cleared_count": response.cleared_count,
                         "result_code": "cleared",
                     }

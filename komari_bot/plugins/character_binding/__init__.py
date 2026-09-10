@@ -27,7 +27,6 @@ from .qq_coordinator import QQBindingCoordinator
 from .repair import (
     BindingRepairService,
     get_binding_repair_service,
-    set_binding_repair_service,
 )
 from .reply_evidence import (
     ReplyEvidence,
@@ -217,13 +216,6 @@ async def init_plugin() -> None:
     await coordinator.start()
     from .database import _open_session
 
-    set_binding_repair_service(
-        BindingRepairService(
-            session_factory=_open_session,
-            clock=lambda: datetime.now(UTC),
-            manager=manager,
-        )
-    )
     set_binding_wizard(
         BindingWizard(
             coordinator=coordinator,
@@ -240,7 +232,6 @@ async def close_plugin() -> None:
     if wizard is not None:
         await wizard.close()
     set_binding_wizard(None)
-    set_binding_repair_service(None)
     if _qq_plugin_state.coordinator is not None:
         await _qq_plugin_state.coordinator.close()
         _qq_plugin_state.coordinator = None
@@ -313,7 +304,6 @@ __all__ = [
     "get_qq_character_name",
     "get_runtime_collectors",
     "register_character_binding_repair_api",
-    "set_binding_repair_service",
     "set_runtime_collectors",
 ]
 
