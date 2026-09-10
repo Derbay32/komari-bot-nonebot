@@ -20,6 +20,7 @@ from .keyboard import (
     ITEM_ORDER,
     TERMINAL_LIFECYCLES,
     build_keyboard,
+    eligible_lock_targets,
     is_error_result_code,
 )
 
@@ -70,6 +71,18 @@ def get_sentence_pool() -> dict[str, str]:
 
 GENERIC_ERROR_TEXT = "游戏状态异常，本次操作未执行。请联系管理员。"
 
+#: 1E locked-turn restriction line; also the fixed ``locked_turn_restriction``
+#: error copy (kept in one place so both paths cannot drift).
+LOCKED_TURN_RESTRICTION_TEXT = "你本回合受到锁限制，只能执行一次开枪命令或弃权。"
+
+#: 1B pending-burst hint.  It is shown only while ``pending_burst`` is true; the
+#: neutral ``手枪：普通`` line does not exist.
+PENDING_BURST_HINT = "手枪：下一次开枪连发"
+
+#: Static usage placeholder for the defensive bare ``/轮盘`` syntax failure.  The
+#: renderer never echoes the raw input here.
+BARE_INVALID_ARGS_USAGE = "<子命令>"
+
 #: TSK-266 11.3: leaving with "退出" after the game started gets its own copy.
 LEAVE_AFTER_START_TEXT = (
     "游戏已经开始，“退出”只用于等候阶段；主动离开请使用 @Bot /轮盘 弃权。"
@@ -98,7 +111,7 @@ _ERROR_TEXTS: dict[str, str] = {
     "turn_expired": "你的行动时间已经结束，本次命令未执行。",
     "state_conflict": "局面刚刚发生变化，本次操作未执行。请根据机器人最新回复重新操作。",
     "action_not_allowed_in_phase": "当前阶段不能执行这个操作。",
-    "locked_turn_restriction": "你本回合受到锁限制，只能执行一次开枪命令或弃权。",
+    "locked_turn_restriction": LOCKED_TURN_RESTRICTION_TEXT,
     "invalid_game_state": GENERIC_ERROR_TEXT,
     "chamber_not_ready": "弹仓尚未就绪，本次操作未执行。",
     "chamber_full": "弹仓已满，不能装填。",
@@ -139,6 +152,10 @@ def _fixed_error_text(context: ReplyProjectionContext) -> str:
         key = (context.result_code, reason)
         if key in _ERROR_REASON_TEXTS:
             return _ERROR_REASON_TEXTS[key]
+    if context.result_code == "invalid_args":
+        # A bare ``/轮盘`` must render the static usage copy, never the generic
+        # system error (TSK-266 11.1 defensive branch).
+        return f"命令参数不正确。正确用法：@Bot /轮盘 {BARE_INVALID_ARGS_USAGE}"
     if context.result_code.startswith("invalid_args:"):
         usage = context.result_code[len("invalid_args:") :]
         return f"命令参数不正确。正确用法：@Bot /轮盘 {usage}"
@@ -222,6 +239,33 @@ def _current_line(context: ReplyProjectionContext) -> str:
     return line
 
 
+def _actor_player(context: ReplyProjectionContext) -> ReplyPlayer | None:
+    """Resolve the frozen seat that commanded the action (the actor).
+
+    Rotation results (``end_turn`` / ``forfeit``) move the current player to
+    the next seat, so a result sentence must name the actor, never
+    ``current_player``.
+    """
+
+    actor = context.actor_member_openid
+    if actor:
+        for player in context.players:
+            if player.member_openid == actor:
+                return player
+    return None
+
+
+def _sentence_name(context: ReplyProjectionContext) -> str:
+    """The actor's frozen display name, falling back to the current player."""
+
+    actor = _actor_player(context)
+    if actor is not None:
+        return _escape_name(actor.display_name)
+    if context.current_player is not None:
+        return _escape_name(context.current_player.display_name)
+    return ""
+
+
 def _sentence(key: str, **kwargs: object) -> str:
     template = _sentence_pool.get(key, DEFAULT_SENTENCE_POOL.get(key, ""))
     if not template:
@@ -232,26 +276,20 @@ def _sentence(key: str, **kwargs: object) -> str:
 def _follow_up_body(context: ReplyProjectionContext) -> str:
     details = context.details
     kind = _KIND_CN.get(str(details.get("consumed_kind", "")), "空弹")
-    sentence = _sentence(
-        context.result_code,
-        name=_escape_name(context.current_player.display_name)
-        if context.current_player
-        else "",
-        kind=kind,
-    )
+    sentence = _sentence(context.result_code, name=_sentence_name(context), kind=kind)
     current_seq = context.current_player.join_seq if context.current_player else None
-    return "\n".join(
-        [
-            f"> {sentence}",
-            "",
-            _current_line(context),
-            _chamber_line(context.game_view),
-            "",
-            "***",
-            "",
-            *_roster_lines(context, current_seq=current_seq),
-        ]
-    )
+    lines = [
+        f"> {sentence}",
+        "",
+        _current_line(context),
+        _chamber_line(context.game_view),
+    ]
+    if context.phase == "locked_turn":
+        lines.append(LOCKED_TURN_RESTRICTION_TEXT)
+    if context.pending_burst:
+        lines.append(PENDING_BURST_HINT)
+    lines += ["", "***", "", *_roster_lines(context, current_seq=current_seq)]
+    return "\n".join(lines)
 
 
 def _reward_choice_body(context: ReplyProjectionContext) -> str:
@@ -261,10 +299,9 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     inventory = _roster_inventory(context, reward_seq) if reward_seq is not None else ()
     # The reward phase only exists while the inventory is full (TSK-272 mapper
     # invariant), and TSK-266 6a9bf4b7 always shows the replacement prompt.
-    lines: list[str] = [
-        f"> {_sentence(context.result_code) or _sentence('item_choice_pending')}",
-        "",
-    ]
+    # The reward-phase first line is the same blank-shot sentence frozen for the
+    # shot that produced the reward, never the generic "you got a new item".
+    lines: list[str] = [f"> {_reward_sentence(context)}", ""]
     if details.get("inventory_full", True):
         lines.append("道具列表已满，选择一项来替换。")
         lines.append("")
@@ -294,6 +331,15 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     current_seq = context.current_player.join_seq if context.current_player else None
     lines += _roster_lines(context, current_seq=current_seq)
     return "\n".join(lines)
+
+
+def _reward_sentence(context: ReplyProjectionContext) -> str:
+    """First line of the reward-choice reply: the frozen shot sentence."""
+
+    kind = _KIND_CN.get(str(context.details.get("consumed_kind", "")))
+    if kind is not None:
+        return _sentence("shot", name=_sentence_name(context), kind=kind)
+    return _sentence(context.result_code) or _sentence("item_choice_pending")
 
 
 def _inventory_in_order(
@@ -424,14 +470,22 @@ def _panel_body(context: ReplyProjectionContext) -> str:
     inventory = context.details.get("inventory")
     if not isinstance(inventory, tuple):
         inventory = ()
-    for item, count in _inventory_in_order(inventory):
+    ordered = _inventory_in_order(inventory)
+    for item, count in ordered:
         lines.append(f"- {ITEM_LETTER[item]}｜{ITEM_CN[item]} ×{count}")
-    pending = context.game_view.pending_lock_players if context.game_view is not None else ()
-    if pending:
+    held = dict(ordered)
+    if held.get("lock", 0) > 0:
+        # The lock region lists only legal targets: alive, not self, and not
+        # already pending a lock.  ``game_view.pending_lock_players`` is the
+        # exclusion set and must never be rendered as the target list.
         lines += ["", "**可上锁的玩家**"]
-        for player in sorted(pending, key=lambda p: p.join_seq):
-            lines.append(f"- {player.join_seq}｜{_escape_name(player.display_name)}")
-        lines += ["", "使用锁时，在“使用”后补上 D 和目标编号。"]
+        targets = eligible_lock_targets(context)
+        if targets:
+            for player in targets:
+                lines.append(f"- {player.join_seq}｜{_escape_name(player.display_name)}")
+            lines += ["", "使用锁时，在“使用”后补上 D 和目标编号。"]
+        else:
+            lines.append("当前没有可上锁的玩家。")
     return "\n".join(lines)
 
 

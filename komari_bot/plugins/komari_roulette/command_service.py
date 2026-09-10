@@ -1650,6 +1650,14 @@ def _reply_lock_target(
     return _reply_player(players, target_seq)
 
 
+#: Rotation-family result codes: the reply names the *new* current player, so
+#: the outbound reminder follows the rotated seat (a timeout that eliminated the
+#: old current player triggers the same rotation mention).
+_ROTATION_MENTION_RESULT_CODES: frozenset[str] = frozenset(
+    {"started", "shot", "forfeited", "reloaded", "turn_ended", "turn_expired"}
+)
+
+
 def _reply_mention_target(
     request: CommandRequest,
     *,
@@ -1668,14 +1676,7 @@ def _reply_mention_target(
     if (
         current_player is not None
         and current_player.join_seq != actor_seq
-        and result_code
-        in {
-            "started",
-            "shot",
-            "forfeited",
-            "reloaded",
-            "turn_ended",
-        }
+        and result_code in _ROTATION_MENTION_RESULT_CODES
     ):
         return current_player
     if reward_player is not None:
@@ -1710,7 +1711,7 @@ def _reply_mention_reason(
     if (
         target is current_player
         and target.join_seq != actor_seq
-        and result_code in {"started", "shot", "forfeited", "reloaded", "turn_ended"}
+        and result_code in _ROTATION_MENTION_RESULT_CODES
     ):
         return "turn"
     if target is reward_player:
