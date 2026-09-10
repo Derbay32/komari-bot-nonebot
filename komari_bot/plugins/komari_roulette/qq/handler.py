@@ -18,7 +18,7 @@ from nonebot import logger
 from nonebot.adapters.qq import Bot as QQBot
 from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
 
-from komari_bot.plugins.group_admission import get_qq_admission_token
+from komari_bot.plugins import group_admission
 
 from ..command_service import OBSERVED_ACTIVE_WRITES, CommandRequest
 from .parser import parse_command
@@ -105,7 +105,10 @@ class RouletteQQHandler:
             and member_openid.strip()
         ):
             return
-        token = get_qq_admission_token(state)
+        # Resolve the live handoff helper through the package attribute: the
+        # group-admission package may be reloaded in-process, and a token minted
+        # by the reloaded class must still be recognized by the real helper.
+        token = group_admission.get_qq_admission_token(state)
         if token is None or not self._token_binds_to_event(
             token,
             bot=bot,
