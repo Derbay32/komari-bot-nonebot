@@ -143,7 +143,7 @@ _ELIMINATED_REASON_CN: dict[str, str] = {
 }
 
 #: mention_reason values whose tag sits right after ``**当前：{冻结名}**``.
-_CURRENT_POSITION_REASONS: frozenset[str] = frozenset({"turn", "reward", "current"})
+_CURRENT_POSITION_REASONS: frozenset[str] = frozenset({"turn", "reward"})
 
 
 def _fixed_error_text(context: ReplyProjectionContext) -> str:
