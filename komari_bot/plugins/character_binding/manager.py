@@ -108,6 +108,17 @@ class CharacterBindingManager:
         self._lock = asyncio.Lock()
         self._initialized = False
 
+    @property
+    def is_ready(self) -> bool:
+        """Whether a committed binding snapshot was published successfully.
+
+        :meth:`initialize` fails closed with an empty (degraded) snapshot and
+        leaves this ``False``, so callers can distinguish a real snapshot from
+        the degraded empty one without reading private state.
+        """
+
+        return self._initialized
+
     async def initialize(self) -> None:
         """初始化存储并发布完整快照；失败时以空快照故障关闭。"""
         if self._initialized:
