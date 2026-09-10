@@ -4,16 +4,24 @@
 ``render_reply`` projects a frozen ``ReplyProjectionContext`` into a
 ``ReplyProjection`` whose ``body`` follows the TSK-266 final copy and whose
 ``metadata`` carries the frozen keyboard spec plus the outbound mention pair.
-Pure projection: no services, no random, no time.  Result sentences come from
-a module-level copy pool (defaults deterministic; TSK-279 will inject
-config-driven copy via ``set_sentence_pool``).
+Pure projection: no services, no time, no global mutable state.
+
+Result sentences come from a frozen
+:class:`~komari_bot.plugins.komari_roulette.copy_pool.CopyPoolSnapshot`: each
+projection draws exactly one template per sentence through its own isolated
+:class:`~komari_bot.plugins.komari_roulette.copy_pool.CopyRandomSource`, so the
+domain random sequence stays untouched.  ``render_reply`` stays the code-level
+default-snapshot projection (the TSK-278 public seam) and
+:func:`build_reply_projector` binds a configured snapshot + random source.
 """
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..command_service import ReplyProjection
+from ..copy_pool import FINAL_COPY_KEYS, default_copy_snapshot
 from .keyboard import (
     ITEM_CN,
     ITEM_LETTER,
@@ -25,44 +33,101 @@ from .keyboard import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from ..command_service import ReplyPlayer, ReplyProjectionContext
+    from ..copy_pool import CopyPoolSnapshot, CopyRandomSource
 
 # ---------------------------------------------------------------------------
-# Copy pool (TSK-266 / TSK-269 文案；TSK-279 注入配置化副本)
+# Frozen copy pool (TSK-266 / TSK-269 文案；TSK-279 冻结快照 + 隔离随机)
 # ---------------------------------------------------------------------------
 
-DEFAULT_SENTENCE_POOL: dict[str, str] = {
-    "shot": "{name}打出一发{kind}。",
-    "started": "游戏开始，{name}先手。",
-    "reloaded": "{name}装填了一发。",
-    "turn_ended": "{name}结束了回合。",
-    "forfeited": "{name}选择弃权。",
-    "joined": "你已加入本局。",
-    "created": "新局已创建。",
-    "left": "你已退出本局。",
-    "cancelled": "本局已取消。",
-    "item_used": "道具已使用。",
-    "item_discarded": "已丢弃道具。",
-    "item_choice_pending": "你获得了新道具。",
-    "item_choice_updated": "奖励选择已更新。",
-    "lock_used": "{actor}对{target}（{tag}）使用了锁。",
-    "final": "{eliminated_prefix}{winner}{winner_tag} 获胜，累计胜场 {wins}。",
-}
+#: 动作结果码 → 动作文案键。``shot`` 同时是终局原因键（两个闭集互斥），因此
+#: 动作侧的空弹/实弹结果句使用 ``shoot``。
+RESULT_CODE_COPY_KEYS: Mapping[str, str] = MappingProxyType({"shot": "shoot"})
 
-_sentence_pool: dict[str, str] = dict(DEFAULT_SENTENCE_POOL)
+#: TSK-266 1G：等候局结束（取消 / 最后退出）是固定文案，不进入可配置闭集。
+WAITING_CANCELLED_TEXT = "本局已取消。"
+
+#: 终局提及注入槽位。终局模板只含 ``{winner}``：渲染层把 ``{winner}`` 的值写成
+#: “冻结显示名 + 槽位”，再把槽位替换成受控提及标签，所以提及位置由模板中
+#: ``{winner}`` 的位置唯一决定，配置既不能伪造也不能移动它。
+_MENTION_SLOT = "\x00"
+
+#: 无法解析终局原因时使用的终局槽位。三条终局模板都必须同时表达胜者、事件与
+#: 胜场，因此这只是文案选择，不是状态回退。
+DEFAULT_FINAL_COPY_KEY = "shot"
 
 
-def set_sentence_pool(pool: Mapping[str, str] | None) -> None:
-    """Replace the result-sentence pool (TSK-279 copy injection seam)."""
-    _sentence_pool.clear()
-    _sentence_pool.update(pool if pool is not None else DEFAULT_SENTENCE_POOL)
+class _ProjectionCopyPool:
+    """A frozen copy snapshot bound to one isolated random source."""
+
+    __slots__ = ("_action", "_final", "_random")
+
+    def __init__(
+        self,
+        *,
+        snapshot: CopyPoolSnapshot,
+        random_source: CopyRandomSource,
+    ) -> None:
+        self._action = snapshot.action_templates
+        self._final = snapshot.final_templates
+        self._random = random_source
+
+    def action_sentence(self, key: str, /, **kwargs: object) -> str:
+        """Draw one action template; an unknown key renders no sentence."""
+
+        return self._format(self._action.get(key), kwargs)
+
+    def final_sentence(self, key: str, /, **kwargs: object) -> str:
+        """Draw one terminal template (the terminal key set is closed)."""
+
+        return self._format(self._final.get(key), kwargs)
+
+    def _format(
+        self,
+        templates: tuple[str, ...] | None,
+        kwargs: Mapping[str, object],
+    ) -> str:
+        if not templates:
+            return ""
+        return self._random.choice(templates).format(**kwargs)
 
 
-def get_sentence_pool() -> dict[str, str]:
-    """Current result-sentence pool, as a mutable copy."""
-    return dict(_sentence_pool)
+class _FirstChoiceCopyRandom:
+    """Deterministic source for the code-level default snapshot."""
+
+    __slots__ = ()
+
+    def choice(self, options: Sequence[str]) -> str:
+        return options[0]
+
+
+#: ``render_reply`` 的默认池（默认快照 + 确定性首选项），无可变状态。
+DEFAULT_PROJECTION_COPY_POOL = _ProjectionCopyPool(
+    snapshot=default_copy_snapshot(),
+    random_source=_FirstChoiceCopyRandom(),
+)
+
+
+def build_reply_projector(
+    *,
+    snapshot: CopyPoolSnapshot,
+    random_source: CopyRandomSource,
+) -> Callable[[ReplyProjectionContext], ReplyProjection]:
+    """Bind a frozen copy snapshot + isolated random source into a projector.
+
+    The returned closure is injected through the existing
+    ``RouletteCommandService(reply_projector=...)`` seam; it never touches the
+    code-level default pool and never falls back to the domain random source.
+    """
+
+    pool = _ProjectionCopyPool(snapshot=snapshot, random_source=random_source)
+
+    def projector(context: ReplyProjectionContext) -> ReplyProjection:
+        return render_reply(context, pool=pool)
+
+    return projector
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +331,39 @@ def _sentence_name(context: ReplyProjectionContext) -> str:
     return ""
 
 
-def _sentence(key: str, **kwargs: object) -> str:
-    template = _sentence_pool.get(key, DEFAULT_SENTENCE_POOL.get(key, ""))
-    if not template:
-        return ""
-    return template.format(**kwargs)
+def _action_key(result_code: str) -> str:
+    """Map a domain result code onto its action copy key."""
+
+    return RESULT_CODE_COPY_KEYS.get(result_code, result_code)
 
 
-def _follow_up_body(context: ReplyProjectionContext) -> str:
-    details = context.details
-    kind = _KIND_CN.get(str(details.get("consumed_kind", "")), "空弹")
-    sentence = _sentence(context.result_code, name=_sentence_name(context), kind=kind)
+def _action_kind(context: ReplyProjectionContext) -> str:
+    """The consumed-chamber wording for a result sentence (defaults to blank)."""
+
+    return _KIND_CN.get(str(context.details.get("consumed_kind", "")), "空弹")
+
+
+def _sentence(
+    pool: _ProjectionCopyPool,
+    context: ReplyProjectionContext,
+    key: str,
+    **extra: object,
+) -> str:
+    """Draw one configured action sentence, always naming the actor."""
+
+    kwargs: dict[str, object] = {
+        "name": _sentence_name(context),
+        "kind": _action_kind(context),
+    }
+    kwargs.update(extra)
+    return pool.action_sentence(_action_key(key), **kwargs)
+
+
+def _follow_up_body(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+) -> str:
+    sentence = _sentence(pool, context, context.result_code)
     current_seq = context.current_player.join_seq if context.current_player else None
     lines = [
         f"> {sentence}",
@@ -292,7 +379,10 @@ def _follow_up_body(context: ReplyProjectionContext) -> str:
     return "\n".join(lines)
 
 
-def _reward_choice_body(context: ReplyProjectionContext) -> str:
+def _reward_choice_body(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+) -> str:
     details = context.details
     reward_player = context.reward_player or context.current_player
     reward_seq = reward_player.join_seq if reward_player is not None else None
@@ -301,7 +391,7 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     # invariant), and TSK-266 6a9bf4b7 always shows the replacement prompt.
     # The reward-phase first line is the same blank-shot sentence frozen for the
     # shot that produced the reward, never the generic "you got a new item".
-    lines: list[str] = [f"> {_reward_sentence(context)}", ""]
+    lines: list[str] = [f"> {_reward_sentence(context, pool)}", ""]
     if details.get("inventory_full", True):
         lines.append("道具列表已满，选择一项来替换。")
         lines.append("")
@@ -333,13 +423,20 @@ def _reward_choice_body(context: ReplyProjectionContext) -> str:
     return "\n".join(lines)
 
 
-def _reward_sentence(context: ReplyProjectionContext) -> str:
+def _reward_sentence(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+) -> str:
     """First line of the reward-choice reply: the frozen shot sentence."""
 
     kind = _KIND_CN.get(str(context.details.get("consumed_kind", "")))
     if kind is not None:
-        return _sentence("shot", name=_sentence_name(context), kind=kind)
-    return _sentence(context.result_code) or _sentence("item_choice_pending")
+        return _sentence(pool, context, "shot", kind=kind)
+    return _sentence(pool, context, context.result_code) or _sentence(
+        pool,
+        context,
+        "item_choice_pending",
+    )
 
 
 def _inventory_in_order(
@@ -371,7 +468,10 @@ def _pending_reward_count(context: ReplyProjectionContext) -> int:
     return count
 
 
-def _lock_body(context: ReplyProjectionContext) -> str:
+def _lock_body(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+) -> str:
     actor = context.current_player
     target = context.lock_target_player
     actor_name = _escape_name(actor.display_name) if actor is not None else ""
@@ -380,6 +480,8 @@ def _lock_body(context: ReplyProjectionContext) -> str:
     if context.mention_target is not None and context.mention_reason == "lock_target":
         tag = _mention_tag(context.mention_target)
     sentence = _sentence(
+        pool,
+        context,
         "lock_used",
         actor=actor_name,
         target=target_name,
@@ -421,29 +523,46 @@ def _final_outcome_player(context: ReplyProjectionContext) -> ReplyPlayer | None
     return next((player for player in context.players if not player.alive), None)
 
 
-def _final_body(context: ReplyProjectionContext) -> str:
+def _final_copy_key(context: ReplyProjectionContext) -> str:
+    """Resolve the terminal copy key from the frozen receipt details.
+
+    ``_eliminate_current`` always stamps the terminal reason into the reply, so
+    a committed game resolves one of the closed terminal keys.  A projection
+    built without one (direct unit projection) still renders the generic slot.
+    """
+
+    for field in ("eliminated_reason", "completion_reason"):
+        value = context.details.get(field)
+        if isinstance(value, str) and value in FINAL_COPY_KEYS:
+            return value
+    return DEFAULT_FINAL_COPY_KEY
+
+
+def _final_body(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+) -> str:
     winner = context.winner
     winner_name = _escape_name(winner.display_name) if winner is not None else ""
     tag = ""
     if context.mention_target is not None and context.mention_reason == "winner":
         tag = _mention_tag(context.mention_target)
-    winner_tag = f" {tag}" if tag else ""
-    eliminated_prefix = ""
+    event = ""
     eliminated = _final_outcome_player(context)
     if eliminated is not None:
         reason = context.details.get("eliminated_reason")
         if reason is None:
             reason = context.details.get("completion_reason")
         reason_text = _ELIMINATED_REASON_CN.get(str(reason), "出局")
-        eliminated_prefix = f"{_escape_name(eliminated.display_name)}{reason_text}，"
+        event = f"{_escape_name(eliminated.display_name)}{reason_text}，"
     wins = context.winner_group_wins
-    return _sentence(
-        "final",
-        eliminated_prefix=eliminated_prefix,
-        winner=winner_name,
-        winner_tag=winner_tag,
+    sentence = pool.final_sentence(
+        _final_copy_key(context),
+        event=event,
+        winner=f"{winner_name}{_MENTION_SLOT}",
         wins=wins if wins is not None else 0,
     )
+    return sentence.replace(_MENTION_SLOT, f" {tag}" if tag else "")
 
 
 def _leaderboard_body(context: ReplyProjectionContext) -> str:
@@ -489,12 +608,55 @@ def _panel_body(context: ReplyProjectionContext) -> str:
     return "\n".join(lines)
 
 
-def _waiting_body(context: ReplyProjectionContext) -> str:
+def _player_by_seq(
+    context: ReplyProjectionContext,
+    join_seq: int | None,
+) -> ReplyPlayer | None:
+    """Resolve one frozen roster seat by its stable join sequence."""
+
+    if join_seq is None:
+        return None
+    return next(
+        (player for player in context.players if player.join_seq == join_seq),
+        None,
+    )
+
+
+def _waiting_result_sentence(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+    host_seq: int | None,
+) -> str:
+    """TSK-266 1A: the waiting-phase result sentence, drawn once per projection.
+
+    ``host_transferred`` is reached both by an explicit transfer and by the host
+    leaving, so its ``{name}`` is the *new* host for either path; the other
+    waiting keys name the commanding actor.
+    """
+
+    if context.result_code == "host_transferred":
+        new_host = _player_by_seq(context, host_seq)
+        if new_host is not None:
+            return _sentence(
+                pool,
+                context,
+                context.result_code,
+                name=_escape_name(new_host.display_name),
+            )
+    return _sentence(pool, context, context.result_code)
+
+
+def _waiting_body(
+    context: ReplyProjectionContext,
+    pool: _ProjectionCopyPool,
+) -> str:
     view = context.game_view
     host_seq = view.host_seq if view is not None else None
     capacity_value = context.details.get("capacity", 6)
     capacity = capacity_value if isinstance(capacity_value, int) else 6
+    sentence = _waiting_result_sentence(context, pool, host_seq)
     lines = [
+        *([f"> {sentence}", ""] if sentence else []),
         "**俄罗斯轮盘 · 等候中**",
         f"在席 {len(context.players)}/{capacity} 人",
         "",
@@ -549,7 +711,7 @@ def _waiting_end_body(context: ReplyProjectionContext) -> str:
             return f"{_escape_name(name)}取消了这局游戏，等候中的玩家已经全部离席。"
         if reason == "last_player_left":
             return f"{_escape_name(name)}离开后，等候局已自动结束。"
-    return _sentence("cancelled")
+    return WAITING_CANCELLED_TEXT
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +719,16 @@ def _waiting_end_body(context: ReplyProjectionContext) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_reply(context: ReplyProjectionContext) -> ReplyProjection:  # noqa: PLR0911
-    """Project a frozen context into the full Markdown reply projection."""
+def render_reply(  # noqa: PLR0911
+    context: ReplyProjectionContext,
+    *,
+    pool: _ProjectionCopyPool = DEFAULT_PROJECTION_COPY_POOL,
+) -> ReplyProjection:
+    """Project a frozen context into the full Markdown reply projection.
+
+    ``pool`` defaults to the code-level default snapshot; a configured snapshot
+    plus its isolated random source arrive through :func:`build_reply_projector`.
+    """
     if context.result_code == "leaderboard":
         body = _leaderboard_body(context)
         return _project(context, body, allow_mention=False)
@@ -570,7 +740,7 @@ def render_reply(context: ReplyProjectionContext) -> ReplyProjection:  # noqa: P
         if context.lifecycle == "completed":
             return _project(
                 context,
-                f"{fixed}\n\n{_final_body(context)}",
+                f"{fixed}\n\n{_final_body(context, pool)}",
                 allow_mention=True,
             )
         return _project(
@@ -588,18 +758,18 @@ def render_reply(context: ReplyProjectionContext) -> ReplyProjection:  # noqa: P
     if is_error_result_code(context.result_code):
         return _project(context, _fixed_error_text(context), allow_mention=False)
     if context.lifecycle == "completed":
-        return _project(context, _final_body(context), allow_mention=True)
+        return _project(context, _final_body(context, pool), allow_mention=True)
     if context.lifecycle in TERMINAL_LIFECYCLES:
         return _project(context, _fixed_error_text(context), allow_mention=False)
     if context.phase == "item_choice":
-        return _project(context, _reward_choice_body(context), allow_mention=True)
+        return _project(context, _reward_choice_body(context, pool), allow_mention=True)
     if context.result_code == "panel_opened":
         return _project(context, _panel_body(context), allow_mention=True)
     if context.lifecycle == "waiting":
-        return _project(context, _waiting_body(context), allow_mention=True)
+        return _project(context, _waiting_body(context, pool), allow_mention=True)
     if context.result_code == "item_used" and context.details.get("item") == "lock":
-        return _project(context, _lock_body(context), allow_mention=True)
-    return _project(context, _follow_up_body(context), allow_mention=True)
+        return _project(context, _lock_body(context, pool), allow_mention=True)
+    return _project(context, _follow_up_body(context, pool), allow_mention=True)
 
 
 def _project(
