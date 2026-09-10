@@ -241,16 +241,61 @@ config manager 上，避免用假单测上下文「猜终局」而假绿。
 |------|------|
 | `test_tsk279_configuration_pg.py` | 自定义合法快照：`created` 闭集内加入脚本文案（且非首项），断言复制随机源确实被投喂该键的编译列表、域随机源完全不被触碰、改池/重建 service/重放收据都不重抽 |
 | `test_tsk279_stage_a_pg.py` | 真实 `ConfigManager("komari_roulette", DynamicConfigSchema)` 初始化写 JSONB 默认值 + 字段 CAS 更新 + 非法池拒绝且 PG 行逐字节不变；三种终局（forfeit / 自定义先实弹枪膛 shot / PG 期限超时）分别命中 `shot`/`forfeit`/`timeout` 键并断言 winner + 真实事件 + `累计胜场 1` + 唯一提及，收据重放不重选；合法 action 分支 created/joined/host_transferred/shoot/lock；固定 cancel/lastleave/waitexpiry 文案不受自定义池影响；markup 名字转义 |
-| `test_tsk279_terminal_key_fallback.py` | 纯函数记录并钉住**不合规范的 fallback** |
+| `test_tsk279_terminal_key_fallback.py` | 纯函数 RED：missing / unknown / 互相矛盾终局 reason 必须拒绝投影；三种真实 reason 仍各自命中闭集键 |
 
-### `_final_copy_key` 缺 reason 回退（不合规范，仅供直接单测投影）
+### `_final_copy_key` 终局 reason 契约（收尾返工：拒绝猜测）
 
-`komari_bot/plugins/komari_roulette/qq/renderer.py::_final_copy_key` 在
-`details` 同时缺少 `eliminated_reason` 与 `completion_reason` 时回退
-`DEFAULT_FINAL_COPY_KEY == "shot"`（docstring 也承认面向 direct unit
-projection）。真实领域 `_eliminate_current` 必定在 reply details 盖入原因
-（shot/forfeit 为 `eliminated_reason`，timeout 为 `eliminated_reason="timeout"`，
-forfeit 另带 `completion_reason`），因此该回退**不是**合法终局语义。
-`test_tsk279_terminal_key_fallback.py` 显式断言该回退选中 `shot` 槽、且原因存在
-时不再回退；真实三分支由 `test_tsk279_stage_a_pg.py` 的三条真实终局负责，二者
-不可互相替代。若后续要求删除该回退，应先更新此记录与用例。
+`komari_bot/plugins/komari_roulette/qq/renderer.py::_final_copy_key` 必须把
+`details` 的 `eliminated_reason` / `completion_reason` 解析为**唯一**闭集终局
+原因 `shot` / `forfeit` / `timeout`。以下输入一律在投影前以 `ValueError`
+（允许专门子类，如 `ValueError` 子类）拒绝，**不抽任何文案**、不产生捏造
+「出局」事件或 `shot` 终局模板，且异常消息安全、不回显原始 `details`：
+
+- 两个字段都缺失（`{}`）；
+- 任一存在的字段值不在闭集内（unknown，含「一个合法 + 一个非法」）；
+- 两个字段都存在且为不同闭集键（互相矛盾）。
+
+真实的三个原因仍各自命中自身键：`shot` 只在 `completion_reason` 盖入，
+`forfeit` / `timeout` 由 `_eliminate_current` 把两字段盖成同一键。真实三分支
+由 `test_tsk279_stage_a_pg.py` 的三条真实终局负责；纯契约由
+`test_tsk279_terminal_key_fallback.py` 负责（**RED** 基线，见 §7）。禁止再用
+`DEFAULT_FINAL_COPY_KEY` 之类实现常量作为断言输入。
+
+### 278 遗留伪 context（本票不改，待各自拥有者补 facts）
+
+下述 TSK-278 用例直接构造 `lifecycle="completed"` 的投影 context 却未提供任何
+终局原因字段；`_final_copy_key` 收尾返工（缺失/未知/矛盾即拒绝）落地后，这些
+用例会随之由绿转红，需要在**各自文件**补入真实闭合原因，而不是改动本票测试
+来规避：
+
+| 文件:行 | 用例 | 现状 | 建议 |
+|---------|------|------|------|
+| `tests/komari_roulette/test_tsk278_renderer.py:402` | `test_final_mentions_winner_once_with_metadata_pair` | completed context 无 `details` | 补 `details={"completion_reason": "shot", "winner_seq": 1}`（真实实弹终局同形） |
+| `tests/komari_roulette/test_tsk278_renderer.py:859` | `test_render_escapes_xml_injection_in_frozen_name` | completed context 无 `details` | 同上，补 `completion_reason="shot"` |
+| `tests/komari_roulette/test_tsk278_keyboard.py:374` | `test_final_has_no_buttons` | completed context 无 `details`，仅调 `build_keyboard` | 仅当返工把校验上移到共享 context / `build_keyboard` 路径时受影响；否则保持不动 |
+
+## 7. Stage-A 收尾返工记录（终局 reason 拒绝猜测，RED）
+
+依据验收意见：把已标注 non-conforming 的「缺 reason → `shot`」绿断言改为
+**RED**——missing / unknown / 互相矛盾终局 reason 必须明确拒绝投影；三种真实
+reason 仍正确；不再 import `DEFAULT_FINAL_COPY_KEY` 断言实现常量。本轮**只改**
+`test_tsk279_terminal_key_fallback.py` 与本合同；生产 `_final_copy_key` 由
+TSK-279 本体修复，修复前该文件保持 RED。
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+HEAD `acc4215`，root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`
+（3.13.11）；定向纯函数用例不需要 PG/Redis 门控。
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/test_tsk279_terminal_key_fallback.py` | ✅ All checks passed |
+| `pytest tests/komari_roulette/test_tsk279_terminal_key_fallback.py -q` | 3 passed（三种真实 reason）/ 6 failed（RED） |
+
+RED 失败原因（`--tb=line`）：`Failed: DID NOT RAISE ValueError` ×6，分别对应
+`missing` / `unknown` / `unknown-secondary` / `contradictory` 四个拒绝用例 +
+`test_rejection_message_does_not_echo_raw_details` +
+`test_default_projection_rejects_missing_reason`。即当前实现静默回退 `shot`，
+正是本次要求消除的错误 fallback；不为全绿而断言该 fallback。
+
+真实三分支真证仍由 `test_tsk279_stage_a_pg.py`（三条真实终局）承担；本返工
+不得与其互相替代。
