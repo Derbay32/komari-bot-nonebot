@@ -178,5 +178,8 @@ def parse_command(text: str) -> CanonicalCommand | None:  # noqa: PLR0911
     if builder is None:
         return _syntax("unknown_command")
     if args:
-        return _syntax("invalid_args")
+        # Recognized bare subcommands with extra arguments carry their own
+        # static usage suffix; a bare ``invalid_args`` would fall through to
+        # the generic system-error copy (TSK-266 11.1).
+        return _invalid_args(sub)
     return builder()
