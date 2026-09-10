@@ -37,6 +37,7 @@ from .tsk278_support import (
     assert_no_keyboard_segment,
     assert_single_mention_tag,
     claim,
+    has_keyboard_segment,
     message_keyboard_rows,
     message_markdown_content,
     projection,
@@ -211,7 +212,10 @@ async def test_deliver_sends_real_keyboard_from_frozen_spec() -> None:
     )
     await _delivery(service=service).deliver(frozen, sender)
 
-    keyboard_rows = message_keyboard_rows(sender.calls[0]["message"])
+    message = sender.calls[0]["message"]
+    # 有按钮分支：载荷必须真实携带 keyboard 段（不是 message["keyboard"] 假阴性）。
+    assert has_keyboard_segment(message) is True
+    keyboard_rows = message_keyboard_rows(message)
     assert [[b.label for b in row] for row in keyboard_rows] == [["🔫开枪"]]
     assert keyboard_rows[0][0].data == "/轮盘 开枪"
     assert keyboard_rows[0][0].action_type == 2

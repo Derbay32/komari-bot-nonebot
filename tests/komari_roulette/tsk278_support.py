@@ -475,9 +475,15 @@ def build_real_message(body: str, keyboard_spec: str = '{"rows": []}') -> Messag
 
 
 def has_keyboard_segment(message: Any) -> bool:
-    """True when a real QQ ``Message`` carries a keyboard segment."""
+    """True when a real QQ ``Message`` carries a keyboard segment.
+
+    ``message["keyboard"]`` cannot be used here: the adapter's
+    ``Message.__getitem__`` returns an empty ``Message`` (not ``None``) when no
+    segment of that type exists, so absence must be tested against the real
+    members by segment type (TSK-278-contract.md section 5).
+    """
     if isinstance(message, Message):
-        return message["keyboard"] is not None
+        return any(segment.type == "keyboard" for segment in message)
     return False
 
 
