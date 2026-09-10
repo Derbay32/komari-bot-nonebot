@@ -19,9 +19,6 @@ from nonebot.adapters.qq import Bot as QQBot
 from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
 
 from komari_bot.plugins import group_admission
-from komari_bot.plugins.group_admission import (
-    get_qq_admission_token as _get_qq_admission_token,
-)
 
 from ..command_service import OBSERVED_ACTIVE_WRITES, CommandRequest
 from .parser import parse_command
@@ -86,19 +83,14 @@ class RouletteQQHandler:
 
     @staticmethod
     def _resolve_token(state: Mapping[str, Any] | None) -> QQAdmissionToken | None:
-        """Read the handoff token through the real group_admission helper.
+        """Read the handoff token through the live authoritative helper.
 
-        The group-admission package can be reloaded in-process; a token minted
-        by the pre-reload module is still a real token, so the live helper is
-        consulted first and the helper bound at import time second.  Neither
-        path accepts a token on presence alone, and the caller still enforces
-        scope + identity binding.
+        ``get_qq_admission_token`` is the single authority for the handoff
+        token: when it reports no token the event is rejected, with no fallback
+        to an import-time binding.
         """
 
-        token = group_admission.get_qq_admission_token(state)
-        if token is not None:
-            return token
-        return _get_qq_admission_token(state)
+        return group_admission.get_qq_admission_token(state)
 
     async def handle(
         self,
@@ -124,8 +116,8 @@ class RouletteQQHandler:
             and member_openid.strip()
         ):
             return
-        # Resolve the real handoff token (see ``_resolve_token``); a token minted
-        # by a reloaded group-admission module must still be recognized.
+        # Resolve the real handoff token (see ``_resolve_token``); the live
+        # helper is the single authority and ``None`` means reject.
         token = self._resolve_token(state)
         if token is None or not self._token_binds_to_event(
             token,
