@@ -746,6 +746,33 @@ class RouletteCommandService:
         except (DBAPIError, SQLAlchemyError, ConnectionError, OSError, TimeoutError) as error:
             raise StorageUnavailableError("fulfillment storage is unavailable") from error
 
+    async def check_fulfillment_window(self, claim: FulfillmentClaim) -> bool:
+        """Re-read the credential window from the DB clock before the send.
+
+        The claim is a positive send authorization only for
+        ``PENDING_CONFIRMATION``; the receipt's ``created_at`` is compared to
+        the PostgreSQL ``clock_timestamp()`` so a slow pre-send recheck cannot
+        deliver on an expired credential.  Store errors propagate unfiltered so
+        the delivery boundary fails closed without a network call.
+        """
+
+        try:
+            async with self._session_factory() as session:
+                row = await self._fulfillment_window_row(session, claim.receipt_id)
+                await session.rollback()
+        except (DBAPIError, SQLAlchemyError, ConnectionError, OSError, TimeoutError) as error:
+            raise StorageUnavailableError("fulfillment storage is unavailable") from error
+        if row is None:
+            return False
+        state = FulfillmentState(str(row["state"]))
+        if state is not FulfillmentState.PENDING_CONFIRMATION:
+            return False
+        age_seconds = _age_seconds(row["age_seconds"])
+        return (
+            age_seconds is not None
+            and age_seconds < FULFILLMENT_CREDENTIAL_WINDOW_SECONDS
+        )
+
     async def mark_delivered(
         self,
         claim: FulfillmentClaim,
