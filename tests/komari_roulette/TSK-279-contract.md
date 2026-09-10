@@ -850,3 +850,165 @@ character_binding members / groups 全部为 0；`members_total` / `groups_total
 前后不变（未动其它套件的历史残留）。全 roulette 套件结束后
 `lifecycle IN ('waiting','active')` 为 0，`tsk279-post-lock-foreign` /
 `post-lock-admission` 行均为 0；`alembic_version` 仍为 `0021`。
+
+## 13. Stage-C1：真实组合根（lifecycle）+ 锁后复核 + 发出最终裁决（本阶段）
+
+本阶段把 TSK-269 Resolution §2–§5 的**真实装配**钉在真实 Driver lifespan、真实
+`nonebot_plugin_orm` 连接、真实 `ConfigManager` 注册表、真实
+`RouletteCommandService`/`RouletteDelivery` 上。新增文件：
+
+- `test_tsk279_lifecycle.py`（seam / 真实 driver hook / QQ 安装 / 定时任务 /
+  start-stop 幂等 / 不 dispose 共享引擎）；
+- `test_tsk279_lifecycle_pg.py`（真实配置注入到已安装服务 + 冻结事实 + 已安装
+  cron 多批 drain + 维护准入 canonical 数字群 + maintenance close 有界）；
+- `test_tsk279_effect_recheck_pg.py`（`execute_group_command` 锁后 `effect_check`
+  + handler 逐调用 closure + delivery claim 后最终裁决）；
+- `tsk279_lifecycle_support.py`（真实 Driver lifespan + `FakeScheduler` + 录制
+  `get_config_manager`）。
+
+生产模块 `komari_bot.plugins.komari_roulette.lifecycle`、`app` 对象、锁后
+`effect_check` 与 `EffectCheckRejectedError` 尚不存在，RED 由 `application_api`
+懒加载（`ModuleNotFoundError`/`AttributeError`）或生产签名缺参
+（`TypeError`/`reportCallIssue`）触发；`maintenance.close` 缺界为真实的业务断言
+RED（生产模块已存在）。两者都是设计内 RED，不是 fixture 造假。
+
+### 13.1 拟议最窄公共接缝
+
+```python
+# komari_bot/plugins/komari_roulette/lifecycle.py
+APPLICATION_FUNCTIONS = (
+    "start_roulette_application", "stop_roulette_application",
+    "get_roulette_application",
+)
+# 包 __init__ 必须 `from . import lifecycle`，使包 reload 恰注册
+# 一个 driver.on_startup(_startup) + 一个 driver.on_shutdown(_shutdown)；
+# 两个 hook 的 __module__ 前缀必须是 komari_bot.plugins.komari_roulette。
+
+@dataclass(frozen=True, slots=True)
+class RouletteApplication:
+    runtime: RouletteRuntime            # 必暴露
+    service: RouletteCommandService     # 真实冻结/投影装配
+    maintenance: RouletteMaintenance
+    config_manager: ConfigManager        # 顶层注册表 getter 返回值 is 同一实例
+
+async def start_roulette_application() -> RouletteApplication   # 单飞；重复调用不再取 manager/不再登记 job
+async def stop_roulette_application() -> None                   # 幂等
+def get_roulette_application() -> RouletteApplication | None
+```
+
+装配顺序（AC1，故障关闭）：共享 ORM 已托管 → 顶层唯一
+`get_config_manager("komari_roulette", DynamicConfigSchema)` 恰一次 →
+binding/admission → maintenance（真实 session factory + 真实 service + canonical
+群准入）→ `runtime.start()`（config → recovery tick → READY/DISABLED/FAILED）→
+`install_roulette_qq_runtime(service=…, business_gate=…, runtime_check=…,
+send_gate=…)` → `scheduler.add_job` 恰 `RECOVERY_JOB_ID` + `CLEANUP_JOB_ID`。
+运行时不新建私有 engine、不执行 DDL。
+
+```python
+# komari_bot/plugins/komari_roulette/command_service.py
+class EffectCheckRejectedError(RuntimeError): ...   # 专用安全拒绝控制流
+
+# 语义：锁已持有、幂等重放已排除、任何写入之前评估；False / gate 抛错 →
+# EffectCheckRejectedError，零 receipt / 零状态变更 / 零 fulfillment；
+# storage / domain 错误照旧上抛（`_run_effect_check` 只把 gate 自身失败读作拒绝）。
+async def execute_group_command(
+    self, request: CommandRequest, *,
+    observation: Observation | None = None,
+    effect_check: EffectCheck | None = None,   # 无 always-true 默认
+) -> CommandReceipt
+
+# komari_bot/plugins/komari_roulette/qq/handler.py
+# 每次 handle 构造一个 closure，闭包捕获**原始** (bot, event, token)；
+# 它同时传给执行前和 claim 后两处，不出现进程级 current event、不从 receipt
+# 重新铸造凭证、不跨消息复用。
+await self._service.execute_group_command(request, observation=…, effect_check=closure)
+await self._delivery.deliver(receipt, bot, effect_check=closure)
+# EffectCheckRejectedError 被 handler 静默吸收（不发送、不报错、不建 receipt）。
+
+# komari_bot/plugins/komari_roulette/qq/delivery.py
+async def deliver(
+    self, receipt: CommandReceipt, sender: QQMessageSender,
+    *, effect_check: EffectCheck | None = None,
+) -> DeliveryOutcome
+# claim 之后、网络之前评估；False/抛错 → NOT_DELIVERED + mark_not_delivered，
+# 零网络；CancelledError 仍按既有语义传播（PENDING，不重发）；
+# 原有 runtime_check(receipt) 与 DB 时钟窗口重核仍是必经裁决。
+
+# komari_bot/plugins/komari_roulette/maintenance.py
+async def close(self) -> None
+# 置 _stopped 后必须（有界）等待在途 advance_due / cleanup_retention 轮次结束，
+# 不能在轮次仍持组锁运行时立即返回。
+```
+
+### 13.2 AC → 用例 → 冻结断言
+
+| AC | 用例 | 断言性质 |
+|---|---|---|
+| 真实 driver 恰一个 startup/shutdown hook | `lifecycle::test_package_import_registers_single_driver_hooks` | 缺 seam RED |
+| seam 暴露三个 application 函数 | `lifecycle::test_lifecycle_seam_exposes_application_functions` | 缺 seam RED |
+| 启动装 QQ 运行时 + 只登记 owned job + 幂等 | `lifecycle::test_start_installs_qq_runtime_and_registers_owned_jobs_once` | 缺 seam RED |
+| 60s recovery job 回调走 `Runtime.run_recovery_tick` | `lifecycle::test_recovery_job_func_reaches_runtime_state_machine` | 缺 seam RED |
+| `plugin_enable=false` 不动维护、不授权业务 | `lifecycle::test_business_disabled_keeps_maintenance_and_never_allows` | 缺 seam RED |
+| shutdown 先移 owned job + 清 QQ 分发、幂等 | `lifecycle::test_stop_removes_owned_jobs_and_clears_qq_runtime` | 缺 seam RED |
+| shutdown 不 dispose 共享 ORM 引擎 | `lifecycle::test_stop_never_disposes_shared_orm_engine` | 缺 seam RED |
+| shutdown 不误删其它插件 job | `lifecycle::test_stop_does_not_remove_foreign_jobs` | 缺 seam RED |
+| 已安装 service 读**实时**真实配置权重 + 开局冻结 | `lifecycle_pg::test_installed_service_reads_live_real_item_weights_and_freezes_game` | 缺 seam RED |
+| 已安装 projector 读**实时**真实文案池 + receipt 冻结 | `lifecycle_pg::test_installed_service_reads_live_real_copy_pool_and_freezes_receipt` | 缺 seam RED |
+| 已安装 04:00 cron 一次 run 消费多批积压 | `lifecycle_pg::test_installed_cron_callback_drains_multi_batch_backlog` | 缺 seam RED |
+| 维护准入 canonical app/group→数字群 + admission，绝不用业务开关 | `lifecycle_pg::test_maintenance_admission_is_canonical_and_ignores_business_switch` | 缺 seam RED |
+| `maintenance.close` 有界等待在途清理轮次 | `lifecycle_pg::test_maintenance_close_waits_for_the_in_flight_cleanup_round` | **业务断言 RED** |
+| stop 后无 roulette job | `lifecycle_pg::test_stop_after_start_leaves_no_roulette_jobs` | 缺 seam RED |
+| `execute_group_command` 接受 per-call `effect_check` | `effect::test_execute_group_command_exposes_effect_check_keyword` | 缺签名 RED |
+| gate False → 零 receipt/状态/fulfillment，专用安全拒绝 | `effect::test_effect_check_rejection_leaves_zero_effects` | 缺签名 RED |
+| gate 仅在组锁持有后评估 | `effect::test_effect_check_is_evaluated_only_after_the_group_lock` | 缺签名 RED |
+| gate True 不吞 storage 错误 | `effect::test_effect_check_true_still_propagates_storage_errors` | 缺签名 RED |
+| handler 把原始 token closure 传给 service + delivery | `effect::test_handler_passes_original_token_closure_to_service_and_delivery` | 业务断言 RED |
+| handler 静默吸收 effect 拒绝 | `effect::test_handler_silently_absorbs_effect_rejection` | 缺符号 RED |
+| 两并发组不互借 token | `effect::test_concurrent_handlers_keep_their_own_token_in_the_closure` | 业务断言 RED |
+| `deliver` 接受 per-call `effect_check` | `effect::test_delivery_exposes_per_call_effect_check_keyword` | 缺签名 RED |
+| claim 后 False → NOT_DELIVERED + 零网络 | `effect::test_delivery_post_claim_check_blocks_network_as_not_delivered` | 缺签名 RED |
+| 锁内等待期间撤权 → 拒绝且不推进 | `effect::test_delivery_variant_effect_rejected_after_lock_wait` | 缺签名 RED |
+
+### 13.3 RED 分类（本阶段实测，均为设计内）
+
+| 桶 | 用例 | 实测首错 |
+|---|---|---|
+| 缺 seam（lifecycle 模块不存在） | 8 个 lifecycle + 6 个 lifecycle_pg | `AssertionError: 生产未注册恰一个 … startup hook，实际 0` / `ModuleNotFoundError`/`AttributeError` |
+| 缺签名（`effect_check`） | `effect::…exposes_effect_check_keyword`、`…is_evaluated_only_after…`、`…propagates_storage_errors`、`delivery::…exposes…`、`delivery::…blocks_network…`、`delivery_variant…` | `TypeError: … got an unexpected keyword argument 'effect_check'` / `AssertionError: 'effect_check' in mappingproxy(...)` |
+| 缺符号（`EffectCheckRejectedError`） | `…leaves_zero_effects`、`handler::…silently_absorbs…` | `ImportError: cannot import name 'EffectCheckRejectedError'` |
+| 业务断言（handler 未传 per-call closure） | `handler::…original_token_closure…`、`concurrent_handlers…` | `AssertionError: the handler must pass the per-call effect_check to the service / each handler call must pass its own post-lock closure` |
+| 业务断言（`maintenance.close` 立即返回） | `lifecycle_pg::test_maintenance_close_waits_for_the_in_flight_cleanup_round` | `AssertionError: maintenance.close() must wait for the in-flight cleanup round instead of returning immediately`（`assert not True`） |
+
+未使用 `fakeSender`/import error 单独宣称任一 AC 通过；缺 seam 用例在被测符号存在
+后才会执行真实业务断言。
+
+### 13.4 本阶段未验证（保留给后续修复轮）
+
+- 真实 `group_admission` 运行时 READY 时的端到端「维护准入放行 → 到期对局推进」
+  路径（本阶段用受控 `adjudicate` 证明 canonical 数字群翻译与不使用业务开关；
+  群准入快照就绪属 `group_admission` 自身套件）。
+- `runtime` 在 `failed>0` tick 上 FAILED 的装配层证据（Stage-B 已在端口层覆盖，
+  本阶段不重复）。
+- 真实进程 `on_startup`/`on_shutdown` 被 NoneBot Driver 调用的顺序（本阶段直接
+  调用 driver lifespan 注册的真实 hook，证明注册与行为，不启动完整 gunicorn）。
+- REST/管理面、OBS/get_status 公开面（延后到 C2）。
+
+### 13.5 执行记录（命令日志）
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+branch `pi/TSK-279-runtime-recovery`，HEAD `8a4483b8733dfd95f026ad5803586baaa1a66788`
+（base `bc4b1cc`），root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`
+（3.13.11）。PG/Redis 门控：
+
+```
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume
+KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
+```
+
+| 命令 | 结果 |
+|------|------|
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控） | 1 passed / 24 failed（全部设计内 RED；1 passed 为 lifecycle 模块路径冻结探针） |
+| `pytest .../test_tsk279_runtime.py .../test_tsk279_maintenance_pg.py .../test_tsk279_observability.py -q`（带门控，改后回归） | ✅ 62 passed / 0 failed |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python` | 7 errors，全部为设计内 `effect_check`/`EffectCheckRejectedError` 缺签名 RED；lifecycle 文件 0 报错 |
