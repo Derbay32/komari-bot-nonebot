@@ -55,6 +55,10 @@ CLEANUP_BATCH_SIZE = 100
 CLEANUP_HOUR = 4
 CLEANUP_MINUTE = 0
 
+#: Hard upper bound on one daily-drain run so a stuck ``more_pending`` can
+#: never busy-loop the scheduler.  Each round is still one bounded page.
+CLEANUP_DRAIN_MAX_ROUNDS = 1000
+
 #: Retention boundaries, measured in PostgreSQL time (the storage is UTC).
 RECEIPT_RETENTION_DAYS = 7
 TERMINAL_RETENTION_DAYS = 30
@@ -91,6 +95,14 @@ _SQL_AGED_RECEIPT_GROUPS = (
     "ORDER BY app_id ASC, group_openid ASC "
     "LIMIT :limit"
 )
+_SQL_AGED_RECEIPT_GROUPS_AFTER_CURSOR = (
+    "SELECT app_id, group_openid FROM komari_roulette_command_receipts "
+    "WHERE created_at < clock_timestamp() - make_interval(days => :retention_days) "
+    "AND (app_id, group_openid) > (:cursor_app, :cursor_group) "
+    "GROUP BY app_id, group_openid "
+    "ORDER BY app_id ASC, group_openid ASC "
+    "LIMIT :limit"
+)
 _SQL_DELETE_AGED_RECEIPTS = (
     "DELETE FROM komari_roulette_command_receipts "
     "WHERE receipt_id IN ("
@@ -106,6 +118,16 @@ _SQL_AGED_TERMINAL_GROUPS = (
     "WHERE lifecycle IN ('cancelled', 'expired', 'failed') "
     "AND ended_at IS NOT NULL "
     "AND ended_at < clock_timestamp() - make_interval(days => :retention_days) "
+    "GROUP BY app_id, group_openid "
+    "ORDER BY app_id ASC, group_openid ASC "
+    "LIMIT :limit"
+)
+_SQL_AGED_TERMINAL_GROUPS_AFTER_CURSOR = (
+    "SELECT app_id, group_openid FROM komari_roulette_games "
+    "WHERE lifecycle IN ('cancelled', 'expired', 'failed') "
+    "AND ended_at IS NOT NULL "
+    "AND ended_at < clock_timestamp() - make_interval(days => :retention_days) "
+    "AND (app_id, group_openid) > (:cursor_app, :cursor_group) "
     "GROUP BY app_id, group_openid "
     "ORDER BY app_id ASC, group_openid ASC "
     "LIMIT :limit"
@@ -188,16 +210,93 @@ def _cursor_token(due_at: datetime, game_id: str) -> str:
     )
 
 
+def _next_group_cursor(
+    groups: list[tuple[str, str]],
+    *,
+    page_limit: int,
+    processed: int,
+    current: tuple[str, str] | None,
+) -> tuple[str, str] | None:
+    """Advance a retention rotation cursor past the last *processed* group.
+
+    A short page means the candidate list was exhausted, so the cursor wraps to
+    ``None`` (restart from the top).  A full page keeps the position of the last
+    group we actually reached, so a page that stopped early on budget does not
+    skip the groups behind it.  No progress at all keeps the cursor unchanged.
+    """
+
+    if processed <= 0:
+        return current
+    if len(groups) < page_limit:
+        return None
+    return groups[processed - 1]
+
+
+def _safe_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(value, 0)
+
+
+def _merge_cleanup(
+    total: CleanupResult,
+    result: CleanupResult,
+) -> CleanupResult:
+    """Accumulate one bounded cleanup page into the running drain total."""
+
+    return CleanupResult(
+        receipts_deleted=total.receipts_deleted
+        + _safe_int(result.receipts_deleted),
+        games_deleted=total.games_deleted + _safe_int(result.games_deleted),
+        results_deleted=total.results_deleted
+        + _safe_int(result.results_deleted),
+        more_pending=bool(result.more_pending),
+    )
+
+
+async def _drain_cleanup(maintenance: RouletteMaintenance) -> CleanupResult:
+    """Consume the multi-batch retention backlog in one scheduled run.
+
+    Each round is still a single bounded :meth:`cleanup_retention` page; the
+    loop only continues while that page reported ``more_pending``.  It stops
+    when the maintenance owner is closed, when a round makes no progress (so a
+    stuck ``more_pending`` cannot busy-loop), or after a hard round bound.
+    """
+
+    total = CleanupResult(
+        receipts_deleted=0,
+        games_deleted=0,
+        results_deleted=0,
+        more_pending=False,
+    )
+    for _ in range(CLEANUP_DRAIN_MAX_ROUNDS):
+        if getattr(maintenance, "stopped", False):
+            break
+        result = await maintenance.cleanup_retention(batch_size=CLEANUP_BATCH_SIZE)
+        total = _merge_cleanup(total, result)
+        if not result.more_pending:
+            break
+        if result.receipts_deleted <= 0 and result.games_deleted <= 0:
+            break
+    return total
+
+
 def register_maintenance_jobs(
     scheduler: Any,
     maintenance: RouletteMaintenance,
 ) -> None:
     """Register the two fixed jobs on the caller's scheduler singleton.
 
-    The triggers are passed as the string aliases ``"interval"`` / ``"cron"`` on
-    purpose: APScheduler then injects the *scheduler's* timezone, so "04:00"
-    means 04:00 in the deployment timezone instead of the host's or UTC's.
+    The recovery job is one bounded page per 60s; the daily cron job is a real
+    drain callable that keeps pulling ``more_pending`` pages until the backlog
+    is gone (or the maintenance owner closes).  The triggers are passed as the
+    string aliases ``"interval"`` / ``"cron"`` on purpose: APScheduler then
+    injects the *scheduler's* timezone, so "04:00" means 04:00 in the
+    deployment timezone instead of the host's or UTC's.
     """
+
+    async def _daily_cleanup() -> CleanupResult:
+        return await _drain_cleanup(maintenance)
 
     scheduler.add_job(
         maintenance.advance_due,
@@ -209,7 +308,7 @@ def register_maintenance_jobs(
         max_instances=1,
     )
     scheduler.add_job(
-        maintenance.cleanup_retention,
+        _daily_cleanup,
         trigger="cron",
         hour=CLEANUP_HOUR,
         minute=CLEANUP_MINUTE,
@@ -243,6 +342,29 @@ class RouletteMaintenance:
         self._admission = admission
         #: Internal keyset resume position; never exported except as ``cursor``.
         self._resume_after: tuple[datetime, str] | None = None
+        #: Retention rotation cursors, one per aged table.  They make every
+        #: bounded page resume *after* the last group actually processed, so a
+        #: saturated sorting-first group cannot starve the later ones.
+        self._receipt_group_cursor: tuple[str, str] | None = None
+        self._terminal_group_cursor: tuple[str, str] | None = None
+        #: Set by :meth:`close`; stops dispatch and the daily drain.
+        self._stopped = False
+
+    @property
+    def stopped(self) -> bool:
+        """Whether the owner has asked maintenance to stop."""
+
+        return self._stopped
+
+    async def close(self) -> None:
+        """Stop new dispatch; in-flight rounds finish their bounded page.
+
+        The maintenance path owns no shared ORM engine and no long-lived task,
+        so close only flips the stop flag: the recovery gate and the daily
+        drain both observe it on their next step.
+        """
+
+        self._stopped = True
 
     async def advance_due(
         self,
@@ -259,7 +381,7 @@ class RouletteMaintenance:
         settles as a skip, not as an advance.
         """
 
-        if batch_size <= 0:
+        if self._stopped or batch_size <= 0:
             return RecoveryTickResult(0, 0, 0, 0, None)
         async with self._session_factory() as session:
             candidates = await self._load_due_candidates(session, batch_size)
@@ -326,7 +448,8 @@ class RouletteMaintenance:
         games_deleted = 0
         results_deleted = 0
         if batch_size > 0:
-            receipts_deleted, remaining = await self._cleanup_receipts(batch_size)
+            receipts_deleted = await self._cleanup_receipts(batch_size)
+            remaining = batch_size - receipts_deleted
             if remaining > 0:
                 games_deleted, results_deleted = await self._cleanup_terminals(
                     remaining
@@ -399,6 +522,13 @@ class RouletteMaintenance:
         """Build the gate re-evaluated inside the group lock."""
 
         async def gate() -> bool:
+            # The owner's own stop state is part of the post-lock gate: a
+            # shutdown that happened while the worker waited on the group lock
+            # must abandon the effect.  This is never the business
+            # ``plugin_enable`` switch; maintenance still runs while business
+            # is disabled.
+            if self._stopped:
+                return False
             return await self._resolve_admission(app_id, group_openid)
 
         return gate
@@ -423,43 +553,55 @@ class RouletteMaintenance:
     # Retention internals
     # ------------------------------------------------------------------
 
-    async def _cleanup_receipts(self, batch_size: int) -> tuple[int, int]:
-        """Delete up to ``batch_size`` aged receipts; return (deleted, remaining)."""
+    async def _cleanup_receipts(self, batch_size: int) -> int:
+        """Delete up to ``batch_size`` aged receipts; return the deleted count.
 
+        Candidate groups are walked in ``(app_id, group_openid)`` order from a
+        keyset cursor, and the page budget is spread over the page so every
+        group (including the later ones behind a saturated first group) gets at
+        least one slot before any single group can consume the whole round.
+        The cursor only advances past groups that were actually processed, so a
+        budget stop never skips the rest of the page.
+        """
+
+        if batch_size <= 0:
+            return 0
+        cursor = self._receipt_group_cursor
         async with self._session_factory() as session:
-            groups = (
-                (
-                    await session.execute(
-                        text(_SQL_AGED_RECEIPT_GROUPS),
-                        {
-                            "retention_days": RECEIPT_RETENTION_DAYS,
-                            "limit": batch_size,
-                        },
-                    )
-                )
-                .mappings()
-                .all()
+            groups = await self._load_group_page(
+                session,
+                cursor=cursor,
+                limit=batch_size,
+                after_cursor_sql=_SQL_AGED_RECEIPT_GROUPS_AFTER_CURSOR,
+                first_page_sql=_SQL_AGED_RECEIPT_GROUPS,
+                retention_days=RECEIPT_RETENTION_DAYS,
             )
-            remaining = batch_size
             deleted = 0
-            for row in groups:
-                if remaining <= 0:
+            processed = 0
+            for index, (app_id, group_openid) in enumerate(groups):
+                if deleted >= batch_size:
                     break
-                app_id = str(row["app_id"])
-                group_openid = str(row["group_openid"])
+                remaining_groups = len(groups) - index
+                share = max(1, (batch_size - deleted) // remaining_groups)
                 deleted_here = await self._delete_aged_receipts(
                     session,
                     app_id,
                     group_openid,
-                    remaining,
+                    share,
                 )
                 if deleted_here:
                     await session.commit()
                 else:
                     await session.rollback()
                 deleted += deleted_here
-                remaining -= deleted_here
-        return deleted, remaining
+                processed = index + 1
+            self._receipt_group_cursor = _next_group_cursor(
+                groups,
+                page_limit=batch_size,
+                processed=processed,
+                current=cursor,
+            )
+        return deleted
 
     async def _delete_aged_receipts(
         self,
@@ -490,33 +632,31 @@ class RouletteMaintenance:
     async def _cleanup_terminals(self, batch_size: int) -> tuple[int, int]:
         """Delete up to ``batch_size`` aged terminals; return (games, results)."""
 
+        if batch_size <= 0:
+            return 0, 0
+        cursor = self._terminal_group_cursor
         async with self._session_factory() as session:
-            groups = (
-                (
-                    await session.execute(
-                        text(_SQL_AGED_TERMINAL_GROUPS),
-                        {
-                            "retention_days": TERMINAL_RETENTION_DAYS,
-                            "limit": batch_size,
-                        },
-                    )
-                )
-                .mappings()
-                .all()
+            groups = await self._load_group_page(
+                session,
+                cursor=cursor,
+                limit=batch_size,
+                after_cursor_sql=_SQL_AGED_TERMINAL_GROUPS_AFTER_CURSOR,
+                first_page_sql=_SQL_AGED_TERMINAL_GROUPS,
+                retention_days=TERMINAL_RETENTION_DAYS,
             )
-            remaining = batch_size
             games_deleted = 0
             results_deleted = 0
-            for row in groups:
-                if remaining <= 0:
+            processed = 0
+            for index, (app_id, group_openid) in enumerate(groups):
+                if games_deleted >= batch_size:
                     break
-                app_id = str(row["app_id"])
-                group_openid = str(row["group_openid"])
+                remaining_groups = len(groups) - index
+                share = max(1, (batch_size - games_deleted) // remaining_groups)
                 games, results = await self._delete_aged_terminals(
                     session,
                     app_id,
                     group_openid,
-                    remaining,
+                    share,
                 )
                 if games or results:
                     await session.commit()
@@ -524,8 +664,38 @@ class RouletteMaintenance:
                     await session.rollback()
                 games_deleted += games
                 results_deleted += results
-                remaining -= games
+                processed = index + 1
+            self._terminal_group_cursor = _next_group_cursor(
+                groups,
+                page_limit=batch_size,
+                processed=processed,
+                current=cursor,
+            )
         return games_deleted, results_deleted
+
+    async def _load_group_page(
+        self,
+        session: AsyncSession,
+        *,
+        cursor: tuple[str, str] | None,
+        limit: int,
+        after_cursor_sql: str,
+        first_page_sql: str,
+        retention_days: int,
+    ) -> list[tuple[str, str]]:
+        """Load one keyset page of aged groups as ``(app_id, group_openid)``."""
+
+        params: dict[str, object] = {
+            "retention_days": retention_days,
+            "limit": limit,
+        }
+        statement = first_page_sql
+        if cursor is not None:
+            statement = after_cursor_sql
+            params["cursor_app"] = cursor[0]
+            params["cursor_group"] = cursor[1]
+        rows = (await session.execute(text(statement), params)).all()
+        return [(str(row[0]), str(row[1])) for row in rows]
 
     async def _delete_aged_terminals(
         self,
@@ -586,6 +756,7 @@ class RouletteMaintenance:
 
 __all__ = [
     "CLEANUP_BATCH_SIZE",
+    "CLEANUP_DRAIN_MAX_ROUNDS",
     "CLEANUP_HOUR",
     "CLEANUP_JOB_ID",
     "CLEANUP_MINUTE",

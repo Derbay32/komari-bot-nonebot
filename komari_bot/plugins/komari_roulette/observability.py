@@ -25,11 +25,24 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from sqlalchemy import text
 
+from .reasons import (
+    FAULT_REASON_CODES,
+    OBSERVATION_REASON_CODES,
+    PENDING_UNAVAILABLE,
+    RUNTIME_STATUS_VALUES,
+    UNEXPECTED_FAULT_REASON,
+    UNKNOWN_RUNTIME_REASON,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .command_service import SessionFactory
     from .maintenance import CleanupResult, RecoveryTickResult
+
+
+class PendingRefreshUnavailableError(RuntimeError):
+    """``refresh_pending`` has no session factory to read the count from."""
 
 
 class RuntimeStateLike(Protocol):
@@ -48,26 +61,8 @@ class RuntimeStateLike(Protocol):
     def reason_code(self) -> str | None: ...
 
 
-#: Closed set of fault reason codes.  Every projected fault maps here; anything
-#: unrecognized collapses to :data:`UNEXPECTED_FAULT_REASON`.
-FAULT_REASON_CODES: frozenset[str] = frozenset(
-    {
-        "storage_unavailable",
-        "recovery_failed",
-        "scan_failed",
-        "cleanup_failed",
-        "pending_unavailable",
-        "config_unavailable",
-        "admission_unavailable",
-        "runtime_failed",
-        "unexpected_fault",
-    }
-)
-
-#: Backwards/externally referenced name for the same closed reason set.
-OBSERVATION_REASON_CODES: frozenset[str] = FAULT_REASON_CODES
-
-UNEXPECTED_FAULT_REASON = "unexpected_fault"
+#: Both reason-code sets are declared once in ``reasons.py`` (single authority)
+#: and re-exported here so operators keep importing this module.
 
 #: Exact exception type names mapped to a fixed reason.  Matching is by class
 #: name (not by rendered message), so no exception body can influence the code.
@@ -118,17 +113,40 @@ def set_runtime_state(state: RuntimeStateLike) -> None:
     _runtime_holder.state = state
 
 
+def _normalize_runtime_status(status: object) -> str | None:
+    """Reduce a published status to a fixed lifecycle value (or ``None``)."""
+
+    if status is None:
+        return None
+    code = str(getattr(status, "value", status))
+    return code if code in RUNTIME_STATUS_VALUES else None
+
+
+def _normalize_runtime_reason(reason: object) -> str | None:
+    """Normalize a published reason into the shared closed set.
+
+    A foreign or identity-bearing reason is never copied through: it collapses
+    to :data:`UNKNOWN_RUNTIME_REASON`, which is itself a member of the shared
+    closed set.
+    """
+
+    if reason is None:
+        return None
+    code = str(getattr(reason, "value", reason))
+    if code in OBSERVATION_REASON_CODES:
+        return code
+    return UNKNOWN_RUNTIME_REASON
+
+
 def _runtime_projection() -> tuple[str | None, str | None]:
-    """Return ``(status, reason)`` as plain JSON-safe strings."""
+    """Return ``(status, reason)`` as normalized JSON-safe strings."""
 
     state = _runtime_holder.state
     if state is None:
         return None, None
-    status = getattr(state, "status", None)
-    reason = getattr(state, "reason_code", None)
     return (
-        None if status is None else str(getattr(status, "value", status)),
-        None if reason is None else str(reason),
+        _normalize_runtime_status(getattr(state, "status", None)),
+        _normalize_runtime_reason(getattr(state, "reason_code", None)),
     )
 
 
@@ -180,9 +198,17 @@ class RouletteObservation:
     fault_counts: tuple[tuple[str, int], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        """Return the snapshot as a JSON-safe dict with a fixed key set."""
+        """Return the snapshot as a JSON-safe dict with a fixed key set.
 
-        return {name: getattr(self, name) for name in sorted(self.FIELDS)}
+        Nested counter dicts are copied so mutating the returned projection can
+        never rewrite the snapshot's own state.
+        """
+
+        projected: dict[str, object] = {}
+        for name in sorted(self.FIELDS):
+            value = getattr(self, name)
+            projected[name] = dict(value) if isinstance(value, dict) else value
+        return projected
 
 
 @dataclass(slots=True)
@@ -229,41 +255,57 @@ class RouletteObservability:
     def note_fault(self, error: BaseException) -> None:
         """Aggregate one fault under its fixed reason code."""
 
-        reason = safe_fault_projection(error)["reason_code"]
-        self._fault_counts[reason] = self._fault_counts.get(reason, 0) + 1
+        self._note_fault_reason(safe_fault_projection(error)["reason_code"])
+
+    def _note_fault_reason(self, reason: str) -> None:
+        """Aggregate one fault under an explicit, already-closed reason code."""
+
+        code = reason if reason in FAULT_REASON_CODES else UNEXPECTED_FAULT_REASON
+        self._fault_counts[code] = self._fault_counts.get(code, 0) + 1
 
     async def refresh_pending(self) -> int:
         """Count receipts still awaiting confirmation; never claims or retries.
 
         A store failure keeps ``pending_receipts`` at ``None`` (unknown) and
-        records a normalized fault before re-raising, so a caller can fail the
-        tick without ever publishing a fake ``0``.
+        aggregates the fault under :data:`PENDING_UNAVAILABLE` before
+        re-raising.  It is deliberately *not* routed through the generic
+        ``RuntimeError -> recovery_failed`` map, so a failed observation read
+        can never masquerade as a recovery failure.
         """
 
         if self.session_factory is None:
-            error = RuntimeError("pending refresh requires a session factory")
             self._pending_receipts = None
-            self.note_fault(error)
-            raise error
+            self._note_fault_reason(PENDING_UNAVAILABLE)
+            raise PendingRefreshUnavailableError
         try:
             async with self.session_factory() as session:
                 value = await session.scalar(text(_PENDING_RECEIPTS_SQL))
-        except Exception as error:
+        except Exception:
             self._pending_receipts = None
-            self.note_fault(error)
+            self._note_fault_reason(PENDING_UNAVAILABLE)
             raise
         self._pending_receipts = _safe_count(value)
         return self._pending_receipts
 
     def snapshot(self) -> RouletteObservation:
-        """Freeze the current counters into an immutable observation."""
+        """Freeze the current counters into an immutable observation.
+
+        The nested counter dicts are copied so mutating a snapshot (or the
+        record passed to ``note_*``) can never rewrite the accumulated state.
+        """
 
         runtime_status, runtime_reason = _runtime_projection()
         return RouletteObservation(
             runtime_status=runtime_status,
             runtime_reason=runtime_reason,
-            latest_scan=self._latest_scan,
-            latest_cleanup=self._latest_cleanup,
+            latest_scan=(
+                None if self._latest_scan is None else dict(self._latest_scan)
+            ),
+            latest_cleanup=(
+                None
+                if self._latest_cleanup is None
+                else dict(self._latest_cleanup)
+            ),
             pending_receipts=self._pending_receipts,
             fault_counts=tuple(sorted(self._fault_counts.items())),
         )
@@ -272,7 +314,10 @@ class RouletteObservability:
 __all__ = [
     "FAULT_REASON_CODES",
     "OBSERVATION_REASON_CODES",
+    "PENDING_UNAVAILABLE",
     "UNEXPECTED_FAULT_REASON",
+    "UNKNOWN_RUNTIME_REASON",
+    "PendingRefreshUnavailableError",
     "RouletteObservability",
     "RouletteObservation",
     "RuntimeStateLike",

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
     from ..command_service import CommandReceipt, FulfillmentClaim
 
-type RuntimeCheck = Callable[[], bool | Awaitable[bool]]
+type RuntimeCheck = Callable[["CommandReceipt"], bool | Awaitable[bool]]
 type PayloadBuilder = Callable[["CommandReceipt"], Any]
 
 
@@ -145,7 +145,7 @@ class RouletteDelivery:
             )
             await self._service.mark_not_delivered(claim)
             return DeliveryOutcome.NOT_DELIVERED
-        if not await self._send_allowed(claim):
+        if not await self._send_allowed(receipt, claim):
             return DeliveryOutcome.NOT_DELIVERED
         if not await self._window_allowed(claim):
             return DeliveryOutcome.NOT_DELIVERED
@@ -194,20 +194,27 @@ class RouletteDelivery:
         except Exception as error:  # 预发送阶段的显式失败：绝不发送、绝不重试
             return None, error
 
-    async def _send_allowed(self, claim: FulfillmentClaim) -> bool:
+    async def _send_allowed(
+        self,
+        receipt: CommandReceipt,
+        claim: FulfillmentClaim,
+    ) -> bool:
         """Live pre-send recheck; a failing check fails closed, never hangs.
 
-        The recheck runs after the claim and before any network call.  A check
-        that raises must not bubble out and leave the claim stuck in
-        ``PENDING_CONFIRMATION``: it is recorded as ``NOT_DELIVERED`` instead.
-        ``asyncio.CancelledError`` is a cancellation, not a rejected check.
+        The recheck runs after the claim and before any network call and is
+        resolved for *this* receipt (so two concurrent groups never share a
+        decision).  A check that raises must not bubble out and leave the claim
+        stuck in ``PENDING_CONFIRMATION``: it is recorded as ``NOT_DELIVERED``
+        instead.  ``asyncio.CancelledError`` is a cancellation, not a rejected
+        check.  A legacy zero-argument callable is not special-cased: it raises
+        and is handled by this same fail-closed boundary.
         """
 
         check = self._runtime_check
         if check is None:
             return True
         try:
-            result = check()
+            result = check(receipt)
             if inspect.isawaitable(result):
                 result = await cast("Awaitable[bool]", result)
         except asyncio.CancelledError:

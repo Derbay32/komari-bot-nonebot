@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     )
     from .delivery import QQMessageSender
 
-type SendGate = Callable[[], bool | Awaitable[bool]]
+type SendGate = Callable[[CommandRequest], bool | Awaitable[bool]]
 type BusinessGate = Callable[
     [QQBot, GroupAtMessageCreateEvent, "QQAdmissionToken"],
     bool | Awaitable[bool],
@@ -150,7 +150,7 @@ class RouletteQQHandler:
             request,
             observation=observation,
         )
-        if not await self._send_allowed():
+        if not await self._send_allowed(request):
             return
         await self._delivery.deliver(receipt, bot)
 
@@ -197,12 +197,20 @@ class RouletteQQHandler:
             return False
         return bool(result)
 
-    async def _send_allowed(self) -> bool:
+    async def _send_allowed(self, request: CommandRequest) -> bool:
+        """Resolve the send gate for *this* command, failing closed on error.
+
+        The gate receives the caller's own :class:`CommandRequest`, so two
+        concurrent groups can never borrow each other's decision.  A legacy
+        zero-argument callable is not special-cased: it simply raises and is
+        treated by the existing fail-closed boundary.
+        """
+
         gate = self._send_gate
         if gate is None:
             return True
         try:
-            result = gate()
+            result = gate(request)
             if inspect.isawaitable(result):
                 return bool(await cast("Awaitable[bool]", result))
             return bool(result)
