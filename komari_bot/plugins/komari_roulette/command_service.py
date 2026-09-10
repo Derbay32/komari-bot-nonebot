@@ -225,8 +225,18 @@ class CanonicalCommand:
         if self.intent == "syntax_failure" and not (self.syntax_code or "").strip():
             raise ValueError("syntax failure code must not be empty")
 
-    def to_action(self, player: PlayerRef) -> Action:
-        """Translate a canonical command to the pure domain action seam."""
+    def to_action(
+        self,
+        player: PlayerRef,
+        *,
+        item_weights: Mapping[ItemType, int] | None = None,
+    ) -> Action:
+        """Translate a canonical command to the pure domain action seam.
+
+        ``item_weights`` is only meaningful for ``start``: TSK-269 §1 freezes the
+        configurable weights into the game snapshot exactly once, at the
+        ``waiting -> active`` edge, so every other intent ignores the argument.
+        """
 
         match self.intent:
             case "create":
@@ -238,7 +248,7 @@ class CanonicalCommand:
             case "cancel":
                 return Action.cancel(player)
             case "start":
-                return Action.start(player)
+                return Action.start(player, item_weights=item_weights)
             case "shoot":
                 return Action.shoot(player)
             case "forfeit":
@@ -537,10 +547,12 @@ class RouletteCommandService:
         session_factory: SessionFactory,
         reply_projector: Callable[[ReplyProjectionContext], ReplyProjection],
         random_source: RandomSource | None = None,
+        item_weights_provider: Callable[[], Mapping[ItemType, int]] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._reply_projector = reply_projector
         self._random_source = random_source or _DefaultRandomSource()
+        self._item_weights_provider = item_weights_provider
 
     async def execute_group_command(
         self,
@@ -583,6 +595,22 @@ class RouletteCommandService:
             raise
         except (DBAPIError, SQLAlchemyError, ConnectionError, OSError, TimeoutError) as error:
             raise StorageUnavailableError("roulette command storage is unavailable") from error
+
+    def _start_item_weights(
+        self,
+        intent: str,
+    ) -> Mapping[ItemType, int] | None:
+        """Read the configurable item weights for a ``start`` command only.
+
+        TSK-269 §1: the provider is consulted once, on the ``waiting -> active``
+        edge, and the normalized weights are persisted with the game snapshot.
+        Every other intent (and a service built without a provider) returns
+        ``None``, which keeps the pure domain default unchanged.
+        """
+
+        if intent != "start" or self._item_weights_provider is None:
+            return None
+        return self._item_weights_provider()
 
     async def observe_current(self, group: GroupRef) -> Observation | None:
         """Read the latest validated game snapshot for a group."""
@@ -1035,7 +1063,10 @@ class RouletteCommandService:
             current=current,
             binding_record=member_record,
         )
-        action = request.command.to_action(player)
+        action = request.command.to_action(
+            player,
+            item_weights=self._start_item_weights(request.command.intent),
+        )
         result = apply_action(
             state,
             action,
