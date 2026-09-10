@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from nonebot import logger
 from nonebot.adapters.qq.message import Message, MessageSegment
 
+from ..command_service import FulfillmentState
 from .keyboard import keyboard_from_spec
 
 if TYPE_CHECKING:
@@ -129,6 +130,11 @@ class RouletteDelivery:
         claim = await self._service.claim_fulfillment(receipt.receipt_id)
         if claim is None:
             return DeliveryOutcome.NO_CLAIM
+        if claim.state is not FulfillmentState.PENDING_CONFIRMATION:
+            # The claim is the only send authorization: a receipt whose
+            # credential window expired was already converged atomically to
+            # NOT_DELIVERED inside the claim and must never reach the network.
+            return DeliveryOutcome.NOT_DELIVERED
         if build_error is not None:
             logger.warning(
                 "[Roulette] 冻结载荷构建失败，本次不发送: error_type={}",

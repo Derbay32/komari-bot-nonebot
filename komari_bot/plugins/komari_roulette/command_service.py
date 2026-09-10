@@ -101,6 +101,13 @@ class FulfillmentState(StrEnum):
     NOT_DELIVERED = "NOT_DELIVERED"
 
 
+#: Age after which a receipt's delivery credential is expired.  The window is
+#: enforced atomically inside :meth:`RouletteCommandService.claim_fulfillment`
+#: against the PostgreSQL clock; the TSK-279 scheduler reuses this same constant
+#: and the same ``komari_roulette_command_receipts.created_at`` column.
+FULFILLMENT_CREDENTIAL_WINDOW_SECONDS: int = 300
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalCommand:
     """Typed intent produced by the command parser boundary."""
@@ -663,14 +670,46 @@ class RouletteCommandService:
             raise StorageUnavailableError("roulette expiry storage is unavailable") from error
 
     async def claim_fulfillment(self, receipt_id: str) -> FulfillmentClaim | None:
-        """Atomically claim the one allowed platform send attempt."""
+        """Atomically claim the one allowed platform send attempt.
+
+        The 5-minute credential window is enforced *inside* the claim while the
+        row lock is held, comparing the receipt's ``created_at`` against the
+        PostgreSQL ``clock_timestamp()`` (never a local wall clock).  An expired
+        ``NOT_STARTED`` row converges to ``NOT_DELIVERED`` and the returned
+        claim carries that state, so the sender never starts a network call; a
+        receipt still in the window transitions ``NOT_STARTED`` to
+        ``PENDING_CONFIRMATION``.  Any other state is left untouched and yields
+        no claim.
+        """
 
         try:
             async with self._session_factory() as session:
-                row = await self._fulfillment_row(session, receipt_id, for_update=True)
-                if row is None or row["state"] != FulfillmentState.NOT_STARTED.value:
+                row = await self._fulfillment_window_row(session, receipt_id)
+                if row is None:
                     await session.rollback()
                     return None
+                state = FulfillmentState(str(row["state"]))
+                if state is not FulfillmentState.NOT_STARTED:
+                    await session.rollback()
+                    return None
+                age_seconds = row["age_seconds"]
+                if age_seconds is None or (
+                    float(age_seconds) >= FULFILLMENT_CREDENTIAL_WINDOW_SECONDS
+                ):
+                    await session.execute(
+                        text(
+                            "UPDATE komari_roulette_fulfillments "
+                            "SET state = 'NOT_DELIVERED', "
+                            "updated_at = clock_timestamp() "
+                            "WHERE receipt_id = :receipt_id"
+                        ),
+                        {"receipt_id": receipt_id},
+                    )
+                    await session.commit()
+                    return FulfillmentClaim(
+                        receipt_id=receipt_id,
+                        state=FulfillmentState.NOT_DELIVERED,
+                    )
                 await session.execute(
                     text(
                         "UPDATE komari_roulette_fulfillments "
@@ -1231,6 +1270,34 @@ class RouletteCommandService:
         ).mappings().one_or_none()
         return cast("Mapping[str, object] | None", row)
 
+    @staticmethod
+    async def _fulfillment_window_row(
+        session: AsyncSession,
+        receipt_id: str,
+    ) -> Mapping[str, object] | None:
+        """Lock the fulfillment row and read its credential age from the DB clock.
+
+        ``clock_timestamp()`` is evaluated after the ``FOR UPDATE`` lock is
+        acquired, so a long lock wait cannot inherit a stale transaction time.
+        """
+
+        row = (
+            await session.execute(
+                text(
+                    "SELECT f.receipt_id, f.state, "
+                    "EXTRACT(EPOCH FROM (clock_timestamp() - r.created_at)) "
+                    "AS age_seconds "
+                    "FROM komari_roulette_fulfillments AS f "
+                    "JOIN komari_roulette_command_receipts AS r "
+                    "ON r.receipt_id = f.receipt_id "
+                    "WHERE f.receipt_id = :receipt_id "
+                    "FOR UPDATE OF f"
+                ),
+                {"receipt_id": receipt_id},
+            )
+        ).mappings().one_or_none()
+        return cast("Mapping[str, object] | None", row)
+
     async def _insert_receipt(
         self,
         session: AsyncSession,
@@ -1674,6 +1741,7 @@ def _member_for_seq(snapshot: GameSnapshot | None, join_seq: int | None) -> str 
 
 
 __all__ = [
+    "FULFILLMENT_CREDENTIAL_WINDOW_SECONDS",
     "CanonicalCommand",
     "CommandReceipt",
     "CommandRequest",
