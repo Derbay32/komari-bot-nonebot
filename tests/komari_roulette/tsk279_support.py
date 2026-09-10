@@ -36,6 +36,7 @@ from .command_support import (
     reset_shared_orm_engine,
     scope,
 )
+from .test_command_service import Harness
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Sequence
@@ -181,13 +182,15 @@ async def delete_binding_scope(engine: AsyncEngine, current: Scope) -> None:
                 await connection.execute(text(statement), params)
 
 
-@dataclass(slots=True)
-class Tsk279Harness:
-    """Real PG harness that cleans up the exact scope each case created."""
+@dataclass(frozen=True, slots=True)
+class Tsk279Harness(Harness):
+    """Real PG harness that cleans up the exact scope each case created.
 
-    engine: AsyncEngine
-    session_factory: async_sessionmaker[AsyncSession]
-    binding_manager: CharacterBindingManager
+    Extends the ``test_command_service.Harness`` value object so the shared
+    ``service_for`` helper accepts it; this is a nominal type relationship
+    only, and the fields keep their original meaning.
+    """
+
     _scopes: list[Scope] = field(default_factory=list)
 
     @asynccontextmanager

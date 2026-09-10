@@ -1118,7 +1118,7 @@ async def test_maintenance_rechecks_admission_after_group_lock_wait(
                 gate["allowed"] = False
             finally:
                 await blocker.commit()
-            with asyncio.timeout(10):
+            async with asyncio.timeout(10):
                 tick = await tick_task
         async with harness.session_factory() as session:
             lifecycle = await session.scalar(
@@ -1171,6 +1171,12 @@ async def test_maintenance_rechecks_closed_runtime_after_group_lock_wait(
         await runtime.start()
         assert runtime.accepting is True
 
+        # Test port for the True→close transition only: ``runtime.accepting``
+        # stands in for "runtime still alive".  Production maintenance must NOT
+        # gate on the business ``plugin_enable`` switch (see TSK-279-contract
+        # §10.2): a disabled business switch still requires maintenance.  The
+        # real shutdown / dependency-ready / group-admission combination is a
+        # Stage-C concern.
         def admission(candidate_app: str, candidate_group: str) -> bool:
             return runtime.accepting and (candidate_app, candidate_group) == (
                 app_id,
@@ -1194,7 +1200,7 @@ async def test_maintenance_rechecks_closed_runtime_after_group_lock_wait(
                 assert runtime.accepting is False
             finally:
                 await blocker.commit()
-            with asyncio.timeout(10):
+            async with asyncio.timeout(10):
                 tick = await tick_task
         async with harness.session_factory() as session:
             lifecycle = await session.scalar(

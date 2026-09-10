@@ -555,6 +555,8 @@ class RouletteMaintenance:
     async def advance_due(self, *, batch_size: int = 100) -> RecoveryTickResult:
         # 对每个候选群：先粗判 admission，进入真实 advance 后由 effect_check 在锁内再判；
         # 期间转受限 / runtime 关闭都必须放弃推进。
+        # 注意：这里的「runtime accepting」只是 **shutdown / 依赖未就绪** 的可控端口，
+        # 绝不是 business `plugin_enable`：业务开关为 False 时维护仍必须运行。
         ...
 
 # 4) 现网回调按调用签名（destructive change）
@@ -564,6 +566,15 @@ RuntimeCheck = Callable[[CommandReceipt], bool | Awaitable[bool]]
 
 约束：`effect_check` 为 `None` 表示调用方**未要求**锁后复核（不是 always-true）；
 需要准入的生产调用必须显式传入，实现不得内置「永远返回 True」的兜底。
+
+> **维护准入端口澄清（Stage-C 检查组合）**：`test_tsk279_maintenance_pg.py::
+> test_maintenance_rechecks_closed_runtime_after_group_lock_wait` 把 `admission`
+> 写成 `runtime.accepting and (app, group)`，**只是该用例制造「worker 等锁期间
+> runtime 关闭」这一 True→close 转移的可控端口**，绝不是生产 maintenance 接线
+> 建议。生产维护只能受 **shutdown / 依赖 ready / 群准入** 控制，不得用 business
+> `accepting`（即 `plugin_enable`）一刀切：`plugin_enable=false` 时维护仍必须继续
+> 推进绝对期限。Stage-C 必须验证「shutdown × 依赖 ready × 群准入」的组合，禁止把
+> 该用例的端口当成生产 authority。
 
 ### 10.3 返工后 RED / 绿分类（本阶段同一命令测得）
 

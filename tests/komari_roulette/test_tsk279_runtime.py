@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import AsyncExitStack, suppress
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -221,19 +221,19 @@ class _PerRequestService:
 
     async def execute_group_command(
         self,
-        command_request: Any,
+        request: Any,
         *,
         observation: Any = None,
     ) -> Any:
         del observation
         from .tsk278_support import projection, receipt
 
-        self.requests.append(command_request)
+        self.requests.append(request)
         return receipt(
-            receipt_id=f"r-{command_request.inbound_msg_id}",
-            app_id=command_request.app_id,
-            group_openid=command_request.group_openid,
-            inbound_msg_id=command_request.inbound_msg_id,
+            receipt_id=f"r-{request.inbound_msg_id}",
+            app_id=request.app_id,
+            group_openid=request.group_openid,
+            inbound_msg_id=request.inbound_msg_id,
             reply=projection("> 测试正文。"),
         )
 
@@ -739,14 +739,16 @@ async def test_real_config_manager_read_api_supports_live_flip(
     await _delete_roulette_config(harness)
     manager = ConfigManager("komari_roulette", DynamicConfigSchema)
     try:
-        initial = await manager.initialize_async()
+        initial = cast("DynamicConfigSchema", await manager.initialize_async())
         assert initial.plugin_enable is False
         await manager.update_field_async("plugin_enable", value=True)
-        assert (await manager.get_async()).plugin_enable is True
-        assert manager.get().plugin_enable is True
+        enabled = cast("DynamicConfigSchema", await manager.get_async())
+        assert enabled.plugin_enable is True
+        assert cast("DynamicConfigSchema", manager.get()).plugin_enable is True
         await manager.update_field_async("plugin_enable", value=False)
-        assert (await manager.get_async()).plugin_enable is False
-        assert manager.get().plugin_enable is False
+        disabled = cast("DynamicConfigSchema", await manager.get_async())
+        assert disabled.plugin_enable is False
+        assert cast("DynamicConfigSchema", manager.get()).plugin_enable is False
     finally:
         await _delete_roulette_config(harness)
 
