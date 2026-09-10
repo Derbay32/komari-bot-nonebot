@@ -22,6 +22,7 @@ from sqlalchemy import text
 
 from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 from komari_bot.plugins.komari_roulette import (
+    FulfillmentState,
     ReplyProjection,
     RouletteCommandService,
 )
@@ -829,3 +830,117 @@ async def test_real_slow_build_crossing_window_never_sends(
             {"receipt_id": real_receipt.receipt_id},
         )
     assert state == "NOT_DELIVERED"
+
+
+# ---------------------------------------------------------------------------
+# 发送前权威凭证窗口重核：service.check_fulfillment_window(claim)，DB 时钟
+# ---------------------------------------------------------------------------
+
+
+async def test_real_window_recheck_reads_db_clock(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """真实 seam：pending claim 窗口内 True；收据 DB 老化 >300s 后 False。
+
+    判定完全使用 PostgreSQL 时钟（``clock_timestamp()`` 对
+    ``komari_roulette_command_receipts.created_at``），不依赖本地 ``now``，
+    因此不需要 sleep。
+    """
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-window-recheck-dbclock")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+
+    claim_obj = await service.claim_fulfillment(real_receipt.receipt_id)
+    assert claim_obj is not None
+    assert claim_obj.state is FulfillmentState.PENDING_CONFIRMATION
+    assert await service.check_fulfillment_window(claim_obj) is True
+
+    # 仅在 DB 内让收据老化；本地时钟不动，避免 sleep/flaky。
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_command_receipts "
+                "SET created_at = clock_timestamp() - make_interval(secs => 301) "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+        await session.commit()
+
+    assert await service.check_fulfillment_window(claim_obj) is False
+
+
+async def test_real_slow_runtime_crossing_window_never_sends(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """claim 时刻在窗口内，runtime 重核期间收据跨过 300s → 发送前重核拒发。
+
+    交付必须先 claim 得到正的 PENDING（窗口内），随后 runtime 重核把 DB
+    ``created_at`` 改到 -301s；delivery 发送前调用真实
+    ``check_fulfillment_window(claim)``（DB 时钟）→ False → 0 网络且
+    NOT_DELIVERED。全程不 sleep。
+    """
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-delivery-window-recheck")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+    assert await _receipt_age_seconds(session_factory, real_receipt.receipt_id) < 300
+
+    async def slow_runtime() -> bool:
+        async with session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE komari_roulette_command_receipts "
+                    "SET created_at = clock_timestamp() - make_interval(secs => 301) "
+                    "WHERE receipt_id = :receipt_id"
+                ),
+                {"receipt_id": real_receipt.receipt_id},
+            )
+            await session.commit()
+        return True
+
+    sender = FakeSender(result="qq-platform-window-recheck")
+    outcome = await RouletteDelivery(
+        service=service,
+        runtime_check=slow_runtime,
+    ).deliver(real_receipt, sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert sender.calls == []
+    assert sender.network_calls == []
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT state, platform_message_id "
+                    "FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id"
+                ),
+                {"receipt_id": real_receipt.receipt_id},
+            )
+        ).mappings().first()
+    assert row is not None
+    assert row["state"] == "NOT_DELIVERED"
+    assert row["platform_message_id"] is None

@@ -238,6 +238,10 @@ async def test_deliver_order_build_then_claim_then_send_then_mark() -> None:
             events.append("claim")
             return await super().claim_fulfillment(receipt_id)
 
+        async def check_fulfillment_window(self, claim: Any) -> bool:
+            events.append("check")
+            return await super().check_fulfillment_window(claim)
+
         async def mark_delivered(
             self,
             claim: Any,
@@ -285,8 +289,16 @@ async def test_deliver_order_build_then_claim_then_send_then_mark() -> None:
         payload_builder=recording_builder,
     ).deliver(_success_receipt(), RecordingSender())
 
-    # 固定顺序：构建冻结载荷 → 原子领取 → runtime 重核 → 发送 → mark_delivered。
-    assert events == ["build", "claim", "runtime_check", "send", "mark_delivered"]
+    # 固定顺序：构建冻结载荷 → 原子领取 → runtime 重核 → 凭证窗口重核 →
+    # 发送 → mark_delivered。
+    assert events == [
+        "build",
+        "claim",
+        "runtime_check",
+        "check",
+        "send",
+        "mark_delivered",
+    ]
     assert service.mark_delivered_calls == [(claim("receipt-1"), "qq-platform-msg-1")]
 
 
@@ -420,6 +432,123 @@ async def test_deliver_async_runtime_recheck_exception_fails_closed() -> None:
     assert sender.network_calls == []
     assert service.mark_not_delivered_calls == [claim("receipt-1")]
     assert service.mark_delivered_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Authoritative pre-send credential-window recheck (service seam)
+# ---------------------------------------------------------------------------
+
+
+def test_command_service_exposes_async_window_recheck_seam() -> None:
+    """契约：``check_fulfillment_window(claim) -> bool`` 是真实异步服务 seam。
+
+    Delivery 必须在发送前直接调用它（不是可选 ``getattr``/本地时钟），
+    参数名与协程形状记录为该 seam 的契约。
+    """
+
+    import inspect
+
+    from komari_bot.plugins.komari_roulette import RouletteCommandService
+
+    seam = RouletteCommandService.check_fulfillment_window
+    assert inspect.iscoroutinefunction(seam)
+    assert list(inspect.signature(seam).parameters) == ["self", "claim"]
+
+
+async def test_deliver_window_recheck_false_is_zero_network_not_delivered() -> None:
+    """发送前凭证窗口重核返回 False → 0 网络、mark_not_delivered、NOT_DELIVERED。
+
+    重核只针对有效的 PENDING claim，且不得再次 claim（不能自己制造第二次
+    发送权）。
+    """
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    service.check_result = False
+    sender = FakeSender()
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert service.check_calls == [claim("receipt-1")]
+    assert service.claim_calls == ["receipt-1"]
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.mark_not_delivered_calls == [claim("receipt-1")]
+    assert service.mark_delivered_calls == []
+
+
+async def test_deliver_window_recheck_exception_fails_closed_zero_network() -> None:
+    """窗口重核自身抛异常（PG 时钟/收据不可读）→ 故障关闭，0 网络、NOT_DELIVERED。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    service.check_error = _RuntimeCheckError("window read failed")
+    sender = FakeSender()
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert service.check_calls == [claim("receipt-1")]
+    assert service.claim_calls == ["receipt-1"]
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.mark_not_delivered_calls == [claim("receipt-1")]
+    assert service.mark_delivered_calls == []
+
+
+async def test_deliver_window_recheck_skipped_for_non_pending_claim() -> None:
+    """claim 非 PENDING_CONFIRMATION → 直接 NOT_DELIVERED，绝不重核窗口。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1", state=FulfillmentState.NOT_DELIVERED)
+    sender = FakeSender()
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert service.check_calls == []
+    assert service.claim_calls == ["receipt-1"]
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.mark_not_delivered_calls == []
+    assert service.mark_delivered_calls == []
+
+
+async def test_deliver_window_recheck_runs_without_runtime_check() -> None:
+    """窗口重核是必选 seam；没有注入 runtime_check 也必须按当前服务状态重核。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender()
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.DELIVERED
+    assert service.check_calls == [claim("receipt-1")]
+    assert service.claim_calls == ["receipt-1"]
+
+
+# ---------------------------------------------------------------------------
+# Credential age fail-closed (claim seam)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, object(), [], {}, b"bytes", "not-a-number", True, False],
+    ids=["none", "object", "list", "dict", "bytes", "text", "bool-true", "bool-false"],
+)
+def test_invalid_credential_age_fails_closed(value: object) -> None:
+    """不可用的 driver age 不得参与比较：返回 None → claim 侧收敛 NOT_DELIVERED。
+
+    只锁定行为边界（invalid → 不可用/失败关闭），不锁定实现里的具体
+    isinstance 编码；asyncpg 给 ``numeric`` 的 Decimal 走真实数值路径。
+    """
+    from komari_bot.plugins.komari_roulette.command_service import _age_seconds
+
+    assert _age_seconds(value) is None
+
+
+def test_numeric_credential_age_is_usable_seconds() -> None:
+    from decimal import Decimal
+
+    from komari_bot.plugins.komari_roulette.command_service import _age_seconds
+
+    assert _age_seconds(Decimal("299.5")) == 299.5
+    assert _age_seconds(0) == 0.0
 
 
 async def test_deliver_build_failure_after_claim_is_zero_send() -> None:

@@ -21,7 +21,6 @@ from typing import Any
 
 import pytest
 
-from komari_bot.plugins.group_admission.qq import get_qq_admission_token
 from komari_bot.plugins.komari_roulette import (
     CommandReceipt,
     CommandRequest,
@@ -38,6 +37,7 @@ from .tsk278_support import (
     admission_state,
     business_token,
     event_mention_count,
+    live_get_qq_admission_token,
     make_c2c_event,
     make_direct_event,
     make_group_at_event,
@@ -170,7 +170,7 @@ async def test_empty_state_is_silent() -> None:
 async def test_admission_token_reads_real_state_key() -> None:
     # handler 必须用真实 get_qq_admission_token 读取 NoneBot state 中的准入 token。
     state = admission_state(token=business_token(member_openid="member-1"))
-    token = get_qq_admission_token(state)
+    token = live_get_qq_admission_token(state)
     assert token is not None and token.member_openid == "member-1"
 
     handler, service, delivery = _handler()
@@ -183,6 +183,56 @@ async def test_admission_token_reads_real_state_key() -> None:
     )
     assert len(service.execute_calls) == 1
     assert len(delivery.deliver_calls) == 1
+
+
+async def test_authoritative_none_never_falls_back_to_import_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """权威 ``get_qq_admission_token`` 明确返回 None → 静默拒绝，绝不回退旧 helper。
+
+    import-time 绑定的 helper 是一个不同的模块代类；只要权威 helper 说
+    "没有 token"，它就不能被用来补一个 token 继续执行。 同时锁定权威 helper
+    每次事件只调用一次。
+    """
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.komari_roulette.qq import handler as handler_module
+
+    state = admission_state()
+    live_calls: list[object] = []
+    legacy_calls: list[object] = []
+
+    def authoritative_helper(received: object) -> None:
+        live_calls.append(received)
+
+    def stale_import_helper(received: object) -> Any:
+        legacy_calls.append(received)
+        return business_token()
+
+    monkeypatch.setattr(
+        group_admission, "get_qq_admission_token", authoritative_helper
+    )
+    monkeypatch.setattr(
+        handler_module,
+        "_get_qq_admission_token",
+        stale_import_helper,
+        raising=False,
+    )
+
+    handler, service, delivery = _handler()
+    _execute_success(service)
+    await _run(
+        handler,
+        FakeQQBot(),
+        make_group_at_event("/轮盘 开枪"),
+        state=state,
+    )
+
+    assert live_calls == [state], "权威 helper 必须恰好调用一次"
+    assert legacy_calls == [], "权威返回 None 后不得回退旧 import-time helper"
+    assert service.observe_calls == []
+    assert service.execute_calls == []
+    assert delivery.deliver_calls == []
 
 
 # ---------------------------------------------------------------------------

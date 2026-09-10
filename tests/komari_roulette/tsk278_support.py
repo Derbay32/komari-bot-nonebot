@@ -15,10 +15,11 @@ module.  Tests that need a TSK-278 symbol import it inside the test function
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from nonebot.adapters.qq import Bot as QQBot
 from nonebot.adapters.qq.adapter import Adapter as QQAdapter
@@ -33,10 +34,9 @@ from nonebot.adapters.qq.message import Message
 from nonebot.adapters.qq.models import Action, Button, Permission, RenderData
 from nonebot.adapters.qq.models.qq import GroupMemberAuthor
 
-from komari_bot.plugins.group_admission.qq import (
-    QQ_ADMISSION_STATE_KEY,
-    QQAdmissionToken,
-)
+if TYPE_CHECKING:
+    from komari_bot.plugins.group_admission import QQAdmissionToken
+
 from komari_bot.plugins.komari_roulette import (
     CommandReceipt,
     FulfillmentClaim,
@@ -56,6 +56,38 @@ GROUP_OPENID = "group-1"
 # Real admission handoff (TSK-274 gate token; not faked)
 # ---------------------------------------------------------------------------
 
+#: The live admission package is resolved at *call time*.  The shared
+#: group_admission acceptance suite reloads the package in-process, which
+#: replaces ``QQAdmissionToken``; a token must always be minted with the same
+#: live class identity the live ``get_qq_admission_token`` checks.  Importing
+#: the class once at module load captures a stale generation and would force a
+#: production compatibility shim that bypasses the authoritative helper.
+_ADMISSION_PACKAGE = "komari_bot.plugins.group_admission"
+
+
+def live_admission_package() -> Any:
+    """Return the current live ``group_admission`` package object."""
+
+    return importlib.import_module(_ADMISSION_PACKAGE)
+
+
+def live_admission_token_class() -> Any:
+    """Return the live token class the live public helper checks."""
+
+    return live_admission_package().QQAdmissionToken
+
+
+def live_admission_state_key() -> str:
+    """Return the live state key the live public helper reads."""
+
+    return live_admission_package().QQ_ADMISSION_STATE_KEY
+
+
+def live_get_qq_admission_token(state: object) -> Any:
+    """Read a handoff token with the live public helper (same as production)."""
+
+    return live_admission_package().get_qq_admission_token(state)
+
 
 def business_token(
     *,
@@ -73,7 +105,7 @@ def business_token(
     ``app_id`` / ``group_openid`` are overridable so tests can build a token
     whose identity does **not** match the event (the handler must reject it).
     """
-    return QQAdmissionToken(
+    return live_admission_token_class()(
         scope=cast("Any", scope),
         app_id=app_id,
         group_openid=group_openid,
@@ -99,7 +131,7 @@ def admission_state(
     """
     if token is None:
         token = business_token()
-    return {QQ_ADMISSION_STATE_KEY: token}
+    return {live_admission_state_key(): token}
 
 
 # ---------------------------------------------------------------------------
@@ -665,21 +697,24 @@ class FakeCommandService:
 
     Implements the calls used by the handler and the delivery:
     observe_current / execute_group_command / claim_fulfillment /
-    mark_delivered / mark_not_delivered.  Behavior is configured per test;
-    everything is recorded for assertions.  PG-backed tests use the real
-    service instead.
+    check_fulfillment_window / mark_delivered / mark_not_delivered.  Behavior is
+    configured per test; everything is recorded for assertions.  PG-backed
+    tests use the real service instead.
     """
 
     def __init__(self) -> None:
         self.observe_calls: list[Any] = []
         self.execute_calls: list[tuple[Any, Observation | None]] = []
         self.claim_calls: list[str] = []
+        self.check_calls: list[FulfillmentClaim] = []
         self.mark_delivered_calls: list[tuple[Any, str]] = []
         self.mark_not_delivered_calls: list[Any] = []
         self.observation: Observation | None = None
         self.receipt: CommandReceipt | None = None
         self.claim_result: FulfillmentClaim | None = None
         self.claim_error: BaseException | None = None
+        self.check_result: bool = True
+        self.check_error: BaseException | None = None
         self.mark_delivered_error: BaseException | None = None
 
     async def observe_current(self, group: Any) -> Observation | None:
@@ -702,6 +737,19 @@ class FakeCommandService:
         if self.claim_error is not None:
             raise self.claim_error
         return self.claim_result
+
+    async def check_fulfillment_window(self, claim: FulfillmentClaim) -> bool:
+        """Explicit pre-send credential-window recheck (PG clock in production).
+
+        Defined directly (never discovered via ``getattr``) so the delivery's
+        mandatory seam call is a real, recorded contract rather than optional
+        magic.  ``check_result``/``check_error`` configure the outcome.
+        """
+
+        self.check_calls.append(claim)
+        if self.check_error is not None:
+            raise self.check_error
+        return self.check_result
 
     async def mark_delivered(
         self,
