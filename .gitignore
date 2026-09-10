@@ -145,7 +145,7 @@ dmypy.json
 !/docs/adr/
 !/docs/adr/**
 /.ruff_cache
-/.agents
+/.agents/worktrees/
 /.vscode/
 
 # config files
