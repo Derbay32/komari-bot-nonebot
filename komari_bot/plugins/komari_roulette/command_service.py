@@ -391,6 +391,9 @@ class ReplyProjectionContext:
     mention_target: ReplyPlayer | None = None
     mention_reason: str | None = None
     game_view: ReplyGameView | None = None
+    #: Protocol intent of the command that produced this projection (for
+    #: phase-specific copy such as "leave" after a game has started).
+    intent: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
@@ -990,7 +993,7 @@ class RouletteCommandService:
             request,
             result_code=result.code,
             snapshot=saved,
-            details=_projection_details(result),
+            details=_waiting_end_details(result, request, current),
             winner_group_wins=winner_group_wins,
         )
         return await self._insert_receipt(
@@ -1147,6 +1150,7 @@ class RouletteCommandService:
                 lock_target_player=lock_target_player,
             ),
             game_view=_reply_game_view(snapshot, players),
+            intent=request.command.intent,
         )
         projection = self._reply_projector(context)
         if not isinstance(projection, ReplyProjection):
@@ -1385,6 +1389,35 @@ def _projection_details(result: ActionResult) -> dict[str, object]:
     return details
 
 
+def _waiting_end_details(
+    result: ActionResult,
+    request: CommandRequest,
+    current: GameSnapshot | None,
+) -> dict[str, object]:
+    """Add the TSK-266 1G waiting-end actor facts for a cancelled game.
+
+    A cancel commits an empty roster, so the post-transition snapshot can no
+    longer resolve who ended the game: the actor name is captured from the
+    pre-transition snapshot while it is still available.
+    """
+
+    details = _projection_details(result)
+    if result.code != "cancelled":
+        return details
+    if request.command.intent == "cancel":
+        details["waiting_end_reason"] = "host_cancelled"
+    elif request.command.intent == "leave":
+        details["waiting_end_reason"] = "last_player_left"
+    else:
+        return details
+    if current is not None:
+        for seat in current.players:
+            if seat.member_openid == request.member_openid:
+                details["waiting_end_actor_name"] = seat.display_name
+                break
+    return details
+
+
 def _safe_details(details: Mapping[str, object]) -> dict[str, PublicValue]:
     safe: dict[str, PublicValue] = {}
     allowed = {
@@ -1414,6 +1447,8 @@ def _safe_details(details: Mapping[str, object]) -> dict[str, PublicValue]:
         "winner_seq",
         "eliminated_reason",
         "leaderboard",
+        "waiting_end_reason",
+        "waiting_end_actor_name",
     }
     for key, value in details.items():
         if key not in allowed:

@@ -70,6 +70,11 @@ def get_sentence_pool() -> dict[str, str]:
 
 GENERIC_ERROR_TEXT = "游戏状态异常，本次操作未执行。请联系管理员。"
 
+#: TSK-266 11.3: leaving with "退出" after the game started gets its own copy.
+LEAVE_AFTER_START_TEXT = (
+    "游戏已经开始，“退出”只用于等候阶段；主动离开请使用 @Bot /轮盘 弃权。"
+)
+
 _ERROR_TEXTS: dict[str, str] = {
     "unknown_command": "无法识别这条轮盘命令。发送 .docs 轮盘 查看使用说明。",
     "invalid_player_seq": "玩家编号格式不正确。请填写不带前导零的正整数。",
@@ -459,23 +464,73 @@ def _waiting_body(context: ReplyProjectionContext) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _rotation_body(context: ReplyProjectionContext) -> str:
+    """The authoritative board after a committed rotation (TSK-266 11.3).
+
+    Used when an active timeout eliminated the current player but the game
+    continues: the fixed timeout notice is followed by this board instead of
+    the ordinary action sentence (there is no action result to quote).
+    """
+
+    current_seq = context.current_player.join_seq if context.current_player else None
+    return "\n".join(
+        [
+            _current_line(context),
+            _chamber_line(context.game_view),
+            "",
+            "***",
+            "",
+            *_roster_lines(context, current_seq=current_seq),
+        ]
+    )
+
+
+def _waiting_end_body(context: ReplyProjectionContext) -> str:
+    """TSK-266 1G: name whoever ended a waiting game, without the number."""
+
+    reason = context.details.get("waiting_end_reason")
+    name = context.details.get("waiting_end_actor_name")
+    if isinstance(name, str) and name:
+        if reason == "host_cancelled":
+            return f"{_escape_name(name)}取消了这局游戏，等候中的玩家已经全部离席。"
+        if reason == "last_player_left":
+            return f"{_escape_name(name)}离开后，等候局已自动结束。"
+    return _sentence("cancelled")
+
+
+# ---------------------------------------------------------------------------
+# Public seam
+# ---------------------------------------------------------------------------
+
+
 def render_reply(context: ReplyProjectionContext) -> ReplyProjection:  # noqa: PLR0911
     """Project a frozen context into the full Markdown reply projection."""
     if context.result_code == "leaderboard":
         body = _leaderboard_body(context)
         return _project(context, body, allow_mention=False)
-    if context.result_code == "turn_expired" and context.lifecycle == "completed":
+    if context.result_code == "turn_expired":
         # TSK-266 11.3: the timeout elimination is already committed, so one
-        # reply carries the fixed timeout notice followed by the final outcome.
+        # reply carries the fixed timeout notice followed by the final outcome
+        # (terminal) or the next authoritative board (still active).
         fixed = _fixed_error_text(context)
+        if context.lifecycle == "completed":
+            return _project(
+                context,
+                f"{fixed}\n\n{_final_body(context)}",
+                allow_mention=True,
+            )
         return _project(
             context,
-            f"{fixed}\n\n{_final_body(context)}",
+            f"{fixed}\n\n{_rotation_body(context)}",
             allow_mention=True,
         )
     if context.lifecycle == "cancelled" and context.result_code == "cancelled":
         # TSK-266 1G: the waiting game ended without a winner.
-        return _project(context, _sentence("cancelled"), allow_mention=False)
+        return _project(context, _waiting_end_body(context), allow_mention=False)
+    if context.result_code == "game_already_started" and context.intent == "leave":
+        # TSK-266 11.3: "退出" after start has its own copy; other waiting-roster
+        # commands with the same code keep the generic copy below.
+        return _project(context, LEAVE_AFTER_START_TEXT, allow_mention=False)
     if is_error_result_code(context.result_code):
         return _project(context, _fixed_error_text(context), allow_mention=False)
     if context.lifecycle == "completed":
