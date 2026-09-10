@@ -2,23 +2,26 @@
 
 The runtime is a deep module with a deliberately small interface:
 
-* :meth:`RouletteRuntime.start` reads the persisted config once, publishes the
-  lifecycle and *dispatches* one recovery tick, so authority is only ever
-  released through a runtime that has already gone through startup;
+* :meth:`RouletteRuntime.start` reads the persisted config once, awaits the
+  first recovery tick to settle, and only then publishes the lifecycle, so
+  authority is never released on a merely *scheduled* recovery.  Concurrent
+  callers share that single startup pass and later calls are idempotent;
 * :meth:`RouletteRuntime.close` blocks every new dispatch *first*, then
-  bounded-cancels the in-flight recovery tick, and never disposes the shared
+  bounded-cancels the in-flight recovery tick and the recovery port's own
+  ``close`` (which may swallow a cancellation), and never disposes the shared
   ``nonebot_plugin_orm`` engine (it does not own it);
 * :meth:`RouletteRuntime.authorize` resolves admission from the *arguments of
   that call* (scope + group ids), never from a process-global "current event";
-* the ``plugin_enable`` switch is re-read live on every authority check, so a
-  persisted flip stops new business/send immediately without a restart, while
-  maintenance keeps running on the absolute deadlines.
+* the ``plugin_enable`` switch is re-read live on every authoritative read, so a
+  persisted flip stops new business/send immediately without a restart, while a
+  live read failure is recorded as ``config_unavailable`` instead of keeping a
+  stale ``READY``.
 
 Recovery is single-flight: the startup tick, the scheduled tick and any caller
 of :meth:`run_recovery_tick` all share **one** in-flight task, so two callers
 can never advance the same deadline twice.  A tick that reports per-group
-failures (or raises) downgrades the runtime to ``failed`` and withholds
-business authority until a later clean tick.
+failures, raises, or returns a malformed result downgrades the runtime to
+``failed`` and withholds business authority until a later clean tick.
 
 No always-true authority is fabricated here: ``admission`` is injected by the
 composition root and an unknown scope is always denied.  Real token / binding /
@@ -41,12 +44,13 @@ from komari_bot.plugins.group_admission import (
     AdmissionResult,
 )
 
+from .maintenance import RecoveryTickResult
 from .reasons import RUNTIME_REASON_CODES
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
-#: Bounded wait for an in-flight dispatch to honour a cancellation.
+#: Bounded wait for an in-flight dispatch / recovery ``close`` to honour it.
 CLOSE_CANCEL_TIMEOUT_SECONDS = 1.0
 
 #: Scopes this runtime knows how to adjudicate.  Anything else is denied.
@@ -118,16 +122,67 @@ class RouletteAuthority:
     scope: str
 
 
-def _retrieve_background_error(task: asyncio.Task[object]) -> None:
-    """Mark a fire-and-forget tick task's exception as retrieved.
+def _retrieve_background_error(task: asyncio.Task[Any]) -> None:
+    """Mark a fire-and-forget task's exception as retrieved.
 
-    The startup dispatch does not await its tick; without this the event loop
-    would log "Task exception was never retrieved" for a failing recovery while
-    the state transition itself was already recorded.
+    Background dispatches and the recovery ``close`` task are not awaited by
+    their creator in every path; without this the event loop would log "Task
+    exception was never retrieved" while the state transition (if any) was
+    already recorded.
     """
 
     with suppress(asyncio.CancelledError, Exception):
         task.exception()
+
+
+def _snapshot_plugin_enable(snapshot: object) -> bool | None:
+    """Return the snapshot's ``plugin_enable`` only when it is a real ``bool``.
+
+    A missing field, ``None`` or any other shape (e.g. the string ``"false"``)
+    is *not* coerced; it means the config cannot be trusted and the caller must
+    fail closed.
+    """
+
+    value = getattr(snapshot, "plugin_enable", None)
+    if not isinstance(value, bool):
+        return None
+    return value
+
+
+def _validated_failure_count(result: object) -> int | None:
+    """Return ``result.failed`` only for a contract-valid recovery tick.
+
+    The port must yield the real :class:`RecoveryTickResult`; a foreign object
+    (``object`` / ``SimpleNamespace`` / text) and a missing / ``None`` / text /
+    negative / bool ``failed`` are never coerced to ``0`` and must not be read
+    as a clean recovery.
+    """
+
+    if not isinstance(result, RecoveryTickResult):
+        return None
+    failed = result.failed
+    if isinstance(failed, bool) or not isinstance(failed, int) or failed < 0:
+        return None
+    return failed
+
+
+async def _bounded_cancel(task: asyncio.Task[Any]) -> None:
+    """Wait for a task, then cancel and bounded-wait again if it is stubborn.
+
+    ``asyncio.wait`` (not ``asyncio.timeout`` around ``await task``) is used so
+    a dependency that swallows ``CancelledError`` can never drag shutdown past
+    the bound.  The task keeps its owning reference for error retrieval.
+    """
+
+    if task.done():
+        return
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait({task}, timeout=CLOSE_CANCEL_TIMEOUT_SECONDS)
+    if task.done():
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait({task}, timeout=CLOSE_CANCEL_TIMEOUT_SECONDS)
 
 
 class RouletteRuntime:
@@ -148,7 +203,10 @@ class RouletteRuntime:
         self._recovery_completed = False
         self._plugin_enable = False
         self._closed = False
-        self._tick_task: asyncio.Task[object] | None = None
+        self._start_done = False
+        self._tick_task: asyncio.Task[Any] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._recovery_close_task: asyncio.Task[None] | None = None
         self._start_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
 
@@ -157,18 +215,21 @@ class RouletteRuntime:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Read config once, dispatch one recovery tick, publish the lifecycle.
+        """Read config once, await one recovery tick, publish the lifecycle.
 
-        A config failure is recorded as ``FAILED`` (never a silent fallback) and
-        no tick is dispatched.  A valid config releases the startup barrier and
-        dispatches the single-flight recovery tick; that tick's result is
-        reconciled asynchronously and downgrades the runtime if it reports
-        per-group failures.  ``CancelledError`` is a real cancellation and
-        propagates.
+        A config read that is unavailable or malformed is recorded as
+        ``FAILED`` / ``config_unavailable`` (never a silent fallback) and no
+        tick is dispatched.  A valid config releases the startup barrier and
+        dispatches the single-flight recovery tick; ``start`` does not return
+        until that tick has settled, so ``await start()`` means "startup
+        recovery has really run", not "a tick was scheduled".  A failing tick
+        is recorded as ``failed`` without raising, and ``CancelledError`` is a
+        real cancellation and propagates.  Overlapping calls share this one
+        pass; a later call is idempotent.
         """
 
         async with self._start_lock:
-            if self._closed:
+            if self._closed or self._start_done:
                 return
             try:
                 snapshot = await self._config_manager.initialize_async()
@@ -176,41 +237,49 @@ class RouletteRuntime:
                 raise
             except Exception:
                 self._set_failed(CONFIG_UNAVAILABLE_REASON)
+                self._start_done = True
                 return
-            enabled = getattr(snapshot, "plugin_enable", None)
+            if self._closed:
+                self._start_done = True
+                return
+            enabled = _snapshot_plugin_enable(snapshot)
             if enabled is None:
                 self._set_failed(CONFIG_UNAVAILABLE_REASON)
+                self._start_done = True
                 return
-            self._plugin_enable = bool(enabled)
-            # Startup barrier: authority is released only for a runtime whose
-            # startup has completed and whose recovery has been dispatched.
-            self._recovery_completed = True
-            self._publish_lifecycle()
-            self._ensure_tick_task()
-            # Let an immediately-settling tick (no internal awaits) reconcile
-            # before ``start`` returns; a slow tick keeps running in the
-            # background and settles through the same guarded path.
-            await asyncio.sleep(0)
+            self._plugin_enable = enabled
+            task = self._ensure_tick_task()
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The guarded tick already recorded the failure; startup itself
+                # still completes so the caller can observe the FAILED state.
+                pass
+            finally:
+                self._start_done = True
 
     async def close(self) -> None:
-        """Block new dispatch, then bounded-cancel the in-flight tick.
+        """Block new dispatch immediately, then bounded-cancel the in-flight work.
 
-        The closed flag is set *before* any wait so a task holding the runtime
-        lock can never deadlock shutdown.  The shared ORM engine is owned by
-        ``nonebot_plugin_orm`` and is never disposed from here.
+        The closed flag is set *before* any wait, so a task holding the runtime
+        lock can never deadlock shutdown and a late tick result can no longer
+        write ``READY`` back.  Concurrent / repeated callers all join the same
+        close task instead of assuming the first one finished.  The shared ORM
+        engine is owned by ``nonebot_plugin_orm`` and is never disposed here.
         """
 
         async with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            task = self._tick_task
-            self._tick_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.wait({task}, timeout=CLOSE_CANCEL_TIMEOUT_SECONDS)
-        with suppress(Exception):
-            await self._recovery.close()
+            if self._close_task is None:
+                self._closed = True
+                self._recovery_completed = False
+                self._status = RouletteRuntimeStatus.FAILED
+                self._reason_code = NOT_READY_REASON
+                self._close_task = asyncio.ensure_future(self._close_impl())
+                self._close_task.add_done_callback(_retrieve_background_error)
+            task = self._close_task
+        await asyncio.shield(task)
 
     @property
     def accepting(self) -> bool:
@@ -221,31 +290,47 @@ class RouletteRuntime:
         accepting, and a runtime past ``close()`` is never accepting again.
         """
 
-        if self._closed or self._status is RouletteRuntimeStatus.FAILED:
+        if self._closed:
             return False
-        return self._try_read_plugin_enable() is True
+        self._refresh_safe_state()
+        if self._status is RouletteRuntimeStatus.FAILED:
+            return False
+        return self._plugin_enable
 
     def get_state(self) -> RouletteRuntimeState:
-        """Return an immutable snapshot of the current lifecycle."""
+        """Refresh the safe state, then return an immutable snapshot.
 
+        The live read is applied *before* the snapshot is built, so the status
+        and the ``plugin_enable`` flag can never come from different points in
+        time; a live read failure downgrades the state to ``FAILED`` /
+        ``config_unavailable`` instead of reporting ``READY`` alongside an
+        unavailable config.
+        """
+
+        self._refresh_safe_state()
         return RouletteRuntimeState(
             status=self._status,
             reason_code=self._reason_code,
             recovery_completed=self._recovery_completed,
-            plugin_enable=self._try_read_plugin_enable() is True,
+            plugin_enable=self._plugin_enable,
         )
 
     async def run_recovery_tick(self) -> RouletteRuntimeState:
         """Join (or start) the single-flight recovery tick and report state.
 
-        When a tick is already in flight the caller joins that exact task, so
-        two concurrent workers never advance one deadline twice.  A failed tick
-        is re-raised after the failure has been recorded.
+        A tick is only dispatched when the config is legally readable; an
+        unreadable config fails closed (``config_unavailable``) without running
+        recovery.  When a tick is already in flight the caller joins that exact
+        task, so two concurrent workers never advance one deadline twice.  A
+        failed tick is re-raised after the failure has been recorded.
         """
 
         if self._closed:
             return self.get_state()
-        await self._ensure_tick_task()
+        if self._refresh_safe_state() is None:
+            return self.get_state()
+        task = self._ensure_tick_task()
+        await asyncio.shield(task)
         return self.get_state()
 
     def authorize(  # noqa: PLR0911 - one guard per closed-set decision
@@ -253,17 +338,13 @@ class RouletteRuntime:
         *,
         scope: str,
         group_ids: Sequence[int],
-        token: Mapping[str, Any] | None = None,
     ) -> RouletteAuthority:
         """Adjudicate *this* call's scope/group ids; never a global event.
 
-        ``token`` is accepted for the Stage-C token/binding translation and is
-        not interpreted here.  The admission port is queried with the group ids
-        of this call only, so two concurrent groups can never borrow each
-        other's decision.
+        The admission port is queried with the group ids of this call only, so
+        two concurrent groups can never borrow each other's decision.
         """
 
-        del token
         if self._closed:
             return RouletteAuthority(
                 allowed=False, reason_code=NOT_READY_REASON, scope=scope
@@ -272,17 +353,14 @@ class RouletteRuntime:
             return RouletteAuthority(
                 allowed=False, reason_code=POLICY_RESTRICTED_REASON, scope=scope
             )
-        if (
-            self._status is RouletteRuntimeStatus.FAILED
-            or not self._recovery_completed
-        ):
-            return RouletteAuthority(
-                allowed=False, reason_code=NOT_READY_REASON, scope=scope
-            )
-        enabled = self._try_read_plugin_enable()
+        enabled = self._refresh_safe_state()
         if enabled is None:
             return RouletteAuthority(
                 allowed=False, reason_code=CONFIG_UNAVAILABLE_REASON, scope=scope
+            )
+        if self._status is RouletteRuntimeStatus.FAILED or not self._recovery_completed:
+            return RouletteAuthority(
+                allowed=False, reason_code=NOT_READY_REASON, scope=scope
             )
         if not enabled:
             return RouletteAuthority(
@@ -311,7 +389,28 @@ class RouletteRuntime:
     # Internals
     # ------------------------------------------------------------------
 
-    def _ensure_tick_task(self) -> asyncio.Task[object]:
+    async def _close_impl(self) -> None:
+        """Cancel the in-flight tick, then bounded-close the recovery port."""
+
+        task = self._tick_task
+        self._tick_task = None
+        if task is not None:
+            await _bounded_cancel(task)
+        await self._close_recovery_bounded()
+
+    async def _close_recovery_bounded(self) -> None:
+        """Bound the recovery port's ``close`` even if it swallows cancellation."""
+
+        try:
+            close_coro = self._recovery.close()
+        except Exception:
+            return
+        task = asyncio.ensure_future(close_coro)
+        task.add_done_callback(_retrieve_background_error)
+        self._recovery_close_task = task
+        await _bounded_cancel(task)
+
+    def _ensure_tick_task(self) -> asyncio.Task[Any]:
         """Return the in-flight tick, or dispatch exactly one new tick."""
 
         task = self._tick_task
@@ -327,18 +426,24 @@ class RouletteRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._set_failed(RECOVERY_FAILED_REASON)
+            if not self._closed:
+                self._set_failed(RECOVERY_FAILED_REASON)
             raise
         self._apply_tick_result(result)
         return result
 
     def _apply_tick_result(self, result: object) -> None:
-        failed = _safe_count(getattr(result, "failed", 0))
-        if failed > 0:
+        """Reconcile one settled tick; a late result after close is dropped."""
+
+        if self._closed:
+            return
+        failures = _validated_failure_count(result)
+        if failures is None or failures > 0:
             self._set_failed(RECOVERY_FAILED_REASON)
             return
         enabled = self._try_read_plugin_enable()
         if enabled is None:
+            self._plugin_enable = False
             self._set_failed(CONFIG_UNAVAILABLE_REASON)
             return
         self._plugin_enable = enabled
@@ -346,6 +451,8 @@ class RouletteRuntime:
         self._publish_lifecycle()
 
     def _publish_lifecycle(self) -> None:
+        if self._closed:
+            return
         if self._plugin_enable:
             self._status = RouletteRuntimeStatus.READY
             self._reason_code = None
@@ -353,37 +460,47 @@ class RouletteRuntime:
             self._status = RouletteRuntimeStatus.DISABLED
             self._reason_code = PLUGIN_DISABLED_REASON
 
+    def _refresh_safe_state(self) -> bool | None:
+        """Apply a live read, downgrading on failure and **never** upgrading.
+
+        A readable config alone never clears a recorded failure: only a clean
+        recovery tick does that.  Returns the live ``plugin_enable`` or ``None``
+        when the config cannot be trusted.
+        """
+
+        if self._closed:
+            return None
+        enabled = self._try_read_plugin_enable()
+        if enabled is None:
+            self._plugin_enable = False
+            self._set_failed(CONFIG_UNAVAILABLE_REASON)
+            return None
+        self._plugin_enable = enabled
+        return enabled
+
     def _set_failed(self, reason: str) -> None:
         self._status = RouletteRuntimeStatus.FAILED
         self._reason_code = reason
         self._recovery_completed = False
 
     def _try_read_plugin_enable(self) -> bool | None:
-        """Read the live ``plugin_enable`` flag; ``None`` means unreadable.
+        """Read the live ``plugin_enable`` flag; ``None`` means untrustworthy.
 
         The real ``ConfigManager.get`` and the test double both expose this
-        synchronous read, so no arbitrary-attribute fallback is used.
+        synchronous read.  Only an actual ``bool`` is accepted; a missing or
+        malformed field fails closed rather than being coerced.
         """
 
         try:
             snapshot = self._config_manager.get()
         except Exception:
             return None
-        value = getattr(snapshot, "plugin_enable", None)
-        if value is None:
-            return None
-        return bool(value)
+        return _snapshot_plugin_enable(snapshot)
 
 
 def _qualifies_for_business(outcome: object) -> bool:
     qualification = getattr(outcome, "qualification", None)
     return qualification is AdmissionQualification.BUSINESS
-
-
-def _safe_count(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return max(value, 0)
 
 
 __all__ = [
