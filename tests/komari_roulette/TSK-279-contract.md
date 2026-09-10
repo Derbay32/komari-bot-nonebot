@@ -229,3 +229,28 @@ RED 失败原因分类（`--tb=line`）：
 ，即 S4 尚未实现的红，与 pytest RED 一致。
 
 仍未覆盖：第 4 节列出的 runtime/worker/发送观测/REST/迁移面。
+
+## 6. Stage-A 验收强化记录（TSK-279 runtime-recovery 回归）
+
+本阶段把 Stage-A 的功能性验收钉在**真实** service / domain / renderer / 强类型
+config manager 上，避免用假单测上下文「猜终局」而假绿。
+
+新增/更新的真实服务用例：
+
+| 文件 | 覆盖 |
+|------|------|
+| `test_tsk279_configuration_pg.py` | 自定义合法快照：`created` 闭集内加入脚本文案（且非首项），断言复制随机源确实被投喂该键的编译列表、域随机源完全不被触碰、改池/重建 service/重放收据都不重抽 |
+| `test_tsk279_stage_a_pg.py` | 真实 `ConfigManager("komari_roulette", DynamicConfigSchema)` 初始化写 JSONB 默认值 + 字段 CAS 更新 + 非法池拒绝且 PG 行逐字节不变；三种终局（forfeit / 自定义先实弹枪膛 shot / PG 期限超时）分别命中 `shot`/`forfeit`/`timeout` 键并断言 winner + 真实事件 + `累计胜场 1` + 唯一提及，收据重放不重选；合法 action 分支 created/joined/host_transferred/shoot/lock；固定 cancel/lastleave/waitexpiry 文案不受自定义池影响；markup 名字转义 |
+| `test_tsk279_terminal_key_fallback.py` | 纯函数记录并钉住**不合规范的 fallback** |
+
+### `_final_copy_key` 缺 reason 回退（不合规范，仅供直接单测投影）
+
+`komari_bot/plugins/komari_roulette/qq/renderer.py::_final_copy_key` 在
+`details` 同时缺少 `eliminated_reason` 与 `completion_reason` 时回退
+`DEFAULT_FINAL_COPY_KEY == "shot"`（docstring 也承认面向 direct unit
+projection）。真实领域 `_eliminate_current` 必定在 reply details 盖入原因
+（shot/forfeit 为 `eliminated_reason`，timeout 为 `eliminated_reason="timeout"`，
+forfeit 另带 `completion_reason`），因此该回退**不是**合法终局语义。
+`test_tsk279_terminal_key_fallback.py` 显式断言该回退选中 `shot` 槽、且原因存在
+时不再回退；真实三分支由 `test_tsk279_stage_a_pg.py` 的三条真实终局负责，二者
+不可互相替代。若后续要求删除该回退，应先更新此记录与用例。

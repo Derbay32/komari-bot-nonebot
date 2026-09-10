@@ -10,7 +10,8 @@ never as a whole-file collection error.
 
 from __future__ import annotations
 
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,12 @@ from komari_bot.plugins.komari_roulette.domain import (
     Action,
     ItemType,
 )
+from komari_bot.plugins.komari_roulette.qq.renderer import render_reply
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 from .support import (
     ScriptedRandomSource,
@@ -120,15 +127,23 @@ def test_service_ctor_accepts_item_weights_provider_seam() -> None:
 
     A strict construction here fails with ``TypeError`` (unknown keyword) while
     the real behaviour is verified against PostgreSQL in
-    ``test_tsk279_configuration_pg.py``.
+    ``test_tsk279_configuration_pg.py``.  The session factory is a real typed
+    async-context-manager fixture (never opened by this construction probe) and
+    the projector is the real ``render_reply`` seam, so the construction is
+    type-checked without any production cast.
     """
+
+    @asynccontextmanager
+    async def unopened_session_factory() -> AsyncIterator[AsyncSession]:
+        raise AssertionError("构造探针不得打开数据库会话")
+        yield  # pragma: no cover
 
     def provider() -> dict[ItemType, int]:
         return dict(DEFAULT_ITEM_WEIGHTS)
 
     service = RouletteCommandService(
-        session_factory=lambda: None,
-        reply_projector=lambda _context: None,
+        session_factory=unopened_session_factory,
+        reply_projector=render_reply,
         item_weights_provider=provider,
     )
     assert service is not None
@@ -280,6 +295,48 @@ def test_config_schema_rejects_native_mention_in_pools() -> None:
     action[key] = ['<qqbot-at-user id="member-2" />']
     with pytest.raises(VALIDATION_ERRORS):
         cls(action_copy_pool=action)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        '【279-注入】<qqbot-at-user id="member-2" />',
+        "【279-注入】**粗体**",
+        "> 【279-注入】引用行",
+        "- 【279-注入】列表行",
+        "【279-注入】第一行\n第二行",
+    ],
+)
+def test_config_schema_rejects_injection_in_action_pool(template: str) -> None:
+    cls = _config_schema()
+    base = dict(cls().action_copy_pool)
+    key = next(iter(base))
+    base[key] = [template]
+    with pytest.raises(VALIDATION_ERRORS):
+        cls(action_copy_pool=base)
+
+
+@pytest.mark.parametrize(
+    "decoration",
+    [
+        '【279-注入】<qqbot-at-user id="member-2" />',
+        "【279-注入】**粗体**",
+        "> 【279-注入】引用",
+        "- 【279-注入】列表",
+        "【279-注入】第一行\n第二行",
+    ],
+)
+def test_config_schema_rejects_injection_in_final_pool(decoration: str) -> None:
+    cls = _config_schema()
+    base = dict(cls().final_copy_pool)
+    key = next(iter(base))
+    # Keep the terminal placeholders complete so the *only* rejection is the
+    # injected layout, not a missing-placeholder error.
+    base[key] = [
+        f"{decoration}{{event}}{{winner}} 获胜，累计胜场 {{wins}}。"
+    ]
+    with pytest.raises(VALIDATION_ERRORS):
+        cls(final_copy_pool=base)
 
 
 # ---------------------------------------------------------------------------

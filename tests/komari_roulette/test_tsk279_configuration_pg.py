@@ -332,15 +332,40 @@ def _pool_with(
     return rebuilt
 
 
+def _snapshot_with_scripted_created() -> Any:
+    """Compile a legal snapshot whose ``created`` key offers the script copy.
+
+    ``ScriptedCopyRandom`` forces a queued value and rejects any value outside
+    the offered candidates, so the scripted sentence has to be a real member of
+    a closed-key list.  Making it the *second* candidate also proves the pick
+    is not merely ``options[0]``.
+    """
+
+    compile_copy_pool = load_symbol(COPY_POOL_MODULE, "compile_copy_pool")
+    defaults = load_symbol(COPY_POOL_MODULE, "default_copy_snapshot")()
+    action_pool = {
+        name: list(values) for name, values in defaults.action_templates.items()
+    }
+    action_pool["created"] = ["默认创建文案：{name}。", INDEPENDENT_COPY_SENTENCE]
+    return compile_copy_pool(
+        action_copy_pool=action_pool,
+        final_copy_pool={
+            name: list(values) for name, values in defaults.final_templates.items()
+        },
+    )
+
+
 async def test_copy_pool_and_receipt_freeze_independent_of_domain_random(
     harness: Any,
 ) -> None:
     build_projector = load_symbol(RENDERER_MODULE, "build_reply_projector")
-    default_snapshot = load_symbol(COPY_POOL_MODULE, "default_copy_snapshot")
     action_keys = set(load_symbol(COPY_POOL_MODULE, "ACTION_COPY_KEYS"))
     assert "created" in action_keys
     assert "started" in action_keys
-    snapshot = default_snapshot()
+    snapshot = _snapshot_with_scripted_created()
+    created_candidates = tuple(snapshot.action_templates["created"])
+    assert INDEPENDENT_COPY_SENTENCE in created_candidates
+    assert created_candidates[0] != INDEPENDENT_COPY_SENTENCE
 
     copy_rng = ScriptedCopyRandom([INDEPENDENT_COPY_SENTENCE])
     projector = build_projector(snapshot=snapshot, random_source=copy_rng)
@@ -410,10 +435,13 @@ async def test_copy_random_source_is_not_the_domain_random_source(
     """
 
     build_projector = load_symbol(RENDERER_MODULE, "build_reply_projector")
-    snapshot = load_symbol(COPY_POOL_MODULE, "default_copy_snapshot")()
+    snapshot = _snapshot_with_scripted_created()
     copy_rng = ScriptedCopyRandom([INDEPENDENT_COPY_SENTENCE])
     domain_rng = CountingRandom()
     assert not hasattr(domain_rng, "choice")
+    assert (
+        INDEPENDENT_COPY_SENTENCE in snapshot.action_templates["created"]
+    ), "scripted copy must be a legal closed-key candidate"
 
     async with harness.scope("copy-source") as current:
         await seed_players(harness.binding_manager, current, 2)
@@ -426,10 +454,14 @@ async def test_copy_random_source_is_not_the_domain_random_source(
         )
         created = await create_waiting(service, current)
         assert created.result_code == "created"
+        joined = await join_player(
+            service, current, member_id(current, 2), "copy-source-join-2"
+        )
+        assert joined.result_code == "joined"
         started = await start_game(service, current, member_id(current, 1))
         assert started.result_code == "started"
         # start needed the domain chamber draw AND a copy pick; the two
         # sources advanced independently.
         assert domain_rng.chamber_calls == 1
-        assert copy_rng.draw_count >= 2
+        assert copy_rng.draw_count >= 3
         assert copy_rng.calls[-1] == tuple(snapshot.action_templates["started"])
