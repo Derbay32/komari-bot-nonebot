@@ -2,9 +2,10 @@
 
 ``RouletteDelivery`` consumes an already committed ``CommandReceipt``: it
 rebuilds the frozen payload, atomically claims the single platform send
-attempt, re-reads the live send authority, sends at most once, and records the
-outcome.  It never re-reads game state, never re-renders, never retries, and
-never rolls the domain back after a send has started (TSK-267).
+attempt, re-reads the live send authority, re-reads the DB-clock credential
+window, sends at most once, and records the outcome.  It never re-reads game
+state, never re-renders, never retries, and never rolls the domain back after
+a send has started (TSK-267).
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ class _RouletteService(Protocol):
     """The narrow fulfillment surface the delivery consumes (TSK-276)."""
 
     async def claim_fulfillment(self, receipt_id: str) -> FulfillmentClaim | None: ...
+
+    async def check_fulfillment_window(self, claim: FulfillmentClaim) -> bool: ...
 
     async def mark_delivered(
         self,
@@ -124,7 +127,7 @@ class RouletteDelivery:
         receipt: CommandReceipt,
         sender: QQMessageSender | QQBot,
     ) -> DeliveryOutcome:
-        """Build frozen payload → claim → recheck → send once → mark."""
+        """Build frozen payload → claim → recheck → window → send once → mark."""
 
         message, build_error = self._build(receipt)
         claim = await self._service.claim_fulfillment(receipt.receipt_id)
@@ -143,6 +146,8 @@ class RouletteDelivery:
             await self._service.mark_not_delivered(claim)
             return DeliveryOutcome.NOT_DELIVERED
         if not await self._send_allowed(claim):
+            return DeliveryOutcome.NOT_DELIVERED
+        if not await self._window_allowed(claim):
             return DeliveryOutcome.NOT_DELIVERED
         try:
             response = await sender.send_to_group(
@@ -210,6 +215,32 @@ class RouletteDelivery:
         except Exception as error:
             logger.warning(
                 "[Roulette] 发送前运行时重核失败，故障关闭: error_type={}",
+                type(error).__name__,
+            )
+            await self._service.mark_not_delivered(claim)
+            return False
+        if not bool(result):
+            await self._service.mark_not_delivered(claim)
+            return False
+        return True
+
+    async def _window_allowed(self, claim: FulfillmentClaim) -> bool:
+        """Authoritative pre-send credential-window recheck from the DB clock.
+
+        This mandatory seam runs after the runtime recheck and immediately
+        before any network call: the claim alone is not enough authority, so a
+        ``False`` answer or a raising check converges the claim to
+        ``NOT_DELIVERED`` without re-claiming.  ``asyncio.CancelledError`` is a
+        cancellation, not a rejected check.
+        """
+
+        try:
+            result = await self._service.check_fulfillment_window(claim)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "[Roulette] 发送前凭证窗口重核失败，故障关闭: error_type={}",
                 type(error).__name__,
             )
             await self._service.mark_not_delivered(claim)
