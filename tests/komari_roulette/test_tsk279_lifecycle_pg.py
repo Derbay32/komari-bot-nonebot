@@ -27,6 +27,7 @@ import inspect
 import json
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
@@ -55,6 +56,7 @@ from .tsk279_lifecycle_support import (
 from .tsk279_support import (
     Tsk279Harness,
     harness_fixture_body,
+    insert_waiting_game,
     seed_aged_receipt,
 )
 
@@ -126,6 +128,40 @@ async def _scope_receipts(harness: Tsk279Harness, current: Any) -> int:
             )
             or 0
         )
+
+
+async def _scope_latest_lifecycle(harness: Tsk279Harness, current: Any) -> str | None:
+    async with harness.session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT lifecycle FROM komari_roulette_games "
+                "WHERE app_id = :app_id AND group_openid = :group_openid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+    return None if value is None else str(value)
+
+
+async def _drive_installed_recovery(
+    maintenance: Any,
+    harness: Tsk279Harness,
+    current: Any,
+    *,
+    batch_size: int = 100,
+    max_pages: int = 60,
+) -> Any:
+    """Drive the real installed worker until this scope's latest game settles."""
+
+    tick: Any = None
+    for _ in range(max_pages):
+        tick = await maintenance.advance_due(batch_size=batch_size)
+        lifecycle = await _scope_latest_lifecycle(harness, current)
+        if lifecycle not in {"waiting", "active"}:
+            return tick
+        if getattr(tick, "cursor", None) is None:
+            return tick
+    return tick
 
 
 def _application() -> Any:
@@ -280,30 +316,28 @@ async def test_maintenance_admission_is_canonical_and_ignores_business_switch(
     harness: Tsk279Harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The installed worker resolves the canonical group and consults admission.
+
+    The real composition root is exercised end to end through the public
+    ``advance_due`` worker (never ``app.maintenance._admission``): the business
+    switch is off by default yet a canonically-bound, currently-admitted group
+    is still advanced, and the same group is left untouched once the real
+    admission policy revokes it.
+    """
+
     from komari_bot.plugins import group_admission
-    from komari_bot.plugins.group_admission import (
-        AdmissionIntent,
-        AdmissionQualification,
-        AdmissionResult,
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
     )
 
-    recorded: list[tuple[list[int], AdmissionIntent]] = []
-
-    def fake_adjudicate(
-        group_ids: Any,
-        *,
-        intent: AdmissionIntent = AdmissionIntent.BUSINESS,
-    ) -> AdmissionResult:
-        recorded.append(([int(value) for value in group_ids], intent))
-        return AdmissionResult(
-            qualification=AdmissionQualification.BUSINESS,
-            effective_revision=1,
-            reason_code="policy_admitted",
-        )
-
-    monkeypatch.setattr(group_admission, "adjudicate", fake_adjudicate)
-
     numeric_group = 770031
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
     await delete_roulette_config(harness.engine)
     try:
         async with lifecycle_context(monkeypatch) as ctx:
@@ -322,20 +356,45 @@ async def test_maintenance_admission_is_canonical_and_ignores_business_switch(
                     character_name="Seat 1",
                     bot_self_id="tsk279-test-bot",
                 )
-                allowed = await _maybe_await(
-                    app.maintenance._admission(
-                        current.app_id,
-                        current.group_openid,
+                await insert_waiting_game(
+                    harness.session_factory,
+                    game_id=str(uuid4()),
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    deadline_age_seconds=315_360_000,
+                )
+                await _drive_installed_recovery(
+                    app.maintenance, harness, current
+                )
+                assert await _scope_latest_lifecycle(harness, current) == "expired", (
+                    "maintenance must advance the canonically-bound group via "
+                    "admission even while the business switch is off"
+                )
+
+                # The same canonical group is revoked by the real policy.
+                storage.deliver(
+                    stored_policy(
+                        2,
+                        {"mode": "blacklist", "group_ids": [numeric_group]},
                     )
                 )
-                assert allowed is True, (
-                    "maintenance admission must resolve the canonical group and "
-                    "consult group_admission, not the business switch"
+                await insert_waiting_game(
+                    harness.session_factory,
+                    game_id=str(uuid4()),
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                    deadline_age_seconds=315_360_000,
                 )
-                assert recorded == [([numeric_group], AdmissionIntent.BUSINESS)], (
-                    "maintenance admission must adjudicate the numeric group"
+                await _drive_installed_recovery(
+                    app.maintenance, harness, current
+                )
+                assert await _scope_latest_lifecycle(harness, current) == "waiting", (
+                    "a policy-revoked group must not advance"
                 )
     finally:
+        group_admission.register_qq_group_resolver(None)
         await delete_roulette_config(harness.engine)
 
 

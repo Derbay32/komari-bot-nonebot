@@ -23,7 +23,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
@@ -38,6 +39,7 @@ from .command_support import (
     wait_for_blocked,
 )
 from .test_command_service import (
+    CountingProjector,
     CountingRandom,
     create_waiting,
     current_game_row,
@@ -638,3 +640,719 @@ async def test_delivery_variant_effect_rejected_after_lock_wait(
         assert row["lifecycle"] == "waiting", (
             "a revoked group must not advance the game past waiting"
         )
+
+
+# ---------------------------------------------------------------------------
+# Real "old API" GREEN probes (no lifecycle module dependency)
+#
+# These pin the shipped admission / binding / user_ban authority chain the C1
+# installed gates must reuse: a real READY ``AdmissionRuntime`` (real
+# ``adjudicate`` / ``recheck_qq_effect``), real ``BindingTransaction`` canonical
+# group/member resolution against real PostgreSQL, and a real ``user_ban``
+# service (its real repository, not a `return False` shim).  They never touch
+# the still-missing ``lifecycle`` module, so they are the persistent green
+# proof the C1 review asked for.
+# ---------------------------------------------------------------------------
+
+
+async def _real_binding_resolvers(harness: Tsk279Harness) -> tuple[Any, Any]:
+    """Build the canonical resolvers from the real ``BindingTransaction``."""
+
+    from komari_bot.plugins.character_binding import BindingTransaction
+
+    async def resolve_group(app_id: str, group_openid: str) -> int | None:
+        async with harness.session_factory() as session, session.begin():
+            group = await BindingTransaction(session).resolve_group(
+                app_id=app_id,
+                group_openid=group_openid,
+                lock=False,
+            )
+        if group is None:
+            return None
+        value = int(group.group_id)
+        return value if value > 0 else None
+
+    async def resolve_member(
+        app_id: str,
+        group_openid: str,
+        member_openid: str,
+    ) -> int | None:
+        async with harness.session_factory() as session, session.begin():
+            member = await BindingTransaction(session).resolve_member(
+                app_id=app_id,
+                group_openid=group_openid,
+                member_openid=member_openid,
+                lock=False,
+            )
+        if member is None:
+            return None
+        value = int(member.member_qq)
+        return value if value > 0 else None
+
+    return resolve_group, resolve_member
+
+
+@PG_REQUIRED
+async def test_old_api_authority_chain_allows_then_rejects_the_same_token(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real admission + binding + user_ban: mint, verify and then revoke one token."""
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.user_ban.service import UserBanService
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.qq_admission_support import QQProbeBot, make_group_at
+    from tests.group_admission.registry_isolation_support import (
+        registry_isolation_context,
+    )
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+
+    async with harness.scope("old-api-green") as current:
+        numeric_group = 279001
+        member_qq = 1_000_000_000 + int(uuid4().int % 1_000_000_000)
+        await harness.binding_manager.bind_group_member(
+            app_id=current.app_id,
+            group_id=str(numeric_group),
+            group_openid=current.group_openid,
+            member_qq=str(member_qq),
+            member_openid=current.member_openid,
+            character_name="Seat 1",
+            bot_self_id="tsk279-test-bot",
+        )
+        resolve_group, resolve_member = await _real_binding_resolvers(harness)
+        ban_service = UserBanService()
+
+        async def ban_checker(member_qq_value: int, scope: object) -> bool:
+            assert str(scope) == "command"
+            return await ban_service.is_user_banned(
+                str(member_qq_value), cast("Any", scope)
+            )
+
+        bot = QQProbeBot(self_id=current.app_id)
+        event = make_group_at(
+            content="/轮盘 开局",
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            message_id="old-api-msg-1",
+        )
+        try:
+            with registry_isolation_context():
+                group_admission.register_qq_group_resolver(
+                    resolve_group, member_resolver=resolve_member
+                )
+                group_admission.register_qq_ban_checker(ban_checker)
+                try:
+                    token = await group_admission.qualify_qq_event(bot, event)
+                    assert token is not None, (
+                        "the real admission chain must mint a business token"
+                    )
+                    assert token.scope == "business"
+                    assert token.group_id == numeric_group
+                    assert token.member_qq == member_qq
+
+                    decision = await group_admission.recheck_qq_effect(
+                        token, effect="business"
+                    )
+                    assert decision.allowed is True
+                    assert decision.reason_code == "policy_admitted"
+
+                    await ban_service.ban_user(
+                        user_id=str(member_qq),
+                        target_scope="command",
+                        operator_id="tsk279-test",
+                    )
+                    banned = await group_admission.recheck_qq_effect(
+                        token, effect="business"
+                    )
+                    assert banned.allowed is False
+                    assert banned.reason_code == "user_banned"
+
+                    await ban_service.unban_user(
+                        user_id=str(member_qq), target_scope="command"
+                    )
+                    restored = await group_admission.recheck_qq_effect(
+                        token, effect="business"
+                    )
+                    assert restored.allowed is True
+
+                    storage.deliver(
+                        stored_policy(
+                            2,
+                            {
+                                "mode": "blacklist",
+                                "group_ids": [numeric_group],
+                            },
+                        )
+                    )
+                    restricted = await group_admission.recheck_qq_effect(
+                        token, effect="business"
+                    )
+                    assert restricted.allowed is False
+                    assert restricted.reason_code == "policy_restricted"
+
+                    storage.deliver(
+                        stored_policy(3, {"mode": "blacklist", "group_ids": []})
+                    )
+                    readmitted = await group_admission.recheck_qq_effect(
+                        token, effect="business"
+                    )
+                    assert readmitted.allowed is True
+
+                    async with harness.engine.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "UPDATE komari_character_binding_groups "
+                                "SET group_id = :moved "
+                                "WHERE app_id = :app_id AND group_openid = :group"
+                            ),
+                            {
+                                "moved": str(numeric_group + 1),
+                                "app_id": current.app_id,
+                                "group": current.group_openid,
+                            },
+                        )
+                    remapped = await group_admission.recheck_qq_effect(
+                        token, effect="business"
+                    )
+                    assert remapped.allowed is False
+                    assert remapped.reason_code == "scope_mismatch"
+                finally:
+                    group_admission.register_qq_group_resolver(None)
+                    group_admission.register_qq_ban_checker(None)
+        finally:
+            with suppress(Exception):
+                await ban_service.unban_user(
+                    user_id=str(member_qq), target_scope="command"
+                )
+            with suppress(Exception):
+                await ban_service.close()
+
+
+# ---------------------------------------------------------------------------
+# Second green probe: the shipped PG credential window still blocks a send even
+# when the runtime authority says yes, and (RED) an accepted post-claim
+# ``effect_check`` must not bypass that window.
+# ---------------------------------------------------------------------------
+
+
+@PG_REQUIRED
+async def test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends(
+    harness: Tsk279Harness,
+) -> None:
+    """``runtime_check`` accepts, the PG window expired → NOT_DELIVERED, no network."""
+
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    service = service_for(harness, random_source=CountingRandom())
+    async with harness.scope("window-green") as current:
+        await seed_binding(harness.binding_manager, current, 1)
+        pending = await create_waiting(
+            service, current, message_id="window-green-1"
+        )
+        sender = _NetworkRecordingSender()
+
+        async def runtime_accepts(receipt: Any) -> bool:
+            assert receipt is pending
+            async with harness.session_factory() as session:
+                await session.execute(
+                    text(
+                        "UPDATE komari_roulette_command_receipts "
+                        "SET created_at = clock_timestamp() "
+                        "- make_interval(secs => 301) "
+                        "WHERE receipt_id = :receipt_id"
+                    ),
+                    {"receipt_id": pending.receipt_id},
+                )
+                await session.commit()
+            return True
+
+        outcome = await RouletteDelivery(
+            service,
+            runtime_check=runtime_accepts,
+            payload_builder=lambda command_receipt: command_receipt.reply.body,
+        ).deliver(pending, sender)
+
+        assert outcome is DeliveryOutcome.NOT_DELIVERED
+        assert sender.calls == []
+        async with harness.session_factory() as session:
+            state = await session.scalar(
+                text(
+                    "SELECT state FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id"
+                ),
+                {"receipt_id": pending.receipt_id},
+            )
+        assert state == "NOT_DELIVERED"
+
+
+@PG_REQUIRED
+async def test_real_delivery_accepted_effect_check_still_honours_expired_window(
+    harness: Tsk279Harness,
+) -> None:
+    """An accepted post-claim ``effect_check`` must not bypass the PG window."""
+
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    service = service_for(harness, random_source=CountingRandom())
+    async with harness.scope("window-effect-green") as current:
+        await seed_binding(harness.binding_manager, current, 1)
+        pending = await create_waiting(
+            service, current, message_id="window-effect-1"
+        )
+        sender = _NetworkRecordingSender()
+
+        async def runtime_accepts(receipt: Any) -> bool:
+            assert receipt is pending
+            async with harness.session_factory() as session:
+                await session.execute(
+                    text(
+                        "UPDATE komari_roulette_command_receipts "
+                        "SET created_at = clock_timestamp() "
+                        "- make_interval(secs => 301) "
+                        "WHERE receipt_id = :receipt_id"
+                    ),
+                    {"receipt_id": pending.receipt_id},
+                )
+                await session.commit()
+            return True
+
+        outcome = await RouletteDelivery(
+            service,
+            runtime_check=runtime_accepts,
+            payload_builder=lambda command_receipt: command_receipt.reply.body,
+        ).deliver(pending, sender, effect_check=lambda: True)
+
+        assert outcome is DeliveryOutcome.NOT_DELIVERED
+        assert sender.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Installed real handler / service / delivery GREEN proofs
+#
+# The C1 review found that "QQ runtime != None" plus always-true fakes let the
+# RED matrix pass without ever reading real authority.  These GREEN cases wire
+# the *real* installed matcher (via ``install_roulette_qq_runtime`` /
+# ``handle_roulette_qq``), a real ``RouletteCommandService`` on PostgreSQL and
+# the real QQ adapter transport (recorded, never sent), and require the installed
+# business gate to answer from the real ``recheck_qq_effect`` authority chain.
+# ---------------------------------------------------------------------------
+
+
+async def _mint_business_token(
+    current: Any,
+    message_id: str,
+) -> tuple[Any, Any, Any]:
+    from komari_bot.plugins import group_admission
+    from tests.group_admission.qq_admission_support import QQProbeBot, make_group_at
+
+    bot = QQProbeBot(self_id=current.app_id)
+    event = make_group_at(
+        content="/轮盘 开局",
+        group_openid=current.group_openid,
+        member_openid=current.member_openid,
+        message_id=message_id,
+    )
+    token = await group_admission.qualify_qq_event(bot, event)
+    assert token is not None, "the real admission chain must mint the token"
+    return token, bot, event
+
+
+@PG_REQUIRED
+async def test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid original token through the installed handler commits and sends once."""
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.komari_roulette.qq import (
+        clear_roulette_qq_runtime,
+        handle_roulette_qq,
+        install_roulette_qq_runtime,
+    )
+    from komari_bot.plugins.user_ban.service import UserBanService
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    from .tsk279_lifecycle_support import RecordingQQBot
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    # Real projector metadata: the frozen keyboard spec is part of the wire
+    # contract, so the default ``build_qq_message`` path is exercised end to end.
+    service = service_for(
+        harness,
+        projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+        random_source=CountingRandom(),
+    )
+
+    async with harness.scope("installed-green") as current:
+        numeric_group = 279101
+        member_qq = 2_000_000_000 + int(uuid4().int % 1_000_000_000)
+        await harness.binding_manager.bind_group_member(
+            app_id=current.app_id,
+            group_id=str(numeric_group),
+            group_openid=current.group_openid,
+            member_qq=str(member_qq),
+            member_openid=current.member_openid,
+            character_name="Seat 1",
+            bot_self_id="tsk279-test-bot",
+        )
+        resolve_group, resolve_member = await _real_binding_resolvers(harness)
+        ban_service = UserBanService()
+
+        async def ban_checker(member_qq_value: int, scope: object) -> bool:
+            return await ban_service.is_user_banned(
+                str(member_qq_value), cast("Any", scope)
+            )
+
+        group_admission.register_qq_group_resolver(
+            resolve_group, member_resolver=resolve_member
+        )
+        group_admission.register_qq_ban_checker(ban_checker)
+        try:
+            token, _mint_bot, event = await _mint_business_token(
+                current, "installed-green-1"
+            )
+
+            async def business_gate(_bot: Any, _event: Any, checked: Any) -> bool:
+                decision = await group_admission.recheck_qq_effect(
+                    checked, effect="business"
+                )
+                return decision.allowed
+
+            install_roulette_qq_runtime(
+                service=service,
+                business_gate=business_gate,
+                runtime_check=lambda _receipt: True,
+                send_gate=lambda _request: True,
+            )
+            try:
+                bot = RecordingQQBot(current.app_id)
+                await handle_roulette_qq(
+                    bot, event, admission_state(token=token)
+                )
+                assert await _receipt_count(
+                    harness, current, "installed-green-1"
+                ) == 1, "the installed handler must commit the domain receipt"
+                apis = [api for api, _data in bot.calls]
+                assert apis == ["post_group_messages"], (
+                    f"the installed delivery must send exactly one real SDK "
+                    f"payload, got {apis}"
+                )
+                payload = bot.calls[0][1]
+                assert payload["msg_id"] == "installed-green-1"
+                assert payload["msg_seq"] == 1
+                assert payload["markdown"].content == "冻结安全回复"
+            finally:
+                clear_roulette_qq_runtime()
+        finally:
+            group_admission.register_qq_group_resolver(None)
+            group_admission.register_qq_ban_checker(None)
+            with suppress(Exception):
+                await ban_service.unban_user(
+                    user_id=str(member_qq), target_scope="command"
+                )
+            with suppress(Exception):
+                await ban_service.close()
+
+
+@PG_REQUIRED
+async def test_installed_matcher_business_gate_reads_live_authority_for_same_token(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ban / canonical remap / policy change must each deny the minted token."""
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.komari_roulette.qq import (
+        clear_roulette_qq_runtime,
+        handle_roulette_qq,
+        install_roulette_qq_runtime,
+    )
+    from komari_bot.plugins.user_ban.service import UserBanService
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    from .tsk279_lifecycle_support import RecordingQQBot
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    service = service_for(harness, random_source=CountingRandom())
+
+    async with harness.scope("installed-authority") as current:
+        numeric_group = 279201
+        member_qq = 3_000_000_000 + int(uuid4().int % 1_000_000_000)
+        await harness.binding_manager.bind_group_member(
+            app_id=current.app_id,
+            group_id=str(numeric_group),
+            group_openid=current.group_openid,
+            member_qq=str(member_qq),
+            member_openid=current.member_openid,
+            character_name="Seat 1",
+            bot_self_id="tsk279-test-bot",
+        )
+        resolve_group, resolve_member = await _real_binding_resolvers(harness)
+        ban_service = UserBanService()
+
+        async def ban_checker(member_qq_value: int, scope: object) -> bool:
+            return await ban_service.is_user_banned(
+                str(member_qq_value), cast("Any", scope)
+            )
+
+        async def business_gate(_bot: Any, _event: Any, checked: Any) -> bool:
+            decision = await group_admission.recheck_qq_effect(
+                checked, effect="business"
+            )
+            return decision.allowed
+
+        group_admission.register_qq_group_resolver(
+            resolve_group, member_resolver=resolve_member
+        )
+        group_admission.register_qq_ban_checker(ban_checker)
+        install_roulette_qq_runtime(
+            service=service,
+            business_gate=business_gate,
+            runtime_check=lambda _receipt: True,
+            send_gate=lambda _request: True,
+        )
+        bot = RecordingQQBot(current.app_id)
+        try:
+            # 1. An applicable user ban rejects the already-minted token.
+            token_ban, _mint_bot, event_ban = await _mint_business_token(
+                current, "installed-ban-1"
+            )
+            await ban_service.ban_user(
+                user_id=str(member_qq),
+                target_scope="command",
+                operator_id="tsk279-test",
+            )
+            await handle_roulette_qq(
+                bot, event_ban, admission_state(token=token_ban)
+            )
+            await ban_service.unban_user(
+                user_id=str(member_qq), target_scope="command"
+            )
+
+            # 2. A canonical group remap rejects the same (already-minted) token.
+            token_map, _mint_bot, event_map = await _mint_business_token(
+                current, "installed-map-1"
+            )
+            async with harness.engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE komari_character_binding_groups "
+                        "SET group_id = :moved "
+                        "WHERE app_id = :app_id AND group_openid = :group"
+                    ),
+                    {
+                        "moved": str(numeric_group + 1),
+                        "app_id": current.app_id,
+                        "group": current.group_openid,
+                    },
+                )
+            await handle_roulette_qq(
+                bot, event_map, admission_state(token=token_map)
+            )
+            async with harness.engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE komari_character_binding_groups "
+                        "SET group_id = :original "
+                        "WHERE app_id = :app_id AND group_openid = :group"
+                    ),
+                    {
+                        "original": str(numeric_group),
+                        "app_id": current.app_id,
+                        "group": current.group_openid,
+                    },
+                )
+
+            # 3. A live policy revocation rejects the same (already-minted) token.
+            token_policy, _mint_bot, event_policy = await _mint_business_token(
+                current, "installed-policy-1"
+            )
+            storage.deliver(
+                stored_policy(
+                    2, {"mode": "blacklist", "group_ids": [numeric_group]}
+                )
+            )
+            await handle_roulette_qq(
+                bot, event_policy, admission_state(token=token_policy)
+            )
+            storage.deliver(
+                stored_policy(3, {"mode": "blacklist", "group_ids": []})
+            )
+
+            assert bot.calls == [], "a denied authority must never send"
+            assert await _receipt_count(harness, current, "installed-ban-1") == 0
+            assert await _receipt_count(harness, current, "installed-map-1") == 0
+            assert await _receipt_count(
+                harness, current, "installed-policy-1"
+            ) == 0
+        finally:
+            clear_roulette_qq_runtime()
+            group_admission.register_qq_group_resolver(None)
+            group_admission.register_qq_ban_checker(None)
+            with suppress(Exception):
+                await ban_service.unban_user(
+                    user_id=str(member_qq), target_scope="command"
+                )
+            with suppress(Exception):
+                await ban_service.close()
+
+
+# ---------------------------------------------------------------------------
+# Installed-path RED: the post-lock authority window through the real handler
+# ---------------------------------------------------------------------------
+
+
+@PG_REQUIRED
+async def test_installed_handler_rechecks_authority_inside_the_group_lock(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authority revoked while the installed handler waits on the group lock.
+
+    The full production path is used here (real matcher, real service, real
+    admission/binding/ban).  The handler mints a valid token, then the member is
+    banned while the domain command is queued on the group advisory lock; the
+    installed path must re-read the authority *after* the lock and produce no
+    receipt and no send.  A handler that only checks the front door fails this.
+    """
+
+    from komari_bot.plugins import group_admission
+    from komari_bot.plugins.komari_roulette.qq import (
+        clear_roulette_qq_runtime,
+        handle_roulette_qq,
+        install_roulette_qq_runtime,
+    )
+    from komari_bot.plugins.user_ban.service import UserBanService
+    from tests.group_admission.management_support import prepare_control_plane
+    from tests.group_admission.runtime_support import (
+        AdmissionStorageFake,
+        stored_policy,
+    )
+
+    from .tsk279_lifecycle_support import RecordingQQBot
+
+    storage = AdmissionStorageFake(
+        stored_policy(1, {"mode": "blacklist", "group_ids": []})
+    )
+    await prepare_control_plane(monkeypatch, storage)
+    service = service_for(
+        harness,
+        projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+        random_source=CountingRandom(),
+    )
+
+    async with harness.scope("installed-postlock") as current:
+        numeric_group = 279301
+        member_qq = 4_000_000_000 + int(uuid4().int % 1_000_000_000)
+        await harness.binding_manager.bind_group_member(
+            app_id=current.app_id,
+            group_id=str(numeric_group),
+            group_openid=current.group_openid,
+            member_qq=str(member_qq),
+            member_openid=current.member_openid,
+            character_name="Seat 1",
+            bot_self_id="tsk279-test-bot",
+        )
+        resolve_group, resolve_member = await _real_binding_resolvers(harness)
+        ban_service = UserBanService()
+
+        async def ban_checker(member_qq_value: int, scope: object) -> bool:
+            return await ban_service.is_user_banned(
+                str(member_qq_value), cast("Any", scope)
+            )
+
+        async def business_gate(_bot: Any, _event: Any, checked: Any) -> bool:
+            decision = await group_admission.recheck_qq_effect(
+                checked, effect="business"
+            )
+            return decision.allowed
+
+        group_admission.register_qq_group_resolver(
+            resolve_group, member_resolver=resolve_member
+        )
+        group_admission.register_qq_ban_checker(ban_checker)
+        install_roulette_qq_runtime(
+            service=service,
+            business_gate=business_gate,
+            runtime_check=lambda _receipt: True,
+            send_gate=lambda _request: True,
+        )
+        bot = RecordingQQBot(current.app_id)
+        try:
+            token, _mint_bot, event = await _mint_business_token(
+                current, "postlock-create-1"
+            )
+            async with harness.session_factory() as blocker:
+                await blocker.begin()
+                blocker_pid = await backend_pid(blocker)
+                await hold_group_lock(blocker, current)
+
+                async def _run_handler() -> None:
+                    await handle_roulette_qq(
+                        bot, event, admission_state(token=token)
+                    )
+
+                task = asyncio.create_task(_run_handler())
+                try:
+                    await wait_for_blocked(harness.session_factory, blocker_pid)
+                    # The authority is revoked while the command is queued.
+                    await ban_service.ban_user(
+                        user_id=str(member_qq),
+                        target_scope="command",
+                        operator_id="tsk279-test",
+                    )
+                finally:
+                    await blocker.commit()
+                async with asyncio.timeout(10):
+                    with suppress(Exception):
+                        await task
+
+            assert await _receipt_count(
+                harness, current, "postlock-create-1"
+            ) == 0, (
+                "an authority revoked while the command queued must leave no "
+                "domain receipt"
+            )
+            assert bot.calls == [], (
+                "an authority revoked while the command queued must never send"
+            )
+        finally:
+            clear_roulette_qq_runtime()
+            group_admission.register_qq_group_resolver(None)
+            group_admission.register_qq_ban_checker(None)
+            with suppress(Exception):
+                await ban_service.unban_user(
+                    user_id=str(member_qq), target_scope="command"
+                )
+            with suppress(Exception):
+                await ban_service.close()

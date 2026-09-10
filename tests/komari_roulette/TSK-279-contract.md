@@ -952,10 +952,13 @@ async def close(self) -> None
 | shutdown 先移 owned job + 清 QQ 分发、幂等 | `lifecycle::test_stop_removes_owned_jobs_and_clears_qq_runtime` | 缺 seam RED |
 | shutdown 不 dispose 共享 ORM 引擎 | `lifecycle::test_stop_never_disposes_shared_orm_engine` | 缺 seam RED |
 | shutdown 不误删其它插件 job | `lifecycle::test_stop_does_not_remove_foreign_jobs` | 缺 seam RED |
+| 配置获取失败 → 安全 failed/notready、不装 QQ、注册受控恢复入口；依赖恢复后经周期入口转 READY 并装 QQ | `lifecycle::test_start_config_acquisition_failure_is_safe_and_recovers` | 缺 seam RED |
+| owned recovery 阻塞在组锁时 stop → 有界收尾、移除 owned job、foreign job 不动、零推进 | `lifecycle::test_stop_while_owned_recovery_waits_on_group_lock_settles` | 缺 seam RED |
+| 启动阻塞于 config.initialize 时 stop → 不后置安装 QQ/不留 owned job | `lifecycle::test_stop_during_blocking_config_initialize_never_installs_later` | 缺 seam RED |
 | 已安装 service 读**实时**真实配置权重 + 开局冻结 | `lifecycle_pg::test_installed_service_reads_live_real_item_weights_and_freezes_game` | 缺 seam RED |
 | 已安装 projector 读**实时**真实文案池 + receipt 冻结 | `lifecycle_pg::test_installed_service_reads_live_real_copy_pool_and_freezes_receipt` | 缺 seam RED |
 | 已安装 04:00 cron 一次 run 消费多批积压 | `lifecycle_pg::test_installed_cron_callback_drains_multi_batch_backlog` | 缺 seam RED |
-| 维护准入 canonical app/group→数字群 + admission，绝不用业务开关 | `lifecycle_pg::test_maintenance_admission_is_canonical_and_ignores_business_switch` | 缺 seam RED |
+| 维护准入 canonical app/group→数字群 + 真实 admission，绝不用业务开关 | `lifecycle_pg::test_maintenance_admission_is_canonical_and_ignores_business_switch` | 缺 seam RED（驱动真实 `advance_due`，不再读私有 `_admission`） |
 | `maintenance.close` 有界等待在途清理轮次 | `lifecycle_pg::test_maintenance_close_waits_for_the_in_flight_cleanup_round` | **业务断言 RED** |
 | stop 后无 roulette job | `lifecycle_pg::test_stop_after_start_leaves_no_roulette_jobs` | 缺 seam RED |
 | `execute_group_command` 接受 per-call `effect_check` | `effect::test_execute_group_command_exposes_effect_check_keyword` | 缺签名 RED |
@@ -968,25 +971,37 @@ async def close(self) -> None
 | `deliver` 接受 per-call `effect_check` | `effect::test_delivery_exposes_per_call_effect_check_keyword` | 缺签名 RED |
 | claim 后 False → NOT_DELIVERED + 零网络 | `effect::test_delivery_post_claim_check_blocks_network_as_not_delivered` | 缺签名 RED |
 | 锁内等待期间撤权 → 拒绝且不推进 | `effect::test_delivery_variant_effect_rejected_after_lock_wait` | 缺签名 RED |
+| 旧 API 权威链 mint/verify/ban/remap/policy 同一 token 放行后逐一拒绝 | `effect::test_old_api_authority_chain_allows_then_rejects_the_same_token` | **GREEN 探针（不依赖 lifecycle）** |
+| 真实 delivery `runtime_check` 通过但 PG 窗口过期 → NOT_DELIVERED 零网络 | `effect::test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends` | **GREEN 探针（不依赖 lifecycle）** |
+| 已接受的 claim 后 `effect_check` 不得绕过 PG 窗口 | `effect::test_real_delivery_accepted_effect_check_still_honours_expired_window` | 缺签名 RED |
+| 已安装真实 handler/service 提交有效 token 并产出真实 SDK 载荷 | `effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload` | **GREEN 探针（不依赖 lifecycle）** |
+| 已安装真实 handler 的 business gate 对 ban/remap/policy 逐一拒绝同一 token | `effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token` | **GREEN 探针（不依赖 lifecycle）** |
+| 已安装真实 handler 在组锁内复核撤权 → 零 receipt/零发送 | `effect::test_installed_handler_rechecks_authority_inside_the_group_lock` | **业务断言 RED（缺锁后 effect 复核）** |
 
-### 13.3 RED 分类（本阶段实测，均为设计内）
+### 13.3 RED / GREEN 分类（Stage-C1 返工后实测：29 failed / 4 passed）
 
 | 桶 | 用例 | 实测首错 |
 |---|---|---|
-| 缺 seam（lifecycle 模块不存在） | 8 个 lifecycle + 6 个 lifecycle_pg | `AssertionError: 生产未注册恰一个 … startup hook，实际 0` / `ModuleNotFoundError`/`AttributeError` |
-| 缺签名（`effect_check`） | `effect::…exposes_effect_check_keyword`、`…is_evaluated_only_after…`、`…propagates_storage_errors`、`delivery::…exposes…`、`delivery::…blocks_network…`、`delivery_variant…` | `TypeError: … got an unexpected keyword argument 'effect_check'` / `AssertionError: 'effect_check' in mappingproxy(...)` |
+| 缺 seam（lifecycle 模块不存在） | 11 个 `lifecycle::*` + 6 个 `lifecycle_pg::*` | `AssertionError: 生产未注册恰一个 komari_roulette driver startup hook，实际 0` / `ModuleNotFoundError`/`AttributeError` |
+| 缺签名（`effect_check`） | `effect::…exposes_effect_check_keyword`、`…is_evaluated_only_after…`、`…propagates_storage_errors`、`delivery::…exposes…`、`delivery::…blocks_network…`、`delivery_variant…`、`installed::…accepted_effect_check_still_honours_expired_window` | `TypeError: … got an unexpected keyword argument 'effect_check'` / `AssertionError: 'effect_check' in mappingproxy(...)` |
 | 缺符号（`EffectCheckRejectedError`） | `…leaves_zero_effects`、`handler::…silently_absorbs…` | `ImportError: cannot import name 'EffectCheckRejectedError'` |
 | 业务断言（handler 未传 per-call closure） | `handler::…original_token_closure…`、`concurrent_handlers…` | `AssertionError: the handler must pass the per-call effect_check to the service / each handler call must pass its own post-lock closure` |
+| 业务断言（已安装 handler 缺锁后复核） | `installed::test_installed_handler_rechecks_authority_inside_the_group_lock` | `AssertionError: an authority revoked while the command queued must leave no domain receipt`（receipt 被提交） |
 | 业务断言（`maintenance.close` 立即返回） | `lifecycle_pg::test_maintenance_close_waits_for_the_in_flight_cleanup_round` | `AssertionError: maintenance.close() must wait for the in-flight cleanup round instead of returning immediately`（`assert not True`） |
+| **GREEN（不依赖 lifecycle 的真实旧 API 探针）** | `effect::test_old_api_authority_chain…`、`effect::test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends`、`effect::test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload`、`effect::test_installed_matcher_business_gate_reads_live_authority_for_same_token` | ✅ 4 passed（真实 `AdmissionRuntime` + 真实 `BindingTransaction` + 真实 `user_ban` + 真实 `RouletteCommandService`/`RouletteDelivery` + 真实 QQ adapter 传输录制） |
 
 未使用 `fakeSender`/import error 单独宣称任一 AC 通过；缺 seam 用例在被测符号存在
-后才会执行真实业务断言。
+后才会执行真实业务断言。四条 GREEN 均不依赖 `lifecycle` 模块，证明 C1 不是靠
+「`QQruntime != None` + 全 true 门」才能通过。
 
 ### 13.4 本阶段未验证（保留给后续修复轮）
 
-- 真实 `group_admission` 运行时 READY 时的端到端「维护准入放行 → 到期对局推进」
-  路径（本阶段用受控 `adjudicate` 证明 canonical 数字群翻译与不使用业务开关；
-  群准入快照就绪属 `group_admission` 自身套件）。
+- 真实 `group_admission` READY 时的端到端「维护准入放行 → 到期对局推进」在
+  **已安装 lifecycle** 上的完整闭环仍未验证：`test_maintenance_admission_is_canonical_and_ignores_business_switch`
+  已改为驱动真实 `app.maintenance.advance_due` + 真实 admission worker（删除私有
+  `_admission` 与 `adjudicate` monkeypatch），但当前首错仍是缺 `lifecycle` seam；
+  该 AC 精确态为「已冻结、待实现后真实运行」，不得据本阶段任何一轮宣称通过。
+  （真实 admission READY 的旧 API 链已由不依赖 lifecycle 的 GREEN 探针单独覆盖。）
 - `runtime` 在 `failed>0` tick 上 FAILED 的装配层证据（Stage-B 已在端口层覆盖，
   本阶段不重复）。
 - 真实进程 `on_startup`/`on_shutdown` 被 NoneBot Driver 调用的顺序（本阶段直接
@@ -996,8 +1011,7 @@ async def close(self) -> None
 ### 13.5 执行记录（命令日志）
 
 环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
-branch `pi/TSK-279-runtime-recovery`，HEAD `8a4483b8733dfd95f026ad5803586baaa1a66788`
-（base `bc4b1cc`），root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`
+branch `pi/TSK-279-runtime-recovery`，root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`
 （3.13.11）。PG/Redis 门控：
 
 ```
@@ -1009,6 +1023,78 @@ KOMARI_TEST_REDIS_URL=redis://127.0.0.1:56358/15
 | 命令 | 结果 |
 |------|------|
 | `ruff check tests/komari_roulette/` | ✅ All checks passed |
-| `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控） | 1 passed / 24 failed（全部设计内 RED；1 passed 为 lifecycle 模块路径冻结探针） |
+| `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控，C1 初版：baseline `8a4483b` + 当时**未提交**的 C1 测试 diff，后提交为 `9592c74`） | 1 passed / 24 failed（全部设计内 RED；1 passed 为后来删除的 tautological `test_lifecycle_module_path_is_frozen`） |
 | `pytest .../test_tsk279_runtime.py .../test_tsk279_maintenance_pg.py .../test_tsk279_observability.py -q`（带门控，改后回归） | ✅ 62 passed / 0 failed |
-| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python` | 7 errors，全部为设计内 `effect_check`/`EffectCheckRejectedError` 缺签名 RED；lifecycle 文件 0 报错 |
+| `pytest .../test_tsk279_lifecycle.py .../test_tsk279_lifecycle_pg.py .../test_tsk279_effect_recheck_pg.py -q`（带门控，C1 返工后，HEAD `9592c74`） | 4 passed / 29 failed（4 GREEN 旧 API 探针；29 缺 seam/签名/符号/业务断言 RED，详见 §13.6） |
+| `ruff check tests/komari_roulette/`（C1 返工后） | ✅ All checks passed |
+| `pyright --pythonpath /Users/derbay32/project/komari-bot/.venv/bin/python`（C1 初版） | 7 errors，全部为设计内 `effect_check`/`EffectCheckRejectedError` 缺签名 RED；lifecycle 文件 0 报错 |
+
+> 证据口径：本阶段生产基线是 `8a4483b`；C1 测试文件在 `8a4483b` 时只是工作区
+> **未提交** diff，随后才提交为 `9592c7`（`9592c74`）。因此不能把裸 `8a4483b`
+> 当“含 C1 代码”的证据，也不能把 `9592c7` 当生产实现证据——`9592c7` 仅新增
+> 测试文件，生产代码仍停在 `8a4483b`。
+
+### 13.6 C1 测试基线返工（2026-09-11，审查响应）
+
+触发：C1 初版存在四个可被“全 true 门”蒙混的漏洞——(1) 唯一通过的用例是
+常量自比较 `test_lifecycle_module_path_is_frozen`；(2) 工作区残留一次性探针
+`.pyc`；(3) 持久 GREEN 全部依赖 lifecycle seam，无法证明已交付的旧 API 权威链
+真的可用；(4) 维护准入用例读取私有 `app.maintenance._admission` 并 monkeypatch
+`adjudicate`；(5) 核心 RED 全部由 `_FakeService`/`_RecordingService` 闭包捕获，
+只要 `QQruntime != None` 且三个门恒真即可通过。
+
+本轮只改测试（生产代码未动，仍停在 `8a4483b`）：
+
+1. **删除 tautology**：移除 `test_lifecycle_module_path_is_frozen`（常量自比较，
+   零信息）及其未使用的 `LIFECYCLE_MODULE` 导入。
+2. **删除工作区残留探针**：`tests/komari_roulette/__pycache__/test_tsk279_c1_probe_tmp.cpython-313-pytest-9.1.1.pyc`
+   是 Scratch-then-delete 探针的产物（无对应 `.py` 源，已确认）。以后所有探针
+   直接写进允许的 C1 测试文件，不再走临时文件。
+3. **新增 4 条不依赖 lifecycle 的持久 GREEN 探针**（真实服务/PG/协议，禁
+   monkeypatch `recheck`/`adjudicate`/`is_banned` 返回布尔）：
+   - `test_old_api_authority_chain_allows_then_rejects_the_same_token`：真实
+     `AdmissionRuntime` + `qualify_qq_event`/`recheck_qq_effect` + 真实
+     `BindingTransaction.resolve_group/resolve_member` + 真实 `UserBanService`；
+     同一原始 token 依次：放行 → ban 拒绝（`user_banned`）→ 解封放行 →
+     canonical 群重映射拒绝（`scope_mismatch`）→ policy 撤销拒绝
+     （`policy_restricted`）。回调在 `finally` 显式 `register_*(None)` 复位
+     （`registry_isolation_context` 不保存 `group_admission._callbacks`）。
+   - `test_real_delivery_true_runtime_check_with_expired_pg_window_never_sends`：
+     真实 `RouletteDelivery`，`runtime_check` 接受、PG 窗口过期 → `NOT_DELIVERED`、
+     零网络、落库状态 `NOT_DELIVERED`。
+   - `test_installed_matcher_commits_valid_token_and_captures_real_sdk_payload`：
+     真实 `install_roulette_qq_runtime` + 真实 `handle_roulette_qq` + 真实
+     `RouletteCommandService` + 真实 QQ `Bot`（`RecordingQQBot.call_api` 录制
+     `post_group_messages`，零网络）；断言 receipt 提交且 SDK 载荷
+     `msg_id`/`msg_seq`/markdown 正文正确。
+   - `test_installed_matcher_business_gate_reads_live_authority_for_same_token`：
+     已安装 handler 的 business gate 对同一 token 在 ban / canonical 重映射 /
+     policy 撤销后均拒绝：零 receipt、零发送。
+4. **新增 1 条已安装路径 RED**：`test_installed_handler_rechecks_authority_inside_the_group_lock`
+   ——真实 handler/service/admission/binding/ban，成员在命令排队等组锁时被封禁；
+   要求组锁内复核后零 receipt、零发送。当前失败于 receipt 被提交（缺锁后复核）。
+5. **旧 API＋PG 窗口 RED**：`test_real_delivery_accepted_effect_check_still_honours_expired_window`
+   ——即使 claim 后 `effect_check` 接受，仍必须遵守 PG 窗口（缺 `effect_check` 签名即 RED）。
+6. **依赖获取/生命周期竞态 RED（lifecycle）**：
+   - `test_start_config_acquisition_failure_is_safe_and_recovers`：配置获取失败 →
+     不装 QQ、保留安全 failed/disabled gate 与受控周期恢复入口；依赖恢复后经该
+     入口（非手动重装）转 READY 并安装 QQ。不错误断言“失败即无 job/runtime”。
+   - `test_stop_while_owned_recovery_waits_on_group_lock_settles`：owned recovery
+     回调阻塞在组锁时 stop → 有界收尾、移除 owned job、清 QQ 分发、foreign job
+     不动、被排队效果零推进。
+   - `test_stop_during_blocking_config_initialize_never_installs_later`：startup
+     阻塞在 `initialize_async` 时 stop → 释放后不后置安装 QQ、不留 owned job。
+   - 新增 `BlockingConfig`（`TogglableConfig` 子类，`initialize_async` 以
+     `asyncio.Event` 阻塞）。
+7. **维护准入用例去私有化**：`test_maintenance_admission_is_canonical_and_ignores_business_switch`
+   改为驱动真实 `app.maintenance.advance_due()`（真实 `group_admission` +
+   `prepare_control_plane` + 真实 canonical 绑定）：业务开关关闭时仍放行推进，
+   policy 撤销后不推进；删除 `_admission` 私有属性访问与 `adjudicate` fake。
+8. **共享引擎 spy 收敛**：`test_stop_never_disposes_shared_orm_engine` 只断言
+   `id(shared_engine) not in dispose_calls`，避免把测试自身 engine 清理误判为
+   生产 dispose。
+
+边界与风险：`group_admission` 的注册回调是进程级模块全局，用例在 `finally`
+显式复位；`prepare_control_plane` 的 watcher 任务随 monkeypatch 撤销，测试内不做
+手动 `runtime.close()`（沿用既有 group_admission 测试约定）。维护准入用例仍以缺
+`lifecycle` seam 为首错，属“已冻结、待实现后真实运行”，本轮不宣称该 AC 通过。

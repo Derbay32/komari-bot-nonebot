@@ -31,6 +31,9 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from nonebot import get_driver
+from nonebot.adapters.qq import Bot as QQBot
+from nonebot.adapters.qq.adapter import Adapter as QQAdapter
+from nonebot.adapters.qq.config import BotInfo, Intents
 
 from tests.group_admission.registry_isolation_support import (
     registry_isolation_context,
@@ -59,6 +62,7 @@ __all__ = [
     "PACKAGE",
     "QQ_MODULE",
     "FakeScheduler",
+    "RecordingQQBot",
     "application_api",
     "delete_roulette_config",
     "invoke_hook",
@@ -66,6 +70,43 @@ __all__ = [
     "require_single_shutdown_hook",
     "require_single_startup_hook",
 ]
+
+
+class RecordingQQBot(QQBot):
+    """Real QQ ``Bot`` whose ``call_api`` records the SDK payload, never sends.
+
+    The delivery's `sender.send_to_group` is the adapter method, so this keeps
+    the whole production delivery path (message build, claim, recheck, window)
+    intact while intercepting the transport: the platform is never touched and
+    the exact ``post_group_messages`` payload is observable.
+    """
+
+    def __init__(
+        self,
+        self_id: str,
+        *,
+        platform_message_id: str | None = "qq-platform-1",
+    ) -> None:
+        adapter = QQAdapter.__new__(QQAdapter)
+        super().__init__(
+            adapter,
+            self_id,
+            BotInfo(
+                id=self_id,
+                token="test-token",
+                secret="test-secret",
+                intent=Intents(c2c_group_at_messages=True),
+                use_websocket=False,
+            ),
+        )
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.platform_message_id = platform_message_id
+
+    async def call_api(self, api: str, **data: Any) -> Any:
+        self.calls.append((api, data))
+        if self.platform_message_id is None:
+            return None
+        return SimpleNamespace(id=self.platform_message_id)
 
 
 class FakeScheduler:
