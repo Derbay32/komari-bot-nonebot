@@ -24,7 +24,9 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0020"
+HEAD = "0021"
+#: 历史 0020 收据/履约迁移，保留其专属源文本断言（不被新 head 0021 覆盖）。
+RECEIPT_REVISION = "0020"
 RECEIPT_TABLE = "komari_roulette_command_receipts"
 FULFILLMENT_TABLE = "komari_roulette_fulfillments"
 PG_REQUIRED = pytest.mark.skipif(
@@ -44,7 +46,7 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_0020_does_not_reuse_chat_reply_outbox() -> None:
-    revision = script_directory().get_revision(HEAD)
+    revision = script_directory().get_revision(RECEIPT_REVISION)
     assert revision is not None
     text = Path(revision.path).read_text()
     assert "komari_chat_reply_outbox" not in text
