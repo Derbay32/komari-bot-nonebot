@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -198,7 +198,11 @@ def test_repair_confirm_audit_context_is_frozen_dataclass_with_fixed_fields() ->
     context_type: Any = getattr(repair, "RepairConfirmAuditContext", None)
     assert context_type is not None, "缺少 RepairConfirmAuditContext"
     assert is_dataclass(context_type)
-    assert getattr(context_type, "__dataclass_params__").frozen is True
+    # ``is_dataclass`` 会把 ``context_type`` 收窄为不含运行期 dunder 的
+    # ``DataclassInstance``；用显式 ``Any`` 引用直接读取 ``__dataclass_params__``，
+    # 既避免 getattr 字面量（B009）又不触发 pyright 属性未知告警。
+    params = cast("Any", context_type).__dataclass_params__
+    assert params.frozen is True
     assert [field.name for field in fields(context_type)] == [
         "scope",
         "member_openid",

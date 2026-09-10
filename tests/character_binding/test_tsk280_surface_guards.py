@@ -176,21 +176,97 @@ def test_repair_module_does_not_evade_roulette_dependency_with_dynamic_import() 
     assert not dynamic_imports, "\n".join(dynamic_imports)
 
 
+_BINDING_LIFECYCLE_FUNCTIONS = ("init_plugin", "close_plugin")
+_GUARDED_REPAIR_SERVICE_SYMBOLS = (
+    "BindingRepairService",
+    "get_binding_repair_service",
+    "set_binding_repair_service",
+)
+
+
+def _joined_string_literal(node: ast.AST) -> str | None:
+    """在 AST 上静态还原字符串常量（含 ``+`` 拼接），封死拼接绕规则。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _joined_string_literal(node.left)
+        right = _joined_string_literal(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _binding_lifecycle_repair_service_references(tree: ast.Module) -> list[str]:
+    """绑定生命周期函数体内对修复服务符号的引用或字符串拼接访问。
+
+    只检查 ``init_plugin`` / ``close_plugin`` 函数体：顶层 import 与 ``__all__``
+    公开导出是跨插件边界要求的合法暴露面，不属于反向依赖。
+    """
+    lifecycle = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    violations: list[str] = []
+    for function_name in _BINDING_LIFECYCLE_FUNCTIONS:
+        function = lifecycle.get(function_name)
+        if function is None:
+            violations.append(f"缺少绑定生命周期函数: {function_name}")
+            continue
+        for node in ast.walk(function):
+            if isinstance(node, ast.Name):
+                if node.id in _GUARDED_REPAIR_SERVICE_SYMBOLS:
+                    violations.append(f"{function_name}: 引用 {node.id}")
+            elif isinstance(node, ast.Attribute):
+                if node.attr in _GUARDED_REPAIR_SERVICE_SYMBOLS:
+                    violations.append(f"{function_name}: 属性访问 {node.attr}")
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+            ):
+                for argument in node.args[1:]:
+                    text = _joined_string_literal(argument)
+                    if text is not None and any(
+                        symbol in text for symbol in _GUARDED_REPAIR_SERVICE_SYMBOLS
+                    ):
+                        violations.append(
+                            f"{function_name}: getattr 拼接访问 {text!r}"
+                        )
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                text = _joined_string_literal(node)
+                if text is not None and any(
+                    symbol in text for symbol in _GUARDED_REPAIR_SERVICE_SYMBOLS
+                ):
+                    violations.append(f"{function_name}: 字符串拼接 {text!r}")
+    return violations
+
+
 def test_repair_service_lifecycle_is_owned_by_management_assembly() -> None:
     """修复服务生命周期由管理装配负责（创建注入真实 game_state_reader 并关闭）；
-    character_binding 旧生命周期不得持有这反向依赖。"""
-    binding_init = (
-        PROJECT_ROOT / "komari_bot" / "plugins" / "character_binding" / "__init__.py"
-    ).read_text(encoding="utf-8")
-    management_root = PROJECT_ROOT / "komari_bot" / "plugins" / "komari_management"
+    character_binding 旧生命周期不得创建/关闭这反向依赖的服务。
+
+    顶层 import 与 ``__all__`` 公开导出是跨插件边界要求，不在禁止范围内；
+    只有 ``init_plugin`` / ``close_plugin`` 函数体内的直接引用或字符串拼接访问
+    属于违规。
+    """
+    binding_tree = ast.parse(
+        (BINDING_ROOT / "__init__.py").read_text(encoding="utf-8")
+    )
     management_source = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(management_root.rglob("*.py"))
+        for path in sorted(MANAGEMENT_ROOT.rglob("*.py"))
     )
 
-    # 绑定插件生命周期不再创建/关闭修复服务。
-    assert "BindingRepairService(" not in binding_init
-    assert "set_binding_repair_service" not in binding_init
+    # 绑定插件生命周期不再创建/关闭修复服务：AST 只检查 init/close 函数体，
+    # 顶层公开 export 不受影响，字符串拼接也不能绕过。
+    violations = _binding_lifecycle_repair_service_references(binding_tree)
+    assert not violations, "\n".join(violations)
+    # 顶层公开面仍必须导出修复服务符号（与深 import 守卫一致）。
+    binding_exports = _module_all_exports(BINDING_ROOT / "__init__.py")
+    assert "BindingRepairService" in binding_exports
+    assert "set_binding_repair_service" in binding_exports
+
     # 管理装配创建修复服务并注入真实 game_state_reader。
     assert "BindingRepairService(" in management_source
     assert "game_state_reader=" in management_source

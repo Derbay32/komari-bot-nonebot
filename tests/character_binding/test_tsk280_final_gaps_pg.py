@@ -142,6 +142,14 @@ def _confirm_events(
     ]
 
 
+def _confirm_events_for(
+    events: list[ManagementAuditEvent],
+    request_id: str,
+) -> list[ManagementAuditEvent]:
+    """按 request ID 取 confirm 审计事件：每次尝试各记 started + result。"""
+    return [event for event in _confirm_events(events) if event.request_id == request_id]
+
+
 def _only(events: list[ManagementAuditEvent], outcome: str) -> ManagementAuditEvent:
     matches = [event for event in events if event.outcome == outcome]
     assert len(matches) == 1, [event.outcome for event in events]
@@ -525,10 +533,16 @@ async def test_committed_member_delete_survives_refresh_failure(
     # 提交已确定：不得因 refresh 失败回报 503/failed。
     assert confirm.status_code == 200
     assert confirm.json()["cleared_count"] == 1
-    outcomes = [event.outcome for event in _confirm_events(audit_events)]
-    assert outcomes == ["started", "succeeded"]
-    # 令牌重试不重复删除也不报存储失败。
+    # 每次确认尝试各记一条 started + 一条 succeeded/failed：首次确认成功，
+    # 已消耗令牌的重试仍必须留下可审计的 started/failed 记录。
+    first_confirm = _confirm_events_for(audit_events, "final-cache-member-confirm")
+    assert [event.outcome for event in first_confirm] == ["started", "succeeded"]
+    assert _only(first_confirm, "succeeded").metadata["cleared_count"] == 1
+    # 令牌重试不重复删除也不报存储失败，但重试尝试仍得审计。
     assert retry.status_code == 422
+    retry_events = _confirm_events_for(audit_events, "final-cache-member-retry")
+    assert [event.outcome for event in retry_events] == ["started", "failed"]
+    assert _only(retry_events, "failed").status_code == 422
 
     # 正式库：仅目标成员行被删，群映射与另一成员保留。
     assert await group_binding_rows(harness.engine, current) == 1
@@ -629,9 +643,13 @@ async def test_committed_group_delete_survives_refresh_failure(
     assert preview.status_code == 200
     assert confirm.status_code == 200
     assert confirm.json()["cleared_count"] == 2
-    outcomes = [event.outcome for event in _confirm_events(audit_events)]
-    assert outcomes == ["started", "succeeded"]
+    first_confirm = _confirm_events_for(audit_events, "final-cache-group-confirm")
+    assert [event.outcome for event in first_confirm] == ["started", "succeeded"]
+    assert _only(first_confirm, "succeeded").metadata["cleared_count"] == 2
     assert retry.status_code == 422
+    retry_events = _confirm_events_for(audit_events, "final-cache-group-retry")
+    assert [event.outcome for event in retry_events] == ["started", "failed"]
+    assert _only(retry_events, "failed").status_code == 422
 
     assert await group_binding_rows(harness.engine, current) == 0
     assert await group_mapping_rows(harness.engine, current) == 0
