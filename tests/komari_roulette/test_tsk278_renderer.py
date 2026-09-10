@@ -13,12 +13,12 @@ import json
 from typing import Any
 
 import pytest
-from komari_bot.plugins.komari_roulette.qq.renderer import render_reply
 
 from komari_bot.plugins.komari_roulette import (
     ReplyProjection,
     ReplyProjectionContext,
 )
+from komari_bot.plugins.komari_roulette.qq.renderer import render_reply
 
 from .tsk278_support import (
     assert_body_has_markdown_structure,
@@ -31,6 +31,21 @@ from .tsk278_support import (
     mention_tag_position,
     player,
 )
+
+
+def _keyboard_spec(rendered: ReplyProjection) -> dict[str, Any]:
+    """Narrow the frozen ``metadata["keyboard"]`` scalar to a JSON object."""
+    spec = rendered.metadata.get("keyboard")
+    if not isinstance(spec, str):
+        raise TypeError(  # noqa: TRY003
+            f"keyboard spec must be a JSON string, got {type(spec).__name__}"
+        )
+    parsed = json.loads(spec)
+    if not isinstance(parsed, dict):
+        raise TypeError(  # noqa: TRY003
+            f"keyboard spec must be a JSON object, got {type(parsed).__name__}"
+        )
+    return parsed
 
 
 def _roster() -> tuple[Any, ...]:
@@ -308,7 +323,7 @@ def test_final_mentions_winner_once_with_metadata_pair() -> None:
     assert metadata.get("mention_display_name") == "小明"
     assert len([k for k in metadata if k.startswith("mention_")]) == 2
     # 终局无按钮。
-    assert json.loads(metadata["keyboard"])["rows"] == []
+    assert _keyboard_spec(rendered)["rows"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +350,7 @@ def test_leaderboard_no_winners_copy() -> None:
     body = rendered.body
     assert body == "本群还没有俄罗斯轮盘胜者。"
     assert_no_mention_tag(body)
-    assert json.loads(rendered.metadata["keyboard"])["rows"] == []
+    assert _keyboard_spec(rendered)["rows"] == []
 
 
 def test_leaderboard_shows_top_10_and_total_all_winners() -> None:
@@ -394,25 +409,120 @@ def test_leaderboard_frozen_name_with_colon_rsplits_last_colon() -> None:
 
 
 def test_leaderboard_timeout_result_suppresses_leaderboard() -> None:
-    # TSK-266 10.2：排行榜查询推进查询者自己到期 → 返回超时结果而非排行榜。
-    # 服务层（真实 PG 测试）保证该场景 result_code=turn_expired；渲染层此时
-    # 必须输出固定超时文案，不得渲染排行榜。
+    # TSK-266 10.2：排行榜查询推进查询者自己到期 → 服务层返回 turn_expired。
+    # TSK-266 11.3：超时淘汰已提交，固定超时提示后必须附上轮转/终局消息，
+    # 渲染层因此不得输出单句正文，更不能追加排行榜。
     base = context(
         result_code="turn_expired",
         lifecycle="active",
-        phase="follow_up",
+        phase="first_shot",
         details={"eliminated_reason": "timeout"},
-        players=_roster(),
+        players=(
+            player(1, name="小明", alive=False),
+            player(2, name="小红"),
+            player(3, name="小白"),
+        ),
+        actor_member_openid="member-1",
         current_player=player(2, name="小红"),
         mention_target=None,
         mention_reason=None,
-        view=game_view(remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
+        view=game_view(
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+        ),
     )
     rendered = render_reply(base)
     body = rendered.body
-    assert body == "你的行动时间已经结束，本次命令未执行。"
+    fixed = "你的行动时间已经结束，本次命令未执行。"
+    assert body.startswith(fixed), body
     assert "排行榜" not in body
+    # 固定提示之后是新权威局面（当前玩家 / 弹仓 / 名单）。
+    assert "**当前：小红**" in body
+    assert "弹仓：**4/6**｜实弹 **1**｜空弹 **3**｜中弹概率 **25%**" in body
+    assert "- 小明｜出局｜道具 0" in body
+    assert "- 小白｜存活｜道具 0" in body
+    assert_no_player_numbers(body, 1, 2, 3)
     assert_no_mention_tag(body)
+
+
+def test_turn_expired_active_renders_fixed_notice_then_rotation() -> None:
+    """TSK-266 11.3: 进行中的超时是固定提示 + 轮转消息（不是只有一句话）。
+
+    3 名玩家、淘汰当前玩家后仍有 2 人存活 → 提交的超时是轮转而非终局。
+    """
+    next_player = player(2, name="小红")
+    base = context(
+        result_code="turn_expired",
+        lifecycle="active",
+        phase="first_shot",
+        details={"eliminated_reason": "timeout"},
+        players=(
+            player(1, name="小明", alive=False),
+            next_player,
+            player(3, name="小白"),
+        ),
+        actor_member_openid="member-1",
+        current_player=next_player,
+        mention_target=None,
+        mention_reason=None,
+        view=game_view(
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+        ),
+    )
+    rendered = render_reply(base)
+    body = rendered.body
+
+    assert body.startswith("你的行动时间已经结束，本次命令未执行。"), body
+    assert "排行榜" not in body
+    assert "**当前：小红**" in body
+    assert "弹仓：**4/6**｜实弹 **1**｜空弹 **3**｜中弹概率 **25%**" in body
+    assert "- 小明｜出局｜道具 0" in body
+    assert "- **小红**｜当前｜道具 0" in body
+    assert "- 小白｜存活｜道具 0" in body
+    assert_no_player_numbers(body, 1, 2, 3)
+    # 11.3 只批准“固定提示 + 轮转”；提醒策略（8.2 候选）尚未人工通过，
+    # 本上下文不提供提及目标，渲染层不得凭空生成出站 mention。
+    assert_no_mention_tag(body)
+
+
+def test_turn_expired_completed_renders_fixed_notice_then_final() -> None:
+    """TSK-266 11.3: 超时淘汰即终局时，固定提示后附上终局文案。"""
+    winner = player(2, name="小红")
+    base = context(
+        result_code="turn_expired",
+        lifecycle="completed",
+        phase=None,
+        details={
+            "completion_reason": "timeout",
+            "winner_seq": 2,
+            "eliminated_reason": "timeout",
+        },
+        winner=winner,
+        winner_group_wins=4,
+        mention_target=winner,
+        mention_reason="winner",
+        players=(player(1, name="小明", alive=False), winner),
+        actor_member_openid="member-1",
+        view=game_view(
+            remaining_total=0,
+            remaining_live=0,
+            remaining_blank=0,
+            hit_percent=None,
+        ),
+    )
+    rendered = render_reply(base)
+    body = rendered.body
+
+    assert body.startswith("你的行动时间已经结束，本次命令未执行。"), body
+    assert "超时出局" in body
+    assert "小红" in body
+    assert "累计胜场 4" in body
+    assert_single_mention_tag(body, "member-2")
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +720,6 @@ FIXED_ERROR_CASES: list[tuple[str, str, dict[str, Any]]] = [
     ("not_participant", "你不是当前游戏的参与者。", {}),
     ("player_eliminated", "你已经出局，不能再操作这局游戏。", {}),
     ("not_current_player", "现在不是你的回合。", {}),
-    ("turn_expired", "你的行动时间已经结束，本次命令未执行。", {}),
     ("state_conflict", "局面刚刚发生变化，本次操作未执行。请根据机器人最新回复重新操作。", {}),
     ("action_not_allowed_in_phase", "当前阶段不能执行这个操作。", {}),
     ("locked_turn_restriction", "你本回合受到锁限制，只能执行一次开枪命令或弃权。", {}),
@@ -693,7 +802,7 @@ def test_error_reply_is_fixed_text_without_state(
     assert_no_member_openid(body, "member-1", "member-2", "member-3", "member-9")
     metadata = dict(rendered.metadata)
     assert not [k for k in metadata if k.startswith("mention_")], metadata
-    assert json.loads(metadata["keyboard"])["rows"] == []
+    assert _keyboard_spec(rendered)["rows"] == []
 
 
 def test_error_never_echoes_raw_input() -> None:

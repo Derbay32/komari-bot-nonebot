@@ -216,6 +216,21 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
 | `item_precondition_failed` | `beer_blocked_by_burst` | 手枪处于待连发状态，不能使用啤酒。 |
 | `no_pending_item_choice` | - | 当前没有需要处理的道具奖励。 |
 
+**超时与等候结束的补充边界**（TSK-266 11.3 / 1G；测试按逐字或前缀断言）：
+
+- `turn_expired` 在固定错误表里是单句文案，但**进行中（`lifecycle=active`）的超时是既定例外**：
+  超时淘汰已经提交，同一条回复在固定提示后附上**轮转或终局**消息（布局按本节“完整
+  Markdown 结构”的普通动作/终局规则），不得只剩一句；迟到的原命令仍不执行。终局超时
+  （`lifecycle=completed`）为固定提示＋单段终局文案。
+- 等候局结束（`lifecycle=cancelled` + `result_code=cancelled`）有三类定稿文案（TSK-266 1G；
+  评论 16 去编号后的最终形态）：
+  - 局主取消：`{冻结显示名}取消了这局游戏，等候中的玩家已经全部离席。`
+  - 最后一名玩家退出：`{冻结显示名}离开后，等候局已自动结束。`
+  - 等候超时：`这局游戏等待太久仍未开始，现已自动结束。`（`waiting_game_expired`）
+- **开始后使用“退出”**（`game_already_started` + `intent=leave`）使用专属文案
+  `游戏已经开始，“退出”只用于等候阶段；主动离开请使用 @Bot /轮盘 弃权。`；其它带
+  同一码的等候阵容操作（加入/转让等）仍用通用文案 `游戏已经开始，无法再改变等候阵容。`
+
 ## 5. keyboard 契约
 
 - `build_keyboard(context: ReplyProjectionContext) -> str`：纯函数，把冻结投影布局为
@@ -243,6 +258,11 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
     `'{"rows": []}'`）。规范 spec 恒为 JSON 对象 `{"rows": [...]}`；本票无历史数据/
     兼容要求，`keyboard_from_spec`/`build_real_keyboard` **不接受裸 `[]` 形式**（无
     历史宽容回退），`render_reply` 输出恒为对象形式。
+  - **零按钮 spec 不产生 keyboard 段**：spec 的 `rows` 为空时交付载荷只有
+    `MessageSegment.markdown(...)`，绝不发送 `MessageSegment.keyboard(rows=[])`
+    （无按钮 ≠ 空键盘字段；覆盖 TSK-266 评论 40/41 的“无键盘时…”与评论 81 验收
+    记录的“无引用、无键盘”）。`RouletteDelivery` 用 `has_keyboard_segment` 断言时，任何
+    空按钮载荷必须只含 markdown 段。
   - 按钮标签不截断昵称、不把冻结姓名/编号塞进短标签。
 - 覆盖评论按 `6a9e6ce3`（等候转让）、`6a9bc5dd`（1H 尺寸）、`6a9c5988`（排行榜）定稿。
 
@@ -253,8 +273,9 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
 是真实枚举 `DELIVERED | NOT_DELIVERED | UNKNOWN | NO_CLAIM`；`SendNotAcceptedError`
 是 sender 明确"发送前/未被接受"失败的型别异常。**顺序固定（TSK-267 6）**：
 
-1. **先从已提交收据构建冻结载荷**：`MessageSegment.markdown(receipt.reply.body)` ＋
-   `MessageSegment.keyboard(keyboard_from_spec(receipt.reply.metadata["keyboard"]))`；
+1. **先从已提交收据构建冻结载荷**：`MessageSegment.markdown(receipt.reply.body)`；
+   仅当 `keyboard_from_spec(...)` 得到非空 `rows` 时才追加
+   `MessageSegment.keyboard(...)`（零按钮 spec 只发 markdown 段，见第 5 节）；
    不重读服务状态、不 observe、不重渲染。构建失败 → 按第 3 步语义转 NOT_DELIVERED
    （0 网络）。
 2. `service.claim_fulfillment(receipt.receipt_id)`：返回 `None` → `NO_CLAIM`，0 网络
@@ -274,6 +295,12 @@ TSK-276 `_project_reply` 对 syntax_failure 只转发 `result_code=code`、`deta
 7. 发送成功 → `service.mark_delivered(claim, platform_message_id=...)`；mark 抛异常
    （发送已发生）→ **不重试**，返回 `UNKNOWN`。
 8. mark 成功 → `DELIVERED`。
+9. **平台回执缺少可用消息 ID**（真实 `PostGroupMessagesReturn.id: str | None`）→
+   发送已发生但无法确认 → `UNKNOWN`，保持 `PENDING_CONFIRMATION`，**绝不**把
+   `None`/`"None"`/`str(dict)`/空串写成 `platform_message_id`。
+10. **`runtime_check()` 自身抛异常**（凭证/准入查询失败，发送尚未开始）→ 故障关闭
+    为 `NOT_DELIVERED`（0 网络），不得让异常冒泡后把 claim 永久留在
+    `PENDING_CONFIRMATION`。`asyncio.CancelledError` 不属于此分支。
 
 测试断言顺序：build 先于 claim，claim 先于 runtime_check，runtime_check 先于 send，
 send 先于 mark_delivered（无服务模式下用记录型 builder/runtime_check/service 记录顺序；
@@ -317,3 +344,9 @@ send 先于 mark_delivered（无服务模式下用记录型 builder/runtime_chec
   ImportError 只证明 TSK-278 接缝缺失，不能把 fixture/276 回归误判为整体基线失败。
 - RED 判定：子包 import 缺失（`komari_bot.plugins.komari_roulette.qq` 等）即"缺失行为"，
   不是夹具/依赖错误。
+
+## 9. 领域边界补充断言
+
+- **把局主转让给自己**（`/轮盘 转让 <自己的编号>`）必须被拒绝：
+  `invalid_transfer_target` + `self`，文案 `不能把局主转让给自己。`，且**不修改局面**
+  （不推进 revision、不换局主）；合法的转让给其他在席玩家仍成功。TSK-266 11.2 定稿。

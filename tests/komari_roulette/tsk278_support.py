@@ -459,13 +459,33 @@ def build_real_keyboard(spec: str) -> Any:
 
 
 def build_real_message(body: str, keyboard_spec: str = '{"rows": []}') -> Message:
-    """Real QQ ``Message``: one markdown segment + one keyboard segment."""
+    """Real QQ ``Message``: one markdown segment plus a keyboard only with rows.
+
+    TSK-266 1F / TSK-278-contract.md: a keyboard with no buttons is not a
+    keyboard field at all, so a spec whose ``rows`` are empty yields a
+    markdown-only payload (no empty keyboard segment).
+    """
     from nonebot.adapters.qq.message import MessageSegment
 
     message = Message()
     message += MessageSegment.markdown(body)
-    message += MessageSegment.keyboard(build_real_keyboard(keyboard_spec))
+    if json.loads(keyboard_spec)["rows"]:
+        message += MessageSegment.keyboard(build_real_keyboard(keyboard_spec))
     return message
+
+
+def has_keyboard_segment(message: Any) -> bool:
+    """True when a real QQ ``Message`` carries a keyboard segment."""
+    if isinstance(message, Message):
+        return message["keyboard"] is not None
+    return False
+
+
+def assert_no_keyboard_segment(message: Any) -> None:
+    """A no-buttons payload must not carry an empty keyboard field."""
+    assert not has_keyboard_segment(message), (
+        "empty-buttons message must not carry a keyboard segment"
+    )
 
 
 def message_markdown_content(message: Any) -> str:
@@ -645,7 +665,7 @@ class FakeSender:
         *,
         mode: str = "success",
         exc: BaseException | None = None,
-        result: str = "qq-platform-msg-1",
+        result: object = "qq-platform-msg-1",
     ) -> None:
         self.mode = mode
         self.exc = exc

@@ -52,8 +52,8 @@ from .test_command_service import (
 )
 from .tsk278_support import (
     FakeSender,
+    assert_no_keyboard_segment,
     assert_single_mention_tag,
-    message_keyboard_rows,
     message_markdown_content,
 )
 
@@ -184,8 +184,8 @@ async def test_real_delivery_payload_is_real_qq_message(
     message = sender.calls[0]["message"]
     # 真实 QQ MessageSegment.markdown 正文来自冻结收据投影。
     assert message_markdown_content(message) == real_receipt.reply.body
-    # 冻结 keyboard spec '{"rows": []}' 还原为空键盘。
-    assert message_keyboard_rows(message) == []
+    # 冻结 keyboard spec '{"rows": []}' 无按钮 → 载荷不得携带空 keyboard 字段。
+    assert_no_keyboard_segment(message)
 
 
 async def test_real_delivery_preserves_frozen_mention_body(
@@ -366,6 +366,55 @@ async def test_real_delivery_duplicate_event_single_network_call(
 
     assert len(sender.network_calls) == 1
     assert len(sender.calls) == 1
+
+
+async def test_real_delivery_missing_platform_id_stays_pending_confirmation(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """平台回执无可用 id（真实 ``PostGroupMessagesReturn.id`` 可为 ``None``）→
+    UNKNOWN，真实履约行保持 PENDING_CONFIRMATION，绝不写假 id。"""
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        DeliveryOutcome,
+        RouletteDelivery,
+    )
+
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-delivery-noid")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+
+    class _NoIdResponse:
+        id = None
+
+    sender = FakeSender(result=_NoIdResponse())
+    outcome = await RouletteDelivery(service=service).deliver(
+        real_receipt, sender
+    )
+
+    assert outcome is DeliveryOutcome.UNKNOWN
+    assert len(sender.network_calls) == 1
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT state, platform_message_id "
+                    "FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id"
+                ),
+                {"receipt_id": real_receipt.receipt_id},
+            )
+        ).mappings().first()
+    assert row is not None
+    assert row["state"] == "PENDING_CONFIRMATION"
+    assert row["platform_message_id"] is None
 
 
 async def test_real_delivery_explicit_failure_marks_not_delivered(

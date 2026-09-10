@@ -9,9 +9,9 @@ the observable parsing contract recorded in ``TSK-278-contract.md`` section 3.
 from __future__ import annotations
 
 import pytest
-from komari_bot.plugins.komari_roulette.qq.parser import parse_command
 
 from komari_bot.plugins.komari_roulette import CanonicalCommand
+from komari_bot.plugins.komari_roulette.qq.parser import parse_command
 
 SYNTAX = "syntax_failure"
 

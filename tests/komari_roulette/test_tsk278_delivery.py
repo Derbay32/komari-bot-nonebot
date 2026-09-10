@@ -17,23 +17,24 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+from komari_bot.plugins.komari_roulette import (
+    CommandReceipt,
+    StorageUnavailableError,
+)
 from komari_bot.plugins.komari_roulette.qq.delivery import (
     DeliveryOutcome,
     RouletteDelivery,
     SendNotAcceptedError,
 )
 
-from komari_bot.plugins.komari_roulette import (
-    CommandReceipt,
-    StorageUnavailableError,
-)
-
 from .tsk278_support import (
     FakeCommandService,
     FakeSender,
+    assert_no_keyboard_segment,
     assert_single_mention_tag,
     claim,
     message_keyboard_rows,
@@ -42,12 +43,22 @@ from .tsk278_support import (
     receipt,
 )
 
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_roulette.qq.delivery import (
+        PayloadBuilder,
+        RuntimeCheck,
+    )
+
+
+class _RuntimeCheckError(RuntimeError):
+    """Stand-in for a failing live admission/credential recheck."""
+
 
 def _delivery(
     *,
     service: FakeCommandService | None = None,
-    runtime_check: object | None = None,
-    payload_builder: object | None = None,
+    runtime_check: RuntimeCheck | None = None,
+    payload_builder: PayloadBuilder | None = None,
 ) -> RouletteDelivery:
     return RouletteDelivery(
         service=service or FakeCommandService(),
@@ -86,6 +97,60 @@ async def test_deliver_success_marks_delivered() -> None:
     assert service.mark_not_delivered_calls == []
 
 
+class _IdNoneResponse:
+    """Real ``PostGroupMessagesReturn`` whose ``id`` is ``None``."""
+
+    id = None
+
+
+class _IdLessResponse:
+    """Return object with no usable platform message id attribute."""
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(_IdNoneResponse(), id="id-none"),
+        pytest.param(_IdLessResponse(), id="no-id"),
+        pytest.param({"no": "id"}, id="dict-no-id"),
+        pytest.param("", id="empty-string"),
+    ],
+)
+async def test_deliver_unusable_platform_id_is_unknown(response: object) -> None:
+    """平台回执没有可用 id：发送已发生但无法确认 → UNKNOWN，绝不写假 id。
+
+    真实 ``PostGroupMessagesReturn.id`` 类型是 ``str | None``，缺失/``None`` 回执
+    不得被 ``str(...)`` 变成 ``"None"``/``"{...}"`` 后标记 DELIVERED。
+    """
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender(result=response)
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.UNKNOWN
+    assert len(sender.network_calls) == 1
+    assert service.mark_delivered_calls == []
+    assert service.mark_not_delivered_calls == []
+
+
+async def test_deliver_object_with_usable_platform_id_is_delivered() -> None:
+    """带真实 ``id`` 属性的回执照常标记 DELIVERED 并保存该 id。"""
+
+    class _Response:
+        id = "real-platform-id"
+
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender(result=_Response())
+    outcome = await _delivery(service=service).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.DELIVERED
+    assert service.mark_delivered_calls == [
+        (claim("receipt-1"), "real-platform-id")
+    ]
+
+
 async def test_deliver_uses_inbound_msg_id_and_seq_1_without_reference() -> None:
     service = FakeCommandService()
     service.claim_result = claim("receipt-1")
@@ -112,11 +177,26 @@ async def test_deliver_sends_real_qq_message_payload() -> None:
     text = message_markdown_content(message)
     assert text == frozen.reply.body
     assert_single_mention_tag(text, "member-1")
-    # 冻结 keyboard spec 还原为真实键盘段：默认 spec '{"rows": []}' → 无按钮。
-    assert message_keyboard_rows(message) == []
+    # 冻结 keyboard spec 无按钮：载荷不能携带空 keyboard 字段。
+    assert_no_keyboard_segment(message)
     # 送达只读冻结收据：不 observe、不重读当前状态。
     assert service.observe_calls == []
     assert service.execute_calls == []
+
+
+async def test_deliver_empty_keyboard_sends_markdown_only() -> None:
+    """空按钮 spec 不得构造空 keyboard 段（TSK-266 1F “无按钮”）。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender()
+    frozen = receipt(
+        reply=projection("> 无按钮正文。", keyboard_spec='{"rows": []}')
+    )
+    await _delivery(service=service).deliver(frozen, sender)
+
+    message = sender.calls[0]["message"]
+    assert_no_keyboard_segment(message)
+    assert message_markdown_content(message) == frozen.reply.body
 
 
 async def test_deliver_sends_real_keyboard_from_frozen_spec() -> None:
@@ -294,7 +374,47 @@ async def test_deliver_async_runtime_recheck_is_awaited() -> None:
     assert service.mark_delivered_calls == []
 
 
-async def test_deliver_build_failure_is_zero_network() -> None:
+async def test_deliver_sync_runtime_recheck_exception_fails_closed() -> None:
+    """runtime 重核查抛异常（发送尚未开始、0 网络）→ NOT_DELIVERED，不留悬挂 PENDING。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender()
+
+    def exploding_runtime() -> bool:
+        raise _RuntimeCheckError
+
+    outcome = await _delivery(
+        service=service,
+        runtime_check=exploding_runtime,
+    ).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.claim_calls == ["receipt-1"]
+    assert service.mark_not_delivered_calls == [claim("receipt-1")]
+    assert service.mark_delivered_calls == []
+
+
+async def test_deliver_async_runtime_recheck_exception_fails_closed() -> None:
+    """异步 runtime 重核查抛异常 → 同样故障关闭为 NOT_DELIVERED（0 网络）。"""
+    service = FakeCommandService()
+    service.claim_result = claim("receipt-1")
+    sender = FakeSender()
+
+    async def exploding_runtime() -> bool:
+        raise _RuntimeCheckError
+
+    outcome = await _delivery(
+        service=service,
+        runtime_check=exploding_runtime,
+    ).deliver(_success_receipt(), sender)
+
+    assert outcome is DeliveryOutcome.NOT_DELIVERED
+    assert sender.calls == []
+    assert sender.network_calls == []
+    assert service.mark_not_delivered_calls == [claim("receipt-1")]
+    assert service.mark_delivered_calls == []
     """冻结载荷构建失败（如损坏的 keyboard spec）→ claim 后 mark_not_delivered。"""
     service = FakeCommandService()
     service.claim_result = claim("receipt-1")

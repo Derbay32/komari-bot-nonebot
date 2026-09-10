@@ -14,14 +14,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from komari_bot.plugins.komari_roulette.qq.handler import RouletteQQHandler
-
 from komari_bot.plugins.group_admission.qq import get_qq_admission_token
 from komari_bot.plugins.komari_roulette import (
     CommandReceipt,
     CommandRequest,
     Observation,
 )
+from komari_bot.plugins.komari_roulette.qq.handler import RouletteQQHandler
 
 from .tsk278_support import (
     APP_ID,

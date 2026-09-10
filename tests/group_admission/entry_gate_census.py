@@ -9,8 +9,9 @@ MatcherEntryRow: entry_id, source_path, source_symbol, factory, event_family, ef
 
 ``ONEBOT_EVENT_CENSUS``: 22 个 OneBot V11 事件子类。
 ``QQ_EVENT_CENSUS``: QQ 入口允许的精确事件与显式拒绝事件闭集。
-``MATCHER_ENTRY_CENSUS``: 24 个 matcher 注册项（TSK-277 退役旧
-character_binding 四个 on_command，新增一个 QQ handler on_message）。
+``MATCHER_ENTRY_CENSUS``: 25 个 matcher 注册项（TSK-277 退役旧
+character_binding 四个 on_command，新增一个 QQ handler on_message；TSK-278
+新增一个 komari_roulette QQ group-@ on_message）。
 """
 
 from __future__ import annotations
@@ -94,10 +95,11 @@ QQ_EVENT_CENSUS: tuple[QQEventCensusRow, ...] = (
 )
 
 MATCHER_ENTRY_CENSUS: tuple[MatcherEntryRow, ...] = (
-    # on_message (3)
+    # on_message (4)
     _M("matcher.komari_chat.__init__.matcher", "komari_bot/plugins/komari_chat/__init__.py", "matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.character_binding.reply_evidence.reply_evidence_matcher", "komari_bot/plugins/character_binding/reply_evidence.py", "reply_evidence_matcher", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     _M("matcher.character_binding.qq_commands.bind_qq", "komari_bot/plugins/character_binding/qq_commands.py", "bind_qq", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
+    _M("matcher.komari_roulette.qq.__init__.roulette_qq", "komari_bot/plugins/komari_roulette/qq/__init__.py", "roulette_qq", "on_message", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     # on_regex (1)
     _M("matcher.group_history_summary.__init__.summary_matcher", "komari_bot/plugins/group_history_summary/__init__.py", "summary_matcher", "on_regex", "message", (_EFFECT_ID,), _MATCHER_ANCHOR),
     # on_notice (1)
