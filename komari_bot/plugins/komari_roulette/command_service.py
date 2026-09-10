@@ -1319,28 +1319,51 @@ class RouletteCommandService:
         session: AsyncSession,
         receipt_id: str,
     ) -> Mapping[str, object] | None:
-        """Lock the fulfillment row and read its credential age from the DB clock.
+        """Lock the fulfillment row, then read its credential age from the DB clock.
 
-        ``clock_timestamp()`` is evaluated after the ``FOR UPDATE`` lock is
-        acquired, so a long lock wait cannot inherit a stale transaction time.
+        The lock and the age read are deliberately *two* statements in one
+        transaction.  PostgreSQL evaluates a ``LockRows`` node's target list
+        below the lock, so computing ``clock_timestamp() - r.created_at`` in the
+        locking statement would freeze the age at statement start: a claim that
+        blocked for seconds on another connection's row lock would still see the
+        pre-wait age and could admit an already-expired credential (TSK-278).
+
+        The lock is taken by a statement whose target list only reads columns,
+        and the age is then read by a second statement that is sent strictly
+        after the lock is held, against the same
+        ``komari_roulette_command_receipts.created_at`` column.  A missing
+        fulfillment row returns ``None`` before any age is read, so callers
+        keep their existing missing-row handling.
         """
 
-        row = (
+        locked = (
             await session.execute(
                 text(
-                    "SELECT f.receipt_id, f.state, "
-                    "EXTRACT(EPOCH FROM (clock_timestamp() - r.created_at)) "
-                    "AS age_seconds "
-                    "FROM komari_roulette_fulfillments AS f "
-                    "JOIN komari_roulette_command_receipts AS r "
-                    "ON r.receipt_id = f.receipt_id "
-                    "WHERE f.receipt_id = :receipt_id "
-                    "FOR UPDATE OF f"
+                    "SELECT receipt_id, state "
+                    "FROM komari_roulette_fulfillments "
+                    "WHERE receipt_id = :receipt_id "
+                    "FOR UPDATE"
                 ),
                 {"receipt_id": receipt_id},
             )
         ).mappings().one_or_none()
-        return cast("Mapping[str, object] | None", row)
+        if locked is None:
+            return None
+        age_seconds = await session.scalar(
+            text(
+                "SELECT EXTRACT(EPOCH FROM (clock_timestamp() - created_at)) "
+                "FROM komari_roulette_command_receipts "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": receipt_id},
+        )
+        if age_seconds is None:
+            return None
+        return {
+            "receipt_id": locked["receipt_id"],
+            "state": locked["state"],
+            "age_seconds": age_seconds,
+        }
 
     async def _insert_receipt(
         self,
