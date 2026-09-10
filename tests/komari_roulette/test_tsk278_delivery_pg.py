@@ -13,6 +13,7 @@ gate is enabled.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 from .command_support import (
     PG_REQUIRED,
+    backend_pid,
     command_factory,
     create_engine_and_factory,
     delete_scope,
@@ -42,6 +44,7 @@ from .command_support import (
     reset_shared_orm_engine,
     scope,
     seed_binding,
+    wait_for_blocked,
 )
 from .test_command_service import (
     CountingProjector,
@@ -877,6 +880,142 @@ async def test_real_window_recheck_reads_db_clock(
         await session.commit()
 
     assert await service.check_fulfillment_window(claim_obj) is False
+
+
+async def _age_receipt_seconds(
+    session_factory: async_sessionmaker[AsyncSession],
+    receipt_id: str,
+    seconds: float,
+) -> None:
+    """Backdate the receipt inside the DB so the real clock sees the new age."""
+
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE komari_roulette_command_receipts "
+                "SET created_at = clock_timestamp() - make_interval(secs => :secs) "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": receipt_id, "secs": seconds},
+        )
+        await session.commit()
+
+
+async def test_real_window_recheck_takes_db_clock_after_lock_wait(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """锁等待跨过 300s 时，发送前重核必须在拿到行锁后取 DB 时钟。
+
+    另一连接只用 ``FOR UPDATE`` 持有履约行锁、不改数据（不触发 EPQ 重评），
+    被阻塞的 ``check_fulfillment_window`` 若在等锁前就把
+    ``clock_timestamp() - created_at`` 算成 ~299s，就会在真实年龄 ~301s 时
+    仍返回 True 放行发送。断言以锁释放时刻的真实年龄为准：必须 False。
+    """
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-window-lock-wait")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+    await _age_receipt_seconds(session_factory, real_receipt.receipt_id, 299)
+
+    # claim 时刻仍在窗口内（precondition：否则下面无法构造 PENDING）。
+    claim = await service.claim_fulfillment(real_receipt.receipt_id)
+    assert claim is not None
+    assert claim.state is FulfillmentState.PENDING_CONFIRMATION
+
+    async with session_factory() as blocker:
+        blocker_pid = await backend_pid(blocker)
+        await blocker.execute(
+            text(
+                "SELECT receipt_id FROM komari_roulette_fulfillments "
+                "WHERE receipt_id = :receipt_id FOR UPDATE"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+        task = asyncio.create_task(service.check_fulfillment_window(claim))
+        try:
+            await wait_for_blocked(session_factory, blocker_pid)
+            await asyncio.sleep(2.0)  # 真实锁等待：收据年龄 299s → ~301s
+            await blocker.rollback()  # 释放行锁，被阻塞的重核查询继续
+            allowed = await asyncio.wait_for(task, timeout=5)
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            with suppress(Exception):
+                await blocker.rollback()
+
+    # 锁释放时真实年龄 > 300s → 必须拒绝发送。
+    assert allowed is False
+
+
+async def test_real_claim_takes_db_clock_after_lock_wait(
+    harness: tuple[
+        AsyncEngine,
+        async_sessionmaker[AsyncSession],
+        CharacterBindingManager,
+    ],
+) -> None:
+    """claim 自身在行锁上等待跨过 300s 时必须收敛为 NOT_DELIVERED。
+
+    与发送前重核同一 SQL：另一连接只用 ``FOR UPDATE`` 持锁不改数据，claim
+    若在等锁前求值 age 会以 ~299s 放行成 PENDING_CONFIRMATION；正确行为是
+    拿到锁后用 DB 时钟得到 ~301s 并原子收敛为 NOT_DELIVERED。
+    """
+    _engine, session_factory, manager = harness
+    current = scope("tsk278-claim-lock-wait")
+    await seed_binding(manager, current, 1)
+    service = RouletteCommandService(
+        session_factory=session_factory,
+        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
+    )
+    real_receipt = await create_waiting(service, current)
+    await _age_receipt_seconds(session_factory, real_receipt.receipt_id, 299)
+
+    async with session_factory() as blocker:
+        blocker_pid = await backend_pid(blocker)
+        await blocker.execute(
+            text(
+                "SELECT receipt_id FROM komari_roulette_fulfillments "
+                "WHERE receipt_id = :receipt_id FOR UPDATE"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+        task = asyncio.create_task(
+            service.claim_fulfillment(real_receipt.receipt_id)
+        )
+        try:
+            await wait_for_blocked(session_factory, blocker_pid)
+            await asyncio.sleep(2.0)  # 真实锁等待
+            await blocker.rollback()
+            claim = await asyncio.wait_for(task, timeout=5)
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            with suppress(Exception):
+                await blocker.rollback()
+
+    assert claim is not None
+    assert claim.state is FulfillmentState.NOT_DELIVERED
+    async with session_factory() as session:
+        state = await session.scalar(
+            text(
+                "SELECT state FROM komari_roulette_fulfillments "
+                "WHERE receipt_id = :receipt_id"
+            ),
+            {"receipt_id": real_receipt.receipt_id},
+        )
+    assert state == "NOT_DELIVERED"
 
 
 async def test_real_slow_runtime_crossing_window_never_sends(
