@@ -125,6 +125,7 @@ def second_member(current: Scope) -> tuple[str, int, str]:
 
 
 async def _cleanup(engine: AsyncEngine, current: Scope) -> None:
+    """只清当前 scope 的 canonical 群/成员记录；legacy 行由播种者自行限定清理。"""
     params = {"app_id": current.app_id, "group_openid": current.group_openid}
     async with engine.begin() as connection:
         await connection.execute(
@@ -140,10 +141,6 @@ async def _cleanup(engine: AsyncEngine, current: Scope) -> None:
                 "WHERE app_id = :app_id AND group_openid = :group_openid"
             ),
             params,
-        )
-        await connection.execute(
-            text("DELETE FROM komari_character_bindings WHERE user_id = :member_qq"),
-            {"member_qq": str(current.member_qq)},
         )
 
 
@@ -1088,6 +1085,8 @@ async def test_legacy_candidate_reuse_and_conflict(
     conflict_scope = scope("legacy-conflict")
     other_openid, other_qq, _ = second_member(current)
     clock = FrozenClock(datetime(2026, 9, 8, 12, 0, tzinfo=UTC))
+    #: 只登记本用例确认成功提交的 legacy 行；绝不按 scope 的 member_qq 盲删。
+    owned_legacy_user_ids: list[str] = []
     async for engine, factory in create_engine_and_factory():
         try:
             async with factory() as session:
@@ -1099,6 +1098,7 @@ async def test_legacy_candidate_reuse_and_conflict(
                     {"user_id": str(current.member_qq)},
                 )
                 await session.commit()
+            owned_legacy_user_ids.append(str(current.member_qq))
 
             coordinator = FakeCoordinator()
             wizard = _wizard(
@@ -1178,6 +1178,7 @@ async def test_legacy_candidate_reuse_and_conflict(
                     {"user_id": str(conflict_scope.member_qq)},
                 )
                 await session.commit()
+            owned_legacy_user_ids.append(str(conflict_scope.member_qq))
             conflict_token = _binding_token(
                 conflict_scope,
                 clock=clock,
@@ -1225,14 +1226,16 @@ async def test_legacy_candidate_reuse_and_conflict(
         finally:
             await _cleanup(engine, current)
             await _cleanup(engine, conflict_scope)
-            async with engine.begin() as connection:
-                await connection.execute(
-                    text(
-                        "DELETE FROM komari_character_bindings "
-                        "WHERE user_id = :user_id"
-                    ),
-                    {"user_id": str(other_qq)},
-                )
+            if owned_legacy_user_ids:
+                async with engine.begin() as connection:
+                    for user_id in owned_legacy_user_ids:
+                        await connection.execute(
+                            text(
+                                "DELETE FROM komari_character_bindings "
+                                "WHERE user_id = :user_id"
+                            ),
+                            {"user_id": user_id},
+                        )
 
 
 async def test_commit_outcome_unknown_after_commit_does_not_report_and_converges(
@@ -2919,48 +2922,6 @@ async def test_authorize_send_rechecks_after_canonical_read(
             await _cleanup(engine, current)
 
 
-async def _terminate_advisory_waiters(engine: AsyncEngine) -> None:
-    """有界清理：终止仍等待组 advisory lock 的后端，避免用例失败后挂住后续测试。"""
-    async with engine.begin() as connection:
-        await connection.execute(
-            text(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE wait_event_type = 'Lock' "
-                "AND query ILIKE '%pg_advisory_xact_lock%' "
-                "AND pid <> pg_backend_pid()"
-            )
-        )
-
-
-async def _database_name(engine: AsyncEngine) -> str:
-    async with engine.connect() as connection:
-        return str(await connection.scalar(text("SELECT current_database()")))
-
-
-async def _set_database_timeouts(
-    engine: AsyncEngine,
-    db_name: str,
-    *,
-    reset: bool,
-) -> None:
-    """有界兜底：给该测试库的新连接设置/复位 lock_timeout 与 statement_timeout。"""
-    async with engine.begin() as connection:
-        if reset:
-            await connection.execute(
-                text(f'ALTER DATABASE "{db_name}" RESET lock_timeout')
-            )
-            await connection.execute(
-                text(f'ALTER DATABASE "{db_name}" RESET statement_timeout')
-            )
-        else:
-            await connection.execute(
-                text(f'ALTER DATABASE "{db_name}" SET lock_timeout = \'2s\'')
-            )
-            await connection.execute(
-                text(f'ALTER DATABASE "{db_name}" SET statement_timeout = \'15s\'')
-            )
-
-
 async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3011,8 +2972,6 @@ async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
         stored_policy(1, {"mode": "blacklist", "group_ids": []})
     )
     async for engine, _factory in create_engine_and_factory():
-        db_name = await _database_name(engine)
-        await _set_database_timeouts(engine, db_name, reset=False)
         await _reset_shared_orm_engine()
         await prepare_control_plane(monkeypatch, storage)
         try:
@@ -3097,10 +3056,13 @@ async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
                             {confirm_task},
                             timeout=10,
                         )
-                        if not done:
-                            await _terminate_advisory_waiters(engine)
-                            with suppress(Exception):
-                                await asyncio.wait_for(confirm_task, timeout=5)
+                        if confirm_task in done:
+                            # 正常完成也必须 await 取出结果/异常，绝不留自有任务。
+                            await confirm_task
+                        else:
+                            confirm_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await confirm_task
                             pytest.fail(
                                 "真实 confirm 在 10s 内未完成：生产 resolver 在持组锁后自锁"
                             )
@@ -3123,7 +3085,5 @@ async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
                     finally:
                         await package.close_plugin()
         finally:
-            await _terminate_advisory_waiters(engine)
             await _cleanup(engine, current)
-            await _set_database_timeouts(engine, db_name, reset=True)
             await _reset_shared_orm_engine()
