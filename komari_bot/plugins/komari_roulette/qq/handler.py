@@ -46,32 +46,6 @@ type BusinessGate = Callable[
 
 _MENTION_SEGMENT_TYPES = frozenset({"mention_user", "mention_everyone"})
 
-_EFFECT_CHECK_PARAMETER = "effect_check"
-
-
-def _supports_per_call_effect_check(target: object, member: str) -> bool:
-    """Whether ``target.member`` can receive the per-call ``effect_check`` keyword.
-
-    The production command service and delivery always advertise the seam (and
-    the TSK-279 probes do too).  A collaborator that cannot accept the keyword
-    cannot host the post-lock / post-claim recheck either; the handler must not
-    fabricate a closure for it, and for such a collaborator the mandatory
-    front-door business gate remains the only authority point.  Nothing here is
-    ever consulted to *relax* a check on a collaborator that does accept the
-    keyword.
-    """
-
-    try:
-        parameters = inspect.signature(getattr(target, member)).parameters
-    except (AttributeError, TypeError, ValueError):
-        return False
-    if _EFFECT_CHECK_PARAMETER in parameters:
-        return True
-    return any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-
 
 class _CommandService(Protocol):
     """The narrow TSK-276 command surface the handler orchestrates."""
@@ -83,6 +57,7 @@ class _CommandService(Protocol):
         request: CommandRequest,
         *,
         observation: Observation | None = None,
+        effect_check: EffectCheck | None = None,
     ) -> CommandReceipt: ...
 
 
@@ -93,6 +68,8 @@ class _Delivery(Protocol):
         self,
         receipt: CommandReceipt,
         sender: QQMessageSender,
+        *,
+        effect_check: EffectCheck | None = None,
     ) -> object: ...
 
 
@@ -111,14 +88,6 @@ class RouletteQQHandler:
         self._delivery = delivery
         self._business_gate = business_gate
         self._send_gate = send_gate
-        # Probed once: the per-call recheck is only handed to a collaborator
-        # that can actually host it (see ``_supports_per_call_effect_check``).
-        self._service_effect_check = _supports_per_call_effect_check(
-            service, "execute_group_command"
-        )
-        self._delivery_effect_check = _supports_per_call_effect_check(
-            delivery, "deliver"
-        )
 
     @staticmethod
     def _resolve_token(state: Mapping[str, Any] | None) -> QQAdmissionToken | None:
@@ -184,15 +153,15 @@ class RouletteQQHandler:
         if command.intent in OBSERVED_ACTIVE_WRITES:
             observation = await self._service.observe_current(request.group)
         # One closure for *this* call, capturing the original bot / event / token.
-        # It is the per-call authority recheck handed to the service (before the
-        # domain write, under the group lock) and to the delivery (after the
-        # claim, before the network): authority is never re-minted from the
-        # receipt and never shared across concurrent groups.
+        # It is both the mandatory front-door gate (after observe, before
+        # execute) and the per-call authority recheck handed to the service
+        # (before the domain write, under the group lock) and to the delivery
+        # (after the claim, before the network): authority is never re-minted
+        # from the receipt and never shared across concurrent groups.
         effect_check = self._effect_closure(bot, event, token)
-        if not self._service_effect_check and not await effect_check():
-            # A collaborator that cannot host the in-lock recheck keeps the
-            # mandatory front-door gate as its only authority point, so every
-            # command is gated exactly once, as late as the collaborator allows.
+        if not await effect_check():
+            # Front-door authority revoked after observe: no domain write and no
+            # send, and the collaborators are never consulted without the gate.
             return
         try:
             receipt = await self._execute(request, observation, effect_check)
@@ -212,21 +181,17 @@ class RouletteQQHandler:
     ) -> CommandReceipt:
         """Run the single domain execution, rechecking authority under the lock.
 
-        The keyword is only passed to a collaborator that advertises it (see
-        ``_supports_per_call_effect_check``); the resulting argument-shape
-        narrowing is what the ``cast`` below records.
+        The per-call keyword is *always* handed over, with no support probe and
+        no legacy-signature cover: the service protocol declares the
+        ``effect_check`` keyword, so a collaborator without the seam raises
+        ``TypeError`` at the call instead of silently degrading to a single
+        front-door gate, and the call is type-checked against the protocol.
         """
 
-        if not self._service_effect_check:
-            return await self._service.execute_group_command(
-                request, observation=observation
-            )
-        execute = cast(
-            "Callable[..., Awaitable[CommandReceipt]]",
-            self._service.execute_group_command,
-        )
-        return await execute(
-            request, observation=observation, effect_check=effect_check
+        return await self._service.execute_group_command(
+            request,
+            observation=observation,
+            effect_check=effect_check,
         )
 
     async def _deliver(
@@ -235,16 +200,18 @@ class RouletteQQHandler:
         sender: QQMessageSender,
         effect_check: EffectCheck,
     ) -> None:
-        """Run the single delivery, rechecking authority after the claim."""
+        """Run the single delivery, rechecking authority after the claim.
 
-        if not self._delivery_effect_check:
-            await self._delivery.deliver(receipt, sender)
-            return
-        deliver = cast(
-            "Callable[..., Awaitable[object]]",
-            self._delivery.deliver,
+        As in :meth:`_execute`, the per-call keyword is always handed over (no
+        probe and no legacy-signature cover): a collaborator without the seam
+        raises ``TypeError`` instead of sending with a weaker authority check.
+        """
+
+        await self._delivery.deliver(
+            receipt,
+            sender,
+            effect_check=effect_check,
         )
-        await deliver(receipt, sender, effect_check=effect_check)
 
     def _effect_closure(
         self,

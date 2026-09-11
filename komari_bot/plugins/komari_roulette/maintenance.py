@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -38,7 +39,7 @@ from .command_service import EFFECT_CHECK_REJECTED
 from .domain import GroupRef
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -265,7 +266,9 @@ async def _drain_cleanup(maintenance: RouletteMaintenance) -> CleanupResult:
     Each round is still a single bounded :meth:`cleanup_retention` page; the
     loop only continues while that page reported ``more_pending``.  It stops
     when the maintenance owner is closed, when a round makes no progress (so a
-    stuck ``more_pending`` cannot busy-loop), or after a hard round bound.
+    stuck ``more_pending`` cannot busy-loop), or after a hard round bound.  The
+    whole drain is one tracked round, so ``close`` waits for the next page
+    boundary instead of slipping through the gap between pages.
     """
 
     total = CleanupResult(
@@ -274,15 +277,16 @@ async def _drain_cleanup(maintenance: RouletteMaintenance) -> CleanupResult:
         results_deleted=0,
         more_pending=False,
     )
-    for _ in range(CLEANUP_DRAIN_MAX_ROUNDS):
-        if getattr(maintenance, "stopped", False):
-            break
-        result = await maintenance.cleanup_retention(batch_size=CLEANUP_BATCH_SIZE)
-        total = _merge_cleanup(total, result)
-        if not result.more_pending:
-            break
-        if result.receipts_deleted <= 0 and result.games_deleted <= 0:
-            break
+    async with maintenance._round_scope():
+        for _ in range(CLEANUP_DRAIN_MAX_ROUNDS):
+            if getattr(maintenance, "stopped", False):
+                break
+            result = await maintenance.cleanup_retention(batch_size=CLEANUP_BATCH_SIZE)
+            total = _merge_cleanup(total, result)
+            if not result.more_pending:
+                break
+            if result.receipts_deleted <= 0 and result.games_deleted <= 0:
+                break
     return total
 
 
@@ -363,11 +367,17 @@ class RouletteMaintenance:
         #: saturated sorting-first group cannot starve the later ones.
         self._receipt_group_cursor: tuple[str, str] | None = None
         self._terminal_group_cursor: tuple[str, str] | None = None
-        #: Set by :meth:`close`; stops dispatch and the daily drain.
+        #: Set by :meth:`mark_stopped` / :meth:`close`; stops dispatch and the
+        #: daily drain.
         self._stopped = False
         #: Serializes every dispatch round and lets :meth:`close` observe a
         #: round boundary instead of returning mid-page.
         self._round_gate = asyncio.Lock()
+        #: Every round task currently holding (or *waiting for*) the round gate,
+        #: with a re-entrancy depth so a nested round never drops the outer one
+        #: early.  ``close`` uses it to bounded-join, then cancel, a round the
+        #: gate alone cannot settle.
+        self._in_flight: dict[asyncio.Task[Any], int] = {}
 
     @property
     def stopped(self) -> bool:
@@ -375,28 +385,90 @@ class RouletteMaintenance:
 
         return self._stopped
 
-    async def close(self) -> None:
-        """Stop new dispatch; bounded-wait for the in-flight round to settle.
+    def mark_stopped(self) -> None:
+        """Flip the stop flag synchronously, before any ``await``.
 
-        Flipping the stop flag alone lets a bounded page keep deleting after
-        shutdown returned.  The round gate serializes every dispatch round, so
-        ``close`` marks ``_stopped`` first (the blocked round's post-lock gate
-        then observes it and abandons the effect) and then waits, bounded, for
-        that round to release the gate.  A round that never settles cannot drag
-        shutdown past the bound; maintenance owns no long-lived task and no
-        shared ORM engine.
+        A shutdown must reject a queued round *immediately*: the bounded drain
+        in :meth:`close` runs later, and a blocked round's post-lock gate reads
+        this flag when the group lock is finally handed over.
         """
 
         self._stopped = True
-        try:
-            acquired = await asyncio.wait_for(
-                self._round_gate.acquire(),
-                timeout=CLOSE_ROUND_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
+
+    def _enter_round(self) -> asyncio.Task[Any] | None:
+        """Register the current task as a round participant, returning its key.
+
+        Registration happens *before* the round gate is acquired, so a task
+        blocked on the gate is still tracked; the depth keeps a nested round
+        from dropping the outer round's registration early.
+        """
+
+        task = asyncio.current_task()
+        if task is None:
+            return None
+        self._in_flight[task] = self._in_flight.get(task, 0) + 1
+        return task
+
+    def _leave_round(self, task: asyncio.Task[Any] | None) -> None:
+        """Drop one round-registration depth for ``task``."""
+
+        if task is None:
             return
-        if acquired:
-            self._round_gate.release()
+        depth = self._in_flight.get(task, 0) - 1
+        if depth > 0:
+            self._in_flight[task] = depth
+        else:
+            self._in_flight.pop(task, None)
+
+    @asynccontextmanager
+    async def _round_scope(self) -> AsyncIterator[None]:
+        """Track the current task for the *whole* round it is about to run.
+
+        Used by every entry point (including the multi-page daily drain) so
+        ``close`` can bounded-join a round that is waiting on the gate, deleting
+        a page, or between pages of a drain.
+        """
+
+        task = self._enter_round()
+        try:
+            yield
+        finally:
+            self._leave_round(task)
+
+    async def close(self) -> None:
+        """Stop new dispatch; bounded-join (then cancel) the in-flight rounds.
+
+        Flipping the stop flag alone lets a bounded page keep deleting after
+        shutdown returned.  Every round registers its task *before* it waits for
+        the round gate (and keeps the registration for the whole drain), so
+        ``close`` marks ``_stopped`` first - the blocked round's post-lock gate
+        then observes it and abandons the effect - and then waits, bounded, for
+        the registered rounds.  A round that cannot settle inside the bound is
+        cancelled and joined, so shutdown never returns while a late ``DELETE``
+        is still in flight.  Maintenance owns no long-lived task and no shared
+        ORM engine, and the caller's own task is never awaited (or cancelled)
+        here.
+        """
+
+        self._stopped = True
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in self._in_flight
+            if task is not current and not task.done()
+        }
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=CLOSE_ROUND_TIMEOUT_SECONDS,
+        )
+        pending = {task for task in pending if not task.done()}
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        await asyncio.wait(pending, timeout=CLOSE_ROUND_TIMEOUT_SECONDS)
 
     async def advance_due(
         self,
@@ -415,7 +487,7 @@ class RouletteMaintenance:
 
         if self._stopped or batch_size <= 0:
             return RecoveryTickResult(0, 0, 0, 0, None)
-        async with self._round_gate:
+        async with self._round_scope(), self._round_gate:
             if self._stopped:
                 return RecoveryTickResult(0, 0, 0, 0, None)
             return await self._advance_due_locked(batch_size=batch_size)
@@ -488,7 +560,21 @@ class RouletteMaintenance:
         touched, and the leaderboard is never rebuilt here.
         """
 
-        async with self._round_gate:
+        if self._stopped:
+            return CleanupResult(
+                receipts_deleted=0,
+                games_deleted=0,
+                results_deleted=0,
+                more_pending=False,
+            )
+        async with self._round_scope(), self._round_gate:
+            if self._stopped:
+                return CleanupResult(
+                    receipts_deleted=0,
+                    games_deleted=0,
+                    results_deleted=0,
+                    more_pending=False,
+                )
             return await self._cleanup_retention_locked(batch_size=batch_size)
 
     async def _cleanup_retention_locked(

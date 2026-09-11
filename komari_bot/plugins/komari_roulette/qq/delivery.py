@@ -116,10 +116,12 @@ class RouletteDelivery:
         service: _RouletteService,
         *,
         runtime_check: RuntimeCheck | None = None,
+        post_window_check: RuntimeCheck | None = None,
         payload_builder: PayloadBuilder | None = None,
     ) -> None:
         self._service = service
         self._runtime_check = runtime_check
+        self._post_window_check = post_window_check
         self._payload_builder: PayloadBuilder = payload_builder or build_qq_message
 
     async def deliver(  # noqa: PLR0911 — 每个结果分支都是一个真实结局
@@ -129,14 +131,19 @@ class RouletteDelivery:
         *,
         effect_check: EffectCheck | None = None,
     ) -> DeliveryOutcome:
-        """Build frozen payload → claim → recheck → window → send once → mark.
+        """Build frozen payload → claim → local recheck → effect → window → send.
 
-        ``effect_check`` is the per-call post-claim authority recheck: it runs
-        after the atomic claim and before any network call, so an authority
-        revoked while the send queued blocks the network.  A ``False`` answer (or
+        ``runtime_check`` (when supplied) runs after the atomic claim as a live,
+        pure-local runtime-state recheck.  ``effect_check`` is the per-call
+        post-claim authority recheck and runs *before* the DB-clock credential
+        window, so a slow authority check can never consume the five-minute
+        window without a fresh PG-clock verification.  ``check_fulfillment_window``
+        is then the final remote/DB authority immediately before the network
+        call; ``post_window_check`` (when supplied) is a *pure-local* runtime-state
+        recheck after that window, so a local stop during the window still blocks
+        the network without reopening a remote/DB window.  A ``False`` answer (or
         a raising gate) converges the claim to ``NOT_DELIVERED``; a cancellation
-        is a cancellation.  The original ``runtime_check`` and the DB-clock
-        credential window remain mandatory.
+        is a cancellation.
         """
 
         message, build_error = self._build(receipt)
@@ -155,11 +162,27 @@ class RouletteDelivery:
             )
             await self._service.mark_not_delivered(claim)
             return DeliveryOutcome.NOT_DELIVERED
-        if not await self._send_allowed(receipt, claim):
+        if not await self._local_allowed(
+            self._runtime_check,
+            receipt,
+            claim,
+            phase="发送前运行时重核",
+        ):
             return DeliveryOutcome.NOT_DELIVERED
+        # Per-call business gate *before* the final DB-clock window: the gate
+        # re-reads the owner/runtime after its own (possibly remote) recheck, so
+        # running it here keeps the window as the last remote/DB authority.
         if not await self._effect_allowed(effect_check, claim):
             return DeliveryOutcome.NOT_DELIVERED
         if not await self._window_allowed(claim):
+            return DeliveryOutcome.NOT_DELIVERED
+        # Only a pure-local runtime-state recheck may run after the window.
+        if not await self._local_allowed(
+            self._post_window_check,
+            receipt,
+            claim,
+            phase="窗口后本地运行态复核",
+        ):
             return DeliveryOutcome.NOT_DELIVERED
         try:
             response = await sender.send_to_group(
@@ -206,23 +229,25 @@ class RouletteDelivery:
         except Exception as error:  # 预发送阶段的显式失败：绝不发送、绝不重试
             return None, error
 
-    async def _send_allowed(
+    async def _local_allowed(
         self,
+        check: RuntimeCheck | None,
         receipt: CommandReceipt,
         claim: FulfillmentClaim,
+        *,
+        phase: str,
     ) -> bool:
-        """Live pre-send recheck; a failing check fails closed, never hangs.
+        """Run one pure-local runtime-state check, failing closed, never hanging.
 
-        The recheck runs after the claim and before any network call and is
-        resolved for *this* receipt (so two concurrent groups never share a
-        decision).  A check that raises must not bubble out and leave the claim
+        The check runs for *this* receipt (so two concurrent groups never share
+        a decision) and is only ever local: no network or database round trip,
+        hence safe both before the send gate and after the final DB-clock
+        window.  A check that raises must not bubble out and leave the claim
         stuck in ``PENDING_CONFIRMATION``: it is recorded as ``NOT_DELIVERED``
         instead.  ``asyncio.CancelledError`` is a cancellation, not a rejected
-        check.  A legacy zero-argument callable is not special-cased: it raises
-        and is handled by this same fail-closed boundary.
+        check.  ``None`` means the caller did not request that check.
         """
 
-        check = self._runtime_check
         if check is None:
             return True
         try:
@@ -233,7 +258,8 @@ class RouletteDelivery:
             raise
         except Exception as error:
             logger.warning(
-                "[Roulette] 发送前运行时重核失败，故障关闭: error_type={}",
+                "[Roulette] {}失败，故障关闭: error_type={}",
+                phase,
                 type(error).__name__,
             )
             await self._service.mark_not_delivered(claim)
@@ -280,11 +306,12 @@ class RouletteDelivery:
     async def _window_allowed(self, claim: FulfillmentClaim) -> bool:
         """Authoritative pre-send credential-window recheck from the DB clock.
 
-        This mandatory seam runs after the runtime recheck and immediately
-        before any network call: the claim alone is not enough authority, so a
-        ``False`` answer or a raising check converges the claim to
-        ``NOT_DELIVERED`` without re-claiming.  ``asyncio.CancelledError`` is a
-        cancellation, not a rejected check.
+        This mandatory seam is the *last* remote/DB authority and runs
+        immediately before any network call: the claim alone is not enough
+        authority, so a ``False`` answer or a raising check converges the claim
+        to ``NOT_DELIVERED`` without re-claiming.  ``asyncio.CancelledError`` is
+        a cancellation, not a rejected check.  Nothing after it may touch the
+        network or database.
         """
 
         try:

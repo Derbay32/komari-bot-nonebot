@@ -17,7 +17,7 @@ access (collaborators are injected).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -46,6 +46,9 @@ from .tsk278_support import (
     projection,
     receipt,
 )
+
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_roulette.qq import handler as handler_module
 
 _MISSING = object()
 
@@ -479,7 +482,11 @@ async def test_handler_never_probes_service_effect_check_support() -> None:
     service = _LegacyServiceWithoutEffectCheck()
     delivery = FakeDelivery()
     handler = RouletteQQHandler(
-        service=service,
+        # Deliberately illegal runtime input: cast to the collaborator shape the
+        # production constructor requires so the loud ``TypeError`` (not a static
+        # argument error) is what the case pins.  The production protocol must
+        # not be weakened just to admit this double.
+        service=cast("handler_module._CommandService", service),
         delivery=delivery,
         business_gate=_allow_gate,
     )
@@ -502,7 +509,10 @@ async def test_handler_never_probes_delivery_effect_check_support() -> None:
     delivery = _LegacyDeliveryWithoutEffectCheck()
     handler = RouletteQQHandler(
         service=service,
-        delivery=delivery,
+        # See the service-negative case: the double is cast to the production
+        # constructor's delivery shape, so the missing keyword is a real runtime
+        # ``TypeError`` rather than something the protocol is widened to allow.
+        delivery=cast("handler_module._Delivery", delivery),
         business_gate=_allow_gate,
     )
     with pytest.raises(TypeError):

@@ -39,13 +39,14 @@ import asyncio
 import random
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from apscheduler.jobstores.base import JobLookupError
 from nonebot import get_driver, logger
 from nonebot_plugin_apscheduler import scheduler
+from sqlalchemy import text
 
-from komari_bot.plugins import group_admission
+from komari_bot.plugins import character_binding, group_admission
 from komari_bot.plugins.character_binding import BindingTransaction
 from komari_bot.plugins.group_admission import (
     AdmissionIntent,
@@ -64,9 +65,14 @@ from .maintenance import (
     RouletteMaintenance,
     drain_cleanup,
 )
+from .observability import RouletteObservability, RouletteObservation, set_runtime_state
 from .qq import clear_roulette_qq_runtime, install_roulette_qq_runtime
 from .qq.renderer import build_live_reply_projector
-from .runtime import RouletteRuntime
+from .runtime import (
+    CONFIG_UNAVAILABLE_REASON,
+    NOT_READY_REASON,
+    RouletteRuntime,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -107,6 +113,7 @@ class RouletteApplication:
     service: RouletteCommandService
     maintenance: RouletteMaintenance
     config_manager: ConfigPort
+    observability: RouletteObservability
 
 
 class _StartupAbortedError(RuntimeError):
@@ -158,6 +165,26 @@ class _LazyConfigPort:
         return await manager.get_async()
 
 
+async def _refresh_pending_safely(observability: RouletteObservability) -> None:
+    """Refresh the read-only pending count without failing the whole tick.
+
+    ``refresh_pending`` already keeps ``pending_receipts`` at ``None`` and
+    aggregates ``pending_unavailable`` before raising; this boundary only stops
+    that observation fault from being mistaken for a recovery failure (the tick
+    still publishes its clean result).  A cancellation is a cancellation.
+    """
+
+    try:
+        await observability.refresh_pending()
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning(
+            "[Roulette] 待确认观测读取失败，保持未知: error_type={}",
+            type(error).__name__,
+        )
+
+
 class _RecoveryPort:
     """Adapt the maintenance worker to the runtime's recovery port.
 
@@ -166,13 +193,22 @@ class _RecoveryPort:
     maintenance interface.
     """
 
-    __slots__ = ("_maintenance",)
+    __slots__ = ("_maintenance", "_observability")
 
-    def __init__(self, maintenance: RouletteMaintenance) -> None:
+    def __init__(
+        self,
+        maintenance: RouletteMaintenance,
+        observability: RouletteObservability,
+    ) -> None:
         self._maintenance = maintenance
+        self._observability = observability
 
     async def run_recovery_tick(self) -> object:
-        return await self._maintenance.advance_due()
+        result = await self._maintenance.advance_due()
+        self._observability.note_scan(result)
+        # Read-only ground truth *after* the real scan ran; never a claim/resend.
+        await _refresh_pending_safely(self._observability)
+        return result
 
     async def close(self) -> None:
         await self._maintenance.close()
@@ -199,10 +235,20 @@ class _CopyPoolRandom:
 # ---------------------------------------------------------------------------
 
 
-class _LifecycleState:
-    """Mutable process-local lifecycle slots (avoids ``global`` rebinding)."""
+#: Bounded wait for a shutdown to settle the startup hook's own task(s).
+STARTUP_CANCEL_TIMEOUT_SECONDS = 1.0
 
-    __slots__ = ("app", "bootstrap", "generation", "qq_installed")
+
+class _LifecycleState:
+    """Mutable process-local lifecycle slots (avoids ``global`` rebinding).
+
+    The slots belong to this module: the composition root is the single owner
+    of the roulette lifecycle, so a reload must rebuild them together with the
+    hooks rather than keep an orphaned application alive across module
+    identities.
+    """
+
+    __slots__ = ("app", "bootstrap", "generation", "qq_installed", "startup_tasks")
 
     def __init__(self) -> None:
         self.app: RouletteApplication | None = None
@@ -211,6 +257,8 @@ class _LifecycleState:
         self.qq_installed = False
         #: Bumped by every shutdown so a racing startup can detect the race.
         self.generation = 0
+        #: The startup hook's own in-flight task(s); shutdown settles them.
+        self.startup_tasks: set[asyncio.Task[Any]] = set()
 
 
 _state = _LifecycleState()
@@ -221,10 +269,63 @@ _start_lock = asyncio.Lock()
 _stop_lock = asyncio.Lock()
 
 
+def _take_startup_tasks() -> set[asyncio.Task[Any]]:
+    """Drain the startup-task registry, keeping only solvable tasks.
+
+    The caller's own task and already-settled tasks are dropped, and the
+    registry is cleared so a repeated shutdown sees the same empty set.
+    """
+
+    current = asyncio.current_task()
+    tasks = {
+        task for task in _state.startup_tasks if task is not current and not task.done()
+    }
+    _state.startup_tasks.clear()
+    return tasks
+
+
+async def _bounded_cancel_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """Wait, then cancel and bounded-wait again, for the startup task(s).
+
+    ``asyncio.wait`` (never ``await task``) is used so a startup that swallows
+    ``CancelledError`` cannot drag shutdown past the bound.  The caller's own
+    task is filtered out by :func:`_take_startup_tasks`, so this never awaits
+    or cancels itself.
+    """
+
+    if not tasks:
+        return
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait(tasks, timeout=STARTUP_CANCEL_TIMEOUT_SECONDS)
+    pending = {task for task in tasks if not task.done()}
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait(pending, timeout=STARTUP_CANCEL_TIMEOUT_SECONDS)
+
+
 def get_roulette_application() -> RouletteApplication | None:
     """Return the installed application, or ``None`` when it is not live."""
 
     return _state.app
+
+
+def get_roulette_observation() -> RouletteObservation | None:
+    """Return the owner's accumulated safe observation, or ``None`` if unowned.
+
+    The runtime status is refreshed from the live runtime *before* the snapshot
+    is built (the runtime is the source of truth for its own lifecycle), but the
+    scan / cleanup records come only from the real jobs that ran: nothing here
+    fabricates counts at read time.
+    """
+
+    app = _state.app
+    if app is None:
+        return None
+    set_runtime_state(app.runtime.get_state())
+    return app.observability.snapshot()
 
 
 def _shared_session_factory() -> SessionFactory:
@@ -237,6 +338,54 @@ def _shared_session_factory() -> SessionFactory:
     from nonebot_plugin_orm import get_session
 
     return get_session
+
+
+async def _orm_reachable() -> bool:
+    """Execute one real read on the shared ORM so "importable" is not readiness.
+
+    The contract requires the startup barrier to prove the shared storage is
+    actually readable: importing ``get_session`` says nothing about whether the
+    engine returned by ``nonebot_plugin_orm`` can serve a statement.  Any failure
+    (uninitialised engine, connection refused, ...) is a fail-closed ``False``.
+    """
+
+    try:
+        async with _shared_session_factory()() as session:
+            value = await session.scalar(text("SELECT 1"))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+    return value == 1
+
+
+async def _dependencies_ready() -> bool:
+    """Recheck the real startup dependencies (ORM + binding + admission).
+
+    ``character_binding`` / ``group_admission`` are resolved as *module*
+    attributes at call time (never bound at import), so the live public
+    ``is_ready`` seams are observed.  Any failure is fail-closed.
+    """
+
+    if not await _orm_reachable():
+        return False
+    try:
+        binding = character_binding.get_binding_manager()
+        if not bool(getattr(binding, "is_ready", False)):
+            return False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+    try:
+        state = group_admission.get_runtime_state()
+        if not bool(getattr(state, "is_ready", False)):
+            return False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+    return True
 
 
 def _acquire_config_manager() -> ConfigPort:
@@ -343,6 +492,9 @@ def _build_application(config_port: ConfigPort) -> RouletteApplication:
     """Assemble the whole graph around an acquired config resource."""
 
     service = _build_service(config_port)
+    observability = RouletteObservability(
+        session_factory=_shared_session_factory()
+    )
     maintenance = RouletteMaintenance(
         session_factory=_shared_session_factory(),
         service=service,
@@ -350,7 +502,7 @@ def _build_application(config_port: ConfigPort) -> RouletteApplication:
     )
     runtime = RouletteRuntime(
         config_manager=config_port,
-        recovery=_RecoveryPort(maintenance),
+        recovery=_RecoveryPort(maintenance, observability),
         admission=_admission_port,
     )
     return RouletteApplication(
@@ -358,6 +510,7 @@ def _build_application(config_port: ConfigPort) -> RouletteApplication:
         service=service,
         maintenance=maintenance,
         config_manager=config_port,
+        observability=observability,
     )
 
 
@@ -380,13 +533,23 @@ def _business_gate(app: RouletteApplication) -> BusinessGate:
         decision = await group_admission.recheck_qq_effect(
             token, effect="business"
         )
-        return decision.allowed
+        if not decision.allowed:
+            return False
+        # The remote recheck is a long wait: re-read the local owner/runtime
+        # state afterwards so a switch/stop that happened during the await can
+        # no longer release the effect (or the send).
+        return app.runtime.accepting
 
     return gate
 
 
 def _runtime_check(app: RouletteApplication) -> RuntimeCheck:
-    """Post-claim runtime recheck (the DB-clock window remains mandatory)."""
+    """Pure-local runtime-state recheck (pre-claim and post-window).
+
+    It reads only the live runtime's local authority, so it is safe to run both
+    before the send gate and again after the final DB-clock credential window;
+    it never opens a network or database round trip.
+    """
 
     async def check(receipt: CommandReceipt) -> bool:
         del receipt
@@ -408,10 +571,15 @@ def _send_gate(app: RouletteApplication) -> SendGate:
 def _install_qq(app: RouletteApplication) -> None:
     """Install the real QQ adapter runtime with the real authority gates."""
 
+    runtime_check = _runtime_check(app)
     install_roulette_qq_runtime(
         service=app.service,
         business_gate=_business_gate(app),
-        runtime_check=_runtime_check(app),
+        runtime_check=runtime_check,
+        # The DB-clock window is the last remote/DB authority, so it is
+        # re-verified with a *pure-local* runtime-state recheck afterwards
+        # instead of a second remote/DB read past the window.
+        post_window_check=runtime_check,
         send_gate=_send_gate(app),
     )
 
@@ -424,33 +592,54 @@ def _install_qq(app: RouletteApplication) -> None:
 async def _recovery_entry() -> None:
     """Periodic recovery entry: re-acquire a missing dependency, then tick.
 
-    On the fail-closed bootstrap path this is the *only* recovery seam: once the
-    config dependency is healthy again it installs the QQ runtime and drives the
-    runtime state machine.  On the healthy path it just joins the runtime's own
-    single-flight recovery tick.
+    On the fail-closed bootstrap path this is the *only* recovery seam.  The
+    dependency probe order is pinned to shared ORM -> config -> binding /
+    admission, and every not-ready branch *revokes* business authority
+    (recoverably) instead of returning with a stale ``READY``; the runtime is
+    published ``READY`` again only by a real successful tick.
     """
 
     app = _state.app
     if app is None:
         return
-    port = _state.bootstrap
-    if port is not None:
-        try:
-            await port.initialize_async()
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.warning(
-                "[Roulette] 配置依赖仍未恢复，保持故障关闭: error_type={}",
-                type(error).__name__,
-            )
+    generation = _state.generation
+    try:
+        port = _state.bootstrap
+        if port is not None:
+            if not await _orm_reachable():
+                logger.warning("[Roulette] 共享 ORM 尚不可读，故障关闭")
+                app.runtime.mark_unavailable(NOT_READY_REASON)
+                return
+            try:
+                await port.initialize_async()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "[Roulette] 配置依赖仍未恢复，保持故障关闭: error_type={}",
+                    type(error).__name__,
+                )
+                app.runtime.mark_unavailable(CONFIG_UNAVAILABLE_REASON)
+                return
+            if _state.app is not app or _state.generation != generation:
+                return
+        if not await _dependencies_ready():
+            # A not-ready binding/admission dependency must never be mistaken
+            # for a clean empty scan: revoke business authority instead of
+            # leaving a stale ``READY`` published.  This is not gated by the
+            # business ``plugin_enable`` switch.
+            logger.warning("[Roulette] 依赖尚未就绪，故障关闭")
+            app.runtime.mark_unavailable(NOT_READY_REASON)
             return
-        if _state.app is not app:
+        if _state.app is not app or _state.generation != generation:
             return
-    if not _state.qq_installed:
-        _install_qq(app)
-        _state.qq_installed = True
-    await app.runtime.run_recovery_tick()
+        if not _state.qq_installed:
+            _install_qq(app)
+            _state.qq_installed = True
+        await app.runtime.run_recovery_tick()
+    finally:
+        if _state.app is app:
+            set_runtime_state(app.runtime.get_state())
 
 
 async def _cleanup_entry() -> CleanupResult | None:
@@ -459,7 +648,12 @@ async def _cleanup_entry() -> CleanupResult | None:
     app = _state.app
     if app is None:
         return None
-    return await drain_cleanup(app.maintenance)
+    result = await drain_cleanup(app.maintenance)
+    app.observability.note_cleanup(result)
+    # Read-only ground truth *after* the real drain ran; never a claim/resend.
+    await _refresh_pending_safely(app.observability)
+    set_runtime_state(app.runtime.get_state())
+    return result
 
 
 def _register_owned_jobs() -> None:
@@ -507,6 +701,50 @@ def _remove_owned_jobs() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed / degraded installers
+# ---------------------------------------------------------------------------
+
+
+def _install_bootstrap(generation: int) -> RouletteApplication:
+    """Install the fail-closed bootstrap graph the periodic entry recovers.
+
+    The app is built over :class:`_LazyConfigPort`, so every read fails closed
+    until the periodic entry acquires the real manager; the owned jobs are
+    registered so that entry really runs.  The generation is rechecked first so
+    a startup that lost the race with a completed shutdown never resurrects an
+    application or its jobs.
+    """
+
+    if generation != _state.generation:
+        raise _StartupAbortedError
+    lazy = _LazyConfigPort()
+    app = _build_application(lazy)
+    _state.bootstrap = lazy
+    _state.app = app
+    _register_owned_jobs()
+    return app
+
+
+def _install_degraded(
+    config_port: ConfigPort,
+    generation: int,
+) -> RouletteApplication:
+    """Install a real-config graph whose dependencies are not ready yet.
+
+    The config resource is genuine, but ``runtime.start()`` is deliberately not
+    called (no recovery, no READY) and QQ dispatch is not installed; the
+    periodic entry rechecks the real dependencies and only then resumes.
+    """
+
+    if generation != _state.generation:
+        raise _StartupAbortedError
+    app = _build_application(config_port)
+    _state.app = app
+    _register_owned_jobs()
+    return app
+
+
+# ---------------------------------------------------------------------------
 # Start / stop
 # ---------------------------------------------------------------------------
 
@@ -518,13 +756,36 @@ async def start_roulette_application() -> RouletteApplication:
     and registers the owned jobs.  A dependency acquisition / initialization
     failure installs the fail-closed bootstrap graph plus the periodic recovery
     entry instead of raising, and never installs QQ dispatch while the
-    dependency is down.
+    dependency is down.  The caller's task is registered so a shutdown that
+    races this startup can settle it instead of leaving it pending.
     """
+
+    task = asyncio.current_task()
+    if task is not None:
+        _state.startup_tasks.add(task)
+    try:
+        return await _start_roulette_locked()
+    finally:
+        if task is not None:
+            _state.startup_tasks.discard(task)
+
+
+async def _start_roulette_locked() -> RouletteApplication:
+    """The single-flighted assembly body (see :func:`start_roulette_application`)."""
 
     async with _start_lock:
         if _state.app is not None:
             return _state.app
         generation = _state.generation
+        # Real dependency barrier: the shared ORM must serve a read *before* any
+        # config acquisition, so an uninitialised engine cannot masquerade as a
+        # healthy start.
+        orm_ok = await _orm_reachable()
+        if generation != _state.generation:
+            raise _StartupAbortedError
+        if not orm_ok:
+            logger.error("[Roulette] 共享 ORM 尚不可读，故障关闭并等待周期恢复")
+            return _install_bootstrap(generation)
         try:
             config_port = _acquire_config_manager()
             await config_port.initialize_async()
@@ -535,12 +796,14 @@ async def start_roulette_application() -> RouletteApplication:
                 "[Roulette] 配置依赖获取失败，故障关闭并等待周期恢复: error_type={}",
                 type(error).__name__,
             )
-            lazy = _LazyConfigPort()
-            app = _build_application(lazy)
-            _state.bootstrap = lazy
-            _state.app = app
-            _register_owned_jobs()
-            return app
+            return _install_bootstrap(generation)
+        if generation != _state.generation:
+            raise _StartupAbortedError
+        # The binding/admission dependencies are part of the barrier: a not-ready
+        # dependency must fail closed instead of passing as an empty-scan start.
+        if not await _dependencies_ready():
+            logger.error("[Roulette] 依赖尚未就绪，故障关闭并等待周期恢复")
+            return _install_degraded(config_port, generation)
         if generation != _state.generation:
             raise _StartupAbortedError
         app = _build_application(config_port)
@@ -553,6 +816,7 @@ async def start_roulette_application() -> RouletteApplication:
         _state.qq_installed = True
         _register_owned_jobs()
         _state.app = app
+        set_runtime_state(app.runtime.get_state())
         return app
 
 
@@ -563,7 +827,9 @@ async def stop_roulette_application() -> None:
     blocked on the config dependency can never install a late graph.  Owned jobs
     and QQ dispatch are cleared before the bounded closes; maintenance is closed
     before the runtime so an in-flight tick observes the owner's stop state, and
-    the shared ORM engine is never disposed.
+    the startup hook's own task(s) are bounded-cancelled/joined last.  The
+    shared ORM engine is never disposed, and repeated shutdowns share the same
+    idempotent path.
     """
 
     async with _stop_lock:
@@ -574,12 +840,26 @@ async def stop_roulette_application() -> None:
         _state.qq_installed = False
         _remove_owned_jobs()
         clear_roulette_qq_runtime()
-        if app is None:
-            return
-        with suppress(Exception):
-            await app.maintenance.close()
-        with suppress(Exception):
-            await app.runtime.close()
+        # Drain the startup registry *before* any wait: a blocked startup must
+        # be settled by this shutdown, and clearing it here keeps a repeated
+        # stop idempotent (it observes the same, already-empty, registry).
+        startup_tasks = _take_startup_tasks()
+        if app is not None:
+            # Revoke local authority *synchronously* before any bounded wait: an
+            # already-installed gate must reject immediately, not only after the
+            # maintenance drain releases the group lock.  The maintenance stop
+            # flag is flipped for the same reason, so a blocked round's post-lock
+            # gate observes it when the lock is handed over.
+            app.runtime.freeze()
+            app.maintenance.mark_stopped()
+            with suppress(Exception):
+                await app.maintenance.close()
+            with suppress(Exception):
+                await app.runtime.close()
+        # Settle the startup hook's own task(s) last: the generation guard
+        # already blocks a late install, and this bound guarantees shutdown does
+        # not return while that task is still pending (never awaiting self).
+        await _bounded_cancel_tasks(startup_tasks)
 
 
 async def _startup() -> None:
@@ -629,6 +909,7 @@ if _driver is not None:
 __all__ = [
     "RouletteApplication",
     "get_roulette_application",
+    "get_roulette_observation",
     "start_roulette_application",
     "stop_roulette_application",
 ]

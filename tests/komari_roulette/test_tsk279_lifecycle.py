@@ -43,7 +43,11 @@ from .tsk279_lifecycle_support import (
     require_single_shutdown_hook,
     require_single_startup_hook,
 )
-from .tsk279_support import harness_fixture_body, insert_waiting_game
+from .tsk279_support import (
+    harness_fixture_body,
+    insert_waiting_game,
+    seed_aged_receipt,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -138,6 +142,44 @@ class BlockingFailingConfig(TogglableConfig):
 async def harness() -> AsyncIterator[Tsk279Harness]:
     async for current in harness_fixture_body():
         yield current
+
+
+async def _pending_fulfillment_count(session_factory: Any) -> int:
+    """Ground-truth count of receipts still awaiting a platform confirmation.
+
+    The owner observation must not fabricate this at read time; comparing the
+    snapshot against the real status view is what proves the assembled jobs
+    really refreshed it.
+    """
+
+    async with session_factory() as session:
+        value = await session.scalar(
+            text(
+                "SELECT count(*) FROM komari_roulette_fulfillments "
+                "WHERE state IN ('NOT_STARTED', 'PENDING_CONFIRMATION')"
+            )
+        )
+    return int(value or 0)
+
+
+async def _scoped_fulfillment_states(
+    session_factory: Any,
+    current: Any,
+) -> list[tuple[str, Any]]:
+    """Return ``(state, platform_message_id)`` for one exact scope's receipts."""
+
+    async with session_factory() as session:
+        rows = await session.execute(
+            text(
+                "SELECT f.state, f.platform_message_id "
+                "FROM komari_roulette_fulfillments AS f "
+                "JOIN komari_roulette_command_receipts AS r "
+                "ON r.receipt_id = f.receipt_id "
+                "WHERE r.app_id = :app_id AND r.group_openid = :group_openid"
+            ),
+            {"app_id": current.app_id, "group_openid": current.group_openid},
+        )
+        return [(str(row[0]), row[1]) for row in rows.all()]
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +720,10 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
                 await invoke_hook(shutdown)
 
             port.release.set()
-            with suppress(Exception):
+            # Ignore the late-failure *and* a bounded cancellation: shutdown is
+            # allowed to cancel the blocked startup instead of merely preventing
+            # the late install.  The load-bearing assertions are below.
+            with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(start_task, timeout=10)
 
             qq = __import__(QQ_MODULE, fromlist=["get_roulette_qq_runtime"])
@@ -689,6 +734,69 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
             assert ctx.scheduler.get_job(RECOVERY_JOB_ID) is None
             assert ctx.scheduler.get_job(CLEANUP_JOB_ID) is None
     finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_stop_bounded_cancels_a_startup_blocked_in_config_initialize(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown must bounded-cancel/join a startup blocked in config initialize.
+
+    The generation guard alone only prevents a *late install*; the blocked
+    startup task itself must be settled before shutdown returns.  A cancellable
+    config-initialize wait is what is pinned here - the test never asks Python
+    to forcibly kill a coroutine that ignores cancellation.
+    """
+
+    await delete_roulette_config(harness.engine)
+    holder: dict[str, BlockingConfig] = {}
+    constructed = asyncio.Event()
+    start_task: asyncio.Task[None] | None = None
+
+    def factory(
+        plugin_name: str,
+        config_schema: type[object],
+        env_config_schema: type[object] | None,
+    ) -> BlockingConfig:
+        del plugin_name, config_schema, env_config_schema
+        port = BlockingConfig(plugin_enable=True)
+        holder["port"] = port
+        constructed.set()
+        return port
+
+    try:
+        async with lifecycle_context(monkeypatch, manager_factory=factory) as ctx:
+            startup = require_single_startup_hook(ctx)
+            shutdown = require_single_shutdown_hook(ctx)
+            start_task = asyncio.create_task(invoke_hook(startup))
+            async with asyncio.timeout(5):
+                await constructed.wait()
+            port = holder["port"]
+            async with asyncio.timeout(5):
+                await port.entered.wait()
+
+            # Shutdown returns (bounded) while the config initialize is still
+            # blocked; it must not leave that startup running.
+            async with asyncio.timeout(10):
+                await invoke_hook(shutdown)
+
+            assert start_task.done(), (
+                "shutdown must bounded-cancel/join an in-flight startup blocked "
+                "in config initialization instead of leaving it pending"
+            )
+            assert application_api()["get_roulette_application"]() is None
+            qq = __import__(QQ_MODULE, fromlist=["get_roulette_qq_runtime"])
+            assert qq.get_roulette_qq_runtime() is None
+    finally:
+        # Never leak the blocked task if the assertion above went red.
+        blocked = holder.get("port")
+        if blocked is not None:
+            blocked.release.set()
+        if start_task is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(start_task, timeout=10)
         await delete_roulette_config(harness.engine)
 
 
@@ -777,6 +885,84 @@ async def test_start_fails_closed_when_dependency_not_ready_and_recovers(
 
 
 @PG_REQUIRED
+@pytest.mark.parametrize("dependency", _DEPENDENCY_RED_CASES)
+async def test_scheduled_recovery_tick_fails_closed_after_dependency_loss(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    dependency: str,
+) -> None:
+    """A dependency lost *after* a healthy READY must really fail closed.
+
+    The cold-start guard is not enough: once the runtime is READY the scheduled
+    recovery entry must still drive it to FAILED when the live binding/admission
+    dependency goes away, instead of returning early and leaving the previous
+    READY published.  Restoring the dependency must recover through the same
+    entry.
+    """
+
+    from komari_bot.plugins.komari_roulette.maintenance import RECOVERY_JOB_ID
+
+    toggles = install_dependency_readiness(
+        monkeypatch,
+        binding_ready=True,
+        admission_ready=True,
+    )
+    await delete_roulette_config(harness.engine)
+    try:
+        async with lifecycle_context(
+            monkeypatch,
+            ready_dependencies=False,
+        ) as ctx:
+            await invoke_hook(require_single_startup_hook(ctx))
+            app = application_api()["get_roulette_application"]()
+            assert app is not None
+
+            # Real live switch through the registry manager, then a real owned
+            # tick: the runtime must reach a genuine READY first.
+            manager = ctx.config_managers["komari_roulette"]
+            await manager.update_field_async("plugin_enable", value=True)
+            job = ctx.scheduler.get_job(RECOVERY_JOB_ID)
+            assert job is not None
+            await job["func"]()
+            assert app.runtime.get_state().status.value == "ready", (
+                "the healthy start must really reach READY before the loss"
+            )
+
+            # The dependency goes not-ready *after* READY.
+            if dependency == "binding":
+                toggles.binding.ready = False
+            else:
+                toggles.admission.ready = False
+            await job["func"]()
+            lost = app.runtime.get_state()
+            assert lost.status.value == "failed", (
+                f"a live {dependency} readiness loss must not leave the runtime "
+                f"READY (got {lost.status.value}); the scheduled tick must fail "
+                "closed instead of returning early"
+            )
+            assert lost.recovery_completed is False
+            assert app.runtime.accepting is False
+            assert (
+                app.runtime.authorize(scope="business", group_ids=[1]).allowed
+                is False
+            )
+
+            # Restoring the dependency recovers through the same owned entry.
+            toggles.binding.ready = True
+            toggles.admission.ready = True
+            await job["func"]()
+            recovered = app.runtime.get_state()
+            assert recovered.status.value == "ready", (
+                "the scheduled tick must recover to READY once the dependency "
+                f"is healthy again, got {recovered.status.value}"
+            )
+            assert recovered.recovery_completed is True
+            assert app.runtime.accepting is True
+    finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
 async def test_registered_jobs_feed_the_owner_observability_snapshot(
     harness: Tsk279Harness,
     monkeypatch: pytest.MonkeyPatch,
@@ -793,10 +979,13 @@ async def test_registered_jobs_feed_the_owner_observability_snapshot(
         RECOVERY_JOB_ID,
     )
 
-    get_observation = lifecycle_symbol("get_roulette_observation")
     await delete_roulette_config(harness.engine)
     try:
         async with lifecycle_context(monkeypatch) as ctx:
+            # The symbol must be resolved *after* the context reloaded the
+            # lifecycle module: a symbol captured before the reload would point
+            # at the previous module object (and its orphaned module state).
+            get_observation = lifecycle_symbol("get_roulette_observation")
             await invoke_hook(require_single_startup_hook(ctx))
             app = application_api()["get_roulette_application"]()
             assert app is not None
@@ -833,6 +1022,73 @@ async def test_registered_jobs_feed_the_owner_observability_snapshot(
                 "cleanup must not replace the recorded recovery scan"
             )
             assert after_cleanup.runtime_status == after_recovery.runtime_status
+    finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_real_owner_tick_refreshes_pending_without_claiming_or_sending(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real owned tick must sync the pending count from real storage.
+
+    The independent observability cases already own the full read-failure
+    matrix; this only pins the *assembly*: after the real registered recovery
+    callback ran, the owner snapshot must expose the ground-truth pending
+    count, and the pending receipts must be untouched (never claimed, never
+    resent).
+    """
+
+    from komari_bot.plugins.komari_roulette.maintenance import RECOVERY_JOB_ID
+
+    await delete_roulette_config(harness.engine)
+    try:
+        async with lifecycle_context(monkeypatch) as ctx:
+            get_observation = lifecycle_symbol("get_roulette_observation")
+            await invoke_hook(require_single_startup_hook(ctx))
+            app = application_api()["get_roulette_application"]()
+            assert app is not None
+
+            async with harness.scope("owner-pending") as current:
+                for index in range(2):
+                    await seed_aged_receipt(
+                        harness.session_factory,
+                        current,
+                        inbound_msg_id=f"owner-pending-{index}-{uuid4().hex}",
+                        age_seconds=30,
+                        state="PENDING_CONFIRMATION",
+                    )
+
+                job = ctx.scheduler.get_job(RECOVERY_JOB_ID)
+                assert job is not None
+                await job["func"]()
+
+                snapshot = get_observation()
+                assert snapshot is not None
+                expected = await _pending_fulfillment_count(
+                    harness.session_factory
+                )
+                assert snapshot.pending_receipts == expected, (
+                    "the assembled recovery callback must refresh the owner "
+                    "pending count from real storage"
+                )
+                assert (
+                    dict(snapshot.fault_counts).get("pending_unavailable")
+                    is None
+                ), "a successful pending refresh must not aggregate a fault"
+
+                states = await _scoped_fulfillment_states(
+                    harness.session_factory, current
+                )
+                assert len(states) == 2
+                assert all(
+                    state == "PENDING_CONFIRMATION" for state, _ in states
+                )
+                assert all(
+                    platform_message_id is None
+                    for _, platform_message_id in states
+                ), "a pending observation must never claim or resend a receipt"
     finally:
         await delete_roulette_config(harness.engine)
 
@@ -888,7 +1144,9 @@ async def test_stop_then_failed_config_initialize_never_installs_bootstrap(
 
             # The dependency then fails; the startup must not install anything.
             port.release.set()
-            with suppress(Exception):
+            # Tolerate both the late failure and a bounded cancellation of the
+            # blocked startup; the no-install assertions below are unchanged.
+            with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(start_task, timeout=10)
 
             assert application_api()["get_roulette_application"]() is None, (

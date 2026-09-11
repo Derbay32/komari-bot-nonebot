@@ -260,6 +260,40 @@ class RouletteRuntime:
             finally:
                 self._start_done = True
 
+    def freeze(self) -> None:
+        """Revoke authority *synchronously* at the very start of a shutdown.
+
+        A shutdown must reject an already-installed gate immediately, not only
+        after the slower maintenance drain releases the lock.  Setting the
+        closed flag here (before any ``await``) makes ``accepting`` false for
+        every holder of the old gate; :meth:`close` still performs the bounded
+        drain afterwards.  This is deliberately irreversible: only a real
+        restart may release authority again.
+        """
+
+        self._closed = True
+        self._recovery_completed = False
+        self._status = RouletteRuntimeStatus.FAILED
+        self._reason_code = NOT_READY_REASON
+
+    def mark_unavailable(self, reason_code: str) -> None:
+        """Record a *recoverable* dependency failure and revoke business authority.
+
+        Unlike :meth:`freeze`, this is reversible: the runtime stays failed for
+        business but a later clean recovery tick may publish ``READY`` again.
+        It exists for the scheduled-recovery path, where a dependency
+        (ORM/config/binding/admission) that was healthy at startup turns
+        unavailable later; merely returning would leave a stale ``READY``
+        published and keep the gates accepting.  An unknown reason collapses to
+        the closed-set ``not_ready`` instead of copying a foreign string.
+        """
+
+        if self._closed:
+            return
+        self._set_failed(
+            reason_code if reason_code in RUNTIME_REASON_CODES else NOT_READY_REASON
+        )
+
     async def close(self) -> None:
         """Block new dispatch immediately, then bounded-cancel the in-flight work.
 
