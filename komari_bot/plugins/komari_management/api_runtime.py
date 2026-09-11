@@ -59,6 +59,8 @@ class ManagementApiComponents:
     prompt_resources: tuple[ManagedPromptResource, ...]
     register_character_binding_repair_api: Callable[..., None]
     character_binding_repair_service_getter: Callable[[], object | None]
+    register_roulette_management_api: Callable[..., None]
+    roulette_observation_getter: Callable[[], object | None]
 
 
 def register_management_api_for_driver(
@@ -138,6 +140,12 @@ def register_management_api_for_driver(
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
         service_getter=components.character_binding_repair_service_getter,
+    )
+    components.register_roulette_management_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+        observation_getter=components.roulette_observation_getter,
     )
     register_reply_fulfillment_api(
         server_app,

@@ -61,10 +61,13 @@ from .domain import (
     apply_action,
     initial_state,
 )
+from .lifecycle import get_roulette_observation
+from .management_api import register_roulette_management_api
 from .mapper import (
     EliminationRecord,
     GameSnapshot,
     LeaderboardEntry,
+    LeaderboardInspection,
     ResultPlayer,
     RouletteResult,
     StateTransition,
@@ -102,6 +105,7 @@ __all__ = [
     "IdempotencyKeyConflictError",
     "ItemType",
     "LeaderboardEntry",
+    "LeaderboardInspection",
     "Observation",
     "PlayerRef",
     "PostgresRouletteStorage",
@@ -121,6 +125,8 @@ __all__ = [
     "apply_action",
     "game_state_from_snapshot",
     "game_state_to_snapshot",
+    "get_roulette_observation",
     "initial_state",
+    "register_roulette_management_api",
     "transition_from_action_result",
 ]

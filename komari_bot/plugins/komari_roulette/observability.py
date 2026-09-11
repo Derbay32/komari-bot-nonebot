@@ -201,13 +201,22 @@ class RouletteObservation:
         """Return the snapshot as a JSON-safe dict with a fixed key set.
 
         Nested counter dicts are copied so mutating the returned projection can
-        never rewrite the snapshot's own state.
+        never rewrite the snapshot's own state.  Tuple counters (``fault_counts``)
+        are rendered as JSON arrays so the REST status body is byte-identical to
+        a round-tripped JSON payload instead of ``tuple`` vs ``list``.
         """
 
         projected: dict[str, object] = {}
         for name in sorted(self.FIELDS):
             value = getattr(self, name)
-            projected[name] = dict(value) if isinstance(value, dict) else value
+            if isinstance(value, dict):
+                projected[name] = dict(value)
+            elif isinstance(value, tuple):
+                projected[name] = [
+                    list(item) if isinstance(item, tuple) else item for item in value
+                ]
+            else:
+                projected[name] = value
         return projected
 
 

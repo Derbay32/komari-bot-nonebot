@@ -1288,3 +1288,459 @@ GREEN（不在 15 RED 内）。
 未覆盖/风险：本轮只加 RED，不修生产；四个缺口在实现修复前必须保持 RED。Gap B/C
 用“在途/阻塞”制造窗口，未覆盖真实 gunicorn 进程级 on_shutdown 顺序（同 §13.4）；
 真实远端原子性未断言，只断言本地动态开关/owner 状态的实时性。
+
+## 14. Stage-C2：REST status / 排行榜核查（inspect）/ 重投影（rebuild）+ 正式管理装配（本阶段）
+
+本阶段把「控制面」钉死在真实 FastAPI（ASGI 传输）+ 真实
+``komari_bot.management.management_api`` 鉴权/权限 + 真实
+``management_audit_span`` + 真实 ``PostgresRouletteStorage`` 上，并把
+``komari_roulette`` 接入正式管理装配（``ManagementApiComponents`` /
+``register_management_api_for_driver``）。新增文件（均为测试专用）：
+
+| 文件 | 行数 | 作用 |
+|---|---|---|
+| `tsk279_management_support.py` | 685 | 冻结常量（前缀/三条路由/错误闭集/差异闭集/响应字段集/四凭据）、DTO 构造、路由遍历（fastapi 0.139 `_IncludedRouter` 递归）、真实 ASGI 客户端、fake 存储/会话、录制审计、控制面装配 |
+| `test_tsk279_management_api.py` | 744 | 无 PG 的 HTTP 契约 + 装配守卫（23 个 `def`，参数化后 26 例） |
+| `test_tsk279_leaderboard_management_pg.py` | 700 | 真实 PostgreSQL 存储接缝 + 两种加锁顺序竞态 + HTTP e2e（12 个 `def`，参数化后 16 例） |
+
+生产 ``komari_bot.plugins.komari_roulette.management_api``、
+``PostgresRouletteStorage.inspect_leaderboard``、顶层
+``get_roulette_observation`` 暴露面与 ``ManagementApiComponents`` 两个新字段
+尚不存在，RED 由 ``ModuleNotFoundError`` / ``AttributeError`` / 顶层
+``__all__`` 缺符号 / 生产 dataclass 缺字段触发。**两者都是设计内 RED，不是
+fixture 造假**：无 PG 文件里真实装配的是真 DI 骨架，有 PG 文件里真实跑完的
+是种子数据与原始 SQL 变异（见 §14.5 首错证据）。
+
+### 14.1 拟议最窄公共接缝
+
+```python
+# komari_bot/plugins/komari_roulette/management_api.py（新模块）
+API_PREFIX = "/api/v2/komari-roulette"
+ROULETTE_MANAGEMENT_ERROR_CODES = frozenset({
+    "roulette_status_unavailable", "roulette_storage_unavailable",
+    "roulette_aggregate_corrupt",
+})
+
+def register_roulette_management_api(
+    app: FastAPI, *, api_token: Sequence[Mapping[str, object]],
+    allowed_origins: Sequence[str],
+    observation_getter: Callable[[], RouletteObservation | None] | None = None,
+    session_factory: Callable[[], AsyncContextManager[AsyncSession]] | None = None,
+    storage_factory: Callable[[AsyncSession], RouletteStorage] | None = None,
+    audit_recorder: Callable[[ManagementAuditEvent], None] | None = None,
+) -> None                                  # 幂等（app.state.<flag>），镜像 config/prompt 模式
+# 默认值：observation_getter=顶层 get_roulette_observation，
+#        session_factory=共享 ORM get_session，storage_factory=PostgresRouletteStorage
+# 路由面**精确**三条，无 reset / 改分 / 预览确认令牌入口：
+#   GET  /status                              roulette:read
+#   POST /leaderboards/inspect                roulette:read   （POST 让身份不进 URL 访问日志）
+#   POST /leaderboards/rebuild                roulette:manage
+#                                              + X-Komari-Change-Reason + X-Request-ID
+# 路由模块不得 import group_admission / komari_roulette.config_schema /
+# komari_management（控制面不是业务门）
+
+# komari_bot/management/management_api.py
+_READ_PERMISSION_IMPLICATIONS["roulette:read"] = frozenset({"roulette:manage"})
+# manage 蕴含 read（与 character_binding / reply_fulfillment 同形）；
+# 表内容本身无数值断言，由「MANAGER_TOKEN 只带 roulette:manage 而 status/inspect 返回 200」行为覆盖
+
+# komari_bot/plugins/komari_roulette/storage.py
+async def inspect_leaderboard(self, group: GroupRef) -> LeaderboardInspection
+# 一致快照：同一事务内读 completed 证明（results）与缓存投影（leaderboard），
+# 逐 member_openid 对照；缺行/多行/错 wins/显示名错配/时间错配都给精确 code。
+# completed 证明损坏（如 winner_display_name 为 NULL）→ AggregateCorruptError
+# （与 rebuild_leaderboard 同一 fail-safe 判定），绝不静默伪 0。
+
+@dataclass(frozen=True, slots=True)
+class LeaderboardInspection:            # 具体宿主模块不指定，只要求顶层可 import
+    app_id: str; group_openid: str; consistent: bool
+    cached_entry_count: int; completed_entry_count: int
+    cached_total_wins: int; completed_total_wins: int
+    discrepancy_codes: tuple[str, ...]   # <= DISCREPANCY_CODES
+    entries: tuple[LeaderboardEntry, ...]  # 安全面：无 member_openid
+
+DISCREPANCY_CODES = {  # 冻结闭集（生产不必导出同名常量）
+    "missing_cached_row", "extra_cached_row", "wins_mismatch",
+    "display_name_mismatch", "last_won_at_mismatch",
+}
+
+# komari_bot/plugins/komari_roulette/__init__.py（ADR-0006 顶层暴露面）
+__all__ += ["get_roulette_observation", "register_roulette_management_api",
+            "LeaderboardInspection"]
+```
+
+固定错误外壳（三条路由共用）：``{"detail": {"code", "message"}}``，``code`` 属
+``ROULETTE_MANAGEMENT_ERROR_CODES`` 闭集，``message`` 为固定文案，**绝不回显异常
+正文/身份**（测试注入 ``SECRET_LEAK = "SECRET-LEAK-9f2c4d"`` 并断言缺失）。三个
+code **统一映射 503**：``roulette_status_unavailable``（owner 未装配，绝不伪造
+``ready``）、``roulette_storage_unavailable``、``roulette_aggregate_corrupt``——
+统一「运维上不可用」语义，避免把「无 owner」错读成 404/500。
+
+响应面（冻结键集，多一键即红）：
+
+| 路由 | 响应 |
+|---|---|
+| `status` | `== RouletteObservation.as_dict()`（`runtime_status`/`runtime_reason`/`latest_scan`/`latest_cleanup`/`pending_receipts`/`fault_counts`），不包含任何进程/队列内部态 |
+| `inspect` | `app_id`/`group_openid`/`consistent`/`cached_entry_count`/`completed_entry_count`/`cached_total_wins`/`completed_total_wins`/`discrepancy_codes`/`entries`；entry 仅 `display_name`/`wins`/`last_won_at` |
+| `rebuild` | `app_id`/`group_openid`/`consistent`/`entry_count`/`total_wins` |
+
+rebuild 处理器算法（冻结）：校验 body（extra 禁止 / 空标识 422）→ 鉴权
+（缺 token 401 / 权限不足 403）→ reason + request-id（缺/空白 400，超 200 字符或
+格式非法 422）→ 开 session → ``rebuild_leaderboard`` → ``inspect_leaderboard`` →
+``commit``，全部在 ``management_audit_span`` 内。审计事件固定：
+``action="roulette.leaderboard.rebuild"``、``resource="roulette"``、
+``field_name=None``、``target_hash=hash_management_target(app_id, group_openid)``、
+``metadata={entry_count, total_wins, result_code="rebuilt"}``、``status_code=200``；
+**只读面不写审计**；``started`` 必须先于变更、``succeeded`` 后于变更（用
+``probe`` 在事件时刻抄 ``storage.rebuilds`` 证明）。失败语义：``started`` 阶段失败
+→ 中止在变更之前（零 rebuild / 零 commit / 非 200）；``succeeded`` 阶段失败 →
+只告警，**不回滚已提交事实**（200 + commit 保留）。rebuild **不**申请/校验
+10 分钟预览确认令牌（该令牌在本控制面不存在，由路由面精确相等守住）。
+
+正式管理装配（生产必须改的两处）：
+
+* `komari_bot/plugins/komari_management/api_runtime.py`：
+  `ManagementApiComponents` 增加 `register_roulette_management_api` 与
+  `roulette_observation_getter` 两个**必填**字段，并在
+  `register_management_api_for_driver` 中调用
+  `components.register_roulette_management_api(...)` 且传
+  `observation_getter=components.roulette_observation_getter`。
+* `komari_bot/plugins/komari_management/__init__.py`：`_load_management_components`
+  增加 `require("komari_roulette")`、`from komari_bot.plugins import komari_roulette as roulette_plugin`，
+  并把 `register_roulette_management_api=roulette_plugin.register_roulette_management_api`、
+  `roulette_observation_getter=roulette_plugin.get_roulette_observation` 作为真实符号传入。
+
+**是否必填的裁决（C2 基线根审后纠正）**：两个新字段
+``register_roulette_management_api`` / ``roulette_observation_getter`` **必须必填**
+（无默认值），与 TSK-280 的 ``register_character_binding_repair_api`` /
+``character_binding_repair_service_getter`` 先例一致；**不得**用 ``None`` / ``_noop``
+默认值去迁就旧构造点。既有构造点
+（``tests/komari_management/test_management_api_runtime.py``、
+``test_plugin_integration.py``）的 fixture 必须同步补齐这两个字段（仅 dummy
+registrar/getter，不削弱任何业务断言），并以
+``test_management_components_require_binding_repair_fields`` 同款 ``inspect.signature``
+断言覆盖新字段无默认值。
+
+**真实 loader 证据（取代源码字符串守卫）**：删除只匹配 ``__init__.py`` 源码文本
+形状（``from ... import ... as roulette_plugin`` 的逐字形状、逐字 kwarg 行）的守卫
+——它既不证明真实 loader 载入真实符号，又钉死了 ``from import`` 形状（根要求
+“别钉”）。代之以行为证据：复用 ``tests/komari_management/test_plugin_integration.py``
+的真实 NoneBot 测试语境，**实际执行生产** ``komari_management/__init__.py`` 的
+``_load_management_components``（隔离加载真实 ``__init__``，其余插件依赖按既有
+shim/stub 提供），断言
+``components.register_roulette_management_api is komari_bot.plugins.komari_roulette.register_roulette_management_api``
+与 ``components.roulette_observation_getter is ...get_roulette_observation``，并记录
+loader 确实调用过 ``require("komari_roulette")``（不匹配 import 形状）。后续真实
+``register_management_api_for_driver`` 挂载路由的测试仍由
+``api::test_real_management_assembly_mounts_roulette_routes`` 承担。
+
+装配路径沿用 ``binding_repair_lifecycle.py`` 先例（函数内 deferred ``require`` +
+顶层公开面 import），跨插件只走顶层面。
+
+### 14.2 AC → 用例 → 冻结断言
+
+| AC | 用例 | 断言性质 |
+|---|---|---|
+| 观测快照键集 + 共享管理接缝可用 | `api::test_green_probe_observation_and_shared_management_seams` | **GREEN 探针（不依赖 C2 seam）** |
+| 审计投影（事件 → dict）永不携带 app/group 身份 | `api::test_audit_event_projection_never_carries_identity` | **GREEN 探针（不依赖 C2 seam）** |
+| 路由模块声明冻结前缀与三条路径 | `api::test_roulette_management_module_declares_the_frozen_prefix` | 缺 seam RED |
+| 错误 code 恰为闭集 | `api::test_management_error_codes_are_the_frozen_closed_set` | 缺 seam RED |
+| 顶层 `__all__` 暴露三个 C2 符号 | `api::test_roulette_package_exposes_the_c2_surface_at_top_level` | 缺暴露面 RED |
+| 路由面精确三条 + 注册幂等 + 无禁用入口词 | `api::test_exact_route_surface_and_idempotent_registration` | 缺 seam RED |
+| 控制面不读 `plugin_enable`、不过群准入（无关权限仍 403） | `api::test_control_plane_needs_no_plugin_enable_or_admission_gate` | 缺 seam RED |
+| 路由模块不 import 门控/管理插件内部模块 | `api::test_roulette_management_module_imports_no_forbidden_gate` | 缺 seam RED |
+| `status` 键集 == `RouletteObservation.as_dict()`；read/manage/wildcard 200，无关 403，匿名 401，零审计 | `api::test_status_projects_the_frozen_snapshot_and_permission_matrix` | 缺 seam RED |
+| owner 未装配 ⇒ 503 `roulette_status_unavailable`（走真实默认 getter） | `api::test_status_fails_closed_when_no_application_owns_the_runtime` | 缺 seam RED |
+| `inspect` 安全面（entry 三键、无 `member_openid`）+ 三凭据 200 / 无关 403 / 零变更 / 零审计 | `api::test_inspect_projects_safe_leaderboard_and_permission_matrix` | 缺 seam RED |
+| `inspect` 差异如实透出且不写缓存 | `api::test_inspect_reports_discrepancies_without_mutating_the_cache` | 缺 seam RED |
+| `inspect` 存储/聚合失败 → 固定外壳 + 不回显正文（参数化 2） | `api::test_inspect_failures_use_the_fixed_error_envelope[StorageUnavailableError\|AggregateCorruptError]` | 缺 seam RED |
+| inspect/rebuild extra 字段与空标识一律 422 | `api::test_inspect_and_rebuild_forbid_extra_fields_and_empty_identifiers` | 缺 seam RED |
+| rebuild 必须带 manage + reason + request-id（缺/空白 400、超长/非法 422、reader/无关 403） | `api::test_rebuild_requires_manage_reason_and_request_id` | 缺 seam RED |
+| rebuild 恰一次 commit、`started` 先于变更、审计事件安全投影 | `api::test_rebuild_commits_once_and_records_safe_audit_events` | 缺 seam RED |
+| 审计 `succeeded` 写失败不回滚已提交事实 | `api::test_rebuild_audit_final_failure_keeps_the_committed_fact` | 缺 seam RED |
+| 审计 `started` 写失败 ⇒ 零 rebuild / 零 commit | `api::test_rebuild_started_audit_failure_leaves_no_change` | 缺 seam RED |
+| rebuild 失败 → 固定外壳 + 零 commit | `api::test_rebuild_failures_use_the_fixed_error_envelope` | 缺 seam RED |
+| `ManagementApiComponents` 含两个 C2 **必填**字段 | `api::test_management_components_expose_the_roulette_fields` | 缺字段 RED |
+| 生产 `_load_management_components` 载入**真实** roulette 两符号 + `require` 声明 | `plugin_integration::test_production_loader_carries_real_roulette_symbols` | 缺接线 RED |
+| 真实 `register_management_api_for_driver` 挂载三条路由并端到端可读 | `api::test_real_management_assembly_mounts_roulette_routes` | 缺 seam RED |
+| `status` 对 ready/disabled/failed 经**真实 getter** 全 200（控制面不因业务状态拒绝） | `api::test_status_returns_every_lifecycle_state_through_the_real_getter[ready\|disabled\|failed]` | 缺 seam RED |
+| 共享 `management_audit_span` 的 `started` fail-closed / final 吞异常语义 | `api::test_shared_audit_span_started_is_fail_closed_and_final_is_swallowed` | **GREEN 探针（不依赖 C2 seam）** |
+| 空作用域核查一致且为空 | `pg::test_inspect_empty_scope_is_consistent_and_empty` | 缺 seam RED |
+| 一次真实 completed 后核查与真实投影一致 | `pg::test_inspect_matches_the_real_projection_after_a_completed_game` | 缺 seam RED |
+| 缓存缺行/多行/错 wins/显示名/时间 → 精确差异 code（参数化 5） | `pg::test_inspect_reports_the_exact_cache_divergence[delete\|insert\|wins\|display_name\|last_won_at]` | 缺 seam RED |
+| rebuild 只从 completed 证明重建缓存并回到一致 | `pg::test_rebuild_reproduces_the_cache_from_completed_proofs` | 缺 seam RED |
+| 损坏证明 ⇒ 两个入口都抛 `AggregateCorruptError` 且缓存不变 | `pg::test_inspect_and_rebuild_fail_safe_on_a_corrupt_proof` | 缺 seam RED |
+| rebuild 连做两次仍同一真实投影、不增 wins、不改 completed 证明 | `pg::test_rebuilt_projection_is_idempotent_and_never_recounts_wins` | 缺 seam RED |
+| 同名不同 member、总 wins 相同的成员级 last_won_at 错配必须 `consistent=False`（只比 displayName/总 sum 不能过） | `pg::test_inspect_flags_same_name_member_level_mismatch` | 缺 seam RED |
+| 并发在途终局投影时 `inspect` 仍读到单一一致快照（复用真实 PG 暂停接缝） | `pg::test_inspect_reads_one_consistent_snapshot_while_a_projection_is_uncommitted` | 缺 seam RED |
+| rebuild 先持组锁、终局投影后到：wins 不丢且核查一致 | `pg::test_rebuild_holding_the_scope_lock_keeps_the_next_terminal_win` | 缺 seam RED |
+| 终局投影先持组锁、rebuild 后到：两种顺序收敛同一事实 | `pg::test_terminal_projection_holding_the_scope_lock_keeps_the_win` | 缺 seam RED |
+| HTTP inspect/rebuild 走真实存储默认缝并持久生效 | `pg::test_http_inspect_and_rebuild_drive_the_real_storage` | 缺 seam RED |
+| HTTP rebuild 遇到损坏证明 → 503 `roulette_aggregate_corrupt` 且缓存不被破坏 | `pg::test_http_rebuild_maps_a_corrupt_proof_to_the_fixed_code` | 缺 seam RED |
+
+### 14.3 RED / GREEN 分类（C2 基线实测：34 failed / 2 passed；根审 delta 后的当前实测见 §14.7）
+
+| 桶 | 用例数 | 实测首错 |
+|---|---|---|
+| 缺 seam（路由模块不存在） | API 14 + PG 2 | `ModuleNotFoundError: No module named 'komari_bot.plugins.komari_roulette.management_api'` |
+| 缺 seam（`inspect_leaderboard` 不存在） | PG 11 | `AttributeError: 'PostgresRouletteStorage' object has no attribute 'inspect_leaderboard'. Did you mean: 'list_leaderboard'?` |
+| 缺暴露面 | API 1 | `AssertionError: 顶层 __all__ 缺少 Stage-C2 跨插件暴露面: ['get_roulette_observation', 'register_roulette_management_api', 'LeaderboardInspection']` |
+| 缺字段（`ManagementApiComponents`） | API 2 | `pyright: No parameter named "register_roulette_management_api" / "roulette_observation_getter"`（运行期经 `build_management_components` 的 assert 硬化） |
+| **GREEN（不依赖 C2 seam）** | API 2 | ✅ 观测键集 == `STATUS_RESPONSE_FIELDS`、审计投影不含身份 |
+
+无「业务断言 RED」桶：C2 的一个业务常量（三 code 全 503、manage⇒read、
+`started` 先于变更）在路由面不存在时无法与真值对照，因此不伪装成已测；它们
+改为在 seam 落地后由上述用例**首次真实求值**。本地 SQLite/无 PG 环境不跑 PG 文件
+（`skipif(not POSTGRES_URL)`），门控库不一致时 `db_scope` 再 skip 一层。
+
+### 14.4 本阶段未验证（保留给后续修复轮）
+
+- `inspect_leaderboard` 的**聚合语义**（真实 completed 证明 → 逐 member 期望
+  wins/显示名/时间，以及差异 code 的**完整组合**）只在 seam 落地后才能求值；
+  本阶段只能证明「种子数据 + 原始 SQL 变异 + 会话/事务编排」全部真实可用
+  （见 §14.5 首错行号证据）。
+- 差异 code 的**多 code 同时出现**（如缺行 + wins 错）未断言：PG 参数化各只
+  制造**单一**变异，只断言期望 code `in` 且 `set(codes) <= DISCREPANCY_CODES`。
+- `entries` 的**排序**（`wins desc, last_won_at asc, member_openid asc`）在 C2
+  未断言（HTTP/PG 都只断言成员集合与 wins 集合），沿用 C1 `list_leaderboard` 覆盖。
+- rebuild **幂等重放**：根审 delta 已补
+  `pg::test_rebuilt_projection_is_idempotent_and_never_recounts_wins`（连做两次
+  收敛同一真实投影、不增 wins、不改 completed 证明），原缺口关闭（见 §14.7）。
+- HTTP 层并发（两个同时 rebuild / rebuild 与 inspect 并发）未做：PG 层用真实
+  `pg_advisory_xact_lock` 阻塞 + `_wait_until_blocked` 断言阻塞方 backend pid，
+  已确定性覆盖两种加锁顺序，但未覆盖 HTTP 请求级并发。
+- `X-Komari-Change-Reason` 的**恰好 200 字符**边界（应接受）未断言：只断言缺/
+  空白 → 400、201 字符 → 422。
+- CORS：`allowed_origins` 只做透传，C2 全部用例传 `()`，未断言预检/CORS 头
+  （沿用共享 `ensure_management_cors` 的既有覆盖）。
+- 真实 ASGI 进程（uvicorn/gunicorn）下的挂载未验证：`test_real_management_assembly_mounts_roulette_routes`
+  用 `_FakeDriver("fastapi", app)` + `httpx.ASGITransport`，与 §13.4 同一限制。
+- `status` 在 `runtime_status` 为 `disabled`/`failed` 时的投影：根审 delta 已补
+  `api::test_status_returns_every_lifecycle_state_through_the_real_getter[ready|disabled|failed]`
+  （真实默认 getter + 真实 owner 状态归一化，控制面一律 200），原缺口关闭（见 §14.7）。
+
+### 14.5 执行记录（命令日志）
+
+环境：worktree `/Users/derbay32/project/komari-bot/.agents/worktrees/tsk-279`，
+branch `pi/TSK-279-runtime-recovery`，HEAD `d869bfe575986ddb94a509f7bd051174045d4000`，
+root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`（3.13.11）。PG/Redis
+门控同 §13.5（`postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume`、
+`redis://127.0.0.1:56358/15`，pytest 均带 `-p no:cacheprovider`）。
+
+| 命令 | 结果 |
+|---|---|
+| `ruff check tests/komari_roulette/` | ✅ All checks passed |
+| `pyright --pythonpath … tests/komari_roulette/{tsk279_management_support,test_tsk279_management_api,test_tsk279_leaderboard_management_pg}.py` | 7 errors / 0 warnings，**全部为设计内 RED**（2 × `ManagementApiComponents` 缺字段 + 5 × `inspect_leaderboard` 缺接口） |
+| `pyright --pythonpath …`（全仓） | 7 errors / 0 warnings / 0 informations，**与本文件同源**（C1 基线全仓 0 报错，§13.8）；即本轮增量为 +7，全部落在上表两个新测试文件 |
+| `pytest tests/komari_roulette/test_tsk279_management_api.py -q --tb=no -rA` | **21 failed / 2 passed**（2 GREEN 为不依赖 seam 的探针） |
+| `pytest tests/komari_roulette/test_tsk279_leaderboard_management_pg.py -q --tb=line`（带门控） | **13 failed**，首错：11 × `AttributeError: inspect_leaderboard`、2 × `ModuleNotFoundError: …management_api`（无连接错误） |
+| `pytest tests/komari_roulette/test_tsk279_lifecycle.py tests/komari_roulette/test_tsk278_handler.py -q --tb=no`（带门控，C1 回归） | ✅ **61 passed**（C1 生命周期 + 278 handler 未受影响） |
+| `git status --porcelain` / `git diff --cached --stat` / `git rev-parse HEAD` | 见 §14.6 |
+
+首错行号证据（证明「种子/变异/事务编排」在真实 PG 上已经跑完，而非 fixture 报错）：
+
+| 失败行 | 含义 | 已真实执行的部分 |
+|---|---|---|
+| `test_tsk279_leaderboard_management_pg.py:157`（7 例） | `_inspect` 辅助里的 `inspect_leaderboard` | 空作用域路径；2×`_persist_completed`（含 waiting→joining→shoot→forfeit 各阶段 commit）；5 种原始 SQL 缓存变异（DELETE / INSERT 幽灵行 / wins+5 / 改名 / `last_won_at + make_interval`）全部成功提交 |
+| `:189`（2 例，正是两条竞态用例） | 末尾 `_assert_consistent_projection` | `_persist_completed(project=False)`、真实 `rebuild_leaderboard`、真实 `project_terminal`、`_backend_pid` 抄取、`_wait_until_blocked` **断言阻塞方 pid 命中**、两种顺序的 `commit()` 全部成功——即 `pg_advisory_xact_lock` 双向阻塞与「两顺序都保留 wins」已在真实库上跑通，只差最后的一致性核查 |
+| `:275`（1 例） | `rebuild_reproduces` 的首次 `inspect` | 两次 completed 种子 + `DELETE` 缓存全部成功 |
+| `:308`（1 例） | `fail_safe_on_a_corrupt_proof` 的 `inspect` | 种子 + `UPDATE komari_roulette_results SET winner_display_name = NULL` 成功（迁移 0019 对 winner 列无 CHECK，允许该变异），随后缓存未被改写 |
+
+### 14.6 C1 索引不变声明
+
+本阶段**只新增**三个测试文件 + 追加本节，未改动任何 C1 产物：
+
+```
+M  komari_bot/plugins/komari_roulette/lifecycle.py      ┐
+M  komari_bot/plugins/komari_roulette/maintenance.py    │
+M  komari_bot/plugins/komari_roulette/qq/__init__.py    ├ 6 个已 staged 的 C1 生产文件
+M  komari_bot/plugins/komari_roulette/qq/delivery.py    │ （git diff --cached --stat 仍是
+M  komari_bot/plugins/komari_roulette/qq/handler.py     │  562 insertions / 161 deletions）
+M  komari_bot/plugins/komari_roulette/runtime.py        ┘
+ M tests/group_admission/test_qq_roulette_gate.py       ┐ 3 个 C1 测试文件
+ M tests/komari_roulette/test_tsk278_handler.py         ├ 仍为未 staged 的 ` M`，内容未动
+ M tests/komari_roulette/test_tsk279_lifecycle.py       ┘
+?? tests/komari_roulette/tsk279_management_support.py   ┐ 本轮新增（untracked）
+?? tests/komari_roulette/test_tsk279_management_api.py  ├
+?? tests/komari_roulette/test_tsk279_leaderboard_management_pg.py ┘
+```
+
+HEAD 仍为 `d869bfe575986ddb94a509f7bd051174045d4000`；C1 生命周期回归
+61 passed 证明 C1 语义未被本阶段触碰。本阶段**未提交**、未触碰分支/索引/工作树
+之外的任何状态（除本节追加到已跟踪的 `tests/komari_roulette/TSK-279-contract.md`）。
+
+### 14.7 根审 delta 收尾执行记录（general test 收尾）
+
+C2 基线根审后追加三项关键覆盖（`api::test_status_returns_every_lifecycle_state_through_the_real_getter`
+参数化 3 例、`pg::test_rebuilt_projection_is_idempotent_and_never_recounts_wins`、
+`pg::test_inspect_flags_same_name_member_level_mismatch`、
+`pg::test_inspect_reads_one_consistent_snapshot_while_a_projection_is_uncommitted`）
+与 `api::test_management_components_expose_the_roulette_fields`，并把「`__init__.py`
+源码字符串守卫」换成真实 loader 行为证据（§14.1「真实 loader 证据」）。本轮收尾
+修复了后者的一处 fixture 缺陷并冻结共享审计源码语义。
+
+**唯一代码变更（测试专用）**：`tests/komari_management/test_plugin_integration.py`
+的 `real_management_loader` fixture 原先对非 roulette 依赖回落到 suite 的
+`nonebot.plugin.require` 桩（`tests/conftest.py:453`），而该桩白名单不含
+`komari_help`，导致生产 `_load_management_components` 在 `require("komari_help")`
+处 `RuntimeError: Unsupported plugin require in tests: komari_help` 中止——RED 落在
+fixture 而非真实接线。现改为纯记录桩（loader 丢弃 `require` 返回值，其余依赖本就可
+stub，§14.1），真实 loader 随后实际执行完毕。
+
+实测 loader 记录到的 `require` 顺序（真实执行证据）：`komari_knowledge,
+komari_help, komari_memory, agent_run_logger, komari_search, user_ban, komari_chat,
+group_admission, character_binding`，缺 `komari_roulette` ⇒ 断言
+`"komari_roulette" in required_plugins` 是设计内缺接线 RED；两符号身份断言
+（`is roulette_plugin.register_roulette_management_api` / `get_roulette_observation`）
+同样 RED，且不会被 stub 冒充（fixture 不 stub roulette 两符号）。
+
+**`management_audit_span` 源码证明（冻结，不另造审计）**：`komari_bot/management/management_audit.py:253`
+的 `await recorder(base_event)` 位于 `try: yield span`（`:257`）之前，`started` 写失败
+直接抛出 `__aenter__`、业务体零执行 ⇒ fail-closed；`:204-211` 的 `_record_final_event`
+把 final 写入异常吞掉并只 `logger.critical` ⇒ final 失败不回滚已提交事实。
+`api::test_shared_audit_span_started_is_fail_closed_and_final_is_swallowed` 已 GREEN
+冻结该语义（未改生产）。
+
+**当前实测 counts**（root venv `/Users/derbay32/project/komari-bot/.venv/bin/python`
+3.13.11；PG/Redis 门控同 §13.5）：
+
+| 命令 | 结果 |
+|---|---|
+| `ruff check`（C2 3 文件 + 2 个 management fixture） | ✅ All checks passed |
+| `pyright --pythonpath …`（全仓） | **16 errors / 0 warnings**，全部设计内 RED：`ManagementApiComponents` 缺字段 6（support 2 + runtime fixture 2 + plugin_integration fixture 2）+ roulette 顶层缺符号 2 + `inspect_leaderboard` 缺接口 8；C1 基线全仓 0 |
+| `pytest tests/komari_roulette/test_tsk279_management_api.py` | **23 failed / 3 passed**（3 GREEN 探针：观测键集、审计投影、审计 span 语义） |
+| `pytest tests/komari_roulette/test_tsk279_leaderboard_management_pg.py`（门控） | **16 failed**（14 × `AttributeError: inspect_leaderboard`；2 × `ModuleNotFoundError: …management_api`） |
+| `pytest tests/komari_management/{test_management_api_runtime,test_plugin_integration}.py` | **6 failed / 3 passed**（4 + 2，均为 `ManagementApiComponents` 缺字段 / roulette 缺接线 RED） |
+
+**新增 RED 分类**：API 新增 `test_management_components_expose_the_roulette_fields`（缺字段
+RED）、`test_status_returns_every_lifecycle_state_through_the_real_getter[ready|disabled|failed]`
+（缺 seam RED ×3）、`test_shared_audit_span_…`（GREEN）；PG 新增 3 例（幂等重放 /
+同名成员级错配 / 在途投影一致快照）全部缺 seam RED；旧 management fixture 新增 6 例
+缺字段/缺接线 RED。
+
+**未覆盖义务**（保留原状）：§14.4 其余条目（多 code 同时出现、entries 排序、HTTP
+请求级并发、reason 恰好 200 字符、CORS、真实 ASGI 进程）。
+
+本轮只改 `tests/komari_roulette/TSK-279-contract.md` 与
+`tests/komari_management/test_plugin_integration.py` 的测试 fixture；C1 的 6 生产 + 3
+旧测试仍原样未提交，HEAD / 分支 / 索引 / 生产实现未动。
+
+### 14.8 C2 根审测试自错误修复（test-only，3 例 fixture 缺陷，2026-09-11）
+
+C2 生产接缝落地后（`management_api.py` / `inspect_leaderboard` / 顶层暴露面 /
+`ManagementApiComponents` 两字段），C2 四文件基线为 **2 failed / 49 passed**
+（唯一失败均落在 `test_tsk279_leaderboard_management_pg.py`）。根审确认这 3 例
+是**用例自身**的 fixture 缺陷，不是生产 bug：两例必红、一例假绿（安全比对即可
+识别，未真正钉成员 key）。本轮只改该 PG 测试文件与本合同，**不碰任何生产代码**。
+
+**（1）`test_http_rebuild_maps_a_corrupt_proof_to_the_fixed_code`（必红 → 绿）**
+HTTP rebuild 对损坏证明正确返回 503 `roulette_aggregate_corrupt`，但原末行
+`_assert_consistent_projection` 又要求损坏 proof 能成功 `inspect_leaderboard`，
+与该接缝自己的 fail-safe 合同（损坏证明必须抛 `AggregateCorruptError`）冲突。
+改为请求前后**直接读缓存完整行（含 `member_openid`）与损坏证明行**：缓存逐字节
+相等、仍 1 胜；损坏证明未被擅自修复/改写（`winner_display_name` 保持 NULL）。
+HTTP 503 断言不变，且不再为检查缓存去 inspect 损坏源。
+
+**（2）`test_inspect_reads_one_consistent_snapshot_while_a_projection_is_uncommitted`
+（必红 → 绿）** 原用例两局复用同一 `SEATS` 的同一 winner member，两胜实际只落
+1 个 entry，却断言 `late.cached_entry_count == 2`。按根裁决**保留强 2-entry
+断言**：在途第二局改用不同合法 `member_openids`（显示名不变），使已提交快照
+1 entry/1 胜 → 提交后 2 entry/2 胜；保留 `early.cached_entry_count ∈ {1,2}`、
+`late == 2`、`late totals == 2` 与「cache/proofs 计数与总胜场不得撕裂」断言。
+entry 按**冠军成员聚合行**定义，不是 completed 对局数。
+
+**（3）`test_inspect_flags_same_name_member_level_mismatch`（假绿 → 真证）**
+原用例用 `CACHE_MUTATIONS["last_won_at"]`（全部行 `+1h`）制造差异，安全的公共
+entry 列表比较也能识别，未真正钉成员 key。改为**先断言两名同名成员真实落库的
+`last_won_at` 不相等**，再在同一事务内**互换这两行的时间**（只改本 case 的两个
+PK，不动 completed 证明）：时间值集合、总 wins、`completed_*` 计数、排序后的
+公共 `entries` 全部与 baseline 相同，只有 `member_openid → last_won_at` 映射错位
+⇒ `consistent=False` / `last_won_at_mismatch`。即仅逐成员比对才能发现。
+
+新增测试内原始 SQL 读写助手 `_cache_rows` / `_swap_cached_last_won_at`（均在本
+测试文件内，无外部探针）；`CACHE_MUTATIONS["last_won_at"]` 仍由单 entry 的
+参数化用例 `test_inspect_reports_the_exact_cache_divergence[last_won_at]` 使用。
+
+**执行记录**（环境同 §14.5：worktree `.../worktrees/tsk-279`，branch
+`pi/TSK-279-runtime-recovery`，HEAD `d869bfe575986ddb94a509f7bd051174045d4000`，
+root venv `/Users/derbay32/project/komari-bot/.venv/bin/python` 3.13.11；PG/Redis
+门控 `postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume`、
+`redis://127.0.0.1:56358/15`）：
+
+| 命令 | 结果 |
+|---|---|
+| `ruff check`（PG 测试文件） | ✅ All checks passed |
+| `ruff format --check`（PG 测试文件） | ✅ 1 file already formatted |
+| `ruff check`（C2 3 测试/支撑文件 + 2 个 management fixture） | ✅ All checks passed |
+| `pyright --pythonpath <root venv>`（PG 测试文件） | ✅ 0 errors / 0 warnings |
+| `pyright --pythonpath <root venv>`（全仓） | ✅ **0 errors / 0 warnings**（§14.7 的 16 个设计内 RED 随生产接缝落地全部消失） |
+| `pytest …/test_tsk279_leaderboard_management_pg.py -q`（门控） | ✅ **16 passed**（修复前 14 passed / 2 failed） |
+| `pytest`（C2 四文件：`test_tsk279_management_api.py` + PG 文件 + `test_management_api_runtime.py` + `test_plugin_integration.py`，门控） | ✅ **51 passed**（修复前 2 failed / 49 passed） |
+| 同四文件重复 2 次 | ✅ 51 passed / 51 passed（无抖动） |
+
+**是否新暴露生产 bug**：否。三处修复后全绿，且第 3 例的成员级错配确实由生产
+`inspect_leaderboard` 的逐 `member_openid` 对照捕获（若生产只比显示名/总胜场，
+该用例必红），说明生产比对语义正确。
+
+**边界**：本轮只改 `tests/komari_roulette/test_tsk279_leaderboard_management_pg.py`
+与本合同；C1 的 6 个 staged 生产文件与全部 C2 生产未暂存/新文件原样未动，
+HEAD / 分支 / 索引均未变，未提交、未清表、未跑 full suite、未 deselect。
+
+### 14.9 C2 错误路径回归（test-only，固定外壳三 code 全 503，2026-09-11）
+
+独立源审发现生产 `komari_bot/plugins/komari_roulette/management_api.py` 的错误分支
+违反 §14.1 冻结外壳。本轮**只**补回归用例（生产由 TSK-279 本体另人实现）：
+
+1. **rebuild `session.commit()` 未被 storage 包装**：commit 抛 SQL/连接错误 → inner
+   `except Exception` 直接返回 500 `{"detail": "轮盘管理接口内部错误"}`，而非 503
+   `roulette_storage_unavailable`。
+2. **status `.as_dict()` 在 try 外**：快照投影协作者抛错无人接住 → FastAPI 默认 500
+   （`Internal Server Error`），而非 503 `roulette_status_unavailable`。
+3. 其余 generic inspect/rebuild（非两已知 storage/aggregate 异常）同样落 500 内部错误壳。
+
+**本轮新增/加强（测试专用，不动生产）**
+
+| 用例 | 性质 | 冻结断言 |
+|---|---|---|
+| `api::test_status_projection_failure_fails_closed_without_leaking` | RED（新） | 投影失败的协作者（`as_dict()` 抛 canary）→ 503 `roulette_status_unavailable` 固定外壳、无 canary、零审计；故意非 `RouletteObservation` 协作者对 `object` 接缝合法 |
+| `api::test_rebuild_commit_failure_fails_closed_without_partial_state` | RED（新） | commit 抛 generic RuntimeError → 503 `roulette_storage_unavailable`、`commit_attempts==1`/`commits==0`、恰好一次 rebuild、一个已退出 session、审计零 `succeeded` |
+| `api::test_inspect_failures_use_the_fixed_error_envelope[RuntimeError-…]` | RED（既有参数化 +1） | generic inspect 失败同样 503 固定外壳，且响应体**不是**空排行榜（`set(body)=={"detail"}`、无 `entries`） |
+| `api::test_rebuild_failures_use_the_fixed_error_envelope[RuntimeError-…]` | RED（既有参数化 +1） | generic rebuild 失败同样 503 固定外壳、零 commit 尝试 |
+
+支撑改动（`tsk279_management_support.py`，测试专用）：
+
+- `_FakeSession` / `FakeSessionFactory` 新增 `commit_error` 注入与 `commit_attempts`
+  计数，区分「commit 尝试一次」与「成功提交 0」；`_FakeSessionContext` 退出时标记
+  `closed`。`commit_error` 是**已知**失败（应用前抛出），故可断言无成功提交；**不**
+  宣称真实网络 commit 结果未知时必然回滚（PG 语义如要覆盖另报，不扩本票）。
+- `asgi_client` 新增 `raise_app_exceptions: bool = True`；置 `False` 时观察 FastAPI
+  默认 500 响应而不被 ASGI 传输重抛（默认值不变，其余用例零影响）。
+
+**根裁决遵守**：统一沿用 §14.1 原三 code、统一 503，不新增 code；不改权限/校验
+（400/401/403/422）既有语义；新外壳仍只 `except Exception`（不吞 `CancelledError`）。
+共享 `management_audit_span` 的 `started` fail-closed / final 吞错语义不复测、不重写。
+
+**RED 证据**（环境：worktree `.../worktrees/tsk-279`，branch
+`pi/TSK-279-runtime-recovery`，HEAD `d869bfe575986ddb94a509f7bd051174045d4000`，
+root venv `/Users/derbay32/project/komari-bot/.venv/bin/python` 3.13.11；门控
+`postgresql+asyncpg://komari_test@127.0.0.1:55458/komari_tsk279_resume`、
+`redis://127.0.0.1:56358/15`）：
+
+| 命令 | 结果 |
+|---|---|
+| `ruff check`（2 测试/支撑文件） | ✅ All checks passed |
+| `pyright --pythonpath <root venv>`（2 文件） | ✅ 0 errors / 0 warnings |
+| `pytest …/test_tsk279_management_api.py -q` | **4 failed / 26 passed** |
+| `pytest …/test_tsk279_leaderboard_management_pg.py -q`（回归） | ✅ 16 passed |
+
+4 例首错：`test_status_projection_failure_fails_closed_without_leaking` 为
+`AssertionError: Internal Server Error`；另 3 例为
+`AssertionError: {"detail":"轮盘管理接口内部错误"}`（均来自支持文件
+`assert_error_envelope` 的 status 断言）。即现状是默认 500 / generic 500 内部错误壳，
+正是本轮要收敛到 503 固定外壳的缺口。
+
+**边界**：本轮只改 `tests/komari_roulette/test_tsk279_management_api.py`、
+`tests/komari_roulette/tsk279_management_support.py` 与本合同；生产 `management_api.py`
+及 C1 6 个 staged 文件、全部 C2 生产未暂存/新文件原样未动，HEAD / 分支 / 索引均未变，
+未提交、未跑 full suite。`ruff format --check` 的漂移为仓库现存 ruff 版本差异（未改的
+management fixture 同样 “would reformat”），非本轮引入，未擅自重排。
