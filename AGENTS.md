@@ -15,7 +15,7 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | 语言 | Python **3.13+**（禁止兼容旧版） | 强制使用 `X \| Y`、`list[T]`、`match-case` |
 | 包管理 | Poetry | `pyproject.toml` + `poetry.lock` |
 | Bot 框架 | NoneBot2 >=2.4.4 | 插件通过 `require()` 声明依赖 |
-| 适配器 | OneBot V11 | QQ 协议适配 |
+| 适配器 | OneBot V11 + QQ 官方适配器 | 既有 OneBot 功能；可选官 Bot 群 @ 绑定与轮盘 |
 | Web | FastAPI（内嵌于 NoneBot2） | 管理 API、知识库 WebUI |
 | 数据库 | PostgreSQL + **pgvector**（HNSW 索引） | 连接/会话由 **nonebot-plugin-orm**（SQLAlchemy 2.x）托管，Schema 由 **Alembic 版本链**（`migrations/`）唯一管理；特殊 DDL 表保留 raw SQL |
 | 缓存 | Redis >=7.1.0 | `redis.asyncio`（**禁止**使用 `aioredis`） |
@@ -121,12 +121,13 @@ komari-bot/
   group_history_summary ────── 群聊历史总结
 
 辅助功能层
-  character_binding ────────── PostgreSQL 角色名绑定 + 进程内快照（普通用户 self-only；跨用户管理入口已移至 `.debug bind ...`）
+  character_binding ────────── 应用/群作用域角色名与双协议身份关联；QQ `/bind` 用户向导、OneBot 静默取证；受权 REST 预览/清除修复
   sr ───────────────────────── 神人榜抽签
   komari_custom ────────────── .custom 知识库提案与投票采纳
   komari_sentry ────────────── Sentry 集成
   komari_management ────────── 管理 REST API
-  komari_debug ─────────────── SUPERUSER 调试命令（好感度/绑定/回复干跑/总结诊断/失败通知开关）
+  komari_debug ─────────────── SUPERUSER 调试命令（好感度/已确认群角色名/回复干跑/总结诊断/失败通知开关）
+  komari_roulette ──────────── QQ 群俄罗斯轮盘（纯领域规则 + PG 事务/收据/一次履约 + 恢复维护；默认关闭）
 ```
 
 ### 数据流路径
@@ -312,11 +313,24 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 ### 3.3 角色名绑定 (`character_binding`)
 
-- **持久化**：PostgreSQL 表 `komari_character_bindings`（SQLModel ORM，见 `orm_models.py`），以 `user_id` 为主键；运行时不再读写 JSON 绑定文件
-- **同步读取**：`get_character_name()`、`list_bindings()`、`has_binding()` 只读取进程内不可变快照；写库成功后用新字典原子替换快照
-- **一致性边界**：部署层强制单 worker，因此不轮询数据库也不使用 LISTEN/NOTIFY；直接改库需重启后生效，未来放开多 worker 时必须重新设计跨进程刷新
-- **故障降级**：启动时 PostgreSQL 不可用则保留空快照，角色名回退昵称或 QQ 号；写入失败统一抛出 `BindingPersistenceError`
-- **显式迁移**：升级部署前先执行 `poetry run python scripts/migrate_character_binding_to_pg.py`，把旧 `data/character_binding/bindings.json` 内容 upsert 到 PostgreSQL
+- **正式真源**：迁移 0018 的 `komari_character_binding_groups` / `komari_character_binding_members`，按 `(app_id, group_openid)` 隔离群关联、成员身份与本群角色名；名字使用 NFKC/casefold 唯一键，双向身份约束由 PG 事务保证。
+- **消费边界**：QQ 使用应用/群/成员 OpenID 上下文；OneBot 只通过 `(group_id, user_id)` 做最小群作用域桥接，禁止裸 `user_id` 查询当前角色名。缺失或歧义不猜测身份。
+- **快照与就绪**：同步名称读取使用进程内快照；写库成功后发布新快照。修复提交后先在锁内失效受影响缓存，再尽力刷新；刷新失败不能把已提交清除改成失败或保留旧身份。部署保持单 worker。
+- **用户入口**：普通用户仅使用官 Bot 群 @ `/bind` 向导；OneBot 原 `bind/bind_set/bind_del/bind_list` matcher 已退役。首次未知群只在有效策略及可信取证配置齐备时获得一次原生引用挑战；OneBot listener 经真实引用和 `get_msg` 取证，保持静默。两平台消息 ID 不混用，10 分钟绝对会话期限不续期，重启失效。
+- **确认边界**：草稿不能当正式绑定；取证后、提交前和发送前重新核查群准入及身份。不可用或受限时失败关闭，不将数据库失败解释为无绑定。
+- **改名/解绑**：`/bind rename`、`/bind unbind` 经公开键盘会话码和二次确认；普通解绑只清本群角色名，保留已确认身份关系。改名、解绑和取消草稿不改变已有对局的入席资格或冻结名；无当前角色名不能新开局或重入。
+- **旧值**：`komari_character_bindings` 仅保留旧全局候选；`get_legacy_character_name()` 只用于本人主动选择迁移，不自动 fallback 或批量创建新关系。旧 JSON 导入脚本不等于正式群绑定迁移。
+- **运营修复**：`/api/v2/character-bindings/repair/{diagnose,preview,confirm}` 提供受权诊断、预览和清除；修复需 read/manage 权限、理由、请求 ID 和 10 分钟单次令牌。waiting/active 拒绝修复，清后未绑定是正确终态，用户之后独立 `/bind`；不自动改指身份，不改历史胜场。既有 `.debug bind set|del|list` 仅管理已确认群内角色名，不是身份修复入口。
+
+### 3.4 俄罗斯轮盘 (`komari_roulette`)
+
+- **启动与配置**：`QQ_BOTS` 非空时注册官 Bot 适配器；可信官 Bot 数字 QQ 按 `QQ_OFFICIAL_BOT_QQ_BY_APP` 启动配置。迁移 0019/0020/0021 建立游戏、收据/履约和强类型配置；`plugin_enable` 默认 false，动态生效。按共享 ORM → 合法配置 → binding/admission → storage/recovery 顺序启动，首次成功恢复前不放行业务。
+- **领域与事务**：2～6 人、6 发弹仓、15 分钟绝对行动期限；稳定 `join_seq` 不重排或复用。开始时冻结名字、编号顺序与道具权重。命令、收据、游戏状态和胜场通过 PG 事务/约束/锁/CAS 一致提交，不新增轮盘专用 Redis 依赖。
+- **QQ 交互**：仅群 @ `/轮盘 …`，目标用稳定玩家编号，不依赖第二个 mention。按钮只填入命令，用户手动发送才执行。终局为完整普通单段，无引用/粗体/按钮；提及使用胜者已知 OpenID，不从昵称猜测。
+- **一次履约**：领域提交后冻结文案与投影；配置变化不重渲染旧收据。发送开始后异常、取消或缺失合法平台 ID 保持 UNKNOWN / `PENDING_CONFIRMATION`，不得回滚领域事实、重抽、重发或猜测确认。后台无合法入站消息 ID 不创建群消息 outbox。
+- **恢复与清理**：关闭开关不暂停绝对期限；受限群不推进，恢复后只处理旧当前玩家一次，下一人取得完整 15 分钟。每 60 秒小批扫描，每日调度器时区 04:00 清理，PG UTC 比较保留边界；收据/履约 7 天，cancelled/expired/failed 30 天，completed/结果玩家/胜场长期保留，waiting/active 不清理。关闭先撤权和调度，再有界收束自有工作，不 dispose 共享 ORM。
+- **控制面**：`/api/v2/komari-roulette/status` 与 `/leaderboards/{inspect,rebuild}`；read/manage 分权。仅按 completed 真源校验/重建，不提供任意加分、重置、恢复发送或强制终局。`latest_scan/latest_cleanup` 是结果计数，不是时间戳。
+- **交付边界**：根目录 `ROULETTE-ROLLOUT.md` 记录升级、旧名主动迁移、运维与最终 QQ 样本；自动化及旧原型不代替当前部署版本的真实 QQ 展示/通知验收。
 
 ### 4. 四层记忆系统 (`komari_memory`)
 
@@ -548,4 +562,4 @@ Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-08-07。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-09-11。发现不一致请以实际代码为准并更新本文档。*
