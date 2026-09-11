@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import random
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -63,6 +63,10 @@ from .storage import (
 Scalar = str | int | bool | None
 PublicValue = Scalar | tuple[str, ...]
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+#: Caller gate re-evaluated while the group lock is held, before any write.
+#: ``None`` means the caller did *not* ask for a post-lock recheck; it is not an
+#: implicit always-true default, and no implementation may add one.
+EffectCheck = Callable[[], bool | Awaitable[bool]]
 #: Intents whose active-game writes are guarded by a caller observation.
 OBSERVED_ACTIVE_WRITES = frozenset(
     {
@@ -93,6 +97,17 @@ class FulfillmentConflictError(RuntimeError):
     """A fulfillment claim was used with an incompatible terminal state."""
 
 
+class EffectCheckRejectedError(RuntimeError):
+    """The caller's post-lock gate declined the command.
+
+    A dedicated safe-rejection control flow, not a storage / state failure: the
+    group lock was already held, the idempotent replay was already excluded, and
+    the gate was evaluated before any write, so nothing was written (no receipt,
+    no state mutation, no fulfillment).  The QQ handler absorbs it silently; a
+    caller that does not expect it may still observe it as a ``RuntimeError``.
+    """
+
+
 class FulfillmentState(StrEnum):
     """Durable one-to-one reply fulfillment lifecycle."""
 
@@ -107,6 +122,10 @@ class FulfillmentState(StrEnum):
 #: against the PostgreSQL clock; the TSK-279 scheduler reuses this same constant
 #: and the same ``komari_roulette_command_receipts.created_at`` column.
 FULFILLMENT_CREDENTIAL_WINDOW_SECONDS: int = 300
+
+#: ``result_code`` returned by :meth:`RouletteCommandService.advance_expired`
+#: when the caller's post-lock gate declined the advance.  Nothing was written.
+EFFECT_CHECK_REJECTED = "effect_check_rejected"
 
 
 def _age_seconds(value: object) -> float | None:
@@ -225,8 +244,18 @@ class CanonicalCommand:
         if self.intent == "syntax_failure" and not (self.syntax_code or "").strip():
             raise ValueError("syntax failure code must not be empty")
 
-    def to_action(self, player: PlayerRef) -> Action:
-        """Translate a canonical command to the pure domain action seam."""
+    def to_action(
+        self,
+        player: PlayerRef,
+        *,
+        item_weights: Mapping[ItemType, int] | None = None,
+    ) -> Action:
+        """Translate a canonical command to the pure domain action seam.
+
+        ``item_weights`` is only meaningful for ``start``: TSK-269 §1 freezes the
+        configurable weights into the game snapshot exactly once, at the
+        ``waiting -> active`` edge, so every other intent ignores the argument.
+        """
 
         match self.intent:
             case "create":
@@ -238,7 +267,7 @@ class CanonicalCommand:
             case "cancel":
                 return Action.cancel(player)
             case "start":
-                return Action.start(player)
+                return Action.start(player, item_weights=item_weights)
             case "shoot":
                 return Action.shoot(player)
             case "forfeit":
@@ -537,18 +566,30 @@ class RouletteCommandService:
         session_factory: SessionFactory,
         reply_projector: Callable[[ReplyProjectionContext], ReplyProjection],
         random_source: RandomSource | None = None,
+        item_weights_provider: Callable[[], Mapping[ItemType, int]] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._reply_projector = reply_projector
         self._random_source = random_source or _DefaultRandomSource()
+        self._item_weights_provider = item_weights_provider
 
     async def execute_group_command(
         self,
         request: CommandRequest,
         *,
         observation: Observation | None = None,
+        effect_check: EffectCheck | None = None,
     ) -> CommandReceipt:
-        """Execute one parsed command and commit its receipt atomically."""
+        """Execute one parsed command and commit its receipt atomically.
+
+        ``effect_check`` mirrors :meth:`advance_expired`: the caller's internal
+        post-lock guard is evaluated once the group advisory lock is held and
+        before any read that could write.  A ``False`` answer (or a gate that
+        raises) settles as the dedicated :class:`EffectCheckRejectedError` with
+        zero effects; ordinary storage / domain errors still propagate.  ``None``
+        means the caller explicitly supplied no gate.  A gate that rejected the
+        command is never converted into an error receipt.
+        """
 
         try:
             async with self._session_factory() as session:
@@ -557,6 +598,7 @@ class RouletteCommandService:
                         session,
                         request,
                         observation=observation,
+                        effect_check=effect_check,
                     )
                     try:
                         await session.commit()
@@ -584,6 +626,22 @@ class RouletteCommandService:
         except (DBAPIError, SQLAlchemyError, ConnectionError, OSError, TimeoutError) as error:
             raise StorageUnavailableError("roulette command storage is unavailable") from error
 
+    def _start_item_weights(
+        self,
+        intent: str,
+    ) -> Mapping[ItemType, int] | None:
+        """Read the configurable item weights for a ``start`` command only.
+
+        TSK-269 §1: the provider is consulted once, on the ``waiting -> active``
+        edge, and the normalized weights are persisted with the game snapshot.
+        Every other intent (and a service built without a provider) returns
+        ``None``, which keeps the pure domain default unchanged.
+        """
+
+        if intent != "start" or self._item_weights_provider is None:
+            return None
+        return self._item_weights_provider()
+
     async def observe_current(self, group: GroupRef) -> Observation | None:
         """Read the latest validated game snapshot for a group."""
 
@@ -607,8 +665,21 @@ class RouletteCommandService:
         group: GroupRef,
         *,
         observation: Observation | None = None,
+        effect_check: EffectCheck | None = None,
     ) -> ExpiryAdvance:
-        """Advance one expired game without creating a receipt or sending."""
+        """Advance one expired game without creating a receipt or sending.
+
+        ``effect_check`` is the caller's *internal* post-lock guard.  A worker
+        that only decided to advance *before* waiting on the group advisory lock
+        must re-confirm the decision after the wait: the gate is evaluated once
+        the lock is held and before any read that could write, so a group that
+        turned restricted (or a runtime that closed) while the worker queued
+        settles as a no-effect ``effect_check_rejected`` result instead of
+        advancing a turn nobody is allowed to see.
+
+        ``None`` means the caller explicitly supplied no gate; it is not an
+        always-true default and this method never substitutes one.
+        """
 
         del observation
         try:
@@ -619,6 +690,18 @@ class RouletteCommandService:
                     app_id=group.app_id,
                     group_openid=group.group_openid,
                 )
+                if effect_check is not None and not await _run_effect_check(
+                    effect_check
+                ):
+                    await session.rollback()
+                    return ExpiryAdvance(
+                        receipt_id=None,
+                        game_id=None,
+                        result_code=EFFECT_CHECK_REJECTED,
+                        changed=False,
+                        state_revision=None,
+                        turn_seq=None,
+                    )
                 try:
                     current = await storage.load_current(group, for_update=True)
                 except AggregateCorruptError:
@@ -859,6 +942,7 @@ class RouletteCommandService:
         request: CommandRequest,
         *,
         observation: Observation | None,
+        effect_check: EffectCheck | None,
     ) -> CommandReceipt:
         """Run one command while retaining the caller's transaction."""
 
@@ -891,6 +975,13 @@ class RouletteCommandService:
         )
         if existing is not None:
             return self._replay_or_conflict(existing, fingerprint)
+
+        # The caller's authority was decided *before* this transaction waited on
+        # the group advisory lock; re-confirm it now that the lock is held and
+        # before any write.  A false / raising gate is a dedicated safe refusal
+        # with zero effects (never an error receipt).
+        if effect_check is not None and not await _run_effect_check(effect_check):
+            raise EffectCheckRejectedError("roulette command effect check rejected")
 
         if request.command.intent == "syntax_failure":
             code = request.command.syntax_code or "invalid_syntax"
@@ -1035,7 +1126,10 @@ class RouletteCommandService:
             current=current,
             binding_record=member_record,
         )
-        action = request.command.to_action(player)
+        action = request.command.to_action(
+            player,
+            item_weights=self._start_item_weights(request.command.intent),
+        )
         result = apply_action(
             state,
             action,
@@ -1449,6 +1543,24 @@ class RouletteCommandService:
         return value
 
 
+async def _run_effect_check(effect_check: EffectCheck) -> bool:
+    """Evaluate a caller's post-lock gate, treating any failure as a refusal.
+
+    A gate that raises - or an awaitable gate that rejects - must never be read
+    as "the group is still allowed".  The caller asked for the admission or
+    runtime decision to be re-confirmed after the group lock; an unanswerable
+    question is a no-effect refusal, not a licence to write.
+    """
+
+    try:
+        outcome = effect_check()
+        if isinstance(outcome, Awaitable):
+            return bool(await outcome)
+        return bool(outcome)
+    except Exception:
+        return False
+
+
 def _receipt_from_row(row: Mapping[str, object]) -> CommandReceipt:
     raw_projection = row["reply_projection"]
     if isinstance(raw_projection, str):
@@ -1809,11 +1921,14 @@ def _member_for_seq(snapshot: GameSnapshot | None, join_seq: int | None) -> str 
 
 
 __all__ = [
+    "EFFECT_CHECK_REJECTED",
     "FULFILLMENT_CREDENTIAL_WINDOW_SECONDS",
     "CanonicalCommand",
     "CommandReceipt",
     "CommandRequest",
     "CommitOutcomeUnknownError",
+    "EffectCheck",
+    "EffectCheckRejectedError",
     "ExpiryAdvance",
     "FulfillmentClaim",
     "FulfillmentConflictError",

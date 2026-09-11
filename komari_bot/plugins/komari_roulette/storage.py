@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 
@@ -25,6 +25,7 @@ from .mapper import (
     EliminationRecord,
     GameSnapshot,
     LeaderboardEntry,
+    LeaderboardInspection,
     ResultPlayer,
     RouletteResult,
     StateTransition,
@@ -53,6 +54,70 @@ _P = RoulettePlayerRow.__table__
 _R = RouletteResultRow.__table__
 _RP = RouletteResultPlayerRow.__table__
 _L = RouletteLeaderboardRow.__table__
+
+
+#: One statement = one snapshot.  The cached projection and the completed
+#: proofs are read together so a concurrent terminal projection can never make
+#: the two sides look inconsistent under READ COMMITTED.  ``row_kind`` splits
+#: the two shapes; the proof branch left-joins its immutable seat proofs.
+_INSPECT_SNAPSHOT_SQL = text(
+    """
+SELECT
+    'cached' AS row_kind,
+    l.member_openid AS cache_member_openid,
+    l.display_name AS cache_display_name,
+    l.wins AS cache_wins,
+    l.last_won_at AS cache_last_won_at,
+    NULL::text AS result_game_id,
+    NULL::text AS result_app_id,
+    NULL::text AS result_group_openid,
+    NULL::text AS result_lifecycle,
+    NULL::text AS result_reason,
+    NULL::timestamptz AS result_created_at,
+    NULL::timestamptz AS result_started_at,
+    NULL::timestamptz AS result_ended_at,
+    NULL::integer AS result_terminal_revision,
+    NULL::integer AS result_winner_seq,
+    NULL::text AS result_winner_member_openid,
+    NULL::text AS result_winner_display_name,
+    NULL::integer AS player_join_seq,
+    NULL::text AS player_member_openid,
+    NULL::text AS player_display_name,
+    NULL::boolean AS player_alive,
+    NULL::integer AS player_eliminated_order,
+    NULL::text AS player_eliminated_reason,
+    NULL::timestamptz AS player_eliminated_at
+FROM komari_roulette_leaderboard AS l
+WHERE l.app_id = :app_id AND l.group_openid = :group_openid
+UNION ALL
+SELECT
+    'proof' AS row_kind,
+    NULL::text, NULL::text, NULL::integer, NULL::timestamptz,
+    r.game_id,
+    r.app_id,
+    r.group_openid,
+    r.lifecycle,
+    r.reason,
+    r.created_at,
+    r.started_at,
+    r.ended_at,
+    r.terminal_revision,
+    r.winner_seq,
+    r.winner_member_openid,
+    r.winner_display_name,
+    p.join_seq,
+    p.member_openid,
+    p.display_name,
+    p.alive,
+    p.eliminated_order,
+    p.eliminated_reason,
+    p.eliminated_at
+FROM komari_roulette_results AS r
+LEFT JOIN komari_roulette_result_players AS p ON p.game_id = r.game_id
+WHERE r.app_id = :app_id AND r.group_openid = :group_openid
+  AND r.lifecycle = 'completed'
+"""
+)
 
 
 class StorageUnavailableError(RuntimeError):
@@ -486,7 +551,146 @@ class PostgresRouletteStorage:
         """Rebuild the projection solely from completed result proofs."""
 
         await self._lock_scope(group)
+        aggregate = await self._completed_leaderboard_aggregate(
+            group,
+            for_update=True,
+        )
+        await self._replace_leaderboard(group, aggregate)
+
+    async def inspect_leaderboard(self, group: GroupRef) -> LeaderboardInspection:
+        """Reconcile the cached projection against completed proofs.
+
+        Both sides are read in **one** statement so the caller always sees a
+        single committed snapshot; no advisory lock is taken and no lock is
+        left behind for the caller.  A corrupt completed proof raises
+        :class:`AggregateCorruptError` and is never silently counted as zero.
+        """
+
         result = await self._execute(
+            _INSPECT_SNAPSHOT_SQL,
+            {"app_id": group.app_id, "group_openid": group.group_openid},
+        )
+        cached_rows: list[RouletteLeaderboardRow] = []
+        proof_headers: dict[str, RouletteResultRow] = {}
+        proof_players: dict[str, list[RouletteResultPlayerRow]] = {}
+        for row in result.all():
+            mapping = row._mapping
+            if mapping["row_kind"] == "cached":
+                cached_rows.append(
+                    RouletteLeaderboardRow(
+                        app_id=group.app_id,
+                        group_openid=group.group_openid,
+                        member_openid=mapping["cache_member_openid"],
+                        display_name=mapping["cache_display_name"],
+                        wins=mapping["cache_wins"],
+                        last_won_at=mapping["cache_last_won_at"],
+                    )
+                )
+                continue
+            game_id = mapping["result_game_id"]
+            if game_id not in proof_headers:
+                proof_headers[game_id] = RouletteResultRow(
+                    game_id=game_id,
+                    app_id=mapping["result_app_id"],
+                    group_openid=mapping["result_group_openid"],
+                    lifecycle=mapping["result_lifecycle"],
+                    reason=mapping["result_reason"],
+                    created_at=mapping["result_created_at"],
+                    started_at=mapping["result_started_at"],
+                    ended_at=mapping["result_ended_at"],
+                    terminal_revision=mapping["result_terminal_revision"],
+                    winner_seq=mapping["result_winner_seq"],
+                    winner_member_openid=mapping["result_winner_member_openid"],
+                    winner_display_name=mapping["result_winner_display_name"],
+                )
+                proof_players[game_id] = []
+            join_seq = mapping["player_join_seq"]
+            if join_seq is not None:
+                proof_players[game_id].append(
+                    RouletteResultPlayerRow(
+                        game_id=game_id,
+                        join_seq=join_seq,
+                        member_openid=mapping["player_member_openid"],
+                        display_name=mapping["player_display_name"],
+                        alive=mapping["player_alive"],
+                        eliminated_order=mapping["player_eliminated_order"],
+                        eliminated_reason=mapping["player_eliminated_reason"],
+                        eliminated_at=mapping["player_eliminated_at"],
+                    )
+                )
+
+        cached_by_member: dict[str, RouletteLeaderboardRow] = {}
+        try:
+            for cached_row in cached_rows:
+                _validate_leaderboard_row(cached_row)
+                cached_by_member[cached_row.member_openid] = cached_row
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
+            raise AggregateCorruptError(
+                "persisted leaderboard row is invalid"
+            ) from exc
+
+        validated: list[tuple[datetime, str, RouletteResultRow]] = []
+        for game_id, header in proof_headers.items():
+            self._validate_completed_result(header, proof_players[game_id])
+            validated.append((header.ended_at, game_id, header))
+
+        aggregate: dict[str, tuple[int, str, Any]] = {}
+        for _ended_at, _game_id, header in sorted(
+            validated,
+            key=lambda item: (item[0], item[1]),
+        ):
+            self._merge_completed_result(aggregate, header)
+
+        discrepancy_codes: list[str] = []
+        for member_openid in sorted(set(cached_by_member) | set(aggregate)):
+            cached_row = cached_by_member.get(member_openid)
+            completed_entry = aggregate.get(member_openid)
+            if cached_row is None:
+                discrepancy_codes.append("missing_cached_row")
+                continue
+            if completed_entry is None:
+                discrepancy_codes.append("extra_cached_row")
+                continue
+            wins, display_name, last_won_at = completed_entry
+            if cached_row.wins != wins:
+                discrepancy_codes.append("wins_mismatch")
+            if cached_row.display_name != display_name:
+                discrepancy_codes.append("display_name_mismatch")
+            if cached_row.last_won_at != last_won_at:
+                discrepancy_codes.append("last_won_at_mismatch")
+
+        entries = tuple(
+            LeaderboardEntry(
+                display_name=cached_row.display_name,
+                wins=cached_row.wins,
+                last_won_at=cached_row.last_won_at,
+            )
+            for cached_row in sorted(
+                cached_rows,
+                key=lambda row: (-row.wins, row.last_won_at, row.member_openid),
+            )
+        )
+        return LeaderboardInspection(
+            app_id=group.app_id,
+            group_openid=group.group_openid,
+            consistent=not discrepancy_codes,
+            cached_entry_count=len(cached_rows),
+            completed_entry_count=len(aggregate),
+            cached_total_wins=sum(row.wins for row in cached_rows),
+            completed_total_wins=sum(entry[0] for entry in aggregate.values()),
+            discrepancy_codes=tuple(discrepancy_codes),
+            entries=entries,
+        )
+
+    async def _completed_leaderboard_aggregate(
+        self,
+        group: GroupRef,
+        *,
+        for_update: bool,
+    ) -> dict[str, tuple[int, str, Any]]:
+        """Aggregate completed proofs, validating every proof first."""
+
+        statement = (
             select(RouletteResultRow)
             .where(
                 _R.c.app_id == group.app_id,
@@ -495,39 +699,32 @@ class PostgresRouletteStorage:
             )
             .order_by(_R.c.ended_at.asc(), _R.c.game_id.asc())
             .execution_options(populate_existing=True)
-            .with_for_update()
         )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._execute(statement)
         aggregate: dict[str, tuple[int, str, Any]] = {}
         for row in result.scalars().all():
-            try:
-                _validate_result_header(row)
-                player_result = await self._execute(
-                    select(RouletteResultPlayerRow)
-                    .where(_RP.c.game_id == row.game_id)
-                    .order_by(_RP.c.join_seq)
-                    .execution_options(populate_existing=True)
-                )
-                result_players = list(player_result.scalars().all())
-                _validate_result_players(row, result_players)
-            except AggregateCorruptError:
-                raise
-            except (AttributeError, TypeError, ValueError, KeyError) as exc:
-                raise AggregateCorruptError(
-                    "persisted terminal result is invalid"
-                ) from exc
-            previous = aggregate.get(row.winner_member_openid)
-            if previous is None:
-                aggregate[row.winner_member_openid] = (
-                    1,
-                    row.winner_display_name,
-                    row.ended_at,
-                )
-            else:
-                aggregate[row.winner_member_openid] = (
-                    previous[0] + 1,
-                    row.winner_display_name,
-                    row.ended_at,
-                )
+            player_result = await self._execute(
+                select(RouletteResultPlayerRow)
+                .where(_RP.c.game_id == row.game_id)
+                .order_by(_RP.c.join_seq)
+                .execution_options(populate_existing=True)
+            )
+            self._validate_completed_result(
+                row,
+                list(player_result.scalars().all()),
+            )
+            self._merge_completed_result(aggregate, row)
+        return aggregate
+
+    async def _replace_leaderboard(
+        self,
+        group: GroupRef,
+        aggregate: dict[str, tuple[int, str, Any]],
+    ) -> None:
+        """Replace the scope projection with one aggregate-derived state."""
+
         await self._execute(
             delete(RouletteLeaderboardRow).where(
                 _L.c.app_id == group.app_id,
@@ -546,6 +743,53 @@ class PostgresRouletteStorage:
                 )
             )
         await self._flush()
+
+    @staticmethod
+    def _validate_completed_result(
+        result: RouletteResultRow,
+        players: Sequence[RouletteResultPlayerRow],
+    ) -> None:
+        """Validate one completed proof or fail closed as corrupt."""
+
+        try:
+            _validate_result_header(result)
+            _validate_result_players(result, players)
+        except AggregateCorruptError:
+            raise
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
+            raise AggregateCorruptError(
+                "persisted terminal result is invalid"
+            ) from exc
+
+    @staticmethod
+    def _merge_completed_result(
+        aggregate: dict[str, tuple[int, str, Any]],
+        result: RouletteResultRow,
+    ) -> None:
+        """Fold one validated proof into the per-member aggregate.
+
+        ``_validate_completed_result`` already rejected a proof without a
+        complete winner; the guard keeps the fail-safe decision explicit at
+        the point where the winner identity is dereferenced.
+        """
+
+        member_openid = result.winner_member_openid
+        display_name = result.winner_display_name
+        if member_openid is None or display_name is None:
+            raise AggregateCorruptError("persisted terminal result is invalid")
+        previous = aggregate.get(member_openid)
+        if previous is None:
+            aggregate[member_openid] = (
+                1,
+                display_name,
+                result.ended_at,
+            )
+        else:
+            aggregate[member_openid] = (
+                previous[0] + 1,
+                display_name,
+                result.ended_at,
+            )
 
     async def _load_current_rows(
         self,

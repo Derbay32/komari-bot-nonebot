@@ -404,6 +404,9 @@ def test_final_mentions_winner_once_with_metadata_pair() -> None:
         result_code="shot",
         lifecycle="completed",
         phase=None,
+        # 真实实弹终局：`_eliminate_current` 只在 details 盖入
+        # `completion_reason="shot"` 与获胜玩家编号 `winner_seq`。
+        details={"completion_reason": "shot", "winner_seq": 1},
         winner=player(1, name="小明"),
         winner_group_wins=6,
         mention_target=player(1, name="小明"),
@@ -862,6 +865,9 @@ def test_render_escapes_xml_injection_in_frozen_name() -> None:
         result_code="shot",
         lifecycle="completed",
         phase=None,
+        # 真实实弹终局：`_eliminate_current` 只在 details 盖入
+        # `completion_reason="shot"` 与获胜玩家编号 `winner_seq`。
+        details={"completion_reason": "shot", "winner_seq": 1},
         winner=player(1, name=name, member_openid="member-1"),
         winner_group_wins=1,
         mention_target=player(1, name=name, member_openid="member-1"),

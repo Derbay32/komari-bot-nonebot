@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import re
 from dataclasses import dataclass
@@ -705,6 +706,8 @@ class FakeCommandService:
     def __init__(self) -> None:
         self.observe_calls: list[Any] = []
         self.execute_calls: list[tuple[Any, Observation | None]] = []
+        #: Calls whose per-call ``effect_check`` rejected *under the lock*.
+        self.effect_rejected_calls: list[tuple[Any, Observation | None]] = []
         self.claim_calls: list[str] = []
         self.check_calls: list[FulfillmentClaim] = []
         self.mark_delivered_calls: list[tuple[Any, str]] = []
@@ -726,8 +729,24 @@ class FakeCommandService:
         request: Any,
         *,
         observation: Observation | None = None,
+        effect_check: Any = None,
     ) -> CommandReceipt:
+        """Record the call, then honour the mandatory per-call authority recheck.
+
+        Production evaluates ``effect_check`` under the group lock *before* any
+        write; this stub mirrors that by recording the invocation first, then
+        raising the real control-flow rejection with zero receipt.  The keyword
+        is explicit (never probed): the handler always passes it.
+        """
+
         self.execute_calls.append((request, observation))
+        if effect_check is not None and not await _maybe_await(effect_check()):
+            from komari_bot.plugins.komari_roulette.command_service import (
+                EffectCheckRejectedError,
+            )
+
+            self.effect_rejected_calls.append((request, observation))
+            raise EffectCheckRejectedError
         if self.receipt is None:
             raise AssertionError("receipt not configured")  # noqa: TRY003
         return self.receipt
@@ -819,17 +838,38 @@ class FakeSender:
         return self.result
 
 
+async def _maybe_await(value: Any) -> Any:
+    """Await a per-call gate only when it is actually awaitable."""
+
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 class FakeDelivery:
     """Recording stand-in for RouletteDelivery (injected seam).
 
     Outcomes are not asserted in handler tests — only that deliver was or was
-    not called — so this stub returns a plain marker and records calls.
+    not called — so this stub returns a plain marker and records calls.  It
+    still honours an explicit ``effect_check`` (including the ``False`` path),
+    exactly like the real delivery: a rejected final recheck must never count
+    as a send.
     """
 
     def __init__(self) -> None:
         self.deliver_calls: list[tuple[Any, Any]] = []
+        self.effect_rejections: int = 0
 
-    async def deliver(self, receipt: Any, sender: Any) -> Any:
+    async def deliver(
+        self,
+        receipt: Any,
+        sender: Any,
+        *,
+        effect_check: Any = None,
+    ) -> Any:
+        if effect_check is not None and not await _maybe_await(effect_check()):
+            self.effect_rejections += 1
+            return None
         self.deliver_calls.append((receipt, sender))
         return None
 

@@ -198,7 +198,7 @@ async def init_plugin() -> None:
     """初始化管理器后安装 QQ 准入、证据接线与绑定向导。"""
     manager = get_manager()
     await manager.initialize()
-    if not manager._initialized:
+    if not manager.is_ready:
         return
     previous_wizard = get_binding_wizard()
     if previous_wizard is not None:

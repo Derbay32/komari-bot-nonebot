@@ -7,6 +7,8 @@ connection or execute DDL.  Database/session ownership remains with callers.
 from nonebot.plugin import PluginMetadata, require
 
 require("character_binding")
+require("config_manager")
+require("nonebot_plugin_apscheduler")
 # The QQ adapter layer consumes the group-admission handoff token written into
 # the event state; declare the dependency explicitly and import its public
 # top-level surface only.
@@ -15,7 +17,12 @@ require("group_admission")
 # Importing the QQ subpackage registers its group-@ matcher.  The matcher stays
 # inert until the composition root installs the runtime, so importing it has no
 # side effect on a deployment where the roulette plugin is disabled.
-from . import qq  # noqa: F401
+# Importing the lifecycle module registers exactly one driver startup / shutdown
+# hook; it is the single production composition root (TSK-279).
+from . import (
+    lifecycle,  # noqa: F401
+    qq,  # noqa: F401
+)
 from .help_copy import help_usage
 
 __plugin_meta__ = PluginMetadata(
@@ -29,6 +36,7 @@ from .command_service import (
     CommandReceipt,
     CommandRequest,
     CommitOutcomeUnknownError,
+    EffectCheckRejectedError,
     ExpiryAdvance,
     FulfillmentClaim,
     FulfillmentConflictError,
@@ -53,10 +61,13 @@ from .domain import (
     apply_action,
     initial_state,
 )
+from .lifecycle import get_roulette_observation
+from .management_api import register_roulette_management_api
 from .mapper import (
     EliminationRecord,
     GameSnapshot,
     LeaderboardEntry,
+    LeaderboardInspection,
     ResultPlayer,
     RouletteResult,
     StateTransition,
@@ -82,6 +93,7 @@ __all__ = [
     "CommandReceipt",
     "CommandRequest",
     "CommitOutcomeUnknownError",
+    "EffectCheckRejectedError",
     "EliminationRecord",
     "ExpiryAdvance",
     "FulfillmentClaim",
@@ -93,6 +105,7 @@ __all__ = [
     "IdempotencyKeyConflictError",
     "ItemType",
     "LeaderboardEntry",
+    "LeaderboardInspection",
     "Observation",
     "PlayerRef",
     "PostgresRouletteStorage",
@@ -112,6 +125,8 @@ __all__ = [
     "apply_action",
     "game_state_from_snapshot",
     "game_state_to_snapshot",
+    "get_roulette_observation",
     "initial_state",
+    "register_roulette_management_api",
     "transition_from_action_result",
 ]

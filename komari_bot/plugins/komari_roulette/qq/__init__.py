@@ -61,20 +61,28 @@ def install_roulette_qq_runtime(
     business_gate: BusinessGate,
     runtime_check: RuntimeCheck,
     send_gate: SendGate,
+    post_window_check: RuntimeCheck | None = None,
     payload_builder: PayloadBuilder | None = None,
 ) -> RouletteQQRuntime:
     """Install the QQ adapter runtime from explicit, non-optional authority.
 
     ``business_gate`` runs immediately before the single domain execution (the
     live plugin switch + group-admission recheck), ``send_gate`` runs before the
-    atomic claim, and ``runtime_check`` runs after it and immediately before the
-    platform send.  All three are required keyword arguments so no caller can
-    wire an always-true gate by omission.
+    atomic claim and receives *this call's* ``CommandRequest``, and
+    ``runtime_check`` runs after the claim and immediately before the platform
+    send and receives *this receipt's* ``CommandReceipt``.  All three are
+    required keyword arguments so no caller can wire an always-true gate by
+    omission, and none of them may read a process-global "current event".
+
+    ``post_window_check`` is the optional *pure-local* runtime-state recheck the
+    delivery runs after the final DB-clock credential window; it must not touch
+    the network or database (see :class:`RouletteDelivery`).
     """
 
     delivery = RouletteDelivery(
         service,
         runtime_check=runtime_check,
+        post_window_check=post_window_check,
         payload_builder=payload_builder,
     )
     runtime = RouletteQQRuntime(

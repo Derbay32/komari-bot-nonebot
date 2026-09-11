@@ -35,6 +35,9 @@ from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSch
 from komari_bot.plugins.komari_memory.prompt_schema import (
     DISPLAY_NAME as KOMARI_MEMORY_SUMMARY_PROMPT_DISPLAY_NAME,
 )
+from komari_bot.plugins.komari_roulette.config_schema import (
+    DynamicConfigSchema as RouletteConfigSchema,
+)
 from komari_bot.plugins.komari_sentry.config_schema import KomariSentryConfigSchema
 from komari_bot.plugins.llm_provider.config_schema import (
     DynamicConfigSchema as LlmProviderConfigSchema,
@@ -99,6 +102,8 @@ def _load_management_components() -> ManagementApiComponents:
     from komari_bot.plugins import group_admission as group_admission_plugin
     require("character_binding")
     from komari_bot.plugins import character_binding as character_binding_plugin
+    require("komari_roulette")
+    from komari_bot.plugins import komari_roulette as roulette_plugin
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
@@ -117,6 +122,8 @@ def _load_management_components() -> ManagementApiComponents:
         reply_fulfillment_service_getter=chat_plugin.get_reply_fulfillment_ops_service,
         register_character_binding_repair_api=character_binding_plugin.register_character_binding_repair_api,
         character_binding_repair_service_getter=character_binding_plugin.get_binding_repair_service,
+        register_roulette_management_api=roulette_plugin.register_roulette_management_api,
+        roulette_observation_getter=roulette_plugin.get_roulette_observation,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -209,6 +216,14 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "sr",
                     SrConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="komari_roulette",
+                display_name="Komari Roulette",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_roulette",
+                    RouletteConfigSchema,
                 ),
             ),
             ManagedConfigResource(

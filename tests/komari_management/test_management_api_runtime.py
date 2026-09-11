@@ -110,6 +110,14 @@ def _credentials(
     ]
 
 
+def _noop_roulette_registrar(*_args: object, **_kwargs: object) -> None:
+    """Dummy roulette management registrar for the shared DI matrix."""
+
+
+def _noop_roulette_observation_getter() -> None:
+    """Dummy roulette observation getter for the shared DI matrix."""
+
+
 def _build_components() -> ManagementApiComponents:
     return ManagementApiComponents(
         register_group_admission_api=register_group_admission_api,
@@ -128,6 +136,8 @@ def _build_components() -> ManagementApiComponents:
         reply_fulfillment_service_getter=lambda: None,
         register_character_binding_repair_api=register_character_binding_repair_api,
         character_binding_repair_service_getter=lambda: None,
+        register_roulette_management_api=_noop_roulette_registrar,
+        roulette_observation_getter=_noop_roulette_observation_getter,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -150,6 +160,17 @@ def test_management_components_require_binding_repair_fields() -> None:
     for name in (
         "register_character_binding_repair_api",
         "character_binding_repair_service_getter",
+    ):
+        assert name in parameters, name
+        assert parameters[name].default is inspect.Parameter.empty, name
+
+
+def test_management_components_require_roulette_fields() -> None:
+    """TSK-279 C2 两个组件字段必填：不得用 _noop 注册默认兼容旧构造。"""
+    parameters = inspect.signature(ManagementApiComponents).parameters
+    for name in (
+        "register_roulette_management_api",
+        "roulette_observation_getter",
     ):
         assert name in parameters, name
         assert parameters[name].default is inspect.Parameter.empty, name

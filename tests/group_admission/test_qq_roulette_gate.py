@@ -52,8 +52,13 @@ class _RecordingService:
         request: Any,
         *,
         observation: Any = None,
+        effect_check: Any = None,
     ) -> Any:
         self.execute_calls.append((request, observation))
+        # Accepted for the production per-call seam; the handler's front-door
+        # gate owns the revocation decision in this probe (a second recheck here
+        # would double-count ``business_gate``).
+        del effect_check
         return object()
 
 
@@ -61,7 +66,11 @@ class _RecordingDelivery:
     def __init__(self) -> None:
         self.calls: list[Any] = []
 
-    async def deliver(self, receipt: Any, sender: Any) -> None:
+    async def deliver(
+        self, receipt: Any, sender: Any, *, effect_check: Any = None
+    ) -> None:
+        # Accepted for the production per-call seam; see _RecordingService.
+        del effect_check
         self.calls.append((receipt, sender))
 
 

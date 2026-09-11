@@ -262,6 +262,53 @@ class LeaderboardEntry:
     last_won_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class LeaderboardInspection:
+    """Read-only reconciliation of the cached projection and completed proofs.
+
+    The counts, totals and safe ``entries`` expose only display-level facts;
+    member openids and the per-proof aggregate stay storage-internal.  The
+    frozen ``as_dict`` projection is the JSON-native REST body and never
+    carries a raw member identifier.
+    """
+
+    app_id: str
+    group_openid: str
+    consistent: bool
+    cached_entry_count: int
+    completed_entry_count: int
+    cached_total_wins: int
+    completed_total_wins: int
+    discrepancy_codes: tuple[str, ...] = ()
+    entries: tuple[LeaderboardEntry, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "discrepancy_codes", tuple(self.discrepancy_codes))
+        object.__setattr__(self, "entries", tuple(self.entries))
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the frozen JSON-native inspection body."""
+
+        return {
+            "app_id": self.app_id,
+            "group_openid": self.group_openid,
+            "consistent": self.consistent,
+            "cached_entry_count": self.cached_entry_count,
+            "completed_entry_count": self.completed_entry_count,
+            "cached_total_wins": self.cached_total_wins,
+            "completed_total_wins": self.completed_total_wins,
+            "discrepancy_codes": list(self.discrepancy_codes),
+            "entries": [
+                {
+                    "display_name": entry.display_name,
+                    "wins": entry.wins,
+                    "last_won_at": entry.last_won_at,
+                }
+                for entry in self.entries
+            ],
+        }
+
+
 def game_state_to_snapshot(state: GameState, *, game_id: str) -> GameSnapshot:
     """Copy a trusted state into an immutable storage DTO."""
 
@@ -529,6 +576,7 @@ __all__ = [
     "EliminationRecord",
     "GameSnapshot",
     "LeaderboardEntry",
+    "LeaderboardInspection",
     "ResultPlayer",
     "RouletteResult",
     "StateTransition",

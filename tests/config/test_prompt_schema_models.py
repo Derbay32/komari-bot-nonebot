@@ -96,7 +96,8 @@ def test_load_all_typed_models_covers_config_and_prompt_schemas() -> None:
     assert total == len(TYPED_CONFIG_MODEL_REGISTRY) + len(
         TYPED_PROMPT_MODEL_REGISTRY
     )
-    assert len(TYPED_CONFIG_MODEL_REGISTRY) == 16
+    # TSK-279 新增 komari_roulette 强类型配置资源（迁移 0021）。
+    assert len(TYPED_CONFIG_MODEL_REGISTRY) == 17
     assert len(TYPED_PROMPT_MODEL_REGISTRY) == 3
 
 

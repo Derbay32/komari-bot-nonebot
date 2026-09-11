@@ -20,7 +20,12 @@ from nonebot.adapters.qq.event import GroupAtMessageCreateEvent
 
 from komari_bot.plugins import group_admission
 
-from ..command_service import OBSERVED_ACTIVE_WRITES, CommandRequest
+from ..command_service import (
+    OBSERVED_ACTIVE_WRITES,
+    CommandRequest,
+    EffectCheck,
+    EffectCheckRejectedError,
+)
 from .parser import parse_command
 
 if TYPE_CHECKING:
@@ -33,7 +38,7 @@ if TYPE_CHECKING:
     )
     from .delivery import QQMessageSender
 
-type SendGate = Callable[[], bool | Awaitable[bool]]
+type SendGate = Callable[[CommandRequest], bool | Awaitable[bool]]
 type BusinessGate = Callable[
     [QQBot, GroupAtMessageCreateEvent, "QQAdmissionToken"],
     bool | Awaitable[bool],
@@ -52,6 +57,7 @@ class _CommandService(Protocol):
         request: CommandRequest,
         *,
         observation: Observation | None = None,
+        effect_check: EffectCheck | None = None,
     ) -> CommandReceipt: ...
 
 
@@ -62,6 +68,8 @@ class _Delivery(Protocol):
         self,
         receipt: CommandReceipt,
         sender: QQMessageSender,
+        *,
+        effect_check: EffectCheck | None = None,
     ) -> object: ...
 
 
@@ -92,7 +100,7 @@ class RouletteQQHandler:
 
         return group_admission.get_qq_admission_token(state)
 
-    async def handle(
+    async def handle(  # noqa: PLR0911 — 一个守卫一个真实不处理分支
         self,
         bot: QQBot,
         event: object,
@@ -144,15 +152,79 @@ class RouletteQQHandler:
         observation: Observation | None = None
         if command.intent in OBSERVED_ACTIVE_WRITES:
             observation = await self._service.observe_current(request.group)
-        if not await self._business_allowed(bot, event, token):
+        # One closure for *this* call, capturing the original bot / event / token.
+        # It is both the mandatory front-door gate (after observe, before
+        # execute) and the per-call authority recheck handed to the service
+        # (before the domain write, under the group lock) and to the delivery
+        # (after the claim, before the network): authority is never re-minted
+        # from the receipt and never shared across concurrent groups.
+        effect_check = self._effect_closure(bot, event, token)
+        if not await effect_check():
+            # Front-door authority revoked after observe: no domain write and no
+            # send, and the collaborators are never consulted without the gate.
             return
-        receipt = await self._service.execute_group_command(
+        try:
+            receipt = await self._execute(request, observation, effect_check)
+        except EffectCheckRejectedError:
+            # The authority turned false while the command queued on the group
+            # lock: a silent no-effect control flow, never an error reply.
+            return
+        if not await self._send_allowed(request):
+            return
+        await self._deliver(receipt, bot, effect_check)
+
+    async def _execute(
+        self,
+        request: CommandRequest,
+        observation: Observation | None,
+        effect_check: EffectCheck,
+    ) -> CommandReceipt:
+        """Run the single domain execution, rechecking authority under the lock.
+
+        The per-call keyword is *always* handed over, with no support probe and
+        no legacy-signature cover: the service protocol declares the
+        ``effect_check`` keyword, so a collaborator without the seam raises
+        ``TypeError`` at the call instead of silently degrading to a single
+        front-door gate, and the call is type-checked against the protocol.
+        """
+
+        return await self._service.execute_group_command(
             request,
             observation=observation,
+            effect_check=effect_check,
         )
-        if not await self._send_allowed():
-            return
-        await self._delivery.deliver(receipt, bot)
+
+    async def _deliver(
+        self,
+        receipt: CommandReceipt,
+        sender: QQMessageSender,
+        effect_check: EffectCheck,
+    ) -> None:
+        """Run the single delivery, rechecking authority after the claim.
+
+        As in :meth:`_execute`, the per-call keyword is always handed over (no
+        probe and no legacy-signature cover): a collaborator without the seam
+        raises ``TypeError`` instead of sending with a weaker authority check.
+        """
+
+        await self._delivery.deliver(
+            receipt,
+            sender,
+            effect_check=effect_check,
+        )
+
+    def _effect_closure(
+        self,
+        bot: QQBot,
+        event: GroupAtMessageCreateEvent,
+        token: QQAdmissionToken,
+    ) -> Callable[[], Awaitable[bool]]:
+        """Build the per-call post-lock / post-claim authority recheck."""
+
+        async def effect_check() -> bool:
+            return await self._business_allowed(bot, event, token)
+
+        return effect_check
 
     @staticmethod
     def _token_binds_to_event(
@@ -197,12 +269,20 @@ class RouletteQQHandler:
             return False
         return bool(result)
 
-    async def _send_allowed(self) -> bool:
+    async def _send_allowed(self, request: CommandRequest) -> bool:
+        """Resolve the send gate for *this* command, failing closed on error.
+
+        The gate receives the caller's own :class:`CommandRequest`, so two
+        concurrent groups can never borrow each other's decision.  A legacy
+        zero-argument callable is not special-cased: it simply raises and is
+        treated by the existing fail-closed boundary.
+        """
+
         gate = self._send_gate
         if gate is None:
             return True
         try:
-            result = gate()
+            result = gate(request)
             if inspect.isawaitable(result):
                 return bool(await cast("Awaitable[bool]", result))
             return bool(result)
