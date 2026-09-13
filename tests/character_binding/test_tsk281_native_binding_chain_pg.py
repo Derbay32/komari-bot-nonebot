@@ -152,6 +152,7 @@ async def test_first_binding_chain_commits_once_through_real_onebot_evidence(
                     _challenge_event(
                         message_id=challenge_id,
                         session_code=session_code,
+                        challenge_body=challenge,
                         quoted_message_id=onebot_original_message_id,
                         quoted_text=COMMAND,
                         group_id=current.group_id,

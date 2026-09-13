@@ -311,6 +311,8 @@ class Chain:
         self,
         member: NativeMember,
         session_code: str,
+        *,
+        challenge_body: str,
     ) -> int:
         original_id = self.next_onebot_id()
         self.onebot.serve(
@@ -337,6 +339,7 @@ class Chain:
             _challenge_event(
                 message_id=challenge_id,
                 session_code=session_code,
+                challenge_body=challenge_body,
                 quoted_message_id=original_id,
                 quoted_text=CMD_BIND,
                 group_id=self.scope.group_id,
@@ -377,7 +380,11 @@ class Chain:
             f"{challenge_message_id!r}，实际 {reference_message_id(challenge_payload)!r}"
         )
 
-        onebot_original_id = await self._deliver_evidence(member, session_code)
+        onebot_original_id = await self._deliver_evidence(
+            member,
+            session_code,
+            challenge_body=challenge_body,
+        )
         assert isinstance(onebot_original_id, int)
         assert str(onebot_original_id) != challenge_message_id, (
             "OneBot 引用必须使用自己的独立整数消息 id，不得复用 QQ 字符串 id"
