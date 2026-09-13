@@ -17,11 +17,12 @@
 
 ## 启动
 
-1. 准备一份私有配置文件（格式见下，放在本仓库外或已忽略路径）。
-2. 运行一条命令：
+1. 进入此原型 worktree，激活项目既有的 Python 3.13 虚拟环境。
+2. 准备一份私有配置文件（格式见下，放在本仓库外或已忽略路径）。
+3. 运行一条命令：
 
 ```bash
-PERMISSION_PROBE_CONFIG=/absolute/private/config.json nb run -f komari_bot/plugins/character_binding/prototype_permission_probe.py
+PYTHONPATH=. PERMISSION_PROBE_CONFIG=/absolute/private/config.json nb run -f komari_bot/plugins/character_binding/prototype_permission_probe.py
 ```
 
 预期结果：日志出现 `探针已启动`，仅监听配置中的实验群。
@@ -50,13 +51,15 @@ PERMISSION_PROBE_CONFIG=/absolute/private/config.json nb run -f komari_bot/plugi
    预期结果：可点击的按钮把对应 `/permtest X` 命令填入输入框。
 3. 手动发送填入的命令。
    预期结果：收到对应字母的纯文本回执，回执只证明命令到达服务端。
-4. 换另一位群成员账号重复步骤 1–3，对比名单权限差异。
-   预期结果：可观察 A 按钮对非触发者的表现。
+4. 同一账号切换到另一客户端，在同一张已有卡片上重复步骤 2–3，不重新发送 `/permtest`。
+   预期结果：获得原版 QQ 9.33.55.609 / iOS 26.6.2 与 QQ 7.0.0-52194 / macOS 26.6.2 的同卡对照。
+
+可选：让其他群成员点击原触发者的同一张卡片，记录非本人表现。不要重新生成卡片，否则 A 会授权给新的触发者，不能作为非本人对照。
 
 ## 实验记录矩阵（结果待填，不预判客户端行为）
 
-| 按钮 | permission 配置 | 触发者本人可点击 | 其他成员可点击 | 回执到达 |
-|------|----------------|------------------|----------------|----------|
+| 按钮 | permission 配置 | iOS 填入结果/报错 | macOS 填入结果/报错 | 两端手动发送回执 |
+|------|----------------|-------------------|---------------------|------------------|
 | A 仅本人 | type=0 + 触发者名单 | 待填 | 待填 | 待填 |
 | B 空名单 | type=0 + 空名单 | 待填 | 待填 | 待填 |
 | C 所有人 | type=2 | 待填 | 待填 | 待填 |
@@ -72,5 +75,5 @@ PERMISSION_PROBE_CONFIG=/absolute/private/config.json nb run -f komari_bot/plugi
 
 1. 在运行终端按 `Ctrl+C` 停止进程。
    预期结果：进程退出，无任何持久化状态需要清理。
-2. 删除私有配置文件。
-   预期结果：凭据不再留存于本机。
+2. 保留或按需清理原型专用私有配置，不修改既有共享凭据。
+   预期结果：实验不会破坏原服务配置；正式服务由主代理协调恢复，不自动启动。

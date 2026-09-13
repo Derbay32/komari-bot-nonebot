@@ -38,7 +38,7 @@ UNSUPPORT_TIPS = "当前客户端不支持按钮，请升级 QQ 后重试"
 
 PROBE_BODY = (
     "**按钮权限实验（一次性探针）**\n"
-    "本消息携带 3 个按钮，仅 `action.permission` 不同，其余参数完全一致：\n"
+    "本消息对比 3 种 `action.permission` 配置。除区分 A/B/C 的标签、ID 和回执命令外，渲染与动作参数统一：\n"
     "- A 仅本人：`type=0`，指定名单为触发者本人\n"
     "- B 空名单：`type=0`，指定名单为空\n"
     "- C 所有人：`type=2`\n\n"
@@ -62,7 +62,7 @@ class _ProbeConfig(BaseModel):
 
 
 def _button(button_id: str, label: str, data: str, permission: Permission) -> Button:
-    """三个按钮共用同一渲染风格与动作类型，只有权限不同。"""
+    """统一渲染与动作参数，保留 A/B/C 标识和待比较的权限配置。"""
     return Button(
         id=button_id,
         render_data=RenderData(label=label, visited_label=label, style=0),
