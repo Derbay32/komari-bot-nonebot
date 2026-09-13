@@ -83,6 +83,7 @@ UNBIND_CONFIRM = (
     "确认解绑？"
 )
 UNBIND_SUCCESS = "已解除本群角色名绑定。\n再次开局或加入前，请通过 /bind 设置角色名。"
+ALREADY_COMPLETED = "本次操作已完成，无需再次确认。"
 CANCELLED = "已取消本次操作，原有绑定未变更。"
 EXPIRED = "本次操作已失效，请重新运行 /bind。"
 NAME_FORMAT_ERROR = "请输入 1–64 个字符的角色名。"  # noqa: RUF001
@@ -942,7 +943,7 @@ class BindingWizard:
         if isinstance(session, str):
             return await self._reply(token, event, session)
         if session.completed:
-            return await self._reply(token, event, self._success_body(session))
+            return await self._reply(token, event, ALREADY_COMPLETED)
         if session.step not in _CONFIRM_STEPS:
             return await self._reply(token, event, WRONG_STEP)
         if not await self._recheck(token):
@@ -1328,6 +1329,7 @@ def get_binding_wizard() -> BindingWizard | None:
 
 
 __all__ = [
+    "ALREADY_COMPLETED",
     "BAD_COMMAND",
     "BINDING_CONFIRM",
     "BIND_SUCCESS",
