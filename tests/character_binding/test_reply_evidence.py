@@ -15,7 +15,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -239,11 +239,20 @@ def _challenge_event(
     quoted_real_id: int | None = None,
     quoted_has_mention: bool = True,
     to_me: bool = False,
+    body_format: Literal["text", "markdown"] = "markdown",
+    challenge_body: str | None = None,
 ) -> GroupMessageEvent:
-    challenge_text = f"正在确认你的本群身份。会话码：{session_code}"
-    original = Message(
-        [MessageSegment.reply(quoted_message_id), MessageSegment.text(challenge_text)]
+    challenge_text = (
+        f"正在确认你的本群身份。会话码：{session_code}"
+        if challenge_body is None
+        else challenge_body
     )
+    body_segment = (
+        MessageSegment.text(challenge_text)
+        if body_format == "text"
+        else MessageSegment("markdown", {"content": challenge_text})
+    )
+    original = Message([MessageSegment.reply(quoted_message_id), body_segment])
     quoted_message = (
         _bind_message(quoted_text)
         if quoted_has_mention
@@ -269,7 +278,7 @@ def _challenge_event(
         text=challenge_text,
         self_id=ONEBOT_SELF_ID,
         to_me=to_me,
-        message=Message(challenge_text),
+        message=Message([body_segment]),
         original_message=original,
         reply=reply,
         sender_id=official_sender,

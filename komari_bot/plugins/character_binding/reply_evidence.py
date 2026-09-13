@@ -205,6 +205,33 @@ def _message_text(message: Message) -> str:
     return message.extract_plain_text().strip()
 
 
+def _challenge_bodies(message: Message) -> tuple[str, ...] | None:
+    """Return scannable challenge bodies, or None on an invalid carrier.
+
+    Text segments contribute one concatenated body (the shared plain-text
+    semantics); each markdown segment contributes its own body.  A text or
+    markdown carrier with a missing or non-string payload fails closed.
+    Every other segment type is ignored entirely.
+    """
+    texts: list[str] = []
+    bodies: list[str] = []
+    for segment in message:
+        match segment.type:
+            case "text":
+                text = segment.data.get("text")
+                if not isinstance(text, str):
+                    return None
+                texts.append(text)
+            case "markdown":
+                content = segment.data.get("content")
+                if not isinstance(content, str):
+                    return None
+                bodies.append(content)
+            case _:
+                continue
+    return ("".join(texts).strip(), *bodies)
+
+
 def _challenge_code(event: GroupMessageEvent) -> str | None:
     candidates: list[str] = []
     for candidate in (
@@ -213,7 +240,13 @@ def _challenge_code(event: GroupMessageEvent) -> str | None:
     ):
         if not isinstance(candidate, Message):
             continue
-        candidates.extend(match.group(1) for match in _SESSION_CODE_RE.finditer(_message_text(candidate)))
+        bodies = _challenge_bodies(candidate)
+        if bodies is None:
+            return None
+        for body in bodies:
+            candidates.extend(
+                match.group(1) for match in _SESSION_CODE_RE.finditer(body)
+            )
     if not candidates or len(set(candidates)) != 1:
         return None
     return candidates[0]
