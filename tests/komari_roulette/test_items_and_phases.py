@@ -758,6 +758,40 @@ def test_random_failure_in_pre_draw_rolls_back_shot_chamber_rewards_and_deadline
     assert failed.state.deadline == before.deadline
 
 
+def test_partial_reward_reply_reports_only_items_added_to_inventory() -> None:
+    before = restore_trusted_state(
+        phase="follow_up",
+        ordered_chamber=(
+            ChamberKind.BLANK,
+            ChamberKind.BLANK,
+            ChamberKind.LIVE,
+            ChamberKind.LIVE,
+            ChamberKind.BLANK,
+            ChamberKind.BLANK,
+        ),
+        pending_burst=True,
+        inventory={ItemType.MAGNIFIER: 1, ItemType.BEER: 1, ItemType.LOCK: 1},
+    )
+    result = dispatch(
+        before,
+        Action.shoot(player(1)),
+        random_source=ScriptedRandomSource(items=(ItemType.LOCK, ItemType.MAGNIFIER)),
+    )
+
+    assert_ok(result, "item_choice_pending")
+    assert result.reply["rewards"] == ["lock"]
+    assert result.reply["pending_item"] == "magnifier"
+    assert result.reply["pending_item_count"] == 0
+    assert result.reply["reward_count"] == 2
+    assert _inventory(result.state, 1) == {
+        ItemType.MAGNIFIER: 1,
+        ItemType.BEER: 1,
+        ItemType.LOCK: 2,
+    }
+    assert result.state.pending_rewards == (ItemType.MAGNIFIER,)
+    assert_no_secret_chamber_or_reward_fields(result)
+
+
 def test_item_choice_safe_reply_hides_future_reward_types() -> None:
     first = restore_trusted_state(
         phase="follow_up",
@@ -811,6 +845,7 @@ def test_item_choice_safe_reply_hides_future_reward_types() -> None:
         ItemType.MAGNIFIER,
     )
     assert first_result.reply == second_result.reply
+    assert first_result.reply["rewards"] == []
     assert first_result.reply["pending_item"] == ItemType.BEER.value
     assert first_result.reply["pending_item_count"] == 1
     assert second_result.reply["pending_item_count"] == 1

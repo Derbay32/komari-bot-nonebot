@@ -17,6 +17,7 @@ default-snapshot projection (the TSK-278 public seam) and
 
 from __future__ import annotations
 
+from collections import Counter
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -380,6 +381,20 @@ def _sentence(
     return pool.action_sentence(_action_key(key), **kwargs)
 
 
+def _awarded_item_lines(context: ReplyProjectionContext) -> list[str]:
+    """Describe this shot's committed awards, never inventory or pending draws."""
+    rewards = context.details.get("rewards")
+    if context.result_code not in {"shot", "item_choice_pending"} or not isinstance(
+        rewards, tuple
+    ):
+        return []
+    counts = Counter(rewards)
+    awarded = [
+        f"{ITEM_CN[item]} ×{counts[item]}" for item in ITEM_ORDER if counts[item] > 0
+    ]
+    return [f"获得道具：**{'、'.join(awarded)}**", ""] if awarded else []
+
+
 def _follow_up_body(
     context: ReplyProjectionContext,
     pool: _ProjectionCopyPool,
@@ -389,6 +404,7 @@ def _follow_up_body(
     lines = [
         f"> {sentence}",
         "",
+        *_awarded_item_lines(context),
         _current_line(context),
         _chamber_line(context.game_view),
     ]
@@ -412,7 +428,9 @@ def _reward_choice_body(
     # invariant), and TSK-266 6a9bf4b7 always shows the replacement prompt.
     # The reward-phase first line is the same blank-shot sentence frozen for the
     # shot that produced the reward, never the generic "you got a new item".
-    lines: list[str] = [f"> {_reward_sentence(context, pool)}", ""]
+    lines: list[str] = [
+        f"> {_reward_sentence(context, pool)}", "", *_awarded_item_lines(context)
+    ]
     if details.get("inventory_full", True):
         lines.append("道具列表已满，选择一项来替换。")
         lines.append("")

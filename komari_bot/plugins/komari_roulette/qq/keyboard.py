@@ -152,11 +152,14 @@ def _follow_up_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]
 
     rows: list[list[dict[str, Any]]] = []
     if sum(_current_inventory(context).values()) > 0:
-        item_row: list[dict[str, Any]] = []
-        if _has_usable_item(context):
-            item_row.append(_button("🧰使用", "/轮盘 道具 使用"))
-        item_row.append(_button("🗑️丢弃", "/轮盘 道具 丢弃"))
-        rows.append(item_row)
+        if context.result_code == "panel_opened":
+            item_row: list[dict[str, Any]] = []
+            if _has_usable_item(context):
+                item_row.append(_button("🧰使用", "/轮盘 道具 使用"))
+            item_row.append(_button("🗑️丢弃", "/轮盘 道具 丢弃"))
+            rows.append(item_row)
+        else:
+            rows.append([_button("🧰道具", "/轮盘 道具")])
     action_row = [_button("🔫开枪", "/轮盘 开枪")]
     if context.chamber_remaining_total != 6:
         action_row.append(_button("🔄装填", "/轮盘 装填"))

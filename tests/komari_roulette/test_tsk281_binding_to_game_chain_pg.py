@@ -48,6 +48,7 @@ import sys
 from typing import Any
 
 import pytest
+from nonebot.adapters.qq.models import MessageKeyboard
 
 from komari_bot.plugins.komari_roulette.domain import ChamberKind, ItemType
 from tests.character_binding.conftest import require_postgres
@@ -59,6 +60,7 @@ from tests.komari_roulette.tsk278_support import (
     assert_body_has_markdown_structure,
     assert_no_member_openid,
     assert_single_mention_tag,
+    flatten_keyboard,
 )
 from tests.komari_roulette.tsk279_lifecycle_support import (
     LIFECYCLE_MODULE,
@@ -943,8 +945,20 @@ async def test_item_panel_full_inventory_reward_to_endgame_chain(
             return payload
 
         # ---- 4 发真实跟进射击，逐步累积第一批库存 -------------------------
-        for index in range(1, 5):
-            await run("/轮盘 开枪", f"b1e-shot-{index}", "shot")
+        for index, awarded in enumerate(
+            (None, "啤酒 ×1", "啤酒 ×1", "连发器 ×1"), start=1
+        ):
+            shot_payload = await run("/轮盘 开枪", f"b1e-shot-{index}", "shot")
+            shot_body = markdown_content(shot_payload)
+            if awarded is None:
+                assert "获得道具：" not in shot_body
+            else:
+                assert f"获得道具：**{awarded}**" in shot_body
+                buttons = flatten_keyboard(
+                    MessageKeyboard.model_validate(shot_payload["keyboard"])
+                )
+                assert [button.label for button in buttons[0]] == ["🧰道具"]
+                assert [button.data for button in buttons[0]] == ["/轮盘 道具"]
         snap = await chain.current_snapshot()
         assert snap is not None
         assert snap.phase == "follow_up"
@@ -965,12 +979,20 @@ async def test_item_panel_full_inventory_reward_to_endgame_chain(
         assert panel_body.startswith(f"**{_CHARACTER_NAMES[seat]}的道具**")
         assert "- B｜啤酒 ×2" in panel_body
         assert "- C｜连发器 ×1" in panel_body
+        panel_buttons = flatten_keyboard(
+            MessageKeyboard.model_validate(panel_payload["keyboard"])
+        )
+        assert [button.label for button in panel_buttons[0]] == ["🧰使用", "🗑️丢弃"]
+        assert [button.data for button in panel_buttons[0]] == [
+            "/轮盘 道具 使用", "/轮盘 道具 丢弃"
+        ]
 
         # ---- 用掉两瓶真实啤酒（各丢弃一轮）后重载，再连发双奖励 ----------
         await run("/轮盘 道具 使用 B", "b1e-beer-1", "item_used")
         await run("/轮盘 道具 使用 B", "b1e-beer-2", "item_used")
         await run("/轮盘 道具 使用 C", "b1e-burst-1", "item_used")
-        await run("/轮盘 开枪", "b1e-burst-shot-1", "shot")
+        burst_payload = await run("/轮盘 开枪", "b1e-burst-shot-1", "shot")
+        assert "获得道具：**放大镜 ×1、锁 ×1**" in markdown_content(burst_payload)
         await run("/轮盘 开枪", "b1e-shot-5", "shot")
         await run("/轮盘 开枪", "b1e-shot-6", "shot")
         snap = await chain.current_snapshot()
@@ -1007,6 +1029,8 @@ async def test_item_panel_full_inventory_reward_to_endgame_chain(
         reward_body = markdown_content(reward_payload)
         assert "道具列表已满，选择一项来替换。" in reward_body
         assert "当前新道具：**啤酒**" in reward_body
+        assert "获得道具：**锁 ×1**" in reward_body
+        assert "获得道具：**啤酒" not in reward_body
 
         # ---- item_choice 中所有非奖励选择动作被拒且不改变任何事实 ----------
         locked_snapshot = await chain.current_snapshot()

@@ -707,12 +707,12 @@ def _shoot(  # noqa: PLR0911
         return _failure(state, "random_source_failed")
     updated, visible_rewards, pending = _apply_rewards(new_state, rewards)
     base_reply["reward_count"] = len(rewards)
+    base_reply["rewards"] = [item.value for item in visible_rewards]
     if pending:
         updated = replace(updated, phase="item_choice")
         base_reply.update(_item_choice_reply(updated))
     else:
         updated = replace(updated, phase="follow_up")
-        base_reply["rewards"] = [item.value for item in visible_rewards]
     return _success(updated, "item_choice_pending" if pending else "shot", base_reply)
 
 
