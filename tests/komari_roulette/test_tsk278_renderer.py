@@ -627,6 +627,55 @@ def test_turn_expired_completed_renders_fixed_notice_then_final() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "inventory",
+    [(), (("magnifier", 0), ("lock", 0)), ("magnifier:0", "lock:0")],
+    ids=["empty", "zero-count-pairs", "zero-count-frozen-strings"],
+)
+def test_empty_item_panel_explains_how_to_get_items(inventory: tuple[Any, ...]) -> None:
+    owner = player(1, name="小明")
+    base = context(
+        result_code="panel_opened",
+        lifecycle="active",
+        phase="follow_up",
+        details={"inventory": inventory},
+        players=(owner, player(2, name="小红")),
+        current_player=owner,
+        view=game_view(
+            remaining_total=5, remaining_live=1, remaining_blank=4, hit_percent=20.0
+        ),
+    )
+    rendered = render_reply(base)
+
+    assert rendered.body == (
+        "**小明的道具**\n\n没有任何道具，在自己回合进行额外开枪时即可抽取道具"
+    )
+    rows = _keyboard_spec(rendered)["rows"]
+    assert [[(button["label"], button["data"]) for button in row] for row in rows] == [
+        [("🔫开枪", "/轮盘 开枪"), ("🔄装填", "/轮盘 装填")],
+        [("⏹️结束", "/轮盘 结束"), ("🏳️弃权", "/轮盘 弃权")],
+    ]
+
+
+@pytest.mark.parametrize(
+    "inventory",
+    [(("beer", 2), ("magnifier", 1)), ("beer:2", "magnifier:1")],
+    ids=["pairs", "frozen-strings"],
+)
+def test_nonempty_item_panel_keeps_existing_copy(inventory: tuple[Any, ...]) -> None:
+    owner = player(1, name="小明", inventory=(("beer", 2), ("magnifier", 1)))
+    base = context(
+        result_code="panel_opened",
+        lifecycle="active",
+        phase="follow_up",
+        details={"inventory": inventory},
+        players=(owner,),
+        current_player=owner,
+    )
+
+    assert render_reply(base).body == "**小明的道具**\n- A｜放大镜 ×1\n- B｜啤酒 ×2"
+
+
 def test_item_panel_lists_only_eligible_lock_targets() -> None:
     """可上锁列表 = 存活 ∧ 非自己 ∧ 无已有待生效锁；`pending_lock_players` 是排除集合。"""
     base = context(

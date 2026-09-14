@@ -627,6 +627,9 @@ def _panel_body(context: ReplyProjectionContext) -> str:
     if not isinstance(inventory, tuple):
         inventory = ()
     ordered = _inventory_in_order(inventory)
+    if not any(count > 0 for _item, count in ordered):
+        lines += ["", "没有任何道具，在自己回合进行额外开枪时即可抽取道具"]
+        return "\n".join(lines)
     for item, count in ordered:
         lines.append(f"- {ITEM_LETTER[item]}｜{ITEM_CN[item]} ×{count}")
     held = dict(ordered)
