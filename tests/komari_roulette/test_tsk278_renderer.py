@@ -61,7 +61,7 @@ def _follow_up_context() -> ReplyProjectionContext:
         result_code="shot",
         lifecycle="active",
         phase="follow_up",
-        details={"consumed_kind": "blank", "rewards": ["beer"]},
+        details={"consumed_kind": "blank", "rewards": ("beer",)},
         players=_roster(),
         current_player=player(1, name="小明"),
         mention_target=player(1, name="小明"),
@@ -73,6 +73,81 @@ def _follow_up_context() -> ReplyProjectionContext:
 # ---------------------------------------------------------------------------
 # 继续行动：完整 Markdown 结构
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("rewards", "inventory", "expected"),
+    [
+        (("beer",), (("beer", 1),), "啤酒 ×1"),
+        (("beer", "beer"), (("beer", 3),), "啤酒 ×2"),
+        (("lock", "magnifier"), (("lock", 1), ("magnifier", 1)), "放大镜 ×1、锁 ×1"),
+        (("burst",), (("burst", 1),), "连发器 ×1"),
+    ],
+)
+def test_shot_reports_awarded_items(
+    rewards: tuple[str, ...], inventory: tuple[tuple[str, int], ...], expected: str
+) -> None:
+    owner = player(1, name="小明", inventory=inventory)
+    base = context(
+        result_code="shot",
+        phase="follow_up",
+        details={"consumed_kind": "blank", "rewards": rewards},
+        players=(owner,),
+        current_player=owner,
+        view=game_view(
+            remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0
+        ),
+    )
+
+    body = render_reply(base).body
+
+    assert f"\n\n获得道具：**{expected}**\n\n" in body
+    assert body.index("获得道具：") < body.index("**当前：小明**")
+
+
+@pytest.mark.parametrize("details", [{}, {"rewards": ()}, {"reward_count": 2}])
+def test_shot_without_awarded_items_does_not_claim_existing_inventory(
+    details: dict[str, Any],
+) -> None:
+    owner = player(1, name="小明", inventory=(("beer", 3),))
+    base = context(
+        result_code="shot",
+        phase="follow_up",
+        details={"consumed_kind": "blank", **details},
+        players=(owner,),
+        current_player=owner,
+        view=game_view(
+            remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0
+        ),
+    )
+    assert "获得道具：" not in render_reply(base).body
+
+
+def test_reward_choice_distinguishes_awarded_items_from_pending_item() -> None:
+    owner = player(1, name="小明", inventory=(("beer", 2), ("lock", 2)))
+    base = context(
+        result_code="item_choice_pending",
+        phase="item_choice",
+        details={
+            "consumed_kind": "blank",
+            "reward_count": 2,
+            "rewards": ("lock",),
+            "pending_item": "magnifier",
+            "pending_item_count": 0,
+        },
+        players=(owner,),
+        current_player=owner,
+        reward_player=owner,
+        view=game_view(
+            remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0
+        ),
+    )
+    body = render_reply(base).body
+    assert "获得道具：**锁 ×1**" in body
+    assert "当前新道具：**放大镜**" in body
+    assert "道具列表已满，选择一项来替换。" in body
+    assert "获得道具：**放大镜" not in body
+    assert body.index("获得道具：") < body.index("当前新道具：")
 
 
 def test_follow_up_is_complete_markdown() -> None:
@@ -174,6 +249,7 @@ def test_reward_choice_has_two_dividers() -> None:
     # 首行必须是本次空弹射击那份被冻结的空弹文案，而非通用的“你获得了新道具。”
     assert body.splitlines()[0] == "> 小明打出一发空弹。", body
     assert "你获得了新道具。" not in body
+    assert "获得道具：" not in body
     assert_body_has_markdown_structure(body, dividers=2, blockquote=True, bold=True, roster=True)
     assert "当前新道具：**放大镜**" in body
     assert "已有道具：放大镜 ×1、啤酒 ×2、锁 ×1" in body

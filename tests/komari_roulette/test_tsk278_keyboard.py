@@ -7,7 +7,8 @@ TSK-266 1H ``6a9bc5dd`` / 1D ``6a9ac966`` / ``6a9e6ce3`` confirmed layouts:
 emoji labels, at most 3 buttons per row, at most 3 Chinese chars per label
 (5 when a row has exactly 2 buttons), reward-replacement labels never 6
 glyphs, action.type=2 / permission.type=2 / reply=false / enter=false,
-fill-only commands.
+fill-only commands. TSK-305 moves use/discard actions into the item panel;
+ordinary state cards expose only the panel entry.
 """
 
 from __future__ import annotations
@@ -113,16 +114,16 @@ def _follow_up_context() -> ReplyProjectionContext:
     )
 
 
-def test_follow_up_button_layout_1h() -> None:
+def test_follow_up_button_layout_opens_item_panel() -> None:
     rows = _materialize(_follow_up_context())
     assert _labels(rows) == [
-        ["🧰使用", "🗑️丢弃"],
+        ["🧰道具"],
         ["🔫开枪", "🔄装填"],
         ["⏹️结束", "🏳️弃权"],
     ]
     _assert_fill_only(rows)
-    # 1H 定稿：使用/丢弃只填入前缀，由用户补完道具字母后手动发送，无尾随空格。
-    assert _data(rows)[0] == ["/轮盘 道具 使用", "/轮盘 道具 丢弃"]
+    # TSK-305：状态卡只提供道具面板入口，使用/丢弃留在面板中。
+    assert _data(rows)[0] == ["/轮盘 道具"]
     assert _data(rows)[1] == ["/轮盘 开枪", "/轮盘 装填"]
     assert _data(rows)[2] == ["/轮盘 结束", "/轮盘 弃权"]
 
@@ -172,8 +173,8 @@ def test_locked_phase_alias_is_not_accepted() -> None:
         ),
     )
     labels = [button.label for row in _materialize(base) for button in row]
-    # 应该是普通 follow_up 布局（含使用/丢弃），而不是只剩开枪/弃权。
-    assert "🧰使用" in labels
+    # 应该是普通 follow_up 布局（含道具入口），而不是只剩开枪/弃权。
+    assert "🧰道具" in labels
     assert "⏹️结束" in labels
 
 
@@ -187,11 +188,12 @@ def _follow_up_context_with(
     inventory: tuple[tuple[str, int], ...],
     others: tuple[Any, ...] = (),
     remaining_total: int = 4,
+    result_code: str = "shot",
 ) -> ReplyProjectionContext:
     current = player(1, name="小明", inventory=inventory)
     roster = (current, *others)
     return context(
-        result_code="shot",
+        result_code=result_code,
         lifecycle="active",
         phase="follow_up",
         players=roster,
@@ -205,10 +207,11 @@ def _follow_up_context_with(
     )
 
 
-def test_follow_up_without_inventory_omits_use_and_discard() -> None:
+@pytest.mark.parametrize("result_code", ["shot", "panel_opened"])
+def test_follow_up_without_inventory_omits_use_and_discard(result_code: str) -> None:
     """当前玩家道具 0 → 不出现 🧰使用 / 🗑️丢弃（1H 动态布局）。"""
     base = _follow_up_context_with(
-        inventory=(), others=(player(2, name="小红"),)
+        inventory=(), others=(player(2, name="小红"),), result_code=result_code
     )
     labels = [button.label for row in _materialize(base) for button in row]
     assert "🧰使用" not in labels
@@ -216,6 +219,32 @@ def test_follow_up_without_inventory_omits_use_and_discard() -> None:
     assert "🔫开枪" in labels
     assert "⏹️结束" in labels
     assert "🏳️弃权" in labels
+    assert "🧰道具" not in labels
+
+
+def test_item_panel_keeps_direct_use_and_discard_buttons() -> None:
+    base = _follow_up_context_with(
+        inventory=(("magnifier", 1),), result_code="panel_opened"
+    )
+    rows = _materialize(base)
+    assert _labels(rows) == [
+        ["🧰使用", "🗑️丢弃"],
+        ["🔫开枪", "🔄装填"],
+        ["⏹️结束", "🏳️弃权"],
+    ]
+    assert _data(rows)[0] == ["/轮盘 道具 使用", "/轮盘 道具 丢弃"]
+    _assert_fill_only(rows)
+
+
+def test_state_card_with_unusable_lock_still_opens_item_panel() -> None:
+    base = _follow_up_context_with(
+        inventory=(("lock", 1),),
+        others=(player(2, name="小红", pending_lock=True),),
+    )
+    rows = _materialize(base)
+    assert _labels(rows)[0] == ["🧰道具"]
+    assert _data(rows)[0] == ["/轮盘 道具"]
+    _assert_fill_only(rows)
 
 
 def test_follow_up_on_full_chamber_omits_reload() -> None:
@@ -228,40 +257,60 @@ def test_follow_up_on_full_chamber_omits_reload() -> None:
     labels = [button.label for row in _materialize(base) for button in row]
     assert "🔄装填" not in labels
     assert "🔫开枪" in labels
-    assert "🧰使用" in labels
+    assert "🧰道具" in labels
 
 
-def test_follow_up_lock_only_without_legal_target_omits_use() -> None:
+def test_item_panel_lock_only_without_legal_target_omits_use() -> None:
     """只有锁且无合法目标 → 不出现 🧰使用（仍可丢弃）。"""
     base = _follow_up_context_with(
         inventory=(("lock", 1),),
         # 唯一在席对手已有待生效锁 → 不是合法目标。
         others=(player(2, name="小红", pending_lock=True),),
+        result_code="panel_opened",
     )
     labels = [button.label for row in _materialize(base) for button in row]
     assert "🧰使用" not in labels
     assert "🗑️丢弃" in labels
 
 
-def test_follow_up_lock_only_with_legal_target_keeps_use() -> None:
+def test_item_panel_lock_only_with_legal_target_keeps_use() -> None:
     """只有锁但存在合法目标 → 🧰使用 仍出现。"""
     base = _follow_up_context_with(
         inventory=(("lock", 1),),
         others=(player(2, name="小红"),),
+        result_code="panel_opened",
     )
     labels = [button.label for row in _materialize(base) for button in row]
     assert "🧰使用" in labels
 
 
-def test_follow_up_omits_item_buttons_when_all_counts_zero() -> None:
+@pytest.mark.parametrize("result_code", ["shot", "panel_opened"])
+def test_follow_up_omits_item_buttons_when_all_counts_zero(result_code: str) -> None:
     """只有 0 数量条目等价于无道具：不出现使用/丢弃。"""
     base = _follow_up_context_with(
         inventory=(("magnifier", 0), ("lock", 0)),
         others=(player(2, name="小红"),),
+        result_code=result_code,
     )
     labels = [button.label for row in _materialize(base) for button in row]
     assert "🧰使用" not in labels
     assert "🗑️丢弃" not in labels
+    assert "🧰道具" not in labels
+
+
+def test_old_frozen_item_action_buttons_are_not_rewritten() -> None:
+    spec = (
+        '{"rows":[[{"label":"🧰使用","data":"/轮盘 道具 使用",'
+        '"action_type":2,"permission_type":2,"reply":false,"enter":false},'
+        '{"label":"🗑️丢弃","data":"/轮盘 道具 丢弃",'
+        '"action_type":2,"permission_type":2,"reply":false,"enter":false}]]}'
+    )
+    keyboard = keyboard_from_spec(spec)
+    rows = flatten_keyboard(keyboard)
+    assert _labels(rows) == [["🧰使用", "🗑️丢弃"]]
+    assert _data(rows) == [["/轮盘 道具 使用", "/轮盘 道具 丢弃"]]
+    _assert_settled_serialized_fields(keyboard)
+    _assert_fill_only(rows)
 
 
 def test_keyboard_from_spec_rejects_bare_list() -> None:
