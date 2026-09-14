@@ -536,6 +536,8 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.llm.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
 13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
 
+14. **QQ 按钮协议**：显式配置权限，现有绑定/轮盘公开群命令按钮使用 `permission.type=2`；仅指定用户入口才使用 `type=0` + 真实 QQ 群成员 OpenID 非空名单，禁止缺失权限、空名单或身份缺失时放宽权限。按钮可点击性不替代服务端授权。按官方字段表完整输出 `label` / `visited_label` / `style` / `action.type` / `action.permission.type` / `data` / `unsupport_tips`，群命令保持 `enter=false` / `reply=false`；在真实 SDK 最终序列化层验收，不依赖客户端或 SDK 的宽松默认。设计、实测与现有待修复缺口见 `QQ-BUTTON-POLICY.md`（TSK-296～299），本约定不表示修复已落地。
+
 ## Agent skills
 
 ### Issue tracker
@@ -562,4 +564,4 @@ Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-09-11。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-09-14。发现不一致请以实际代码为准并更新本文档。*
