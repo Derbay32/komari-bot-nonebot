@@ -422,9 +422,10 @@ async def test_confirm_commits_atomically_and_publishes_cache_only_after_commit(
             row = await _member_row(factory, current, current.member_openid)
             assert row["character_name"] == "阿明"
             assert row["character_name_key"] == "阿明"
-            assert await _count_rows(
-                factory, "komari_character_binding_groups", current
-            ) == 1
+            assert (
+                await _count_rows(factory, "komari_character_binding_groups", current)
+                == 1
+            )
             assert (
                 binding_manager.get_qq_character_name(
                     app_id=current.app_id,
@@ -473,12 +474,19 @@ async def test_confirm_commits_atomically_and_publishes_cache_only_after_commit(
                 token,
             )
             assert repeat is not None
-            assert repeat.body == BIND_SUCCESS.format(name="阿明")
+            assert repeat.body == "本次操作已完成，无需再次确认。"
             row_after = await _member_row(factory, current, current.member_openid)
-            assert row_after["updated_at"] == updated_before, "重复 confirm 不得二次写入"
-            assert await _count_rows(
-                factory, "komari_character_binding_members", current
-            ) == 1
+            assert row_after["updated_at"] == updated_before, (
+                "重复 confirm 不得二次写入"
+            )
+            assert row_after == row
+            assert await wizard.get_session(view.scope) == view, (
+                "重复确认不得续期或改变完成态"
+            )
+            assert (
+                await _count_rows(factory, "komari_character_binding_members", current)
+                == 1
+            )
 
             existing = await wizard.handle_event(
                 make_event(
@@ -845,9 +853,9 @@ async def test_rename_preview_confirm_conflict_and_cancel(
             )
             assert conflict is not None
             assert conflict.body == NAME_DUPLICATE_ERROR
-            assert (
-                await _member_row(factory, current, current.member_openid)
-            )["character_name"] == "阿明"
+            assert (await _member_row(factory, current, current.member_openid))[
+                "character_name"
+            ] == "阿明"
 
             cancel = await wizard.handle_event(
                 make_event(
@@ -860,9 +868,9 @@ async def test_rename_preview_confirm_conflict_and_cancel(
             )
             assert cancel is not None
             assert cancel.body == CANCELLED
-            assert (
-                await _member_row(factory, current, current.member_openid)
-            )["character_name"] == "阿明"
+            assert (await _member_row(factory, current, current.member_openid))[
+                "character_name"
+            ] == "阿明"
 
             await wizard.handle_event(
                 make_event(
@@ -894,9 +902,23 @@ async def test_rename_preview_confirm_conflict_and_cancel(
             )
             assert success is not None
             assert success.body == RENAME_SUCCESS.format(name="小暗")
-            assert (
-                await _member_row(factory, current, current.member_openid)
-            )["character_name"] == "小暗"
+            row = await _member_row(factory, current, current.member_openid)
+            assert row["character_name"] == "小暗"
+            await wizard.finish_send(success)
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {second_session}",
+                    message_id="rename-repeat",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert repeat is not None
+            assert repeat.body == "本次操作已完成，无需再次确认。"
+            assert await _member_row(factory, current, current.member_openid) == row, (
+                "重复确认不得改写角色名或更新时间"
+            )
             assert (
                 binding_manager.get_qq_character_name(
                     app_id=current.app_id,
@@ -1014,9 +1036,25 @@ async def test_unbind_clears_only_name_and_identity_stays_reusable(
             row = await _member_row(factory, current, current.member_openid)
             assert row["character_name"] is None
             assert str(row["member_qq"]) == str(current.member_qq)
-            assert await _count_rows(
-                factory, "komari_character_binding_groups", current
-            ) == 1
+            await wizard.finish_send(success)
+            repeat = await wizard.handle_event(
+                make_event(
+                    content=f"/bind confirm {unbind_session}",
+                    message_id="unbind-repeat",
+                    group_openid=current.group_openid,
+                    member_openid=current.member_openid,
+                ),
+                token,
+            )
+            assert repeat is not None
+            assert repeat.body == "本次操作已完成，无需再次确认。"
+            assert await _member_row(factory, current, current.member_openid) == row, (
+                "重复确认不得再次清名、改写身份或更新时间"
+            )
+            assert (
+                await _count_rows(factory, "komari_character_binding_groups", current)
+                == 1
+            )
             assert (
                 binding_manager.get_qq_character_name(
                     app_id=current.app_id,
@@ -1067,9 +1105,7 @@ async def test_unbind_clears_only_name_and_identity_stays_reusable(
             assert rebound is not None
             assert rebound.body == BIND_SUCCESS.format(name="新名")
             assert (
-                await _count_rows(
-                    factory, "komari_character_binding_members", current
-                )
+                await _count_rows(factory, "komari_character_binding_members", current)
                 == 1
             )
         finally:
