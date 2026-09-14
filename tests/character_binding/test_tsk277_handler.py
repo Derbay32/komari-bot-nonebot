@@ -189,6 +189,34 @@ def _only_call(bot: QQProbeBot) -> dict[str, Any]:
     return data
 
 
+UNSUPPORT_TIPS = "当前客户端不支持此按钮。"
+
+
+def _serialized_buttons(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """真实 post_group_messages 载荷中 keyboard 的实际序列化按钮字段。"""
+    keyboard = data.get("keyboard")
+    assert keyboard is not None, "挑战载荷必须携带 keyboard"
+    dumped = keyboard.model_dump(exclude_none=True)
+    return [button for row in dumped["content"]["rows"] for button in row["buttons"]]
+
+
+def _assert_settled_button_fields(button: dict[str, Any]) -> None:
+    """TSK-298/299 定稿：公开命令按钮序列化后的必填字段值。
+
+    只断言协议要求的字段值；button id 等可选 SDK 字段保持可选，
+    不禁止出现，也不做序列化字段白名单。
+    """
+    render_data = button["render_data"]
+    assert render_data["visited_label"] == render_data["label"]
+    assert render_data["style"] == 0
+    action = button["action"]
+    assert action["type"] == 2
+    assert action["permission"] == {"type": 2}, "必须显式序列化 permission.type=2"
+    assert action["reply"] is False
+    assert action["enter"] is False
+    assert action["unsupport_tips"] == UNSUPPORT_TIPS
+
+
 async def test_real_handler_sends_markdown_challenge_with_quote_and_no_second_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,6 +252,8 @@ async def test_real_handler_sends_markdown_challenge_with_quote_and_no_second_cl
             (CONTINUE_BUTTON, "/bind", 2),
             (CANCEL_BUTTON, f"/bind cancel {session_code}", 2),
         ]
+        for button in _serialized_buttons(data):
+            _assert_settled_button_fields(button)
         assert reference_message_id(data) == "qq-handler-1"
         assert data["group_openid"] == GROUP_OPENID
 
