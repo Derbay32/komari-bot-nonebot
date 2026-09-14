@@ -1,6 +1,6 @@
 # QQ 按钮协议与权限约定
 
-记录日期：2026-09-14（Asia/Shanghai）。设计已确认；现有实现缺口由 TSK-298 / TSK-299 修复，本记录不表示代码已经修复。
+记录日期：2026-09-14（Asia/Shanghai）。设计已确认，TSK-298 / TSK-299 的生产修复已实现；下文审计表保留修复前基线。
 
 ## 设计决定
 
@@ -48,7 +48,7 @@ PC 拒绝指定用户空名单符合限制预期；iOS 放行表现出客户端�
 
 服务日志仅确认测试命令到达，未记录 A/B/C 手动回执命令。点击结论不是服务端回执推断，亦不替代正式业务新卡片的实机验收。
 
-## 现有代码审计
+## 修复前代码审计
 
 审计基线为 `4cbc7fc`。已搜索生产代码、启动入口与脚本的按钮构造及键盘 JSON 物化路径；排除隔离 worktree 和一次性原型，找到以下两个生产入口。
 
@@ -57,9 +57,20 @@ PC 拒绝指定用户空名单符合限制预期；iOS 放行表现出客户端�
 | `character_binding/qq_commands.py::_qq_message` | render 只有 label，action 只有 type/data | 缺 permission、visited_label、style、unsupport_tips；TSK-298 |
 | `komari_roulette/qq/keyboard.py::keyboard_from_spec` | 显式 permission.type2，enter/reply false | 缺 visited_label、style、unsupport_tips；TSK-299 |
 
-绑定测试 helper 当前只提取 label/data/type，未覆盖权限和完整必填字段。轮盘键盘与送达测试已断言权限 type2，但未覆盖上述三个缺失字段。
+审计时，绑定测试 helper 只提取 label/data/type，未覆盖权限和完整必填字段。轮盘键盘与送达测试已断言权限 type2，但未覆盖上述三个缺失字段。
 
-轮盘权限本身正确；缺少其他必填字段是独立的协议完整性问题，不宣称已复现相同的 macOS 故障。TSK-299 在实施前还须核查冻结物化契约，不直接改历史记录。
+轮盘权限本身正确；缺少其他必填字段是独立的协议完整性问题，不宣称已复现相同的 macOS 故障。
+
+## 修复结果与回归边界
+
+- 补齐绑定公开按钮的显式权限与完整展示字段。
+- 补齐轮盘最终物化层的 `visited_label`、`style` 与 `unsupport_tips`。
+- 保留轮盘冻结格式，不迁移、补写或重发旧收据。
+- 增加真实绑定 handler 发送载荷的字段断言，不只读取测试 helper 的简化投影。
+- 增加既有轮盘键盘布局的真实 SDK 序列化断言。
+- 对照独立字面量校验生产冻结格式，不用输入字符串的不可变性冒充格式验证。
+- 保留 `button.id` 等 SDK 可选字段的可选性，不把必填字段检查扩大成全字段白名单。
+- 记录用户对修复后权限测试正常的反馈；不据此宣称全部客户端或轮盘完整流程均已验收。
 
 ## 来源
 
@@ -67,4 +78,5 @@ PC 拒绝指定用户空名单符合限制预期；iOS 放行表现出客户端�
 - [QQ 群消息自动生成文档](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)：可选标记与手册必填列存在不一致；示例和 SDK Optional 不作为省略必填字段的依据。
 - TSK-296：客户端差异调查与项目设计结论。
 - TSK-297：一次性真实客户端对照；代码不进入正式分支。
-- TSK-298 / TSK-299：绑定与轮盘修复子票；本次只审计建票，不实现修复。
+- TSK-298 / TSK-299：绑定与轮盘修复子票。
+- TSK-281：后续回归、CI 与完整实机验收记录。

@@ -19,6 +19,7 @@ from nonebot.adapters.qq.models import (
     InlineKeyboardRow,
     MessageKeyboard,
     MessageReference,
+    Permission,
     RenderData,
 )
 from nonebot.typing import T_State  # noqa: TC002 - NoneBot 运行时解析 DI 注解
@@ -42,8 +43,19 @@ def _qq_message(reply: WizardReply) -> Message:
         InlineKeyboardRow(
             buttons=[
                 Button(
-                    render_data=RenderData(label=button.label),
-                    action=Action(type=2, data=button.command),
+                    render_data=RenderData(
+                        label=button.label,
+                        visited_label=button.label,
+                        style=0,
+                    ),
+                    action=Action(
+                        type=2,
+                        permission=Permission(type=2),
+                        data=button.command,
+                        reply=False,
+                        enter=False,
+                        unsupport_tips="当前客户端不支持此按钮。",
+                    ),
                 )
                 for button in row
             ]

@@ -226,7 +226,9 @@ def _layout_rows(context: ReplyProjectionContext) -> list[list[dict[str, Any]]]:
 
 def build_keyboard(context: ReplyProjectionContext) -> str:
     """Serialize the frozen button layout as the canonical JSON spec string."""
-    return json.dumps({"rows": _layout_rows(context)}, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        {"rows": _layout_rows(context)}, ensure_ascii=False, separators=(",", ":")
+    )
 
 
 def keyboard_from_spec(spec: str) -> MessageKeyboard:
@@ -234,6 +236,8 @@ def keyboard_from_spec(spec: str) -> MessageKeyboard:
 
     Only the object form ``{"rows": [[button, ...], ...]}`` is accepted: a bare
     list and the historical dict-row form ``{"buttons": [...]}`` are rejected.
+    Required render fields use the frozen label and fixed protocol values here;
+    the canonical spec stays unchanged and no runtime configuration is read.
     """
 
     parsed = json.loads(spec)
@@ -245,13 +249,20 @@ def keyboard_from_spec(spec: str) -> MessageKeyboard:
             raise TypeError("each keyboard row must be a button list")  # noqa: TRY003
         buttons = [
             Button(
-                render_data=RenderData(label=str(button_spec["label"])),
+                render_data=RenderData(
+                    label=str(button_spec["label"]),
+                    visited_label=str(button_spec["label"]),
+                    style=0,
+                ),
                 action=Action(
                     type=int(button_spec.get("action_type", 2)),
-                    permission=Permission(type=int(button_spec.get("permission_type", 2))),
+                    permission=Permission(
+                        type=int(button_spec.get("permission_type", 2))
+                    ),
                     data=str(button_spec["data"]),
                     reply=bool(button_spec.get("reply", False)),
                     enter=bool(button_spec.get("enter", False)),
+                    unsupport_tips="当前客户端不支持此按钮。",
                 ),
             )
             for button_spec in row_spec

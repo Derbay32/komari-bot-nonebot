@@ -55,13 +55,42 @@ def _assert_fill_only(rows: list[list[ButtonSpec]]) -> None:
             assert button.data, "button data must not be empty"
 
 
+UNSUPPORT_TIPS = "当前客户端不支持此按钮。"
+
+
+def _assert_settled_serialized_fields(keyboard: Any) -> None:
+    """TSK-298/299 定稿：真实适配器序列化后的公开命令按钮必填值。
+
+    应用于真实 ``MessageKeyboard`` 的 ``model_dump(exclude_none=True)`` 结果
+    （即 ``post_group_messages`` 实际发送的 JSON 形状）；空键盘恒通过。
+    只断言协议要求的字段值；button id 等可选 SDK 字段保持可选，
+    不禁止出现，也不做序列化字段白名单。
+    """
+    dumped = keyboard.model_dump(exclude_none=True)
+    for row in dumped["content"]["rows"]:
+        for button in row["buttons"]:
+            render_data = button["render_data"]
+            assert render_data["visited_label"] == render_data["label"]
+            assert render_data["style"] == 0
+            action = button["action"]
+            assert action["type"] == 2
+            assert action["permission"] == {"type": 2}, (
+                "必须显式序列化 permission.type=2"
+            )
+            assert action["reply"] is False
+            assert action["enter"] is False
+            assert action["unsupport_tips"] == UNSUPPORT_TIPS
+
+
 def _materialize(context_obj: ReplyProjectionContext) -> list[list[ButtonSpec]]:
     """build_keyboard → JSON spec → real QQ MessageKeyboard → flattened."""
     spec = build_keyboard(context_obj)
     assert isinstance(spec, str), "build_keyboard must return a JSON spec string"
     parsed = json.loads(spec)
     assert "rows" in parsed and isinstance(parsed["rows"], list)
-    return flatten_keyboard(keyboard_from_spec(spec))
+    keyboard = keyboard_from_spec(spec)
+    _assert_settled_serialized_fields(keyboard)
+    return flatten_keyboard(keyboard)
 
 
 def _hanzi_count(label: str) -> int:
@@ -336,16 +365,25 @@ def test_item_choice_held_types_are_fill_only_and_ordered() -> None:
     assert replace_labels == ["🔄放大镜", "🔄啤酒", "🔄锁"]
 
 
-def test_waiting_buttons_with_transfer() -> None:
-    base = context(
+def _waiting_with_transfer_context() -> ReplyProjectionContext:
+    return context(
         result_code="joined",
         lifecycle="waiting",
         phase=None,
         players=(player(1, name="小明"), player(2, name="小红")),
         current_player=None,
-        view=game_view(host_seq=1, remaining_total=4, remaining_live=1, remaining_blank=3, hit_percent=25.0),
+        view=game_view(
+            host_seq=1,
+            remaining_total=4,
+            remaining_live=1,
+            remaining_blank=3,
+            hit_percent=25.0,
+        ),
     )
-    rows = _materialize(base)
+
+
+def test_waiting_buttons_with_transfer() -> None:
+    rows = _materialize(_waiting_with_transfer_context())
     # 加入/开始 + 退出/取消 两排，加通用 🔄转让（末尾保留参数分隔空格）。
     labels = _labels(rows)
     assert labels == [
@@ -421,6 +459,54 @@ def test_keyboard_spec_round_trips_through_real_adapter() -> None:
     keyboard = keyboard_from_spec(spec)
     rows = flatten_keyboard(keyboard)
     assert rows == flatten_keyboard(keyboard_from_spec(spec))
+
+
+# TSK-298/299：存量收据中的冻结 spec（生产 spec 形状：六个规范键，
+# 无 visited_label/style/unsupport_tips 展示字段，无可选 id）。
+# 标签/命令与 test_waiting_buttons_with_transfer 的定稿布局逐字一致。
+FROZEN_WAITING_SPEC = (
+    '{"rows":['
+    '[{"label":"加入","data":"/轮盘 加入","action_type":2,"permission_type":2,"reply":false,"enter":false},'
+    '{"label":"开始","data":"/轮盘 开始","action_type":2,"permission_type":2,"reply":false,"enter":false}],'
+    '[{"label":"退出","data":"/轮盘 退出","action_type":2,"permission_type":2,"reply":false,"enter":false},'
+    '{"label":"取消","data":"/轮盘 取消","action_type":2,"permission_type":2,"reply":false,"enter":false}],'
+    '[{"label":"🔄转让","data":"/轮盘 转让 ","action_type":2,"permission_type":2,"reply":false,"enter":false}]'
+    "]}"
+)
+
+
+def test_build_keyboard_waiting_with_transfer_matches_frozen_spec() -> None:
+    """生产 build_keyboard 对既有 waiting/转让 fixture 输出与冻结 spec 结构一致。"""
+    spec = build_keyboard(_waiting_with_transfer_context())
+    assert json.loads(spec) == json.loads(FROZEN_WAITING_SPEC), (
+        "waiting/转让布局的生产 spec 必须与存量冻结 spec 逐键同值"
+    )
+
+
+def test_frozen_spec_materializes_display_fields() -> None:
+    """存量冻结 spec（缺三个展示字段）物化出定稿展示字段，标签/命令/布局不变。"""
+    parsed = json.loads(FROZEN_WAITING_SPEC)
+    for row in parsed["rows"]:
+        for button in row:
+            assert set(button) == {
+                "label",
+                "data",
+                "action_type",
+                "permission_type",
+                "reply",
+                "enter",
+            }, "冻结 spec 不含展示字段与可选 id"
+
+    keyboard = keyboard_from_spec(FROZEN_WAITING_SPEC)
+    _assert_settled_serialized_fields(keyboard)
+    rows = flatten_keyboard(keyboard)
+    assert _labels(rows) == [
+        ["加入", "开始"],
+        ["退出", "取消"],
+        ["🔄转让"],
+    ]
+    assert _data(rows)[2] == ["/轮盘 转让 "]
+    _assert_fill_only(rows)
 
 
 def test_keyboard_is_pure_over_frozen_context() -> None:
