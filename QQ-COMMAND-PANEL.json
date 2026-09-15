@@ -1,0 +1,19 @@
+{
+  "items": [
+    {"name": "bind", "desc": "开始或继续本群绑定", "type": "command", "only_admin": false},
+    {"name": "bind rename", "desc": "修改本群角色名", "type": "command", "only_admin": false},
+    {"name": "bind unbind", "desc": "解除本群角色名绑定", "type": "command", "only_admin": false},
+    {"name": "轮盘 开局", "desc": "创建本群轮盘等候局", "type": "command", "only_admin": false},
+    {"name": "轮盘 加入", "desc": "加入本群等候中的对局", "type": "command", "only_admin": false},
+    {"name": "轮盘 开始", "desc": "由局主开始对局", "type": "command", "only_admin": false},
+    {"name": "轮盘 开枪", "desc": "当前玩家进行射击", "type": "command", "only_admin": false},
+    {"name": "轮盘 结束", "desc": "结束当前回合", "type": "command", "only_admin": false},
+    {"name": "轮盘 装填", "desc": "补充空弹并结束回合", "type": "command", "only_admin": false},
+    {"name": "轮盘 道具", "desc": "查看当前道具及操作", "type": "command", "only_admin": false},
+    {"name": "轮盘 排行榜", "desc": "查看本群累计胜场", "type": "command", "only_admin": false},
+    {"name": "轮盘 退出", "desc": "离开尚未开始的对局", "type": "command", "only_admin": false},
+    {"name": "轮盘 取消", "desc": "由局主取消等候局", "type": "command", "only_admin": false},
+    {"name": "轮盘 弃权", "desc": "主动弃权并退出对局", "type": "command", "only_admin": false}
+  ],
+  "remark": "komari-bot:group-commands:v1"
+}
