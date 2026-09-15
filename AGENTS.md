@@ -330,7 +330,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **一次履约**：领域提交后冻结文案与投影；配置变化不重渲染旧收据。发送开始后异常、取消或缺失合法平台 ID 保持 UNKNOWN / `PENDING_CONFIRMATION`，不得回滚领域事实、重抽、重发或猜测确认。后台无合法入站消息 ID 不创建群消息 outbox。
 - **恢复与清理**：关闭开关不暂停绝对期限；受限群不推进，恢复后只处理旧当前玩家一次，下一人取得完整 15 分钟。每 60 秒小批扫描，每日调度器时区 04:00 清理，PG UTC 比较保留边界；收据/履约 7 天，cancelled/expired/failed 30 天，completed/结果玩家/胜场长期保留，waiting/active 不清理。关闭先撤权和调度，再有界收束自有工作，不 dispose 共享 ORM。
 - **控制面**：`/api/v2/komari-roulette/status` 与 `/leaderboards/{inspect,rebuild}`；read/manage 分权。仅按 completed 真源校验/重建，不提供任意加分、重置、恢复发送或强制终局。`latest_scan/latest_cleanup` 是结果计数，不是时间戳。
-- **交付边界**：根目录 `ROULETTE-ROLLOUT.md` 记录升级、旧名主动迁移、运维与最终 QQ 样本；自动化及旧原型不代替当前部署版本的真实 QQ 展示/通知验收。
+- **交付边界**：`docs/adr/ROULETTE-ROLLOUT.md` 记录升级、旧名主动迁移、运维与最终 QQ 样本；自动化及旧原型不代替当前部署版本的真实 QQ 展示/通知验收。
 
 ### 4. 四层记忆系统 (`komari_memory`)
 
@@ -536,7 +536,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.llm.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
 13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
 
-14. **QQ 按钮协议**：显式配置权限，现有绑定/轮盘公开群命令按钮使用 `permission.type=2`；仅指定用户入口才使用 `type=0` + 真实 QQ 群成员 OpenID 非空名单，禁止缺失权限、空名单或身份缺失时放宽权限。按钮可点击性不替代服务端授权。按官方字段表完整输出 `label` / `visited_label` / `style` / `action.type` / `action.permission.type` / `data` / `unsupport_tips`，群命令保持 `enter=false` / `reply=false`；在真实 SDK 最终序列化层验收，不依赖客户端或 SDK 的宽松默认。设计、历史审计与修复说明见 `QQ-BUTTON-POLICY.md`（TSK-296～299）；生产物化层已补齐字段，真实客户端展示仍须按实际运行版本记录样本。
+14. **QQ 按钮协议**：显式配置权限，现有绑定/轮盘公开群命令按钮使用 `permission.type=2`；仅指定用户入口才使用 `type=0` + 真实 QQ 群成员 OpenID 非空名单，禁止缺失权限、空名单或身份缺失时放宽权限。按钮可点击性不替代服务端授权。按官方字段表完整输出 `label` / `visited_label` / `style` / `action.type` / `action.permission.type` / `data` / `unsupport_tips`，群命令保持 `enter=false` / `reply=false`；在真实 SDK 最终序列化层验收，不依赖客户端或 SDK 的宽松默认。设计、历史审计与修复说明见 `docs/adr/QQ-BUTTON-POLICY.md`（TSK-296～299）；生产物化层已补齐字段，真实客户端展示仍须按实际运行版本记录样本。
 
 ## Agent skills
 
@@ -550,7 +550,7 @@ Track issues and PRDs in the self-hosted Huly project **TSK** through the Huly M
 
 ### Domain docs
 
-Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/domain.md`.
+Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。专题与任务文档统一放在 `docs/adr/`，不在根目录追加独立 Markdown；Git 忽略规则只影响默认跟踪，不构成改放根目录的理由。QQ 菜单静态资源位于 `resources/qq/`，通过 API 直接配置，不增加控制台提交或菜单提审步骤。See `docs/agents/domain.md`.
 
 ## 相关文档
 

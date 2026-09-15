@@ -12,7 +12,7 @@ import pytest
 
 from komari_bot.plugins.komari_roulette.qq.parser import parse_command
 
-_MANIFEST = Path(__file__).resolve().parents[2] / "QQ-COMMAND-PANEL.json"
+_MANIFEST = Path(__file__).resolve().parents[2] / "resources/qq/command-panel.json"
 _ROULETTE_COMMANDS = [
     ("轮盘 开局", "create"),
     ("轮盘 加入", "join"),

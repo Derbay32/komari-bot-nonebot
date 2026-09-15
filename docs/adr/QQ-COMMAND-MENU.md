@@ -23,14 +23,15 @@
 | 删除后不再对关联对象生效 | [删除面板](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_panels_panel_id.delete.html) |
 | 统一 API 地址与 AccessToken 鉴权 | [接口调用与鉴权](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/api-use.html) |
 
-管理端「发布设置→功能配置→指令配置」也提供指令入口，见[接入指南](https://bot.q.qq.com/wiki)。
-其旧说明的 24 项上限与 API 面板的 20 项上限不能混用；两种配置是否共用数据源未得到官方明确说明。
-本轮使用已实际调用成功的面板 API，不同时修改控制台设置，不推断不需要审核或所有应用均已获权限。
+新版群指令面板直接通过上述 API 创建、更新或删除，不需要额外的控制台提交或菜单提审步骤。
+本轮已通过 API 配置并由客户端确认生效，不把旧控制台发布流程作为前置条件。
+应用的场景权限与 API 鉴权仍需满足；不据此推断所有应用均已获权限。
 仅限 C2C 的全局自定义菜单不是群指令面板，不使用 `/v2/menu` 完成本任务。
 
 ## 静态命令清单
 
-使用仓库中的 [面板配置](QQ-COMMAND-PANEL.json) 作为唯一可提交的静态内容。
+使用 [菜单资源](../../resources/qq/command-panel.json) 保存可复用的 API 请求内容模板。
+该文件不需要上传给控制台或提审，Bot 启动也不会自动读取它；实际生效配置由 API 写入并回读核对。
 该文件不包含应用凭据、群 OpenID、面板 ID 或动态会话码。
 
 | 面板名称 | 对应处理器命令 | 用途 |
