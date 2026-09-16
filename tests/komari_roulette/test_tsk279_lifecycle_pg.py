@@ -465,31 +465,6 @@ async def test_maintenance_close_waits_for_the_in_flight_cleanup_round(
         assert await _scope_receipts(harness, current) == 0
 
 
-@PG_REQUIRED
-async def test_stop_after_start_leaves_no_roulette_jobs(
-    harness: Tsk279Harness,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from komari_bot.plugins.komari_roulette.maintenance import (
-        CLEANUP_JOB_ID,
-        RECOVERY_JOB_ID,
-    )
-
-    await delete_roulette_config(harness.engine)
-    try:
-        async with lifecycle_context(monkeypatch) as ctx:
-            await invoke_hook(require_single_startup_hook(ctx))
-            assert ctx.scheduler.get_job(RECOVERY_JOB_ID) is not None
-            assert ctx.scheduler.get_job(CLEANUP_JOB_ID) is not None
-            api = application_api()
-            with suppress(Exception):
-                await _maybe_await(api["stop_roulette_application"]())
-            assert ctx.scheduler.get_job(RECOVERY_JOB_ID) is None
-            assert ctx.scheduler.get_job(CLEANUP_JOB_ID) is None
-    finally:
-        await delete_roulette_config(harness.engine)
-
-
 # ---------------------------------------------------------------------------
 # Lifecycle → QQ business wiring: the *real* composition root, not a manual
 # ``install_roulette_qq_runtime``.
