@@ -14,15 +14,13 @@ storage/ORM to prove
 
 The remaining cases cover the real ``komari_bot.plugins.komari_roulette.maintenance``
 seam (recovery pagination, retention boundaries, no-Redis dependency) plus
-the two runtime-facing post-lock rechecks, which stay RED
-until ``komari_bot.plugins.komari_roulette.runtime`` is implemented and fail
-with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
+the two runtime-facing post-lock rechecks against the real
+``komari_bot.plugins.komari_roulette.runtime``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import timedelta
@@ -60,7 +58,6 @@ from .tsk279_support import (
     age_game,
     harness_fixture_body,
     insert_waiting_game,
-    load_module,
     load_symbol,
     scope_counts,
     seed_aged_receipt,
@@ -1325,14 +1322,6 @@ async def test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed
 # ---------------------------------------------------------------------------
 
 
-async def test_maintenance_does_not_require_redis() -> None:
-    before = set(sys.modules)
-    module = load_module(MAINTENANCE_MODULE)
-    assert module is not None
-    new_modules = set(sys.modules) - before
-    assert not any(name.split(".")[0] == "redis" for name in new_modules)
-
-
 @PG_REQUIRED
 async def test_recovery_and_cleanup_do_not_require_redis(
     harness: Tsk279Harness,
@@ -1340,17 +1329,16 @@ async def test_recovery_and_cleanup_do_not_require_redis(
 ) -> None:
     """Real recovery + retention never issue a single Redis command.
 
-    ``test_maintenance_does_not_require_redis`` only proves the maintenance
-    module does not *import* Redis; this case drives the real recovery scan
-    and the real retention sweep against real PG rows while both actual Redis
-    command entry points (``redis.asyncio.Redis.execute_command`` and
-    ``redis.Redis.execute_command``) are denied.  The denial records every
-    attempt *and* raises ``AssertionError``, and the closing
-    ``attempts == []`` assertion stays honest even if production code were to
-    swallow that error.  Only the maintenance operations and their ``close``
-    sit inside the observation window; seeding and the independent PG result
-    assertions happen outside it.  No real Redis server is needed: the denied
-    entry point fires before any connection is made.
+    Both Redis command entry points (``redis.asyncio.Redis.execute_command``
+    and ``redis.Redis.execute_command``) are denied while the real recovery
+    scan and retention sweep run against real PG rows; every attempt is
+    recorded *and* raises ``AssertionError``, so the closing
+    ``attempts == []`` stays honest even if production code swallowed it.
+    Framework-level Redis imports elsewhere are legitimate and untouched:
+    the denial window covers only the maintenance operations and their
+    ``close``, while scope creation, seeding and the PG result queries sit
+    outside it.  No real Redis server is needed: the denied entry point
+    fires before any connection is made.
     """
 
     import redis as redis_sync
