@@ -15,13 +15,12 @@ from nonebot.config import Config as NoneBotConfig
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.character_binding.conftest import (
-    _reset_shared_orm_engine,
     require_postgres,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     APP_ID as ONEBOT_APP_ID,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     BASE_TIME,
     COMMAND,
     OFFICIAL_BOT_QQ,
@@ -32,10 +31,10 @@ from tests.character_binding.test_reply_evidence import (
     _original_event,
     _real_character_binding_package,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     MEMBER_OPENID as ONEBOT_MEMBER_OPENID,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     MEMBER_QQ as ONEBOT_MEMBER_QQ,
 )
 from tests.group_admission.entry_gate_support import (
@@ -50,6 +49,7 @@ from tests.group_admission.qq_admission_support import (
     make_group_at,
 )
 from tests.group_admission.runtime_support import AdmissionStorageFake, stored_policy
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -291,7 +291,7 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
     from nonebot import get_driver
 
     from komari_bot.plugins import user_ban as user_ban_module
-    from tests.character_binding.test_reply_evidence import (
+    from tests.character_binding.reply_evidence_support import (
         _real_character_binding_package,
     )
 
@@ -356,7 +356,7 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
         raising=False,
     )
 
-    await _reset_shared_orm_engine()
+    await reset_shared_orm_engine()
     dispose_calls: list[AsyncEngine] = []
     original_dispose = AsyncEngine.dispose
 
@@ -487,7 +487,7 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
         assert dispose_calls == []
     finally:
         monkeypatch.setattr(AsyncEngine, "dispose", original_dispose)
-        await _reset_shared_orm_engine()
+        await reset_shared_orm_engine()
 
     captured_output = capsys.readouterr()
     captured_logs = "\n".join((caplog.text, captured_output.out, captured_output.err))

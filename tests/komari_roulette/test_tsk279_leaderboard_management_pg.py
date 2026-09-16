@@ -30,6 +30,7 @@ from komari_bot.plugins.komari_roulette import (
     PostgresRouletteStorage,
 )
 from komari_bot.plugins.komari_roulette.observability import RouletteObservation
+from tests.pg_support import reset_shared_orm_engine
 
 from .storage_support import (
     POSTGRES_URL,
@@ -37,7 +38,6 @@ from .storage_support import (
     clear_scope,
     group_for,
     open_session,
-    reset_shared_orm_engine,
     same_database,
     scope,
 )

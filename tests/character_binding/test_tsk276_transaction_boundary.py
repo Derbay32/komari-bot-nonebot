@@ -19,15 +19,14 @@ from komari_bot.plugins.character_binding.manager import (
 )
 from tests.komari_roulette.command_support import (
     PG_REQUIRED,
-    backend_pid,
     create_engine_and_factory,
     delete_scope,
     hold_group_lock,
     request,
     scope,
     seed_binding,
-    wait_for_blocked,
 )
+from tests.pg_support import backend_pid, wait_for_blocked
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator

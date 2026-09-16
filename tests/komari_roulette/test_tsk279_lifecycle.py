@@ -27,11 +27,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.pg_support import backend_pid, wait_for_blocked
+
 from .command_support import (
     PG_REQUIRED,
-    backend_pid,
     hold_group_lock,
-    wait_for_blocked,
 )
 from .tsk279_lifecycle_support import (
     APPLICATION_FUNCTIONS,

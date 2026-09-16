@@ -9,7 +9,9 @@ from typing import Any, cast
 
 import pytest
 
-from tests.character_binding.test_reply_evidence import _real_character_binding_package
+from tests.character_binding.reply_evidence_support import (
+    _real_character_binding_package,
+)
 from tests.group_admission.management_support import prepare_control_plane
 from tests.group_admission.qq_admission_support import (
     APP_ID,

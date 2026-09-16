@@ -14,9 +14,9 @@ from pathlib import Path
 
 from tests.character_binding.tsk280_support import (
     REPAIR_API_PREFIX,
-    reset_shared_orm_engine,
 )
 from tests.group_admission.entry_gate_census import MATCHER_ENTRY_CENSUS
+from tests.pg_support import reset_shared_orm_engine
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEBUG_COMMANDS = (
