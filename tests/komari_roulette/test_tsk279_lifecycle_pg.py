@@ -34,16 +34,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from tests.pg_support import backend_pid, wait_for_blocked
+
 from .command_support import (
     PG_REQUIRED,
-    backend_pid,
-    hold_group_lock,
-    wait_for_blocked,
-)
-from .test_command_service import (
     CountingRandom,
     create_waiting,
     current_game_row,
+    hold_group_lock,
     join_player,
     seed_players,
     service_for,

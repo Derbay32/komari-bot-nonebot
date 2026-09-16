@@ -34,26 +34,23 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from tests.pg_support import backend_pid, reset_shared_orm_engine, wait_for_blocked
+
 from .command_support import (
     PG_REQUIRED,
-    Scope,
-    backend_pid,
-    command_factory,
-    create_engine_and_factory,
-    delete_scope,
-    observation,
-    request,
-    reset_shared_orm_engine,
-    scope,
-    seed_binding,
-    wait_for_blocked,
-)
-from .test_command_service import (
     CountingProjector,
     CountingRandom,
+    Scope,
+    command_factory,
+    create_engine_and_factory,
     create_waiting,
     current_game_row,
+    delete_scope,
     join_player,
+    observation,
+    request,
+    scope,
+    seed_binding,
     seed_players,
     start_game,
 )

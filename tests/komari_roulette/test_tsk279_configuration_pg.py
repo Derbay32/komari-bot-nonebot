@@ -23,18 +23,16 @@ from komari_bot.plugins.komari_roulette.qq.renderer import render_reply
 
 from .command_support import (
     PG_REQUIRED,
+    CountingProjector,
+    CountingRandom,
     command_factory,
+    create_waiting,
+    current_game_row,
+    join_player,
     member_id,
     observation,
     request,
     seed_binding,
-)
-from .test_command_service import (
-    CountingProjector,
-    CountingRandom,
-    create_waiting,
-    current_game_row,
-    join_player,
     seed_players,
     start_game,
 )

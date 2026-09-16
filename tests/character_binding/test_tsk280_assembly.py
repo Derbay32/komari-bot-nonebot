@@ -43,13 +43,13 @@ from tests.character_binding.tsk280_support import (
     make_game_state_reader,
     make_roulette,
     read_headers,
-    reset_shared_orm_engine,
     seed_binding,
     write_headers,
 )
 from tests.character_binding.tsk280_support import (
     scope as make_scope,
 )
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

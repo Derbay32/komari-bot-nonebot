@@ -42,17 +42,15 @@ from komari_bot.plugins.komari_roulette.qq.renderer import build_reply_projector
 
 from .command_support import (
     PG_REQUIRED,
+    CountingRandom,
     command_factory,
+    create_waiting,
+    current_game_row,
+    join_player,
     member_id,
     observation,
     request,
     seed_binding,
-)
-from .test_command_service import (
-    CountingRandom,
-    create_waiting,
-    current_game_row,
-    join_player,
     seed_players,
     start_game,
 )

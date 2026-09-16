@@ -48,7 +48,6 @@ from tests.character_binding.tsk280_support import (
     PG_REQUIRED,
     CommitFailureSwitch,
     Scope,
-    backend_pid,
     bind_member,
     clear_roulette_scope,
     create_active,
@@ -65,14 +64,12 @@ from tests.character_binding.tsk280_support import (
     member_rows,
     persist_completed_game,
     request,
-    reset_shared_orm_engine,
     roulette_counts,
     seed_binding,
     track_session_closes,
-    wait_for_blocked,
-    wait_for_blocked_count,
 )
 from tests.character_binding.tsk280_support import scope as make_scope
+from tests.pg_support import backend_pid, reset_shared_orm_engine, wait_for_blocked
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -1263,7 +1260,7 @@ async def test_concurrent_confirm_and_bind_share_group_lock(
             _blocking_bind(harness.binding_manager, current, 3, name="并发绑定")
         )
         try:
-            await wait_for_blocked_count(
+            await wait_for_blocked(
                 harness.session_factory, blocker_pid, min_count=2
             )
             async with harness.engine.connect() as probe:
@@ -1359,7 +1356,7 @@ async def test_concurrent_confirm_and_roulette_open_share_group_lock(
         )
         open_task = asyncio.create_task(_blocking_open())
         try:
-            await wait_for_blocked_count(
+            await wait_for_blocked(
                 harness.session_factory, blocker_pid, min_count=2
             )
             async with harness.engine.connect() as probe:

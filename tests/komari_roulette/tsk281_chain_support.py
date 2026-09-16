@@ -52,7 +52,7 @@ from uuid import uuid4
 
 from nonebot import get_driver
 
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     _challenge_event,
     _get_msg_payload,
     _original_event,

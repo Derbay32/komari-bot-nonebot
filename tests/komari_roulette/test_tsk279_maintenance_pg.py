@@ -31,22 +31,20 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from tests.pg_support import backend_pid, wait_for_blocked
+
 from .command_support import (
     PG_REQUIRED,
+    CountingRandom,
     Scope,
-    backend_pid,
     command_factory,
+    create_waiting,
+    current_game_row,
     hold_group_lock,
+    join_player,
     observation,
     request,
     seed_binding,
-    wait_for_blocked,
-)
-from .test_command_service import (
-    CountingRandom,
-    create_waiting,
-    current_game_row,
-    join_player,
     seed_players,
     service_for,
     start_game,
