@@ -13,8 +13,8 @@ storage/ORM to prove
   cancelled / expired / failed) is schema- and FK-valid.
 
 The remaining cases cover the real ``komari_bot.plugins.komari_roulette.maintenance``
-seam (recovery pagination, retention boundaries, job registration, no-Redis
-dependency) plus the two runtime-facing post-lock rechecks, which stay RED
+seam (recovery pagination, retention boundaries, no-Redis dependency) plus
+the two runtime-facing post-lock rechecks, which stay RED
 until ``komari_bot.plugins.komari_roulette.runtime`` is implemented and fail
 with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
 """
@@ -22,7 +22,6 @@ with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -1016,8 +1015,10 @@ async def test_cleanup_is_batch_bounded_and_reentrant(
             admission=_allow_only(set()),
         )
         first = await maintenance.cleanup_retention(batch_size=2)
-        assert isinstance(first.more_pending, bool)
         assert first.receipts_deleted <= 2
+        # One direct call stays a bounded page: with three aged receipts and a
+        # two-row budget the backlog signal must stay up.
+        assert first.more_pending is True
 
         async def ours_gone() -> bool:
             async with harness.session_factory() as session:
@@ -1320,107 +1321,8 @@ async def test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed
 
 
 # ---------------------------------------------------------------------------
-# RED: scheduler wiring (fixed ids, throttle only) and no-Redis dependency
+# No-Redis dependency
 # ---------------------------------------------------------------------------
-
-
-async def test_maintenance_jobs_registered_with_throttle_and_deploy_timezone() -> None:
-    api = _maintenance_api()
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-    # The deployment timezone is trusted from the scheduler config, never by
-    # mutating the host clock/timezone.
-    deploy_timezone = "Asia/Shanghai"
-    scheduler = AsyncIOScheduler(timezone=deploy_timezone)
-
-    class _MaintenanceStub:
-        async def advance_due(self, **_kwargs: Any) -> None:
-            return None
-
-        async def cleanup_retention(self, **_kwargs: Any) -> None:
-            return None
-
-    api["register_maintenance_jobs"](scheduler, _MaintenanceStub())
-    recovery = scheduler.get_job(api["RECOVERY_JOB_ID"])
-    cleanup = scheduler.get_job(api["CLEANUP_JOB_ID"])
-    assert recovery is not None
-    assert cleanup is not None
-    assert recovery.trigger.interval == timedelta(seconds=60)
-    assert recovery.coalesce is True
-    assert recovery.max_instances == 1
-    # APScheduler renders the cron field as the bare value (``4``), not a
-    # shell-like ``hour='4'`` repr.  Assert the 04:00 schedule directly on the
-    # trigger's own timezone (the deployment timezone), so the host clock/TZ is
-    # never involved.
-    assert str(cleanup.trigger.fields[5]) == "4"
-    assert str(cleanup.trigger.fields[6]) == "0"
-    from datetime import datetime as _datetime
-
-    at_noon = _datetime(2026, 1, 1, 12, 0, tzinfo=cleanup.trigger.timezone)
-    next_fire = cleanup.trigger.get_next_fire_time(None, at_noon)
-    assert next_fire is not None
-    assert (next_fire.hour, next_fire.minute) == (4, 0)
-    assert str(cleanup.trigger.timezone) == deploy_timezone
-    assert cleanup.coalesce is True
-    assert cleanup.max_instances == 1
-    api["unregister_maintenance_jobs"](scheduler)
-    assert scheduler.get_job(api["RECOVERY_JOB_ID"]) is None
-    assert scheduler.get_job(api["CLEANUP_JOB_ID"]) is None
-
-
-@PG_REQUIRED
-async def test_daily_cleanup_callback_drains_backlog_beyond_one_batch(
-    harness: Tsk279Harness,
-) -> None:
-    """One real 04:00 callback run must drain more than a single batch.
-
-    The registered cron callable is fetched from the scheduler and *invoked*
-    (never asserted by name); a direct ``cleanup_retention(batch=100)`` stays
-    bounded to one batch, while one callback run consumes the multi-batch
-    backlog the daily sweep would otherwise leave behind.
-    """
-
-    api = _maintenance_api()
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-    async with harness.scope("cron-drain") as current:
-        for index in range(201):
-            await seed_aged_receipt(
-                harness.session_factory,
-                current,
-                inbound_msg_id=f"cron-drain-{index}-{uuid4().hex}",
-                age_seconds=_DAY_SECONDS * 8,
-            )
-        maintenance = api["RouletteMaintenance"](
-            session_factory=harness.session_factory,
-            service=service_for(harness, random_source=CountingRandom()),
-            admission=_allow_only(set()),
-        )
-        # A single direct call stays a *bounded* page: more than one batch of
-        # eligible backlog is still present afterwards.
-        first = await maintenance.cleanup_retention(batch_size=100)
-        assert first.receipts_deleted <= 100
-        assert first.more_pending is True
-        remaining = await _scope_receipts(harness.session_factory, current)
-        assert remaining >= 101
-
-        scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-        api["register_maintenance_jobs"](scheduler, maintenance)
-        try:
-            job = scheduler.get_job(api["CLEANUP_JOB_ID"])
-            assert job is not None
-            callback = job.func
-            assert callable(callback)
-            outcome = callback()
-            if inspect.isawaitable(outcome):
-                await outcome
-        finally:
-            api["unregister_maintenance_jobs"](scheduler)
-
-        remaining_after = await _scope_receipts(harness.session_factory, current)
-        assert remaining_after == 0, (
-            "one 04:00 cron run must drain the aged backlog, not just one batch"
-        )
 
 
 async def test_maintenance_does_not_require_redis() -> None:

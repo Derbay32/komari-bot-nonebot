@@ -414,15 +414,14 @@ async def test_real_scheduler_observes_owned_jobs_and_real_shutdown_clears_them(
 ) -> None:
     """A real ``AsyncIOScheduler`` observes the real start/stop job contract.
 
-    The same production registration path is driven against a real running
+    The production registration path is driven against a real paused
     ``AsyncIOScheduler`` pinned to the deployment timezone (Asia/Shanghai):
-    the real startup hook must register exactly the two owned jobs with the
-    pinned throttling contract (60-second recovery interval, daily 04:00
-    cleanup cron, ``coalesce=True`` / ``max_instances=1`` on both), and the
-    real shutdown hook must remove them while clearing QQ dispatch and the
-    application; a repeated shutdown stays quiet.  Fire times are observed
-    only through the public trigger ``get_next_fire_time`` API - never
-    through internal cron fields.
+    startup must register exactly the two owned jobs with the pinned
+    throttling contract (60-second recovery interval, daily 04:00 cleanup
+    cron, ``coalesce=True`` / ``max_instances=1``), and shutdown must remove
+    them while clearing QQ dispatch and the application; a repeated shutdown
+    stays quiet.  Fire times are observed only through the public trigger
+    ``get_next_fire_time`` API - never through internal cron fields.
     """
 
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -440,9 +439,9 @@ async def test_real_scheduler_observes_owned_jobs_and_real_shutdown_clears_them(
         async with lifecycle_context(monkeypatch, scheduler=real_scheduler) as ctx:
             startup = require_single_startup_hook(ctx)
             shutdown = require_single_shutdown_hook(ctx)
-            # Real production shape: the scheduler is already running when the
-            # startup hook registers the owned jobs on it.
-            real_scheduler.start()
+            # Real production shape: the scheduler is already running (paused,
+            # so no wall-clock firing) when startup registers the owned jobs.
+            real_scheduler.start(paused=True)
             await invoke_hook(startup)
 
             app = application_api()["get_roulette_application"]()
@@ -466,7 +465,7 @@ async def test_real_scheduler_observes_owned_jobs_and_real_shutdown_clears_them(
                 assert job.max_instances == 1
 
             # 60-second recovery interval: two consecutive public fire times
-            # are exactly one interval apart, independent of the wall clock.
+            # are exactly one interval apart.
             reference = datetime(2026, 1, 1, 12, 0, tzinfo=shanghai)
             first_fire = recovery_job.trigger.get_next_fire_time(None, reference)
             assert first_fire is not None
@@ -479,8 +478,8 @@ async def test_real_scheduler_observes_owned_jobs_and_real_shutdown_clears_them(
             )
 
             # Daily cleanup: from a fixed 2026-01-01 Shanghai noon the next
-            # public fire time is the next day 04:00 in the deployment
-            # timezone (never read the internal cron fields).
+            # public fire time is the next day 04:00 (never read the internal
+            # cron fields).
             next_cleanup = cleanup_job.trigger.get_next_fire_time(
                 None, reference
             )
