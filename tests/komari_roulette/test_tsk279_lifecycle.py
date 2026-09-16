@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -402,6 +404,106 @@ async def test_stop_removes_owned_jobs_and_clears_qq_runtime(
             await invoke_hook(shutdown)
             assert ctx.scheduler.jobs == []
     finally:
+        await delete_roulette_config(harness.engine)
+
+
+@PG_REQUIRED
+async def test_real_scheduler_observes_owned_jobs_and_real_shutdown_clears_them(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real ``AsyncIOScheduler`` observes the real start/stop job contract.
+
+    The same production registration path is driven against a real running
+    ``AsyncIOScheduler`` pinned to the deployment timezone (Asia/Shanghai):
+    the real startup hook must register exactly the two owned jobs with the
+    pinned throttling contract (60-second recovery interval, daily 04:00
+    cleanup cron, ``coalesce=True`` / ``max_instances=1`` on both), and the
+    real shutdown hook must remove them while clearing QQ dispatch and the
+    application; a repeated shutdown stays quiet.  Fire times are observed
+    only through the public trigger ``get_next_fire_time`` API - never
+    through internal cron fields.
+    """
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.schedulers.base import STATE_STOPPED
+
+    from komari_bot.plugins.komari_roulette.maintenance import (
+        CLEANUP_JOB_ID,
+        RECOVERY_JOB_ID,
+    )
+
+    shanghai = ZoneInfo("Asia/Shanghai")
+    real_scheduler = AsyncIOScheduler(timezone=shanghai)
+    await delete_roulette_config(harness.engine)
+    try:
+        async with lifecycle_context(monkeypatch, scheduler=real_scheduler) as ctx:
+            startup = require_single_startup_hook(ctx)
+            shutdown = require_single_shutdown_hook(ctx)
+            # Real production shape: the scheduler is already running when the
+            # startup hook registers the owned jobs on it.
+            real_scheduler.start()
+            await invoke_hook(startup)
+
+            app = application_api()["get_roulette_application"]()
+            assert app is not None, "startup hook must install the application"
+
+            recovery_job = real_scheduler.get_job(RECOVERY_JOB_ID)
+            cleanup_job = real_scheduler.get_job(CLEANUP_JOB_ID)
+            assert recovery_job is not None, (
+                "startup must register the recovery job on the real scheduler"
+            )
+            assert cleanup_job is not None, (
+                "startup must register the cleanup job on the real scheduler"
+            )
+            assert {job.id for job in real_scheduler.get_jobs()} == {
+                RECOVERY_JOB_ID,
+                CLEANUP_JOB_ID,
+            }, "startup must register exactly the two owned jobs"
+
+            for job in (recovery_job, cleanup_job):
+                assert job.coalesce is True
+                assert job.max_instances == 1
+
+            # 60-second recovery interval: two consecutive public fire times
+            # are exactly one interval apart, independent of the wall clock.
+            reference = datetime(2026, 1, 1, 12, 0, tzinfo=shanghai)
+            first_fire = recovery_job.trigger.get_next_fire_time(None, reference)
+            assert first_fire is not None
+            second_fire = recovery_job.trigger.get_next_fire_time(
+                first_fire, first_fire
+            )
+            assert second_fire is not None
+            assert second_fire - first_fire == timedelta(seconds=60), (
+                "the recovery job must be pinned to the 60-second interval"
+            )
+
+            # Daily cleanup: from a fixed 2026-01-01 Shanghai noon the next
+            # public fire time is the next day 04:00 in the deployment
+            # timezone (never read the internal cron fields).
+            next_cleanup = cleanup_job.trigger.get_next_fire_time(
+                None, reference
+            )
+            assert next_cleanup == datetime(2026, 1, 2, 4, 0, tzinfo=shanghai), (
+                "the cleanup job must fire at 04:00 in the deployment timezone"
+            )
+
+            qq = __import__(QQ_MODULE, fromlist=["get_roulette_qq_runtime"])
+            assert qq.get_roulette_qq_runtime() is not None
+
+            await invoke_hook(shutdown)
+            assert real_scheduler.get_jobs() == [], (
+                "the real shutdown hook must remove both owned jobs"
+            )
+            assert qq.get_roulette_qq_runtime() is None
+            assert application_api()["get_roulette_application"]() is None
+
+            # Repeated real shutdown: no exception, still nothing left.
+            await invoke_hook(shutdown)
+            assert real_scheduler.get_jobs() == []
+    finally:
+        if real_scheduler.state != STATE_STOPPED:
+            real_scheduler.shutdown(wait=False)
         await delete_roulette_config(harness.engine)
 
 
