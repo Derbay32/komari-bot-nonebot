@@ -111,24 +111,47 @@ async def test_commit_failure_switch_health_check(harness: Harness) -> None:
     assert switch.raised == 1
 
 
-async def test_group_lock_wait_helper_is_bounded_and_clean(harness: Harness) -> None:
-    """共享组锁 + 等待辅助真实可用；等待者在锁释放后继续、无泄漏。"""
+@pytest.mark.parametrize("waiter_count", [1, 2])
+async def test_group_lock_wait_helper_is_bounded_and_clean(
+    harness: Harness,
+    waiter_count: int,
+) -> None:
+    """共享组锁 + 等待辅助真实可用：N 个等待者均被真实阻塞、锁释放后无泄漏。"""
     current = make_scope("probe-lock")
 
     async def _waiter() -> None:
         async with harness.session_factory() as session:
             await hold_group_lock(session, current)
 
+    tasks: list[asyncio.Task[None]] = []
     async with harness.session_factory() as blocker:
         await blocker.begin()
         blocker_pid = await backend_pid(blocker)
         await hold_group_lock(blocker, current)
-        task = asyncio.create_task(_waiter())
         try:
+            tasks = [asyncio.create_task(_waiter()) for _ in range(waiter_count)]
             await wait_for_blocked_count(
-                harness.session_factory, blocker_pid, min_count=1
+                harness.session_factory, blocker_pid, min_count=waiter_count
             )
+            # 独立 PG 观察连接复核：真实阻塞会话数至少为 waiter_count。
+            async with harness.engine.connect() as observer:
+                observed = await observer.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE :blocker = ANY(pg_blocking_pids(pid))"
+                    ),
+                    {"blocker": blocker_pid},
+                )
+            assert int(observed or 0) >= waiter_count
         finally:
             await blocker.rollback()
-        await asyncio.wait_for(task, timeout=5)
-    assert task.done()
+            if tasks:
+                done, pending = await asyncio.wait(tasks, timeout=5)
+                for pending_task in pending:
+                    pending_task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                assert not pending, f"{len(pending)} waiter task(s) not settled"
+                for done_task in done:
+                    done_task.result()  # waiter 内部异常在此重抛
+    assert all(task.done() for task in tasks)
