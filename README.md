@@ -27,7 +27,11 @@ docker compose up
 
 ## 文档
 
-架构决策记录位于 [`docs/adr/`](docs/adr/)。操作手册与验收记录分别保留在本地 `docs/runbooks/` 和 `docs/acceptance/`，不纳入 Git；仓库检出不包含这些本地文档。
+架构决策记录位于 [`docs/adr/`](docs/adr/)。操作手册与验收记录存储在 Huly 文档团队空间 `komari-bot`，不纳入 Git，也不维护仓库内副本；访问需要相应的 Huly 权限。
+
+- [QQ 群指令面板：配置与验收](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/qq-6aaa94d8649daed23e114cf6)
+- [群绑定与俄罗斯轮盘：升级、运维与终验](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa95dd649daed23e114cfa)
+- [群绑定与轮盘最终验收记录](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa9521649daed23e114cf8)
 
 官 Bot 接入由非空 `QQ_BOTS` 启用，轮盘业务默认关闭；合入 `dev` 不会自动部署。
 
