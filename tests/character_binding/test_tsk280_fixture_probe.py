@@ -21,21 +21,19 @@ from komari_bot.plugins.character_binding.manager import CharacterBindingManager
 from tests.character_binding.tsk280_support import (
     PG_REQUIRED,
     CommitFailureSwitch,
-    backend_pid,
     clear_binding_scope,
     clear_roulette_scope,
     create_engine_and_factory,
     health_check_commit_failure_switch,
     hold_group_lock,
     persist_completed_game,
-    reset_shared_orm_engine,
     roulette_counts,
     seed_binding,
-    wait_for_blocked_count,
 )
 from tests.character_binding.tsk280_support import (
     scope as make_scope,
 )
+from tests.pg_support import backend_pid, reset_shared_orm_engine, wait_for_blocked
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -130,7 +128,7 @@ async def test_group_lock_wait_helper_is_bounded_and_clean(
         await hold_group_lock(blocker, current)
         try:
             tasks = [asyncio.create_task(_waiter()) for _ in range(waiter_count)]
-            await wait_for_blocked_count(
+            await wait_for_blocked(
                 harness.session_factory, blocker_pid, min_count=waiter_count
             )
             # 独立 PG 观察连接复核：真实阻塞会话数至少为 waiter_count。

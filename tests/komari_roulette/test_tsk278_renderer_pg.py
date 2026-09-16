@@ -29,6 +29,8 @@ from komari_bot.plugins.komari_roulette.qq.renderer import render_reply
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
 
+from tests.pg_support import reset_shared_orm_engine
+
 from .command_support import (
     PG_REQUIRED,
     Scope,
@@ -37,7 +39,6 @@ from .command_support import (
     delete_scope,
     observation,
     request,
-    reset_shared_orm_engine,
     scope,
 )
 from .test_command_service import (

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from tests.pg_support import reset_shared_orm_engine
+
 from .command_support import (
     PG_REQUIRED,
     Scope,
@@ -39,7 +41,6 @@ from .command_support import (
     delete_scope,
     observation,
     request,
-    reset_shared_orm_engine,
     scope,
     seed_binding,
 )

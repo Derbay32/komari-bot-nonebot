@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -291,22 +290,6 @@ def active_state_with_join_gap(group: GroupRef) -> GameState:
     )
     assert started.ok and started.code == "started"
     return started.state
-
-
-async def reset_shared_orm_engine() -> None:
-    """Dispose nonebot-plugin-orm pools between pytest event loops."""
-
-    from nonebot import require
-
-    require("nonebot_plugin_orm")
-    import nonebot_plugin_orm as orm_module
-
-    engines = getattr(orm_module, "_engines", None)
-    if not engines:
-        return
-    for engine in list(engines.values()):
-        with suppress(Exception):
-            await engine.dispose()
 
 
 def open_session() -> "AsyncSession":

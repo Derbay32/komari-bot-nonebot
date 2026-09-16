@@ -25,11 +25,11 @@ from komari_bot.plugins.komari_roulette import (
     StorageUnavailableError,
 )
 from komari_bot.plugins.komari_roulette.domain import ChamberKind, ItemType
+from tests.pg_support import backend_pid, reset_shared_orm_engine, wait_for_blocked
 
 from .command_support import (
     PG_REQUIRED,
     Scope,
-    backend_pid,
     command_factory,
     count_rows,
     create_engine_and_factory,
@@ -37,10 +37,8 @@ from .command_support import (
     hold_group_lock,
     observation,
     request,
-    reset_shared_orm_engine,
     scope,
     seed_binding,
-    wait_for_blocked,
 )
 
 if TYPE_CHECKING:

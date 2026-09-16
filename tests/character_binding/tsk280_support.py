@@ -9,9 +9,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -33,6 +32,7 @@ from komari_bot.plugins.komari_roulette import (
     ReplyProjection,
     RouletteCommandService,
 )
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
@@ -124,21 +124,6 @@ def scope(tag: str = "repair") -> Scope:
     )
 
 
-async def reset_shared_orm_engine() -> None:
-    """归还 nonebot-plugin-orm 共享引擎连接。"""
-    from nonebot import require
-
-    require("nonebot_plugin_orm")
-    import nonebot_plugin_orm as orm_module
-
-    engines = getattr(orm_module, "_engines", None)
-    if not engines:
-        return
-    for engine in list(engines.values()):
-        with suppress(Exception):
-            await engine.dispose()
-
-
 async def create_engine_and_factory() -> AsyncIterator[
     tuple[AsyncEngine, async_sessionmaker[AsyncSession]]
 ]:
@@ -155,39 +140,6 @@ async def create_engine_and_factory() -> AsyncIterator[
         yield engine, async_sessionmaker(engine, expire_on_commit=False)
     finally:
         await engine.dispose()
-
-
-async def backend_pid(session: AsyncSession) -> int:
-    return int(await session.scalar(text("SELECT pg_backend_pid()")))
-
-
-async def wait_for_blocked(
-    session_factory: async_sessionmaker[AsyncSession],
-    blocker_pid: int,
-) -> None:
-    """等待真实 PostgreSQL 锁等待者出现（有界 5 秒）。"""
-    await wait_for_blocked_count(session_factory, blocker_pid, min_count=1)
-
-
-async def wait_for_blocked_count(
-    session_factory: async_sessionmaker[AsyncSession],
-    blocker_pid: int,
-    min_count: int,
-) -> None:
-    """等待至少 ``min_count`` 个会话被 blocker 阻塞，带边界超时。"""
-    async with asyncio.timeout(5):
-        while True:
-            async with session_factory() as session:
-                blocked = await session.scalar(
-                    text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE :blocker = ANY(pg_blocking_pids(pid))"
-                    ),
-                    {"blocker": blocker_pid},
-                )
-            if int(blocked or 0) >= min_count:
-                return
-            await asyncio.sleep(0.02)
 
 
 async def hold_group_lock(
@@ -999,7 +951,6 @@ __all__ = [
     "SessionCloseCounter",
     "StubBindingRepairService",
     "StubRepairConfirmAuditContext",
-    "backend_pid",
     "bind_member",
     "clear_binding_scope",
     "clear_roulette_scope",
@@ -1024,13 +975,10 @@ __all__ = [
     "read_headers",
     "request",
     "require_postgres",
-    "reset_shared_orm_engine",
     "roulette_counts",
     "safe_target_hash",
     "scope",
     "seed_binding",
     "track_session_closes",
-    "wait_for_blocked",
-    "wait_for_blocked_count",
     "write_headers",
 ]

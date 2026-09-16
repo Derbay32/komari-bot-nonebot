@@ -27,13 +27,13 @@ from uuid import uuid4
 from sqlalchemy import text
 
 from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+from tests.pg_support import reset_shared_orm_engine
 
 from .command_support import (
     PG_REQUIRED,
     Scope,
     create_engine_and_factory,
     delete_scope,
-    reset_shared_orm_engine,
     scope,
 )
 from .test_command_service import Harness

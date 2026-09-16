@@ -31,16 +31,16 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from tests.pg_support import backend_pid, wait_for_blocked
+
 from .command_support import (
     PG_REQUIRED,
     Scope,
-    backend_pid,
     command_factory,
     hold_group_lock,
     observation,
     request,
     seed_binding,
-    wait_for_blocked,
 )
 from .test_command_service import (
     CountingRandom,

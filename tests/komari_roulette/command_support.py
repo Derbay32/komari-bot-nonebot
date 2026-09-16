@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from contextlib import suppress
 from dataclasses import dataclass
@@ -38,22 +37,6 @@ PG_REQUIRED = pytest.mark.skipif(
     not POSTGRES_URL,
     reason="未设置 KOMARI_TEST_POSTGRES_URL，不能执行 TSK-276 真实 PG 测试",
 )
-
-
-async def reset_shared_orm_engine() -> None:
-    """Dispose nonebot-plugin-orm engines before crossing pytest event loops."""
-
-    from nonebot import require
-
-    require("nonebot_plugin_orm")
-    import nonebot_plugin_orm as orm_module
-
-    engines = getattr(orm_module, "_engines", None)
-    if not engines:
-        return
-    for engine in list(engines.values()):
-        with suppress(Exception):
-            await engine.dispose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,31 +212,6 @@ async def count_rows(
         )
         or 0
     )
-
-
-async def backend_pid(session: AsyncSession) -> int:
-    return int(await session.scalar(text("SELECT pg_backend_pid()")))
-
-
-async def wait_for_blocked(
-    session_factory: async_sessionmaker[AsyncSession],
-    blocker_pid: int,
-) -> None:
-    """Wait for a real PostgreSQL lock waiter, with a bounded assertion."""
-
-    async with asyncio.timeout(5):
-        while True:
-            async with session_factory() as session:
-                blocked = await session.scalar(
-                    text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE :blocker = ANY(pg_blocking_pids(pid))"
-                    ),
-                    {"blocker": blocker_pid},
-                )
-            if int(blocked or 0) > 0:
-                return
-            await asyncio.sleep(0.02)
 
 
 async def hold_group_lock(
