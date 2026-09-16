@@ -14,15 +14,13 @@ storage/ORM to prove
 
 The remaining cases cover the real ``komari_bot.plugins.komari_roulette.maintenance``
 seam (recovery pagination, retention boundaries, no-Redis dependency) plus
-the two runtime-facing post-lock rechecks, which stay RED
-until ``komari_bot.plugins.komari_roulette.runtime`` is implemented and fail
-with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
+the two runtime-facing post-lock rechecks against the real
+``komari_bot.plugins.komari_roulette.runtime``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import timedelta
@@ -60,7 +58,6 @@ from .tsk279_support import (
     age_game,
     harness_fixture_body,
     insert_waiting_game,
-    load_module,
     load_symbol,
     scope_counts,
     seed_aged_receipt,
@@ -1325,12 +1322,110 @@ async def test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed
 # ---------------------------------------------------------------------------
 
 
-async def test_maintenance_does_not_require_redis() -> None:
-    before = set(sys.modules)
-    module = load_module(MAINTENANCE_MODULE)
-    assert module is not None
-    new_modules = set(sys.modules) - before
-    assert not any(name.split(".")[0] == "redis" for name in new_modules)
+@PG_REQUIRED
+async def test_recovery_and_cleanup_do_not_require_redis(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real recovery + retention never issue a single Redis command.
+
+    Both Redis command entry points (``redis.asyncio.Redis.execute_command``
+    and ``redis.Redis.execute_command``) are denied while the real recovery
+    scan and retention sweep run against real PG rows; every attempt is
+    recorded *and* raises ``AssertionError``, so the closing
+    ``attempts == []`` stays honest even if production code swallowed it.
+    Framework-level Redis imports elsewhere are legitimate and untouched:
+    the denial window covers only the maintenance operations and their
+    ``close``, while scope creation, seeding and the PG result queries sit
+    outside it.  No real Redis server is needed: the denied entry point
+    fires before any connection is made.
+    """
+
+    import redis as redis_sync
+    import redis.asyncio as redis_asyncio
+
+    api = _maintenance_api()
+    async with harness.scope("maintenance-no-redis") as current:
+        # Seeded before the window opens: one already-due waiting game, one
+        # 8-day-old receipt (eligible for the 7-day retention sweep) and one
+        # fresh receipt (must survive the sweep).
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        aged = await seed_aged_receipt(
+            harness.session_factory,
+            current,
+            inbound_msg_id="no-redis-aged",
+            age_seconds=_DAY_SECONDS * 8,
+        )
+        fresh = await seed_aged_receipt(
+            harness.session_factory,
+            current,
+            inbound_msg_id="no-redis-fresh",
+            age_seconds=60,
+        )
+        maintenance = api["RouletteMaintenance"](
+            session_factory=harness.session_factory,
+            service=service_for(harness, random_source=CountingRandom()),
+            admission=_allow_only({(current.app_id, current.group_openid)}),
+        )
+        attempts: list[str] = []
+
+        def reject(entry: str) -> Any:
+            def _blocked(self: Any, *args: Any, **kwargs: Any) -> Any:
+                del self, args, kwargs
+                attempts.append(entry)
+                message = f"maintenance issued a Redis command via {entry}"
+                raise AssertionError(message)
+
+            return _blocked
+
+        # Observation window: only the real maintenance work and its close.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                redis_asyncio.Redis,
+                "execute_command",
+                reject("redis.asyncio.Redis.execute_command"),
+            )
+            patch.setattr(
+                redis_sync.Redis,
+                "execute_command",
+                reject("redis.Redis.execute_command"),
+            )
+            try:
+                drive = await _drive_recovery_until_settled(
+                    maintenance,
+                    harness,
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                )
+                assert drive.settled is True
+
+                async def aged_gone() -> bool:
+                    return not await _receipt_exists(harness.session_factory, aged)
+
+                await _drive_cleanup_until(
+                    maintenance, harness, done=aged_gone, batch_size=100
+                )
+            finally:
+                await maintenance.close()
+        assert attempts == []
+
+        # Independent PG truth: the real recovery expired the waiting game and
+        # the real cleanup deleted the aged receipt while keeping the fresh one.
+        lifecycle = await _group_lifecycle(
+            harness,
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+        )
+        assert lifecycle == "expired"
+        assert not await _receipt_exists(harness.session_factory, aged)
+        assert await _receipt_exists(harness.session_factory, fresh)
 
 
 # ---------------------------------------------------------------------------
