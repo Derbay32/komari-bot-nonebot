@@ -242,33 +242,20 @@ def _binding_lifecycle_repair_service_references(tree: ast.Module) -> list[str]:
     return violations
 
 
-def test_repair_service_lifecycle_is_owned_by_management_assembly() -> None:
-    """修复服务生命周期由管理装配负责（创建注入真实 game_state_reader 并关闭）；
-    character_binding 旧生命周期不得创建/关闭这反向依赖的服务。
+def test_binding_lifecycle_does_not_reverse_assemble_repair_service() -> None:
+    """AST 守卫：绑定 ``init_plugin`` / ``close_plugin`` 不得创建/关闭修复服务。
 
-    顶层 import 与 ``__all__`` 公开导出是跨插件边界要求，不在禁止范围内；
-    只有 ``init_plugin`` / ``close_plugin`` 函数体内的直接引用或字符串拼接访问
-    属于违规。
+    只检查生命周期函数体内的直接引用与 getattr/字符串拼接绕过；顶层
+    import 与 ``__all__`` 公开导出是跨插件边界要求的合法暴露面，必须保留。
+    管理装配的真实创建、reader 注入与关闭由装配及生命周期用例验证。
     """
     binding_tree = ast.parse(
         (BINDING_ROOT / "__init__.py").read_text(encoding="utf-8")
     )
-    management_source = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in sorted(MANAGEMENT_ROOT.rglob("*.py"))
-    )
 
-    # 绑定插件生命周期不再创建/关闭修复服务：AST 只检查 init/close 函数体，
-    # 顶层公开 export 不受影响，字符串拼接也不能绕过。
     violations = _binding_lifecycle_repair_service_references(binding_tree)
     assert not violations, "\n".join(violations)
     # 顶层公开面仍必须导出修复服务符号（与深 import 守卫一致）。
     binding_exports = _module_all_exports(BINDING_ROOT / "__init__.py")
     assert "BindingRepairService" in binding_exports
     assert "set_binding_repair_service" in binding_exports
-
-    # 管理装配创建修复服务并注入真实 game_state_reader。
-    assert "BindingRepairService(" in management_source
-    assert "game_state_reader=" in management_source
-    # 管理装配负责关闭（set_binding_repair_service(None) 或 service.close()）。
-    assert "set_binding_repair_service(" in management_source

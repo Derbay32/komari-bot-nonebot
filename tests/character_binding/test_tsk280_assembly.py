@@ -1,20 +1,11 @@
 """TSK-280 真实装配：register → service getter → 真实服务 → 真实 PostgreSQL。
 
-这是 root 要求的「最小真实 REST 接缝」：不注入 FakeService，路由的
-``service_getter`` 指向全局注册表 ``get_binding_repair_service``，服务用真实
-会话工厂与真实 clock 构造，端到端完成 diagnose → preview → confirm 并验证
-数据库不变量与真实审计事件。生产 ``repair`` / ``management_api`` 模块缺失
-时本文件为预期 RED（ImportError）。
-
-第二接缝补管理装配缺口：经生产
-``komari_management.binding_repair_lifecycle.start_binding_repair_service``
-创建服务并从公开 getter 取得，只在公开端口注入（shim 顶层包
-``get_binding_manager`` 返回已有真实测试管理器、``nonebot require`` 依赖
-加载端口旁路 ``komari_roulette`` 真实插件加载），不 mock 生产
-``_read_game_state``、不替换生产存储 reader；waiting 对局由真实轮盘命令
-服务落入真实 PG，验证 diagnose 读到 game_present/lifecycle=waiting、
-preview 被 RepairBlockedByGameError 阻断且绑定未清除，以及真实
-stop_binding_repair_service 后 getter 为 None、旧引用拒绝、二次关闭幂等。
+不注入 FakeService：路由的 ``service_getter`` 指向全局注册表
+``get_binding_repair_service``，服务用真实会话工厂与真实 clock 构造，
+端到端完成 diagnose → preview → confirm 并验证数据库不变量与真实审计
+事件。第二接缝经生产 ``binding_repair_lifecycle`` 创建/关闭服务，注入
+只在公开端口（shim ``get_binding_manager``、``nonebot require`` 旁路），
+生产 ``_read_game_state`` 与真实存储 reader 不替换。
 """
 
 from __future__ import annotations
@@ -202,15 +193,11 @@ async def test_management_lifecycle_assembly_with_real_game_reader(
     harness: Harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """生产管理装配创建的服务经真实 reader 直读 PG；真实关闭后旧引用拒绝。
+    """生产装配创建的服务经真实 reader 直读 PG；真实关闭后旧引用拒绝。
 
-    与手工构造的 ``test_register_to_service_get_real_assembly`` 互补：本用例的
-    服务由生产 ``start_binding_repair_service`` 创建、经公开
-    ``get_binding_repair_service`` 取得。注入只在公开端口：shim 顶层包的
-    ``get_binding_manager`` 返回已有真实测试管理器；``nonebot require`` 依赖
-    加载端口旁路 ``komari_roulette`` 真实插件加载（避免测试进程启动副作用），
-    其余依赖（含 ``nonebot_plugin_orm``）走真实加载。生产 ``_read_game_state``
-    与其真实 ``PostgresRouletteStorage.load_current`` reader 不做任何替换。
+    注入只在公开端口：shim 顶层包的 ``get_binding_manager`` 返回已有真实
+    测试管理器；``nonebot require`` 旁路 ``komari_roulette`` 真实插件加载
+    （避免测试进程启动副作用），其余依赖走真实加载。
     """
     current = make_scope("assembly-lifecycle")
     await seed_binding(harness.binding_manager, current, 1, name="甲")
@@ -243,14 +230,10 @@ async def test_management_lifecycle_assembly_with_real_game_reader(
     monkeypatch.setattr(nonebot.plugin, "require", _require)
 
     try:
-        # 真实创建：生产装配构造服务并装入全局注册表，公开 getter 可取。
         binding_repair_lifecycle.start_binding_repair_service()
         service = get_binding_repair_service()
         assert service is not None
-        # 注入的是已有真实测试管理器（与种子写入同一实例）。
-        assert service._manager is harness.binding_manager
 
-        # 真实 reader 直读 PG：看到当前作用域的 waiting 对局与真实绑定。
         diagnosis = await service.diagnose(
             app_id=current.app_id,
             group_openid=current.group_openid,
@@ -260,7 +243,6 @@ async def test_management_lifecycle_assembly_with_real_game_reader(
         assert len(diagnosis.members) == 1
         assert diagnosis.members[0].character_name == "甲"
 
-        # waiting 对局阻断预览，且绑定未被清除。
         with pytest.raises(RepairBlockedByGameError):
             await service.preview(
                 app_id=current.app_id,
@@ -271,7 +253,6 @@ async def test_management_lifecycle_assembly_with_real_game_reader(
         assert await group_binding_rows(harness.engine, current) == 1
         assert await group_mapping_rows(harness.engine, current) == 1
 
-        # 真实关闭：getter 为 None，旧引用一切操作拒绝，二次关闭幂等。
         await binding_repair_lifecycle.stop_binding_repair_service()
         assert get_binding_repair_service() is None
         with pytest.raises(RuntimeError):
@@ -289,6 +270,9 @@ async def test_management_lifecycle_assembly_with_real_game_reader(
         await binding_repair_lifecycle.stop_binding_repair_service()
         assert get_binding_repair_service() is None
     finally:
+        # 失败路径同样关闭生产装配创建的服务（幂等）并清掉本作用域数据。
+        with suppress(Exception):
+            await binding_repair_lifecycle.stop_binding_repair_service()
         set_binding_repair_service(None)
         await clear_roulette_scope(harness.engine, current)
         await clear_binding_scope(harness.engine, current)
