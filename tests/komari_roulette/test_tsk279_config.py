@@ -1,11 +1,10 @@
 # ruff: noqa: RUF003  # ｜ ＝ × 等定稿文案字符
 """TSK-279 Stage-A: typed config + frozen-copy validation (pure, no PG/Redis).
 
-Green probes below exercise only *existing* canonical seams (``domain`` item
-weights) so a red run cannot hide a broken fixture behind a missing-seam
-import.  RED cases lazily load the proposed ``config_schema`` / ``copy_pool``
-modules inside their own test; a missing module is reported as a missing seam,
-never as a whole-file collection error.
+The old-API probes exercise the existing canonical domain seams (item
+weights).  The typed-config and copy-pool cases load ``config_schema`` /
+``copy_pool`` symbols through ``load_symbol`` so each case reports the seam it
+needs by name instead of failing the whole file at import time.
 """
 
 from __future__ import annotations
@@ -66,25 +65,8 @@ def _copy_pool_symbol(name: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# GREEN old-API probes: the domain already freezes item weights at start
+# Old-API domain probes: weight validation and missing-key normalization
 # ---------------------------------------------------------------------------
-
-
-def test_old_api_default_item_weights_are_each_one() -> None:
-    assert set(DEFAULT_ITEM_WEIGHTS) == set(ITEM_TYPES)
-    for item in ITEM_TYPES:
-        assert DEFAULT_ITEM_WEIGHTS[item] == 1
-
-
-def test_old_api_action_start_freezes_item_weights() -> None:
-    weights = {MAGNIFIER: 2, BEER: 1, BURST: 1, LOCK: 1}
-    state, _entropy = start_active(item_weights=weights)
-    assert state.lifecycle == "active"
-    assert dict(state.item_weights) == weights
-    # ``Action.start`` snapshots the mapping: mutating the caller's dict after
-    # the transition must not rewrite the frozen game.
-    weights[LOCK] = 99
-    assert state.item_weights[LOCK] == 1
 
 
 def test_old_api_invalid_item_weights_are_rejected() -> None:
@@ -118,16 +100,16 @@ def test_old_api_weights_are_normalized_against_the_real_domain_contract() -> No
 
 
 # ---------------------------------------------------------------------------
-# RED S4: the service accepts a per-game item-weights provider
+# Service construction: per-game item-weights provider seam
 # ---------------------------------------------------------------------------
 
 
 def test_service_ctor_accepts_item_weights_provider_seam() -> None:
     """The narrowest freeze seam: the service can be handed a weights provider.
 
-    A strict construction here fails with ``TypeError`` (unknown keyword) while
-    the real behaviour is verified against PostgreSQL in
-    ``test_tsk279_configuration_pg.py``.  The session factory is a real typed
+    The real behaviour is verified against PostgreSQL in
+    ``test_tsk279_configuration_pg.py``; this pure construction probe only
+    pins the constructor keyword.  The session factory is a real typed
     async-context-manager fixture (never opened by this construction probe) and
     the projector is the real ``render_reply`` seam, so the construction is
     type-checked without any production cast.
@@ -150,7 +132,7 @@ def test_service_ctor_accepts_item_weights_provider_seam() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RED: typed config resource (S1)
+# Typed config resource
 # ---------------------------------------------------------------------------
 
 
@@ -340,7 +322,7 @@ def test_config_schema_rejects_injection_in_final_pool(decoration: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RED: pure copy snapshot / compiler (S2)
+# Pure copy snapshot / compiler
 # ---------------------------------------------------------------------------
 
 

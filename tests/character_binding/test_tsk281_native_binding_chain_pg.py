@@ -39,10 +39,9 @@ from uuid import uuid4
 import pytest
 
 from tests.character_binding.conftest import (
-    _reset_shared_orm_engine,
     require_postgres,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     COMMAND,
     _challenge_event,
     _get_msg_payload,
@@ -71,6 +70,7 @@ from tests.group_admission.qq_admission_support import (
     make_group_at,
 )
 from tests.komari_roulette.command_support import PG_REQUIRED, create_engine_and_factory
+from tests.pg_support import reset_shared_orm_engine
 
 pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
 
@@ -85,7 +85,7 @@ async def test_first_binding_chain_commits_once_through_real_onebot_evidence(
     current = native_scope("native")
 
     async for engine, _factory in create_engine_and_factory():
-        await _reset_shared_orm_engine()
+        await reset_shared_orm_engine()
         try:
             async with binding_chain_window(monkeypatch, scope=current) as package:
                 wizard = package.get_binding_wizard()
@@ -258,7 +258,7 @@ async def test_first_binding_chain_commits_once_through_real_onebot_evidence(
                 assert bindings[0].character_name == _CHARACTER_NAME
         finally:
             await cleanup_scope_rows(engine, current)
-            await _reset_shared_orm_engine()
+            await reset_shared_orm_engine()
 
 
 async def test_init_failure_after_coordinator_start_still_closes(
@@ -294,7 +294,7 @@ async def test_init_failure_after_coordinator_start_still_closes(
         monkeypatch.setattr(package, "BindingWizard", _fail_wizard_construction)
 
     async for engine, _factory in create_engine_and_factory():
-        await _reset_shared_orm_engine()
+        await reset_shared_orm_engine()
         try:
             with pytest.raises(RuntimeError, match="injected"):
                 async with binding_chain_window(
@@ -320,4 +320,4 @@ async def test_init_failure_after_coordinator_start_still_closes(
             )
         finally:
             await cleanup_scope_rows(engine, current)
-            await _reset_shared_orm_engine()
+            await reset_shared_orm_engine()

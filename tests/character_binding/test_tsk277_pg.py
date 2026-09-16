@@ -25,10 +25,9 @@ from komari_bot.plugins.group_admission import (
     QQInitialBindRequest,
 )
 from tests.character_binding.conftest import (
-    _reset_shared_orm_engine,
     require_postgres,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     _real_character_binding_package,
 )
 from tests.character_binding.tsk277_support import (
@@ -72,8 +71,11 @@ from tests.group_admission.registry_isolation_support import registry_isolation_
 from tests.group_admission.runtime_support import AdmissionStorageFake, stored_policy
 from tests.komari_roulette.command_support import (
     PG_REQUIRED,
-    backend_pid,
     create_engine_and_factory,
+)
+from tests.pg_support import (
+    backend_pid,
+    reset_shared_orm_engine,
     wait_for_blocked,
 )
 
@@ -2623,7 +2625,7 @@ async def test_rename_case_only_change_updates_display(
 async def test_init_plugin_installs_and_close_plugin_removes_wizard() -> None:
     """AC10：真实 init_plugin/close_plugin 必须安装与关闭 wizard。"""
     require_postgres()
-    await _reset_shared_orm_engine()
+    await reset_shared_orm_engine()
     with registry_isolation_context(), _real_character_binding_package() as binding:
         package = cast("Any", binding)
         module = require_wizard_contract()
@@ -2632,7 +2634,7 @@ async def test_init_plugin_installs_and_close_plugin_removes_wizard() -> None:
         assert module.get_binding_wizard() is not None, "init_plugin 必须安装 wizard"
         await package.close_plugin()
         assert module.get_binding_wizard() is None, "close_plugin 必须移除 wizard"
-    await _reset_shared_orm_engine()
+    await reset_shared_orm_engine()
 
 
 @pytest.mark.parametrize(
@@ -3008,7 +3010,7 @@ async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
         stored_policy(1, {"mode": "blacklist", "group_ids": []})
     )
     async for engine, _factory in create_engine_and_factory():
-        await _reset_shared_orm_engine()
+        await reset_shared_orm_engine()
         await prepare_control_plane(monkeypatch, storage)
         try:
             async with event_gate_context():
@@ -3122,4 +3124,4 @@ async def test_real_init_plugin_resolvers_do_not_self_deadlock_on_confirm(
                         await package.close_plugin()
         finally:
             await _cleanup(engine, current)
-            await _reset_shared_orm_engine()
+            await reset_shared_orm_engine()

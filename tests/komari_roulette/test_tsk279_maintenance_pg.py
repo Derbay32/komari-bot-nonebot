@@ -13,17 +13,14 @@ storage/ORM to prove
   cancelled / expired / failed) is schema- and FK-valid.
 
 The remaining cases cover the real ``komari_bot.plugins.komari_roulette.maintenance``
-seam (recovery pagination, retention boundaries, job registration, no-Redis
-dependency) plus the two runtime-facing post-lock rechecks, which stay RED
-until ``komari_bot.plugins.komari_roulette.runtime`` is implemented and fail
-with ``ModuleNotFoundError`` — never with a wrong-fixture assertion.
+seam (recovery pagination, retention boundaries, no-Redis dependency) plus
+the two runtime-facing post-lock rechecks against the real
+``komari_bot.plugins.komari_roulette.runtime``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
-import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import timedelta
@@ -34,22 +31,20 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from tests.pg_support import backend_pid, wait_for_blocked
+
 from .command_support import (
     PG_REQUIRED,
+    CountingRandom,
     Scope,
-    backend_pid,
     command_factory,
+    create_waiting,
+    current_game_row,
     hold_group_lock,
+    join_player,
     observation,
     request,
     seed_binding,
-    wait_for_blocked,
-)
-from .test_command_service import (
-    CountingRandom,
-    create_waiting,
-    current_game_row,
-    join_player,
     seed_players,
     service_for,
     start_game,
@@ -61,7 +56,6 @@ from .tsk279_support import (
     age_game,
     harness_fixture_body,
     insert_waiting_game,
-    load_module,
     load_symbol,
     scope_counts,
     seed_aged_receipt,
@@ -1016,8 +1010,10 @@ async def test_cleanup_is_batch_bounded_and_reentrant(
             admission=_allow_only(set()),
         )
         first = await maintenance.cleanup_retention(batch_size=2)
-        assert isinstance(first.more_pending, bool)
         assert first.receipts_deleted <= 2
+        # One direct call stays a bounded page: with three aged receipts and a
+        # two-row budget the backlog signal must stay up.
+        assert first.more_pending is True
 
         async def ours_gone() -> bool:
             async with harness.session_factory() as session:
@@ -1320,115 +1316,137 @@ async def test_cleanup_fairness_reaches_later_terminal_group_and_keeps_completed
 
 
 # ---------------------------------------------------------------------------
-# RED: scheduler wiring (fixed ids, throttle only) and no-Redis dependency
+# No-Redis dependency
 # ---------------------------------------------------------------------------
 
 
-async def test_maintenance_jobs_registered_with_throttle_and_deploy_timezone() -> None:
-    api = _maintenance_api()
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-    # The deployment timezone is trusted from the scheduler config, never by
-    # mutating the host clock/timezone.
-    deploy_timezone = "Asia/Shanghai"
-    scheduler = AsyncIOScheduler(timezone=deploy_timezone)
-
-    class _MaintenanceStub:
-        async def advance_due(self, **_kwargs: Any) -> None:
-            return None
-
-        async def cleanup_retention(self, **_kwargs: Any) -> None:
-            return None
-
-    api["register_maintenance_jobs"](scheduler, _MaintenanceStub())
-    recovery = scheduler.get_job(api["RECOVERY_JOB_ID"])
-    cleanup = scheduler.get_job(api["CLEANUP_JOB_ID"])
-    assert recovery is not None
-    assert cleanup is not None
-    assert recovery.trigger.interval == timedelta(seconds=60)
-    assert recovery.coalesce is True
-    assert recovery.max_instances == 1
-    # APScheduler renders the cron field as the bare value (``4``), not a
-    # shell-like ``hour='4'`` repr.  Assert the 04:00 schedule directly on the
-    # trigger's own timezone (the deployment timezone), so the host clock/TZ is
-    # never involved.
-    assert str(cleanup.trigger.fields[5]) == "4"
-    assert str(cleanup.trigger.fields[6]) == "0"
-    from datetime import datetime as _datetime
-
-    at_noon = _datetime(2026, 1, 1, 12, 0, tzinfo=cleanup.trigger.timezone)
-    next_fire = cleanup.trigger.get_next_fire_time(None, at_noon)
-    assert next_fire is not None
-    assert (next_fire.hour, next_fire.minute) == (4, 0)
-    assert str(cleanup.trigger.timezone) == deploy_timezone
-    assert cleanup.coalesce is True
-    assert cleanup.max_instances == 1
-    api["unregister_maintenance_jobs"](scheduler)
-    assert scheduler.get_job(api["RECOVERY_JOB_ID"]) is None
-    assert scheduler.get_job(api["CLEANUP_JOB_ID"]) is None
-
-
 @PG_REQUIRED
-async def test_daily_cleanup_callback_drains_backlog_beyond_one_batch(
+async def test_recovery_and_cleanup_do_not_require_redis(
     harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One real 04:00 callback run must drain more than a single batch.
+    """Real recovery + retention never issue a single Redis command.
 
-    The registered cron callable is fetched from the scheduler and *invoked*
-    (never asserted by name); a direct ``cleanup_retention(batch=100)`` stays
-    bounded to one batch, while one callback run consumes the multi-batch
-    backlog the daily sweep would otherwise leave behind.
+    Both Redis command entry points (``redis.asyncio.Redis.execute_command``
+    and ``redis.Redis.execute_command``) plus the four protocol connection
+    entry points (``connect`` / ``send_packed_command`` on both
+    ``redis.connection.AbstractConnection`` and
+    ``redis.asyncio.connection.AbstractConnection``) are denied while the real
+    recovery scan and retention sweep run against real PG rows; every attempt
+    is recorded *and* raises ``AssertionError``, so the closing
+    ``attempts == []`` stays honest even if production code swallowed it.
+    The pipelined path bypasses ``Redis.execute_command`` and writes through a
+    connection, so the connection boundary needs its own denial.
+    Framework-level Redis imports elsewhere are legitimate and untouched:
+    the denial window covers only the maintenance operations and their
+    ``close``, while scope creation, seeding and the PG result queries sit
+    outside it.  No real Redis server is needed: the denied entry points fire
+    before any connection or command is issued.
     """
 
-    api = _maintenance_api()
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    import redis as redis_sync
+    import redis.asyncio as redis_asyncio
+    import redis.asyncio.connection as redis_asyncio_connection
+    import redis.connection as redis_sync_connection
 
-    async with harness.scope("cron-drain") as current:
-        for index in range(201):
-            await seed_aged_receipt(
-                harness.session_factory,
-                current,
-                inbound_msg_id=f"cron-drain-{index}-{uuid4().hex}",
-                age_seconds=_DAY_SECONDS * 8,
-            )
+    api = _maintenance_api()
+    async with harness.scope("maintenance-no-redis") as current:
+        # Seeded before the window opens: one already-due waiting game, one
+        # 8-day-old receipt (eligible for the 7-day retention sweep) and one
+        # fresh receipt (must survive the sweep).
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        aged = await seed_aged_receipt(
+            harness.session_factory,
+            current,
+            inbound_msg_id="no-redis-aged",
+            age_seconds=_DAY_SECONDS * 8,
+        )
+        fresh = await seed_aged_receipt(
+            harness.session_factory,
+            current,
+            inbound_msg_id="no-redis-fresh",
+            age_seconds=60,
+        )
         maintenance = api["RouletteMaintenance"](
             session_factory=harness.session_factory,
             service=service_for(harness, random_source=CountingRandom()),
-            admission=_allow_only(set()),
+            admission=_allow_only({(current.app_id, current.group_openid)}),
         )
-        # A single direct call stays a *bounded* page: more than one batch of
-        # eligible backlog is still present afterwards.
-        first = await maintenance.cleanup_retention(batch_size=100)
-        assert first.receipts_deleted <= 100
-        assert first.more_pending is True
-        remaining = await _scope_receipts(harness.session_factory, current)
-        assert remaining >= 101
+        attempts: list[str] = []
 
-        scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-        api["register_maintenance_jobs"](scheduler, maintenance)
-        try:
-            job = scheduler.get_job(api["CLEANUP_JOB_ID"])
-            assert job is not None
-            callback = job.func
-            assert callable(callback)
-            outcome = callback()
-            if inspect.isawaitable(outcome):
-                await outcome
-        finally:
-            api["unregister_maintenance_jobs"](scheduler)
+        def reject(entry: str) -> Any:
+            def _blocked(self: Any, *args: Any, **kwargs: Any) -> Any:
+                del self, args, kwargs
+                attempts.append(entry)
+                message = f"maintenance issued a Redis command via {entry}"
+                raise AssertionError(message)
 
-        remaining_after = await _scope_receipts(harness.session_factory, current)
-        assert remaining_after == 0, (
-            "one 04:00 cron run must drain the aged backlog, not just one batch"
+            return _blocked
+
+        # Observation window: only the real maintenance work and its close.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                redis_asyncio.Redis,
+                "execute_command",
+                reject("redis.asyncio.Redis.execute_command"),
+            )
+            patch.setattr(
+                redis_sync.Redis,
+                "execute_command",
+                reject("redis.Redis.execute_command"),
+            )
+            # A pipelined round never calls ``execute_command``: it goes
+            # client -> pipeline -> connection.  Deny both protocols at the
+            # connection boundary so a pipeline cannot slip past the
+            # command-level guard; ``connect`` fires before any socket opens
+            # and ``send_packed_command`` covers an already-open connection.
+            # Monkeypatch restores every entry point at window exit.
+            for connection_class in (
+                redis_sync_connection.AbstractConnection,
+                redis_asyncio_connection.AbstractConnection,
+            ):
+                for method_name in ("connect", "send_packed_command"):
+                    patch.setattr(
+                        connection_class,
+                        method_name,
+                        reject(f"{connection_class.__module__}.{method_name}"),
+                    )
+            try:
+                drive = await _drive_recovery_until_settled(
+                    maintenance,
+                    harness,
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                )
+                assert drive.settled is True
+
+                async def aged_gone() -> bool:
+                    return not await _receipt_exists(harness.session_factory, aged)
+
+                await _drive_cleanup_until(
+                    maintenance, harness, done=aged_gone, batch_size=100
+                )
+            finally:
+                await maintenance.close()
+        assert attempts == []
+
+        # Independent PG truth: the real recovery expired the waiting game and
+        # the real cleanup deleted the aged receipt while keeping the fresh one.
+        lifecycle = await _group_lifecycle(
+            harness,
+            app_id=current.app_id,
+            group_openid=current.group_openid,
         )
-
-
-async def test_maintenance_does_not_require_redis() -> None:
-    before = set(sys.modules)
-    module = load_module(MAINTENANCE_MODULE)
-    assert module is not None
-    new_modules = set(sys.modules) - before
-    assert not any(name.split(".")[0] == "redis" for name in new_modules)
+        assert lifecycle == "expired"
+        assert not await _receipt_exists(harness.session_factory, aged)
+        assert await _receipt_exists(harness.session_factory, fresh)
 
 
 # ---------------------------------------------------------------------------

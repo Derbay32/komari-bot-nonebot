@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from contextlib import suppress
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -11,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -45,21 +45,6 @@ def require_postgres() -> None:
         )
 
 
-async def _reset_shared_orm_engine() -> None:
-    """归还 nonebot-plugin-orm 共享引擎的连接。"""
-    from nonebot import require
-
-    require("nonebot_plugin_orm")
-    import nonebot_plugin_orm as orm_module
-
-    engines = getattr(orm_module, "_engines", None)
-    if not engines:
-        return
-    for engine in list(engines.values()):
-        with suppress(Exception):
-            await engine.dispose()
-
-
 @pytest.fixture
 def app_id() -> str:
     return f"tsk271-{uuid4().hex}"
@@ -69,14 +54,14 @@ def app_id() -> str:
 async def binding_manager(app_id: str) -> AsyncIterator[CharacterBindingManager]:
     del app_id
     require_postgres()
-    await _reset_shared_orm_engine()
+    await reset_shared_orm_engine()
     manager = CharacterBindingManager()
     await manager.initialize()
     try:
         yield manager
     finally:
         await manager.close()
-        await _reset_shared_orm_engine()
+        await reset_shared_orm_engine()
 
 
 async def bind_member(

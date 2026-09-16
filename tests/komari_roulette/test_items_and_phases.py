@@ -117,7 +117,15 @@ def test_start_freezes_item_weights_before_later_reward_draws() -> None:
     )
     active, _ = start_active(random_source=entropy, item_weights=weights)
     expected = dict(weights)
+    # Start enters the active lifecycle with the complete item-weights mapping
+    # frozen equal to the initial input (carried over from the retired TSK-279
+    # probe ``test_old_api_action_start_freezes_item_weights``).
+    assert active.lifecycle == "active"
+    assert dict(active.item_weights) == expected
     weights[ItemType.BEER] = 99
+    # Mutating the caller's dict after the transition must not rewrite the
+    # frozen game.
+    assert dict(active.item_weights) == expected
 
     first = dispatch(active, Action.shoot(player(1)), random_source=entropy)
     assert_ok(first, "shot")

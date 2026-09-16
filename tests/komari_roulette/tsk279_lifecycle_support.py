@@ -12,10 +12,12 @@ This support drives that seam deterministically:
   "registered exactly once" and call the *real* registered ``func`` objects;
 * :func:`lifecycle_context` uses the real NoneBot ``Driver`` lifespan as the
   assembly source.  It snapshots the lifespan containers, swaps the scheduler
-  for the recording fake, installs a recording ``get_config_manager`` getter
-  (the sanctioned config resource seam), pops the reloadable roulette
-  lifecycle/QQ modules, reloads the package and yields the newly registered
-  hooks.  It never calls ``runtime.start()`` by hand.
+  for the recording fake (or a caller-injected concrete scheduler, e.g. a
+  real ``AsyncIOScheduler`` pinned to the deployment timezone), installs a
+  recording ``get_config_manager`` getter (the sanctioned config resource
+  seam), pops the reloadable roulette lifecycle/QQ modules, reloads the
+  package and yields the newly registered hooks.  It never calls
+  ``runtime.start()`` by hand.
 
 Registry / lifespan isolation is delegated to the single authority
 ``tests.group_admission.registry_isolation_support.registry_isolation_context``
@@ -390,13 +392,21 @@ async def lifecycle_context(
     acquisition_error: Exception | None = None,
     manager_factory: Callable[..., Any] | None = None,
     ready_dependencies: bool = True,
+    scheduler: Any | None = None,
 ) -> AsyncIterator[SimpleNamespace]:
     """Assemble the roulette lifecycle from the real Driver + recording scheduler.
 
     Yields a namespace with ``startup_hooks`` / ``shutdown_hooks`` (the hooks
-    registered during the reload), ``scheduler`` (the recording fake),
-    ``jobs``, ``config_manager_calls``, ``config_managers`` (the manager cache)
-    and ``config_getter_state`` (flip ``state["error"]`` to recover).
+    registered during the reload), ``scheduler`` (the scheduler the reloaded
+    package actually bound), ``jobs``, ``config_manager_calls``,
+    ``config_managers`` (the manager cache) and ``config_getter_state`` (flip
+    ``state["error"]`` to recover).
+
+    ``scheduler`` defaults to the recording :class:`FakeScheduler`; a caller
+    may inject a concrete scheduler (e.g. a real ``AsyncIOScheduler`` pinned
+    to the deployment timezone) so the same production registration surface is
+    driven through the real APScheduler implementation.  The original
+    singleton is restored in ``finally`` either way.
 
     By default it installs *ready* dependency seams (real-shaped binding manager
     + real ``AdmissionRuntimeState``), so the healthy path is genuinely ready
@@ -409,9 +419,11 @@ async def lifecycle_context(
     with registry_isolation_context():
         apscheduler_mod: Any = sys.modules.get("nonebot_plugin_apscheduler")
         previous_scheduler = getattr(apscheduler_mod, "scheduler", None)
-        scheduler = FakeScheduler()
+        effective_scheduler = (
+            scheduler if scheduler is not None else FakeScheduler()
+        )
         if apscheduler_mod is not None:
-            apscheduler_mod.scheduler = scheduler
+            apscheduler_mod.scheduler = effective_scheduler
 
         (
             config_manager_calls,
@@ -436,8 +448,12 @@ async def lifecycle_context(
             yield SimpleNamespace(
                 startup_hooks=startup_hooks,
                 shutdown_hooks=shutdown_hooks,
-                scheduler=scheduler,
-                jobs=list(scheduler.jobs),
+                scheduler=effective_scheduler,
+                jobs=(
+                    list(effective_scheduler.jobs)
+                    if isinstance(effective_scheduler, FakeScheduler)
+                    else list(effective_scheduler.get_jobs())
+                ),
                 config_manager_calls=config_manager_calls,
                 config_managers=config_managers,
                 config_getter_state=config_getter_state,

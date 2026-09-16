@@ -48,11 +48,11 @@ from tests.komari_roulette.storage_support import (
     group_for,
     open_session,
     player_for,
-    reset_shared_orm_engine,
     same_database,
     scope,
     waiting_state,
 )
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

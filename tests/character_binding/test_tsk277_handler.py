@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     _real_character_binding_package,
 )
 from tests.character_binding.tsk277_support import (

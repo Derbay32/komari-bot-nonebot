@@ -45,13 +45,13 @@ from tests.character_binding.tsk280_support import (
     group_mapping_rows,
     make_game_state_reader,
     member_rows,
-    reset_shared_orm_engine,
     safe_target_hash,
     write_headers,
 )
 from tests.character_binding.tsk280_support import (
     scope as make_scope,
 )
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable

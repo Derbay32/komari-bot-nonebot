@@ -36,7 +36,7 @@ from nonebot.adapters.onebot.v11 import Adapter as OneBotAdapter
 from nonebot.adapters.onebot.v11 import Bot as OneBotBot
 from sqlalchemy import text
 
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     _real_character_binding_package,
 )
 from tests.group_admission.entry_gate_support import event_gate_context
@@ -265,7 +265,7 @@ def _configure_driver_qq(monkeypatch: pytest.MonkeyPatch, scope: NativeScope) ->
     from nonebot.adapters.qq.config import BotInfo, Intents
     from nonebot.config import Config as NoneBotConfig
 
-    from tests.character_binding.test_reply_evidence import OFFICIAL_BOT_QQ
+    from tests.character_binding.reply_evidence_support import OFFICIAL_BOT_QQ
 
     driver = get_driver()
     config_values = driver.config.model_dump()

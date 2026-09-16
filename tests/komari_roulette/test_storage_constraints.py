@@ -18,11 +18,11 @@ from tests.komari_roulette.storage_support import (
     clear_scope,
     group_for,
     open_session,
-    reset_shared_orm_engine,
     same_database,
     scope,
     waiting_state,
 )
+from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
