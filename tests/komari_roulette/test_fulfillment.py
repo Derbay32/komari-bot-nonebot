@@ -27,13 +27,14 @@ from tests.pg_support import backend_pid, reset_shared_orm_engine, wait_for_bloc
 
 from .command_support import (
     PG_REQUIRED,
+    CountingProjector,
     Scope,
     create_engine_and_factory,
+    create_waiting,
     delete_scope,
     scope,
     seed_binding,
 )
-from .test_command_service import CountingProjector, create_waiting
 
 pytestmark = [pytest.mark.asyncio, PG_REQUIRED]
 

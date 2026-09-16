@@ -33,20 +33,18 @@ from tests.pg_support import reset_shared_orm_engine
 
 from .command_support import (
     PG_REQUIRED,
+    CountingRandom,
+    Harness,
     Scope,
     command_factory,
     create_engine_and_factory,
+    create_waiting,
+    current_game_row,
     delete_scope,
+    join_player,
     observation,
     request,
     scope,
-)
-from .test_command_service import (
-    CountingRandom,
-    Harness,
-    create_waiting,
-    current_game_row,
-    join_player,
     seed_players,
     start_game,
 )

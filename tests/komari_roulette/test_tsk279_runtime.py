@@ -37,16 +37,14 @@ from komari_bot.plugins.komari_roulette.maintenance import RecoveryTickResult
 
 from .command_support import (
     PG_REQUIRED,
-    command_factory,
-    observation,
-    request,
-    seed_binding,
-)
-from .test_command_service import (
     CountingRandom,
+    command_factory,
     create_waiting,
     current_game_row,
     join_player,
+    observation,
+    request,
+    seed_binding,
     seed_players,
     service_for,
     start_game,
@@ -1017,7 +1015,7 @@ async def test_delivery_runtime_check_receives_the_per_call_receipt(
         RouletteDelivery,
     )
 
-    from .test_command_service import CountingRandom
+    from .command_support import CountingRandom
 
     class RecordingSender:
         def __init__(self) -> None:

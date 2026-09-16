@@ -33,17 +33,15 @@ from tests.pg_support import backend_pid, wait_for_blocked
 
 from .command_support import (
     PG_REQUIRED,
-    command_factory,
-    hold_group_lock,
-    request,
-    seed_binding,
-)
-from .test_command_service import (
     CountingProjector,
     CountingRandom,
+    command_factory,
     create_waiting,
     current_game_row,
+    hold_group_lock,
     join_player,
+    request,
+    seed_binding,
     seed_players,
     service_for,
 )

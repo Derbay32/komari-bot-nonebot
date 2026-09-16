@@ -38,21 +38,19 @@ from tests.pg_support import backend_pid, reset_shared_orm_engine, wait_for_bloc
 
 from .command_support import (
     PG_REQUIRED,
+    CountingProjector,
+    CountingRandom,
     Scope,
     command_factory,
     create_engine_and_factory,
+    create_waiting,
+    current_game_row,
     delete_scope,
+    join_player,
     observation,
     request,
     scope,
     seed_binding,
-)
-from .test_command_service import (
-    CountingProjector,
-    CountingRandom,
-    create_waiting,
-    current_game_row,
-    join_player,
     seed_players,
     start_game,
 )

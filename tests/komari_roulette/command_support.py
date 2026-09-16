@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
@@ -18,17 +18,26 @@ from sqlalchemy.ext.asyncio import (
 from komari_bot.db.group_transaction_locks import lock_group_scope
 from komari_bot.plugins.komari_roulette import (
     CanonicalCommand,
+    CommandReceipt,
     CommandRequest,
     Observation,
+    ReplyProjection,
+    ReplyProjectionContext,
+    RouletteCommandService,
 )
-from komari_bot.plugins.komari_roulette.domain import GroupRef
+from komari_bot.plugins.komari_roulette.domain import (
+    ChamberKind,
+    GroupRef,
+    ItemType,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Mapping
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
     from komari_bot.plugins.character_binding.manager import CharacterBindingManager
+    from komari_bot.plugins.komari_roulette.domain import RandomSource
 
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
@@ -232,3 +241,163 @@ def command_factory(name: str, **params: object) -> CanonicalCommand:
 
     factory: Callable[..., CanonicalCommand] = getattr(CanonicalCommand, name)
     return factory(**params)
+
+
+@dataclass(frozen=True, slots=True)
+class Harness:
+    engine: AsyncEngine
+    session_factory: async_sessionmaker[AsyncSession]
+    binding_manager: CharacterBindingManager
+
+
+class CountingProjector:
+    """Deterministic projector that exposes only the public reply context."""
+
+    def __init__(self, *, metadata: Mapping[str, str | int | bool] | None = None) -> None:
+        self.calls = 0
+        self.contexts: list[str] = []
+        self.context_objects: list[ReplyProjectionContext] = []
+        self.metadata = dict(metadata or {})
+
+    def __call__(self, context: ReplyProjectionContext) -> ReplyProjection:
+        self.calls += 1
+        self.contexts.append(repr(context))
+        self.context_objects.append(context)
+        metadata = {"projector_call": self.calls, **self.metadata}
+        return ReplyProjection(
+            body="冻结安全回复",
+            metadata=metadata,
+        )
+
+
+def service_for(
+    harness: Harness,
+    *,
+    projector: CountingProjector | None = None,
+    random_source: RandomSource | None = None,
+) -> RouletteCommandService:
+    reply_projector = projector or CountingProjector()
+    if random_source is None:
+        return RouletteCommandService(
+            session_factory=harness.session_factory,
+            reply_projector=reply_projector,
+        )
+    return RouletteCommandService(
+        session_factory=harness.session_factory,
+        reply_projector=reply_projector,
+        random_source=random_source,
+    )
+
+
+class CountingRandom:
+    def __init__(self) -> None:
+        self.chamber_calls = 0
+        self.item_calls = 0
+
+    def chamber_order(
+        self,
+        live_count: int,
+        blank_count: int,
+    ) -> tuple[ChamberKind, ...]:
+        self.chamber_calls += 1
+        assert (live_count, blank_count) == (2, 4)
+        return (
+            ChamberKind.BLANK,
+            ChamberKind.BLANK,
+            ChamberKind.LIVE,
+            ChamberKind.BLANK,
+            ChamberKind.LIVE,
+            ChamberKind.BLANK,
+        )
+
+    def weighted_item(self, weights: Mapping[ItemType, int]) -> ItemType:
+        self.item_calls += 1
+        del weights
+        return ItemType.BEER
+
+
+async def seed_players(
+    manager: CharacterBindingManager,
+    current: Scope,
+    count: int,
+) -> tuple[str, ...]:
+    return tuple(
+        [
+            await seed_binding(manager, current, number)
+            for number in range(1, count + 1)
+        ]
+    )
+
+
+async def create_waiting(
+    service: RouletteCommandService,
+    current: Scope,
+    *,
+    message_id: str = "create-1",
+    member_openid: str | None = None,
+) -> CommandReceipt:
+    return await service.execute_group_command(
+        request(
+            current,
+            message_id,
+            command_factory("create"),
+            member_openid=member_openid,
+        )
+    )
+
+
+async def join_player(
+    service: RouletteCommandService,
+    current: Scope,
+    member_openid: str,
+    message_id: str,
+) -> CommandReceipt:
+    return await service.execute_group_command(
+        request(
+            current,
+            message_id,
+            command_factory("join"),
+            member_openid=member_openid,
+        )
+    )
+
+
+async def start_game(
+    service: RouletteCommandService,
+    current: Scope,
+    member_openid: str,
+    message_id: str = "start-1",
+) -> CommandReceipt:
+    return await service.execute_group_command(
+        request(
+            current,
+            message_id,
+            command_factory("start"),
+            member_openid=member_openid,
+        )
+    )
+
+
+async def current_game_row(
+    session_factory: async_sessionmaker[AsyncSession],
+    current: Scope,
+) -> Mapping[str, Any] | None:
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT game_id, lifecycle, state_revision, turn_seq, "
+                    "chamber_revision, current_player_seq, waiting_expires_at, "
+                    "turn_deadline_at, "
+                    "ordered_chamber, pending_rewards "
+                    "FROM komari_roulette_games "
+                    "WHERE app_id = :app_id AND group_openid = :group_openid "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {
+                    "app_id": current.app_id,
+                    "group_openid": current.group_openid,
+                },
+            )
+        ).mappings().first()
+        return dict(row) if row is not None else None
