@@ -177,9 +177,13 @@ async def test_pre_send_known_failure_is_not_delivered_and_unknown_stays_pending
     known_failure = await service.claim_fulfillment(receipt_id)
     assert known_failure is not None
     await service.mark_not_delivered(known_failure)
-    assert (await fulfillment_row(harness.session_factory, receipt_id))["state"] == (
-        "NOT_DELIVERED"
-    )
+    # Exact row assertion carried over from the retired TSK-278 probe
+    # ``test_real_claim_and_mark_transitions``: a known pre-send failure
+    # persists NOT_DELIVERED with no platform message id.
+    assert await fulfillment_row(harness.session_factory, receipt_id) == {
+        "state": "NOT_DELIVERED",
+        "platform_message_id": None,
+    }
     assert await service.claim_fulfillment(receipt_id) is None
 
     second_current = scope("claim-unknown")
