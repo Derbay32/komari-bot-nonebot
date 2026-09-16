@@ -41,7 +41,7 @@ import pytest
 from tests.character_binding.conftest import (
     require_postgres,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     COMMAND,
     _challenge_event,
     _get_msg_payload,

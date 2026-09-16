@@ -17,10 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.character_binding.conftest import (
     require_postgres,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     APP_ID as ONEBOT_APP_ID,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     BASE_TIME,
     COMMAND,
     OFFICIAL_BOT_QQ,
@@ -31,10 +31,10 @@ from tests.character_binding.test_reply_evidence import (
     _original_event,
     _real_character_binding_package,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     MEMBER_OPENID as ONEBOT_MEMBER_OPENID,
 )
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     MEMBER_QQ as ONEBOT_MEMBER_QQ,
 )
 from tests.group_admission.entry_gate_support import (
@@ -291,7 +291,7 @@ async def test_real_character_binding_startup_installs_and_closes_qq_admission(
     from nonebot import get_driver
 
     from komari_bot.plugins import user_ban as user_ban_module
-    from tests.character_binding.test_reply_evidence import (
+    from tests.character_binding.reply_evidence_support import (
         _real_character_binding_package,
     )
 

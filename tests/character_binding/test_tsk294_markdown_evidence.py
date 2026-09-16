@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import pytest
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
-from tests.character_binding.test_reply_evidence import (
+from tests.character_binding.reply_evidence_support import (
     BASE_TIME,
     COMMAND,
     FrozenClock,
