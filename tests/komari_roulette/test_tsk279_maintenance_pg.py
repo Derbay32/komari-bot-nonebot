@@ -1328,19 +1328,26 @@ async def test_recovery_and_cleanup_do_not_require_redis(
     """Real recovery + retention never issue a single Redis command.
 
     Both Redis command entry points (``redis.asyncio.Redis.execute_command``
-    and ``redis.Redis.execute_command``) are denied while the real recovery
-    scan and retention sweep run against real PG rows; every attempt is
-    recorded *and* raises ``AssertionError``, so the closing
+    and ``redis.Redis.execute_command``) plus the four protocol connection
+    entry points (``connect`` / ``send_packed_command`` on both
+    ``redis.connection.AbstractConnection`` and
+    ``redis.asyncio.connection.AbstractConnection``) are denied while the real
+    recovery scan and retention sweep run against real PG rows; every attempt
+    is recorded *and* raises ``AssertionError``, so the closing
     ``attempts == []`` stays honest even if production code swallowed it.
+    The pipelined path bypasses ``Redis.execute_command`` and writes through a
+    connection, so the connection boundary needs its own denial.
     Framework-level Redis imports elsewhere are legitimate and untouched:
     the denial window covers only the maintenance operations and their
     ``close``, while scope creation, seeding and the PG result queries sit
-    outside it.  No real Redis server is needed: the denied entry point
-    fires before any connection is made.
+    outside it.  No real Redis server is needed: the denied entry points fire
+    before any connection or command is issued.
     """
 
     import redis as redis_sync
     import redis.asyncio as redis_asyncio
+    import redis.asyncio.connection as redis_asyncio_connection
+    import redis.connection as redis_sync_connection
 
     api = _maintenance_api()
     async with harness.scope("maintenance-no-redis") as current:
@@ -1395,6 +1402,22 @@ async def test_recovery_and_cleanup_do_not_require_redis(
                 "execute_command",
                 reject("redis.Redis.execute_command"),
             )
+            # A pipelined round never calls ``execute_command``: it goes
+            # client -> pipeline -> connection.  Deny both protocols at the
+            # connection boundary so a pipeline cannot slip past the
+            # command-level guard; ``connect`` fires before any socket opens
+            # and ``send_packed_command`` covers an already-open connection.
+            # Monkeypatch restores every entry point at window exit.
+            for connection_class in (
+                redis_sync_connection.AbstractConnection,
+                redis_asyncio_connection.AbstractConnection,
+            ):
+                for method_name in ("connect", "send_packed_command"):
+                    patch.setattr(
+                        connection_class,
+                        method_name,
+                        reject(f"{connection_class.__module__}.{method_name}"),
+                    )
             try:
                 drive = await _drive_recovery_until_settled(
                     maintenance,
