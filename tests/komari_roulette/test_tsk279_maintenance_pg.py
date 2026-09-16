@@ -1333,6 +1333,113 @@ async def test_maintenance_does_not_require_redis() -> None:
     assert not any(name.split(".")[0] == "redis" for name in new_modules)
 
 
+@PG_REQUIRED
+async def test_recovery_and_cleanup_do_not_require_redis(
+    harness: Tsk279Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real recovery + retention never issue a single Redis command.
+
+    ``test_maintenance_does_not_require_redis`` only proves the maintenance
+    module does not *import* Redis; this case drives the real recovery scan
+    and the real retention sweep against real PG rows while both actual Redis
+    command entry points (``redis.asyncio.Redis.execute_command`` and
+    ``redis.Redis.execute_command``) are denied.  The denial records every
+    attempt *and* raises ``AssertionError``, and the closing
+    ``attempts == []`` assertion stays honest even if production code were to
+    swallow that error.  Only the maintenance operations and their ``close``
+    sit inside the observation window; seeding and the independent PG result
+    assertions happen outside it.  No real Redis server is needed: the denied
+    entry point fires before any connection is made.
+    """
+
+    import redis as redis_sync
+    import redis.asyncio as redis_asyncio
+
+    api = _maintenance_api()
+    async with harness.scope("maintenance-no-redis") as current:
+        # Seeded before the window opens: one already-due waiting game, one
+        # 8-day-old receipt (eligible for the 7-day retention sweep) and one
+        # fresh receipt (must survive the sweep).
+        await insert_waiting_game(
+            harness.session_factory,
+            game_id=str(uuid4()),
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+            member_openid=current.member_openid,
+            deadline_age_seconds=60,
+        )
+        aged = await seed_aged_receipt(
+            harness.session_factory,
+            current,
+            inbound_msg_id="no-redis-aged",
+            age_seconds=_DAY_SECONDS * 8,
+        )
+        fresh = await seed_aged_receipt(
+            harness.session_factory,
+            current,
+            inbound_msg_id="no-redis-fresh",
+            age_seconds=60,
+        )
+        maintenance = api["RouletteMaintenance"](
+            session_factory=harness.session_factory,
+            service=service_for(harness, random_source=CountingRandom()),
+            admission=_allow_only({(current.app_id, current.group_openid)}),
+        )
+        attempts: list[str] = []
+
+        def reject(entry: str) -> Any:
+            def _blocked(self: Any, *args: Any, **kwargs: Any) -> Any:
+                del self, args, kwargs
+                attempts.append(entry)
+                message = f"maintenance issued a Redis command via {entry}"
+                raise AssertionError(message)
+
+            return _blocked
+
+        # Observation window: only the real maintenance work and its close.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                redis_asyncio.Redis,
+                "execute_command",
+                reject("redis.asyncio.Redis.execute_command"),
+            )
+            patch.setattr(
+                redis_sync.Redis,
+                "execute_command",
+                reject("redis.Redis.execute_command"),
+            )
+            try:
+                drive = await _drive_recovery_until_settled(
+                    maintenance,
+                    harness,
+                    app_id=current.app_id,
+                    group_openid=current.group_openid,
+                )
+                assert drive.settled is True
+
+                async def aged_gone() -> bool:
+                    return not await _receipt_exists(harness.session_factory, aged)
+
+                await _drive_cleanup_until(
+                    maintenance, harness, done=aged_gone, batch_size=100
+                )
+            finally:
+                await maintenance.close()
+        assert attempts == []
+
+        # Independent PG truth: the real recovery expired the waiting game and
+        # the real cleanup deleted the aged receipt while keeping the fresh one.
+        lifecycle = await _group_lifecycle(
+            harness,
+            app_id=current.app_id,
+            group_openid=current.group_openid,
+        )
+        assert lifecycle == "expired"
+        assert not await _receipt_exists(harness.session_factory, aged)
+        assert await _receipt_exists(harness.session_factory, fresh)
+
+
 # ---------------------------------------------------------------------------
 # Worker concurrency on one real group lock (requirement 4)
 # ---------------------------------------------------------------------------
