@@ -27,7 +27,9 @@ docker compose up
 
 ## 文档
 
-群绑定与俄罗斯轮盘的升级顺序、旧名主动迁移、运维权限及最终 QQ 验收见 [运行交接](docs/adr/ROULETTE-ROLLOUT.md)。官 Bot 接入由非空 `QQ_BOTS` 启用，轮盘业务默认关闭；合入 `dev` 不会自动部署。
+架构决策记录位于 [`docs/adr/`](docs/adr/)。操作手册与验收记录分别保留在本地 `docs/runbooks/` 和 `docs/acceptance/`，不纳入 Git；仓库检出不包含这些本地文档。
+
+官 Bot 接入由非空 `QQ_BOTS` 启用，轮盘业务默认关闭；合入 `dev` 不会自动部署。
 
 总的来说我建议你直接去看 [Nonebot2 文档](https://nonebot.dev/)
 
