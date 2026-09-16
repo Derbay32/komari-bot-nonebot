@@ -345,12 +345,6 @@ def assert_no_secret_chamber_or_reward_fields(result: ActionResult) -> None:
     assert not (flatten_keys(public_payload(result)) & forbidden)
 
 
-def require_attr(obj: object, name: str) -> Any:
-    """Use an explicitly public contract field and fail clearly if absent."""
-
-    return getattr(obj, name)
-
-
 @pytest.fixture
 def entropy() -> ScriptedRandomSource:
     return ScriptedRandomSource()

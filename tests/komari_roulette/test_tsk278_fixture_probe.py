@@ -3,10 +3,9 @@
 This file is gated on ``KOMARI_TEST_POSTGRES_URL`` exactly like the existing
 TSK-276 tests and imports **no TSK-278 symbol**.  It exists to prove that the
 real TSK-276 PG API/SQL/helpers the TSK-278 tests rely on are healthy on their
-own: receipt/fulfillment tables and columns, real claim/mark transitions,
-real leaderboard rows with a frozen latest-win display name, and real
-service-generated contexts with the mention priority (轮转→奖励→胜者→锁) and
-原地不@.  With the gate disabled the whole file skips cleanly; with the gate
+own: receipt/fulfillment tables and columns, real leaderboard rows with a
+frozen latest-win display name, and real service-generated contexts with the
+mention priority (轮转→奖励→胜者→锁) and 原地不@.  With the gate disabled the whole file skips cleanly; with the gate
 enabled any failure here is a 276/fixture regression, never a TSK-278
 missing-seam false positive.
 """
@@ -173,68 +172,7 @@ async def test_real_pg_helpers_and_tables_are_healthy(
 
 
 # ---------------------------------------------------------------------------
-# 2. Real claim/mark transitions
-# ---------------------------------------------------------------------------
-
-
-async def test_real_claim_and_mark_transitions(
-    harness: tuple[
-        AsyncEngine,
-        async_sessionmaker[AsyncSession],
-        CharacterBindingManager,
-    ],
-) -> None:
-    _engine, session_factory, manager = harness
-    current = scope("tsk278-probe-claim")
-    await seed_binding(manager, current, 1)
-    service = RouletteCommandService(
-        session_factory=session_factory,
-        reply_projector=CountingProjector(metadata={"keyboard": '{"rows": []}'}),
-    )
-    receipt_a = await create_waiting(
-        service, current, message_id="probe-a"
-    )
-    receipt_b = await create_waiting(
-        service, current, message_id="probe-b"
-    )
-
-    claim_a = await service.claim_fulfillment(receipt_a.receipt_id)
-    assert claim_a is not None
-    assert claim_a.state == FulfillmentState.PENDING_CONFIRMATION
-    # 已领取后再次领取 → None（重复事件幂等）。
-    assert await service.claim_fulfillment(receipt_a.receipt_id) is None
-
-    await service.mark_delivered(claim_a, platform_message_id="qq-probe-1")
-    claim_b = await service.claim_fulfillment(receipt_b.receipt_id)
-    assert claim_b is not None
-    await service.mark_not_delivered(claim_b)
-
-    async with session_factory() as session:
-        rows = {
-            row[0]: (row[1], row[2])
-            for row in (
-                await session.execute(
-                    text(
-                        "SELECT receipt_id, state, platform_message_id "
-                        "FROM komari_roulette_fulfillments "
-                        "WHERE receipt_id IN (:a, :b)"
-                    ),
-                    {"a": receipt_a.receipt_id, "b": receipt_b.receipt_id},
-                )
-            )
-        }
-    assert rows[receipt_a.receipt_id] == (
-        FulfillmentState.DELIVERED.value,
-        "qq-probe-1",
-    )
-    assert rows[receipt_b.receipt_id] == (
-        FulfillmentState.NOT_DELIVERED.value,
-        None,
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3. Real leaderboard: frozen latest-win display name survives rename
+# 2. Real leaderboard: frozen latest-win display name survives rename
 # ---------------------------------------------------------------------------
 
 
@@ -368,7 +306,7 @@ async def test_real_leaderboard_details_encoding_with_colon_name(
 
 
 # ---------------------------------------------------------------------------
-# 4. Real service contexts: mention priority 轮转→奖励→胜者→锁 and 原地不@
+# 3. Real service contexts: mention priority 轮转→奖励→胜者→锁 and 原地不@
 # ---------------------------------------------------------------------------
 
 

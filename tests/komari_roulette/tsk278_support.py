@@ -5,11 +5,6 @@ Everything here runs without a NoneBot driver, without a real PostgreSQL,
 without redis and without the network.  QQ events are built with
 ``model_construct``, the bot is a minimal subclass, and every collaborator
 of the handler/delivery under test is a recording fake.
-
-No TSK-278 production symbol is imported at module import time on purpose:
-the RED baseline must fail on the specific missing seam, not on this helper
-module.  Tests that need a TSK-278 symbol import it inside the test function
-/ module they own.
 """
 
 from __future__ import annotations
@@ -17,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
-import json
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -32,7 +26,6 @@ from nonebot.adapters.qq.event import (
     GroupMessageCreateEvent,
 )
 from nonebot.adapters.qq.message import Message
-from nonebot.adapters.qq.models import Action, Button, Permission, RenderData
 from nonebot.adapters.qq.models.qq import GroupMemberAuthor
 
 if TYPE_CHECKING:
@@ -497,77 +490,8 @@ def claim(
 
 
 # ---------------------------------------------------------------------------
-# Real QQ payload builders (no TSK-278 import; adapter classes only)
+# Real QQ payload inspection
 # ---------------------------------------------------------------------------
-
-
-def make_button(
-    label: str,
-    data: str,
-    *,
-    action_type: int = 2,
-    permission_type: int = 2,
-    reply: bool = False,
-    enter: bool = False,
-) -> Button:
-    return Button(
-        render_data=RenderData(label=label),
-        action=Action(
-            type=action_type,
-            permission=Permission(type=permission_type),
-            data=data,
-            reply=reply,
-            enter=enter,
-        ),
-    )
-
-
-def build_real_keyboard(spec: str) -> Any:
-    """Materialize a real QQ MessageKeyboard from a JSON spec.
-
-    This mirrors what TSK-278 ``keyboard_from_spec`` must do; it lets the
-    delivery tests assert on the *real* adapter payload without importing the
-    missing seam.  Only the canonical object form ``{"rows": [...]}`` is
-    accepted — there is no historical bare-``[]`` fallback (see
-    TSK-278-contract.md section 5).
-    """
-    from nonebot.adapters.qq.models import (
-        InlineKeyboard,
-        InlineKeyboardRow,
-        MessageKeyboard,
-    )
-
-    parsed = json.loads(spec)
-    rows = []
-    for row_spec in parsed["rows"]:
-        if not isinstance(row_spec, list):
-            msg = (
-                "canonical keyboard spec rows are button-object lists, "
-                f"got {row_spec!r}"
-            )
-            raise TypeError(msg)
-        rows.append(
-            InlineKeyboardRow(
-                buttons=[make_button(b["label"], b["data"]) for b in row_spec]
-            )
-        )
-    return MessageKeyboard(content=InlineKeyboard(rows=rows))
-
-
-def build_real_message(body: str, keyboard_spec: str = '{"rows": []}') -> Message:
-    """Real QQ ``Message``: one markdown segment plus a keyboard only with rows.
-
-    TSK-266 1F / TSK-278-contract.md: a keyboard with no buttons is not a
-    keyboard field at all, so a spec whose ``rows`` are empty yields a
-    markdown-only payload (no empty keyboard segment).
-    """
-    from nonebot.adapters.qq.message import MessageSegment
-
-    message = Message()
-    message += MessageSegment.markdown(body)
-    if json.loads(keyboard_spec)["rows"]:
-        message += MessageSegment.keyboard(build_real_keyboard(keyboard_spec))
-    return message
 
 
 def has_keyboard_segment(message: Any) -> bool:
