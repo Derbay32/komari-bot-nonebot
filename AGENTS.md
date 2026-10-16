@@ -82,12 +82,7 @@ komari-bot/
 │                                          #   user_data/komari_custom/komari_management/komari_decision）
 │
 ├── docs/
-│   ├── adr/                              #   架构决策记录（0001–0013）
-│   ├── config/                           #   旧版配置归档（迁移输入源）
-│   ├── local/                            #   本地工具脚本
-│   ├── reviews/                          #   代码审查记录
-│   ├── handoff/                          #   任务交接记录
-│   └── *.md                              #   组件文档
+│   ├── adr/                              #   架构决策记录
 │
 ├── data/ / scripts/ / tools/ / tests/    # 数据 / 脚本 / 工具 / 测试
 └── logs/                                 # 运行时日志（含 Agent Run JSONL）
@@ -537,32 +532,6 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
 
 14. **QQ 按钮协议**：显式配置权限，现有绑定/轮盘公开群命令按钮使用 `permission.type=2`；仅指定用户入口才使用 `type=0` + 真实 QQ 群成员 OpenID 非空名单，禁止缺失权限、空名单或身份缺失时放宽权限。按钮可点击性不替代服务端授权。按官方字段表完整输出 `label` / `visited_label` / `style` / `action.type` / `action.permission.type` / `data` / `unsupport_tips`，群命令保持 `enter=false` / `reply=false`；在真实 SDK 最终序列化层验收，不依赖客户端或 SDK 的宽松默认。设计、历史审计与修复说明见 `docs/adr/0013-qq-button-permission-policy.md`（TSK-296～299）；生产物化层已补齐字段，真实客户端展示仍须按实际运行版本记录样本。
-
-## Agent skills
-
-### Issue tracker
-
-Track issues and PRDs in the self-hosted Huly project **TSK** through the Huly MCP proxy tools, not through `gh`. Publish `/to-tickets` implementation tickets as sub-issues of their parent spec. Represent blocking edges with Huly's native issue relations and retain a textual `Blocked by` line as a quick-reading fallback. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-使用默认五个规范标签：needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix。See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context 布局：根目录 `CONTEXT.md` + `docs/adr/`。仅架构决策记录放在 `docs/adr/`，使用连续四位编号；配置、部署与运维操作手册及验收结果与证据记录统一存储在 Huly 文档团队空间 `komari-bot`，不再维护仓库内副本。其他专题与任务文档按类型管理，不在根目录追加独立 Markdown；`docs/` 下仅 `docs/adr/` 允许 Git 跟踪，其他文档不添加忽略例外、不强制跟踪，也不为绕过规则改放根目录。QQ 菜单静态资源位于 `resources/qq/`，通过 API 直接配置，不增加控制台提交或菜单提审步骤。See `docs/agents/domain.md`.
-
-## 相关文档
-
-| 文档 | 位置 | 用途 |
-|------|------|------|
-| 任务交接记录 | `docs/handoff/` | 历史任务详情、跨会话交接文档 |
-| 架构决策记录 | `docs/adr/`（0001–0013） | 搜索抽象、管理 API v2、绑定迁移、ORM/强类型配置迁移等 |
-| 操作手册（Huly `komari-bot`） | [QQ 菜单配置](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/qq-6aaa94d8649daed23e114cf6)、[绑定与轮盘升级运维](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa95dd649daed23e114cfa) | 配置与运行交接，不维护仓库内副本 |
-| 验收记录（Huly `komari-bot`） | [绑定与轮盘最终验收](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa9521649daed23e114cf8) | 实际运行版本、自动化证据与真人验收边界 |
-| 组件文档 | `docs/*.md` | 各插件的详细设计文档 |
-| 迁移说明 | `migrations/README.md` | Alembic 工作流与存量配置搬运 |
-| Agent skill 配置 | `docs/agents/*.md` | issue tracker / triage 标签 / 领域文档约定 |
 
 ---
 
