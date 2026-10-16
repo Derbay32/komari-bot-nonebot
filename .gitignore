@@ -171,3 +171,5 @@ data/character_binding/.bindings.json.lock
 
 # Pi Agent
 .pi/
+.agents/
+skills-lock.json
