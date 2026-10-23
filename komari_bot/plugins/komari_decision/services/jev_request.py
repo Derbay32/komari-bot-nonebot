@@ -189,11 +189,20 @@ async def configured_jev_request(
 async def _close(client: AsyncTypeSafeClient) -> BaseException | None:
     """关闭本上下文独占的 SDK 客户端，返回关闭异常而不抛出。
 
-    关闭在同一个任务里直接 await：取消会等它收尾，不留下未跟踪的后台清理
-    任务；关闭失败也不覆盖已经发生的请求失败。
+    关闭任务由当前上下文持有，并在退出前等待完成。屏蔽调用方的重复取消，
+    但保留取消结果；关闭任务自身的异常仍会被读取，不留后台任务。
     """
+    closing = asyncio.create_task(client.aclose())
+    cancellation: asyncio.CancelledError | None = None
+    while not closing.done():
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+        except BaseException:
+            break
     try:
-        await client.aclose()
+        closing.result()
     except BaseException as error:
-        return error
-    return None
+        return cancellation or error
+    return cancellation

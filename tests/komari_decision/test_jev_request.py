@@ -710,3 +710,60 @@ async def test_cancellation_suppressing_transport_late_result_is_rejected() -> N
     assert arrived == [pytest.approx(0.18)]
     assert transport.suppressed is True
     assert transport.closed is True
+
+
+class BlockingCloseTransport(ScriptedTypesafeTransport):
+    """在异步关闭边界暂停，验证调用方取消不会留下未释放的传输。"""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(
+            system_one_payload if status_code == 200 else _status_response(status_code)
+        )
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_release.wait()
+        self.closed = True
+
+
+@pytest.mark.parametrize("status_code", [200, 503])
+@pytest.mark.asyncio
+async def test_cancellation_during_cleanup_waits_for_owned_transport(
+    status_code: int,
+) -> None:
+    """关闭期间的重复取消等待资源释放；请求已失败时保留原始错误。"""
+    transport = BlockingCloseTransport(status_code)
+
+    async def request() -> None:
+        async with configured_jev_request(
+            config_for_request(), transport=transport
+        ) as client:
+            await client.system_one(
+                state=state_payload(), questions={"summary": NOUL_QUESTION}
+            )
+
+    task = asyncio.create_task(request())
+    try:
+        await asyncio.wait_for(transport.close_started.wait(), timeout=1)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "取消后必须等待已启动的传输关闭"
+            assert not transport.closed
+        transport.close_release.set()
+        expected = (
+            asyncio.CancelledError
+            if status_code == 200
+            else TypeSafeInternalServerError
+        )
+        with pytest.raises(expected):
+            await asyncio.wait_for(task, timeout=1)
+        assert transport.closed
+        assert transport.close_calls == 1
+    finally:
+        transport.close_release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
