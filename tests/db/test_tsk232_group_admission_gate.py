@@ -2,7 +2,7 @@
 
 覆盖工单 B 区：
 
-- fresh 空库 ``upgrade head`` 成功、停留在单一 head 0021，最终 schema 含
+- fresh 空库 ``upgrade head`` 成功、停留在单一 head 0022，最终 schema 含
   ``komari_group_admission_config`` 强类型单行表并与 SQLModel metadata
   零漂移（orm_bootstrap check），且仅 fresh marker 空库自动初始化缺省策略
   ``{"mode": "blacklist", "group_ids": []}``；

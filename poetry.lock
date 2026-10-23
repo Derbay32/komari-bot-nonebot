@@ -1352,6 +1352,29 @@ socks = ["socksio (==1.*)"]
 trio = ["trio (>=0.22.0,<1.0)"]
 
 [[package]]
+name = "httpcore2"
+version = "2.16.0"
+description = "A minimal low-level HTTP client."
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+markers = "sys_platform != \"emscripten\""
+files = [
+    {file = "httpcore2-2.16.0-py3-none-any.whl", hash = "sha256:5c4358319f2602d984ad93182c9fee5160f22e9da7babdda870a5e7c4e2dc34f"},
+    {file = "httpcore2-2.16.0.tar.gz", hash = "sha256:c72cd0413563b17e1cd8354677dff887466f8ec2551679759e93126534428643"},
+]
+
+[package.dependencies]
+h11 = ">=0.16"
+truststore = ">=0.10"
+
+[package.extras]
+asyncio = ["anyio (>=4.5.0,<5.0)"]
+http2 = ["h2 (>=3,<5)"]
+socks = ["socksio (==1.*)"]
+trio = ["trio (>=0.34.0,<1.0)"]
+
+[[package]]
 name = "httptools"
 version = "0.8.0"
 description = "A collection of framework independent HTTP protocol utils."
@@ -1435,6 +1458,46 @@ cli = ["click (==8.*)", "pygments (==2.*)", "rich (>=10,<14)"]
 http2 = ["h2 (>=3,<5)"]
 socks = ["socksio (==1.*)"]
 zstd = ["zstandard (>=0.18.0)"]
+
+[[package]]
+name = "httpx2"
+version = "2.16.0"
+description = "The next generation HTTP client."
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+files = [
+    {file = "httpx2-2.16.0-py3-none-any.whl", hash = "sha256:fd2c5d7909e8d86fe92d53020c310ca0e4e431b838c207c5754b9bbf0308d49a"},
+    {file = "httpx2-2.16.0.tar.gz", hash = "sha256:0d54c98128e8f2ff7fbbde0fca8c359e5f032edeaaaac443cdb7f31f685bcd7f"},
+]
+
+[package.dependencies]
+anyio = {version = ">=4.10", markers = "sys_platform != \"emscripten\""}
+httpcore2 = {version = "2.16.0", markers = "sys_platform != \"emscripten\""}
+httpx2-jsfetch = {version = "*", markers = "sys_platform == \"emscripten\" and python_version >= \"3.12\""}
+idna = ">=3.18"
+truststore = {version = ">=0.10", markers = "sys_platform != \"emscripten\""}
+
+[package.extras]
+brotli = ["brotli (>=1.2.0) ; platform_python_implementation == \"CPython\"", "brotlicffi (>=1.2.0.2) ; platform_python_implementation != \"CPython\""]
+cli = ["click (>=8.4.2)", "pygments (==2.*)", "rich (>=10,<16)"]
+http2 = ["h2 (>=3,<5)"]
+socks = ["socksio (==1.*)"]
+ws = ["wsproto (>=1.2)"]
+zstd = ["backports-zstd (>=1.0.0) ; python_version <= \"3.13\""]
+
+[[package]]
+name = "httpx2-jsfetch"
+version = "1.0"
+description = "httpx2 transports for Emscripten/Pyodide, backed by the JavaScript fetch API."
+optional = false
+python-versions = ">=3.12"
+groups = ["main"]
+markers = "sys_platform == \"emscripten\""
+files = [
+    {file = "httpx2_jsfetch-1.0-py3-none-any.whl", hash = "sha256:cb916b707601e69a07721aabc8f3f6659be3a6893bc1ff5c6f9e02241df2da32"},
+    {file = "httpx2_jsfetch-1.0.tar.gz", hash = "sha256:70a0e3eabfef7cce5ad9c629f7d01ca05e418f586646f4ddf14782e4c1454c60"},
+]
 
 [[package]]
 name = "idna"
@@ -4429,6 +4492,22 @@ requests = "*"
 tiktoken = ">=0.5.1"
 
 [[package]]
+name = "tenacity"
+version = "9.2.1"
+description = "Retry code until it succeeds"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "tenacity-9.2.1-py3-none-any.whl", hash = "sha256:9e56f17539296baab7beabb08b92f6ee3d7be92d8be72d763360677c2ad6580e"},
+    {file = "tenacity-9.2.1.tar.gz", hash = "sha256:a606b5c808d0cded4a359d5b9932d867ff2a6a6b64d37350260fd01bbdf83839"},
+]
+
+[package.extras]
+doc = ["reno", "sphinx"]
+test = ["pytest", "tornado (>=6.0)"]
+
+[[package]]
 name = "terminado"
 version = "0.18.1"
 description = "Tornado websocket backend for the Xterm.js Javascript terminal emulator library."
@@ -4599,6 +4678,46 @@ files = [
 [package.extras]
 docs = ["myst-parser", "pydata-sphinx-theme", "sphinx"]
 test = ["argcomplete (>=3.0.3)", "mypy (>=1.17.0,<1.19)", "pre-commit", "pytest (>=7.0,<8.2)", "pytest-mock", "pytest-mypy-testing"]
+
+[[package]]
+name = "truststore"
+version = "0.10.5"
+description = "Verify certificates using native system trust stores"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+markers = "sys_platform != \"emscripten\""
+files = [
+    {file = "truststore-0.10.5-py3-none-any.whl", hash = "sha256:9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c"},
+    {file = "truststore-0.10.5.tar.gz", hash = "sha256:30d36967ccaded5cbb38d602c433f53600036c79d502f4533a49b60a03bbefcd"},
+]
+
+[[package]]
+name = "typesafe-sdk"
+version = "0.7.5"
+description = "Python SDK for TypeSafe AI API."
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "typesafe_sdk-0.7.5-py3-none-any.whl", hash = "sha256:967a8b61494d536abb55ee3f3a2b10e81685cb6baad6ccdcab588bdc6c9b86d2"},
+    {file = "typesafe_sdk-0.7.5.tar.gz", hash = "sha256:1eeeb0dc80a7161d84896db42a5016dc0a7c8872fa16540b70163e5357b6d398"},
+]
+
+[package.dependencies]
+anyio = ">=4.0.0"
+httpx2 = ">=2.0.0"
+packaging = ">=24.0"
+pydantic = ">=2.12.0"
+pydantic-core = ">=2.41.1"
+tenacity = ">=9.0.0"
+truststore = {version = ">=0.10.0", markers = "sys_platform != \"emscripten\""}
+typing-extensions = ">=4.13.0"
+
+[package.extras]
+http2 = ["httpx2[http2] (>=2.0.0)"]
+pil = ["pillow (>=11.0.0)"]
+zstd = ["backports-zstd (>=1.0.0) ; python_full_version < \"3.14.0\""]
 
 [[package]]
 name = "typing-extensions"
@@ -5236,4 +5355,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13, <4.0"
-content-hash = "f2695af9822427bbe11db591023c54f5830eb22ce2d11ddc73388ec1fa4a6f6c"
+content-hash = "de94b46cd3491841e20132be164968f7592918c01213b1f25c36de1cc6df0e11"

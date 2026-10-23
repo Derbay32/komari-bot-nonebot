@@ -33,7 +33,7 @@ def _decision_schema() -> type[Any]:
 
 
 def test_decision_config_declares_ordered_chat_and_summary_sections() -> None:
-    """配置 Schema 以稳定 ID、展示名和顺序声明两个用途分区。"""
+    """配置 Schema 以稳定 ID、展示名和顺序声明各用途分区。"""
     metadata = get_config_section_metadata(_decision_schema())
 
     assert [
@@ -42,6 +42,7 @@ def test_decision_config_declares_ordered_chat_and_summary_sections() -> None:
     ] == [
         ("chat_scene", "聊天场景", 10),
         ("summary_classification", "群总结归类", 20),
+        ("jev_request", "Jev 请求", 30),
     ]
 
     for field_name in (

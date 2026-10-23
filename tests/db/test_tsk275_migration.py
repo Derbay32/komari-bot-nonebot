@@ -23,7 +23,7 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0021"
+HEAD = "0022"
 ROULETTE_TABLES = {
     "komari_roulette_games",
     "komari_roulette_players",
@@ -58,10 +58,10 @@ def _script_directory() -> ScriptDirectory:
     return ScriptDirectory.from_config(config)
 
 
-def test_0021_is_the_single_head_after_roulette_config_0020() -> None:
+def test_single_head_preserves_roulette_config_revision() -> None:
     script = _script_directory()
     assert script.get_heads() == [HEAD]
-    revision = script.get_revision(HEAD)
+    revision = script.get_revision("0021")
     assert revision is not None
     assert revision.down_revision == "0020"
     # 历史节点保留：0020 仍是 0019 的直接后继，0019 接在 0018 之后。
@@ -150,7 +150,7 @@ async def test_fresh_database_upgrade_head_and_check_include_roulette_schema() -
 
 @PG_REQUIRED
 @pytest.mark.asyncio
-async def test_upgrade_from_0018_preserves_binding_schema_and_converges_to_0021() -> (
+async def test_upgrade_from_0018_preserves_binding_schema_and_converges_to_head() -> (
     None
 ):
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
