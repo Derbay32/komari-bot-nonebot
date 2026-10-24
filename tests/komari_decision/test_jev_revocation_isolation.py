@@ -176,6 +176,7 @@ async def test_live_pending_message_survives_other_delivery_and_late_noise(
                 ),
                 protocol=first_identity.protocol,
                 account_id=first_identity.account_id,
+                received_at=datetime.now(UTC),
             )
             next_identity = make_identity(
                 account_id=first_identity.account_id,

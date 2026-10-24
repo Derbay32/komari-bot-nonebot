@@ -113,17 +113,19 @@ async def test_overlapping_reference_is_reused_without_fetch(
 
     async with DecisionHarness(decision_database, options) as harness:
         assert harness.decision is not None
+        first_received = datetime.now(UTC)
         first = await harness.decision.evaluate(
             make_request(
                 identity=recent_identity,
-                target=make_message(identity=recent_identity, text="近期窗口里的原文"),
+                target=make_message(identity=recent_identity, text="近期窗口里的原文", timestamp=first_received),
+                received_at=first_received,
             )
         )
         assert first.status == "success"
         harness.reference_calls.clear()
 
         result = await harness.decision.evaluate(
-            make_request(identity=identity, target=target, known_references=(known,))
+            make_request(identity=identity, target=target, known_references=(known,), received_at=first_received + timedelta(seconds=1))
         )
         assert result.status == "success"
         assert harness.reference_calls == []

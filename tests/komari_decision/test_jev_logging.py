@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -425,6 +426,7 @@ async def test_media_payloads_never_reach_sdk_input_or_log(
             ),
             protocol=identity.protocol,
             account_id=identity.account_id,
+            received_at=datetime.now(UTC),
         )
         result = await harness.decision.evaluate(
             make_request(

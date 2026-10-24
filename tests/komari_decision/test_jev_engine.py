@@ -746,7 +746,7 @@ async def test_frozen_recent_window_excludes_later_messages(
             group_id=group_id, message_id="m3", text="之后才送达的消息"
         )
         await harness.decision.observe_delivered(
-            later, protocol="onebot_v11", account_id=account_id
+            later, protocol="onebot_v11", account_id=account_id, received_at=later.timestamp
         )
         release.set()
         result = await pending
@@ -774,7 +774,7 @@ async def test_observe_delivered_is_idempotent_and_private(
         )
         for _ in range(2):
             await harness.decision.observe_delivered(
-                delivered, protocol=identity.protocol, account_id=identity.account_id
+                delivered, protocol=identity.protocol, account_id=identity.account_id, received_at=delivered.timestamp
             )
 
         result = await harness.decision.evaluate(make_request(identity=identity))

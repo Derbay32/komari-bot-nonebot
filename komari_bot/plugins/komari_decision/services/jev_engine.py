@@ -476,6 +476,7 @@ class JevDecisionEngine:
         *,
         protocol: str,
         account_id: str,
+        received_at: datetime,
     ) -> None:
         """吸收一条已确认的平台送达（只更新判定自有上下文）。"""
         if self._closed:
@@ -484,6 +485,7 @@ class JevDecisionEngine:
             protocol=protocol,
             account_id=account_id,
             message=message,
+            received_at=received_at,
         )
 
     # ------------------------------ 判定入口 ------------------------------
@@ -834,24 +836,36 @@ class JevDecisionEngine:
         observation = _current_observation()
         if observation is not None:
             observation.note_path(path)
-        eligible = path.input_eligible
-        prompt = await self._load_prompt() if path.needs_prompt else None
-        if prompt is not None and observation is not None:
-            observation.note_prompt(prompt)
-        if path.needs_prompt and prompt is None:
-            # Prompt 缺失只影响执行受理，不撤销已经成立的输入资格。
-            path = _Path(
-                kind="prompt_failure",
-                terminal_state=STATE_FAILED,
-                terminal_reason="prompt_unavailable",
-                input_eligible=eligible,
-            )
         reservation, predecessors = await self._reserve(
             request, path, frozen, decision_id
         )
         early = self._reservation_outcome(reservation, path, decision_id)
         if early is not None:
             return _Prepared(early=early)
+        prompt = await self._load_prompt() if path.needs_prompt else None
+        if prompt is not None and observation is not None:
+            observation.note_prompt(prompt)
+        if path.needs_prompt and prompt is None:
+            await self._repository.finalize(
+                identity=request.event,
+                decision_id=decision_id,
+                dispatch_id=request.dispatch_id,
+                status=STATE_FAILED,
+                reason_code="prompt_unavailable",
+                business_route="none",
+                notification_eligible=self._notification_eligible(
+                    "prompt_unavailable", summary_candidate=request.summary_candidate
+                ),
+                effect_check=lambda: self._completion_admitted(request),
+            )
+            await self._settle_finished(request.event)
+            if (request.event, request.dispatch_id) in self._admission_revoked:
+                return _Prepared(early=self._cancelled_result(request, decision_id))
+            return _Prepared(
+                early=_terminal_result(
+                    "failed", "prompt_unavailable", decision_id=decision_id
+                )
+            )
         return _Prepared(
             frozen=frozen,
             prompt=prompt,
@@ -1649,6 +1663,7 @@ class JevDecisionEngine:
                 protocol=request.event.protocol,
                 account_id=request.event.account_id,
                 message=request.target,
+                received_at=request.received_at,
             )
 
     async def _settle_entry(
@@ -2102,7 +2117,6 @@ class _Path:
         "disabled",
         "admission_denied",
         "configuration_invalid",
-        "prompt_failure",
     ]
     terminal_state: str | None = None
     terminal_reason: str | None = None
@@ -2355,7 +2369,6 @@ _TERMINAL_SPECS: Final[dict[str, _TerminalSpec]] = {
     "configuration_invalid": _TerminalSpec(
         status="failed", reason="configuration_invalid"
     ),
-    "prompt_failure": _TerminalSpec(status="failed", reason="prompt_unavailable"),
 }
 
 _RESERVATION_OUTCOMES: Final[

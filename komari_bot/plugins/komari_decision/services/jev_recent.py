@@ -37,10 +37,32 @@ _CONFIRMED: Final = "c"
 
 _KEY_PREFIX: Final = "komari:decision:recent:v1"
 
+_RECEIVE_ORDER: Final = """
+local function received_order(order, times)
+  local members = redis.call('ZREVRANGE', order, 0, -1, 'WITHSCORES')
+  local rows = {}
+  for index = 1, #members, 2 do
+    local id = members[index]
+    local received = tonumber(redis.call('ZSCORE', times, id))
+    if received ~= nil then
+      rows[#rows + 1] = {id=id, received=received, seq=tonumber(members[index + 1])}
+    end
+  end
+  table.sort(rows, function(a, b)
+    if a.received == b.received then
+      return a.seq > b.seq
+    end
+    return a.received > b.received
+  end)
+  return rows
+end
+"""
+
 _PRUNE_STEP: Final = """
-local ids = redis.call('ZREVRANGE', order, 0, -1)
+local rows = received_order(order, times)
 local kept = 0
-for _, id in ipairs(ids) do
+for _, row in ipairs(rows) do
+  local id = row.id
   local body = redis.call('HGET', entries, id)
   if body then
     if redis.call('HGET', states, id) == 'c' then
@@ -63,7 +85,8 @@ end
 """保留最新 keep 条 confirmed；provisional 一律保留，绝不按时间删除。"""
 
 _SNAPSHOT_APPEND_SCRIPT: Final = (
-    """
+    _RECEIVE_ORDER
+    + """
 local entries = KEYS[1]
 local order = KEYS[2]
 local counter = KEYS[3]
@@ -84,14 +107,15 @@ if not score then
   redis.call('HSET', states, message_id, 'p')
 end
 -- 先按接收截止与身份筛选，再取最近 limit 条：过滤发生在计数之前。
-local candidates = redis.call('ZREVRANGEBYSCORE', order, '(' .. score, '-inf')
+local candidates = received_order(order, times)
 local out = {tonumber(score)}
-for _, id in ipairs(candidates) do
+for _, row in ipairs(candidates) do
+  local id = row.id
   if #out > limit then
     break
   end
-  local at = tonumber(redis.call('ZSCORE', times, id))
-  if at ~= nil and at <= cutoff and id ~= message_id then
+  if (row.received < cutoff or (row.received == cutoff and row.seq < tonumber(score)))
+      and id ~= message_id then
     local body = redis.call('HGET', entries, id)
     if body then
       out[#out + 1] = body
@@ -107,7 +131,8 @@ return out
 )
 
 _SETTLE_SCRIPT: Final = (
-    """
+    _RECEIVE_ORDER
+    + """
 local entries = KEYS[1]
 local order = KEYS[2]
 local states = KEYS[3]
@@ -143,7 +168,8 @@ return changed
 )
 
 _OBSERVE_SCRIPT: Final = (
-    """
+    _RECEIVE_ORDER
+    + """
 local entries = KEYS[1]
 local order = KEYS[2]
 local counter = KEYS[3]
@@ -172,6 +198,20 @@ end
     + _PRUNE_STEP
     + """
 return changed
+"""
+)
+
+_WINDOW_SCRIPT: Final = (
+    _RECEIVE_ORDER
+    + """
+local out = {}
+for _, row in ipairs(received_order(KEYS[2], KEYS[3])) do
+  local body = redis.call('HGET', KEYS[1], row.id)
+  if body then
+    out[#out + 1] = body
+  end
+end
+return out
 """
 )
 
@@ -322,7 +362,7 @@ class DecisionRecentStore:
                 RecentRecord.from_message(target).encode(),
                 str(self._window_size),
                 str(cutoff.timestamp()),
-                str(target.timestamp.timestamp()),
+                str(cutoff.timestamp()),
                 str(self._window_size),
             ),
         )
@@ -414,6 +454,7 @@ class DecisionRecentStore:
         protocol: str,
         account_id: str,
         message: DecisionMessage,
+        received_at: datetime,
     ) -> bool:
         """把一条已确认的合格消息写入窗口（按实际消息身份幂等）。"""
         keys = scope_keys(protocol, account_id, message.group_id)
@@ -425,7 +466,7 @@ class DecisionRecentStore:
                 message.message_id,
                 RecentRecord.from_message(message).encode(),
                 str(self._window_size),
-                str(message.timestamp.timestamp()),
+                str(received_at.timestamp()),
             ),
         )
         return bool(int(cast("int", changed) or 0))
@@ -439,21 +480,18 @@ class DecisionRecentStore:
     ) -> tuple[DecisionMessage, ...]:
         """只读返回当前窗口（确认记录 + 未决 provisional，按接收顺序）。"""
         keys = scope_keys(protocol, account_id, group_id)
-        members = cast(
-            "list[object]",
-            await cast(
-                "Awaitable[list[object]]", self._redis.zrange(keys.order, 0, -1)
-            ),
+        rows = await _eval(
+            self._redis,
+            _WINDOW_SCRIPT,
+            (keys.entries, keys.order, keys.times),
+            (),
         )
-        messages: list[DecisionMessage] = []
-        for member in members:
-            payload = await cast(
-                "Awaitable[object]", self._redis.hget(keys.entries, _text(member))
-            )
-            if payload is None:
-                continue
-            messages.append(RecentRecord.decode(_text(payload)).message)
-        return tuple(messages)
+        if not isinstance(rows, list):
+            message = "Recent window response is not a list"
+            raise TypeError(message)
+        return tuple(
+            RecentRecord.decode(_text(item)).message for item in reversed(rows)
+        )
 
 
 def resolve_action_for_retention(*, retain_recent: bool | None) -> ResolveAction:
