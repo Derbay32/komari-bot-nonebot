@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 import traceback
 import uuid
@@ -19,10 +18,13 @@ from nonebot.exception import FinishedException
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import require
 
-from komari_bot.decision import (
+from komari_bot.decision import (  # noqa: TC001 - 消费方注解的契约类型
     DecisionEngineProtocol,
-    DecisionOutcome,
-    DecisionRuntimeStatus,
+)
+from komari_bot.decision.dispatch import DecisionDispatch  # noqa: TC001
+from komari_bot.decision.jev import (  # noqa: TC001 - 消费方注解的契约类型
+    DecisionRequest,
+    DecisionResult,
 )
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
@@ -94,7 +96,7 @@ if TYPE_CHECKING:
     )
     from ..services.reply_fulfillment_workflow import ReplyFulfillmentQueryProtocol
 
-AttemptReplyReason = Literal["at", "direct_call", "score"]
+AttemptReplyReason = Literal["platform_summon", "required", "optional"]
 ReplyAction = Literal[
     "replied",
     "replied_forced",
@@ -148,7 +150,6 @@ class PendingReply:
     bot_self_id: str
     adapter_name: str
     reason: AttemptReplyReason
-    reply_score: float | None
     fulfillment_id: str
     request_trace_id: str
     reply_timestamp: float
@@ -260,68 +261,6 @@ class MessageHandler:
         self._reaction_tasks: set[asyncio.Task[None]] = set()
         self.decision_engine = decision_engine
         self.proactive_reservation = proactive_reservation
-
-    def _is_at_trigger(self, event: GroupMessageEvent) -> bool:
-        """检查是否 @ 了机器人。"""
-        return bool(hasattr(event, "to_me") and event.to_me)
-
-    @staticmethod
-    def _is_reply_to_bot(event: GroupMessageEvent) -> bool:
-        """检查当前消息是否引用了机器人消息。"""
-        reply = event.reply
-        if reply is None or reply.sender.user_id is None:
-            return False
-        return str(reply.sender.user_id) == str(event.self_id)
-
-    @staticmethod
-    def _strip_text_at_alias_prefix(
-        message_content: str,
-        aliases: list[str],
-    ) -> str | None:
-        """剥离纯文本形式的 `@机器人别名` 前缀。"""
-        cleaned_aliases = sorted(
-            {alias.strip() for alias in aliases if alias and alias.strip()},
-            key=len,
-            reverse=True,
-        )
-        if not cleaned_aliases:
-            return None
-
-        alias_pattern = "|".join(re.escape(alias) for alias in cleaned_aliases)
-        match = re.match(
-            rf"^\s*(?:@|\uFF20)\s*(?:{alias_pattern})(?:[\s,，。.!！?？:：、~-]|\uFF5E)*",
-            message_content,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return None
-
-        stripped_content = message_content[match.end() :].lstrip()
-        return stripped_content or message_content
-
-    def _resolve_trigger_message(
-        self,
-        event: GroupMessageEvent,
-    ) -> tuple[bool, str]:
-        """解析当前消息是否应按 `@机器人` 直通处理，并返回清洗后的文本。"""
-        message_content = event.get_plaintext()
-        if self._is_at_trigger(event) or self._is_reply_to_bot(event):
-            return True, message_content
-
-        config = get_memory_config()
-        stripped_content = self._strip_text_at_alias_prefix(
-            message_content,
-            [config.bot_nickname, *config.bot_aliases],
-        )
-        if stripped_content is None:
-            return False, message_content
-
-        logger.debug(
-            "[KomariChat] 纯文本 @ 命中机器人别名，按 at_trigger 处理: raw={} cleaned={}",
-            message_content,
-            stripped_content,
-        )
-        return True, stripped_content
 
     @staticmethod
     def _safe_round(value: float | None) -> float | None:
@@ -451,9 +390,9 @@ class MessageHandler:
         *,
         bot: Bot,
         event: GroupMessageEvent,
-        at_trigger: bool,
+        platform_summoned: bool,
     ) -> ResolvedReplyContext:
-        if not at_trigger or event.reply is None:
+        if not platform_summoned or event.reply is None:
             return ResolvedReplyContext(context=None, refetched=False)
 
         context = self._build_reply_context(
@@ -486,72 +425,76 @@ class MessageHandler:
         group_id: str,
         user_id: str,
         message_id: str,
-        outcome: DecisionOutcome,
+        result: DecisionResult,
         reply_action: ReplyAction,
+        reason: AttemptReplyReason | None = None,
     ) -> dict[str, object]:
+        """投影本次判定的安全诊断事实（无正文、无提示词、无旧评分字段）。"""
         return {
             "group_id": group_id,
             "user_id": user_id,
             "message_id": message_id,
-            "alias_hit": outcome.alias_hit,
-            "call_intent": outcome.call_intent,
-            "call_margin": self._safe_round(outcome.call_margin),
-            "memory_action": outcome.memory_action,
+            "decision_id": result.decision_id,
+            "status": result.status,
+            "reason_code": result.reason_code,
+            "route": result.route,
+            "effective_reply": result.effective_reply,
+            "reply_choice": (
+                None if result.reply_choice is None else result.reply_choice.value
+            ),
+            "retention_choice": (
+                None
+                if result.retention_choice is None
+                else result.retention_choice.value
+            ),
+            "memory_candidate": result.memory_candidate,
+            "retain_recent": result.retain_recent,
+            "optional_selected": result.optional_selected,
+            "summary_probability": self._safe_round(result.summary_probability),
             "reply_action": reply_action,
-            "forced_reply_reason": outcome.forced_reply_reason,
-            "filter_reason": outcome.filter_reason,
-            "reply_score": self._safe_round(outcome.reply_score),
-            "timing_score": self._safe_round(outcome.timing_score),
-            "scene_score": self._safe_round(outcome.scene_score),
-            "best_scene_id": outcome.best_scene_id,
-            "noise_score": self._safe_round(outcome.noise_score),
-            "meaningful_score": self._safe_round(outcome.meaningful_score),
-            "call_direct_score": self._safe_round(outcome.call_direct_score),
-            "call_mention_score": self._safe_round(outcome.call_mention_score),
-            "decision_runtime_status": outcome.runtime_status.value,
-            "decision_runtime_reason": outcome.runtime_reason,
+            "reply_reason": reason,
         }
 
     def _log_decision(self, payload: dict[str, object]) -> None:
-        """输出决策日志（info 摘要 + debug 完整结构）。"""
+        """输出判定日志：安全类型化事实，绝不回显正文或提示词。"""
         logger.info(
             "[KomariMemory] decision_summary group={} user={} msg={} "
-            "memory={} reply={} reason={} intent={} scene={} "
-            "reply_score={} timing={}",
+            "status={} reason={} route={} reply={} effective={} draw={}",
             payload.get("group_id"),
             payload.get("user_id"),
             payload.get("message_id"),
-            payload.get("memory_action"),
+            payload.get("status"),
+            payload.get("reason_code"),
+            payload.get("route"),
             payload.get("reply_action"),
-            payload.get("forced_reply_reason"),
-            payload.get("call_intent"),
-            payload.get("best_scene_id"),
-            payload.get("reply_score"),
-            payload.get("timing_score"),
+            payload.get("effective_reply"),
+            payload.get("optional_selected"),
         )
         logger.debug(
             "[KomariMemory] decision_full={}",
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
 
-    async def process_message(
+    async def process_message(  # noqa: PLR0911 - 每个判定终态都是独立安全停止
         self,
         bot: Bot,
         event: GroupMessageEvent,
         on_reply_triggered: ReplyTriggeredCallback | None = None,
         *,
+        decision_dispatch: DecisionDispatch,
         reply_allowed: bool = True,
     ) -> PendingReply | None:
-        """处理群聊消息的主流程。"""
+        """处理群聊消息的主流程：消费本次分发唯一的判定结果。
+
+        判定事实（状态、路由、回应资格、保留用途、既有抽签）全部来自共享
+        载体；聊天入口不再自行分类、不再二次抽签，也不提供旧结果回退。
+        """
         user_id = str(event.user_id)
         group_id = str(event.group_id)
-        at_trigger, message_content = self._resolve_trigger_message(event)
+        request = decision_dispatch.request
+        message_content = request.target.text
+        platform_summoned = request.platform_summoned
         message_id = str(event.message_id)
-        reply_context_result = await self._resolve_reply_context(
-            bot=bot,
-            event=event,
-            at_trigger=at_trigger,
-        )
 
         image_urls, image_count = extract_image_sources(event.message)
         if image_count:
@@ -571,18 +514,24 @@ class MessageHandler:
             message_id=message_id,
         )
 
-        outcome = await self.decision_engine.evaluate(
-            message_content=message_content,
-            group_id=group_id,
-            at_trigger=at_trigger,
-        )
-        memory_store = outcome.memory_action == "store"
+        try:
+            result = await decision_dispatch.evaluate(
+                self.decision_engine,
+                summary_candidate=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 判定边界的普通异常就地隔离：不外泄到入口失败善后（那会提交未经
+            # 授权的群内/私聊诊断），也不伪造失败结果或进入任何业务效果。
+            logger.error("[KomariChat] 判定评估边界异常，放弃本次分发")
+            return None
+        memory_candidate = result.memory_candidate is True
 
-        if outcome.filter_reason is not None:
+        if result.status == "filtered":
             logger.debug(
-                "[KomariMemory] 消息被过滤: {} - {}...",
-                outcome.filter_reason,
-                message_content[:30],
+                "[KomariMemory] 消息被前置规则过滤: reason={}",
+                result.reason_code,
             )
             await self._handle_low_value(message)
             self._log_decision(
@@ -590,43 +539,124 @@ class MessageHandler:
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
-                    outcome=outcome,
+                    result=result,
                     reply_action="not_replied",
                 )
             )
             return None
 
-        if not outcome.should_reply:
-            if memory_store:
-                await self._handle_normal_message(message)
-            else:
-                await self._handle_low_value(message)
+        if result.status in {"cancelled", "duplicate"}:
+            # 撤权与外部重投不重放存储、生成或交接。
+            logger.debug(
+                "[KomariMemory] 判定终态不产生聊天效果: status={} reason={}",
+                result.status,
+                result.reason_code,
+            )
             self._log_decision(
                 self._build_decision_payload(
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
-                    outcome=outcome,
-                    reply_action=(
-                        "not_replied"
-                        if outcome.runtime_status is DecisionRuntimeStatus.READY
-                        else "decision_unavailable"
-                    ),
+                    result=result,
+                    reply_action="not_replied",
+                )
+            )
+            return None
+
+        if result.status == "failed":
+            # 技术失败不默认回复；原消息继续既有保存处理，也不逐条刷群提示。
+            await self._handle_normal_message(message)
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    result=result,
+                    reply_action="decision_unavailable",
+                )
+            )
+            # TSK-188：判定技术失败只提交一次既有共享私聊诊断（``group_text=None``
+            # 表示不逐条刷群）。资格与重复事实由判定引擎的持久行拥有；设置/投递
+            # 失败只记录安全诊断，绝不产生群错误、重试或第二条业务路径。
+            try:
+                claimed = await decision_dispatch.claim_handoff(
+                    "failure_notification"
+                )
+            except Exception:
+                claimed = False
+                logger.error("[KomariChat] 判定失败通知资格领取异常")
+            if not claimed:
+                logger.debug(
+                    "[KomariChat] 判定失败通知未获准（重复/撤权/静默终态），保持静默: reason={}",
+                    result.reason_code,
+                )
+                return None
+            notify_superusers = False
+            chat_enabled = False
+            try:
+                memory_config = get_memory_config()
+                notify_superusers = bool(memory_config.error_notify_enabled)
+                chat_enabled = bool(memory_config.plugin_enable)
+            except Exception:
+                # 读取失败只静默私聊诊断（不打印原始异常，避免泄漏运行环境细节）。
+                logger.debug(
+                    "[KomariChat] 失败通知配置读取失败，静默 SUPERUSER 私聊"
+                )
+            if notify_superusers:
+                try:
+                    # 通知前最后复检：聊天功能开关与目标群 BUSINESS 准入。
+                    if chat_enabled and effect_business_admitted(
+                        group_id=int(event.group_id)
+                    ):
+                        notifier = GroupTaskFailureNotifier(
+                            cooldown=RedisFailureNotificationCooldown(
+                                cast("Any", self.redis.redis)
+                            ),
+                        )
+                        await notifier.notify(
+                            bot=bot,
+                            notification=GroupTaskFailureNotification(
+                                group_id=int(event.group_id),
+                                message_id=int(event.message_id),
+                                group_text=None,
+                                task_kind="chat_reply",
+                                stage="decision",
+                                reason_code=result.reason_code,
+                                notify_superusers=notify_superusers,
+                                request_trace_id=result.decision_id,
+                                summary=None,
+                            ),
+                        )
+                    else:
+                        logger.debug(
+                            "[KomariChat] 判定失败通知复检未通过，保持静默"
+                        )
+                except Exception:
+                    logger.error("[KomariChat] 判定失败通知上报异常")
+            return None
+
+        if result.route != "chat":
+            await self._store_or_drop(message, memory_candidate=memory_candidate)
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    result=result,
+                    reply_action="not_replied",
                 )
             )
             return None
 
         if not reply_allowed:
-            if memory_store:
-                await self._handle_normal_message(message)
-            else:
-                await self._handle_low_value(message)
+            # 聊天封禁仍允许分类与合格原文保存，但禁止回复生成与交接。
+            await self._store_or_drop(message, memory_candidate=memory_candidate)
             self._log_decision(
                 self._build_decision_payload(
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
-                    outcome=outcome,
+                    result=result,
                     reply_action="blocked_by_user_ban",
                 )
             )
@@ -641,20 +671,44 @@ class MessageHandler:
             )
             return None
 
-        reason: AttemptReplyReason = (
-            outcome.reply_reason if outcome.reply_reason != "none" else "score"
+        # 回复权限与既有履约重复检查之后、任何读取/表情/生成/预占之前领取
+        # 一次性聊天交接资格：失败或边界异常都绝不生成或发送。
+        try:
+            claimed = await decision_dispatch.claim_handoff("chat")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 交接边界的普通异常同样就地隔离：不补取生成上下文、不生成、不发送，
+            # 也不授权任何失败诊断。
+            logger.error("[KomariChat] 聊天交接边界异常，不生成回复")
+            return None
+        if not claimed:
+            logger.debug(
+                "[KomariChat] 聊天交接未获准（重复或撤权），不生成回复: group={} message={}",
+                group_id,
+                message_id,
+            )
+            return None
+
+        # 引用补取只服务回复生成：交接成功之后才读取生成上下文。外部重投、
+        # 撤权或未获准交接都在此之前返回，绝不发起额外的平台读取。
+        reply_context_result = await self._resolve_reply_context(
+            bot=bot,
+            event=event,
+            platform_summoned=platform_summoned,
         )
+
+        reason = self._attempt_reason(request, result)
         pending_reply, stored, failure = await self._attempt_reply(
             message=message,
             reply_to_message_id=message_id,
             image_urls=image_urls,
             reply_context=reply_context_result.context,
-            reply_context_requested=at_trigger and event.reply is not None,
+            reply_context_requested=platform_summoned and event.reply is not None,
             reply_context_refetched=reply_context_result.refetched,
-            force_reply=outcome.force_reply,
+            force_reply=result.force_reply,
             reason=reason,
-            reply_score=outcome.reply_score,
-            store_current=memory_store,
+            store_current=memory_candidate,
             caller_is_superuser=await SUPERUSER(bot, event),
             on_reply_triggered=on_reply_triggered,
             bot_self_id=str(bot.self_id),
@@ -672,7 +726,7 @@ class MessageHandler:
                     request_trace_id=pending_reply.request_trace_id,
                 )
             reply_action: ReplyAction = (
-                "replied_forced" if outcome.force_reply else "replied"
+                "replied_forced" if result.force_reply else "replied"
             )
             return replace(
                 pending_reply,
@@ -680,12 +734,13 @@ class MessageHandler:
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
-                    outcome=outcome,
+                    result=result,
                     reply_action=reply_action,
+                    reason=reason,
                 ),
             )
 
-        if memory_store and not stored:
+        if memory_candidate and not stored:
             await self._handle_normal_message(message)
 
         self._log_decision(
@@ -693,8 +748,9 @@ class MessageHandler:
                 group_id=group_id,
                 user_id=user_id,
                 message_id=message_id,
-                outcome=outcome,
+                result=result,
                 reply_action="generation_failed",
+                reason=reason,
             )
         )
         if failure is not None:
@@ -705,6 +761,28 @@ class MessageHandler:
                 reason=reason,
             )
         return None
+
+    @staticmethod
+    def _attempt_reason(
+        request: DecisionRequest,
+        result: DecisionResult,
+    ) -> AttemptReplyReason:
+        """从冻结请求与类型化结果推导生成原因（不再依赖模型评分）。"""
+        if request.platform_summoned:
+            return "platform_summon"
+        return "required" if result.force_reply else "optional"
+
+    async def _store_or_drop(
+        self,
+        message: MessageSchema,
+        *,
+        memory_candidate: bool,
+    ) -> None:
+        """按原始保留用途保存合格原文，否则丢弃。"""
+        if memory_candidate:
+            await self._handle_normal_message(message)
+            return
+        await self._handle_low_value(message)
 
     async def _handle_low_value(self, message: MessageSchema) -> None:
         """处理低价值消息（直接丢弃，不存储）。"""
@@ -1372,7 +1450,6 @@ class MessageHandler:
         reply_context_refetched: bool,
         force_reply: bool,
         reason: AttemptReplyReason,
-        reply_score: float | None,
         store_current: bool,
         bot_self_id: str,
         adapter_name: str,
@@ -1477,7 +1554,6 @@ class MessageHandler:
                     "image_urls": image_urls,
                     "reply_context": reply_context,
                     "reason": reason,
-                    "reply_score": reply_score,
                     "force_reply": force_reply,
                 },
             )
@@ -1542,10 +1618,9 @@ class MessageHandler:
             reply = reply_result.content
             if not reply:
                 logger.warning(
-                    "[KomariMemory] 回复生成失败: group={} reason={} score={}",
+                    "[KomariMemory] 回复生成失败: group={} reason={}",
                     message.group_id,
                     reason,
-                    f"{reply_score:.3f}" if reply_score is not None else "-",
                 )
                 return None, stored, ReplyFailureInfo(
                     stage="generate",
@@ -1594,10 +1669,9 @@ class MessageHandler:
                 handoff = None
 
             logger.info(
-                "[KomariMemory] 回复生成完成，等待发送: group={} reason={} score={}",
+                "[KomariMemory] 回复生成完成，等待发送: group={} reason={}",
                 message.group_id,
                 reason,
-                f"{reply_score:.3f}" if reply_score is not None else "-",
             )
             pending_reply = PendingReply(
                 reply=reply,
@@ -1609,7 +1683,6 @@ class MessageHandler:
                 bot_self_id=bot_self_id,
                 adapter_name=adapter_name,
                 reason=reason,
-                reply_score=reply_score,
                 fulfillment_id=self._reply_fulfillment_id(message),
                 request_trace_id=request_trace_id,
                 reply_timestamp=time.time(),

@@ -2,7 +2,7 @@
 
 > 最后同步：2026-08-09。本文以当前后端代码与 OpenAPI Schema 为准，面向管理后台前端开发。
 
-Komari Management 统一把配置、提示词、判定场景、维护公告以及各业务插件的管理 API 挂载到 NoneBot2 的 FastAPI 应用。前端不需要对接独立的管理服务，所有接口共用同一后端 Origin、Bearer 鉴权和 CORS 配置。
+Komari Management 统一把配置、提示词、维护公告以及各业务插件的管理 API 挂载到 NoneBot2 的 FastAPI 应用。前端不需要对接独立的管理服务，所有接口共用同一后端 Origin、Bearer 鉴权和 CORS 配置。
 
 ## 1. 联调入口
 
@@ -63,7 +63,6 @@ Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 
 | --- | --- | --- |
 | 动态配置 | `config:read` | `config:write` |
 | 提示词 | `prompt:read` | `prompt:write` |
-| 判定场景 | `scene:read` | `scene:write` |
 | 维护公告 | `announce:read` | `announce:send` |
 | 知识库 | `knowledge:read` | `knowledge:write` |
 | 帮助库 | `help:read` | `help:write` |
@@ -93,7 +92,6 @@ X-Komari-Change-Reason: update-sentry-pii-setting
 
 - 配置：字段更新、资源重载；
 - 提示词：整份替换、单字段更新；
-- Scene：全量写入、局部更新、同步；
 - 维护公告：发送；
 - 用户封禁：封禁、解封；
 - 回复履约对账：确认送达、确认未送达、承诺续跑。
@@ -333,34 +331,7 @@ If-Match: "7"
 
 收到 `409` 表示 revision 已过期。前端应重新 GET 最新详情，保留用户草稿并提示比较差异，不能静默覆盖。
 
-## 5. Komari Decision Scene 页面
-
-Base path：`/api/v2/komari-decision-scenes`
-
-| 方法 | 路径 | 权限 | 用途 |
-| --- | --- | --- | --- |
-| `GET` | `/scenes` | `scene:read` | 获取 Scene 摘要列表 |
-| `GET` | `/scenes/{scene_key}` | `scene:read` | 获取包含 `content_text` 的详情 |
-| `PUT` | `/scenes/{scene_key}` | `scene:write` | 创建或全量替换 |
-| `PATCH` | `/scenes/{scene_key}` | `scene:write` | 局部更新 |
-| `POST` | `/sync` | `scene:write` | 构建/同步 Scene Set |
-
-`PUT` 请求体：
-
-```json
-{
-  "scene_type": "general",
-  "content_text": "场景模板正文",
-  "enabled": true,
-  "order_index": 10
-}
-```
-
-`PATCH` 可提交 `content_text`、`enabled`、`order_index` 中任意需要修改的字段。
-
-固定 Scene `NOISE`、`MEANINGFUL`、`CALL_DIRECT`、`CALL_MENTION` 不允许改为 `general`，也不允许禁用。保存模板后由操作者触发 `/sync`；同步响应中的 `pending_count` 大于 0 表示 embedding 仍可能在后台生成，不能把 HTTP 成功直接显示成“全部就绪”。
-
-## 6. 维护公告页面
+## 5. 维护公告页面
 
 Base path：`/api/v2/komari-announce`
 
@@ -391,7 +362,7 @@ Base path：`/api/v2/komari-announce`
 - 遇到 `error_code=delivery_unknown` 时展示“需要人工核对”，禁止前端自动换新 request ID 重发；
 - 单次群数量还受动态配置 `announce_max_group_count` 限制。
 
-## 7. 用户封禁页面
+## 6. 用户封禁页面
 
 Base path：`/api/v2/komari-user-bans`
 
@@ -420,7 +391,7 @@ Base path：`/api/v2/komari-user-bans`
 - `notification` 是私信通知尝试结果，通知失败不会回滚封禁操作；
 - `POST` 和 `DELETE` 都必须携带审计请求头。
 
-## 7.5 回复履约对账页面
+## 6.5 回复履约对账页面
 
 Base path：`/api/v2/reply-fulfillments`
 
@@ -443,7 +414,7 @@ Base path：`/api/v2/reply-fulfillments`
 - 三个写接口都必须携带 `X-Komari-Change-Reason` 与显式 `X-Request-ID`（缺失 `400`、格式非法 `422`）；
 - 后端审计日志只记录操作者、request ID、动作、目标哈希与安全结果，前端不得依赖接口响应之外的原始 ID 回显。
 
-## 8. 知识库与帮助库页面
+## 7. 知识库与帮助库页面
 
 ### 8.1 知识库
 
@@ -478,7 +449,7 @@ Base path：`/api/v2/komari-help`
 
 知识库和帮助库的 GET/搜索需要对应读权限，增删改和帮助扫描需要对应写权限。目前这些接口不要求 `X-Komari-Change-Reason`。
 
-## 9. 记忆库页面
+## 8. 记忆库页面
 
 Base path：`/api/v2/komari-memory`
 
@@ -499,7 +470,7 @@ Base path：`/api/v2/komari-memory`
 
 读操作需要 `memory:read`，写操作和失败快照重新入队需要 `memory:write`。当前这些写接口不要求审计请求头。
 
-## 10. Agent Run 日志页面
+## 9. Agent Run 日志页面
 
 Base path：`/api/v2/agent-run-logs`
 
@@ -521,7 +492,7 @@ Base path：`/api/v2/agent-run-logs`
 
 PostgreSQL 只保存可重建的定位元数据；列表预览来自当前页命中的 JSONL。PG 索引不可用时读取器自动降级扫描保留期文件，读取器整体未初始化时返回 `503`。稳定定位键为 `run_id`。
 
-## 10.5 Komari Search 提供者描述
+## 9.5 Komari Search 提供者描述
 
 Base path：`/api/v2/komari-search`
 
@@ -540,19 +511,18 @@ Base path：`/api/v2/komari-search`
 - 本端点只表达 provider 条件字段（通用字段 + 按提供者分组的专用字段），不承载动态配置页面的视觉分区元数据：响应与 OpenAPI 中都没有 `sections` 或 `section_id`，前端不要在这里查找分区信息，也不要给搜索表单套用动态配置页面的 `sections` 归组逻辑；
 - 响应形状保持不变，前端以 `common_fields` 与 `providers[].fields` 作为该表单的唯一字段来源。
 
-## 11. 前端实现优先级与验收清单
+## 10. 前端实现优先级与验收清单
 
 建议按以下顺序接入：
 
 1. 公共 Bearer 客户端、权限错误页、统一错误解析；
 2. 配置资源与字段编辑，正确展示秘密值和生效模式；
 3. Prompt 编辑器，实现 revision 冲突处理和草稿保留；
-4. Scene 编辑与同步状态；
-5. 公告群选择、幂等提交和逐群结果；
-6. 用户封禁；
-7. 知识库、帮助库、记忆库 CRUD；
-8. 搜索提供者动态表单；
-9. Agent Run 日志筛选与完整详情，并为正文区域增加敏感数据提示。
+4. 公告群选择、幂等提交和逐群结果；
+5. 用户封禁；
+6. 知识库、帮助库、记忆库 CRUD；
+7. 搜索提供者动态表单；
+8. Agent Run 日志筛选与完整详情，并为正文区域增加敏感数据提示。
 
 联调验收时至少确认：
 
@@ -569,10 +539,10 @@ Base path：`/api/v2/komari-search`
 - 公告重试不会生成新的 request ID，也不会因 HTTP `200` 忽略单群失败；
 - 前端生产 Origin 已加入 CORS 白名单。
 
-## 12. 后端运行说明
+## 11. 后端运行说明
 
 - 动态配置存储于 PostgreSQL 强类型单行表 `komari_<插件>_config`（14 张，迁移 0002 建表），旧 JSONB KV 表 `komari_plugin_configs` 仅保留存量数据、运行时不读写；
 - Prompt 存储于 3 张强类型单行表（`komari_prompt_komari_chat` / `komari_prompt_memory_summary` / `komari_prompt_group_history_summary`，迁移 0003 建表），旧 YAML 不是运行时来源；
 - 业务插件自己的管理 API 挂载逻辑已经移除，统一由本插件注册；
-- 知识库、帮助库、记忆库、Agent Run 日志或 Scene 依赖未初始化时，对应接口可能返回 `503`；
+- 知识库、帮助库、记忆库或 Agent Run 日志依赖未初始化时，对应接口可能返回 `503`；
 - FastAPI OpenAPI 是字段级类型、格式和长度限制的最终机器可读契约，前端类型应优先从 OpenAPI 生成或定期校对。

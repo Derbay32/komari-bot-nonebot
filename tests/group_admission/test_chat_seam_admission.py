@@ -140,7 +140,13 @@ async def _not_banned(_a: object, _b: object, _c: object) -> bool:
 def _pending() -> SimpleNamespace:
     m = SimpleNamespace(group_id=str(GROUP_ID))
     return SimpleNamespace(message=m, reply="hi", reply_to_message_id="9",
-                           decision_id="d9", decision_payload={}, reason="at")
+                           decision_id="d9", decision_payload={},
+                           reason="platform_summon")
+
+
+def _carrier() -> SimpleNamespace:
+    """本次分发共享载体替身：本用例只验证下游发送准入栅栏。"""
+    return SimpleNamespace(request=SimpleNamespace(platform_summoned=False))
 
 
 async def test_reply_send_restricted_blocks_outbound(
@@ -161,6 +167,8 @@ async def test_reply_send_restricted_blocks_outbound(
     monkeypatch.setattr(mod, "get_config", lambda: SimpleNamespace(),
                         raising=False)
     sent: list[str] = []
+    reached = SimpleNamespace(process=False, fulfill=0, send_callback=0)
+    carrier = _carrier()
 
     class _Sender:
         def __init__(self, bot: object) -> None:
@@ -172,7 +180,10 @@ async def test_reply_send_restricted_blocks_outbound(
     class _Handler:
         async def process_message(self, _bot: object, _event: object,
                                   **kw: object) -> Any:
-            del _bot, _event, kw
+            del _bot, _event
+            # 入口编排确实把本次分发的载体交给了消息处理器。
+            assert kw.get("decision_dispatch") is carrier
+            reached.process = True
             return _pending()
         async def report_reply_failure(self, **kw: object) -> None:
             del kw
@@ -181,8 +192,10 @@ async def test_reply_send_restricted_blocks_outbound(
 
     class _Wf:
         async def fulfill(self, reply: object, **kw: object) -> bool:
+            reached.fulfill += 1
             sr = cast("Any", kw.get("send_reply"))
             if sr is not None:
+                reached.send_callback += 1
                 await sr(reply)
             return True
 
@@ -191,9 +204,15 @@ async def test_reply_send_restricted_blocks_outbound(
     monkeypatch.setattr(mod, "_get_or_build_reply_fulfillment",
                         lambda: _Wf(), raising=False)
     monkeypatch.setattr(mod, "OneBotReplySender", _Sender, raising=False)
+    monkeypatch.setattr(mod, "get_decision_dispatch",
+                        lambda *_a, **_kw: carrier, raising=False)
     bot = SimpleNamespace(self_id="12345", type="OneBot V11")
     event = SimpleNamespace(group_id=GROUP_ID, message_id=9, user_id="7")
-    await mod.handle_group_message(bot, event)
+    await mod.handle_group_message(bot, event, {})
+    # 不空转证明：入口处理与发送回调确实都走到了，才断言发送被受限拦截。
+    assert reached.process is True, "入口未到达消息处理（用例空转）"
+    assert reached.fulfill == 1, "履约未接过一次回复（用例空转）"
+    assert reached.send_callback == 1, "发送回调未被执行（用例空转）"
     assert s.calls != [], "reply_send 前未裁决"
     assert sent == [], "受限下仍执行群回复 send/write"
 

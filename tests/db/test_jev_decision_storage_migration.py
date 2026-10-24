@@ -11,6 +11,11 @@ import asyncpg
 import pytest
 
 from komari_bot.config.typed_config import ensure_typed_config_model
+from tests.db.tsk190_legacy_config_support import (
+    RETAINED_DECISION_CONFIG_FIELDS,
+    STORAGE_COLUMNS,
+    historical_decision_config_row,
+)
 from tests.db.tsk197_gate_support import (
     POSTGRES_URL,
     drop_scratch_database,
@@ -37,6 +42,10 @@ EXECUTION_DEFAULTS = {
     "optional_reply_probability": 0.5,
     "decision_log_retention_days": 7,
 }
+#: TSK-190（0025）之后判定配置表的列集合：3 个存储字段 + 13 个保留字段。
+SURVIVING_CONFIG_COLUMNS = frozenset(
+    (*STORAGE_COLUMNS, *RETAINED_DECISION_CONFIG_FIELDS)
+)
 
 
 @pytest.mark.skipif(not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL")
@@ -65,17 +74,13 @@ async def test_decision_storage_upgrade_downgrade_preserves_existing_configurati
             }
             previous = None
             if existing_row:
-                schema = ensure_typed_config_model("komari_decision")
-                assert schema is not None
-                values = schema(
+                # 0024 时代表结构（含 0025 才退役的 38 列）必须用显式历史
+                # 测试数据写入；生产 Schema 已不再声明这些字段。
+                values = historical_decision_config_row(
                     plugin_enable=False,
                     bot_aliases=["保留显式关闭"],
                     jev_model="jev-1.14.0",
-                ).model_dump(mode="json")
-                values.update(
-                    id=1,
                     revision=23,
-                    updated_at=datetime(2026, 10, 23, tzinfo=UTC).isoformat(),
                 )
                 await connection.execute(
                     "INSERT INTO komari_decision_config "
@@ -90,7 +95,8 @@ async def test_decision_storage_upgrade_downgrade_preserves_existing_configurati
         finally:
             await connection.close()
 
-        upgraded = run_bootstrap(database_url, "upgrade", "head")
+        # TSK-190：中间升级钉在 0024（0025 不可逆，之后不能再 downgrade）
+        upgraded = run_bootstrap(database_url, "upgrade", "0024")
         assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
         connection = await asyncpg.connect(**scratch)
         try:
@@ -142,8 +148,6 @@ async def test_decision_storage_upgrade_downgrade_preserves_existing_configurati
             )
         finally:
             await connection.close()
-        checked = run_bootstrap(database_url, "check")
-        assert checked.returncode == 0, checked.stdout + checked.stderr
 
         downgraded = run_bootstrap(database_url, "downgrade", "0022")
         assert downgraded.returncode == 0, downgraded.stdout + downgraded.stderr
@@ -164,6 +168,40 @@ async def test_decision_storage_upgrade_downgrade_preserves_existing_configurati
             await connection.close()
         upgraded = run_bootstrap(database_url, "upgrade", "head")
         assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+        connection = await asyncpg.connect(**scratch)
+        try:
+            # 0025 之后只剩存储字段与保留字段，退役列在最终 head 上必须消失
+            tail_columns = {
+                row["column_name"]
+                for row in await connection.fetch(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name='komari_decision_config'"
+                )
+            }
+            assert tail_columns == SURVIVING_CONFIG_COLUMNS
+            tail_record = await connection.fetchrow(
+                "SELECT * FROM komari_decision_config WHERE id=1"
+            )
+            if previous is None:
+                assert tail_record is None
+            else:
+                assert tail_record is not None
+                # previous 抓自 0022（尚无执行配置列），只比对两代共有列；执行
+                # 列在 0024 边界已断言为 0023 的默认值，这里确认 0025 未改写。
+                comparable = [
+                    name
+                    for name in sorted(SURVIVING_CONFIG_COLUMNS)
+                    if name in previous
+                ]
+                assert {name: tail_record[name] for name in comparable} == {
+                    name: previous[name] for name in comparable
+                }
+                assert {
+                    name: tail_record[name] for name in EXECUTION_DEFAULTS
+                } == EXECUTION_DEFAULTS
+                assert tail_record["plugin_enable"] is False
+        finally:
+            await connection.close()
         checked = run_bootstrap(database_url, "check")
         assert checked.returncode == 0, checked.stdout + checked.stderr
     finally:

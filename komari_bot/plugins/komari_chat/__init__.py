@@ -8,7 +8,9 @@ from typing import Any, cast
 from nonebot import get_bots, get_driver, logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
+from nonebot.typing import T_State
 
+from komari_bot.decision.dispatch import DecisionDispatchUnavailableError
 from komari_bot.onebot.onebot_rules import group_message_rule
 
 from .handlers.message_handler import (
@@ -79,7 +81,10 @@ from komari_bot.plugins.komari_chat.services.config_interface import (
     get_config,
     get_memory_config,
 )
-from komari_bot.plugins.komari_decision import get_decision_engine
+from komari_bot.plugins.komari_decision import (
+    get_decision_dispatch,
+    get_decision_engine,
+)
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠聊天",
@@ -367,7 +372,11 @@ async def generate_debug_reply(
 
 
 @matcher.handle()
-async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
+async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独立的安全停止
+    bot: Bot,
+    event: GroupMessageEvent,
+    state: T_State,
+) -> None:
     """处理群聊消息。"""
     config = get_memory_config()
     if not config.plugin_enable:
@@ -384,6 +393,14 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return
 
+    # 入口门禁之后才创建本次分发的冻结判定请求；缺失载体或必需 OneBot 事实时
+    # 故障关闭（不生成、不存储、不猜测身份），与无引擎的安全停止同向。
+    try:
+        decision_dispatch = get_decision_dispatch(bot, event, state)
+    except DecisionDispatchUnavailableError:
+        logger.debug("[KomariChat] 当前分发缺少可用判定载体，跳过消息处理")
+        return
+
     try:
         reply_allowed = not await user_ban_plugin.is_event_banned(bot, event, "chat")
     except user_ban_plugin.BanServiceUnavailableError as error:
@@ -396,6 +413,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             bot,
             event,
             on_reply_triggered=lambda: _send_face_reaction(bot, event),
+            decision_dispatch=decision_dispatch,
             reply_allowed=reply_allowed,
         )
         if pending_reply is None:

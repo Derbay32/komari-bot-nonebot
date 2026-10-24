@@ -1,10 +1,10 @@
-"""常驻判定运行时（TSK-182 standby）：自有资源、被动健康、刷新与日志清理。
+"""常驻判定运行时（TSK-182）：自有资源、被动健康、刷新与日志清理。
 
 本模块是判定插件唯一的**进程内运行时单例**：它自己持有可重试的判定前置条件
 （顶层 config_manager 的版本化配置管理器、共享 ORM 会话工厂、自有 Redis 客户端、
 一个 Prompt 加载器、一个 ``DecisionLogRepository``），并按需构建**真实**的
-``JevDecisionEngine``。它不接收真实流量：聊天/总结调用方直到 TSK-183 仍走既有
-``get_decision_engine``；本模块也不导出第二个公共引擎 getter。
+``JevDecisionEngine``。聊天/总结调用方经插件顶层 ``get_decision_engine`` 消费
+本运行时持有的引擎；本模块不导出第二个公共引擎 getter。
 
 边界（与 182 运行时装配契约一致）：
 
@@ -160,7 +160,7 @@ class DecisionRuntime:
 
     @property
     def engine(self) -> JevDecisionEngine | None:
-        """内部持有的真实引擎（供 TSK-183 交接使用，不是公共 getter）。"""
+        """内部持有的真实引擎（供插件顶层 getter 使用，不是公共 getter）。"""
         return None if self._closed else self._engine
 
     def get_health(self) -> DecisionHealthSnapshot:
@@ -613,7 +613,7 @@ async def _await_owned(task: asyncio.Task[Any]) -> None:
 
 
 _runtime = DecisionRuntime()
-"""进程内判定运行时单例（standby；TSK-183 消费其内部引擎）。"""
+"""进程内判定运行时单例（插件顶层 getter 消费其内部引擎）。"""
 
 
 def get_decision_runtime() -> DecisionRuntime:

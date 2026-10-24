@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-from komari_bot.config.typed_config import ensure_typed_config_model
+from tests.db.tsk190_legacy_config_support import (
+    historical_decision_config_row,
+)
 from tests.db.tsk197_gate_support import (
     POSTGRES_URL,
     drop_scratch_database,
@@ -58,17 +59,14 @@ async def test_upgrade_and_downgrade_preserve_existing_config(
             }
             before = None
             if existing_row:
-                schema = ensure_typed_config_model("komari_decision")
-                assert schema is not None
-                values = schema(
-                    plugin_enable=True, bot_aliases=["Jev 迁移测试"], scene_top_k=7
-                ).model_dump(mode="json")
-                values.update(
-                    id=1,
+                # 0022 时代表结构仍含 0025 才退役的字段（如 scene_top_k），
+                # 存量行必须用显式历史测试数据写入。
+                values = historical_decision_config_row(
+                    plugin_enable=True,
+                    bot_aliases=["Jev 迁移测试"],
+                    scene_top_k=7,
                     revision=17,
-                    updated_at=datetime(2026, 10, 23, tzinfo=UTC).isoformat(),
                 )
-                # 历史表自行选择已有列，避免在用例内复制旧配置的完整结构。
                 await connection.execute(
                     "INSERT INTO komari_decision_config "
                     "SELECT * FROM json_populate_record("

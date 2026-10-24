@@ -193,11 +193,23 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 ### 1.1 Prompt 配置 (`komari_prompt_*`)
 
-- **存储源**：`komari_chat`、`komari_memory_summary`、`group_history_summary` 三组字符串 prompt 各对应一张强类型单行表（`komari_prompt_komari_chat` / `komari_prompt_memory_summary` / `komari_prompt_group_history_summary`，迁移 0003 建表），运行时经 `config/prompt_storage.py` 读取；表结构真源是各插件 `prompt_schema.py` 的 `TypedPromptModel` 元数据
-- **默认值回退**：PG 无记录或读取失败时使用代码内 defaults；读取失败优先回退当前进程缓存，避免聊天主流程中断
-- **跨进程刷新**：无 LISTEN/NOTIFY；`PromptTemplateLoader` 缓存自带 1 秒陈限上限，本进程写入经 `register_invalidator` 回调立即失效本地缓存，传播延迟 ≤1 秒级
-- **管理 API**：`komari_management` Prompt API 的 GET / PUT / PATCH 均读写强类型表（`If-Match` revision 强 ETag），响应中 `config_source` 形如 `postgresql:komari_prompt_komari_chat:komari_chat`，`file_path` 仅保留为 `null` 兼容字段
-- **旧表与旧 YAML**：`komari_prompt_configs` JSONB 表与 `config/prompts/*.yaml` 均不再作为运行时来源；如需保留旧值，显式执行 `scripts/migrate_prompt_config_to_pg.py` 导入旧 JSONB 表（旧表数据由 `migrate_legacy_config_to_typed_tables.py` 统一搬运）。`komari_decision` 的 `komari_memory_scenes.yaml` 已迁移到 PostgreSQL `komari_decision_scenes` 表，运行时默认使用 `PostgresSceneTemplateLoader`；YAML loader 仅供迁移脚本和测试使用。
+运行时从 PostgreSQL 强类型单行表读取 Prompt。
+各插件 `prompt_schema.py` 是字段结构的真源。
+聊天、记忆总结、群总结的必需 Prompt 缺失会阻止冷启动。
+判定 Prompt 使用独立的可选初始化步骤。
+判定 Prompt 不可用时，新判定报告 `failed`。
+已加载的 Prompt 在暂时读取失败时保留进程内有效快照。
+运行时不使用初始数据文件或 Python 长文本默认值回退。
+
+`seed_bootstrap` 只插入缺失行或补齐空字段。
+初始化器保留非空管理员文案。
+`initial_data/scenes.yaml` 保留历史文件名，但只承载 3 组必需 Prompt。
+`initial_data/decision_prompt.yaml` 承载独立的判定 Prompt。
+场景播种与场景冷启动校验已退役。
+修改初始化行为前，读取 ADR-0011。
+
+Prompt 管理写入使用强 `If-Match` 修订校验。
+提示词缓存沿用既有失效与跨进程刷新机制。
 
 ### 1.2 Komari Management v2
 
@@ -347,20 +359,44 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 ### 5. 判定引擎 (`komari_decision`)
 
-核心服务：
-- `SceneRuntimeService` — 场景生命周期管理
-- `SceneAdminService` — 场景运维（CRUD）
-- `SocialTimingService` — 社交时机判定（主动回复冷却、频控）
-- `MessageFilter` — 消息过滤
+依据：TSK-180、ADR-0007、ADR-0011。
 
-聊天候选重排与群总结场景归类收敛到深场景归类 module（`services/scene_classification.py`）内部：聊天专用 operation `rank_chat_message` 及其候选/结果/异常类型不对外导出，不加入插件顶层、services `__all__` 与共享包 `komari_bot.decision`（KOMARIBOT-27 已物理删除旧宽重排服务与跨插件宽契约）。
+- `get_decision_engine()` 是唯一公共引擎 getter。
+- `get_decision_dispatch()` 提供同次入站分发的共享载体。
+- 同次分发只执行一次 `evaluate(DecisionRequest)`。
+- 总结与聊天消费同一份冻结结果。
+- 外部效果前必须成功领取 `claim_handoff` 资格。
+- 总结命中后只交接总结。
+- 总结未命中后，聊天复用结果，不重调模型或抽签。
+- 平台重投不能重复领取交接资格。
+- `observe_delivered_reply()` 只接收已送达回复事实。
 
-存储：场景四表（`komari_decision_scenes` / `komari_memory_scene_set` / `komari_memory_scene_item` / `komari_memory_scene_runtime`）为 SQLModel ORM 模型（`orm_models.py`），经 nonebot-plugin-orm `get_session` 访问，DDL 由 Alembic 基线 0001 管理；embedding 生成经 `embedding_provider` 远程接口。
+Jev 请求按需合并回应资格、保留用途与总结识别问题。
+总结候选的 Noul 结果只有在 `p > 0.7` 时命中。
+带数量的总结也必须经过判定。
+数量提取和范围校验仍由总结执行服务负责。
+真实平台 @ 或引用机器人消息支持确定性召唤。
+文本别名只提供输入事实与长度例外，不构成确定性召唤。
 
-运行时契约：
-- 运行时状态模型 `DecisionRuntimeState`（共享包 `komari_bot.decision`，经顶层 `get_decision_engine()` 发放的引擎内部消费）明确返回 `ready` / `disabled` / `failed`，禁止再用 `None` 混合表达状态。
-- `disabled` 或 `failed` 时，显式 @、文本 @ 别名和回复机器人仍由 `komari_chat` 直通；普通非 @ 消息仅保留必要缓冲，不执行 embedding/rerank，也不主动回复。
-- `plugin_enable=true` 但初始化异常或 scene snapshot 缺失必须报告 `failed`；只有 snapshot 可用时才记录 `ready`。
+`plugin_enable` 在新配置中默认为 `true`。
+迁移保留已有的显式关闭值。
+运行状态区分 `ready`、`disabled`、`failed`。
+启用但缺少有效连接或 Prompt 时报告 `failed`。
+停用撤销尚未交接结果的生效资格。
+重启不恢复旧队列。
+
+技术失败通知直接使用 `GroupTaskFailureNotifier.notify`。
+通知前先领取持久化的 `failure_notification` 资格。
+总结候选判定失败会停止总结与聊天两条路径。
+总结失败沿用固定群提示，不依赖生成中表情。
+普通判定失败不逐条发送群错误提示。
+通知继续遵守共享开关、冷却及逐效果准入。
+
+旧场景运行代码、管理路由与后台任务已物理删除。
+迁移 `0025` 删除旧场景四表与 38 个专用配置字段。
+禁止恢复旧签名适配、双跑或故障回退。
+公共向量生成与重排继续服务记忆召回。
+判定存储与迁移细节见插件 `orm_models.py` 和迁移 `0022` 至 `0025`。
 
 ### 6. 聊天处理器拆解 (`komari_chat`)
 
@@ -401,8 +437,8 @@ ok, reason = await check_runtime_permission(bot, event, config)
 `execution_service.py` 提供共享执行服务 `execute_group_summary()`：
 - 输入 bot、group ID、bot self ID、自然语言总结要求、动态配置、可选 collector
 - 复用 `_running_groups` 集合（非 TOCTOU）+ 共享 `_group_locks` 双重保障
-- 正常 handler 必须按“动态开关 → 运行时权限 → 平台能力 → 场景识别”顺序检查；matcher 默认 `block=False`，只有确认接管总结请求后才对当前实例调用 `stop_propagation()`
-- debug 入口直接调用共享服务，跳过场景识别与业务权限，但仍执行能力检查与群锁
+- 正常 handler 必须按“动态开关 → 群聊准入 → 运行时权限 → 平台能力 → Noul 判定”顺序检查；matcher 默认 `block=False`，只有确认接管总结请求后才对当前实例调用 `stop_propagation()`
+- debug 入口直接调用共享服务，跳过 Noul 判定与业务权限，但仍执行能力检查与群锁
 - 返回结构化 `SummaryExecutionResult`：正文、筛选数、规划结果、图片 base64、过滤标签、时间范围
 
 规划与总结阶段采集诊断：
@@ -475,8 +511,8 @@ Alembic 迁移工作流（Schema 变更唯一入口）：
 poetry run python -m komari_bot.db.orm_bootstrap upgrade head
 poetry run python -m komari_bot.db.orm_bootstrap check
 
-# 生成新 revision（改完 SQLModel 后必须 autogenerate 并审阅生成的迁移）
-poetry run python -m komari_bot.db.orm_bootstrap revision --autogenerate -m "描述"
+# 生成新 revision（当前命令默认 autogenerate；审阅生成的迁移）
+poetry run python -m komari_bot.db.orm_bootstrap revision -m "描述"
 ```
 
 规则：

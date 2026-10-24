@@ -6,12 +6,13 @@
 检查」，而不是把升级、播种、校验拆散到互不相关的测试里。
 
 覆盖（对应验收标准）：
-- AC1：从基线重建的全新数据库可依次完成 Alembic 升级（head = 0024）、
-  初始数据播种与冷启动完整性验证（三个 Prompt 资源单行 + 判定场景）；
+- AC1：从基线重建的全新数据库可依次完成 Alembic 升级（head = 0025）、
+  初始数据播种与冷启动完整性验证（三个 Prompt 资源单行 + 可选判定
+  Prompt 单行）；
 - AC3：迁移链单一 head 且 ``orm_bootstrap check`` 零漂移（升级后与
   播种后各一次）；
-- AC4：三个 Prompt 资源与判定场景在新库中完整初始化；重复播种不产生
-  无意义 revision 变化。
+- AC4：三个 Prompt 资源与可选判定 Prompt 在新库中完整初始化；重复播种
+  不产生无意义 revision 变化；4 张退役场景表在播种前后都不存在。
 
 隔离纪律：用例在从门控 DSN 派生的一次性隔离库（库名后缀
 ``_tsk197fresh``）内执行，用例结束即 DROP；共享门控库始终保持 head。
@@ -46,9 +47,29 @@ from tests.db.tsk197_gate_support import (
     same_database,
     scratch_url,
 )
-from tests.komari_decision.required_fixed_scene_keys import REQUIRED_FIXED_SCENE_KEYS
 
 pytestmark = [SKIP_NO_POSTGRES, pytest.mark.asyncio]
+
+#: 已退役的 4 张场景表（test-owned 字面量，来自 TSK-190 manifest）。
+RETIRED_SCENE_TABLES: tuple[str, ...] = (
+    "komari_memory_scene_item",
+    "komari_memory_scene_runtime",
+    "komari_decision_scenes",
+    "komari_memory_scene_set",
+)
+
+
+async def _public_tables(connection: asyncpg.Connection) -> set[str]:
+    rows = await connection.fetch(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+    )
+    return {str(row["tablename"]) for row in rows}
+
+
+async def _assert_retired_tables_absent(connection: asyncpg.Connection) -> None:
+    present = await _public_tables(connection)
+    retired = set(RETIRED_SCENE_TABLES) & present
+    assert not retired, f"播种不得重建已退役的场景表: {sorted(retired)}"
 
 
 async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> None:
@@ -68,7 +89,7 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
                 == HEAD_REVISION
-            ), "全新库升级后必须停留在单一 head 0024"
+            ), "全新库升级后必须停留在单一 head"
         finally:
             await connection.close()
 
@@ -78,7 +99,7 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
             f"{check_result.stdout}\n{check_result.stderr}"
         )
 
-        # 3. 初始数据播种（三个 Prompt 资源 + 判定场景）
+        # 3. 初始数据播种（三个必需 Prompt 资源 + 可选判定 Prompt）
         result = run_seed(db_url)
         output = f"{result.stdout}\n{result.stderr}"
         assert result.returncode == 0, output
@@ -88,22 +109,8 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
 
         connection = await asyncpg.connect(**scratch)
         try:
-            # 4. 冷启动完整性：必需 fixed 场景 + 至少一个启用的一般场景
-            fixed_rows = await connection.fetch(
-                "SELECT scene_key, scene_type, enabled, content_text"
-                " FROM komari_decision_scenes WHERE scene_type = 'fixed'"
-            )
-            fixed_by_key = {row["scene_key"]: row for row in fixed_rows}
-            assert set(fixed_by_key) == set(REQUIRED_FIXED_SCENE_KEYS), (
-                f"播种后必需固定场景不齐: {sorted(fixed_by_key)}"
-            )
-            assert all(row["enabled"] for row in fixed_rows)
-            assert all(str(row["content_text"]).strip() for row in fixed_rows)
-            general_count = await connection.fetchval(
-                "SELECT count(*) FROM komari_decision_scenes"
-                " WHERE scene_type = 'general' AND enabled = true"
-            )
-            assert general_count >= 1, "播种后缺少启用的一般场景"
+            # 4. 场景初始化已退役：4 张退役场景表不得存在
+            await _assert_retired_tables_absent(connection)
 
             # 5. 冷启动完整性：三个 Prompt 资源单行完整且等于 seed 资产值
             before_rows: dict[str, dict[str, Any] | None] = {}
@@ -155,15 +162,7 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
                 )
                 == decision_before
             )
-            scene_count = await connection.fetchval(
-                "SELECT count(*) FROM komari_decision_scenes"
-            )
-            fixed_count = await connection.fetchval(
-                "SELECT count(*) FROM komari_decision_scenes WHERE scene_type = 'fixed'"
-            )
-            assert scene_count == fixed_count + general_count, (
-                "重复播种不得重复插入场景"
-            )
+            await _assert_retired_tables_absent(connection)
         finally:
             await connection.close()
 

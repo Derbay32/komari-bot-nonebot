@@ -372,7 +372,6 @@ def _pending_reply(
         bot_self_id="bot-1",
         adapter_name="OneBot V11",
         reason="score",
-        reply_score=0.9,
         fulfillment_id=operation_id,
         request_trace_id="chat-message-1",
         reply_timestamp=2.0,

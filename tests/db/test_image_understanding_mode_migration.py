@@ -302,8 +302,9 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
     完整链路：
     upgrade 0014 → 写入 memory（自定义图片列，vision_tool_enabled=true）
     与 chat 存量行
-    → upgrade head（分支一：true → delegated、8 项预算原样复制）→
-    downgrade 0014（回滚：delegated → true、预算原样回填、chat 删除新列）
+    → upgrade 0024（分支一：true → delegated、8 项预算原样复制；钉在
+    不可逆的 0025 之前）→ downgrade 0014（回滚：delegated → true、预算
+    原样回填、chat 删除新列）
     → memory 旧开关切 false → 再次 upgrade head（分支二：false → native、
     预算与 revision 原样、memory 旧 9 列再次删除）→ 最后 check 零漂移。
     """
@@ -326,13 +327,14 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         finally:
             await conn.close()
 
-        # upgrade head：图片列迁入 chat、memory 旧列删除
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        # upgrade 0024：图片列迁入 chat、memory 旧列删除；不可逆的 0025
+        # 留在 downgrade 之后，否则下面的 downgrade 0014 会撞上不可逆边界。
+        result = _run_bootstrap(scratch_url, "upgrade", "0024")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
         try:
             chat_columns = await _chat_image_columns(conn)
-            assert set(CHAT_IMAGE_COLUMNS) <= chat_columns, "head 的 chat 必须含图片列"
+            assert set(CHAT_IMAGE_COLUMNS) <= chat_columns, "0024 的 chat 必须含图片列"
 
             memory_columns = await _memory_columns(conn)
             assert not set(MEMORY_LEGACY_IMAGE_COLUMNS) & memory_columns, (

@@ -402,8 +402,7 @@ def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) ->
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
         )
     )
@@ -571,8 +570,7 @@ def test_normal_entry_freezes_budget_snapshot_across_rounds(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
         )
     )
@@ -1186,8 +1184,7 @@ def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
                 reply_context_requested=False,
                 reply_context_refetched=False,
                 force_reply=True,
-                reason="at",
-                reply_score=1.0,
+                reason="platform_summon",
                 store_current=True,
             )
         )
@@ -1332,8 +1329,7 @@ def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
         )
     )

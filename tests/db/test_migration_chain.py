@@ -830,6 +830,102 @@ def test_image_understanding_config_revision_exists() -> None:
     assert "IMPORT KOMARI_BOT" not in normalized
 
 
+def test_scene_storage_retirement_revision_exists() -> None:
+    """TSK-190：0025 退役四张场景表与 38 个判定配置字段。
+
+    删除集合是显式测试数据（冻结清单，来自
+    ``tests.db.tsk190_legacy_config_support``），不来自被测迁移源文本。
+    本用例只守结构面：revision/parent、38 列逐列删除、四表按引用顺序手写
+    删除、无级联/无 IF EXISTS/无归档与重建、迁移自包含；真实语义由
+    ``test_scene_storage_retirement.py`` 的隔离库用例验证。
+    """
+    from tests.db.tsk190_legacy_config_support import (
+        RETIRED_DECISION_CONFIG_FIELDS,
+    )
+
+    script = _load_script_directory()
+    revisions = list(script.walk_revisions())
+    children = [rev for rev in revisions if rev.down_revision == "0024"]
+    assert len(children) == 1, f"0024 的直接后继 revision 必须唯一: {children}"
+    assert children[0].revision == "0025"
+
+    revision_sql = Path(children[0].path).read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", revision_sql).upper()
+
+    def _drops_decision_column(column: str) -> bool:
+        """识别 autogenerate 的 batch_op 形式与通用的 op/SQL 形式。"""
+        batch_form = re.search(
+            rf"batch_op\.drop_column\(\s*(['\"]){re.escape(column)}\1",
+            revision_sql,
+        )
+        return bool(batch_form) or _has_explicit_drop_column(revision_sql, column)
+
+    # 38 个退役字段逐列显式删除（接受 Alembic batch_op/op 或自包含 SQL 表达）
+    dropped_fields = {
+        column
+        for column in RETIRED_DECISION_CONFIG_FIELDS
+        if _drops_decision_column(column)
+    }
+    assert dropped_fields == set(RETIRED_DECISION_CONFIG_FIELDS)
+    assert len(RETIRED_DECISION_CONFIG_FIELDS) == 38
+
+    # 四张表按引用顺序手写删除：条目 → 运行时 → 场景 → 构建集
+    retired_tables = (
+        "komari_memory_scene_item",
+        "komari_memory_scene_runtime",
+        "komari_decision_scenes",
+        "komari_memory_scene_set",
+    )
+    positions = []
+    for table in retired_tables:
+        match = re.search(
+            rf"op\.drop_table\(\s*(['\"]){re.escape(table)}\1", revision_sql
+        )
+        assert match is not None, f"0025 必须显式删除 {table}"
+        positions.append(match.start())
+    assert positions == sorted(positions), "删表顺序必须是引用方向（条目在前）"
+
+    # 禁止用级联/条件存在判断掩盖迁移基线，也禁止归档、备份与表重建
+    for forbidden in (
+        "CASCADE",
+        "IF EXISTS",
+        "CREATE TABLE",
+        "INSERT INTO",
+        "DROP SCHEMA",
+    ):
+        assert forbidden not in normalized, f"0025 不得包含 {forbidden}"
+
+    # 迁移自包含：不导入任何应用/运行时模块
+    assert "from komari_bot" not in revision_sql
+    assert "import komari_bot" not in revision_sql
+
+
+def test_scene_storage_retirement_downgrade_is_irreversible() -> None:
+    """TSK-190：0025 的 downgrade 真实执行必须抛固定不可逆标记。
+
+    直接加载迁移模块并调用 ``downgrade()``（真实执行，非文本扫描）：必须
+    抛出带 ``0025_SCENE_RETIREMENT_IS_IRREVERSIBLE`` 标记的
+    ``RuntimeError``；被删除的字段值与四表数据按 TSK-190 契约永久丢弃，
+    不提供归档、恢复或旧运行时重建。
+    """
+    import importlib.util
+
+    migration_path = next(
+        rev
+        for rev in sorted((MIGRATIONS_DIR / "versions").glob("*.py"))
+        if "0025_scene_storage_retirement" in rev.name
+    )
+    spec = importlib.util.spec_from_file_location("mig_0025_guard", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.revision == "0025"
+    assert module.down_revision == "0024"
+    with pytest.raises(RuntimeError, match="0025_SCENE_RETIREMENT_IS_IRREVERSIBLE"):
+        module.downgrade()
+
+
 
 
 

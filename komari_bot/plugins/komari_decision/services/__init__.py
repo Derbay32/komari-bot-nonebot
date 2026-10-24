@@ -1,8 +1,3 @@
-"""Scene 服务层。"""
+"""判定插件服务层：实现模块按需直接 import，不提供聚合重导出。"""
 
-from .scene_admin_service import SceneAdminService, ScenePruneResult
-
-__all__ = [
-    "SceneAdminService",
-    "ScenePruneResult",
-]
+__all__ = []

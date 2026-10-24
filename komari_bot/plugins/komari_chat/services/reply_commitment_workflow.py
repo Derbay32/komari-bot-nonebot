@@ -225,6 +225,7 @@ class ReplyCommitmentWorkflow:
             if await self._finish_claimed(
                 str(record["fulfillment_id"]),
                 config,
+                claimed=record,
             ):
                 completed += 1
         return completed
@@ -243,7 +244,7 @@ class ReplyCommitmentWorkflow:
         )
         if record is None:
             return False
-        return await self._finish_claimed(fulfillment_id, config)
+        return await self._finish_claimed(fulfillment_id, config, claimed=record)
 
     async def cleanup_terminal_fulfillments(self) -> int:
         """清理超过保护期的已解决终态，返回删除的父 tombstone 数。
@@ -310,7 +311,13 @@ class ReplyCommitmentWorkflow:
             owner_token=self._owner_token,
         )
 
-    async def _finish_claimed(self, fulfillment_id: str, config: Any) -> bool:
+    async def _finish_claimed(
+        self,
+        fulfillment_id: str,
+        config: Any,
+        *,
+        claimed: dict[str, Any] | None = None,
+    ) -> bool:
         """在一轮父租约内兑现一个履约，返回是否完成父记录。
 
         领取时的配置快照用于本轮的领取/心跳租约；失败策略由
@@ -333,6 +340,7 @@ class ReplyCommitmentWorkflow:
                 completed = await self._process_claimed(
                     fulfillment_id,
                     lease_lost,
+                    claimed,
                 )
             except asyncio.CancelledError:
                 raise
@@ -363,6 +371,7 @@ class ReplyCommitmentWorkflow:
         self,
         fulfillment_id: str,
         lease_lost: asyncio.Event,
+        claimed: dict[str, Any] | None,
     ) -> bool:
         """按固定顺序处理当前到期子项，并在全部完成后门控父完成。"""
         rows = await self.repository.load_claimed_commitments(
@@ -387,6 +396,7 @@ class ReplyCommitmentWorkflow:
                 fulfillment_id,
                 row,
                 lease_lost,
+                claimed,
             ):
                 return False
         if lease_lost.is_set():
@@ -428,6 +438,7 @@ class ReplyCommitmentWorkflow:
         fulfillment_id: str,
         row: dict[str, Any],
         lease_lost: asyncio.Event,
+        claimed: dict[str, Any] | None,
     ) -> bool:
         """兑现单个当前到期承诺；返回 False 表示租约已丢失需中止。
 
@@ -459,6 +470,7 @@ class ReplyCommitmentWorkflow:
                 fulfillment_id,
                 commitment_type,
                 payload,
+                claimed,
             )
         except asyncio.CancelledError:
             raise
@@ -576,6 +588,7 @@ class ReplyCommitmentWorkflow:
         fulfillment_id: str,
         commitment_type: str,
         payload: Any,
+        claimed: dict[str, Any] | None,
     ) -> None:
         """串行调用对应下游承诺能力；外部副作用依赖既有幂等 ID 恢复。
 
@@ -613,6 +626,9 @@ class ReplyCommitmentWorkflow:
                 operation_id=fulfillment_id,
                 dedupe_ttl_seconds=None,
             )
+            # TSK-187：既有记忆历史写入**成功**之后，才把已确认送达回复
+            # 尽力吸收进判定自有近期上下文；它不是新的持久业务承诺。
+            await self._observe_confirmed_delivery(payload, claimed)
             return
         if commitment_type == "interaction_history":
             interaction_record: dict[str, object] = {
@@ -632,6 +648,42 @@ class ReplyCommitmentWorkflow:
             return
         msg = f"不支持的承诺类型: {commitment_type!r}"
         raise TypeError(msg)
+
+    async def _observe_confirmed_delivery(
+        self,
+        payload: Any,
+        claimed: dict[str, Any] | None,
+    ) -> None:
+        """把一条已确认送达的角色回复吸收进判定自有上下文（尽力而为）。
+
+        只使用父领取行已带回的 ``bot_self_id`` / ``adapter_name`` /
+        ``platform_message_id`` / ``delivered_at`` 与冻结历史载荷的正文/昵称，
+        不新增查询、不改持久载荷、不用合成消息标识；证据缺失或观测失败都不
+        改变已完成的记忆历史承诺，也不安排独立重试。``CancelledError`` 原样
+        传播。
+        """
+        if claimed is None:
+            return
+        try:
+            from komari_bot.plugins.komari_decision import observe_delivered_reply
+
+            await observe_delivered_reply(
+                group_id=claimed.get("group_id"),
+                bot_self_id=claimed.get("bot_self_id"),
+                adapter_name=claimed.get("adapter_name"),
+                platform_message_id=claimed.get("platform_message_id"),
+                delivered_at=claimed.get("delivered_at"),
+                reply_content=payload.reply_content,
+                bot_nickname=payload.bot_nickname,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 只记录异常类型，不回显正文、载荷或原始异常。
+            logger.debug(
+                "[KomariChat] 已确认回复的判定观测失败: error={}",
+                type(exc).__name__,
+            )
 
     async def _heartbeat(
         self,

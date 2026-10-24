@@ -1,50 +1,79 @@
-"""TSK-189 ``seed_bootstrap`` 模块级单元测试（无数据库）。
+"""TSK-189/TSK-190 ``seed_bootstrap`` 模块级单元测试（无数据库）。
 
 已接受的公开契约测试（``test_seed_data_contract.py``）以子进程方式覆盖 CLI
 外部行为；本文件直接锁定契约未完全覆盖的生产语义：
 
-- 文件校验细节：version 缺失、根节点非对象、空内容、缺失键 / 重复键点名；
-- 播种后数据库最终状态校验（冷启动充分性）：缺必需固定场景、必需场景不可用、
-  无启用一般场景时明确失败。
+- 文件校验细节：version 缺失、根节点非对象、YAML 解析失败；
+- 版本化 manifest 只要求三个 Prompt 资源块：完全不含场景块的 manifest
+  必须校验通过（TSK-190 退役场景初始化）；
+- 旧场景键是**无关顶层键**：校验层不因此新增拒绝规则，读取时直接忽略；
+- 载荷与报告只统计 Prompt：不再携带场景条目或场景计数；
+- 默认版本化资产只携带三个 Prompt 资源块，不再携带 ``fixed_candidates`` /
+  ``general_scenes``。
 
-测试数据只使用测试自有的字面量，不从生产私有常量导入 required-fixed 键
-（与 ``tests/komari_decision/required_fixed_scene_keys.py`` oracle 保持一致）。
+测试数据只使用测试自有的 marker，Prompt 字段名一律从
+``tests/config/prompt_field_contract.py`` oracle 派生，不复制生产默认正文。
 """
 
 from __future__ import annotations
 
+import json
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
 from komari_bot.db.seed_bootstrap import (
+    DEFAULT_SEED_FILE,
+    SeedPayload,
+    SeedReport,
     SeedValidationError,
-    SeedVerificationError,
     load_seed_file,
-    verify_cold_start_state,
+)
+from tests.config.prompt_field_contract import (
+    PROMPT_RESOURCE_IDS,
+    prompt_marker_values,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-REQUIRED_FIXED_SCENE_KEYS = ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION")
+#: 三个 Prompt 资源块在 manifest 中的节名（只影响可读性，不参与定位）。
+_SECTION_BY_RESOURCE: dict[str, str] = {
+    "komari_chat": "chat_prompt",
+    "komari_memory_summary": "memory_summary_prompt",
+    "group_history_summary": "group_history_summary_prompt",
+}
+
+#: 已退役的场景键：只作为“无关顶层键”输入，校验层必须忽略而不拒绝。
+_RETIRED_SCENE_BLOCKS: tuple[str, ...] = (
+    "fixed_candidates:",
+    '  NOISE: "退役场景内容"',
+    "general_scenes:",
+    '  - id: "scene_retired"',
+    '    text: "退役场景内容"',
+)
 
 
-def _seed_text(
+def _prompt_seed_text(
     *,
-    version: str = "1",
-    fixed_keys: tuple[str, ...] = REQUIRED_FIXED_SCENE_KEYS,
-    general_scenes: list[dict[str, str]] | None = None,
+    version: str | None = "1",
+    retired_scene_blocks: bool = False,
 ) -> str:
-    if general_scenes is None:
-        general_scenes = [{"id": "scene_test_general", "text": "测试一般场景内容"}]
-    lines = [f'version: "{version}"', "fixed_candidates:"]
-    lines.extend(f'  {key}: "固定内容 {key}"' for key in fixed_keys)
-    lines.append("general_scenes:")
-    for scene in general_scenes:
-        lines.append(f'  - id: "{scene["id"]}"')
-        lines.append(f'    text: "{scene["text"]}"')
+    """构造测试自有的只带 Prompt 的 manifest 文本。"""
+    lines: list[str] = []
+    if version is not None:
+        lines.append(f'version: "{version}"')
+    if retired_scene_blocks:
+        lines.extend(_RETIRED_SCENE_BLOCKS)
+    for resource_id in PROMPT_RESOURCE_IDS:
+        lines.append(f"{_SECTION_BY_RESOURCE[resource_id]}:")
+        values = prompt_marker_values(resource_id)
+        lines.extend(
+            f"  {field}: {json.dumps(values[field], ensure_ascii=False)}"
+            for field in sorted(values)
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -54,29 +83,48 @@ def _write(tmp_path: Path, name: str, body: str) -> Path:
     return path
 
 
-def test_load_seed_file_accepts_well_formed_seed(tmp_path: Path) -> None:
-    path = _write(tmp_path, "ok.yaml", _seed_text())
+def test_load_seed_file_accepts_prompt_only_seed(tmp_path: Path) -> None:
+    """场景块退役后，只带三个 Prompt 块的 manifest 是完整合法载荷。"""
+    path = _write(tmp_path, "prompt-only.yaml", _prompt_seed_text())
+
     payload = load_seed_file(path)
 
     assert payload.version == "1"
-    assert set(payload.fixed_candidates) == set(REQUIRED_FIXED_SCENE_KEYS)
-    assert payload.general_scenes == [
-        {"id": "scene_test_general", "text": "测试一般场景内容"}
-    ]
-    assert [item.scene_key for item in payload.items[:4]] == list(
-        REQUIRED_FIXED_SCENE_KEYS
+    assert set(payload.prompts) == set(PROMPT_RESOURCE_IDS)
+    for resource_id in PROMPT_RESOURCE_IDS:
+        assert payload.prompts[resource_id] == prompt_marker_values(resource_id)
+
+
+def test_seed_payload_and_report_carry_prompt_data_only() -> None:
+    """载荷只剩 version 与 prompts；报告只剩 Prompt 新建行与补齐字段数。"""
+    assert {field.name for field in fields(SeedPayload)} == {"version", "prompts"}
+    assert {field.name for field in fields(SeedReport)} == {
+        "prompt_rows_inserted",
+        "prompt_fields_filled",
+    }
+
+
+def test_load_seed_file_ignores_retired_scene_blocks(tmp_path: Path) -> None:
+    """旧场景键是无关顶层键：不新增拒绝规则，读取结果与只带 Prompt 时一致。"""
+    path = _write(
+        tmp_path,
+        "legacy-scene-keys.yaml",
+        _prompt_seed_text(retired_scene_blocks=True),
     )
-    assert all(item.enabled for item in payload.items)
-    assert payload.items[4].scene_key == "scene_test_general"
-    assert payload.items[4].scene_type == "general"
-    assert payload.items[4].content_hash == load_seed_file(path).items[4].content_hash
+
+    payload = load_seed_file(path)
+
+    assert payload.version == "1"
+    assert set(payload.prompts) == set(PROMPT_RESOURCE_IDS)
+    for resource_id in PROMPT_RESOURCE_IDS:
+        assert payload.prompts[resource_id] == prompt_marker_values(resource_id)
 
 
 @pytest.mark.parametrize(
     ("body", "message_fragment"),
     [
         ("- just\n- a list\n", "根节点必须是对象"),
-        ("fixed_candidates: [unclosed\n", "YAML 解析失败"),
+        ("version: [unclosed\n", "YAML 解析失败"),
     ],
 )
 def test_load_seed_file_rejects_invalid_format(
@@ -90,169 +138,22 @@ def test_load_seed_file_rejects_invalid_format(
 
 
 def test_load_seed_file_rejects_missing_version(tmp_path: Path) -> None:
-    body = (
-        "fixed_candidates:\n"
-        "  NOISE: 'x'\n"
-        "  MEANINGFUL: 'x'\n"
-        "  CALL_DIRECT: 'x'\n"
-        "  CALL_MENTION: 'x'\n"
-        "general_scenes:\n"
-        "  - id: 'scene_test_general'\n"
-        "    text: '内容'\n"
+    path = _write(
+        tmp_path,
+        "no-version.yaml",
+        _prompt_seed_text(version=None),
     )
-    path = _write(tmp_path, "no-version.yaml", body)
     with pytest.raises(SeedValidationError, match="version"):
         load_seed_file(path)
 
 
-@pytest.mark.parametrize("missing_key", REQUIRED_FIXED_SCENE_KEYS)
-def test_load_seed_file_rejects_missing_required_fixed_key(
-    tmp_path: Path,
-    missing_key: str,
-) -> None:
-    fixed_keys = tuple(k for k in REQUIRED_FIXED_SCENE_KEYS if k != missing_key)
-    path = _write(tmp_path, "missing-fixed.yaml", _seed_text(fixed_keys=fixed_keys))
-    with pytest.raises(SeedValidationError) as exc_info:
-        load_seed_file(path)
-    assert missing_key in str(exc_info.value)
-
-
-def test_load_seed_file_rejects_empty_general_scenes(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path,
-        "no-general.yaml",
-        _seed_text(general_scenes=[]).replace("general_scenes:\n", "general_scenes: []\n"),
-    )
-    with pytest.raises(SeedValidationError, match="general_scenes 不能为空"):
-        load_seed_file(path)
-
-
-@pytest.mark.parametrize(
-    ("general_scenes", "duplicated_key"),
-    [
-        ([{"id": "NOISE", "text": "与 fixed 候选重复"}], "NOISE"),
-        (
-            [
-                {"id": "scene_dup", "text": "第一个"},
-                {"id": "scene_dup", "text": "第二个"},
-            ],
-            "scene_dup",
-        ),
-    ],
-    ids=["fixed-general-duplicate", "within-general-duplicate"],
-)
-def test_load_seed_file_rejects_duplicate_scene_keys(
-    tmp_path: Path,
-    general_scenes: list[dict[str, str]],
-    duplicated_key: str,
-) -> None:
-    path = _write(
-        tmp_path,
-        "duplicate-keys.yaml",
-        _seed_text(general_scenes=general_scenes),
-    )
-    with pytest.raises(SeedValidationError) as exc_info:
-        load_seed_file(path)
-    assert duplicated_key in str(exc_info.value)
-
-
-def test_load_seed_file_rejects_blank_fixed_content(tmp_path: Path) -> None:
-    body = (
-        "version: '1'\n"
-        "fixed_candidates:\n"
-        "  NOISE: '  '\n"
-        "  MEANINGFUL: '内容'\n"
-        "  CALL_DIRECT: '内容'\n"
-        "  CALL_MENTION: '内容'\n"
-        "general_scenes:\n"
-        "  - id: 'scene_test_general'\n"
-        "    text: '内容'\n"
-    )
-    path = _write(tmp_path, "blank-fixed.yaml", body)
-    with pytest.raises(SeedValidationError, match="NOISE"):
-        load_seed_file(path)
-
-
-def _rows_with(
-    *,
-    missing: tuple[str, ...] = (),
-    disabled: tuple[str, ...] = (),
-    general_enabled: int = 1,
-) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    rows.extend(
-        {
-            "scene_key": key,
-            "scene_type": "fixed",
-            "content_text": f"内容 {key}",
-            "enabled": key not in disabled,
-        }
-        for key in REQUIRED_FIXED_SCENE_KEYS
-        if key not in missing
-    )
-    rows.extend(
-        {
-            "scene_key": f"scene_general_{index}",
-            "scene_type": "general",
-            "content_text": "一般场景内容",
-            "enabled": True,
-        }
-        for index in range(general_enabled)
-    )
-    return rows
-
-
-def test_verify_cold_start_state_accepts_sufficient_database_state() -> None:
-    result = verify_cold_start_state(_rows_with())
-    assert result.fixed_count == len(REQUIRED_FIXED_SCENE_KEYS)
-    assert result.general_count == 1
-
-
-@pytest.mark.parametrize("missing_key", REQUIRED_FIXED_SCENE_KEYS)
-def test_verify_cold_start_state_rejects_missing_required_key(
-    missing_key: str,
-) -> None:
-    with pytest.raises(SeedVerificationError) as exc_info:
-        verify_cold_start_state(_rows_with(missing=(missing_key,)))
-    assert "缺少必需固定场景" in str(exc_info.value)
-    assert missing_key in str(exc_info.value)
-
-
-def test_verify_cold_start_state_rejects_disabled_required_key() -> None:
-    with pytest.raises(SeedVerificationError) as exc_info:
-        verify_cold_start_state(_rows_with(disabled=("NOISE",)))
-    assert "NOISE" in str(exc_info.value)
-
-
-def test_verify_cold_start_state_rejects_zero_enabled_general() -> None:
-    with pytest.raises(SeedVerificationError) as exc_info:
-        verify_cold_start_state(
-            [dict(row) for row in _rows_with() if row["scene_type"] == "fixed"]
-        )
-    assert "一般场景" in str(exc_info.value)
-
-
-def test_verify_cold_start_state_ignores_disabled_general() -> None:
-    rows = [
-        *[dict(row) for row in _rows_with() if row["scene_type"] == "fixed"],
-        {
-            "scene_key": "scene_disabled_general",
-            "scene_type": "general",
-            "content_text": "已禁用一般场景",
-            "enabled": False,
-        },
-    ]
-    with pytest.raises(SeedVerificationError, match="一般场景"):
-        verify_cold_start_state(rows)
-
-
 def test_default_seed_file_satisfies_validation() -> None:
-    """默认版本化资产必须通过自身校验（防资产与校验逻辑漂移）。"""
-    from komari_bot.db.seed_bootstrap import DEFAULT_SEED_FILE
-
+    """默认版本化资产必须通过自身校验：只有 Prompt 块，没有场景块。"""
     assert DEFAULT_SEED_FILE.is_file()
     payload = load_seed_file(DEFAULT_SEED_FILE)
-    assert set(payload.fixed_candidates) == set(REQUIRED_FIXED_SCENE_KEYS)
-    assert payload.general_scenes
+    assert set(payload.prompts) == set(PROMPT_RESOURCE_IDS)
+
     raw = yaml.safe_load(DEFAULT_SEED_FILE.read_text(encoding="utf-8")) or {}
     assert raw.get("version")
+    assert "fixed_candidates" not in raw
+    assert "general_scenes" not in raw

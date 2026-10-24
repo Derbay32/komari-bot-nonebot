@@ -27,7 +27,7 @@ def _install_allowed_entry_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     handler: object,
     workflow: object | None = None,
-) -> None:
+) -> SimpleNamespace:
     config = SimpleNamespace(
         plugin_enable=True,
         group_whitelist=[],
@@ -64,6 +64,7 @@ def _install_allowed_entry_dependencies(
 
     monkeypatch.setattr(chat_module, "adjudicate", _adjudicate_allowed)
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
+    return _install_dispatch(chat_module, monkeypatch)
 
 
 class _EntryBot:
@@ -93,7 +94,7 @@ def _pending_reply(
         reply_to_message_id=reply_to_message_id,
         message=SimpleNamespace(group_id="114514"),
         request_trace_id=request_trace_id,
-        reason="at",
+        reason="platform_summon",
         reaction_sent=reaction_sent,
     )
 
@@ -121,6 +122,9 @@ def chat_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
             )
         ]
         decision_package.get_decision_engine = lambda: None  # type: ignore[attr-defined]
+        decision_package.get_decision_dispatch = (  # type: ignore[attr-defined]
+            lambda *_args, **_kwargs: None
+        )
         sys.modules[decision_package_name] = decision_package
 
     module_name = "komari_bot.plugins.komari_chat._entry_under_test"
@@ -141,12 +145,27 @@ def chat_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
     return module
 
 
+def _install_dispatch(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
+    """入口共享载体替身：本文件只验证入口编排，不覆盖判定语义。"""
+    dispatch = SimpleNamespace(request=SimpleNamespace(platform_summoned=False))
+    monkeypatch.setattr(
+        chat_module,
+        "get_decision_dispatch",
+        lambda *_args, **_kwargs: dispatch,
+        raising=False,
+    )
+    return dispatch
+
+
 @pytest.mark.asyncio
 async def test_admission_gate_controls_group_message_processing(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = SimpleNamespace(process=False)
+    calls = SimpleNamespace(process=False, dispatch=None)
     config = SimpleNamespace(plugin_enable=True)
 
     def _adjudicate_allowed(_groups: object) -> object:
@@ -171,22 +190,26 @@ async def test_admission_gate_controls_group_message_processing(
         async def process_message(
             _bot: object,
             _event: object,
-            **_kwargs: object,
+            **kwargs: object,
         ) -> None:
             calls.process = True
+            calls.dispatch = kwargs.get("decision_dispatch")
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
     monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
     monkeypatch.setattr(chat_module, "adjudicate", _adjudicate_allowed)
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
+    dispatch = _install_dispatch(chat_module, monkeypatch)
 
     await chat_module.handle_group_message(
         cast("Bot", cast("Any", object())),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+        {},
     )
 
     assert calls.process
+    assert calls.dispatch is dispatch
 
 
 def test_reply_fulfillment_ops_does_not_require_decision_engine(
@@ -328,6 +351,7 @@ async def test_send_failure_does_not_commit_reply_side_effects(
     await chat_module.handle_group_message(
         cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+        {},
     )
 
     assert calls.fulfill == 1
@@ -376,6 +400,7 @@ async def test_successful_send_is_delegated_once_to_reply_fulfillment(
     await chat_module.handle_group_message(
         cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+        {},
     )
 
     assert fulfill_calls == [pending_reply]
@@ -424,6 +449,7 @@ async def test_llm_cq_literal_is_sent_as_one_plain_text_segment(
     await chat_module.handle_group_message(
         cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+        {},
     )
 
     assert len(bot.calls) == 1
@@ -480,6 +506,7 @@ async def test_fulfillment_failure_after_send_is_reported_by_entry(
     await chat_module.handle_group_message(
         cast("Bot", cast("Any", bot)),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+        {},
     )
 
     assert calls.send
@@ -500,7 +527,7 @@ async def test_unknown_send_result_is_owned_by_reply_fulfillment(
         reply_to_message_id=None,
         operation_id="reply-operation-unknown",
         request_trace_id="test-trace-unknown",
-        reason="at",
+        reason="platform_summon",
         reaction_sent=False,
     )
 
@@ -541,10 +568,12 @@ async def test_unknown_send_result_is_owned_by_reply_fulfillment(
         _Workflow(),
     )
     monkeypatch.setattr(chat_module.matcher, "send", _unknown_send)
+    _install_dispatch(chat_module, monkeypatch)
 
     await chat_module.handle_group_message(
         cast("Bot", cast("Any", object())),
         cast("GroupMessageEvent", SimpleNamespace(group_id=114514)),
+        {},
     )
 
     assert calls.fulfill == 1

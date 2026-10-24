@@ -6,7 +6,8 @@ Schema + 配置管理器测试替身）验证：
 - 五个请求字段（``jev_base_url`` / ``jev_api_key`` / ``jev_model`` /
   ``jev_http_timeout_seconds`` / ``jev_request_timeout_seconds``）经既有字段写入
   接口保存，并在读取响应中只返回秘密字段掩码；
-- 旧字段（含 ``plugin_enable=False``）保持原样，新字段以 ``immediate`` 生效；
+- TSK-190 后只剩 ``jev_request`` 与 ``jev_execution`` 两个分区，保留字段
+  （含新初始化默认启用的 ``plugin_enable``）取值不变；退役字段不再出现；
 - 非法截止、空模型、畸形连接地址与畸形凭据在写入边界被拒绝：422 响应、
   审计输出与读取投影都不得回显被拒值（凭据 canary 不得出现），配置保持原样。
 """
@@ -29,6 +30,9 @@ from komari_bot.plugins.komari_management.config_api import (
 )
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
+)
+from tests.db.tsk190_legacy_config_support import (
+    RETIRED_DECISION_CONFIG_FIELDS,
 )
 from tests.komari_decision.test_jev_request import (
     CHOICE_QUESTION,
@@ -151,8 +155,10 @@ async def test_jev_fields_are_exposed_with_secret_masking(
     assert values["jev_model"] == "jev-1.14.0"
     assert values["jev_http_timeout_seconds"] == 3.0
     assert values["jev_request_timeout_seconds"] == 3.0
-    # 旧字段保持原样，本票不提前切换业务开关
-    assert values["plugin_enable"] is False
+    # TSK-190：新初始化配置默认启用，退役字段不再返回
+    assert values["plugin_enable"] is True
+    for retired in RETIRED_DECISION_CONFIG_FIELDS:
+        assert retired not in values, retired
 
     field_metadata = payload["field_metadata"]
     assert field_metadata["jev_api_key"] == {
@@ -175,14 +181,14 @@ async def test_jev_fields_are_exposed_with_secret_masking(
     assert payload["field_states"]["jev_api_key"]["configured_value"] == "******"
     assert payload["field_states"]["jev_api_key"]["effective_value"] == "******"
     section_ids = [section["section_id"] for section in payload["sections"]]
-    assert "jev_request" in section_ids
+    # TSK-190：只剩 Jev 两个分区，场景与总结分区不再暴露
+    assert section_ids == ["jev_request", "jev_execution"]
     jev_section = next(
         section
         for section in payload["sections"]
         if section["section_id"] == "jev_request"
     )
     assert jev_section["display_name"]
-    assert section_ids.index("jev_request") > section_ids.index("chat_scene")
 
 
 @pytest.mark.asyncio

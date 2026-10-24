@@ -1,40 +1,42 @@
-"""版本化初始数据播种入口（TSK-189 / TSK-190）。
+"""版本化 Prompt 初始数据播种入口（TSK-190/191；场景初始化已退役）。
 
 统一、版本化且幂等的初始数据播种命令，供本地、容器 prestart 与 CI 复用：
 
     python -m komari_bot.db.seed_bootstrap [--seed-file PATH]
         [--decision-seed-file PATH]
 
-TSK-182 起新增**可选**的判定 Prompt 初始数据资产
-（``--decision-seed-file``，默认
-``komari_bot/db/initial_data/decision_prompt.yaml``）：它独立解析与校验，
-避免可选资产的格式错误影响必需资源的校验；必需资源提交并通过校验后，才
-以自己的独立连接租约与独立事务写入判定 Prompt。可选资产的读取/校验/
-取用/写入/归还失败只输出一条固定安全诊断（不含正文、未知字段值、凭据、
-原始异常或回溯），不阻止角色服务启动，也绝不把运行时健康状态判成失败
-（ADR-0011《判定 Prompt 的隔离初始化》）。
+必需 manifest（``--seed-file``，默认
+``komari_bot/db/initial_data/scenes.yaml``）只携带三个必需 Prompt 资源
+（chat / memory summary / group history summary）的初始数据；
+``--decision-seed-file``（默认
+``komari_bot/db/initial_data/decision_prompt.yaml``）是**可选**的判定 Prompt
+初始数据资产：它独立解析与校验，避免可选资产的格式错误影响必需资源的校验；
+必需资源提交并通过校验后，才以自己的独立连接租约与独立事务写入判定 Prompt。
+可选资产的读取/校验/取用/写入/归还失败只输出一条固定安全诊断（不含正文、
+未知字段值、凭据、原始异常或回溯），不阻止角色服务启动，也绝不把运行时健康
+状态判成失败（ADR-0011《判定 Prompt 的隔离初始化》）。
+
+TSK-190 起判定场景初始化退役（依据 TSK-180 与 TSK-159 最终决议）：播种
+不读取、不写入且绝不重建旧场景存储；旧 manifest 若残留场景键，按无关顶层
+键忽略，校验层不因此新增拒绝规则。
 
 执行顺序与约束：
 
 1. **seed 文件校验先于数据库访问**：默认读取
    ``komari_bot/db/initial_data/scenes.yaml``（可经 ``--seed-file`` 覆盖），
-   校验 version、必需 fixed 场景、一般场景与 scene_key 唯一性，并在 YAML
-   解析阶段拒绝 mapping 重复键（PyYAML 默认静默覆盖）；TSK-190/191 起
-   同时校验三个 Prompt 资源（chat / memory summary / group history
-   summary）的初始数据块：字段集合与各自强类型 Schema 一一对应、全部非空
-   字符串且共享内容预算通过，缺块/缺字段/违规在数据库访问前即失败，
-   任何格式或约束不满足都以非零退出码结束并指明出错的 seed 文件。
-2. **只插缺失、绝不覆盖**：场景按稳定 ``scene_key`` 执行
-   ``INSERT ... ON CONFLICT DO NOTHING``，已有默认或管理员场景（含 disabled）
-   保持原值；三个 Prompt 资源只新建缺失单行（id=1）并补齐空字段
-   （``None``、空字符串与纯空白字符串均视为空），非空自定义值绝不覆盖；
-   两者均重复执行幂等（TSK-190/191 验收标准 6）。
-3. **写入后验证最终数据库状态足以冷启动**：校验 PostgreSQL 中必需 fixed
-   场景齐全且可用、至少存在一个启用的一般场景，且三个 Prompt 资源单行
-   全部字段非空；不满足则命令失败，容器 prestart 的 ``set -e`` 会随之中止
-   应用启动（fail fast）。
-4. **运行时从不读取本文件**：初始化数据只是 bootstrap seed，运行时的场景
-   快照与 Prompt 快照一律从 PostgreSQL 构建（见 ADR-0011）。
+   校验 version，并在 YAML 解析阶段拒绝 mapping 重复键（PyYAML 默认静默
+   覆盖）；同时校验三个必需 Prompt 资源的初始数据块：字段集合与各自强类型
+   Schema 一一对应、全部非空字符串且共享内容预算通过，缺块/缺字段/违规在
+   数据库访问前即失败，任何格式或约束不满足都以非零退出码结束并指明出错的
+   seed 文件。
+2. **只插缺失、绝不覆盖**：三个 Prompt 资源只新建缺失单行（id=1）并补齐空
+   字段（``None``、空字符串与纯空白字符串均视为空），非空自定义值绝不覆盖；
+   重复执行幂等（TSK-190/191 验收标准 6）。
+3. **写入后验证最终数据库状态足以冷启动**：校验 PostgreSQL 中三个 Prompt
+   资源单行全部字段非空；不满足则命令失败，容器 prestart 的 ``set -e`` 会
+   随之中止应用启动（fail fast）。
+4. **运行时从不读取本文件**：初始化数据只是 bootstrap seed，运行时的 Prompt
+   快照一律从 PostgreSQL 构建（见 ADR-0011）。
 5. **可选判定 Prompt 的隔离初始化**（TSK-182）：独立的
    ``decision_prompt.yaml`` 只校验自己的严格固定形状，只在必需资源已提交并
    通过校验之后、以自己的独立连接租约与独立事务写入判定 Prompt；只新建
@@ -57,7 +59,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import sys
 from collections.abc import Hashable
 from dataclasses import dataclass
@@ -84,14 +85,6 @@ DEFAULT_SEED_FILE = Path(__file__).resolve().parent / "initial_data" / "scenes.y
 #: TSK-182：判定 Prompt 的独立可选初始数据资产（与必需 manifest 隔离）。
 DEFAULT_DECISION_SEED_FILE = (
     Path(__file__).resolve().parent / "initial_data" / "decision_prompt.yaml"
-)
-
-#: 必需 fixed 场景键（seed 资产与数据库冷启动校验共用）。
-_REQUIRED_FIXED_SCENE_KEYS: tuple[str, ...] = (
-    "NOISE",
-    "MEANINGFUL",
-    "CALL_DIRECT",
-    "CALL_MENTION",
 )
 
 #: Prompt 强类型表继承自 TypedConfigModel 的存储专用字段。
@@ -177,25 +170,10 @@ class SeedVerificationError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class SceneSeedItem:
-    """归一化后的待播种 scene 条目。"""
-
-    scene_key: str
-    scene_type: str  # fixed | general
-    content_text: str
-    content_hash: str
-    enabled: bool
-    order_index: int
-
-
-@dataclass(frozen=True)
 class SeedPayload:
     """校验通过的版本化初始数据载荷。"""
 
     version: str
-    fixed_candidates: dict[str, str]
-    general_scenes: list[dict[str, str]]
-    items: list[SceneSeedItem]
     #: 三个 Prompt 资源（chat / memory summary / group history summary）
     #: 的完整初始值（TSK-191）；文件缺块时键缺失，由 CLI 层按冷启动
     #: 要求拒绝。
@@ -204,72 +182,10 @@ class SeedPayload:
 
 @dataclass(frozen=True)
 class SeedReport:
-    """播种结果。"""
+    """播种结果：三个必需 Prompt 资源新建行 / 补齐字段数。"""
 
-    inserted: int
-    total: int
-    fixed_count: int
-    general_count: int
-    #: TSK-191：三个 Prompt 资源新建行 / 补齐字段数。
-    prompt_rows_inserted: int = 0
-    prompt_fields_filled: int = 0
-
-
-@dataclass(frozen=True)
-class ColdStartState:
-    """播种后数据库满足冷启动条件的状态统计。"""
-
-    fixed_count: int
-    general_count: int
-
-
-def compute_text_hash(text: str) -> str:
-    """计算场景内容哈希（与 SceneRepository 同一约定）。"""
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
-
-
-def _normalize_fixed_candidates(raw: object, path: Path) -> dict[str, str]:
-    """标准化 fixed_candidates；空键或空内容一律视为非法。"""
-    if not isinstance(raw, dict):
-        msg = f"fixed_candidates 必须是对象: {path}"
-        raise SeedValidationError(msg)
-    normalized: dict[str, str] = {}
-    for key, value in raw.items():
-        key_str = str(key).strip()
-        value_str = str(value).strip()
-        if not key_str:
-            msg = f"固定场景键不能为空: {path}"
-            raise SeedValidationError(msg)
-        if not value_str:
-            msg = f"固定场景内容不能为空: {key_str}（{path}）"
-            raise SeedValidationError(msg)
-        normalized[key_str] = value_str
-    return normalized
-
-
-def _normalize_general_scenes(raw: object, path: Path) -> list[dict[str, str]]:
-    """标准化 general_scenes；条目缺 id/text 一律视为非法。"""
-    if not isinstance(raw, list):
-        msg = f"general_scenes 必须是数组: {path}"
-        raise SeedValidationError(msg)
-    normalized: list[dict[str, str]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            msg = f"一般场景条目必须是对象: {path}"
-            raise SeedValidationError(msg)
-        scene_id = str(item.get("id") or "").strip()
-        scene_text = str(item.get("text") or "").strip()
-        if not scene_id:
-            msg = f"一般场景缺少 id: {path}"
-            raise SeedValidationError(msg)
-        if not scene_text:
-            msg = f"一般场景缺少 text: {scene_id}（{path}）"
-            raise SeedValidationError(msg)
-        normalized.append({"id": scene_id, "text": scene_text})
-    if not normalized:
-        msg = f"初始数据缺少一般场景（general_scenes 不能为空）: {path}"
-        raise SeedValidationError(msg)
-    return normalized
+    prompt_rows_inserted: int
+    prompt_fields_filled: int
 
 
 def _find_prompt_mapping(raw: object, resource_id: str) -> dict[str, Any] | None:
@@ -457,23 +373,6 @@ def load_decision_prompt_seed(path: Path) -> dict[str, str]:
     return _validate_prompt_values(section, _DECISION_PROMPT_RESOURCE_ID, path)
 
 
-def _find_duplicate_scene_keys(
-    fixed_candidates: dict[str, str],
-    general_scenes: list[dict[str, str]],
-) -> list[str]:
-    """返回 fixed 与 general 之间、general 内部重复的 scene_key（稳定顺序）。"""
-    seen: set[str] = set(fixed_candidates)
-    duplicates: list[str] = []
-    for scene in general_scenes:
-        key = scene["id"]
-        if key in seen:
-            if key not in duplicates:
-                duplicates.append(key)
-        else:
-            seen.add(key)
-    return duplicates
-
-
 def _load_yaml_document(path: Path) -> dict[str, Any]:
     """读取 YAML 文档并拒绝 mapping 重复键（必需与可选资产共用同一严格解析）。
 
@@ -503,10 +402,12 @@ def _load_yaml_document(path: Path) -> dict[str, Any]:
 
 
 def load_seed_file(path: Path) -> SeedPayload:
-    """读取并校验版本化 seed 文件，返回归一化载荷。
+    """读取并校验版本化 seed 文件，返回归一化 Prompt 载荷。
 
-    校验失败抛出 :class:`SeedValidationError`，消息始终指明出错的 seed 文件
-    路径，并在缺键 / 重复键场景点名具体键。
+    只校验 version 与三个必需 Prompt 资源的初始数据块；旧场景键属于无关
+    顶层键，既不校验也不据此新增拒绝规则。校验失败抛出
+    :class:`SeedValidationError`，消息始终指明出错的 seed 文件路径，并在
+    缺键 / 重复键情形点名具体键。
     """
     path = path if path.is_absolute() else path.resolve()
     raw = _load_yaml_document(path)
@@ -516,118 +417,13 @@ def load_seed_file(path: Path) -> SeedPayload:
         msg = f"初始数据缺少 version 标记: {path}"
         raise SeedValidationError(msg)
 
-    fixed_candidates = _normalize_fixed_candidates(raw.get("fixed_candidates"), path)
-    general_scenes = _normalize_general_scenes(raw.get("general_scenes"), path)
-
-    missing = [
-        key for key in _REQUIRED_FIXED_SCENE_KEYS if key not in fixed_candidates
-    ]
-    if missing:
-        msg = (
-            "初始数据缺少必需固定场景: "
-            f"{', '.join(missing)}（{path}）"
-        )
-        raise SeedValidationError(msg)
-
-    duplicates = _find_duplicate_scene_keys(fixed_candidates, general_scenes)
-    if duplicates:
-        msg = (
-            "初始数据 scene_key 重复: "
-            f"{', '.join(duplicates)}（{path}）"
-        )
-        raise SeedValidationError(msg)
-
     prompts: dict[str, dict[str, str]] = {}
     for resource_id in _PROMPT_RESOURCE_IDS:
         normalized = _normalize_prompt(raw, resource_id, path)
         if normalized:
             prompts[resource_id] = normalized
 
-    items: list[SceneSeedItem] = []
-    order = 0
-    for key, content in fixed_candidates.items():
-        items.append(
-            SceneSeedItem(
-                scene_key=key,
-                scene_type="fixed",
-                content_text=content,
-                content_hash=compute_text_hash(content),
-                enabled=True,
-                order_index=order,
-            )
-        )
-        order += 1
-    for scene in general_scenes:
-        content = scene["text"]
-        items.append(
-            SceneSeedItem(
-                scene_key=scene["id"],
-                scene_type="general",
-                content_text=content,
-                content_hash=compute_text_hash(content),
-                enabled=True,
-                order_index=order,
-            )
-        )
-        order += 1
-
-    return SeedPayload(
-        version=version,
-        fixed_candidates=fixed_candidates,
-        general_scenes=general_scenes,
-        items=items,
-        prompts=prompts,
-    )
-
-
-def verify_cold_start_state(rows: list[dict[str, Any]]) -> ColdStartState:
-    """校验数据库最终状态足以冷启动。
-
-    必需 fixed 场景必须全部存在、类型为 fixed、启用且内容非空；数据库至少
-    存在一个启用且内容非空的一般场景。不满足则抛出
-    :class:`SeedVerificationError`。
-    """
-    by_key = {str(row["scene_key"]): row for row in rows}
-    missing = [key for key in _REQUIRED_FIXED_SCENE_KEYS if key not in by_key]
-    unavailable: list[str] = []
-    for key in _REQUIRED_FIXED_SCENE_KEYS:
-        row = by_key.get(key)
-        if row is None:
-            continue
-        valid = (
-            str(row["scene_type"]) == "fixed"
-            and bool(row["enabled"])
-            and bool(str(row["content_text"] or "").strip())
-        )
-        if not valid:
-            unavailable.append(key)
-
-    general_enabled = 0
-    for row in rows:
-        if (
-            str(row["scene_type"]) == "general"
-            and bool(row["enabled"])
-            and bool(str(row["content_text"] or "").strip())
-        ):
-            general_enabled += 1
-
-    problems: list[str] = []
-    if missing:
-        problems.append(f"缺少必需固定场景: {', '.join(missing)}")
-    if unavailable:
-        problems.append(f"必需固定场景不可用: {', '.join(unavailable)}")
-    if general_enabled <= 0:
-        problems.append("至少需要一个启用的一般场景")
-    if problems:
-        msg = "；".join(problems)
-        raise SeedVerificationError(msg)
-
-    return ColdStartState(
-        fixed_count=sum(
-            1 for row in rows if str(row["scene_type"]) == "fixed"
-        ),
-        general_count=general_enabled,
-    )
+    return SeedPayload(version=version, prompts=prompts)
 
 
 async def _seed_prompt_row(
@@ -740,11 +536,12 @@ async def _seed_database(
     *,
     decision_prompt: dict[str, str] | None = None,
 ) -> SeedReport:
-    """写入缺失场景与聊天 Prompt 初始数据，并在写入后校验冷启动充分性。
+    """写入缺失 Prompt 初始数据，并在写入后校验冷启动充分性。
 
     数据库访问经 nonebot-plugin-orm 共享连接边界（shared engine pool）：
     只借还连接，不捕获也不 dispose 共享引擎（生命周期由 nonebot-plugin-orm
-    托管）；查询为既有表的只读与幂等写入，不使用任何运行时 DDL。
+    托管）；查询为既有 Prompt 表的只读与幂等写入，不使用任何运行时 DDL，
+    也不读写已退役的场景存储。
 
     ``decision_prompt`` 为 TSK-182 的可选判定 Prompt 正文：``None`` 明确
     表示可选资产未提供或不可用（运行时没有回退正文），不表示已写入任何
@@ -754,30 +551,10 @@ async def _seed_database(
     from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
     pool = get_shared_orm_connection_pool()
-    inserted = 0
     prompt_rows_inserted = 0
     prompt_fields_filled = 0
     async with pool.acquire() as conn:
         async with conn.transaction():
-            for item in payload.items:
-                inserted_id = await conn.fetchval(
-                    """
-                    INSERT INTO komari_decision_scenes
-                        (scene_key, scene_type, content_text, content_hash,
-                         enabled, order_index)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (scene_key) DO NOTHING
-                    RETURNING id
-                    """,
-                    item.scene_key,
-                    item.scene_type,
-                    item.content_text,
-                    item.content_hash,
-                    item.enabled,
-                    item.order_index,
-                )
-                if inserted_id is not None:
-                    inserted += 1
             for resource_id, prompt_values in payload.prompts.items():
                 rows_added, fields_filled = await _seed_prompt_row(
                     conn,
@@ -788,13 +565,6 @@ async def _seed_database(
                 prompt_fields_filled += fields_filled
         for resource_id in payload.prompts:
             await _verify_prompt_cold_start(conn, resource_id)
-        rows = await conn.fetch(
-            """
-            SELECT scene_key, scene_type, content_text, enabled
-            FROM komari_decision_scenes
-            """
-        )
-        state = verify_cold_start_state([dict(row) for row in rows])
     # 必需租约到这里完整结束：取用、写入、提交、写入后校验与归还同属
     # 必需资源的错误边界（其中的失败仍然判主失败）。
 
@@ -808,10 +578,6 @@ async def _seed_database(
             prompt_fields_filled += seeded[1]
 
     return SeedReport(
-        inserted=inserted,
-        total=len(rows),
-        fixed_count=state.fixed_count,
-        general_count=state.general_count,
         prompt_rows_inserted=prompt_rows_inserted,
         prompt_fields_filled=prompt_fields_filled,
     )
@@ -821,15 +587,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m komari_bot.db.seed_bootstrap",
         description=(
-            "版本化初始数据播种：校验 seed 文件后按 scene_key 只补插缺失场景，"
-            "并在写入后验证数据库最终状态足以冷启动。"
+            "版本化初始数据播种：校验 seed 文件后只为三个必需 Prompt 资源"
+            "补插缺失单行或补齐空字段，并在写入后验证数据库最终状态足以冷启动。"
         ),
     )
     parser.add_argument(
         "--seed-file",
         type=Path,
         default=DEFAULT_SEED_FILE,
-        help=f"版本化初始数据文件路径（默认: {DEFAULT_SEED_FILE}）",
+        help=f"版本化 Prompt 初始数据文件路径（默认: {DEFAULT_SEED_FILE}）",
     )
     parser.add_argument(
         "--decision-seed-file",
@@ -908,9 +674,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(1) from exc
 
     print(  # noqa: T201
-        f"[seed_bootstrap] 场景初始数据播种完成: 新增 {report.inserted} 条，"
-        f"共 {report.total} 条（fixed={report.fixed_count} "
-        f"general={report.general_count}）；Prompt: "
+        f"[seed_bootstrap] Prompt 初始数据播种完成: "
         f"新建 {report.prompt_rows_inserted} 行，"
         f"补齐 {report.prompt_fields_filled} 个字段"
     )
