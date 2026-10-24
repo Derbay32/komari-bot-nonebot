@@ -84,7 +84,6 @@ from komari_bot.plugins.komari_decision.services.jev_input import (
 from komari_bot.plugins.komari_decision.services.jev_recent import (
     DecisionRecentStore,
     ResolveAction,
-    resolve_action_for_retention,
 )
 from komari_bot.plugins.komari_decision.services.jev_request import (
     JevRequestConfigurationError,
@@ -93,7 +92,7 @@ from komari_bot.plugins.komari_decision.services.jev_request import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     import httpx2
     from redis.asyncio import Redis
@@ -646,6 +645,7 @@ class JevDecisionEngine:
                     identity=request.event,
                     decision_id=decision_id,
                     dispatch_id=request.dispatch_id,
+                    effect_check=lambda: self._completion_admitted(request),
                     status=STATE_FAILED,
                     reason_code="internal_error",
                     business_route="none",
@@ -655,6 +655,8 @@ class JevDecisionEngine:
             except Exception:
                 self._invalidate_unsettled_owner()
             await self._settle_finished(request.event)
+            if (request.event, request.dispatch_id) in self._admission_revoked:
+                return self._cancelled_result(request, decision_id)
             return _terminal_result("failed", "internal_error", decision_id=decision_id)
 
     async def _finalize_cancelled(
@@ -671,6 +673,7 @@ class JevDecisionEngine:
                     identity=request.event,
                     decision_id=decision_id,
                     dispatch_id=request.dispatch_id,
+                    effect_check=lambda: self._completion_admitted(request),
                     status=STATE_CANCELLED,
                     reason_code="interrupted",
                     business_route="none",
@@ -1007,6 +1010,12 @@ class JevDecisionEngine:
                 decisions[message_id] = action
         if not decisions:
             return
+        if not self._admission(identity):
+            self._mark_scope_revoked(identity, pending)
+            await ingress.revoke_unhanded_messages(
+                identity=identity, message_ids=pending
+            )
+            decisions = dict.fromkeys(pending, "remove")
         with suppress(Exception):
             await self._recent.settle(
                 protocol=protocol,
@@ -1015,7 +1024,6 @@ class JevDecisionEngine:
                 decisions=decisions,
             )
 
-    @staticmethod
     @staticmethod
     def _settlement_action(
         fact: RecentSettlementFact | None,
@@ -1150,13 +1158,19 @@ class JevDecisionEngine:
                     identity=request.event,
                     decision_id=decision_id,
                     dispatch_id=request.dispatch_id,
+                    effect_check=lambda: self._completion_admitted(request),
                 )
-        await self._resolve_recent(
-            request.event,
-            request.target.group_id,
-            request.target.message_id,
-            retain_recent=None if status == "failed" else False,
-        )
+        if status == "failed":
+            await self._settle_finished(request.event)
+        else:
+            await self._settle_entry(
+                request.event,
+                request.target.group_id,
+                request.target.message_id,
+                action="remove",
+            )
+        if (request.event, request.dispatch_id) in self._admission_revoked:
+            return self._cancelled_result(request, decision_id)
         return _terminal_result(
             status,
             reason,
@@ -1380,6 +1394,7 @@ class JevDecisionEngine:
             identity=request.event,
             decision_id=decision_id,
             dispatch_id=request.dispatch_id,
+            effect_check=lambda: self._completion_admitted(request),
             status=STATE_FAILED,
             reason_code=failure.reason,
             business_route="none",
@@ -1389,6 +1404,8 @@ class JevDecisionEngine:
             recent_retained=None,
         )
         await self._settle_finished(request.event)
+        if (request.event, request.dispatch_id) in self._admission_revoked:
+            return self._cancelled_result(request, decision_id)
         return _terminal_result(
             "failed",
             failure.reason,
@@ -1431,6 +1448,7 @@ class JevDecisionEngine:
             identity=request.event,
             decision_id=decision_id,
             dispatch_id=request.dispatch_id,
+            effect_check=lambda: self._completion_admitted(request),
             status=result.status,
             reason_code=result.reason_code,
             business_route=result.route,
@@ -1438,10 +1456,13 @@ class JevDecisionEngine:
             recent_retained=result.retain_recent,
         )
         await self._settle_finished(request.event)
-        if not finalized:
+        if (
+            not finalized
+            or (request.event, request.dispatch_id) in self._admission_revoked
+        ):
             return _terminal_result(
                 "cancelled",
-                "interrupted",
+                self._cancelled_result(request, decision_id).reason_code,
                 decision_id=decision_id,
                 durations=outcome.durations,
                 references=outcome.references,
@@ -1647,21 +1668,6 @@ class JevDecisionEngine:
                 message_id=message_id,
                 action=action,
             )
-
-    async def _resolve_recent(
-        self,
-        identity: EventIdentity,
-        group_id: str,
-        message_id: str,
-        *,
-        retain_recent: bool | None,
-    ) -> None:
-        await self._settle_entry(
-            identity,
-            group_id,
-            message_id,
-            action=resolve_action_for_retention(retain_recent=retain_recent),
-        )
 
     # ------------------------------ 路径与就绪 ------------------------------
 
@@ -1913,6 +1919,32 @@ class JevDecisionEngine:
         return response, parsed
 
     # ------------------------------ 守卫与观察 ------------------------------
+
+    def _completion_admitted(self, request: DecisionRequest) -> bool:
+        """Check current admission and remember any observed denial for this dispatch."""
+        key = (request.event, request.dispatch_id)
+        if key in self._admission_revoked:
+            return False
+        if self._admission(request.event):
+            return True
+        self._revoked.add(key)
+        self._admission_revoked.add(key)
+        return False
+
+    def _mark_scope_revoked(
+        self, identity: EventIdentity, message_ids: Sequence[str]
+    ) -> None:
+        """Keep local revocations sticky while their persistent cleanup is pending."""
+        for key in (*self._dispatches, *self._results):
+            event = key[0]
+            if (
+                event.protocol == identity.protocol
+                and event.account_id == identity.account_id
+                and event.group_id == identity.group_id
+                and event.message_id in message_ids
+            ):
+                self._revoked.add(key)
+                self._admission_revoked.add(key)
 
     async def _require_current(
         self, request: DecisionRequest, decision_id: str

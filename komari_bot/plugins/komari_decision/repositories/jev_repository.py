@@ -939,6 +939,7 @@ class JevDecisionRepository:
         reason_code: str,
         business_route: str,
         notification_eligible: bool,
+        effect_check: Callable[[], bool],
         recent_retained: bool | None = None,
     ) -> bool:
         """写入终态（含允许路由与输入缓存处置事实）并释放名额。"""
@@ -948,12 +949,17 @@ class JevDecisionRepository:
             row = await self._row_for(session, identity, decision_id)
             if row is None:
                 return False
+            admitted = effect_check()
+            if not admitted:
+                status = STATE_CANCELLED
+                reason_code = "admission_revoked"
+                business_route = "none"
+                notification_eligible = False
+                recent_retained = False
             result = await session.execute(
                 update(DecisionDispatchRow)
                 .where(
-                    *self._fence(
-                        row, dispatch_id=dispatch_id, decision_id=decision_id
-                    ),
+                    *self._fence(row, dispatch_id=dispatch_id, decision_id=decision_id),
                     col(DecisionDispatchRow.state).in_(_LIVE_STATES),
                 )
                 .values(
@@ -971,7 +977,7 @@ class JevDecisionRepository:
                 session, row, dispatch_id=dispatch_id, decision_id=decision_id
             )
             await self._grant_pass(session)
-            return completed
+            return completed and admitted
 
     async def release_slot(
         self,
@@ -1084,6 +1090,7 @@ class JevDecisionRepository:
         identity: EventIdentity,
         decision_id: str,
         dispatch_id: str,
+        effect_check: Callable[[], bool],
     ) -> bool:
         """给已终态的技术失败补上一次性失败通知资格（幂等）。"""
         if not self.ready:
@@ -1092,12 +1099,18 @@ class JevDecisionRepository:
             row = await self._row_for(session, identity, decision_id)
             if row is None:
                 return False
+            if not effect_check():
+                await self._revoke_locked(
+                    session,
+                    identity=identity,
+                    decision_id=decision_id,
+                    dispatch_id=dispatch_id,
+                )
+                return False
             result = await session.execute(
                 update(DecisionDispatchRow)
                 .where(
-                    *self._fence(
-                        row, dispatch_id=dispatch_id, decision_id=decision_id
-                    ),
+                    *self._fence(row, dispatch_id=dispatch_id, decision_id=decision_id),
                     col(DecisionDispatchRow.state) == STATE_FAILED,
                     col(DecisionDispatchRow.handed_off_at).is_(None),
                     col(DecisionDispatchRow.notification_eligible).is_(False),
@@ -1219,6 +1232,32 @@ class Ingress:
             account_id=account_id,
             group_id=group_id,
             message_ids=message_ids,
+        )
+
+    async def revoke_unhanded_messages(
+        self, *, identity: EventIdentity, message_ids: Sequence[str]
+    ) -> None:
+        """Persist observed scope revocation without releasing active work slots."""
+        await self._session.execute(
+            update(DecisionDispatchRow)
+            .where(
+                col(DecisionDispatchRow.protocol) == identity.protocol,
+                col(DecisionDispatchRow.account_id) == identity.account_id,
+                col(DecisionDispatchRow.group_id) == identity.group_id,
+                col(DecisionDispatchRow.message_id).in_(list(message_ids)),
+                col(DecisionDispatchRow.handed_off_at).is_(None),
+                col(DecisionDispatchRow.state).in_(_UNHANDED_STATES),
+            )
+            .values(
+                state=STATE_CANCELLED,
+                reason_code="admission_revoked",
+                business_route="none",
+                notification_eligible=False,
+                recent_retained=False,
+                finished_at=func.coalesce(
+                    col(DecisionDispatchRow.finished_at), _db_now()
+                ),
+            )
         )
 
     async def reserve(

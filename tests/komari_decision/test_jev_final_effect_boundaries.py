@@ -157,7 +157,8 @@ async def test_repeated_cancellation_waits_for_owned_finalization(
             result = await self.inner.execute(statement, *args, **kwargs)
             if (
                 str(statement).startswith("UPDATE komari_decision_dispatches")
-                and statement.compile().params.get("reason_code") == "interrupted"
+                and statement.compile().params.get("reason_code") == "admission_revoked"
+                and statement.compile().params.get("slot_held") is False
                 and not finalize_started.is_set()
             ):
                 finalize_started.set()

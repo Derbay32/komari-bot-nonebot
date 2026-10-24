@@ -1397,7 +1397,7 @@ async def test_cancel_finalization_fault_still_records_and_recovers_ownership(
             ):
                 parameters = statement.compile().params
                 if (
-                    parameters.get("reason_code") == "interrupted"
+                    parameters.get("reason_code") == "admission_revoked"
                     and parameters.get("slot_held") is False
                 ):
                     armed = False
